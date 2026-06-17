@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
-from minisgl.utils import is_sm90_supported, nvtx_annotate
+from minisgl.utils import nvtx_annotate
 
 if TYPE_CHECKING:
     from minisgl.core import Batch
@@ -21,28 +21,36 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
+def _apply_top_k(probs: torch.Tensor, top_k: torch.Tensor) -> torch.Tensor:
+    # per-row top-k mask (top_k: [bs] int); keep the k highest probs, zero the rest.
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    ranks = torch.arange(probs.shape[-1], device=probs.device).unsqueeze(0)
+    sorted_probs = sorted_probs.masked_fill(ranks >= top_k.unsqueeze(-1), 0.0)
+    return torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
+
+
+def _apply_top_p(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    # per-row nucleus mask (top_p: [bs] float); keep the smallest prefix whose mass > top_p.
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    cumsum = sorted_probs.cumsum(dim=-1)
+    sorted_probs = sorted_probs.masked_fill((cumsum - sorted_probs) > top_p.unsqueeze(-1), 0.0)
+    return torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
-    import flashinfer.sampling as sampling
-
-    probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
-    if top_k is None and top_p is None:
-        return sampling.sampling_from_probs(probs)
-
-    if top_p is None:
-        assert top_k is not None
-        return sampling.top_k_sampling_from_probs(probs, top_k)
-
-    if top_k is None:
-        assert top_p is not None
-        return sampling.top_p_sampling_from_probs(probs, top_p)
-
-    assert top_k is not None and top_p is not None
-    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    # torch port of the former flashinfer.sampling path (greedy goes through argmax in Sampler).
+    probs = torch.softmax(logits / temperatures.unsqueeze(-1).clamp_min(1e-6), dim=-1)
+    if top_k is not None:
+        probs = _apply_top_k(probs, top_k)
+    if top_p is not None:
+        probs = _apply_top_p(probs, top_p)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1).to(torch.int32)
 
 
 @dataclass

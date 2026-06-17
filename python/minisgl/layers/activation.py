@@ -1,21 +1,31 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Callable
 
-if TYPE_CHECKING:
-    import torch
+import torch
+import torch.nn.functional as F
+
+
+def _gated(
+    x: torch.Tensor, act: Callable[[torch.Tensor], torch.Tensor], out: torch.Tensor | None
+):
+    # gated activation over a [..., 2d] tensor: act(x[..., :d]) * x[..., d:].
+    # fp32-internal, in-dtype out (no F16 dequant).
+    d = x.shape[-1] // 2
+    a, b = x[..., :d], x[..., d:]
+    result = (act(a.float()) * b.float()).to(x.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
 
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from flashinfer import silu_and_mul
-
-    return silu_and_mul(x, out=out)
+    return _gated(x, F.silu, out)
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from flashinfer import gelu_and_mul
-
-    return gelu_and_mul(x, out=out)
+    return _gated(x, lambda t: F.gelu(t, approximate="none"), out)
 
 
 __all__ = ["silu_and_mul", "gelu_and_mul"]

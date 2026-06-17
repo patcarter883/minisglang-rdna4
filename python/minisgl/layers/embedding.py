@@ -31,15 +31,16 @@ class VocabParallelEmbedding(BaseOP):
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from minisgl.kernel import indexing
-
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
-
-        return self._comm.all_reduce(y) if self.tp_size > 1 else y
+        # torch port of the former `indexing` .cu op: vocab-parallel gather with
+        # out-of-range masking, then all-reduce across TP ranks.
+        if self.tp_size > 1:
+            start, count = self.vocab_range
+            mask = (x >= start) & (x < start + count)
+            local_idx = (x - start).clamp_(0, count - 1)
+            y = self.weight[local_idx]
+            y = torch.where(mask.unsqueeze(-1), y, torch.zeros_like(y))
+            return self._comm.all_reduce(y)
+        return self.weight[x]
 
 
 class ParallelLMHead(VocabParallelEmbedding):
