@@ -24,13 +24,49 @@ WMMA kernel and the tuned RDNA4 `triton_attn`, extended with GDN (Gated Delta Ne
 Greedy **token-identical vs `vllm22-w4a8:combined`** (same kernels) — tighter than vs HF. Reuse the
 `vllm-gfx1201/patches/run_het_e2e_combined.sh` pattern. Stand up before Phase 2.
 
+## Phase 1a boot — RESULT (2026-06-17): SUCCESS ✅
+
+Booted **Qwen/Qwen3-0.6B** (dense, bf16, eager, TP=1) on gfx1201 via the recipe below. The
+`triton_rdna4` backend auto-selected (`is_rocm()` works), the vendored tuned Triton attention
+kernel JIT-compiled and ran under HIP, and **all 4 greedy prompts produced coherent, correct
+completions** ("The capital of France is" -> " Paris…"; "2 + 2? A:" -> " 4"). Validates the whole
+stripped path: embedding -> torch RMSNorm -> NeoX RoPE -> tuned Triton attention -> SwiGLU -> greedy
+sampling -> paged KV + radix scheduler. KV cache 8.13 GiB, eager.
+
+Gotchas hit + fixed: (1) hand-rolled `docker run` needs ROCm device passthrough
+(`--device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined
+--security-opt label=disable --cap-add SYS_PTRACE --ipc host --shm-size 16gb`) or torch sees no HIP
+GPUs and `is_rocm()`->False. (2) Qwen3-0.6B weights weren't cached (config only) — fetched via
+`snapshot_download` (drop `HF_HUB_OFFLINE` for the fetch). The weight loader globs `*.safetensors`
+in the resolved snapshot dir, so a bare hub-id with no cached weights yields 0 tensors.
+
+NEXT validation (tight): greedy **token-identical vs vLLM** on the SAME input token-ids (feed ids to
+both to remove tokenization skew). Then Phase 1b (fp8-KV + 3D decode + autotuner).
+
+## Phase 1a boot — ready-to-run recipe (fire when GPUs idle)
+
+```bash
+docker run --rm \
+  -e HIP_VISIBLE_DEVICES=0,1 -e ROCR_VISIBLE_DEVICES=0,1 \
+  -v /home/pat/code/minisgl-rdna4:/engine \
+  -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
+  -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+  --entrypoint bash vllm22-w4a8:combined -lc '
+    source /app/.venv/bin/activate
+    pip install -q msgpack pyzmq prompt_toolkit accelerate 2>&1 | tail -1
+    PYTHONPATH=/engine/python python /engine/tools/boot_smoke.py \
+      --model Qwen/Qwen3-0.6B --json-out /engine/tools/boot_ours.json'
+```
+Expect: coherent greedy completions for 4 prompts + token ids. Validates the whole stripped path +
+tuned attention. If it works, do the token-diff vs vLLM (same kernel) on the same prompts.
+
 ## Phase status
 
 | Phase | What | Status |
 |---|---|---|
 | 0 | Fork + strip NVIDIA deps (dense path) | **done** (cf5a478) |
 | 1a | Tuned RDNA4 `triton_attn` backend, bf16 KV, 2D grid — wired + import-validated | **done** (fed6efa) |
-| 1a-boot | Functional boot Qwen2.5-0.5B bf16 eager TP=1, greedy token-diff | **NEXT — needs GPU window** |
+| 1a-boot | Functional boot bf16 eager TP=1 — **coherent greedy generation on gfx1201** | **done** 2026-06-17 |
 | 1b | fp8-KV (lift `reshape_and_cache_flash`) + 3D flash-decode + startup autotuner | todo |
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
