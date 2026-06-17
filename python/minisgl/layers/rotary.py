@@ -32,9 +32,16 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
-
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+    def _apply(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: [n, num_heads * head_size] -> NeoX rotate-half RoPE, fp32 internal, in-dtype out.
+        n = x.shape[0]
+        orig_dtype = x.dtype
+        x = x.view(n, -1, self.head_size).float()
+        d = self.head_size // 2
+        x1, x2 = x[..., :d], x[..., d:]
+        rot = torch.cat((-x2, x1), dim=-1)
+        out = x * cos.view(n, 1, self.head_size) + rot * sin.view(n, 1, self.head_size)
+        return out.view(n, -1).to(orig_dtype)
 
     def forward(
         self,
@@ -42,14 +49,11 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
-        )
-        return query, key
+        # cos_sin_cache row = cat(cos[d/2], sin[d/2]); NeoX needs each repeated to head_size.
+        cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
+        cos = torch.cat((cos_half, cos_half), dim=-1)
+        sin = torch.cat((sin_half, sin_half), dim=-1)
+        return self._apply(query, cos, sin), self._apply(key, cos, sin)
 
 
 def _get_rope(

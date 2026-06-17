@@ -45,15 +45,14 @@ class MHAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-        from minisgl.kernel import store_cache
-
-        store_cache(
-            k_cache=self._k_buffer[layer_id].view(self._storage_shape),
-            v_cache=self._v_buffer[layer_id].view(self._storage_shape),
-            indices=out_loc,
-            k=k,
-            v=v,
-        )
+        # torch port of the former `store_cache` .cu op: scatter new K/V into the
+        # paged buffer at `out_loc`. (bf16 path; the fp8-KV write uses the lifted
+        # reshape_and_cache Triton kernel in Phase 1.)
+        _, kv_heads, head_dim = self._storage_shape
+        k_cache = self._k_buffer[layer_id].view(self._storage_shape)
+        v_cache = self._v_buffer[layer_id].view(self._storage_shape)
+        k_cache[out_loc] = k.view(-1, kv_heads, head_dim).to(k_cache.dtype)
+        v_cache[out_loc] = v.view(-1, kv_heads, head_dim).to(v_cache.dtype)
 
     @property
     def device(self) -> torch.device:
