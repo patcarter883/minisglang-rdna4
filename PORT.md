@@ -28,8 +28,10 @@ Greedy **token-identical vs `vllm22-w4a8:combined`** (same kernels) — tighter 
 
 | Phase | What | Status |
 |---|---|---|
-| 0 | Fork + strip NVIDIA deps + boot Qwen2.5-0.5B bf16 eager TP=1, greedy-equiv | **IN PROGRESS** |
-| 1 | Tuned RDNA4 `triton_attn` backend + fp8-KV | todo |
+| 0 | Fork + strip NVIDIA deps (dense path) | **done** (cf5a478) |
+| 1a | Tuned RDNA4 `triton_attn` backend, bf16 KV, 2D grid — wired + import-validated | **done** (fed6efa) |
+| 1a-boot | Functional boot Qwen2.5-0.5B bf16 eager TP=1, greedy token-diff | **NEXT — needs GPU window** |
+| 1b | fp8-KV (lift `reshape_and_cache_flash`) + 3D flash-decode + startup autotuner | todo |
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid (3a state cache → 3b layer numerics → 3c scheduler split → 3d serve) | todo |
@@ -61,3 +63,22 @@ placeholders, validated by token-diff vs the combined image once Phase 1 attenti
 _Verification: `python -m py_compile` passes on all edited files; no top-level NVIDIA imports remain
 (the residual `flashinfer`/`sgl_kernel` refs are the lazy CUDA attention backends — replaced in
 P1 — and the deferred MoE path)._
+
+_Phase 1a — tuned RDNA4 attention (commit fed6efa):_
+- Vendored `attention/_triton_unified.py` + `_triton_helpers.py` from the baseline image's tuned
+  `triton_attn` (vLLM imports stubbed; `KVQuantMode` reproduced; fp8 dtype = `e4m3fn`). Kernel logic
+  unchanged.
+- `attention/triton_rdna4.py` (`TritonRDNA4Backend`) behind `attention/base.py`. KV layout maps 1:1
+  (`k_cache(layer_id)` = `(num_pages, page_size, kv_heads, head_dim)` == kernel's
+  `(num_blocks, block_size, ...)`); metadata lifted from `fa.py`. Phase 1a = bf16 KV (torch store),
+  2D grid (no 3D scratch), Triton-heuristic tuning.
+- `is_rocm()`/`get_gcn_arch()` in `utils/arch.py`; `_adjust_config` auto-selects `triton_rdna4` on
+  ROCm and forces `page_size % 16 == 0`.
+- **Validated CPU-only** in `vllm22-w4a8:combined` (GPUs hidden): `import minisgl.attention`, the
+  vendored kernel, and the backend all import under real Triton; backend is concrete (no unmet
+  abstractmethods). Functional boot (token generation) is the next step and needs a GPU window.
+
+**Build-story note:** the combined image's venv lacks minisgl's runtime deps (msgpack, pyzmq,
+prompt_toolkit, accelerate, modelscope, fastapi/uvicorn, openai…). The engine image (`FROM
+vllm22-w4a8:combined`) must `pip install` the engine + those deps. For ad-hoc runs, `pip install`
+them into the ephemeral container first.
