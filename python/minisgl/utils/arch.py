@@ -27,3 +27,21 @@ def is_sm90_supported() -> bool:
 
 def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
+
+
+@functools.cache
+def is_rocm() -> bool:
+    import torch
+    import torch.version
+
+    return torch.cuda.is_available() and bool(getattr(torch.version, "hip", None))
+
+
+@functools.cache
+def get_gcn_arch() -> str | None:
+    """AMD GCN/RDNA arch name, e.g. 'gfx1201' (None on non-ROCm)."""
+    if not is_rocm():
+        return None
+    import torch
+
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]

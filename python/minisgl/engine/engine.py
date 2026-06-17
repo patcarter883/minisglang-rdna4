@@ -11,7 +11,14 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
-from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.utils import (
+    div_even,
+    init_logger,
+    is_rocm,
+    is_sm90_supported,
+    is_sm100_supported,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -220,13 +227,23 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        if is_rocm():
+            backend = "triton_rdna4"  # tuned RDNA4 unified attention (gfx1201)
+        else:
+            backend = (
+                "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+            )
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
+
+    # The RDNA4 unified Triton kernel requires a KV block size that is a multiple of 16.
+    if "triton_rdna4" in config.attention_backend and config.page_size % 16 != 0:
+        override("page_size", 16)
+        logger.warning_rank0("Page size is overridden to 16 for the triton_rdna4 backend")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
