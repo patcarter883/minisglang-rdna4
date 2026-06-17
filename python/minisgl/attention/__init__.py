@@ -40,6 +40,13 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("triton_rdna4")
+def create_triton_rdna4_backend(config: ModelConfig):
+    from .triton_rdna4 import TritonRDNA4Backend
+
+    return TritonRDNA4Backend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
