@@ -106,7 +106,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                         continue
                     parts = [merge_buf[merged_key][s] for s in all_slots]
                     del merge_buf[merged_key]
-                    out = (merged_key, torch.cat(parts, dim=0))
+                    # AWQ quant siblings ((K,N//8)/(G,N)/(G,N//8)) merge along the
+                    # output dim=1; dense .weight (N,K) and .bias merge along dim=0.
+                    cat_dim = 1 if merged_key.endswith((".qweight", ".qzeros", ".scales")) else 0
+                    out = (merged_key, torch.cat(parts, dim=cat_dim))
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info

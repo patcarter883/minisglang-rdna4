@@ -16,6 +16,7 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.models import ModelConfig
+from minisgl.quant import create_linear_method
 from minisgl.utils import nvtx_annotate
 
 if TYPE_CHECKING:
@@ -24,10 +25,12 @@ if TYPE_CHECKING:
 
 class GatedMLP(BaseOP):
     def __init__(self, config: ModelConfig):
+        qm = create_linear_method(config.quant)
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
             has_bias=False,
+            quant_method=qm,
         )
 
         FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
@@ -39,6 +42,7 @@ class GatedMLP(BaseOP):
             config.intermediate_size,
             config.hidden_size,
             has_bias=False,
+            quant_method=qm,
         )
 
     @nvtx_annotate("MLP")
@@ -86,12 +90,14 @@ class RopeAttn(BaseOP):
         has_qk_norm: bool = False,
     ):
         head_dim = config.head_dim
+        qm = create_linear_method(config.quant)
         self.qkv_proj = LinearQKVMerged(
             hidden_size=config.hidden_size,
             head_dim=config.head_dim,
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=has_attn_bias,
+            quant_method=qm,
         )
         self.has_qk_norm = has_qk_norm
         if has_qk_norm:
@@ -113,6 +119,7 @@ class RopeAttn(BaseOP):
             head_dim * config.num_qo_heads,
             config.hidden_size,
             has_bias=False,
+            quant_method=qm,
         )
 
     @nvtx_annotate("MHA")

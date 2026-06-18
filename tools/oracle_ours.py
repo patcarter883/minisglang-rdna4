@@ -4,13 +4,15 @@ last position per prompt) by hooking the sampler, and save them with the input i
 Run each prompt singly (batch=1) so the saved order is unambiguous."""
 from __future__ import annotations
 
+import os
+
 import torch
 from transformers import AutoTokenizer
 
 from minisgl.core import SamplingParams
 from minisgl.llm import LLM
 
-MODEL = "Qwen/Qwen3-0.6B"
+MODEL = os.environ.get("MINISGL_ORACLE_MODEL", "Qwen/Qwen3-0.6B")
 PROMPTS = [
     "The capital of France is",
     "Once upon a time, in a small village,",

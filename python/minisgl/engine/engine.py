@@ -64,6 +64,7 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        self.model.post_load()  # finalize weights (e.g. quantized layout conversion)
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -157,7 +158,14 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            # Cast bf16 weights/biases to the model dtype, but PRESERVE quantized tensors:
+            # int packs (qweight/qzeros) and fp16 scales must keep their checkpoint dtype.
+            def _cast(k: str, v: torch.Tensor) -> torch.Tensor:
+                if not v.is_floating_point() or k.endswith(".scales"):
+                    return v
+                return v.to(self.dtype)
+
+            return {k: _cast(k, v) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]

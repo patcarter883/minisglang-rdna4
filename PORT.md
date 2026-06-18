@@ -89,15 +89,21 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
   - `models/config.py`: `ModelConfig.quant` parsed (top-level `quantization_config`).
   - `layers/linear.py`: `_LinearTPImpl` routes through `_method` (default unquantized = no behavior
     change); OProj/RowParallel forwards too. Validate: bf16 oracle still ~0.9996 (no regression).
-- **2c (next, the intricate core) — AWQ→op weight conversion** behind the provider:
-  - `W4A8LinearMethod.create_weights`: declare buffers in CHECKPOINT layout (AWQ: qweight (K,N//8)
-    i32, qzeros (K//group,N//8) i32, scales (K//group,N) f16) so BaseOP load matches.
-  - `process_weights_after_load`: AWQ→op layout (N,K//8) — unpack nibbles, transpose, repack;
-    scales/zeros transpose; g128→g32 if needed. Reference:
-    `vllm-gfx1201/w4a8_fp8_wmma/vllm_adapter.py:421-461` (+ moe_experts `_awq_to_op_layout`).
-  - Wire `config.quant` through `models/utils.py` (qkv/o/gate_up/down get W4A8; lm_head/embed stay
-    bf16) + the weight loader (sibling scale/zero routing, no blanket int-cast — R3 audit).
-  - Validate on Qwen2.5-Coder-7B-AWQ via the logit oracle (vs vLLM-W4A8 / HF).
+- **2c (IMPLEMENTED, validating) — AWQ→op weight conversion + wiring:**
+  - `quant/kernels.py:awq_to_op_layout` — dense AWQ (K,N//8)/(G,N)/(G,N//8) → op
+    (N,K//8)/(N,G)/(N//8,G) (unpack nibbles, reverse AWQ order, transpose, repack). op supports
+    g128 natively (v10), no g→32 re-expansion.
+  - `quant/method.py:W4A8LinearMethod` — create_weights (declare AWQ buffers), process_weights_after_load
+    (convert → underscore `_w_packed_op`/`_scales_op`/`_zeros_op`, free originals), apply (provider).
+  - `layers/base.py` + `linear.py`: `post_load()` recursion runs the conversion; quant_method threaded
+    through the 4 proj-linear ctors.
+  - `models/utils.py`: qkv/o/gate_up/down get `create_linear_method(config.quant)` (lm_head/embed bf16).
+  - `models/weight.py`: AWQ siblings merge along dim=1 (output/packed dim); dense/bias dim=0.
+  - `engine.py`: load no longer blanket-casts int/scales (preserves quant dtypes); calls `post_load()`.
+  - TP-quant sharding deferred (MVP is TP=1). One-shot unpack transient — chunk for >7B (27B OOM note).
+  - **Validation:** boot Qwen2.5-Coder-7B-AWQ (coherence = MVP), then logit oracle vs the cached
+    UNQUANTIZED bf16 7B (`MINISGL_ORACLE_MODEL`=AWQ, `MINISGL_ORACLE_REF`=base; cos-sim reflects
+    quant error, not a bug). Run via `gpu-lease.sh -n 1`.
 
 ## Phase status
 
