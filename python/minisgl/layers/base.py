@@ -52,6 +52,15 @@ class BaseOP:
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
+    def post_load(self) -> None:
+        """Recurse after load_state_dict, letting layers finalize weights (e.g. quantized
+        layout conversion). Default: descend into sub-ops."""
+        for name, param in self.__dict__.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(param, BaseOP):
+                param.post_load()
+
 
 class StateLessOP(BaseOP):
     def __init__(self):
@@ -97,3 +106,7 @@ class OPList(BaseOP, Generic[T]):
 
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def post_load(self) -> None:
+        for op in self.op_list:
+            op.post_load()

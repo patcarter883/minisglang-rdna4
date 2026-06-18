@@ -4,11 +4,15 @@ and compare to the RDNA4 engine's (cosine-sim, top-1, top-5 overlap, max-abs-dif
 standing numerical oracle — tolerant of sub-ULP rounding, unlike greedy token-identity."""
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-MODEL = "Qwen/Qwen3-0.6B"
+# Reference model: defaults to the same model; for a W4A8 run, point this at the
+# UNQUANTIZED bf16 equivalent (cos-sim then reflects quantization error, not a bug).
+MODEL = os.environ.get("MINISGL_ORACLE_REF", os.environ.get("MINISGL_ORACLE_MODEL", "Qwen/Qwen3-0.6B"))
 
 
 def main() -> None:

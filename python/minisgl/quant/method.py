@@ -59,24 +59,39 @@ class W4A8LinearMethod:
         self.quant = quant
 
     def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
-        raise NotImplementedError(
-            "W4A8LinearMethod.create_weights: AWQ/CT buffer declaration is Phase 2c "
-            "(see vllm_adapter._awq_to_op_layout for the layout contract)."
-        )
+        # Declare buffers in CHECKPOINT (AWQ "gemm") layout so BaseOP load matches:
+        #   qweight (K, N//pf) i32, scales (K//group, N) f16, qzeros (K//group, N//pf) i32.
+        # (N=out, K=in are the LOCAL/per-TP sizes; TP-quant sharding is a follow-up.)
+        pf = 32 // self.quant.bits
+        g = self.quant.group_size
+        N, K = out_features, in_features
+        assert N % pf == 0 and K % g == 0, f"W4A8 needs N%{pf}==0,K%{g}==0; got N={N},K={K}"
+        layer.qweight = torch.empty((K, N // pf), dtype=torch.int32)
+        layer.scales = torch.empty((K // g, N), dtype=torch.float16)
+        if not self.quant.sym:
+            layer.qzeros = torch.empty((K // g, N // pf), dtype=torch.int32)
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
-        """Convert loaded checkpoint-layout weights -> op layout
-        (layer.w_packed_op / scales_op / zeros_op). TODO Phase 2c."""
-        raise NotImplementedError
+        qz = getattr(layer, "qzeros", None)
+        w_packed, scales_op, zeros_op = kernels.awq_to_op_layout(
+            layer.qweight, layer.scales, qz, bits=self.quant.bits  # type: ignore[attr-defined]
+        )
+        # op-layout buffers are derived (underscore -> not re-serialized); free the loaded ones.
+        layer._w_packed_op = w_packed
+        layer._scales_op = scales_op
+        layer._zeros_op = zeros_op
+        del layer.qweight, layer.scales
+        if qz is not None:
+            del layer.qzeros
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         out = kernels.w4a8_linear(
             x,
-            layer.w_packed_op,  # type: ignore[attr-defined]
-            layer.scales_op,  # type: ignore[attr-defined]
-            getattr(layer, "zeros_op", None),
+            layer._w_packed_op,  # type: ignore[attr-defined]
+            layer._scales_op,  # type: ignore[attr-defined]
+            layer._zeros_op,  # type: ignore[attr-defined]
             self.quant.group_size,
         )
         out = out.to(x.dtype)

@@ -40,6 +40,11 @@ class _LinearTPImpl(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._method.apply(self, x, self.bias)
 
+    def post_load(self) -> None:
+        proc = getattr(self._method, "process_weights_after_load", None)
+        if proc is not None:
+            proc(self)
+
 
 class LinearReplicated(_LinearTPImpl):
     """
@@ -68,13 +73,14 @@ class LinearColParallelMerged(_LinearTPImpl):
         input_size: int,
         output_sizes: List[int],
         has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
     ):
         # check that all output sizes are divisible by tp_size
         tp_info = get_tp_info()
         tp_output_sizes = [div_even(size, tp_info.size) for size in output_sizes]
         output_size = sum(output_sizes)
         tp_output_size = sum(tp_output_sizes)
-        super().__init__(input_size, output_size, input_size, tp_output_size, has_bias)
+        super().__init__(input_size, output_size, input_size, tp_output_size, has_bias, quant_method)
 
 
 class LinearQKVMerged(_LinearTPImpl):
@@ -85,6 +91,7 @@ class LinearQKVMerged(_LinearTPImpl):
         num_qo_heads: int,
         num_kv_heads: int,
         has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
     ):
         tp_info = get_tp_info()
 
@@ -94,11 +101,17 @@ class LinearQKVMerged(_LinearTPImpl):
         full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
         local_isize = hidden_size
         local_osize = (local_num_qo + 2 * local_num_kv) * head_dim
-        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
+        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias, quant_method)
 
 
 class LinearOProj(_LinearTPImpl):
-    def __init__(self, input_size: int, output_size: int, has_bias: bool):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
+    ):
         tp_info = get_tp_info()
         full_isize = input_size
         full_osize = output_size
@@ -106,7 +119,7 @@ class LinearOProj(_LinearTPImpl):
         local_osize = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
-        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
+        super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias, quant_method)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self._method.apply(self, x, self.bias)
@@ -121,13 +134,16 @@ class LinearRowParallel(_LinearTPImpl):
         input_size: int,
         output_size: int,
         has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
     ):
         tp_info = get_tp_info()
         local_input_size = div_even(input_size, tp_info.size)
         local_output_size = output_size
         self._comm = DistributedCommunicator()
         self._tp_size = tp_info.size
-        super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
+        super().__init__(
+            input_size, output_size, local_input_size, local_output_size, has_bias, quant_method
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self._method.apply(self, x, self.bias)
