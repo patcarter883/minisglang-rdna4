@@ -8,7 +8,7 @@ import torch
 from minisgl.core import Batch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
-from ._triton_unified import unified_attention
+from ._triton_unified import KVQuantMode, unified_attention
 
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
@@ -43,6 +43,17 @@ class TritonRDNA4Backend(BaseAttnBackend):
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
+        # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. Per-tensor
+        # scale 1.0 (direct e4m3 cast on store; the kernel folds the descale into the
+        # score/accumulator). The store cast lives in MHAKVCache.store_kv (.to(cache.dtype)).
+        self.kv_is_fp8 = self.kvcache.dtype == torch.float8_e4m3fn
+        if self.kv_is_fp8:
+            self._kv_quant_mode = KVQuantMode.FP8_PER_TENSOR
+            ones = torch.ones(1, dtype=torch.float32, device=self.kvcache.device)
+            self._k_descale, self._v_descale = ones, ones
+        else:
+            self._kv_quant_mode = KVQuantMode.NONE
+            self._k_descale = self._v_descale = None
         # 3D flash-decode segment scratch (f32), lazily sized on first forward.
         self._seq_threshold_3D = 0
         self._segm_output: torch.Tensor | None = None
@@ -93,8 +104,9 @@ class TritonRDNA4Backend(BaseAttnBackend):
             block_table=metadata.page_table,
             softcap=0.0,
             q_descale=None,
-            k_descale=None,
-            v_descale=None,
+            k_descale=self._k_descale,
+            v_descale=self._v_descale,
+            kv_quant_mode=self._kv_quant_mode,
             seq_threshold_3D=self._seq_threshold_3D,
             num_par_softmax_segments=self.NUM_PAR_SOFTMAX_SEGMENTS,
             softmax_segm_output=self._segm_output,

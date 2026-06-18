@@ -85,8 +85,9 @@ tuned attention. If it works, do the token-diff vs vLLM (same kernel) on the sam
 | 1a-boot | Functional boot bf16 eager TP=1 — **coherent greedy generation on gfx1201** | **done** 2026-06-17 |
 | 1b-1 | 3D flash-decode wired (lazy f32 segment scratch); validated correct (converges to 2D as segments→1) | **done** 2026-06-18 |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo |
-| 1b-3 | fp8-KV (lift `reshape_and_cache_flash`, e4m3fn KV buffer + scales) | todo |
-| — | **logit-level oracle** (replaces token-diff; needed before optimizing — see PERF_NOTES [V1]) | todo |
+| 1b-3 | fp8-KV (e4m3fn KV buffer, torch-scatter store, scale=1.0) — env MINISGL_KV_FP8=1 | **done** 2026-06-18 |
+| — | **logit-level oracle** (engine vs HF, cos-sim/top-1) — the standing numerical oracle | **done** 2026-06-18 |
+| 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid (3a state cache → 3b layer numerics → 3c scheduler split → 3d serve) | todo |

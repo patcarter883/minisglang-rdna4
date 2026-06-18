@@ -25,9 +25,11 @@ oracle to keep correctness while tuning. Ordered roughly by expected payoff.
 - **[A3] `prepare_metadata` rebuilds the page table via a Python list-comprehension + `torch.stack`
   every step** (per-req CPU slicing → GPU). Vectorize the page-table gather; avoid per-step
   host-side Python loops over reqs.
-- **[A4] fp8-KV (Phase 1b-3) replaces the torch-scatter KV store** with the fused
-  `reshape_and_cache_flash` Triton kernel (also halves KV bandwidth + memory). Until then the bf16
-  torch scatter in `kvcache/mha_pool.py:store_kv` is correctness-first.
+- **[A4] fp8-KV store is a torch scatter** (`kvcache/mha_pool.py:store_kv`, `.to(e4m3fn)`); replace
+  with the fused `reshape_and_cache_flash` Triton kernel for less store overhead + bandwidth.
+- **[A5] fp8-KV uses a static per-tensor scale of 1.0** (direct e4m3 cast). This cost ~0.006 cos-sim
+  vs HF (0.9996→0.9935, top-1 still all-match). A calibrated/dynamic per-tensor (or per-token-head,
+  kv_quant_mode 2/3) scale would recover most of that. Add a calibration pass when accuracy matters.
 
 ## Phase-0 torch shims (all fp32-internal, correctness-first)
 All of these upcast to fp32 and materialize intermediates for numerical safety. Once the logit

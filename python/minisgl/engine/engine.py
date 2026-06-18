@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -45,6 +46,12 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        # fp8 (e4m3fn) KV cache — opt-in via MINISGL_KV_FP8=1 (the "no-F16" KV path:
+        # store e4m3 -> cast once to bf16 -> f32 accumulate, scalar scale folded in the
+        # attention kernel). Activations/weights stay bf16; only the KV buffer is fp8.
+        self.kv_dtype = (
+            torch.float8_e4m3fn if os.environ.get("MINISGL_KV_FP8") == "1" else self.dtype
+        )
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
@@ -66,7 +73,7 @@ class Engine:
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
             device=self.device,
-            dtype=self.dtype,
+            dtype=self.kv_dtype,
         )
 
         # ======================= Page table initialization ========================
@@ -159,7 +166,7 @@ class Engine:
             * config.model_config.head_dim
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
-            * self.dtype.itemsize
+            * self.kv_dtype.itemsize
             * config.model_config.num_layers
         )
         num_pages = config.num_page_override
