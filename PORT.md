@@ -116,7 +116,17 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo |
 | 1b-3 | fp8-KV (e4m3fn KV buffer, torch-scatter store, scale=1.0) — env MINISGL_KV_FP8=1 | **done** 2026-06-18 |
 | — | **logit-level oracle** (engine vs HF, cos-sim/top-1) — the standing numerical oracle | **done** 2026-06-18 |
+| 2 | **W4A8 (AWQ) dense serving — MVP** | **DONE 2026-06-18** ✅ |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
+
+## ★ MVP REACHED 2026-06-18 — W4A8 quantized serving on RDNA4
+
+Qwen2.5-Coder-7B-Instruct-**AWQ** (4-bit, g128, asymmetric) boots on gfx1201 via the `triton_rdna4`
+attention + the W4A8 path, generating **coherent + correct** greedy output ("capital of France →
+Paris", "2+2 → 4, 3+3 → 6, 4+4 → 8"). Full chain validated: AWQ checkpoint → `awq_to_op_layout`
+conversion → `mmq_fp8_gemm` v10 (asymmetric zeros) → fp8 WMMA. Weights load 6s, KV 1.81 GiB, eager.
+Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then MoE W4A8 (toward 35B),
+the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid (3a state cache → 3b layer numerics → 3c scheduler split → 3d serve) | todo |
