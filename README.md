@@ -1,186 +1,69 @@
-<p align="center">
-<img width="400" src="/assets/logo.png">
-</p>
+# minisgl-rdna4
 
-# Mini-SGLang
+A minimal LLM serving engine for **AMD RDNA4 (gfx1201 / Radeon RX 9070 XT)**, forked from
+[mini-SGLang](https://github.com/sgl-project/mini-sglang) (upstream `9a91cfa`, tracked via the
+`upstream` remote) and re-targeted from NVIDIA/CUDA to ROCm. Built around the in-repo
+`w4a8_fp8_wmma` int4-weight / fp8-activation WMMA kernel and the tuned RDNA4 `triton_attn`, with the
+kernel-call layer kept swappable for an incoming custom kernel framework.
 
-A **lightweight yet high-performance** inference framework for Large Language Models.
+> This README documents the RDNA4 fork. The original CUDA-targeted mini-SGLang README is in git
+> history and on the `upstream` remote.
 
----
+**Status:** dense engine working + numerically validated (Phase 1); W4A8 quantized serving in
+progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.md`. Full design:
+`vllm-gfx1201/docs/RDNA4_ENGINE_DESIGN.md`.
 
-Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-project/sglang), designed to demystify the complexities of modern LLM serving systems. With a compact codebase of **~5,000 lines of Python**, it serves as both a capable inference engine and a transparent reference for researchers and developers.
+## What works today
 
-## ✨ Key Features
+- **Dense bf16** (Qwen2/Qwen3/Llama/Mistral), eager, TP=1 — boots and generates coherent output;
+  logits match HF transformers to **cos-sim 0.9996** (the standing oracle).
+- **Tuned RDNA4 attention** — the vLLM `triton_attn` unified prefill+decode kernel, lifted and
+  running under HIP, with **3D flash-decode** and an **fp8 (e4m3) KV cache** (`MINISGL_KV_FP8=1`;
+  e4m3 → bf16 → f32 accumulate, nothing dequants to F16).
+- **W4A8 (AWQ) dense** — `quant/` package: swappable kernel provider + `LinearMethod` protocol +
+  AWQ→op weight conversion (validation in progress).
 
-- **High Performance**: Achieves state-of-the-art throughput and latency with advanced optimizations.
-- **Lightweight & Readable**: A clean, modular, and fully type-annotated codebase that is easy to understand and modify.
-- **Advanced Optimizations**:
-  - **Radix Cache**: Reuses KV cache for shared prefixes across requests.
-  - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
-  - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
-  - **Tensor Parallelism**: Scales inference across multiple GPUs.
-  - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
-  - ...
+## Design principles
 
-## 🚀 Quick Start
+1. Maximise RDNA4 strengths — native fp8/int4 WMMA, 3D flash-decode, `waves_per_eu` tuning.
+2. **Nothing dequants to F16** — I/O bf16, compute fp8 (e4m3fn), accumulate f32.
+3. Clean, tidy, agent+human-maintainable — small typed modules, Protocol-based backends.
+4. The W4A8 kernel is a **dependency** from `vllm-gfx1201/w4a8_fp8_wmma/` (never copied); all
+   quantized GEMMs route through `quant/kernels.py` so a different kernel backend can drop in.
 
-> **⚠️ Platform Support**: Mini-SGLang currently supports **Linux only** (x86_64 and aarch64). Windows and macOS are not supported due to dependencies on Linux-specific CUDA kernels (`sgl-kernel`, `flashinfer`). We recommend using [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows or Docker for cross-platform compatibility.
+## Running (combined image, via the GPU lease)
 
-### 1. Environment Setup
-
-We recommend using `uv` for a fast and reliable installation (note that `uv` does not conflict with `conda`).
-
-```bash
-# Create a virtual environment (Python 3.10+ recommended)
-uv venv --python=3.12
-source .venv/bin/activate
-```
-
-**Prerequisites**: Mini-SGLang relies on CUDA kernels that are JIT-compiled. Ensure you have the **NVIDIA CUDA Toolkit** installed and that its version matches your driver's version. You can check your driver's CUDA capability with `nvidia-smi`.
-
-### 2. Installation
-
-Install Mini-SGLang directly from the source:
+GPU work goes through the shared-box `flock` lease (never hand-set devices/ports):
 
 ```bash
-git clone https://github.com/sgl-project/mini-sglang.git
-cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e .
+LEASE=/home/pat/code/vllm-gfx1201-gpu-lease/scripts/gpu-lease.sh
+$LEASE -n 1 -- bash -c '
+  docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+    --security-opt seccomp=unconfined --security-opt label=disable \
+    --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
+    -e HIP_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES -e ROCR_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES \
+    -v '"$PWD"':/engine \
+    -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
+    -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+    --entrypoint bash vllm22-w4a8:combined -lc "
+      source /app/.venv/bin/activate
+      pip install -q msgpack pyzmq prompt_toolkit accelerate
+      PYTHONPATH=/engine/python python /engine/tools/boot_smoke.py --model Qwen/Qwen3-0.6B"'
 ```
 
-<details>
-<summary><b>💡 Installing on Windows (WSL2)</b></summary>
+The engine image should eventually bake the deps (`FROM vllm22-w4a8:combined` + pip install — see
+PERF_NOTES B1) instead of installing per run.
 
-Since Mini-SGLang requires Linux-specific dependencies, Windows users should use WSL2:
+## Tools
 
-1. **Install WSL2** (if not already installed):
-   ```powershell
-   # In PowerShell (as Administrator)
-   wsl --install
-   ```
+- `tools/boot_smoke.py` — load a model + greedy-generate (coherence smoke test).
+- `tools/oracle_ours.py` + `oracle_cmp.py` — the **logit oracle**: capture first-token logits and
+  compare to HF (cos-sim / top-1). `MINISGL_ORACLE_MODEL` / `MINISGL_ORACLE_REF` parameterize it.
 
-2. **Install CUDA on WSL2**:
-   - Follow [NVIDIA's WSL2 CUDA guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
-   - Ensure your Windows GPU drivers support WSL2
+## Layout (changes from upstream)
 
-3. **Install Mini-SGLang in WSL2**:
-   ```bash
-   # Inside WSL2 terminal
-   git clone https://github.com/sgl-project/mini-sglang.git
-   cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-   uv pip install -e .
-   ```
-
-4. **Access from Windows**: The server will be accessible at `http://localhost:8000` from Windows browsers and applications.
-
-</details>
-
-<details>
-<summary><b>🐳 Running with Docker</b></summary>
-
-**Prerequisites**:
-- [Docker](https://docs.docker.com/get-docker/)
-- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-
-1. **Build the Docker image**:
-   ```bash
-   docker build -t minisgl .
-   ```
-
-2. **Run the server**:
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-3. **Run in interactive shell mode**:
-   ```bash
-   docker run -it --gpus all \
-       minisgl --model Qwen/Qwen3-0.6B --shell
-   ```
-
-4. **Using Docker Volumes for persistent caches** (recommended for faster subsequent startups):
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       -v huggingface_cache:/app/.cache/huggingface \
-       -v tvm_cache:/app/.cache/tvm-ffi \
-       -v flashinfer_cache:/app/.cache/flashinfer \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-</details>
-
-### 3. Online Serving
-
-Launch an OpenAI-compatible API server with a single command.
-
-```bash
-# Deploy Qwen/Qwen3-0.6B on a single GPU
-python -m minisgl --model "Qwen/Qwen3-0.6B"
-
-# Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
-python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
-```
-
-Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
-
-### 4. Interactive Shell
-
-Chat with your model directly in the terminal by adding the `--shell` flag.
-
-```bash
-python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
-```
-
-![shell-example](https://lmsys.org/images/blog/minisgl/shell.png)
-
-You can also use `/reset` to clear the chat history.
-
-## Benchmark
-
-### Offline inference
-
-See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
-
-Test Configuration:
-
-- Hardware: 1xH200 GPU.
-- Model: Qwen3-0.6B, Qwen3-14B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100-1024 tokens
-- Output Length: Randomly sampled between 100-1024 tokens
-
-![offline](https://lmsys.org/images/blog/minisgl/offline.png)
-
-### Online inference
-
-See [benchmark_qwen.py](./benchmark/online/bench_qwen.py) for more details.
-
-Test Configuration:
-
-- Hardware: 4xH200 GPU, connected by NVLink.
-- Model: Qwen3-32B
-- Dataset: [Qwen trace](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon/blob/main/qwen_traceA_blksz_16.jsonl), replaying first 1000 requests.
-
-Launch command:
-
-```bash
-# Mini-SGLang
-python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --cache naive
-
-# SGLang
-python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
-    --disable-radix --port 1919 --decode-attention flashinfer
-```
-
-> **Note**: If you encounter network issues when downloading models from HuggingFace, try using `--model-source modelscope` to download from ModelScope instead:
-> ```bash
-> python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --model-source modelscope
-> ```
-
-![online](https://lmsys.org/images/blog/minisgl/online.png)
-
-## 📚 Learn More
-
-- **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
-- **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.
+- `python/minisgl/attention/` — `triton_rdna4.py` backend + the vendored tuned kernel
+  (`_triton_unified.py`, `_triton_helpers.py`).
+- `python/minisgl/quant/` — W4A8: `config.py`, `kernels.py` (swappable provider), `method.py`.
+- Phase-0 torch shims replace flashinfer/sgl_kernel/tvm ops in `layers/`, `engine/sample.py`,
+  `kvcache/`, `kernel/radix.py`.
