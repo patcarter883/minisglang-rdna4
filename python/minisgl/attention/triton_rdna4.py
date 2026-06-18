@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
@@ -31,12 +32,41 @@ class TritonRDNA4Backend(BaseAttnBackend):
     tuning (no 3D flash-decode / autotuner yet — those land in Phase 1b/4). cudagraph capture
     is not yet supported: run with ``--cuda-graph-max-bs 0``."""
 
+    # Number of parallel tiled-softmax segments for the 3D flash-decode path
+    # (matches vLLM's NUM_PAR_SOFTMAX_SEGMENTS default; the autotuner refines it later).
+    # Env-overridable for tuning/validation (e.g. =1 collapses 3D to a single pass ~= 2D).
+    NUM_PAR_SOFTMAX_SEGMENTS = int(os.environ.get("MINISGL_ATTN_SEGMENTS", "64"))
+
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
         self.config = config
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
+        # 3D flash-decode segment scratch (f32), lazily sized on first forward.
+        self._seq_threshold_3D = 0
+        self._segm_output: torch.Tensor | None = None
+        self._segm_max: torch.Tensor | None = None
+        self._segm_expsum: torch.Tensor | None = None
+
+    def _ensure_segm_scratch(self, q: torch.Tensor) -> None:
+        """Allocate the persistent f32 segment scratch for the 3D flash-decode path.
+        Sized once to the max decode batch (page-table rows) so it covers every batch;
+        the kernel's capacity gate falls back to 2D for anything larger."""
+        if self._segm_output is not None:
+            return
+        rows = int(get_global_ctx().page_table.shape[0])  # max_running_req + 1
+        num_heads_q = q.shape[1]
+        head_dim = q.shape[2]
+        headdim_padded = 1 << (head_dim - 1).bit_length()
+        seg = self.NUM_PAR_SOFTMAX_SEGMENTS
+        dev = q.device
+        self._seq_threshold_3D = rows
+        self._segm_output = torch.empty(
+            (rows, num_heads_q, seg, headdim_padded), dtype=torch.float32, device=dev
+        )
+        self._segm_max = torch.empty((rows, num_heads_q, seg), dtype=torch.float32, device=dev)
+        self._segm_expsum = torch.empty((rows, num_heads_q, seg), dtype=torch.float32, device=dev)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -45,6 +75,9 @@ class TritonRDNA4Backend(BaseAttnBackend):
         assert isinstance(metadata, RDNA4Metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         out = torch.empty_like(q)
+        self._ensure_segm_scratch(q)
+        # Always pass the 3D scratch + segments; the kernel's gate routes prefill
+        # (max_seqlen_q>1) to the 2D grid and decode (max_seqlen_q==1) to 3D flash-decode.
         unified_attention(
             q=q,
             k=self.kvcache.k_cache(layer_id),  # (num_pages, page_size, kv_heads, head_dim)
@@ -62,6 +95,11 @@ class TritonRDNA4Backend(BaseAttnBackend):
             q_descale=None,
             k_descale=None,
             v_descale=None,
+            seq_threshold_3D=self._seq_threshold_3D,
+            num_par_softmax_segments=self.NUM_PAR_SOFTMAX_SEGMENTS,
+            softmax_segm_output=self._segm_output,
+            softmax_segm_max=self._segm_max,
+            softmax_segm_expsum=self._segm_expsum,
         )
         return out
 
