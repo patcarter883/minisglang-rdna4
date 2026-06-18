@@ -83,7 +83,10 @@ tuned attention. If it works, do the token-diff vs vLLM (same kernel) on the sam
 | 0 | Fork + strip NVIDIA deps (dense path) | **done** (cf5a478) |
 | 1a | Tuned RDNA4 `triton_attn` backend, bf16 KV, 2D grid — wired + import-validated | **done** (fed6efa) |
 | 1a-boot | Functional boot bf16 eager TP=1 — **coherent greedy generation on gfx1201** | **done** 2026-06-17 |
-| 1b | fp8-KV (lift `reshape_and_cache_flash`) + 3D flash-decode + startup autotuner | todo |
+| 1b-1 | 3D flash-decode wired (lazy f32 segment scratch); validated correct (converges to 2D as segments→1) | **done** 2026-06-18 |
+| 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo |
+| 1b-3 | fp8-KV (lift `reshape_and_cache_flash`, e4m3fn KV buffer + scales) | todo |
+| — | **logit-level oracle** (replaces token-diff; needed before optimizing — see PERF_NOTES [V1]) | todo |
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid (3a state cache → 3b layer numerics → 3c scheduler split → 3d serve) | todo |
