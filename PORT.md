@@ -76,6 +76,29 @@ docker run --rm \
 Expect: coherent greedy completions for 4 prompts + token ids. Validates the whole stripped path +
 tuned attention. If it works, do the token-diff vs vLLM (same kernel) on the same prompts.
 
+## Phase 2 — W4A8 (in progress)
+
+Designed around a **swappable kernel provider** so the parallel custom kernel framework drops in
+without touching layers/models/loader (memory: parallel-custom-kernel-framework).
+
+- **2a foundation (built, pending no-regression oracle):**
+  - `quant/` package: `config.py` (`QuantConfig.from_hf` — AWQ + minimal compressed-tensors),
+    `kernels.py` (the swappable provider — `w4a8_linear` + per-M version ladder v11/v10/v5, fp16
+    staging), `method.py` (`LinearMethod` protocol, `UnquantizedLinearMethod`, `W4A8LinearMethod`
+    scaffold, `create_linear_method`).
+  - `models/config.py`: `ModelConfig.quant` parsed (top-level `quantization_config`).
+  - `layers/linear.py`: `_LinearTPImpl` routes through `_method` (default unquantized = no behavior
+    change); OProj/RowParallel forwards too. Validate: bf16 oracle still ~0.9996 (no regression).
+- **2c (next, the intricate core) — AWQ→op weight conversion** behind the provider:
+  - `W4A8LinearMethod.create_weights`: declare buffers in CHECKPOINT layout (AWQ: qweight (K,N//8)
+    i32, qzeros (K//group,N//8) i32, scales (K//group,N) f16) so BaseOP load matches.
+  - `process_weights_after_load`: AWQ→op layout (N,K//8) — unpack nibbles, transpose, repack;
+    scales/zeros transpose; g128→g32 if needed. Reference:
+    `vllm-gfx1201/w4a8_fp8_wmma/vllm_adapter.py:421-461` (+ moe_experts `_awq_to_op_layout`).
+  - Wire `config.quant` through `models/utils.py` (qkv/o/gate_up/down get W4A8; lm_head/embed stay
+    bf16) + the weight loader (sibling scale/zero routing, no blanket int-cast — R3 audit).
+  - Validate on Qwen2.5-Coder-7B-AWQ via the logit oracle (vs vLLM-W4A8 / HF).
+
 ## Phase status
 
 | Phase | What | Status |

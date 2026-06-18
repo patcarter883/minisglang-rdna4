@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Any, Dict
 from transformers import PretrainedConfig
 
+from minisgl.quant.config import QuantConfig
+
 
 @dataclass(frozen=True)
 class RotaryConfig:
@@ -32,6 +34,7 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    quant: QuantConfig | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -39,6 +42,7 @@ class ModelConfig:
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+        quant = QuantConfig.from_hf(config)  # quantization_config is top-level
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -84,4 +88,5 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            quant=quant,
         )
