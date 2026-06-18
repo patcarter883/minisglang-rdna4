@@ -119,6 +119,20 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
 | 2 | **W4A8 (AWQ) dense serving — MVP** | **DONE 2026-06-18** ✅ |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
 
+## Phase 2-MoE — W4A8 grouped MoE (in progress)
+
+- `quant/kernels.py:w4a8_moe` — grouped MoE forward (topk → moe_align → grouped GEMM(w13) →
+  silu_and_mul → grouped GEMM(w2) → `mmq_fp8_moe_gather_reduce`), mirroring the proven
+  `_run_grouped_moe` (non-GEMV path). Imports vLLM's `moe_align_block_size` for now (port later).
+- `tools/moe_parity.py` — numerical parity vs a bf16-dequant reference on **synthetic** symmetric
+  int4 experts (op layout). Validates the MoE compute integration independent of checkpoint loading.
+- **Target note:** no small standard Qwen3-MoE-AWQ is bootable (smallest plain Qwen3-MoE is 30B; the
+  35B is GDN-hybrid → Phase 3). The 35B MoE is **compressed-tensors pack-quantized symmetric g32**
+  routed through vLLM **MoeWNA16** — real-checkpoint MoE loading is a Phase-3 follow-up; the synthetic
+  parity test validates the compute path now.
+- TODO after parity: a `"w4a8"` MoE backend in the registry + MoELayer expert-weight conversion
+  (`_ct_moe_to_op_layout`/MoeWNA16) for the real 35B; strip the bf16 MoE `sgl_kernel` deps (topk/align).
+
 ## ★ MVP REACHED 2026-06-18 — W4A8 quantized serving on RDNA4
 
 Qwen2.5-Coder-7B-Instruct-**AWQ** (4-bit, g128, asymmetric) boots on gfx1201 via the `triton_rdna4`
