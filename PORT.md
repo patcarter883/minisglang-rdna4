@@ -119,7 +119,14 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
 | 2 | **W4A8 (AWQ) dense serving — MVP** | **DONE 2026-06-18** ✅ |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
 
-## Phase 2-MoE — W4A8 grouped MoE (in progress)
+## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
+
+`w4a8_moe` matches a bf16-dequant reference at **cos-sim 0.99894** (rel-err 4.6% = fp8-activation
+error over 2 GEMMs) on real MoE shapes (E=32, K=2048, inter=512, top_k=4, g=32). The full MoE
+compute path — topk → moe_align → grouped GEMM(w13) → SwiGLU → grouped GEMM(w2) →
+`mmq_fp8_moe_gather_reduce` — is sound, at parity with the dense W4A8 MVP. (`tools/moe_parity.py`.)
+
+## Phase 2-MoE — W4A8 grouped MoE
 
 - `quant/kernels.py:w4a8_moe` — grouped MoE forward (topk → moe_align → grouped GEMM(w13) →
   silu_and_mul → grouped GEMM(w2) → `mmq_fp8_moe_gather_reduce`), mirroring the proven
