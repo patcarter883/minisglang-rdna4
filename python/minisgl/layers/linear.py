@@ -1,17 +1,24 @@
 from __future__ import annotations
 
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import torch
-import torch.nn.functional as F
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.quant.method import UnquantizedLinearMethod
 from minisgl.utils import div_even
 
 from .base import BaseOP
 
+if TYPE_CHECKING:
+    from minisgl.quant.method import LinearMethod
+
 
 class _LinearTPImpl(BaseOP):
-    """Real implementation of a linear layer with tensor parallelism."""
+    """Real implementation of a linear layer with tensor parallelism.
+
+    Weight layout + the matmul are delegated to a LinearMethod (default unquantized
+    `F.linear`); a W4A8 method swaps in quantized buffers + the WMMA kernel without
+    changing the sharding/collective logic here."""
 
     def __init__(
         self,
@@ -20,16 +27,18 @@ class _LinearTPImpl(BaseOP):
         local_isize: int,
         local_osize: int,
         has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
     ):
         self.full_input_size = full_isize
         self.full_output_size = full_osize
         self.local_input_size = local_isize
         self.local_output_size = local_osize
-        self.weight = torch.empty(local_osize, local_isize)
+        self._method = quant_method or UnquantizedLinearMethod()
+        self._method.create_weights(self, local_osize, local_isize)
         self.bias = torch.empty(local_osize) if has_bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self._method.apply(self, x, self.bias)
 
 
 class LinearReplicated(_LinearTPImpl):
@@ -100,7 +109,7 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = self._method.apply(self, x, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
@@ -121,7 +130,7 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)
+        y = self._method.apply(self, x, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
         return y
