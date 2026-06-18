@@ -119,6 +119,28 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
 | 2 | **W4A8 (AWQ) dense serving — MVP** | **DONE 2026-06-18** ✅ |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
 
+## Phase 3 — GDN (Gated Delta Net) hybrid attention → the 35B (STARTED)
+
+The 35B is a GDN/SSD hybrid: 40 layers, 1-in-4 full-attention interleave; linear layers use GDN
+(delta-rule linear attention). FLA kernels already run on gfx1201 (vLLM vendors them) — this is
+integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn/`.
+
+- **3a — recurrent state cache (DONE):** `kvcache/gdn_state.py` `GDNStateCache` — per-seq fixed slots
+  (conv_state `(conv_dim, k-1)` + ssm_state `(num_v_heads, head_v_dim, head_k_dim)`), free-list
+  allocator (NOT paged/prefix-cacheable — GDN state can't roll back). CPU unit-tested
+  (`tools/gdn_state_test.py`): shapes/alloc/free/reuse/reset/exhaustion. 35B dims: conv_dim 8192,
+  ssm (32,128,128).
+- **3b — one GDN layer's numerics (next):** vendor FLA kernels (chunk_gated_delta_rule + deps,
+  fused_recurrent, fused_sigmoid_gating, causal_conv1d, l2norm, fused_gdn_gating from
+  `scratch/gdn/fla` + `scratch/gdn/mamba/ops`), build one `QwenGatedDeltaNet` layer (in_proj_qkvz/ba,
+  conv1d, gating, delta-rule, RMSNormGated, out_proj), token-diff one layer vs the combined image.
+- **3c — scheduler subset-split + warmup hook (THE risk):** one batch splits into prefill/decode
+  subsets running DIFFERENT kernels (chunk-scan vs fused-recurrent) with per-subset query_start_loc +
+  state indices; FLA first-batch autotune needs a warmup-prefill hook or it OOMs. No spec-decode/MTP.
+- **3d — interleave + serve:** qwen3_5 1-in-4 full/linear interleave (full layers reuse Phase-1
+  attention); serve the 35B; greedy token-diff vs combined image. GDN projections are unquantized
+  bf16; only routed MoE experts are W4A8 (uses the Phase-2-MoE path).
+
 ## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
 
 `w4a8_moe` matches a bf16-dequant reference at **cos-sim 0.99894** (rel-err 4.6% = fp8-activation
