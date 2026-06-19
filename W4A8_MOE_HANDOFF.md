@@ -73,6 +73,35 @@ The complete SWMMAC story (dense kernel, vLLM plugin, PPL gates, the cracked ind
 `feat/swmmac-microbench`, `e3ac002`). **Do not edit that worktree's `swmmac_gemm_k`** — it's a
 separate concern's committed kernel.
 
+### 2b. UPDATE 2026-06-19 — grouped SWMMAC fully characterized; verdict: NOT a minisgl deliverable yet
+The grouped SWMMAC rungs above are now **built and measured to their ceiling** (on
+`feat/w4a8-tile-autotune`; full data in `TILE_FRAMEWORK_DESIGN.md §2.7c/§2.7d`). Three results that
+**supersede the optimistic numbers in §2 / §4** — read these before treating SWMMAC as a drop-in:
+
+- **int4-sparse + per-group-scale grouped kernel** (`moe_gemm_swmmac_int4.h`) — the production-shaped
+  rung, self-consistency bit-exact (1 fp16 ULP) at g32/g64, bm32/64.
+- **tiled-LDS variant** (`moe_gemm_swmmac_int4_tiled_kernel`) — stages the weight tile once in LDS.
+  Bit-exact (non-scatter only; **SCATTER path NOT yet validated**). Helps **only weight-BW-bound
+  shapes**: gemm2 prefill **1.13→1.25× vs WMMA-dense**; large-prefill gemm1 stays at **parity**.
+- **honest decode A/B vs the v7-GEMV you actually dispatch** (`bench_swmmac_int4_vs_v7_decode.hip`):
+  the old "12–18× / 1.17–1.55×" was **baseline-inflated** (vs WMMA-tiled, a kernel nobody runs at
+  decode). Against v7: at **single-stream decode T=1, v7 WINS gemm1** (SWMMAC 0.39×); SWMMAC ~ties
+  gemm2 (1.28×). Crossover is **2D**: gemm2 → SWMMAC almost always; gemm1 → v7 at T≤~4, SWMMAC at T≥8.
+
+**Verdict — do NOT consume SWMMAC in minisgl yet** (it is *not* ready to send, for structural reasons,
+not packaging):
+1. **No torch op** — still raw `.hip` kernels, not exposed via `torch.ops.w4a8_fp8_wmma.*`; your
+   provider has nothing to call. (The op binding was scoped, then **deliberately deferred** —
+   `run_moe_gemm` receives dense `(E,N,K/8)` weights, not compressed `(Wc_i4, idx)`, so a dispatch
+   branch can't even receive its inputs without new bindings/adapter plumbing the project declined.)
+2. **No weight source** — the HW instruction is 2:4, which is PPL-hopeless on the 35B; the PPL-viable
+   ratios (6:8/4:6) don't map to it. There is no served path and no research path to one.
+3. **Self-consistency only** — never validated against a served reference.
+
+So the **WMMA-dense + grouped path you already consume (parity 0.99894) remains the only deployable
+W4A8-MoE kernel.** SWMMAC stays a parked future lever: revisit only if a 2:4-pruned + finetuned MoE
+checkpoint ever exists, at which point it needs the torch op + served validation first.
+
 ---
 
 ## 3. Practical notes
