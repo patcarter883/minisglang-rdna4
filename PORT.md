@@ -130,10 +130,27 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
   allocator (NOT paged/prefix-cacheable — GDN state can't roll back). CPU unit-tested
   (`tools/gdn_state_test.py`): shapes/alloc/free/reuse/reset/exhaustion. 35B dims: conv_dim 8192,
   ssm (32,128,128).
-- **3b — one GDN layer's numerics (next):** vendor FLA kernels (chunk_gated_delta_rule + deps,
-  fused_recurrent, fused_sigmoid_gating, causal_conv1d, l2norm, fused_gdn_gating from
-  `scratch/gdn/fla` + `scratch/gdn/mamba/ops`), build one `QwenGatedDeltaNet` layer (in_proj_qkvz/ba,
-  conv1d, gating, delta-rule, RMSNormGated, out_proj), token-diff one layer vs the combined image.
+- **3b — one GDN layer's numerics (IN PROGRESS).** Split into three checks:
+  - **3b-1 — vendor the FLA/mamba kernels (DONE 2026-06-19):** the 16-file closure
+    (chunk_gated_delta_rule + chunk_delta_h/chunk_o/chunk_scaled_dot_kkt/cumsum/wy_fast/solve_tril/
+    l2norm/op/index/utils, fused_recurrent, fused_sigmoid_gating, fused_gdn_prefill_post_conv,
+    layernorm_guard; mamba/ops causal_conv1d/layernorm_gated/triton_helpers) vendored into
+    `python/minisgl/gdn/{fla,mamba}/ops`. Their only non-torch/triton deps were ~5 `vllm.*` symbols
+    — rewritten to `gdn/_compat.py` (triton/tl/tldevice, current_platform.is_cuda_alike,
+    cdiv/next_power_of_2, num_compute_units via runtime CU query, NULL_BLOCK_ID/PAD_SLOT_ID). No
+    fake `vllm` package (would shadow the real one in the image). **Validated:** 18/18 files
+    byte-identical to installed vLLM 0.22.69 modulo import lines; GPU parity vs installed originals
+    (`tools/gdn_kernel_parity.py`, `gpu-lease -n 1`) — 5/5 gated kernels max|Δ|=0 incl. both
+    shim-sensitive paths (chunk_gated_delta_rule→is_cuda_alike, RMSNormGated→num_compute_units).
+    `causal_conv1d_fn` micro-call is info-only (needs full GDNAttentionMetadata; covered by byte-diff
+    + 3b-3). `kda.py` excluded (outside closure; would need a custom_op stub).
+  - **3b-2 — the layer (next):** build a clean `QwenGatedDeltaNet` minisgl module (in_proj_qkvz/ba,
+    conv1d, gating, delta-rule, RMSNormGated, out_proj) on minisgl linears + vendored kernels,
+    stripping vLLM CustomOp/forward_context/distributed coupling.
+  - **3b-3 — single-layer parity:** capture/replay vs the REAL vLLM `QwenGatedDeltaNetAttention`
+    (importable in the combined image) — independent oracle, not a self-authored eager ref. Drive
+    **prefill→decode** (not prefill-only) to exercise conv_state/ssm_state read-back and discharge
+    `gdn_state.py`'s conv-orientation caveat against the live `causal_conv1d` path.
 - **3c — scheduler subset-split + warmup hook (THE risk):** one batch splits into prefill/decode
   subsets running DIFFERENT kernels (chunk-scan vs fused-recurrent) with per-subset query_start_loc +
   state indices; FLA first-batch autotune needs a warmup-prefill hook or it OOMs. No spec-decode/MTP.
