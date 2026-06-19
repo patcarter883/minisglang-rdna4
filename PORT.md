@@ -130,7 +130,7 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
   allocator (NOT paged/prefix-cacheable — GDN state can't roll back). CPU unit-tested
   (`tools/gdn_state_test.py`): shapes/alloc/free/reuse/reset/exhaustion. 35B dims: conv_dim 8192,
   ssm (32,128,128).
-- **3b — one GDN layer's numerics (IN PROGRESS).** Split into three checks:
+- **3b — one GDN layer's numerics (DONE 2026-06-19).** Three checks, all green:
   - **3b-1 — vendor the FLA/mamba kernels (DONE 2026-06-19):** the 16-file closure
     (chunk_gated_delta_rule + chunk_delta_h/chunk_o/chunk_scaled_dot_kkt/cumsum/wy_fast/solve_tril/
     l2norm/op/index/utils, fused_recurrent, fused_sigmoid_gating, fused_gdn_prefill_post_conv,
@@ -151,23 +151,41 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     (RMSNormGated(core,z) → out_proj). TP=1, unquantized bf16, state passed EXPLICITLY (no
     forward_context). Strips CustomOp/distributed/MergedColumnParallelLinear. Import-validated; numerics
     pending 3b-3. conv_state assumed dim-first DS `(slots, conv_dim, k-1)` (= GDNStateCache layout).
-  - **3b-3 — single-layer parity (next):** capture/replay vs the REAL vLLM `QwenGatedDeltaNetAttention`
-    (imports in the combined image, vllm 0.22.69) — independent oracle, NOT a self-authored eager ref.
-    Harness recipe (seam already found):
-      * Stand up the real layer (Qwen3NextConfig + minimal VllmConfig, tp=1, quant=None).
-      * `_forward_core`/`_forward_core_rocm` read `get_forward_context().attn_metadata` as a **dict
-        keyed by `self.prefix`** (lines 1228/1284). Monkeypatch `get_forward_context` → stub with
-        `.attn_metadata = {prefix: GDNAttentionMetadata(...)}`; set `real_layer.kv_cache=[conv,ssm]`;
-        call `_forward_core_rocm(qkvz, ba, z, core_attn_out)` directly (bypasses the custom op +
-        set_forward_context). `GDNAttentionMetadata` is a plain dataclass — construct by hand.
-      * Copy weights real→minisgl with a per-param shape assert; expect ~bit-exact (TP=1), gate <1e-2 bf16.
-      * Cheap CPU pre-check first: diff `real.prepare_gdn_attention_core_inputs` vs `_split_qkvz_ba`
-        and `_output_projection` on shared inputs (isolates split/reshape/gate-order bugs, no GPU).
-      * Drive **prefill→decode**; compare the OUTPUT **and** `conv_state` **and** `ssm_state` after
-        prefill (validates the 3a state write-path). Gate decode parity on prefill-state parity; also
-        run an independent decode test injecting one shared random `(conv,ssm)` into both.
-      * Print `is_conv_state_dim_first()` on the live RDNA4 run — if False, the real layer transposes
-        kv_cache[0] and `layer.py`/`GDNStateCache` (DS) must match; this boolean decides 3a's layout.
+  - **3b-3 — single-layer parity (DONE 2026-06-19 — PASS):** capture/replay vs the REAL vLLM
+    `QwenGatedDeltaNetAttention` (combined image, vllm 0.22.69) — independent oracle, NOT a
+    self-authored eager ref. Two harnesses (commits 88a228c, cb812ed):
+      * `tools/gdn_layer_parity_cpu.py` (CPU, no GPU) — minisgl `_split_qkvz_ba` /
+        `_rearrange_mixed_qkv` / `_output_projection` reshape order vs inline replications of the
+        real non-interleaved (Qwen3.5) logic. **9/9 bit-exact.**
+      * `tools/gdn_layer_parity.py` (GPU) — stands up the real layer (Qwen3NextConfig + a real
+        `VllmConfig(ModelConfig=Qwen3-0.6B)` under `set_current_vllm_config`, TP=1 via
+        `init_distributed_environment`+`initialize_model_parallel`, quant=None,
+        `gqa_interleaved_layout=False`). Monkeypatches `qwen_gdn_linear_attn.get_forward_context`
+        → stub with `.attn_metadata = {prefix: GDNAttentionMetadata(...)}` (hand-built dataclass),
+        sets `real.kv_cache=[conv,ssm]`, drives `_forward_core_rocm(qkvz, ba, z, core)` directly
+        **then `real._output_projection(...)` separately** (the core op does NOT project). Forces
+        `enable_packed_recurrent_decode=False`; coerces real's standalone-default fp32 linear
+        weights → bf16 (fp32 A_log/dt_bias) to match minisgl; per-param shape-asserted copy.
+      * **PREFILL bit-exact** — output + conv_state + ssm_state all max|Δ|=0 (validates the 3a
+        write-path + prefill compute). **DECODE** — independent shared-random-state decode (nonzero
+        readout core ~3e-2, output ~17) matches at rel 3.6e-3 (bf16); continue-from-prefill matches
+        (readout ~0 for these dims, real==mini exact). Only non-zero diffs are bf16-magnitude
+        (rel<4e-3) from real's non-contiguous SD-transposed conv view vs minisgl's contiguous DS.
+    **Live RDNA4 facts that bind 3a/3c:**
+      * `is_conv_state_dim_first() = False` (**SD**, no `VLLM_SSM_CONV_STATE_LAYOUT` env) — the real
+        layer transposes `kv_cache[0]` to `(…, conv_dim, k-1)` for the conv kernels; minisgl +
+        `GDNStateCache` store dim-first **DS** `(slots, conv_dim, k-1)`. So **3c must wire the conv
+        state in the transposed frame** (allocate the engine's conv buffer SD and pass
+        `.transpose(-1,-2)`, or keep DS and accept it as the minisgl-native layout). The harness
+        already branches on this boolean for both the fed buffer and the comparison frame.
+      * `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE = True` in the image — production decode would take
+        `fused_recurrent_gated_delta_rule_packed_decode`; minisgl `gdn/layer.py` implements the
+        non-packed `fused_sigmoid_gating_delta_rule_update`. **Deliberate divergence to revisit in
+        3c** (validate the packed path or keep non-packed for greedy token-parity).
+      * `GDN_AITER_TRITON_AVAILABLE = None` — production `forward_hip` → `forward_cuda` →
+        `_forward_core` (the path the oracle drives; the aiter decode-fast path is unavailable).
+      * Box quirk: hipBLASLt intermittently `INTERNAL_ERROR`→`ALLOC_FAILED` on the in_proj GEMM
+        under serve load — run with `-e TORCH_BLAS_PREFER_HIPBLASLT=0`.
 - **3c — scheduler subset-split + warmup hook (THE risk):** one batch splits into prefill/decode
   subsets running DIFFERENT kernels (chunk-scan vs fused-recurrent) with per-subset query_start_loc +
   state indices; FLA first-batch autotune needs a warmup-prefill hook or it OOMs. No spec-decode/MTP.
