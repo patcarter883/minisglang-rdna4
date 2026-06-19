@@ -144,13 +144,30 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     shim-sensitive paths (chunk_gated_delta_rule→is_cuda_alike, RMSNormGated→num_compute_units).
     `causal_conv1d_fn` micro-call is info-only (needs full GDNAttentionMetadata; covered by byte-diff
     + 3b-3). `kda.py` excluded (outside closure; would need a custom_op stub).
-  - **3b-2 — the layer (next):** build a clean `QwenGatedDeltaNet` minisgl module (in_proj_qkvz/ba,
-    conv1d, gating, delta-rule, RMSNormGated, out_proj) on minisgl linears + vendored kernels,
-    stripping vLLM CustomOp/forward_context/distributed coupling.
-  - **3b-3 — single-layer parity:** capture/replay vs the REAL vLLM `QwenGatedDeltaNetAttention`
-    (importable in the combined image) — independent oracle, not a self-authored eager ref. Drive
-    **prefill→decode** (not prefill-only) to exercise conv_state/ssm_state read-back and discharge
-    `gdn_state.py`'s conv-orientation caveat against the live `causal_conv1d` path.
+  - **3b-2 — the layer (DONE, pending 3b-3 parity):** `gdn/layer.py` `QwenGatedDeltaNet` — clean
+    `nn.Module` reimplementing the reference's no-spec forward COMPUTE (prefill = causal_conv1d_fn →
+    fused_post_conv_prep → chunk_gated_delta_rule, writes final ssm_state; decode = causal_conv1d_update
+    → rearrange → fused_sigmoid_gating_delta_rule_update, in-place state) + `_output_projection`
+    (RMSNormGated(core,z) → out_proj). TP=1, unquantized bf16, state passed EXPLICITLY (no
+    forward_context). Strips CustomOp/distributed/MergedColumnParallelLinear. Import-validated; numerics
+    pending 3b-3. conv_state assumed dim-first DS `(slots, conv_dim, k-1)` (= GDNStateCache layout).
+  - **3b-3 — single-layer parity (next):** capture/replay vs the REAL vLLM `QwenGatedDeltaNetAttention`
+    (imports in the combined image, vllm 0.22.69) — independent oracle, NOT a self-authored eager ref.
+    Harness recipe (seam already found):
+      * Stand up the real layer (Qwen3NextConfig + minimal VllmConfig, tp=1, quant=None).
+      * `_forward_core`/`_forward_core_rocm` read `get_forward_context().attn_metadata` as a **dict
+        keyed by `self.prefix`** (lines 1228/1284). Monkeypatch `get_forward_context` → stub with
+        `.attn_metadata = {prefix: GDNAttentionMetadata(...)}`; set `real_layer.kv_cache=[conv,ssm]`;
+        call `_forward_core_rocm(qkvz, ba, z, core_attn_out)` directly (bypasses the custom op +
+        set_forward_context). `GDNAttentionMetadata` is a plain dataclass — construct by hand.
+      * Copy weights real→minisgl with a per-param shape assert; expect ~bit-exact (TP=1), gate <1e-2 bf16.
+      * Cheap CPU pre-check first: diff `real.prepare_gdn_attention_core_inputs` vs `_split_qkvz_ba`
+        and `_output_projection` on shared inputs (isolates split/reshape/gate-order bugs, no GPU).
+      * Drive **prefill→decode**; compare the OUTPUT **and** `conv_state` **and** `ssm_state` after
+        prefill (validates the 3a state write-path). Gate decode parity on prefill-state parity; also
+        run an independent decode test injecting one shared random `(conv,ssm)` into both.
+      * Print `is_conv_state_dim_first()` on the live RDNA4 run — if False, the real layer transposes
+        kv_cache[0] and `layer.py`/`GDNStateCache` (DS) must match; this boolean decides 3a's layout.
 - **3c — scheduler subset-split + warmup hook (THE risk):** one batch splits into prefill/decode
   subsets running DIFFERENT kernels (chunk-scan vs fused-recurrent) with per-subset query_start_loc +
   state indices; FLA first-batch autotune needs a warmup-prefill hook or it OOMs. No spec-decode/MTP.
