@@ -210,9 +210,65 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
         `_forward_core` (the path the oracle drives; the aiter decode-fast path is unavailable).
       * Box quirk: hipBLASLt intermittently `INTERNAL_ERROR`→`ALLOC_FAILED` on the in_proj GEMM
         under serve load — run with `-e TORCH_BLAS_PREFER_HIPBLASLT=0`.
-- **3c — scheduler subset-split + warmup hook (THE risk):** one batch splits into prefill/decode
-  subsets running DIFFERENT kernels (chunk-scan vs fused-recurrent) with per-subset query_start_loc +
-  state indices; FLA first-batch autotune needs a warmup-prefill hook or it OOMs. No spec-decode/MTP.
+- **3c — scheduler slot lifecycle + metadata + warmup hook (DONE 2026-06-20).** The vLLM
+  framing ("one batch splits into prefill/decode subsets") does NOT apply here: **minisgl
+  schedules HOMOGENEOUS batches** (`Batch.phase` = prefill XOR decode — `_schedule_next_batch`
+  is `prefill_manager … or decode_manager …`), so the subset-split is already done by the
+  scheduler and a GDN layer just dispatches `forward_prefill`/`forward_decode` on
+  `batch.is_prefill`. THE RISK relocated to **chunked-prefill state threading** (one recurrent
+  slot shared across fresh / chunk-continuation / prefill→decode / free for a sequence). Five
+  sub-phases, all green:
+  - **3c-0 (`f636197`) — `GDNStateCache` reserves slot 0 = NULL_BLOCK_ID.** The free-list
+    popped slot 0 FIRST (`range(N-1,-1,-1)`), so the first real sequence got the null block →
+    `causal_conv1d_fn`/`update` silently skip it (output unwritten = garbage). This was the
+    root cause of the vacuous 3b-3 PASS. Free-list now stops at 1; slot 0 is buffer-only.
+    Size `num_slots = max_running_req + 2`. CPU test asserts slot 0 is never handed out.
+  - **3c-1 (`8310cea`) — `gdn/metadata.py`.** `build_gdn_metadata(batch, state_indices, device)`
+    packages the per-batch tensors the layer consumes: `query_start_loc` (cumsum `extend_len` /
+    arange), `state_indices` (scheduler slots, all ≥1), per-seq `has_initial_state`
+    (`cached_len>0`). chunk/conv metadata left None for MVP (kernels compute on the fly;
+    `cumsum.py` self-calls `prepare_chunk_indices` when None — verified). Pins host staging
+    only for a CUDA target (stays CPU-testable).
+  - **3c-2a (`e6e65d9`) — `GDNSlotManager`, the spine.** uid-anchored slot lifecycle (uid is
+    the only identity stable across chunks — each chunk builds a NEW `Req`). Fresh→alloc+zero;
+    continuation→reuse, no re-zero; decode→pure lookup (unknown uid raises, no silent garbage);
+    finish/abort→idempotent free (overlap can double-free). CPU-unit-tested (all 4 cases).
+    **★ Precondition: GDN-hybrid models MUST run the non-radix ("naive") prefix cache** — GDN
+    state isn't prefix-cacheable; a radix hit gives `cached_len>0` with no state behind it
+    (silent garbage). Confirmed `NaivePrefixCache.match_prefix` always returns `cached_len=0`,
+    so under it `cached_len>0` ⟺ chunk continuation = exactly the `has_initial_state` predicate.
+  - **3c-2b (`40b26b2`) — inert scheduler/engine wiring.** `Engine.gdn_state: GDNStateCache|None`
+    placeholder (None for every dense model; **3d constructs it** from the 35B's linear-attn
+    dims); `Scheduler` builds a `GDNSlotManager` iff non-None; `_prepare_batch` allocs slots +
+    builds `batch.gdn_metadata`; `_free_req_resources` frees the slot (single site covering
+    finish AND abort). All hooks are `if self.gdn_slots is not None` no-ops today → dense path
+    byte-unchanged (import-smoke verified). Eager only (GDN cudagraph out of 3c scope).
+  - **3c-3 (`e2337ec`) — `QwenGatedDeltaNet.warmup_conv`.** GEMM-free conv warmup on a private
+    2-slot scratch (never touches real state) settling `causal_conv1d_fn`'s in-place
+    batch_ptr autotune (per-process — NOT in the on-disk Triton JIT cache). Engine calls it
+    once before the first real batch in 3d.
+  - **3c-4 (`8e97784`, `4f4165a`) — engine-plumbing integration test, GREEN on gfx1201**
+    (`tools/gdn_3c_integration.py`, lease + `TORCH_BLAS_PREFER_HIPBLASLT=0`). Validates the
+    WIRING (not 3b numerics), non-vacuous with magnitude guards:
+      * **A** metadata exactness — built tensors == hand-built (`[0,96,160,192]`, `[F,T,F]`).
+      * **B** chunked-vs-single prefill parity (independent state-threading oracle): a 2-chunk
+        prefill sharing one slot (`has_initial_state=True` on chunk 1) reproduces a single-shot
+        prefill of the concatenation. **conv_state BIT-EXACT (Δ=0)** for aligned 64+64 AND
+        non-aligned 80+48 (partial FLA block + mid-block conv carry); ssm/output at bf16 noise
+        (rel ~2–4e-3), |out|~17.
+      * **C** prefill→decode handoff: decode reuses the slot, reads the state (|out|~12),
+        advances ssm in place.
+      * **D** multi-seq batch executed through the kernels (the load-bearing case): a 2-seq
+        (96+64) batch in ONE `forward_prefill`/`forward_decode` vs each seq run ALONE. Exact
+        signature of correct segmentation — **seqA (leading segment) BIT-EXACT** (Δ=0
+        output/ssm/conv), seqB (trailing) at bf16 noise (rel ~1e-3); slots `[1,2]` distinct,
+        reused at decode. This is the ONLY place varlen segmentation + per-seq state gather is
+        EXECUTED (Part A only asserts the tensors).
+  - **Packed-decode (deliberate divergence, carried to 3d perf):** image sets
+    `VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=True`; minisgl keeps the non-packed
+    `fused_sigmoid_gating_delta_rule_update` (3b-3-validated) for greedy token-parity.
+  - **Deferred to 3d (needs the GDN model to exist):** construct `Engine.gdn_state` from the
+    35B's linear-attn dims; force the non-radix cache + eager for GDN models; live serve.
 - **3d — interleave + serve:** qwen3_5 1-in-4 full/linear interleave (full layers reuse Phase-1
   attention); serve the 35B; greedy token-diff vs combined image. GDN projections are unquantized
   bf16; only routed MoE experts are W4A8 (uses the Phase-2-MoE path).
@@ -248,7 +304,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid (3a state cache → 3b layer numerics → 3c scheduler split → 3d serve) | todo |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d interleave+serve | **3d todo** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
