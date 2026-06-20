@@ -79,6 +79,9 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # GDN (linear-attention) per-batch metadata — set by the scheduler ONLY for GDN-hybrid
+    # models (None otherwise, so the dense path is unaffected). See gdn/metadata.py.
+    gdn_metadata: object | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
