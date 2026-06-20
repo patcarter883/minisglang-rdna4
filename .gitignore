@@ -34,3 +34,4 @@ env/
 
 # torch artifacts
 *.pt
+.triton-cache-3c/
