@@ -23,10 +23,13 @@ def main() -> None:
     )
     assert tuple(c.conv_state.shape) == (30, 8, 8192, 3), c.conv_state.shape
     assert tuple(c.ssm_state.shape) == (30, 8, 32, 128, 128), c.ssm_state.shape
-    assert c.num_free == 8
+    # Slot 0 is the reserved NULL block: 8 buffer slots -> 7 allocatable.
+    assert c.num_free == 7
 
     s = c.alloc_many(3)
-    assert c.num_free == 5 and len(set(s.tolist())) == 3
+    assert c.num_free == 4 and len(set(s.tolist())) == 3
+    # ★ slot 0 (NULL_BLOCK_ID) must NEVER be handed out (the 3c load-bearing constraint).
+    assert (s != 0).all(), f"allocated slot 0 (NULL_BLOCK_ID): {s.tolist()}"
 
     # slot isolation: writing one slot leaves the others zero
     c.ssm(0)[s[0]] = 1.0
@@ -35,13 +38,13 @@ def main() -> None:
 
     # free -> reuse
     c.free(s)
-    assert c.num_free == 8
-    s2 = c.alloc_many(8)
+    assert c.num_free == 7
+    # exhaust ALL allocatable slots and confirm slot 0 is never among them
+    s2 = c.alloc_many(7)
     assert c.num_free == 0
+    assert (s2 != 0).all(), f"allocated slot 0 (NULL_BLOCK_ID): {s2.tolist()}"
 
     # reset clears a reused slot's prior state
-    if (c.ssm(0)[s2[0]] != 0).any():
-        pass  # may carry the earlier write depending on reuse order
     c.reset_slots(s2[:1])
     assert (c.ssm(0)[s2[0]] == 0).all() and (c.conv(0)[s2[0]] == 0).all()
 
@@ -53,8 +56,8 @@ def main() -> None:
         pass
 
     mem_mb = (c.conv_state.numel() * 2 + c.ssm_state.numel() * 2) / 1e6
-    print(f"GDN state cache OK: shapes/alloc/free/reuse/reset/exhaustion all pass "
-          f"({mem_mb:.0f} MB for 30 layers x 8 slots)")
+    print(f"GDN state cache OK: shapes/alloc/free/reuse/reset/exhaustion + slot-0 "
+          f"reservation all pass ({mem_mb:.0f} MB for 30 layers x 8 slots)")
     print("PASS")
 
 
