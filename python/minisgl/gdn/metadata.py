@@ -84,19 +84,21 @@ def build_gdn_metadata(
         )
 
     # prefill: cu_seqlens over the tokens processed THIS pass (extend_len per seq).
+    # Pin the host staging only for a CUDA target (page-locked H2D overlap); pinning needs
+    # a live GPU, so the CPU path (unit tests) skips it.
+    pin = device.type == "cuda" and torch.cuda.is_available()
     extend_lens = [req.extend_len for req in reqs]
-    # build on CPU (pinned) then async copy — avoids a per-seq device sync.
-    qsl_host = torch.zeros(num_seqs + 1, dtype=torch.int32, pin_memory=True)
+    qsl_host = torch.zeros(num_seqs + 1, dtype=torch.int32, pin_memory=pin)
     torch.cumsum(
         torch.tensor(extend_lens, dtype=torch.int32), dim=0, out=qsl_host[1:]
     )
-    query_start_loc = qsl_host.to(device, non_blocking=True)
+    query_start_loc = qsl_host.to(device, non_blocking=pin)
 
     # has_initial_state: True ⟺ continuation (cached_len > 0). With the non-radix cache
     # forced for GDN models, cached_len > 0 happens only for chunked-prefill continuations.
     has_initial = torch.tensor(
-        [req.cached_len > 0 for req in reqs], dtype=torch.bool, pin_memory=True
-    ).to(device, non_blocking=True)
+        [req.cached_len > 0 for req in reqs], dtype=torch.bool, pin_memory=pin
+    ).to(device, non_blocking=pin)
 
     return GDNMetadata(
         is_prefill=True,
