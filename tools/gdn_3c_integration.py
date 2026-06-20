@@ -133,6 +133,36 @@ def new_cache_mgr(device):
     return cache, GDNSlotManager(cache)
 
 
+def run_batched_prefill(layer, cache, mgr, specs, hs_list, device):
+    """One prefill call over a MULTI-seq batch. Returns (out, slots, [conv per slot],
+    [ssm per slot]); out rows are seq-concatenated in `specs` order."""
+    from minisgl.gdn.metadata import build_gdn_metadata
+
+    batch = fake_batch(specs, prefill=True)
+    si = mgr.state_indices(batch)
+    md = build_gdn_metadata(batch, si, device)
+    out = layer.forward_prefill(
+        torch.cat(hs_list, 0), cache.conv(0), cache.ssm(0),
+        md.query_start_loc, md.state_indices, md.has_initial_state)
+    slots = si.tolist()
+    return (out, slots,
+            [cache.conv(0)[s].clone() for s in slots],
+            [cache.ssm(0)[s].clone() for s in slots])
+
+
+def run_batched_decode(layer, cache, mgr, specs, tok_list, device):
+    """One decode call over a MULTI-seq batch. Returns (out, slots); out row i is seq i."""
+    from minisgl.gdn.metadata import build_gdn_metadata
+
+    batch = fake_batch(specs, prefill=False)
+    si = mgr.state_indices(batch)
+    md = build_gdn_metadata(batch, si, device)
+    out = layer.forward_decode(
+        torch.cat(tok_list, 0), cache.conv(0), cache.ssm(0),
+        md.query_start_loc, md.state_indices)
+    return out, si.tolist()
+
+
 # --------------------------------------------------- Part B (the ★ chunked-vs-single oracle)
 def run_prefill_through_plumbing(layer, cache, mgr, uid_specs, hs_slices, device):
     """Drive one or more prefill passes for a single uid through manager+builder+layer.
@@ -217,6 +247,47 @@ def part_c_decode(layer, device, prefill_len=96) -> None:
     check("decode advanced ssm state in place", advanced > 0, f"max|Δssm|={advanced:.3e}")
 
 
+def part_d_multiseq(layer, device, lenA=96, lenB=64) -> None:
+    """The load-bearing multi-seq check: a 2-seq batch run through the kernels in ONE call
+    must reproduce each sequence run ALONE in its own slot. This is the ONLY place the varlen
+    segmentation (multi-segment query_start_loc, multi cache_indices, per-seq initial_state
+    gather) is EXERCISED — Part A only asserts the metadata tensors, not their execution."""
+    banner("D. multi-seq batch vs individual (segmentation + per-seq state indexing)")
+    torch.manual_seed(SEED + 2)
+    hsA = torch.randn(lenA, HIDDEN, device=device, dtype=torch.bfloat16)
+    hsB = torch.randn(lenB, HIDDEN, device=device, dtype=torch.bfloat16)
+    tokA = torch.randn(1, HIDDEN, device=device, dtype=torch.bfloat16)
+    tokB = torch.randn(1, HIDDEN, device=device, dtype=torch.bfloat16)
+
+    # individual prefills (each alone, fresh cache+slot)
+    cA, mA = new_cache_mgr(device)
+    outA, _, convA, ssmA = run_prefill_through_plumbing(layer, cA, mA, [(1, lenA, 0)], [hsA], device)
+    cB, mB = new_cache_mgr(device)
+    outB, _, convB, ssmB = run_prefill_through_plumbing(layer, cB, mB, [(2, lenB, 0)], [hsB], device)
+
+    # batched prefill: both sequences in ONE call, distinct slots
+    cAB, mAB = new_cache_mgr(device)
+    out_ab, slots_ab, conv_ab, ssm_ab = run_batched_prefill(
+        layer, cAB, mAB, [(1, lenA, 0), (2, lenB, 0)], [hsA, hsB], device)
+    check("batched prefill: 2 distinct slots", len(set(slots_ab)) == 2, str(slots_ab))
+    cmp("batched prefill seqA output", out_ab[:lenA], outA)
+    cmp("batched prefill seqB output", out_ab[lenA:], outB)
+    cmp("batched prefill seqA ssm", ssm_ab[0], ssmA)
+    cmp("batched prefill seqB ssm", ssm_ab[1], ssmB)
+    cmp("batched prefill seqA conv", conv_ab[0], convA)
+    cmp("batched prefill seqB conv", conv_ab[1], convB)
+
+    # decode: individual (continue each alone) vs batched (continue both in one call).
+    # The prefilled states match (verified above), so batched-decode rows must match the
+    # individual decodes iff the per-seq state gather + segmentation are correct.
+    doutA, _ = run_batched_decode(layer, cA, mA, [(1, 1, lenA)], [tokA], device)
+    doutB, _ = run_batched_decode(layer, cB, mB, [(2, 1, lenB)], [tokB], device)
+    dout_ab, dslots = run_batched_decode(layer, cAB, mAB, [(1, 1, lenA), (2, 1, lenB)], [tokA, tokB], device)
+    check("batched decode reuses prefill slots", dslots == slots_ab, f"{dslots} vs {slots_ab}")
+    cmp("batched decode seqA output", dout_ab[:1], doutA)
+    cmp("batched decode seqB output", dout_ab[1:], doutB)
+
+
 def main() -> None:
     print(f"torch {torch.__version__}  hip={getattr(torch.version, 'hip', None)}", flush=True)
     if torch.cuda.device_count() == 0:
@@ -227,11 +298,12 @@ def main() -> None:
 
     layer = build_layer(device)
     banner("warmup_conv (GEMM-free; settles causal_conv1d_fn autotune)")
-    layer.warmup_conv(128)
+    layer.warmup_conv(160)  # >= max batch token count tested (Part D's 96+64)
     print("  warmup_conv complete", flush=True)
 
     part_b_chunked(layer, device)
     part_c_decode(layer, device)
+    part_d_multiseq(layer, device)
 
     print(f"\n{'PASS' if ok_all else 'FAIL'} — 3c integration "
           f"(metadata + slot lifecycle + warmup + chunked-state-threading + decode handoff)")
