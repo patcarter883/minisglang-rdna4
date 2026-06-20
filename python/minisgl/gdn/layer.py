@@ -224,6 +224,36 @@ class QwenGatedDeltaNet(nn.Module):
         )
         return self._output_projection(core_attn_out.squeeze(0), z, n)
 
+    # ---- 3c-3: warmup hook — settle causal_conv1d_fn's in-place autotune ----
+    @torch.no_grad()
+    def warmup_conv(self, num_tokens: int, *, iters: int = 2) -> None:
+        """Run the prefill conv on a THROWAWAY buffer before the first REAL batch.
+
+        ``causal_conv1d_fn`` autotunes on its first call by benchmarking candidate configs
+        IN PLACE on the live conv buffer; an unwarmed first prefill is op-sequence-sensitive
+        (3b-3 saw NaN/0, and it can OOM). A single warm forward was proven insufficient — the
+        GEMM-free multi-call regime (default 2 iters) is what settled it. This is GEMM-free
+        (no in_proj, so no hipBLASLt OOM risk) and writes only a private 2-slot scratch (slot
+        1; slot 0 would be skipped as the NULL block), so NO real sequence state is touched.
+
+        Per-process: the in-place batch_ptr autotune is not in Triton's on-disk JIT cache, so
+        this must run once per engine process (mounting a warm Triton cache does NOT cover it).
+        """
+        device = self.conv1d_weight.device
+        dtype = self.conv1d_weight.dtype
+        weight = self._conv_weights()
+        query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        cache_indices = torch.tensor([1], dtype=torch.int32, device=device)  # never slot 0
+        has_initial_state = torch.tensor([False], device=device)
+        scratch = torch.zeros(2, self.conv_dim, self.conv_kernel_size - 1, dtype=dtype, device=device)
+        for _ in range(iters):
+            x = torch.randn(num_tokens, self.conv_dim, dtype=dtype, device=device).transpose(0, 1)
+            causal_conv1d_fn(
+                x, weight, self.conv1d_bias, activation=self.activation,
+                conv_states=scratch, has_initial_state=has_initial_state,
+                cache_indices=cache_indices, query_start_loc=query_start_loc, metadata=None,
+            )
+
     def _rearrange_mixed_qkv(self, mixed_qkv: torch.Tensor, seq_len: int):
         """Split packed [.., 2*key_dim + value_dim] into (1, seq, heads, dim) q/k/v."""
         q_dim = k_dim = self.key_dim
