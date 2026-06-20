@@ -130,12 +130,17 @@ class QwenGatedDeltaNet(nn.Module):
         query_start_loc: torch.Tensor,  # cu_seqlens, int32 (num_seqs+1,)
         state_indices: torch.Tensor,  # slot id per sequence, int32
         has_initial_state: torch.Tensor,  # bool per sequence
+        conv_metadata=None,  # GDN conv metadata (nums_dict/batch_ptr/token_chunk_offset_ptr)
     ) -> torch.Tensor:
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
 
+        # `mixed_qkv` is a `.split()` VIEW into the wider qkvz (token-stride = qkvz_dim).
+        # causal_conv1d_fn handles that non-unit token-stride correctly (verified vs a CPU
+        # reference conv at slot>=1: gapped split-view == contiguous, rel ~7e-3 bf16), so no
+        # explicit .contiguous() is needed here — the reference passes the analogous view too.
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             self._conv_weights(),
@@ -145,7 +150,7 @@ class QwenGatedDeltaNet(nn.Module):
             has_initial_state=has_initial_state,
             cache_indices=state_indices,
             query_start_loc=query_start_loc,
-            metadata=None,  # optional precompute; kernel falls back internally
+            metadata=conv_metadata,  # precomputed nums_dict/batch_ptr/token_chunk_offset_ptr
         ).transpose(0, 1)
 
         q, k, v, g, beta = fused_post_conv_prep(

@@ -151,26 +151,50 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     (RMSNormGated(core,z) → out_proj). TP=1, unquantized bf16, state passed EXPLICITLY (no
     forward_context). Strips CustomOp/distributed/MergedColumnParallelLinear. Import-validated; numerics
     pending 3b-3. conv_state assumed dim-first DS `(slots, conv_dim, k-1)` (= GDNStateCache layout).
-  - **3b-3 — single-layer parity (DONE 2026-06-19 — PASS):** capture/replay vs the REAL vLLM
-    `QwenGatedDeltaNetAttention` (combined image, vllm 0.22.69) — independent oracle, NOT a
-    self-authored eager ref. Two harnesses (commits 88a228c, cb812ed):
-      * `tools/gdn_layer_parity_cpu.py` (CPU, no GPU) — minisgl `_split_qkvz_ba` /
-        `_rearrange_mixed_qkv` / `_output_projection` reshape order vs inline replications of the
-        real non-interleaved (Qwen3.5) logic. **9/9 bit-exact.**
+  - **3b-3 — single-layer parity (DONE 2026-06-20 — PASS; the 2026-06-19 "DONE" was PREMATURE).**
+    capture/replay vs the REAL vLLM `QwenGatedDeltaNetAttention` (combined image, vllm 0.22.69) —
+    independent oracle, NOT a self-authored eager ref.
+      * `tools/gdn_layer_parity_cpu.py` (CPU) — `_split_qkvz_ba` / `_rearrange_mixed_qkv` /
+        `_output_projection` reshape order vs inline replications of the real non-interleaved
+        (Qwen3.5) logic. **9/9 bit-exact.** (SOLID — stable across the whole investigation.)
       * `tools/gdn_layer_parity.py` (GPU) — stands up the real layer (Qwen3NextConfig + a real
-        `VllmConfig(ModelConfig=Qwen3-0.6B)` under `set_current_vllm_config`, TP=1 via
-        `init_distributed_environment`+`initialize_model_parallel`, quant=None,
-        `gqa_interleaved_layout=False`). Monkeypatches `qwen_gdn_linear_attn.get_forward_context`
-        → stub with `.attn_metadata = {prefix: GDNAttentionMetadata(...)}` (hand-built dataclass),
-        sets `real.kv_cache=[conv,ssm]`, drives `_forward_core_rocm(qkvz, ba, z, core)` directly
-        **then `real._output_projection(...)` separately** (the core op does NOT project). Forces
-        `enable_packed_recurrent_decode=False`; coerces real's standalone-default fp32 linear
-        weights → bf16 (fp32 A_log/dt_bias) to match minisgl; per-param shape-asserted copy.
-      * **PREFILL bit-exact** — output + conv_state + ssm_state all max|Δ|=0 (validates the 3a
-        write-path + prefill compute). **DECODE** — independent shared-random-state decode (nonzero
-        readout core ~3e-2, output ~17) matches at rel 3.6e-3 (bf16); continue-from-prefill matches
-        (readout ~0 for these dims, real==mini exact). Only non-zero diffs are bf16-magnitude
-        (rel<4e-3) from real's non-contiguous SD-transposed conv view vs minisgl's contiguous DS.
+        `VllmConfig(ModelConfig=Qwen3-0.6B)` under `set_current_vllm_config`, TP=1, quant=None,
+        `gqa_interleaved_layout=False`); monkeypatches `get_forward_context`; sets `real.kv_cache`;
+        drives `_forward_core_rocm` then `_output_projection` separately; per-param shape-asserted
+        copy of ALL 7 tensors (in_proj_qkvz/ba, conv1d, out_proj, A_log, dt_bias, norm) real→mini;
+        shares in_proj via `_SharedProj`. Run modes via `GDN_SINGLE`: `both` (in-process A/B),
+        `probe` (kernel matrix vs a CPU ground-truth conv), `real`/`mini` (single-pass capture).
+      * **⚠ THE 2026-06-19 "PREFILL bit-exact, max|Δ|=0" PASS WAS VACUOUS (0==0 aliasing).** Root
+        cause: the harness used cache **slot 0**, and `causal_conv1d_fn` treats any program whose
+        `cache_indices[seq] == NULL_BLOCK_ID (==0)` as a null/padding block and **returns its output
+        buffer UNWRITTEN** (`out = torch.empty_like(x)` → reads back as 0 / NaN / aliased garbage,
+        the exact "flip-flop 0.0 / 11.875 / NaN"). Both real AND mini were skipped, so every prior
+        prefill check compared garbage-to-garbage. Proven with a pure-torch CPU reference conv:
+        **slot 0 → WRONG, slot ≥ 1 → CORRECT (rel ~7e-3 bf16), namespace/layout/metadata-independent.**
+      * **PREFILL — now genuinely bit-exact at slot ≥ 1, IN-PROCESS (shared weights+hs).** `q, k, v,
+        g, beta, core_attn_out, ssm_state, conv_state` all **max|Δ| = 0** at substantial magnitude
+        (core ~1.8e-2, ssm ~0.30, conv ~9.3); only the z-dominated `out` differs at rel ~2e-3 (bf16
+        out_proj GEMM backend). Stable across runs. Δ=0 follows from shared in_proj + copied weights +
+        byte-identical kernels, so this validates the **GDN orchestration** (split order, DS-vs-SD
+        conv_state layout, state write/indexing, call sequence) — the kernels were validated in 3b-1.
+        NOTE: a TWO-process A/B is invalid — each process
+        random-inits its own real layer (incl. `A_log ~ N(-2,0.3)`), so weights differ across
+        processes; parity MUST be in-process (`GDN_SINGLE=both`) where the weight-copy applies.
+      * **DECODE** — independent shared-random-state decode (nonzero readout core ~3e-2, output ~17)
+        matches bit-exact; SOLID across the investigation. It was unaffected by the slot-0 bug because
+        that test used **slot 1** (`sidx=1`), not because the kernel differs: `causal_conv1d_update`
+        carries the SAME `cache_indices[seq] == NULL_BLOCK_ID` skip, so decode at slot 0 is skipped too
+        — the "never slot 0" constraint is identical for prefill and decode.
+      * **Corrections to earlier notes:** (1) a transient `.contiguous()` "GAP fix" in
+        `forward_prefill` was REMOVED — the probe showed gapped split-view == contiguous == CPU-ref at
+        slot ≥ 1 (the earlier GAP≠PACK was slot-0 aliasing noise). (2) `metadata=None` in
+        `causal_conv1d_fn` is correct (== precomputed `md_p` at slot ≥ 1); the on-the-fly batch_ptr
+        path is fine. (3) The conv autotune is sensitive to op-sequence on a cold/live buffer — a
+        GEMM-free warmup settles it before the measured prefill.
+    **★ 3c CONSTRAINT (the durable finding): `GDNStateCache` MUST NOT allocate slot 0 to a real
+    sequence** — cache index 0 == `NULL_BLOCK_ID`, which `causal_conv1d_fn` silently treats as a
+    padding/no-op block (conv output unwritten). Either reserve slot 0 as the null block (offset all
+    real slots by ≥1, matching vLLM), or the prefill conv produces garbage with no error.
     **Live RDNA4 facts that bind 3a/3c:**
       * `is_conv_state_dim_first() = False` (**SD**, no `VLLM_SSM_CONV_STATE_LAYOUT` env) — the real
         layer transposes `kv_cache[0]` to `(…, conv_dim, k-1)` for the conv kernels; minisgl +
