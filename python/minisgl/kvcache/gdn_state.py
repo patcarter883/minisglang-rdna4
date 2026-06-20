@@ -15,6 +15,15 @@ class GDNStateCache:
       - the slot's conv_state + ssm_state are read+updated in place across decode steps,
       - the slot is freed when the sequence finishes.
 
+    ★ Slot 0 is RESERVED as the NULL block and is NEVER handed to a real sequence.
+    Cache index 0 == ``NULL_BLOCK_ID``: ``causal_conv1d_fn`` / ``causal_conv1d_update``
+    treat any sequence whose ``cache_indices[seq] == 0`` as a null/padding block and
+    return their output buffer UNWRITTEN (garbage, no error). So the free-list starts at
+    slot 1 (real slots in ``[1, num_slots-1]``); slot 0 exists in the buffer but is only
+    ever the padding target. (This was the root cause of the vacuous 3b-3 prefill PASS;
+    see PORT.md "★ 3c CONSTRAINT".) Size ``num_slots = max_running_req + 2`` (one NULL +
+    one per running req), mirroring the engine's "+1 dummy page" habit.
+
     Buffers are indexed [gdn_layer_id, slot] — gdn_layer_id enumerates ONLY the linear-
     attention layers (the 1-in-4 full-attention layers use the normal MHA KV cache).
 
@@ -49,8 +58,10 @@ class GDNStateCache:
             dtype=dtype,
             device=device,
         )
-        # LIFO free-list of slot ids.
-        self._free: list[int] = list(range(num_slots - 1, -1, -1))
+        # LIFO free-list of slot ids. Slot 0 is the reserved NULL block (see class
+        # docstring): the range STOPS at 1, so slot 0 is never popped/allocated.
+        self.NULL_SLOT = 0
+        self._free: list[int] = list(range(num_slots - 1, 0, -1))
 
     def alloc_many(self, n: int) -> torch.Tensor:
         """Allocate n state slots; returns their ids as an int32 device tensor."""
