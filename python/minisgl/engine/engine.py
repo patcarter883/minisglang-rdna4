@@ -77,6 +77,16 @@ class Engine:
             dtype=self.kv_dtype,
         )
 
+        # ======================= GDN recurrent-state cache (Phase 3c/3d) ========================
+        # GDN-hybrid models keep a fixed per-sequence recurrent state (conv + ssm) alongside
+        # the paged MHA KV cache. It is constructed in Phase 3d, once a GDN model exposes its
+        # linear-attention dims; it stays None (and therefore inert) for every dense model
+        # today. The scheduler wires GDN slot alloc/free + per-batch GDN metadata ONLY when
+        # this is non-None — see Scheduler.__init__ / _prepare_batch / _free_req_resources.
+        # ★ A GDN-hybrid engine MUST run the non-radix ("naive") prefix cache: GDN state is
+        # not prefix-cacheable (see GDNSlotManager). Eager only (GDN cudagraph is out of 3c).
+        self.gdn_state = None  # type: ignore[var-annotated]  # GDNStateCache | None
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)

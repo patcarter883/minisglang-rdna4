@@ -18,6 +18,7 @@ from minisgl.utils import init_logger, load_tokenizer
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .gdn_slots import GDNSlotManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
@@ -62,6 +63,14 @@ class Scheduler(SchedulerIOMixin):
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
+        )
+        # GDN recurrent-state slot lifecycle — active ONLY for GDN-hybrid models (engine
+        # constructs the state cache in 3d). None (inert) for every dense model today, so
+        # the dense scheduling path below is unchanged.
+        self.gdn_slots = (
+            GDNSlotManager(self.engine.gdn_state)
+            if self.engine.gdn_state is not None
+            else None
         )
 
         # some alias for easy access
@@ -200,6 +209,10 @@ class Scheduler(SchedulerIOMixin):
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
+        # Release the GDN state slot (idempotent — overlap scheduling can free a req twice).
+        # This single site covers both normal finish (via _process_last_data) and abort.
+        if self.gdn_slots is not None:
+            self.gdn_slots.free(req.uid)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -209,6 +222,14 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        # GDN-hybrid: allocate/reuse a recurrent-state slot per sequence and build the
+        # per-batch GDN metadata (cu_seqlens / state_indices / has_initial_state). Inert for
+        # dense models (gdn_slots is None). The GDN layers read batch.gdn_metadata in 3d.
+        if self.gdn_slots is not None:
+            from minisgl.gdn.metadata import build_gdn_metadata
+
+            state_indices = self.gdn_slots.state_indices(batch)
+            batch.gdn_metadata = build_gdn_metadata(batch, state_indices, self.device)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
