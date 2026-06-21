@@ -302,11 +302,28 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     `Context.gdn_state` (mirrors `kv_cache`, None for dense). CPU-verified: `tools/qwen3_5_config_test.py`
     (`--standalone`, no torch) — 4B parse (conv_dim 8192, rotary_dim 64, 24+8, tied, SwiGLU 9216)
     AND dense regression (non-GDN, full rotary, GDN fields None) both PASS.
-  - **3d-1 (todo) — `models/qwen3_5.py`.** Reuse `QwenGatedDeltaNet` for the 24 linear layers;
-    author the gated/partial-rotary attention op for the 8 full layers (global layer_id indexes the
-    KV pool); dense SwiGLU MLP; tied lm_head. Per-layer branch on `config.layer_types`; the GDN
-    layer pulls `ctx.gdn_state.conv/ssm(gdn_layer_id)` + `batch.gdn_metadata` and dispatches
-    `forward_prefill`/`forward_decode` on `batch.is_prefill`. Register `Qwen3_5ForConditionalGeneration`.
+  - **3d-1a (DONE 2026-06-21) — partial rotary in `RotaryEmbedding`.** Dropped `assert rotary_dim
+    == head_size`; `_apply` rotates the first `rotary_dim` dims (NeoX rotate-half) and concats the
+    unrotated tail — reduces EXACTLY to the old path when `rotary_dim == head_size`. CPU-verified
+    bit-exact (`tools/rotary_partial_test.py`) vs an HF reference for partial (256/64) AND full
+    (128/128, 64/64); tail bit-identical. `AttentionLayer` already builds rope from
+    `rotary_config.rotary_dim`, so partial rotary engages with no other change.
+  - **3d-1b (DONE 2026-06-21) — `models/qwen3_5.py` + register.** `Qwen3_5Attn` (gated GQA: q_proj
+    emits 2× per-head = q + sigmoid gate applied to the attn output; q/k norm; partial rotary via
+    the shared `AttentionLayer`; global layer_id indexes the KV pool). `GDNLinearAttn` — a **BaseOP
+    bridge** around the nn.Module `QwenGatedDeltaNet` (its params live in nn.Module `_parameters`,
+    invisible to BaseOP's `__dict__` walk): `state_dict`/`load_state_dict` delegate to the module,
+    load via `assign=True` so meta params are replaced by real-device checkpoint tensors AND fp32
+    `A_log`/`dt_bias` dtype is preserved. Built on the meta device; per-layer branch on
+    `config.layer_types`; the GDN bridge pulls `ctx.gdn_state.conv/ssm(gdn_layer_id)` +
+    `batch.gdn_metadata` and dispatches `forward_prefill`/`forward_decode` on `batch.is_prefill`.
+    Dense SwiGLU `GatedMLP`; tied lm_head. Registered `Qwen3_5ForConditionalGeneration`.
+    **Verified (`tools/qwen3_5_build_smoke.py`, combined image, CPU/meta — no GPU lease):** builds
+    the 4B on meta → 24 GDN + 8 full layers, 346 state-dict tensors (24·11 + 8·10 + embed + norm),
+    correct per-layer key sets / shapes (q_proj 8192×2560, in_proj_qkvz 12288×2560, conv1d 8192·1·4)
+    / fp32 A_log+dt_bias, AND a clean `state_dict()`↔`load_state_dict()` round-trip (the bridge's
+    key layout is self-consistent). ★ Carries to 3d-3: the engine's bf16 weight cast MUST skip
+    `A_log`/`dt_bias` (keep fp32).
   - **3d-2 (todo) — engine wiring.** Construct `GDNStateCache` from the model dims, set
     `ctx.gdn_state`, warmup each GDN layer's conv; force `cache_type="naive"` + eager for GDN models.
   - **3d-3 (todo) — weight-name mapping** (`model.language_model.*`; concat qkv+z / b+a; skip vision).
@@ -343,7 +360,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done 2026-06-21** → 3d-1..4 model/engine/weights/serve | **3d-1 next** |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done 2026-06-21** → 3d-2..4 engine/weights/serve | **3d-2 next** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
