@@ -9,6 +9,7 @@ from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache.gdn_state import GDNStateCache
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
@@ -26,6 +27,10 @@ from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
+
+# Token count for the one-time GDN conv autotune warmup (3c-3). A single representative
+# prefill length settles the per-process in-place batch_ptr autotune.
+_GDN_WARMUP_TOKENS = 512
 
 
 class ForwardOutput(NamedTuple):
@@ -79,13 +84,36 @@ class Engine:
 
         # ======================= GDN recurrent-state cache (Phase 3c/3d) ========================
         # GDN-hybrid models keep a fixed per-sequence recurrent state (conv + ssm) alongside
-        # the paged MHA KV cache. It is constructed in Phase 3d, once a GDN model exposes its
-        # linear-attention dims; it stays None (and therefore inert) for every dense model
-        # today. The scheduler wires GDN slot alloc/free + per-batch GDN metadata ONLY when
-        # this is non-None — see Scheduler.__init__ / _prepare_batch / _free_req_resources.
-        # ★ A GDN-hybrid engine MUST run the non-radix ("naive") prefix cache: GDN state is
-        # not prefix-cacheable (see GDNSlotManager). Eager only (GDN cudagraph is out of 3c).
-        self.gdn_state = None  # type: ignore[var-annotated]  # GDNStateCache | None
+        # the paged MHA KV cache. The scheduler wires GDN slot alloc/free + per-batch GDN
+        # metadata ONLY when this is non-None — see Scheduler.__init__ / _prepare_batch /
+        # _free_req_resources — so the dense path stays untouched (gdn_state is None).
+        # ★ A GDN-hybrid engine MUST run the non-radix ("naive") prefix cache (GDN state is not
+        # prefix-cacheable — see GDNSlotManager) AND eager (GDN cudagraph out of scope) — both
+        # forced below / in Scheduler.__init__.
+        mc = config.model_config
+        if mc.is_gdn_hybrid:
+            self.ctx.gdn_state = self.gdn_state = GDNStateCache(
+                num_gdn_layers=mc.num_gdn_layers,
+                num_slots=config.max_running_req + 2,  # +1 NULL block, +1 dummy
+                conv_dim=mc.gdn_conv_dim,
+                conv_kernel=mc.linear_conv_kernel_dim,
+                num_v_heads=mc.linear_num_value_heads,
+                head_v_dim=mc.linear_value_head_dim,
+                head_k_dim=mc.linear_key_head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            # Settle causal_conv1d's per-process in-place batch_ptr autotune on a private
+            # scratch BEFORE the first real batch (3c-3) — an unwarmed first prefill is
+            # op-sequence-sensitive (NaN/0/OOM). Writes no real state.
+            for gdn in self.model.iter_gdn_layers():
+                gdn.warmup_conv(_GDN_WARMUP_TOKENS)
+            logger.info_rank0(
+                f"GDN state: {mc.num_gdn_layers} layers x {config.max_running_req + 2} slots "
+                f"(conv_dim={mc.gdn_conv_dim}); conv warmup done"
+            )
+        else:
+            self.gdn_state = None  # type: ignore[var-annotated]  # GDNStateCache | None
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -121,12 +149,17 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        # GDN-hybrid models run eager (cudagraph out of scope): an empty bs list disables
+        # capture (max_graph_bs -> 0, can_use_cuda_graph -> False). Dense path unchanged.
+        cuda_graph_bs = [] if self.gdn_state is not None else config.cuda_graph_bs
+        if self.gdn_state is not None:
+            logger.info_rank0("GDN-hybrid model: CUDA graph disabled (eager only)")
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,

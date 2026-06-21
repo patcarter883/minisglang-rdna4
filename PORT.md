@@ -324,8 +324,14 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     / fp32 A_log+dt_bias, AND a clean `state_dict()`↔`load_state_dict()` round-trip (the bridge's
     key layout is self-consistent). ★ Carries to 3d-3: the engine's bf16 weight cast MUST skip
     `A_log`/`dt_bias` (keep fp32).
-  - **3d-2 (todo) — engine wiring.** Construct `GDNStateCache` from the model dims, set
-    `ctx.gdn_state`, warmup each GDN layer's conv; force `cache_type="naive"` + eager for GDN models.
+  - **3d-2 (DONE 2026-06-21, import-verified; live boot deferred to 3d-4) — engine wiring.**
+    `Engine.__init__`: for `mc.is_gdn_hybrid`, construct `GDNStateCache(num_gdn_layers,
+    max_running_req+2 slots, conv_dim/conv_kernel/v-heads/head-dims from the config)`, set
+    `ctx.gdn_state`, and `warmup_conv(512)` each GDN layer (settles the per-process conv autotune).
+    Force **eager** via an empty `cuda_graph_bs` (→ `max_graph_bs=0`, capture skipped,
+    `can_use_cuda_graph`→False). `Scheduler.__init__`: force **naive** prefix cache when
+    `engine.gdn_state is not None`. Dense path byte-unchanged (all branches gated on the flag);
+    import-smoke clean in the combined image. ★ Live boot verification rides with 3d-4.
   - **3d-3 (todo) — weight-name mapping** (`model.language_model.*`; concat qkv+z / b+a; skip vision).
   - **3d-4 (todo) — live serve 4B + greedy token-diff** vs the combined image's vLLM.
 
@@ -360,7 +366,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done 2026-06-21** → 3d-2..4 engine/weights/serve | **3d-2 next** |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weights / 3d-4 serve | **3d-3 next (GPU)** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
