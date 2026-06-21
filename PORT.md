@@ -269,9 +269,48 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     `fused_sigmoid_gating_delta_rule_update` (3b-3-validated) for greedy token-parity.
   - **Deferred to 3d (needs the GDN model to exist):** construct `Engine.gdn_state` from the
     35B's linear-attn dims; force the non-radix cache + eager for GDN models; live serve.
-- **3d — interleave + serve:** qwen3_5 1-in-4 full/linear interleave (full layers reuse Phase-1
-  attention); serve the 35B; greedy token-diff vs combined image. GDN projections are unquantized
-  bf16; only routed MoE experts are W4A8 (uses the Phase-2-MoE path).
+- **3d — interleave + serve (STARTED 2026-06-21).** Build the qwen3_5 hybrid model, construct
+  `Engine.gdn_state`, force naive cache + eager, serve, greedy token-diff vs the combined image.
+  **★ TARGET CORRECTION (2026-06-21 — what's actually on the box):** the ONLY cached GDN-hybrid
+  checkpoint is the **multimodal `Qwen/Qwen3.5-4B`** (`Qwen3_5ForConditionalGeneration`, text
+  submodel `model_type=qwen3_5_text`, 32 layers = 24 GDN + 8 full at `[3,7,11,15,19,23,27,31]`,
+  **dense MLP — no MoE**, weights under `model.language_model.*`, vision under `model.visual.*`).
+  Both "DFlash" dirs in cache (`z-lab/Qwen3.5-4B-DFlash`, `z-lab/Qwen3.5-35B-A3B-DFlash`) are
+  `DFlashDraftModel` **speculative draft** models (model_type qwen3, sliding-attn, ~6 layers) —
+  NOT the base hybrid. So the **35B base is not present**; the 4B is the servable MVP target and
+  exercises the full GDN-interleave + serve path **without** the MoE path (already validated in
+  Phase-2-MoE). The 35B becomes a later weight/MoE swap once a checkpoint exists.
+  **★ FULL-ATTENTION LAYER IS NOT THE PHASE-1 `RopeAttn`** (the earlier "full layers reuse Phase-1
+  attention" was wrong for Qwen3.5). `qwen3_5_text` full attention (`modeling_qwen3_5.py:714-789`)
+  adds: (1) **attn output gate** — `q_proj` emits `2*num_heads*head_dim`; the 2nd half is a gate,
+  `attn_out *= sigmoid(gate)` AFTER attention; (2) **partial rotary** — `partial_rotary_factor=0.25`
+  → `rotary_dim=64` of `head_dim=256` (rotate first 64, pass the rest); (3) per-head q_norm/k_norm
+  (RMSNorm, eps 1e-6); (4) separate q/k/v projections (16 q / 4 kv heads, GQA). So 3d-1 authors a
+  NEW gated-partial-rotary attention op (and the rope/attention path must honor `rotary_dim<head_dim`).
+  **★ GDN LAYER REUSABLE AS-IS:** `minisgl/gdn/layer.py` `QwenGatedDeltaNet` is a faithful compute
+  match to `Qwen3_5GatedDeltaNet` (non-interleaved qkv/z + b/a, conv kernel 4, RMSNormGated, l2norm
+  in kernel, `repeat_interleave(2)` GQA) — only the **weight names differ**: the checkpoint splits
+  `in_proj_qkv`+`in_proj_z` and `in_proj_b`+`in_proj_a`, so 3d-3 concats them into the layer's
+  `in_proj_qkvz` / `in_proj_ba`. GDN projections stay unquantized bf16.
+  Sub-phases:
+  - **3d-0 (DONE 2026-06-21) — `ModelConfig` GDN fields + `ctx.gdn_state`.** `config.py`: added
+    `linear_num_{key,value}_heads` / `linear_{key,value}_head_dim` / `linear_conv_kernel_dim` /
+    `layer_types` (+ `is_gdn_hybrid` / `gdn_layer_ids` / `num_gdn_layers` / `gdn_conv_dim`), parsed
+    in `from_hf` ONLY when the config carries linear dims (dense path untouched). Made `from_hf`
+    robust to Qwen3.5's `rope_parameters` dict (rope_theta + `partial_rotary_factor` → `rotary_dim`;
+    the existing `RotaryConfig.rotary_dim` field already supports partial rotary). Added
+    `Context.gdn_state` (mirrors `kv_cache`, None for dense). CPU-verified: `tools/qwen3_5_config_test.py`
+    (`--standalone`, no torch) — 4B parse (conv_dim 8192, rotary_dim 64, 24+8, tied, SwiGLU 9216)
+    AND dense regression (non-GDN, full rotary, GDN fields None) both PASS.
+  - **3d-1 (todo) — `models/qwen3_5.py`.** Reuse `QwenGatedDeltaNet` for the 24 linear layers;
+    author the gated/partial-rotary attention op for the 8 full layers (global layer_id indexes the
+    KV pool); dense SwiGLU MLP; tied lm_head. Per-layer branch on `config.layer_types`; the GDN
+    layer pulls `ctx.gdn_state.conv/ssm(gdn_layer_id)` + `batch.gdn_metadata` and dispatches
+    `forward_prefill`/`forward_decode` on `batch.is_prefill`. Register `Qwen3_5ForConditionalGeneration`.
+  - **3d-2 (todo) — engine wiring.** Construct `GDNStateCache` from the model dims, set
+    `ctx.gdn_state`, warmup each GDN layer's conv; force `cache_type="naive"` + eager for GDN models.
+  - **3d-3 (todo) — weight-name mapping** (`model.language_model.*`; concat qkv+z / b+a; skip vision).
+  - **3d-4 (todo) — live serve 4B + greedy token-diff** vs the combined image's vLLM.
 
 ## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
 
@@ -304,7 +343,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d interleave+serve | **3d todo** |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done 2026-06-21** → 3d-1..4 model/engine/weights/serve | **3d-1 next** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
