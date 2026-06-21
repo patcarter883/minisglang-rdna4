@@ -20,7 +20,10 @@ class RotaryEmbedding(StateLessOP):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
+        # Partial rotary (Qwen3.5: rotary_dim < head_size): rotate the first rotary_dim dims of
+        # each head, pass the rest through. rotary_dim == head_size is the full-rotary default.
+        assert rotary_dim <= head_size and rotary_dim % 2 == 0
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         if post_process is not None:
             inv_freq = post_process(inv_freq)
@@ -34,13 +37,18 @@ class RotaryEmbedding(StateLessOP):
 
     def _apply(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         # x: [n, num_heads * head_size] -> NeoX rotate-half RoPE, fp32 internal, in-dtype out.
+        # cos/sin are rotary_dim wide; only the first rotary_dim dims of each head are rotated
+        # (partial rotary), the remaining [rotary_dim:head_size] pass through unchanged.
         n = x.shape[0]
         orig_dtype = x.dtype
         x = x.view(n, -1, self.head_size).float()
-        d = self.head_size // 2
-        x1, x2 = x[..., :d], x[..., d:]
+        rd = self.rotary_dim
+        d = rd // 2
+        x_rot = x[..., :rd]
+        x1, x2 = x_rot[..., :d], x_rot[..., d:]
         rot = torch.cat((-x2, x1), dim=-1)
-        out = x * cos.view(n, 1, self.head_size) + rot * sin.view(n, 1, self.head_size)
+        out_rot = x_rot * cos.view(n, 1, rd) + rot * sin.view(n, 1, rd)
+        out = torch.cat((out_rot, x[..., rd:]), dim=-1) if rd < self.head_size else out_rot
         return out.view(n, -1).to(orig_dtype)
 
     def forward(
