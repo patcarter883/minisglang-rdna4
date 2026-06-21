@@ -206,6 +206,10 @@ class Engine:
             def _cast(k: str, v: torch.Tensor) -> torch.Tensor:
                 if not v.is_floating_point() or k.endswith(".scales"):
                     return v
+                # GDN gating params stay fp32 (A_log ships fp32; dt_bias ships bf16 -> upcast).
+                # The kernels + the model's nn.Parameter dtype both require fp32 here.
+                if k.endswith((".A_log", ".dt_bias")):
+                    return v.to(torch.float32)
                 return v.to(self.dtype)
 
             return {k: _cast(k, v) for k, v in load_weight(config.model_path, self.device)}

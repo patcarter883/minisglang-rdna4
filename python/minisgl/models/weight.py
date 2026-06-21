@@ -72,6 +72,88 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
+# ---- Qwen3.5 GDN-hybrid weight-name remap (Phase 3d-3) ----
+# The checkpoint is a multimodal wrapper: `model.language_model.*` (the text decoder we serve),
+# `model.visual.*` (vision tower) and `mtp.*` (the multi-token-prediction speculative head). We
+# serve text only with no MTP, so vision + mtp are skipped. The GDN `linear_attn` ships the
+# fused projections SPLIT — concat them into what `QwenGatedDeltaNet` wants: in_proj_qkv+in_proj_z
+# -> in_proj_qkvz, in_proj_b+in_proj_a -> in_proj_ba; conv1d.weight -> conv1d_weight (the module
+# stores it as a flat Parameter, not an nn.Conv1d). Dense MLP gate/up -> gate_up (as elsewhere).
+# Full-attn q/k/v stay SEPARATE: q_proj carries the per-head output gate (emits 2x), so it cannot
+# be fused into a single qkv_proj the way the dense Qwen3 path does.
+_QWEN35_SKIP_PREFIXES = ("model.visual.", "visual.", "mtp.")
+_QWEN35_LM_PREFIX = "model.language_model."
+# checkpoint suffix -> renamed native suffix (rename only, no concat)
+_QWEN35_RENAME = {".linear_attn.conv1d.weight": ".linear_attn.conv1d_weight"}
+# checkpoint suffix -> (merged native suffix, ordered source suffixes, cat_dim). All are
+# nn.Linear weights (out, in), so the fused tensor concatenates along the output dim (0).
+_QKVZ = (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_z.weight")
+_BA = (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight")
+_GATE_UP = (".mlp.gate_proj.weight", ".mlp.up_proj.weight")
+_QWEN35_CONCAT = {
+    _QKVZ[0]: (".linear_attn.in_proj_qkvz.weight", _QKVZ, 0),
+    _QKVZ[1]: (".linear_attn.in_proj_qkvz.weight", _QKVZ, 0),
+    _BA[0]: (".linear_attn.in_proj_ba.weight", _BA, 0),
+    _BA[1]: (".linear_attn.in_proj_ba.weight", _BA, 0),
+    _GATE_UP[0]: (".mlp.gate_up_proj.weight", _GATE_UP, 0),
+    _GATE_UP[1]: (".mlp.gate_up_proj.weight", _GATE_UP, 0),
+}
+
+
+def qwen3_5_remap(ckpt_key: str):
+    """Map a Qwen3.5 GDN-hybrid checkpoint key to a minisgl-native key plan. Pure (no tensors),
+    so it is CPU-testable against the checkpoint header vs. the model's `state_dict()`.
+
+    Returns one of:
+      ``None``                                           -> skip this checkpoint tensor
+      ``("direct", native_key)``                         -> rename only
+      ``("concat", merged_key, slot, n_slots, cat_dim)`` -> one member of an ordered concat group
+    """
+    if ckpt_key.startswith(_QWEN35_SKIP_PREFIXES):
+        return None
+    if not ckpt_key.startswith(_QWEN35_LM_PREFIX):
+        raise ValueError(f"unexpected Qwen3.5 checkpoint key (not under {_QWEN35_LM_PREFIX!r}): {ckpt_key}")
+    native = "model." + ckpt_key[len(_QWEN35_LM_PREFIX) :]
+    for suffix, renamed in _QWEN35_RENAME.items():
+        if native.endswith(suffix):
+            return ("direct", native[: -len(suffix)] + renamed)
+    for suffix, (merged_suffix, members, cat_dim) in _QWEN35_CONCAT.items():
+        if native.endswith(suffix):
+            return ("concat", native[: -len(suffix)] + merged_suffix, members.index(suffix), len(members), cat_dim)
+    return ("direct", native)
+
+
+def _load_qwen3_5_weight(
+    model_folder: str, device: torch.device
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for the Qwen3.5 GDN-hybrid checkpoint (TP=1). Applies `qwen3_5_remap`
+    and buffers the ordered concat groups until complete. dtype coercion (A_log/dt_bias -> fp32)
+    is the engine's job, exactly as for the dense path."""
+    tp_info = get_tp_info()
+    if tp_info.size != 1:
+        raise NotImplementedError("Qwen3.5 GDN-hybrid weight loading is TP=1 only (TP is Phase 4)")
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # merged_key -> {slot: tensor}
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for name in f.keys():
+                plan = qwen3_5_remap(name)
+                if plan is None:
+                    continue
+                if plan[0] == "direct":
+                    yield plan[1], f.get_tensor(name)
+                    continue
+                _, merged, slot, n_slots, cat_dim = plan
+                concat_buf.setdefault(merged, {})[slot] = f.get_tensor(name)
+                if len(concat_buf[merged]) != n_slots:
+                    continue
+                parts = [concat_buf[merged][i] for i in range(n_slots)]
+                del concat_buf[merged]
+                yield merged, torch.cat(parts, dim=cat_dim)
+    assert not concat_buf, f"incomplete concat groups in checkpoint: {list(concat_buf.keys())}"
+
+
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
@@ -79,6 +161,9 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
 
     model_folder = download_hf_weight(model_path)
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
+    if config.is_gdn_hybrid:
+        yield from _load_qwen3_5_weight(model_folder, device)
+        return
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()

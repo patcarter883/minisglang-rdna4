@@ -332,8 +332,23 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     `can_use_cuda_graph`→False). `Scheduler.__init__`: force **naive** prefix cache when
     `engine.gdn_state is not None`. Dense path byte-unchanged (all branches gated on the flag);
     import-smoke clean in the combined image. ★ Live boot verification rides with 3d-4.
-  - **3d-3 (todo) — weight-name mapping** (`model.language_model.*`; concat qkv+z / b+a; skip vision).
-  - **3d-4 (todo) — live serve 4B + greedy token-diff** vs the combined image's vLLM.
+  - **3d-3 (mapping CPU-VERIFIED 2026-06-21; live load rides with 3d-4) — weight-name mapping.**
+    `weight.py`: `qwen3_5_remap` (pure, testable) + `_load_qwen3_5_weight` streaming loader, branched
+    in `load_weight` on `config.is_gdn_hybrid`. Skips `model.visual.*` (vision) + `mtp.*` (the
+    multi-token-prediction head — text-only MVP); strips `model.language_model.` → `model.`; concats
+    `in_proj_qkv`+`in_proj_z` → `in_proj_qkvz` and `in_proj_b`+`in_proj_a` → `in_proj_ba` (dim 0),
+    renames `conv1d.weight` → `conv1d_weight`, merges dense `gate`+`up` → `gate_up`. Full-attn q/k/v
+    stay SEPARATE (q_proj carries the output gate → unfusable). ★ Engine `_cast`: A_log/dt_bias forced
+    fp32 — A_log ships fp32 but **dt_bias ships bf16 in the checkpoint** (must upcast; the kernels +
+    the model nn.Parameter both want fp32). CPU-verified header-only (no GPU, no 8 GB load):
+    `tools/qwen3_5_weight_map_test.py` — 738 ckpt keys → skip 312 → **346 native keys == the model's
+    346**, every shape + dtype matches, GDN concat shapes + fp32 gating + split-QKV spot-checks pass.
+    ★ FOUND (defer to rope/3d-4): `from_hf` maps Qwen3.5's `rope_parameters` (rope_type "default" +
+    an `mrope_section` LIST) into `RotaryConfig.scaling`; `AttentionLayer` does `tuple(scaling.items())`
+    → unhashable list into the lru-cached `_get_rope` → crash on model build from the real config. The
+    weight test nulls `scaling` (rope is non-parametric, irrelevant to key layout) to isolate 3d-3.
+  - **3d-4 (todo) — live serve 4B + greedy token-diff** vs the combined image's vLLM. Includes:
+    fix the `from_hf` rope_parameters/mrope→scaling crash above; first live load via the new loader.
 
 ## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
 
@@ -366,7 +381,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weights / 3d-4 serve | **3d-3 next (GPU)** |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve | **3d-4 next (GPU)** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
