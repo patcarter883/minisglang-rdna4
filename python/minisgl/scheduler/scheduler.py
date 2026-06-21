@@ -57,8 +57,18 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        # GDN-hybrid models MUST use the non-radix ("naive") prefix cache: GDN recurrent state
+        # is not prefix-cacheable, and a radix hit would report cached_len>0 with no state behind
+        # it (silent garbage). Force it here; dense models keep config.cache_type.
+        cache_type = config.cache_type
+        if self.engine.gdn_state is not None and cache_type != "naive":
+            logger.warning_rank0(
+                f"GDN-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
+                "GDN state is not prefix-cacheable"
+            )
+            cache_type = "naive"
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
