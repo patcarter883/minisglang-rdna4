@@ -5,38 +5,43 @@ import torch
 from .base import BaseOP
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+def _rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, plus_one: bool = False
+) -> torch.Tensor:
     # fp32-internal RMSNorm over the last dim; bf16/f16 in -> same dtype out (no F16 dequant).
+    # plus_one: the (1 + weight) gain convention (Qwen3.5 / Gemma — weight is centered on 0).
     dtype = x.dtype
     xf = x.float()
     var = xf.pow(2).mean(dim=-1, keepdim=True)
     normed = (xf * torch.rsqrt(var + eps)).to(dtype)
-    return normed * weight
+    return normed * (weight + 1.0) if plus_one else normed * weight
 
 
 class RMSNorm(BaseOP):
-    def __init__(self, size: int, eps: float) -> None:
+    def __init__(self, size: int, eps: float, *, plus_one: bool = False) -> None:
         self.eps = eps
+        self.plus_one = plus_one
         self.weight = torch.empty(size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _rms_norm(x, self.weight, self.eps)
+        return _rms_norm(x, self.weight, self.eps, self.plus_one)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
-        x.copy_(_rms_norm(x, self.weight, self.eps))
+        x.copy_(_rms_norm(x, self.weight, self.eps, self.plus_one))
 
 
 class RMSNormFused(BaseOP):
-    def __init__(self, size: int, eps: float) -> None:
+    def __init__(self, size: int, eps: float, *, plus_one: bool = False) -> None:
         self.eps = eps
+        self.plus_one = plus_one
         self.weight = torch.empty(size)
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            return _rms_norm(x, self.weight, self.eps), x
+            return _rms_norm(x, self.weight, self.eps, self.plus_one), x
         # fused residual-add: residual <- x + residual (new residual); x <- rmsnorm(sum)
         residual.add_(x)
-        x.copy_(_rms_norm(residual, self.weight, self.eps))
+        x.copy_(_rms_norm(residual, self.weight, self.eps, self.plus_one))
         return x, residual

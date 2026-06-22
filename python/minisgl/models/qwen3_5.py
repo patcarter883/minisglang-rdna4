@@ -66,8 +66,11 @@ class Qwen3_5Attn(BaseOP):
         self.v_proj = LinearColParallelMerged(
             config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=qm
         )
-        self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
+        # Qwen3.5 RMSNorm uses the (1 + weight) gain convention (weight init 0), UNLIKE the dense
+        # Qwen3 plain-weight norm. Applies to all Qwen3_5RMSNorm sites (q/k norm, input/post/final
+        # decoder norms); the GDN's RMSNormGated keeps the plain-weight convention (init 1).
+        self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
+        self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
         self.attn = AttentionLayer(
             layer_id=layer_id,
             head_dim=head_dim,
@@ -166,8 +169,12 @@ class Qwen3_5DecoderLayer(BaseOP):
             self.self_attn = Qwen3_5Attn(config, layer_id)
             self._attn_op = self.self_attn
         self.mlp = Qwen3MLP(config)
-        self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNormFused(
+            size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True
+        )
+        self.post_attention_layernorm = RMSNormFused(
+            size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True
+        )
         self._layer_id = layer_id
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
@@ -195,7 +202,7 @@ class Qwen3_5Model(BaseOP):
                 for lid in range(config.num_layers)
             ]
         )
-        self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)

@@ -110,6 +110,19 @@ class ModelConfig:
             partial = rope_params.get("partial_rotary_factor")
         rotary_dim = int(head_dim * partial) if partial is not None else head_dim
 
+        # Rope scaling: only a real scheme (llama3/yarn/...) becomes RotaryConfig.scaling.
+        # A "default" rope_type carries no scaling -> None (so _get_rope takes the plain-rotary
+        # path, identical to the default branch). Qwen3.5's rope_parameters is rope_type
+        # "default" + an mrope_section LIST; mrope is multimodal-only (text serving uses plain
+        # partial rotary, already set via rotary_dim above) and the list is unhashable in the
+        # cached rope builder, so it must NOT be folded into scaling.
+        rope_dict = rope_scaling if rope_scaling is not None else rope_params
+        scaling = (
+            rope_dict
+            if rope_dict is not None and rope_dict.get("rope_type") not in (None, "default")
+            else None
+        )
+
         # GDN / linear-attention hybrid (Qwen3-Next / Qwen3.5). Only populated when the config
         # actually carries linear-attention dims, so dense models keep layer_types=None even if
         # they define a (sliding/full) layer_types list of their own.
@@ -142,7 +155,7 @@ class ModelConfig:
                 rotary_dim=rotary_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
-                scaling=rope_scaling,
+                scaling=scaling,
             ),
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
