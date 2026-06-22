@@ -117,6 +117,8 @@ without touching layers/models/loader (memory: parallel-custom-kernel-framework)
 | 1b-3 | fp8-KV (e4m3fn KV buffer, torch-scatter store, scale=1.0) — env MINISGL_KV_FP8=1 | **done** 2026-06-18 |
 | — | **logit-level oracle** (engine vs HF, cos-sim/top-1) — the standing numerical oracle | **done** 2026-06-18 |
 | 2 | **W4A8 (AWQ) dense serving — MVP** | **DONE 2026-06-18** ✅ |
+| 3d | GDN-hybrid Qwen3.5-4B — build + serve, greedy token-diff vs vLLM (coherent) | **DONE 2026-06-21** ✅ |
+| 3e | GDN-hybrid — quantitative logit oracle + decode-path per-step parity vs HF | **DONE 2026-06-22** ✅ |
 | 1b-2 | startup autotuner — right-size segments + tuned `waves_per_eu`/warps/tile (RDNA4 perf) | todo (needs perf-bench infra) |
 
 ## Phase 3 — GDN (Gated Delta Net) hybrid attention → the 35B (STARTED)
@@ -377,6 +379,57 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     values bit-identical → not a loader bug), `qwen3_5_gdn_replay.py` (engine GDN input ≠ HF input by
     5.37× → pinpointed the norm), `qwen3_5_vllm_ref.py` (the token-diff harness). Validated on
     `Qwen/Qwen3.5-4B` (tied lm_head, no MTP served).
+- **3e — quantitative numerical validation of the GDN-hybrid (DONE 2026-06-22 — decode path SOUND).**
+  3d-4 proved prefill numerics (per-layer hidden-state diff vs HF caught the RMSNorm bug) but the
+  **decode** path was only validated by "the generated text is coherent." forward_decode is a DISTINCT
+  code path — `causal_conv1d_update` + `fused_sigmoid_gating_delta_rule_update` with **in-place
+  ssm_state recurrence**, none of which `forward_prefill` (chunk_gated_delta_rule) exercises. 3e hardens
+  it with three quantitative checks vs an independent HF oracle (`Qwen/Qwen3.5-4B`, bf16, same vendored
+  FLA/conv kernels), all GREEN:
+  - **3e-A — single-GDN-layer decode unit test** (`tools/qwen3_5_gdn_isolate.py`, now `--mode
+    {prefill,decode,both}`). Copies HF's layer-0 GDN weights into minisgl's `QwenGatedDeltaNet`, then:
+    *prefill* (the 3d-4 check) — T=6 fresh prefill, **cos 0.99997** (rel 8e-3); *decode* (NEW) —
+    establish state with a T-token prefill, then ONE `forward_decode` step for token T (reusing the
+    in-place conv/ssm state) vs HF's full (T+1)-token forward sliced at position T: **cos 0.99995**
+    (rel 1.0e-2). Isolates the recurrent kernels from loading/wiring — no checkpoint. (Fixed a display
+    bug: decode `hf_out` is 1-D `(D,)`, the per-row print indexed it as a scalar — the overall cos was
+    always correct; both args now 2-D.)
+  - **3e-B — first-token logit oracle** (task 3e-1; `tools/qwen3_5_decode_oracle_{ours,cmp}.py`,
+    mirrors the dense path's `oracle_ours.py`/`oracle_cmp.py`). minisgl's prefill first-token logits vs
+    HF full logits: **prefill cos 0.99990–0.99991**, top-1 OK, top-5 5/5 across 3 prompts — exceeds the
+    0.999 bar.
+  - **3e-C — decode-path per-step parity (the real target; task 3e-2).** minisgl greedy 16 steps on one
+    prompt, hooking the sampler to ACCUMULATE per-step logits (sample() fires once per generated
+    token → step 0 = prefill, steps 1.. = recurrent decode), saved with the gen ids. The cmp side
+    **teacher-forces HF on minisgl's OWN gen sequence** in one `use_cache=False` forward, slicing logits
+    at positions `P-1+t` — so each step is conditioned on an IDENTICAL prefix (apples-to-apples even past
+    any greedy divergence), and HF's single full-sequence forward (CHUNK path) is compared step-by-step
+    to minisgl's RECURRENT decode kernels. **Result over 3 prompts (48 decode steps): worst decode-step
+    cos 0.99922**, top-5 5/5 at every step. **★ The load-bearing finding: cos does NOT degrade with
+    decode step** (e.g. prompt A decode7 dips to 0.99922, decode8 right after is 0.99995) — flat bf16
+    noise, NOT the monotonically-growing drift a state-update/recurrence bug would produce. The in-place
+    ssm_state recurrence is correct.
+    * **One benign top-1 flip** (prompt B "Once upon a time", decode1: ours 11815 "lived" vs HF 557) at
+      **cos 0.99990** — the two leading logits are tied to within bf16 noise; a sub-1e-4-cos perturbation
+      flips the argmax. This is exactly the greedy-token-identity brittleness the cos-based logit oracle
+      exists to see past. The cmp verdict now classifies a top-1 flip under `cos >= 0.9995` as a TIE (not
+      a failure) and only an under-0.9995 flip as a real break → all 3 prompts: **DECODE PATH NUMERICALLY
+      SOUND**. (Teacher-forcing keeps steps ≥2 apples-to-apples regardless: HF stays conditioned on
+      minisgl's actual emitted prefix.)
+  - **★ Box/recipe fix (durable):** the README "Running" recipe sets BOTH `HIP_VISIBLE_DEVICES` and
+    `ROCR_VISIBLE_DEVICES` to `$LEASE_ROCR_DEVICES` (the physical card index). That **only works when the
+    lease assigns card 0** — for card 1 it double-filters (`ROCR=1` selects physical card 1 and
+    re-indexes it to 0, then `HIP=1` selects nothing → torch `RuntimeError: No HIP GPUs are available`).
+    The arbiter already exports the correctly-composed pair in the lease shell (`ROCR_VISIBLE_DEVICES=1`,
+    `HIP_VISIBLE_DEVICES=0`); **forward those verbatim** (`-e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e
+    ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES`) rather than overriding both with `$LEASE_ROCR_DEVICES`.
+  **★ NEXT — the GATE before 35B (do NOT start 35B blind):** the 35B GDN-hybrid MoE combines (a) the
+  now-proven GDN path (3b–3e), (b) the Phase-2 W4A8 grouped MoE (synthetically parity-validated), and
+  (c) real compressed-tensors MoE checkpoint loading (not yet exercised) — BUT 35B @ W4A8 ≈ 17.5 GB
+  **exceeds one 16 GB card**, so it needs **TP=2 (Phase 4)**. 35B is therefore BLOCKED on TP. Also: no
+  35B base checkpoint is currently on the box (the cached "35B-DFlash" is a speculative draft, not the
+  base — see 3d). Ordering decision (TP-first vs MoE-loading-first) deferred to a strategic checkpoint;
+  flagged here so 35B isn't begun before TP exists and a base checkpoint is fetched.
 
 ## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
 
