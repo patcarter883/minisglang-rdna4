@@ -1,19 +1,19 @@
 #!/usr/bin/env python
-"""Phase 3M-0 — CPU config test for Qwen3.6-35B-A3B (qwen3_5_moe + compressed-tensors int4).
+"""Phase 3M-0 — CPU config test for Qwen3.6-35B-A3B (qwen3_5_moe + AWQ-gemm int4).
 
 The 35B GDN-hybrid MoE = the 4B qwen3_5 GDN-hybrid attention pattern + a Qwen2-MoE-style sparse
 block (256 routed experts top-8 + an always-on shared expert), with ONLY the routed experts
-quantized (compressed-tensors pack-quantized, g32, symmetric). Asserts ModelConfig.from_hf +
-QuantConfig.from_hf extract the GDN dims, the layer interleave, the MoE dims, partial rotary, and
-the compressed-tensors quant; plus the all-MoE `intermediate_size=0` (no dense MLP) path.
+quantized. The repo's canonical revision (refs/main) is the AWQ-gemm g32 snapshot (qweight/qzeros/
+scales, asymmetric — there is also an alternate compressed-tensors snapshot, NOT the default).
+Asserts ModelConfig.from_hf + QuantConfig.from_hf extract the GDN dims, the layer interleave, the
+MoE dims, partial rotary, the AWQ quant, and the all-MoE `intermediate_size=0` (no dense MLP).
 
   * In the combined image: `python tools/qwen3_5_moe_config_test.py` (transformers AutoConfig).
   * On a host with broken torch/transformers: `--standalone` loads models/config.py + the REAL
-    quant/config.py (both torch-free) with transformers stubbed, reading config.json directly.
+    quant/config.py (both torch-free) with transformers stubbed, reading the refs/main config.json.
 """
 from __future__ import annotations
 
-import glob
 import json
 import sys
 from pathlib import Path
@@ -53,8 +53,9 @@ def _hf_config(standalone: bool):
 
         return AutoConfig.from_pretrained(MODEL, trust_remote_code=False)
 
-    cfg_path = glob.glob(str(_HUB / f"models--{MODEL.replace('/', '--')}/snapshots/*/config.json"))[0]
-    raw = json.load(open(cfg_path))
+    repo = _HUB / f"models--{MODEL.replace('/', '--')}"
+    snap = (repo / "refs/main").read_text().strip()  # canonical revision (the AWQ snapshot)
+    raw = json.load(open(repo / "snapshots" / snap / "config.json"))
 
     class Stub:
         def __init__(self, d):
@@ -77,7 +78,7 @@ def main() -> None:
     print(f"qwen3_5_moe: type={m.model_type} layers={m.num_layers} gdn={m.num_gdn_layers} "
           f"experts={m.num_experts}x top{m.num_experts_per_tok} conv_dim={m.gdn_conv_dim} "
           f"rotary_dim={m.rotary_config.rotary_dim} "
-          f"quant={q.method}/{q.bits}b/g{q.group_size}/sym={q.sym}/ignore={len(q.ignore)}")
+          f"quant={q.method}/{q.bits}b/g{q.group_size}/sym={q.sym}")
 
     # --- architecture / GDN-hybrid ---
     # model_type comes from text_config ("qwen3_5_moe_text", same _text suffix as the 4B);
@@ -99,13 +100,11 @@ def main() -> None:
     assert m.moe_intermediate_size == 512 and m.shared_expert_intermediate_size == 512
     assert m.intermediate_size == 0, m.intermediate_size
 
-    # --- compressed-tensors int4 g32 symmetric, with an ignore list (bf16 attn/shared/gates) ---
-    assert q is not None and q.is_compressed_tensors, q
-    assert q.method == "compressed-tensors" and q.bits == 4 and q.group_size == 32, q
-    assert q.sym is True, q.sym
-    assert len(q.ignore) > 0, "compressed-tensors must carry an ignore list"
-    print(f"[OK] qwen3_5_moe 35B GDN-hybrid MoE parse + compressed-tensors quant "
-          f"(ignore={len(q.ignore)} entries) all asserts pass.")
+    # --- AWQ-gemm int4 g32 asymmetric (canonical refs/main; only routed experts quantized) ---
+    assert q is not None and q.is_awq, q
+    assert q.method == "awq" and q.bits == 4 and q.group_size == 32, q
+    assert q.sym is False, q.sym  # AWQ zero_point=True -> asymmetric
+    print(f"[OK] qwen3_5_moe 35B GDN-hybrid MoE parse + AWQ-gemm g32 quant all asserts pass.")
 
 
 if __name__ == "__main__":

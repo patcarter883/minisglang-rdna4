@@ -19,7 +19,7 @@ minisgl-native key layout the loader targets.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from minisgl.core import get_global_ctx
@@ -149,7 +149,15 @@ class GDNLinearAttn(BaseOP):
 
 
 class Qwen3_5DecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int, *, is_gdn: bool, gdn_layer_id: int | None):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        *,
+        is_gdn: bool,
+        gdn_layer_id: int | None,
+        mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP,
+    ):
         if is_gdn:
             assert gdn_layer_id is not None
             gdn = QwenGatedDeltaNet(
@@ -168,7 +176,9 @@ class Qwen3_5DecoderLayer(BaseOP):
         else:
             self.self_attn = Qwen3_5Attn(config, layer_id)
             self._attn_op = self.self_attn
-        self.mlp = Qwen3MLP(config)
+        # Dense SwiGLU for the 4B; the MoE variants pass a sparse-block factory (the MLP is the
+        # ONLY structural difference between qwen3_5 and qwen3_5_moe decoder layers).
+        self.mlp = mlp_factory(config)
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True
         )
@@ -189,7 +199,9 @@ class Qwen3_5DecoderLayer(BaseOP):
 
 
 class Qwen3_5Model(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(
+        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP
+    ):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
         )
@@ -197,7 +209,8 @@ class Qwen3_5Model(BaseOP):
         self.layers = OPList(
             [
                 Qwen3_5DecoderLayer(
-                    config, lid, is_gdn=lid in gdn_pos, gdn_layer_id=gdn_pos.get(lid)
+                    config, lid, is_gdn=lid in gdn_pos, gdn_layer_id=gdn_pos.get(lid),
+                    mlp_factory=mlp_factory,
                 )
                 for lid in range(config.num_layers)
             ]
@@ -213,8 +226,10 @@ class Qwen3_5Model(BaseOP):
 
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
-    def __init__(self, config: ModelConfig):
-        self.model = Qwen3_5Model(config)
+    def __init__(
+        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP
+    ):
+        self.model = Qwen3_5Model(config, mlp_factory=mlp_factory)
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
