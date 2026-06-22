@@ -41,7 +41,7 @@ $LEASE -n 1 -- bash -c '
   docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
     --security-opt seccomp=unconfined --security-opt label=disable \
     --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
-    -e HIP_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES -e ROCR_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES \
+    -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES \
     -v '"$PWD"':/engine \
     -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
     -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
