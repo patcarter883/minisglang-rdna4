@@ -91,6 +91,8 @@ class ModelConfig:
         head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
         model_type = getattr(config, "model_type", "llama")
+        # All-MoE models (e.g. qwen3_5_moe, mlp_only_layers=[]) carry no dense `intermediate_size`.
+        intermediate_size = getattr(config, "intermediate_size", 0)
         num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
@@ -150,7 +152,7 @@ class ModelConfig:
             head_dim=head_dim,
             hidden_size=config.hidden_size,
             vocab_size=config.vocab_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             hidden_act=config.hidden_act,
             rms_norm_eps=config.rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,

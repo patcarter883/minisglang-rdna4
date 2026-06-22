@@ -29,6 +29,10 @@ class QuantConfig:
     def is_gptq(self) -> bool:
         return self.method == "gptq"
 
+    @property
+    def is_compressed_tensors(self) -> bool:
+        return self.method == "compressed-tensors"
+
     @staticmethod
     def _as_dict(qc: Any) -> dict:
         if isinstance(qc, dict):
