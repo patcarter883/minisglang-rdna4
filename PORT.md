@@ -452,6 +452,48 @@ compute path — topk → moe_align → grouped GEMM(w13) → SwiGLU → grouped
 - TODO after parity: a `"w4a8"` MoE backend in the registry + MoELayer expert-weight conversion
   (`_ct_moe_to_op_layout`/MoeWNA16) for the real 35B; strip the bf16 MoE `sgl_kernel` deps (topk/align).
 
+## Phase 2M (real-checkpoint MoE loading) — Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4 (STARTED 2026-06-22)
+
+De-risks the 35B's "real quantized-MoE checkpoint loading" prerequisite on a model that is **NOT**
+GDN and fits one 16 GB card (so it needs neither TP nor the GDN path — see the ★ 35B GATE at
+Phase 3e). Target picked by the user; **vLLM (combined image) loads/serves it fine** → it is the
+loading reference AND the parity oracle.
+**★ What the checkpoint actually is** (`tools/` header scan): `Qwen2MoeForCausalLM` / `qwen2_moe`,
+24 layers, hidden 2048, **60 experts top-4**, `moe_intermediate_size=1408`, a **shared expert**
+(`shared_expert_intermediate_size=5632`) + a 1-row `shared_expert_gate` (sigmoid), MHA 16/16 heads
+head_dim 128, **qkv+o bias**. **EVERYTHING is GPTQ-Int4** (attn q/k/v/o, shared expert, AND the 60
+routed experts) — only embeds/norms/router/lm_head are fp16. GPTQ packing: `qweight I32 (K//8, N)`
+packed along **input** (vs AWQ's `(K, N//8)` along output → a *different* unpack/repack), per-group
+`scales (K//g, N)`, `qzeros (K//g, N//8)`, `g_idx` identity (`desc_act=false`). 14.3B params → must
+stay int4 (bf16 ≈ 28 GB won't fit) → **W4A8 fp8-activation kernel is the only memory-viable compute
+path**, and it aligns with the 35B W4A8 target.
+**★ vLLM reference path** (mirror, don't reinvent): `GPTQConfig.get_quant_method` sees a `FusedMoE`
+layer → redirects to **MoeWNA16** (W4A16; `sym` true → `has_zp=False`, no zeros loaded), stacking
+per-expert `gate/up/down_proj` into grouped `w13 (E,2·inter,K//8)` / `w2 (E,K,inter//8)`; the shared
+expert + router are separate (shared expert = a quantized dense MLP, router/shared_gate = fp16
+`ReplicatedLinear`). `make_expert_params_mapping` drives the per-expert load. (We feed the same
+grouped int4 layout to our `w4a8_moe` fp8-activation kernel instead of MoeWNA16's fp16 path.)
+Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
+- **2M-0 (DONE 2026-06-22) — config + GPTQ recognition.** `quant/config.py`: recognize
+  `quant_method=="gptq"` (`sym`, `group_size`, `desc_act`; `is_gptq` prop; `desc_act` field).
+  `config.py`: `shared_expert_intermediate_size` field + parse. CPU-verified
+  (`tools/qwen2_moe_config_test.py --standalone`, torch-free — loads the real QuantConfig +
+  ModelConfig with transformers stubbed, reads config.json): 4B-MoE parse (qwen2_moe, 60 experts,
+  top-4, inter 1408, shared 5632, GPTQ g128 sym desc_act=false) AND dense regression (shared=0,
+  quant=None, not GDN) both PASS.
+- **2M-1 (TODO) — `models/qwen2_moe.py` + register `Qwen2MoeForCausalLM`.** Attn = Qwen2-style
+  (qkv+o bias, MHA, no q/k norm); MoE block = router `gate` (fp16) + 60 grouped experts (MoELayer) +
+  shared-expert quant MLP + `shared_expert_gate` (sigmoid weighting of the shared output). Meta build
+  smoke. (Template: `qwen3_moe.py` + `utils.MoEMLP`; add the shared-expert branch.)
+- **2M-2 (TODO) — GPTQ→op-layout conversion**, the load-bearing numerics. `quant/kernels.py`
+  `gptq_to_op_layout` (input-packed int4, symmetric-zero convention) for dense AND per-expert.
+  CPU-unit-tested: converted+dequant matches a transformers/AutoGPTQ dequant reference bit-close.
+- **2M-3 (TODO) — quantized-MoE method + wire `w4a8_moe`** into MoELayer (dispatch to the W4A8
+  grouped kernel when `config.quant` is set; per-expert stacking already exists in `weight.py`).
+  Header-only weight-map test (22539 ckpt keys → native keys/shapes, expert stacking, shared expert).
+- **2M-4 (TODO) — serve on gfx1201 + token/logit parity vs vLLM.** Greedy token-diff + the
+  decode/logit oracle vs the combined image's vLLM (loads it fine). DoD = full serve + parity.
+
 ## ★ MVP REACHED 2026-06-18 — W4A8 quantized serving on RDNA4
 
 Qwen2.5-Coder-7B-Instruct-**AWQ** (4-bit, g128, asymmetric) boots on gfx1201 via the `triton_rdna4`

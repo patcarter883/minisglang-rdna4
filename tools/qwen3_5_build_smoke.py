@@ -45,6 +45,7 @@ def _qwen3_5_4b_config() -> ModelConfig:
         num_experts_per_tok=0,
         moe_intermediate_size=0,
         norm_topk_prob=False,
+        shared_expert_intermediate_size=0,
         model_type="qwen3_5_text",
         architectures=["Qwen3_5ForConditionalGeneration"],
         quant=None,
