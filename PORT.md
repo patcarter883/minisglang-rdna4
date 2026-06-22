@@ -494,9 +494,16 @@ Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
   CPU/meta — no GPU):** 459 tensors, 24 MoE layers, merged `qkv_proj` (GPTQ + bias) / `o_proj` (no
   bias), shared-expert GPTQ buffers, fp16 router+shared gates, grouped expert buffers `(E,2·inter,H)`
   / `(E,H,inter)` — all shapes correct.
-- **2M-2 (TODO) — GPTQ→op-layout conversion**, the load-bearing numerics. `quant/kernels.py`
-  `gptq_to_op_layout` (input-packed int4, symmetric-zero convention) for dense AND per-expert.
-  CPU-unit-tested: converted+dequant matches a transformers/AutoGPTQ dequant reference bit-close.
+- **2M-2 (DONE 2026-06-22) — GPTQ→op-layout conversion**, the load-bearing numerics.
+  `quant/kernels.py` `gptq_to_op_layout`: GPTQ packs int4 along **input** K (natural nibble order, no
+  AWQ interleave); qzeros are ALWAYS present and the dequant zero point is `unpacked_qzeros + 1`
+  (AutoGPTQ off-by-one). **Checkpoint scan: every qzero unpacks to 7 → constant zero point 8**
+  (symmetric, fits 4 bits); `g_idx` is identity (`desc_act=false`). We fold the +1 into an EXPLICIT
+  zeros tensor and reuse the proven **asymmetric** op path (`w = scale·(q − zero)`), exact regardless
+  of `sym`. **CPU-unit-tested (`tools/qwen2_moe_gptq_convert_test.py`, combined image, no GPU):** for
+  real q_proj / expert gate&down / shared-expert down, an op-layout dequant equals an independent
+  GPTQ-checkpoint dequant at **max|Δ| = 0** (faithful re-encoding); zero point 8 asserted. (The GPTQ
+  *formula* itself is the end-to-end oracle in 2M-4.)
 - **2M-3 (TODO) — quantized-MoE method + wire `w4a8_moe`** into MoELayer (dispatch to the W4A8
   grouped kernel when `config.quant` is set; per-expert stacking already exists in `weight.py`).
   Header-only weight-map test (22539 ckpt keys → native keys/shapes, expert stacking, shared expert).

@@ -61,18 +61,49 @@ def awq_to_op_layout(
 
 
 def gptq_to_op_layout(
-    qweight: torch.Tensor,  # (K//pf, N) int32, GPTQ-packed along INPUT
+    qweight: torch.Tensor,  # (K//pf, N) int32, GPTQ-packed along INPUT (natural nibble order)
     scales: torch.Tensor,  # (K//group, N) fp16
-    qzeros: torch.Tensor | None,  # (K//group, N//pf) int32, GPTQ-packed; constant if symmetric
+    qzeros: torch.Tensor | None,  # (K//group, N//pf) int32, GPTQ-packed along N; +1 = zero point
     *,
     bits: int = 4,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert ONE dense GPTQ matrix to the op's native layout
     (w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32).
-    Implemented in Phase 2M-2 (validated vs an AutoGPTQ dequant reference). GPTQ differs from
-    AWQ: int32 packed along INPUT (K) with NATURAL nibble order (no AWQ interleave), and qzeros
-    are always present (the symmetric constant zero stored explicitly)."""
-    raise NotImplementedError("gptq_to_op_layout lands in Phase 2M-2")
+
+    GPTQ vs AWQ: int32 is packed along INPUT (K) with NATURAL nibble order (no AWQ interleave),
+    and qzeros are ALWAYS present — the dequant zero point is `unpacked_qzeros + 1` (AutoGPTQ's
+    historical off-by-one; symmetric int4 stores 7 -> zero=8). We fold the +1 and emit an EXPLICIT
+    zeros tensor so the proven asymmetric op path (w = scale*(q - zero)) is exact regardless of the
+    `sym` flag. Asserts the folded zero fits 4 bits (true for this checkpoint: all 8)."""
+    pf = 32 // bits  # 8
+    mask = (1 << bits) - 1
+    Kp, N = qweight.shape
+    K = Kp * pf
+    dev = qweight.device
+    shifts = torch.arange(0, 32, bits, dtype=torch.int32, device=dev)  # [0,4,...,28]
+
+    # qweight: unpack (K//pf, N, pf) NATURAL (channel = ki*pf + j) -> (K, N) -> (N, K) -> repack/K
+    uw = (qweight.unsqueeze(-1) >> shifts) & mask  # (Kp, N, pf)
+    uw = uw.permute(0, 2, 1).reshape(K, N)  # (K, N): row ki*pf+j
+    uw = uw.t().contiguous().to(torch.int32)  # (N, K)
+    w_packed = torch.zeros((N, K // pf), dtype=torch.int32, device=dev)
+    for j in range(pf):
+        w_packed |= (uw[:, j::pf] & mask) << (j * bits)
+
+    scales_op = scales.t().contiguous().to(torch.float16)  # (G, N) -> (N, G)
+
+    # qzeros: unpack (G, N//pf, pf) NATURAL along N -> (G, N), fold +1, -> (N, G), repack/N.
+    assert qzeros is not None, "GPTQ always ships qzeros"
+    G = qzeros.shape[0]
+    uz = (qzeros.unsqueeze(-1) >> shifts) & mask  # (G, N//pf, pf)
+    uz = uz.reshape(G, N) + 1  # (G, N) actual zero point; col = np*pf + j (natural)
+    assert int(uz.max()) <= mask, f"GPTQ zero+1 overflows {bits}b (max={int(uz.max())})"
+    uz = uz.t().contiguous().to(torch.int32)  # (N, G)
+    zeros_op = torch.zeros((N // pf, G), dtype=torch.int32, device=dev)
+    for j in range(pf):
+        zeros_op |= (uz[j::pf, :] & mask) << (j * bits)
+
+    return w_packed, scales_op, zeros_op
 
 
 def w4a8_moe(
