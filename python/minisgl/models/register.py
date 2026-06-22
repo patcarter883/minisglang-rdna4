@@ -5,6 +5,7 @@ from .config import ModelConfig
 _MODEL_REGISTRY = {
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
+    "Qwen2MoeForCausalLM": (".qwen2_moe", "Qwen2MoeForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "Qwen3_5ForConditionalGeneration": (".qwen3_5", "Qwen3_5ForConditionalGeneration"),

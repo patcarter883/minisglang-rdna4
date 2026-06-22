@@ -60,6 +60,21 @@ def awq_to_op_layout(
     return w_packed, scales_op, zeros_op
 
 
+def gptq_to_op_layout(
+    qweight: torch.Tensor,  # (K//pf, N) int32, GPTQ-packed along INPUT
+    scales: torch.Tensor,  # (K//group, N) fp16
+    qzeros: torch.Tensor | None,  # (K//group, N//pf) int32, GPTQ-packed; constant if symmetric
+    *,
+    bits: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Convert ONE dense GPTQ matrix to the op's native layout
+    (w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32).
+    Implemented in Phase 2M-2 (validated vs an AutoGPTQ dequant reference). GPTQ differs from
+    AWQ: int32 packed along INPUT (K) with NATURAL nibble order (no AWQ interleave), and qzeros
+    are always present (the symmetric constant zero stored explicitly)."""
+    raise NotImplementedError("gptq_to_op_layout lands in Phase 2M-2")
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
