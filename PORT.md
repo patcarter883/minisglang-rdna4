@@ -504,9 +504,17 @@ Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
   real q_proj / expert gate&down / shared-expert down, an op-layout dequant equals an independent
   GPTQ-checkpoint dequant at **max|Δ| = 0** (faithful re-encoding); zero point 8 asserted. (The GPTQ
   *formula* itself is the end-to-end oracle in 2M-4.)
-- **2M-3 (TODO) — quantized-MoE method + wire `w4a8_moe`** into MoELayer (dispatch to the W4A8
-  grouped kernel when `config.quant` is set; per-expert stacking already exists in `weight.py`).
-  Header-only weight-map test (22539 ckpt keys → native keys/shapes, expert stacking, shared expert).
+- **2M-3 (TODO) — quantized-MoE method + wire `w4a8_moe`.** ★ Loader read (`weight.py`): the dense
+  GPTQ path **already works unchanged** — q/k/v→qkv and gate/up→gate_up merge along dim 1 for
+  `.qweight/.scales/.qzeros` (the existing `cat_dim=1` branch), and per-expert merge→stack runs for
+  any `is_moe` model. Remaining: (a) **skip the all-zero non-qkv `.bias` placeholders** (o_proj,
+  experts, shared) for `is_moe` models — the model only has `qkv_proj.bias`; (b) **quantize MoELayer**:
+  declare per-expert grouped GPTQ buffers (gate_up/down qweight/scales/qzeros in checkpoint layout,
+  stacked over E), convert each expert GPTQ→op layout after load (reusing `gptq_to_op_layout`), hold
+  the kernel's `w13 (E,2·inter,K//8)` / `w2 (E,K,inter//8)` grouped tensors; (c) **dispatch
+  `MoELayer.forward` to `w4a8_moe`** when `config.quant` is set (vs the unquantized `FusedMoe`).
+  Header-only weight-map test (22539 ckpt keys → native keys/shapes, expert stack, shared expert,
+  bias-skip).
 - **2M-4 (TODO) — serve on gfx1201 + token/logit parity vs vLLM.** Greedy token-diff + the
   decode/logit oracle vs the combined image's vLLM (loads it fine). DoD = full serve + parity.
 
