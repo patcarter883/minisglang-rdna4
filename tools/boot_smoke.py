@@ -33,10 +33,17 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--page-size", type=int, default=16)
     ap.add_argument("--memory-ratio", type=float, default=0.6)
+    # GDN-hybrid models size a fixed recurrent-state slot per running req (max_running_req+2
+    # slots, conv+ssm per GDN layer); the default 256 slots is GiB-scale and OOMs a 16 GB card
+    # for a smoke. Lower it for GDN; dense models ignore the cost. None -> engine default (256).
+    ap.add_argument("--max-running-req", type=int, default=None)
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--prompt", action="append", default=None, help="override PROMPTS (repeatable)")
     args = ap.parse_args()
+    prompts = args.prompt if args.prompt else PROMPTS
 
     print(f"[boot] loading {args.model} (bf16, eager, attention=auto) ...", flush=True)
+    extra = {} if args.max_running_req is None else {"max_running_req": args.max_running_req}
     llm = LLM(
         model_path=args.model,
         dtype=torch.bfloat16,
@@ -44,6 +51,7 @@ def main() -> None:
         page_size=args.page_size,  # triton_rdna4 requires a multiple of 16
         memory_ratio=args.memory_ratio,
         attention_backend="auto",  # -> triton_rdna4 on ROCm
+        **extra,
     )
     try:
         print(
@@ -54,10 +62,10 @@ def main() -> None:
         pass
 
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)  # greedy
-    out = llm.generate(PROMPTS, sp)
+    out = llm.generate(prompts, sp)
 
     results = []
-    for p, o in zip(PROMPTS, out):
+    for p, o in zip(prompts, out):
         print(f"\n=== {p!r}\n--> {o['text']!r}", flush=True)
         print(f"    ids[:24]: {list(o['token_ids'])[:24]}", flush=True)
         results.append({"prompt": p, "text": o["text"], "token_ids": list(o["token_ids"])})

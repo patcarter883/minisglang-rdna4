@@ -20,7 +20,6 @@ from __future__ import annotations
 import glob
 import json
 import struct
-from dataclasses import replace
 from typing import Dict, Tuple
 
 import torch
@@ -119,12 +118,8 @@ def main() -> None:
     print(f"  predicted native keys: {len(predicted)}")
 
     # --- model side: build on meta exactly as the engine does ---
-    # NOTE: rope is non-parametric (cos/sin cache, never in state_dict), so it cannot affect the
-    # weight-key layout under test. We null out rotary scaling here ONLY to dodge an unrelated rope
-    # bug: from_hf maps Qwen3.5's `rope_parameters` (rope_type "default" + an mrope_section LIST)
-    # into RotaryConfig.scaling, and AttentionLayer feeds tuple(scaling.items()) to the lru-cached
-    # _get_rope -> "unhashable type: 'list'". That belongs to the rope/3d-4 sub-phase, not 3d-3.
-    cfg = replace(cfg, rotary_config=replace(cfg.rotary_config, scaling=None))
+    # (from_hf now correctly leaves rotary scaling None for Qwen3.5's rope_type "default", so we
+    # build from the real config unmodified — no rope-bug workaround needed here.)
     set_tp_info(rank=0, size=1)
     set_rope_device(torch.device("cpu"))
     with torch.device("meta"), torch_dtype(model_dtype):

@@ -347,8 +347,36 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     an `mrope_section` LIST) into `RotaryConfig.scaling`; `AttentionLayer` does `tuple(scaling.items())`
     → unhashable list into the lru-cached `_get_rope` → crash on model build from the real config. The
     weight test nulls `scaling` (rope is non-parametric, irrelevant to key layout) to isolate 3d-3.
-  - **3d-4 (todo) — live serve 4B + greedy token-diff** vs the combined image's vLLM. Includes:
-    fix the `from_hf` rope_parameters/mrope→scaling crash above; first live load via the new loader.
+  - **3d-4 (DONE 2026-06-21 — live serve 4B + greedy token-diff PASS, coherent, not bit-identical) —**
+    Qwen3.5-4B (bf16, eager, naive cache, 24 GDN + 8 full-attn layers) boots on gfx1201 and generates
+    **coherent + correct** greedy output. Token-diff vs the combined image's vLLM (same prompts, greedy,
+    eager): "three primary colors → yellow…" **32/32 exact**, "2+2 → 4…" **32/32 exact**, "capital of
+    France → Paris…" 24/32 (first div @ tok 23), "Once upon a time…" 15/32 (div @ tok 1) — both remain
+    coherent. Late/early divergence = expected bf16 drift between minisgl's `triton_rdna4`+vendored GDN
+    and vLLM's own kernels (same posture as Phase 1a "PASS, not bit-identical").
+    Three fixes were required to get from "boots but emits all-spaces (token 220)" to coherent:
+    1. **rope crash (from 3d-3):** `from_hf` now leaves `RotaryConfig.scaling=None` for a "default"
+       `rope_type` (Qwen3.5's `rope_parameters` is rope_type "default" + an `mrope_section` LIST — mrope
+       is multimodal-only; for text it reduces to plain partial rotary, already set via `rotary_dim`, and
+       the list is unhashable in the lru-cached `_get_rope`). The weight test now builds from the real
+       config unmodified and still PASSES.
+    2. **GDN-state OOM:** `GDNStateCache` sizes `max_running_req+2` fixed conv+ssm slots/GDN-layer; the
+       default 256 → 6 GiB ssm alloc OOMs a 16 GB card. `boot_smoke.py` gained `--max-running-req`
+       (used 16 for the smoke) + `--prompt`.
+    3. **★ ROOT-CAUSE of the all-spaces garbage — RMSNorm gain convention.** `Qwen3_5RMSNorm` applies
+       `(1 + weight)` with weight **init 0** (centred on 0), UNLIKE the dense Qwen3 plain `weight` (init
+       1). The checkpoint weights load bit-identically, but minisgl applied them plainly → every norm
+       scaled by ~0.2 instead of ~1.2 (a measured **5.37× input-magnitude deficit** + direction error
+       cos 0.81 at the layer-0 GDN input), washing out all context → unigram-frequency output (bare
+       space). Fix: `plus_one` flag on `RMSNorm`/`RMSNormFused` (default False = dense path untouched),
+       set True in qwen3_5 for `input_layernorm`/`post_attention_layernorm`/`model.norm`/`q_norm`/
+       `k_norm`. The GDN's `RMSNormGated` keeps the plain convention (init 1) — verified, unchanged.
+    Diagnosis tools added (kept for regression/parity): `qwen3_5_hf_ref.py` (HF per-layer ground truth),
+    `qwen3_5_hs_cmp.py` (per-layer cos/rel — localized divergence to layer 0), `qwen3_5_gdn_isolate.py`
+    (GDN compute vs HF = cos 0.99996, exonerated the kernel), `qwen3_5_weight_value_cmp.py` (loaded
+    values bit-identical → not a loader bug), `qwen3_5_gdn_replay.py` (engine GDN input ≠ HF input by
+    5.37× → pinpointed the norm), `qwen3_5_vllm_ref.py` (the token-diff harness). Validated on
+    `Qwen/Qwen3.5-4B` (tied lm_head, no MTP served).
 
 ## ★ MoE PARITY REACHED 2026-06-18 — W4A8 grouped MoE numerically validated
 
@@ -381,7 +409,7 @@ Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then
 the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
 | ★ | GATE: re-decide 35B GDN port | — |
-| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve | **3d-4 next (GPU)** |
+| 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
 
 ## Change log (what we've diverged from upstream + why)
