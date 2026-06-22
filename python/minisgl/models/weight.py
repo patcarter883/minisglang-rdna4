@@ -100,6 +100,16 @@ _QWEN35_CONCAT = {
 }
 
 
+def _gate_up_merge(key: str):
+    """gate_proj/up_proj -> gate_up_proj for the qwen3_5_moe shared + routed experts. Unlike the
+    dense q/k/v path, qwen3_5 keeps full-attn q/k/v SEPARATE (q_proj carries the output gate), so
+    this handles ONLY gate/up. Returns (merged_key, slot) or None."""
+    for sub, slot in ((".gate_proj.", "gate"), (".up_proj.", "up")):
+        if sub in key:
+            return key.replace(sub, ".gate_up_proj."), slot
+    return None
+
+
 def qwen3_5_remap(ckpt_key: str):
     """Map a Qwen3.5 GDN-hybrid checkpoint key to a minisgl-native key plan. Pure (no tensors),
     so it is CPU-testable against the checkpoint header vs. the model's `state_dict()`.
@@ -111,6 +121,8 @@ def qwen3_5_remap(ckpt_key: str):
     """
     if ckpt_key.startswith(_QWEN35_SKIP_PREFIXES):
         return None
+    if ckpt_key == "lm_head.weight":
+        return ("direct", "lm_head.weight")  # untied (qwen3_5_moe); top-level, no LM prefix
     if not ckpt_key.startswith(_QWEN35_LM_PREFIX):
         raise ValueError(f"unexpected Qwen3.5 checkpoint key (not under {_QWEN35_LM_PREFIX!r}): {ckpt_key}")
     native = "model." + ckpt_key[len(_QWEN35_LM_PREFIX) :]
@@ -124,17 +136,47 @@ def qwen3_5_remap(ckpt_key: str):
 
 
 def _load_qwen3_5_weight(
-    model_folder: str, device: torch.device
+    model_folder: str, device: torch.device, config
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Streaming loader for the Qwen3.5 GDN-hybrid checkpoint (TP=1). Applies `qwen3_5_remap`
-    and buffers the ordered concat groups until complete. dtype coercion (A_log/dt_bias -> fp32)
-    is the engine's job, exactly as for the dense path."""
+    """Streaming loader for the Qwen3.5 GDN-hybrid checkpoint (TP=1; dense 4B or MoE 35B).
+    Applies `qwen3_5_remap` (LM-prefix strip, GDN in_proj concat, conv1d rename, vision/MTP skip,
+    untied lm_head), then for MoE checkpoints merges gate/up -> gate_up and stacks the per-expert
+    tensors over E (reusing the generic `_get_expert_stack_info`). dtype coercion
+    (A_log/dt_bias -> fp32) is the engine's job, exactly as for the dense path."""
     tp_info = get_tp_info()
     if tp_info.size != 1:
         raise NotImplementedError("Qwen3.5 GDN-hybrid weight loading is TP=1 only (TP is Phase 4)")
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
-    concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # merged_key -> {slot: tensor}
+    concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN/dense in_proj concat (qwen3_5_remap)
+    merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}   # MoE gate/up -> gate_up
+    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # MoE per-expert -> stacked over E
+
+    def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        # MoE gate/up merge (shared expert: dense .weight -> dim 0; routed experts: AWQ
+        # .qweight/.qzeros/.scales -> dim 1). q/k/v are NOT merged (qwen3_5 keeps them separate).
+        if (mm := _gate_up_merge(native_key)) is not None:
+            merged_key, slot = mm
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if len(merge_buf[merged_key]) != 2:
+                return
+            parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+            del merge_buf[merged_key]
+            cat_dim = 1 if merged_key.endswith((".qweight", ".qzeros", ".scales")) else 0
+            native_key, tensor = merged_key, torch.cat(parts, dim=cat_dim)
+        # MoE expert stacking (experts.<e>.<name> -> experts.<name>, stacked over E).
+        if config.is_moe and (einfo := _get_expert_stack_info(native_key)) is not None:
+            packed_key, idx = einfo
+            slots = expert_buf.setdefault(packed_key, {})
+            slots[idx] = tensor
+            if len(slots) != config.num_experts:
+                return
+            experts = [slots[i] for i in range(config.num_experts)]
+            del expert_buf[packed_key]
+            yield packed_key, torch.stack(experts, dim=0)
+        else:
+            yield native_key, tensor
+
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
@@ -142,7 +184,7 @@ def _load_qwen3_5_weight(
                 if plan is None:
                     continue
                 if plan[0] == "direct":
-                    yield plan[1], f.get_tensor(name)
+                    yield from emit(plan[1], f.get_tensor(name))
                     continue
                 _, merged, slot, n_slots, cat_dim = plan
                 concat_buf.setdefault(merged, {})[slot] = f.get_tensor(name)
@@ -150,8 +192,10 @@ def _load_qwen3_5_weight(
                     continue
                 parts = [concat_buf[merged][i] for i in range(n_slots)]
                 del concat_buf[merged]
-                yield merged, torch.cat(parts, dim=cat_dim)
+                yield from emit(merged, torch.cat(parts, dim=cat_dim))
     assert not concat_buf, f"incomplete concat groups in checkpoint: {list(concat_buf.keys())}"
+    assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
 
 
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -162,7 +206,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     model_folder = download_hf_weight(model_path)
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
     if config.is_gdn_hybrid:
-        yield from _load_qwen3_5_weight(model_folder, device)
+        yield from _load_qwen3_5_weight(model_folder, device, config)
         return
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
