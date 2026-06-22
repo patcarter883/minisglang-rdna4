@@ -504,19 +504,33 @@ Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
   real q_proj / expert gate&down / shared-expert down, an op-layout dequant equals an independent
   GPTQ-checkpoint dequant at **max|Δ| = 0** (faithful re-encoding); zero point 8 asserted. (The GPTQ
   *formula* itself is the end-to-end oracle in 2M-4.)
-- **2M-3 (TODO) — quantized-MoE method + wire `w4a8_moe`.** ★ Loader read (`weight.py`): the dense
-  GPTQ path **already works unchanged** — q/k/v→qkv and gate/up→gate_up merge along dim 1 for
-  `.qweight/.scales/.qzeros` (the existing `cat_dim=1` branch), and per-expert merge→stack runs for
-  any `is_moe` model. Remaining: (a) **skip the all-zero non-qkv `.bias` placeholders** (o_proj,
-  experts, shared) for `is_moe` models — the model only has `qkv_proj.bias`; (b) **quantize MoELayer**:
-  declare per-expert grouped GPTQ buffers (gate_up/down qweight/scales/qzeros in checkpoint layout,
-  stacked over E), convert each expert GPTQ→op layout after load (reusing `gptq_to_op_layout`), hold
-  the kernel's `w13 (E,2·inter,K//8)` / `w2 (E,K,inter//8)` grouped tensors; (c) **dispatch
-  `MoELayer.forward` to `w4a8_moe`** when `config.quant` is set (vs the unquantized `FusedMoe`).
-  Header-only weight-map test (22539 ckpt keys → native keys/shapes, expert stack, shared expert,
-  bias-skip).
-- **2M-4 (TODO) — serve on gfx1201 + token/logit parity vs vLLM.** Greedy token-diff + the
-  decode/logit oracle vs the combined image's vLLM (loads it fine). DoD = full serve + parity.
+- **2M-3 (DONE 2026-06-22) — quantized-MoE method + wire `w4a8_moe`.** ★ Loader read (`weight.py`):
+  the dense GPTQ path **already works unchanged** — q/k/v→qkv and gate/up→gate_up merge along dim 1
+  for `.qweight/.scales/.qzeros` (the existing `cat_dim=1` branch), and per-expert merge→stack runs
+  for any `is_moe` model. Implemented: (a) **loader skips `.g_idx` (desc_act=False → identity,
+  implied by the op layout) and all-zero `.bias` placeholders** (o_proj, experts, shared) — both are
+  numerically no-ops; the real q/k/v biases (non-zero) flow on to merge; (b) **`MoELayer` quant
+  path**: `_GroupedGPTQExperts` declares per-expert grouped GPTQ buffers (qweight/scales/qzeros,
+  checkpoint layout, stacked over E) for w13/w2; `post_load` converts each expert via
+  `gptq_to_op_layout` and stacks to the op's grouped layout (`w13 (E,2·inter,K//8)` /
+  `w2 (E,K,inter//8)`); (c) **`MoELayer.forward` dispatches `kernels.w4a8_moe`** when `config.quant`
+  is set (else the unquantized `FusedMoe`). **CPU-verified (combined image, no GPU):**
+  `tools/qwen2_moe_weight_map_test.py` replays the loader's name/shape transforms over the real
+  **22539-key** checkpoint header and asserts an **exact 555↔555 keys+shapes bijection** with
+  `model.state_dict()` (48 stacked grouped-GPTQ expert tensors; g_idx + zero-bias skips); build smoke
+  updated for the nested quant buffers; convert test still max|Δ|=0.
+- **2M-4 (DONE 2026-06-22) — serve on gfx1201 + parity vs vLLM (PASS, not bit-identical).** First
+  fixed a stale kernel API: the combined image's `w4a8_fp8_wmma` now takes a kernel-**name** string
+  (`"prefill_wmma"`/`"decode_gemv"`/`"wmma"`) not a `version` int — updated `quant/kernels.py` dense +
+  MoE call sites (`mmq_fp8_moe_gather_reduce` keeps `top_k`). Then on the lease: `moe_parity.py`
+  (synthetic grouped W4A8) **cos-sim 0.99896**; `boot_smoke` serves the real checkpoint (loads ~5s,
+  3.17 GiB free after init, eager) with **coherent + correct** greedy output on all 4 prompts
+  (Paris / green / 4). **Token-diff vs the combined image's vLLM** (`tools/qwen2_moe_vllm_ref.py`,
+  GPTQ→MoeWNA16): **2/4 prompts EXACT** (32/32, 20/20); the other two fork only at near-ties
+  (distractor ordering; "4." vs "The sum … is 4") and stay correct. Same posture as Phase 1a/3d-4
+  (minisgl runs int4 through the fp8 WMMA **e4m3** path; vLLM dequants to **bf16**), corroborated by
+  the exact per-component numerics (conversion max|Δ|=0, MoE cos 0.999, weight-map bijection).
+  **Phase 2M COMPLETE.**
 
 ## ★ MVP REACHED 2026-06-18 — W4A8 quantized serving on RDNA4
 
@@ -526,7 +540,7 @@ Paris", "2+2 → 4, 3+3 → 6, 4+4 → 8"). Full chain validated: AWQ checkpoint
 conversion → `mmq_fp8_gemm` v10 (asymmetric zeros) → fp8 WMMA. Weights load 6s, KV 1.81 GiB, eager.
 Optional next: quantitative logit oracle vs the cached unquantized bf16 7B; then MoE W4A8 (toward 35B),
 the autotuner, and TP.
-| 2 | W4A8 dense (`LinearMethod`) + MoE backend + weight-loader fix → 7B-AWQ | todo |
+| 2 | W4A8 dense (`LinearMethod`) → 7B-AWQ **MVP done 2026-06-18**; 2M real-checkpoint W4A8 **MoE** (GPTQ-Int4, Qwen1.5-MoE-A2.7B): 2M-0 config → 2M-1 model → 2M-2 GPTQ→op conv (max|Δ|=0) → 2M-3 quant MoELayer + loader skip → 2M-4 serve + vLLM parity **DONE 2026-06-22** (coherent+correct, 2/4 EXACT, forks only at near-ties) | **2 + 2M DONE ✅** |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
 | 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
