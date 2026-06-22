@@ -62,8 +62,16 @@ kernel as vllm-gfx1201) via hand-rolled `docker run`. The canonical recipe is in
   `--device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined
   --security-opt label=disable --cap-add SYS_PTRACE --ipc host --shm-size 16gb`.
 - **Devices come from the lease, never by hand.** Inside the `gpu-lease.sh -- bash -c '…'` wrapper,
-  pass `-e HIP_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES -e ROCR_VISIBLE_DEVICES=$LEASE_ROCR_DEVICES`
-  (the arbiter injects `LEASE_ROCR_DEVICES`). Do NOT hardcode `0`/`1`.
+  **forward the arbiter's already-composed pair**:
+  `-e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES`.
+  Do NOT hardcode `0`/`1`, and do NOT set BOTH to `$LEASE_ROCR_DEVICES` — that is the *physical*
+  card index, so it double-filters and breaks whenever the lease assigns **card 1**:
+  `ROCR_VISIBLE_DEVICES=1` selects physical card 1 and re-indexes it to 0, then
+  `HIP_VISIBLE_DEVICES=1` selects nothing → torch `RuntimeError: No HIP GPUs are available` (it only
+  ever worked on card 0). The arbiter exports the correct composition in the lease shell already
+  (`ROCR_VISIBLE_DEVICES=<physical>`, `HIP_VISIBLE_DEVICES=0`) — pass those through verbatim.
+  (Diagnosed in Phase 3e, 2026-06-22; the canonical vllm-gfx1201 doc is unaffected — its compose path
+  auto-injects the pair.)
 - **Mount the source, don't bake it (yet):** `-v "$PWD":/engine` and run with
   `PYTHONPATH=/engine/python python /engine/tools/…`. Activate the image venv first
   (`--entrypoint bash … -lc 'source /app/.venv/bin/activate && …'`) so Triton's JIT has PATH.
