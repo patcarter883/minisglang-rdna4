@@ -118,7 +118,7 @@ def w4a8_moe(
     top_k: int,
     renormalize: bool,
     *,
-    version: int = 5,
+    kernel: str = "wmma",
     block_m: int = 16,
 ) -> torch.Tensor:
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
@@ -147,14 +147,16 @@ def w4a8_moe(
 
     x16 = x.to(torch.float16).contiguous()
     out1 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-        x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, version, w13_zeros
+        x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+        kernel=kernel, w_zeros=w13_zeros,
     )  # (P, 2*inter)
     d = out1.shape[1] // 2
     buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous()
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     out2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-        buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, version, w2_zeros
+        buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+        kernel=kernel, w_zeros=w2_zeros,
     )  # (P, K)
     tw_flat = topk_weights.reshape(-1).float().contiguous()
     acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
@@ -163,14 +165,11 @@ def w4a8_moe(
     return acc.to(x.dtype)
 
 
-def _pick_dense_version(m: int, k: int, group_size: int) -> int:
-    """Per-M kernel-variant ladder (simplified from vllm_adapter.py). The full adapter
-    also has env tuning + a Triton W4A16 small-M/large-group fallback (PERF_NOTES)."""
-    if m <= 2 and k % 1024 == 0 and group_size % 32 == 0:
-        return 11  # decode
-    if group_size in (32, 128):
-        return 10  # mid/prefill workhorse
-    return 5  # large-M
+def _pick_dense_kernel(m: int) -> str:
+    """Per-M dense kernel selection. The served WMMA prefill kernel handles all M; the
+    scalar-dot GEMV is the decode (M<=2) fast path. (The full vllm_adapter also has env
+    tuning + a Triton W4A16 small-M/large-group fallback — PERF_NOTES.)"""
+    return "decode_gemv" if m <= 2 else "prefill_wmma"
 
 
 def w4a8_linear(
@@ -179,14 +178,13 @@ def w4a8_linear(
     scales: torch.Tensor,  # (N, K/group) fp16
     w_zeros: torch.Tensor | None,  # (N/8, K/group) int32 (AWQ asym) or None (sym)
     group_size: int,
-    version: int | None = None,
+    kernel: str | None = None,
 ) -> torch.Tensor:
     """Dense W4A8 GEMM: (M, K) @ (N, K)^T -> (M, N). Returns the op's fp16 output;
     the caller casts back to the activation dtype."""
     import w4a8_fp8_wmma
 
     x2d = x if x.dtype == torch.float16 else x.to(torch.float16)  # op computes in fp16
-    k = x2d.shape[-1]
-    if version is None:
-        version = _pick_dense_version(x2d.shape[0], k, group_size)
-    return w4a8_fp8_wmma.mmq_fp8_gemm(x2d, w_packed, scales, version=version, w_zeros=w_zeros)
+    if kernel is None:
+        kernel = _pick_dense_kernel(x2d.shape[0])
+    return w4a8_fp8_wmma.mmq_fp8_gemm(x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros)
