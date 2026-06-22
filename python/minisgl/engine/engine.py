@@ -92,12 +92,17 @@ class Engine:
         # forced below / in Scheduler.__init__.
         mc = config.model_config
         if mc.is_gdn_hybrid:
+            # GDN is head-parallel under TP: each rank's linear_attn owns conv_dim/tp channels
+            # and num_v_heads/tp value heads (Phase 4-1), so its recurrent state slot must match.
+            # conv_dim = 2*key_dim + value_dim is linear in the (tp-divisible) head counts, so
+            # div_even(conv_dim, tp) == the layer's local conv_dim exactly. head_*_dim are per-head.
+            tp = config.tp_info.size
             self.ctx.gdn_state = self.gdn_state = GDNStateCache(
                 num_gdn_layers=mc.num_gdn_layers,
                 num_slots=config.max_running_req + 2,  # +1 NULL block, +1 dummy
-                conv_dim=mc.gdn_conv_dim,
+                conv_dim=div_even(mc.gdn_conv_dim, tp),
                 conv_kernel=mc.linear_conv_kernel_dim,
-                num_v_heads=mc.linear_num_value_heads,
+                num_v_heads=div_even(mc.linear_num_value_heads, tp),
                 head_v_dim=mc.linear_value_head_dim,
                 head_k_dim=mc.linear_key_head_dim,
                 dtype=self.dtype,
