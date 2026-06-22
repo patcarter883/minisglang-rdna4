@@ -72,9 +72,13 @@ def main() -> None:
     assert tuple(sd[L + "mlp.shared_expert.down_proj.qweight"].shape) == (sinter // pf, H)
     assert tuple(sd[L + "mlp.shared_expert.down_proj.scales"].shape) == (sinter // g, H)
 
-    # --- grouped experts (MoELayer buffers; quantized in 2M-3) ---
-    assert tuple(sd[L + "mlp.experts.gate_up_proj"].shape) == (E, 2 * inter, H)
-    assert tuple(sd[L + "mlp.experts.down_proj"].shape) == (E, H, inter)
+    # --- grouped experts (quantized MoELayer buffers, CHECKPOINT layout stacked over E) ---
+    assert tuple(sd[L + "mlp.experts.gate_up_proj.qweight"].shape) == (E, H // pf, 2 * inter)
+    assert tuple(sd[L + "mlp.experts.gate_up_proj.scales"].shape) == (E, H // g, 2 * inter)
+    assert tuple(sd[L + "mlp.experts.gate_up_proj.qzeros"].shape) == (E, H // g, 2 * inter // pf)
+    assert tuple(sd[L + "mlp.experts.down_proj.qweight"].shape) == (E, inter // pf, H)
+    assert tuple(sd[L + "mlp.experts.down_proj.scales"].shape) == (E, inter // g, H)
+    assert tuple(sd[L + "mlp.experts.down_proj.qzeros"].shape) == (E, inter // g, H // pf)
 
     nlayers = sum(1 for k in sd if k.endswith("input_layernorm.weight"))
     assert nlayers == cfg.num_layers == 24, nlayers

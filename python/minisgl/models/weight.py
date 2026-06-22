@@ -177,8 +177,20 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
+                # GPTQ act-order indices: with desc_act=False the group map is the trivial
+                # arange(K)//group_size, already implied by the op's grouped layout, so g_idx is
+                # never materialized. (desc_act=True is rejected later in process_weights_after_load.)
+                if name.endswith(".g_idx"):
+                    continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
+                # AutoGPTQ emits a bias for EVERY linear, all-zero where the original layer had
+                # bias=False (here: o_proj, all experts, the shared expert). The model declares no
+                # bias buffer for those, and adding a zero bias is a no-op, so drop all-zero biases.
+                # The genuine q/k/v biases are non-zero and flow on to merge as usual.
+                if name.endswith(".bias") and not bool(raw.any()):
+                    del raw
+                    continue
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 
