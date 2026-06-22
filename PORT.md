@@ -583,7 +583,72 @@ the autotuner, and TP.
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
 | 3M | 35B GDN-hybrid MoE (Qwen3.6-35B-A3B-AWQ) model code: 3M-0 config → 3M-1 model+register → 3M-2 AWQ expert convert (max\|Δ\|=0) → 3M-3 loader+weight map (753↔753 bijection) **DONE 2026-06-22 (CPU-verified)**; serve gated on TP=2 | **3M model code DONE ✅** |
-| 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity — **unblocks 35B serve (3M)** | todo |
+| 4 | RCCL TP=2 — **PLAN drafted 2026-06-22** (see "Phase 4 — RCCL TP=2 plan" below); 4-1a/4-1b/4-2 CPU-verifiable, 4-0/4-3/4-4 need GPU. **Unblocks 35B serve (3M)** | plan ready |
+
+## Phase 4 — RCCL TP=2 plan (drafted 2026-06-22)
+
+**Headline:** this is *not* "build TP from scratch". The TP machinery already exists and is wired
+end-to-end — it has simply never been run on this box, and exactly one loader rejected it.
+
+_Already done (dense models exercise it):_ launcher spawns N rank-pinned procs (`server/launch.py`
+`mp.spawn`); engine inits `torch.distributed` + CPU barrier group (`engine.py` `_init_communication`);
+col/row-parallel linears with live `all_reduce` (`layers/linear.py` `LinearOProj`/`LinearRowParallel`);
+vocab-parallel embed (`all_reduce`) + lm_head (`all_gather`) (`layers/embedding.py`); MoE
+intermediate-sharded + `all_reduce` (`layers/moe.py:127,189`); attention head-split + per-rank KV
+cache (`attention/fi.py`, `engine.py:222`); dense weight loader shards per-rank (`weight.py`
+`_shard_tensor`).
+
+_Two corrections to the initial scoping, both load-bearing:_
+1. **No RCCL kernel rewrite needed.** Default backend = `TorchDistributedImpl` (`impl.py:64`) over
+   `torch.distributed`'s `"nccl"` backend, which on ROCm *is* RCCL (hipified transparently). The
+   custom `pynccl.cu` is opt-in (`use_pynccl`) and an optimization — **deferred**.
+2. **The real gap is one function.** `_load_qwen3_5_weight` (`weight.py`) hard-raised
+   `NotImplementedError(...TP=1 only)`. That is the GDN-hybrid + MoE-expert weight sharding — and it
+   is CPU-verifiable, exactly like the 3d/3M model work.
+
+_Model side, what's already TP-aware:_ full-attn `Qwen3_5Attn` (q/k/v via `LinearColParallelMerged`,
+o via `LinearOProj`), the **entire** MoE block (`MoELayer` per-partition intermediate + all_reduce;
+shared expert via TP linears; router/shared gates `LinearReplicated`), embed/lm_head. The **only**
+model-side gap is the GDN module (`gdn/layer.py` `QwenGatedDeltaNet` uses plain full-size `nn.Linear`,
+no out_proj all_reduce) — shared identically by the 4B and the 35B.
+
+_Divisibility — all clean at TP=2 (verified against the real config):_
+
+| Tensor | Full | ÷2 | Shard |
+|---|---|---|---|
+| GDN key heads / `key_dim` | 16 / 2048 | 8 / 1024 | column, head-aligned |
+| GDN value heads / `value_dim` | 32 / 4096 | 16 / 2048 | column, head-aligned |
+| GDN `conv_dim` (2·key+val) | 8192 | 4096 | column, co-sharded with qkv |
+| GDN `A_log`/`dt_bias` (per v-head) | 32 | 16 | shard with v-heads (**not** replicate) |
+| GDN `norm` (head_v_dim) | 128 | 128 | replicate |
+| GDN `out_proj` | in 4096 | 2048 | row + all_reduce |
+| Full-attn q_proj (q+gate) | 8192 | 4096 | column (head-contiguous chunk) |
+| Full-attn k/v (2 kv heads) | 2 | 1/rank | clean split |
+| MoE expert intermediate | 512 | 256 | col gate_up (N) / row down (K); 256 % g32=0, % pf8=0 |
+| Shared expert / router / norms | — | — | dense-MLP rule / replicated |
+| embed / lm_head | vocab | div_ceil | vocab-parallel |
+
+_Sub-phases (CPU-verify-then-serve cadence):_
+- **4-0** — RCCL bringup de-risk (GPU `-n 2`): serve a small *dense* model TP=2 through the untouched
+  path; token-diff vs its TP=1 run. Isolates RCCL on the 2× gfx1201 box from any model-sharding bug.
+- **4-1a** — GDN dense TP sharding (CPU): `QwenGatedDeltaNet` sizes buffers to local heads + the
+  `GDNLinearAttn` bridge all_reduces out_proj; `_shard_qwen3_5` (keyed on ckpt suffix, applied at
+  read so concat/merge/stack compose pre-sharded parts) + drop the TP>1 reject. DoD: 4B TP=2
+  weight-map bijection (rank0⊕rank1 tile to full).
+- **4-1b** — 35B MoE-expert TP sharding (CPU): extend `_shard_qwen3_5` for AWQ routed experts
+  (gate/up split N dim1, down split K dim0) + shared expert; model side already TP-aware. DoD: TP=2
+  bijection over the full 95427-key 35B checkpoint.
+- **4-2** — GDN state-cache + attn TP sizing (CPU/meta): engine sizes GDN conv/ssm state + KV cache
+  to per-rank-local v-heads/kv-heads. DoD: meta-build TP=2 asserts per-rank state shapes.
+- **4-3** — serve 4B GDN TP=2 + parity (GPU `-n 2`): the GDN-TP correctness gate, oracle = the
+  bit-exact TP=1 4B (`ad30a2f`). Cheap; catches GDN sharding numerics before the 35B.
+- **4-4** — serve 35B TP=2 + vLLM token-diff (GPU `-n 2`): the finale (~9–10 GB/card, fits 16 GB).
+- **4-5 (deferred)** — custom pynccl path only if torch.distributed-RCCL shows a latency floor.
+
+_Risks (ranked):_ (1) GDN in_proj head-aligned split — qkvz/conv1d are *concats* of q/k/v sub-blocks;
+naive chunk corrupts them (CPU-caught in 4-1a). (2) RCCL on gfx1201 never exercised — 4-0 isolates
+it. (3) AWQ N/K shard arithmetic under packing — mechanical, CPU-verified in 4-1b. (4) GDN per-head
+scalars (A_log/dt_bias) — silent-wrong if replicated instead of split.
 
 ## Change log (what we've diverged from upstream + why)
 
