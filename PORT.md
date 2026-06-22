@@ -532,6 +532,45 @@ Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
   the exact per-component numerics (conversion max|Δ|=0, MoE cos 0.999, weight-map bijection).
   **Phase 2M COMPLETE.**
 
+## Phase 3M (35B GDN-hybrid MoE model code) — Qwen3.6-35B-A3B-AWQ-4bit (model code DONE 2026-06-22)
+
+The 35B target = the proven 4B `qwen3_5` GDN-hybrid backbone (3b–3e) + a Qwen2-MoE-style sparse
+block (3M-1). Arch `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe`: 40 layers, the same 3-in-4
+linear/full interleave, hidden 2048, 16 qo / 2 kv heads, head_dim 256, partial rotary 0.25; **256
+routed experts top-8 + an always-on shared expert** (sigmoid-gated), MoE on **every** layer
+(`mlp_only_layers=[]`, no dense MLP → `intermediate_size=0`). **Only the routed experts are
+quantized** — the 504-entry quant ignore/`modules_to_not_convert` lists GDN, full-attn, the shared
+expert, both gates and lm_head as F16. ★ **Canonical quant = AWQ-gemm g32** (refs/main snapshot,
+`qweight/qzeros/scales`, asymmetric) — what AutoConfig + the loader resolve; there is an *alternate*
+compressed-tensors snapshot, NOT the default. AWQ reuses the **proven `awq_to_op_layout`** (7B-AWQ
+MVP) — no new converter. **Serve is gated on TP=2 (Phase 4): the 35B does not fit one 16 GB card.**
+
+- **3M-0 (DONE) — config.** `config.py`: all-MoE models read `intermediate_size` via getattr
+  (default 0; no dense MLP). `quant/config.py`: `is_compressed_tensors` (AWQ already recognized).
+  `tools/qwen3_5_moe_config_test.py` (torch-free `--standalone`, reads refs/main): GDN dims,
+  30-GDN/10-full interleave, MoE dims, partial rotary, `intermediate_size==0`, AWQ g32. PASS.
+- **3M-1 (DONE) — `models/qwen3_5_moe.py` + register.** Threaded an `mlp_factory` seam through
+  `qwen3_5`'s DecoderLayer/Model/Head (default = dense `Qwen3MLP`) so the MoE variant reuses the
+  ENTIRE GDN/full-attn scaffold. The MoE block is the sole structural diff: bf16 router gate + AWQ
+  `MoELayer` experts + bf16 shared expert + bf16 sigmoid `shared_expert_gate`. Because only experts
+  are quantized, the **backbone is built UNQUANTIZED** (`dataclasses.replace(config, quant=None)`)
+  and the real AWQ quant is handed only to the experts via the factory closure. `layers/moe.py`:
+  `_GroupedAWQExperts` (AWQ K-major `qweight/scales/qzeros` stacked over E; post_load = per-expert
+  `awq_to_op_layout` → grouped op layout) + `is_awq` dispatch. **Meta build smoke**
+  (`tools/qwen3_5_moe_build_smoke.py`): 40 layers (30 GDN/10 full), 753 tensors, AWQ expert buffer
+  shapes, bf16 backbone, round-trip clean. PASS.
+- **3M-2 (DONE) — AWQ grouped-expert convert numerics.** `tools/qwen3_5_moe_awq_convert_test.py`:
+  on real 35B expert matrices (gate/up/down, experts 0/5/200) an op-layout dequant equals an
+  independent AWQ-checkpoint dequant (deinterleave → `w=scale·(q−z)`) at **max|Δ| = 0**.
+- **3M-3 (DONE) — loader + weight map.** `weight.py`: `qwen3_5_remap` handles untied top-level
+  `lm_head`; `_gate_up_merge` (gate/up → gate_up for shared + routed experts ONLY, never q/k/v);
+  `_load_qwen3_5_weight` gains an `emit` generator doing the MoE gate/up merge (shared `.weight`
+  dim 0; routed AWQ `.qweight/.qzeros/.scales` dim 1) + per-expert stacking over E, after the
+  existing GDN in_proj concat. Dense 4B path unchanged (regression smoke clean).
+  `tools/qwen3_5_moe_weight_map_test.py`: exact **753↔753 keys+shapes bijection** over the real
+  95427-key refs/main header (80 stacked AWQ expert tensors, GDN concats, untied lm_head; 2654
+  vision/MTP skipped). PASS. **Phase 3M model code COMPLETE; serve blocked on Phase 4 TP=2.**
+
 ## ★ MVP REACHED 2026-06-18 — W4A8 quantized serving on RDNA4
 
 Qwen2.5-Coder-7B-Instruct-**AWQ** (4-bit, g128, asymmetric) boots on gfx1201 via the `triton_rdna4`
@@ -543,7 +582,8 @@ the autotuner, and TP.
 | 2 | W4A8 dense (`LinearMethod`) → 7B-AWQ **MVP done 2026-06-18**; 2M real-checkpoint W4A8 **MoE** (GPTQ-Int4, Qwen1.5-MoE-A2.7B): 2M-0 config → 2M-1 model → 2M-2 GPTQ→op conv (max|Δ|=0) → 2M-3 quant MoELayer + loader skip → 2M-4 serve + vLLM parity **DONE 2026-06-22** (coherent+correct, 2/4 EXACT, forks only at near-ties) | **2 + 2M DONE ✅** |
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
-| 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity | todo |
+| 3M | 35B GDN-hybrid MoE (Qwen3.6-35B-A3B-AWQ) model code: 3M-0 config → 3M-1 model+register → 3M-2 AWQ expert convert (max\|Δ\|=0) → 3M-3 loader+weight map (753↔753 bijection) **DONE 2026-06-22 (CPU-verified)**; serve gated on TP=2 | **3M model code DONE ✅** |
+| 4 | RCCL TP + het-TP (re-derive ratio) + decode HIP graphs + parity — **unblocks 35B serve (3M)** | todo |
 
 ## Change log (what we've diverged from upstream + why)
 
