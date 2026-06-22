@@ -481,10 +481,19 @@ Sub-phases (mirrors the GDN port's CPU-verified-then-serve cadence):
   ModelConfig with transformers stubbed, reads config.json): 4B-MoE parse (qwen2_moe, 60 experts,
   top-4, inter 1408, shared 5632, GPTQ g128 sym desc_act=false) AND dense regression (shared=0,
   quant=None, not GDN) both PASS.
-- **2M-1 (TODO) — `models/qwen2_moe.py` + register `Qwen2MoeForCausalLM`.** Attn = Qwen2-style
-  (qkv+o bias, MHA, no q/k norm); MoE block = router `gate` (fp16) + 60 grouped experts (MoELayer) +
-  shared-expert quant MLP + `shared_expert_gate` (sigmoid weighting of the shared output). Meta build
-  smoke. (Template: `qwen3_moe.py` + `utils.MoEMLP`; add the shared-expert branch.)
+- **2M-1 (DONE 2026-06-22) — `models/qwen2_moe.py` + register `Qwen2MoeForCausalLM`.** Attn = Qwen2
+  `RopeAttn(has_attn_bias=True, has_qk_norm=False)` — **only q/k/v carry a real bias** (`o_proj.bias`
+  and all expert/shared `.bias` are all-zero GPTQ placeholders → skipped on load, verified by value
+  scan). MoE block (`Qwen2MoeSparseBlock`, all 24 layers sparse, `decoder_sparse_step=1`) = router
+  `gate` (fp16 `LinearReplicated`) + 60 grouped experts (`MoELayer`) + `Qwen2MoeSharedExpert` (quant
+  SwiGLU at `shared_expert_intermediate_size=5632`) + `shared_expert_gate` (fp16, weight `[1,H]`):
+  `final = routed(x) + sigmoid(shared_gate(x))·shared(x)`. Also added the **GPTQ buffer-shape branch**
+  to `W4A8LinearMethod.create_weights` (qweight `(K//8,N)` input-packed, scales `(K//g,N)`, qzeros
+  `(K//g,N//8)` ALWAYS present even symmetric) + a `gptq_to_op_layout` stub (impl 2M-2) +
+  process-after-load dispatch. **Meta build smoke (`tools/qwen2_moe_build_smoke.py`, combined image,
+  CPU/meta — no GPU):** 459 tensors, 24 MoE layers, merged `qkv_proj` (GPTQ + bias) / `o_proj` (no
+  bias), shared-expert GPTQ buffers, fp16 router+shared gates, grouped expert buffers `(E,2·inter,H)`
+  / `(E,H,inter)` — all shapes correct.
 - **2M-2 (TODO) — GPTQ→op-layout conversion**, the load-bearing numerics. `quant/kernels.py`
   `gptq_to_op_layout` (input-packed int4, symmetric-zero convention) for dense AND per-expert.
   CPU-unit-tested: converted+dequant matches a transformers/AutoGPTQ dequant reference bit-close.

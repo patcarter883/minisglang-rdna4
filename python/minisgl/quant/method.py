@@ -59,12 +59,26 @@ class W4A8LinearMethod:
         self.quant = quant
 
     def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
-        # Declare buffers in CHECKPOINT (AWQ "gemm") layout so BaseOP load matches:
-        #   qweight (K, N//pf) i32, scales (K//group, N) f16, qzeros (K//group, N//pf) i32.
-        # (N=out, K=in are the LOCAL/per-TP sizes; TP-quant sharding is a follow-up.)
+        # Declare buffers in CHECKPOINT layout so BaseOP load matches. (N=out, K=in are the
+        # LOCAL/per-TP sizes; TP-quant sharding is a follow-up.)
         pf = 32 // self.quant.bits
         g = self.quant.group_size
         N, K = out_features, in_features
+        if self.quant.is_gptq:
+            # GPTQ "gemm" layout: qweight int32 packed along INPUT (K//pf, N), per-group
+            # scales (K//g, N), and qzeros (K//g, N//pf) ALWAYS present (even symmetric — the
+            # constant zero is stored explicitly; MoeWNA16 likewise loads then folds it).
+            assert K % pf == 0 and K % g == 0 and N % pf == 0, (
+                f"GPTQ needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
+            )
+            layer.qweight = torch.empty((K // pf, N), dtype=torch.int32)
+            layer.scales = torch.empty((K // g, N), dtype=torch.float16)
+            layer.qzeros = torch.empty((K // g, N // pf), dtype=torch.int32)
+            if self.quant.desc_act:
+                layer.g_idx = torch.empty((K,), dtype=torch.int32)
+            return
+        # AWQ "gemm" layout: qweight (K, N//pf) i32, scales (K//group, N) f16,
+        # qzeros (K//group, N//pf) i32 (asymmetric only).
         assert N % pf == 0 and K % g == 0, f"W4A8 needs N%{pf}==0,K%{g}==0; got N={N},K={K}"
         layer.qweight = torch.empty((K, N // pf), dtype=torch.int32)
         layer.scales = torch.empty((K // g, N), dtype=torch.float16)
@@ -73,9 +87,16 @@ class W4A8LinearMethod:
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         qz = getattr(layer, "qzeros", None)
-        w_packed, scales_op, zeros_op = kernels.awq_to_op_layout(
-            layer.qweight, layer.scales, qz, bits=self.quant.bits  # type: ignore[attr-defined]
-        )
+        if self.quant.is_gptq:
+            # GPTQ -> op layout (2M-2). desc_act is asserted off (g_idx identity) by the converter.
+            assert not self.quant.desc_act, "GPTQ desc_act (act-order) not supported"
+            w_packed, scales_op, zeros_op = kernels.gptq_to_op_layout(
+                layer.qweight, layer.scales, qz, bits=self.quant.bits  # type: ignore[attr-defined]
+            )
+        else:
+            w_packed, scales_op, zeros_op = kernels.awq_to_op_layout(
+                layer.qweight, layer.scales, qz, bits=self.quant.bits  # type: ignore[attr-defined]
+            )
         # op-layout buffers are derived (underscore -> not re-serialized); free the loaded ones.
         layer._w_packed_op = w_packed
         layer._scales_op = scales_op
