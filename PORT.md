@@ -583,7 +583,7 @@ the autotuner, and TP.
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
 | 3M | 35B GDN-hybrid MoE (Qwen3.6-35B-A3B-AWQ) model code: 3M-0 config → 3M-1 model+register → 3M-2 AWQ expert convert (max\|Δ\|=0) → 3M-3 loader+weight map (753↔753 bijection) **DONE 2026-06-22 (CPU-verified)**; serve gated on TP=2 | **3M model code DONE ✅** |
-| 4 | RCCL TP=2 — **PLAN drafted 2026-06-22** (see "Phase 4 — RCCL TP=2 plan" below); 4-1a/4-1b/4-2 CPU-verifiable, 4-0/4-3/4-4 need GPU. **Unblocks 35B serve (3M)** | plan ready |
+| 4 | RCCL TP=2 (plan 2026-06-22): **4-1a/4-1b/4-2 DONE 2026-06-22 (CPU-verified)** — GDN+MoE TP weight sharding (4B+35B exact bijection+tiling at TP=2) + GDN/KV state TP sizing; remaining 4-0/4-3/4-4 need GPU. **Unblocks 35B serve (3M)** | CPU code DONE; GPU serve pending |
 
 ## Phase 4 — RCCL TP=2 plan (drafted 2026-06-22)
 
@@ -631,15 +631,22 @@ _Divisibility — all clean at TP=2 (verified against the real config):_
 _Sub-phases (CPU-verify-then-serve cadence):_
 - **4-0** — RCCL bringup de-risk (GPU `-n 2`): serve a small *dense* model TP=2 through the untouched
   path; token-diff vs its TP=1 run. Isolates RCCL on the 2× gfx1201 box from any model-sharding bug.
-- **4-1a** — GDN dense TP sharding (CPU): `QwenGatedDeltaNet` sizes buffers to local heads + the
-  `GDNLinearAttn` bridge all_reduces out_proj; `_shard_qwen3_5` (keyed on ckpt suffix, applied at
-  read so concat/merge/stack compose pre-sharded parts) + drop the TP>1 reject. DoD: 4B TP=2
-  weight-map bijection (rank0⊕rank1 tile to full).
-- **4-1b** — 35B MoE-expert TP sharding (CPU): extend `_shard_qwen3_5` for AWQ routed experts
-  (gate/up split N dim1, down split K dim0) + shared expert; model side already TP-aware. DoD: TP=2
-  bijection over the full 95427-key 35B checkpoint.
-- **4-2** — GDN state-cache + attn TP sizing (CPU/meta): engine sizes GDN conv/ssm state + KV cache
-  to per-rank-local v-heads/kv-heads. DoD: meta-build TP=2 asserts per-rank state shapes.
+- **4-1a — DONE 2026-06-22 (CPU).** GDN dense TP sharding: `QwenGatedDeltaNet` sizes buffers to
+  local heads + the `GDNLinearAttn` bridge all_reduces out_proj; `_shard_qwen3_5` (keyed on ckpt
+  suffix, applied at read so concat/merge/stack compose pre-sharded parts) + dropped the TP>1
+  reject. `tools/qwen3_5_tp_weight_map_test.py`: 4B TP=2 exact per-rank bijection (346 buffers ea.)
+  + tiling-consistency (241 sharded / 105 replicated). TP=1 regressions + GDN numeric parity
+  unchanged.
+- **4-1b — DONE 2026-06-22 (CPU).** 35B MoE-expert TP sharding: same `_shard_qwen3_5` covers AWQ
+  routed experts (gate/up split packed N dim1, down split K dim0) + shared expert; MoE/embed model
+  side was already TP-aware. Same test: 35B TP=2 exact bijection (753 buffers ea.) + tiling over
+  the full 95427-key checkpoint (542 sharded / 211 replicated). Bug caught+fixed: GDN
+  `in_proj_ba`/`A_log`/`dt_bias` had used the full `num_v_heads` arg instead of the local count.
+- **4-2 — DONE 2026-06-22 (CPU).** GDN state-cache + KV TP sizing: `engine.py` divides
+  `gdn_conv_dim` + `linear_num_value_heads` by tp for `GDNStateCache` (KV cache was already
+  TP-sized). `tools/qwen3_5_tp_state_test.py`: engine sizing formula == GDN layer local geometry,
+  concrete conv/ssm slot shapes match forward reads, full-attn `div_even` KV split (4B kv 4→2/rank,
+  35B kv 2→1/rank; conv_dim 8192→4096, v_heads 32→16).
 - **4-3** — serve 4B GDN TP=2 + parity (GPU `-n 2`): the GDN-TP correctness gate, oracle = the
   bit-exact TP=1 4B (`ad30a2f`). Cheap; catches GDN sharding numerics before the 35B.
 - **4-4** — serve 35B TP=2 + vLLM token-diff (GPU `-n 2`): the finale (~9–10 GB/card, fits 16 GB).
