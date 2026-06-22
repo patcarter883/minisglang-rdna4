@@ -48,22 +48,33 @@ class QwenGatedDeltaNet(nn.Module):
         head_v_dim: int,
         conv_kernel_size: int,
         *,
+        tp_size: int = 1,
         eps: float = 1e-6,
         activation: str = "silu",
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cuda",
     ) -> None:
         super().__init__()
+        # Tensor parallel: GDN is purely HEAD-parallel — each rank owns num_*_heads/tp_size key &
+        # value heads, and every downstream dim (key_dim, value_dim, conv_dim, the qkvz/ba/conv
+        # projections, the per-v-head A_log/dt_bias, the ssm/conv state) follows the head split. The
+        # forward below uses these LOCAL counts unchanged, so it computes the rank's shard; the
+        # bridge (GDNLinearAttn) all-reduces the row-parallel out_proj. head_*_dim and the gated
+        # `norm` (over head_v_dim) are per-head and stay replicated. tp_size=1 -> unchanged (the
+        # standalone Phase-3b numerics tests build with the default).
+        assert num_k_heads % tp_size == 0 and num_v_heads % tp_size == 0, (
+            f"GDN heads must divide tp_size={tp_size}: k={num_k_heads}, v={num_v_heads}"
+        )
         self.hidden_size = hidden_size
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        self.num_k_heads = num_k_heads // tp_size
+        self.num_v_heads = num_v_heads // tp_size
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
         self.conv_kernel_size = conv_kernel_size
         self.activation = activation
 
-        self.key_dim = head_k_dim * num_k_heads
-        self.value_dim = head_v_dim * num_v_heads
+        self.key_dim = head_k_dim * self.num_k_heads
+        self.value_dim = head_v_dim * self.num_v_heads
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
         # Projections (bias-free, like the reference). in_proj_qkvz packs q,k,v,z;
@@ -72,7 +83,7 @@ class QwenGatedDeltaNet(nn.Module):
             hidden_size, self.key_dim * 2 + self.value_dim * 2, bias=False, dtype=dtype, device=device
         )
         self.in_proj_ba = nn.Linear(
-            hidden_size, 2 * num_v_heads, bias=False, dtype=dtype, device=device
+            hidden_size, 2 * self.num_v_heads, bias=False, dtype=dtype, device=device
         )
         # conv1d weight mirrors the checkpoint shape (conv_dim, 1, kernel); the kernels
         # take a (conv_dim, kernel) view. Depthwise causal short-conv, bias-free here.
@@ -81,8 +92,8 @@ class QwenGatedDeltaNet(nn.Module):
         )
         self.conv1d_bias: torch.Tensor | None = None
 
-        self.dt_bias = nn.Parameter(torch.ones(num_v_heads, dtype=torch.float32, device=device))
-        self.A_log = nn.Parameter(torch.empty(num_v_heads, dtype=torch.float32, device=device))
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads, dtype=torch.float32, device=device))
+        self.A_log = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32, device=device))
 
         self.norm = RMSNormGated(
             head_v_dim,

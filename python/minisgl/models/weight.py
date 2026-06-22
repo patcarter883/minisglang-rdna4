@@ -135,6 +135,81 @@ def qwen3_5_remap(ckpt_key: str):
     return ("direct", native)
 
 
+def _shard_blocks_dim0(t: torch.Tensor, sizes: list[int], r: int, n: int) -> torch.Tensor:
+    """Head-aligned column shard: split `t` along dim 0 into the given sub-blocks (q/k/v, or
+    gate/up), take rank r's even chunk of EACH, and re-concat. A naive `t.chunk(n, 0)[r]` would
+    corrupt a concatenated projection (it would hand rank 0 all of q and rank 1 all of v); this
+    keeps every sub-block's heads partitioned consistently. Each block size must divide n."""
+    parts = torch.split(t, sizes, dim=0)
+    return torch.cat([p.chunk(n, dim=0)[r].contiguous() for p in parts], dim=0)
+
+
+def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Extract rank r's TP shard of a Qwen3.5 GDN-hybrid CHECKPOINT tensor (Phase 4-1).
+
+    Keyed on the checkpoint suffix and applied at READ time — BEFORE the loader's GDN in_proj
+    concat / MoE gate-up merge / per-expert stack — so those compose pre-sharded parts into the
+    rank-local fused buffers the TP-aware model declares. Mirrors the dense `_shard_tensor` rules
+    (q/k/v + gate/up split output dim 0; o/down split input dim 1; embed/lm_head vocab-parallel)
+    and adds the GDN head-parallel splits (qkvz/ba/conv1d are concats -> head-aligned per sub-block;
+    A_log/dt_bias per v-head; out_proj row-parallel) and the AWQ routed-expert splits (gate/up on
+    the packed N=dim1, down on K=dim0). Everything not matched (norms, q/k/gdn norm, router gate,
+    shared_expert_gate) is replicated. n==1 is the identity."""
+    if n == 1:
+        return t
+    key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+    value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+
+    # ---- GDN linear-attention (head-parallel) ----
+    if name.endswith((".linear_attn.in_proj_qkv.weight", ".linear_attn.conv1d.weight")):
+        # qkv = [q(key_dim) | k(key_dim) | v(value_dim)]; conv1d (conv_dim,1,kernel) same order.
+        return _shard_blocks_dim0(t, [key_dim, key_dim, value_dim], r, n)
+    if name.endswith(
+        (".linear_attn.in_proj_z.weight", ".linear_attn.in_proj_b.weight",
+         ".linear_attn.in_proj_a.weight", ".linear_attn.A_log", ".linear_attn.dt_bias")
+    ):
+        return t.chunk(n, dim=0)[r].clone()  # z (value_dim) / b,a,A_log,dt_bias (per v-head)
+    if name.endswith(".linear_attn.out_proj.weight"):
+        return t.chunk(n, dim=1)[r].clone()  # row-parallel (input value_dim/n) + all-reduce
+    # .linear_attn.norm.weight (head_v_dim) is per-head -> replicate (falls through)
+
+    # ---- full attention (head-parallel; same rules as the dense path) ----
+    if name.endswith(
+        (".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+    ):
+        return t.chunk(n, dim=0)[r].clone()  # q carries q+gate per head; heads are contiguous
+    if name.endswith(".self_attn.o_proj.weight"):
+        return t.chunk(n, dim=1)[r].clone()
+    # q_norm/k_norm (head_dim) -> replicate
+
+    # ---- routed experts (AWQ): gate/up split packed N (dim 1); down split K (dim 0) ----
+    if ".mlp.experts." in name:
+        if name.endswith(
+            (".gate_proj.qweight", ".gate_proj.scales", ".gate_proj.qzeros",
+             ".up_proj.qweight", ".up_proj.scales", ".up_proj.qzeros")
+        ):
+            return t.chunk(n, dim=1)[r].clone()
+        if name.endswith(
+            (".down_proj.qweight", ".down_proj.scales", ".down_proj.qzeros")
+        ):
+            return t.chunk(n, dim=0)[r].clone()
+
+    # ---- dense MLP (4B) + shared expert (35B): col gate/up (dim 0), row down (dim 1) ----
+    if name.endswith((".gate_proj.weight", ".up_proj.weight")):
+        return t.chunk(n, dim=0)[r].clone()
+    if name.endswith(".down_proj.weight"):
+        return t.chunk(n, dim=1)[r].clone()
+
+    # ---- vocab-parallel embedding + untied lm_head ----
+    if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
+        num = t.shape[0]
+        per = div_ceil(num, n)
+        return t[r * per : min((r + 1) * per, num)].clone()
+
+    # norms, router gate (.mlp.gate.weight), shared_expert_gate -> replicated
+    return t
+
+
 def _load_qwen3_5_weight(
     model_folder: str, device: torch.device, config
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -144,8 +219,6 @@ def _load_qwen3_5_weight(
     tensors over E (reusing the generic `_get_expert_stack_info`). dtype coercion
     (A_log/dt_bias -> fp32) is the engine's job, exactly as for the dense path."""
     tp_info = get_tp_info()
-    if tp_info.size != 1:
-        raise NotImplementedError("Qwen3.5 GDN-hybrid weight loading is TP=1 only (TP is Phase 4)")
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN/dense in_proj concat (qwen3_5_remap)
@@ -183,11 +256,14 @@ def _load_qwen3_5_weight(
                 plan = qwen3_5_remap(name)
                 if plan is None:
                     continue
+                # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
+                # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
+                raw = _shard_qwen3_5(name, f.get_tensor(name), tp_info.rank, tp_info.size, config)
                 if plan[0] == "direct":
-                    yield from emit(plan[1], f.get_tensor(name))
+                    yield from emit(plan[1], raw)
                     continue
                 _, merged, slot, n_slots, cat_dim = plan
-                concat_buf.setdefault(merged, {})[slot] = f.get_tensor(name)
+                concat_buf.setdefault(merged, {})[slot] = raw
                 if len(concat_buf[merged]) != n_slots:
                     continue
                 parts = [concat_buf[merged][i] for i in range(n_slots)]

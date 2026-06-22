@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from minisgl.core import get_global_ctx
+from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.gdn.layer import QwenGatedDeltaNet
 from minisgl.layers import (
     AttentionLayer,
@@ -113,6 +114,11 @@ class GDNLinearAttn(BaseOP):
     def __init__(self, gdn: QwenGatedDeltaNet, gdn_layer_id: int):
         self._gdn = gdn  # leading "_" -> hidden from BaseOP's default state-dict walk
         self._gdn_layer_id = gdn_layer_id
+        # out_proj is row-parallel (each rank contracts its value_dim/tp shard): the GDN module
+        # returns a PARTIAL hidden-size output per rank, so the bridge all-reduces it (a no-op at
+        # tp_size=1). The collective lives here, not in the standalone GDN compute module.
+        self._comm = DistributedCommunicator()
+        self._tp_size = get_tp_info().size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
@@ -122,10 +128,14 @@ class GDNLinearAttn(BaseOP):
         conv = state.conv(self._gdn_layer_id)
         ssm = state.ssm(self._gdn_layer_id)
         if ctx.batch.is_prefill:
-            return self._gdn.forward_prefill(
+            out = self._gdn.forward_prefill(
                 x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state
             )
-        return self._gdn.forward_decode(x, conv, ssm, md.query_start_loc, md.state_indices)
+        else:
+            out = self._gdn.forward_decode(x, conv, ssm, md.query_start_loc, md.state_indices)
+        if self._tp_size > 1:
+            out = self._comm.all_reduce(out)
+        return out
 
     def warmup_conv(self, num_tokens: int) -> None:
         self._gdn.warmup_conv(num_tokens)
@@ -167,6 +177,7 @@ class Qwen3_5DecoderLayer(BaseOP):
                 head_k_dim=config.linear_key_head_dim,
                 head_v_dim=config.linear_value_head_dim,
                 conv_kernel_size=config.linear_conv_kernel_dim,
+                tp_size=get_tp_info().size,  # head-parallel: local heads + out_proj all-reduce
                 eps=config.rms_norm_eps,
                 dtype=torch.get_default_dtype(),  # bf16 under the engine's build context
                 device=torch.device("meta"),  # built on meta; real tensors via load(assign=True)
