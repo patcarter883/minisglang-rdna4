@@ -57,6 +57,7 @@ class Qwen2MoeSparseBlock(BaseOP):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
+            quant=config.quant,
         )
         self.shared_expert = Qwen2MoeSharedExpert(config)
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
