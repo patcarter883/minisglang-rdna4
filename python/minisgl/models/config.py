@@ -32,6 +32,9 @@ class ModelConfig:
     num_experts_per_tok: int
     moe_intermediate_size: int
     norm_topk_prob: bool
+    # Qwen2-MoE-style shared expert (always-on, runs alongside the top-k routed experts) +
+    # its sigmoid gate. 0 for models without a shared expert (Qwen3-MoE, Mixtral).
+    shared_expert_intermediate_size: int
     model_type: str
     architectures: list[str]
     quant: QuantConfig | None = None
@@ -92,6 +95,7 @@ class ModelConfig:
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
+        shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict;
@@ -161,6 +165,7 @@ class ModelConfig:
             num_experts_per_tok=num_experts_per_tok,
             moe_intermediate_size=moe_intermediate_size,
             norm_topk_prob=norm_topk_prob,
+            shared_expert_intermediate_size=shared_expert_intermediate_size,
             model_type=model_type,
             architectures=architectures,
             quant=quant,
