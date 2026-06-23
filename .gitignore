@@ -35,3 +35,4 @@ env/
 # torch artifacts
 *.pt
 .triton-cache-3c/
+tools/tp2_results/
