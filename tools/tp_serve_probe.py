@@ -64,6 +64,24 @@ def _post(url: str, payload: dict, timeout: float) -> dict:
         return json.loads(r.read().decode())
 
 
+# A TP rank runs in a CHILD process; if it crashes the PARENT (uvicorn) can stay alive and the
+# server just never becomes ready — so poll the log for crash banners and fail in seconds, not
+# at the full ready-timeout.
+_CRASH_MARKERS = (b"Traceback (most recent call last)", b"Process minisgl-TP")
+
+
+def _server_crashed(logpath: str) -> str | None:
+    try:
+        with open(logpath, "rb") as f:
+            blob = f.read()
+    except FileNotFoundError:
+        return None
+    if any(m in blob for m in _CRASH_MARKERS):
+        tail = blob.decode("utf-8", "replace").strip().splitlines()[-6:]
+        return "child rank crashed:\n      " + "\n      ".join(tail)
+    return None
+
+
 def run_config(cfg: dict) -> dict:
     port = cfg["port"]
     name = cfg["name"]
@@ -100,6 +118,9 @@ def run_config(cfg: dict) -> dict:
                 break
             if proc.poll() is not None:
                 result["error"] = f"server exited during load (rc={proc.returncode}); see {logpath}"
+                return result
+            if (crash := _server_crashed(logpath)) is not None:
+                result["error"] = f"{crash}\n      (see {logpath})"
                 return result
             time.sleep(3)
         if not ready:
@@ -138,8 +159,22 @@ def _diff(a: dict, b: dict) -> str:
     gb = {g["prompt"]: g["text"] for g in b.get("generations", [])}
     if not a.get("ok") or not b.get("ok"):
         return f"SKIP ({a['name']} ok={a.get('ok')}, {b['name']} ok={b.get('ok')})"
-    n = sum(1 for p in PROMPTS if ga.get(p) == gb.get(p))
-    return f"{n}/{len(PROMPTS)} greedy-text identical"
+    exact = 0
+    fracs = []
+    for p in PROMPTS:
+        ta, tb = ga.get(p) or "", gb.get(p) or ""
+        if ta == tb:
+            exact += 1
+        m = 0
+        for x, y in zip(ta, tb):
+            if x == y:
+                m += 1
+            else:
+                break
+        fracs.append(m / max(len(ta), len(tb), 1))
+    # TP1 vs TP2 is NOT expected bit-identical (all-reduce reorders float sums); a long common
+    # prefix + coherent text is the real pass signal ("PASS not bit-identical" posture).
+    return f"{exact}/{len(PROMPTS)} exact, mean prefix agreement {sum(fracs) / len(fracs):.0%}"
 
 
 def main() -> None:
