@@ -1,5 +1,15 @@
 # Continuation prompt — finish the WMMA chunked GDN prefill (gdn_hip #22)
 
+> **STATUS: DONE (2026-06-24).** `gdn_hip::gdn_prefill_wmma` is built, validated, benchmarked, and is
+> now the DEFAULT serve prefill (`gdn/layer.py`; `GDN_HIP_WMMA_PREFILL=0` reverts to recurrent).
+> Steps 1–4 below all complete. Key result: **4.8–5.9× faster than recurrent** (T=256..16384), parity
+> vs the recurrent oracle ≤1.6e-3 across strong+mild decay × short+long seqs, real 4B serve coherent
+> (5/6 prompts token-identical). **Critical lesson:** the textbook decay absorption `k̃=k/γ` OVERFLOWS
+> fp16 (γ underflows over a 16-tok chunk) → NaN in the real serve though it passes mild-random op
+> parity; the shipped kernel keeps raw operands + bounded log-space decay scalings instead. The scalar
+> `gdn_prefill_chunked` is now only a mild-decay oracle (it also NaNs under strong decay). The rest of
+> this brief is the original plan, kept for context.
+
 You are in `/home/pat/code/minisgl-rdna4` (branch `rdna4`). Read `CLAUDE.md` first — the GPU lease
 protocol is MANDATORY. Continue task #22: a native-HIP **WMMA (matrix-core) chunked gated-delta-rule
 prefill** for gfx1201 — the genuine long-context throughput win for the GDN linear-attention path.
