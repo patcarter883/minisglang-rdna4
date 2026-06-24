@@ -105,7 +105,9 @@ class Engine:
                 num_v_heads=div_even(mc.linear_num_value_heads, tp),
                 head_v_dim=mc.linear_value_head_dim,
                 head_k_dim=mc.linear_key_head_dim,
-                dtype=self.dtype,
+                # fp32 recurrent state: the gdn_hip HIP kernels read/update conv+ssm state in place
+                # in fp32 (also more accurate than the bf16 the Triton path stored each step).
+                dtype=torch.float32,
                 device=self.device,
             )
             # Settle causal_conv1d's per-process in-place batch_ptr autotune on a private
