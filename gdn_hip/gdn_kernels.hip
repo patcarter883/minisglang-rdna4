@@ -305,19 +305,26 @@ __global__ void gdn_prefill_chunked_kernel(
 
 // ---------------------------------------------------------------------------------------------
 // WMMA (matrix-core) CHUNKED prefill — the long-context fast path. Same result as gdn_prefill /
-// gdn_prefill_chunked, but the intra-chunk couplings (KK / KQ / state read & carry) are matrix-core
-// GEMMs instead of scalar dot products. One block per (sequence, value-head); chunks of C=16 tokens
-// run sequentially carrying the state S [Dv x Dk] resident in LDS (fp16). Per chunk, with decay
-// absorbed into scaled fp16 copies (k~=k/gamma, kbar=gamma*k, q~=gamma*q*scale):
-//   M  = kbar @ k~^T      [C x C]    (NT)      Atil = q~ @ k~^T   [C x C]   (NT)
-//   KS = kbar @ S0^T      [C x Dv]   (NT)      QS   = q~ @ S0^T   [C x Dv]  (NT)
-//   B  = beta * (V - KS)  [C x Dv]   (elementwise)
-//   U  = (I + tril(beta*M,-1))^-1 B  [C x Dv]  (forward-substitution solve, per v-column)
-//   O  = QS + tril(Atil,0) @ U        [C x Dv]  (NN, causal mask incl. diagonal)
-//   S' = gamma_C * (S0 + U^T @ k~)    [Dv x Dk] (TN carry)
-// fp16 operands / fp32 accumulate (matches fla chunked precision). LDS budget ~62 KB: S(32K, fp16)
-// + 3 scaled-operand buffers + reused fp32 scratch (see the offset map below). Block = 8 wave32
-// warps (256 threads); a warp owns a 16x16 output tile, 8 tiles cover a [C x Dv] row, 64 the carry.
+// gdn_prefill_chunked, but the intra-chunk couplings are matrix-core GEMMs instead of scalar dot
+// products. One block per (sequence, value-head); chunks of C=16 tokens run sequentially carrying
+// the state S [Dv x Dk] resident in LDS (fp16).
+//
+// CRITICAL — decay is NOT absorbed into the operands. The textbook chunk form scales k~=k/gamma,
+// kbar=gamma*k, but gamma_j = exp(sum of per-token log-decays) UNDERFLOWS over a 16-token chunk for
+// realistic decay (gamma_16 ~ 1e-12 even at mild A_log~-2), so k/gamma OVERFLOWS fp16 -> inf -> NaN
+// (this silently passes a mild-random parity test, then NaNs the real serve). Instead we keep the
+// RAW l2-normed operands (kk = k, qq = q*scale, both O(1)) and apply decay as bounded (<=1) fp32
+// scalings computed in LOG space from clog[j] = cumulative log-decay (<=0); every ratio used is
+// causal (gamma_j/gamma_i with j>=i), hence exp(clog_j - clog_i) in (0,1] — no overflow, no 0/0:
+//   G   = kk @ kk^T   [C x C]    (NT)   Aqk = qq @ kk^T  [C x C]   (NT)   (decay-free Grams)
+//   KS0 = kk @ S0^T   [C x Dv]   (NT)   QS0 = qq @ S0^T  [C x Dv]  (NT)   (decay-free state reads)
+//   L[j][i] = beta_j (gamma_j/gamma_i) G[j][i]  (strict lower);  B = beta*(V - gamma_j*KS0)
+//   U   = (I + L)^-1 B               [C x Dv]  (forward-substitution solve, per v-column)
+//   O[t] = gamma_t*QS0[t] + (tril_{j<=t}(gamma_t/gamma_j Aqk) @ U)[t]     (NN, causal incl. diagonal)
+//   S'  = gamma_C*S0 + U'^T @ kk,  U'[j] = (gamma_C/gamma_j) U[j]         (TN carry)
+// fp16 operands / fp32 accumulate. LDS ~62 KB: S(32K fp16) + kk(4K) + 3 reused 8K fp32 regions +
+// small tiles. Block = 8 wave32 warps (256 threads); a warp owns a 16x16 tile, 8 cover [C x Dv], 64
+// the carry.
 #ifndef GDN_WC
 #define GDN_WC 16  // WMMA chunk length == one 16x16 tile dim
 #endif
@@ -395,18 +402,21 @@ __global__ void gdn_prefill_wmma_kernel(
   const int Dk = K, Dv = V;             // both 128 for Qwen3.5/3.6
   const int NTv = Dv / 16;              // v-dim tiles (8)
 
-  // ---- LDS arena (manual reuse; peak ~62 KB at phase A). Each Rn is 8 KB = [16 x 128] fp32. ----
+  // ---- LDS arena (manual reuse; peak ~62 KB). Each Rn is 8 KB = [16 x 128] fp32. ----
+  // Decay is NOT absorbed into the stored operands (that needs k/gamma, which overflows fp16 when the
+  // cumulative decay gamma underflows). Instead kk/qq hold the RAW l2-normed k, scaled q (bounded
+  // ~O(1)); decay enters only as bounded (<=1) fp32 post-scales computed in log space from clog[]
+  // (clog[j] = cumulative log-decay <= 0; gamma_j = exp(clog[j])), so no operand ever overflows.
   __shared__ f16 Sh[GDN_MAX_K * GDN_MAX_K];     // 32 KB  state S [Dv x Dk] row-major (n-major), fp16
-  __shared__ f16 ktil[GDN_WC * GDN_MAX_K];      //  4 KB  k~ = k/gamma            (live thru carry)
-  __shared__ float R1[GDN_WC * GDN_MAX_K];      //  8 KB  kbar(f16)+q~(f16) | then U16(f16) (phases C,D)
-  __shared__ float R2[GDN_WC * GDN_MAX_K];      //  8 KB  KS->B (f32) | then O-accum (f32)
-  __shared__ float R3[GDN_WC * GDN_MAX_K];      //  8 KB  QS (f32, thru phase C) | then carry scratch
-  __shared__ float Mf[GDN_WC * GDN_WC];         //  1 KB  M (f32) -> L (f32) -> Atril(f16) overlay
-  __shared__ float Af[GDN_WC * GDN_WC];         //  1 KB  Atil (f32, thru phase C)
-  __shared__ float gam[GDN_WC], bet[GDN_WC], invk[GDN_WC], invq[GDN_WC];
+  __shared__ f16 kk[GDN_WC * GDN_MAX_K];        //  4 KB  k l2-normed (raw)        (live thru carry)
+  __shared__ float R1[GDN_WC * GDN_MAX_K];      //  8 KB  qq=q*scale (f16, phase A) | U16(f16, ph C,D)
+  __shared__ float R2[GDN_WC * GDN_MAX_K];      //  8 KB  KS0->B (f32) | then O-accum (f32)
+  __shared__ float R3[GDN_WC * GDN_MAX_K];      //  8 KB  QS0 (f32, thru phase C) | then carry scratch
+  __shared__ float Mf[GDN_WC * GDN_WC];         //  1 KB  G=k.k (f32) -> L (f32) -> Atril(f16) overlay
+  __shared__ float Af[GDN_WC * GDN_WC];         //  1 KB  Aqk=q.k (f32, thru phase C)
+  __shared__ float clog[GDN_WC], bet[GDN_WC], invk[GDN_WC], invq[GDN_WC];
   __shared__ float gamC_s;
-  f16* kbar = reinterpret_cast<f16*>(R1);                       // [16x128] f16 during phase A
-  f16* qtil = reinterpret_cast<f16*>(R1) + GDN_WC * GDN_MAX_K;  // [16x128] f16 during phase A
+  f16* qq = reinterpret_cast<f16*>(R1);    // [16x128] f16 during phase A (q l2-normed * scale)
   f16* U16 = reinterpret_cast<f16*>(R1);   // R1 free after phase A -> holds U as fp16 (phases C,D)
 
   // ---- load S from slot (or zero) ----
@@ -444,52 +454,49 @@ __global__ void gdn_prefill_wmma_kernel(
       } else { invk[j] = 0.0f; invq[j] = 0.0f; }
     }
     if (tid == 0) {
-      float acc = 0.0f;
+      float acc = 0.0f;  // cumulative log-decay within the chunk (<= 0, monotone decreasing)
       for (int j = 0; j < L; ++j) {
         const float x = a[(c0 + j) * HV + hv] + dtb;
         acc += -__expf(Alog) * gdn_softplus(x);
-        gam[j] = __expf(acc);
+        clog[j] = acc;
         bet[j] = 1.0f / (1.0f + __expf(-b[(c0 + j) * HV + hv]));
       }
-      for (int j = L; j < GDN_WC; ++j) { gam[j] = 1.0f; bet[j] = 0.0f; }
-      gamC_s = gam[L - 1];
+      for (int j = L; j < GDN_WC; ++j) { clog[j] = (L > 0 ? acc : 0.0f); bet[j] = 0.0f; }
+      gamC_s = __expf(L > 0 ? clog[L - 1] : 0.0f);  // gamma_C = exp(cumulative log-decay over chunk)
     }
     __syncthreads();
-    // build decay-absorbed fp16 operands k~=k/gamma, kbar=gamma*k, q~=gamma*(q*scale)
+    // build RAW fp16 operands: kk = l2norm(k), qq = l2norm(q) * scale (NO decay absorption — decay is
+    // applied later as bounded fp32 scalings, so these stay O(1) and never overflow fp16).
     for (int idx = tid; idx < GDN_WC * Dk; idx += GDN_WTHREADS) {
-      const int j = idx / Dk, kk = idx % Dk;
-      const float g = gam[j];
-      const float nk = rawk[idx] * invk[j];
-      const float nq = rawq[idx] * invq[j];   // invq already folds scale
-      ktil[idx] = (f16)(nk / g);
-      kbar[idx] = (f16)(nk * g);
-      qtil[idx] = (f16)(nq * g);
+      const int j = idx / Dk;
+      kk[idx] = (f16)(rawk[idx] * invk[j]);
+      qq[idx] = (f16)(rawq[idx] * invq[j]);   // invq already folds the q scale
     }
     __syncthreads();
 
-    // ---- phase A: M, Atil (single tile each); KS, QS (8 tiles each) ----  rawk/rawq (R2/R3) freed
+    // ---- phase A (decay-free matmuls): G=k.k, Aqk=q.k (single tile each); KS0=k.S0^T, QS0=q.S0^T
+    // (8 tiles each). rawk/rawq (R2/R3) freed. ----
     {
       const int w = warp;
-      // KS tile w -> R2 ; QS tile w -> R3
-      gdnw::nt_tile(kbar, Dk, 0, Sh, Dk, w * 16, Dk, R2, Dv, 0, w * 16);
-      gdnw::nt_tile(qtil, Dk, 0, Sh, Dk, w * 16, Dk, R3, Dv, 0, w * 16);
-      if (w == 0) gdnw::nt_tile(kbar, Dk, 0, ktil, Dk, 0, Dk, Mf, GDN_WC, 0, 0);
-      if (w == 1) gdnw::nt_tile(qtil, Dk, 0, ktil, Dk, 0, Dk, Af, GDN_WC, 0, 0);
+      gdnw::nt_tile(kk, Dk, 0, Sh, Dk, w * 16, Dk, R2, Dv, 0, w * 16);   // KS0 tile w -> R2
+      gdnw::nt_tile(qq, Dk, 0, Sh, Dk, w * 16, Dk, R3, Dv, 0, w * 16);   // QS0 tile w -> R3
+      if (w == 0) gdnw::nt_tile(kk, Dk, 0, kk, Dk, 0, Dk, Mf, GDN_WC, 0, 0);   // G  = k.k  -> Mf
+      if (w == 1) gdnw::nt_tile(qq, Dk, 0, kk, Dk, 0, Dk, Af, GDN_WC, 0, 0);   // Aqk = q.k  -> Af
     }
     __syncthreads();
-    float* KS = R2;   // [16x128]
-    float* QS = R3;   // [16x128]
+    float* KS0 = R2;   // [16x128]
+    float* QS0 = R3;   // [16x128]
 
-    // ---- phase B: B = beta*(V - KS) in-place into R2; L = tril(beta*M,-1) into Mf; solve U ----
+    // ---- phase B: B = beta*(V - gamma_j*KS0) in-place into R2; L = tril(beta*(gamma_j/gamma_i)*G,-1)
+    // into Mf; solve U. Decay ratios via exp(clog diff) (<=1, log-space => stable). ----
     for (int idx = tid; idx < GDN_WC * Dv; idx += GDN_WTHREADS) {
       const int j = idx / Dv, nn = idx % Dv;
-      if (j < L) KS[idx] = bet[j] * (v[((c0 + j) * HV + hv) * Dv + nn] - KS[idx]);
-      else KS[idx] = 0.0f;
+      if (j < L) KS0[idx] = bet[j] * (v[((c0 + j) * HV + hv) * Dv + nn] - __expf(clog[j]) * KS0[idx]);
+      else KS0[idx] = 0.0f;
     }
-    // L = strictly-lower(beta*M); overwrite Mf
     for (int idx = tid; idx < GDN_WC * GDN_WC; idx += GDN_WTHREADS) {
-      const int j = idx / GDN_WC, i = idx % GDN_WC;
-      Mf[idx] = (i < j) ? bet[j] * Mf[idx] : 0.0f;
+      const int j = idx / GDN_WC, i = idx % GDN_WC;       // L[j][i] = beta_j (gamma_j/gamma_i) G[j][i]
+      Mf[idx] = (i < j) ? bet[j] * __expf(clog[j] - clog[i]) * Mf[idx] : 0.0f;
     }
     __syncthreads();
     // forward-substitution solve: thread nn<Dv owns column nn of U; result -> U16 (fp16, in R1).
@@ -498,7 +505,7 @@ __global__ void gdn_prefill_wmma_kernel(
       const int nn = tid;
       float u[GDN_WC];
       for (int j = 0; j < GDN_WC; ++j) {
-        float s = KS[j * Dv + nn];              // B[j][nn]
+        float s = KS0[j * Dv + nn];             // B[j][nn]
         for (int i = 0; i < j; ++i) s -= Mf[j * GDN_WC + i] * u[i];
         u[j] = s;
         U16[j * Dv + nn] = (f16)s;
@@ -506,32 +513,40 @@ __global__ void gdn_prefill_wmma_kernel(
     }
     __syncthreads();
 
-    // ---- phase C: Atril (fp16, mask j<=t) overlaid in Mf; O = QS + tril(Atil)@U -> out ----
+    // ---- phase C: Atril[t][j] = (j<=t)(gamma_t/gamma_j) Aqk[t][j] (fp16, in Mf); O = gamma_t*QS0 +
+    // tril(Atil)@U -> out ----
     f16* Atril = reinterpret_cast<f16*>(Mf);   // 16x16 f16 (512 B) fits in Mf (1 KB)
     for (int idx = tid; idx < GDN_WC * GDN_WC; idx += GDN_WTHREADS) {
       const int t = idx / GDN_WC, j = idx % GDN_WC;
-      Atril[idx] = (j <= t) ? (f16)Af[idx] : (f16)0.0f;
+      Atril[idx] = (j <= t) ? (f16)(__expf(clog[t] - clog[j]) * Af[idx]) : (f16)0.0f;
     }
     __syncthreads();
-    float* Ofull = R2;   // KS/B no longer needed -> reuse R2 for O accumulation
+    float* Ofull = R2;   // KS0/B no longer needed -> reuse R2 for O accumulation
     gdnw::nn_tile(Atril, GDN_WC, 0, U16, Dv, warp * 16, GDN_WC, Ofull, Dv, 0, warp * 16);
     __syncthreads();
     for (int idx = tid; idx < L * Dv; idx += GDN_WTHREADS) {
       const int j = idx / Dv, nn = idx % Dv;
-      out[((c0 + j) * HV + hv) * Dv + nn] = Ofull[idx] + QS[idx];
+      out[((c0 + j) * HV + hv) * Dv + nn] = __expf(clog[j]) * QS0[idx] + Ofull[idx];
     }
     __syncthreads();
 
-    // ---- phase D: S' = gamma_C * (S0 + U^T @ k~) ; 64 tiles over (Dv x Dk), 8 per warp ----
+    // ---- phase D carry: S' = gamma_C*S0 + U'^T @ k, with U'[j] = (gamma_C/gamma_j) U[j] folded into
+    // U16 (bounded <=U, stays fp16-safe). 64 tiles over (Dv x Dk), 8 per warp. ----
     const float gamC = gamC_s;
-    float* scr = R3 + warp * 256;   // per-warp 16x16 fp32 scratch (R3 = 8 KB = 8*256*4); QS dead
+    const float clogC = clog[L > 0 ? L - 1 : 0];
+    for (int idx = tid; idx < GDN_WC * Dv; idx += GDN_WTHREADS) {   // U16[j] *= gamma_C/gamma_j
+      const int j = idx / Dv;
+      U16[idx] = (f16)(__expf(clogC - clog[j]) * (float)U16[idx]);
+    }
+    __syncthreads();
+    float* scr = R3 + warp * 256;   // per-warp 16x16 fp32 scratch (R3 = 8 KB = 8*256*4); QS0 dead
     for (int ti = warp; ti < NTv * (Dk / 16); ti += GDN_WNWARP) {
       const int rt = ti / (Dk / 16), ct = ti % (Dk / 16);   // rt over Dv, ct over Dk
-      gdnw::tn_tile(U16, Dv, rt * 16, ktil, Dk, ct * 16, GDN_WC, scr);
+      gdnw::tn_tile(U16, Dv, rt * 16, kk, Dk, ct * 16, GDN_WC, scr);
       for (int e = lane; e < 256; e += 32) {
         const int rr = e >> 4, cc = e & 15;
-        const int nn = rt * 16 + rr, kk = ct * 16 + cc;
-        Sh[nn * Dk + kk] = (f16)(gamC * ((float)Sh[nn * Dk + kk] + scr[e]));
+        const int nn = rt * 16 + rr, kc = ct * 16 + cc;
+        Sh[nn * Dk + kc] = (f16)(gamC * (float)Sh[nn * Dk + kc] + scr[e]);
       }
     }
     __syncthreads();
