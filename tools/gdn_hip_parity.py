@@ -125,6 +125,36 @@ def check_prefill() -> bool:
     return ok
 
 
+def check_prefill_chunked() -> bool:
+    """Chunked prefill vs the recurrent kernel (the validated oracle), on sequences spanning several
+    GDN_CHUNK=32 chunks + a partial final chunk. Mild decay (A_log~-2) so gamma doesn't underflow —
+    the regime where the chunked ratio formulation and the recurrent step form are comparable."""
+    lens = [40, 70]  # 40 = 1.25 chunks; 70 = 2.19 chunks
+    N, T = len(lens), sum(lens)
+    num_slots = 6
+    cu = torch.tensor([0, 40, 110], dtype=torch.int32, device=DEV)
+    q = torch.randn(T, H, K, device=DEV)
+    k = torch.randn(T, H, K, device=DEV)
+    v = torch.randn(T, HV, V, device=DEV)
+    a = torch.randn(T, HV, device=DEV)
+    b = torch.randn(T, HV, device=DEV)
+    A_log = torch.randn(HV, device=DEV) * 0.5 - 2.0  # exp(A_log)~0.05-0.3 -> mild per-token decay
+    dt_bias = torch.randn(HV, device=DEV)
+    state = torch.randn(num_slots, HV, V, K, device=DEV)
+    idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
+    has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+
+    st_ref = state.clone()
+    out_ref = torch.ops.gdn_hip.gdn_prefill(q, k, v, a, b, A_log, dt_bias, cu, idx, has_init,
+                                            st_ref, SCALE, 1)
+    st_ch = state.clone()
+    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(q, k, v, a, b, A_log, dt_bias, cu, idx, has_init,
+                                                   st_ch, SCALE, 1)
+    ok = _report("prefill_chunked.out (vs recurrent)", out_ch, out_ref, tol=5e-3)
+    ok &= _report("prefill_chunked.state", st_ch[idx], st_ref[idx], tol=5e-3)
+    return ok
+
+
 def check_conv_update() -> bool:
     B, C, W = 4, 256, 4
     num_slots = 6
@@ -203,6 +233,7 @@ def main() -> None:
     results = {
         "gdn_decode": check_decode(),
         "gdn_prefill": check_prefill(),
+        "gdn_prefill_chunked": check_prefill_chunked(),
         "causal_conv1d_update": check_conv_update(),
         "causal_conv1d_fwd": check_conv_fwd(),
         "rmsnorm_gated": check_rmsnorm_gated(),
