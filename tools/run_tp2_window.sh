@@ -33,7 +33,7 @@ docker run --rm \
   -v "$PWD":/engine \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/triton-ro:ro \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
-  -e PYTHONPATH=/engine/python \
+  -e PYTHONPATH=/engine/python:/engine \
   --entrypoint bash vllm22-w4a8:combined -lc '
     set -e
     source /app/.venv/bin/activate
@@ -41,6 +41,10 @@ docker run --rm \
     mkdir -p /root/.triton && cp -a /triton-ro/. /root/.triton/ 2>/dev/null || true
     echo "[setup] installing server deps ..."
     pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil
+    echo "[setup] building gdn_hip HIP kernels (the GDN forward now imports torch.ops.gdn_hip) ..."
+    ( cd /engine/gdn_hip && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace >/tmp/gdn_build.log 2>&1 \
+      && python -c "import gdn_hip; print(\"  gdn_hip loaded OK\")" ) \
+      || { echo "[setup] gdn_hip build/load FAILED:"; tail -25 /tmp/gdn_build.log; exit 1; }
     echo "[setup] rocm devices visible to torch:"
     python -c "import torch; print(\"  cuda.is_available=\", torch.cuda.is_available(), \"device_count=\", torch.cuda.device_count())"
     python /engine/tools/tp_serve_probe.py '"$PROBE_ARGS"'
