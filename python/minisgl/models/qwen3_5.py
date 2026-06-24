@@ -37,7 +37,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
 )
 from minisgl.quant import create_linear_method
-from minisgl.utils import nvtx_annotate
+from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
 from .utils import GatedMLP as Qwen3MLP
@@ -85,7 +85,10 @@ class Qwen3_5Attn(BaseOP):
             head_dim * nqo, config.hidden_size, has_bias=False, quant_method=qm
         )
         self._head_dim = head_dim
-        self._num_qo_heads = nqo
+        # LOCAL qo-head count: q_proj is column-parallel, so under TP each rank emits nqo/tp heads
+        # (q+gate). The forward reshape MUST use the local count, not the full nqo. (This TP path
+        # was masked until the GDN compile stall was removed — Phase 4 / gdn_hip.)
+        self._num_qo_heads = div_even(nqo, get_tp_info().size)
 
     @nvtx_annotate("MHA_gated")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
