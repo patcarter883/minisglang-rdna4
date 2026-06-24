@@ -114,7 +114,9 @@ def run_config(cfg: dict) -> dict:
               "error": None, "load_secs": None, "generations": []}
     t0 = time.time()
     logf = open(logpath, "wb")
-    env = {**os.environ, "PYTHONPATH": "/engine/python"}
+    # /engine on the path too, so the GDN forward's `import gdn_hip` resolves (the HIP GDN op pkg
+    # lives at /engine/gdn_hip, not under /engine/python).
+    env = {**os.environ, "PYTHONPATH": "/engine/python:/engine"}
     proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
                             start_new_session=True, env=env)
     try:
