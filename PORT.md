@@ -583,7 +583,22 @@ the autotuner, and TP.
 | ★ | GATE: re-decide 35B GDN port | — |
 | 3 | GDN hybrid: 3a state cache **done** → 3b layer numerics **done** → 3c scheduler/slot/metadata/warmup **done 2026-06-20** → 3d-0 config+ctx **done** → 3d-1 model+rotary+register **done** → 3d-2 engine wiring **done 2026-06-21** → 3d-3 weight map **CPU-verified 2026-06-21** → 3d-4 serve **DONE 2026-06-21** (coherent, greedy token-diff vs vLLM PASS; RMSNorm (1+w) fix) | **3d DONE ✅** |
 | 3M | 35B GDN-hybrid MoE (Qwen3.6-35B-A3B-AWQ) model code: 3M-0 config → 3M-1 model+register → 3M-2 AWQ expert convert (max\|Δ\|=0) → 3M-3 loader+weight map (753↔753 bijection) **DONE 2026-06-22 (CPU-verified)**; serve gated on TP=2 | **3M model code DONE ✅** |
-| 4 | RCCL TP=2 (plan 2026-06-22): **4-1a/4-1b/4-2 DONE 2026-06-22 (CPU-verified)** — GDN+MoE TP weight sharding (4B+35B exact bijection+tiling at TP=2) + GDN/KV state TP sizing; remaining 4-0/4-3/4-4 need GPU. **Unblocks 35B serve (3M)** | CPU code DONE; GPU serve pending |
+| 4 | RCCL TP=2: 4-1a/4-1b/4-2 CPU-verified 2026-06-22 → **4-0/4-3/4-4 SERVE DONE 2026-06-24**: dense+4B+**35B all boot+generate at TP=2**. Path needed a native-HIP GDN (gdn_hip, killed the Triton compile stall) + `--dtype auto` fix + full-attn local-head reshape fix | **TP=2 SERVE DONE ✅** |
+| gdn_hip | Native HIP GDN kernels (no Triton): AOT-built gfx1201, parity vs fla ALL PASS (max\|Δ\|~1e-7), wired into gdn/layer.py, **serves 4B TP1/TP2 + 35B TP2 coherent 2026-06-24**. Shared standalone pkg (vLLM hand-off prompt written). TODO: delete Triton GDN tree; chunked-HIP prefill | **HIP GDN serving ✅** |
+
+## ★ 35B TP=2 SERVE REACHED 2026-06-24 — Qwen3.6-35B-A3B-AWQ on 2× gfx1201
+
+The GDN-hybrid MoE 35B **boots and generates across both RX 9070 cards** (`--tp-size 2
+--disable-pynccl`), coherent + correct ("capital of France → Paris", "2+2 → 4", "primary colors →
+red, blue, yellow"), load 69s, first token 15.9s / steady 2.1s. Full stack working together:
+**native-HIP GDN** (`gdn_hip`, zero Triton compile) + **RCCL TP=2** (torch.distributed) + **W4A8 AWQ
+MoE experts** + per-rank GDN/KV state + vocab-parallel head. 4B GDN serves at TP=1 *and* TP=2 (the
+case that previously stalled on cold Triton GDN compile — `gdn_hip` removed it). 4B TP1↔TP2 greedy
+parity 2/4 exact / 77% mean prefix ("PASS not bit-identical": all-reduce float ordering + fp32 GDN
+state). The five blockers, in order found: RCCL bringup → `--dtype auto` for GDN configs (`34c608d`)
+→ GDN TP weight sharding + state sizing (`a86426a`,`3a76a4f`) → Triton GDN compile cliff → native HIP
+(`gdn_hip`, `3642403`) → full-attn local-head reshape under TP (`26e9c4f`). Remaining: delete the
+(now unused) Triton GDN tree; 35B-vs-vLLM token parity; chunked-HIP prefill for long-context speed.
 
 ## Phase 4 — RCCL TP=2 plan (drafted 2026-06-22)
 
