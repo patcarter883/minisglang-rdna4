@@ -29,13 +29,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from minisgl.gdn.fla.ops import (
-    RMSNormGated,
-    chunk_gated_delta_rule,
-    fused_post_conv_prep,
-    fused_sigmoid_gating_delta_rule_update,
-)
-from minisgl.gdn.mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+# RMSNormGated is kept ONLY as the norm-weight container (its .weight / .eps); its Triton forward is
+# never called — the gated norm runs through torch.ops.gdn_hip.rmsnorm_gated. The GDN compute kernels
+# (conv, gated-delta-rule prefill/decode) are now native HIP (gdn_hip), AOT-compiled, no Triton JIT.
+from minisgl.gdn.fla.ops import RMSNormGated
 
 
 class QwenGatedDeltaNet(nn.Module):
@@ -122,15 +119,25 @@ class QwenGatedDeltaNet(nn.Module):
     def _conv_weights(self) -> torch.Tensor:
         return self.conv1d_weight.view(self.conv_dim, self.conv_kernel_size)
 
-    # ---- output projection: RMSNormGated(core, z) -> flatten -> out_proj ----
+    def _split_conv_qkv(self, conv_out: torch.Tensor, n: int):
+        """Split the conv output [n, conv_dim] = [q|k|v] into q,k [n, num_k_heads, head_k_dim] and
+        v [n, num_v_heads, head_v_dim] — the layout gdn_hip's recurrent kernels consume."""
+        q, k, v = conv_out.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(n, self.num_k_heads, self.head_k_dim).contiguous()
+        k = k.reshape(n, self.num_k_heads, self.head_k_dim).contiguous()
+        v = v.reshape(n, self.num_v_heads, self.head_v_dim).contiguous()
+        return q, k, v
+
+    # ---- output projection: rmsnorm_gated(core, z) -> flatten -> out_proj ----
     def _output_projection(self, core_attn_out: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
-        z_shape_og = z.shape
-        core = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core = self.norm(core, z)
-        core = core.reshape(z_shape_og)
-        core = core.flatten(-2)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
-        return self.out_proj(core)
+        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+
+        out_dtype = self.out_proj.weight.dtype
+        core = core_attn_out.reshape(-1, core_attn_out.shape[-1]).float()  # [n*HV, head_v_dim]
+        z_flat = z.reshape(-1, z.shape[-1]).float()
+        normed = gdn.rmsnorm_gated(core, z_flat, self.norm.weight.float(), self.norm.eps)
+        normed = normed.reshape(n, self.value_dim)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
+        return self.out_proj(normed.to(out_dtype))
 
     # ---- prefill: chunk-scan over the full sequence, writes final SSM state ----
     def forward_prefill(
@@ -143,56 +150,34 @@ class QwenGatedDeltaNet(nn.Module):
         has_initial_state: torch.Tensor,  # bool per sequence
         conv_metadata=None,  # GDN conv metadata (nums_dict/batch_ptr/token_chunk_offset_ptr)
     ) -> torch.Tensor:
+        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
 
-        # `mixed_qkv` is a `.split()` VIEW into the wider qkvz (token-stride = qkvz_dim).
-        # causal_conv1d_fn handles that non-unit token-stride correctly (verified vs a CPU
-        # reference conv at slot>=1: gapped split-view == contiguous, rel ~7e-3 bf16), so no
-        # explicit .contiguous() is needed here — the reference passes the analogous view too.
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv.transpose(0, 1),
-            self._conv_weights(),
-            self.conv1d_bias,
-            activation=self.activation,
-            conv_states=conv_state,
-            has_initial_state=has_initial_state,
-            cache_indices=state_indices,
-            query_start_loc=query_start_loc,
-            metadata=conv_metadata,  # precomputed nums_dict/batch_ptr/token_chunk_offset_ptr
-        ).transpose(0, 1)
-
-        q, k, v, g, beta = fused_post_conv_prep(
-            conv_output=mixed_qkv,
-            a=a,
-            b=b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            num_k_heads=self.num_k_heads,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            apply_l2norm=True,
-            output_g_exp=False,
+        # Depthwise causal conv (varlen) + SiLU; conv_state (fp32) updated in place per slot. The HIP
+        # kernel takes token-major [T, conv_dim] contiguous (vs the Triton path's transposed view).
+        conv_out = gdn.causal_conv1d_fwd(
+            mixed_qkv.float().contiguous(),
+            self._conv_weights().float(),
+            None,  # bias-free
+            query_start_loc,
+            state_indices.long(),
+            has_initial_state.to(torch.uint8),
+            conv_state,
+            1,  # SiLU
         )
-        q, k, v, g, beta = (t.unsqueeze(0) for t in (q, k, v, g, beta))
-
-        initial_state = ssm_state[state_indices].contiguous()
-        initial_state[~has_initial_state, ...] = 0
-        core_attn_out, last_state = chunk_gated_delta_rule(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=False,  # l2norm already applied in fused_post_conv_prep
-        )
-        ssm_state[state_indices] = last_state.to(ssm_state.dtype)
-        return self._output_projection(core_attn_out.squeeze(0), z, n)
+        # Recurrent gated-delta-rule: l2norm(q,k) + g/beta from (a,b,A_log,dt_bias) are folded INTO
+        # the kernel (replacing fused_post_conv_prep + chunk_gated_delta_rule). State written in place.
+        q, k, v = self._split_conv_qkv(conv_out, n)
+        core = gdn.gdn_prefill(
+            q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
+            query_start_loc, state_indices.long(), has_initial_state.to(torch.uint8),
+            ssm_state, self.head_k_dim ** -0.5, 1,
+        )  # [T, num_v_heads, head_v_dim] fp32
+        return self._output_projection(core, z, n)
 
     # ---- decode: single-step recurrent update per sequence, advances state in place ----
     def forward_decode(
@@ -203,74 +188,34 @@ class QwenGatedDeltaNet(nn.Module):
         query_start_loc: torch.Tensor,  # int32 (num_decodes+1,)
         state_indices: torch.Tensor,  # slot id per sequence, int32
     ) -> torch.Tensor:
+        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
 
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
+        # One-step depthwise causal conv update (state roll) + SiLU; conv_state (fp32) in place.
+        conv_out = gdn.causal_conv1d_update(
+            mixed_qkv.float().contiguous(),
+            self._conv_weights().float(),
+            None,  # bias-free
             conv_state,
-            self._conv_weights(),
-            self.conv1d_bias,
-            self.activation,
-            conv_state_indices=state_indices,
-            validate_data=True,
+            state_indices.long(),
+            1,  # SiLU
         )
-        q, k, v = self._rearrange_mixed_qkv(mixed_qkv, n)
+        # One-step gated-delta-rule (l2norm + g/beta folded in); ssm_state updated in place per slot.
+        q, k, v = self._split_conv_qkv(conv_out, n)
+        core = gdn.gdn_decode(
+            q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
+            ssm_state, state_indices.long(), self.head_k_dim ** -0.5, 1,
+        )  # [B, num_v_heads, head_v_dim] fp32
+        return self._output_projection(core, z, n)
 
-        core_attn_out, _ = fused_sigmoid_gating_delta_rule_update(
-            A_log=self.A_log,
-            a=a,
-            b=b,
-            dt_bias=self.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            initial_state=ssm_state,
-            inplace_final_state=True,
-            cu_seqlens=query_start_loc,
-            ssm_state_indices=state_indices,
-            use_qk_l2norm_in_kernel=True,
-        )
-        return self._output_projection(core_attn_out.squeeze(0), z, n)
-
-    # ---- 3c-3: warmup hook — settle causal_conv1d_fn's in-place autotune ----
+    # ---- warmup hook — no-op now that the conv is AOT HIP (no Triton autotune to settle) ----
     @torch.no_grad()
     def warmup_conv(self, num_tokens: int, *, iters: int = 2) -> None:
-        """Run the prefill conv on a THROWAWAY buffer before the first REAL batch.
-
-        ``causal_conv1d_fn`` autotunes on its first call by benchmarking candidate configs
-        IN PLACE on the live conv buffer; an unwarmed first prefill is op-sequence-sensitive
-        (3b-3 saw NaN/0, and it can OOM). A single warm forward was proven insufficient — the
-        GEMM-free multi-call regime (default 2 iters) is what settled it. This is GEMM-free
-        (no in_proj, so no hipBLASLt OOM risk) and writes only a private 2-slot scratch (slot
-        1; slot 0 would be skipped as the NULL block), so NO real sequence state is touched.
-
-        Per-process: the in-place batch_ptr autotune is not in Triton's on-disk JIT cache, so
-        this must run once per engine process (mounting a warm Triton cache does NOT cover it).
-        """
-        device = self.conv1d_weight.device
-        dtype = self.conv1d_weight.dtype
-        weight = self._conv_weights()
-        query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
-        cache_indices = torch.tensor([1], dtype=torch.int32, device=device)  # never slot 0
-        has_initial_state = torch.tensor([False], device=device)
-        scratch = torch.zeros(2, self.conv_dim, self.conv_kernel_size - 1, dtype=dtype, device=device)
-        for _ in range(iters):
-            x = torch.randn(num_tokens, self.conv_dim, dtype=dtype, device=device).transpose(0, 1)
-            causal_conv1d_fn(
-                x, weight, self.conv1d_bias, activation=self.activation,
-                conv_states=scratch, has_initial_state=has_initial_state,
-                cache_indices=cache_indices, query_start_loc=query_start_loc, metadata=None,
-            )
-
-    def _rearrange_mixed_qkv(self, mixed_qkv: torch.Tensor, seq_len: int):
-        """Split packed [.., 2*key_dim + value_dim] into (1, seq, heads, dim) q/k/v."""
-        q_dim = k_dim = self.key_dim
-        v_dim = self.value_dim
-        query, key, value = mixed_qkv.split([q_dim, k_dim, v_dim], dim=-1)
-        query = query.reshape(1, seq_len, -1, self.head_k_dim).contiguous()
-        key = key.reshape(1, seq_len, -1, self.head_k_dim).contiguous()
-        value = value.reshape(1, seq_len, -1, self.head_v_dim).contiguous()
-        return query, key, value
+        """The Triton causal_conv1d_fn autotuned in place on its first call (NaN/0/OOM risk), so it
+        had to be warmed per process. gdn_hip's conv is AOT-compiled HIP — no JIT, no autotune —
+        so there is nothing to warm. Kept as a no-op for engine API compatibility."""
+        return
