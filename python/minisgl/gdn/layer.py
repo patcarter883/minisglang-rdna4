@@ -26,6 +26,8 @@ re-verified against the live RDNA4 path in 3b-3.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -169,14 +171,19 @@ class QwenGatedDeltaNet(nn.Module):
             conv_state,
             1,  # SiLU
         )
-        # Recurrent gated-delta-rule: l2norm(q,k) + g/beta from (a,b,A_log,dt_bias) folded INTO the
+        # Gated-delta-rule prefill: l2norm(q,k) + g/beta from (a,b,A_log,dt_bias) folded INTO the
         # kernel (replacing fused_post_conv_prep + chunk_gated_delta_rule). State written in place.
-        # NOTE: gdn_prefill_chunked is numerically equal (max|Δ|~1e-7) but ~4x SLOWER as a scalar
-        # per-row kernel (benchmark: tools/gdn_hip_bench.py) — the chunked throughput win needs a
-        # WMMA/matrix-core formulation of the intra-chunk matmuls, which is future work. Until then
-        # the recurrent kernel is the serve path.
+        # Two validated kernels (tools/gdn_hip_parity.py, both vs the recurrent oracle):
+        #   - gdn_prefill_wmma (DEFAULT): matrix-core chunked, 5-6.7x FASTER than recurrent at
+        #     T=256..16384 (tools/gdn_hip_bench.py); fp16 matmul operands -> max|Δ|~1e-3 vs recurrent.
+        #   - gdn_prefill (recurrent): the per-token fp32 reference; exact but slow. Fallback via
+        #     GDN_HIP_WMMA_PREFILL=0 (e.g. if a real-decay regime stresses the fp16 absorption).
+        # (gdn_prefill_chunked, the scalar chunked op, is kept only as a parity oracle — it was ~4x
+        # SLOWER than recurrent, which is why the WMMA reformulation exists.)
         q, k, v = self._split_conv_qkv(conv_out, n)
-        core = gdn.gdn_prefill(
+        prefill_op = gdn.gdn_prefill if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0" \
+            else gdn.gdn_prefill_wmma
+        core = prefill_op(
             q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
             query_start_loc, state_indices.long(), has_initial_state.to(torch.uint8),
             ssm_state, self.head_k_dim ** -0.5, 1,

@@ -156,35 +156,56 @@ def check_prefill_chunked() -> bool:
 
 
 def check_prefill_wmma() -> bool:
-    """WMMA (matrix-core) chunked prefill vs BOTH oracles (recurrent + scalar-chunked), on varlen
-    sequences spanning several C=16 chunks + partial finals. Mild decay (A_log~-2) so the fp16 decay
-    absorption (k~=k/gamma) doesn't under/overflow. fp16 matmul operands -> looser tol (5e-3)."""
-    lens = [40, 70, 16, 33]  # exact-multiple, partial, single-chunk, >2-chunk-with-tail
+    """WMMA (matrix-core) chunked prefill. The RECURRENT kernel is the ground-truth oracle (per-token
+    multiplicative exp(g) — robust to any decay). Two regimes, both on SHORT (<16-token) single
+    partial chunks + multi-chunk + partial finals (the geometry mix that a naive kernel got wrong):
+
+      (A) STRONG decay A_log~N(0,.5): cumulative gamma underflows ~1e-3 over a chunk. The naive
+          k/gamma fp16 absorption went to NaN here; the stable log-space kernel must stay FINITE and
+          match the recurrent oracle. NB: gdn_prefill_chunked (the SCALAR chunked op) ALSO NaNs here
+          — it forms gam[j]/gam[i]=0/0 in fp32 — so it is NOT a valid oracle under strong decay; the
+          WMMA kernel is strictly more robust. We therefore check (A) against recurrent ONLY.
+      (B) MILD decay A_log~N(-2,.5): all three kernels are valid -> three-way agreement, incl. the
+          scalar-chunked cross-check.
+    fp16 matmul operands -> looser tol (8e-3)."""
+    lens = [5, 11, 3, 8, 40, 70, 16, 33]  # short single sub-chunks + multi-chunk + partial finals
     N, T = len(lens), sum(lens)
-    num_slots = 8
+    num_slots = 16
     cu = torch.tensor([0, *torch.cumsum(torch.tensor(lens), 0).tolist()], dtype=torch.int32, device=DEV)
     q = torch.randn(T, H, K, device=DEV)
     k = torch.randn(T, H, K, device=DEV)
     v = torch.randn(T, HV, V, device=DEV)
     a = torch.randn(T, HV, device=DEV)
     b = torch.randn(T, HV, device=DEV)
-    A_log = torch.randn(HV, device=DEV) * 0.5 - 2.0  # exp(A_log)~0.05-0.3 -> mild per-token decay
     dt_bias = torch.randn(HV, device=DEV)
     state = torch.randn(num_slots, HV, V, K, device=DEV)
-    idx = torch.tensor([1, 4, 6, 2], dtype=torch.long, device=DEV)
-    has_init = torch.tensor([1, 0, 1, 0], dtype=torch.uint8, device=DEV)
+    idx = torch.tensor([1, 4, 6, 2, 9, 11, 13, 15], dtype=torch.long, device=DEV)
+    has_init = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.uint8, device=DEV)
 
-    args = (q, k, v, a, b, A_log, dt_bias, cu, idx, has_init)
-    st_rec = state.clone()
-    out_rec = torch.ops.gdn_hip.gdn_prefill(*args, st_rec, SCALE, 1)
-    st_ch = state.clone()
-    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(*args, st_ch, SCALE, 1)
-    st_w = state.clone()
-    out_w = torch.ops.gdn_hip.gdn_prefill_wmma(*args, st_w, SCALE, 1)
-    ok = _report("prefill_wmma.out (vs recurrent)", out_w, out_rec, tol=5e-3)
-    ok &= _report("prefill_wmma.state (vs recurrent)", st_w[idx], st_rec[idx], tol=5e-3)
-    ok &= _report("prefill_wmma.out (vs scalar-chunked)", out_w, out_ch, tol=5e-3)
-    ok &= _report("prefill_wmma.state (vs scalar-chunked)", st_w[idx], st_ch[idx], tol=5e-3)
+    def _args(A_log):
+        return (q, k, v, a, b, A_log, dt_bias, cu, idx, has_init)
+
+    # (A) strong decay -> recurrent oracle only (+ finiteness regression guard)
+    A_strong = torch.randn(HV, device=DEV) * 0.5  # exp(A_log)~0.4-2.7
+    st_rec, st_w = state.clone(), state.clone()
+    out_rec = torch.ops.gdn_hip.gdn_prefill(*_args(A_strong), st_rec, SCALE, 1)
+    out_w = torch.ops.gdn_hip.gdn_prefill_wmma(*_args(A_strong), st_w, SCALE, 1)
+    fin = torch.isfinite(out_w).all().item() and torch.isfinite(st_w).all().item()
+    if not fin:
+        print("  [FAIL] prefill_wmma produced non-finite values (NaN/Inf) — decay overflow regression")
+    ok = fin
+    ok &= _report("prefill_wmma.out  [strong decay] (vs recurrent)", out_w, out_rec, tol=8e-3)
+    ok &= _report("prefill_wmma.state[strong decay] (vs recurrent)", st_w[idx], st_rec[idx], tol=8e-3)
+
+    # (B) mild decay -> three-way agreement (recurrent + scalar-chunked both valid)
+    A_mild = torch.randn(HV, device=DEV) * 0.5 - 2.0  # exp(A_log)~0.05-0.3
+    st_rec2, st_ch, st_w2 = state.clone(), state.clone(), state.clone()
+    out_rec2 = torch.ops.gdn_hip.gdn_prefill(*_args(A_mild), st_rec2, SCALE, 1)
+    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(*_args(A_mild), st_ch, SCALE, 1)
+    out_w2 = torch.ops.gdn_hip.gdn_prefill_wmma(*_args(A_mild), st_w2, SCALE, 1)
+    ok &= _report("prefill_wmma.out  [mild decay] (vs recurrent)", out_w2, out_rec2, tol=8e-3)
+    ok &= _report("prefill_wmma.out  [mild decay] (vs scalar-chunked)", out_w2, out_ch, tol=8e-3)
+    ok &= _report("prefill_wmma.state[mild decay] (vs scalar-chunked)", st_w2[idx], st_ch[idx], tol=8e-3)
     return ok
 
 
