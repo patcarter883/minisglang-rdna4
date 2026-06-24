@@ -27,3 +27,16 @@ for (M, K, N) in [(16, 16, 16), (64, 64, 64), (128, 128, 128), (16, 128, 16), (1
     Atn = torch.randn(K, M, device="cuda", dtype=torch.float16)  # [K,M]
     _chk(f"TN {M}x{K}x{N} (A^T@B)", torch.ops.wmma_probe.gemm_tn(Atn, B), Atn.float().T @ B.float())
 print("rocWMMA GEMM toolkit (NN/NT/TN) done — the matmul primitives for the chunked kernel.")
+
+# Triangular solve U = (I + L)^-1 B (the one non-matmul piece of the chunked GDN prefill). L is
+# strictly-lower CxC (unit diagonal implied), B is CxN. Validate vs torch.linalg.solve_triangular.
+print("\n--- tri_solve U = (I + tril(.,-1))^-1 B (forward substitution) ---")
+for (C, N) in [(16, 128), (16, 16), (8, 128), (16, 1)]:
+    Lraw = torch.randn(C, C, device="cuda", dtype=torch.float32)
+    L = torch.tril(Lraw, diagonal=-1)            # strict lower; diagonal ignored by the kernel
+    B = torch.randn(C, N, device="cuda", dtype=torch.float32)
+    got = torch.ops.wmma_probe.tri_solve(L, B)
+    ref = torch.linalg.solve_triangular(L + torch.eye(C, device="cuda"), B, upper=False,
+                                        unitriangular=True)
+    _chk(f"tri_solve C={C} N={N}", got, ref)
+print("tri_solve done — forward-substitution solver for the U = (I+L)^-1 B step.")

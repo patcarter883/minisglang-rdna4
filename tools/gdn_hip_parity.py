@@ -155,6 +155,39 @@ def check_prefill_chunked() -> bool:
     return ok
 
 
+def check_prefill_wmma() -> bool:
+    """WMMA (matrix-core) chunked prefill vs BOTH oracles (recurrent + scalar-chunked), on varlen
+    sequences spanning several C=16 chunks + partial finals. Mild decay (A_log~-2) so the fp16 decay
+    absorption (k~=k/gamma) doesn't under/overflow. fp16 matmul operands -> looser tol (5e-3)."""
+    lens = [40, 70, 16, 33]  # exact-multiple, partial, single-chunk, >2-chunk-with-tail
+    N, T = len(lens), sum(lens)
+    num_slots = 8
+    cu = torch.tensor([0, *torch.cumsum(torch.tensor(lens), 0).tolist()], dtype=torch.int32, device=DEV)
+    q = torch.randn(T, H, K, device=DEV)
+    k = torch.randn(T, H, K, device=DEV)
+    v = torch.randn(T, HV, V, device=DEV)
+    a = torch.randn(T, HV, device=DEV)
+    b = torch.randn(T, HV, device=DEV)
+    A_log = torch.randn(HV, device=DEV) * 0.5 - 2.0  # exp(A_log)~0.05-0.3 -> mild per-token decay
+    dt_bias = torch.randn(HV, device=DEV)
+    state = torch.randn(num_slots, HV, V, K, device=DEV)
+    idx = torch.tensor([1, 4, 6, 2], dtype=torch.long, device=DEV)
+    has_init = torch.tensor([1, 0, 1, 0], dtype=torch.uint8, device=DEV)
+
+    args = (q, k, v, a, b, A_log, dt_bias, cu, idx, has_init)
+    st_rec = state.clone()
+    out_rec = torch.ops.gdn_hip.gdn_prefill(*args, st_rec, SCALE, 1)
+    st_ch = state.clone()
+    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(*args, st_ch, SCALE, 1)
+    st_w = state.clone()
+    out_w = torch.ops.gdn_hip.gdn_prefill_wmma(*args, st_w, SCALE, 1)
+    ok = _report("prefill_wmma.out (vs recurrent)", out_w, out_rec, tol=5e-3)
+    ok &= _report("prefill_wmma.state (vs recurrent)", st_w[idx], st_rec[idx], tol=5e-3)
+    ok &= _report("prefill_wmma.out (vs scalar-chunked)", out_w, out_ch, tol=5e-3)
+    ok &= _report("prefill_wmma.state (vs scalar-chunked)", st_w[idx], st_ch[idx], tol=5e-3)
+    return ok
+
+
 def check_conv_update() -> bool:
     B, C, W = 4, 256, 4
     num_slots = 6
@@ -234,6 +267,7 @@ def main() -> None:
         "gdn_decode": check_decode(),
         "gdn_prefill": check_prefill(),
         "gdn_prefill_chunked": check_prefill_chunked(),
+        "gdn_prefill_wmma": check_prefill_wmma(),
         "causal_conv1d_update": check_conv_update(),
         "causal_conv1d_fwd": check_conv_fwd(),
         "rmsnorm_gated": check_rmsnorm_gated(),

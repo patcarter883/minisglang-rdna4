@@ -84,6 +84,37 @@ __global__ void wmma_gemm_tn_kernel(const rocwmma::float16_t* __restrict__ A,
   rocwmma::store_matrix_sync(D + row * N + col, acc, N, rocwmma::mem_row_major);
 }
 
+// Unit-lower-triangular solve U = (I + L)^-1 B, where L is strictly-lower C x C (diagonal implied 1,
+// not read) and B is C x N. This is the ONLY non-matmul piece of the chunked gated-delta-rule prefill
+// (the (I + tril(beta*M,-1))^-1 step). Per-column forward substitution: thread n owns column n and
+// solves U[:,n] sequentially over rows j=0..C-1 holding its column in registers; L lives in LDS,
+// shared across all columns. grid = (1), block = N threads. C <= GDN_SOLVE_MAXC.
+#ifndef GDN_SOLVE_MAXC
+#define GDN_SOLVE_MAXC 16
+#endif
+__global__ void tri_solve_kernel(const float* __restrict__ L, const float* __restrict__ B,
+                                 float* __restrict__ U, int C, int N) {
+  const int n = threadIdx.x;
+  __shared__ float Ls[GDN_SOLVE_MAXC * GDN_SOLVE_MAXC];
+  for (int idx = threadIdx.x; idx < C * C; idx += blockDim.x) Ls[idx] = L[idx];
+  __syncthreads();
+  if (n >= N) return;
+  float u[GDN_SOLVE_MAXC];
+  for (int j = 0; j < C; ++j) {
+    float s = B[j * N + n];
+    for (int i = 0; i < j; ++i) s -= Ls[j * C + i] * u[i];
+    u[j] = s;
+    U[j * N + n] = s;
+  }
+}
+
+void launch_tri_solve(const at::Tensor& L, const at::Tensor& B, at::Tensor& U) {
+  const int C = L.size(0), N = B.size(1);
+  auto s = at::cuda::getCurrentCUDAStream();
+  hipLaunchKernelGGL(tri_solve_kernel, dim3(1), dim3(N), 0, s,
+      L.data_ptr<float>(), B.data_ptr<float>(), U.data_ptr<float>(), C, N);
+}
+
 static dim3 _grid(int M, int N) { return dim3((N + WN - 1) / WN, (M + WM * 4 - 1) / (WM * 4)); }
 
 void launch_wmma_gemm(const at::Tensor& A, const at::Tensor& B, at::Tensor& D) {

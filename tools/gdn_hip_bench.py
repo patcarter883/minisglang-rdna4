@@ -57,19 +57,24 @@ def _time(op, g, st, iters: int) -> float:
 
 def main() -> None:
     assert torch.cuda.is_available()
-    print(f"=== GDN prefill: recurrent vs chunked ({torch.cuda.get_device_name()}) ===")
-    print(f"{'T':>7} | {'recurrent ms':>13} | {'chunked ms':>11} | {'speedup':>8} | {'max|Δ|':>9}")
-    print("-" * 60)
+    print(f"=== GDN prefill: recurrent vs scalar-chunked vs WMMA ({torch.cuda.get_device_name()}) ===")
+    print(f"{'T':>7} | {'recur ms':>9} | {'chunk ms':>9} | {'wmma ms':>9} | "
+          f"{'wmma/rec':>8} | {'Δchunk':>8} | {'Δwmma':>8}")
+    print("-" * 78)
     for T in LENGTHS:
         g = _inputs(T)
         o_rec = _call(torch.ops.gdn_hip.gdn_prefill, g, g["state"].clone())
         o_chk = _call(torch.ops.gdn_hip.gdn_prefill_chunked, g, g["state"].clone())
-        d = (o_rec - o_chk).abs().max().item()
+        o_w = _call(torch.ops.gdn_hip.gdn_prefill_wmma, g, g["state"].clone())
+        d_chk = (o_rec - o_chk).abs().max().item()
+        d_w = (o_rec - o_w).abs().max().item()
         t_rec = _time(torch.ops.gdn_hip.gdn_prefill, g, g["state"].clone(), ITERS)
         t_chk = _time(torch.ops.gdn_hip.gdn_prefill_chunked, g, g["state"].clone(), ITERS)
-        flag = "" if d < 5e-3 else "  <-- MISMATCH"
-        print(f"{T:>7} | {t_rec:>13.3f} | {t_chk:>11.3f} | {t_rec / t_chk:>7.2f}x | {d:>9.2e}{flag}")
-    print("\n(speedup > 1 => chunked faster; max|Δ| small => chunked == recurrent numerically)")
+        t_w = _time(torch.ops.gdn_hip.gdn_prefill_wmma, g, g["state"].clone(), ITERS)
+        flag = "" if d_w < 5e-3 else "  <-- WMMA MISMATCH"
+        print(f"{T:>7} | {t_rec:>9.3f} | {t_chk:>9.3f} | {t_w:>9.3f} | "
+              f"{t_rec / t_w:>7.2f}x | {d_chk:>8.1e} | {d_w:>8.1e}{flag}")
+    print("\n(wmma/rec > 1 => WMMA faster than recurrent; Δ small => numerically equal to recurrent)")
 
 
 if __name__ == "__main__":
