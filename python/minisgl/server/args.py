@@ -251,7 +251,16 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if (dtype_str := kwargs["dtype"]) == "auto":
         from minisgl.utils import cached_load_hf_config
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        hf = cached_load_hf_config(kwargs["model_path"])
+        dtype_str = getattr(hf, "dtype", None) or getattr(hf, "torch_dtype", None)
+        # Multimodal-wrapper configs (e.g. the Qwen3.5 GDN-hybrid 4B / 35B) carry the real
+        # compute dtype in `text_config`, not at the top level — so top-level `.dtype` is None
+        # there and the engine would crash on `self.dtype.itemsize`. Fall back to text_config,
+        # then to bf16 (the weights ship bf16; only the MoE experts are int4).
+        if dtype_str is None and (tc := getattr(hf, "text_config", None)) is not None:
+            dtype_str = getattr(tc, "dtype", None) or getattr(tc, "torch_dtype", None)
+        if dtype_str is None:
+            dtype_str = "bfloat16"
 
     DTYPE_MAP = {
         "float16": torch.float16,
