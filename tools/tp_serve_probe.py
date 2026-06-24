@@ -38,15 +38,23 @@ OUTDIR = "/engine/tools/tp2_results"
 # Each config launches one server. Distinct ports => distinct torch.distributed init addr
 # (tcp://127.0.0.1:port+1), so sequential servers never collide. GDN models bound the recurrent
 # state slots (max_running_requests small) — the default 256 is GiB-scale and OOMs a 16 GB card.
+# req_timeout: per-generation HTTP timeout. At TP=2 the GDN SSM kernels JIT-compile COLD at the
+# new local-head shapes (conv_dim 4096, v_heads 16 — absent from the TP=1 warm cache), so the FIRST
+# request can stall in autotune for minutes; give the TP=2 GDN/MoE configs a long first-request
+# budget to distinguish slow-compile from a true hang.
 CONFIGS = [
     dict(name="s0_dense_0p6b_tp1", model="Qwen/Qwen3-0.6B", tp=1, port=21001),
     dict(name="s0_dense_0p6b_tp2", model="Qwen/Qwen3-0.6B", tp=2, port=21003),
     dict(name="s1_gdn_4b_tp1", model="Qwen/Qwen3.5-4B", tp=1, port=21005, max_running=16),
-    dict(name="s1_gdn_4b_tp2", model="Qwen/Qwen3.5-4B", tp=2, port=21007, max_running=16),
+    dict(name="s1_gdn_4b_tp2", model="Qwen/Qwen3.5-4B", tp=2, port=21007, max_running=16,
+         req_timeout=900),
     dict(name="s2_moe_35b_tp2", model="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit", tp=2, port=21009,
-         max_running=16, memory_ratio=0.85, ready_timeout=1800),
+         max_running=16, memory_ratio=0.85, ready_timeout=1800, req_timeout=900),
 ]
 MAX_TOKENS = 48
+# Hard wall-clock ceiling for the WHOLE run — a backstop so a hang can NEVER squat on the leased
+# cards (last window held both cards ~30 min grinding 300s timeouts). Past this, abort + release.
+OVERALL_BUDGET_SECS = 1500
 
 
 def _get_ok(url: str, timeout: float = 3.0) -> bool:
@@ -127,21 +135,29 @@ def run_config(cfg: dict) -> dict:
             result["error"] = f"server not ready within {cfg.get('ready_timeout', 900)}s; see {logpath}"
             return result
         result["load_secs"] = round(time.time() - t0, 1)
-        print(f"[{name}] ready in {result['load_secs']}s; generating ...", flush=True)
-        for p in PROMPTS:
+        req_timeout = cfg.get("req_timeout", 300)
+        print(f"[{name}] ready in {result['load_secs']}s; generating "
+              f"(req_timeout={req_timeout}s; first req may cold-compile) ...", flush=True)
+        for i, p in enumerate(PROMPTS):
+            tg = time.time()
             try:
                 resp = _post(
                     f"http://127.0.0.1:{port}/v1/chat/completions",
                     {"model": "", "prompt": p, "max_tokens": MAX_TOKENS,
                      "temperature": 0.0, "ignore_eos": False, "stream": False},
-                    timeout=300,
+                    timeout=req_timeout,
                 )
                 text = resp["choices"][0]["message"]["content"]
             except Exception as e:  # noqa: BLE001 - record + continue
                 text = None
                 result.setdefault("gen_errors", []).append(repr(e))
-            result["generations"].append({"prompt": p, "text": text})
-            print(f"  [{name}] {p!r} -> {text!r}", flush=True)
+            result["generations"].append({"prompt": p, "text": text, "secs": round(time.time() - tg, 1)})
+            print(f"  [{name}] ({round(time.time() - tg, 1)}s) {p!r} -> {text!r}", flush=True)
+            # If the FIRST request of a config hangs to timeout, the rest will too — skip them
+            # rather than burn req_timeout x3 more holding the cards.
+            if i == 0 and text is None:
+                print(f"  [{name}] first request failed/timed out — skipping remaining prompts", flush=True)
+                break
         result["ok"] = bool(result["generations"]) and all(g["text"] for g in result["generations"])
     finally:
         for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -185,7 +201,12 @@ def main() -> None:
     configs = [c for c in CONFIGS if not filters or any(f in c["name"] for f in filters)]
     print(f"[probe] running {len(configs)}/{len(CONFIGS)} configs: {[c['name'] for c in configs]}", flush=True)
     results = {}
+    t_start = time.time()
     for cfg in configs:
+        if time.time() - t_start > OVERALL_BUDGET_SECS:
+            print(f"[probe] OVERALL_BUDGET_SECS={OVERALL_BUDGET_SECS}s exceeded — aborting "
+                  f"remaining configs to release the cards", flush=True)
+            break
         r = run_config(cfg)
         results[cfg["name"]] = r
         with open(f"{OUTDIR}/{cfg['name']}.json", "w") as f:
