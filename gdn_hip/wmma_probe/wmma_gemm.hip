@@ -43,13 +43,72 @@ __global__ void wmma_gemm_kernel(const rocwmma::float16_t* __restrict__ A,
   rocwmma::store_matrix_sync(D + row * ldd + col, acc, ldd, rocwmma::mem_row_major);
 }
 
+// D[M,N] = A[M,K] @ B[N,K]^T  (the chunked KK / KQ / K·S0 shape). matrix_b col_major over B[N,K]
+// (col_major with ld=K reads B^T) — element (k,n) at n*K+k == B[n][k].
+__global__ void wmma_gemm_nt_kernel(const rocwmma::float16_t* __restrict__ A,
+                                    const rocwmma::float16_t* __restrict__ B,
+                                    float* __restrict__ D, int M, int N, int Kd) {
+  const int tileN = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+  const int tileM = blockIdx.y * blockDim.y + threadIdx.y;
+  const int row = tileM * WM, col = tileN * WN;
+  if (row >= M || col >= N) return;
+  rocwmma::fragment<accumulator, WM, WN, WK, float> acc;
+  rocwmma::fill_fragment(acc, 0.0f);
+  for (int i = 0; i < Kd; i += WK) {
+    rocwmma::fragment<matrix_a, WM, WN, WK, rocwmma::float16_t, row_major> aFrag;
+    rocwmma::fragment<matrix_b, WM, WN, WK, rocwmma::float16_t, col_major> bFrag;
+    rocwmma::load_matrix_sync(aFrag, A + row * Kd + i, Kd);   // A[M,K] row-major
+    rocwmma::load_matrix_sync(bFrag, B + col * Kd + i, Kd);   // B[N,K]; col_major frag => B^T
+    rocwmma::mma_sync(acc, aFrag, bFrag, acc);
+  }
+  rocwmma::store_matrix_sync(D + row * N + col, acc, N, rocwmma::mem_row_major);
+}
+
+// D[M,N] = A[K,M]^T @ B[K,N]  (the U^T·K state-carry shape). matrix_a col_major over A[K,M].
+__global__ void wmma_gemm_tn_kernel(const rocwmma::float16_t* __restrict__ A,
+                                    const rocwmma::float16_t* __restrict__ B,
+                                    float* __restrict__ D, int M, int N, int Kd) {
+  const int tileN = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+  const int tileM = blockIdx.y * blockDim.y + threadIdx.y;
+  const int row = tileM * WM, col = tileN * WN;
+  if (row >= M || col >= N) return;
+  rocwmma::fragment<accumulator, WM, WN, WK, float> acc;
+  rocwmma::fill_fragment(acc, 0.0f);
+  for (int i = 0; i < Kd; i += WK) {
+    rocwmma::fragment<matrix_a, WM, WN, WK, rocwmma::float16_t, col_major> aFrag;
+    rocwmma::fragment<matrix_b, WM, WN, WK, rocwmma::float16_t, row_major> bFrag;
+    rocwmma::load_matrix_sync(aFrag, A + i * M + row, M);     // A[K,M]; col_major frag => A^T
+    rocwmma::load_matrix_sync(bFrag, B + i * N + col, N);     // B[K,N] row-major
+    rocwmma::mma_sync(acc, aFrag, bFrag, acc);
+  }
+  rocwmma::store_matrix_sync(D + row * N + col, acc, N, rocwmma::mem_row_major);
+}
+
+static dim3 _grid(int M, int N) { return dim3((N + WN - 1) / WN, (M + WM * 4 - 1) / (WM * 4)); }
+
 void launch_wmma_gemm(const at::Tensor& A, const at::Tensor& B, at::Tensor& D) {
   const int M = A.size(0), Kd = A.size(1), N = B.size(1);
-  dim3 block(32, 4);                         // 1 wave (32) along N, 4 tiles along M
-  dim3 grid((N + WN - 1) / WN, (M + WM * 4 - 1) / (WM * 4));
-  auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(wmma_gemm_kernel, grid, block, 0, stream,
+  auto s = at::cuda::getCurrentCUDAStream();
+  hipLaunchKernelGGL(wmma_gemm_kernel, _grid(M, N), dim3(32, 4), 0, s,
       reinterpret_cast<const rocwmma::float16_t*>(A.data_ptr<at::Half>()),
       reinterpret_cast<const rocwmma::float16_t*>(B.data_ptr<at::Half>()),
       D.data_ptr<float>(), M, N, Kd, Kd, N, N);
+}
+
+void launch_wmma_gemm_nt(const at::Tensor& A, const at::Tensor& B, at::Tensor& D) {
+  const int M = A.size(0), Kd = A.size(1), N = B.size(0);  // B is [N,K]
+  auto s = at::cuda::getCurrentCUDAStream();
+  hipLaunchKernelGGL(wmma_gemm_nt_kernel, _grid(M, N), dim3(32, 4), 0, s,
+      reinterpret_cast<const rocwmma::float16_t*>(A.data_ptr<at::Half>()),
+      reinterpret_cast<const rocwmma::float16_t*>(B.data_ptr<at::Half>()),
+      D.data_ptr<float>(), M, N, Kd);
+}
+
+void launch_wmma_gemm_tn(const at::Tensor& A, const at::Tensor& B, at::Tensor& D) {
+  const int Kd = A.size(0), M = A.size(1), N = B.size(1);  // A is [K,M]
+  auto s = at::cuda::getCurrentCUDAStream();
+  hipLaunchKernelGGL(wmma_gemm_tn_kernel, _grid(M, N), dim3(32, 4), 0, s,
+      reinterpret_cast<const rocwmma::float16_t*>(A.data_ptr<at::Half>()),
+      reinterpret_cast<const rocwmma::float16_t*>(B.data_ptr<at::Half>()),
+      D.data_ptr<float>(), M, N, Kd);
 }
