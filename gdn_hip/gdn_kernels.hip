@@ -188,6 +188,116 @@ __global__ void gdn_prefill_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
+// CHUNKED prefill (fast path) — same result as gdn_prefill, but processes the sequence in chunks of
+// GDN_CHUNK tokens with intra-chunk parallelism instead of a per-token recurrence. Validated against
+// gdn_prefill (the recurrent oracle). Derivation: within a chunk (carried state S0), the gated delta
+// rule's written values u_j satisfy a lower-triangular system
+//     u_j + beta_j * sum_{i<j} (gamma_j/gamma_i)(k_i.k_j) u_i = beta_j (v_j - gamma_j S0 k_j)
+// (gamma_j = cumulative decay = prod_{i<=j} exp(g_i)); solve by forward substitution, then
+//     o_t  = gamma_t (S0 q_t) + sum_{j<=t} (gamma_t/gamma_j)(k_j.q_t) u_j
+//     S_C  = gamma_C S0 + sum_j (gamma_C/gamma_j) u_j k_j^T.
+// Crucially each v-ROW is independent (the k.k / k.q couplings are shared across rows), so we keep
+// the one-thread-per-v-row mapping: thread r owns S row (registers) + its U column (registers); the
+// per-chunk shared matrices (l2-normed k,q; KK=k_i.k_j; KQ=k_j.q_t; gamma; beta) live in LDS.
+#ifndef GDN_CHUNK
+#define GDN_CHUNK 32  // chunk length; LDS = 2*C*K + 2*C*C floats (C=32,K=128 -> ~40 KB)
+#endif
+
+__global__ void gdn_prefill_chunked_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
+    const unsigned char* __restrict__ has_initial_state,
+    float* __restrict__ ssm_state, float* __restrict__ out,
+    int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
+  const int blk = blockIdx.x, r = threadIdx.x;
+  const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
+  const int bos = cu_seqlens[n], eos = cu_seqlens[n + 1];
+  const long slot = state_indices[n];
+  if (slot <= 0 || bos >= eos) return;
+
+  __shared__ float ks[GDN_CHUNK * GDN_MAX_K];  // k (C x K), l2-normed
+  __shared__ float qs[GDN_CHUNK * GDN_MAX_K];  // q (C x K), l2-normed * scale
+  __shared__ float KK[GDN_CHUNK * GDN_CHUNK];  // k_i . k_j
+  __shared__ float KQ[GDN_CHUNK * GDN_CHUNK];  // k_j . q_t  (row j, col t)
+  __shared__ float gam[GDN_CHUNK];             // cumulative decay within chunk
+  __shared__ float bet[GDN_CHUNK];
+
+  const bool active = (r < V);
+  float* S = ssm_state + ((slot * HV + hv) * V + r) * K;
+  float s_row[GDN_MAX_K];
+  if (active) {
+    const bool ui = has_initial_state[n] != 0;
+    for (int j = 0; j < K; ++j) s_row[j] = ui ? S[j] : 0.0f;
+  }
+
+  for (int c0 = bos; c0 < eos; c0 += GDN_CHUNK) {
+    const int L = min(GDN_CHUNK, eos - c0);
+    for (int idx = r; idx < L * K; idx += blockDim.x) {
+      const int j = idx / K, kk = idx % K;
+      ks[j * K + kk] = k[((c0 + j) * H + hq) * K + kk];
+      qs[j * K + kk] = q[((c0 + j) * H + hq) * K + kk];
+    }
+    __syncthreads();
+    for (int j = r; j < L; j += blockDim.x) {  // one token per thread: l2norm(k,q), scale q
+      float nk = 0.0f, nq = 0.0f;
+      for (int kk = 0; kk < K; ++kk) { nk += ks[j * K + kk] * ks[j * K + kk];
+                                       nq += qs[j * K + kk] * qs[j * K + kk]; }
+      const float ik = use_l2norm ? rsqrtf(nk + 1e-6f) : 1.0f;
+      const float iq = (use_l2norm ? rsqrtf(nq + 1e-6f) : 1.0f) * scale;
+      for (int kk = 0; kk < K; ++kk) { ks[j * K + kk] *= ik; qs[j * K + kk] *= iq; }
+    }
+    if (r == 0) {  // cumulative decay + write gate
+      float acc = 0.0f;
+      for (int j = 0; j < L; ++j) {
+        const float x = a[(c0 + j) * HV + hv] + dt_bias[hv];
+        acc += -__expf(A_log[hv]) * gdn_softplus(x);
+        gam[j] = __expf(acc);
+        bet[j] = 1.0f / (1.0f + __expf(-b[(c0 + j) * HV + hv]));
+      }
+    }
+    __syncthreads();
+    for (int idx = r; idx < L * L; idx += blockDim.x) {  // KK, KQ
+      const int i = idx / L, j = idx % L;
+      float dk = 0.0f, dq = 0.0f;
+      for (int kk = 0; kk < K; ++kk) { dk += ks[i * K + kk] * ks[j * K + kk];
+                                       dq += ks[i * K + kk] * qs[j * K + kk]; }
+      KK[i * GDN_CHUNK + j] = dk;
+      KQ[i * GDN_CHUNK + j] = dq;  // row i = k, col j = q
+    }
+    __syncthreads();
+
+    if (active) {
+      float U[GDN_CHUNK];
+      for (int j = 0; j < L; ++j) {  // B[j] then forward-substitution
+        float Sk = 0.0f;
+        for (int kk = 0; kk < K; ++kk) Sk += s_row[kk] * ks[j * K + kk];
+        float uj = bet[j] * (v[((c0 + j) * HV + hv) * V + r] - gam[j] * Sk);
+        for (int i = 0; i < j; ++i)
+          uj -= bet[j] * (gam[j] / gam[i]) * KK[i * GDN_CHUNK + j] * U[i];
+        U[j] = uj;
+      }
+      for (int t = 0; t < L; ++t) {  // outputs
+        float Sq = 0.0f;
+        for (int kk = 0; kk < K; ++kk) Sq += s_row[kk] * qs[t * K + kk];
+        float o = gam[t] * Sq;
+        for (int j = 0; j <= t; ++j) o += (gam[t] / gam[j]) * KQ[j * GDN_CHUNK + t] * U[j];
+        out[((c0 + t) * HV + hv) * V + r] = o;
+      }
+      const float gL = gam[L - 1];  // carry state to next chunk
+      for (int kk = 0; kk < K; ++kk) {
+        float acc = gL * s_row[kk];
+        for (int j = 0; j < L; ++j) acc += (gL / gam[j]) * U[j] * ks[j * K + kk];
+        s_row[kk] = acc;
+      }
+    }
+    __syncthreads();  // ks/qs/KK/KQ reused next chunk
+  }
+  if (active) for (int j = 0; j < K; ++j) S[j] = s_row[j];
+}
+
+// ---------------------------------------------------------------------------------------------
 // Depthwise causal conv1d, DECODE update (one token/seq). conv_state holds the last (W-1) inputs
 // per channel; we append the new token, dot with the kernel, optional SiLU, and roll the state.
 //   x:       [B, C]   weight: [C, W]   bias: [C] or null   conv_state: [num_slots, C, W-1]
@@ -314,6 +424,24 @@ void launch_gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
   size_t shmem = (2 * K + V) * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
   hipLaunchKernelGGL(gdn_prefill_kernel, grid, block, shmem, stream,
+      CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
+      cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+      has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), FP(out),
+      N, H, HV, K, V, (float)scale, (int)use_l2norm);
+}
+
+void launch_gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                                const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
+                                const at::Tensor& dt_bias, const at::Tensor& cu_seqlens,
+                                const at::Tensor& state_indices, const at::Tensor& has_initial_state,
+                                at::Tensor& ssm_state, at::Tensor& out, double scale,
+                                int64_t use_l2norm) {
+  const int H = q.size(1), K = q.size(2);
+  const int HV = v.size(1), V = v.size(2);
+  const int N = state_indices.size(0);
+  dim3 grid(N * HV), block(V);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  hipLaunchKernelGGL(gdn_prefill_chunked_kernel, grid, block, 0, stream,  // static shared mem
       CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
       cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
       has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), FP(out),

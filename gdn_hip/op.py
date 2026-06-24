@@ -31,6 +31,12 @@ def _gdn_prefill_fake(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
     return v.new_empty((v.shape[0], v.shape[1], v.shape[2]))
 
 
+@torch.library.register_fake("gdn_hip::gdn_prefill_chunked")
+def _gdn_prefill_chunked_fake(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
+                              has_initial_state, ssm_state, scale, use_l2norm):
+    return v.new_empty((v.shape[0], v.shape[1], v.shape[2]))
+
+
 @torch.library.register_fake("gdn_hip::causal_conv1d_update")
 def _conv_update_fake(x, weight, bias, conv_state, state_indices, activation):
     return torch.empty_like(x)
@@ -50,10 +56,12 @@ def _rmsnorm_gated_fake(x, z, weight, eps):
 # ---- raw ops ----
 gdn_decode = torch.ops.gdn_hip.gdn_decode
 gdn_prefill = torch.ops.gdn_hip.gdn_prefill
+gdn_prefill_chunked = torch.ops.gdn_hip.gdn_prefill_chunked
 causal_conv1d_update = torch.ops.gdn_hip.causal_conv1d_update
 causal_conv1d_fwd = torch.ops.gdn_hip.causal_conv1d_fwd
 rmsnorm_gated = torch.ops.gdn_hip.rmsnorm_gated
 
 __all__ = [
-    "gdn_decode", "gdn_prefill", "causal_conv1d_update", "causal_conv1d_fwd", "rmsnorm_gated",
+    "gdn_decode", "gdn_prefill", "gdn_prefill_chunked",
+    "causal_conv1d_update", "causal_conv1d_fwd", "rmsnorm_gated",
 ]
