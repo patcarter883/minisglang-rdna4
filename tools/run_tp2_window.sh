@@ -16,8 +16,13 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Args (if any) are forwarded to tp_serve_probe.py as config-name filters, e.g.
+#   gpu-lease.sh -n 1 -- bash tools/run_tp2_window.sh tp1   # single-card TP=1 validation
+#   gpu-lease.sh -n 2 -- bash tools/run_tp2_window.sh       # full TP=2 escalation
+PROBE_ARGS="$*"
+
 mkdir -p tools/tp2_results
-echo "[run_tp2_window] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset}"
+echo "[run_tp2_window] HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-unset} ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-unset} probe_args='${PROBE_ARGS}'"
 
 docker run --rm \
   --device /dev/kfd --device /dev/dri --group-add video \
@@ -38,7 +43,7 @@ docker run --rm \
     pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil
     echo "[setup] rocm devices visible to torch:"
     python -c "import torch; print(\"  cuda.is_available=\", torch.cuda.is_available(), \"device_count=\", torch.cuda.device_count())"
-    python /engine/tools/tp_serve_probe.py
+    python /engine/tools/tp_serve_probe.py '"$PROBE_ARGS"'
   '
 rc=$?
 echo "[run_tp2_window] container exited rc=$rc; results in tools/tp2_results/"

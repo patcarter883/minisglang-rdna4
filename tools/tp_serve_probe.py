@@ -179,8 +179,13 @@ def _diff(a: dict, b: dict) -> str:
 
 def main() -> None:
     os.makedirs(OUTDIR, exist_ok=True)
+    # Optional argv filters: run only configs whose name contains any given substring (e.g. "tp1"
+    # for a single-card validation). No args -> the full escalation.
+    filters = sys.argv[1:]
+    configs = [c for c in CONFIGS if not filters or any(f in c["name"] for f in filters)]
+    print(f"[probe] running {len(configs)}/{len(CONFIGS)} configs: {[c['name'] for c in configs]}", flush=True)
     results = {}
-    for cfg in CONFIGS:
+    for cfg in configs:
         r = run_config(cfg)
         results[cfg["name"]] = r
         with open(f"{OUTDIR}/{cfg['name']}.json", "w") as f:
