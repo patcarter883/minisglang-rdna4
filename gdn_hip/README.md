@@ -10,7 +10,8 @@ one `.so`, call `torch.ops.gdn_hip.*` from either.
 | op | replaces | notes |
 |---|---|---|
 | `gdn_decode` | fused_sigmoid_gating decode SSM | 1 token/seq; g,β computed inline; state updated in place |
-| `gdn_prefill` | `chunk_gated_delta_rule` | recurrent (correct-first); chunked-HIP optimization is future work |
+| `gdn_prefill` | `chunk_gated_delta_rule` | recurrent fp32 reference oracle; robust, slow |
+| `gdn_prefill_wmma` | `chunk_gated_delta_rule` | **matrix-core chunked — the serve prefill path; 4.8-5.9× faster than recurrent** |
 | `causal_conv1d_update` | mamba conv decode | depthwise causal conv + state roll + SiLU |
 | `causal_conv1d_fwd` | mamba conv prefill | varlen depthwise causal conv + state write |
 | `rmsnorm_gated` | RMSNormGated | norm-before-gate, SiLU(z) |
@@ -33,10 +34,15 @@ impls for torch.compile safety).
 - [x] **Numeric parity** vs torch reference (`tools/gdn_hip_parity.py`): ALL PASS, max|Δ|~1e-7.
 - [x] **Wired into `gdn/layer.py`** (recurrent path) — **serves 4B TP1/TP2 + 35B TP2 coherent** on
       2× gfx1201 (2026-06-24). The Triton GDN compile cliff is gone.
-- [x] **Chunked prefill (`gdn_prefill_chunked`)** — numerically correct (max|Δ|~1e-7 vs recurrent),
-      but **~4× SLOWER** as a scalar per-row kernel (`tools/gdn_hip_bench.py`: 0.23–0.29× at
-      T=256..16384). The serve uses the **recurrent** `gdn_prefill`; the chunked op is kept as a
-      validated reference. **The throughput win needs a WMMA/matrix-core formulation** of the
-      intra-chunk `KK`/`KQ`/solve matmuls — that is the real "fast path", future work.
-- [ ] WMMA chunked prefill (the actual long-context speedup).
+- [x] **Chunked prefill (`gdn_prefill_chunked`)** — numerically correct vs recurrent under MILD
+      decay (max|Δ|~1e-7), but **~4× SLOWER** as a scalar per-row kernel, and it NaNs under strong
+      decay (`gam[j]/gam[i]`=0/0 in fp32). Kept only as a mild-decay parity oracle.
+- [x] **WMMA chunked prefill (`gdn_prefill_wmma`)** — the long-context speedup. Matrix-core
+      (rocWMMA) reformulation of the intra-chunk Grams/state-reads/carry; **4.8–5.9× FASTER than
+      recurrent** at T=256..16384 (`tools/gdn_hip_bench.py`). Decay is applied as bounded log-space
+      fp32 scalings (NOT k/γ absorption, which overflows fp16 → NaN), so it is robust to any decay —
+      strictly more so than the scalar chunked op. Validated vs the recurrent oracle on short+long
+      varlen seqs × strong/mild decay (`tools/gdn_hip_parity.py`), and coherent on the real 4B GDN
+      serve (`tools/gdn_wmma_serve_smoke.py`: 5/6 prompts token-identical to recurrent). **Now the
+      default serve prefill** (`gdn/layer.py`; `GDN_HIP_WMMA_PREFILL=0` reverts to recurrent).
 - [ ] Delete the (now unused) Triton GDN tree (`gdn/{fla,mamba}`); bf16-native state (v1 = fp32).
