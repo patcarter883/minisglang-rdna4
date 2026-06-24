@@ -169,13 +169,14 @@ class QwenGatedDeltaNet(nn.Module):
             conv_state,
             1,  # SiLU
         )
-        # Chunked gated-delta-rule: l2norm(q,k) + g/beta from (a,b,A_log,dt_bias) are folded INTO
-        # the kernel (replacing fused_post_conv_prep + chunk_gated_delta_rule). State written in
-        # place. The chunked form is the throughput path (intra-chunk parallel); it is numerically
-        # equal to the recurrent gdn_prefill (validated max|Δ|~2e-7, the oracle), which remains the
-        # fallback/reference op.
+        # Recurrent gated-delta-rule: l2norm(q,k) + g/beta from (a,b,A_log,dt_bias) folded INTO the
+        # kernel (replacing fused_post_conv_prep + chunk_gated_delta_rule). State written in place.
+        # NOTE: gdn_prefill_chunked is numerically equal (max|Δ|~1e-7) but ~4x SLOWER as a scalar
+        # per-row kernel (benchmark: tools/gdn_hip_bench.py) — the chunked throughput win needs a
+        # WMMA/matrix-core formulation of the intra-chunk matmuls, which is future work. Until then
+        # the recurrent kernel is the serve path.
         q, k, v = self._split_conv_qkv(conv_out, n)
-        core = gdn.gdn_prefill_chunked(
+        core = gdn.gdn_prefill(
             q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
             query_start_loc, state_indices.long(), has_initial_state.to(torch.uint8),
             ssm_state, self.head_k_dim ** -0.5, 1,

@@ -29,7 +29,14 @@ impls for torch.compile safety).
 
 ## Status
 - [x] **Builds AOT for gfx1201** (hipify clean, links torch_hip) — CPU-only build verified.
-- [x] **All 5 ops load + register** with valid schemas (CPU).
-- [ ] **Numeric parity vs the fla-Triton reference** — needs a GPU window (`tools/gdn_hip_parity.py`).
-- [ ] **Wire into minisgl's `gdn/layer.py`** (swap the fla calls) + delete the Triton GDN tree.
-- [ ] bf16-native state (v1 is fp32 at the boundary); chunked-HIP prefill for long-context speed.
+- [x] **All 6 ops load + register** with valid schemas (CPU).
+- [x] **Numeric parity** vs torch reference (`tools/gdn_hip_parity.py`): ALL PASS, max|Δ|~1e-7.
+- [x] **Wired into `gdn/layer.py`** (recurrent path) — **serves 4B TP1/TP2 + 35B TP2 coherent** on
+      2× gfx1201 (2026-06-24). The Triton GDN compile cliff is gone.
+- [x] **Chunked prefill (`gdn_prefill_chunked`)** — numerically correct (max|Δ|~1e-7 vs recurrent),
+      but **~4× SLOWER** as a scalar per-row kernel (`tools/gdn_hip_bench.py`: 0.23–0.29× at
+      T=256..16384). The serve uses the **recurrent** `gdn_prefill`; the chunked op is kept as a
+      validated reference. **The throughput win needs a WMMA/matrix-core formulation** of the
+      intra-chunk `KK`/`KQ`/solve matmuls — that is the real "fast path", future work.
+- [ ] WMMA chunked prefill (the actual long-context speedup).
+- [ ] Delete the (now unused) Triton GDN tree (`gdn/{fla,mamba}`); bf16-native state (v1 = fp32).
