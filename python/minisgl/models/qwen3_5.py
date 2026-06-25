@@ -69,7 +69,7 @@ class Qwen3_5Attn(BaseOP):
         )
         # Qwen3.5 RMSNorm uses the (1 + weight) gain convention (weight init 0), UNLIKE the dense
         # Qwen3 plain-weight norm. Applies to all Qwen3_5RMSNorm sites (q/k norm, input/post/final
-        # decoder norms); the GDN's RMSNormGated keeps the plain-weight convention (init 1).
+        # decoder norms); the GDN's gated norm weight keeps the plain-weight convention (init 1).
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
         self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
         self.attn = AttentionLayer(
