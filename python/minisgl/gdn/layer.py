@@ -2,8 +2,9 @@
 
 Reimplements vLLM's `QwenGatedDeltaNetAttention` (Qwen3.5 / Qwen3-Next GDN) forward
 COMPUTE, stripped of all vLLM coupling (CustomOp / forward_context / distributed /
-MergedColumnParallelLinear / the torch.ops dispatch). It consumes the vendored FLA
-kernels (`minisgl.gdn.fla.ops` + `minisgl.gdn.mamba.ops`) directly.
+MergedColumnParallelLinear / the torch.ops dispatch). The compute now runs entirely on
+native HIP kernels (`torch.ops.gdn_hip.*`) — conv, gated-delta-rule prefill/decode, and
+the gated RMSNorm — with no Triton dependency.
 
 Scope (3b): NUMERICS of one layer, in isolation.
   * TP=1, unquantized bf16 projections (the 35B keeps GDN projections in bf16; only
@@ -16,7 +17,7 @@ Scope (3b): NUMERICS of one layer, in isolation.
 Faithful to the reference's `_forward_core` (prefill = causal_conv1d_fn ->
 fused_post_conv_prep -> chunk_gated_delta_rule; decode = causal_conv1d_update ->
 rearrange -> fused_sigmoid_gating_delta_rule_update) and `_output_projection`
-(RMSNormGated(core, z) -> out_proj).
+(gated RMSNorm(core, z) -> out_proj).
 
 conv_state convention: this layer expects the dim-first / "DS" layout
 `(num_slots, conv_dim, conv_kernel-1)` — exactly what `GDNStateCache` allocates. On a
@@ -31,10 +32,21 @@ import os
 import torch
 from torch import nn
 
-# RMSNormGated is kept ONLY as the norm-weight container (its .weight / .eps); its Triton forward is
-# never called — the gated norm runs through torch.ops.gdn_hip.rmsnorm_gated. The GDN compute kernels
-# (conv, gated-delta-rule prefill/decode) are now native HIP (gdn_hip), AOT-compiled, no Triton JIT.
-from minisgl.gdn.fla.ops import RMSNormGated
+# The GDN compute kernels (conv, gated-delta-rule prefill/decode, the gated RMSNorm) are now native
+# HIP (torch.ops.gdn_hip.*), AOT-compiled, no Triton JIT. Importing this layer no longer drags in the
+# vendored Triton tree at all.
+
+
+class GatedRMSNormWeight(nn.Module):
+    """Pure parameter holder for the gated-RMSNorm weight + eps. The gated norm itself runs through
+    torch.ops.gdn_hip.rmsnorm_gated (norm-before-gate + SiLU, both hardcoded in the HIP kernel), so
+    this module's forward is never called — it exists only to own `.weight` (state_dict key
+    `…linear_attn.norm.weight`) and `.eps`."""
+
+    def __init__(self, hidden_size: int, eps: float, *, device=None, dtype=None) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
 
 
 class QwenGatedDeltaNet(nn.Module):
@@ -94,15 +106,7 @@ class QwenGatedDeltaNet(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads, dtype=torch.float32, device=device))
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32, device=device))
 
-        self.norm = RMSNormGated(
-            head_v_dim,
-            eps=eps,
-            group_size=None,
-            norm_before_gate=True,
-            activation=("silu" if activation == "swish" else activation),
-            device=device,
-            dtype=dtype,
-        )
+        self.norm = GatedRMSNormWeight(head_v_dim, eps=eps, device=device, dtype=dtype)
         self.out_proj = nn.Linear(
             self.value_dim, hidden_size, bias=False, dtype=dtype, device=device
         )
