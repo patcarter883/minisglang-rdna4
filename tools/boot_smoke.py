@@ -39,10 +39,13 @@ def main() -> None:
     ap.add_argument("--max-running-req", type=int, default=None)
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--prompt", action="append", default=None, help="override PROMPTS (repeatable)")
+    ap.add_argument("--attn-backend", default="auto",
+                    help="attention backend (auto -> triton_rdna4 on ROCm; 'hip' = native HIP "
+                         "flash-prefill + paged flash-decode, Triton-free)")
     args = ap.parse_args()
     prompts = args.prompt if args.prompt else PROMPTS
 
-    print(f"[boot] loading {args.model} (bf16, eager, attention=auto) ...", flush=True)
+    print(f"[boot] loading {args.model} (bf16, eager, attention={args.attn_backend}) ...", flush=True)
     extra = {} if args.max_running_req is None else {"max_running_req": args.max_running_req}
     llm = LLM(
         model_path=args.model,
@@ -50,7 +53,7 @@ def main() -> None:
         cuda_graph_max_bs=0,  # eager: triton_rdna4 has no graph capture yet
         page_size=args.page_size,  # triton_rdna4 requires a multiple of 16
         memory_ratio=args.memory_ratio,
-        attention_backend="auto",  # -> triton_rdna4 on ROCm
+        attention_backend=args.attn_backend,  # 'auto' -> triton_rdna4 on ROCm; 'hip' = Triton-free
         **extra,
     )
     try:
