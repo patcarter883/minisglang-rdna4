@@ -32,6 +32,15 @@
 #define GDN_MAX_K 128  // head_k_dim (Qwen3.5/3.6 GDN = 128); state row held in registers
 #endif
 
+// Recurrent-state Frobenius-norm cap ("Stuffed Mamba" guardrail): bound ||H||_F so the gated
+// delta-rule state can't grow without limit over a long sequence (q/k l2-norm + gated-RMSNorm
+// bound the I/O but never the accumulated state). 1000 matches the Atlas GDN reference; it sits
+// far above any in-range state, so it is a no-op on short/normal prompts (parity unchanged) and
+// only engages as a safety clamp on long-context runs. Set <= 0 to disable.
+#ifndef SSM_STATE_MAX_NORM
+#define SSM_STATE_MAX_NORM 1000.0f
+#endif
+
 __device__ __forceinline__ float gdn_softplus(float x) {
   // matches the Triton ref: threshold 20 to avoid overflow in log1p(exp(x))
   return x <= 20.0f ? log1pf(__expf(x)) : x;
@@ -69,6 +78,33 @@ __device__ __forceinline__ float gdn_step(float* s_row, const float* q_s, const 
 #pragma unroll 4
   for (int j = 0; j < K; ++j) { s_row[j] += vr * k_s[j]; o += s_row[j] * q_s[j]; }
   return o;
+}
+
+// Frobenius-norm clamp on the recurrent state (Stuffed-Mamba guardrail). The block's V threads each
+// own state row s_reg[0..K-1], so ||H||_F^2 = block-reduce over the V threads of per-thread
+// sum_j s_reg[j]^2. If ||H||_F > max_norm, scale the whole state by max_norm/||H||_F; otherwise it
+// is a strict no-op (the common case, so short-prompt parity is bit-unchanged). ALL blockDim.x
+// threads must call it — it uses the shared `red` scratch + the same tree reduction as gdn_inv_l2,
+// with interleaved __syncthreads. Disabled when max_norm <= 0.
+__device__ __forceinline__ void gdn_state_norm_clamp(float* s_reg, int K, float* __restrict__ red,
+                                                     int tid, int nthreads, float max_norm) {
+  if (max_norm <= 0.0f) return;
+  float local_sq = 0.0f;
+#pragma unroll 4
+  for (int j = 0; j < K; ++j) local_sq += s_reg[j] * s_reg[j];
+  red[tid] = local_sq;
+  __syncthreads();
+  for (int s = nthreads >> 1; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  const float norm_sq = red[0];  // ||H||_F^2 for this (sequence, value-head)
+  __syncthreads();               // release `red` before the caller reuses it
+  if (norm_sq > max_norm * max_norm) {
+    const float sc = max_norm * rsqrtf(norm_sq);
+#pragma unroll 4
+    for (int j = 0; j < K; ++j) s_reg[j] *= sc;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -119,6 +155,8 @@ __global__ void gdn_decode_kernel(
 #pragma unroll 4
     for (int j = 0; j < K; ++j) s_reg[j] = s_row[j];
     float o = gdn_step(s_reg, q_s, k_s, v[(bi * HV + hv) * V + r], g, beta, K);
+    // bound the carried state's Frobenius norm (no-op unless it has grown past the cap)
+    gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
 #pragma unroll 4
     for (int j = 0; j < K; ++j) s_row[j] = s_reg[j];
     *o_p = o;
@@ -182,6 +220,8 @@ __global__ void gdn_prefill_kernel(
       const float g = -__expf(Alog) * gdn_softplus(x);
       const float beta = 1.0f / (1.0f + __expf(-b[t * HV + hv]));
       float o = gdn_step(s_reg, q_s, k_s, v[(t * HV + hv) * V + r], g, beta, K);
+      // bound the carried state's Frobenius norm per token (no-op until it grows past the cap)
+      gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
       out[(t * HV + hv) * V + r] = o;
     }
     __syncthreads();  // q_s/k_s reused next token
