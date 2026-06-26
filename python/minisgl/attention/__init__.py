@@ -47,6 +47,14 @@ def create_triton_rdna4_backend(config: ModelConfig):
     return TritonRDNA4Backend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("hip")
+def create_hip_backend(config: ModelConfig):
+    # Fully Triton-free: native HIP flash-prefill (attn_hip) + paged flash-decode (attn_decode).
+    from .hip import HIPAttnBackend
+
+    return HIPAttnBackend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
