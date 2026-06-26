@@ -5,6 +5,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from . import _tail_hip
+
 
 def _gated(
     x: torch.Tensor, act: Callable[[torch.Tensor], torch.Tensor], out: torch.Tensor | None
@@ -21,6 +23,12 @@ def _gated(
 
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    if _tail_hip.active(x):
+        result = torch.ops.tail_hip.silu_and_mul(x.contiguous())  # act(x[:,:d]) * x[:,d:]
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     return _gated(x, F.silu, out)
 
 

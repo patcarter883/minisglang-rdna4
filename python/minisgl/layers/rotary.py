@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Tuple
 
 import torch
 
+from . import _tail_hip
 from .base import StateLessOP
 
 
@@ -57,6 +58,17 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _tail_hip.active(query, key):
+            # tail_hip.rope takes the FULL fp32 cat(cos,sin) cache + int32 positions and does the
+            # NeoX partial rotate internally (same convention as _apply below).
+            pos = positions.to(torch.int32)
+            q = torch.ops.tail_hip.rope(
+                query.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
+            )
+            k = torch.ops.tail_hip.rope(
+                key.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
+            )
+            return q, k
         # cos_sin_cache row = cat(cos[d/2], sin[d/2]); NeoX needs each repeated to head_size.
         cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
         cos = torch.cat((cos_half, cos_half), dim=-1)
