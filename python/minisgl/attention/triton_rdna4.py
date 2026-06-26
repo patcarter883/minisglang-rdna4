@@ -21,6 +21,7 @@ class RDNA4Metadata(BaseAttnMetadata):
     max_seqlen_q: int
     max_seqlen_k: int
     page_table: torch.Tensor  # [bs, max_pages] page-indexed block table
+    cold_prefill: bool  # prefill with no prefix-cache hit (every seq's KV == its new tokens)
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -59,6 +60,26 @@ class TritonRDNA4Backend(BaseAttnBackend):
         self._segm_output: torch.Tensor | None = None
         self._segm_max: torch.Tensor | None = None
         self._segm_expsum: torch.Tensor | None = None
+        # --- Native HIP attention (on by default; MINISGL_ATTN_HIP=0 forces pure Triton) ---
+        # Per-op hybrid: decode -> attn_decode.flash_decode_paged, cold prefill ->
+        # attn_hip.flash_prefill, extend/paged-prefix prefill -> Triton (kept, see below).
+        # Hard-require: when enabled the .so must import or boot fails (the user opted in to
+        # default-on, so a missing build is a hard error, not a silent Triton fallback).
+        self._attn_hip = os.environ.get("MINISGL_ATTN_HIP", "1") != "0"
+        if self._attn_hip:
+            import attn_decode  # noqa: F401  registers torch.ops.attn_decode.*
+            import attn_hip  # noqa: F401  registers torch.ops.attn_hip.*
+            import attn_prefill_paged  # noqa: F401  registers torch.ops.attn_prefill_paged.*
+
+            self._hip_decode_op = torch.ops.attn_decode.flash_decode_paged
+            self._hip_decode_fp8_op = torch.ops.attn_decode.flash_decode_paged_fp8
+            self._hip_prefill_op = torch.ops.attn_hip.flash_prefill  # dense cold prefill
+            self._hip_prefill_paged_op = (
+                torch.ops.attn_prefill_paged.flash_prefill_paged  # paged/chunked extend prefill
+            )
+            # attn_hip / attn_prefill_paged support head_dim 64/128 only (256 gated off) ->
+            # otherwise prefill falls back to Triton.
+            self._hip_prefill_ok = config.head_dim in (64, 128)
 
     def _ensure_segm_scratch(self, q: torch.Tensor) -> None:
         """Allocate the persistent f32 segment scratch for the 3D flash-decode path.
@@ -85,6 +106,22 @@ class TritonRDNA4Backend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, RDNA4Metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        # Native-HIP per-op dispatch (default on). store_kv above already persisted the new
+        # tokens' K/V into the paged cache, so the decode kernel reads them back; the cold-prefill
+        # kernel computes attention over the contiguous new-token K/V directly.
+        if self._attn_hip:
+            if metadata.max_seqlen_q == 1:
+                return self._hip_decode(q, layer_id, metadata)
+            if self._hip_prefill_ok:  # head_dim 64/128
+                if metadata.cold_prefill:
+                    # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
+                    # since it reads inline k/v, not the cache).
+                    return self._hip_prefill(q, k, v, metadata)
+                if not self.kv_is_fp8:
+                    # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset
+                    # causal mask. (attn_prefill_paged has no fp8-KV path yet -> Triton for that.)
+                    return self._hip_prefill_paged(q, layer_id, metadata)
+            # head_dim 256, or fp8-KV extend prefill -> fall through to Triton.
         out = torch.empty_like(q)
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
@@ -115,6 +152,60 @@ class TritonRDNA4Backend(BaseAttnBackend):
         )
         return out
 
+    def _hip_decode(
+        self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
+    ) -> torch.Tensor:
+        # Paged flash-decode over the full KV cache. q is [B, Hq, D] (one token per seq).
+        k_cache = self.kvcache.k_cache(layer_id)  # [num_pages, page_size, kv_heads, head_dim]
+        v_cache = self.kvcache.v_cache(layer_id)
+        block_table = metadata.page_table.to(torch.int32)
+        ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        if self.kv_is_fp8:
+            # fp8 (e4m3) paged KV: per-tensor descale 1.0 (store cast uses scale 1.0).
+            return self._hip_decode_fp8_op(
+                q, k_cache, v_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0
+            )
+        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+
+    def _hip_prefill(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, metadata: RDNA4Metadata
+    ) -> torch.Tensor:
+        # Dense causal prefill, no prefix cache (cold_prefill guarantees each seq's KV == its new
+        # tokens). q is [tokens, Hq, D]; k/v arrive flat [tokens, Hk*D] -> reshape to [tokens, Hk, D]
+        # (store_kv above already consumed the flat k/v). flash_prefill is single-sequence, so slice
+        # the varlen batch by cu_seqlens_q and run each independently.
+        D = self.config.head_dim
+        k = k.view(-1, k.shape[-1] // D, D)
+        v = v.view(-1, v.shape[-1] // D, D)
+        cu = metadata.cu_seqlens_q.tolist()
+        out = torch.empty_like(q)
+        for i in range(len(cu) - 1):
+            s, e = cu[i], cu[i + 1]
+            if e - s <= 0:
+                continue
+            out[s:e] = self._hip_prefill_op(
+                q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
+                self.scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
+            )
+        return out
+
+    def _hip_prefill_paged(
+        self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
+    ) -> torch.Tensor:
+        # Chunked / radix-hit prefill: Q = the packed varlen new tokens [total_q, Hq, D];
+        # K/V read from the paged cache (prefix + new, already stored above) with a prefix-offset
+        # causal mask. context_lens = full per-seq KV length (cache_seqlens); cu_seqlens_q = new
+        # tokens. kv_block_stride=0 (minisgl's cache is contiguous, not vLLM's interleaved view).
+        k_cache = self.kvcache.k_cache(layer_id)  # [num_pages, page_size, kv_heads, head_dim]
+        v_cache = self.kvcache.v_cache(layer_id)
+        block_table = metadata.page_table.to(torch.int32)
+        cu_q = metadata.cu_seqlens_q.to(torch.int32)
+        ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        return self._hip_prefill_paged_op(
+            q.contiguous(), k_cache, v_cache, block_table, cu_q, ctx_lens,
+            self.scale, 1, 0, metadata.max_seqlen_q, 0,  # causal=1, sw=0, kv_block_stride=0
+        )
+
     def prepare_metadata(self, batch: Batch) -> None:
         # Lifted from the FlashAttention backend: the page-table slicing + cu_seqlens
         # construction is backend-agnostic (the global page table is page_size=1).
@@ -129,9 +220,11 @@ class TritonRDNA4Backend(BaseAttnBackend):
 
         cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS).to(device, non_blocking=True)
 
+        cold_prefill = False
         if max_seqlen_q == 1:
             cu_seqlens_q = torch.arange(0, len(reqs) + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):  # prefill, no cache hit
+            cold_prefill = True
             cu_seqlens_q = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(0)
             cu_seqlens_q = cu_seqlens_q.to(device, non_blocking=True)
         else:  # extend prefill with partial cache hit
@@ -152,6 +245,7 @@ class TritonRDNA4Backend(BaseAttnBackend):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             page_table=new_page_table,
+            cold_prefill=cold_prefill,
         )
 
     # --- cudagraph capture: not yet supported (Phase 4). Boot with --cuda-graph-max-bs 0. ---
