@@ -13,6 +13,10 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 TARGET_ARCH = os.environ.get("GPU_ARCHS", "gfx1201").split(";")[0]
+# Optional extra preprocessor defines, e.g. GDN_DEFINES="SSM_STATE_MAX_NORM=80.0f" to force the
+# recurrent-state Frobenius clamp to engage for a forced-engagement validation run. Empty by default
+# (the in-source #ifndef keeps SSM_STATE_MAX_NORM=1000 — production value, a no-op on normal states).
+_extra_defs = [f"-D{d}" for d in os.environ.get("GDN_DEFINES", "").split() if d]
 
 setup(
     name="gdn_hip",
@@ -30,7 +34,7 @@ setup(
                     f"--offload-arch={TARGET_ARCH}",
                     "-Wno-unused-result",
                     "-Wno-unused-variable",
-                ],
+                ] + _extra_defs,
             },
         ),
     ],
