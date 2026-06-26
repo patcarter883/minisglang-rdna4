@@ -61,10 +61,11 @@ class TritonRDNA4Backend(BaseAttnBackend):
         self._segm_max: torch.Tensor | None = None
         self._segm_expsum: torch.Tensor | None = None
         # --- Native HIP attention (on by default; MINISGL_ATTN_HIP=0 forces pure Triton) ---
-        # Per-op hybrid: decode -> attn_decode.flash_decode_paged, cold prefill ->
-        # attn_hip.flash_prefill, extend/paged-prefix prefill -> Triton (kept, see below).
-        # Hard-require: when enabled the .so must import or boot fails (the user opted in to
-        # default-on, so a missing build is a hard error, not a silent Triton fallback).
+        # Per-op hybrid (head_dim 64/128): decode -> attn_decode.flash_decode_paged (fp8 variant
+        # when KV is fp8); cold prefill -> attn_hip.flash_prefill; extend/paged-prefix prefill ->
+        # attn_prefill_paged.flash_prefill_paged (fp8 variant when KV is fp8). Only head_dim 256
+        # falls back to Triton. Hard-require: when enabled the .so must import or boot fails (the
+        # user opted in to default-on, so a missing build is a hard error, not a silent fallback).
         self._attn_hip = os.environ.get("MINISGL_ATTN_HIP", "1") != "0"
         if self._attn_hip:
             import attn_decode  # noqa: F401  registers torch.ops.attn_decode.*
@@ -76,6 +77,9 @@ class TritonRDNA4Backend(BaseAttnBackend):
             self._hip_prefill_op = torch.ops.attn_hip.flash_prefill  # dense cold prefill
             self._hip_prefill_paged_op = (
                 torch.ops.attn_prefill_paged.flash_prefill_paged  # paged/chunked extend prefill
+            )
+            self._hip_prefill_paged_fp8_op = (
+                torch.ops.attn_prefill_paged.flash_prefill_paged_fp8  # fp8-KV paged extend prefill
             )
             # attn_hip / attn_prefill_paged support head_dim 64/128 only (256 gated off) ->
             # otherwise prefill falls back to Triton.
@@ -117,11 +121,10 @@ class TritonRDNA4Backend(BaseAttnBackend):
                     # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
                     # since it reads inline k/v, not the cache).
                     return self._hip_prefill(q, k, v, metadata)
-                if not self.kv_is_fp8:
-                    # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset
-                    # causal mask. (attn_prefill_paged has no fp8-KV path yet -> Triton for that.)
-                    return self._hip_prefill_paged(q, layer_id, metadata)
-            # head_dim 256, or fp8-KV extend prefill -> fall through to Triton.
+                # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset causal
+                # mask. fp8 variant folds the per-tensor descale (bf16 + fp8 KV both covered).
+                return self._hip_prefill_paged(q, layer_id, metadata)
+            # head_dim 256 -> fall through to Triton.
         out = torch.empty_like(q)
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
@@ -201,8 +204,16 @@ class TritonRDNA4Backend(BaseAttnBackend):
         block_table = metadata.page_table.to(torch.int32)
         cu_q = metadata.cu_seqlens_q.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        q = q.contiguous()
+        if self.kv_is_fp8:
+            # fp8 (e4m3) paged KV: per-tensor descale 1.0 (store cast uses scale 1.0), folded
+            # in the kernel. Descales sit between scale and causal in this op's signature.
+            return self._hip_prefill_paged_fp8_op(
+                q, k_cache, v_cache, block_table, cu_q, ctx_lens,
+                self.scale, 1.0, 1.0, 1, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+            )
         return self._hip_prefill_paged_op(
-            q.contiguous(), k_cache, v_cache, block_table, cu_q, ctx_lens,
+            q, k_cache, v_cache, block_table, cu_q, ctx_lens,
             self.scale, 1, 0, metadata.max_seqlen_q, 0,  # causal=1, sw=0, kv_block_stride=0
         )
 
