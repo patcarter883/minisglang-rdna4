@@ -44,12 +44,13 @@ using bf16_t = rocwmma::bfloat16_t;
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
-constexpr int BR = 32;            // query rows per CTA tile
-constexpr int BC = 32;            // key  cols per KV tile
-constexpr int M_TILES = BR / WMMA_M;   // 2
-constexpr int N_TILES = BC / WMMA_N;   // 2  (keys)
-constexpr int WARPS = M_TILES;         // one warp per query m-tile
-constexpr int THREADS = WARPS * 32;    // 64
+// Tile sizes are head_dim-dependent. head_dim 64/128 use BR=BC=32 (2 warps), unchanged. head_dim 256
+// (Qwen3.5/3.6 full-attn) would blow the 64 KB gfx1201 LDS at BR=BC=32 — the two fp32 [BR][HEAD_DIM]
+// smem buffers (smem_O + smem_PV) alone are 64 KB before Q/K/V — so it drops to BR=BC=16 (1 warp,
+// ~58 KB), trading occupancy for fit. Same algorithm; all tile counts derive from these.
+template <int HEAD_DIM> constexpr int kBR()      { return HEAD_DIM >= 256 ? 16 : 32; }
+template <int HEAD_DIM> constexpr int kBC()      { return HEAD_DIM >= 256 ? 16 : 32; }
+template <int HEAD_DIM> constexpr int kThreads() { return (kBR<HEAD_DIM>() / WMMA_M) * 32; }
 
 // QK^T fragments: S[m][n] = sum_k Q[m][k] * K[n][k].
 //   A = Q  (M x K, row-major)                 : smem_Q[m][k]
@@ -65,7 +66,7 @@ using FragV = rocwmma::fragment<rocwmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16_
 using FragAcc = rocwmma::fragment<rocwmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
 
 template <int HEAD_DIM>
-__global__ __launch_bounds__(THREADS) void flash_prefill_kernel(
+__global__ __launch_bounds__(kThreads<HEAD_DIM>()) void flash_prefill_kernel(
     const __hip_bfloat16* __restrict__ Q,   // [seq, num_q_heads, HEAD_DIM]
     const __hip_bfloat16* __restrict__ K,   // [seq, num_kv_heads, HEAD_DIM]
     const __hip_bfloat16* __restrict__ V,   // [seq, num_kv_heads, HEAD_DIM]
@@ -85,6 +86,12 @@ __global__ __launch_bounds__(THREADS) void flash_prefill_kernel(
     constexpr int D_TILES = HEAD_DIM / WMMA_N;    // PV output d-tiles
     constexpr int PAD = 8;                        // 16B-aligned smem rows
     constexpr int LDK = HEAD_DIM + PAD;
+    // head_dim-dependent tiling (see kBR/kBC/kThreads): 32 for head_dim 64/128, 16 for 256.
+    constexpr int BR = kBR<HEAD_DIM>();
+    constexpr int BC = kBC<HEAD_DIM>();
+    constexpr int M_TILES = BR / WMMA_M;
+    constexpr int N_TILES = BC / WMMA_N;
+    constexpr int THREADS = kThreads<HEAD_DIM>();
 
     const unsigned int q_head  = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
@@ -261,8 +268,6 @@ void launch_flash_prefill(const at::Tensor& q, const at::Tensor& k, const at::Te
     const unsigned int num_kv_heads = k.size(1);
     const float inv_sqrt_d = (scale > 0) ? (float)scale : 1.0f / sqrtf((float)head_dim);
 
-    dim3 grid(num_q_heads, (seq_len + BR - 1) / BR, 1);
-    dim3 block(THREADS, 1, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
@@ -270,22 +275,25 @@ void launch_flash_prefill(const at::Tensor& q, const at::Tensor& k, const at::Te
     const auto* vp = reinterpret_cast<const __hip_bfloat16*>(v.data_ptr());
     auto* op = reinterpret_cast<__hip_bfloat16*>(out.data_ptr());
 
+    // grid/block are head_dim-dependent (BR / THREADS vary), so build them per instantiation.
 #define LAUNCH(HD)                                                                      \
-    flash_prefill_kernel<HD><<<grid, block, 0, stream>>>(                               \
-        qp, kp, vp, op, seq_len, num_q_heads, num_kv_heads, inv_sqrt_d,                 \
-        (unsigned)causal, (unsigned)sliding_window, mask_bias);                         \
-    break
+    do {                                                                                \
+        dim3 grid(num_q_heads, (seq_len + kBR<HD>() - 1) / kBR<HD>(), 1);               \
+        dim3 block(kThreads<HD>(), 1, 1);                                               \
+        flash_prefill_kernel<HD><<<grid, block, 0, stream>>>(                           \
+            qp, kp, vp, op, seq_len, num_q_heads, num_kv_heads, inv_sqrt_d,             \
+            (unsigned)causal, (unsigned)sliding_window, mask_bias);                     \
+    } while (0); break
 
     switch (head_dim) {
         case 64:  LAUNCH(64);
         case 128: LAUNCH(128);
-        // head_dim 256 (Qwen3.5/3.6) does NOT fit the v0 smem layout: at BR=BC=32 the two
-        // fp32 [BR][HEAD_DIM] buffers (smem_O + smem_PV) alone are 64 KB == the whole gfx1201
-        // LDS cap, before Q/K/V. Needs the smem-reduction pass (per-d-tile fold so smem_PV is
-        // [BR][16], BR=16, and O held in registers, not fp32 smem) before it can be enabled.
+        // head_dim 256 (Qwen3.5/3.6 full-attn): BR=BC=16 keeps the two fp32 [BR][HEAD_DIM] smem
+        // buffers at 16 KB each (~58 KB total) so it fits the 64 KB gfx1201 LDS. Same algorithm.
+        case 256: LAUNCH(256);
         default:
             TORCH_CHECK(false, "attn_hip: unsupported head_dim ", head_dim,
-                        " (v0 supports 64/128; 256 needs the smem-reduction pass — multiple of 16)");
+                        " (supports 64/128/256; must be a multiple of 16)");
     }
 #undef LAUNCH
 }
