@@ -85,6 +85,23 @@ class GDNStateCache:
         self.conv_state[:, slots] = 0
         self.ssm_state[:, slots] = 0
 
+    def snapshot(self, slots: torch.Tensor):
+        """Clone conv+ssm state for `slots` (across all GDN layers) for spec-decode rollback.
+
+        A spec VERIFY processes K+1 tokens/seq through the recurrent layers, over-advancing the
+        state past the eventually-accepted prefix (the kernel persists only the FINAL state, so
+        the intermediate state cannot be recovered). The scheduler snapshots the pre-verify state,
+        runs verify, then on a partial accept restores this and re-advances exactly the accepted
+        tokens. Returns an opaque handle for `restore`."""
+        sl = slots.to(torch.long)
+        return (sl, self.conv_state[:, sl].clone(), self.ssm_state[:, sl].clone())
+
+    def restore(self, snapshot) -> None:
+        """Restore a `snapshot()` back into the same slots (conv + ssm, all layers)."""
+        sl, conv, ssm = snapshot
+        self.conv_state[:, sl] = conv
+        self.ssm_state[:, sl] = ssm
+
     def conv(self, gdn_layer_id: int) -> torch.Tensor:
         """conv_state for one GDN layer: (num_slots, conv_dim, conv_kernel-1)."""
         return self.conv_state[gdn_layer_id]

@@ -148,13 +148,75 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 
 ### Later phases (post-MVP)
 - **Sampling acceptance** — `coin*q<p` + residual bonus for temperature>0 correctness.
-- **MTP/NEXTN self-spec** — stop skipping the MTP head in `models/weight.py::_is_beyond_decoder`;
-  load it as a 1-layer draft; reuse this entire cycle with the head as the proposer. GLM/DeepSeek.
 - ~~**MLA multi-query verify kernel**~~ — DONE (`mla_hip.mla_verify`, absorbed, paged latent).
 - **EAGLE2 dynamic tree** — `topk>1`: add `custom_mask`+`mask_indptr` to `attn_prefill_paged`
   (and an analogous per-query tree mask to `mla_verify`).
 - **Overlap scheduling** — `FutureMap`-style to hide the acceptance host-sync.
 - **CUDA graph capture** of the verify forward (fixed max tree size, dynamic accept count post-replay).
+
+---
+
+## 6. Model coverage: proposer abstraction, GDN, MTP, DFlash/EAGLE3
+
+The proposer is pluggable (`python/minisgl/spec/base.py::Proposer`); the verify/accept/commit/KV-
+rollback machinery is proposer-agnostic. Four families share one interface:
+
+| proposer | model | `needs_last_hidden` | `capture_layer_ids` | owns | verify |
+|----------|-------|---------------------|---------------------|------|--------|
+| **ngram** | none | no | None | nothing | linear |
+| **MTP** | target's appended head | yes | None | head + 1-layer draft KV | linear |
+| **DFlash** | separate ckpt | (via aux) | [N target layers] | fc+trunk+KV, mask-block | linear block |
+| **EAGLE3** | separate ckpt | (via aux) | [3 target layers] | fc+1-layer+KV, d2t/t2d | tree |
+
+`Proposer.propose(reqs, num_draft, ctx)` returns drafts; `Proposer.on_accept(reqs, num_accepted)`
+rolls back draft-owned state. `make_proposer(spec_config, engine)` is the factory. The seams MTP/
+DFlash/EAGLE3 need from the engine: (a) the target's **last hidden state** per verified position;
+(b) **aux-hidden capture** — `capture_layer_ids` programs a target hook to stash N decoder layers'
+outputs; (c) `bind_target(embed, lm_head, d2t, t2d)` so a draft borrows the target's embed/head.
+
+### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — WORKING (bit-exactness pending a verify kernel)
+Validated on Qwen3.5-4B (TP=1, `--attn hip`): coherent, no crash, ~17% accept / 1.3 tok/step. NOT
+bit-exact vs single-token decode: the re-advance reprocesses through the full model, where the
+full-attention layers use the *extend* kernel (spec, n+1 tokens) vs the *decode* kernel (1 token),
+and the WMMA GDN prefill is chunk-size-dependent — so spec drifts from a 1-token-per-step reference
+by fp after a few hundred chars (output stays coherent; a rollback *logic* bug would corrupt at
+char ~10). True bit-exactness + the 2× recompute removal both need a **per-token-state GDN verify
+kernel** (emit the recurrent state after each of the K+1 tokens to a scratch buffer, index the
+accepted one — no snapshot, no re-advance). That kernel is the GDN "completion" item.
+
+A verify batch carries `Batch.spec_verify=True` (phase "decode", but `extend_len=K+1`/seq). This
+flag routes the GDN layer + `build_gdn_metadata` through the **varlen recurrent (prefill) path**
+(they otherwise key on `is_prefill`). The GDN kernel persists only the FINAL recurrent state, so a
+K+1-token verify over-advances conv+ssm past the accepted prefix and the intermediate state is
+unrecoverable. Rollback (`scheduler._gdn_readvance`): snapshot conv+ssm before verify
+(`GDNStateCache.snapshot/restore`), and on a partial accept restore + **re-advance** every running
+seq through exactly its accepted tokens (a second eager forward; logits discarded). Skipped when all
+seqs fully accept. Cost: ~2× verify on partial-accept steps — a per-token-state verify kernel
+(emit the state after each of the K+1 tokens) would remove the re-advance; future work.
+
+### MTP self-speculation (the appended heads we currently discard) — DESIGNED
+GLM-4.7-Flash (`num_nextn_predict_layers=1`) and Qwen3.5/3.6 (`mtp_num_hidden_layers=1`) ship one
+MTP head, currently skipped (`weight.py::_is_beyond_decoder` for GLM `layers.47.*`;
+`_QWEN35_SKIP_PREFIXES` `"mtp."` for Qwen). Structure (both): `head_out = layer( fc( concat[
+norm_e(embed(next_tok)), norm_h(last_hidden) ] ) )` → head. GLM ships its own `embed_tokens` +
+untied `shared_head.head` + a full **MLA+MoE** layer at `layers.47`; Qwen reuses the target's embed
++ tied lm_head and ships a single **standard full-attention** `mtp.layers.0` (NOT GDN — so the MTP
+draft forward never touches GDN state; only the verify over the 32-layer backbone does, handled
+above). Implementation: (1) load the head (exempt those tensors, add module classes reusing
+`GLMDecoderLayer` / `Qwen3_5Attn`+MLP); (2) expose `last_hidden` from the target forward (split
+`model.forward` from `lm_head`); (3) `MTPProposer` runs the head autoregressively K times with its
+own 1-layer draft KV, `on_accept` truncates that KV. Validate GLM (no GDN) first, then Qwen3.5.
+
+### DFlash / EAGLE3 (extension targets) — SCAFFOLDED via the abstraction
+Both consume `fc(concat of N captured target layers)` → trunk → head, from a **separate checkpoint**
+with its **own draft KV pool**. DFlash (`DFlashDraftModel`, local ckpts for Laguna/Qwen3.5/3.6):
+N=5–8 captured layers, 5–6-layer trunk, **block-parallel** drafting (denoise `block_size`
+mask-tokens in one pass), linear verify; z-lab ckpts borrow the target embed+head, Laguna ships its
+own + `d2t/t2d` (compressed draft vocab). EAGLE3: 3 captured layers, 1-layer trunk, autoregressive,
+tree verify. To add them: a `DraftModelProposer` (separate `ModelRunner` for the draft ckpt) + the
+aux-hidden capture hook (`capture_layer_ids`) + `bind_target`. The abstraction's `capture_layer_ids`
+/ `needs_last_hidden` / `bind_target` seams exist for exactly this; EAGLE3's tree verify additionally
+needs the `topk>1` custom-mask kernels (see §5 later phases).
 
 ---
 

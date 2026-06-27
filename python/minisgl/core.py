@@ -83,6 +83,12 @@ class Batch:
     # GDN (linear-attention) per-batch metadata — set by the scheduler ONLY for GDN-hybrid
     # models (None otherwise, so the dense path is unaffected). See gdn/metadata.py.
     gdn_metadata: object | None = field(default=None, init=False)
+    # Speculative-decode VERIFY batch: phase is "decode" (so the LM head returns all-token logits,
+    # no last-token reduction) BUT each req carries extend_len = K+1 query tokens. Multi-token paths
+    # that key on `is_prefill` (GDN layer dispatch + gdn_metadata) must treat a verify batch like a
+    # prefill; attention/MLA key on extend_len/max_seqlen_q and need no flag. False for every
+    # normal batch. See scheduler._spec_decode_step and SPEC_DECODE.md.
+    spec_verify: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:

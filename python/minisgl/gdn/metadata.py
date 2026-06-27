@@ -72,7 +72,10 @@ def build_gdn_metadata(
         f"state_indices ({state_indices.numel()}) must match batch.size ({num_seqs})"
     )
 
-    if batch.is_decode:
+    # A spec-decode VERIFY batch has phase "decode" but carries extend_len = K+1 tokens/seq, so it
+    # must use the varlen (prefill-style) recurrent path — not the one-token decode path. Treat it
+    # like a prefill here; the GDN layer dispatch (qwen3_5.py) makes the matching choice.
+    if batch.is_decode and not batch.spec_verify:
         # one token per sequence: cu_seqlens = [0, 1, 2, ..., num_seqs]
         query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32, device=device)
         return GDNMetadata(
@@ -83,7 +86,7 @@ def build_gdn_metadata(
             has_initial_state=None,
         )
 
-    # prefill: cu_seqlens over the tokens processed THIS pass (extend_len per seq).
+    # prefill (and spec-verify): cu_seqlens over the tokens processed THIS pass (extend_len per seq).
     # Pin the host staging only for a CUDA target (page-locked H2D overlap); pinning needs
     # a live GPU, so the CPU path (unit tests) skips it.
     pin = device.type == "cuda" and torch.cuda.is_available()

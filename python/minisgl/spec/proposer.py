@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, List, Sequence
 
 import torch
 
-__all__ = ["propose_ngram"]
+from .base import Proposer, ProposeContext
+
+if TYPE_CHECKING:
+    from minisgl.core import Req
+
+__all__ = ["propose_ngram", "NgramProposer"]
 
 
 def propose_ngram(
@@ -65,3 +70,27 @@ def propose_ngram(
         draft = t[start : start + num_draft]
         return [int(x) for x in draft.tolist()]
     return []
+
+
+class NgramProposer(Proposer):
+    """Prompt-lookup proposer: zero model, draft tokens come from `propose_ngram` over each req's
+    own token sequence. Owns no draft state (no `on_accept` rollback)."""
+
+    def __init__(self, num_draft: int, ngram_max: int, ngram_min: int = 1) -> None:
+        self._num_draft = num_draft
+        self._ngram_max = ngram_max
+        self._ngram_min = ngram_min
+
+    def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
+        out: List[List[int]] = []
+        for req in reqs:
+            # Clamp to remain_len-1 so a full accept (K_i+1 emitted) stays within the req budget.
+            k_i = max(0, min(num_draft, req.remain_len - 1))
+            out.append(
+                propose_ngram(
+                    req.input_ids, num_draft=k_i, max_ngram=self._ngram_max, min_ngram=self._ngram_min
+                )
+                if k_i > 0
+                else []
+            )
+        return out
