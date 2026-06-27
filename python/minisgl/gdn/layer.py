@@ -111,6 +111,16 @@ class QwenGatedDeltaNet(nn.Module):
             self.value_dim, hidden_size, bias=False, dtype=dtype, device=device
         )
 
+        # fp32 caches of the two FROZEN weights the gdn_hip kernels consume at fp32: the depthwise
+        # conv weight and the gated-RMSNorm weight. Both are model parameters — constant after the
+        # state-dict load — so the previous per-call `.float()` was recomputing a constant, i.e. one
+        # extra elementwise launch per layer per token (felt as launch overhead in the eager,
+        # cudagraph-disabled decode loop). Built once lazily on first forward (which runs post-load,
+        # before any graph capture) and reused. Assumes weights are frozen + not device-moved after
+        # warmup, which is the inference contract here.
+        self._conv_w_fp32: torch.Tensor | None = None
+        self._norm_w_fp32: torch.Tensor | None = None
+
     # ---- input split (non-interleaved Qwen3.5 layout) ----
     def _split_qkvz_ba(self, qkvz: torch.Tensor, ba: torch.Tensor, n: int):
         """qkvz -> (mixed_qkv, z); ba -> (b, a). Mirrors
@@ -124,6 +134,19 @@ class QwenGatedDeltaNet(nn.Module):
 
     def _conv_weights(self) -> torch.Tensor:
         return self.conv1d_weight.view(self.conv_dim, self.conv_kernel_size)
+
+    def _conv_weights_fp32(self) -> torch.Tensor:
+        """Cached fp32 (conv_dim, kernel) conv weight — built once (lazily, post weight-load), not
+        re-cast per step. Replaces the per-call `self._conv_weights().float()` constant-recompute."""
+        if self._conv_w_fp32 is None:
+            self._conv_w_fp32 = self._conv_weights().float().contiguous()
+        return self._conv_w_fp32
+
+    def _norm_weight_fp32(self) -> torch.Tensor:
+        """Cached fp32 gated-RMSNorm weight — same constant-recompute fix as the conv weight."""
+        if self._norm_w_fp32 is None:
+            self._norm_w_fp32 = self.norm.weight.float().contiguous()
+        return self._norm_w_fp32
 
     def _split_conv_qkv(self, conv_out: torch.Tensor, n: int):
         """Split the conv output [n, conv_dim] = [q|k|v] into q,k [n, num_k_heads, head_k_dim] and
@@ -139,9 +162,12 @@ class QwenGatedDeltaNet(nn.Module):
         from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
 
         out_dtype = self.out_proj.weight.dtype
-        core = core_attn_out.reshape(-1, core_attn_out.shape[-1]).float()  # [n*HV, head_v_dim]
-        z_flat = z.reshape(-1, z.shape[-1]).float()
-        normed = gdn.rmsnorm_gated(core, z_flat, self.norm.weight.float(), self.norm.eps)
+        # bf16-native rmsnorm_gated: reads x/z at the input dtype, up-casts to fp32 for the norm, writes
+        # back at the input dtype. .contiguous() (was implicit in the old .float() copy) is required:
+        # core is a reshape of the gdn output, and z is a strided slice of the qkvz projection.
+        core = core_attn_out.reshape(-1, core_attn_out.shape[-1]).contiguous()  # [n*HV, head_v_dim]
+        z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+        normed = gdn.rmsnorm_gated(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
         normed = normed.reshape(n, self.value_dim)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
         return self.out_proj(normed.to(out_dtype))
 
@@ -162,16 +188,22 @@ class QwenGatedDeltaNet(nn.Module):
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        state_idx = state_indices.long()  # int32->int64 once, reused by conv + prefill kernels
+        has_init = has_initial_state.to(torch.uint8)  # bool->uint8 once, reused likewise
 
         # Depthwise causal conv (varlen) + SiLU; conv_state (fp32) updated in place per slot. The HIP
         # kernel takes token-major [T, conv_dim] contiguous (vs the Triton path's transposed view).
+        # bf16-native: the gdn_hip kernels are templated on the I/O dtype and up-cast to fp32
+        # in-register, so mixed_qkv/a/b/core/z flow through at the model dtype (no .float() HBM
+        # round-trip). .contiguous() is still required — the conv kernel reads token-major contiguous,
+        # and it also replaces the contiguity the old .float() copy used to provide for the views below.
         conv_out = gdn.causal_conv1d_fwd(
-            mixed_qkv.float().contiguous(),
-            self._conv_weights().float(),
+            mixed_qkv.contiguous(),
+            self._conv_weights_fp32(),
             None,  # bias-free
             query_start_loc,
-            state_indices.long(),
-            has_initial_state.to(torch.uint8),
+            state_idx,
+            has_init,
             conv_state,
             1,  # SiLU
         )
@@ -188,10 +220,10 @@ class QwenGatedDeltaNet(nn.Module):
         prefill_op = gdn.gdn_prefill if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0" \
             else gdn.gdn_prefill_wmma
         core = prefill_op(
-            q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
-            query_start_loc, state_indices.long(), has_initial_state.to(torch.uint8),
+            q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+            query_start_loc, state_idx, has_init,
             ssm_state, self.head_k_dim ** -0.5, 1,
-        )  # [T, num_v_heads, head_v_dim] fp32
+        )  # [T, num_v_heads, head_v_dim] at the input (model) dtype
         return self._output_projection(core, z, n)
 
     # ---- decode: single-step recurrent update per sequence, advances state in place ----
@@ -209,22 +241,23 @@ class QwenGatedDeltaNet(nn.Module):
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        state_idx = state_indices.long()  # int32->int64 once, reused by both kernels below
 
         # One-step depthwise causal conv update (state roll) + SiLU; conv_state (fp32) in place.
         conv_out = gdn.causal_conv1d_update(
-            mixed_qkv.float().contiguous(),
-            self._conv_weights().float(),
+            mixed_qkv.contiguous(),  # bf16-native; .contiguous() supplies the token-major layout
+            self._conv_weights_fp32(),
             None,  # bias-free
             conv_state,
-            state_indices.long(),
+            state_idx,
             1,  # SiLU
         )
         # One-step gated-delta-rule (l2norm + g/beta folded in); ssm_state updated in place per slot.
         q, k, v = self._split_conv_qkv(conv_out, n)
         core = gdn.gdn_decode(
-            q, k, v, a.float(), b.float(), self.A_log, self.dt_bias,
-            ssm_state, state_indices.long(), self.head_k_dim ** -0.5, 1,
-        )  # [B, num_v_heads, head_v_dim] fp32
+            q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+            ssm_state, state_idx, self.head_k_dim ** -0.5, 1,
+        )  # [B, num_v_heads, head_v_dim] at the input (model) dtype
         return self._output_projection(core, z, n)
 
     # ---- warmup hook — no-op now that the conv is AOT HIP (no Triton autotune to settle) ----

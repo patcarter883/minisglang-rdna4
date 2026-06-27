@@ -4,8 +4,13 @@
 // from minisgl OR vLLM). Mirrors the zaya_cca TORCH_LIBRARY pattern: opaque custom ops with a
 // registered fake/meta (in op.py) so torch.compile/Inductor steps over them without graph-breaking.
 //
-// v1 is fp32 at the boundary (the Python wrapper casts q/k/v/a/b and the state to float); bf16-native
-// state is a follow-up. State tensors (ssm_state / conv_state) are mutated in place (Tensor(a!)).
+// Activation I/O (q/k/v/a/b/x/z and the returned out) is dtype-GENERIC: the kernels are templated on
+// the input element type and dispatch over fp32/fp16/bf16 (AT_DISPATCH_FLOATING_TYPES_AND2), reading
+// each element and up-casting to float in-register for the math, then writing back at the I/O dtype.
+// This removes the Python-side .float() casts + their HBM round-trips. Per-head params (A_log,
+// dt_bias, conv/norm weight) and the recurrent STATE (ssm_state / conv_state) stay fp32 for numerics;
+// state is bf16 is a separate follow-up. out follows the input dtype (at::empty_like / v.options()).
+// State tensors are mutated in place (Tensor(a!)).
 
 #include <torch/extension.h>
 #include <torch/library.h>

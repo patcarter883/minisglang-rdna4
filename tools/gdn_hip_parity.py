@@ -1,9 +1,13 @@
-"""Task 4-#19 — numeric parity for the native gdn_hip HIP kernels (GPU).
+"""Task 4-#19 — numeric parity for the native gdn_hip HIP kernels (GPU), across I/O dtypes.
 
 Each gdn_hip op is checked against a pure-torch reference of the EXACT math it implements (the fla
-gated-delta-rule recurrence + depthwise causal conv + gated RMSNorm). Both run fp32, so a faithful
-kernel matches to ~1e-4; a real indexing/LDS/register bug shows as a large max|Δ|. This recurrent
-reference is also the oracle for the future chunked-HIP prefill.
+gated-delta-rule recurrence + depthwise causal conv + gated RMSNorm). The kernels are now templated
+on the ACTIVATION I/O dtype (fp32/fp16/bf16) and up-cast to fp32 in-register for the math; per-head
+params (A_log/dt_bias/weight/bias) and the recurrent STATE (ssm/conv) stay fp32. So this harness runs
+each check at all three dtypes: the activation inputs (q/k/v/a/b/x/z) are rounded to the test dtype
+and the REFERENCE is fed the SAME rounded values, so what's measured is the kernel's own error (RELATIVE
+to the output magnitude), NOT input rounding. A faithful kernel sits near the dtype's mantissa floor
+(fp32~1e-3, fp16~1e-2, bf16~5e-2 rel); a real indexing/LDS/register bug or NaN blows past it.
 
 Run inside the combined ROCm image UNDER a 1-card lease (executes HIP kernels):
     .../gpu-lease.sh -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_hip_parity.py'
@@ -23,12 +27,39 @@ torch.manual_seed(0)
 H, HV, K, V = 16, 32, 128, 128
 SCALE = K ** -0.5
 
+# --- per-run dtype state (set by main()'s dtype loop) ----------------------------------------------
+DT = torch.float32                     # current activation I/O dtype under test
+# base RELATIVE threshold (max|Δ| / mean|ref|) per dtype = a few x the mantissa floor. Calibrated to
+# the measured kernel-vs-fp32-reference error: fp32 non-wmma is ~1e-6 (exact); the floors rise with the
+# dtype's mantissa (fp16 ~8e-3, bf16 ~6-8e-2 — the mean denominator inflates a single max-element's
+# low-bit output rounding). The TIGHT fp32 tier + the isfinite guard are the real bug catchers (a logic
+# bug shows at fp32 too, since one templated kernel serves all dtypes); the looser low-precision tiers
+# confirm the bf16/fp16 path runs and stays within gross rounding.
+_BASE_THR = {torch.float32: 4e-3, torch.float16: 1.5e-2, torch.bfloat16: 1.2e-1}
 
-def _report(name: str, got: torch.Tensor, ref: torch.Tensor, tol: float = 2e-3) -> bool:
+
+def to_dt(t: torch.Tensor) -> torch.Tensor:
+    """Cast an activation tensor to the test dtype for the KERNEL call (exact when t is already
+    DT-rounded in fp32 storage)."""
+    return t.to(DT)
+
+
+def rnd(*ts: torch.Tensor):
+    """DT-round the activation inputs but keep them in fp32 storage, so the torch REFERENCE computes
+    on exactly the values the kernel sees. (No-op at fp32.)"""
+    if DT == torch.float32:
+        return ts if len(ts) > 1 else ts[0]
+    out = tuple(t.to(DT).float() for t in ts)
+    return out if len(out) > 1 else out[0]
+
+
+def _report(name: str, got: torch.Tensor, ref: torch.Tensor, tol_mult: float = 1.0) -> bool:
     d = (got.float() - ref.float()).abs().max().item()
     scale = ref.float().abs().mean().item()
-    ok = d <= tol
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name:24s} max|Δ|={d:.3e}  (ref |·|~{scale:.3e})")
+    rel = d / (scale + 1e-9)
+    thr = _BASE_THR[DT] * tol_mult
+    ok = rel <= thr and torch.isfinite(got).all().item()
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:42s} max|Δ|={d:.3e} rel={rel:.3e} (thr={thr:.1e})")
     return ok
 
 
@@ -59,6 +90,7 @@ def check_decode() -> bool:
     state = torch.randn(num_slots, HV, V, K, device=DEV)
     # slots: mix of valid + one NULL (0) to exercise the skip
     idx = torch.tensor([1, 0, 3, 5], dtype=torch.long, device=DEV)
+    q, k, v, a, b = rnd(q, k, v, a, b)  # reference sees the DT-rounded activation inputs
 
     ref_state = state.clone()
     ref_out = torch.zeros(B, HV, V, device=DEV)
@@ -77,7 +109,8 @@ def check_decode() -> bool:
             ref_state[slot, hv] = S
 
     got_state = state.clone()
-    got_out = torch.ops.gdn_hip.gdn_decode(q, k, v, a, b, A_log, dt_bias, got_state, idx, SCALE, 1)
+    got_out = torch.ops.gdn_hip.gdn_decode(to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, got_state,
+                                           idx, SCALE, 1)
     ok = _report("gdn_decode.out", got_out, ref_out)
     ok &= _report("gdn_decode.state", got_state[idx[idx > 0]], ref_state[idx[idx > 0]])
     return ok
@@ -99,6 +132,7 @@ def check_prefill() -> bool:
     state = torch.randn(num_slots, HV, V, K, device=DEV)
     idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
     has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+    q, k, v, a, b = rnd(q, k, v, a, b)  # reference sees the DT-rounded activation inputs
 
     ref_state = state.clone()
     ref_out = torch.zeros(T, HV, V, device=DEV)
@@ -118,8 +152,8 @@ def check_prefill() -> bool:
             ref_state[slot, hv] = S
 
     got_state = state.clone()
-    got_out = torch.ops.gdn_hip.gdn_prefill(q, k, v, a, b, A_log, dt_bias, cu, idx, has_init,
-                                            got_state, SCALE, 1)
+    got_out = torch.ops.gdn_hip.gdn_prefill(to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, cu, idx,
+                                            has_init, got_state, SCALE, 1)
     ok = _report("gdn_prefill.out", got_out, ref_out)
     ok &= _report("gdn_prefill.state", got_state[idx], ref_state[idx])
     return ok
@@ -143,15 +177,16 @@ def check_prefill_chunked() -> bool:
     state = torch.randn(num_slots, HV, V, K, device=DEV)
     idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
     has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+    q, k, v, a, b = rnd(q, k, v, a, b)  # both kernels see identical DT-rounded inputs
 
     st_ref = state.clone()
-    out_ref = torch.ops.gdn_hip.gdn_prefill(q, k, v, a, b, A_log, dt_bias, cu, idx, has_init,
-                                            st_ref, SCALE, 1)
+    out_ref = torch.ops.gdn_hip.gdn_prefill(to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, cu, idx,
+                                            has_init, st_ref, SCALE, 1)
     st_ch = state.clone()
-    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(q, k, v, a, b, A_log, dt_bias, cu, idx, has_init,
-                                                   st_ch, SCALE, 1)
-    ok = _report("prefill_chunked.out (vs recurrent)", out_ch, out_ref, tol=5e-3)
-    ok &= _report("prefill_chunked.state", st_ch[idx], st_ref[idx], tol=5e-3)
+    out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, cu,
+                                                   idx, has_init, st_ch, SCALE, 1)
+    ok = _report("prefill_chunked.out (vs recurrent)", out_ch, out_ref, tol_mult=2.0)
+    ok &= _report("prefill_chunked.state", st_ch[idx], st_ref[idx], tol_mult=2.0)
     return ok
 
 
@@ -181,9 +216,10 @@ def check_prefill_wmma() -> bool:
     state = torch.randn(num_slots, HV, V, K, device=DEV)
     idx = torch.tensor([1, 4, 6, 2, 9, 11, 13, 15], dtype=torch.long, device=DEV)
     has_init = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0], dtype=torch.uint8, device=DEV)
+    q, k, v, a, b = rnd(q, k, v, a, b)  # all kernels see identical DT-rounded inputs
 
     def _args(A_log):
-        return (q, k, v, a, b, A_log, dt_bias, cu, idx, has_init)
+        return (to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, cu, idx, has_init)
 
     # (A) strong decay -> recurrent oracle only (+ finiteness regression guard)
     A_strong = torch.randn(HV, device=DEV) * 0.5  # exp(A_log)~0.4-2.7
@@ -194,8 +230,8 @@ def check_prefill_wmma() -> bool:
     if not fin:
         print("  [FAIL] prefill_wmma produced non-finite values (NaN/Inf) — decay overflow regression")
     ok = fin
-    ok &= _report("prefill_wmma.out  [strong decay] (vs recurrent)", out_w, out_rec, tol=8e-3)
-    ok &= _report("prefill_wmma.state[strong decay] (vs recurrent)", st_w[idx], st_rec[idx], tol=8e-3)
+    ok &= _report("prefill_wmma.out  [strong decay] (vs recurrent)", out_w, out_rec, tol_mult=8.0)
+    ok &= _report("prefill_wmma.state[strong decay] (vs recurrent)", st_w[idx], st_rec[idx], tol_mult=8.0)
 
     # (B) mild decay -> three-way agreement (recurrent + scalar-chunked both valid)
     A_mild = torch.randn(HV, device=DEV) * 0.5 - 2.0  # exp(A_log)~0.05-0.3
@@ -203,9 +239,9 @@ def check_prefill_wmma() -> bool:
     out_rec2 = torch.ops.gdn_hip.gdn_prefill(*_args(A_mild), st_rec2, SCALE, 1)
     out_ch = torch.ops.gdn_hip.gdn_prefill_chunked(*_args(A_mild), st_ch, SCALE, 1)
     out_w2 = torch.ops.gdn_hip.gdn_prefill_wmma(*_args(A_mild), st_w2, SCALE, 1)
-    ok &= _report("prefill_wmma.out  [mild decay] (vs recurrent)", out_w2, out_rec2, tol=8e-3)
-    ok &= _report("prefill_wmma.out  [mild decay] (vs scalar-chunked)", out_w2, out_ch, tol=8e-3)
-    ok &= _report("prefill_wmma.state[mild decay] (vs scalar-chunked)", st_w2[idx], st_ch[idx], tol=8e-3)
+    ok &= _report("prefill_wmma.out  [mild decay] (vs recurrent)", out_w2, out_rec2, tol_mult=8.0)
+    ok &= _report("prefill_wmma.out  [mild decay] (vs scalar-chunked)", out_w2, out_ch, tol_mult=8.0)
+    ok &= _report("prefill_wmma.state[mild decay] (vs scalar-chunked)", st_w2[idx], st_ch[idx], tol_mult=8.0)
     return ok
 
 
@@ -217,6 +253,7 @@ def check_conv_update() -> bool:
     bias = torch.randn(C, device=DEV)
     state = torch.randn(num_slots, C, W - 1, device=DEV)
     idx = torch.tensor([1, 0, 3, 5], dtype=torch.long, device=DEV)
+    x = rnd(x)  # reference sees the DT-rounded input
 
     ref_state = state.clone()
     ref_out = torch.zeros(B, C, device=DEV)
@@ -232,7 +269,7 @@ def check_conv_update() -> bool:
             ref_state[slot] = win[:, 1:]  # roll left, append new at tail
 
     got_state = state.clone()
-    got_out = torch.ops.gdn_hip.causal_conv1d_update(x, weight, bias, got_state, idx, 1)
+    got_out = torch.ops.gdn_hip.causal_conv1d_update(to_dt(x), weight, bias, got_state, idx, 1)
     ok = _report("conv1d_update.out", got_out, ref_out)
     ok &= _report("conv1d_update.state", got_state[idx[idx > 0]], ref_state[idx[idx > 0]])
     return ok
@@ -249,6 +286,7 @@ def check_conv_fwd() -> bool:
     state = torch.randn(num_slots, C, W - 1, device=DEV)
     idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
     has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+    x = rnd(x)  # reference sees the DT-rounded input
 
     ref_state = state.clone()
     ref_out = torch.zeros(T, C, device=DEV)
@@ -263,7 +301,7 @@ def check_conv_fwd() -> bool:
         ref_state[slot] = hist
 
     got_state = state.clone()
-    got_out = torch.ops.gdn_hip.causal_conv1d_fwd(x, weight, bias, cu, idx, has_init, got_state, 1)
+    got_out = torch.ops.gdn_hip.causal_conv1d_fwd(to_dt(x), weight, bias, cu, idx, has_init, got_state, 1)
     ok = _report("conv1d_fwd.out", got_out, ref_out)
     ok &= _report("conv1d_fwd.state", got_state[idx], ref_state[idx])
     return ok
@@ -275,29 +313,38 @@ def check_rmsnorm_gated() -> bool:
     z = torch.randn(M, D, device=DEV)
     weight = torch.randn(D, device=DEV)
     eps = 1e-5
+    x, z = rnd(x, z)  # reference sees the DT-rounded inputs
     inv = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     ref = x * inv * weight * F.silu(z)
-    got = torch.ops.gdn_hip.rmsnorm_gated(x, z, weight, eps)
+    got = torch.ops.gdn_hip.rmsnorm_gated(to_dt(x), to_dt(z), weight, eps)
     return _report("rmsnorm_gated", got, ref)
 
 
 def main() -> None:
+    global DT
     assert torch.cuda.is_available(), "needs a GPU (run under a lease)"
     print(f"=== gdn_hip parity vs torch reference (device={torch.cuda.get_device_name()}) ===")
-    results = {
-        "gdn_decode": check_decode(),
-        "gdn_prefill": check_prefill(),
-        "gdn_prefill_chunked": check_prefill_chunked(),
-        "gdn_prefill_wmma": check_prefill_wmma(),
-        "causal_conv1d_update": check_conv_update(),
-        "causal_conv1d_fwd": check_conv_fwd(),
-        "rmsnorm_gated": check_rmsnorm_gated(),
+    checks = {
+        "gdn_decode": check_decode,
+        "gdn_prefill": check_prefill,
+        "gdn_prefill_chunked": check_prefill_chunked,
+        "gdn_prefill_wmma": check_prefill_wmma,
+        "causal_conv1d_update": check_conv_update,
+        "causal_conv1d_fwd": check_conv_fwd,
+        "rmsnorm_gated": check_rmsnorm_gated,
     }
-    print("=" * 50)
-    allok = all(results.values())
-    for n, ok in results.items():
-        print(f"  {n:24s} {'PASS' if ok else 'FAIL'}")
-    print("\nRESULT:", "ALL PASS — gdn_hip numerics faithful" if allok else "FAIL (see above)")
+    allok = True
+    for dt, label in [(torch.float32, "fp32"), (torch.float16, "fp16"), (torch.bfloat16, "bf16")]:
+        DT = dt
+        torch.manual_seed(0)  # identical random inputs across dtypes (comparability)
+        print(f"\n--- I/O dtype: {label}  (base rel-thr={_BASE_THR[dt]:.1e}) ---")
+        results = {n: fn() for n, fn in checks.items()}
+        ok = all(results.values())
+        allok &= ok
+        print(f"  >>> {label}: {'ALL PASS' if ok else 'FAIL'}")
+    print("\n" + "=" * 60)
+    print("RESULT:", "ALL PASS — gdn_hip numerics faithful across fp32/fp16/bf16"
+          if allok else "FAIL (see above)")
     if not allok:
         raise SystemExit(1)
 
