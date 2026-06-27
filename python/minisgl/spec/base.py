@@ -102,4 +102,16 @@ def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
         if engine is None:
             raise ValueError("the MTP proposer needs the engine (model + device); none was passed")
         return MTPProposer(engine=engine, num_draft=spec_config.num_draft)
+    if spec_config.algorithm == "eagle3":
+        from .draft_model import DraftModelProposer
+
+        if engine is None:
+            raise ValueError("the EAGLE3 proposer needs the engine (model + device); none was passed")
+        if not spec_config.draft_model_path:
+            raise ValueError("--spec-algorithm eagle3 requires --spec-draft-model-path <ckpt>")
+        return DraftModelProposer(
+            engine=engine,
+            num_draft=spec_config.num_draft,
+            draft_model_path=spec_config.draft_model_path,
+        )
     raise ValueError(f"no proposer for spec algorithm {spec_config.algorithm!r}")

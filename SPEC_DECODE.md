@@ -280,16 +280,53 @@ scheduler carries the per-uid seed row into the next `ProposeContext`); see "Tar
 exposure" above; (3) `MTPProposer` runs the head autoregressively K times with its own 1-layer draft
 KV, `on_accept` truncates that KV. Validate GLM (no GDN) first, then Qwen3.5.
 
-### DFlash / EAGLE3 (extension targets) — SCAFFOLDED via the abstraction
-Both consume `fc(concat of N captured target layers)` → trunk → head, from a **separate checkpoint**
-with its **own draft KV pool**. DFlash (`DFlashDraftModel`, local ckpts for Laguna/Qwen3.5/3.6):
-N=5–8 captured layers, 5–6-layer trunk, **block-parallel** drafting (denoise `block_size`
-mask-tokens in one pass), linear verify; z-lab ckpts borrow the target embed+head, Laguna ships its
-own + `d2t/t2d` (compressed draft vocab). EAGLE3: 3 captured layers, 1-layer trunk, autoregressive,
-tree verify. To add them: a `DraftModelProposer` (separate `ModelRunner` for the draft ckpt) + the
-aux-hidden capture hook (`capture_layer_ids`) + `bind_target`. The abstraction's `capture_layer_ids`
-/ `needs_last_hidden` / `bind_target` seams exist for exactly this; EAGLE3's tree verify additionally
-needs the `topk>1` custom-mask kernels (see §5 later phases).
+### EAGLE3 (separate draft checkpoint) — DONE, GPU-VALIDATED (coherent, 29% accept / 2.38 tok/step)
+GPU-validated on GLM-4.7-Flash (`QuantTrio/GLM-4.7-Flash-AWQ`, TP=2, MLA) with `--spec-algorithm
+eagle3 --spec-draft-model-path thoughtworks/GLM-4.7-Flash-Eagle3` (`tools/eagle3_glm.sh`): coherent
+("the capital of France is Paris") and **~29% accept / 2.38 tok/step** on a linear chain. The verify
+corrects every draft, so the served output is lossless (== the plain GLM output). Acceptance is below
+the README's bf16-H200 ~55% because the target here is AWQ-quantized (perturbs the aux features the
+draft was trained on) and the MVP runs a LINEAR chain without the SGLang draft-extend-over-prompt seed.
+
+Implementation (`spec/draft_model.py::DraftModelProposer`, `capture_layer_ids=[1,22,43]`,
+`needs_last_hidden=False`): the draft is a SEPARATE 15-tensor checkpoint — a standard 1-layer Llama
+GQA head (16q/4kv/d128, full RoPE θ=1e6, SwiGLU, compressed 32000 draft vocab), NOT the target's MLA
+(`models/glm_eagle3.py::GLMEagle3DraftModel`). It is loaded directly from its safetensors (its arch +
+vocab differ from the target, so it does NOT go through `load_weight`), replicated on every TP rank,
+and BORROWS the target's `model.embed_tokens` (the checkpoint ships none; draft hidden == target
+hidden == 2048). Each step it fuses the 3 captured target aux layers (`fc(concat[h1,h22,h43])`) with
+the embedded token and drafts a chain of K; the draft argmax (draft vocab) maps to the target vocab
+via `d2t` (delta: `target_id = draft_id + d2t[draft_id]`) before staging into the existing linear
+verify. **Three findings that set the shape:**
+- **the EAGLE3 aux = the full residual stream `x + residual`** entering the captured target layer,
+  NOT `residual` alone. minisgl's `GLMDecoderLayer` returns the mlp output un-added in `x` (folded in
+  by the next layer's input_norm), so `residual` alone misses the layer's mlp; SGLang captures
+  `hidden_states + residual` (the complete stream). The minisgl capture ids are **[1,22,43]** = the
+  outputs of those layers, == SGLang's *inputs* to its default `[2,23,44]` (`[2, N//2, N-3]`, N=47),
+  because minisgl grabs `residual` AFTER a layer whereas SGLang grabs it BEFORE.
+- **the 1-layer draft needs a PERSISTENT per-request KV cache** (same finding as MTP): restricting
+  its self-attention to just the K-token chain collapses it to ~2% accept (near random). The proposer
+  keeps `_cache[uid]`, runs every confirmed token through the draft layer (growing the context across
+  decode steps), appends the K drafts temporarily, and `on_accept` truncates to the accepted prefix;
+  `free(uid)` drops it on finish. The cache starts empty at the first decode (the prompt is not
+  replayed), so early-token acceptance is lower — the same future lever as MTP.
+- **the draft forward is parity-exact** against an independent reference (`tools/eagle3_parity.py`,
+  cos≈1.0, identical argmax) — the model math + weight load are correct; all the acceptance came from
+  the aux content + persistent-KV fixes above. Diagnostics (env-gated, default = the validated
+  config): `MINISGL_EAGLE3_CAPTURE_LAYERS`, `MINISGL_EAGLE3_AUX_MODE` (xr/r),
+  `MINISGL_EAGLE3_TOK_OFF`/`POS_OFF`, `MINISGL_EAGLE3_NO_CTX`.
+
+Future levers (not needed for the bar): tree verify (topk>1 custom-mask kernels, §5); the SGLang
+draft-extend-over-accepted-prefix seed (rebuild the chain hidden through the draft rather than reuse
+the single last aux); a bf16 (non-AWQ) target to recover the README's ~55%.
+
+### DFlash (extension target) — SCAFFOLDED via the same abstraction
+DFlash (`DFlashDraftModel`, local ckpts for Laguna/Qwen3.5/3.6): N=5–8 captured layers, 5–6-layer
+trunk, **block-parallel** drafting (denoise `block_size` mask-tokens in one pass), linear verify;
+z-lab ckpts borrow the target embed+head, Laguna ships its own + `d2t/t2d`. To add it: reuse the
+`DraftModelProposer` shape (separate ckpt load + aux-hidden capture + persistent draft KV) with a
+multi-layer block-parallel trunk. The `capture_layer_ids` / `bind_target` seams (now exercised by
+EAGLE3) exist for exactly this.
 
 ---
 

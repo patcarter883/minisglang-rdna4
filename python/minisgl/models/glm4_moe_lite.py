@@ -23,6 +23,7 @@ a follow-up. The MTP head (layers.<num_layers>, num_nextn_predict_layers) is ski
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -313,11 +314,15 @@ class GLMModel(BaseOP):
         cap = self._capture_layer_ids if return_hidden else None
         cap_set = set(cap) if cap else None
         grabbed: dict[int, torch.Tensor] = {}
+        # EAGLE3 aux = the full residual stream entering the NEXT layer = x + residual (SGLang
+        # captures `hidden_states + residual`). `residual` alone MISSES this layer's mlp output, which
+        # the layer returns un-added in `x` (folded into the stream by the next layer's input_norm).
+        # MINISGL_EAGLE3_AUX_MODE=r captures `residual` only (diagnostic).
+        _aux_xr = cap_set is None or os.environ.get("MINISGL_EAGLE3_AUX_MODE", "xr") == "xr"
         for lid, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
             if cap_set is not None and lid in cap_set:
-                # output hidden of layer lid = the residual stream after it (feeds the next layer).
-                grabbed[lid] = residual.clone()
+                grabbed[lid] = (x + residual).clone() if _aux_xr else residual.clone()
         # MTP seed = the PRE-final-norm residual stream (x + residual), the standard GLM/DeepSeek
         # NextN `previous_hidden_states` input (the MTP's own hnorm re-normalizes it). Snapshot it
         # before self.norm mutates `residual` in place. Only materialized when capturing.

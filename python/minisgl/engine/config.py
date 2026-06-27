@@ -42,6 +42,7 @@ class EngineConfig:
     spec_num_draft: int = 4
     spec_ngram_max: int = 3
     spec_ngram_min: int = 1
+    spec_draft_model_path: str | None = None  # EAGLE3/DFlash: separate draft checkpoint path
 
     @cached_property
     def spec_config(self):
@@ -54,6 +55,7 @@ class EngineConfig:
             num_draft=self.spec_num_draft,
             ngram_max=self.spec_ngram_max,
             ngram_min=self.spec_ngram_min,
+            draft_model_path=self.spec_draft_model_path,
         )
 
     @cached_property
