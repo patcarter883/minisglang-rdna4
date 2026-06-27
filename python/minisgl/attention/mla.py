@@ -35,7 +35,8 @@ class MLABackend(BaseAttnBackend):
         the model from the latent — handles cold + extend via cu_seqlens_q/k + prefix-offset causal).
 
     The generic ``forward(q,k,v,...)`` is unused (the MLA layer calls the methods above directly).
-    cudagraph capture is not implemented — run with ``--cuda-graph-max-bs 0``.
+    DECODE cudagraph capture is supported (static cache_seqlens + page_table buffers, see below);
+    MoE-decode must run the graph-safe gather_reduce path (MINISGL_MOE_SCATTER=0). Prefill is eager.
     """
 
     def __init__(self, config: "ModelConfig"):
@@ -128,14 +129,56 @@ class MLABackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
-    # --- cudagraph capture: not yet supported. Boot with --cuda-graph-max-bs 0. ---
+    # ---- cudagraph capture (DECODE only) -----------------------------------------------------
+    # Decode is one token/seq, so the only per-step-varying metadata mla_decode reads is
+    # cache_seqlens (latent KV length, +1 each step) and the page table (a row can gain a page).
+    # Both live in STATIC int32 buffers the captured graph reads; prepare_for_replay refreshes them
+    # in place before g.replay(). The latent STORE (store_latent at batch.out_loc, from the model-
+    # level capture buffer) and the decode kernel both run inside the graph; the decode kernel bounds
+    # its reads by cache_seqlens, so a fixed max-width page table is fine (stale tail ignored). The
+    # latent pool is a fixed tensor (captured by reference). cu_seqlens_* are unused by decode (q-len
+    # is always 1) — a static arange placeholder. Mirrors HIPAttnBackend's capture. (MoE-decode must
+    # use the graph-safe gather_reduce path, MINISGL_MOE_SCATTER=0 — the scatter atomicAdd is not
+    # graph-capturable; see [[splitk-gemm2-modest-win]] / production-serve-config-and-bench.)
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        raise NotImplementedError(
-            "mla cudagraph capture is not yet supported; run with --cuda-graph-max-bs 0"
+        dev = self.kvcache.device
+        self._cap_max_bs = max(bs_list)
+        self._cap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._cap_cache_seqlens = torch.ones(self._cap_max_bs, dtype=torch.int32, device=dev)
+        self._cap_page_table = torch.zeros(
+            self._cap_max_bs, self._cap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._cap_cu_q = torch.arange(self._cap_max_bs + 1, dtype=torch.int32, device=dev)
+
+    def _decode_metadata_static(self, bs: int) -> MLAMetadata:
+        return MLAMetadata(
+            cache_seqlens=self._cap_cache_seqlens[:bs],
+            cu_seqlens_q=self._cap_cu_q[: bs + 1],
+            cu_seqlens_k=self._cap_cu_q[: bs + 1],  # unused by decode (placeholder)
+            max_seqlen_q=1,
+            page_table=self._cap_page_table[:bs],
         )
 
+    def _fill_decode_static(self, batch: Batch) -> None:
+        """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding).
+        Runs eager, OUTSIDE the graph; writes the exact int32 tensors the captured kernel reads."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        seqlens_k = [req.device_len for req in reqs]
+        self._cap_cache_seqlens[:bs].copy_(torch.tensor(seqlens_k, dtype=torch.int32, device=dev))
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (seqlens_k[i] + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._cap_page_table[i, :npages].copy_(row.to(torch.int32))
+
     def prepare_for_capture(self, batch: Batch) -> None:
-        raise NotImplementedError
+        self._fill_decode_static(batch)
+        batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        raise NotImplementedError
+        self._fill_decode_static(batch)
+        batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
