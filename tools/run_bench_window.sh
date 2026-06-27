@@ -15,6 +15,7 @@ docker run --rm \
   -e MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" -e TP="${TP:-2}" \
   -e MEMRATIO="${MEMRATIO:-0.82}" -e MAXRUN="${MAXRUN:-24}" \
   -e GRAPH="${GRAPH:-16}" -e MOE_SCATTER="${MOE_SCATTER:-0}" -e BENCH_M="${BENCH_M:-1,2,4,8,16}" \
+  -e ATTN="${ATTN:-hip}" \
   -e SKIP_TRITON_COPY="${SKIP_TRITON_COPY:-1}" \
   -v "$PWD":/engine \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/triton-ro:ro \

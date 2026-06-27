@@ -14,6 +14,11 @@ MEMRATIO="${MEMRATIO:-0.82}"
 MAXRUN="${MAXRUN:-24}"
 GRAPH="${GRAPH:-16}"            # cuda_graph_max_bs; capture set = [1,2,4]+range(8,GRAPH+1,8)
 MMS="${MOE_SCATTER:-0}"        # MINISGL_MOE_SCATTER: 0 = graph-safe gather_reduce decode path
+# Attention backend. 'hip' = native HIP flash (the only capture-capable GQA/MHA backend, for
+# dense/Qwen). MLA models (GLM-4.7-Flash) MUST use 'auto' — the engine force-selects the capture-
+# capable 'mla' backend (page_size 16) and a 'hip' override would just be re-overridden. The 'mla'
+# backend's decode cudagraph capture is wired, so GRAPH>0 works for GLM too.
+ATTN="${ATTN:-hip}"
 BENCH_M="${BENCH_M:-1,2,4,8,16}"
 RESULTS=/engine/tools/tp2_results
 mkdir -p "$RESULTS"
@@ -26,13 +31,13 @@ else
 fi
 echo "[setup] server deps (pip install, ~1 min) ..."
 pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil
-python -c "import gdn_hip, moe_hip, tail_hip; print('[setup] hip pkgs import OK')" \
+python -c "import gdn_hip, moe_hip, tail_hip, mla_hip; print('[setup] hip pkgs import OK')" \
   || { echo '[setup] hip pkg import FAILED'; exit 1; }
 
 SRV=""
 launch() {  # $1 = log tag
   local tag="$1" log="$RESULTS/bench_$1.server.log"
-  echo "[launch] graph_max_bs=$GRAPH moe_scatter=$MMS tag=$tag -> $log"
+  echo "[launch] attn=$ATTN graph_max_bs=$GRAPH moe_scatter=$MMS tag=$tag -> $log"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
   # setsid => own process group, so stop() can kill the WHOLE engine tree (scheduler/worker subprocs);
   # a bare kill leaves them holding GPU+port and the next boot hangs.
@@ -41,7 +46,7 @@ launch() {  # $1 = log tag
   # is a Phase-4 stub (NotImplementedError). So production graph mode REQUIRES --attn hip.
   setsid env MINISGL_MOE_SCATTER="$MMS" python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" \
-    --attention-backend hip $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
+    --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
     > "$log" 2>&1 &
   SRV=$!
   for _ in $(seq 1 400); do   # graph capture adds boot time (captures each bs in the set)
