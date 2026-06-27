@@ -87,7 +87,8 @@ def main():
                 out[m] += w * (ref_rotate_quant(act) @ w2dq[e].t())[0]
         return out
 
-    for M in (4, 16):
+    # M=1,2 exercise the fused scatter decode path; M=4,16 the gemm2+gather_reduce prefill path.
+    for M in (1, 2, 4, 16):
         x = (torch.randn(M, Kk, device=dev) * 0.3).to(torch.bfloat16)
         gating = torch.randn(M, E, device=dev)
         out = kernels.rxf_moe(x, w13p, w13s, w2p, w2s, gating, top_k, True, span=SPAN)
@@ -95,7 +96,8 @@ def main():
         c = cos(out, ref)
         good = c > 0.99
         ok &= good
-        print(f"  [{'PASS' if good else 'FAIL'}] M={M:3d} cos-sim={c:.5f}")
+        path = "scatter" if M <= 2 else "gather "
+        print(f"  [{'PASS' if good else 'FAIL'}] M={M:3d} ({path}) cos-sim={c:.5f}")
 
     print("VERDICT:", "RXF DISPATCH PARITY" if ok else "INVESTIGATE")
 

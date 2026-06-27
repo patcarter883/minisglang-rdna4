@@ -35,35 +35,63 @@ lands cleanly on a 2-kstep boundary.
 
 ## Ops (`torch.ops.rxf_hip.*`)
 
-- `rotate_quant_int8(x, span) -> (q_int8, scale_fp32)` — fused block-diagonal FWHT-span +
-  per-token symmetric int8 quant. One block/row; each thread owns whole 32-groups in registers
-  (no intra-group sync), staged in smem for the row absmax + quantize. span=32 only.
-- `linear(q, a_scale, w_packed, w_scale, nl, bias?) -> bf16` — int8·NL-int4 GEMM. **WMMA** path
-  (M>2): 16×16 tile/warp, int32 partial per 32-group scaled by the group's fp16 weight scale
-  into an fp32 smem accumulator (store-to-smem epilogue, attn_hip-style → no WMMA fragment-layout
-  assumption escapes). **GEMV** path (M≤2): scalar int8 dot.
-- `moe_gemm(...)` — grouped per-expert int8 GEMM (scalar v0), mirrors the fp8 MoE dispatch
-  (`sorted_token_ids`/`expert_ids`/`num_tokens_post_padded`).
+Built out to MIRROR the production fp8 W4A8 kernels (`w4a8_fp8_wmma/{gemm_tiled.h,
+moe_gemm_tiled.h,moe_kernel.hip}`). The fp8 lesson that holds for int8: the gfx12 WMMA fragment
+layout is IDENTICAL (same `v2i` operand packing, same `row=(lane>>4)*8+e, col=lane&15`
+accumulator), so we reuse the validated fp8 tiling verbatim with the int8 builtin — raw
+`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`, register-resident int32 accumulation, no smem
+round-trip. Only fp8→int8 staging (NL unpack vs e4m3 decode) and acc dtype differ.
 
+- `rotate_quant_int8(x, span) -> (q_int8, scale_fp32)` — fused FWHT-span + per-token int8 quant.
+- `linear(q, a_scale, w_packed, w_scale, nl, bias?) -> bf16` — **WMMA** (M>2): BM=64×BN=128 tile,
+  4 warps × 8 N-frags, `BK_TILE=128` LDS staging chunk decoupled from the 32-wide scale group
+  (== fp8's `group_size` staging — one sync per 128, not per 32), vectorized uint32 weight
+  staging (8 NL codes/iter). **GEMV** (M≤2): scalar int8 dot.
+- `moe_gemm` / `moe_gemm_scatter` — BN=128 tiled WMMA grouped GEMM, `SCATTER` template fuses
+  gemm2's topk-weighted atomic scatter into the (M,K) fp32 acc (== `mmq_fp8_moe_gemm_scatter`).
+  `BK_TILE` is scatter-conditional: decode-scatter keeps the low-LDS 32 (occupancy-bound, few real
+  rows); prefill non-scatter uses 128 (many token-blocks → sync reduction wins). **`WARPS_N`
+  warps split the BN columns** (each owns `NFRAG/WARPS_N`=2 fragments) so `block_m` stays 16
+  (minimal padding) while the block runs 4 warps → full WGP occupancy + 4× less register pressure
+  than the fp8 v5 design's 1-warp-does-all-N. This is what made RXF MoE *faster* than fp8.
+- `moe_gemv` — per-token GEMV for **gemm1 at decode (M≤2)**, == fp8's per-GEMM kernel selection.
+  One warp/output-column, activation row staged in LDS once; with GROUP==32==warp width, lane l
+  owns k=g*32+l so a single warp-reduce is the group dot. Padding rows early-exit the whole block
+  → none of the ~16× WMMA-on-padding waste. This is what closed the 3× decode-MoE gap.
+- `moe_gather_reduce` — prefill gemm2 epilogue (gather by sorted_ids, topk-weight, atomic reduce).
+
+`kernels.rxf_moe` mirrors `w4a8_moe`'s dispatch: gemm1 GEMV at decode / WMMA at prefill; gemm2
+fused scatter at decode (M≤2, `MINISGL_MOE_SCATTER` gate) / gemm2 + gather-reduce at prefill.
 Weight layout (op-layout, no conversion): `weight_packed` uint8 [N, K/2] (low nibble = even
-channel), `weight_scale` fp16 [N, K/32], NL codebook int8[16] (`NL_DEFAULT`, model-wide).
+channel), `weight_scale` fp16 [N, K/32], NL int8[16].
 
 ## Status
 
 - **Parity GREEN** (`rxf_hip_parity.py` raw ops; `tools/rxf_parity.py` engine dispatch):
-  rotate_quant int8 **bit-exact** + scale exact; dense GEMV/WMMA/e2e cos-sim 1.00000;
-  grouped MoE 0.9999x. (rel-err ~0.0016 is bf16 output rounding vs the fp32 reference.)
-- **Numerics matched** to the Triton reference: FWHT butterfly + norm `0.1767766953` (=1/√32),
-  per-token `scale=absmax/127`, `q=round(x·127/absmax)` clamped [-127,127], low-nibble=even.
+  rotate_quant int8 **bit-exact**; dense GEMV/WMMA/e2e cos-sim 1.00000; MoE scatter+gather 0.9999x.
+- **Perf** (`tools/rxf_bench.py`, RX 9070 XT, vs the validated fp8 W4A8 kernel, µs/call; MoE has
+  ~20% run-to-run variance from shared-card clock scaling):
+  | shape | fp8 | RXF |
+  |---|---|---|
+  | dense M=1 N=K=4096 | 66 | **51** |
+  | dense M=64 N=K=4096 | 484 | 678 |
+  | dense M=256 N=K=4096 | 665 | 795 |
+  | dense M=64 N=11008 K=4096 | 1433 | **752** |
+  | MoE M=1 (decode) | 384 | 396 |
+  | MoE M=16 (small prefill) | 3561 | **1491** |
+  | MoE M=128 (prefill) | 4613 | **1949** |
+  Dense at parity (geomean ~0.9× — faster at decode + large-N; ~1.2–1.4× at the occupancy-limited
+  4096² shape). **MoE is faster than fp8** — decode at parity (396 vs 384), prefill ~2.4× faster
+  (the `WARPS_N` occupancy win exceeds the fp8 v5 tiling). M=128 sub-op breakdown (µs): rotate1 11,
+  gemm1 1398, silu 17, rotate2 23, gemm2 548, gather 277.
 
-## Perf follow-ups (correctness-first v0, like the fp8 path's v0)
+## Perf follow-ups (optional — goal met)
 
-- MoE GEMM is scalar v0 — port the int8 WMMA tiling from `linear` into `moe_gemm`.
-- Dense WMMA tile is a single 16×16 warp tile — widen to multi-warp / larger BN for occupancy.
-- Gather-reduce is torch `index_add_` in `kernels.rxf_moe` — a fused HIP scatter (cf.
-  `mmq_fp8_moe_gemm_scatter`) is the decode-path win.
-- Wire RXF-format checkpoint loading in the model + a real serve/PPL validation (no RXF
-  checkpoint is in this repo yet; parity uses synthetic op-layout weights).
+- **Dense N-warp split**: porting the MoE's `WARPS_N` idea to the dense kernel (currently fp8's
+  1-warp-does-8-frags `running[8][8]`=64 regs) should push the 4096² shape below fp8 too.
+- **Dense 2-deep K-pipeline**: the fp8 `gemm_tiled_kernel` prefetches the next K-step's frags.
+- Wire RXF-format checkpoint loading in the model + a real serve/PPL run (no RXF checkpoint is in
+  this repo yet; parity/bench use synthetic op-layout weights).
 
 ## Build
 
