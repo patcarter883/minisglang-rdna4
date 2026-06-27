@@ -8,7 +8,7 @@ from typing import List, Tuple
 import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
-from minisgl.utils import init_logger
+from minisgl.utils import init_logger, is_rocm
 
 
 @dataclass(frozen=True)
@@ -121,12 +121,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Use dummy weights for testing.",
     )
 
-    assert ServerArgs.use_pynccl == True
+    # NOTE: argparse (not the dataclass default) governs the `python -m minisgl` CLI path — kwargs
+    # below always carries use_pynccl into ServerArgs(**kwargs). PyNCCL is CUDA-only (pynccl.cu →
+    # NVIDIA NCCL + apache-tvm-ffi), so default it OFF on ROCm: tp>1 then uses torch.distributed
+    # backend="nccl" (→ RCCL). store_false means --disable-pynccl forces it off everywhere; on ROCm
+    # it is already off without the flag (mirrors EngineConfig.use_pynccl's ROCm-aware default).
     parser.add_argument(
         "--disable-pynccl",
         action="store_false",
         dest="use_pynccl",
-        help="Disable PyNCCL for tensor parallelism.",
+        default=not is_rocm(),
+        help="Disable PyNCCL for tensor parallelism (already the default on ROCm; CUDA-only path).",
     )
 
     parser.add_argument(
