@@ -114,11 +114,12 @@ __device__ __forceinline__ void gdn_state_norm_clamp(float* s_reg, int K, float*
 //   ssm_state:  [num_slots, HV, V, K]   state_indices: [B]   out: [B, HV, V]
 //   GQA: head h = hv / (HV / H).
 // grid = (B * HV), block = V threads.
+template <typename scalar_t>
 __global__ void gdn_decode_kernel(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ a, const float* __restrict__ b,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
-    float* __restrict__ ssm_state, const long* __restrict__ state_indices, float* __restrict__ out,
+    float* __restrict__ ssm_state, const long* __restrict__ state_indices, scalar_t* __restrict__ out,
     int B, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int bi = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -130,8 +131,8 @@ __global__ void gdn_decode_kernel(
 
   // load q,k for (bi,hq) into LDS
   for (int j = r; j < K; j += blockDim.x) {
-    q_s[j] = q[(bi * H + hq) * K + j];
-    k_s[j] = k[(bi * H + hq) * K + j];
+    q_s[j] = (float)q[(bi * H + hq) * K + j];
+    k_s[j] = (float)k[(bi * H + hq) * K + j];
   }
   __syncthreads();
   if (use_l2norm) {
@@ -145,21 +146,21 @@ __global__ void gdn_decode_kernel(
 
   const long slot = state_indices[bi];
   if (r < V) {
-    float* o_p = out + (bi * HV + hv) * V + r;
-    if (slot <= 0) { *o_p = 0.0f; return; }
-    const float x = a[bi * HV + hv] + dt_bias[hv];
+    scalar_t* o_p = out + (bi * HV + hv) * V + r;
+    if (slot <= 0) { *o_p = (scalar_t)0.0f; return; }
+    const float x = (float)a[bi * HV + hv] + dt_bias[hv];
     const float g = -__expf(A_log[hv]) * gdn_softplus(x);
-    const float beta = 1.0f / (1.0f + __expf(-b[bi * HV + hv]));
+    const float beta = 1.0f / (1.0f + __expf(-(float)b[bi * HV + hv]));
     float* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
     float s_reg[GDN_MAX_K];
 #pragma unroll 4
     for (int j = 0; j < K; ++j) s_reg[j] = s_row[j];
-    float o = gdn_step(s_reg, q_s, k_s, v[(bi * HV + hv) * V + r], g, beta, K);
+    float o = gdn_step(s_reg, q_s, k_s, (float)v[(bi * HV + hv) * V + r], g, beta, K);
     // bound the carried state's Frobenius norm (no-op unless it has grown past the cap)
     gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
 #pragma unroll 4
     for (int j = 0; j < K; ++j) s_row[j] = s_reg[j];
-    *o_p = o;
+    *o_p = (scalar_t)o;
   }
 }
 
@@ -171,13 +172,14 @@ __global__ void gdn_decode_kernel(
 //   cu_seqlens: [N+1]   state_indices: [N]   has_initial_state: [N] (uint8)
 //   ssm_state: [num_slots, HV, V, K]   out: [T, HV, V]
 // grid = (N * HV), block = V threads.
+template <typename scalar_t>
 __global__ void gdn_prefill_kernel(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ a, const float* __restrict__ b,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, float* __restrict__ out,
+    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -202,8 +204,8 @@ __global__ void gdn_prefill_kernel(
   const float Alog = A_log[hv], dtb = dt_bias[hv];
   for (int t = bos; t < eos; ++t) {
     for (int j = r; j < K; j += blockDim.x) {
-      q_s[j] = q[(t * H + hq) * K + j];
-      k_s[j] = k[(t * H + hq) * K + j];
+      q_s[j] = (float)q[(t * H + hq) * K + j];
+      k_s[j] = (float)k[(t * H + hq) * K + j];
     }
     __syncthreads();
     if (use_l2norm) {
@@ -216,13 +218,13 @@ __global__ void gdn_prefill_kernel(
     __syncthreads();
 
     if (r < V) {
-      const float x = a[t * HV + hv] + dtb;
+      const float x = (float)a[t * HV + hv] + dtb;
       const float g = -__expf(Alog) * gdn_softplus(x);
-      const float beta = 1.0f / (1.0f + __expf(-b[t * HV + hv]));
-      float o = gdn_step(s_reg, q_s, k_s, v[(t * HV + hv) * V + r], g, beta, K);
+      const float beta = 1.0f / (1.0f + __expf(-(float)b[t * HV + hv]));
+      float o = gdn_step(s_reg, q_s, k_s, (float)v[(t * HV + hv) * V + r], g, beta, K);
       // bound the carried state's Frobenius norm per token (no-op until it grows past the cap)
       gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
-      out[(t * HV + hv) * V + r] = o;
+      out[(t * HV + hv) * V + r] = (scalar_t)o;
     }
     __syncthreads();  // q_s/k_s reused next token
   }
@@ -249,13 +251,14 @@ __global__ void gdn_prefill_kernel(
 #define GDN_CHUNK 32  // chunk length; LDS = 2*C*K + 2*C*C floats (C=32,K=128 -> ~40 KB)
 #endif
 
+template <typename scalar_t>
 __global__ void gdn_prefill_chunked_kernel(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ a, const float* __restrict__ b,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, float* __restrict__ out,
+    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -282,8 +285,8 @@ __global__ void gdn_prefill_chunked_kernel(
     const int L = min(GDN_CHUNK, eos - c0);
     for (int idx = r; idx < L * K; idx += blockDim.x) {
       const int j = idx / K, kk = idx % K;
-      ks[j * K + kk] = k[((c0 + j) * H + hq) * K + kk];
-      qs[j * K + kk] = q[((c0 + j) * H + hq) * K + kk];
+      ks[j * K + kk] = (float)k[((c0 + j) * H + hq) * K + kk];
+      qs[j * K + kk] = (float)q[((c0 + j) * H + hq) * K + kk];
     }
     __syncthreads();
     for (int j = r; j < L; j += blockDim.x) {  // one token per thread: l2norm(k,q), scale q
@@ -297,10 +300,10 @@ __global__ void gdn_prefill_chunked_kernel(
     if (r == 0) {  // cumulative decay + write gate
       float acc = 0.0f;
       for (int j = 0; j < L; ++j) {
-        const float x = a[(c0 + j) * HV + hv] + dt_bias[hv];
+        const float x = (float)a[(c0 + j) * HV + hv] + dt_bias[hv];
         acc += -__expf(A_log[hv]) * gdn_softplus(x);
         gam[j] = __expf(acc);
-        bet[j] = 1.0f / (1.0f + __expf(-b[(c0 + j) * HV + hv]));
+        bet[j] = 1.0f / (1.0f + __expf(-(float)b[(c0 + j) * HV + hv]));
       }
     }
     __syncthreads();
@@ -319,7 +322,7 @@ __global__ void gdn_prefill_chunked_kernel(
       for (int j = 0; j < L; ++j) {  // B[j] then forward-substitution
         float Sk = 0.0f;
         for (int kk = 0; kk < K; ++kk) Sk += s_row[kk] * ks[j * K + kk];
-        float uj = bet[j] * (v[((c0 + j) * HV + hv) * V + r] - gam[j] * Sk);
+        float uj = bet[j] * ((float)v[((c0 + j) * HV + hv) * V + r] - gam[j] * Sk);
         for (int i = 0; i < j; ++i)
           uj -= bet[j] * (gam[j] / gam[i]) * KK[i * GDN_CHUNK + j] * U[i];
         U[j] = uj;
@@ -329,7 +332,7 @@ __global__ void gdn_prefill_chunked_kernel(
         for (int kk = 0; kk < K; ++kk) Sq += s_row[kk] * qs[t * K + kk];
         float o = gam[t] * Sq;
         for (int j = 0; j <= t; ++j) o += (gam[t] / gam[j]) * KQ[j * GDN_CHUNK + t] * U[j];
-        out[((c0 + t) * HV + hv) * V + r] = o;
+        out[((c0 + t) * HV + hv) * V + r] = (scalar_t)o;
       }
       const float gL = gam[L - 1];  // carry state to next chunk
       for (int kk = 0; kk < K; ++kk) {
@@ -424,13 +427,14 @@ __device__ __forceinline__ void tn_tile(const f16* A, int lda, int aRowM, const 
 }
 }  // namespace gdnw
 
+template <typename scalar_t>
 __global__ void gdn_prefill_wmma_kernel(
-    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-    const float* __restrict__ a, const float* __restrict__ b,
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, float* __restrict__ out,
+    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   using gdnw::f16;
   const int blk = blockIdx.x, tid = threadIdx.x;
@@ -477,8 +481,8 @@ __global__ void gdn_prefill_wmma_kernel(
     for (int idx = tid; idx < GDN_WC * Dk; idx += GDN_WTHREADS) {
       const int j = idx / Dk, kk = idx % Dk;
       if (j < L) {
-        rawk[idx] = k[((c0 + j) * H + hq) * Dk + kk];
-        rawq[idx] = q[((c0 + j) * H + hq) * Dk + kk];
+        rawk[idx] = (float)k[((c0 + j) * H + hq) * Dk + kk];
+        rawq[idx] = (float)q[((c0 + j) * H + hq) * Dk + kk];
       } else { rawk[idx] = 0.0f; rawq[idx] = 0.0f; }
     }
     __syncthreads();
@@ -496,10 +500,10 @@ __global__ void gdn_prefill_wmma_kernel(
     if (tid == 0) {
       float acc = 0.0f;  // cumulative log-decay within the chunk (<= 0, monotone decreasing)
       for (int j = 0; j < L; ++j) {
-        const float x = a[(c0 + j) * HV + hv] + dtb;
+        const float x = (float)a[(c0 + j) * HV + hv] + dtb;
         acc += -__expf(Alog) * gdn_softplus(x);
         clog[j] = acc;
-        bet[j] = 1.0f / (1.0f + __expf(-b[(c0 + j) * HV + hv]));
+        bet[j] = 1.0f / (1.0f + __expf(-(float)b[(c0 + j) * HV + hv]));
       }
       for (int j = L; j < GDN_WC; ++j) { clog[j] = (L > 0 ? acc : 0.0f); bet[j] = 0.0f; }
       gamC_s = __expf(L > 0 ? clog[L - 1] : 0.0f);  // gamma_C = exp(cumulative log-decay over chunk)
@@ -531,7 +535,7 @@ __global__ void gdn_prefill_wmma_kernel(
     // into Mf; solve U. Decay ratios via exp(clog diff) (<=1, log-space => stable). ----
     for (int idx = tid; idx < GDN_WC * Dv; idx += GDN_WTHREADS) {
       const int j = idx / Dv, nn = idx % Dv;
-      if (j < L) KS0[idx] = bet[j] * (v[((c0 + j) * HV + hv) * Dv + nn] - __expf(clog[j]) * KS0[idx]);
+      if (j < L) KS0[idx] = bet[j] * ((float)v[((c0 + j) * HV + hv) * Dv + nn] - __expf(clog[j]) * KS0[idx]);
       else KS0[idx] = 0.0f;
     }
     for (int idx = tid; idx < GDN_WC * GDN_WC; idx += GDN_WTHREADS) {
@@ -566,7 +570,7 @@ __global__ void gdn_prefill_wmma_kernel(
     __syncthreads();
     for (int idx = tid; idx < L * Dv; idx += GDN_WTHREADS) {
       const int j = idx / Dv, nn = idx % Dv;
-      out[((c0 + j) * HV + hv) * Dv + nn] = __expf(clog[j]) * QS0[idx] + Ofull[idx];
+      out[((c0 + j) * HV + hv) * Dv + nn] = (scalar_t)(__expf(clog[j]) * QS0[idx] + Ofull[idx]);
     }
     __syncthreads();
 
@@ -605,9 +609,10 @@ __global__ void gdn_prefill_wmma_kernel(
 //   x:       [B, C]   weight: [C, W]   bias: [C] or null   conv_state: [num_slots, C, W-1]
 //   state_indices: [B]   out: [B, C]   (silu applied iff activation!=0)
 // grid = (B), block = min(C, 1024); each thread strides over channels.
+template <typename scalar_t>
 __global__ void causal_conv1d_update_kernel(
-    const float* __restrict__ x, const float* __restrict__ weight, const float* __restrict__ bias,
-    float* __restrict__ conv_state, const long* __restrict__ state_indices, float* __restrict__ out,
+    const scalar_t* __restrict__ x, const float* __restrict__ weight, const float* __restrict__ bias,
+    float* __restrict__ conv_state, const long* __restrict__ state_indices, scalar_t* __restrict__ out,
     int B, int C, int W, int activation) {
   const int bi = blockIdx.x;
   const long slot = state_indices[bi];
@@ -617,7 +622,7 @@ __global__ void causal_conv1d_update_kernel(
     const float* wc = weight + c * W;
     float* st = (slot > 0) ? conv_state + (slot * C + c) * Wm1 : nullptr;
     // window = [state(W-1) , x_new]; conv = sum_{i<W} window[i]*w[i]
-    float xnew = x[bi * C + c];
+    float xnew = (float)x[bi * C + c];
     if (st) {
       for (int i = 0; i < Wm1; ++i) acc += st[i] * wc[i];
     }
@@ -628,7 +633,7 @@ __global__ void causal_conv1d_update_kernel(
       st[Wm1 - 1] = xnew;
     }
     if (activation) acc = acc / (1.0f + __expf(-acc));  // SiLU
-    out[bi * C + c] = acc;
+    out[bi * C + c] = (scalar_t)acc;
   }
 }
 
@@ -639,11 +644,12 @@ __global__ void causal_conv1d_update_kernel(
 //   cu_seqlens: [N+1]   state_indices: [N]   has_initial_state: [N]   conv_state: [num_slots,C,W-1]
 //   out:  [T, C]
 // grid = (N, ceil(C/CT)); block = CT threads over channels. Simple per-channel sliding window.
+template <typename scalar_t>
 __global__ void causal_conv1d_fwd_kernel(
-    const float* __restrict__ x, const float* __restrict__ weight, const float* __restrict__ bias,
+    const scalar_t* __restrict__ x, const float* __restrict__ weight, const float* __restrict__ bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state, float* __restrict__ conv_state,
-    float* __restrict__ out, int N, int C, int W, int activation) {
+    scalar_t* __restrict__ out, int N, int C, int W, int activation) {
   const int n = blockIdx.x;
   const int bos = cu_seqlens[n], eos = cu_seqlens[n + 1];
   const long slot = state_indices[n];
@@ -657,14 +663,14 @@ __global__ void causal_conv1d_fwd_kernel(
     float hist[16];  // W-1 <= 15 (GDN W=4); generous bound
     for (int i = 0; i < Wm1; ++i) hist[i] = (use_init && st) ? st[i] : 0.0f;
     for (int t = bos; t < eos; ++t) {
-      float xnew = x[t * C + c];
+      float xnew = (float)x[t * C + c];
       float acc = bc;
       for (int i = 0; i < Wm1; ++i) acc += hist[i] * wc[i];
       acc += xnew * wc[Wm1];
       for (int i = 0; i < Wm1 - 1; ++i) hist[i] = hist[i + 1];
       hist[Wm1 - 1] = xnew;
       if (activation) acc = acc / (1.0f + __expf(-acc));
-      out[t * C + c] = acc;
+      out[t * C + c] = (scalar_t)acc;
     }
     if (st) for (int i = 0; i < Wm1; ++i) st[i] = hist[i];  // persist trailing window
   }
@@ -673,13 +679,14 @@ __global__ void causal_conv1d_fwd_kernel(
 // ---------------------------------------------------------------------------------------------
 // RMSNormGated: y = (x / rms(x)) * weight * silu(z), normalized over the last dim D (norm-before-gate
 // = the Qwen3.5 GDN convention). x,z,out: [M, D]; weight: [D]. grid=(M), block=min(D,1024).
+template <typename scalar_t>
 __global__ void rmsnorm_gated_kernel(
-    const float* __restrict__ x, const float* __restrict__ z, const float* __restrict__ weight,
-    float* __restrict__ out, int M, int D, float eps) {
+    const scalar_t* __restrict__ x, const scalar_t* __restrict__ z, const float* __restrict__ weight,
+    scalar_t* __restrict__ out, int M, int D, float eps) {
   const int m = blockIdx.x;
   extern __shared__ float red[];
   float partial = 0.0f;
-  for (int j = threadIdx.x; j < D; j += blockDim.x) { float xv = x[m * D + j]; partial += xv * xv; }
+  for (int j = threadIdx.x; j < D; j += blockDim.x) { float xv = (float)x[m * D + j]; partial += xv * xv; }
   red[threadIdx.x] = partial;
   __syncthreads();
   for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -688,9 +695,9 @@ __global__ void rmsnorm_gated_kernel(
   }
   const float inv = rsqrtf(red[0] / D + eps);
   for (int j = threadIdx.x; j < D; j += blockDim.x) {
-    const float zv = z[m * D + j];
+    const float zv = (float)z[m * D + j];
     const float gate = zv / (1.0f + __expf(-zv));  // SiLU(z)
-    out[m * D + j] = x[m * D + j] * inv * weight[j] * gate;
+    out[m * D + j] = (scalar_t)((float)x[m * D + j] * inv * weight[j] * gate);
   }
 }
 
@@ -708,10 +715,13 @@ void launch_gdn_decode(const at::Tensor& q, const at::Tensor& k, const at::Tenso
   dim3 grid(B * HV), block(V);
   size_t shmem = (2 * K + V) * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(gdn_decode_kernel, grid, block, shmem, stream,
-      CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
-      FP(ssm_state), state_indices.data_ptr<long>(), FP(out),
-      B, H, HV, K, V, (float)scale, (int)use_l2norm);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_decode", [&] {
+    hipLaunchKernelGGL((gdn_decode_kernel<scalar_t>), grid, block, shmem, stream,
+        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+        FP(ssm_state), state_indices.data_ptr<long>(), out.data_ptr<scalar_t>(),
+        B, H, HV, K, V, (float)scale, (int)use_l2norm);
+  });
 }
 
 void launch_gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -725,11 +735,14 @@ void launch_gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
   dim3 grid(N * HV), block(V);
   size_t shmem = (2 * K + V) * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(gdn_prefill_kernel, grid, block, shmem, stream,
-      CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
-      cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-      has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), FP(out),
-      N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill", [&] {
+    hipLaunchKernelGGL((gdn_prefill_kernel<scalar_t>), grid, block, shmem, stream,
+        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
+        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  });
 }
 
 void launch_gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -743,11 +756,14 @@ void launch_gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const 
   const int N = state_indices.size(0);
   dim3 grid(N * HV), block(V);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(gdn_prefill_chunked_kernel, grid, block, 0, stream,  // static shared mem
-      CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
-      cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-      has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), FP(out),
-      N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill_chunked", [&] {
+    hipLaunchKernelGGL((gdn_prefill_chunked_kernel<scalar_t>), grid, block, 0, stream,  // static shared mem
+        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
+        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  });
 }
 
 void launch_gdn_prefill_wmma(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -761,11 +777,14 @@ void launch_gdn_prefill_wmma(const at::Tensor& q, const at::Tensor& k, const at:
   const int N = state_indices.size(0);
   dim3 grid(N * HV), block(GDN_WTHREADS);  // 256 threads = 8 wave32 warps
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(gdn_prefill_wmma_kernel, grid, block, 0, stream,  // static shared mem (~62 KB)
-      CFP(q), CFP(k), CFP(v), CFP(a), CFP(b), CFP(A_log), CFP(dt_bias),
-      cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-      has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), FP(out),
-      N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill_wmma", [&] {
+    hipLaunchKernelGGL((gdn_prefill_wmma_kernel<scalar_t>), grid, block, 0, stream,  // static shared mem (~62 KB)
+        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
+        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+  });
 }
 
 void launch_causal_conv1d_update(const at::Tensor& x, const at::Tensor& weight,
@@ -775,9 +794,11 @@ void launch_causal_conv1d_update(const at::Tensor& x, const at::Tensor& weight,
   const int B = x.size(0), C = x.size(1), W = weight.size(1);
   dim3 grid(B), block(C < 1024 ? C : 1024);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(causal_conv1d_update_kernel, grid, block, 0, stream,
-      CFP(x), CFP(weight), bias.has_value() ? CFP(*bias) : nullptr,
-      FP(conv_state), state_indices.data_ptr<long>(), FP(out), B, C, W, (int)activation);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_update", [&] {
+    hipLaunchKernelGGL((causal_conv1d_update_kernel<scalar_t>), grid, block, 0, stream,
+        x.data_ptr<scalar_t>(), CFP(weight), bias.has_value() ? CFP(*bias) : nullptr,
+        FP(conv_state), state_indices.data_ptr<long>(), out.data_ptr<scalar_t>(), B, C, W, (int)activation);
+  });
 }
 
 void launch_causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
@@ -789,10 +810,13 @@ void launch_causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
   const int CT = C < 256 ? C : 256;
   dim3 grid(N, (C + CT - 1) / CT), block(CT);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(causal_conv1d_fwd_kernel, grid, block, 0, stream,
-      CFP(x), CFP(weight), bias.has_value() ? CFP(*bias) : nullptr,
-      cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-      has_initial_state.data_ptr<unsigned char>(), FP(conv_state), FP(out), N, C, W, (int)activation);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_fwd", [&] {
+    hipLaunchKernelGGL((causal_conv1d_fwd_kernel<scalar_t>), grid, block, 0, stream,
+        x.data_ptr<scalar_t>(), CFP(weight), bias.has_value() ? CFP(*bias) : nullptr,
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+        has_initial_state.data_ptr<unsigned char>(), FP(conv_state), out.data_ptr<scalar_t>(), N, C, W,
+        (int)activation);
+  });
 }
 
 void launch_rmsnorm_gated(const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight,
@@ -801,6 +825,9 @@ void launch_rmsnorm_gated(const at::Tensor& x, const at::Tensor& z, const at::Te
   dim3 grid(M), block(D < 1024 ? D : 1024);
   size_t shmem = block.x * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(rmsnorm_gated_kernel, grid, block, shmem, stream,
-      CFP(x), CFP(z), CFP(weight), FP(out), M, D, (float)eps);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "rmsnorm_gated", [&] {
+    hipLaunchKernelGGL((rmsnorm_gated_kernel<scalar_t>), grid, block, shmem, stream,
+        x.data_ptr<scalar_t>(), z.data_ptr<scalar_t>(), CFP(weight), out.data_ptr<scalar_t>(), M, D,
+        (float)eps);
+  });
 }
