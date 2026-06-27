@@ -18,6 +18,51 @@ import torch
 # vllm-gfx1201/w4a8_fp8_wmma/moe_experts.py:_REVERSE_AWQ_PACK_ORDER.
 _REVERSE_AWQ_PACK_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 
+# --- env-gated W4A8-MoE sub-step GPU-time attribution (diagnostics only) ------------------------
+# MINISGL_MOE_PROF=<N> times each step of w4a8_moe (route/align/cast/gemm1/silu/gemm2/gather) with
+# CUDA events and logs the split every N calls. Inert (zero overhead) when unset.
+import os as _os
+from collections import defaultdict as _dd
+
+_MOE_EVERY = int(_os.environ["MINISGL_MOE_PROF"]) if _os.environ.get("MINISGL_MOE_PROF", "").isdigit() else 0
+_moe_buckets: dict = _dd(float)
+_moe_calls = 0
+
+# Decode-path gemm2+gather fusion via mmq_fp8_moe_gemm_scatter (atomic scatter). On by default;
+# MINISGL_MOE_SCATTER=0 reverts to the unfused gemm2 + gather_reduce (set this if CUDA graphs are
+# enabled for decode — the scatter's atomicAdd is not graph-capture-safe).
+_MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "1") != "0"
+
+
+def _moe_time(bucket: str, fn):
+    if not _MOE_EVERY:
+        return fn()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    r = fn()
+    e.record()
+    e.synchronize()
+    _moe_buckets[bucket] += s.elapsed_time(e)
+    return r
+
+
+def _moe_report() -> None:
+    global _moe_calls
+    if not _MOE_EVERY:
+        return
+    _moe_calls += 1
+    if _moe_calls % _MOE_EVERY == 0 and _moe_buckets:
+        from minisgl.utils import init_logger
+
+        tot = sum(_moe_buckets.values()) or 1.0
+        parts = "  ".join(
+            f"{k}={v / _MOE_EVERY * 1000:.0f}us({100 * v / tot:.0f}%)"
+            for k, v in sorted(_moe_buckets.items(), key=lambda x: -x[1])
+        )
+        init_logger("moe_prof").info_rank0(f"[moe-prof] per-call over {_MOE_EVERY} calls: {parts}")
+        _moe_buckets.clear()
+
 
 def awq_to_op_layout(
     qweight: torch.Tensor,  # (K, N//pf) int32, AWQ-packed along output
@@ -133,35 +178,88 @@ def w4a8_moe(
     M, K = x.shape
     E = w13.shape[0]
     dev = x.device
+    # Decode fast path is PER-GEMM: the two grouped GEMMs want OPPOSITE kernels at M<=2 (measured on
+    # gfx1201, Qwen3.6-35B). gemm1 (w13, wide 2*inter output, gather-by-sorted, top_k>1): the scalar
+    # GEMV is ~8.7x faster than the prefill WMMA (35us vs 306us). gemm2 (w2, K output, identity
+    # gather, top_k==1): WMMA is ~6.8x faster than GEMV (50us vs 339us) — the GEMV path
+    # underperforms for that shape. So pick gemv for gemm1, keep WMMA for gemm2. Together ~85us vs
+    # ~356us with the old all-WMMA default. Prefill (M>2) keeps the passed/default kernel for both.
+    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm2_kernel = kernel
 
-    probs = torch.softmax(gating_output.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(probs, top_k, dim=-1)
-    if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
-    topk_ids = topk_ids.to(torch.int32)
+    # Fused softmax+topk(+renormalize) in one kernel (vLLM _moe_C.topk_softmax), replacing
+    # torch.softmax+torch.topk+manual-renorm+int32-cast. NB: this image has no sgl_kernel and no
+    # _C.silu_and_mul, but vLLM's _moe_C MoE ops ARE present (same source as the moe_align import).
+    # ids come out int32 directly; renormalize is folded into the kernel.
+    def _route():
+        from vllm import _custom_ops as vllm_ops
 
-    sorted_ids, expert_ids, ntp = moe_align_block_size(
-        topk_ids, block_m, E, None, pad_sorted_ids=True
+        tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
+        ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
+        tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
+        vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
+        return tw, ti
+
+    topk_weights, topk_ids = _moe_time("route", _route)
+
+    sorted_ids, expert_ids, ntp = _moe_time(
+        "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
     )
     P = sorted_ids.shape[0]
 
-    x16 = x.to(torch.float16).contiguous()
-    out1 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-        x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
-        kernel=kernel, w_zeros=w13_zeros,
+    x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
+    out1 = _moe_time(
+        "gemm1",
+        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+            x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+            kernel=gemm1_kernel, w_zeros=w13_zeros,
+        ),
     )  # (P, 2*inter)
     d = out1.shape[1] // 2
-    buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous()
+    # NB: this image has NO fused fp16 silu_and_mul (no sgl_kernel, no torch.ops._C.silu_and_mul,
+    # and tail_hip's is bf16-only while these MoE intermediates are fp16). So the silu bucket stays
+    # the torch chain until a custom fp16 HIP silu_and_mul is vendored (the gemm1-epilogue fused
+    # variant is wmma-only -> unusable at decode where gemm1 must be gemv).
+    buf2 = _moe_time(
+        "silu",
+        lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+    )
+
+    tw_flat = topk_weights.reshape(-1).float().contiguous()
+    # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE kernel (mmq_fp8_moe_gemm_scatter):
+    # it computes gemm2 (identity-gather over buf2) and atomic-scatters topk_weights[r]*(buf2[r]@W) into
+    # a pre-zeroed fp32 (M,K), removing BOTH the (P,K) out2 materialization AND the separate
+    # gather_reduce launch. The atomicAdd scatter is NOT HIP-graph-capture-safe, so it is gated to the
+    # eager decode path (M<=2; the serve default is cuda_graph_max_bs=0) and can be turned off with
+    # MINISGL_MOE_SCATTER=0. Prefill (M>2) keeps the unfused gemm2 + contention-free gather_reduce
+    # (graph-safe; also the (P,K) out2 reuse amortizes better at larger M).
+    if M <= 2 and _MOE_SCATTER:
+        acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
+        _moe_time(
+            "gemm2scat",
+            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
+                buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
+                kernel=gemm2_kernel, w_zeros=w2_zeros,
+            ),
+        )  # writes acc in place
+        _moe_report()
+        return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    out2 = w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-        buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
-        kernel=kernel, w_zeros=w2_zeros,
+    out2 = _moe_time(
+        "gemm2",
+        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+            kernel=gemm2_kernel, w_zeros=w2_zeros,
+        ),
     )  # (P, K)
-    tw_flat = topk_weights.reshape(-1).float().contiguous()
-    acc = w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
-        out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
+    acc = _moe_time(
+        "gather",
+        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+            out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
+        ),
     )  # (M, K) fp32
+    _moe_report()
     return acc.to(x.dtype)
 
 
