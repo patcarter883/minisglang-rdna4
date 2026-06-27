@@ -285,6 +285,110 @@ def w4a8_moe(
     return acc.to(x.dtype)
 
 
+# --- RXF (Rotated eXtra Fast) W4(NL)-A8(int8) path -------------------------------------------
+# Distinct from the fp8 W4A8 above: weights are an NL (non-uniform) int4 codebook, activations are
+# int8 (not fp8), and a fixed block-diagonal Hadamard rotation is applied to the activation at
+# runtime (and was applied to the weights offline) so it cancels in the dot while spreading
+# activation outliers. Native HIP via the vendored rxf_hip package (torch.ops.rxf_hip.*).
+
+_RXF_NL: dict = {}
+
+
+def _rxf_nl(dev: torch.device) -> torch.Tensor:
+    """Cached int8[16] NL codebook on `dev` (rxf_hip.NL_DEFAULT == the Triton _NL_DEFAULT)."""
+    key = str(dev)
+    t = _RXF_NL.get(key)
+    if t is None:
+        import rxf_hip
+
+        t = torch.tensor(rxf_hip.NL_DEFAULT, dtype=torch.int8, device=dev)
+        _RXF_NL[key] = t
+    return t
+
+
+def rxf_linear(
+    x: torch.Tensor,  # (M, K) activations (bf16/fp16)
+    w_packed: torch.Tensor,  # (N, K/2) uint8 NL indices
+    w_scale: torch.Tensor,  # (N, K/32) fp16 per-group weight scale
+    bias: torch.Tensor | None,
+    span: int = 32,
+) -> torch.Tensor:
+    """Dense RXF W4A8: rotate+int8-quant the activation, then int8 . NL-int4 GEMM -> bf16 (M,N).
+    The rotate_quant fuses FWHT-span + per-token int8 quant; linear picks WMMA (M>2) / GEMV (M<=2)."""
+    import rxf_hip  # noqa: F401  registers torch.ops.rxf_hip.*
+
+    q, a_scale = torch.ops.rxf_hip.rotate_quant_int8(x.contiguous(), span)
+    return torch.ops.rxf_hip.linear(q, a_scale, w_packed, w_scale, _rxf_nl(x.device), bias)
+
+
+def rxf_moe(
+    x: torch.Tensor,  # (M, K) activations
+    w13: torch.Tensor,  # (E, 2*inter, K/2) uint8
+    w13_scales: torch.Tensor,  # (E, 2*inter, K/32) fp16
+    w2: torch.Tensor,  # (E, K, inter/2) uint8
+    w2_scales: torch.Tensor,  # (E, K, inter/32) fp16
+    gating_output: torch.Tensor,  # (M, E)
+    top_k: int,
+    renormalize: bool,
+    *,
+    span: int = 32,
+    block_m: int = 16,
+) -> torch.Tensor:
+    """Grouped RXF W4A8 MoE: rotate+quant -> grouped GEMM(w13) -> silu_and_mul -> rotate+quant
+    -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors w4a8_moe's dispatch (vLLM
+    topk_softmax + moe_align), int8/NL on the GEMMs. Returns (M, K)."""
+    import torch.nn.functional as F
+    import rxf_hip  # noqa: F401
+    from vllm import _custom_ops as vllm_ops
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+    M, K = x.shape
+    E = w13.shape[0]
+    dev = x.device
+    nl = _rxf_nl(dev)
+
+    tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
+    ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
+    tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)
+    vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
+
+    sorted_ids, expert_ids, ntp = moe_align_block_size(ti, block_m, E, None, pad_sorted_ids=True)
+    P = sorted_ids.shape[0]
+
+    # gemm1: rotate+quant the activation (gathered by sorted_ids inside the GEMM), grouped over w13.
+    q, a_scale = torch.ops.rxf_hip.rotate_quant_int8(x.contiguous(), span)
+    out1 = torch.ops.rxf_hip.moe_gemm(
+        q, a_scale, w13, w13_scales, nl, sorted_ids, expert_ids, ntp, top_k, block_m, M * top_k
+    )  # (P, 2*inter) bf16
+    d = out1.shape[1] // 2
+
+    from minisgl.layers import _tail_hip
+
+    if _tail_hip.active(out1):
+        buf2 = torch.ops.tail_hip.silu_and_mul(out1.contiguous())
+    else:
+        buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
+
+    # gemm2: rotate+quant the intermediate (w2 was rotated offline too), identity gather.
+    q2, a_scale2 = torch.ops.rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = torch.ops.rxf_hip.moe_gemm(
+        q2, a_scale2, w2, w2_scales, nl, ident, expert_ids, ntp, 1, block_m, P
+    )  # (P, K) bf16
+
+    # topk-weighted gather-reduce (torch v0; a fused HIP scatter is the perf follow-up).
+    acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
+    nvalid = int(ntp.item())
+    valid_rows = sorted_ids[:nvalid]
+    keep = valid_rows < (M * top_k)
+    rows = torch.nonzero(keep, as_tuple=True)[0]
+    offs = valid_rows[rows]
+    tokens = (offs // top_k).long()
+    weights = tw.reshape(-1)[offs.long()]
+    acc.index_add_(0, tokens, out2[rows].float() * weights[:, None])
+    return acc.to(x.dtype)
+
+
 def _pick_dense_kernel(m: int) -> str:
     """Per-M dense kernel selection. The served WMMA prefill kernel handles all M; the
     scalar-dot GEMV is the decode (M<=2) fast path. (The full vllm_adapter also has env
