@@ -37,10 +37,51 @@ from minisgl.layers import (
     VocabParallelEmbedding,
 )
 from minisgl.quant import create_linear_method
-from minisgl.utils import div_even, nvtx_annotate
+from minisgl.utils import div_even, init_logger, nvtx_annotate
 
 from .base import BaseLLMModel
 from .utils import GatedMLP as Qwen3MLP
+
+logger = init_logger(__name__)
+
+# --- env-gated per-layer GPU-time attribution (diagnostics only) -------------------------------
+# MINISGL_LAYER_PROF=<N> times the mixer (GDN/attention) and the FFN (MoE) per layer with CUDA
+# events, bucketed, and logs the per-step split every N forward steps. Splits the decode wall time
+# across gdn / attn / ffn so we know which kernel family owns it. Inert (zero overhead) when unset.
+import os as _os
+from collections import defaultdict as _dd
+
+_LP_EVERY = int(_os.environ["MINISGL_LAYER_PROF"]) if _os.environ.get("MINISGL_LAYER_PROF", "").isdigit() else 0
+_lp_buckets: dict = _dd(float)
+_lp_step = 0
+
+
+def _lp_timed(bucket: str, fn, arg):
+    if not _LP_EVERY:
+        return fn(arg)
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    r = fn(arg)
+    e.record()
+    e.synchronize()
+    _lp_buckets[bucket] += s.elapsed_time(e)
+    return r
+
+
+def _lp_tick(layer_id: int) -> None:
+    global _lp_step
+    if not _LP_EVERY or layer_id != 0:
+        return
+    _lp_step += 1
+    if _lp_step % _LP_EVERY == 0 and _lp_buckets:
+        tot = sum(_lp_buckets.values()) or 1.0
+        parts = "  ".join(
+            f"{k}={v / _LP_EVERY:.2f}ms({100 * v / tot:.0f}%)"
+            for k, v in sorted(_lp_buckets.items(), key=lambda x: -x[1])
+        )
+        logger.info_rank0(f"[layer-prof] per-step GPU over {_LP_EVERY} steps: {parts}")
+        _lp_buckets.clear()
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -205,10 +246,12 @@ class Qwen3_5DecoderLayer(BaseOP):
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _lp_tick(self._layer_id)
         x, residual = self.input_layernorm.forward(x, residual)
-        x = self._attn_op.forward(x)
+        mixer = "gdn" if type(self._attn_op).__name__ == "GDNLinearAttn" else "attn"
+        x = _lp_timed(mixer, self._attn_op.forward, x)
         x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x = _lp_timed("ffn", self.mlp.forward, x)
         return x, residual
 
 

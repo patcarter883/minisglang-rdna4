@@ -94,7 +94,20 @@ services:
       # fp8 (e4m3) KV cache on by default — halves KV bytes; native HIP fp8 paged-decode +
       # fp8 paged/chunked-prefill carry it end-to-end. Set =0 for bf16 KV.
       MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+      # Diagnostics: when set to a path, the engine captures a decode-step Chrome trace then no-ops
+      # (see engine._maybe_profile). Inert/empty on a normal serve.
+      MINISGL_PROFILE: "${MINISGL_PROFILE:-}"
+      MINISGL_PROFILE_SKIP: "${MINISGL_PROFILE_SKIP:-40}"
+      MINISGL_PROFILE_STEPS: "${MINISGL_PROFILE_STEPS:-50}"
+      # Per-layer GPU-time attribution (gdn/attn/ffn split); empty = off. See models/qwen3_5.py.
+      MINISGL_LAYER_PROF: "${MINISGL_LAYER_PROF:-}"
+      # W4A8-MoE sub-step attribution (route/align/cast/gemm/silu/gather); empty = off. quant/kernels.py.
+      MINISGL_MOE_PROF: "${MINISGL_MOE_PROF:-}"
     entrypoint: ["bash", "-lc"]
+    # --disable-pynccl is passed explicitly as a call-site marker; on ROCm it is also the code
+    # default now (see EngineConfig.use_pynccl / server/args.py). The PyNCCL path (pynccl.cu) is
+    # CUDA-only — apache-tvm-ffi (absent from the shared image) + NVIDIA NCCL (nccl227.h / -lnccl,
+    # not RCCL). Off → tp>1 collectives route through torch.distributed backend="nccl" (→ RCCL).
     command:
       - |
         source /app/.venv/bin/activate
@@ -106,6 +119,7 @@ services:
           --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
           --page-size 16 \
           --tp 2 \
-          --cuda-graph-max-bs 0 \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
