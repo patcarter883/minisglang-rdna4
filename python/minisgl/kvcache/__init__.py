@@ -31,7 +31,21 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
 ) -> BaseKVCachePool:
-    from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
+    if model_config.is_mla:
+        # MLA (DeepSeek / GLM-4.x MoE): one compressed latent per token per layer
+        # (kv_lora_rank + qk_rope_head_dim), shared across heads.
+        from .mla_pool import MLAKVCache
+
+        return MLAKVCache(
+            num_layers=model_config.num_layers,
+            latent_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    from .mha_pool import MHAKVCache
 
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,

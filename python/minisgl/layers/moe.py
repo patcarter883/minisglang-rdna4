@@ -180,12 +180,23 @@ class MoELayer(BaseOP):
                 intermediate_size_per_partition,
             )
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+        *,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+    ):
+        # Either pass raw `router_logits` (fused softmax+topk inside the kernel) OR a precomputed
+        # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc computed in the model).
+        precomputed = topk_ids is not None
         if self.quant is not None:
             from minisgl.quant import kernels
 
             w13, w2 = self.gate_up_proj, self.down_proj
             if self.quant.is_rxf:
+                assert not precomputed, "RXF MoE precomputed-topk path not wired yet"
                 final_hidden_states = kernels.rxf_moe(
                     hidden_states,
                     w13.weight_packed,
@@ -209,8 +220,11 @@ class MoELayer(BaseOP):
                     router_logits,
                     self.top_k,
                     self.renormalize,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
                 )
         else:
+            assert not precomputed, "unquantized fused-MoE precomputed-topk path not wired yet"
             ctx = get_global_ctx()
             final_hidden_states = ctx.moe_backend.forward(
                 hidden_states=hidden_states,

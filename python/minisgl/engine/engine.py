@@ -258,14 +258,25 @@ class Engine:
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.kv_dtype.itemsize
-            * config.model_config.num_layers
-        )
+        mc = config.model_config
+        if mc.is_mla:
+            # MLA stores ONE latent (kv_lora_rank + qk_rope_head_dim) per token per layer — no ×2
+            # for K/V and no per-head factor (the latent is shared across heads, TP-replicated).
+            cache_per_page = (
+                (mc.kv_lora_rank + mc.qk_rope_head_dim)
+                * config.page_size
+                * self.kv_dtype.itemsize
+                * mc.num_layers
+            )
+        else:
+            cache_per_page = (
+                2  # key + value
+                * mc.head_dim
+                * div_even(mc.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                * config.page_size
+                * self.kv_dtype.itemsize
+                * mc.num_layers
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -330,6 +341,18 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    # MLA (DeepSeek / GLM-4.x MoE) requires the dedicated mla backend (absorbed decode + materialized
+    # prefill over the latent cache); page_size 16 matches the validated mla_hip block size.
+    if config.model_config.is_mla:
+        if config.attention_backend not in ("auto", "mla"):
+            logger.warning_rank0(
+                f"MLA model: overriding attention backend {config.attention_backend!r} -> 'mla'"
+            )
+        override("attention_backend", "mla")
+        if config.page_size % 16 != 0:
+            override("page_size", 16)
+            logger.warning_rank0("Page size is overridden to 16 for the mla backend")
 
     if config.attention_backend == "auto":
         if is_rocm():

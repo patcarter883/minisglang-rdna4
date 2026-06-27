@@ -33,6 +33,12 @@ _moe_calls = 0
 # enabled for decode — the scatter's atomicAdd is not graph-capture-safe).
 _MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "1") != "0"
 
+# Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
+# to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks
+# to lift occupancy (gemm2 is ~15% of peak BW at M=1). 0/unset = the vendored w4a8_fp8_wmma scatter.
+# Like the base scatter, the atomicAdd is NOT cuda-graph-capture-safe (eager decode only).
+_MOE_SPLITK = int(_os.environ["MINISGL_MOE_SPLITK"]) if _os.environ.get("MINISGL_MOE_SPLITK", "").isdigit() else 0
+
 # Native HIP moe_align (moe_hip) replacing the vLLM moe_align_block_size host op. On by default;
 # MINISGL_MOE_ALIGN=0 reverts to the vLLM reference.
 _MOE_ALIGN_HIP = _os.environ.get("MINISGL_MOE_ALIGN", "1") != "0"
@@ -169,10 +175,12 @@ def w4a8_moe(
     w2: torch.Tensor,  # (E, K, inter//8) i32
     w2_scales: torch.Tensor,  # (E, K, inter//g) f16
     w2_zeros: torch.Tensor | None,
-    gating_output: torch.Tensor,  # (M, E)
+    gating_output: torch.Tensor | None,  # (M, E); ignored when topk_ids/topk_weights are given
     top_k: int,
     renormalize: bool,
     *,
+    topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 — precomputed route (e.g. noaux_tc)
+    topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
     block_m: int = 16,
 ) -> torch.Tensor:
@@ -209,7 +217,14 @@ def w4a8_moe(
         vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
         return tw, ti
 
-    topk_weights, topk_ids = _moe_time("route", _route)
+    # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
+    # normalize + scale, done in the model). Otherwise fall back to fused softmax+topk here.
+    if topk_ids is None:
+        topk_weights, topk_ids = _moe_time("route", _route)
+    else:
+        assert topk_weights is not None, "topk_weights required when topk_ids is given"
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+        topk_ids = topk_ids.to(torch.int32).contiguous()
 
     # moe_align: native HIP (moe_hip) by default, vLLM reference under MINISGL_MOE_ALIGN=0.
     if _MOE_ALIGN_HIP:
@@ -257,13 +272,24 @@ def w4a8_moe(
     # (graph-safe; also the (P,K) out2 reuse amortizes better at larger M).
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        _moe_time(
-            "gemm2scat",
-            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
-                buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
-                kernel=gemm2_kernel, w_zeros=w2_zeros,
-            ),
-        )  # writes acc in place
+        if _MOE_SPLITK >= 2 and M == 1:  # split-K only helps the M==1 grid (M>=2 has enough blocks)
+            import moe_splitk_hip  # noqa: F401  registers torch.ops.moe_splitk_hip.*
+
+            _moe_time(
+                "gemm2scat",
+                lambda: torch.ops.moe_splitk_hip.moe_gemm_splitk_scatter(
+                    buf2, w2, w2_scales, w2_zeros, sorted_ids, expert_ids, ntp, tw_flat, acc,
+                    top_k, block_m, _MOE_SPLITK,
+                ),
+            )  # writes acc in place (atomic scatter over experts AND split_k K-slices)
+        else:
+            _moe_time(
+                "gemm2scat",
+                lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
+                    buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
+                    kernel=gemm2_kernel, w_zeros=w2_zeros,
+                ),
+            )  # writes acc in place
         _moe_report()
         return acc.to(x.dtype)
 

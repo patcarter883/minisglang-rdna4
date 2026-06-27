@@ -24,10 +24,12 @@ sliding_window, max_seqlen_q, kv_block_stride=0)`. Maps to vLLM/sgl extend metad
 
 ## Scope / status
 bf16 **and fp8-KV** (`flash_prefill_paged_fp8`, OCP e4m3 + per-tensor descale: k→score, v→output,
-matching attn_decode + minisgl FP8_PER_TENSOR), GQA, causal + SWA, head_dim 64/128 (256 gated off —
-same 64 KB LDS cap as attn_hip). NOT YET: the smem-reduction pass for 256. Validate with
-`attn_prefill_paged_parity.py` (fp32 SDPA reference over prefix⧺new; bf16 + fp8 cases, ulp_viol=0).
-With prefix_len=0 it reduces to dense prefill (== attn_hip).
+matching attn_decode + minisgl FP8_PER_TENSOR), GQA, causal + SWA, **head_dim 64/128/256** — both the
+bf16 and fp8 paths. head_dim 256 (Qwen3.5/3.6 full-attn) drops to head_dim-dependent BR=BC=16 tiling
+(1 warp) so the two fp32 `[BR][HEAD_DIM]` smem buffers fit the 64 KB gfx1201 LDS, mirroring attn_hip;
+64/128 keep BR=BC=32 (2 warps). Validate with `attn_prefill_paged_parity.py` (fp32 SDPA reference over
+prefix⧺new; bf16 + fp8 cases incl. D256, ulp_viol=0). With prefix_len=0 it reduces to dense prefill
+(== attn_hip).
 
 ## Wiring
 Route the engine's EXTEND/chunked-prefill branch (max_query_len>1 with a non-empty KV cache) here;

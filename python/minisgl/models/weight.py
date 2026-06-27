@@ -29,6 +29,16 @@ _SLOT_NAMES = {
     ".up_proj": "up",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+_LAYER_IDX_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _is_beyond_decoder(name: str, num_layers: int) -> bool:
+    """True for a `...layers.<n>....` tensor with n >= num_layers — i.e. an appended MTP /
+    next-token-prediction head (GLM-4.x / DeepSeek). We serve the decoder only, no speculative
+    decode, so those are skipped. Safe for every model: no standard checkpoint has real decoder
+    layers past num_hidden_layers."""
+    m = _LAYER_IDX_PATTERN.search(name)
+    return m is not None and int(m.group(1)) >= num_layers
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
@@ -296,6 +306,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
             for name in f.keys():
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                    continue
+                # Skip appended MTP / next-token-prediction layers (GLM-4.x / DeepSeek): we serve
+                # the decoder only. layers.<n> with n >= num_layers is the MTP head.
+                if _is_beyond_decoder(name, config.num_layers):
                     continue
                 # GPTQ act-order indices: with desc_act=False the group map is the trivial
                 # arange(K)//group_size, already implied by the op's grouped layout, so g_idx is
