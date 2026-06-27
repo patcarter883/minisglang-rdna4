@@ -63,7 +63,20 @@
 
   **All DOD items met:** mla parity qk256/v256 ✓ · AWQ ckpt loads ✓ · serve coheres ✓ · MLA graph
   capture ✓ · TP=2 ✓ · benchmarked (prefill/decode/mixed × M, graph) ✓.
-  Optional leftover: logit oracle vs bf16 HF (needs CPU/offload — 59 GB ref doesn't fit a card).
+
+- **fp8 latent KV wired + committed** (`6450b96`): MLABackend.decode → mla_decode_fp8 (descale 1.0);
+  MLA prefill dequants the e4m3 latent → bf16. `MINISGL_KV_FP8=1`. Concurrency @ 40k ctx: fp8 0.90
+  = 186k KV tokens → ~4 concurrent (bf16 0.85 = 77k → 1). **Production serve = the `glm`
+  docker-compose profile** (memratio 0.90, fp8, graph, 40k): `gpu-lease.sh -n 2 --detach --name glm
+  -- docker compose --profile glm up -d` ; `docker compose -p lease-glm down`.
+
+- **fp8 vs bf16 KV logit comparison (validated negligible):** first-token logits, 8 prompts, same
+  weights, only KV dtype differs — worst cos=0.999974, **all top-1 match**, mean top-5 overlap
+  4.75/5, max|Δ|≈1.5–4 logit units. fp8 KV ≈ bf16 KV. (Method: an env-gated logit dump in
+  engine.forward_batch + two TP=2 boots; the dump hook was reverted afterward to avoid colliding
+  with the concurrent spec-decode work in engine.py — re-add the 8-line MINISGL_DUMP_LOGITS hook to
+  repeat.) Caveat: first-token only (prefill fp8 roundtrip); long-decode fp8 accumulation not
+  separately measured, but per-step error is tiny.
 
 
 
