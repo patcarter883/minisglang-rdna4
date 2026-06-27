@@ -61,10 +61,11 @@ class TritonRDNA4Backend(BaseAttnBackend):
         self._segm_max: torch.Tensor | None = None
         self._segm_expsum: torch.Tensor | None = None
         # --- Native HIP attention (on by default; MINISGL_ATTN_HIP=0 forces pure Triton) ---
-        # Per-op hybrid (head_dim 64/128): decode -> attn_decode.flash_decode_paged (fp8 variant
-        # when KV is fp8); cold prefill -> attn_hip.flash_prefill; extend/paged-prefix prefill ->
-        # attn_prefill_paged.flash_prefill_paged (fp8 variant when KV is fp8). Only head_dim 256
-        # falls back to Triton. Hard-require: when enabled the .so must import or boot fails (the
+        # Per-op hybrid: decode -> attn_decode.flash_decode_paged (fp8 variant when KV is fp8), all
+        # of head_dim 64/128/256; cold prefill -> attn_hip.flash_prefill, 64/128/256; extend/paged-
+        # prefix prefill -> attn_prefill_paged.flash_prefill_paged (fp8 variant when KV is fp8),
+        # 64/128 only. So only a head_dim-256 EXTEND prefill falls back to Triton (256 decode + 256
+        # cold prefill are native). Hard-require: when enabled the .so must import or boot fails (the
         # user opted in to default-on, so a missing build is a hard error, not a silent fallback).
         self._attn_hip = os.environ.get("MINISGL_ATTN_HIP", "1") != "0"
         if self._attn_hip:
@@ -81,8 +82,11 @@ class TritonRDNA4Backend(BaseAttnBackend):
             self._hip_prefill_paged_fp8_op = (
                 torch.ops.attn_prefill_paged.flash_prefill_paged_fp8  # fp8-KV paged extend prefill
             )
-            # attn_hip / attn_prefill_paged support head_dim 64/128 only (256 gated off) ->
-            # otherwise prefill falls back to Triton.
+            # Cold prefill (attn_hip dense) supports head_dim 64/128/256 (256 via head_dim-dependent
+            # BR/BC=16 tiling). Extend/paged prefill (attn_prefill_paged) is still 64/128 only — a 256
+            # extend (chunked/prefix-hit on a full-attn layer) falls back to Triton until the paged 256
+            # kernel lands. Decode (attn_decode) already covers 256.
+            self._hip_cold_ok = config.head_dim in (64, 128, 256)
             self._hip_prefill_ok = config.head_dim in (64, 128)
 
     def _ensure_segm_scratch(self, q: torch.Tensor) -> None:
@@ -116,15 +120,15 @@ class TritonRDNA4Backend(BaseAttnBackend):
         if self._attn_hip:
             if metadata.max_seqlen_q == 1:
                 return self._hip_decode(q, layer_id, metadata)
-            if self._hip_prefill_ok:  # head_dim 64/128
-                if metadata.cold_prefill:
-                    # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
-                    # since it reads inline k/v, not the cache).
-                    return self._hip_prefill(q, k, v, metadata)
-                # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset causal
-                # mask. fp8 variant folds the per-tensor descale (bf16 + fp8 KV both covered).
+            if metadata.cold_prefill and self._hip_cold_ok:  # 64/128/256
+                # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
+                # since it reads inline k/v, not the cache).
+                return self._hip_prefill(q, k, v, metadata)
+            if self._hip_prefill_ok:  # extend / radix-hit prefill, head_dim 64/128
+                # paged K/V prefix + new tokens, prefix-offset causal mask. fp8 variant folds the
+                # per-tensor descale (bf16 + fp8 KV both covered).
                 return self._hip_prefill_paged(q, layer_id, metadata)
-            # head_dim 256 -> fall through to Triton.
+            # head_dim 256 EXTEND prefill -> fall through to Triton (paged 256 kernel not yet built).
         out = torch.empty_like(q)
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
