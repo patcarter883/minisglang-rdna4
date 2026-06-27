@@ -10,8 +10,12 @@ from minisgl.distributed import get_tp_info
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
+_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".q_b_proj", ".kv_b_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
+# AWQ/GPTQ packed siblings store the OUTPUT features on axis 1 (qweight [K, N//8], scales/qzeros
+# [G, N(//8)]), the opposite of a bf16 weight [N, K]. So a column-parallel (output-sharded) AWQ
+# tensor shards axis 1, and a row-parallel (input-sharded) one shards axis 0 — both flipped vs bf16.
+_AWQ_SUFFIXES = (".qweight", ".qzeros", ".scales")
 
 # Merge groups: individual projections -> fused projection
 _MERGE_GROUPS = {
@@ -42,16 +46,23 @@ def _is_beyond_decoder(name: str, num_layers: int) -> bool:
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
-    """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
-    if any(key.count(sub) for sub in _SPLIT_DIM_0):
-        is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
-        if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
-            head_dim = value.shape[0] // num_kv_heads
-            head_idx = r * num_kv_heads // n
-            return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
-        return value.chunk(n, dim=0)[r].clone()
-    elif any(key.count(sub) for sub in _SPLIT_DIM_1):
-        return value.chunk(n, dim=1)[r].clone()
+    """Extract rank r's shard from a single tensor. Returns a contiguous copy. (No-op at n==1.)
+    AWQ/GPTQ packed tensors flip the shard axis vs a bf16 weight (see _AWQ_SUFFIXES)."""
+    # GLM's always-on shared expert is REPLICATED, not TP-sharded (its down_proj K=moe_intermediate
+    # must stay a multiple of 512 for the W4A8 dense kernel — see GLMSharedExpert). Keep it whole.
+    if ".shared_experts." in key:
+        return value
+    is_awq = key.endswith(_AWQ_SUFFIXES)
+    if any(key.count(sub) for sub in _SPLIT_DIM_0):  # column-parallel (output-sharded)
+        if not is_awq:
+            is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
+            if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
+                head_dim = value.shape[0] // num_kv_heads
+                head_idx = r * num_kv_heads // n
+                return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
+        return value.chunk(n, dim=1 if is_awq else 0)[r].clone()
+    elif any(key.count(sub) for sub in _SPLIT_DIM_1):  # row-parallel (input-sharded)
+        return value.chunk(n, dim=0 if is_awq else 1)[r].clone()
     elif key.count("lm_head") or key.count("embed_tokens"):
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, n)
