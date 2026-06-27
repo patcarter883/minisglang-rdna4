@@ -4,9 +4,11 @@ from dataclasses import dataclass
 
 __all__ = ["SpecConfig", "SPEC_ALGORITHMS"]
 
-# Supported proposers. "ngram" = prompt-lookup (zero-model) — the MVP. MTP/EAGLE land later
-# (see SPEC_DECODE.md §4); they reuse the same verify cycle, only the proposer changes.
-SPEC_ALGORITHMS = ("ngram",)
+# Supported proposers. "ngram" = prompt-lookup (zero-model) — the MVP. "mtp" = the model's own
+# appended next-token-prediction head (GLM-4.x / Qwen3.5), run autoregressively as a draft model.
+# EAGLE/DFlash land later (see SPEC_DECODE.md §4); all reuse the same verify cycle, only the
+# proposer changes.
+SPEC_ALGORITHMS = ("ngram", "mtp")
 
 
 @dataclass(frozen=True)

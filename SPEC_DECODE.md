@@ -1,7 +1,9 @@
 # SPEC_DECODE.md — speculative decoding for minisgl (Triton-free, native-HIP)
 
-Status: **working and GPU-validated on both MHA and MLA** (n-gram / prompt-lookup, topk=1, greedy,
-eager, synchronous loop). Enable with `--spec-algorithm ngram` (see args below).
+Status: **working and GPU-validated** on n-gram (`--spec-algorithm ngram`, MHA+MLA+GDN) AND native
+**MTP self-speculation** (`--spec-algorithm mtp`, GLM-4.7-Flash + Qwen3.5-4B — both coherent and
+lossless vs a 1-token/step reference; see §6 "MTP self-speculation"). topk=1, greedy, eager,
+synchronous loop.
 - **MHA** (Qwen3-0.6B, TP=1): coherent; ~11% accept / 1.25 tok/step on repetitive prompts; spec
   output **bit-identical to sequential decode through the verify kernel** (`tools/spec_lossless.sh`
   → PASS) — accept/commit/KV-rollback is provably lossless.
@@ -232,7 +234,38 @@ The old snapshot + `_gdn_readvance` (restore pre-verify state, re-run the accept
 2nd eager forward) has been removed. `GDNStateCache.snapshot/restore` remain as a general-purpose API
 but are no longer on the spec path.
 
-### MTP self-speculation (the appended heads we currently discard) — DESIGNED
+### MTP self-speculation (the appended next-token heads) — DONE, GPU-VALIDATED (coherent + lossless)
+GPU-validated on both MTP-bearing models with `--spec-algorithm mtp`:
+- **GLM-4.7-Flash-AWQ** (TP=2, MLA+MoE): coherent ("the capital of France is Paris"); ~20% accept /
+  1.8 tok/step; **SPEC == FORCE_N0 byte-identical on all 5 prompts** (`tools/mtp_glm.sh`, RUN_N0=1 →
+  PASS). The lower accept vs Qwen is the AWQ-quantized MTP MoE (lossy draft), not a defect — the
+  verify corrects every draft so output is lossless.
+- **Qwen3.5-4B** (TP=1, GDN-hybrid, bf16 MTP): coherent; **~45–48% accept / 2.7–2.8 tok/step**;
+  SPEC == FORCE_N0 byte-identical on all 5 prompts (`tools/mtp_qwen35.sh`, RUN_N0=1 → PASS).
+
+Implementation (`spec/mtp.py::MTPProposer`, `needs_last_hidden=True`): the head is loaded as a model
+submodule (`model.mtp`) — GLM `GLMMTPHead` (reuses GLMDecoderLayer's MLA+MoE projections + its own
+embed/eh_proj/shared_head, weight.py `_remap_glm_mtp`); Qwen `Qwen3_5MTPHead` (one full-attention
+layer + fc + pre-norms, tied to the target embed + lm_head, weight.py `_qwen3_5_mtp_remap`). The
+proposer runs the head autoregressively K times. **Two findings that set the shape:**
+- the **MTP seed is the PRE-final-norm residual stream** (`x+residual`), not the post-norm hidden —
+  `*Model.forward(return_hidden=True)` now returns it as `last_hidden` (the MTP's own hnorm
+  re-normalizes; post vs pre is numerically near-identical because RMSNorm is scale-free, but pre is
+  the standard GLM/DeepSeek `previous_hidden_states`).
+- the MTP attention needs a **PERSISTENT per-request KV cache** (one MTP layer), not just the K draft
+  tokens: restricting attention to the draft chain collapses the head to ~40% single-token accuracy.
+  The proposer keeps `_cache[uid]`, runs every confirmed token through the MTP layer (growing the
+  context across decode steps), appends the K drafts' K/V temporarily, and `on_accept` truncates to
+  the accepted prefix; `free(uid)` drops it on finish (scheduler `_free_req_resources`). The TP>1
+  full-vocab head all-gather (`ParallelLMHead.logits_all_rows`) is mandatory — a local-shard argmax
+  desyncs the per-rank drafts and deadlocks the verify collective. (Diagnostics: env-gated
+  `MINISGL_MTP_DBG`, `MINISGL_MTP_POS_SHIFT`; default position = embedded token's absolute index.)
+
+Future lever (not needed for the bar): seed the MTP KV with the **prompt prefill** (run the MTP layer
+over the prompt once) to lift early-token acceptance — the cache currently starts empty at the first
+decode, so short generations miss prompt context.
+
+#### (historical) MTP self-speculation — DESIGN NOTES
 GLM-4.7-Flash (`num_nextn_predict_layers=1`) and Qwen3.5/3.6 (`mtp_num_hidden_layers=1`) ship one
 MTP head, currently skipped (`weight.py::_is_beyond_decoder` for GLM `layers.47.*`;
 `_QWEN35_SKIP_PREFIXES` `"mtp."` for Qwen). Structure (both): `head_out = layer( fc( concat[

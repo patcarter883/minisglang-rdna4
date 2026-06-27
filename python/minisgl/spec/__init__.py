@@ -11,6 +11,7 @@ from __future__ import annotations
 from .accept import AcceptResult, verify_greedy
 from .base import Proposer, ProposeContext, make_proposer
 from .config import SPEC_ALGORITHMS, SpecConfig
+from .mtp import MTPProposer
 from .proposer import NgramProposer, propose_ngram
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "verify_greedy",
     "propose_ngram",
     "NgramProposer",
+    "MTPProposer",
     "Proposer",
     "ProposeContext",
     "make_proposer",
