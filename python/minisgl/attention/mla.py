@@ -50,7 +50,12 @@ class MLABackend(BaseAttnBackend):
         import mla_hip  # noqa: F401  registers torch.ops.mla_hip.*
 
         self._decode_op = torch.ops.mla_hip.mla_decode
+        self._decode_fp8_op = torch.ops.mla_hip.mla_decode_fp8
         self._prefill_op = torch.ops.mla_hip.mla_prefill
+        # fp8 (e4m3) latent KV cache — opt-in via MINISGL_KV_FP8=1 (the engine allocates the latent
+        # pool as float8_e4m3fn). Store is a plain bf16->e4m3 cast (scale 1.0), so decode dequant uses
+        # descale 1.0, matching the HIP MHA fp8 path. The prefill rebuild dequants in the model layer.
+        self.kv_is_fp8 = self.kvcache.dtype == torch.float8_e4m3fn
 
     # ---- cache + kernels (called by the model's MLA layer) ----
     def store_latent(self, latent: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
@@ -62,6 +67,9 @@ class MLABackend(BaseAttnBackend):
         latent_cache = self.kvcache.latent_cache(layer_id)  # [num_pages, page_size, latent_dim]
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        if self.kv_is_fp8:
+            # e4m3 latent cache: k_descale=v_descale=1.0 (store was a scale-1.0 cast).
+            return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0, 0)
         return self._decode_op(q, latent_cache, block_table, ctx_lens, self.scale, 0, 0)
 
     def prefill(
