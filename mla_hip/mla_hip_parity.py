@@ -119,22 +119,23 @@ QK_DIM, V_DIM = 192, 128
 COS_MIN_PRE = 0.9995
 
 
-def check_prefill(name, qkv_lens, H=16, sw=0, causal=1) -> bool:
-    """qkv_lens: list of (q_len, k_len) per sequence (k_len >= q_len; prefix = k_len - q_len)."""
-    scale = QK_DIM ** -0.5
+def check_prefill(name, qkv_lens, H=16, sw=0, causal=1, qk_dim=QK_DIM, v_dim=V_DIM) -> bool:
+    """qkv_lens: list of (q_len, k_len) per sequence (k_len >= q_len; prefix = k_len - q_len).
+    qk_dim/v_dim default to DeepSeek 192/128; pass 256/256 for the GLM-4.7-Flash shapes."""
+    scale = qk_dim ** -0.5
     q_lens = [a for a, _ in qkv_lens]
     k_lens = [b for _, b in qkv_lens]
     total_q, total_k = sum(q_lens), sum(k_lens)
-    q = torch.randn(total_q, H, QK_DIM, device=DEV, dtype=torch.bfloat16)
-    k = torch.randn(total_k, H, QK_DIM, device=DEV, dtype=torch.bfloat16)
-    v = torch.randn(total_k, H, V_DIM, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(total_q, H, qk_dim, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(total_k, H, qk_dim, device=DEV, dtype=torch.bfloat16)
+    v = torch.randn(total_k, H, v_dim, device=DEV, dtype=torch.bfloat16)
     cu_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], device=DEV, dtype=torch.int32)
     cu_k = torch.tensor([0, *torch.tensor(k_lens).cumsum(0).tolist()], device=DEV, dtype=torch.int32)
     max_q = max(q_lens)
 
     got = torch.ops.mla_hip.mla_prefill(q, k, v, cu_q, cu_k, scale, causal, sw, max_q).float()
 
-    ref = torch.empty(total_q, H, V_DIM, device=DEV)
+    ref = torch.empty(total_q, H, v_dim, device=DEV)
     for b in range(len(qkv_lens)):
         ql, kl = q_lens[b], k_lens[b]
         prefix = kl - ql
@@ -188,6 +189,17 @@ def main() -> None:
     ok &= check_prefill("cold B1 H128 q=k=256", [(256, 256)], H=128)
     ok &= check_prefill("SWA=128 cold B1 q=k=512", [(512, 512)], sw=128)
     ok &= check_prefill("non-causal B1 q=k=128", [(128, 128)], causal=0)
+    print("--- prefill (GLM-4.7-Flash materialized MHA, qk256/v256) ---")
+    G = dict(qk_dim=256, v_dim=256)
+    ok &= check_prefill("glm cold B1 q=k=128", [(128, 128)], **G)
+    ok &= check_prefill("glm cold B1 q=k=512", [(512, 512)], **G)
+    ok &= check_prefill("glm cold B1 q=k=37 (ragged)", [(37, 37)], **G)
+    ok &= check_prefill("glm cold B3 q=k=[100,250,37]", [(100, 100), (250, 250), (37, 37)], **G)
+    ok &= check_prefill("glm extend B1 q=64 k=512 (prefix=448)", [(64, 512)], **G)
+    ok &= check_prefill("glm extend B2 q=[32,16] k=[200,300]", [(32, 200), (16, 300)], **G)
+    ok &= check_prefill("glm cold B1 H96 q=k=256", [(256, 256)], H=96, **G)
+    ok &= check_prefill("glm SWA=128 cold B1 q=k=512", [(512, 512)], sw=128, **G)
+    ok &= check_prefill("glm non-causal B1 q=k=128", [(128, 128)], causal=0, **G)
     print("RESULT:", "ALL PASS" if ok else "FAILURES PRESENT")
 
 

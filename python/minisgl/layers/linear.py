@@ -49,7 +49,12 @@ class _LinearTPImpl(BaseOP):
 class LinearReplicated(_LinearTPImpl):
     """
     Linear layer where weights are replicated (not sharded) across all TP ranks.
-    Each GPU holds the full weight matrix.
+    Each GPU holds the full weight matrix and computes the full output (no collective).
+
+    May carry a quant_method: a replicated AWQ/W4A8 linear is used where a row-parallel split would
+    violate a kernel tiling constraint (e.g. the GLM shared-expert down_proj, whose K=1536 stays a
+    multiple of 512 only un-sharded; the W4A8 dense kernel needs K % 512 == 0). Its full output is
+    added to the already-all-reduced routed output, so there is no double-count and no extra reduce.
     """
 
     def __init__(
@@ -57,6 +62,7 @@ class LinearReplicated(_LinearTPImpl):
         input_size: int,
         output_size: int,
         has_bias: bool,
+        quant_method: "LinearMethod | None" = None,
     ):
         super().__init__(
             full_isize=input_size,
@@ -64,6 +70,7 @@ class LinearReplicated(_LinearTPImpl):
             local_isize=input_size,
             local_osize=output_size,
             has_bias=has_bias,
+            quant_method=quant_method,
         )
 
 

@@ -20,8 +20,10 @@
 // LDS BUDGET (RDNA4 = 64 KB/workgroup): symmetric BR=BC=32 with qk=192/v=128 overflows (~73.6 KB), so
 // v0 uses BR=32, BC=16 (~59.8 KB). M_TILES=2 (2 warps), N_TILES=1.
 //
-// SCOPE (v0, correctness-first): bf16, causal + optional sliding window, qk192/v128. NOT YET: fp8,
-// other (qk,v) ratios (add a template instantiation). Validate with mla_hip_parity.py.
+// SCOPE (v0, correctness-first): bf16, causal + optional sliding window. Instantiated for
+// qk192/v128 (DeepSeek, BR=32) and qk256/v256 (GLM-4.7-Flash, BR=16 — v256 doubles the float O/PV
+// LDS buffers). NOT YET: fp8, other (qk,v) ratios (add a template instantiation). Validate with
+// mla_hip_parity.py.
 
 #undef __HIP_NO_HALF_CONVERSIONS__
 #undef __HIP_NO_HALF_OPERATORS__
@@ -36,11 +38,9 @@ namespace {
 using bf16_t = rocwmma::bfloat16_t;
 
 constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
-constexpr int BR = 32, BC = 16;                 // query rows / key cols per tile (BC=16 to fit LDS)
-constexpr int M_TILES = BR / WMMA_M;            // 2
-constexpr int N_TILES = BC / WMMA_N;            // 1
-constexpr int WARPS = M_TILES;                  // 2
-constexpr int THREADS = WARPS * 32;             // 64
+// BR (query rows) / BC (key cols) per tile are TEMPLATE params (LDS-budget driven):
+//   qk192/v128 -> BR=32, BC=16 (~59.8 KB);  qk256/v256 -> BR=16, BC=16 (~58.4 KB) because
+//   v_head_dim=256 doubles the two float[BR][V_DIM] O/PV buffers, so BR halves to stay under 64 KB.
 
 using FragQ  = rocwmma::fragment<rocwmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16_t, rocwmma::row_major>;
 using FragKt = rocwmma::fragment<rocwmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16_t, rocwmma::col_major>;
@@ -48,8 +48,8 @@ using FragP  = rocwmma::fragment<rocwmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, bf16
 using FragV  = rocwmma::fragment<rocwmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, bf16_t, rocwmma::row_major>;
 using FragAcc = rocwmma::fragment<rocwmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
 
-template <int QK_DIM, int V_DIM>
-__global__ __launch_bounds__(THREADS) void mla_prefill_kernel(
+template <int QK_DIM, int V_DIM, int BR, int BC>
+__global__ __launch_bounds__(BR / WMMA_M * 32) void mla_prefill_kernel(
     const __hip_bfloat16* __restrict__ Q,        // [total_q_tokens, num_heads, QK_DIM]  (packed varlen)
     const __hip_bfloat16* __restrict__ K,        // [total_kv_tokens, num_heads, QK_DIM] (packed varlen)
     const __hip_bfloat16* __restrict__ V,        // [total_kv_tokens, num_heads, V_DIM]  (packed varlen)
@@ -60,8 +60,12 @@ __global__ __launch_bounds__(THREADS) void mla_prefill_kernel(
     const float inv_sqrt_d,
     const unsigned int causal,
     const unsigned int sliding_window) {
-    constexpr int KSTEPS = QK_DIM / WMMA_K;      // 12
-    constexpr int D_TILES = V_DIM / WMMA_N;      // 8
+    constexpr int M_TILES = BR / WMMA_M;
+    constexpr int N_TILES = BC / WMMA_N;
+    constexpr int WARPS = M_TILES;
+    constexpr int THREADS = WARPS * 32;
+    constexpr int KSTEPS = QK_DIM / WMMA_K;      // qk192->12, qk256->16
+    constexpr int D_TILES = V_DIM / WMMA_N;      // v128->8,  v256->16
     constexpr int PAD = 8;
     constexpr int LDQ = QK_DIM + PAD;            // 200
     constexpr int LDV = V_DIM + PAD;             // 136
@@ -247,8 +251,6 @@ void launch_mla_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
     const unsigned int num_seqs = cu_seqlens_q.size(0) - 1;
     const float inv = (scale > 0) ? (float)scale : 1.0f / sqrtf((float)qk_dim);
 
-    dim3 grid(num_heads, (max_seqlen_q + BR - 1) / BR, num_seqs);
-    dim3 block(THREADS, 1, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
     const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
@@ -258,12 +260,19 @@ void launch_mla_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
     const int* ckp = cu_seqlens_k.data_ptr<int>();
     auto* op = reinterpret_cast<__hip_bfloat16*>(out.data_ptr());
 
-#define LAUNCH(QK, VD)                                                                       \
-    mla_prefill_kernel<QK, VD><<<grid, block, 0, stream>>>(                                  \
-        qp, kp, vp, cqp, ckp, op, num_heads, inv, (unsigned)causal, (unsigned)sliding_window)
+#define LAUNCH(QK, VD, BR_, BC_)                                                             \
+    do {                                                                                    \
+        dim3 grid(num_heads, (max_seqlen_q + (BR_) - 1) / (BR_), num_seqs);                 \
+        dim3 block((BR_) / 16 * 32, 1, 1);                                                  \
+        mla_prefill_kernel<QK, VD, BR_, BC_><<<grid, block, 0, stream>>>(                   \
+            qp, kp, vp, cqp, ckp, op, num_heads, inv, (unsigned)causal,                     \
+            (unsigned)sliding_window);                                                      \
+    } while (0)
 
-    // DeepSeek-V3 / GLM materialized MLA: qk_head_dim=192 (128 nope + 64 rope), v_head_dim=128.
-    if (qk_dim == 192 && v_dim == 128) { LAUNCH(192, 128); }
+    // DeepSeek-V3: qk_head_dim=192 (128 nope + 64 rope), v_head_dim=128 -> BR=32, BC=16.
+    if (qk_dim == 192 && v_dim == 128) { LAUNCH(192, 128, 32, 16); }
+    // GLM-4.7-Flash: qk_head_dim=256 (192 nope + 64 rope), v_head_dim=256 -> BR=16, BC=16 (LDS).
+    else if (qk_dim == 256 && v_dim == 256) { LAUNCH(256, 256, 16, 16); }
     else {
         TORCH_CHECK(false, "mla_hip prefill: unsupported (qk_head_dim=", qk_dim, ", v_head_dim=", v_dim,
                     ") — add a template instantiation (QK_DIM%16==0, V_DIM%16==0)");

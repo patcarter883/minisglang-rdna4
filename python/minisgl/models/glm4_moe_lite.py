@@ -13,11 +13,12 @@ Architecture (from config.json):
     sigmoid + e_score_correction_bias, n_group=1 → plain top-4, normalize, ×routed_scaling_factor)
     PLUS one always-on shared expert (added, not gated).
 
-QUANT SPLIT (mirrors qwen3_5_moe + the [shared-expert-keep-bf16] convention): ONLY the routed
-experts are quantized (W4A8/AWQ). The MLA attention, router gate, the always-on shared expert, the
-dense layer-0 MLP, and lm_head stay bf16. If a given AWQ checkpoint instead quantizes the shared
-expert / dense layers, flip those modules to the model quant. TP=1 only (AWQ INT4 ~9 GB fits one
-card); MLA TP sharding is a follow-up. The MTP head (num_nextn_predict_layers) is skipped.
+QUANT SPLIT: the routed experts AND the always-on shared expert are quantized (W4A8/AWQ) — real AWQ
+checkpoints (QuantTrio/GLM-4.7-Flash-AWQ) quantize the shared expert too, leaving only the MLA
+attention, the router gate, the dense layer-0 MLP, and lm_head in bf16 (their
+modules_to_not_convert = {self_attn, mlp.gate, layers.0}). The shared expert follows expert_quant,
+so a bf16 (non-AWQ) checkpoint keeps it bf16. TP=1 only (AWQ INT4 fits one card); MLA TP sharding is
+a follow-up. The MTP head (layers.<num_layers>, num_nextn_predict_layers) is skipped by the loader.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ from minisgl.distributed import get_tp_info
 from minisgl.layers import (
     BaseOP,
     LinearColParallelMerged,
+    LinearOProj,
     LinearReplicated,
     LinearRowParallel,
     MoELayer,
@@ -43,7 +45,7 @@ from minisgl.layers import (
     silu_and_mul,
 )
 from minisgl.quant import create_linear_method
-from minisgl.utils import nvtx_annotate
+from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
 from .utils import GatedMLP
@@ -57,27 +59,32 @@ class GLMMLAAttention(BaseOP):
     latent cache + the mla_hip kernels live in the MLABackend (ctx.attn_backend)."""
 
     def __init__(self, config: "ModelConfig", layer_id: int):
-        assert get_tp_info().size == 1, "GLM MLA path is TP=1 only (sharding is a follow-up)"
         self._layer_id = layer_id
-        self.num_heads = H = config.num_qo_heads
         self.qk_nope = config.qk_nope_head_dim
         self.qk_rope = config.qk_rope_head_dim
         self.qk_head_dim = self.qk_nope + self.qk_rope
         self.v_head_dim = config.v_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         eps = config.rms_norm_eps
+        # TP: the q/kv up-projections + o_proj are HEAD-parallel (each rank owns num_qo_heads/tp
+        # heads). The q_lora/kv_lora bottlenecks and the SHARED MQA latent (kv_a) are replicated —
+        # the latent KV cache is shared across heads, so it is replicated too (no per-head split).
+        Hfull = config.num_qo_heads
+        self.num_heads = H = div_even(Hfull, get_tp_info().size)  # heads on THIS rank
 
         self.q_a_proj = LinearReplicated(config.hidden_size, config.q_lora_rank, has_bias=False)
         self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=eps)
-        self.q_b_proj = LinearReplicated(config.q_lora_rank, H * self.qk_head_dim, has_bias=False)
+        self.q_b_proj = LinearColParallelMerged(
+            config.q_lora_rank, [Hfull * self.qk_head_dim], has_bias=False
+        )
         self.kv_a_proj_with_mqa = LinearReplicated(
             config.hidden_size, self.kv_lora_rank + self.qk_rope, has_bias=False
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=eps)
-        self.kv_b_proj = LinearReplicated(
-            self.kv_lora_rank, H * (self.qk_nope + self.v_head_dim), has_bias=False
+        self.kv_b_proj = LinearColParallelMerged(
+            self.kv_lora_rank, [Hfull * (self.qk_nope + self.v_head_dim)], has_bias=False
         )
-        self.o_proj = LinearReplicated(H * self.v_head_dim, config.hidden_size, has_bias=False)
+        self.o_proj = LinearOProj(Hfull * self.v_head_dim, config.hidden_size, has_bias=False)
 
         rc = config.rotary_config
         # RoPE over the 64-dim rope sub-vector only (full rotary on that 64-wide head).
@@ -173,17 +180,19 @@ class GLMTopkGate(BaseOP):
 
 
 class GLMSharedExpert(BaseOP):
-    """Always-on shared expert (SwiGLU). Quantized with the model quant when present (AWQ)."""
+    """Always-on shared expert (SwiGLU). REPLICATED across TP ranks (not sharded): a row-parallel
+    down_proj would have K = moe_intermediate/tp = 768, but the W4A8 dense kernel needs K % 512 == 0
+    (1536 only un-sharded). Each rank computes the full shared output, which is added to the
+    already-all-reduced routed output (no double-count, no extra collective). Quantized with the
+    model quant when present (AWQ)."""
 
     def __init__(self, config: "ModelConfig"):
         inter = config.moe_intermediate_size * max(1, config.n_shared_experts)
         qm = create_linear_method(config.quant)
-        self.gate_up_proj = LinearColParallelMerged(
-            config.hidden_size, [inter, inter], has_bias=False, quant_method=qm
+        self.gate_up_proj = LinearReplicated(
+            config.hidden_size, 2 * inter, has_bias=False, quant_method=qm
         )
-        self.down_proj = LinearRowParallel(
-            inter, config.hidden_size, has_bias=False, quant_method=qm
-        )
+        self.down_proj = LinearReplicated(inter, config.hidden_size, has_bias=False, quant_method=qm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
@@ -205,7 +214,12 @@ class GLMSparseBlock(BaseOP):
             renormalize=False,  # noaux_tc normalize is done here, weights passed in precomputed
             quant=expert_quant,
         )
-        self.shared_experts = GLMSharedExpert(config)
+        # The always-on shared expert follows the routed-expert quant: real AWQ GLM-4.7-Flash
+        # checkpoints (e.g. QuantTrio/GLM-4.7-Flash-AWQ) quantize it alongside the routed experts
+        # (their modules_to_not_convert keeps only attn + gate + dense layer-0 bf16). When the MoE is
+        # NOT quantized (expert_quant is None — bf16 checkpoint), it stays bf16. (This intentionally
+        # relaxes commit 7b113b9's "shared expert always bf16" guess, which predated a real AWQ ckpt.)
+        self.shared_experts = GLMSharedExpert(dataclasses.replace(config, quant=expert_quant))
         self.top_k = config.num_experts_per_tok
         self.n_group = config.n_group
         self.topk_group = config.topk_group
