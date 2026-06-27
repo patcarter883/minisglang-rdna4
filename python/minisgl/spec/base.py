@@ -114,4 +114,16 @@ def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
             num_draft=spec_config.num_draft,
             draft_model_path=spec_config.draft_model_path,
         )
+    if spec_config.algorithm == "dflash":
+        from .dflash import DFlashProposer
+
+        if engine is None:
+            raise ValueError("the DFlash proposer needs the engine (model + device); none was passed")
+        if not spec_config.draft_model_path:
+            raise ValueError("--spec-algorithm dflash requires --spec-draft-model-path <ckpt>")
+        return DFlashProposer(
+            engine=engine,
+            num_draft=spec_config.num_draft,
+            draft_model_path=spec_config.draft_model_path,
+        )
     raise ValueError(f"no proposer for spec algorithm {spec_config.algorithm!r}")

@@ -7,9 +7,11 @@ __all__ = ["SpecConfig", "SPEC_ALGORITHMS"]
 # Supported proposers. "ngram" = prompt-lookup (zero-model) — the MVP. "mtp" = the model's own
 # appended next-token-prediction head (GLM-4.x / Qwen3.5), run autoregressively as a draft model.
 # "eagle3" = a SEPARATE EAGLE3 draft checkpoint (3 captured target aux layers fused -> 1-layer GQA
-# trunk -> compressed draft vocab), run as a linear chain. All reuse the same verify cycle, only the
-# proposer changes (see SPEC_DECODE.md §4/§6).
-SPEC_ALGORITHMS = ("ngram", "mtp", "eagle3")
+# trunk -> compressed draft vocab), run as a linear chain. "dflash" = a SEPARATE DFlash draft
+# checkpoint (N captured target aux layers fused as a per-layer KV prefix -> N-layer GQA trunk),
+# block-diffusion: ONE bidirectional forward emits a whole block of candidate tokens. All reuse the
+# same verify cycle, only the proposer changes (see SPEC_DECODE.md §4/§6).
+SPEC_ALGORITHMS = ("ngram", "mtp", "eagle3", "dflash")
 
 
 @dataclass(frozen=True)
