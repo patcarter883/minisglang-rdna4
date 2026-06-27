@@ -351,17 +351,19 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
 
         # GDN-hybrid: build the per-batch recurrent metadata (varlen, like a prefill — see
-        # build_gdn_metadata + the spec_verify dispatch) and SNAPSHOT the pre-verify conv+ssm state.
-        # The verify advances state through all K+1 tokens; a partial accept restores this snapshot
-        # and re-advances exactly the accepted tokens (the kernel keeps only the final state, so the
-        # intermediate accepted-prefix state is unrecoverable otherwise). See SPEC_DECODE.md.
-        gdn_snapshot = None
+        # build_gdn_metadata + the spec_verify dispatch). Instead of snapshotting + re-advancing, the
+        # verify forward CAPTURES the conv+ssm state AFTER each of the K+1 tokens into per-layer
+        # scratch (gdn_prefill_verify / causal_conv1d_fwd_verify). After acceptance the scheduler
+        # installs the state after the accepted prefix (index = committed-1) directly into the slot —
+        # no 2x re-advance, and bit-exact vs 1-token decode. See SPEC_DECODE.md.
+        gdn_state_indices = None
         if self.gdn_slots is not None:
             from minisgl.gdn.metadata import build_gdn_metadata
 
-            state_indices = self.gdn_slots.state_indices(batch)
-            batch.gdn_metadata = build_gdn_metadata(batch, state_indices, device)
-            gdn_snapshot = self.engine.gdn_state.snapshot(state_indices)
+            gdn_state_indices = self.gdn_slots.state_indices(batch)
+            batch.gdn_metadata = build_gdn_metadata(batch, gdn_state_indices, device)
+            batch.gdn_metadata.capture_verify_state = True
+            batch.gdn_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
         logits = self.engine.forward_verify(batch)
@@ -377,10 +379,12 @@ class Scheduler(SchedulerIOMixin):
         c_vals: List[int] = []
         free_chunks: List[torch.Tensor] = []
         accepted_counts: List[int] = []  # drafts accepted per req (drives proposer draft-state rollback)
-        # GDN re-advance bookkeeping: (req, pre-verify cached_len c0, #committed tokens, K_i+1).
-        # A req over-advanced its recurrent state iff committed < K_i+1 (didn't accept the full draft).
-        radv_info: List[Tuple[Req, int, int, int]] = []
-        for req, d in zip(reqs, drafts):
+        # GDN per-token-state install bookkeeping. For each still-running seq, record its BATCH index
+        # (to gather the captured scratch) and the per-token index to install (= committed-1, the
+        # state AFTER the last committed token). A finished seq frees its slot, so its state is moot.
+        gdn_install_batch_idx: List[int] = []
+        gdn_install_t_index: List[int] = []
+        for i, (req, d) in enumerate(zip(reqs, drafts)):
             q_len = len(d) + 1
             target = preds[offset : offset + q_len].tolist()
             offset += q_len
@@ -422,10 +426,13 @@ class Scheduler(SchedulerIOMixin):
             req.device_len = req.cached_len + 1
             total_emitted += len(keep)
             finished = eos or (not req.can_decode)
-            # GDN: a still-running req's recurrent state must end at the accepted position. Record
-            # it for the post-loop re-advance (finished reqs free their slot, so state is moot).
-            if gdn_snapshot is not None and not finished:
-                radv_info.append((req, c0, len(keep), len(d) + 1))
+            # GDN: a still-running req's recurrent state must end after the accepted prefix. The verify
+            # captured the state after each token; install scratch index committed-1 (state after the
+            # last committed token). committed == len(keep) >= 1 (always >= the 1 bonus token) for a
+            # non-EOS-truncated, still-running seq. Finished reqs free their slot, so state is moot.
+            if gdn_state_indices is not None and not finished:
+                gdn_install_batch_idx.append(i)
+                gdn_install_t_index.append(len(keep) - 1)
 
             # One message carries all of this step's committed tokens (the detokenizer keys
             # streaming state by uid and assumes one message per uid per batch).
@@ -461,11 +468,17 @@ class Scheduler(SchedulerIOMixin):
         if free_chunks:
             self.cache_manager._free(torch.cat(free_chunks))
 
-        # GDN: if any still-running seq over-advanced its recurrent state during verify, restore the
-        # pre-verify snapshot and re-advance every running seq through exactly its accepted tokens
-        # (uniform re-advance is correct for full-accept seqs too). Skipped when all fully accepted.
-        if gdn_snapshot is not None and any(c < f for _, _, c, f in radv_info):
-            self._gdn_readvance(gdn_snapshot, radv_info)
+        # GDN: install the captured accepted-prefix recurrent state into each still-running seq's slot.
+        # The verify forward (gdn_prefill_verify) already computed the EXACT per-token conv+ssm state,
+        # so this is a pure gather — no re-advance, no second forward. Bit-exact vs 1-token decode.
+        if gdn_state_indices is not None and gdn_install_batch_idx:
+            md = batch.gdn_metadata
+            sel = torch.tensor(gdn_install_batch_idx, dtype=torch.long, device=device)
+            slots = gdn_state_indices.to(torch.long)[sel]
+            t_index = torch.tensor(gdn_install_t_index, dtype=torch.long, device=device)
+            self.engine.gdn_state.install_verify_state(
+                md.conv_scratch, md.ssm_scratch, slots, t_index
+            )
 
         # Roll back any draft-owned state (draft KV / recurrent) to the accepted prefix. No-op for
         # n-gram; MTP/DFlash/EAGLE truncate their draft KV. (GDN backbone-state rollback is handled
@@ -478,42 +491,6 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
         self._spec_debug(reqs, drafts, total_emitted)
-
-    def _gdn_readvance(
-        self, snapshot, radv_info: List[Tuple[Req, int, int, int]]
-    ) -> None:
-        """Fix the GDN recurrent state after a partial-accept spec step. The verify forward
-        advanced each seq's conv+ssm state through all K+1 query tokens; restore the pre-verify
-        snapshot and re-run JUST the accepted tokens (positions c0 .. c0+committed-1, already in the
-        token pool / KV cache) so the state ends exactly at the accepted prefix. The re-advance is a
-        second eager forward (logits discarded; KV re-stored with identical values) — correctness
-        first; a per-token-state verify kernel would avoid it (see SPEC_DECODE.md, future work)."""
-        device = self.device
-        from minisgl.gdn.metadata import build_gdn_metadata
-
-        self.engine.gdn_state.restore(snapshot)  # all batch slots -> pre-verify state
-        radv_reqs = [r for r, _, _, _ in radv_info]
-        saved = [(r.cached_len, r.device_len) for r in radv_reqs]
-        # Temporarily point each req at its accepted-token window [c0, c0+committed).
-        for req, c0, committed, _ in radv_info:
-            req.cached_len = c0
-            req.device_len = c0 + committed
-
-        batch = Batch(reqs=radv_reqs, phase="decode")
-        batch.spec_verify = True
-        batch.padded_reqs = radv_reqs
-        # No allocate_paged: these tokens' KV pages are already committed. Just re-run the forward.
-        batch.positions = _make_positions(batch, device)
-        input_mapping = _make_input_tuple(batch, device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        state_indices = self.gdn_slots.state_indices(batch)
-        batch.gdn_metadata = build_gdn_metadata(batch, state_indices, device)
-        batch.input_ids = self.token_pool[input_mapping]
-        self.engine.forward_verify(batch)  # discard logits; the side effect is the GDN state advance
-
-        for req, (cl, dl) in zip(radv_reqs, saved):
-            req.cached_len, req.device_len = cl, dl
 
     def _spec_debug(self, reqs: List[Req], drafts: List[List[int]], emitted: int) -> None:
         # MINISGL_SPEC_DEBUG=1: accumulate acceptance stats and log the running mean every 50

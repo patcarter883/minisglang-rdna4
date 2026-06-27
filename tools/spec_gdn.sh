@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Spec-decode validation on a GDN-HYBRID model (Qwen3.5-4B, qwen3_5: 3-in-4 linear-attention +
 # 1-in-4 full-attention, TP=1). Runs INSIDE vllm22-w4a8:combined under a 1-card lease. Exercises the
-# GDN recurrent-state snapshot + re-advance on partial accepts. Verifies:
+# GDN per-token-state verify kernel (gdn_prefill_verify / causal_conv1d_fwd_verify): the verify
+# captures conv+ssm state after each token; the scheduler installs the accepted-prefix state directly
+# (no snapshot, no 2x re-advance). Verifies:
 #   1. coherence with spec on;
-#   2. losslessness: SPEC (multi-token accept) == FORCE_N0 (1 token/step) — both go through the GDN
-#      verify (varlen recurrent) path + state re-advance, so identical output proves the rollback
-#      is correct (a wrong recurrent-state rollback would corrupt the stream).
+#   2. BIT-EXACTNESS: SPEC (multi-token accept) == FORCE_N0 (1 token/step) — both go through the GDN
+#      per-token-state verify path (bit-stable recurrent kernels, independent of GDN_HIP_WMMA_PREFILL),
+#      so identical output proves the captured-state install is exact (a wrong install would corrupt
+#      the stream). This is now BIT-IDENTICAL (was only "coherent, fp-drifting" under re-advance).
 set -uo pipefail
 source /app/.venv/bin/activate
 pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil 2>&1 | tail -1
@@ -20,9 +23,9 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 boot(){ # $1 = extra env assignment
-  # GDN_HIP_WMMA_PREFILL=${WMMA:-1}: the default WMMA chunked prefill is chunk-size-dependent
-  # (~1e-3 fp), so the re-advance (spec reprocesses n+1 tokens, FORCE_N0 reprocesses 1) drifts vs
-  # the bit-stable recurrent path. Set WMMA=0 for a bit-exact spec==n0 lossless check.
+  # GDN_HIP_WMMA_PREFILL=${WMMA:-1}: only affects the PROMPT prefill kernel. The spec VERIFY now
+  # uses the dedicated per-token-state recurrent kernel (gdn_prefill_verify) regardless of this flag,
+  # so spec==n0 is bit-exact even at WMMA=1 (the old re-advance path needed WMMA=0 to be bit-stable).
   setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" $1 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size 1 --port $PORT --graph 0 --attn hip \
     --memory-ratio 0.85 --max-running-requests 4 \
@@ -53,11 +56,11 @@ json.dump(res,open(OUT,"w"))
 PY
 }
 
-echo "===== SPEC (GDN verify + state re-advance) ====="
+echo "===== SPEC (GDN per-token-state verify + accepted-prefix install) ====="
 boot "MINISGL_SPEC_DEBUG=1"; probe /engine/tools/gdn.spec.json
 echo "[spec] acceptance:"; grep -E "\[spec\]" "$LOG" | tail -3; stop
 
-echo "===== FORCE_N0 (1 token/step, same GDN verify + re-advance) ====="
+echo "===== FORCE_N0 (1 token/step, same GDN per-token-state verify) ====="
 boot "MINISGL_SPEC_FORCE_N0=1"; probe /engine/tools/gdn.n0.json; stop
 
 echo "===== DIFF spec vs n0 (must match -> GDN state rollback lossless) ====="

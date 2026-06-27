@@ -226,6 +226,58 @@ class QwenGatedDeltaNet(nn.Module):
         )  # [T, num_v_heads, head_v_dim] at the input (model) dtype
         return self._output_projection(core, z, n)
 
+    # ---- verify: varlen recurrent prefill that ALSO captures the per-token recurrent state ----
+    def forward_prefill_verify(
+        self,
+        hidden_states: torch.Tensor,  # (T, hidden)
+        conv_state: torch.Tensor,  # (num_slots, conv_dim, kernel-1), updated in place
+        ssm_state: torch.Tensor,  # (num_slots, num_v_heads, head_v_dim, head_k_dim)
+        query_start_loc: torch.Tensor,  # cu_seqlens, int32 (num_seqs+1,)
+        state_indices: torch.Tensor,  # slot id per sequence, int32
+        has_initial_state: torch.Tensor,  # bool per sequence
+        max_qlen: int,  # = max extend_len (= max K+1) across the batch's verify windows
+    ):
+        """Spec-decode GDN verify forward. Identical recurrence to ``forward_prefill`` (same bit-stable
+        recurrent kernels), but captures the conv + ssm state AFTER EACH of the per-seq verify tokens
+        into scratch buffers. The scheduler then installs the state after the accepted prefix
+        (index = accepted_count-1) directly into the slot — no snapshot, no 2x re-advance, BIT-EXACT.
+
+        Returns ``(out, conv_scratch, ssm_scratch)``:
+          conv_scratch: [max_qlen, num_seqs, conv_dim, kernel-1] (fp32)
+          ssm_scratch:  [max_qlen, num_seqs, num_v_heads, head_v_dim, head_k_dim] (ssm dtype)
+        """
+        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+
+        n = hidden_states.shape[0]
+        qkvz = self.in_proj_qkvz(hidden_states)
+        ba = self.in_proj_ba(hidden_states)
+        mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        state_idx = state_indices.long()
+        has_init = has_initial_state.to(torch.uint8)
+
+        # Conv: bit-identical to forward_prefill's causal_conv1d_fwd, plus per-token window capture.
+        conv_out, conv_scratch = gdn.causal_conv1d_fwd_verify(
+            mixed_qkv.contiguous(),
+            self._conv_weights_fp32(),
+            None,
+            query_start_loc,
+            state_idx,
+            has_init,
+            conv_state,
+            int(max_qlen),
+            1,  # SiLU
+        )
+        # Gated-delta-rule verify: the RECURRENT (non-WMMA) oracle — bit-stable, the whole point of
+        # verify. Captures the ssm state after each token. (No WMMA path: the chunk-size dependence is
+        # exactly the non-bit-exactness this kernel removes.)
+        q, k, v = self._split_conv_qkv(conv_out, n)
+        core, ssm_scratch = gdn.gdn_prefill_verify(
+            q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+            query_start_loc, state_idx, has_init,
+            ssm_state, int(max_qlen), self.head_k_dim ** -0.5, 1,
+        )
+        return self._output_projection(core, z, n), conv_scratch, ssm_scratch
+
     # ---- decode: single-step recurrent update per sequence, advances state in place ----
     def forward_decode(
         self,

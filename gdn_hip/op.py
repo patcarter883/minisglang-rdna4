@@ -31,6 +31,24 @@ def _gdn_prefill_fake(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
     return v.new_empty((v.shape[0], v.shape[1], v.shape[2]))
 
 
+@torch.library.register_fake("gdn_hip::gdn_prefill_verify")
+def _gdn_prefill_verify_fake(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
+                             has_initial_state, ssm_state, max_qlen, scale, use_l2norm):
+    N = state_indices.shape[0]
+    out = v.new_empty((v.shape[0], v.shape[1], v.shape[2]))
+    scratch = ssm_state.new_empty((max_qlen, N, v.shape[1], v.shape[2], q.shape[2]))
+    return out, scratch
+
+
+@torch.library.register_fake("gdn_hip::causal_conv1d_fwd_verify")
+def _conv_fwd_verify_fake(x, weight, bias, cu_seqlens, state_indices, has_initial_state, conv_state,
+                          max_qlen, activation):
+    N = state_indices.shape[0]
+    out = torch.empty_like(x)
+    scratch = conv_state.new_empty((max_qlen, N, x.shape[1], weight.shape[1] - 1))
+    return out, scratch
+
+
 @torch.library.register_fake("gdn_hip::gdn_prefill_chunked")
 def _gdn_prefill_chunked_fake(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
                               has_initial_state, ssm_state, scale, use_l2norm):
@@ -62,6 +80,8 @@ def _rmsnorm_gated_fake(x, z, weight, eps):
 # ---- raw ops ----
 gdn_decode = torch.ops.gdn_hip.gdn_decode
 gdn_prefill = torch.ops.gdn_hip.gdn_prefill
+gdn_prefill_verify = torch.ops.gdn_hip.gdn_prefill_verify
+causal_conv1d_fwd_verify = torch.ops.gdn_hip.causal_conv1d_fwd_verify
 gdn_prefill_chunked = torch.ops.gdn_hip.gdn_prefill_chunked
 gdn_prefill_wmma = torch.ops.gdn_hip.gdn_prefill_wmma
 causal_conv1d_update = torch.ops.gdn_hip.causal_conv1d_update
@@ -69,6 +89,6 @@ causal_conv1d_fwd = torch.ops.gdn_hip.causal_conv1d_fwd
 rmsnorm_gated = torch.ops.gdn_hip.rmsnorm_gated
 
 __all__ = [
-    "gdn_decode", "gdn_prefill", "gdn_prefill_chunked", "gdn_prefill_wmma",
-    "causal_conv1d_update", "causal_conv1d_fwd", "rmsnorm_gated",
+    "gdn_decode", "gdn_prefill", "gdn_prefill_verify", "gdn_prefill_chunked", "gdn_prefill_wmma",
+    "causal_conv1d_update", "causal_conv1d_fwd", "causal_conv1d_fwd_verify", "rmsnorm_gated",
 ]

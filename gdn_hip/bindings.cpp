@@ -25,6 +25,11 @@ void launch_gdn_prefill(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, double,
                         int64_t);
+void launch_gdn_prefill_verify(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, double,
+                               int64_t);
 void launch_gdn_prefill_chunked(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -39,6 +44,10 @@ void launch_causal_conv1d_update(const at::Tensor&, const at::Tensor&,
 void launch_causal_conv1d_fwd(const at::Tensor&, const at::Tensor&, const c10::optional<at::Tensor>&,
                               const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                               at::Tensor&, int64_t);
+void launch_causal_conv1d_fwd_verify(const at::Tensor&, const at::Tensor&,
+                                     const c10::optional<at::Tensor>&, const at::Tensor&,
+                                     const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&,
+                                     at::Tensor&, int64_t);
 void launch_rmsnorm_gated(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                           double);
 
@@ -62,6 +71,22 @@ at::Tensor gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tenso
   launch_gdn_prefill(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices, has_initial_state,
                      ssm_state, out, scale, use_l2norm);
   return out;
+}
+
+// Verify prefill: same recurrence as gdn_prefill, but also captures the ssm state AFTER each token
+// into a scratch [max_qlen, N, HV, V, K] (state_t = ssm_state dtype). Returns (out, state_scratch).
+std::tuple<at::Tensor, at::Tensor> gdn_prefill_verify(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& a,
+    const at::Tensor& b, const at::Tensor& A_log, const at::Tensor& dt_bias,
+    const at::Tensor& cu_seqlens, const at::Tensor& state_indices,
+    const at::Tensor& has_initial_state, at::Tensor& ssm_state, int64_t max_qlen, double scale,
+    int64_t use_l2norm) {
+  const int N = state_indices.size(0), HV = v.size(1), V = v.size(2), K = q.size(2);
+  auto out = at::empty({v.size(0), v.size(1), v.size(2)}, v.options());
+  auto scratch = at::empty({max_qlen, N, HV, V, K}, ssm_state.options());
+  launch_gdn_prefill_verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, state_indices,
+                            has_initial_state, ssm_state, scratch, out, scale, use_l2norm);
+  return {out, scratch};
 }
 
 at::Tensor gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -104,6 +129,22 @@ at::Tensor causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
   return out;
 }
 
+// Verify conv: same recurrence as causal_conv1d_fwd, but also captures the per-channel trailing
+// window (conv-state-equivalent) AFTER each token into a scratch [max_qlen, N, C, W-1] (fp32).
+// Returns (out, conv_scratch).
+std::tuple<at::Tensor, at::Tensor> causal_conv1d_fwd_verify(
+    const at::Tensor& x, const at::Tensor& weight, const c10::optional<at::Tensor>& bias,
+    const at::Tensor& cu_seqlens, const at::Tensor& state_indices,
+    const at::Tensor& has_initial_state, at::Tensor& conv_state, int64_t max_qlen,
+    int64_t activation) {
+  const int N = state_indices.size(0), C = x.size(1), W = weight.size(1);
+  auto out = at::empty_like(x);
+  auto scratch = at::empty({max_qlen, N, C, W - 1}, conv_state.options());
+  launch_causal_conv1d_fwd_verify(x, weight, bias, cu_seqlens, state_indices, has_initial_state,
+                                  conv_state, scratch, out, activation);
+  return {out, scratch};
+}
+
 at::Tensor rmsnorm_gated(const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight,
                          double eps) {
   auto out = at::empty_like(x);
@@ -119,6 +160,12 @@ TORCH_LIBRARY(gdn_hip, m) {
   m.def("gdn_prefill(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
         "Tensor dt_bias, Tensor cu_seqlens, Tensor state_indices, Tensor has_initial_state, "
         "Tensor(a!) ssm_state, float scale, int use_l2norm) -> Tensor");
+  m.def("gdn_prefill_verify(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
+        "Tensor dt_bias, Tensor cu_seqlens, Tensor state_indices, Tensor has_initial_state, "
+        "Tensor(a!) ssm_state, int max_qlen, float scale, int use_l2norm) -> (Tensor, Tensor)");
+  m.def("causal_conv1d_fwd_verify(Tensor x, Tensor weight, Tensor? bias, Tensor cu_seqlens, "
+        "Tensor state_indices, Tensor has_initial_state, Tensor(a!) conv_state, int max_qlen, "
+        "int activation) -> (Tensor, Tensor)");
   m.def("gdn_prefill_chunked(Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, "
         "Tensor dt_bias, Tensor cu_seqlens, Tensor state_indices, Tensor has_initial_state, "
         "Tensor(a!) ssm_state, float scale, int use_l2norm) -> Tensor");
@@ -136,6 +183,8 @@ TORCH_LIBRARY(gdn_hip, m) {
 TORCH_LIBRARY_IMPL(gdn_hip, CUDA, m) {
   m.impl("gdn_decode", gdn_decode);
   m.impl("gdn_prefill", gdn_prefill);
+  m.impl("gdn_prefill_verify", gdn_prefill_verify);
+  m.impl("causal_conv1d_fwd_verify", causal_conv1d_fwd_verify);
   m.impl("gdn_prefill_chunked", gdn_prefill_chunked);
   m.impl("gdn_prefill_wmma", gdn_prefill_wmma);
   m.impl("causal_conv1d_update", causal_conv1d_update);

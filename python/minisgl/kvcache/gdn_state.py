@@ -86,13 +86,12 @@ class GDNStateCache:
         self.ssm_state[:, slots] = 0
 
     def snapshot(self, slots: torch.Tensor):
-        """Clone conv+ssm state for `slots` (across all GDN layers) for spec-decode rollback.
+        """Clone conv+ssm state for `slots` (across all GDN layers). Returns an opaque handle for
+        `restore`.
 
-        A spec VERIFY processes K+1 tokens/seq through the recurrent layers, over-advancing the
-        state past the eventually-accepted prefix (the kernel persists only the FINAL state, so
-        the intermediate state cannot be recovered). The scheduler snapshots the pre-verify state,
-        runs verify, then on a partial accept restores this and re-advances exactly the accepted
-        tokens. Returns an opaque handle for `restore`."""
+        NOTE: no longer used by spec-decode. The verify path now installs the exact accepted-prefix
+        state directly via the per-token-state verify kernel (`install_verify_state` below), so the
+        old snapshot + re-advance is gone. Kept as a general-purpose state-clone API."""
         sl = slots.to(torch.long)
         return (sl, self.conv_state[:, sl].clone(), self.ssm_state[:, sl].clone())
 
@@ -101,6 +100,34 @@ class GDNStateCache:
         sl, conv, ssm = snapshot
         self.conv_state[:, sl] = conv
         self.ssm_state[:, sl] = ssm
+
+    def install_verify_state(
+        self,
+        conv_scratch: dict,
+        ssm_scratch: dict,
+        slots: torch.Tensor,
+        t_index: torch.Tensor,
+    ) -> None:
+        """Install the per-token state captured by a spec-decode VERIFY forward into the live slots,
+        for every GDN layer at once. ``conv_scratch``/``ssm_scratch`` map gdn_layer_id -> the kernel's
+        scratch ([Q, N, ...] — Q=max_qlen, N=num_seqs). ``slots`` (long, [N]) is the GDN slot per
+        sequence (batch order); ``t_index`` (long, [N]) is the per-seq token index to install
+        (= accepted_count-1, the state AFTER the last accepted/confirmed token). This replaces the
+        snapshot + re-advance: the recurrent verify already computed the exact accepted-prefix state,
+        we just gather it. Both conv + ssm are installed so the next decode step continues correctly.
+
+        Vectorized gather: scratch[t_index[i], i] -> state_cache[layer, slots[i]] for each seq i.
+        """
+        n = slots.numel()
+        seq_ar = torch.arange(n, device=slots.device)
+        for lid in range(self.num_gdn_layers):
+            cs = conv_scratch[lid]  # [Q, N, C, W-1]
+            ss = ssm_scratch[lid]   # [Q, N, HV, V, K]
+            # gather the chosen t per seq: result [N, ...]
+            conv_pick = cs[t_index, seq_ar]  # [N, C, W-1]
+            ssm_pick = ss[t_index, seq_ar]   # [N, HV, V, K]
+            self.conv_state[lid, slots] = conv_pick.to(self.conv_state.dtype)
+            self.ssm_state[lid, slots] = ssm_pick.to(self.ssm_state.dtype)
 
     def conv(self, gdn_layer_id: int) -> torch.Tensor:
         """conv_state for one GDN layer: (num_slots, conv_dim, conv_kernel-1)."""

@@ -174,7 +174,18 @@ class GDNLinearAttn(BaseOP):
         # A spec-decode VERIFY batch (phase "decode", extend_len = K+1 per seq) uses the varlen
         # recurrent path, like a prefill. The GDN state it leaves is "after the last verify token";
         # the scheduler snapshots + re-advances it to the accepted position (see SPEC_DECODE.md).
-        if ctx.batch.is_prefill or ctx.batch.spec_verify:
+        if ctx.batch.spec_verify and getattr(md, "capture_verify_state", False):
+            # Spec verify with per-token-state capture: bit-stable recurrent verify kernels that ALSO
+            # emit the conv/ssm state after each token, so the scheduler can install the accepted-prefix
+            # state directly (no snapshot, no 2x re-advance, bit-exact vs 1-token decode). The scratch
+            # is stashed per gdn_layer_id on the metadata for the scheduler to read post-forward.
+            out, conv_scr, ssm_scr = self._gdn.forward_prefill_verify(
+                x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state,
+                md.verify_max_qlen,
+            )
+            md.conv_scratch[self._gdn_layer_id] = conv_scr
+            md.ssm_scratch[self._gdn_layer_id] = ssm_scr
+        elif ctx.batch.is_prefill or ctx.batch.spec_verify:
             out = self._gdn.forward_prefill(
                 x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state
             )
