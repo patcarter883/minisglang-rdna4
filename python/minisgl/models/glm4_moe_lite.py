@@ -13,13 +13,15 @@ Architecture (from config.json):
     sigmoid + e_score_correction_bias, n_group=1 → plain top-4, normalize, ×routed_scaling_factor)
     PLUS one always-on shared expert (added, not gated).
 
-QUANT ASSUMPTION: the AWQ checkpoint quantizes the MLP linears (routed/shared experts + dense
-layer-0) and keeps MLA attention + router gate + lm_head in bf16 (standard modules_to_not_convert).
-TP=1 only (AWQ INT4 ~9 GB fits one card); MLA TP sharding is a follow-up. The MTP head
-(num_nextn_predict_layers) is skipped (no speculative decode).
+QUANT SPLIT (mirrors qwen3_5_moe + the [shared-expert-keep-bf16] convention): ONLY the routed
+experts are quantized (W4A8/AWQ). The MLA attention, router gate, the always-on shared expert, the
+dense layer-0 MLP, and lm_head stay bf16. If a given AWQ checkpoint instead quantizes the shared
+expert / dense layers, flip those modules to the model quant. TP=1 only (AWQ INT4 ~9 GB fits one
+card); MLA TP sharding is a follow-up. The MTP head (num_nextn_predict_layers) is skipped.
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -188,9 +190,12 @@ class GLMSharedExpert(BaseOP):
 
 
 class GLMSparseBlock(BaseOP):
-    """noaux_tc router + W4A8 routed experts + always-on shared expert (added, not gated)."""
+    """noaux_tc router + W4A8 routed experts + always-on shared expert (added, not gated).
 
-    def __init__(self, config: "ModelConfig"):
+    `expert_quant` is threaded in separately: the surrounding backbone is built unquantized
+    (quant=None) so the gate + shared expert stay bf16; only the routed experts are quantized."""
+
+    def __init__(self, config: "ModelConfig", expert_quant):
         self.gate = GLMTopkGate(config.hidden_size, config.num_experts)
         self.experts = MoELayer(
             num_experts=config.num_experts,
@@ -198,7 +203,7 @@ class GLMSparseBlock(BaseOP):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=False,  # noaux_tc normalize is done here, weights passed in precomputed
-            quant=config.quant,
+            quant=expert_quant,
         )
         self.shared_experts = GLMSharedExpert(config)
         self.top_k = config.num_experts_per_tok
@@ -239,13 +244,13 @@ class GLMSparseBlock(BaseOP):
 
 
 class GLMDecoderLayer(BaseOP):
-    def __init__(self, config: "ModelConfig", layer_id: int):
+    def __init__(self, config: "ModelConfig", layer_id: int, expert_quant):
         self.self_attn = GLMMLAAttention(config, layer_id)
         # first_k_dense_replace early layers use a dense MLP; the rest are sparse MoE blocks.
         if layer_id < config.first_k_dense_replace:
-            self.mlp = GatedMLP(config)
+            self.mlp = GatedMLP(config)  # bf16 (config is the unquantized backbone)
         else:
-            self.mlp = GLMSparseBlock(config)
+            self.mlp = GLMSparseBlock(config, expert_quant)
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps
@@ -264,12 +269,12 @@ class GLMDecoderLayer(BaseOP):
 
 
 class GLMModel(BaseOP):
-    def __init__(self, config: "ModelConfig"):
+    def __init__(self, config: "ModelConfig", expert_quant):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
         )
         self.layers = OPList(
-            [GLMDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [GLMDecoderLayer(config, layer_id, expert_quant) for layer_id in range(config.num_layers)]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
@@ -283,7 +288,12 @@ class GLMModel(BaseOP):
 
 class Glm4MoeLiteForCausalLM(BaseLLMModel):
     def __init__(self, config: "ModelConfig"):
-        self.model = GLMModel(config)
+        # Only the routed experts are quantized; build the rest of the model (MLA attention, gate,
+        # shared expert, dense layer-0, lm_head) unquantized and hand the quant to the experts.
+        expert_quant = config.quant
+        backbone_cfg = dataclasses.replace(config, quant=None)
+        self.model = GLMModel(backbone_cfg, expert_quant)
+        config = backbone_cfg
         self.lm_head = ParallelLMHead(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
