@@ -6,9 +6,10 @@ __all__ = ["SpecConfig", "SPEC_ALGORITHMS"]
 
 # Supported proposers. "ngram" = prompt-lookup (zero-model) — the MVP. "mtp" = the model's own
 # appended next-token-prediction head (GLM-4.x / Qwen3.5), run autoregressively as a draft model.
-# EAGLE/DFlash land later (see SPEC_DECODE.md §4); all reuse the same verify cycle, only the
-# proposer changes.
-SPEC_ALGORITHMS = ("ngram", "mtp")
+# "eagle3" = a SEPARATE EAGLE3 draft checkpoint (3 captured target aux layers fused -> 1-layer GQA
+# trunk -> compressed draft vocab), run as a linear chain. All reuse the same verify cycle, only the
+# proposer changes (see SPEC_DECODE.md §4/§6).
+SPEC_ALGORITHMS = ("ngram", "mtp", "eagle3")
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class SpecConfig:
     num_draft: int  # K: draft tokens proposed per step; verify runs K+1 query positions/seq
     ngram_max: int  # largest trailing n-gram window the proposer matches on
     ngram_min: int = 1  # smallest window to fall back to
+    draft_model_path: str | None = None  # EAGLE3/DFlash: the separate draft checkpoint path
 
     def __post_init__(self) -> None:
         if self.algorithm not in SPEC_ALGORITHMS:

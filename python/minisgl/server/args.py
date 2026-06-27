@@ -233,9 +233,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--spec-algorithm",
         type=str,
         default=ServerArgs.spec_algorithm,
-        choices=["none", "ngram", "mtp"],
+        choices=["none", "ngram", "mtp", "eagle3"],
         help="Speculative-decoding proposer. 'none' disables it; 'ngram' = prompt-lookup; "
-        "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5).",
+        "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5); "
+        "'eagle3' = a separate EAGLE3 draft checkpoint (--spec-draft-model-path).",
+    )
+    parser.add_argument(
+        "--spec-draft-model-path",
+        "--spec-draft-model",
+        type=str,
+        dest="spec_draft_model_path",
+        default=ServerArgs.spec_draft_model_path,
+        help="EAGLE3/DFlash draft checkpoint path (HF repo id or local folder). Required for "
+        "--spec-algorithm eagle3.",
     )
     parser.add_argument(
         "--spec-num-draft",
