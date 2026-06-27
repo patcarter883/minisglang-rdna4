@@ -12,6 +12,8 @@ TP="${TP:-2}"
 PORT="${PORT:-21919}"
 MEMRATIO="${MEMRATIO:-0.85}"
 MAXRUN="${MAXRUN:-8}"
+GRAPH="${GRAPH:-0}"                 # cuda_graph_max_bs; 0 = eager, >0 = capture decode graphs
+MMS="${MOE_SCATTER:-0}"            # MINISGL_MOE_SCATTER: 0 = graph-safe gather_reduce MoE decode
 LOG=/engine/tools/glm_smoke.server.log
 
 echo "[setup] server deps ..."
@@ -31,10 +33,12 @@ stop() {
 trap stop EXIT
 
 pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
-echo "[launch] $MODEL TP=$TP eager(mla) port=$PORT memratio=$MEMRATIO -> $LOG"
-# NO --attention-backend (is_mla forces 'mla'); --graph 0 = eager (MLA capture is a follow-up).
-setsid env PYTHONPATH=/engine/python:/engine python -m minisgl \
-  --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph 0 \
+mode="eager"; [ "$GRAPH" -gt 0 ] && mode="graph(max_bs=$GRAPH, moe_scatter=$MMS)"
+echo "[launch] $MODEL TP=$TP $mode (mla) port=$PORT memratio=$MEMRATIO -> $LOG"
+# NO --attention-backend (is_mla forces 'mla'). --graph 0 = eager; >0 captures the decode graph
+# (MoE-decode uses the graph-safe gather_reduce path via MINISGL_MOE_SCATTER).
+setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER="$MMS" python -m minisgl \
+  --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" \
   $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
   > "$LOG" 2>&1 &
 SRV=$!
@@ -48,8 +52,8 @@ for _ in $(seq 1 300); do
 done
 [ "$ready" = 1 ] || { echo "[launch] NOT ready in time:"; tail -60 "$LOG"; exit 1; }
 
-echo "[serve-log] backend / page_size / KV alloc:"
-grep -iE "attention backend|overrid|page.?size|Allocating .* KV|mla" "$LOG" | head -8 || true
+echo "[serve-log] backend / page_size / KV alloc / capture:"
+grep -iE "overrid|page.?size|Allocating .* KV|CUDA graph|Capturing|captur" "$LOG" | head -10 || true
 
 echo "===== coherence probe (greedy) ====="
 PORT="$PORT" python - <<'PY'

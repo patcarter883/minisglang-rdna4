@@ -38,11 +38,22 @@
     + on-topic responses. Correct facts ⇒ W_UK/W_UV absorption + NeoX RoPE + MoE routing are sound.
     (Pure-greedy reasoning-model looping/`<think>` scaffold is expected, not a bug.)
 
-- **STILL TODO** (DOD remainder): (a) **MLA cudagraph capture** (`MLABackend.init_capture_graph` is
-  a stub → eager only; ~20% TPOT on the floor) + the graph-safe MoE-decode path; (b) **benchmark** in
-  the production config — add a GLM mode to `tools/run_bench_window.sh`/`_bench_inner.sh` (drop
-  `--attn hip`, let the engine force `mla`; `GRAPH=0` until capture lands). Optional: a logit oracle
-  vs bf16 HF needs CPU/offload (the 59 GB bf16 ref doesn't fit a card). Nothing committed yet.
+- **TP=2 MLA sharding committed** at `1baf6e5`.
+
+- **MLA cudagraph capture DONE + GPU-VALIDATED** (`attention/mla.py`): implemented
+  `init_capture_graph`/`prepare_for_capture`/`prepare_for_replay` + `_decode_metadata_static`/
+  `_fill_decode_static`, mirroring `HIPAttnBackend` (decode-only; static int32 `cache_seqlens` +
+  `page_table`; latent store + decode run inside the graph; cu_seqlens are a placeholder arange).
+  MLA is simpler than GDN — no recurrent state to thread. Validated: `GRAPH=8 MOE_SCATTER=0`
+  captures bs [1,2,4,8] cleanly and the replayed graphs produce identical coherent output
+  ("...Paris."). MoE-decode MUST use the graph-safe gather_reduce path (`MINISGL_MOE_SCATTER=0`).
+  `tools/glm_coherence_smoke.sh` now takes `GRAPH`/`MOE_SCATTER` envs.
+
+- **STILL TODO** (DOD remainder): **benchmark** GLM in the production config (graph capture, not
+  eager) — add a GLM mode to `tools/run_bench_window.sh`/`_bench_inner.sh` (drop `--attn hip`, let
+  the engine force `mla`; set `GRAPH>0` + `MINISGL_MOE_SCATTER=0`; TP=2). Compare TPOT eager vs
+  graph and against the 35B baseline (20.4 ms M=1). Optional: logit oracle vs bf16 HF needs
+  CPU/offload (the 59 GB bf16 ref doesn't fit a card).
 
 
 
