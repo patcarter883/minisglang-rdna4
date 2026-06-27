@@ -70,9 +70,23 @@ class Proposer(ABC):
 def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
     """Construct the proposer for a spec config. `engine` is passed to model-based proposers
     (MTP/DFlash/EAGLE) for weight + hidden-state access; n-gram ignores it."""
-    from .proposer import NgramProposer
+    import os
+
+    from .proposer import NgramProposer, _CaptureProbeProposer
 
     if spec_config.algorithm == "ngram":
+        # Diagnostic seam (MINISGL_SPEC_CAPTURE_PROBE=<comma-separated layer ids>): an n-gram
+        # proposer that also exercises the target hidden-state capture path and asserts shapes.
+        # Inert unless the env is set — production n-gram serve is the plain NgramProposer below.
+        probe = os.environ.get("MINISGL_SPEC_CAPTURE_PROBE")
+        if probe:
+            ids = [int(x) for x in probe.split(",") if x.strip() != ""]
+            return _CaptureProbeProposer(
+                num_draft=spec_config.num_draft,
+                ngram_max=spec_config.ngram_max,
+                ngram_min=spec_config.ngram_min,
+                capture_layer_ids=ids,
+            )
         return NgramProposer(
             num_draft=spec_config.num_draft,
             ngram_max=spec_config.ngram_max,

@@ -94,3 +94,40 @@ class NgramProposer(Proposer):
                 else []
             )
         return out
+
+
+class _CaptureProbeProposer(NgramProposer):
+    """Diagnostic-only: an n-gram proposer that ALSO declares it needs the target hidden states, so
+    the engine programs aux capture and feeds last_hidden / aux_hidden back into ProposeContext. It
+    drafts exactly like n-gram (so coherence/losslessness are unaffected) but asserts the per-uid
+    hidden tensors arrive with the right shape ([hidden] and [num_capture_layers, hidden]). Used by
+    the GPU smoke (MINISGL_SPEC_CAPTURE_PROBE=1) to validate the target-exposure seam end-to-end."""
+
+    needs_last_hidden = True
+
+    def __init__(self, num_draft: int, ngram_max: int, ngram_min: int, capture_layer_ids: List[int]):
+        super().__init__(num_draft, ngram_max, ngram_min)
+        self.capture_layer_ids = list(capture_layer_ids)
+        self._checked = 0
+
+    def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
+        import os
+
+        for req in reqs:
+            lh = ctx.last_hidden.get(req.uid)
+            if lh is not None:
+                assert lh.dim() == 1, f"last_hidden expected [hidden], got {tuple(lh.shape)}"
+                ax = ctx.aux_hidden.get(req.uid)
+                assert ax is not None and ax.shape[0] == len(self.capture_layer_ids), (
+                    f"aux_hidden expected [{len(self.capture_layer_ids)}, hidden], "
+                    f"got {None if ax is None else tuple(ax.shape)}"
+                )
+                assert ax.shape[1] == lh.shape[0], "aux/last hidden dim mismatch"
+                self._checked += 1
+                if self._checked <= 3 or self._checked % 50 == 0:
+                    print(
+                        f"[capture-probe] uid={req.uid} last_hidden={tuple(lh.shape)} "
+                        f"aux_hidden={tuple(ax.shape)} dtype={lh.dtype} OK (n={self._checked})",
+                        flush=True,
+                    )
+        return super().propose(reqs, num_draft, ctx)
