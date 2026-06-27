@@ -73,23 +73,23 @@ channel), `weight_scale` fp16 [N, K/32], NL int8[16].
   ~20% run-to-run variance from shared-card clock scaling):
   | shape | fp8 | RXF |
   |---|---|---|
-  | dense M=1 N=K=4096 | 66 | **51** |
-  | dense M=64 N=K=4096 | 484 | 678 |
-  | dense M=256 N=K=4096 | 665 | 795 |
-  | dense M=64 N=11008 K=4096 | 1433 | **752** |
+  | dense M=1 N=K=4096 | 42 | **29** |
+  | dense M=64 N=K=4096 | 707 | **177** |
+  | dense M=256 N=K=4096 | 1049 | **325** |
+  | dense M=64 N=11008 K=4096 | 1557 | **279** |
   | MoE M=1 (decode) | 384 | 396 |
   | MoE M=16 (small prefill) | 3561 | **1491** |
   | MoE M=128 (prefill) | 4613 | **1949** |
-  Dense at parity (geomean ~0.9× — faster at decode + large-N; ~1.2–1.4× at the occupancy-limited
-  4096² shape). **MoE is faster than fp8** — decode at parity (396 vs 384), prefill ~2.4× faster
-  (the `WARPS_N` occupancy win exceeds the fp8 v5 tiling). M=128 sub-op breakdown (µs): rotate1 11,
-  gemm1 1398, silu 17, rotate2 23, gemm2 548, gather 277.
+  Both dense and MoE now beat fp8. The `WARPS_N` split was the lever for **both**: dense
+  `linear_tiled_kernel<BM,BN,BK_TILE,WARPS_N=2>` (4 M-warps × 2 N-warps, `running[4][8]`=32 regs)
+  went from 1.4× slower to ~4× faster; MoE (1-warp blocks → 4 warps) ~2.4× faster. MoE M=128 sub-op
+  breakdown (µs): rotate1 11, gemm1 1398, silu 17, rotate2 23, gemm2 548, gather 277. (fp8 column
+  carries run-to-run clock variance on the shared card; the RXF deltas are from the kernel change.)
 
-## Perf follow-ups (optional — goal met)
+## Perf follow-ups (optional)
 
-- **Dense N-warp split**: porting the MoE's `WARPS_N` idea to the dense kernel (currently fp8's
-  1-warp-does-8-frags `running[8][8]`=64 regs) should push the 4096² shape below fp8 too.
-- **Dense 2-deep K-pipeline**: the fp8 `gemm_tiled_kernel` prefetches the next K-step's frags.
+- **Dense 2-deep K-pipeline**: the fp8 `gemm_tiled_kernel` prefetches the next K-step's frags;
+  RXF dropped it in the rewrite. Could add more at large M.
 - Wire RXF-format checkpoint loading in the model + a real serve/PPL run (no RXF checkpoint is in
   this repo yet; parity/bench use synthetic op-layout weights).
 

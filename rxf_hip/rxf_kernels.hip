@@ -134,8 +134,11 @@ __global__ void rotate_quant_kernel(
 //    scale; per-token act scale is applied in the epilogue (== fp8 structure).
 // ----------------------------------------------------------------------------------------
 
-template <int BM, int BN, int BK_TILE>
-__global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
+// WARPS_N warps split the BN columns (each owns NFRAG/WARPS_N frags), on top of BM/16 M-warps that
+// split the rows -> (BM/16)*WARPS_N warps fill the WGP with NFRAG_W (not NFRAG) accumulators per
+// thread (less register pressure -> more blocks/CU). Same WARPS_N occupancy idea as the MoE kernel.
+template <int BM, int BN, int BK_TILE, int WARPS_N>
+__global__ void __launch_bounds__((BM / 16) * WARPS_N * 32) linear_tiled_kernel(
     const int8_t* __restrict__ q,        // [M, K]
     const float* __restrict__ a_scale,   // [M]
     const uint8_t* __restrict__ wpk,     // [N, K/2]
@@ -144,11 +147,12 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
     const float* __restrict__ bias,      // [N] or nullptr
     bf16* __restrict__ out,              // [M, N]
     int M, int N, int K) {
-    constexpr int NWARPS = BM / 16;
+    constexpr int NWARPS_M = BM / 16;
     constexpr int NFRAG = BN / WMMA_DIM;
+    constexpr int NFRAG_W = NFRAG / WARPS_N;
     constexpr int GPC = BK_TILE / GROUP;       // scale-groups staged per sync (decoupled from sync)
     constexpr int LDSBK = BK_TILE + LDS_PAD;
-    constexpr int THREADS = NWARPS * 32;
+    constexpr int THREADS = NWARPS_M * WARPS_N * 32;
 
     const int block_m = blockIdx.y * BM;
     const int block_n = blockIdx.x * BN;
@@ -159,6 +163,9 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
     const int khalf = (lane >> 4) * 8;
     const int frag_col = lane & 15;
     const int frag_row0 = (lane >> 4) * 8;
+    const int warp_m = warp_id / WARPS_N;        // which 16-row M-subtile
+    const int warp_n = warp_id % WARPS_N;        // which BN/WARPS_N column slab
+    const int nfrag0 = warp_n * NFRAG_W;         // first global N-frag for this warp
 
     const int num_k_groups = K / GROUP;
     const int kpr = K / 2;               // packed bytes per weight row
@@ -174,9 +181,9 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
         act_scale_s[r] = (am < M) ? a_scale[am] : 0.0f;
     }
 
-    float running[NFRAG][8];
+    float running[NFRAG_W][8];
     #pragma unroll
-    for (int f = 0; f < NFRAG; ++f)
+    for (int f = 0; f < NFRAG_W; ++f)
         #pragma unroll
         for (int e = 0; e < 8; ++e) running[f][e] = 0.0f;
 
@@ -215,10 +222,10 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
         #pragma unroll
         for (int gi = 0; gi < GPC; ++gi) {
             const int g = c * GPC + gi;
-            typename MMA::CFrag acc[NFRAG];
+            typename MMA::CFrag acc[NFRAG_W];
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) acc[f] = MMA::zero();
-            const int a_base = (warp_id * WMMA_DIM + lrow) * LDSBK + khalf + gi * GROUP;
+            for (int f = 0; f < NFRAG_W; ++f) acc[f] = MMA::zero();
+            const int a_base = (warp_m * WMMA_DIM + lrow) * LDSBK + khalf + gi * GROUP;
             const int b_base = lrow * LDSBK + khalf + gi * GROUP;
             #pragma unroll
             for (int kt = 0; kt < GROUP / WMMA_DIM; ++kt) {
@@ -226,15 +233,16 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
                 typename MMA::AFrag a_cur =
                     *reinterpret_cast<const typename MMA::AFrag*>(&A_tile[a_base + ko]);
                 #pragma unroll
-                for (int f = 0; f < NFRAG; ++f) {
+                for (int f = 0; f < NFRAG_W; ++f) {
+                    const int gf = nfrag0 + f;
                     typename MMA::BFrag b_cur = *reinterpret_cast<const typename MMA::BFrag*>(
-                        &B_tile[b_base + f * WMMA_DIM * LDSBK + ko]);
+                        &B_tile[b_base + gf * WMMA_DIM * LDSBK + ko]);
                     acc[f] = MMA::mma(a_cur, b_cur, acc[f]);
                 }
             }
             #pragma unroll
-            for (int f = 0; f < NFRAG; ++f) {
-                const int abs_n = block_n + f * WMMA_DIM + frag_col;
+            for (int f = 0; f < NFRAG_W; ++f) {
+                const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
                 const float wsc_v = (abs_n < N) ? __half2float(wsc[(long)abs_n * num_k_groups + g]) : 0.0f;
                 #pragma unroll
                 for (int e = 0; e < 8; ++e) running[f][e] += (float)acc[f][e] * wsc_v;
@@ -245,13 +253,13 @@ __global__ void __launch_bounds__((BM / 16) * 32) linear_tiled_kernel(
 
     #pragma unroll
     for (int e = 0; e < 8; ++e) {
-        const int lrow_m = warp_id * WMMA_DIM + frag_row0 + e;
+        const int lrow_m = warp_m * WMMA_DIM + frag_row0 + e;
         const int abs_m = block_m + lrow_m;
         if (abs_m >= M) continue;
         const float asc = act_scale_s[lrow_m];
         #pragma unroll
-        for (int f = 0; f < NFRAG; ++f) {
-            const int abs_n = block_n + f * WMMA_DIM + frag_col;
+        for (int f = 0; f < NFRAG_W; ++f) {
+            const int abs_n = block_n + (nfrag0 + f) * WMMA_DIM + frag_col;
             if (abs_n < N) {
                 float val = running[f][e] * asc;
                 if (bias) val += bias[abs_n];
@@ -551,16 +559,17 @@ void launch_linear(const at::Tensor& q, const at::Tensor& a_scale, const at::Ten
             q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
             nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
     } else {
-        constexpr int BM = 64, BN = 128;
+        constexpr int BM = 64, BN = 128, WARPS_N = 2;  // 4 M-warps x 2 N-warps = 8 warps (256 thr)
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        const int threads = (BM / 16) * WARPS_N * 32;
         // BK_TILE decouples the LDS staging chunk from the 32-wide scale group (== fp8's
         // group_size staging): 128 when K divides it, else fall back to 32.
         if (K % 128 == 0)
-            linear_tiled_kernel<BM, BN, 128><<<grid, (BM / 16) * 32, 0, stream>>>(
+            linear_tiled_kernel<BM, BN, 128, WARPS_N><<<grid, threads, 0, stream>>>(
                 q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
                 nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
         else
-            linear_tiled_kernel<BM, BN, 32><<<grid, (BM / 16) * 32, 0, stream>>>(
+            linear_tiled_kernel<BM, BN, 32, WARPS_N><<<grid, threads, 0, stream>>>(
                 q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
                 nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
     }
