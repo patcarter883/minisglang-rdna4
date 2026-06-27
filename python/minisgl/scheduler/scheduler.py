@@ -15,7 +15,7 @@ from minisgl.message import (
     UserMsg,
 )
 from minisgl.spec import propose_ngram, verify_greedy
-from minisgl.utils import init_logger, load_tokenizer
+from minisgl.utils import div_ceil, init_logger, load_tokenizer
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -422,11 +422,16 @@ class Scheduler(SchedulerIOMixin):
                     )
                 )
 
-            # Rollback: free the KV slots of staged positions beyond the kept run. Position
-            # `cached_len` (the bonus token) is freed too and reallocated next step (its KV was
-            # computed for a now-rejected draft). page_size==1 -> slot index == page index.
-            if old_device_len > req.cached_len:
-                free_chunks.append(page_table[req.table_idx, req.cached_len : old_device_len])
+            # Rollback: free WHOLE pages allocated for this step that fall entirely beyond the kept
+            # run (page-size-aware: page_size 1 for MHA frees per token; 16 for MLA frees per page).
+            # A partial page straddling cached_len stays (it holds valid KV); its rejected-draft tail
+            # is overwritten as the seq grows back. The bonus token's slot is recomputed next step.
+            ps = self.cache_manager.page_size
+            free_start = div_ceil(req.cached_len, ps) * ps
+            free_end = div_ceil(old_device_len, ps) * ps
+            if free_end > free_start:
+                # contiguous page-aligned token range; cache_manager._free strides by page_size.
+                free_chunks.append(page_table[req.table_idx, free_start:free_end])
 
             if finished:
                 new_finished_reqs.add(req)

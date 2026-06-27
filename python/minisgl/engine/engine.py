@@ -398,19 +398,16 @@ def _adjust_config(config: EngineConfig):
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
 
-    # Speculative decoding (MVP) constraints — see SPEC_DECODE.md §5:
-    #   * MHA-only: the verify forward reuses the paged-extend kernel; MLA has no multi-query
-    #     verify kernel yet, so refuse rather than silently mis-serve.
-    #   * page_size == 1: rollback frees rejected-draft KV by individual token slot.
+    # Speculative decoding constraints — see SPEC_DECODE.md §5:
+    #   * MHA verify reuses the paged-extend kernel; MLA verify uses the absorbed multi-query
+    #     mla_hip.mla_verify kernel (no prefix re-materialization). Both supported.
+    #   * page_size: MHA forces 1 (per-token rollback); MLA keeps 16 (the mla_hip block size) —
+    #     the scheduler's rollback is page-size-aware, freeing whole pages beyond the kept run.
     #   * eager-only: the verify forward is variable-length; no CUDA graph (disable capture).
     if config.spec_config is not None:
-        if config.model_config.is_mla:
-            raise NotImplementedError(
-                "spec-decode MVP supports MHA models only; MLA multi-query verify kernel is TODO"
-            )
-        if config.page_size != 1:
+        if not config.model_config.is_mla and config.page_size != 1:
             override("page_size", 1)
-            logger.warning_rank0("spec-decode: overriding page_size -> 1 (rollback granularity)")
+            logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback granularity)")
         if config.cuda_graph_max_bs != 0:
             override("cuda_graph_max_bs", 0)
             logger.warning_rank0("spec-decode: disabling CUDA graph (verify is eager/var-length)")

@@ -12,6 +12,10 @@ void launch_mla_decode_fp8(const at::Tensor&, const at::Tensor&, const at::Tenso
                            at::Tensor&, double, double, double, int64_t, int64_t);
 void launch_mla_prefill(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, at::Tensor&, double, int64_t, int64_t, int64_t);
+void launch_mla_verify(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, at::Tensor&, double, int64_t, int64_t);
+void launch_mla_verify_fp8(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                           const at::Tensor&, at::Tensor&, double, double, double, int64_t, int64_t);
 
 namespace {
 
@@ -78,6 +82,53 @@ at::Tensor mla_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tenso
   return out;
 }
 
+// MLA multi-query VERIFY (speculative decoding): absorbed multi-query attention over the paged
+// latent. q packs total_q query tokens (confirmed + drafts across sequences); q_seq_idx maps each
+// query row to its sequence (block_table row) and q_kbound is its per-query causal context length
+// (cached_len + within-seq-query-index + 1). -> out:[total_q, num_heads, kv_lora_rank].
+at::Tensor mla_verify(const at::Tensor& q, const at::Tensor& latent_cache,
+                      const at::Tensor& block_table, const at::Tensor& q_seq_idx,
+                      const at::Tensor& q_kbound, double scale, int64_t sliding_window,
+                      int64_t kv_block_stride) {
+  TORCH_CHECK(q.dim() == 3, "q must be [total_q, num_heads, kv_lora_rank + qk_rope_head_dim]");
+  TORCH_CHECK(latent_cache.dim() == 3, "latent_cache must be [num_blocks, block_size, kv_lora_rank + qk_rope]");
+  TORCH_CHECK(q.scalar_type() == at::kBFloat16 && latent_cache.scalar_type() == at::kBFloat16, "bf16-only v0");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && q_seq_idx.scalar_type() == at::kInt &&
+              q_kbound.scalar_type() == at::kInt, "block_table/q_seq_idx/q_kbound must be int32");
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(q.size(2) == latent_cache.size(2), "q and latent_cache last dim (LATENT+ROPE) must match");
+  TORCH_CHECK(q_seq_idx.size(0) == q.size(0) && q_kbound.size(0) == q.size(0),
+              "q_seq_idx/q_kbound must have total_q entries");
+  const int64_t qk = q.size(2);
+  const int64_t latent = qk - 64;                          // v0: qk_rope_head_dim = 64
+  auto out = at::empty({q.size(0), q.size(1), latent}, q.options());
+  launch_mla_verify(q, latent_cache, block_table, q_seq_idx, q_kbound, out, scale, sliding_window,
+                    kv_block_stride);
+  return out;
+}
+
+at::Tensor mla_verify_fp8(const at::Tensor& q, const at::Tensor& latent_cache,
+                          const at::Tensor& block_table, const at::Tensor& q_seq_idx,
+                          const at::Tensor& q_kbound, double scale, double k_descale,
+                          double v_descale, int64_t sliding_window, int64_t kv_block_stride) {
+  TORCH_CHECK(q.dim() == 3, "q must be [total_q, num_heads, kv_lora_rank + qk_rope_head_dim]");
+  TORCH_CHECK(latent_cache.dim() == 3, "latent_cache must be [num_blocks, block_size, kv_lora_rank + qk_rope]");
+  TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must be bf16");
+  TORCH_CHECK(latent_cache.scalar_type() == at::kFloat8_e4m3fn, "latent_cache must be float8_e4m3fn");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt && q_seq_idx.scalar_type() == at::kInt &&
+              q_kbound.scalar_type() == at::kInt, "block_table/q_seq_idx/q_kbound must be int32");
+  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+  TORCH_CHECK(q.size(2) == latent_cache.size(2), "q and latent_cache last dim (LATENT+ROPE) must match");
+  TORCH_CHECK(q_seq_idx.size(0) == q.size(0) && q_kbound.size(0) == q.size(0),
+              "q_seq_idx/q_kbound must have total_q entries");
+  const int64_t qk = q.size(2);
+  const int64_t latent = qk - 64;                          // v0: qk_rope_head_dim = 64
+  auto out = at::empty({q.size(0), q.size(1), latent}, q.options());
+  launch_mla_verify_fp8(q, latent_cache, block_table, q_seq_idx, q_kbound, out, scale, k_descale,
+                        v_descale, sliding_window, kv_block_stride);
+  return out;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(mla_hip, m) {
@@ -88,10 +139,17 @@ TORCH_LIBRARY(mla_hip, m) {
         "-> Tensor");
   m.def("mla_prefill(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
         "float scale, int causal, int sliding_window, int max_seqlen_q) -> Tensor");
+  m.def("mla_verify(Tensor q, Tensor latent_cache, Tensor block_table, Tensor q_seq_idx, "
+        "Tensor q_kbound, float scale, int sliding_window, int kv_block_stride=0) -> Tensor");
+  m.def("mla_verify_fp8(Tensor q, Tensor latent_cache, Tensor block_table, Tensor q_seq_idx, "
+        "Tensor q_kbound, float scale, float k_descale, float v_descale, int sliding_window, "
+        "int kv_block_stride=0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(mla_hip, CUDA, m) {
   m.impl("mla_decode", mla_decode);
   m.impl("mla_decode_fp8", mla_decode_fp8);
   m.impl("mla_prefill", mla_prefill);
+  m.impl("mla_verify", mla_verify);
+  m.impl("mla_verify_fp8", mla_verify_fp8);
 }

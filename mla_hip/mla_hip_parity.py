@@ -162,6 +162,84 @@ def check_prefill(name, qkv_lens, H=16, sw=0, causal=1, qk_dim=QK_DIM, v_dim=V_D
     return ok
 
 
+# ---------------------------------------------------------------------------
+# VERIFY (speculative decoding): absorbed MULTI-QUERY decode over the paged latent. Each sequence
+# contributes q_len query tokens (confirmed + drafts); query qi attends latent [0, cached_len+qi]
+# (causal). Reference = the same fp32 absorbed-MLA as decode, per query row with its own bound.
+def _build_paged_cache(B, ctx_lens, block_size):
+    S = max(ctx_lens)
+    cache_d = torch.randn(B, S, QK, device=DEV, dtype=torch.bfloat16)
+    bps = (S + block_size - 1) // block_size
+    num_blocks = B * bps + 3
+    perm = torch.randperm(num_blocks, device=DEV).int()
+    latent_cache = torch.zeros(num_blocks, block_size, QK, device=DEV, dtype=torch.bfloat16)
+    block_table = torch.zeros(B, bps, device=DEV, dtype=torch.int32)
+    for b in range(B):
+        for lb in range(bps):
+            phys = int(perm[b * bps + lb].item())
+            block_table[b, lb] = phys
+            for off in range(block_size):
+                j = lb * block_size + off
+                if j < ctx_lens[b]:
+                    latent_cache[phys, off] = cache_d[b, j]
+    return cache_d, latent_cache, block_table
+
+
+def check_verify(name, seqs, H=16, block_size=16, sw=0) -> bool:
+    """seqs: list of (cached_len, q_len) per sequence. Full stored context = cached_len + q_len."""
+    scale = QK ** -0.5
+    B = len(seqs)
+    ctx_lens = [c + q for c, q in seqs]
+    cache_d, latent_cache, block_table = _build_paged_cache(B, ctx_lens, block_size)
+    total_q = sum(q for _, q in seqs)
+    q = torch.randn(total_q, H, QK, device=DEV, dtype=torch.bfloat16)
+    seq_idx, kbound = [], []
+    for b, (c, ql) in enumerate(seqs):
+        for qi in range(ql):
+            seq_idx.append(b)
+            kbound.append(c + qi + 1)
+    q_seq_idx = torch.tensor(seq_idx, device=DEV, dtype=torch.int32)
+    q_kbound = torch.tensor(kbound, device=DEV, dtype=torch.int32)
+
+    got = torch.ops.mla_hip.mla_verify(q, latent_cache, block_table, q_seq_idx, q_kbound,
+                                       scale, sw, 0).float()
+
+    ref = torch.empty(total_q, H, LATENT, device=DEV)
+    r = 0
+    for b, (c, ql) in enumerate(seqs):
+        for qi in range(ql):
+            cl = c + qi + 1
+            cb = cache_d[b, :cl].float()
+            scores = torch.einsum("hd,kd->hk", q[r].float(), cb) * scale
+            if sw > 0:
+                kpos = torch.arange(cl, device=DEV)
+                scores = scores.masked_fill(((cl - 1 - kpos) >= sw)[None], float("-inf"))
+            ref[r] = torch.einsum("hk,kd->hd", F.softmax(scores, dim=-1), cb[:, :LATENT])
+            r += 1
+
+    ref_b = ref.bfloat16().float()
+    viol = ((got - ref_b).abs() - (ULP_ATOL + ULP_RTOL * ref_b.abs())).clamp(min=0).max().item()
+    cos = F.cosine_similarity(got.flatten(), ref.flatten(), dim=0).item()
+    ok = (cos >= COS_MIN) and (viol <= 1e-6)
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name:34s} cos={cos:.6f}  ulp_viol={viol:.2e}")
+    return ok
+
+
+def main_verify() -> None:
+    print("=== mla_hip VERIFY parity (absorbed multi-query, LATENT=512 ROPE=64) ===")
+    ok = True
+    # (cached_len, q_len) per seq. q_len = K+1 (confirmed + K drafts).
+    ok &= check_verify("B1 cached=0 q=1 (==decode)", [(0, 1)])
+    ok &= check_verify("B1 cached=128 q=5", [(128, 5)])
+    ok &= check_verify("B1 cached=2048 q=7 (long)", [(2048, 7)])
+    ok &= check_verify("B1 cached=37 q=4 (ragged)", [(37, 4)])
+    ok &= check_verify("B4 mixed q", [(100, 5), (250, 1), (37, 7), (512, 3)])
+    ok &= check_verify("B1 H128 cached=512 q=5", [(512, 5)], H=128)
+    ok &= check_verify("B1 cached=1000 q=6 bs32", [(1000, 6)], block_size=32)
+    ok &= check_verify("B2 page-boundary cached=[14,15] q=5", [(14, 5), (15, 5)])
+    print("RESULT:", "ALL PASS" if ok else "FAILURES PRESENT")
+
+
 def main() -> None:
     print("=== mla_hip decode parity (vs fp32 absorbed-MLA, LATENT=512 ROPE=64) ===")
     ok = True
@@ -204,4 +282,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "verify":
+        main_verify()
+    else:
+        main()

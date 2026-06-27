@@ -34,8 +34,22 @@ def _fake_prefill(q, k, v, cu_seqlens_q, cu_seqlens_k, scale, causal, sliding_wi
     return q.new_empty((q.shape[0], q.shape[1], v.shape[2]))
 
 
+@torch.library.register_fake("mla_hip::mla_verify")
+def _fake_verify(q, latent_cache, block_table, q_seq_idx, q_kbound, scale, sliding_window,
+                 kv_block_stride=0):
+    return q.new_empty((q.shape[0], q.shape[1], q.shape[2] - 64))
+
+
+@torch.library.register_fake("mla_hip::mla_verify_fp8")
+def _fake_verify_fp8(q, latent_cache, block_table, q_seq_idx, q_kbound, scale, k_descale, v_descale,
+                     sliding_window, kv_block_stride=0):
+    return q.new_empty((q.shape[0], q.shape[1], q.shape[2] - 64))
+
+
 mla_decode = torch.ops.mla_hip.mla_decode
 mla_decode_fp8 = torch.ops.mla_hip.mla_decode_fp8
 mla_prefill = torch.ops.mla_hip.mla_prefill
+mla_verify = torch.ops.mla_hip.mla_verify
+mla_verify_fp8 = torch.ops.mla_hip.mla_verify_fp8
 
-__all__ = ["mla_decode", "mla_decode_fp8", "mla_prefill"]
+__all__ = ["mla_decode", "mla_decode_fp8", "mla_prefill", "mla_verify", "mla_verify_fp8"]

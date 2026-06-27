@@ -52,6 +52,8 @@ class MLABackend(BaseAttnBackend):
         self._decode_op = torch.ops.mla_hip.mla_decode
         self._decode_fp8_op = torch.ops.mla_hip.mla_decode_fp8
         self._prefill_op = torch.ops.mla_hip.mla_prefill
+        self._verify_op = torch.ops.mla_hip.mla_verify
+        self._verify_fp8_op = torch.ops.mla_hip.mla_verify_fp8
         # fp8 (e4m3) latent KV cache — opt-in via MINISGL_KV_FP8=1 (the engine allocates the latent
         # pool as float8_e4m3fn). Store is a plain bf16->e4m3 cast (scale 1.0), so decode dequant uses
         # descale 1.0, matching the HIP MHA fp8 path. The prefill rebuild dequants in the model layer.
@@ -71,6 +73,35 @@ class MLABackend(BaseAttnBackend):
             # e4m3 latent cache: k_descale=v_descale=1.0 (store was a scale-1.0 cast).
             return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0, 0)
         return self._decode_op(q, latent_cache, block_table, ctx_lens, self.scale, 0, 0)
+
+    def verify(self, q: torch.Tensor, layer_id: int, metadata: MLAMetadata) -> torch.Tensor:
+        """Speculative-decode VERIFY: absorbed MULTI-QUERY decode over the paged latent (no prefix
+        re-materialization). q: [total_q, H, kv_lora_rank + qk_rope] (confirmed + drafts, packed by
+        cu_seqlens_q) -> out [total_q, H, kv_lora_rank]. Each query attends latent [0, cached_len+qi]
+        (causal); see mla_hip.mla_verify."""
+        latent_cache = self.kvcache.latent_cache(layer_id)
+        block_table = metadata.page_table.to(torch.int32)
+        q_seq_idx, q_kbound = self._verify_indices(metadata)
+        if self.kv_is_fp8:
+            return self._verify_fp8_op(
+                q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 1.0, 1.0, 0, 0
+            )
+        return self._verify_op(q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 0, 0)
+
+    def _verify_indices(self, metadata: MLAMetadata):
+        """Build per-query-row (seq index, causal context length) from the verify metadata.
+        q_kbound[r] = cached_len[seq] + within_seq_query_index + 1 (causal over prefix + this query
+        + earlier drafts of the same seq). cached_len = device_len - q_len."""
+        cu = metadata.cu_seqlens_q.to(torch.int64)  # [B+1]
+        dev = cu.device
+        q_lens = cu[1:] - cu[:-1]  # [B]
+        cached = metadata.cache_seqlens.to(torch.int64) - q_lens  # prefix per seq
+        B = q_lens.numel()
+        total_q = int(cu[-1].item())
+        seq_idx = torch.repeat_interleave(torch.arange(B, device=dev), q_lens)  # [total_q]
+        qi = torch.arange(total_q, device=dev) - torch.repeat_interleave(cu[:-1], q_lens)
+        q_kbound = torch.repeat_interleave(cached, q_lens) + qi + 1
+        return seq_idx.to(torch.int32), q_kbound.to(torch.int32)
 
     def prefill(
         self,

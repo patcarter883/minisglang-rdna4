@@ -135,10 +135,15 @@ class GLMMLAAttention(BaseOP):
         backend.store_latent(latent, batch.out_loc, self._layer_id)
 
         if batch.is_decode:
-            # ABSORBED decode: q_nope·W_UK -> latent space, attend over the paged latent, then ·W_UV.
+            # ABSORBED form: q_nope·W_UK -> latent space, attend over the paged latent, then ·W_UV.
+            # q_len == 1 -> single-token decode kernel; q_len > 1 -> spec-decode multi-query VERIFY
+            # (confirmed + drafts) over the same paged latent (no prefix re-materialization).
             q_absorbed = torch.einsum("thn,hnl->thl", q_nope, self._w_uk)  # [T,H,kv_lora]
             q_full = torch.cat([q_absorbed, q_rope], dim=-1)  # [T,H,kv_lora+rope]
-            o_latent = backend.decode(q_full, self._layer_id, metadata)  # [T,H,kv_lora]
+            if metadata.max_seqlen_q == 1:
+                o_latent = backend.decode(q_full, self._layer_id, metadata)  # [T,H,kv_lora]
+            else:
+                o_latent = backend.verify(q_full, self._layer_id, metadata)  # [T,H,kv_lora]
             o = torch.einsum("thl,hdl->thd", o_latent, self._w_uv)  # [T,H,v]
         else:
             # MATERIALIZED prefill: rebuild full per-head K/V for each seq from the latent cache
