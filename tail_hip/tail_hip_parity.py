@@ -81,11 +81,21 @@ def main():
         ok &= _ok(f"rms_norm_add N{N} D{D} po{po}", got, ref_rms(res_ref.bfloat16(), w, 1e-6, po))
         ok &= _ok(f"  residual-updated N{N}", res.float(), res_ref)
 
-    # SiLU-mul
+    # SiLU-mul (dtype-generic: bf16 attn/norm path + fp16 W4A8-MoE intermediates)
     for (N, D) in [(64, 4096), (128, 11008), (37, 1536)]:
         x = torch.randn(N, 2 * D, device=DEV, dtype=torch.bfloat16)
         got = torch.ops.tail_hip.silu_and_mul(x)
-        ok &= _ok(f"silu_and_mul N{N} D{D}", got, ref_silu(x))
+        ok &= _ok(f"silu_and_mul bf16 N{N} D{D}", got, ref_silu(x))
+    for (N, D) in [(2, 768), (128, 768), (33, 1536)]:   # fp16, MoE-shaped (P, 2*inter)
+        x = torch.randn(N, 2 * D, device=DEV, dtype=torch.float16)
+        got = torch.ops.tail_hip.silu_and_mul(x)
+        ref = ref_silu(x)
+        # fp16 output -> compare against an fp16-rounded reference (fp16 mantissa is finer than bf16)
+        d = (got.float() - ref.half().float()).abs().max().item()
+        cos = F.cosine_similarity(got.float().flatten(), ref.flatten(), dim=0).item()
+        sok = (d <= 5e-3) and (cos >= 0.999)
+        print(f"  [{'PASS' if sok else 'FAIL'}] {f'silu_and_mul fp16 N{N} D{D}':30s} max|Δ|fp16={d:.3e}  cos={cos:.6f}")
+        ok &= sok
 
     # RoPE (full + partial rotary; NeoX)
     for (N, H, hs, rd) in [(64, 16, 128, 128), (100, 16, 128, 64), (37, 8, 256, 128)]:
