@@ -47,6 +47,15 @@ def create_triton_rdna4_backend(config: ModelConfig):
     return TritonRDNA4Backend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("mla")
+def create_mla_backend(config: ModelConfig):
+    # Multi-head latent attention (DeepSeek / GLM-4.x MoE): absorbed decode + materialized prefill
+    # over a paged latent cache, via the native HIP mla_hip kernels.
+    from .mla import MLABackend
+
+    return MLABackend(config)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("hip")
 def create_hip_backend(config: ModelConfig):
     # Fully Triton-free: native HIP flash-prefill (attn_hip) + paged flash-decode (attn_decode).

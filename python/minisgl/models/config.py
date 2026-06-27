@@ -38,6 +38,23 @@ class ModelConfig:
     model_type: str
     architectures: list[str]
     quant: QuantConfig | None = None
+    # ---- MLA (multi-head latent attention; DeepSeek / GLM-4.x MoE). None for non-MLA models. ----
+    # Set ONLY when the config carries kv_lora_rank, so every other model keeps is_mla=False. The
+    # absorbed-decode latent dim is kv_lora_rank + qk_rope_head_dim; the per-head qk dim is
+    # qk_nope_head_dim + qk_rope_head_dim (== head_dim, overwritten in from_hf for MLA).
+    kv_lora_rank: int | None = None
+    q_lora_rank: int | None = None
+    qk_nope_head_dim: int | None = None
+    qk_rope_head_dim: int | None = None
+    v_head_dim: int | None = None
+    # ---- fine-grained MoE routing (GLM-4.x / DeepSeek "noaux_tc": sigmoid score + correction
+    # bias + group-limited top-k, normalize, scale). Defaults are the no-op / plain-top-k case. ----
+    n_group: int = 1
+    topk_group: int = 1
+    routed_scaling_factor: float = 1.0
+    first_k_dense_replace: int = 0  # first K decoder layers use a dense MLP, not MoE
+    n_shared_experts: int = 0  # always-on shared experts (added, not gated — GLM/DeepSeek style)
+    num_nextn_predict_layers: int = 0  # MTP heads appended after the decoder; skipped at serve
     # ---- GDN / linear-attention (Qwen3-Next / Qwen3.5 hybrid). None for dense models. ----
     # `layer_types[i]` is "linear_attention" (GDN) or "full_attention". Populated by from_hf
     # ONLY when the config carries linear-attention dims, so the dense path stays untouched.
@@ -51,6 +68,11 @@ class ModelConfig:
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
+
+    @property
+    def is_mla(self) -> bool:
+        """True for a multi-head latent-attention model (DeepSeek / GLM-4.x MoE)."""
+        return self.kv_lora_rank is not None
 
     @property
     def is_gdn_hybrid(self) -> bool:
@@ -93,12 +115,36 @@ class ModelConfig:
         model_type = getattr(config, "model_type", "llama")
         # All-MoE models (e.g. qwen3_5_moe, mlp_only_layers=[]) carry no dense `intermediate_size`.
         intermediate_size = getattr(config, "intermediate_size", 0)
-        num_experts = getattr(config, "num_local_experts", getattr(config, "num_experts", 0))
+        # Routed-expert count: Mixtral/Qwen use num_local_experts/num_experts; GLM-4.x & DeepSeek
+        # MoE use n_routed_experts.
+        num_experts = (
+            getattr(config, "num_local_experts", None)
+            or getattr(config, "num_experts", None)
+            or getattr(config, "n_routed_experts", 0)
+        )
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
+
+        # MLA (DeepSeek / GLM-4.x MoE): present only when kv_lora_rank is set. When MLA, head_dim
+        # has no meaningful config value (hidden/heads is non-integral), so derive it from the
+        # per-head qk dim (qk_nope + qk_rope) — the value the absorbed/materialized kernels use.
+        kv_lora_rank = getattr(config, "kv_lora_rank", None)
+        q_lora_rank = getattr(config, "q_lora_rank", None)
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", None)
+        v_head_dim = getattr(config, "v_head_dim", None)
+        if kv_lora_rank is not None:
+            head_dim = qk_nope_head_dim + qk_rope_head_dim
+        # noaux_tc / fine-grained MoE knobs (defaults = plain top-k, no shared expert).
+        n_group = getattr(config, "n_group", 1) or 1
+        topk_group = getattr(config, "topk_group", 1) or 1
+        routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0) or 1.0
+        first_k_dense_replace = getattr(config, "first_k_dense_replace", 0) or 0
+        n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
+        num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict;
         # Qwen3.5: a single `rope_parameters` dict (rope_theta + partial_rotary_factor + mrope).
@@ -177,4 +223,15 @@ class ModelConfig:
             linear_value_head_dim=getattr(config, "linear_value_head_dim", None),
             linear_conv_kernel_dim=getattr(config, "linear_conv_kernel_dim", None),
             layer_types=layer_types,
+            kv_lora_rank=kv_lora_rank,
+            q_lora_rank=q_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            first_k_dense_replace=first_k_dense_replace,
+            n_shared_experts=n_shared_experts,
+            num_nextn_predict_layers=num_nextn_predict_layers,
         )

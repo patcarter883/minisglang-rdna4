@@ -29,7 +29,7 @@ from minisgl.layers import (
 from minisgl.quant import create_linear_method
 from minisgl.utils import nvtx_annotate
 
-from .qwen3_5 import Qwen3_5ForConditionalGeneration
+from .qwen3_5 import Qwen3_5ForConditionalGeneration, _lp_timed
 
 if TYPE_CHECKING:
     from minisgl.quant.config import QuantConfig
@@ -76,7 +76,9 @@ class Qwen3_5MoeSparseBlock(BaseOP):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_out = self.shared_expert.forward(hidden_states)
+        # "shared" sub-bucket of the layer-prof "ffn" total (MINISGL_LAYER_PROF). Summed over all
+        # layers, reported per-step -> direct per-step shared-expert cost (Task B #18 attribution).
+        shared_out = _lp_timed("shared", self.shared_expert.forward, hidden_states)
         shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
         router_logits = self.gate.forward(hidden_states)
         routed_out = self.experts.forward(

@@ -10,6 +10,7 @@ _MODEL_REGISTRY = {
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "Qwen3_5ForConditionalGeneration": (".qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "Qwen3_5MoeForConditionalGeneration": (".qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+    "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
 }
