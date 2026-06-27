@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -13,6 +14,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
+from minisgl.spec import propose_ngram, verify_greedy
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -138,6 +140,14 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        # Speculative decoding runs in a dedicated synchronous loop: acceptance is a
+        # data-dependent host-sync that fundamentally conflicts with the zero-sync overlap path
+        # (see SPEC_DECODE.md §1). All GPU work runs on the engine stream, like the eager path.
+        if self.engine.spec_config is not None:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self._spec_loop()
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -262,6 +272,204 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    # ===================================================================================
+    # Speculative decoding (synchronous loop). See SPEC_DECODE.md for the full design.
+    # ===================================================================================
+
+    def _spec_loop(self) -> None:
+        """One synchronous spec-decode iteration. Prefill still goes through the normal path;
+        only an all-greedy decode batch is replaced by a propose→verify→accept step."""
+        blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+        for msg in self.receive_msg(blocking=blocking):
+            self._process_one_msg(msg)
+
+        # Prefill takes priority and uses the normal (non-spec) synchronous path.
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is not None:
+            forward_input = self._prepare_batch(batch)
+            self._process_last_data((forward_input, self._forward(forward_input)))
+            return
+
+        if not self.decode_manager.runnable:
+            return
+
+        reqs = sorted(self.decode_manager.running_reqs, key=lambda req: req.uid)
+        if all(req.sampling_params.is_greedy for req in reqs):
+            self._spec_decode_step(reqs)
+        else:
+            # Spec-decode is greedy-only for now (lossless accept). A non-greedy req in the
+            # running set falls the whole batch back to a plain synchronous decode step.
+            batch = self.decode_manager.schedule_next_batch()
+            forward_input = self._prepare_batch(batch)
+            self._process_last_data((forward_input, self._forward(forward_input)))
+
+    def _spec_decode_step(self, reqs: List[Req]) -> None:
+        spec = self.engine.spec_config
+        assert spec is not None
+        device = self.device
+        page_table = self.engine.page_table
+
+        # --- 1. propose drafts (host n-gram lookup over each req's full token sequence) --------
+        # Clamp to remain_len-1 so even a full accept (K_i+1 emitted) stays within the req budget.
+        drafts: List[List[int]] = []
+        for req in reqs:
+            k_i = max(0, min(spec.num_draft, req.remain_len - 1))
+            d = (
+                propose_ngram(
+                    req.input_ids,
+                    num_draft=k_i,
+                    max_ngram=spec.ngram_max,
+                    min_ngram=spec.ngram_min,
+                )
+                if k_i > 0
+                else []
+            )
+            drafts.append(d)
+
+        # --- 2. stage: extend each req to K_i+1 query tokens; write drafts into the token pool --
+        # Confirmed token sits at position c0 (= cached_len); drafts go at c0+1 .. c0+K_i.
+        d_rows: List[int] = []
+        d_cols: List[int] = []
+        d_vals: List[int] = []
+        for req, d in zip(reqs, drafts):
+            c0 = req.cached_len
+            req.device_len = c0 + len(d) + 1  # extend_len = K_i+1
+            for j, tok in enumerate(d):
+                d_rows.append(req.table_idx)
+                d_cols.append(c0 + 1 + j)
+                d_vals.append(tok)
+        if d_vals:
+            self.token_pool[
+                torch.tensor(d_rows, dtype=torch.int64, device=device),
+                torch.tensor(d_cols, dtype=torch.int64, device=device),
+            ] = torch.tensor(d_vals, dtype=self.token_pool.dtype, device=device)
+
+        # --- 3. build the verify batch (phase='decode' -> full per-position logits + extend) ---
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.padded_reqs = reqs  # eager: no graph padding
+        self.cache_manager.allocate_paged(reqs)
+        batch.positions = _make_positions(batch, device)
+        input_mapping = _make_input_tuple(batch, device)
+        batch.out_loc = page_table[input_mapping]
+        self.engine.attn_backend.prepare_metadata(batch)
+        batch.input_ids = self.token_pool[input_mapping]
+
+        # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
+        logits = self.engine.forward_verify(batch)
+        preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
+
+        # --- 5. accept + commit + rollback per req --------------------------------------------
+        offset = 0
+        total_emitted = 0
+        reply: List[DetokenizeMsg] = []
+        new_finished_reqs: Set[Req] = set()
+        c_rows: List[int] = []
+        c_cols: List[int] = []
+        c_vals: List[int] = []
+        free_chunks: List[torch.Tensor] = []
+        for req, d in zip(reqs, drafts):
+            q_len = len(d) + 1
+            target = preds[offset : offset + q_len].tolist()
+            offset += q_len
+            result = verify_greedy(d, target)
+            if os.environ.get("MINISGL_SPEC_FORCE_N0") == "1":
+                # Diagnostic: stage+verify drafts but accept none (emit only the bonus). Should be
+                # byte-identical to plain decode through the multi-query kernel — isolates whether
+                # the bug is in the verify forward vs. the accept/commit path.
+                result = result._replace(emitted=result.emitted[:1], num_accepted=0)
+            c0 = req.cached_len
+            old_device_len = c0 + len(d) + 1
+
+            if os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3"):
+                logger.info_rank0(
+                    f"[spec-dbg] uid={req.uid} c0={c0} dev={req.device_len} "
+                    f"conf={int(req.input_ids[c0])} k={len(d)} n={result.num_accepted} "
+                    f"emit={result.emitted}"
+                )
+
+            # Decide which emitted tokens to keep, truncating at EOS.
+            keep: List[int] = []
+            eos = False
+            for tok in result.emitted:
+                keep.append(tok)
+                if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
+                    eos = True
+                    break
+
+            # Commit kept tokens to the host sequence + GPU token pool (positions c0+1 .. c0+len).
+            for j, tok in enumerate(keep):
+                c_rows.append(req.table_idx)
+                c_cols.append(c0 + 1 + j)
+                c_vals.append(tok)
+            req.input_ids = torch.cat(
+                [req.input_ids, torch.tensor(keep, dtype=req.input_ids.dtype)]
+            )
+            req.cached_len = c0 + len(keep)  # KV valid through cached_len-1
+            req.device_len = req.cached_len + 1
+            total_emitted += len(keep)
+            finished = eos or (not req.can_decode)
+
+            # One message carries all of this step's committed tokens (the detokenizer keys
+            # streaming state by uid and assumes one message per uid per batch).
+            if keep:
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=keep[0],
+                        finished=finished,
+                        extra_tokens=keep[1:],
+                    )
+                )
+
+            # Rollback: free the KV slots of staged positions beyond the kept run. Position
+            # `cached_len` (the bonus token) is freed too and reallocated next step (its KV was
+            # computed for a now-rejected draft). page_size==1 -> slot index == page index.
+            if old_device_len > req.cached_len:
+                free_chunks.append(page_table[req.table_idx, req.cached_len : old_device_len])
+
+            if finished:
+                new_finished_reqs.add(req)
+
+        if c_vals:
+            self.token_pool[
+                torch.tensor(c_rows, dtype=torch.int64, device=device),
+                torch.tensor(c_cols, dtype=torch.int64, device=device),
+            ] = torch.tensor(c_vals, dtype=self.token_pool.dtype, device=device)
+        if free_chunks:
+            self.cache_manager._free(torch.cat(free_chunks))
+
+        for req in new_finished_reqs:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+        self.finished_reqs = new_finished_reqs
+        self.send_result(reply)
+        self._spec_debug(reqs, drafts, total_emitted)
+
+    def _spec_debug(self, reqs: List[Req], drafts: List[List[int]], emitted: int) -> None:
+        # MINISGL_SPEC_DEBUG=1: accumulate acceptance stats and log the running mean every 50
+        # steps on the primary rank. Inert otherwise (one dict lookup). proposed = sum K_i;
+        # accepted drafts = emitted - num_reqs (each req emits 1 bonus + its accepted drafts).
+        import os
+
+        if os.environ.get("MINISGL_SPEC_DEBUG") != "1":
+            return
+        st = getattr(self, "_spec_stats", None)
+        if st is None:
+            st = self._spec_stats = {"steps": 0, "proposed": 0, "accepted": 0, "emitted": 0, "reqs": 0}
+        st["steps"] += 1
+        st["proposed"] += sum(len(d) for d in drafts)
+        st["accepted"] += emitted - len(reqs)  # accepted drafts (excludes the per-req bonus)
+        st["emitted"] += emitted
+        st["reqs"] += len(reqs)
+        if st["steps"] % 50 == 0:
+            acc_rate = st["accepted"] / max(1, st["proposed"])
+            toks_per_step = st["emitted"] / max(1, st["steps"])
+            logger.info_rank0(
+                f"[spec] step={st['steps']} accept_rate={acc_rate:.2f} "
+                f"draft_accepted={st['accepted']}/{st['proposed']} "
+                f"emitted/step={toks_per_step:.2f} (reqs/step={st['reqs']/st['steps']:.1f})"
+            )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

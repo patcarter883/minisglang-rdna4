@@ -83,6 +83,9 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        # Speculative decoding config (None unless --spec-algorithm enables it). The scheduler
+        # routes to the synchronous spec loop when this is set; every spec path is gated on it.
+        self.spec_config = config.spec_config
         # fp8 (e4m3fn) KV cache — opt-in via MINISGL_KV_FP8=1 (the "no-F16" KV path:
         # store e4m3 -> cast once to bf16 -> f32 accumulate, scalar scale folded in the
         # attention kernel). Activations/weights stay bf16; only the KV buffer is fp8.
@@ -328,6 +331,24 @@ class Engine:
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def forward_verify(self, batch: Batch) -> torch.Tensor:
+        """Eager forward for a speculative-decode verify batch.
+
+        The batch is built with ``phase='decode'`` but each req carries ``extend_len = K+1`` query
+        tokens (confirmed + K drafts). Two consequences we rely on (see SPEC_DECODE.md):
+          * ``prepare_metadata`` keys on ``extend_len`` (not phase), so it takes the paged-extend
+            branch → the existing ``flash_prefill_paged`` kernel applies the topk=1 linear-chain
+            causal mask for free (no new kernel).
+          * the LM head does the per-req last-token reduction only for ``is_prefill``, so a decode
+            batch returns logits for ALL tokens — exactly the K+1 per-position logits verify needs.
+
+        Returns the full logits ``[sum(extend_len), vocab]``. No sampling and no ``complete_one``:
+        the scheduler owns acceptance, commit, and req advancement. Never uses a CUDA graph (the
+        verify batch is variable-length); MVP is eager-only."""
+        assert torch.cuda.current_stream() == self.stream
+        with self.ctx.forward_batch(batch):
+            return self.model.forward()
+
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
@@ -376,3 +397,20 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+
+    # Speculative decoding (MVP) constraints — see SPEC_DECODE.md §5:
+    #   * MHA-only: the verify forward reuses the paged-extend kernel; MLA has no multi-query
+    #     verify kernel yet, so refuse rather than silently mis-serve.
+    #   * page_size == 1: rollback frees rejected-draft KV by individual token slot.
+    #   * eager-only: the verify forward is variable-length; no CUDA graph (disable capture).
+    if config.spec_config is not None:
+        if config.model_config.is_mla:
+            raise NotImplementedError(
+                "spec-decode MVP supports MHA models only; MLA multi-query verify kernel is TODO"
+            )
+        if config.page_size != 1:
+            override("page_size", 1)
+            logger.warning_rank0("spec-decode: overriding page_size -> 1 (rollback granularity)")
+        if config.cuda_graph_max_bs != 0:
+            override("cuda_graph_max_bs", 0)
+            logger.warning_rank0("spec-decode: disabling CUDA graph (verify is eager/var-length)")

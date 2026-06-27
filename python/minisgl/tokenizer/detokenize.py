@@ -80,8 +80,13 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
-                s.decoded_ids.append(msg.next_token)
+            # One message may carry several tokens (speculative decoding); append them in order.
+            # Drop only a trailing EOS on a finished req so it isn't rendered (matches the prior
+            # single-token skip). Spec truncates at EOS, so EOS is always last when present.
+            toks = [msg.next_token, *msg.extra_tokens]
+            if msg.finished and toks and toks[-1] == self.eos_token_id:
+                toks = toks[:-1]
+            s.decoded_ids.extend(toks)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
 

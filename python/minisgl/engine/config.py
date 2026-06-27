@@ -35,6 +35,26 @@ class EngineConfig:
     use_pynccl: bool = field(default_factory=lambda: not is_rocm())
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # --- speculative decoding (off by default; see SPEC_DECODE.md) ------------------------------
+    # "none" disables every spec path (byte-for-byte unchanged serve). "ngram" enables the
+    # prompt-lookup MVP. These flat fields mirror the argparse dests; spec_config assembles them.
+    spec_algorithm: str = "none"
+    spec_num_draft: int = 4
+    spec_ngram_max: int = 3
+    spec_ngram_min: int = 1
+
+    @cached_property
+    def spec_config(self):
+        from minisgl.spec import SpecConfig
+
+        if self.spec_algorithm == "none":
+            return None
+        return SpecConfig(
+            algorithm=self.spec_algorithm,
+            num_draft=self.spec_num_draft,
+            ngram_max=self.spec_ngram_max,
+            ngram_min=self.spec_ngram_min,
+        )
 
     @cached_property
     def hf_config(self):

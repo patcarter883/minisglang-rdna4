@@ -228,6 +228,33 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    # --- speculative decoding (off by default; see SPEC_DECODE.md) -------------------------------
+    parser.add_argument(
+        "--spec-algorithm",
+        type=str,
+        default=ServerArgs.spec_algorithm,
+        choices=["none", "ngram"],
+        help="Speculative-decoding proposer. 'none' disables it; 'ngram' enables prompt-lookup.",
+    )
+    parser.add_argument(
+        "--spec-num-draft",
+        type=int,
+        default=ServerArgs.spec_num_draft,
+        help="Draft tokens proposed per step (K); verify runs K+1 query positions per sequence.",
+    )
+    parser.add_argument(
+        "--spec-ngram-max",
+        type=int,
+        default=ServerArgs.spec_ngram_max,
+        help="Largest trailing n-gram window the prompt-lookup proposer matches on.",
+    )
+    parser.add_argument(
+        "--spec-ngram-min",
+        type=int,
+        default=ServerArgs.spec_ngram_min,
+        help="Smallest trailing n-gram window to fall back to.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
