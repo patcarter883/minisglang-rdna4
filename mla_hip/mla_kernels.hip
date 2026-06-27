@@ -228,6 +228,188 @@ __global__ __launch_bounds__(THREADS) void mla_decode_fp8_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// MLA multi-query VERIFY (speculative decoding). Same absorbed flash-decode math as mla_decode,
+// but q packs several query tokens per sequence (confirmed + K drafts), each attending the SHARED
+// paged latent under a per-query causal bound. One CTA per (head, query-row); the query row's
+// causal context length is q_kbound[r] = cached_len + qi + 1 (qi = within-seq query index), so
+// query qi attends latent positions [0, cached_len+qi] — itself + prefix + earlier drafts. This
+// attends the paged latent DIRECTLY (no prefix re-materialization), preserving the spec speedup.
+template <int LATENT, int ROPE>
+__global__ __launch_bounds__(THREADS) void mla_verify_kernel(
+    const __hip_bfloat16* __restrict__ Q,            // [total_q, num_heads, LATENT+ROPE] (absorbed)
+    const __hip_bfloat16* __restrict__ latent_cache, // [num_blocks, block_size, LATENT+ROPE]
+    const int* __restrict__ block_table,             // [B, max_blocks]
+    const int* __restrict__ q_seq_idx,               // [total_q] -> seq (block_table row)
+    const int* __restrict__ q_kbound,                // [total_q] -> causal context length
+    __hip_bfloat16* __restrict__ O,                  // [total_q, num_heads, LATENT]
+    const unsigned int num_heads,
+    const unsigned int block_size,
+    const unsigned int max_blocks,
+    const long kv_block_stride,
+    const float scale,
+    const unsigned int sliding_window) {
+    constexpr int QK = LATENT + ROPE;
+    constexpr int QK_PL = QK / WARP;
+    constexpr int V_PL = LATENT / WARP;
+
+    const unsigned int head = blockIdx.x;
+    const unsigned int r = blockIdx.y;               // query row (packed token index)
+    if (head >= num_heads) return;
+    const unsigned int ctx_len = (unsigned int)q_kbound[r];
+    if (ctx_len == 0) return;
+    const unsigned int b = (unsigned int)q_seq_idx[r];
+
+    const unsigned int tid = threadIdx.x, warp_id = tid >> 5, lane = tid & 31;
+    const int* bt = block_table + (size_t)b * max_blocks;
+
+    const __hip_bfloat16* q_ptr = Q + (size_t)(r * num_heads + head) * QK;
+    float q_reg[QK_PL];
+    #pragma unroll
+    for (int i = 0; i < QK_PL; i++) q_reg[i] = (float)q_ptr[i * WARP + lane];
+
+    float m = -1e30f, l = 0.0f;
+    float o_reg[V_PL];
+    #pragma unroll
+    for (int i = 0; i < V_PL; i++) o_reg[i] = 0.0f;
+
+    for (unsigned int j = warp_id; j < ctx_len; j += NWARPS) {
+        if (sliding_window > 0 && (ctx_len - 1 - j) >= sliding_window) continue;
+        const size_t base = (size_t)(unsigned int)bt[j / block_size] * kv_block_stride
+                            + (size_t)(j % block_size) * QK;
+        const __hip_bfloat16* kptr = latent_cache + base;
+        float kv[QK_PL];
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < QK_PL; i++) { kv[i] = (float)kptr[i * WARP + lane]; partial += q_reg[i] * kv[i]; }
+        float score = warp_reduce_sum(partial) * scale;
+
+        const float m_new = fmaxf(m, score);
+        const float correct = __expf(m - m_new);
+        const float p = __expf(score - m_new);
+        #pragma unroll
+        for (int i = 0; i < V_PL; i++) o_reg[i] = o_reg[i] * correct + p * kv[i];
+        l = l * correct + p;
+        m = m_new;
+    }
+
+    __shared__ float s_m[NWARPS];
+    __shared__ float s_l[NWARPS];
+    __shared__ float s_o[NWARPS][LATENT];
+    if (lane == 0) { s_m[warp_id] = m; s_l[warp_id] = l; }
+    #pragma unroll
+    for (int i = 0; i < V_PL; i++) s_o[warp_id][i * WARP + lane] = o_reg[i];
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float m_g = -1e30f;
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) m_g = fmaxf(m_g, s_m[w]);
+        float l_g = 0.0f, w_corr[NWARPS];
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) { w_corr[w] = __expf(s_m[w] - m_g); l_g += s_l[w] * w_corr[w]; }
+        const float inv_l = (l_g > 0.0f) ? 1.0f / l_g : 0.0f;
+        __hip_bfloat16* o_ptr = O + (size_t)(r * num_heads + head) * LATENT;
+        #pragma unroll
+        for (int i = 0; i < V_PL; i++) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < NWARPS; w++) acc += s_o[w][i * WARP + lane] * w_corr[w];
+            o_ptr[i * WARP + lane] = (__hip_bfloat16)(acc * inv_l);
+        }
+    }
+}
+
+// fp8 latent-cache verify variant (e4m3 cache; q bf16). k_descale folds into the score, v_descale
+// into the output — identical descale convention to mla_decode_fp8.
+template <int LATENT, int ROPE>
+__global__ __launch_bounds__(THREADS) void mla_verify_fp8_kernel(
+    const __hip_bfloat16* __restrict__ Q,
+    const unsigned char* __restrict__ latent_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ q_seq_idx,
+    const int* __restrict__ q_kbound,
+    __hip_bfloat16* __restrict__ O,
+    const unsigned int num_heads,
+    const unsigned int block_size,
+    const unsigned int max_blocks,
+    const long kv_block_stride,
+    const float scale,
+    const float k_descale,
+    const float v_descale,
+    const unsigned int sliding_window) {
+    constexpr int QK = LATENT + ROPE;
+    constexpr int QK_PL = QK / WARP;
+    constexpr int V_PL = LATENT / WARP;
+
+    const unsigned int head = blockIdx.x;
+    const unsigned int r = blockIdx.y;
+    if (head >= num_heads) return;
+    const unsigned int ctx_len = (unsigned int)q_kbound[r];
+    if (ctx_len == 0) return;
+    const unsigned int b = (unsigned int)q_seq_idx[r];
+
+    const unsigned int tid = threadIdx.x, warp_id = tid >> 5, lane = tid & 31;
+    const int* bt = block_table + (size_t)b * max_blocks;
+    const float score_scale = scale * k_descale;
+
+    const __hip_bfloat16* q_ptr = Q + (size_t)(r * num_heads + head) * QK;
+    float q_reg[QK_PL];
+    #pragma unroll
+    for (int i = 0; i < QK_PL; i++) q_reg[i] = (float)q_ptr[i * WARP + lane];
+
+    float m = -1e30f, l = 0.0f;
+    float o_reg[V_PL];
+    #pragma unroll
+    for (int i = 0; i < V_PL; i++) o_reg[i] = 0.0f;
+
+    for (unsigned int j = warp_id; j < ctx_len; j += NWARPS) {
+        if (sliding_window > 0 && (ctx_len - 1 - j) >= sliding_window) continue;
+        const size_t base = (size_t)(unsigned int)bt[j / block_size] * kv_block_stride
+                            + (size_t)(j % block_size) * QK;
+        const unsigned char* kptr = latent_cache + base;
+        float kv[QK_PL];
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < QK_PL; i++) { kv[i] = e4m3_to_f32(kptr[i * WARP + lane]); partial += q_reg[i] * kv[i]; }
+        float score = warp_reduce_sum(partial) * score_scale;
+
+        const float m_new = fmaxf(m, score);
+        const float correct = __expf(m - m_new);
+        const float p = __expf(score - m_new);
+        #pragma unroll
+        for (int i = 0; i < V_PL; i++) o_reg[i] = o_reg[i] * correct + p * kv[i];
+        l = l * correct + p;
+        m = m_new;
+    }
+
+    __shared__ float s_m[NWARPS];
+    __shared__ float s_l[NWARPS];
+    __shared__ float s_o[NWARPS][LATENT];
+    if (lane == 0) { s_m[warp_id] = m; s_l[warp_id] = l; }
+    #pragma unroll
+    for (int i = 0; i < V_PL; i++) s_o[warp_id][i * WARP + lane] = o_reg[i];
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float m_g = -1e30f;
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) m_g = fmaxf(m_g, s_m[w]);
+        float l_g = 0.0f, w_corr[NWARPS];
+        #pragma unroll
+        for (int w = 0; w < NWARPS; w++) { w_corr[w] = __expf(s_m[w] - m_g); l_g += s_l[w] * w_corr[w]; }
+        const float out_scale = (l_g > 0.0f) ? (v_descale / l_g) : 0.0f;
+        __hip_bfloat16* o_ptr = O + (size_t)(r * num_heads + head) * LATENT;
+        #pragma unroll
+        for (int i = 0; i < V_PL; i++) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < NWARPS; w++) acc += s_o[w][i * WARP + lane] * w_corr[w];
+            o_ptr[i * WARP + lane] = (__hip_bfloat16)(acc * out_scale);
+        }
+    }
+}
+
 }  // namespace
 
 // q:[B,num_heads,LATENT+ROPE]  latent_cache:[num_blocks,block_size,LATENT+ROPE]
@@ -307,4 +489,75 @@ void launch_mla_decode_fp8(const at::Tensor& q, const at::Tensor& latent_cache,
                     ") — add a template instantiation (LATENT%32==0, ROPE%32==0)");
     }
 #undef LAUNCH_FP8
+}
+
+// MLA multi-query VERIFY. q:[total_q,num_heads,LATENT+ROPE]  latent_cache:[blocks,block_size,QK]
+// block_table:[B,max_blocks]  q_seq_idx:[total_q]  q_kbound:[total_q]  ->  out:[total_q,num_heads,LATENT]
+void launch_mla_verify(const at::Tensor& q, const at::Tensor& latent_cache,
+                       const at::Tensor& block_table, const at::Tensor& q_seq_idx,
+                       const at::Tensor& q_kbound, at::Tensor& out, double scale,
+                       int64_t sliding_window, int64_t kv_block_stride) {
+    const unsigned int total_q = q.size(0);
+    const unsigned int num_heads = q.size(1);
+    const unsigned int qk = q.size(2);
+    const unsigned int block_size = latent_cache.size(1);
+    const unsigned int max_blocks = block_table.size(1);
+    const unsigned int latent = out.size(2);
+    const unsigned int rope = qk - latent;
+    const float sc = (float)scale;
+    const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride : (long)block_size * qk;
+
+    dim3 grid(num_heads, total_q, 1);
+    dim3 block(THREADS, 1, 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
+    const auto* cp = reinterpret_cast<const __hip_bfloat16*>(latent_cache.data_ptr());
+    const int* btp = block_table.data_ptr<int>();
+    const int* sip = q_seq_idx.data_ptr<int>();
+    const int* kbp = q_kbound.data_ptr<int>();
+    auto* op = reinterpret_cast<__hip_bfloat16*>(out.data_ptr());
+
+#define LAUNCH_V(L, R)                                                                        \
+    mla_verify_kernel<L, R><<<grid, block, 0, stream>>>(                                      \
+        qp, cp, btp, sip, kbp, op, num_heads, block_size, max_blocks, kvbs, sc,               \
+        (unsigned)sliding_window)
+    if (latent == 512 && rope == 64) { LAUNCH_V(512, 64); }
+    else { TORCH_CHECK(false, "mla_hip verify: unsupported (kv_lora_rank=", latent, ", qk_rope=", rope, ")"); }
+#undef LAUNCH_V
+}
+
+void launch_mla_verify_fp8(const at::Tensor& q, const at::Tensor& latent_cache,
+                           const at::Tensor& block_table, const at::Tensor& q_seq_idx,
+                           const at::Tensor& q_kbound, at::Tensor& out, double scale,
+                           double k_descale, double v_descale, int64_t sliding_window,
+                           int64_t kv_block_stride) {
+    const unsigned int total_q = q.size(0);
+    const unsigned int num_heads = q.size(1);
+    const unsigned int qk = q.size(2);
+    const unsigned int block_size = latent_cache.size(1);
+    const unsigned int max_blocks = block_table.size(1);
+    const unsigned int latent = out.size(2);
+    const unsigned int rope = qk - latent;
+    const float sc = (float)scale;
+    const long kvbs = (kv_block_stride > 0) ? (long)kv_block_stride : (long)block_size * qk;
+
+    dim3 grid(num_heads, total_q, 1);
+    dim3 block(THREADS, 1, 1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    const auto* qp = reinterpret_cast<const __hip_bfloat16*>(q.data_ptr());
+    const auto* cp = reinterpret_cast<const unsigned char*>(latent_cache.data_ptr());
+    const int* btp = block_table.data_ptr<int>();
+    const int* sip = q_seq_idx.data_ptr<int>();
+    const int* kbp = q_kbound.data_ptr<int>();
+    auto* op = reinterpret_cast<__hip_bfloat16*>(out.data_ptr());
+
+#define LAUNCH_VF(L, R)                                                                       \
+    mla_verify_fp8_kernel<L, R><<<grid, block, 0, stream>>>(                                  \
+        qp, cp, btp, sip, kbp, op, num_heads, block_size, max_blocks, kvbs, sc,               \
+        (float)k_descale, (float)v_descale, (unsigned)sliding_window)
+    if (latent == 512 && rope == 64) { LAUNCH_VF(512, 64); }
+    else { TORCH_CHECK(false, "mla_hip verify fp8: unsupported (kv_lora_rank=", latent, ", qk_rope=", rope, ")"); }
+#undef LAUNCH_VF
 }

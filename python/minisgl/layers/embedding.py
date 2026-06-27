@@ -102,7 +102,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        # Fast path keyed on the number of scored ROWS, not the request count. For plain decode
+        # rows == bs == 1; for a speculative-decode VERIFY batch one request contributes K+1 rows,
+        # so gating on bs==1 would collapse them to a single logit row (target-length mismatch).
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

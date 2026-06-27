@@ -1,13 +1,18 @@
 # SPEC_DECODE.md — speculative decoding for minisgl (Triton-free, native-HIP)
 
-Status: **MVP working and GPU-validated** (n-gram / prompt-lookup, topk=1, greedy, MHA, eager,
-synchronous loop). Enable with `--spec-algorithm ngram` (see args below). Validated on Qwen3-0.6B
-(gfx1201): output is coherent, drafts are accepted (~11% on repetitive workloads, emitted/step up
-to 1.25), and multi-token acceptance is **bit-identical to sequential decode through the verify
-kernel** (`tools/spec_lossless.sh` → PASS on all prompts) — i.e. the accept/commit/KV-rollback is
-provably lossless. Residual divergence from a plain-decode baseline is only the inherent
-extend-kernel vs decode-kernel fp difference, not a spec defect. This doc is both the upstream
-porting reference and the concrete minisgl plan; read it before extending.
+Status: **working and GPU-validated on both MHA and MLA** (n-gram / prompt-lookup, topk=1, greedy,
+eager, synchronous loop). Enable with `--spec-algorithm ngram` (see args below).
+- **MHA** (Qwen3-0.6B, TP=1): coherent; ~11% accept / 1.25 tok/step on repetitive prompts; spec
+  output **bit-identical to sequential decode through the verify kernel** (`tools/spec_lossless.sh`
+  → PASS) — accept/commit/KV-rollback is provably lossless.
+- **MLA** (GLM-4.7-Flash AWQ, TP=2): coherent; **~45% accept / 2.2 tok/step**; SPEC == FORCE_N0
+  bit-identical on all prompts (`tools/spec_glm.sh` → PASS). Uses the absorbed multi-query
+  `mla_hip.mla_verify` kernel (paged latent, no prefix re-materialization), kernel parity-validated
+  (`mla_hip/mla_hip_parity.py verify`, cos≈1.0).
+
+Residual divergence from a plain-decode baseline is only the inherent verify-kernel vs decode-kernel
+fp difference, not a spec defect. This doc is both the upstream porting reference and the concrete
+minisgl plan; read it before extending.
 
 Harnesses: `tools/spec_smoke.sh` (coherence + baseline diff), `tools/spec_lossless.sh` (rigorous
 accept/rollback equivalence), `tests/spec_core_test.py` (CPU unit tests for proposer + acceptance).
@@ -121,6 +126,17 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 | 6 | scheduler spec cycle + rollback | `scheduler/scheduler.py::_spec_loop/_spec_decode_step` | **done, GPU-validated** |
 | 7 | multi-token detokenizer streaming | `message/tokenizer.py`, `tokenizer/detokenize.py` | **done** (see note) |
 | 8 | GPU coherence + losslessness harness | `tools/spec_smoke.sh`, `tools/spec_lossless.sh` | **done, PASS** |
+| 9 | MLA multi-query verify kernel (absorbed) | `mla_hip/mla_kernels.hip::mla_verify[_fp8]` | **done, parity PASS** |
+| 10 | MLA wiring (backend/layer/scheduler) | `attention/mla.py`, `models/glm4_moe_lite.py`, `layers/embedding.py` | **done, GPU-validated** |
+| 11 | MLA spec end-to-end (GLM TP=2) | `tools/spec_glm.sh` | **done, PASS (45% accept)** |
+
+> **MLA verify (#9–11):** the verify forward keys on `metadata.max_seqlen_q` — q_len==1 →
+> `mla_decode` (single-token), q_len>1 → `mla_verify` (absorbed multi-query over the **paged
+> latent**, one CTA per `(head, query-row)`, per-row causal bound `cached_len+qi+1`). No prefix
+> re-materialization, so the spec speedup is preserved. Two seams this exposed: (a) the LM head's
+> TP>1 fast path gated on request-count (`bs==1`) collapsed a verify batch's K+1 rows to one — fixed
+> to gate on row-count (`embedding.py`); (b) KV rollback is now page-size-aware (frees whole pages
+> beyond the kept run), so MLA keeps `page_size=16` while MHA stays at 1.
 
 > **Note (#7):** a step commits several tokens per req, but the incremental detokenizer keys
 > streaming offsets by uid and assumed one message per uid per batch — multiple per-token messages
@@ -134,9 +150,9 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 - **Sampling acceptance** — `coin*q<p` + residual bonus for temperature>0 correctness.
 - **MTP/NEXTN self-spec** — stop skipping the MTP head in `models/weight.py::_is_beyond_decoder`;
   load it as a 1-layer draft; reuse this entire cycle with the head as the proposer. GLM/DeepSeek.
-- **MLA multi-query verify kernel** — `mla_hip` currently has decode (qlen=1) + materialized
-  prefill; MLA verify needs multi-query against the paged latent. Required for any MLA-model spec.
-- **EAGLE2 dynamic tree** — `topk>1`: add `custom_mask`+`mask_indptr` to `attn_prefill_paged`.
+- ~~**MLA multi-query verify kernel**~~ — DONE (`mla_hip.mla_verify`, absorbed, paged latent).
+- **EAGLE2 dynamic tree** — `topk>1`: add `custom_mask`+`mask_indptr` to `attn_prefill_paged`
+  (and an analogous per-query tree mask to `mla_verify`).
 - **Overlap scheduling** — `FutureMap`-style to hide the acceptance host-sync.
 - **CUDA graph capture** of the verify forward (fixed max tree size, dynamic accept count post-replay).
 
@@ -146,8 +162,13 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 
 - **Greedy-only correctness** today: assert all reqs in a spec batch are greedy; non-greedy reqs
   fall back to plain decode until sampling acceptance lands.
-- **Sync loop only**: spec-decode forces the synchronous `normal_loop`; do not mix with overlap.
-- **page_size=1** under spec-decode (rollback simplicity) — see §3.
-- **MHA only** for the MVP (MLA verify kernel absent). Guard at config time.
+- **Sync loop only**: spec-decode forces the synchronous spec loop; do not mix with overlap.
+- **page_size**: MHA forces 1 (per-token rollback); MLA keeps 16 (the `mla_hip` block size). The
+  KV rollback is page-size-aware (frees whole pages beyond the kept run) — see §3 / `_spec_decode_step`.
+- **MHA and MLA both supported.** MLA verify uses the absorbed `mla_verify` kernel; only GLM
+  (`glm4_moe_lite`) is wired today (the sole MLA model). A new MLA model needs the same
+  `max_seqlen_q`-keyed dispatch in its attention layer.
+- **LM head row-count**: the TP>1 fast path must gate on logit-row-count, not request-count, or a
+  verify batch (K+1 rows, 1 req) collapses to a single row (`embedding.py`).
 - The verify forward must **not** be flagged `cold_prefill` (it has a cache prefix) — guaranteed by
   `cached_len > 0`, which always holds for a decoding req.
