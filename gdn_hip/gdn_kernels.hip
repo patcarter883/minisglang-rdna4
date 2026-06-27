@@ -114,12 +114,12 @@ __device__ __forceinline__ void gdn_state_norm_clamp(float* s_reg, int K, float*
 //   ssm_state:  [num_slots, HV, V, K]   state_indices: [B]   out: [B, HV, V]
 //   GQA: head h = hv / (HV / H).
 // grid = (B * HV), block = V threads.
-template <typename scalar_t>
+template <typename scalar_t, typename state_t>
 __global__ void gdn_decode_kernel(
     const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
     const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
-    float* __restrict__ ssm_state, const long* __restrict__ state_indices, scalar_t* __restrict__ out,
+    state_t* __restrict__ ssm_state, const long* __restrict__ state_indices, scalar_t* __restrict__ out,
     int B, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int bi = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -151,15 +151,15 @@ __global__ void gdn_decode_kernel(
     const float x = (float)a[bi * HV + hv] + dt_bias[hv];
     const float g = -__expf(A_log[hv]) * gdn_softplus(x);
     const float beta = 1.0f / (1.0f + __expf(-(float)b[bi * HV + hv]));
-    float* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
+    state_t* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
     float s_reg[GDN_MAX_K];
 #pragma unroll 4
-    for (int j = 0; j < K; ++j) s_reg[j] = s_row[j];
+    for (int j = 0; j < K; ++j) s_reg[j] = (float)s_row[j];
     float o = gdn_step(s_reg, q_s, k_s, (float)v[(bi * HV + hv) * V + r], g, beta, K);
     // bound the carried state's Frobenius norm (no-op unless it has grown past the cap)
     gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
 #pragma unroll 4
-    for (int j = 0; j < K; ++j) s_row[j] = s_reg[j];
+    for (int j = 0; j < K; ++j) s_row[j] = (state_t)s_reg[j];
     *o_p = (scalar_t)o;
   }
 }
@@ -172,14 +172,14 @@ __global__ void gdn_decode_kernel(
 //   cu_seqlens: [N+1]   state_indices: [N]   has_initial_state: [N] (uint8)
 //   ssm_state: [num_slots, HV, V, K]   out: [T, HV, V]
 // grid = (N * HV), block = V threads.
-template <typename scalar_t>
+template <typename scalar_t, typename state_t>
 __global__ void gdn_prefill_kernel(
     const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
     const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
+    state_t* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -195,10 +195,10 @@ __global__ void gdn_prefill_kernel(
   // state row in registers; init from slot if has_initial_state, else zero
   float s_reg[GDN_MAX_K];
   if (r < V) {
-    float* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
+    state_t* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
     const bool use_init = has_initial_state[n] != 0;
 #pragma unroll 4
-    for (int j = 0; j < K; ++j) s_reg[j] = use_init ? s_row[j] : 0.0f;
+    for (int j = 0; j < K; ++j) s_reg[j] = use_init ? (float)s_row[j] : 0.0f;
   }
 
   const float Alog = A_log[hv], dtb = dt_bias[hv];
@@ -229,9 +229,9 @@ __global__ void gdn_prefill_kernel(
     __syncthreads();  // q_s/k_s reused next token
   }
   if (r < V) {
-    float* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
+    state_t* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
 #pragma unroll 4
-    for (int j = 0; j < K; ++j) s_row[j] = s_reg[j];
+    for (int j = 0; j < K; ++j) s_row[j] = (state_t)s_reg[j];
   }
 }
 
@@ -251,14 +251,14 @@ __global__ void gdn_prefill_kernel(
 #define GDN_CHUNK 32  // chunk length; LDS = 2*C*K + 2*C*C floats (C=32,K=128 -> ~40 KB)
 #endif
 
-template <typename scalar_t>
+template <typename scalar_t, typename state_t>
 __global__ void gdn_prefill_chunked_kernel(
     const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
     const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
+    state_t* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   const int blk = blockIdx.x, r = threadIdx.x;
   const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
@@ -274,11 +274,11 @@ __global__ void gdn_prefill_chunked_kernel(
   __shared__ float bet[GDN_CHUNK];
 
   const bool active = (r < V);
-  float* S = ssm_state + ((slot * HV + hv) * V + r) * K;
+  state_t* S = ssm_state + ((slot * HV + hv) * V + r) * K;
   float s_row[GDN_MAX_K];
   if (active) {
     const bool ui = has_initial_state[n] != 0;
-    for (int j = 0; j < K; ++j) s_row[j] = ui ? S[j] : 0.0f;
+    for (int j = 0; j < K; ++j) s_row[j] = ui ? (float)S[j] : 0.0f;
   }
 
   for (int c0 = bos; c0 < eos; c0 += GDN_CHUNK) {
@@ -343,7 +343,7 @@ __global__ void gdn_prefill_chunked_kernel(
     }
     __syncthreads();  // ks/qs/KK/KQ reused next chunk
   }
-  if (active) for (int j = 0; j < K; ++j) S[j] = s_row[j];
+  if (active) for (int j = 0; j < K; ++j) S[j] = (state_t)s_row[j];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -427,14 +427,14 @@ __device__ __forceinline__ void tn_tile(const f16* A, int lda, int aRowM, const 
 }
 }  // namespace gdnw
 
-template <typename scalar_t>
+template <typename scalar_t, typename state_t>
 __global__ void gdn_prefill_wmma_kernel(
     const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
     const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
     const unsigned char* __restrict__ has_initial_state,
-    float* __restrict__ ssm_state, scalar_t* __restrict__ out,
+    state_t* __restrict__ ssm_state, scalar_t* __restrict__ out,
     int N, int H, int HV, int K, int V, float scale, int use_l2norm) {
   using gdnw::f16;
   const int blk = blockIdx.x, tid = threadIdx.x;
@@ -466,9 +466,9 @@ __global__ void gdn_prefill_wmma_kernel(
   // ---- load S from slot (or zero) ----
   const bool use_init = has_initial_state[n] != 0;
   {
-    const float* Sg = ssm_state + (slot * HV + hv) * (long)Dv * Dk;
+    const state_t* Sg = ssm_state + (slot * HV + hv) * (long)Dv * Dk;
     for (int idx = tid; idx < Dv * Dk; idx += GDN_WTHREADS)
-      Sh[idx] = use_init ? (f16)Sg[idx] : (f16)0.0f;
+      Sh[idx] = use_init ? (f16)(float)Sg[idx] : (f16)0.0f;
   }
   __syncthreads();
 
@@ -598,8 +598,8 @@ __global__ void gdn_prefill_wmma_kernel(
 
   // ---- persist final state to slot ----
   {
-    float* Sg = ssm_state + (slot * HV + hv) * (long)Dv * Dk;
-    for (int idx = tid; idx < Dv * Dk; idx += GDN_WTHREADS) Sg[idx] = (float)Sh[idx];
+    state_t* Sg = ssm_state + (slot * HV + hv) * (long)Dv * Dk;
+    for (int idx = tid; idx < Dv * Dk; idx += GDN_WTHREADS) Sg[idx] = (state_t)(float)Sh[idx];
   }
 }
 
@@ -705,6 +705,16 @@ __global__ void rmsnorm_gated_kernel(
 static inline float* FP(const at::Tensor& t) { return t.data_ptr<float>(); }
 static inline const float* CFP(const at::Tensor& t) { return t.data_ptr<float>(); }
 
+// ssm_state cache-dtype dispatch: fp32 (default, most accurate) or bf16 (half the recurrent-state
+// HBM -> ~2x max_running_req; what the Triton path stored). Compute stays fp32 in-register; only the
+// persisted cache I/O changes dtype. at::BFloat16 has the same (float) casts the kernels already use.
+#define GDN_DISPATCH_SSM(SSM, NAME, ...)                                                            \
+  do {                                                                                              \
+    if ((SSM).scalar_type() == at::kFloat) { using state_t = float; __VA_ARGS__; }                  \
+    else if ((SSM).scalar_type() == at::kBFloat16) { using state_t = at::BFloat16; __VA_ARGS__; }   \
+    else { TORCH_CHECK(false, NAME ": ssm_state must be fp32 or bf16"); }                           \
+  } while (0)
+
 void launch_gdn_decode(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                        const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
                        const at::Tensor& dt_bias, at::Tensor& ssm_state,
@@ -716,11 +726,12 @@ void launch_gdn_decode(const at::Tensor& q, const at::Tensor& k, const at::Tenso
   size_t shmem = (2 * K + V) * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_decode", [&] {
-    hipLaunchKernelGGL((gdn_decode_kernel<scalar_t>), grid, block, shmem, stream,
-        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
-        FP(ssm_state), state_indices.data_ptr<long>(), out.data_ptr<scalar_t>(),
-        B, H, HV, K, V, (float)scale, (int)use_l2norm);
+    GDN_DISPATCH_SSM(ssm_state, "gdn_decode",
+      hipLaunchKernelGGL((gdn_decode_kernel<scalar_t, state_t>), grid, block, shmem, stream,
+          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+          ssm_state.data_ptr<state_t>(), state_indices.data_ptr<long>(), out.data_ptr<scalar_t>(),
+          B, H, HV, K, V, (float)scale, (int)use_l2norm));
   });
 }
 
@@ -736,12 +747,13 @@ void launch_gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
   size_t shmem = (2 * K + V) * sizeof(float);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill", [&] {
-    hipLaunchKernelGGL((gdn_prefill_kernel<scalar_t>), grid, block, shmem, stream,
-        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
-        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
-        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+    GDN_DISPATCH_SSM(ssm_state, "gdn_prefill",
+      hipLaunchKernelGGL((gdn_prefill_kernel<scalar_t, state_t>), grid, block, shmem, stream,
+          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+          cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+          has_initial_state.data_ptr<unsigned char>(), ssm_state.data_ptr<state_t>(), out.data_ptr<scalar_t>(),
+          N, H, HV, K, V, (float)scale, (int)use_l2norm));
   });
 }
 
@@ -757,12 +769,13 @@ void launch_gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const 
   dim3 grid(N * HV), block(V);
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill_chunked", [&] {
-    hipLaunchKernelGGL((gdn_prefill_chunked_kernel<scalar_t>), grid, block, 0, stream,  // static shared mem
-        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
-        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
-        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+    GDN_DISPATCH_SSM(ssm_state, "gdn_prefill_chunked",
+      hipLaunchKernelGGL((gdn_prefill_chunked_kernel<scalar_t, state_t>), grid, block, 0, stream,  // static shared mem
+          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+          cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+          has_initial_state.data_ptr<unsigned char>(), ssm_state.data_ptr<state_t>(), out.data_ptr<scalar_t>(),
+          N, H, HV, K, V, (float)scale, (int)use_l2norm));
   });
 }
 
@@ -778,12 +791,13 @@ void launch_gdn_prefill_wmma(const at::Tensor& q, const at::Tensor& k, const at:
   dim3 grid(N * HV), block(GDN_WTHREADS);  // 256 threads = 8 wave32 warps
   auto stream = at::cuda::getCurrentCUDAStream();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill_wmma", [&] {
-    hipLaunchKernelGGL((gdn_prefill_wmma_kernel<scalar_t>), grid, block, 0, stream,  // static shared mem (~62 KB)
-        q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
-        a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
-        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
-        has_initial_state.data_ptr<unsigned char>(), FP(ssm_state), out.data_ptr<scalar_t>(),
-        N, H, HV, K, V, (float)scale, (int)use_l2norm);
+    GDN_DISPATCH_SSM(ssm_state, "gdn_prefill_wmma",
+      hipLaunchKernelGGL((gdn_prefill_wmma_kernel<scalar_t, state_t>), grid, block, 0, stream,  // static shared mem (~62 KB)
+          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+          cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+          has_initial_state.data_ptr<unsigned char>(), ssm_state.data_ptr<state_t>(), out.data_ptr<scalar_t>(),
+          N, H, HV, K, V, (float)scale, (int)use_l2norm));
   });
 }
 

@@ -140,6 +140,11 @@ class Engine:
                 # fp32 recurrent state: the gdn_hip HIP kernels read/update conv+ssm state in place
                 # in fp32 (also more accurate than the bf16 the Triton path stored each step).
                 dtype=torch.float32,
+                # MINISGL_SSM_BF16=1 stores the (large) ssm_state in bf16 instead — halves its HBM
+                # (~2x max_running_req), compute still fp32 in-register (gdn_hip GDN_DISPATCH_SSM).
+                # Default fp32 (most accurate). conv_state always stays fp32.
+                ssm_dtype=(torch.bfloat16 if os.environ.get("MINISGL_SSM_BF16", "0") != "0"
+                           else torch.float32),
                 device=self.device,
             )
             # Settle causal_conv1d's per-process in-place batch_ptr autotune on a private
