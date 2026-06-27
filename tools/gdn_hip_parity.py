@@ -320,6 +320,41 @@ def check_rmsnorm_gated() -> bool:
     return _report("rmsnorm_gated", got, ref)
 
 
+def check_ssm_state_bf16(steps: int = 512) -> bool:
+    """bf16 ssm_state cache (MINISGL_SSM_BF16): run the SAME decode stream through an fp32-state and a
+    bf16-state buffer in lockstep and compare. Tests (1) the per-step cast load/store is correct and
+    (2) long-context recurrent STABILITY — the gated decay (S*=exp(g), g<0) is contractive, so bf16
+    state-storage error must stay BOUNDED over many steps (this is what the Triton path relied on),
+    not blow up. Inputs are bf16 (the serve I/O dtype)."""
+    torch.manual_seed(1234)  # deterministic (the metric is a vector L2/cos, not a noisy max-element)
+    B, num_slots = 2, 4
+    A_log = torch.randn(HV, device=DEV)
+    dt_bias = torch.randn(HV, device=DEV)
+    idx = torch.tensor([1, 3], dtype=torch.long, device=DEV)
+    st32 = torch.zeros(num_slots, HV, V, K, device=DEV, dtype=torch.float32)
+    st16 = torch.zeros(num_slots, HV, V, K, device=DEV, dtype=torch.bfloat16)
+    worst_l2, worst_cos = 0.0, 1.0
+    o16 = None
+    for _ in range(steps):
+        q = torch.randn(B, H, K, device=DEV, dtype=torch.bfloat16)
+        k = torch.randn(B, H, K, device=DEV, dtype=torch.bfloat16)
+        v = torch.randn(B, HV, V, device=DEV, dtype=torch.bfloat16)
+        a = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16)
+        b = torch.randn(B, HV, device=DEV, dtype=torch.bfloat16)
+        o32 = torch.ops.gdn_hip.gdn_decode(q, k, v, a, b, A_log, dt_bias, st32, idx, SCALE, 1)
+        o16 = torch.ops.gdn_hip.gdn_decode(q, k, v, a, b, A_log, dt_bias, st16, idx, SCALE, 1)
+        f32, f16 = o32.float().flatten(), o16.float().flatten()
+        worst_l2 = max(worst_l2, ((f16 - f32).norm() / (f32.norm() + 1e-9)).item())
+        worst_cos = min(worst_cos, F.cosine_similarity(f16, f32, dim=0).item())
+    # bf16-state storage must leave the decode OUTPUT directionally intact over a long stream: relative
+    # L2 small and cosine ~1 (the contractive gated decay keeps the bf16 rounding BOUNDED, not
+    # accumulating). L2/cos are robust vector metrics (the per-element max/mean ratio is too noisy here).
+    ok = (worst_l2 < 0.05) and (worst_cos > 0.998) and bool(torch.isfinite(o16).all().item())
+    print(f"  [{'PASS' if ok else 'FAIL'}] ssm_state bf16 ({steps} decode steps) "
+          f"worst_out_L2rel={worst_l2:.3e} (<0.05)  worst_out_cos={worst_cos:.5f} (>0.998)")
+    return ok
+
+
 def main() -> None:
     global DT
     assert torch.cuda.is_available(), "needs a GPU (run under a lease)"
@@ -342,8 +377,10 @@ def main() -> None:
         ok = all(results.values())
         allok &= ok
         print(f"  >>> {label}: {'ALL PASS' if ok else 'FAIL'}")
+    print("\n--- bf16 ssm_state cache (recurrent stability) ---")
+    allok &= check_ssm_state_bf16()
     print("\n" + "=" * 60)
-    print("RESULT:", "ALL PASS — gdn_hip numerics faithful across fp32/fp16/bf16"
+    print("RESULT:", "ALL PASS — gdn_hip numerics faithful across fp32/fp16/bf16 (+ bf16 ssm_state)"
           if allok else "FAIL (see above)")
     if not allok:
         raise SystemExit(1)

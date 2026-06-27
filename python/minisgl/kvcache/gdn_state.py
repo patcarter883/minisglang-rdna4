@@ -43,11 +43,17 @@ class GDNStateCache:
         head_k_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        ssm_dtype: torch.dtype | None = None,
     ) -> None:
         self.num_gdn_layers = num_gdn_layers
         self.num_slots = num_slots
         self._device = device
         self._dtype = dtype
+        # The ssm_state is the memory hog (num_v_heads*head_v_dim*head_k_dim/slot); it may use a
+        # narrower dtype than conv_state to cut recurrent-state HBM (~2x max_running_req). The
+        # gdn_hip kernels read/write it at this dtype but compute fp32 in-register. conv_state stays
+        # `dtype` (fp32). Defaults to `dtype` (no change) unless an ssm_dtype is given.
+        self._ssm_dtype = ssm_dtype or dtype
         # conv state layout follows the causal_conv1d kernel contract (dim-first);
         # orientation is re-verified when the conv1d kernel is wired (Phase 3b).
         self.conv_state = torch.zeros(
@@ -55,7 +61,7 @@ class GDNStateCache:
         )
         self.ssm_state = torch.zeros(
             (num_gdn_layers, num_slots, num_v_heads, head_v_dim, head_k_dim),
-            dtype=dtype,
+            dtype=self._ssm_dtype,
             device=device,
         )
         # LIFO free-list of slot ids. Slot 0 is the reserved NULL block (see class
@@ -98,3 +104,7 @@ class GDNStateCache:
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    @property
+    def ssm_dtype(self) -> torch.dtype:
+        return self._ssm_dtype

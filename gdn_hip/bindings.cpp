@@ -8,8 +8,9 @@
 // the input element type and dispatch over fp32/fp16/bf16 (AT_DISPATCH_FLOATING_TYPES_AND2), reading
 // each element and up-casting to float in-register for the math, then writing back at the I/O dtype.
 // This removes the Python-side .float() casts + their HBM round-trips. Per-head params (A_log,
-// dt_bias, conv/norm weight) and the recurrent STATE (ssm_state / conv_state) stay fp32 for numerics;
-// state is bf16 is a separate follow-up. out follows the input dtype (at::empty_like / v.options()).
+// dt_bias, conv/norm weight) and conv_state stay fp32 for numerics. ssm_state may be fp32 OR bf16:
+// the launchers dispatch on its dtype (GDN_DISPATCH_SSM) and compute stays fp32 in-register — bf16
+// halves the recurrent-state HBM (~2x max_running_req), opt-in. out follows the input dtype.
 // State tensors are mutated in place (Tensor(a!)).
 
 #include <torch/extension.h>
