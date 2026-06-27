@@ -1,9 +1,11 @@
 # SPEC_DECODE.md — speculative decoding for minisgl (Triton-free, native-HIP)
 
 Status: **working and GPU-validated** on n-gram (`--spec-algorithm ngram`, MHA+MLA+GDN) AND native
-**MTP self-speculation** (`--spec-algorithm mtp`, GLM-4.7-Flash + Qwen3.5-4B — both coherent and
-lossless vs a 1-token/step reference; see §6 "MTP self-speculation"). topk=1, greedy, eager,
-synchronous loop.
+**MTP self-speculation** (`--spec-algorithm mtp`, GLM-4.7-Flash + Qwen3.5-4B — coherent, and lossless
+vs a 1-token/step reference on the MHA/MLA verify kernels; see §6 "MTP self-speculation"). topk=1,
+greedy, eager, synchronous loop. **GDN caveat:** GDN-target spec is coherent and the verify kernel is
+parity-exact, but end-to-end SPEC==FORCE_N0 is PROMPT-DEPENDENT (the recurrent verify argmax can differ
+from the 1-token decode argmax on drift-prone prompts) — see the GDN-hybrid section in §6.
 - **MHA** (Qwen3-0.6B, TP=1): coherent; ~11% accept / 1.25 tok/step on repetitive prompts; spec
   output **bit-identical to sequential decode through the verify kernel** (`tools/spec_lossless.sh`
   → PASS) — accept/commit/KV-rollback is provably lossless.
@@ -168,7 +170,7 @@ rollback machinery is proposer-agnostic. Four families share one interface:
 | **ngram** | none | no | None | nothing | linear |
 | **MTP** | target's appended head | yes | None | head + 1-layer draft KV | linear |
 | **DFlash** | separate ckpt | (via aux) | [N target layers] | fc+trunk+KV, mask-block | linear block |
-| **EAGLE3** | separate ckpt | (via aux) | [3 target layers] | fc+1-layer+KV, d2t/t2d | tree |
+| **EAGLE3** | separate ckpt | (via aux) | [3 target layers] | fc+1-layer+KV, d2t/t2d | linear (tree = future) |
 
 `Proposer.propose(reqs, num_draft, ctx)` returns drafts; `Proposer.on_accept(reqs, num_accepted)`
 rolls back draft-owned state. `make_proposer(spec_config, engine)` is the factory. The seams MTP/
@@ -208,11 +210,23 @@ Validated: `tools/spec_capture.sh` (Qwen3-0.6B, MHA, layers `0,13,27`) — the `
 oracle is plain-spec, NOT plain-decode (the verify kernel's fp differs from the decode kernel — see
 the top-of-doc residual-divergence note).
 
-### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — DONE, BIT-EXACT (per-token-state verify kernel)
+### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — DONE; kernel parity-exact, end-to-end PROMPT-DEPENDENT
 GPU-validated on Qwen3.5-4B (TP=1, `--attn hip`, `tools/spec_gdn.sh`): coherent, ~17% accept /
-1.29 tok/step, and **SPEC == FORCE_N0 BIT-IDENTICAL on all prompts** (368/266/347/394/392-char
-outputs, all MATCH). This is the GDN "completion" item: the 2× re-advance is gone and the output is
-now bit-exact vs a 1-token-per-step reference (previously only "coherent, fp-drifting").
+1.29 tok/step. The 2× re-advance is gone (the verify forward captures the per-token state in one pass).
+Two losslessness claims must be kept apart:
+- **Kernel parity is exact and universal.** `tools/gdn_hip_parity.py`: the per-token scratch from
+  `gdn_prefill_verify` / `causal_conv1d_fwd_verify` matches the recurrent oracle (rel ~1e-6) and
+  `scratch[last]==final_state` max|Δ|=0 across fp32/fp16/bf16. The state install is a pure gather.
+- **End-to-end SPEC==FORCE_N0 is PROMPT-DEPENDENT, not universal.** `tools/spec_gdn.sh`'s original
+  5-prompt set was BIT-IDENTICAL (368/266/347/394/392-char, all MATCH), but the later DFlash
+  diagnostics (`tools/spec_gdn_qlen.sh`, see the DFlash section below) show n-gram under
+  `MINISGL_SPEC_FORCE_N0=1` diverges from plain decode on 3/5 of a DIFFERENT prompt set at every
+  qlen≥4. The GDN per-token-state *recurrent verify forward* produces a slightly different argmax at
+  qlen=K+1 than the 1-token *decode* kernel on drift-prone prompts (the chunked recurrent verify path
+  couples position 0's output to the rest of the window). So GDN spec is coherent and the kernel is
+  parity-exact, but the served output is NOT guaranteed bit-identical to plain decode on every prompt.
+  This is the one outstanding GDN-spec correctness gap (tracked in the DFlash section); a kernel-level
+  fix to make the verify argmax match the decode argmax on all prompts is the follow-up.
 
 The mechanism: a verify batch carries `Batch.spec_verify=True` (phase "decode", `extend_len=K+1`/seq),
 which routes the GDN layer + `build_gdn_metadata` through the varlen recurrent path. The scheduler
