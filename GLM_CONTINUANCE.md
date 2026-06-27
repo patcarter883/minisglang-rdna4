@@ -49,11 +49,21 @@
   ("...Paris."). MoE-decode MUST use the graph-safe gather_reduce path (`MINISGL_MOE_SCATTER=0`).
   `tools/glm_coherence_smoke.sh` now takes `GRAPH`/`MOE_SCATTER` envs.
 
-- **STILL TODO** (DOD remainder): **benchmark** GLM in the production config (graph capture, not
-  eager) — add a GLM mode to `tools/run_bench_window.sh`/`_bench_inner.sh` (drop `--attn hip`, let
-  the engine force `mla`; set `GRAPH>0` + `MINISGL_MOE_SCATTER=0`; TP=2). Compare TPOT eager vs
-  graph and against the 35B baseline (20.4 ms M=1). Optional: logit oracle vs bf16 HF needs
-  CPU/offload (the 59 GB bf16 ref doesn't fit a card).
+- **MLA cudagraph capture committed** at `c5035bb`.
+
+- **BENCHMARK DONE — DOD COMPLETE.** Bench harness gained an `ATTN` env (`_bench_inner.sh` /
+  `run_bench_window.sh`): GLM runs with `ATTN=auto MEMRATIO=0.85 TP=2 MOE_SCATTER=0` (engine forces
+  `mla`). Ran eager (GRAPH=0) vs production graph (GRAPH=16) on a 2-card lease, **0 failures** all
+  cells. **Decode TPOT (ms) / tok/s, M=1→16:**
+    eager:  37.0/26.8 · 38.2/51.7 · 38.2/103 · 44.9/176 · 47.2/332
+    graph:  22.9/43.2 · 24.5/80.4 · 37.5/106 · 42.1/187 · 44.4/352
+  Graph capture = **1.61× at M=1** (37.0→22.9 ms; launch-overhead-bound), narrowing to ~1.05× at
+  M≥4 (compute-bound). GLM graph M=1 = 22.9 ms / 43.2 tok/s ≈ the 35B-A3B baseline (20.4 ms /
+  48.6 tok/s). Mixed M=1 TPOT 36.5→24.3. Prefill ~80–110 ms TTFT (not graphed).
+
+  **All DOD items met:** mla parity qk256/v256 ✓ · AWQ ckpt loads ✓ · serve coheres ✓ · MLA graph
+  capture ✓ · TP=2 ✓ · benchmarked (prefill/decode/mixed × M, graph) ✓.
+  Optional leftover: logit oracle vs bf16 HF (needs CPU/offload — 59 GB ref doesn't fit a card).
 
 
 
