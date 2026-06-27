@@ -33,7 +33,8 @@ at::Tensor rms_norm_add(const at::Tensor& x, at::Tensor& residual, const at::Ten
 }
 
 at::Tensor silu_and_mul(const at::Tensor& x) {
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "bf16 only");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf ||
+              x.scalar_type() == at::kFloat, "silu_and_mul: bf16/fp16/fp32 only");
   TORCH_CHECK(x.is_contiguous() && x.size(-1) % 2 == 0, "x must be contiguous, last dim even");
   auto shape = x.sizes().vec();
   shape.back() /= 2;

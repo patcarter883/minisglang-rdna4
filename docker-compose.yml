@@ -1,8 +1,8 @@
 # MiniSGL-RDNA4 serving stack (shared ROCm image vllm22-w4a8:combined + this repo's HIP kernels).
 #
 # This repo mounts its source into the shared image (it is NOT baked — see CLAUDE.md "Container-run
-# conventions"). The five native HIP kernel packages (gdn_hip, attn_decode, attn_hip,
-# attn_prefill_paged, tail_hip) are AOT-compiled, and their .so are gitignored, so a checkout must
+# conventions"). The six native HIP kernel packages (gdn_hip, attn_decode, attn_hip,
+# attn_prefill_paged, tail_hip, moe_hip) are AOT-compiled, and their .so are gitignored, so a checkout must
 # build them once before serving. The `build` profile does exactly that (CPU-only, no GPU/lease).
 #
 # GPU work is leased through the shared-box arbiter; launch the serve profile THROUGH it so the
@@ -37,7 +37,7 @@ x-minisgl-common: &minisgl-common
     GPU_ARCHS: gfx1201
 
 services:
-  # --- AOT build of the five native HIP kernel packages (CPU only; NO GPU device / lease) ---
+  # --- AOT build of the six native HIP kernel packages (CPU only; NO GPU device / lease) ---
   build:
     <<: *minisgl-common
     # In both profiles so `--profile serve up` can resolve+run it via serve's depends_on, while
@@ -49,7 +49,7 @@ services:
       - |
         source /app/.venv/bin/activate
         set -e
-        for pkg in gdn_hip attn_decode attn_hip attn_prefill_paged tail_hip; do
+        for pkg in gdn_hip attn_decode attn_hip attn_prefill_paged tail_hip moe_hip; do
           echo "=== AOT build: $$pkg ==="
           ( cd /engine/$$pkg && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace )
         done

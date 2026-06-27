@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
@@ -84,8 +85,11 @@ __global__ __launch_bounds__(NORM_THREADS) void rms_norm_add_kernel(
     }
 }
 
-// out[n,c] = silu(x[n,c]) * x[n, D+c],  x:[N,2D] out:[N,D]
-__global__ void silu_mul_kernel(const bf16* __restrict__ x, bf16* __restrict__ out, long N, int D) {
+// out[n,c] = silu(x[n,c]) * x[n, D+c],  x:[N,2D] out:[N,D]. fp32-internal; dtype-generic
+// (bf16/fp16/fp32) — MoE intermediates are fp16, attn/norm path is bf16.
+template <typename scalar_t>
+__global__ void silu_mul_kernel(const scalar_t* __restrict__ x, scalar_t* __restrict__ out,
+                                long N, int D) {
     const long total = N * (long)D;
     for (long o = (long)blockIdx.x * blockDim.x + threadIdx.x; o < total;
          o += (long)gridDim.x * blockDim.x) {
@@ -93,7 +97,7 @@ __global__ void silu_mul_kernel(const bf16* __restrict__ x, bf16* __restrict__ o
         const int col = o % D;
         const float a = (float)x[row * 2 * D + col];
         const float b = (float)x[row * 2 * D + D + col];
-        out[o] = (bf16)((a / (1.0f + __expf(-a))) * b);
+        out[o] = (scalar_t)((a / (1.0f + __expf(-a))) * b);
     }
 }
 
@@ -148,8 +152,16 @@ void launch_silu_mul(const at::Tensor& x, at::Tensor& out) {
     const long N = out.numel() / D;
     auto stream = at::cuda::getCurrentCUDAStream();
     const int blocks = (int)std::min<long>(65535, (N * D + 255) / 256);
-    silu_mul_kernel<<<blocks, 256, 0, stream>>>(
-        reinterpret_cast<const bf16*>(x.data_ptr()), reinterpret_cast<bf16*>(out.data_ptr()), N, D);
+    if (x.scalar_type() == at::kBFloat16) {
+        silu_mul_kernel<bf16><<<blocks, 256, 0, stream>>>(
+            reinterpret_cast<const bf16*>(x.data_ptr()), reinterpret_cast<bf16*>(out.data_ptr()), N, D);
+    } else if (x.scalar_type() == at::kHalf) {
+        silu_mul_kernel<__half><<<blocks, 256, 0, stream>>>(
+            reinterpret_cast<const __half*>(x.data_ptr()), reinterpret_cast<__half*>(out.data_ptr()), N, D);
+    } else {
+        silu_mul_kernel<float><<<blocks, 256, 0, stream>>>(
+            x.data_ptr<float>(), out.data_ptr<float>(), N, D);
+    }
 }
 
 void launch_rope(const at::Tensor& x, const at::Tensor& pos, const at::Tensor& cache,

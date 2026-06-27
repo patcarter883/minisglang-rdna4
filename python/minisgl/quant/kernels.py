@@ -33,6 +33,16 @@ _moe_calls = 0
 # enabled for decode — the scatter's atomicAdd is not graph-capture-safe).
 _MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "1") != "0"
 
+# Native HIP moe_align (moe_hip) replacing the vLLM moe_align_block_size host op. On by default;
+# MINISGL_MOE_ALIGN=0 reverts to the vLLM reference.
+_MOE_ALIGN_HIP = _os.environ.get("MINISGL_MOE_ALIGN", "1") != "0"
+
+# Native HIP fp16 silu_and_mul (tail_hip) for the MoE intermediates. Same MINISGL_TAIL_HIP=0 opt-out
+# as the layer path; gated locally (don't import minisgl.layers from quant — it pulls the full layer
+# stack). silu_and_mul is dtype-generic (fp16 MoE intermediates / bf16 / fp32).
+_TAIL_HIP = _os.environ.get("MINISGL_TAIL_HIP", "1") != "0"
+_SILU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
 
 def _moe_time(bucket: str, fn):
     if not _MOE_EVERY:
@@ -173,7 +183,6 @@ def w4a8_moe(
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
     import w4a8_fp8_wmma
-    from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
     M, K = x.shape
     E = w13.shape[0]
@@ -202,9 +211,17 @@ def w4a8_moe(
 
     topk_weights, topk_ids = _moe_time("route", _route)
 
-    sorted_ids, expert_ids, ntp = _moe_time(
-        "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
-    )
+    # moe_align: native HIP (moe_hip) by default, vLLM reference under MINISGL_MOE_ALIGN=0.
+    if _MOE_ALIGN_HIP:
+        import moe_hip
+
+        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
+    else:
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+        sorted_ids, expert_ids, ntp = _moe_time(
+            "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
+        )
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
@@ -216,14 +233,19 @@ def w4a8_moe(
         ),
     )  # (P, 2*inter)
     d = out1.shape[1] // 2
-    # NB: this image has NO fused fp16 silu_and_mul (no sgl_kernel, no torch.ops._C.silu_and_mul,
-    # and tail_hip's is bf16-only while these MoE intermediates are fp16). So the silu bucket stays
-    # the torch chain until a custom fp16 HIP silu_and_mul is vendored (the gemm1-epilogue fused
-    # variant is wmma-only -> unusable at decode where gemm1 must be gemv).
-    buf2 = _moe_time(
-        "silu",
-        lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
-    )
+    # Gated SiLU-mul: the fp16 MoE intermediates (out1 is fp16) now route through the dtype-generic
+    # native HIP tail_hip.silu_and_mul (one launch, fp32-internal, no temps) — replacing the multi-op
+    # torch chain (silu+mul+float+cast+contiguous). MINISGL_TAIL_HIP=0 reverts to the torch ref.
+    # (The gemm1-epilogue fused silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
+    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        import tail_hip  # noqa: F401  registers torch.ops.tail_hip.*
+
+        buf2 = _moe_time("silu", lambda: torch.ops.tail_hip.silu_and_mul(out1.contiguous()))
+    else:
+        buf2 = _moe_time(
+            "silu",
+            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+        )
 
     tw_flat = topk_weights.reshape(-1).float().contiguous()
     # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE kernel (mmq_fp8_moe_gemm_scatter):
