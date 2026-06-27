@@ -236,6 +236,85 @@ __global__ void gdn_prefill_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------
+// VERIFY prefill — byte-identical recurrence to gdn_prefill_kernel, but ALSO snapshots the ssm state
+// AFTER each token of the sequence into a scratch buffer `state_scratch`. Used by spec-decode's GDN
+// verify: a K+1-token varlen pass over-advances conv+ssm past the eventually-accepted prefix and the
+// plain prefill kernel keeps only the FINAL state, so the accepted-prefix state is unrecoverable.
+// Capturing every per-token state lets the scheduler install the state after the accepted prefix
+// directly (index = accepted_count - 1) — no pre-verify snapshot, no second forward (re-advance),
+// and BIT-EXACT (same recurrent path as 1-token decode would take token-by-token).
+//
+//   state_scratch: [max_qlen, N, HV, V, K]  — scratch[t, n, hv, r, :] = state row r of (seq n,
+//   value-head hv) AFTER processing the seq's (t)-th token (0-based within its window). Only the
+//   first (eos-bos) t-slots of each seq are written; the rest are left untouched.
+// All other args + math match gdn_prefill_kernel exactly. grid = (N * HV), block = V threads.
+template <typename scalar_t, typename state_t>
+__global__ void gdn_prefill_verify_kernel(
+    const scalar_t* __restrict__ q, const scalar_t* __restrict__ k, const scalar_t* __restrict__ v,
+    const scalar_t* __restrict__ a, const scalar_t* __restrict__ b,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
+    const unsigned char* __restrict__ has_initial_state,
+    state_t* __restrict__ ssm_state, state_t* __restrict__ state_scratch, scalar_t* __restrict__ out,
+    int N, int H, int HV, int K, int V, int max_qlen, float scale, int use_l2norm) {
+  const int blk = blockIdx.x, r = threadIdx.x;
+  const int n = blk / HV, hv = blk % HV, hq = hv / (HV / H);
+  const int bos = cu_seqlens[n], eos = cu_seqlens[n + 1];
+  const long slot = state_indices[n];
+  if (slot <= 0 || bos >= eos) return;
+
+  extern __shared__ float smem[];
+  float* q_s = smem;             // [K]
+  float* k_s = smem + K;         // [K]
+  float* red = smem + 2 * K;     // [blockDim.x]
+
+  float s_reg[GDN_MAX_K];
+  if (r < V) {
+    state_t* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
+    const bool use_init = has_initial_state[n] != 0;
+#pragma unroll 4
+    for (int j = 0; j < K; ++j) s_reg[j] = use_init ? (float)s_row[j] : 0.0f;
+  }
+
+  const float Alog = A_log[hv], dtb = dt_bias[hv];
+  for (int t = bos; t < eos; ++t) {
+    for (int j = r; j < K; j += blockDim.x) {
+      q_s[j] = (float)q[(t * H + hq) * K + j];
+      k_s[j] = (float)k[(t * H + hq) * K + j];
+    }
+    __syncthreads();
+    if (use_l2norm) {
+      float invq = gdn_inv_l2(q_s, K, red, r, blockDim.x);
+      float invk = gdn_inv_l2(k_s, K, red, r, blockDim.x);
+      for (int j = r; j < K; j += blockDim.x) { q_s[j] *= invq; k_s[j] *= invk; }
+      __syncthreads();
+    }
+    for (int j = r; j < K; j += blockDim.x) q_s[j] *= scale;
+    __syncthreads();
+
+    if (r < V) {
+      const float x = (float)a[t * HV + hv] + dtb;
+      const float g = -__expf(Alog) * gdn_softplus(x);
+      const float beta = 1.0f / (1.0f + __expf(-(float)b[t * HV + hv]));
+      float o = gdn_step(s_reg, q_s, k_s, (float)v[(t * HV + hv) * V + r], g, beta, K);
+      gdn_state_norm_clamp(s_reg, K, red, r, blockDim.x, SSM_STATE_MAX_NORM);
+      out[(t * HV + hv) * V + r] = (scalar_t)o;
+      // Snapshot the state AFTER this token into scratch[(t-bos), n, hv, r, :].
+      const int tw = t - bos;
+      state_t* scr = state_scratch + ((((long)tw * N + n) * HV + hv) * V + r) * K;
+#pragma unroll 4
+      for (int j = 0; j < K; ++j) scr[j] = (state_t)s_reg[j];
+    }
+    __syncthreads();
+  }
+  if (r < V) {
+    state_t* s_row = ssm_state + ((slot * HV + hv) * V + r) * K;
+#pragma unroll 4
+    for (int j = 0; j < K; ++j) s_row[j] = (state_t)s_reg[j];
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // CHUNKED prefill (fast path) — same result as gdn_prefill, but processes the sequence in chunks of
 // GDN_CHUNK tokens with intra-chunk parallelism instead of a per-token recurrence. Validated against
 // gdn_prefill (the recurrent oracle). Derivation: within a chunk (carried state S0), the gated delta
@@ -676,6 +755,48 @@ __global__ void causal_conv1d_fwd_kernel(
   }
 }
 
+// Depthwise causal conv1d, VERIFY (varlen) — byte-identical to causal_conv1d_fwd_kernel, but ALSO
+// snapshots the per-channel trailing window (the conv-state-equivalent) AFTER each token into a
+// scratch buffer. The conv state after processing token t is exactly the W-1 inputs ending at t
+// (what the next decode step would convolve against), so scratch[t] = `hist` after token t.
+//   conv_scratch: [max_qlen, N, C, W-1]   scratch[(t-bos), n, c, :] = trailing window after token t.
+// grid = (N, ceil(C/CT)); block = CT threads over channels. Same conv recurrence as the fwd kernel.
+template <typename scalar_t>
+__global__ void causal_conv1d_fwd_verify_kernel(
+    const scalar_t* __restrict__ x, const float* __restrict__ weight, const float* __restrict__ bias,
+    const int* __restrict__ cu_seqlens, const long* __restrict__ state_indices,
+    const unsigned char* __restrict__ has_initial_state, float* __restrict__ conv_state,
+    float* __restrict__ conv_scratch, scalar_t* __restrict__ out, int N, int C, int W, int max_qlen,
+    int activation) {
+  const int n = blockIdx.x;
+  const int bos = cu_seqlens[n], eos = cu_seqlens[n + 1];
+  const long slot = state_indices[n];
+  const int Wm1 = W - 1;
+  const bool use_init = has_initial_state && has_initial_state[n] != 0;
+  for (int c = blockIdx.y * blockDim.x + threadIdx.x; c < C; c += gridDim.y * blockDim.x) {
+    const float* wc = weight + c * W;
+    const float bc = bias ? bias[c] : 0.0f;
+    float* st = (slot > 0) ? conv_state + (slot * C + c) * Wm1 : nullptr;
+    float hist[16];  // W-1 <= 15 (GDN W=4); generous bound
+    for (int i = 0; i < Wm1; ++i) hist[i] = (use_init && st) ? st[i] : 0.0f;
+    for (int t = bos; t < eos; ++t) {
+      float xnew = (float)x[t * C + c];
+      float acc = bc;
+      for (int i = 0; i < Wm1; ++i) acc += hist[i] * wc[i];
+      acc += xnew * wc[Wm1];
+      for (int i = 0; i < Wm1 - 1; ++i) hist[i] = hist[i + 1];
+      hist[Wm1 - 1] = xnew;
+      if (activation) acc = acc / (1.0f + __expf(-acc));
+      out[t * C + c] = (scalar_t)acc;
+      // Snapshot the trailing window AFTER this token into scratch[(t-bos), n, c, :].
+      const int tw = t - bos;
+      float* scr = conv_scratch + (((long)tw * N + n) * C + c) * Wm1;
+      for (int i = 0; i < Wm1; ++i) scr[i] = hist[i];
+    }
+    if (st) for (int i = 0; i < Wm1; ++i) st[i] = hist[i];  // persist trailing window
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // RMSNormGated: y = (x / rms(x)) * weight * silu(z), normalized over the last dim D (norm-before-gate
 // = the Qwen3.5 GDN convention). x,z,out: [M, D]; weight: [D]. grid=(M), block=min(D,1024).
@@ -757,6 +878,31 @@ void launch_gdn_prefill(const at::Tensor& q, const at::Tensor& k, const at::Tens
   });
 }
 
+void launch_gdn_prefill_verify(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+                               const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
+                               const at::Tensor& dt_bias, const at::Tensor& cu_seqlens,
+                               const at::Tensor& state_indices, const at::Tensor& has_initial_state,
+                               at::Tensor& ssm_state, at::Tensor& state_scratch, at::Tensor& out,
+                               double scale, int64_t use_l2norm) {
+  const int H = q.size(1), K = q.size(2);
+  const int HV = v.size(1), V = v.size(2);
+  const int N = state_indices.size(0);
+  const int max_qlen = state_scratch.size(0);
+  dim3 grid(N * HV), block(V);
+  size_t shmem = (2 * K + V) * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, q.scalar_type(), "gdn_prefill_verify", [&] {
+    GDN_DISPATCH_SSM(ssm_state, "gdn_prefill_verify",
+      hipLaunchKernelGGL((gdn_prefill_verify_kernel<scalar_t, state_t>), grid, block, shmem, stream,
+          q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+          a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), CFP(A_log), CFP(dt_bias),
+          cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+          has_initial_state.data_ptr<unsigned char>(), ssm_state.data_ptr<state_t>(),
+          state_scratch.data_ptr<state_t>(), out.data_ptr<scalar_t>(),
+          N, H, HV, K, V, max_qlen, (float)scale, (int)use_l2norm));
+  });
+}
+
 void launch_gdn_prefill_chunked(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
                                 const at::Tensor& a, const at::Tensor& b, const at::Tensor& A_log,
                                 const at::Tensor& dt_bias, const at::Tensor& cu_seqlens,
@@ -830,6 +976,26 @@ void launch_causal_conv1d_fwd(const at::Tensor& x, const at::Tensor& weight,
         cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
         has_initial_state.data_ptr<unsigned char>(), FP(conv_state), out.data_ptr<scalar_t>(), N, C, W,
         (int)activation);
+  });
+}
+
+void launch_causal_conv1d_fwd_verify(const at::Tensor& x, const at::Tensor& weight,
+                                     const c10::optional<at::Tensor>& bias,
+                                     const at::Tensor& cu_seqlens, const at::Tensor& state_indices,
+                                     const at::Tensor& has_initial_state, at::Tensor& conv_state,
+                                     at::Tensor& conv_scratch, at::Tensor& out, int64_t activation) {
+  const int C = x.size(1), W = weight.size(1);
+  const int N = state_indices.size(0);
+  const int max_qlen = conv_scratch.size(0);
+  const int CT = C < 256 ? C : 256;
+  dim3 grid(N, (C + CT - 1) / CT), block(CT);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_fwd_verify", [&] {
+    hipLaunchKernelGGL((causal_conv1d_fwd_verify_kernel<scalar_t>), grid, block, 0, stream,
+        x.data_ptr<scalar_t>(), CFP(weight), bias.has_value() ? CFP(*bias) : nullptr,
+        cu_seqlens.data_ptr<int>(), state_indices.data_ptr<long>(),
+        has_initial_state.data_ptr<unsigned char>(), FP(conv_state), FP(conv_scratch),
+        out.data_ptr<scalar_t>(), N, C, W, max_qlen, (int)activation);
   });
 }
 

@@ -29,8 +29,8 @@ DS is bit-exact, so no SD transpose is threaded).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 
@@ -45,6 +45,15 @@ class GDNMetadata:
     query_start_loc: torch.Tensor  # int32 (num_seqs+1,) device — cu_seqlens
     state_indices: torch.Tensor  # int32 (num_seqs,) device — GDN slot per seq (all >= 1)
     has_initial_state: torch.Tensor | None = None  # bool (num_seqs,) device, prefill only
+
+    # ---- spec-decode VERIFY per-token-state capture (set by the scheduler; consumed by the GDN
+    # bridge during the verify forward, then read back by the scheduler to install the accepted
+    # state). When `capture_verify_state` is True the GDN layers route through the verify kernels and
+    # stash, per gdn_layer_id, the conv/ssm state AFTER each token. `verify_max_qlen` = max(K+1).
+    capture_verify_state: bool = False
+    verify_max_qlen: int = 0
+    conv_scratch: Dict[int, torch.Tensor] = field(default_factory=dict)  # gdn_layer_id -> [Q,N,C,W-1]
+    ssm_scratch: Dict[int, torch.Tensor] = field(default_factory=dict)  # gdn_layer_id -> [Q,N,HV,V,K]
 
     # ---- perf precomputation (None == kernel computes on the fly; MVP leaves None) ----
     chunk_indices: torch.Tensor | None = None

@@ -159,6 +159,113 @@ def check_prefill() -> bool:
     return ok
 
 
+def check_prefill_verify() -> bool:
+    """gdn_prefill_verify: the spec-decode oracle. Same recurrence as gdn_prefill, but it MUST also
+    snapshot the ssm state AFTER each token into scratch[t, n, hv]. Validate that scratch[t] equals
+    the recurrent state after exactly t+1 tokens (a sequential decode-style scan), AND that the final
+    out + final ssm_state match the plain gdn_prefill. This is THE bit that makes GDN spec bit-exact:
+    the scheduler installs scratch[accepted_count-1] as the post-accept state — no re-advance."""
+    lens = [6, 4]  # K+1 verify windows of different lengths
+    N = len(lens)
+    T = sum(lens)
+    max_qlen = max(lens)
+    num_slots = 6
+    cu = torch.tensor([0, *torch.cumsum(torch.tensor(lens), 0).tolist()], dtype=torch.int32, device=DEV)
+    q = torch.randn(T, H, K, device=DEV)
+    k = torch.randn(T, H, K, device=DEV)
+    v = torch.randn(T, HV, V, device=DEV)
+    a = torch.randn(T, HV, device=DEV)
+    b = torch.randn(T, HV, device=DEV)
+    A_log = torch.randn(HV, device=DEV)
+    dt_bias = torch.randn(HV, device=DEV)
+    state = torch.randn(num_slots, HV, V, K, device=DEV)
+    idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
+    has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+    q, k, v, a, b = rnd(q, k, v, a, b)
+
+    # Reference: per-token state via the same recurrent scan as gdn_prefill, capturing state[t].
+    ref_state = state.clone()
+    ref_out = torch.zeros(T, HV, V, device=DEV)
+    ref_scr = torch.zeros(max_qlen, N, HV, V, K, device=DEV)
+    for n in range(N):
+        slot = int(idx[n])
+        bos = int(cu[n])
+        for hv in range(HV):
+            hq = hv // (HV // H)
+            S = ref_state[slot, hv].clone() if has_init[n] else torch.zeros(V, K, device=DEV)
+            for t in range(bos, int(cu[n + 1])):
+                qn = F.normalize(q[t, hq], dim=-1, eps=1e-6) * SCALE
+                kn = F.normalize(k[t, hq], dim=-1, eps=1e-6)
+                g = -torch.exp(A_log[hv]) * _softplus(a[t, hv] + dt_bias[hv])
+                beta = torch.sigmoid(b[t, hv])
+                o, S = ref_step(S, qn, kn, v[t, hv].clone(), g, beta)
+                ref_out[t, hv] = o
+                ref_scr[t - bos, n, hv] = S  # state AFTER token t
+            ref_state[slot, hv] = S
+
+    got_state = state.clone()
+    got_out, got_scr = torch.ops.gdn_hip.gdn_prefill_verify(
+        to_dt(q), to_dt(k), to_dt(v), to_dt(a), to_dt(b), A_log, dt_bias, cu, idx, has_init,
+        got_state, max_qlen, SCALE, 1)
+    ok = _report("gdn_prefill_verify.out", got_out, ref_out)
+    ok &= _report("gdn_prefill_verify.final_state", got_state[idx], ref_state[idx])
+    # per-token scratch: only the first lens[n] t-slots of each seq are written. Check each.
+    for n in range(N):
+        valid = got_scr[: lens[n], n]   # [lens[n], HV, V, K]
+        ok &= _report(f"gdn_prefill_verify.scratch[seq{n}]", valid, ref_scr[: lens[n], n])
+    # the LAST written scratch slot per seq must equal the final ssm_state (what plain prefill keeps)
+    for n in range(N):
+        ok &= _report(f"gdn_prefill_verify.scratch_last==final[seq{n}]",
+                      got_scr[lens[n] - 1, n], got_state[int(idx[n])])
+    return ok
+
+
+def check_conv_fwd_verify() -> bool:
+    """causal_conv1d_fwd_verify: per-token conv-state capture for spec rollback. scratch[t] = the
+    trailing (W-1)-input window AFTER token t (what the next decode would convolve against). Validate
+    against the same sliding-window reference as conv_fwd, capturing the window each step."""
+    lens = [6, 4]
+    N, C, W = 2, 256, 4
+    T = sum(lens)
+    max_qlen = max(lens)
+    num_slots = 6
+    cu = torch.tensor([0, *torch.cumsum(torch.tensor(lens), 0).tolist()], dtype=torch.int32, device=DEV)
+    x = torch.randn(T, C, device=DEV)
+    weight = torch.randn(C, W, device=DEV)
+    bias = torch.randn(C, device=DEV)
+    state = torch.randn(num_slots, C, W - 1, device=DEV)
+    idx = torch.tensor([1, 4], dtype=torch.long, device=DEV)
+    has_init = torch.tensor([1, 0], dtype=torch.uint8, device=DEV)
+    x = rnd(x)
+
+    ref_state = state.clone()
+    ref_out = torch.zeros(T, C, device=DEV)
+    ref_scr = torch.zeros(max_qlen, N, C, W - 1, device=DEV)
+    for n in range(N):
+        slot = int(idx[n])
+        bos = int(cu[n])
+        hist = ref_state[slot].clone() if has_init[n] else torch.zeros(C, W - 1, device=DEV)
+        for t in range(bos, int(cu[n + 1])):
+            win = torch.cat([hist, x[t].unsqueeze(-1)], dim=-1)  # [C, W]
+            acc = (win * weight).sum(-1) + bias
+            ref_out[t] = F.silu(acc)
+            hist = win[:, 1:]
+            ref_scr[t - bos, n] = hist  # trailing window AFTER token t
+        ref_state[slot] = hist
+
+    got_state = state.clone()
+    got_out, got_scr = torch.ops.gdn_hip.causal_conv1d_fwd_verify(
+        to_dt(x), weight, bias, cu, idx, has_init, got_state, max_qlen, 1)
+    ok = _report("conv1d_fwd_verify.out", got_out, ref_out)
+    ok &= _report("conv1d_fwd_verify.final_state", got_state[idx], ref_state[idx])
+    for n in range(N):
+        ok &= _report(f"conv1d_fwd_verify.scratch[seq{n}]", got_scr[: lens[n], n], ref_scr[: lens[n], n])
+    for n in range(N):
+        ok &= _report(f"conv1d_fwd_verify.scratch_last==final[seq{n}]",
+                      got_scr[lens[n] - 1, n], got_state[int(idx[n])])
+    return ok
+
+
 def check_prefill_chunked() -> bool:
     """Chunked prefill vs the recurrent kernel (the validated oracle), on sequences spanning several
     GDN_CHUNK=32 chunks + a partial final chunk. Mild decay (A_log~-2) so gamma doesn't underflow —
@@ -362,6 +469,8 @@ def main() -> None:
     checks = {
         "gdn_decode": check_decode,
         "gdn_prefill": check_prefill,
+        "gdn_prefill_verify": check_prefill_verify,
+        "causal_conv1d_fwd_verify": check_conv_fwd_verify,
         "gdn_prefill_chunked": check_prefill_chunked,
         "gdn_prefill_wmma": check_prefill_wmma,
         "causal_conv1d_update": check_conv_update,

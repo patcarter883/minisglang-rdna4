@@ -174,25 +174,31 @@ DFlash/EAGLE3 need from the engine: (a) the target's **last hidden state** per v
 (b) **aux-hidden capture** — `capture_layer_ids` programs a target hook to stash N decoder layers'
 outputs; (c) `bind_target(embed, lm_head, d2t, t2d)` so a draft borrows the target's embed/head.
 
-### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — WORKING (bit-exactness pending a verify kernel)
-Validated on Qwen3.5-4B (TP=1, `--attn hip`): coherent, no crash, ~17% accept / 1.3 tok/step. NOT
-bit-exact vs single-token decode: the re-advance reprocesses through the full model, where the
-full-attention layers use the *extend* kernel (spec, n+1 tokens) vs the *decode* kernel (1 token),
-and the WMMA GDN prefill is chunk-size-dependent — so spec drifts from a 1-token-per-step reference
-by fp after a few hundred chars (output stays coherent; a rollback *logic* bug would corrupt at
-char ~10). True bit-exactness + the 2× recompute removal both need a **per-token-state GDN verify
-kernel** (emit the recurrent state after each of the K+1 tokens to a scratch buffer, index the
-accepted one — no snapshot, no re-advance). That kernel is the GDN "completion" item.
+### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — DONE, BIT-EXACT (per-token-state verify kernel)
+GPU-validated on Qwen3.5-4B (TP=1, `--attn hip`, `tools/spec_gdn.sh`): coherent, ~17% accept /
+1.29 tok/step, and **SPEC == FORCE_N0 BIT-IDENTICAL on all prompts** (368/266/347/394/392-char
+outputs, all MATCH). This is the GDN "completion" item: the 2× re-advance is gone and the output is
+now bit-exact vs a 1-token-per-step reference (previously only "coherent, fp-drifting").
 
-A verify batch carries `Batch.spec_verify=True` (phase "decode", but `extend_len=K+1`/seq). This
-flag routes the GDN layer + `build_gdn_metadata` through the **varlen recurrent (prefill) path**
-(they otherwise key on `is_prefill`). The GDN kernel persists only the FINAL recurrent state, so a
-K+1-token verify over-advances conv+ssm past the accepted prefix and the intermediate state is
-unrecoverable. Rollback (`scheduler._gdn_readvance`): snapshot conv+ssm before verify
-(`GDNStateCache.snapshot/restore`), and on a partial accept restore + **re-advance** every running
-seq through exactly its accepted tokens (a second eager forward; logits discarded). Skipped when all
-seqs fully accept. Cost: ~2× verify on partial-accept steps — a per-token-state verify kernel
-(emit the state after each of the K+1 tokens) would remove the re-advance; future work.
+The mechanism: a verify batch carries `Batch.spec_verify=True` (phase "decode", `extend_len=K+1`/seq),
+which routes the GDN layer + `build_gdn_metadata` through the varlen recurrent path. The scheduler
+sets `gdn_metadata.capture_verify_state=True` + `verify_max_qlen=max(K_i+1)`, so the GDN bridge
+(`models/qwen3_5.py`) calls `QwenGatedDeltaNet.forward_prefill_verify`, which runs the **dedicated
+per-token-state HIP kernels** — `gdn_hip.causal_conv1d_fwd_verify` + `gdn_hip.gdn_prefill_verify`.
+These are byte-identical recurrences to the plain conv/`gdn_prefill` kernels but ALSO snapshot the
+conv-window + ssm state AFTER EACH token into a scratch `[max_qlen, N, ...]`, stashed per
+`gdn_layer_id` on the metadata. (They use the bit-stable RECURRENT gdn kernel, never WMMA — the
+chunk-size dependence is exactly the non-bit-exactness this removes, so it is independent of
+`GDN_HIP_WMMA_PREFILL`.) After acceptance, `GDNStateCache.install_verify_state` gathers, per
+still-running seq, the captured state at index `committed-1` (the state after the last committed
+token) and writes it into the live conv+ssm slot for every GDN layer — a pure gather, no snapshot,
+no second forward. Kernel parity: `tools/gdn_hip_parity.py` (`gdn_prefill_verify` /
+`causal_conv1d_fwd_verify` checks — per-token scratch matches the recurrent oracle exactly, and
+`scratch[last]==final_state` max|Δ|=0, across fp32/fp16/bf16).
+
+The old snapshot + `_gdn_readvance` (restore pre-verify state, re-run the accepted tokens through a
+2nd eager forward) has been removed. `GDNStateCache.snapshot/restore` remain as a general-purpose API
+but are no longer on the spec path.
 
 ### MTP self-speculation (the appended heads we currently discard) — DESIGNED
 GLM-4.7-Flash (`num_nextn_predict_layers=1`) and Qwen3.5/3.6 (`mtp_num_hidden_layers=1`) ship one
