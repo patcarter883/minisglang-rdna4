@@ -63,6 +63,12 @@ class HIPAttnBackend(TritonRDNA4Backend):
             # folds the per-tensor descale). The helper is inherited from TritonRDNA4Backend but
             # calls ONLY torch.ops.attn_prefill_paged.* — no Triton kernel runs on this path.
             return self._hip_prefill_paged(q, layer_id, metadata)
+        # Decode phase: a spec-decode VERIFY batch carries max_seqlen_q = K+1 > 1 (multi-query
+        # against the paged prefix), so it takes the extend kernel — exactly like a radix-hit
+        # prefill. Plain decode (one token/seq, max_seqlen_q == 1) uses the single-token decode
+        # kernel. (Dispatch on max_seqlen_q, not is_prefill, so verify routes correctly.)
+        if metadata.max_seqlen_q > 1:
+            return self._hip_prefill_paged(q, layer_id, metadata)
         return self._forward_decode(q, layer_id, metadata)
 
     def _forward_prefill(

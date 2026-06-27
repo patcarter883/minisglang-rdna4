@@ -9,7 +9,18 @@ MTP/EAGLE draft heads and an MLA multi-query verify kernel.
 from __future__ import annotations
 
 from .accept import AcceptResult, verify_greedy
+from .base import Proposer, ProposeContext, make_proposer
 from .config import SPEC_ALGORITHMS, SpecConfig
-from .proposer import propose_ngram
+from .proposer import NgramProposer, propose_ngram
 
-__all__ = ["AcceptResult", "verify_greedy", "propose_ngram", "SpecConfig", "SPEC_ALGORITHMS"]
+__all__ = [
+    "AcceptResult",
+    "verify_greedy",
+    "propose_ngram",
+    "NgramProposer",
+    "Proposer",
+    "ProposeContext",
+    "make_proposer",
+    "SpecConfig",
+    "SPEC_ALGORITHMS",
+]

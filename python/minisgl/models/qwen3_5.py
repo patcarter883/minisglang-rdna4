@@ -171,7 +171,10 @@ class GDNLinearAttn(BaseOP):
         md = ctx.batch.gdn_metadata
         conv = state.conv(self._gdn_layer_id)
         ssm = state.ssm(self._gdn_layer_id)
-        if ctx.batch.is_prefill:
+        # A spec-decode VERIFY batch (phase "decode", extend_len = K+1 per seq) uses the varlen
+        # recurrent path, like a prefill. The GDN state it leaves is "after the last verify token";
+        # the scheduler snapshots + re-advances it to the accepted position (see SPEC_DECODE.md).
+        if ctx.batch.is_prefill or ctx.batch.spec_verify:
             out = self._gdn.forward_prefill(
                 x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state
             )
