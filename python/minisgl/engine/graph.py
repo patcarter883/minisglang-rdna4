@@ -88,6 +88,7 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
+        gdn_state: object | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -100,6 +101,12 @@ class GraphRunner:
         self.dummy_req = dummy_req
         self.stream = stream
         self.device = device
+        # GDN-hybrid models thread per-seq recurrent-state slots through static buffers for capture.
+        self.gdn_capture = None
+        if gdn_state is not None and self.max_graph_bs > 0:
+            from minisgl.gdn.graph_capture import GDNGraphCapture
+
+            self.gdn_capture = GDNGraphCapture(device, self.max_graph_bs)
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
@@ -134,6 +141,8 @@ class GraphRunner:
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
+            if self.gdn_capture is not None:
+                self.gdn_capture.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
@@ -154,6 +163,8 @@ class GraphRunner:
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
+        if self.gdn_capture is not None:
+            self.gdn_capture.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
 

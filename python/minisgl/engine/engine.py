@@ -28,6 +28,38 @@ from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
 
+
+# --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
+# MINISGL_PROFILE=<trace.json> captures a window of forward steps on the primary rank into a Chrome
+# trace, then no-ops. Used to split per-step wall time into GPU-active vs launch-bubble overhead.
+# Inert unless the env var is set, so it costs nothing on a normal serve.
+_PROF_STATE: Dict[str, Any] = {"p": None, "n": 0}
+
+
+def _maybe_profile() -> None:
+    spec = os.environ.get("MINISGL_PROFILE")
+    if not spec:
+        return
+    from minisgl.distributed import get_tp_info
+
+    if not get_tp_info().is_primary():
+        return
+    skip = int(os.environ.get("MINISGL_PROFILE_SKIP", "40"))
+    active = int(os.environ.get("MINISGL_PROFILE_STEPS", "50"))
+    st = _PROF_STATE
+    st["n"] += 1
+    if st["n"] == skip:
+        import torch.profiler as tp
+
+        st["p"] = tp.profile(activities=[tp.ProfilerActivity.CPU, tp.ProfilerActivity.CUDA])
+        st["p"].__enter__()
+    elif st["p"] is not None and st["n"] == skip + active:
+        torch.cuda.synchronize()
+        st["p"].__exit__(None, None, None)
+        st["p"].export_chrome_trace(spec)
+        st["p"] = None
+        logger.info_rank0(f"[profile] wrote {active}-step trace to {spec}")
+
 # Token count for the one-time GDN conv autotune warmup (3c-3). A single representative
 # prefill length settles the per-process in-place batch_ptr autotune.
 _GDN_WARMUP_TOKENS = 512
@@ -156,22 +188,20 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        # GDN-hybrid models run eager (cudagraph out of scope): an empty bs list disables
-        # capture (max_graph_bs -> 0, can_use_cuda_graph -> False). Dense path unchanged.
-        cuda_graph_bs = [] if self.gdn_state is not None else config.cuda_graph_bs
-        if self.gdn_state is not None:
-            logger.info_rank0("GDN-hybrid model: CUDA graph disabled (eager only)")
+        # GDN-hybrid models capture too: per-seq recurrent-state slots are threaded through static
+        # buffers (GDNGraphCapture), so the decode graph replays against the live conv/ssm state.
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=cuda_graph_bs,
+            cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
+            gdn_state=self.gdn_state,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -266,6 +296,7 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        _maybe_profile()
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)

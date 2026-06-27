@@ -19,9 +19,10 @@ Constraints (v0 — eager, validated on dense head_dim 64/128):
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import torch
+from minisgl.core import get_global_ctx
 
 from .triton_rdna4 import RDNA4Metadata, TritonRDNA4Backend
 
@@ -95,3 +96,55 @@ class HIPAttnBackend(TritonRDNA4Backend):
             # fp8 (e4m3) paged KV: per-tensor descale folded in the kernel (store uses scale 1.0).
             return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0)
         return self._decode(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+
+    # ---- cudagraph capture (DECODE only) -----------------------------------------------------
+    # Decode is one token/seq, so the only per-step varying metadata the kernel reads is
+    # cache_seqlens (KV length, +1 each step) and the page table (a row can gain a page). We hold
+    # both in STATIC buffers the captured graph reads; prepare_for_replay refreshes them in place
+    # before g.replay(). cu_seqlens_q is a fixed arange (all q-lengths are 1). The decode kernel
+    # bounds its reads by ctx_lens, so a fixed max-width page table is fine (stale tail ignored).
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        dev = self.kvcache.device
+        self._cap_max_bs = max(bs_list)
+        self._cap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._cap_cache_seqlens = torch.ones(self._cap_max_bs, dtype=torch.int32, device=dev)
+        self._cap_page_table = torch.zeros(
+            self._cap_max_bs, self._cap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._cap_cu_q = torch.arange(self._cap_max_bs + 1, dtype=torch.int32, device=dev)
+
+    def _decode_metadata_static(self, bs: int) -> RDNA4Metadata:
+        return RDNA4Metadata(
+            cache_seqlens=self._cap_cache_seqlens[:bs],
+            cu_seqlens_q=self._cap_cu_q[: bs + 1],
+            max_seqlen_q=1,
+            max_seqlen_k=self._cap_max_pages * self.page_size,
+            page_table=self._cap_page_table[:bs],
+            cold_prefill=False,
+        )
+
+    def _fill_decode_static(self, batch: "Batch") -> None:
+        """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding).
+        Runs eager, OUTSIDE the graph; it writes the exact tensors the captured kernel reads."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        seqlens_k = [req.device_len for req in reqs]
+        self._cap_cache_seqlens[:bs].copy_(
+            torch.tensor(seqlens_k, dtype=torch.int32, device=dev)
+        )
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (seqlens_k[i] + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._cap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_for_capture(self, batch: "Batch") -> None:
+        self._fill_decode_static(batch)
+        batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
+
+    def prepare_for_replay(self, batch: "Batch") -> None:
+        self._fill_decode_static(batch)
+        batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
