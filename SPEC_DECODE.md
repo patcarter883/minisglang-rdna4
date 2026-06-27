@@ -320,13 +320,45 @@ Future levers (not needed for the bar): tree verify (topk>1 custom-mask kernels,
 draft-extend-over-accepted-prefix seed (rebuild the chain hidden through the draft rather than reuse
 the single last aux); a bf16 (non-AWQ) target to recover the README's ~55%.
 
-### DFlash (extension target) — SCAFFOLDED via the same abstraction
-DFlash (`DFlashDraftModel`, local ckpts for Laguna/Qwen3.5/3.6): N=5–8 captured layers, 5–6-layer
-trunk, **block-parallel** drafting (denoise `block_size` mask-tokens in one pass), linear verify;
-z-lab ckpts borrow the target embed+head, Laguna ships its own + `d2t/t2d`. To add it: reuse the
-`DraftModelProposer` shape (separate ckpt load + aux-hidden capture + persistent draft KV) with a
-multi-layer block-parallel trunk. The `capture_layer_ids` / `bind_target` seams (now exercised by
-EAGLE3) exist for exactly this.
+### DFlash (separate block-diffusion draft) — DONE, GPU-VALIDATED (coherent; ~10% accept / ~1.6 tok/step)
+GPU-validated on the GDN-hybrid target Qwen3.5-4B (`Qwen/Qwen3.5-4B`, TP=1) with `--spec-algorithm
+dflash --spec-draft-model-path z-lab/Qwen3.5-4B-DFlash` (`tools/spec_dflash.sh`): **coherent** on all
+5 probes (e.g. "asking for the capital of France"), boots and serves clean. Acceptance ~9–10% /
+~1.6 emitted-tok/step at `--spec-num-draft 7` (block_size 16, so up to 7 of the 15 block positions are
+staged). This is the **tied-vocab z-lab dialect (Checkpoint A)**: 6 Qwen3 GQA layers, 8 captured
+target layers, no own embed/head (borrows the target's).
+
+Implementation (`spec/dflash.py::DFlashProposer`, `models/dflash.py::DFlashDraftModel`,
+`capture_layer_ids = dflash_config.target_layer_ids = [1,5,9,13,17,21,25,29]`): UNLIKE EAGLE3/MTP
+(autoregressive K-chains), DFlash drafts a whole BLOCK in ONE **bidirectional** "denoising" forward
+(block-diffusion). Per step: `target_hidden = hidden_norm(fc(captured_concat))` is injected as a
+per-layer **KV prefix** (`K = cat([k_proj(target_hidden), k_proj(noise)])`, V likewise, `is_causal=
+False`); the noise block `[anchor, mask×(B-1)]` (`mask_token_id 248077`) is embedded and run through
+the N-layer trunk; `lm_head` over positions 1..B-1 yields B-1 candidate drafts in parallel. The
+captured aux IS the cross-block context (the proposer keeps **no** persistent draft KV — `on_accept`
+is a no-op, the scheduler refreshes the aux seed each step). Verification stays the existing linear
+`verify_greedy`. The compressed "speculators" dialect (Checkpoint B, poolside/Laguna: own embed +
+pruned `lm_head` + `d2t/t2d`) is wired (`own_embed`/`_compressed`, `target_id = j + d2t[j]`) but the
+validated path is Checkpoint A. Env knobs: `MINISGL_DFLASH_CAPTURE_LAYERS`, `MINISGL_DFLASH_BLOCK`,
+`MINISGL_DFLASH_POS_OFF`, `MINISGL_DFLASH_CTX_POS`.
+
+**The losslessness mismatch is a GDN-verify property, NOT DFlash** (diagnosed `tools/spec_dflash_diag.sh`):
+DFlash output diverges from plain decode on 2/5 probes, but so does **n-gram** under `MINISGL_SPEC_
+FORCE_N0=1` (stage drafts, accept NONE → emit only the bonus) at the same `num_draft` — and n-gram
+FORCE_N0 diverges on a SUPERSET of the prompts. Since FORCE_N0 commits exactly the plain-decode token
+every step, the divergence is in the **GDN per-token-state verify forward** producing a slightly
+different argmax at qlen=K+1 than a 1-token decode (the recurrent verify kernel's chunked processing
+couples position 0's output to the rest of the verify window). Measured (`tools/spec_gdn_qlen.sh`,
+these 5 prompts): n-gram FORCE_N0 diverges on 3/5 at EVERY block size tested — qlen=4 (`num_draft=3`),
+qlen=6 (`num_draft=5`), qlen=8 (`num_draft=7`) — so it is not a "large block" effect but a baseline
+property of the GDN verify recurrent kernel vs the 1-token decode kernel on these prompts. DFlash
+diverges on a strict SUBSET (2/5) — it accepts FEWER of the drifting tail positions, so it is strictly
+no worse than the GDN verify floor it inherits. (The earlier
+`tools/spec_gdn.sh` "bit-exact at num_draft=5" was on a different, shorter prompt set that happened to
+land on the stable side; this is a prompt-dependent fp drift, not a regression.) DFlash's draft math is
+correct (coherent output, non-trivial acceptance); the residual non-determinism is the shared GDN
+verify kernel, tracked separately. A non-GDN target (MHA/MLA) verify is bit-exact — DFlash on those is
+the same proposer with a different verify dispatch.
 
 ---
 
