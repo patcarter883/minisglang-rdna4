@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.gdn.layer import QwenGatedDeltaNet
@@ -308,12 +309,104 @@ class Qwen3_5Model(BaseOP):
             if cap_set is not None and lid in cap_set:
                 # output hidden of layer lid = the residual stream after it (feeds the next layer).
                 grabbed[lid] = residual.clone()
+        # MTP seed = the PRE-final-norm residual stream (x + residual), the Qwen3.5 MTP
+        # `previous_hidden_states` input (the MTP's own pre_fc_norm_hidden re-normalizes it).
+        pre_norm = (x + residual).clone() if return_hidden else None
         final = self.norm.forward(x, residual)[0]
         if return_hidden:
             # stack in the programmed id order so a consumer can index aux by position; None if empty.
             aux_stack = torch.stack([grabbed[i] for i in cap], dim=0) if cap else None
-            return final, aux_stack
+            return final, pre_norm, aux_stack
         return final
+
+
+class Qwen3_5MTPAttn(Qwen3_5Attn):
+    """Gated partial-rotary GQA for the self-contained MTP draft chain. Reuses the q/k/v/o
+    projections + q_norm/k_norm of Qwen3_5Attn but runs a MATERIALIZED causal attention over the
+    SHORT per-request draft chain (no paged KV / attn backend)."""
+
+    def __init__(self, config: ModelConfig, layer_id: int):
+        super().__init__(config, layer_id)
+        self._num_kv_heads = div_even(config.num_kv_heads, get_tp_info().size)
+        self._scale = float(self._head_dim) ** -0.5
+
+    def forward_draft(
+        self, x: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
+    ) -> torch.Tensor:
+        T = x.shape[0]
+        hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
+        qg = self.q_proj.forward(x).view(T, nq, 2 * hd)
+        q = qg[..., :hd].reshape(T, nq * hd)
+        gate = qg[..., hd:].reshape(T, nq * hd)
+        k = self.k_proj.forward(x)
+        v = self.v_proj.forward(x).view(T, nkv, hd)
+        # q_norm/k_norm over head_dim, then partial rotary (same as AttentionLayer).
+        self.q_norm.forward_inplace(q.view(T, nq, hd))
+        self.k_norm.forward_inplace(k.view(T, nkv, hd))
+        q, k = self.attn.rotary.forward(positions, q, k)
+        q = q.view(T, nq, hd)
+        k = k.view(T, nkv, hd)
+        cache.append((k, v))
+        Ks = torch.stack([c[0] for c in cache], dim=0)  # [S,T,nkv,hd]
+        Vs = torch.stack([c[1] for c in cache], dim=0)  # [S,T,nkv,hd]
+        # GQA: each q-head maps to kv-head (h // (nq//nkv)). Expand kv heads to q heads.
+        rep = nq // nkv
+        Ks = Ks.repeat_interleave(rep, dim=2)  # [S,T,nq,hd]
+        Vs = Vs.repeat_interleave(rep, dim=2)
+        scores = torch.einsum("thd,sthd->ths", q, Ks) * self._scale  # [T,nq,S]
+        probs = scores.softmax(dim=-1).to(Vs.dtype)
+        o = torch.einsum("ths,sthd->thd", probs, Vs).reshape(T, nq * hd)
+        o = o * torch.sigmoid(gate)
+        return self.o_proj.forward(o)
+
+
+class Qwen3_5MTPHead(BaseOP):
+    """Qwen3.5 MTP (next-token-prediction) self-speculation head — a single STANDARD full-attention
+    decoder layer (mtp.layers.0) plus the fc fuser and pre-norms; REUSES the target's embed_tokens
+    and TIED lm_head (no dedicated embed/head in the checkpoint):
+
+        h_mtp = layer( fc( concat[ pre_fc_norm_embedding(embed(tok)), pre_fc_norm_hidden(last_hidden) ] ) )
+        logits = lm_head( mtp.norm(h_mtp) )
+
+    Run K times autoregressively (own short draft chain, no paged KV); see MTPProposer."""
+
+    def __init__(self, config: ModelConfig, layer_id: int, embed: VocabParallelEmbedding,
+                 lm_head: ParallelLMHead):
+        eps = config.rms_norm_eps
+        self.pre_fc_norm_embedding = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
+        self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
+        self.fc = LinearColParallelMerged(
+            2 * config.hidden_size, [config.hidden_size], has_bias=False
+        )
+        self.self_attn = Qwen3_5MTPAttn(config, layer_id)
+        self.mlp = Qwen3MLP(config)
+        self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
+        self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
+        self.norm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
+        # Tied to the TARGET embed + lm_head (hidden, not loaded/saved as MTP weights).
+        self._embed = embed
+        self._lm_head = lm_head
+
+    def embed(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self._embed.forward(tokens)
+
+    def fuse(self, embed_e: torch.Tensor, last_hidden: torch.Tensor) -> torch.Tensor:
+        e = self.pre_fc_norm_embedding.forward(embed_e)
+        h = self.pre_fc_norm_hidden.forward(last_hidden)
+        return self.fc.forward(torch.cat([e, h], dim=-1))
+
+    def step(
+        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, residual = self.input_layernorm.forward(fused, None)
+        x = self.self_attn.forward_draft(x, positions, cache, step)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        x = self.mlp.forward(x)
+        hidden = x + residual
+        normed = self.norm.forward(hidden, None)[0]
+        # Full-vocab logits via the (tied) lm_head's TP all_gather — identical on every rank.
+        logits = self._lm_head.logits_all_rows(normed)
+        return logits, hidden
 
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
@@ -327,14 +420,23 @@ class Qwen3_5ForConditionalGeneration(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
+        # MTP self-speculation head (mtp.* namespace). Built only when the checkpoint ships one
+        # (mtp_num_hidden_layers>0); reuses the target embed + tied lm_head (no dedicated tensors).
+        self.mtp = (
+            Qwen3_5MTPHead(config, layer_id=config.num_layers,
+                           embed=self.model.embed_tokens, lm_head=self.lm_head)
+            if config.mtp_num_hidden_layers > 0
+            else None
+        )
         super().__init__()
 
     def forward(self, return_hidden: bool = False):
         input_ids = get_global_ctx().batch.input_ids
         if return_hidden:
-            # last_hidden = post-final-norm hidden (pre-lm_head); aux = stacked captured layers.
-            last_hidden, aux_hidden = self.model.forward(input_ids, return_hidden=True)
-            return self.lm_head.forward(last_hidden), last_hidden, aux_hidden
+            # (post-norm for lm_head, pre-norm residual for the MTP seed, aux). MTP seeds from
+            # the PRE-final-norm residual stream (its pre_fc_norm_hidden re-normalizes it).
+            final, pre_norm, aux_hidden = self.model.forward(input_ids, return_hidden=True)
+            return self.lm_head.forward(final), pre_norm, aux_hidden
         return self.lm_head.forward(self.model.forward(input_ids))
 
     def set_capture_layers(self, ids: List[int] | None) -> None:

@@ -54,7 +54,8 @@ class ModelConfig:
     routed_scaling_factor: float = 1.0
     first_k_dense_replace: int = 0  # first K decoder layers use a dense MLP, not MoE
     n_shared_experts: int = 0  # always-on shared experts (added, not gated — GLM/DeepSeek style)
-    num_nextn_predict_layers: int = 0  # MTP heads appended after the decoder; skipped at serve
+    num_nextn_predict_layers: int = 0  # GLM/DeepSeek MTP heads appended after the decoder
+    mtp_num_hidden_layers: int = 0  # Qwen3.5 MTP head (mtp.* namespace); 0 = no MTP head
     # ---- GDN / linear-attention (Qwen3-Next / Qwen3.5 hybrid). None for dense models. ----
     # `layer_types[i]` is "linear_attention" (GDN) or "full_attention". Populated by from_hf
     # ONLY when the config carries linear-attention dims, so the dense path stays untouched.
@@ -145,6 +146,7 @@ class ModelConfig:
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0) or 0
         n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
         num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
+        mtp_num_hidden_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0
 
         # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict;
         # Qwen3.5: a single `rope_parameters` dict (rope_theta + partial_rotary_factor + mrope).
@@ -234,4 +236,5 @@ class ModelConfig:
             first_k_dense_replace=first_k_dense_replace,
             n_shared_experts=n_shared_experts,
             num_nextn_predict_layers=num_nextn_predict_layers,
+            mtp_num_hidden_layers=mtp_num_hidden_layers,
         )

@@ -256,6 +256,9 @@ class Scheduler(SchedulerIOMixin):
         # This single site covers both normal finish (via _process_last_data) and abort.
         if self.gdn_slots is not None:
             self.gdn_slots.free(req.uid)
+        # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
+        if self._proposer is not None:
+            self._proposer.free(req.uid)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)

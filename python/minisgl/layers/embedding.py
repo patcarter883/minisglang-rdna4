@@ -85,6 +85,25 @@ class ParallelLMHead(VocabParallelEmbedding):
             return super().state_dict(prefix=prefix, result=result)
         return {} if result is None else result
 
+    def logits_all_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits over ALL input rows (no prefill last-token reduction, no batch context).
+
+        Used by the MTP draft head, which runs OUTSIDE the normal batch forward (every row scored)
+        and MUST produce identical full-vocab logits on every TP rank — calling F.linear over the
+        local vocab shard would leave each rank with a different half, so the per-rank argmax drafts
+        would diverge and desync the verify batch (collective deadlock). Mirrors the all_gather in
+        ``forward`` but keeps every row."""
+        module = self.tied_embedding or self
+        logits = F.linear(x, module.weight, self.bias)  # [rows, vocab//tp]
+        if self.tp_size == 1:
+            return logits
+        input_shape = logits.shape
+        output_tensor = self._comm.all_gather(logits)
+        output_tensor = output_tensor.view((self.tp_size,) + input_shape)
+        output_tensor = output_tensor.permute(1, 0, 2).contiguous()
+        output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
+        return output_tensor[:, : self.num_embeddings]
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()

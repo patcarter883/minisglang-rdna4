@@ -66,6 +66,10 @@ class Proposer(ABC):
         """Roll back any draft-owned state (draft KV / recurrent state) to the accepted prefix.
         Default no-op: n-gram owns no state. MTP/DFlash/EAGLE override to truncate their draft KV."""
 
+    def free(self, uid: int) -> None:
+        """Release any per-request draft-owned state (draft KV) for a finished/aborted request.
+        Default no-op (n-gram); MTP/DFlash/EAGLE override to drop their persistent per-uid cache."""
+
 
 def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
     """Construct the proposer for a spec config. `engine` is passed to model-based proposers
@@ -92,4 +96,10 @@ def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
             ngram_max=spec_config.ngram_max,
             ngram_min=spec_config.ngram_min,
         )
+    if spec_config.algorithm == "mtp":
+        from .mtp import MTPProposer
+
+        if engine is None:
+            raise ValueError("the MTP proposer needs the engine (model + device); none was passed")
+        return MTPProposer(engine=engine, num_draft=spec_config.num_draft)
     raise ValueError(f"no proposer for spec algorithm {spec_config.algorithm!r}")

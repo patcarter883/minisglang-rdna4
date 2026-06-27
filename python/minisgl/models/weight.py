@@ -45,6 +45,18 @@ def _is_beyond_decoder(name: str, num_layers: int) -> bool:
     return m is not None and int(m.group(1)) >= num_layers
 
 
+def _remap_glm_mtp(name: str, num_layers: int) -> str | None:
+    """Remap a GLM-4.x MTP checkpoint key `(model.)layers.<num_layers>.X` -> the model-native
+    `mtp.X` so GLMMTPHead receives it. The MTP layer is structurally a GLMDecoderLayer (self_attn
+    MLA + mlp MoE) PLUS embed_tokens / enorm / hnorm / eh_proj / shared_head.{norm,head}; every
+    sub-key maps 1:1 under the `mtp.` root, and the standard merge/shard/expert-stack pipeline then
+    handles the MLA q/kv splits, the AWQ routed-expert stacking, and (TP>1) head/vocab sharding."""
+    body = name.removeprefix("language_model.").removeprefix("model.")
+    prefix = f"layers.{num_layers}."
+    assert body.startswith(prefix), f"unexpected MTP key layout: {name!r}"
+    return "mtp." + body[len(prefix) :]
+
+
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy. (No-op at n==1.)
     AWQ/GPTQ packed tensors flip the shard axis vs a bf16 weight (see _AWQ_SUFFIXES)."""
@@ -63,7 +75,7 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
         return value.chunk(n, dim=1 if is_awq else 0)[r].clone()
     elif any(key.count(sub) for sub in _SPLIT_DIM_1):  # row-parallel (input-sharded)
         return value.chunk(n, dim=0 if is_awq else 1)[r].clone()
-    elif key.count("lm_head") or key.count("embed_tokens"):
+    elif key.count("lm_head") or key.count("embed_tokens") or key.count("shared_head.head"):
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, n)
         vocab_start_idx = r * num_embeddings_per_partition
@@ -102,7 +114,8 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
 # stores it as a flat Parameter, not an nn.Conv1d). Dense MLP gate/up -> gate_up (as elsewhere).
 # Full-attn q/k/v stay SEPARATE: q_proj carries the per-head output gate (emits 2x), so it cannot
 # be fused into a single qkv_proj the way the dense Qwen3 path does.
-_QWEN35_SKIP_PREFIXES = ("model.visual.", "visual.", "mtp.")
+# mtp.* is handled separately (loaded for the mtp proposer, else skipped) before this check.
+_QWEN35_SKIP_PREFIXES = ("model.visual.", "visual.")
 _QWEN35_LM_PREFIX = "model.language_model."
 # checkpoint suffix -> renamed native suffix (rename only, no concat)
 _QWEN35_RENAME = {".linear_attn.conv1d.weight": ".linear_attn.conv1d_weight"}
@@ -131,7 +144,28 @@ def _gate_up_merge(key: str):
     return None
 
 
-def qwen3_5_remap(ckpt_key: str):
+# Qwen3.5 MTP (mtp.* namespace) -> model-native `mtp.*` remap (single full-attention layer +
+# fc fuser + pre-norms; reuses the target embed + tied lm_head, so no dedicated embed/head key).
+# `mtp.layers.0.X` collapses to `mtp.X`; the gate/up of the dense MLP still merges to gate_up.
+_QWEN35_MTP_LAYER0 = "mtp.layers.0."
+
+
+def _qwen3_5_mtp_remap(ckpt_key: str):
+    """Map an `mtp.*` checkpoint key to the model-native `mtp.*` key plan (or None to skip)."""
+    if ckpt_key.startswith(_QWEN35_MTP_LAYER0):
+        native = "mtp." + ckpt_key[len(_QWEN35_MTP_LAYER0) :]
+    else:
+        native = ckpt_key  # mtp.fc / mtp.norm / mtp.pre_fc_norm_* — already native
+    # dense MLP gate/up -> gate_up (same concat as the backbone dense path).
+    for suffix, slot in ((".mlp.gate_proj.weight", "gate"), (".mlp.up_proj.weight", "up")):
+        if native.endswith(suffix):
+            merged = native[: -len(suffix)] + ".mlp.gate_up_proj.weight"
+            members = (".mlp.gate_proj.weight", ".mlp.up_proj.weight")
+            return ("concat", merged, members.index(suffix), 2, 0)
+    return ("direct", native)
+
+
+def qwen3_5_remap(ckpt_key: str, load_mtp: bool = False):
     """Map a Qwen3.5 GDN-hybrid checkpoint key to a minisgl-native key plan. Pure (no tensors),
     so it is CPU-testable against the checkpoint header vs. the model's `state_dict()`.
 
@@ -140,6 +174,8 @@ def qwen3_5_remap(ckpt_key: str):
       ``("direct", native_key)``                         -> rename only
       ``("concat", merged_key, slot, n_slots, cat_dim)`` -> one member of an ordered concat group
     """
+    if ckpt_key.startswith("mtp."):
+        return _qwen3_5_mtp_remap(ckpt_key) if load_mtp else None
     if ckpt_key.startswith(_QWEN35_SKIP_PREFIXES):
         return None
     if ckpt_key == "lm_head.weight":
@@ -274,7 +310,7 @@ def _load_qwen3_5_weight(
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                plan = qwen3_5_remap(name)
+                plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
                 if plan is None:
                     continue
                 # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
@@ -314,20 +350,27 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
+            for ckpt_name in f.keys():
+                name = ckpt_name
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
-                # Skip appended MTP / next-token-prediction layers (GLM-4.x / DeepSeek): we serve
-                # the decoder only. layers.<n> with n >= num_layers is the MTP head.
+                # Appended MTP / next-token-prediction layers (GLM-4.x / DeepSeek): layers.<n> with
+                # n >= num_layers is the MTP head. Skip it UNLESS the model loads one (mtp proposer),
+                # in which case remap `(model.)layers.<num_layers>.X` -> `mtp.X` so the model's
+                # GLMMTPHead receives it (and the merge/shard/expert-stack pipeline below applies).
                 if _is_beyond_decoder(name, config.num_layers):
-                    continue
+                    if config.num_nextn_predict_layers <= 0:
+                        continue
+                    name = _remap_glm_mtp(name, config.num_layers)
+                    if name is None:
+                        continue
                 # GPTQ act-order indices: with desc_act=False the group map is the trivial
                 # arange(K)//group_size, already implied by the op's grouped layout, so g_idx is
                 # never materialized. (desc_act=True is rejected later in process_weights_after_load.)
                 if name.endswith(".g_idx"):
                     continue
-                raw = f.get_tensor(name)
+                raw = f.get_tensor(ckpt_name)
                 name = name.removeprefix("language_model.")
                 # AutoGPTQ emits a bias for EVERY linear, all-zero where the original layer had
                 # bias=False (here: o_proj, all experts, the shared expert). The model declares no

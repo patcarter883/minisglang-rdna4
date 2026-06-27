@@ -318,12 +318,133 @@ class GLMModel(BaseOP):
             if cap_set is not None and lid in cap_set:
                 # output hidden of layer lid = the residual stream after it (feeds the next layer).
                 grabbed[lid] = residual.clone()
+        # MTP seed = the PRE-final-norm residual stream (x + residual), the standard GLM/DeepSeek
+        # NextN `previous_hidden_states` input (the MTP's own hnorm re-normalizes it). Snapshot it
+        # before self.norm mutates `residual` in place. Only materialized when capturing.
+        pre_norm = (x + residual).clone() if return_hidden else None
         final = self.norm.forward(x, residual)[0]
         if return_hidden:
             # stack in the programmed id order so a consumer can index aux by position; None if empty.
             aux_stack = torch.stack([grabbed[i] for i in cap], dim=0) if cap else None
-            return final, aux_stack
+            return final, pre_norm, aux_stack
         return final
+
+
+class GLMMTPAttention(GLMMLAAttention):
+    """MLA attention for the self-contained MTP draft chain.
+
+    Reuses the decoder MLA projections (q_a/q_b, kv_a/kv_b, o_proj, RoPE, W_UK/W_UV absorption via
+    post_load) but runs a MATERIALIZED causal attention over the SHORT per-request draft chain
+    (<= K tokens, freshly built each propose), never touching the engine's paged latent cache or the
+    attn backend. `forward_draft(x, positions)` processes one autoregressive step for all B requests
+    (x: [B, hidden]); it appends each step's per-head k/v latent to a running cache the caller owns."""
+
+    def forward_draft(
+        self, x: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
+    ) -> torch.Tensor:
+        # x: [B, hidden] (one MTP token per request); positions: [B] absolute RoPE positions.
+        # cache: list growing per step, each entry (k_full [B,H,qk], v [B,H,vhd]); returns [B, hidden].
+        T = x.shape[0]
+        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        q = q.view(T, H, self.qk_head_dim)
+        q_nope, q_rope = q[..., :nope], q[..., nope:]
+        kv = self.kv_a_proj_with_mqa.forward(x)
+        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
+        k_rope = kv[:, self.kv_lora_rank :]
+        q_rope, k_rope = self.rotary.forward(
+            positions, q_rope.reshape(T, H * rope).contiguous(), k_rope.contiguous()
+        )
+        q_rope = q_rope.view(T, H, rope)
+        # Materialize per-head k_nope / v from the latent (drop the absorption — chain is tiny).
+        kvb = self.kv_b_proj.forward(c_kv).view(T, H, nope + vhd)
+        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [T,H,nope], [T,H,vhd]
+        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(T, H, rope)], dim=-1)  # [T,H,qk]
+        q_full = torch.cat([q_nope, q_rope], dim=-1)  # [T,H,qk]
+        cache.append((k_full, v))
+        # Causal attention over the chain so far (steps 0..step). Stack -> [S,T,H,*].
+        Ks = torch.stack([c[0] for c in cache], dim=0)  # [S,T,H,qk]
+        Vs = torch.stack([c[1] for c in cache], dim=0)  # [S,T,H,vhd]
+        # scores[t,h,s] = q[t,h]·k[s,t,h]; per (t,h): attend keys 0..step (all causal, current incl.).
+        scores = torch.einsum("thd,sthd->ths", q_full, Ks) * self.scale_attn  # [T,H,S]
+        probs = scores.softmax(dim=-1).to(Vs.dtype)
+        o = torch.einsum("ths,sthd->thd", probs, Vs)  # [T,H,vhd]
+        return self.o_proj.forward(o.reshape(T, H * vhd))
+
+    def post_load(self) -> None:
+        super().post_load()
+        self.scale_attn = float(self.qk_head_dim) ** -0.5
+
+
+class GLMMTPHead(BaseOP):
+    """GLM-4.x MTP (next-token-prediction) self-speculation head — a FULL MLA+MoE decoder layer at
+    model.layers.<num_layers> plus its own untied embed/lm_head and the enorm/hnorm/eh_proj fuser:
+
+        h_mtp = layer( eh_proj( concat[ enorm(embed(tok)), hnorm(last_hidden) ] ) )
+        logits = shared_head.head( shared_head.norm(h_mtp) )
+
+    Run K times autoregressively (own short draft chain, no paged KV); see MTPProposer."""
+
+    def __init__(self, config: "ModelConfig", layer_id: int, expert_quant):
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+        )
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # eh_proj: concat[enorm(e), hnorm(h)] (2*hidden) -> hidden. Replicated (no TP split).
+        self.eh_proj = LinearReplicated(2 * config.hidden_size, config.hidden_size, has_bias=False)
+        # The MTP decoder layer mirrors GLMDecoderLayer but uses the draft MLA attention.
+        self.self_attn = GLMMTPAttention(config, layer_id)
+        self.mlp = GLMSparseBlock(config, expert_quant)
+        self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNormFused(
+            size=config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.shared_head = GLMMTPSharedHead(config)
+        self._layer_id = layer_id
+
+    def embed(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens.forward(tokens)
+
+    def fuse(self, embed_e: torch.Tensor, last_hidden: torch.Tensor) -> torch.Tensor:
+        # concat[ enorm(e), hnorm(h) ] -> eh_proj -> hidden
+        e = self.enorm.forward(embed_e)
+        h = self.hnorm.forward(last_hidden)
+        return self.eh_proj.forward(torch.cat([e, h], dim=-1))
+
+    def step(
+        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One MTP decoder-layer step over the fused [B, hidden] input. Returns (logits, hidden)
+        where hidden feeds the NEXT step's hnorm and logits gives the next draft token."""
+        # GLMDecoderLayer-shaped: input_layernorm(no residual on the fused input) -> attn ->
+        # post_attention_layernorm(residual) -> mlp(residual). The fused vector is the layer input.
+        x, residual = self.input_layernorm.forward(fused, None)
+        x = self.self_attn.forward_draft(x, positions, cache, step)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        x = self.mlp.forward(x)
+        hidden = x + residual  # residual stream after the layer
+        logits = self.shared_head.forward(hidden)
+        return logits, hidden
+
+
+class GLMMTPSharedHead(BaseOP):
+    """The MTP head's own (untied) final norm + lm_head."""
+
+    def __init__(self, config: "ModelConfig"):
+        self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+        self.head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=False,
+            tied_embedding=None,
+        )
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        normed = self.norm.forward(hidden, None)[0]
+        # Full-vocab logits over all rows (TP all_gather, no prefill reduction) — every rank MUST see
+        # the SAME full-vocab argmax or the per-rank drafts desync the verify batch.
+        return self.head.logits_all_rows(normed)
 
 
 class Glm4MoeLiteForCausalLM(BaseLLMModel):
@@ -340,14 +461,22 @@ class Glm4MoeLiteForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
+        # MTP self-speculation head (model.layers.<num_layers>). Built only when the checkpoint
+        # ships one (num_nextn_predict_layers>0); the routed experts in its MoE follow expert_quant.
+        self.mtp = (
+            GLMMTPHead(backbone_cfg, layer_id=config.num_layers, expert_quant=expert_quant)
+            if config.num_nextn_predict_layers > 0
+            else None
+        )
         super().__init__()
 
     def forward(self, return_hidden: bool = False):
         input_ids = get_global_ctx().batch.input_ids
         if return_hidden:
-            # last_hidden = post-final-norm hidden (pre-lm_head); aux = stacked captured layers.
-            last_hidden, aux_hidden = self.model.forward(input_ids, return_hidden=True)
-            return self.lm_head.forward(last_hidden), last_hidden, aux_hidden
+            # The model returns (post-norm hidden for lm_head, pre-norm residual for MTP, aux). The
+            # MTP seed is the PRE-final-norm residual stream (last_hidden); lm_head uses the post-norm.
+            final, pre_norm, aux_hidden = self.model.forward(input_ids, return_hidden=True)
+            return self.lm_head.forward(final), pre_norm, aux_hidden
         return self.lm_head.forward(self.model.forward(input_ids))
 
     def set_capture_layers(self, ids: list[int] | None) -> None:

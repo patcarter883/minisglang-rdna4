@@ -233,8 +233,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--spec-algorithm",
         type=str,
         default=ServerArgs.spec_algorithm,
-        choices=["none", "ngram"],
-        help="Speculative-decoding proposer. 'none' disables it; 'ngram' enables prompt-lookup.",
+        choices=["none", "ngram", "mtp"],
+        help="Speculative-decoding proposer. 'none' disables it; 'ngram' = prompt-lookup; "
+        "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5).",
     )
     parser.add_argument(
         "--spec-num-draft",
