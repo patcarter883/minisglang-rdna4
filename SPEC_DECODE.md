@@ -174,6 +174,38 @@ DFlash/EAGLE3 need from the engine: (a) the target's **last hidden state** per v
 (b) **aux-hidden capture** — `capture_layer_ids` programs a target hook to stash N decoder layers'
 outputs; (c) `bind_target(embed, lm_head, d2t, t2d)` so a draft borrows the target's embed/head.
 
+### Target hidden-state exposure (seams (a)+(b)) — DONE, GPU-validated (capture-neutral)
+The foundation MTP/EAGLE3/DFlash consume. **OFF by default** — a pure n-gram serve (and normal
+decode) pays nothing: capture only engages when a proposer declares `needs_last_hidden` /
+`capture_layer_ids`. The exposed API (what the draft-head phases call):
+
+- **`*ForCausalLM.forward(return_hidden=False)`** (`models/{qwen3,qwen3_5,glm4_moe_lite}.py`, base
+  in `models/base.py`). Default returns just `lm_head` logits (unchanged). With `return_hidden=True`
+  returns `(logits, last_hidden, aux_hidden)`:
+  - `last_hidden`: `[num_tokens, hidden]` post-final-norm, pre-`lm_head` (the MTP/EAGLE seed).
+  - `aux_hidden`: `[num_capture_layers, num_tokens, hidden]` — the residual stream AFTER each
+    programmed decoder layer (what feeds the next layer), stacked **in the `set_capture_layers` id
+    order**; `None` if no layers are programmed.
+- **`*ForCausalLM.set_capture_layers(ids: list[int] | None)`** — program which decoder layers stash
+  their output (`None`/`[]` = off). Wired once at proposer init from `proposer.capture_layer_ids`.
+- **`Engine.forward_verify(batch, return_hidden=False)`** (`engine/engine.py`) — threads the flag to
+  the model; same return contract. One forward, no extra pass.
+- **Scheduler** (`scheduler/scheduler.py::_spec_decode_step`): reads the proposer's
+  `needs_last_hidden` / `capture_layer_ids` at init (programs `set_capture_layers`). Per verify step,
+  iff `capture`, calls `forward_verify(return_hidden=True)`, then for each still-running req clones
+  the **seed row** = `block_start + len(keep)-1` (the verify row that produced the last committed
+  token — the same index the GDN per-token-state install uses) into per-uid
+  `_spec_last_hidden[uid]` `[hidden]` / `_spec_aux_hidden[uid]` `[num_capture_layers, hidden]`. These
+  are handed to the **next** step's `ProposeContext(last_hidden=…, aux_hidden=…)` keyed by uid;
+  finished uids drop out. The big `[T, …]` verify tensors are released after slicing.
+
+Validated: `tools/spec_capture.sh` (Qwen3-0.6B, MHA, layers `0,13,27`) — the `_CaptureProbeProposer`
+(env `MINISGL_SPEC_CAPTURE_PROBE=<ids>`) drafts exactly like n-gram but asserts the per-uid shapes
+(`last_hidden=(1024,)`, `aux_hidden=(3,1024)`, bf16, delivered across steps) and its greedy output is
+**bit-identical to plain n-gram spec** (capture is output-neutral: 3/3 prompts MATCH). Note the
+oracle is plain-spec, NOT plain-decode (the verify kernel's fp differs from the decode kernel — see
+the top-of-doc residual-divergence note).
+
 ### GDN-hybrid models (qwen3_5 / qwen3_5_moe) — DONE, BIT-EXACT (per-token-state verify kernel)
 GPU-validated on Qwen3.5-4B (TP=1, `--attn hip`, `tools/spec_gdn.sh`): coherent, ~17% accept /
 1.29 tok/step, and **SPEC == FORCE_N0 BIT-IDENTICAL on all prompts** (368/266/347/394/392-char
@@ -209,9 +241,11 @@ untied `shared_head.head` + a full **MLA+MoE** layer at `layers.47`; Qwen reuses
 + tied lm_head and ships a single **standard full-attention** `mtp.layers.0` (NOT GDN — so the MTP
 draft forward never touches GDN state; only the verify over the 32-layer backbone does, handled
 above). Implementation: (1) load the head (exempt those tensors, add module classes reusing
-`GLMDecoderLayer` / `Qwen3_5Attn`+MLP); (2) expose `last_hidden` from the target forward (split
-`model.forward` from `lm_head`); (3) `MTPProposer` runs the head autoregressively K times with its
-own 1-layer draft KV, `on_accept` truncates that KV. Validate GLM (no GDN) first, then Qwen3.5.
+`GLMDecoderLayer` / `Qwen3_5Attn`+MLP); (2) ~~expose `last_hidden` from the target forward~~ **DONE**
+— `forward(return_hidden=True)` / `forward_verify(return_hidden=True)` return `last_hidden` (and the
+scheduler carries the per-uid seed row into the next `ProposeContext`); see "Target hidden-state
+exposure" above; (3) `MTPProposer` runs the head autoregressively K times with its own 1-layer draft
+KV, `on_accept` truncates that KV. Validate GLM (no GDN) first, then Qwen3.5.
 
 ### DFlash / EAGLE3 (extension targets) — SCAFFOLDED via the abstraction
 Both consume `fc(concat of N captured target layers)` → trunk → head, from a **separate checkpoint**

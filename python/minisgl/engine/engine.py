@@ -331,7 +331,7 @@ class Engine:
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
-    def forward_verify(self, batch: Batch) -> torch.Tensor:
+    def forward_verify(self, batch: Batch, return_hidden: bool = False):
         """Eager forward for a speculative-decode verify batch.
 
         The batch is built with ``phase='decode'`` but each req carries ``extend_len = K+1`` query
@@ -342,12 +342,17 @@ class Engine:
           * the LM head does the per-req last-token reduction only for ``is_prefill``, so a decode
             batch returns logits for ALL tokens — exactly the K+1 per-position logits verify needs.
 
-        Returns the full logits ``[sum(extend_len), vocab]``. No sampling and no ``complete_one``:
-        the scheduler owns acceptance, commit, and req advancement. Never uses a CUDA graph (the
-        verify batch is variable-length); MVP is eager-only."""
+        Returns the full logits ``[sum(extend_len), vocab]``. With ``return_hidden=True`` (draft-head
+        proposers — MTP / EAGLE3 / DFlash) returns ``(logits, last_hidden, aux_hidden)`` where
+        ``last_hidden`` is the post-final-norm hidden ``[sum(extend_len), hidden]`` (pre-lm_head) and
+        ``aux_hidden`` is the stacked captured decoder layers ``[num_capture_layers, sum(extend_len),
+        hidden]`` (or ``None`` if no capture layers are programmed). Capture layers are programmed via
+        ``model.set_capture_layers`` at proposer init. No sampling and no ``complete_one``: the
+        scheduler owns acceptance, commit, and req advancement. Never uses a CUDA graph (the verify
+        batch is variable-length); MVP is eager-only."""
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            return self.model.forward()
+            return self.model.forward(return_hidden=return_hidden)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

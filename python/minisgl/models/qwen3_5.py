@@ -287,13 +287,33 @@ class Qwen3_5Model(BaseOP):
             ]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True)
+        # Spec-decode aux capture: decoder-layer ids whose output hidden is stashed (None = off).
+        self._capture_layer_ids: List[int] | None = None
+        self._aux_hidden: List[torch.Tensor] | None = None
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def set_capture_layers(self, ids: List[int] | None) -> None:
+        self._capture_layer_ids = list(ids) if ids else None
+
+    def forward(
+        self, input_ids: torch.Tensor, return_hidden: bool = False
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor | None]:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        # Aux capture is OFF unless return_hidden AND layers are programmed: zero cost otherwise.
+        cap = self._capture_layer_ids if return_hidden else None
+        cap_set = set(cap) if cap else None
+        grabbed: dict[int, torch.Tensor] = {}
+        for lid, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
-        return self.norm.forward(x, residual)[0]
+            if cap_set is not None and lid in cap_set:
+                # output hidden of layer lid = the residual stream after it (feeds the next layer).
+                grabbed[lid] = residual.clone()
+        final = self.norm.forward(x, residual)[0]
+        if return_hidden:
+            # stack in the programmed id order so a consumer can index aux by position; None if empty.
+            aux_stack = torch.stack([grabbed[i] for i in cap], dim=0) if cap else None
+            return final, aux_stack
+        return final
 
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
@@ -309,9 +329,16 @@ class Qwen3_5ForConditionalGeneration(BaseLLMModel):
         )
         super().__init__()
 
-    def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+    def forward(self, return_hidden: bool = False):
+        input_ids = get_global_ctx().batch.input_ids
+        if return_hidden:
+            # last_hidden = post-final-norm hidden (pre-lm_head); aux = stacked captured layers.
+            last_hidden, aux_hidden = self.model.forward(input_ids, return_hidden=True)
+            return self.lm_head.forward(last_hidden), last_hidden, aux_hidden
+        return self.lm_head.forward(self.model.forward(input_ids))
+
+    def set_capture_layers(self, ids: List[int] | None) -> None:
+        self.model.set_capture_layers(ids)
 
     def iter_gdn_layers(self) -> List[GDNLinearAttn]:
         """GDN bridge ops in gdn_layer_id order (engine uses this to size gdn_state + warmup)."""

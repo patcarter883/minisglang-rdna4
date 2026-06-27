@@ -99,6 +99,22 @@ class Scheduler(SchedulerIOMixin):
             if self.engine.spec_config is not None
             else None
         )
+        # Target hidden-state capture wiring. A draft-head proposer (MTP / EAGLE3 / DFlash) declares
+        # `needs_last_hidden` and/or `capture_layer_ids`; the engine then asks forward_verify to
+        # return the target's hidden states and feeds them back into ProposeContext for the next
+        # propose. A pure n-gram proposer declares neither, so capture stays OFF and a normal serve
+        # pays nothing. Aux-layer capture is programmed into the target model ONCE here.
+        self._spec_needs_last_hidden = False
+        self._spec_capture_layer_ids: List[int] | None = None
+        if self._proposer is not None:
+            self._spec_needs_last_hidden = bool(self._proposer.needs_last_hidden)
+            self._spec_capture_layer_ids = self._proposer.capture_layer_ids
+            if self._spec_capture_layer_ids:
+                self.engine.model.set_capture_layers(self._spec_capture_layer_ids)
+        # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
+        # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
+        self._spec_last_hidden: dict[int, torch.Tensor] = {}
+        self._spec_aux_hidden: dict[int, torch.Tensor] = {}
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -319,7 +335,19 @@ class Scheduler(SchedulerIOMixin):
 
         # --- 1. propose drafts (proposer-specific: n-gram lookup / MTP head / draft model). The
         # proposer clamps per-req to the remaining budget; an empty list ⇒ plain decode for that req.
-        drafts = self._proposer.propose(reqs, spec.num_draft, ProposeContext(device))
+        # Draft-head proposers read the target hidden states captured at the PREVIOUS verify (keyed
+        # by uid); n-gram declared neither, so these dicts are empty and ProposeContext is bare.
+        capture = self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
+        ctx = ProposeContext(
+            device,
+            last_hidden={r.uid: self._spec_last_hidden[r.uid]
+                         for r in reqs if r.uid in self._spec_last_hidden}
+            if self._spec_needs_last_hidden else None,
+            aux_hidden={r.uid: self._spec_aux_hidden[r.uid]
+                        for r in reqs if r.uid in self._spec_aux_hidden}
+            if self._spec_capture_layer_ids else None,
+        )
+        drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
 
         # --- 2. stage: extend each req to K_i+1 query tokens; write drafts into the token pool --
         # Confirmed token sits at position c0 (= cached_len); drafts go at c0+1 .. c0+K_i.
@@ -366,7 +394,15 @@ class Scheduler(SchedulerIOMixin):
             batch.gdn_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
-        logits = self.engine.forward_verify(batch)
+        # Draft-head proposers also need the target's hidden states at the verified positions; the
+        # engine returns them from the SAME forward (no extra pass). last_hidden [T, hidden], aux
+        # [num_capture_layers, T, hidden] or None; T = sum(K_i+1). Stays on-device until we slice the
+        # per-uid seed rows after acceptance (then drop the full tensors).
+        last_hidden = aux_hidden = None
+        if capture:
+            logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
+        else:
+            logits = self.engine.forward_verify(batch)
         preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
 
         # --- 5. accept + commit + rollback per req --------------------------------------------
@@ -384,8 +420,12 @@ class Scheduler(SchedulerIOMixin):
         # state AFTER the last committed token). A finished seq frees its slot, so its state is moot.
         gdn_install_batch_idx: List[int] = []
         gdn_install_t_index: List[int] = []
+        # Fresh per-uid target hidden seeds for the NEXT step's propose (draft-head proposers only).
+        new_last_hidden: dict[int, torch.Tensor] = {}
+        new_aux_hidden: dict[int, torch.Tensor] = {}
         for i, (req, d) in enumerate(zip(reqs, drafts)):
             q_len = len(d) + 1
+            block_start = offset  # this req's first query row in the [sum(K_i+1)] verify output
             target = preds[offset : offset + q_len].tolist()
             offset += q_len
             result = verify_greedy(d, target)
@@ -434,6 +474,18 @@ class Scheduler(SchedulerIOMixin):
                 gdn_install_batch_idx.append(i)
                 gdn_install_t_index.append(len(keep) - 1)
 
+            # Draft-head seed: the target hidden at the row that PRODUCED the last committed token
+            # (block_start + len(keep)-1 — same index the GDN install uses). The draft for the next
+            # step is seeded from the accepted token's hidden state. Cloned off the big verify tensor
+            # so the per-step [T, hidden] / [L, T, hidden] outputs can be released. Finished reqs are
+            # gone next step, so we skip them.
+            if capture and not finished and keep:
+                row = block_start + len(keep) - 1
+                if last_hidden is not None:
+                    new_last_hidden[req.uid] = last_hidden[row].clone()
+                if aux_hidden is not None:
+                    new_aux_hidden[req.uid] = aux_hidden[:, row].clone()
+
             # One message carries all of this step's committed tokens (the detokenizer keys
             # streaming state by uid and assumes one message per uid per batch).
             if keep:
@@ -479,6 +531,16 @@ class Scheduler(SchedulerIOMixin):
             self.engine.gdn_state.install_verify_state(
                 md.conv_scratch, md.ssm_scratch, slots, t_index
             )
+
+        # Carry the fresh target hidden seeds to the next propose (replaces the consumed step's seeds
+        # for these uids; finished uids drop out because they aren't in the fresh dict). No-op for
+        # n-gram (capture False ⇒ both dicts stay empty).
+        if capture:
+            for uid in [r.uid for r in reqs]:
+                self._spec_last_hidden.pop(uid, None)
+                self._spec_aux_hidden.pop(uid, None)
+            self._spec_last_hidden.update(new_last_hidden)
+            self._spec_aux_hidden.update(new_aux_hidden)
 
         # Roll back any draft-owned state (draft KV / recurrent) to the accepted prefix. No-op for
         # n-gram; MTP/DFlash/EAGLE truncate their draft KV. (GDN backbone-state rollback is handled
