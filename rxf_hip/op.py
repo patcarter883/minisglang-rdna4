@@ -36,11 +36,34 @@ def _moe_gemm_fake(q, a_scale, w_packed, w_scale, nl, sorted_ids, expert_ids,
     return q.new_empty((sorted_ids.shape[0], w_packed.shape[1]), dtype=torch.bfloat16)
 
 
+@torch.library.register_fake("rxf_hip::moe_gemv")
+def _moe_gemv_fake(q, a_scale, w_packed, w_scale, nl, sorted_ids, expert_ids,
+                   num_tokens_post_padded, top_k, block_m, num_valid_tokens):
+    return q.new_empty((sorted_ids.shape[0], w_packed.shape[1]), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake("rxf_hip::moe_gemm_scatter")
+def _moe_gemm_scatter_fake(q, a_scale, w_packed, w_scale, nl, sorted_ids, expert_ids,
+                           num_tokens_post_padded, topk_weights, out_scatter,
+                           top_k, block_m, num_valid_tokens):
+    return None
+
+
+@torch.library.register_fake("rxf_hip::moe_gather_reduce")
+def _moe_gather_reduce_fake(out2, sorted_ids, topk_weights, num_tokens_post_padded,
+                            num_tokens, top_k, num_valid_tokens):
+    return out2.new_empty((num_tokens, out2.shape[1]), dtype=torch.float32)
+
+
 rotate_quant_int8 = torch.ops.rxf_hip.rotate_quant_int8
 linear = torch.ops.rxf_hip.linear
 moe_gemm = torch.ops.rxf_hip.moe_gemm
+moe_gemv = torch.ops.rxf_hip.moe_gemv
+moe_gemm_scatter = torch.ops.rxf_hip.moe_gemm_scatter
+moe_gather_reduce = torch.ops.rxf_hip.moe_gather_reduce
 
 # Default IQ4-NL integer codebook (matches rxf_kernels.py _NL_DEFAULT). int8 [16].
 NL_DEFAULT = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
-__all__ = ["rotate_quant_int8", "linear", "moe_gemm", "NL_DEFAULT"]
+__all__ = ["rotate_quant_int8", "linear", "moe_gemm", "moe_gemv", "moe_gemm_scatter",
+           "moe_gather_reduce", "NL_DEFAULT"]

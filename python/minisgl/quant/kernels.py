@@ -356,8 +356,11 @@ def rxf_moe(
     P = sorted_ids.shape[0]
 
     # gemm1: rotate+quant the activation (gathered by sorted_ids inside the GEMM), grouped over w13.
+    # Per-GEMM kernel selection (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a
+    # few real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles.
     q, a_scale = torch.ops.rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    out1 = torch.ops.rxf_hip.moe_gemm(
+    gemm1 = torch.ops.rxf_hip.moe_gemv if M <= 2 else torch.ops.rxf_hip.moe_gemm
+    out1 = gemm1(
         q, a_scale, w13, w13_scales, nl, sorted_ids, expert_ids, ntp, top_k, block_m, M * top_k
     )  # (P, 2*inter) bf16
     d = out1.shape[1] // 2
@@ -369,23 +372,29 @@ def rxf_moe(
     else:
         buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
 
-    # gemm2: rotate+quant the intermediate (w2 was rotated offline too), identity gather.
+    # gemm2: rotate+quant the intermediate (w2 was rotated offline too).
     q2, a_scale2 = torch.ops.rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    tw_flat = tw.reshape(-1).float().contiguous()
+
+    # DECODE fast path (mirrors w4a8_moe): fuse gemm2 + topk-weight + reduce into ONE kernel via the
+    # atomic scatter, removing the (P,K) out2 materialization + the separate gather. The atomicAdd is
+    # NOT HIP-graph-capture-safe -> gated to eager decode (M<=2) and MINISGL_MOE_SCATTER.
+    if M <= 2 and _MOE_SCATTER:
+        acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
+        torch.ops.rxf_hip.moe_gemm_scatter(
+            q2, a_scale2, w2, w2_scales, nl, sorted_ids, expert_ids, ntp, tw_flat, acc,
+            top_k, block_m, M * top_k
+        )  # writes acc in place
+        return acc.to(x.dtype)
+
+    # PREFILL: unfused gemm2 (identity gather) + contention-free gather-reduce (graph-safe).
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     out2 = torch.ops.rxf_hip.moe_gemm(
         q2, a_scale2, w2, w2_scales, nl, ident, expert_ids, ntp, 1, block_m, P
     )  # (P, K) bf16
-
-    # topk-weighted gather-reduce (torch v0; a fused HIP scatter is the perf follow-up).
-    acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-    nvalid = int(ntp.item())
-    valid_rows = sorted_ids[:nvalid]
-    keep = valid_rows < (M * top_k)
-    rows = torch.nonzero(keep, as_tuple=True)[0]
-    offs = valid_rows[rows]
-    tokens = (offs // top_k).long()
-    weights = tw.reshape(-1)[offs.long()]
-    acc.index_add_(0, tokens, out2[rows].float() * weights[:, None])
+    acc = torch.ops.rxf_hip.moe_gather_reduce(
+        out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k
+    )  # (M, K) fp32
     return acc.to(x.dtype)
 
 

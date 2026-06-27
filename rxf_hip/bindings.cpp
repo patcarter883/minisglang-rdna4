@@ -13,6 +13,15 @@ void launch_linear(const at::Tensor&, const at::Tensor&, const at::Tensor&, cons
 void launch_moe_gemm(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                      at::Tensor&, int64_t, int64_t, int64_t);
+void launch_moe_gemv(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                     at::Tensor&, int64_t, int64_t, int64_t);
+void launch_moe_gemm_scatter(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                             int64_t, int64_t, int64_t);
+void launch_moe_gather_reduce(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const at::Tensor&, at::Tensor&, int64_t, int64_t);
 
 namespace {
 
@@ -58,6 +67,40 @@ at::Tensor moe_gemm(const at::Tensor& q, const at::Tensor& a_scale, const at::Te
     return out;
 }
 
+at::Tensor moe_gemv(const at::Tensor& q, const at::Tensor& a_scale, const at::Tensor& w_packed,
+                    const at::Tensor& w_scale, const at::Tensor& nl, const at::Tensor& sorted_ids,
+                    const at::Tensor& expert_ids, const at::Tensor& num_tokens_post_padded,
+                    int64_t top_k, int64_t block_m, int64_t num_valid_tokens) {
+    TORCH_CHECK(q.scalar_type() == at::kChar, "rxf_hip::moe_gemv: q must be int8");
+    const int64_t P = sorted_ids.size(0), N = w_packed.size(1);
+    auto out = at::empty({P, N}, q.options().dtype(at::kBFloat16));
+    launch_moe_gemv(q, a_scale, w_packed, w_scale, nl, sorted_ids, expert_ids,
+                    num_tokens_post_padded, out, top_k, block_m, num_valid_tokens);
+    return out;
+}
+
+void moe_gemm_scatter(const at::Tensor& q, const at::Tensor& a_scale, const at::Tensor& w_packed,
+                      const at::Tensor& w_scale, const at::Tensor& nl, const at::Tensor& sorted_ids,
+                      const at::Tensor& expert_ids, const at::Tensor& num_tokens_post_padded,
+                      const at::Tensor& topk_weights, at::Tensor& out_scatter,
+                      int64_t top_k, int64_t block_m, int64_t num_valid_tokens) {
+    TORCH_CHECK(q.scalar_type() == at::kChar, "rxf_hip::moe_gemm_scatter: q must be int8");
+    TORCH_CHECK(out_scatter.scalar_type() == at::kFloat, "out_scatter must be fp32 (pre-zeroed)");
+    launch_moe_gemm_scatter(q, a_scale, w_packed, w_scale, nl, sorted_ids, expert_ids,
+                            num_tokens_post_padded, topk_weights, out_scatter,
+                            top_k, block_m, num_valid_tokens);
+}
+
+at::Tensor moe_gather_reduce(const at::Tensor& out2, const at::Tensor& sorted_ids,
+                             const at::Tensor& topk_weights, const at::Tensor& num_tokens_post_padded,
+                             int64_t num_tokens, int64_t top_k, int64_t num_valid_tokens) {
+    TORCH_CHECK(out2.scalar_type() == at::kBFloat16, "rxf_hip::moe_gather_reduce: out2 bf16");
+    auto out = at::zeros({num_tokens, out2.size(1)}, out2.options().dtype(at::kFloat));
+    launch_moe_gather_reduce(out2, sorted_ids, topk_weights, num_tokens_post_padded, out,
+                             top_k, num_valid_tokens);
+    return out;
+}
+
 }  // namespace
 
 TORCH_LIBRARY(rxf_hip, m) {
@@ -66,10 +109,22 @@ TORCH_LIBRARY(rxf_hip, m) {
     m.def("moe_gemm(Tensor q, Tensor a_scale, Tensor w_packed, Tensor w_scale, Tensor nl, "
           "Tensor sorted_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
           "int top_k, int block_m, int num_valid_tokens) -> Tensor");
+    m.def("moe_gemv(Tensor q, Tensor a_scale, Tensor w_packed, Tensor w_scale, Tensor nl, "
+          "Tensor sorted_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+          "int top_k, int block_m, int num_valid_tokens) -> Tensor");
+    m.def("moe_gemm_scatter(Tensor q, Tensor a_scale, Tensor w_packed, Tensor w_scale, Tensor nl, "
+          "Tensor sorted_ids, Tensor expert_ids, Tensor num_tokens_post_padded, "
+          "Tensor topk_weights, Tensor(a!) out_scatter, int top_k, int block_m, "
+          "int num_valid_tokens) -> ()");
+    m.def("moe_gather_reduce(Tensor out2, Tensor sorted_ids, Tensor topk_weights, "
+          "Tensor num_tokens_post_padded, int num_tokens, int top_k, int num_valid_tokens) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(rxf_hip, CUDA, m) {
     m.impl("rotate_quant_int8", rotate_quant_int8);
     m.impl("linear", linear);
     m.impl("moe_gemm", moe_gemm);
+    m.impl("moe_gemv", moe_gemv);
+    m.impl("moe_gemm_scatter", moe_gemm_scatter);
+    m.impl("moe_gather_reduce", moe_gather_reduce);
 }
