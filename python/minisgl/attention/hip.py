@@ -11,11 +11,14 @@ The two kernel packages are framework-agnostic ``torch.ops`` extensions shared w
 importable (on PYTHONPATH) when this backend is selected.
 
 Constraints (v0 — eager, validated on dense head_dim 64/128):
-  * PREFILL: the kernel is single-sequence + contiguous, so a varlen batch is sliced per sequence
-    by cu_seqlens_q. Correct only when each sequence's keys are its own current tokens (NO
-    prefix-cache hit) — asserted. head_dim 256 (Qwen3.5/3.6 full-attn) is not yet enabled in the
-    prefill kernel (needs the smem-reduction pass); DECODE already supports 256.
-  * cudagraph capture is not wired (run with cuda_graph_max_bs=0).
+  * PREFILL has two native-HIP paths, dispatched on metadata.cold_prefill:
+      - COLD (no prefix-cache hit): attn_hip.flash_prefill, single-sequence + contiguous, so the
+        varlen batch is sliced per sequence by cu_seqlens_q (each seq's keys are its own tokens).
+      - EXTEND (radix-hit / chunked prefill, cached_len > 0): attn_prefill_paged.flash_prefill_paged
+        reads the paged K/V prefix + new tokens with a prefix-offset causal mask (fp8 variant folds
+        the per-tensor descale). Both are Triton-free; metadata is built by the inherited
+        prepare_metadata. head_dim 256 (Qwen3.5/3.6 full-attn) uses BR/BC=16 tiling.
+  * DECODE cudagraph capture is wired; PREFILL (both paths) runs eager.
 """
 from __future__ import annotations
 
@@ -48,10 +51,18 @@ class HIPAttnBackend(TritonRDNA4Backend):
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, RDNA4Metadata)
-        # Persist the current tokens' K/V into the paged cache (decode reads it back).
+        # Persist the current tokens' K/V into the paged cache (decode + extend prefill read it back).
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if batch.is_prefill:
-            return self._forward_prefill(q, k, v, metadata)
+            if metadata.cold_prefill:
+                # No prefix-cache hit: each seq's KV == its own new tokens -> dense contiguous
+                # prefill over the inline K/V (attn_hip.flash_prefill).
+                return self._forward_prefill(q, k, v, metadata)
+            # Radix-hit / chunked extend: Q = new tokens, K/V = paged prefix + new (just stored),
+            # prefix-offset causal. Native HIP attn_prefill_paged kernel (Triton-free; fp8 variant
+            # folds the per-tensor descale). The helper is inherited from TritonRDNA4Backend but
+            # calls ONLY torch.ops.attn_prefill_paged.* — no Triton kernel runs on this path.
+            return self._hip_prefill_paged(q, layer_id, metadata)
         return self._forward_decode(q, layer_id, metadata)
 
     def _forward_prefill(
@@ -64,8 +75,10 @@ class HIPAttnBackend(TritonRDNA4Backend):
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         # flash_prefill is single-sequence; minisgl batches varlen sequences -> slice by
-        # cu_seqlens_q and run each independently. Valid only with no prefix-cache hit (each
-        # seq's keys are exactly its current tokens). Assert that: cache_seqlens == query lengths.
+        # cu_seqlens_q and run each independently. This is the COLD path only (forward() routes
+        # prefix-cache hits to _hip_prefill_paged), so each seq's keys are exactly its current
+        # tokens. Assert that invariant: cache_seqlens == query lengths (a violation means a hit
+        # leaked past the cold_prefill dispatch).
         cu = metadata.cu_seqlens_q.tolist()
         klen = metadata.cache_seqlens.tolist()
         out = torch.empty_like(q)
@@ -75,9 +88,9 @@ class HIPAttnBackend(TritonRDNA4Backend):
             if qlen <= 0:
                 continue
             assert klen[i] == qlen, (
-                "HIP prefill does not support a prefix-cache hit "
-                f"(seq {i}: kv_len={klen[i]} != q_len={qlen}); disable prefix caching "
-                "(naive cache) or extend the kernel to gather the paged prefix."
+                f"cold HIP prefill got a prefix-cache hit (seq {i}: kv_len={klen[i]} != "
+                f"q_len={qlen}); cold_prefill dispatch in forward() should have routed this to "
+                "the paged extend kernel."
             )
             out[s:e] = self._prefill(
                 q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
