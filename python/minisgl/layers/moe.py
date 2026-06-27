@@ -98,6 +98,28 @@ class _GroupedAWQExperts(BaseOP):
         del self.qweight, self.scales, self.qzeros
 
 
+class _GroupedRXFExperts(BaseOP):
+    """RXF W4(NL)-A8 experts for one MoE GEMM (w13 or w2), STACKED over E.
+
+    RXF ships op-layout already (no AWQ/GPTQ unpack-transpose-repack), so these buffers are
+    loaded as-is and need no post_load: weight_packed (E, N, K/2) uint8 NL indices, weight_scale
+    (E, N, K/32) fp16 per-group scale, group=32, symmetric NL codebook (no zero-points). N=out,
+    K=in per expert. Consumed by kernels.rxf_moe."""
+
+    def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
+        N, K = out_features, in_features
+        span = quant.rotation_span
+        assert K % 32 == 0 and K % span == 0 and K % 2 == 0, (
+            f"grouped RXF needs K%32==0,K%span({span})==0,K%2==0; got N={N},K={K}"
+        )
+        self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
+        self.weight_scale = torch.empty((num_experts, N, K // 32), dtype=torch.float16)
+        self._quant = quant
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
+        raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
+
+
 class MoELayer(BaseOP):
     def __init__(
         self,
@@ -136,6 +158,8 @@ class MoELayer(BaseOP):
                 Experts = _GroupedGPTQExperts
             elif quant.is_awq:
                 Experts = _GroupedAWQExperts
+            elif quant.is_rxf:
+                Experts = _GroupedRXFExperts
             else:
                 raise AssertionError(f"MoE W4A8 unsupported quant method: {quant.method}")
             self.gate_up_proj = Experts(
@@ -161,18 +185,31 @@ class MoELayer(BaseOP):
             from minisgl.quant import kernels
 
             w13, w2 = self.gate_up_proj, self.down_proj
-            final_hidden_states = kernels.w4a8_moe(
-                hidden_states,
-                w13._w_op,
-                w13._scales_op,
-                w13._zeros_op,
-                w2._w_op,
-                w2._scales_op,
-                w2._zeros_op,
-                router_logits,
-                self.top_k,
-                self.renormalize,
-            )
+            if self.quant.is_rxf:
+                final_hidden_states = kernels.rxf_moe(
+                    hidden_states,
+                    w13.weight_packed,
+                    w13.weight_scale,
+                    w2.weight_packed,
+                    w2.weight_scale,
+                    router_logits,
+                    self.top_k,
+                    self.renormalize,
+                    span=self.quant.rotation_span,
+                )
+            else:
+                final_hidden_states = kernels.w4a8_moe(
+                    hidden_states,
+                    w13._w_op,
+                    w13._scales_op,
+                    w13._zeros_op,
+                    w2._w_op,
+                    w2._scales_op,
+                    w2._zeros_op,
+                    router_logits,
+                    self.top_k,
+                    self.renormalize,
+                )
         else:
             ctx = get_global_ctx()
             final_hidden_states = ctx.moe_backend.forward(

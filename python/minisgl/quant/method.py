@@ -121,6 +121,41 @@ class W4A8LinearMethod:
         return out
 
 
+class RXFLinearMethod:
+    """RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) linear, native HIP (rxf_hip).
+
+    The checkpoint already ships op-layout (no AWQ/GPTQ unpack-transpose-repack): a uint8
+    weight_packed (N, K/2) of NL indices and an fp16 per-group weight_scale (N, K/32), group=32.
+    The weights were rotated offline by a fixed block-diagonal Hadamard (FWHT-span); apply()
+    rotates+int8-quantizes the activation with the SAME span so the rotation cancels in the dot
+    (and spreads activation outliers to tighten the 4-bit scale). NL codebook is model-wide
+    (kernels._rxf_nl). No zero-points (the NL codebook is symmetric)."""
+
+    def __init__(self, quant: QuantConfig) -> None:
+        self.quant = quant
+
+    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
+        N, K = out_features, in_features
+        span = self.quant.rotation_span
+        assert K % 32 == 0 and K % span == 0 and K % 2 == 0, (
+            f"RXF needs K%32==0,K%span({span})==0,K%2==0; got N={N},K={K}"
+        )
+        layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
+        layer.weight_scale = torch.empty((N, K // 32), dtype=torch.float16)
+
+    def apply(
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        out = kernels.rxf_linear(
+            x,
+            layer.weight_packed,  # type: ignore[attr-defined]
+            layer.weight_scale,  # type: ignore[attr-defined]
+            bias,
+            self.quant.rotation_span,
+        )
+        return out.to(x.dtype)
+
+
 def create_linear_method(
     quant: QuantConfig | None, *, quantized: bool = True
 ) -> LinearMethod:
@@ -128,4 +163,6 @@ def create_linear_method(
     stays unquantized even when the model is quantized."""
     if quant is None or not quantized:
         return UnquantizedLinearMethod()
+    if quant.is_rxf:
+        return RXFLinearMethod(quant)
     return W4A8LinearMethod(quant)
