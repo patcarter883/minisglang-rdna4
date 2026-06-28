@@ -143,6 +143,9 @@ class ZmqSubQueue(Generic[T]):
         event = self.socket.recv()
         return self.decoder(msgpack.unpackb(event, raw=False))
 
+    def get_raw(self) -> bytes:
+        return self.socket.recv()
+
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 
