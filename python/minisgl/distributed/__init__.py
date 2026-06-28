@@ -1,5 +1,20 @@
-from .impl import DistributedCommunicator, destroy_distributed, enable_pynccl_distributed
-from .info import DistributedInfo, get_tp_info, set_tp_info, try_get_tp_info
+from .impl import (
+    DistributedCommunicator,
+    EPCommunicator,
+    destroy_distributed,
+    enable_pynccl_distributed,
+)
+from .info import (
+    DistributedInfo,
+    DpInfo,
+    get_dp_info,
+    get_tp_info,
+    is_ep_enabled,
+    set_dp_info,
+    set_tp_info,
+    try_get_dp_info,
+    try_get_tp_info,
+)
 
 __all__ = [
     "DistributedInfo",
@@ -7,6 +22,12 @@ __all__ = [
     "set_tp_info",
     "enable_pynccl_distributed",
     "DistributedCommunicator",
+    "EPCommunicator",
     "try_get_tp_info",
     "destroy_distributed",
+    "DpInfo",
+    "get_dp_info",
+    "set_dp_info",
+    "try_get_dp_info",
+    "is_ep_enabled",
 ]

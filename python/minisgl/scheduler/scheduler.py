@@ -21,6 +21,7 @@ from .cache import CacheManager
 from .cca_slots import CCASlotManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .ep import SchedulerEPMixin
 from .gdn_slots import GDNSlotManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
@@ -46,7 +47,7 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerIOMixin):
+class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
@@ -208,6 +209,15 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self._spec_loop()
+        # Expert parallelism runs a dedicated synchronous lockstep loop: every step issues the MoE
+        # all_gather/all_reduce over the DP/EP group, so all replicas must agree the per-step
+        # phase+size (one gloo all_reduce(MAX), OUTSIDE the graph) or the collectives deadlock. This
+        # conflicts with the zero-sync overlap path, like spec decode. See SchedulerEPMixin.
+        if self.engine.enable_ep:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self.ep_loop()
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -302,7 +312,18 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
+        return self._finish_prepare(batch)
+
+    def _finish_prepare(self, batch: Batch, skip_alloc: bool = False) -> ForwardInput:
+        # The padding decision (batch.padded_reqs) is set by the caller — pad_batch for the DP/normal
+        # path, or the EP lockstep mixin (which forces a common-bs / dummy-prefill padding so every
+        # replica issues identical-shape MoE collectives). Everything below is padding-agnostic.
+        # skip_alloc=True (EP idle-replica dummy prefill ONLY): the batch's lone dummy_req already
+        # points its page_table at the reserved null page, so allocating a real KV page for it would
+        # leak one every dummy step -> CacheManager integrity-check crash. Skip the allocation and let
+        # the dummy write into the reserved page.
+        if not skip_alloc:
+            self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -339,12 +360,15 @@ class Scheduler(SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
-    def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+    def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
+        # promoted into the decode running set (it would pollute every subsequent decode step).
+        if track_reqs:
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
     # ===================================================================================

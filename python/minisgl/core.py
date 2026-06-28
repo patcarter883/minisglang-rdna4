@@ -8,6 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
+    from minisgl.distributed import EPCommunicator as EPContext
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.kvcache.cca_state import CCAStateCache
     from minisgl.kvcache.gdn_state import GDNStateCache
@@ -125,6 +126,11 @@ class Context:
     # ZAYA CCA recurrent-state cache (conv_states + prev_hs) — set by the Engine ONLY for CCA-hybrid
     # models, reached via `get_global_ctx().cca_state`. Stays None for every non-Zaya model.
     cca_state: "CCAStateCache | None" = field(default=None, init=False)
+    # Expert-parallel (EP) state — set by the Engine ONLY when --enable-ep (dp_size>1). MoELayer.forward
+    # reaches it via get_global_ctx().ep so the EP dispatch/combine (all_gather token rows over the EP
+    # group, masked local-expert compute, all_reduce(SUM)) runs INSIDE the captured decode graph. None
+    # for every non-EP run (single replica or DP-only), where MoE stays purely replica-local.
+    ep: "EPContext | None" = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

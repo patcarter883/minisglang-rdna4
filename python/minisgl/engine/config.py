@@ -5,7 +5,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
-from minisgl.distributed import DistributedInfo
+from minisgl.distributed import DistributedInfo, DpInfo
 from minisgl.utils import cached_load_hf_config, is_rocm
 
 if TYPE_CHECKING:
@@ -17,6 +17,12 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Data-parallel coordinates for this engine replica. Defaults to the inert single-replica DP
+    # (dp_rank=0, dp_size=1) so every existing programmatic EngineConfig build is unchanged. The
+    # server launcher overrides it per spawned replica. `enable_ep` is reserved for the expert-parallel
+    # toggle (shards MoE experts across dp ranks); it stays False / inert in the DP-launcher-only path.
+    dp_info: DpInfo = field(default_factory=lambda: DpInfo(0, 1))
+    enable_ep: bool = False
     max_running_req: int = 256
     attention_backend: str = "auto"
     moe_backend: str = "auto"
@@ -79,5 +85,19 @@ class EngineConfig:
         return self.max_seq_len
 
     @property
+    def device_index(self) -> int:
+        """Physical card slot for this replica's TP rank, within the lease-visible device set.
+
+        The gpu-lease/HIP_VISIBLE_DEVICES exposes the leased cards as cuda:0..N-1; this picks the
+        slot for (dp_rank, tp_rank). With dp_size=1 this collapses to tp_info.rank — the historical
+        `cuda:{tp_rank}` mapping — so single-replica runs are unchanged. With dp_size>1 (tp_size=1
+        for ZAYA) each replica lands on its own card: dp_rank=0 -> cuda:0, dp_rank=1 -> cuda:1.
+        """
+        return self.dp_info.dp_rank * self.tp_info.size + self.tp_info.rank
+
+    @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        # Each DP replica is an INDEPENDENT TP process group (with EP off there is no cross-replica
+        # collective), so give each replica its own rendezvous port to avoid init_method collisions
+        # when several replicas come up on one host. dp_size=1 keeps the historical 2333.
+        return f"tcp://127.0.0.1:{2333 + self.dp_info.dp_rank}"

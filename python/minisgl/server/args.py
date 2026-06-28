@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import torch
-from minisgl.distributed import DistributedInfo
+from minisgl.distributed import DistributedInfo, DpInfo
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger, is_rocm
 
@@ -48,6 +48,10 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def distributed_addr(self) -> str:
+        # ONE shared rendezvous port for ALL ranks: dp_size>1 forms a single global world over every
+        # (dp_rank, tp_rank) on this port (Engine._init_dp_communication then carves TP/DP subgroups);
+        # dp_size=1 keeps the historical single TP world on the same port. (server_port+1 is reserved
+        # for distributed init and never serves HTTP.)
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
@@ -89,6 +93,25 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=1,
         help="The tensor parallelism size.",
+    )
+
+    parser.add_argument(
+        "--data-parallel-size",
+        "--dp-size",
+        type=int,
+        default=1,
+        help="The data parallelism size: number of full-model replicas behind ONE endpoint. "
+        "Each replica runs its own tp_size TP ranks; total backend processes = dp_size*tp_size. "
+        "Used for models whose backbone cannot tensor-parallelize (e.g. ZAYA's CCA). Default 1 "
+        "(single replica, fully inert DP path).",
+    )
+
+    parser.add_argument(
+        "--enable-ep",
+        action="store_true",
+        dest="enable_ep",
+        help="Enable expert parallelism: shard the MoE experts across the DP replicas (requires "
+        "--data-parallel-size > 1). Off by default; the DP launcher replicates every expert.",
     )
 
     parser.add_argument(
@@ -314,6 +337,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
+
+    dp_size = kwargs.pop("data_parallel_size")
+    assert dp_size >= 1, f"--data-parallel-size must be >= 1, got {dp_size}"
+    kwargs["dp_info"] = DpInfo(0, dp_size)
+    if kwargs["enable_ep"]:
+        assert dp_size > 1, "--enable-ep requires --data-parallel-size > 1"
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

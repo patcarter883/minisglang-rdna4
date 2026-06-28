@@ -49,6 +49,37 @@ its **"GPU sharing protocol"** and **"Trace analysis: TraceLens"** sections. The
 > `…-gpu-lease/scripts/gpu-lease.sh`) — all anchor the same hardcoded `…/vllm-gfx1201/.gpu-locks`,
 > so they coordinate the same two cards. Pick one; don't copy it.
 
+## Source isolation — per-task git worktree, NEVER mount the shared `$PWD` (MANDATORY)
+
+The working tree at `/home/pat/code/minisgl-rdna4` is **shared mutable state with no lock**, exactly
+like the two GPUs. Multiple agents edit it concurrently. A container started with `-v "$PWD":/engine`
+reads whatever (possibly torn, mid-edit) state is on disk **at boot AND lazily across the whole run**
+(Python imports, AOT `.so` rebuilds, Triton JIT all happen long after container start). The failure
+modes are both a loud crash (a half-written `moe.py` fails to import) and — far worse — a silent one:
+the run "validates" garbage and you commit/report plausible-but-meaningless numbers. **The worktree
+is the source-side equivalent of the GPU lease: it is how you take an exclusive, consistent snapshot
+of the code for the duration of a job.**
+
+So for ANY container/GPU run, or any multi-step task that edits code while something reads it:
+
+1. **Make an isolated worktree first** (off the commit you intend to build on):
+   ```
+   git worktree add -b <task-branch> /home/pat/code/minisgl-rdna4-<task> <base-commit>
+   ```
+   Bring in ONLY your hunks (when the shared tree mixes your edits with another agent's, reconstruct
+   your changeset there — `git diff <base> -- <your-files>` filtered to your hunks, applied in the
+   worktree — rather than `git commit -A`'ing the mixture).
+2. **Mount the WORKTREE, never `$PWD`:** every `docker run -v <worktree>:/engine`, every
+   `PYTHONPATH=<worktree>/python`, every AOT build path points at the worktree. Validation harnesses
+   in `tools/` must set `REPO=<worktree>` (they default-mounted `$PWD` historically — fix that).
+3. **The isolation window spans the entire job**, not just boot — keep editing in the worktree (or
+   not at all) until the run is fully done, because the container re-reads source lazily.
+4. **Clean up when done:** `git worktree remove <path>` after you've committed/merged.
+
+This rule got skipped once (an EP validation read a tree another agent was mid-edit on) **because the
+GPU-lease rule was written down and this one was not.** Both are now codified; treat them as equally
+mandatory.
+
 ## Container-run conventions for *this* repo (MANDATORY)
 
 GPU runs here do **not** use this repo's `Dockerfile` (that's the inherited CUDA/NVIDIA upstream
