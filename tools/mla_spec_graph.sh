@@ -29,7 +29,11 @@ boot(){ # $1 = --graph value
   SRV=$!
   for _ in $(seq 1 400); do
     python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:$PORT/v1',timeout=3)" 2>/dev/null && return 0
-    kill -0 "$SRV" 2>/dev/null || { echo "[boot] DIED:"; tail -40 "$LOG"; return 1; }; sleep 3
+    kill -0 "$SRV" 2>/dev/null || { echo "[boot] DIED:"; tail -40 "$LOG"; return 1; }
+    # TP>1: a worker rank can crash while the launcher hangs (kill -0 still succeeds), so also bail
+    # on a Python traceback in the log — otherwise the boot loop spins the full timeout holding the lease.
+    grep -q "Traceback (most recent call last)" "$LOG" && { echo "[boot] CRASH:"; tail -40 "$LOG"; return 1; }
+    sleep 3
   done; echo "[boot] timeout:"; tail -40 "$LOG"; return 1
 }
 probe(){ PORT=$PORT OUT=$1 python - <<'PY'

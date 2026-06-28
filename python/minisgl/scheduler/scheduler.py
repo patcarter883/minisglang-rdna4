@@ -516,6 +516,8 @@ class Scheduler(SchedulerIOMixin):
         # [num_capture_layers, T, hidden] or None; T = sum(K_i+1). Stays on-device until we slice the
         # per-uid seed rows after acceptance (then drop the full tensors).
         last_hidden = aux_hidden = None
+        if _timing:
+            _t_stage = _time.perf_counter()  # CPU-side staging (steps 2-3) done; forward next
         if capture:
             logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
         else:
@@ -675,17 +677,21 @@ class Scheduler(SchedulerIOMixin):
             torch.cuda.synchronize(device); _t3 = _time.perf_counter()
             ph = getattr(self, "_spec_phase", None)
             if ph is None:
-                ph = self._spec_phase = {"propose": 0.0, "verify": 0.0, "accept": 0.0, "n": 0}
+                ph = self._spec_phase = {
+                    "propose": 0.0, "stage": 0.0, "forward": 0.0, "accept": 0.0, "n": 0
+                }
             ph["propose"] += _t1 - _t0
-            ph["verify"] += _t2 - _t1
+            ph["stage"] += _t_stage - _t1  # CPU-side verify-batch staging (steps 2-3)
+            ph["forward"] += _t2 - _t_stage  # verify forward + preds.cpu() sync
             ph["accept"] += _t3 - _t2
             ph["n"] += 1
             if ph["n"] % 50 == 0:
                 n = ph["n"]
                 logger.info_rank0(
                     f"[spec-timing] step={n} propose={ph['propose']/n*1e3:.1f}ms "
-                    f"verify_fwd={ph['verify']/n*1e3:.1f}ms accept={ph['accept']/n*1e3:.1f}ms "
-                    f"total={ (ph['propose']+ph['verify']+ph['accept'])/n*1e3:.1f}ms"
+                    f"stage={ph['stage']/n*1e3:.1f}ms forward={ph['forward']/n*1e3:.1f}ms "
+                    f"accept={ph['accept']/n*1e3:.1f}ms "
+                    f"total={(ph['propose']+ph['stage']+ph['forward']+ph['accept'])/n*1e3:.1f}ms"
                 )
         self._spec_debug(reqs, drafts, total_emitted)
 
