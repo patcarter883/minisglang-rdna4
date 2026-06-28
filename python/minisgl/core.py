@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
+    from minisgl.kvcache.cca_state import CCAStateCache
     from minisgl.kvcache.gdn_state import GDNStateCache
     from minisgl.moe import BaseMoeBackend
 
@@ -83,6 +84,9 @@ class Batch:
     # GDN (linear-attention) per-batch metadata — set by the scheduler ONLY for GDN-hybrid
     # models (None otherwise, so the dense path is unaffected). See gdn/metadata.py.
     gdn_metadata: object | None = field(default=None, init=False)
+    # ZAYA CCA per-batch metadata — set by the scheduler ONLY for CCA-hybrid (Zaya) models
+    # (None otherwise, so dense/GDN paths are unaffected). See cca/metadata.py.
+    cca_metadata: object | None = field(default=None, init=False)
     # Speculative-decode VERIFY batch: phase is "decode" (so the LM head returns all-token logits,
     # no last-token reduction) BUT each req carries extend_len = K+1 query tokens. Multi-token paths
     # that key on `is_prefill` (GDN layer dispatch + gdn_metadata) must treat a verify batch like a
@@ -118,6 +122,9 @@ class Context:
     # GDN recurrent-state cache — set by the Engine ONLY for GDN-hybrid models, so a layer
     # forward reaches it via `get_global_ctx().gdn_state`. Stays None for every dense model.
     gdn_state: "GDNStateCache | None" = field(default=None, init=False)
+    # ZAYA CCA recurrent-state cache (conv_states + prev_hs) — set by the Engine ONLY for CCA-hybrid
+    # models, reached via `get_global_ctx().cca_state`. Stays None for every non-Zaya model.
+    cca_state: "CCAStateCache | None" = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

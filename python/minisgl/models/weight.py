@@ -331,6 +331,131 @@ def _load_qwen3_5_weight(
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
 
 
+# ---- ZAYA1-8B CCA-hybrid weight-name remap (Step 3) ----
+# The checkpoint is single-prefix `model.*` (no LM/vision wrapper). Three remap families:
+#  1. Plain rename: top-level `model.res_scale.*` -> `model.res_scale_final.*` (the final merge);
+#     CCA `self_attn.qkv.*` dotted submodule names (`conv_qk.0.weight`, `linear_q.weight`, ...) ->
+#     the CCAConv nn.Module's FLAT param names (`conv_qk_0_weight`, `linear_q`, ...); router
+#     `zaya_block.router.<sub>.weight|bias` -> the ZayaRouter nn.Module's flat names
+#     (`down_proj.weight` -> `down_proj_weight`, `router_mlp.0.bias` -> `router_mlp_0_bias`, ...).
+#  2. fp8 experts: `zaya_block.experts.local_experts.{e}.linear_fc1.{weight,weight_scale}` STAY fp8
+#     -- stack the raw F8_E4M3 weight + F32 per-channel scale over e ->
+#     `zaya_block.experts.gate_up_proj.{weight,weight_scale}` (linear_fc1 is ALREADY the merged
+#     [gate|up] w13 [4096,2048]; gate is the first half, the silu_and_mul convention, so NO
+#     re-split). `linear_fc2` -> `experts.down_proj.{weight,weight_scale}` (w2). Dequant is deferred
+#     to compute (_GroupedFP8Experts); dequant-to-bf16 at load is ~16 GB and OOMs the 16 GB card.
+#  3. Direct: embed_tokens, final_norm, input_norm, layer-level res_scale, o_proj.
+# Router + CCA + res_scale are bf16/fp32 (quant ignore list); the experts keep their checkpoint fp8
+# dtype (~8 GB). TP=1 (no shard) for v0.
+
+# CCAConv submodule (`self_attn.qkv.*`) checkpoint suffix -> CCAConv flat param name.
+_ZAYA_CCA_RENAME = {
+    "linear_q.weight": "linear_q",
+    "linear_k.weight": "linear_k",
+    "val_proj1.weight": "val_proj1",
+    "val_proj2.weight": "val_proj2",
+    "conv_qk.0.weight": "conv_qk_0_weight",
+    "conv_qk.0.bias": "conv_qk_0_bias",
+    "conv_qk.1.weight": "conv_qk_1_weight",
+    "conv_qk.1.bias": "conv_qk_1_bias",
+    "temp": "temp",
+}
+# Router (`zaya_block.router.*`) checkpoint suffix -> ZayaRouter flat param name.
+_ZAYA_ROUTER_RENAME = {
+    "down_proj.weight": "down_proj_weight",
+    "down_proj.bias": "down_proj_bias",
+    "rmsnorm_eda.weight": "rmsnorm_eda_weight",
+    "router_states_scale": "router_states_scale",
+    "router_mlp.0.weight": "router_mlp_0_weight",
+    "router_mlp.0.bias": "router_mlp_0_bias",
+    "router_mlp.2.weight": "router_mlp_2_weight",
+    "router_mlp.2.bias": "router_mlp_2_bias",
+    "router_mlp.4.weight": "router_mlp_4_weight",
+    "balancing_biases": "balancing_biases",
+}
+# Expert key (both fields): local_experts.{e}.linear_fc{1,2}.{weight,weight_scale}.
+_ZAYA_EXPERT_PATTERN = re.compile(
+    r"^(?P<prefix>model\.layers\.\d+\.zaya_block\.experts)\.local_experts\."
+    r"(?P<idx>\d+)\.(?P<fc>linear_fc1|linear_fc2)\.(?P<field>weight|weight_scale)$"
+)
+
+
+def _zaya_remap(ckpt_key: str) -> str | None:
+    """Map a non-expert ZAYA checkpoint key to its native module key (None to skip).
+
+    Expert tensors (`local_experts.{e}.linear_fc*.{weight,weight_scale}`) are handled separately
+    (stacked over E, kept fp8), so they return None here."""
+    if _ZAYA_EXPERT_PATTERN.match(ckpt_key) is not None:
+        return None  # expert weight/scale -> handled by the fp8 stacking path
+    # Top-level final merge: model.res_scale.* -> model.res_scale_final.*
+    if ckpt_key.startswith("model.res_scale."):
+        return "model.res_scale_final." + ckpt_key[len("model.res_scale.") :]
+    # CCA conv front-end: ...self_attn.qkv.<sub> -> ...self_attn.qkv.<flat>
+    m = re.match(r"^(model\.layers\.\d+\.self_attn\.qkv)\.(.+)$", ckpt_key)
+    if m is not None:
+        sub = _ZAYA_CCA_RENAME.get(m.group(2))
+        assert sub is not None, f"unmapped CCA qkv key suffix: {m.group(2)!r} ({ckpt_key})"
+        return f"{m.group(1)}.{sub}"
+    # Router: ...zaya_block.router.<sub> -> ...zaya_block.router.<flat>
+    m = re.match(r"^(model\.layers\.\d+\.zaya_block\.router)\.(.+)$", ckpt_key)
+    if m is not None:
+        sub = _ZAYA_ROUTER_RENAME.get(m.group(2))
+        assert sub is not None, f"unmapped router key suffix: {m.group(2)!r} ({ckpt_key})"
+        return f"{m.group(1)}.{sub}"
+    # Direct: embed_tokens, final_norm, input_norm, layer res_scale, o_proj (LinearOProj.weight).
+    return ckpt_key
+
+
+def _load_zaya_weight(
+    model_folder: str, device: torch.device, config
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for the ZAYA1-8B CCA-hybrid fp8 checkpoint (TP=1).
+
+    Plain keys are renamed by `_zaya_remap`. The fp8 routed experts STAY fp8: the raw F8_E4M3
+    `weight` and per-output-channel F32 `weight_scale` are stacked over the 16 experts into
+    `...experts.{gate_up_proj,down_proj}.{weight,weight_scale}` and consumed by `_GroupedFP8Experts`
+    (dequant deferred to compute). Dequantizing to bf16 at load is ~16 GB and OOMs the 16 GB card;
+    fp8 storage is ~8 GB. `tie_word_embeddings` -> no separate `lm_head.weight`."""
+    tp_info = get_tp_info()
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+
+    # native gemm key -> {"weight": {e: w_fp8 [N,K]}, "weight_scale": {e: scale [N,1]}}; the two
+    # stacks (weight, weight_scale) flush independently once all E experts of that field arrive.
+    expert_buf: Dict[str, Dict[str, Dict[int, torch.Tensor]]] = {}
+    _FC_TO_NATIVE = {"linear_fc1": "gate_up_proj", "linear_fc2": "down_proj"}
+
+    def _store_expert(ckpt_name: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        m = _ZAYA_EXPERT_PATTERN.match(ckpt_name)
+        assert m is not None, f"unexpected expert key: {ckpt_name}"
+        native_key = f"{m.group('prefix')}.{_FC_TO_NATIVE[m.group('fc')]}"
+        field = m.group("field")
+        fields = expert_buf.setdefault(native_key, {"weight": {}, "weight_scale": {}})
+        slots = fields[field]
+        slots[int(m.group("idx"))] = tensor
+        if len(slots) != config.num_experts:
+            return
+        # weight: [N,K] fp8 -> stack [E,N,K] fp8. weight_scale: [N,1] f32 -> stack [E,N,1] f32.
+        stacked = torch.stack([slots[e] for e in range(config.num_experts)], dim=0).contiguous()
+        del fields[field]
+        if not fields.get("weight") and not fields.get("weight_scale"):
+            del expert_buf[native_key]
+        yield f"{native_key}.{field}", stacked
+
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for ckpt_name in f.keys():
+                if _ZAYA_EXPERT_PATTERN.match(ckpt_name) is not None:
+                    yield from _store_expert(ckpt_name, f.get_tensor(ckpt_name))
+                    continue
+                native = _zaya_remap(ckpt_name)
+                if native is None:
+                    continue
+                yield native, f.get_tensor(ckpt_name)
+
+    assert not expert_buf, f"incomplete Zaya expert stacks: {list(expert_buf.keys())}"
+
+
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
@@ -340,6 +465,9 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     config = ModelConfig.from_hf(cached_load_hf_config(model_path))
     if config.is_gdn_hybrid:
         yield from _load_qwen3_5_weight(model_folder, device, config)
+        return
+    if config.is_cca_hybrid:
+        yield from _load_zaya_weight(model_folder, device, config)
         return
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
