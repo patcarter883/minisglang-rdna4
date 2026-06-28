@@ -121,6 +121,53 @@ class _GroupedRXFExperts(BaseOP):
         raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
 
 
+class _GroupedCompressedTensorsExperts(BaseOP):
+    """compressed-tensors int4 *weight-only* (W4A16) experts for one MoE GEMM (w13 or w2), STACKED
+    over E. The format `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` ships (despite "AWQ" in its name):
+        weight_packed (E, N, K//pf) int32 — 8 SIGNED int4 per int32, packed along INPUT K in natural
+            order (K-index k -> column k//pf, nibble k%pf); symmetric, so NO zero-points.
+        weight_scale  (E, N, K//g)  bf16  — per-(output-row, input-group) scale, group g=32.
+    (N=out, K=in per expert.) This is structurally the op's grouped `_w_op (E,N,K//pf)` /
+    `_scales_op (E,N,K//g)` layout ALREADY (same natural nibble order as gptq_to_op_layout's output),
+    so `post_load` is a cheap whole-tensor fixup rather than a per-expert unpack/transpose:
+      * signed int4 -> the kernel's `w = scale*(q_unsigned - zero)` convention by flipping each
+        nibble's top bit (XOR 0x8) and using a CONSTANT zero-point of 8: for every nibble value
+        `(n ^ 8) - 8 == signed_int4(n)` exactly (n<8 -> n, else n-16). XOR 0x8 per nibble == XOR 0x88
+        per byte, done via a uint8 view (no int32 overflow).
+      * zeros_op is all-8 (every nibble 8 -> every int32 0x88888888), shape (E, N//pf, K//g).
+    Then `kernels.w4a8_moe` consumes `_w_op/_scales_op/_zeros_op` exactly as for GPTQ/AWQ (the
+    activations are quantized to int8 by that kernel — same W4A16-weights-through-W4A8-kernel path the
+    AWQ experts already use)."""
+
+    def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
+        pf = 32 // quant.bits  # 8
+        g = quant.group_size  # 32
+        N, K = out_features, in_features
+        assert K % pf == 0 and K % g == 0 and N % pf == 0, (
+            f"grouped compressed-tensors needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
+        )
+        self.weight_packed = torch.empty((num_experts, N, K // pf), dtype=torch.int32)
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.bfloat16)
+        self._quant = quant
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
+        raise RuntimeError("_GroupedCompressedTensorsExperts holds weights; call kernels.w4a8_moe")
+
+    def post_load(self) -> None:
+        pf = 32 // self._quant.bits
+        E, N, Kp = self.weight_packed.shape
+        G = self.weight_scale.shape[-1]
+        # signed int4 -> unsigned (q+8) by flipping each nibble's top bit (XOR 0x88 per byte).
+        flipped = (self.weight_packed.contiguous().view(torch.uint8) ^ 0x88).view(torch.int32)
+        self._w_op = flipped.contiguous()
+        self._scales_op = self.weight_scale.to(torch.float16).contiguous()
+        # symmetric zero-point == 8 for every (output, group): every packed nibble 8 -> 0x88888888.
+        zeros = torch.empty((E, N // pf, G), dtype=torch.int32)
+        zeros.view(torch.uint8).fill_(0x88)
+        self._zeros_op = zeros.to(self.weight_packed.device)
+        del self.weight_packed, self.weight_scale
+
+
 class _GroupedFP8Experts(BaseOP):
     """Weight-only fp8 (F8_E4M3) experts for one MoE GEMM (w13 or w2), STACKED over E.
 
@@ -224,6 +271,10 @@ class MoELayer(BaseOP):
                 Experts = _GroupedAWQExperts
             elif quant.is_rxf:
                 Experts = _GroupedRXFExperts
+            elif quant.is_compressed_tensors:
+                # int4 weight-only (W4A16) experts — convert to the op layout in post_load and run
+                # through the same w4a8_moe kernel as GPTQ/AWQ (the `else` forward branch).
+                Experts = _GroupedCompressedTensorsExperts
             else:
                 raise AssertionError(f"MoE W4A8 unsupported quant method: {quant.method}")
             self.gate_up_proj = Experts(
