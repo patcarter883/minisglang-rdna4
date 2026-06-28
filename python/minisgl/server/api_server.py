@@ -9,9 +9,12 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
+from minisgl.rsa.config import merge_params
+from minisgl.rsa.core import RSAError, run_markovian_rsa
+from minisgl.rsa.inproc import InProcessBackendClient
 from minisgl.message import (
     AbortMsg,
     BaseFrontendMsg,
@@ -85,6 +88,12 @@ class OpenAICompletionRequest(BaseModel):
     response_format: dict | None = None
 
     ignore_eos: bool = False
+
+    # Per-call Markovian-RSA control (in-engine, same port). Absent / null -> ordinary single
+    # completion. `true` -> run RSA with the server's --rsa-* defaults. An object patches those
+    # defaults for THIS call: {n, k, t, tail_tokens, max_tokens, agg_max_tokens, temperature,
+    # selection, max_concurrency, max_retries, enabled}. `false` -> force a plain completion.
+    rsa: bool | dict | None = None
 
 
 def _grammar_from_response_format(rf: dict | None) -> str | None:
@@ -291,6 +300,58 @@ async def v1_root():
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
+
+    # In-engine Markovian RSA (opt-in per call via the `rsa` field). When enabled, the WHOLE
+    # expand -> aggregate(K-subsets over T rounds) -> select loop runs server-side: each rollout is
+    # an internal generation (InProcessBackendClient drives the same front-end primitive, no HTTP),
+    # so N rollouts fan out across the scheduler / DP-EP replicas exactly like concurrent requests.
+    # `merge_params` returns None for an absent/false/disabled `rsa`, which falls through to the
+    # ordinary single-completion path below.
+    rsa_params = merge_params(state.config.rsa_defaults, req.rsa) if req.rsa is not None else None
+    if rsa_params is not None:
+        if not req.messages:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "RSA requires `messages` (chat format), not a raw `prompt`"},
+            )
+        messages = [msg.model_dump() for msg in req.messages]
+        client = InProcessBackendClient(state, state.config.model_path)
+        try:
+            result = await run_markovian_rsa(client, rsa_params, messages, req.model)
+        except RSAError as e:
+            return JSONResponse(status_code=502, content={"error": f"RSA failed: {e}"})
+        finally:
+            await client.close()
+        return {
+            "id": f"chatcmpl-rsa-{state.uid_counter}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result.final_text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result.usage.prompt_tokens,
+                "completion_tokens": result.usage.completion_tokens,
+                "total_tokens": result.usage.total_tokens,
+            },
+            "rsa": {
+                "selection_method": result.selection_method,
+                "n": rsa_params.n,
+                "k": rsa_params.k,
+                "t": rsa_params.t,
+                "tail_tokens": rsa_params.tail_tokens,
+                "rounds": len(result.rounds),
+                "population": len(result.population),
+                "n_requests": result.usage.n_requests,
+                "vote_detail": result.vote_detail,
+            },
+        }
+
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
     else:

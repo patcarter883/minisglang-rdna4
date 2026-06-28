@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
 from minisgl.distributed import DistributedInfo, DpInfo
+from minisgl.rsa.config import RSAParams, add_rsa_args, params_from_args
 from minisgl.scheduler import SchedulerConfig
 from minisgl.utils import init_logger, is_rocm
 
@@ -17,6 +18,10 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    # Server-side DEFAULT Markovian-RSA parameters (set by the --rsa-* flags). A per-request `rsa`
+    # field on /v1/chat/completions patches these; RSA runs ONLY when a request opts in (rsa present
+    # and enabled), so a normal call is an ordinary single completion. See api_server.v1_completions.
+    rsa_defaults: RSAParams = field(default_factory=RSAParams)
 
     @property
     def share_tokenizer(self) -> bool:
@@ -290,8 +295,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Smallest trailing n-gram window to fall back to.",
     )
 
+    # Markovian-RSA server defaults (--rsa-n/k/t/tail-tokens/max-tokens/...). These populate
+    # ServerArgs.rsa_defaults; a per-request `rsa` field patches them at call time.
+    add_rsa_args(parser)
+
     # Parse arguments
-    kwargs = parser.parse_args(args).__dict__.copy()
+    parsed = parser.parse_args(args)
+    kwargs = parsed.__dict__.copy()
+
+    # Fold the --rsa-* flags into a single RSAParams and drop the raw keys so ServerArgs(**kwargs)
+    # (which only knows `rsa_defaults`) doesn't choke on them.
+    kwargs["rsa_defaults"] = params_from_args(parsed)
+    for _k in list(kwargs):
+        if _k.startswith("rsa_") and _k != "rsa_defaults":
+            del kwargs[_k]
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")

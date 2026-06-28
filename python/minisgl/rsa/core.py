@@ -17,8 +17,15 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import httpx
-import openai
+# httpx + openai are needed ONLY by the HTTP BackendClient (the standalone shim path). The
+# in-process client (inproc.py) and the orchestrator below depend on neither, so import them
+# optionally — an in-engine serve that never instantiates the HTTP client must not require them.
+try:
+    import httpx
+    import openai
+except ImportError:  # pragma: no cover - only the HTTP shim path needs these
+    httpx = None  # type: ignore[assignment]
+    openai = None  # type: ignore[assignment]
 
 from . import extract, prompts
 from .config import RSAParams
@@ -96,6 +103,10 @@ class BackendClient:
         timeout: float = 1800.0,
         tokenizer: Optional[str] = None,
     ):
+        assert openai is not None and httpx is not None, (
+            "the HTTP BackendClient (standalone RSA shim) needs `openai` and `httpx` installed; "
+            "the in-engine RSA path uses InProcessBackendClient and needs neither."
+        )
         self.base_url = base_url
         root = base_url.rstrip("/").removesuffix("/v1")
         self.openai = openai.AsyncOpenAI(
