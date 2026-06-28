@@ -206,6 +206,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
+        # Establish the rank0->rank{1..} PUB/SUB fan-out before any request flows, so the first
+        # message can't be lost to the ZMQ slow-joiner (which deadlocked the first request). No-op
+        # for TP=1. See SchedulerIOMixin.establish_inter_rank_link.
+        self.establish_inter_rank_link()
         # Speculative decoding runs in a dedicated synchronous loop: acceptance is a
         # data-dependent host-sync that fundamentally conflicts with the zero-sync overlap path
         # (see SPEC_DECODE.md §1). All GPU work runs on the engine stream, like the eager path.
