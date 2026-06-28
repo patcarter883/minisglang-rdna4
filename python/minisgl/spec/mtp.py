@@ -41,6 +41,7 @@ class MTPProposer(Proposer):
     """
 
     needs_last_hidden = True
+    supports_prefill_seed = True
 
     def __init__(self, engine, num_draft: int) -> None:
         self._engine = engine
@@ -100,6 +101,29 @@ class MTPProposer(Proposer):
                 print(f"[mtp-dbg] uid={req.uid} conf={conf_tok} base_pos={base_pos} "
                       f"ctx={committed} draft={drafts}", flush=True)
         return out
+
+    @torch.inference_mode()
+    def seed_prefill(self, req: "Req", last_hidden, aux_hidden=None) -> None:
+        # Seed the persistent MTP KV from the prompt prefill so the FIRST draft already sees full
+        # prompt context (the cache otherwise starts empty at the first decode -> cold early tokens).
+        # We mirror the decode-time convention exactly: propose processes the pair
+        # (embed(token_p), h_{p-1}) at RoPE position p (h = the target hidden that produced token_p),
+        # so we run the MTP layer's k/v over the prompt pairs p=1..P-1 and mark them all committed.
+        # The first decode step's propose then appends position P (the bonus token), attending to the
+        # whole prompt. (Position 0 has no h_{-1}, so it is the one prompt token left out of the cache
+        # — one key among P, negligible.)
+        if last_hidden is None:
+            return
+        P = last_hidden.shape[0]
+        if P < 2:
+            return  # nothing to seed (P==1: only the bonus, handled by the first propose)
+        device = self._device
+        tokens = req.input_ids[1:P].to(device=device, dtype=torch.int64)  # token_p, p=1..P-1
+        prev_hidden = last_hidden[0 : P - 1].to(self._engine.dtype)  # h_{p-1}
+        positions = torch.arange(1, P, dtype=torch.int32, device=device)
+        entries = self._head.seed_kv(tokens, prev_hidden, positions)
+        self._cache[req.uid] = entries
+        self._committed[req.uid] = len(entries)
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         # The confirmed token (always committed) plus the n accepted drafts become permanent MTP

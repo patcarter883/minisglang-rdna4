@@ -57,10 +57,28 @@ class Proposer(ABC):
     needs_last_hidden: bool = False
     # Target decoder-layer ids whose hidden states must be captured (DFlash/EAGLE3); None = no aux.
     capture_layer_ids: Optional[List[int]] = None
+    # Whether this proposer can seed its persistent draft KV from the prompt prefill (MTP / EAGLE3).
+    # When True AND MINISGL_SPEC_PREFILL_SEED=1, the scheduler runs a hidden-capturing prefill and
+    # hands the per-req prompt hidden to `seed_prefill` so the FIRST draft already sees full prompt
+    # context (lifts early-token acceptance). n-gram (no draft KV) and DFlash (no persistent KV)
+    # leave this False, so the extra prefill capture is skipped for them.
+    supports_prefill_seed: bool = False
 
     @abstractmethod
     def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
         """Return up to ``num_draft`` draft token ids per req (empty list ⇒ plain decode step)."""
+
+    def seed_prefill(
+        self,
+        req: "Req",
+        last_hidden: "Optional[torch.Tensor]",
+        aux_hidden: "Optional[torch.Tensor]",
+    ) -> None:
+        """Seed this req's persistent draft KV from the prompt prefill so the first draft has full
+        prompt context. ``last_hidden`` is the target's pre-final-norm hidden ``[P, hidden]`` over the
+        prompt positions 0..P-1; ``aux_hidden`` is the captured aux ``[num_capture_layers, P, hidden]``
+        (or None). Default no-op (n-gram / DFlash own no seedable per-req KV). Only called when
+        ``supports_prefill_seed`` and seeding is enabled."""
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         """Roll back any draft-owned state (draft KV / recurrent state) to the accepted prefix.

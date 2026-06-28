@@ -106,11 +106,25 @@ class Scheduler(SchedulerIOMixin):
         # pays nothing. Aux-layer capture is programmed into the target model ONCE here.
         self._spec_needs_last_hidden = False
         self._spec_capture_layer_ids: List[int] | None = None
+        # Prompt-prefill draft-KV seed (MINISGL_SPEC_PREFILL_SEED=1): run a hidden-capturing prefill
+        # and seed the proposer's persistent draft KV over the prompt, so the FIRST draft already sees
+        # full prompt context (lifts early-token acceptance). Off by default — it adds prefill work and
+        # grows the per-step draft-KV stack by the prompt length; lossless either way (the verify
+        # corrects every draft, so the seed can only change acceptance, never output). Only engages for
+        # a proposer that owns a seedable per-req draft KV (MTP / EAGLE3 -> supports_prefill_seed).
+        self._spec_seed_enabled = False
         if self._proposer is not None:
             self._spec_needs_last_hidden = bool(self._proposer.needs_last_hidden)
             self._spec_capture_layer_ids = self._proposer.capture_layer_ids
             if self._spec_capture_layer_ids:
                 self.engine.model.set_capture_layers(self._spec_capture_layer_ids)
+            self._spec_seed_enabled = (
+                os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
+                and bool(self._proposer.supports_prefill_seed)
+                and (self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids))
+            )
+            if self._spec_seed_enabled:
+                logger.info_rank0("spec-decode: prompt-prefill draft-KV seed ENABLED")
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -310,11 +324,15 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        # Prefill takes priority and uses the normal (non-spec) synchronous path.
+        # Prefill takes priority and uses the normal (non-spec) synchronous path — except when the
+        # prompt-prefill draft-KV seed is enabled, where it runs a hidden-capturing prefill instead.
         batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         if batch is not None:
-            forward_input = self._prepare_batch(batch)
-            self._process_last_data((forward_input, self._forward(forward_input)))
+            if self._spec_seed_enabled:
+                self._spec_prefill_seeded(batch)
+            else:
+                forward_input = self._prepare_batch(batch)
+                self._process_last_data((forward_input, self._forward(forward_input)))
             return
 
         if not self.decode_manager.runnable:
@@ -329,6 +347,51 @@ class Scheduler(SchedulerIOMixin):
             batch = self.decode_manager.schedule_next_batch()
             forward_input = self._prepare_batch(batch)
             self._process_last_data((forward_input, self._forward(forward_input)))
+
+    def _spec_prefill_seeded(self, batch: Batch) -> None:
+        """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the
+        proposer's persistent draft KV from it (the prompt-prefill draft-KV seed lever). Mirrors the
+        normal prefill (`_forward` + `_process_last_data`) but runs the one forward with
+        `return_hidden=True`, so the bonus token and the prompt hidden come from a SINGLE pass. Only
+        reqs whose WHOLE prompt is in this forward (cached_len==0, not chunked) are seeded — a chunked
+        or prefix-cache-hit prompt's earlier hidden isn't available here, so it falls back to the cold
+        cache (still lossless, just no early-token lift)."""
+        forward_input = self._prepare_batch(batch)
+        # Plan the seed-eligible reqs + their hidden-row slices BEFORE the forward advances cached_len
+        # (forward_batch calls complete_one). Prefill rows follow padded_reqs order, which equals
+        # batch.reqs for a prefill (no CUDA-graph padding — see GraphRunner.pad_batch).
+        real = {id(r) for r in batch.reqs}
+        plan: List[Tuple[Req, int, int]] = []  # (req, hidden-row offset, prompt_len)
+        offset = 0
+        for req in batch.padded_reqs:
+            ext = req.extend_len
+            if (not isinstance(req, ChunkedReq)) and req.cached_len == 0 and id(req) in real:
+                plan.append((req, offset, ext))
+            offset += ext
+
+        fi_batch, sample_args, input_mapping, output_mapping = forward_input
+        fi_batch.input_ids = self.token_pool[input_mapping]
+        out, last_hidden, aux_hidden = self.engine.forward_batch(
+            fi_batch, sample_args, return_hidden=True
+        )
+        self.token_pool[output_mapping] = out.next_tokens_gpu
+        self.decode_manager.filter_reqs(fi_batch.reqs)
+
+        # Seed each eligible req's draft KV over its prompt slice, and carry the first-step seed hidden
+        # (the prompt's LAST position produced the bonus token, so its hidden seeds the first propose —
+        # exactly the row the decode-time carry would have used). Cloned off the big verify tensors so
+        # they can be released. last_hidden/aux_hidden are still the prompt's hidden here (input_ids
+        # has not yet had the bonus appended — that happens in _process_last_data below).
+        for req, off, plen in plan:
+            lh = last_hidden[off : off + plen] if last_hidden is not None else None
+            ax = aux_hidden[:, off : off + plen] if aux_hidden is not None else None
+            self._proposer.seed_prefill(req, lh, ax)
+            if self._spec_needs_last_hidden and lh is not None:
+                self._spec_last_hidden[req.uid] = lh[plen - 1].clone()
+            if self._spec_capture_layer_ids and ax is not None:
+                self._spec_aux_hidden[req.uid] = ax[:, plen - 1].clone()
+
+        self._process_last_data((forward_input, out))
 
     def _spec_decode_step(self, reqs: List[Req]) -> None:
         spec = self.engine.spec_config

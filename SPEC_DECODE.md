@@ -275,9 +275,11 @@ proposer runs the head autoregressively K times. **Two findings that set the sha
   desyncs the per-rank drafts and deadlocks the verify collective. (Diagnostics: env-gated
   `MINISGL_MTP_DBG`, `MINISGL_MTP_POS_SHIFT`; default position = embedded token's absolute index.)
 
-Future lever (not needed for the bar): seed the MTP KV with the **prompt prefill** (run the MTP layer
-over the prompt once) to lift early-token acceptance — the cache currently starts empty at the first
-decode, so short generations miss prompt context.
+**Prompt-prefill draft-KV seed (`MINISGL_SPEC_PREFILL_SEED=1`, opt-in)** — IMPLEMENTED, see below.
+By default the draft KV starts empty at the first decode, so the first few drafts miss prompt context
+and early-token acceptance is low. With the env on, the scheduler runs a hidden-capturing prefill and
+seeds the persistent draft KV over the prompt once, so the FIRST draft already attends to the whole
+prompt. Shared design (MTP + EAGLE3, §"Prompt-prefill draft-KV seed" below).
 
 #### (historical) MTP self-speculation — DESIGN NOTES
 GLM-4.7-Flash (`num_nextn_predict_layers=1`) and Qwen3.5/3.6 (`mtp_num_hidden_layers=1`) ship one
@@ -322,17 +324,68 @@ verify. **Three findings that set the shape:**
   its self-attention to just the K-token chain collapses it to ~2% accept (near random). The proposer
   keeps `_cache[uid]`, runs every confirmed token through the draft layer (growing the context across
   decode steps), appends the K drafts temporarily, and `on_accept` truncates to the accepted prefix;
-  `free(uid)` drops it on finish. The cache starts empty at the first decode (the prompt is not
-  replayed), so early-token acceptance is lower — the same future lever as MTP.
+  `free(uid)` drops it on finish. The cache starts empty at the first decode unless the
+  prompt-prefill draft-KV seed is on (`MINISGL_SPEC_PREFILL_SEED=1`, §"Prompt-prefill draft-KV seed"
+  below), which replays the prompt through the draft layer once to lift early-token acceptance.
 - **the draft forward is parity-exact** against an independent reference (`tools/eagle3_parity.py`,
   cos≈1.0, identical argmax) — the model math + weight load are correct; all the acceptance came from
   the aux content + persistent-KV fixes above. Diagnostics (env-gated, default = the validated
   config): `MINISGL_EAGLE3_CAPTURE_LAYERS`, `MINISGL_EAGLE3_AUX_MODE` (xr/r),
   `MINISGL_EAGLE3_TOK_OFF`/`POS_OFF`, `MINISGL_EAGLE3_NO_CTX`.
 
-Future levers (not needed for the bar): tree verify (topk>1 custom-mask kernels, §5); the SGLang
-draft-extend-over-accepted-prefix seed (rebuild the chain hidden through the draft rather than reuse
-the single last aux); a bf16 (non-AWQ) target to recover the README's ~55%.
+Future levers (not needed for the bar): tree verify (topk>1 custom-mask kernels, §5); a bf16 (non-AWQ)
+target to recover the README's ~55%. (The prompt-prefill draft-KV seed is now implemented — §below.)
+
+### Prompt-prefill draft-KV seed (`MINISGL_SPEC_PREFILL_SEED=1`) — opt-in, lossless by construction
+Both MTP and EAGLE3 keep a PERSISTENT per-request draft KV (one draft layer). By default it starts
+EMPTY at the first decode: the prompt is never replayed through the draft layer, so the first few
+drafts attend only to the just-generated tokens and early-token acceptance is low (worst for short
+generations). This lever replays the prompt through the draft layer once, at prefill, so the FIRST
+draft already attends to the whole prompt.
+
+Mechanism (off by default; engages only for a `supports_prefill_seed` proposer — MTP/EAGLE3 — with
+the env set):
+- **One hidden-capturing prefill.** `Engine.forward_batch(..., return_hidden=True)` runs the prefill
+  forward returning `(ForwardOutput, last_hidden, aux_hidden)` in a SINGLE pass — the lm_head still
+  does its prefill last-token reduction (so the bonus token is unchanged), while `last_hidden`
+  (pre-final-norm `[P, hidden]`) / `aux_hidden` (`[num_capture, P, hidden]`) cover ALL prompt
+  positions. `Scheduler._spec_prefill_seeded` drives it, slicing each req's prompt rows.
+- **Seed the draft KV.** `Proposer.seed_prefill(req, last_hidden, aux_hidden)` runs the draft layer's
+  k/v over the prompt pairs and stores them as the committed prefix. The seed uses the SAME convention
+  the decode-time propose does — the pair `(embed(token_p), h_{p-1})` at RoPE position `p`, where
+  `h_{p-1}` is the target hidden (MTP) / fused aux (EAGLE3) that produced `token_p`. It runs pairs
+  `p=1..P-1` (committed = `P-1`); the first decode step's propose then appends position `P` (the
+  bonus), attending to the whole prompt. Position 0 (no `h_{-1}`) is the one prompt token left out —
+  one key among P, negligible. The heads expose a batched, attention-free `seed_kv` (`GLMMTPHead` /
+  `GLMMTPAttention.seed_kv`, `GLMEagle3DraftModel.seed_kv`) that mirrors `forward_draft`/`step`'s q/k/v
+  exactly (the cache only stores k/v; attention runs at propose time over the stacked cache) — KEEP IN
+  SYNC with the autoregressive path.
+- **First-step seed hidden.** The scheduler carries `last_hidden[P-1]` / `aux_hidden[:,P-1]` (the
+  prompt's last position — it produced the bonus) into the first `ProposeContext`, the same row the
+  decode-time carry would use, so the first decode step drafts immediately (no cold no-draft step).
+
+**GPU-validated (GLM-4.7-Flash-AWQ, TP=2, `tools/run_prefill_seed_window.sh`):**
+- **seed_kv math is byte-EXACT.** `tools/seed_kv_parity.py` (run_seed_kv_parity.sh): the batched
+  attention-free `seed_kv` produces `(k,v)` BYTE-IDENTICAL (`max|Δk|=max|Δv|=0`) to the autoregressive
+  `step` over the same positions. The seeded cache is exactly what decode would have built.
+- **Lossless.** Both seed-ON and seed-OFF are byte-identical to `FORCE_N0` (plain greedy decode) on
+  the long-prompt/short-gen probe set — 8/8 MATCH for MTP and EAGLE3.
+- **EAGLE3 (bf16 draft): the lever pays.** accept_rate 0.26→0.30, **emitted/step 1.89→2.05 (+8.5%)**,
+  draft_accepted 89/342→105/351 (clean apples-to-apples — identical token streams).
+- **MTP (AWQ MTP MoE draft): no lift.** 82/536→82/540 (same accepts; the now-drafting first step's
+  extra proposals are rejected). The AWQ-quantized MTP head's draft quality is the bottleneck, not
+  missing prompt context (cf. the MTP section's AWQ-lossy-draft note) — so seeding is correct but inert
+  for MTP-AWQ. Expect a lift on a bf16 MTP target (e.g. Qwen3.5).
+
+**Lossless by construction.** The verify forward commits the target's argmax regardless of the
+drafts, so the seed can only change WHICH drafts are proposed/accepted — never the committed tokens.
+Worst case (a buggy seed) is lower acceptance, never wrong output. Only fully-fresh single-batch
+prefills are seeded (`cached_len==0`, not chunked); a chunked / prefix-cache-hit prompt's earlier
+hidden isn't in this one forward, so it falls back to the cold cache (still lossless). Validation:
+`tools/run_prefill_seed_window.sh` (TP=2 GLM) boots seed-OFF vs seed-ON and asserts the served output
+is BYTE-IDENTICAL across the two (lossless invariance) while accept_rate rises. Caveat: the persistent
+draft KV is a Python list stacked every propose step, so seeding grows that stack by the prompt length
+— a follow-up is a preallocated-tensor draft KV so long prompts don't pay an O(P) stack per step.
 
 ### DFlash (separate block-diffusion draft) — DONE, GPU-VALIDATED (coherent; ~10% accept / ~1.6 tok/step)
 GPU-validated on the GDN-hybrid target Qwen3.5-4B (`Qwen/Qwen3.5-4B`, TP=1) with `--spec-algorithm

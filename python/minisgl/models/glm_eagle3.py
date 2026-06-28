@@ -192,5 +192,34 @@ class GLMEagle3DraftModel(BaseOP):
         logits = self.lm_head.forward(self.norm.forward(out_hidden))  # [B, draft_vocab]
         return logits, out_hidden
 
+    @torch.inference_mode()
+    def seed_kv(
+        self, embed_e: torch.Tensor, hidden: torch.Tensor, positions: torch.Tensor
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """Compute per-position (k, v) for a batch of prompt positions WITHOUT attention — used to
+        SEED the persistent draft KV from the prompt prefill (DraftModelProposer.seed_prefill), so the
+        first draft sees full prompt context instead of a cold cache. The q/k/v projection MUST mirror
+        ``step`` exactly (keep in sync) — only the attention/MLP/head are dropped (the cache only stores
+        k/v; attention runs at propose time over the stacked cache).
+
+        embed_e/hidden: [S, hidden] (S = number of prompt positions seeded); positions: [S] RoPE pos.
+        Returns a list of S ``(k [1, Hkv, hd], v [1, Hkv, hd])`` entries — same shape/order ``step``
+        appends, so the proposer can stack them directly."""
+        S = embed_e.shape[0]
+        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        a = self.input_layernorm.forward(embed_e)
+        b = self.hidden_norm.forward(hidden)
+        widened = torch.cat([a, b], dim=-1)  # [S, 2*hidden]
+        k = self.k_proj.forward(widened).view(S, Hkv, hd)
+        v = self.v_proj.forward(widened).view(S, Hkv, hd)
+        # RoPE on k uses the shared rotary, which rotates q (H heads) and k (Hkv heads) jointly; compute
+        # q only to satisfy the call and discard it (the seed needs k/v, not q).
+        q = self.q_proj.forward(widened).view(S, H, hd)
+        _, k_flat = self.rotary.forward(
+            positions, q.reshape(S, H * hd).contiguous(), k.reshape(S, Hkv * hd).contiguous()
+        )
+        k = k_flat.view(S, Hkv, hd)
+        return [(k[s : s + 1], v[s : s + 1]) for s in range(S)]
+
 
 __all__ = ["GLMEagle3DraftModel"]

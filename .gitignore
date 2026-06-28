@@ -37,3 +37,4 @@ env/
 .triton-cache-3c/
 tools/tp2_results/
 tools/glm_smoke.server.log
+tools/seed_*.log
