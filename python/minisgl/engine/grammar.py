@@ -38,16 +38,15 @@ class GrammarBackend:
         self.full_vocab_size = tokenizer_info.vocab_size
 
     def make_matcher(self, spec: str):
-        """Compile ``spec`` and return a fresh stateful GrammarMatcher. ``spec`` == "json" -> the
-        builtin any-JSON grammar; otherwise it is treated as a JSON-schema string."""
+        """Compile ``spec`` and return a fresh stateful GrammarMatcher. ``spec`` == "json" -> any JSON
+        object; otherwise ``spec`` is a JSON-schema string."""
         xgr = self._xgr
-        if spec == "json":
-            compiled = self._compiler.compile_builtin_json_grammar()
-        else:
-            # any_whitespace=False -> compact JSON: forbids the unbounded-whitespace runs a greedy
-            # (temp 0) model otherwise gets stuck emitting between schema elements, so the object
-            # actually completes within max_tokens.
-            compiled = self._compiler.compile_json_schema(spec, any_whitespace=False)
+        # any_whitespace=False -> compact JSON: forbids the unbounded-whitespace runs a greedy (temp 0)
+        # model otherwise stalls in, so the value completes within max_tokens. json_object maps to "any
+        # JSON object"; the builtin grammar is avoided because it has no whitespace bound and loops the
+        # same way.
+        schema = '{"type": "object"}' if spec == "json" else spec
+        compiled = self._compiler.compile_json_schema(schema, any_whitespace=False)
         return xgr.GrammarMatcher(compiled)
 
     def allocate_bitmask(self, batch_size: int) -> torch.Tensor:

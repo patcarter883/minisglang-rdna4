@@ -14,7 +14,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
-from minisgl.spec import ProposeContext, make_proposer, verify_greedy
+from minisgl.spec import AcceptResult, ProposeContext, make_proposer, verify_greedy
 from minisgl.utils import div_ceil, init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -398,6 +398,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # a terminated matcher leaves its row all-ones: nothing left to emit but EOS, allow it.
         return bitmask.to(self.device)
 
+    def _verify_greedy_constrained(
+        self, matcher, draft: List[int], logits_block: torch.Tensor, ignore_eos: bool
+    ) -> AcceptResult:
+        """Grammar-constrained speculative acceptance for ONE request (structured output + spec decode).
+
+        The proposer drafts UNCONSTRAINED; the grammar is enforced here, at the verify argmax. Walk the
+        K+1 verify positions: at each, mask the target logits with the matcher's currently-allowed set
+        (its state after the committed prefix), take the masked argmax as the grammar-valid target token
+        ``t_i``, and accept ``draft[i]`` iff it equals ``t_i``. The committed run is exactly the masked
+        target argmaxes (== what plain constrained decode would emit -> LOSSLESS), so a draft that
+        violates the grammar simply mismatches ``t_i`` and is rejected. The matcher is advanced by every
+        committed token (never by EOS, which isn't a grammar token); the walk stops at the bonus /
+        first mismatch / EOS, so it never over-advances past what the caller keeps. ``logits_block`` is
+        the req's [K+1, vocab] verify logits on CPU."""
+        from minisgl.engine.grammar import apply_token_bitmask
+
+        backend = self._grammar_backend
+        emitted: List[int] = []
+        n_acc = 0
+        K = len(draft)
+        for i in range(K + 1):
+            bitmask = backend.allocate_bitmask(1)
+            bitmask.fill_(-1)
+            terminated = matcher.is_terminated()
+            if not terminated:
+                matcher.fill_next_token_bitmask(bitmask, 0)
+            masked = apply_token_bitmask(logits_block[i : i + 1].float(), bitmask)
+            t_i = int(masked[0].argmax().item())
+            emitted.append(t_i)
+            is_eos = (not ignore_eos) and t_i == self.eos_token_id
+            if not is_eos and not terminated:
+                matcher.accept_token(t_i)
+            if is_eos:
+                break  # EOS ends the sequence; not fed to the matcher
+            if i < K and draft[i] == t_i:
+                n_acc += 1
+                continue
+            break  # bonus token (t_i != draft[i], or i == K)
+        return AcceptResult(emitted=emitted, num_accepted=n_acc)
+
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (
@@ -447,14 +487,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return
 
         reqs = sorted(self.decode_manager.running_reqs, key=lambda req: req.uid)
-        # Spec-decode runs only for an all-greedy, fully-UNCONSTRAINED decode set: a non-greedy req
-        # (lossless accept is greedy-only) OR a constrained req (the draft chain would also have to
-        # satisfy the grammar — a later refinement) falls the whole batch back to a plain synchronous
-        # decode step, where the grammar bitmask is applied in the sampler.
-        spec_ok = all(
-            req.sampling_params.is_greedy and not req.sampling_params.is_constrained
-            for req in reqs
-        )
+        # Spec-decode runs for an all-greedy decode set (lossless accept is greedy-only). Constrained
+        # (structured-output) reqs now spec-decode too: their drafts are proposed UNCONSTRAINED and the
+        # grammar is enforced at the verify argmax (_verify_greedy_constrained), so a grammar-violating
+        # draft is simply rejected. A non-greedy req still falls the whole batch back to a plain decode.
+        spec_ok = all(req.sampling_params.is_greedy for req in reqs)
         if spec_ok:
             self._spec_decode_step(reqs)
         else:
@@ -627,9 +664,23 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for i, (req, d) in enumerate(zip(reqs, drafts)):
             q_len = len(d) + 1
             block_start = offset  # this req's first query row in the [sum(K_i+1)] verify output
-            target = preds[offset : offset + q_len].tolist()
             offset += q_len
-            result = verify_greedy(d, target)
+            matcher = (
+                self._grammar_matchers.get(req.uid)
+                if req.sampling_params.is_constrained
+                else None
+            )
+            if matcher is not None:
+                # Structured output + spec: grammar-mask the verify argmax per position and advance the
+                # matcher through the accepted chain (lossless; see _verify_greedy_constrained). Needs
+                # the raw logit rows on host, not the precomputed unmasked argmax.
+                block = logits[block_start : block_start + q_len].float().cpu()
+                result = self._verify_greedy_constrained(
+                    matcher, d, block, req.sampling_params.ignore_eos
+                )
+            else:
+                target = preds[block_start : block_start + q_len].tolist()
+                result = verify_greedy(d, target)
             if os.environ.get("MINISGL_SPEC_FORCE_N0") == "1":
                 # Diagnostic: stage+verify drafts but accept none (emit only the bonus). Should be
                 # byte-identical to plain decode through the multi-query kernel — isolates whether
