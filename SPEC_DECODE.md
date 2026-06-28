@@ -156,7 +156,35 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 - **EAGLE2 dynamic tree** — `topk>1`: add `custom_mask`+`mask_indptr` to `attn_prefill_paged`
   (and an analogous per-query tree mask to `mla_verify`).
 - **Overlap scheduling** — `FutureMap`-style to hide the acceptance host-sync.
-- **CUDA graph capture** of the verify forward (fixed max tree size, dynamic accept count post-replay).
+- ~~**CUDA graph capture** of the verify forward~~ — DONE for **MLA** (GLM-4.7-Flash), see below.
+
+### MLA spec-verify CUDA graph capture — DONE, GPU-validated (lossless; tok/s NEUTRAL at bs=1)
+The verify forward stages a FIXED `bs*(num_draft+1)` query tokens, so it captures one graph per bs
+(`GraphRunner.capture_verify_graphs`, scheduler-triggered AFTER the proposer programs the target's
+aux-capture layers, so the captured forward stashes the EAGLE3/MTP hidden). Mechanics:
+- `MLABackend.init_verify_capture` static buffers; `verify()` reads PRECOMPUTED `verify_seq_idx` /
+  `verify_kbound` (the normal `_verify_indices` does a data-dependent `repeat_interleave` that is NOT
+  capturable; under verify the q-lens are uniformly `K+1`, so seq_idx is a static pattern and kbound a
+  cheap per-step fill).
+- `VerifyCaptureBuffer` holds input_ids/positions/out_loc + logits **and** last_hidden/aux_hidden (so
+  `return_hidden` is captured — what the draft head consumes). Scheduler pads the verify batch FIRST
+  (dummy reqs → dummy-page out_loc, never stale KV), then `replay_verify` copies inputs in and replays.
+- `_adjust_config`: MLA spec keeps CUDA graph (capped at `max_running_req` — spec batches are small);
+  non-MLA (MHA/GDN) spec stays eager. `can_use_verify_graph` falls back to eager on partial-K steps.
+
+**Validated (GLM-4.7-Flash-AWQ EAGLE3, TP=2, `tools/run_mla_spec_graph.sh`):** the verify graphs
+capture (`qlen=7, aux=3`), are USED at serve time (`verify_graph_replays≈steps`), and are **byte-
+identical to eager** (lossless replay — precomputed indices == `_verify_indices`).
+
+**Throughput finding — NEUTRAL at bs=1 (sweep: EAGLE3 K=6 eager 37.23 vs graph 37.34 tok/s).** The
+verify forward is NOT launch-bound on the critical path: in the synchronous spec step the CPU already
+runs ahead and hides its launch latency before the `preds.cpu()` barrier. (A `MINISGL_SPEC_TIMING=1`
+diagnostic with `cuda.synchronize` barriers *exposes* the hidden latency — verify_fwd 69→45ms under
+graph — but those barriers aren't present in real operation, so the eager step is already ~56ms ==
+graph.) The real GLM levers are the verify forward's *compute* (memory-bound MoE/MLA over K+1 tokens
+at TP=2) and the autoregressive EAGLE3 propose (~9ms, CPU↔GPU ping-pong) — neither addressed by
+graphing the verify. Graph capture is the correct completeness fix (and the foundation for an
+overlap-scheduling spec loop, where it WOULD pay), but it does not move bs=1 GLM tok/s today.
 
 ---
 

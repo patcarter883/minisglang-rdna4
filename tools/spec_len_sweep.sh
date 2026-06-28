@@ -32,7 +32,8 @@ boot(){ # $1=algo $2=k $3=seed ; log path echoed via $LOG
   local spec="" graph="--graph 16" env_extra="MINISGL_MOE_SCATTER=0"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
   if [ "$algo" != "none" ]; then
-    spec="--spec-algorithm $algo --spec-num-draft $k"; graph="--graph 0"  # spec is eager-only
+    # GRAPH_SPEC>0 enables MLA spec-decode verify CUDA-graph capture (eager-only otherwise).
+    spec="--spec-algorithm $algo --spec-num-draft $k"; graph="--graph ${GRAPH_SPEC:-0}"
     [ "$algo" = "eagle3" ] && spec="$spec --spec-draft-model-path $DRAFT"
     env_extra="$env_extra MINISGL_SPEC_DEBUG=1"
     [ "$seed" = "1" ] && env_extra="$env_extra MINISGL_SPEC_PREFILL_SEED=1"

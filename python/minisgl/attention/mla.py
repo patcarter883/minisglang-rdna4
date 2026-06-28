@@ -19,6 +19,13 @@ class MLAMetadata(BaseAttnMetadata):
     cu_seqlens_k: torch.Tensor  # [bs+1] cumulative total KV lengths — int32 (prefill materialize)
     max_seqlen_q: int
     page_table: torch.Tensor  # [bs, max_pages] page-indexed block table (for the decode kernel)
+    # Spec-verify graph capture: the per-query (seq index, causal kbound) the mla_verify kernel reads.
+    # Normally `verify()` derives these via `_verify_indices` (data-dependent repeat_interleave — NOT
+    # cudagraph-capturable). For a captured verify graph the scheduler/backend precompute them into
+    # STATIC buffers (q_lens are uniformly num_draft+1, so seq_idx is a fixed pattern and kbound is a
+    # cheap per-step fill); when present, `verify()` reads them directly. None on the eager path.
+    verify_seq_idx: "torch.Tensor | None" = None
+    verify_kbound: "torch.Tensor | None" = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -81,7 +88,11 @@ class MLABackend(BaseAttnBackend):
         (causal); see mla_hip.mla_verify."""
         latent_cache = self.kvcache.latent_cache(layer_id)
         block_table = metadata.page_table.to(torch.int32)
-        q_seq_idx, q_kbound = self._verify_indices(metadata)
+        if metadata.verify_seq_idx is not None:
+            # Captured-graph path: precomputed static indices (see MLAMetadata / prepare_verify_*).
+            q_seq_idx, q_kbound = metadata.verify_seq_idx, metadata.verify_kbound
+        else:
+            q_seq_idx, q_kbound = self._verify_indices(metadata)
         if self.kv_is_fp8:
             return self._verify_fp8_op(
                 q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 1.0, 1.0, 0, 0
@@ -221,3 +232,72 @@ class MLABackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         self._fill_decode_static(batch)
         batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
+
+    # ---- cudagraph capture (SPEC-DECODE VERIFY) ----------------------------------------------
+    # The verify forward stages num_draft+1 query tokens PER req (confirmed + K drafts), so the
+    # token count is bs*(K+1) — fixed once K=num_draft is fixed. We capture one graph per bs (number
+    # of reqs). The mla_verify kernel reads, per query row, a (seq index, causal kbound); since every
+    # req has exactly K+1 query rows, `verify_seq_idx` is a STATIC pattern ([0]*(K+1),[1]*(K+1),...)
+    # and `verify_kbound[i*(K+1)+j] = device_len[i] - (K+1) + j + 1` is a cheap per-step fill. Both
+    # live in static buffers the captured kernel reads; `prepare_verify_for_replay` refreshes them
+    # (+ cache_seqlens + page_table) in place before g.replay(). cu_seqlens_q is unused on this path
+    # (verify reads the precomputed indices), kept as an arange*(K+1) placeholder.
+    def init_verify_capture(self, max_seq_len: int, bs_list: List[int], num_draft: int) -> None:
+        dev = self.kvcache.device
+        self._vcap_max_bs = max(bs_list)
+        self._vcap_qlen = num_draft + 1
+        self._vcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        T = self._vcap_max_bs * self._vcap_qlen
+        self._vcap_cache_seqlens = torch.ones(self._vcap_max_bs, dtype=torch.int32, device=dev)
+        self._vcap_page_table = torch.zeros(
+            self._vcap_max_bs, self._vcap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._vcap_cu_q = (
+            torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
+        )
+        self._vcap_kbound = torch.zeros(T, dtype=torch.int32, device=dev)
+        # static seq-index pattern: row r belongs to seq r // (K+1).
+        self._vcap_seq_idx = (
+            torch.arange(T, dtype=torch.int32, device=dev) // self._vcap_qlen
+        )
+
+    def _verify_metadata_static(self, bs: int) -> MLAMetadata:
+        ql = self._vcap_qlen
+        return MLAMetadata(
+            cache_seqlens=self._vcap_cache_seqlens[:bs],
+            cu_seqlens_q=self._vcap_cu_q[: bs + 1],
+            cu_seqlens_k=self._vcap_cu_q[: bs + 1],  # unused by verify (placeholder)
+            max_seqlen_q=ql,
+            page_table=self._vcap_page_table[:bs],
+            verify_seq_idx=self._vcap_seq_idx[: bs * ql],
+            verify_kbound=self._vcap_kbound[: bs * ql],
+        )
+
+    def _fill_verify_static(self, batch: Batch) -> None:
+        """Refresh the static verify buffers from `batch.padded_reqs` (real rows + dummy padding).
+        Eager, OUTSIDE the graph. cache_seqlens = device_len; kbound[i,j] = device_len_i-(K+1)+1+j;
+        page_table = each seq's page row (stale tail beyond cache_seqlens is ignored by the kernel)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        ql = self._vcap_qlen
+        dev = self.kvcache.device
+        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
+        self._vcap_cache_seqlens[:bs].copy_(dls)
+        # kbound[i, j] = device_len_i - (K+1) + 1 + j  (causal bound for query j of seq i)
+        kb = (dls - ql + 1).unsqueeze(1) + torch.arange(ql, dtype=torch.int32, device=dev).unsqueeze(0)
+        self._vcap_kbound[: bs * ql].copy_(kb.reshape(-1))
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (req.device_len + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._vcap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_verify_for_capture(self, batch: Batch) -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
+
+    def prepare_verify_for_replay(self, batch: Batch) -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)

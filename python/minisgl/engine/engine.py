@@ -410,11 +410,39 @@ class Engine:
         ``aux_hidden`` is the stacked captured decoder layers ``[num_capture_layers, sum(extend_len),
         hidden]`` (or ``None`` if no capture layers are programmed). Capture layers are programmed via
         ``model.set_capture_layers`` at proposer init. No sampling and no ``complete_one``: the
-        scheduler owns acceptance, commit, and req advancement. Never uses a CUDA graph (the verify
-        batch is variable-length); MVP is eager-only."""
+        scheduler owns acceptance, commit, and req advancement.
+
+        MLA verify is CUDA-graph captured: when the batch is graphable (uniform K+1 query tokens, bs
+        fits a captured size) ``replay_verify`` runs the staged forward as one graph replay (the
+        scheduler has copied input_ids/positions/out_loc into the static buffers). Otherwise — a
+        partial-K step, or a non-MLA backend — it falls back to the eager forward."""
         assert torch.cuda.current_stream() == self.stream
+        if self.graph_runner.can_use_verify_graph(batch):
+            return self.graph_runner.replay_verify(batch, return_hidden)
         with self.ctx.forward_batch(batch):
             return self.model.forward(return_hidden=return_hidden)
+
+    def capture_spec_verify_graphs(
+        self, needs_hidden: bool, num_aux: int, bs_list: "list[int]"
+    ) -> None:
+        """Capture the MLA spec-decode verify graphs. Called by the scheduler AFTER the proposer is
+        built and the target's aux-capture layers are programmed (so the captured forward stashes the
+        hidden states the draft head consumes). No-op if graphs are disabled / non-MLA backend."""
+        if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
+            return
+        hidden_size = self.model.model.embed_tokens.weight.shape[1]
+        # Capture on the ENGINE stream (the scheduler may have switched the current stream to its own
+        # in __init__); the warmup forward + graph context must share it.
+        with torch.cuda.stream(self.stream):
+            self.graph_runner.capture_verify_graphs(
+                model=self.model,
+                num_draft=self.spec_config.num_draft,
+                bs_list=bs_list,
+                needs_hidden=needs_hidden,
+                num_aux=num_aux,
+                hidden_size=hidden_size,
+                dtype=self.dtype,
+            )
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
@@ -470,11 +498,23 @@ def _adjust_config(config: EngineConfig):
     #     mla_hip.mla_verify kernel (no prefix re-materialization). Both supported.
     #   * page_size: MHA forces 1 (per-token rollback); MLA keeps 16 (the mla_hip block size) —
     #     the scheduler's rollback is page-size-aware, freeing whole pages beyond the kept run.
-    #   * eager-only: the verify forward is variable-length; no CUDA graph (disable capture).
+    #   * CUDA graph: MLA verify IS graph-captured (fixed bs*(K+1) tokens; scheduler-triggered after
+    #     the proposer is built — see GraphRunner.capture_verify_graphs / forward_verify). Non-MLA
+    #     (MHA/GDN) verify stays eager (page_size-1 / recurrent-state paths) — graph disabled there.
     if config.spec_config is not None:
-        if not config.model_config.is_mla and config.page_size != 1:
-            override("page_size", 1)
-            logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback granularity)")
-        if config.cuda_graph_max_bs != 0:
-            override("cuda_graph_max_bs", 0)
-            logger.warning_rank0("spec-decode: disabling CUDA graph (verify is eager/var-length)")
+        if not config.model_config.is_mla:
+            if config.page_size != 1:
+                override("page_size", 1)
+                logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
+            if config.cuda_graph_max_bs != 0:
+                override("cuda_graph_max_bs", 0)
+                logger.warning_rank0("spec-decode (non-MLA): disabling CUDA graph (verify eager)")
+        else:
+            # Spec batches never exceed max_running_req (all running reqs verify together), so cap the
+            # captured graph sizes there — a default 160 would capture huge unused decode graphs and
+            # OOM (each verify graph also captures bs*(K+1) tokens). 0 keeps the user's eager opt-out.
+            cur = config.cuda_graph_max_bs
+            capped = config.max_running_req if cur is None else min(cur, config.max_running_req)
+            if cur != capped:
+                override("cuda_graph_max_bs", capped)
+                logger.info_rank0(f"spec-decode (MLA): capping CUDA graph bs at {capped} (max_running_req)")
