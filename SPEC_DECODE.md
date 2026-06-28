@@ -158,7 +158,7 @@ prefill kernels accept any page_size, so this is purely an allocator-bookkeeping
 - **Overlap scheduling** — `FutureMap`-style to hide the acceptance host-sync.
 - ~~**CUDA graph capture** of the verify forward~~ — DONE for **MLA** (GLM-4.7-Flash), see below.
 
-### MLA spec-verify CUDA graph capture — DONE, GPU-validated (lossless; tok/s NEUTRAL at bs=1)
+### MLA spec-verify CUDA graph capture — DONE, GPU-validated (lossless; +48% at bs=1 ONCE the propose is on-device)
 The verify forward stages a FIXED `bs*(num_draft+1)` query tokens, so it captures one graph per bs
 (`GraphRunner.capture_verify_graphs`, scheduler-triggered AFTER the proposer programs the target's
 aux-capture layers, so the captured forward stashes the EAGLE3/MTP hidden). Mechanics:
@@ -176,15 +176,40 @@ aux-capture layers, so the captured forward stashes the EAGLE3/MTP hidden). Mech
 capture (`qlen=7, aux=3`), are USED at serve time (`verify_graph_replays≈steps`), and are **byte-
 identical to eager** (lossless replay — precomputed indices == `_verify_indices`).
 
-**Throughput finding — NEUTRAL at bs=1 (sweep: EAGLE3 K=6 eager 37.23 vs graph 37.34 tok/s).** The
-verify forward is NOT launch-bound on the critical path: in the synchronous spec step the CPU already
-runs ahead and hides its launch latency before the `preds.cpu()` barrier. (A `MINISGL_SPEC_TIMING=1`
-diagnostic with `cuda.synchronize` barriers *exposes* the hidden latency — verify_fwd 69→45ms under
-graph — but those barriers aren't present in real operation, so the eager step is already ~56ms ==
-graph.) The real GLM levers are the verify forward's *compute* (memory-bound MoE/MLA over K+1 tokens
-at TP=2) and the autoregressive EAGLE3 propose (~9ms, CPU↔GPU ping-pong) — neither addressed by
-graphing the verify. Graph capture is the correct completeness fix (and the foundation for an
-overlap-scheduling spec loop, where it WOULD pay), but it does not move bs=1 GLM tok/s today.
+**Throughput finding — graph capture was NEUTRAL only because the propose host-syncs masked it; with
+the on-device propose (below) it is +48%.** Initial measurement (graph BEFORE the propose fix) was
+NEUTRAL at bs=1 (EAGLE3 K=6 eager 37.23 vs graph 37.34 tok/s). The naive reading was "verify isn't
+launch-bound — the CPU runs ahead and hides the launches before `preds.cpu()`." That was *incomplete*:
+the thing keeping the CPU from running ahead was the **propose**, not the verify. The EAGLE3/MTP draft
+chain did 2 host syncs per draft step (`logits.argmax().item()` + `d2t[id].item()`) = 12 CPU↔GPU
+round-trips per step, which serialized the whole step. With the verify collapsed to ONE graph replay,
+those propose syncs became the dominant critical-path cost, so graphing the verify bought nothing.
+
+**On-device propose (the fix that unblocks the graph).** `spec/draft_model.py` (EAGLE3) and
+`spec/mtp.py` (MTP) now keep the per-step argmax, the d2t map, and the next-token id **on device**
+across the K draft steps (one `.cpu().tolist()` per req at the end), and slice per-step RoPE positions
+from one precomputed tensor instead of a `torch.tensor(...)` alloc per step. The chain is still
+inherently sequential (step N+1 embeds step N's argmax), but removing the host syncs lets the GPU chain
+the steps back-to-back while the CPU runs ahead through the entire step. Measured (GLM-4.7-Flash-AWQ
+EAGLE3 K=6 seed-on, TP=2; `tools/run_spec_len_sweep.sh`; no-spec graphed baseline reproduced at 35.70):
+
+| config | before | after on-device propose |
+|--------|--------|--------------------------|
+| eagle3 **eager** | 37.23 | **38.17** (+2.5%) |
+| eagle3 **graph** | 37.34 | **55.27** (+48%) |
+
+So the two changes are **synergistic, not additive**: on-device propose alone (eager) is +2.5%; graph
+alone was neutral; together they are +48% (and **+54.8% over the no-spec graphed baseline**). Lossless
+is preserved — GRAPH==EAGER byte-identical (`tools/run_mla_spec_graph.sh` → PASS), and eager==graph
+accept/emit are identical (0.31 / 2.81), so the gain is pure execution, not a quality change.
+
+**Caveat on the timing diagnostic.** `MINISGL_SPEC_TIMING=1` (now split into propose/stage/forward/
+accept) shows propose 8.8→6.8ms and a barriered total drop of only ~2.5ms under graph — wildly
+understating the real +48%. The `cuda.synchronize` barriers serialize exactly the CPU-run-ahead the
+fix enables, so barriered timing is for RELATIVE attribution only, never wall-clock (the real number
+is the sweep). Staging is negligible (0.3ms); the verify forward GPU compute (~28-30ms, memory-bound
+MoE/MLA over K+1 tokens at TP=2) is the remaining irreducible floor. Graph capture also remains the
+foundation for an overlap-scheduling spec loop.
 
 ---
 

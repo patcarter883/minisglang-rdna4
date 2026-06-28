@@ -198,15 +198,26 @@ class DraftModelProposer(Proposer):
             fused = draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden] step-0 hidden
             cur_tok = torch.tensor([conf_tok], dtype=torch.int64, device=device)
             cur_hidden = fused  # [1, hidden]
-            drafts: List[int] = []
+            # On-device draft chain: keep the per-step argmax, the d2t (draft->target) map, and the
+            # next-token id ON DEVICE across the K steps, so the autoregressive chain runs without a
+            # CPU<->GPU round-trip per step. The chain is inherently sequential (step N+1 embeds step
+            # N's argmax), but removing the host syncs lets the GPU chain the steps back-to-back; the
+            # CPU just enqueues and pulls the whole chain to host ONCE at the end. Per-step positions
+            # are sliced from one precomputed tensor (vs a torch.tensor(...) alloc per step).
+            positions_all = torch.arange(
+                base_pos, base_pos + k_i, dtype=torch.int32, device=device
+            )
+            draft_ids: List[torch.Tensor] = []
             for step in range(k_i):
                 embed_e = draft.embed(cur_tok)  # [1, hidden]
-                positions = torch.tensor([base_pos + step], dtype=torch.int32, device=device)
-                logits, cur_hidden = draft.step(embed_e, cur_hidden, positions, cache)
-                draft_id = int(logits.argmax(dim=-1).item())  # COMPRESSED draft vocab
-                target_id = draft_id + int(self._d2t[draft_id].item())  # -> target vocab
-                drafts.append(target_id)
-                cur_tok = torch.tensor([target_id], dtype=torch.int64, device=device)
+                logits, cur_hidden = draft.step(
+                    embed_e, cur_hidden, positions_all[step : step + 1], cache
+                )
+                draft_id = logits.argmax(dim=-1)  # [1] COMPRESSED draft vocab (on device)
+                target_id = draft_id + self._d2t[draft_id]  # [1] -> target vocab (on device)
+                draft_ids.append(target_id)
+                cur_tok = target_id  # next step embeds the target-vocab id; no host sync
+            drafts = torch.cat(draft_ids).cpu().tolist() if draft_ids else []
             out[i] = drafts
             if self._dbg:
                 print(f"[eagle3-dbg] uid={req.uid} conf={conf_tok} base_pos={base_pos} "

@@ -83,19 +83,30 @@ class MTPProposer(Proposer):
             conf_tok = int(req.input_ids[base_pos])
             cur_tok = torch.tensor([conf_tok], dtype=torch.int64, device=device)
             cur_hidden = seed.view(1, -1)  # [1, hidden]
-            drafts: List[int] = []
+            # On-device draft chain: keep the per-step argmax and the next-token id ON DEVICE across
+            # the K steps, so the autoregressive chain runs without a CPU<->GPU round-trip per step
+            # (the chain is sequential, but no host sync lets the GPU chain the steps back-to-back; the
+            # CPU just enqueues and pulls the whole chain to host ONCE at the end). Per-step positions
+            # are sliced from one precomputed tensor (vs a torch.tensor(...) alloc per step).
+            positions_all = torch.arange(
+                base_pos + self._pos_shift,
+                base_pos + self._pos_shift + k_i,
+                dtype=torch.int32,
+                device=device,
+            )
+            draft_ids: List[torch.Tensor] = []
             # Step 0 processes the confirmed token (appends its K/V to the persistent cache and
             # predicts d0); steps 1.. process each draft. The attention sees the full cache (confirmed
             # prefix built over prior steps + this chain), so the MTP head runs with real context.
             for step in range(k_i):
                 fused = head.fuse(head.embed(cur_tok), cur_hidden)
-                positions = torch.tensor(
-                    [base_pos + step + self._pos_shift], dtype=torch.int32, device=device
+                logits, cur_hidden = head.step(
+                    fused, positions_all[step : step + 1], cache, len(cache)
                 )
-                logits, cur_hidden = head.step(fused, positions, cache, len(cache))
-                nxt = int(logits.argmax(dim=-1).item())
-                drafts.append(nxt)
-                cur_tok = torch.tensor([nxt], dtype=torch.int64, device=device)
+                nxt = logits.argmax(dim=-1)  # [1] target vocab (on device)
+                draft_ids.append(nxt)
+                cur_tok = nxt  # next step embeds this id; no host sync
+            drafts = torch.cat(draft_ids).cpu().tolist() if draft_ids else []
             out[i] = drafts
             if dbg:
                 print(f"[mtp-dbg] uid={req.uid} conf={conf_tok} base_pos={base_pos} "
