@@ -174,6 +174,8 @@ def qwen3_5_remap(ckpt_key: str, load_mtp: bool = False):
       ``("direct", native_key)``                         -> rename only
       ``("concat", merged_key, slot, n_slots, cat_dim)`` -> one member of an ordered concat group
     """
+    if ckpt_key.endswith(".weight_shape"):
+        return None  # compressed-tensors metadata (the original [N,K]); not a model param
     if ckpt_key.startswith("mtp."):
         return _qwen3_5_mtp_remap(ckpt_key) if load_mtp else None
     if ckpt_key.startswith(_QWEN35_SKIP_PREFIXES):
@@ -250,6 +252,15 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
             (".down_proj.qweight", ".down_proj.scales", ".down_proj.qzeros")
         ):
             return t.chunk(n, dim=0)[r].clone()
+        # compressed-tensors W4A16: weight_packed [N, K//pf] / weight_scale [N, K//g] are N-major
+        # (output on dim 0). gate/up split the output N (dim 0); down splits the input K (dim 1).
+        if name.endswith(
+            (".gate_proj.weight_packed", ".gate_proj.weight_scale",
+             ".up_proj.weight_packed", ".up_proj.weight_scale")
+        ):
+            return t.chunk(n, dim=0)[r].clone()
+        if name.endswith((".down_proj.weight_packed", ".down_proj.weight_scale")):
+            return t.chunk(n, dim=1)[r].clone()
 
     # ---- dense MLP (4B) + shared expert (35B): col gate/up (dim 0), row down (dim 1) ----
     if name.endswith((".gate_proj.weight", ".up_proj.weight")):

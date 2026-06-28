@@ -31,6 +31,7 @@ from minisgl.layers import (
     BaseOP,
     LinearColParallelMerged,
     LinearOProj,
+    LinearReplicated,
     OPList,
     ParallelLMHead,
     RMSNorm,
@@ -371,15 +372,20 @@ class Qwen3_5MTPHead(BaseOP):
     Run K times autoregressively (own short draft chain, no paged KV); see MTPProposer."""
 
     def __init__(self, config: ModelConfig, layer_id: int, embed: VocabParallelEmbedding,
-                 lm_head: ParallelLMHead):
+                 lm_head: ParallelLMHead,
+                 mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP):
         eps = config.rms_norm_eps
         self.pre_fc_norm_embedding = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
-        self.fc = LinearColParallelMerged(
-            2 * config.hidden_size, [config.hidden_size], has_bias=False
-        )
+        # REPLICATED (not column-parallel): the fc fuses concat[norm(embed), norm(hidden)] into the
+        # FULL hidden seed that feeds the (head-sharded) MTP layer — exactly like GLM's MTP eh_proj /
+        # EAGLE3's fc. ColParallel would shard the output to hidden/tp and feed the layer a truncated
+        # hidden (latent TP>1 bug; the Qwen MTP was only ever validated at TP=1 where it's a no-op).
+        self.fc = LinearReplicated(2 * config.hidden_size, config.hidden_size, has_bias=False)
         self.self_attn = Qwen3_5MTPAttn(config, layer_id)
-        self.mlp = Qwen3MLP(config)
+        # MoE models (qwen3_5_moe, e.g. the 35B) ship a MoE MTP block (mtp.layers.0.mlp.experts.*);
+        # dense models a plain MLP. The same mlp_factory the backbone uses builds the right one.
+        self.mlp = mlp_factory(config)
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.norm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
@@ -424,7 +430,8 @@ class Qwen3_5ForConditionalGeneration(BaseLLMModel):
         # (mtp_num_hidden_layers>0); reuses the target embed + tied lm_head (no dedicated tensors).
         self.mtp = (
             Qwen3_5MTPHead(config, layer_id=config.num_layers,
-                           embed=self.model.embed_tokens, lm_head=self.lm_head)
+                           embed=self.model.embed_tokens, lm_head=self.lm_head,
+                           mlp_factory=mlp_factory)
             if config.mtp_num_hidden_layers > 0
             else None
         )
