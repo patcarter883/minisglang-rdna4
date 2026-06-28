@@ -22,15 +22,26 @@ class SchedulerConfig(EngineConfig):
 
     @property
     def zmq_backend_addr(self) -> str:
-        return "ipc:///tmp/minisgl_0" + self._unique_suffix
+        # Per-replica ingress: each DP replica's rank-0 binds its OWN backend addr so the front-end
+        # can deliver each UserMsg to exactly ONE replica (per-replica routing). dp_size=1 keeps the
+        # historical single address (dp_rank=0 -> ".dp=0" suffix is appended unconditionally; the
+        # tokenizer/scheduler always agree on the same formula so the channel still matches).
+        return f"ipc:///tmp/minisgl_0{self._unique_suffix}.dp={self.dp_info.dp_rank}"
 
     @property
     def zmq_detokenizer_addr(self) -> str:
+        # Replies are shared across replicas — ONE detokenizer demuxes by globally-unique uid — so
+        # this stays a single address (no dp_rank key).
         return "ipc:///tmp/minisgl_1" + self._unique_suffix
 
     @property
     def zmq_scheduler_broadcast_addr(self) -> str:
-        return "ipc:///tmp/minisgl_2" + self._unique_suffix
+        # Within-replica TP fan-out (rank0 -> rank1..). Keyed by dp_rank so replicas don't cross-wire.
+        return f"ipc:///tmp/minisgl_2{self._unique_suffix}.dp={self.dp_info.dp_rank}"
+
+    def backend_addr_for(self, dp_rank: int) -> str:
+        """The backend ingress addr for replica ``dp_rank`` (front-end routing target)."""
+        return f"ipc:///tmp/minisgl_0{self._unique_suffix}.dp={dp_rank}"
 
     @property
     def max_forward_len(self) -> int:

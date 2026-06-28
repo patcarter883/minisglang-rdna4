@@ -6,7 +6,7 @@ from typing import Dict, Iterator, Tuple
 
 import safetensors
 import torch
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_dp_info, get_tp_info, is_ep_enabled
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -431,23 +431,41 @@ def _load_zaya_weight(
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
+    # Expert parallelism: each replica loads ONLY its expert shard [offset : offset+local). EP off
+    # (single replica or DP-only) loads the full E. is_ep_enabled() already gates on dp_size>1.
+    dp_info = get_dp_info()
+    if is_ep_enabled():
+        assert config.num_experts % dp_info.dp_size == 0, (
+            f"EP needs num_experts ({config.num_experts}) divisible by dp_size ({dp_info.dp_size})"
+        )
+        ep_local = config.num_experts // dp_info.dp_size
+        ep_offset = dp_info.dp_rank * ep_local
+    else:
+        ep_local, ep_offset = config.num_experts, 0
+
     # native gemm key -> {"weight": {e: w_fp8 [N,K]}, "weight_scale": {e: scale [N,1]}}; the two
-    # stacks (weight, weight_scale) flush independently once all E experts of that field arrive.
+    # stacks (weight, weight_scale) flush independently once all (local) experts of that field arrive.
+    # Indices are stored as LOCAL ids (global gid - ep_offset) so the stack is over 0..ep_local-1.
     expert_buf: Dict[str, Dict[str, Dict[int, torch.Tensor]]] = {}
     _FC_TO_NATIVE = {"linear_fc1": "gate_up_proj", "linear_fc2": "down_proj"}
 
     def _store_expert(ckpt_name: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
         m = _ZAYA_EXPERT_PATTERN.match(ckpt_name)
         assert m is not None, f"unexpected expert key: {ckpt_name}"
+        gid = int(m.group("idx"))
+        # EP: skip experts this replica does not own (load only the local shard).
+        if not (ep_offset <= gid < ep_offset + ep_local):
+            return
+        local_id = gid - ep_offset
         native_key = f"{m.group('prefix')}.{_FC_TO_NATIVE[m.group('fc')]}"
         field = m.group("field")
         fields = expert_buf.setdefault(native_key, {"weight": {}, "weight_scale": {}})
         slots = fields[field]
-        slots[int(m.group("idx"))] = tensor
-        if len(slots) != config.num_experts:
+        slots[local_id] = tensor
+        if len(slots) != ep_local:
             return
-        # weight: [N,K] fp8 -> stack [E,N,K] fp8. weight_scale: [N,1] f32 -> stack [E,N,1] f32.
-        stacked = torch.stack([slots[e] for e in range(config.num_experts)], dim=0).contiguous()
+        # weight: [N,K] fp8 -> stack [local,N,K] fp8. weight_scale: [N,1] f32 -> [local,N,1] f32.
+        stacked = torch.stack([slots[e] for e in range(ep_local)], dim=0).contiguous()
         del fields[field]
         if not fields.get("weight") and not fields.get("weight_scale"):
             del expert_buf[native_key]

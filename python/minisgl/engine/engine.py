@@ -6,8 +6,14 @@ from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
 from minisgl.attention import create_attention_backend
-from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.core import Batch, Context, Req, SamplingParams, set_global_ctx
+from minisgl.distributed import (
+    EPCommunicator,
+    destroy_distributed,
+    enable_pynccl_distributed,
+    set_dp_info,
+    set_tp_info,
+)
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
@@ -76,9 +82,19 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        # Register this replica's DP coordinates (inert DpInfo(0,1) when dp_size=1). Done before any
+        # CUDA init so EP (later) can build its dp collective group; also lets get_dp_info() resolve
+        # to the real replica everywhere instead of the default.
+        set_dp_info(
+            dp_rank=config.dp_info.dp_rank,
+            dp_size=config.dp_info.dp_size,
+            enable_ep=config.enable_ep,
+        )
         _adjust_config(config)
 
-        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        # Per-replica device: dp_rank=1 (tp_size=1) lands on cuda:1, etc. dp_size=1 -> cuda:{tp_rank}
+        # (unchanged historical mapping). See EngineConfig.device_index.
+        self.device = torch.device(f"cuda:{config.device_index}")
         torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -87,6 +103,12 @@ class Engine:
         # Speculative decoding config (None unless --spec-algorithm enables it). The scheduler
         # routes to the synchronous spec loop when this is set; every spec path is gated on it.
         self.spec_config = config.spec_config
+        # Expert-parallel coordinates (inert when --enable-ep is off / dp_size==1). The scheduler
+        # reads these to drive the per-step common-bs lockstep over self.dp_cpu_group (built in
+        # _init_dp_communication). self.ctx.ep carries the in-graph collective group for MoELayer.
+        self.enable_ep = config.enable_ep and config.dp_info.dp_size > 1
+        self.dp_rank = config.dp_info.dp_rank
+        self.dp_size = config.dp_info.dp_size
         # fp8 (e4m3fn) KV cache — opt-in via MINISGL_KV_FP8=1 (the "no-F16" KV path:
         # store e4m3 -> cast once to bf16 -> f32 accumulate, scalar scale folded in the
         # attention kernel). Activations/weights stay bf16; only the KV buffer is fp8.
@@ -222,7 +244,11 @@ class Engine:
             cached_len=0,
             output_len=1,
             uid=-1,
-            sampling_params=None,  # type: ignore
+            # Greedy (default) params, NOT None: the EP lockstep path builds all-dummy batches for idle
+            # replicas (ep.py) that flow through Sampler.prepare, which reads r.sampling_params.is_greedy
+            # on every req. None crashed it (AttributeError). Graph capture + decode padding only use
+            # dummy_req for padded_reqs (sampler reads real batch.reqs), so this is otherwise inert.
+            sampling_params=SamplingParams(),
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
@@ -244,6 +270,19 @@ class Engine:
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        # self.dp_cpu_group is the cross-replica gloo group over the dp ranks (one member per replica,
+        # this replica's tp-primary). It is built ONLY when dp_size>1 and reserved for EP's
+        # all_gather/all_reduce dispatch (the DP-launcher / EP-off path never touches it in the
+        # forward loop, so replicas stay independent per-step). None when dp_size=1.
+        self.dp_cpu_group = None
+        if config.dp_info.dp_size == 1:
+            return self._init_single_replica_communication(config)
+        return self._init_dp_communication(config)
+
+    def _init_single_replica_communication(
+        self, config: EngineConfig
+    ) -> torch.distributed.ProcessGroup:
+        # Historical single-replica path — UNCHANGED. The whole TP group IS the world.
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -268,6 +307,59 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+        return tp_cpu_group
+
+    def _init_dp_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        # dp_size>1: one GLOBAL world spans every (dp_rank, tp_rank) process so we can carve out both
+        # the per-replica TP subgroup (used by this replica's collectives) and the cross-replica DP
+        # subgroup (reserved for EP). The single boot rendezvous is the only cross-replica sync when
+        # EP is off; after init each replica runs its own queue/forward loop independently.
+        dp_size = config.dp_info.dp_size
+        tp_size = config.tp_info.size
+        global_rank = config.device_index  # dp_rank*tp_size + tp_rank
+        world_size = dp_size * tp_size
+        # pynccl is CUDA-only and assumes the world IS the TP group; with a global DP world it cannot
+        # build the per-replica TP comm, so use torch.distributed (gloo here for CPU control msgs).
+        torch.distributed.init_process_group(
+            backend="gloo",
+            rank=global_rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            init_method=config.distributed_addr,
+        )
+        # TP subgroup for THIS replica: the tp_size contiguous global ranks owning the same dp_rank.
+        tp_cpu_group = None
+        for dp in range(dp_size):
+            ranks = list(range(dp * tp_size, (dp + 1) * tp_size))
+            grp = torch.distributed.new_group(ranks=ranks, backend="gloo")
+            if dp == config.dp_info.dp_rank:
+                tp_cpu_group = grp
+        assert tp_cpu_group is not None
+        # DP subgroup: one tp-rank slice across replicas (for tp_size>1 there are tp_size such groups;
+        # each process joins the one matching its tp_rank). The gloo copy is the per-step common-bs
+        # lockstep channel (all_reduce(MAX) of real batch size, OUTSIDE the graph). EP additionally
+        # builds an nccl (RCCL) copy for the in-graph all_gather/all_reduce — gloo is NOT CUDA-graph-
+        # capturable, so the dispatch/combine collectives must use the nccl group.
+        for tr in range(tp_size):
+            ranks = list(range(tr, world_size, tp_size))
+            grp = torch.distributed.new_group(ranks=ranks, backend="gloo")
+            if tr == config.tp_info.rank:
+                self.dp_cpu_group = grp
+        if config.enable_ep:
+            # new_group must be called on EVERY process for each group (collective construction), so
+            # build all tp_size nccl dp-subgroups and keep the one this process belongs to. An nccl
+            # group off a gloo world is supported by torch.distributed (the reverse of the single-
+            # replica path, which builds a gloo group off an nccl world).
+            for tr in range(tp_size):
+                ranks = list(range(tr, world_size, tp_size))
+                grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+                if tr == config.tp_info.rank:
+                    self.ctx.ep = EPCommunicator(
+                        group=grp,
+                        dp_rank=config.dp_info.dp_rank,
+                        dp_size=dp_size,
+                        num_experts=config.model_config.num_experts,
+                    )
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
@@ -344,7 +436,13 @@ class Engine:
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
-        """Get the min and max free memory across TP ranks."""
+        """Get the min and max free memory across this replica's TP ranks.
+
+        The all_reduce is over ``self.tp_cpu_group`` — the per-replica TP subgroup under DP — so the
+        >2GB imbalance guard is scoped WITHIN a replica. Different DP replicas sit on different cards
+        (card 0 vs card 1, with the iGPU skewing one) and are sized independently, so the guard never
+        compares free memory ACROSS replicas (which would false-trip on benign per-card differences).
+        """
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
