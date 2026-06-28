@@ -311,6 +311,121 @@ def w4a8_moe(
     return acc.to(x.dtype)
 
 
+def w8a8_moe(
+    x: torch.Tensor,  # (M, K) activations
+    w13: torch.Tensor,  # (E, 2*inter, K) f8_e4m3 — gate|up stacked, op layout (natural)
+    w13_scales: torch.Tensor,  # (E, 2*inter) f32 per-output-channel
+    w2: torch.Tensor,  # (E, K, inter) f8_e4m3
+    w2_scales: torch.Tensor,  # (E, K) f32 per-output-channel
+    gating_output: torch.Tensor | None,  # (M, E); ignored when topk_ids/topk_weights are given
+    top_k: int,
+    renormalize: bool,
+    *,
+    topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 — precomputed route
+    topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
+    kernel: str = "wmma",
+    block_m: int = 16,
+) -> torch.Tensor:
+    """Grouped W8A8-fp8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
+    -> grouped GEMM(w2) -> topk-weighted gather-reduce. A strict simplification of `w4a8_moe`
+    (no zeros, no per-K-group scale: fp8 weights carry a per-output-channel f32 scale folded
+    once in the epilogue). Returns (M, K)."""
+    import torch.nn.functional as F
+    import w8a8_fp8_wmma
+
+    M, K = x.shape
+    E = w13.shape[0]
+    dev = x.device
+    # Per-GEMM kernel pick (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a few
+    # real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles; gemm2's
+    # K output favours WMMA. Prefill (M>2) keeps the passed/default kernel for both.
+    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm2_kernel = kernel
+
+    def _route():
+        from vllm import _custom_ops as vllm_ops
+
+        tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
+        ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
+        tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
+        vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
+        return tw, ti
+
+    # Precomputed route (ZAYA top-1 + MOD) or fused softmax+topk fallback.
+    if topk_ids is None:
+        topk_weights, topk_ids = _moe_time("route", _route)
+    else:
+        assert topk_weights is not None, "topk_weights required when topk_ids is given"
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+
+    # moe_align: native HIP (moe_hip) by default, vLLM reference under MINISGL_MOE_ALIGN=0.
+    if _MOE_ALIGN_HIP:
+        import moe_hip
+
+        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
+    else:
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+
+        sorted_ids, expert_ids, ntp = _moe_time(
+            "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
+        )
+    P = sorted_ids.shape[0]
+
+    x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
+    out1 = _moe_time(
+        "gemm1",
+        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+            x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, gemm1_kernel,
+        ),
+    )  # (P, 2*inter)
+    d = out1.shape[1] // 2
+    # Gated SiLU-mul via the dtype-generic native HIP tail_hip.silu_and_mul (one launch, fp32
+    # internal, no temps); MINISGL_TAIL_HIP=0 reverts to the torch ref. (The gemm1-epilogue fused
+    # silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
+    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        import tail_hip  # noqa: F401  registers torch.ops.tail_hip.*
+
+        buf2 = _moe_time("silu", lambda: torch.ops.tail_hip.silu_and_mul(out1.contiguous()))
+    else:
+        buf2 = _moe_time(
+            "silu",
+            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+        )
+
+    tw_flat = topk_weights.reshape(-1).float().contiguous()
+    # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE atomic-scatter kernel (NOT
+    # HIP-graph-capture-safe -> gated to eager decode M<=2 + MINISGL_MOE_SCATTER). Prefill (M>2)
+    # keeps the unfused gemm2 + contention-free gather_reduce (graph-safe).
+    if M <= 2 and _MOE_SCATTER:
+        acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
+        _moe_time(
+            "gemm2scat",
+            lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm_scatter(
+                buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
+                gemm2_kernel,
+            ),
+        )  # writes acc in place
+        _moe_report()
+        return acc.to(x.dtype)
+
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = _moe_time(
+        "gemm2",
+        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
+        ),
+    )  # (P, K)
+    acc = _moe_time(
+        "gather",
+        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+            out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
+        ),
+    )  # (M, K) fp32
+    _moe_report()
+    return acc.to(x.dtype)
+
+
 # --- RXF (Rotated eXtra Fast) W4(NL)-A8(int8) path -------------------------------------------
 # Distinct from the fp8 W4A8 above: weights are an NL (non-uniform) int4 codebook, activations are
 # int8 (not fp8), and a fixed block-diagonal Hadamard rotation is applied to the activation at

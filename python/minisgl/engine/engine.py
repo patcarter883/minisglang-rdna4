@@ -9,6 +9,7 @@ from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -162,6 +163,35 @@ class Engine:
         else:
             self.gdn_state = None  # type: ignore[var-annotated]  # GDNStateCache | None
 
+        # ======================= ZAYA CCA recurrent-state cache (conv + prev_hs) ========================
+        # CCA-hybrid (Zaya) models keep two fixed per-sequence recurrent buffers per CCA (even) layer
+        # alongside the paged GQA KV cache: the causal-conv window (conv_states) and the previous
+        # token's hidden (prev_hs, consumed by val_proj2). Same lifecycle as GDN — the scheduler wires
+        # slot alloc/free + per-batch metadata ONLY when this is non-None (cca_state is None for every
+        # non-Zaya model, so other paths are untouched). Forces naive prefix cache + eager, like GDN.
+        # Guarded on getattr so the engine stays import-safe until ModelConfig grows the CCA fields
+        # (PORT_PLAN §8): a model without is_cca_hybrid leaves cca_state None.
+        if getattr(mc, "is_cca_hybrid", False):
+            self.ctx.cca_state = self.cca_state = CCAStateCache(
+                num_cca_layers=mc.num_cca_layers,
+                num_slots=config.max_running_req + 2,  # +1 NULL block, +1 dummy
+                conv_dim=mc.cca_conv_dim,
+                conv_kernel=mc.cca_conv_width,
+                hidden_size=mc.hidden_size,
+                # fp32 recurrent state: the cca_hip conv kernels read/update conv_states in fp32.
+                dtype=torch.float32,
+                device=self.device,
+            )
+            # CCA conv kernels have no autotune; warmup is a no-op (kept for engine-loop symmetry).
+            for cca in self.model.iter_cca_layers():
+                cca.warmup_conv(_GDN_WARMUP_TOKENS)
+            logger.info_rank0(
+                f"CCA state: {mc.num_cca_layers} layers x {config.max_running_req + 2} slots "
+                f"(conv_dim={mc.cca_conv_dim}, conv_width={mc.cca_conv_width})"
+            )
+        else:
+            self.cca_state = None  # type: ignore[var-annotated]  # CCAStateCache | None
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -210,6 +240,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             gdn_state=self.gdn_state,
+            cca_state=self.cca_state,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -251,9 +282,29 @@ class Engine:
             def _cast(k: str, v: torch.Tensor) -> torch.Tensor:
                 if not v.is_floating_point() or k.endswith(".scales"):
                     return v
+                # ZAYA experts stay fp8: the F8_E4M3 weight must NOT be upcast (that re-inflates
+                # ~8 GB fp8 -> ~16 GB bf16 and OOMs the 16 GB card), and its per-channel fp32
+                # weight_scale must keep fp32. Dequant is deferred to compute (_GroupedFP8Experts).
+                if v.dtype == torch.float8_e4m3fn or k.endswith(".weight_scale"):
+                    return v
                 # GDN gating params stay fp32 (A_log ships fp32; dt_bias ships bf16 -> upcast).
                 # The kernels + the model's nn.Parameter dtype both require fp32 here.
                 if k.endswith((".A_log", ".dt_bias")):
+                    return v.to(torch.float32)
+                # ZAYA router balancing_biases is an fp32 buffer (added to the fp32 router softmax;
+                # ships bf16, upcast to keep the buffer fp32 and the choice numerics faithful). The
+                # ResidualScaling affines run in fp32 on the fp32 residual stream (scale_residual_merge
+                # ships bf16 -> upcast so the merge stays fp32). CCA conv/temp can stay bf16 (post_load
+                # upcasts them to fp32 once for the kernel-weight cache).
+                if k.endswith(
+                    (
+                        ".balancing_biases",
+                        ".hidden_states_scale",
+                        ".hidden_states_bias",
+                        ".residual_scale",
+                        ".residual_bias",
+                    )
+                ):
                     return v.to(torch.float32)
                 return v.to(self.dtype)
 

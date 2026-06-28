@@ -18,6 +18,7 @@ from minisgl.spec import ProposeContext, make_proposer, verify_greedy
 from minisgl.utils import div_ceil, init_logger, load_tokenizer
 
 from .cache import CacheManager
+from .cca_slots import CCASlotManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .gdn_slots import GDNSlotManager
@@ -63,10 +64,15 @@ class Scheduler(SchedulerIOMixin):
         # is not prefix-cacheable, and a radix hit would report cached_len>0 with no state behind
         # it (silent garbage). Force it here; dense models keep config.cache_type.
         cache_type = config.cache_type
-        if self.engine.gdn_state is not None and cache_type != "naive":
+        # GDN AND CCA recurrent state are both non-prefix-cacheable: a radix hit would report
+        # cached_len>0 with no recurrent state behind it (silent garbage). Force naive for either.
+        has_recurrent_state = (
+            self.engine.gdn_state is not None or self.engine.cca_state is not None
+        )
+        if has_recurrent_state and cache_type != "naive":
             logger.warning_rank0(
-                f"GDN-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
-                "GDN state is not prefix-cacheable"
+                f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
+                "GDN/CCA recurrent state is not prefix-cacheable"
             )
             cache_type = "naive"
         self.cache_manager = CacheManager(
@@ -82,6 +88,14 @@ class Scheduler(SchedulerIOMixin):
         self.gdn_slots = (
             GDNSlotManager(self.engine.gdn_state)
             if self.engine.gdn_state is not None
+            else None
+        )
+        # ZAYA CCA recurrent-state slot lifecycle — active ONLY for CCA-hybrid (Zaya) models
+        # (engine builds the state cache when is_cca_hybrid). None (inert) for every other model,
+        # so the scheduling path below is unchanged.
+        self.cca_slots = (
+            CCASlotManager(self.engine.cca_state)
+            if self.engine.cca_state is not None
             else None
         )
 
@@ -270,6 +284,9 @@ class Scheduler(SchedulerIOMixin):
         # This single site covers both normal finish (via _process_last_data) and abort.
         if self.gdn_slots is not None:
             self.gdn_slots.free(req.uid)
+        # Release the CCA conv-state slot (idempotent — overlap scheduling can free a req twice).
+        if self.cca_slots is not None:
+            self.cca_slots.free(req.uid)
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
@@ -290,6 +307,14 @@ class Scheduler(SchedulerIOMixin):
 
             state_indices = self.gdn_slots.state_indices(batch)
             batch.gdn_metadata = build_gdn_metadata(batch, state_indices, self.device)
+        # CCA-hybrid (Zaya): allocate/reuse a conv-state slot per sequence and build the per-batch
+        # CCA metadata (query_start_loc / state_indices / has_initial_state). Inert for non-CCA
+        # models (cca_slots is None). The CCA layers read batch.cca_metadata in the model forward.
+        if self.cca_slots is not None:
+            from minisgl.cca.metadata import build_cca_metadata
+
+            cca_state_indices = self.cca_slots.state_indices(batch)
+            batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, self.device)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

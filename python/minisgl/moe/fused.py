@@ -68,11 +68,16 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
+    try:
+        from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
+    except ImportError:
+        return _moe_align_block_size_torch(
+            topk_ids, block_size, num_experts, max_num_tokens_padded, max_num_m_blocks
+        )
+
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
     cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
@@ -86,6 +91,65 @@ def moe_align_block_size(
         cumsum_buffer,
         True,
     )
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def _moe_align_block_size_torch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    max_num_tokens_padded: int,
+    max_num_m_blocks: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-torch fallback for ``sgl_kernel.moe_align_block_size`` (serve image lacks sgl_kernel).
+
+    Sorts the flattened ``topk_ids`` token-slots by assigned expert, pads each expert's run up to a
+    multiple of ``block_size`` with the sentinel token id ``topk_ids.numel()`` (rows the Triton
+    fused kernel treats as padding), and emits the per-block expert id. Matches the sgl kernel's
+    output contract consumed by ``fused_moe_kernel_triton``.
+
+    CUDA-graph-safe: every step is data-INDEPENDENT and fixed-shape — no ``bincount`` /
+    ``.item()`` / ``.tolist()`` / Python loop / tensor-``repeat_interleave`` (all of which either
+    host-sync or yield a dynamic output shape and so raise ``hipErrorStreamCaptureUnsupported``
+    inside a captured stream). ``num_tokens_post_pad`` is returned as a device tensor (the Triton
+    grid is sized from the fixed ``sorted_ids`` length; the kernel reads this tensor to skip the
+    padding blocks)."""
+    device = topk_ids.device
+    numel = topk_ids.numel()
+    flat_expert = topk_ids.flatten().to(torch.int64)  # expert id per token-slot
+
+    # Tokens per expert via scatter_add (capture-safe; bincount is not), then pad to a block multiple.
+    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int64, device=device)
+    tokens_per_expert.scatter_add_(0, flat_expert, torch.ones_like(flat_expert))
+    padded_per_expert = ((tokens_per_expert + block_size - 1) // block_size) * block_size
+
+    # Exclusive cumsums: each expert's start in the (unpadded) sorted order and in the padded output.
+    unpadded_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert  # [E]
+    expert_block_start = torch.cumsum(padded_per_expert, 0) - padded_per_expert  # [E]
+
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,), numel, dtype=torch.int32, device=device
+    )  # sentinel = padding token row
+
+    # Stable sort token-slots by expert; each slot's rank within its expert = global sorted position
+    # minus that expert's unpadded start. dest is block-aligned and collision-free.
+    order = torch.argsort(flat_expert, stable=True)  # [numel]
+    sorted_experts = flat_expert[order]  # [numel]
+    within = torch.arange(numel, device=device) - unpadded_start[sorted_experts]
+    dest = expert_block_start[sorted_experts] + within
+    sorted_ids[dest] = order.to(torch.int32)
+
+    # Block -> expert id via searchsorted over the inclusive block cumsum (capture-safe; no
+    # tensor-repeat_interleave). Blocks past the real count get clamped to a valid expert (their
+    # rows are padding the kernel skips, so the id is never used — matching the old zeros init).
+    num_blocks_per_expert = padded_per_expert // block_size  # [E]
+    block_cumsum = torch.cumsum(num_blocks_per_expert, 0)  # [E] inclusive
+    block_idx = torch.arange(max_num_m_blocks, device=device)
+    expert_ids = (
+        torch.searchsorted(block_cumsum, block_idx, right=True).clamp_(max=num_experts - 1).to(torch.int32)
+    )
+
+    num_tokens_post_pad = padded_per_expert.sum().to(torch.int32).reshape(1)
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 

@@ -29,12 +29,32 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 
 @functools.cache
 def _load_hf_config(model_path: str) -> Any:
-    return AutoConfig.from_pretrained(model_path)
+    try:
+        return AutoConfig.from_pretrained(model_path)
+    except (ValueError, KeyError):
+        # Models whose `model_type` the installed transformers does not register (e.g. ZAYA's
+        # "zaya") raise here. minisgl reads config fields via getattr, so a generic
+        # PretrainedConfig built directly from config.json is sufficient — we never need the
+        # transformers model class itself.
+        cfg_path = (
+            os.path.join(model_path, "config.json")
+            if os.path.isdir(model_path)
+            else hf_hub_download(repo_id=model_path, filename="config.json")
+        )
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg_dict = json.load(f)
+        return PretrainedConfig.from_dict(cfg_dict)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:
     config = _load_hf_config(model_path)
-    return type(config)(**config.to_dict())
+    fresh = type(config)(**config.to_dict())
+    # PretrainedConfig.__init__ does not accept `model_type` as a kwarg (it is a class attribute),
+    # so the round-trip above resets it to the base class default ("") for configs loaded via the
+    # generic PretrainedConfig fallback (unknown architectures like ZAYA's "zaya"). Restore it so
+    # model_type-gated logic (e.g. ModelConfig.is_cca) sees the real type.
+    fresh.model_type = config.model_type
+    return fresh
 
 
 def download_hf_weight(model_path: str) -> str:
