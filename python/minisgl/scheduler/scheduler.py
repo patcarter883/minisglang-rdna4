@@ -139,6 +139,15 @@ class Scheduler(SchedulerIOMixin):
             )
             if self._spec_seed_enabled:
                 logger.info_rank0("spec-decode: prompt-prefill draft-KV seed ENABLED")
+            # Capture the MLA verify CUDA graphs NOW — after the aux-capture layers are programmed
+            # above, so the captured forward stashes the hidden/aux the draft head consumes. No-op for
+            # non-MLA spec (graph disabled in _adjust_config) or pure n-gram with graphs off. Verify
+            # batches are all-running-reqs, so cap the captured sizes at max_running_req.
+            needs_hidden = self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
+            num_aux = len(self._spec_capture_layer_ids) if self._spec_capture_layer_ids else 0
+            verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
+                         if b <= config.max_running_req]
+            self.engine.capture_spec_verify_graphs(needs_hidden, num_aux, verify_bs)
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -423,6 +432,12 @@ class Scheduler(SchedulerIOMixin):
         assert spec is not None and self._proposer is not None
         device = self.device
         page_table = self.engine.page_table
+        # MINISGL_SPEC_TIMING=1: per-phase wall-clock (propose / verify-forward / accept) to attribute
+        # the synchronous spec step. Adds cuda.synchronize barriers, so DIAGNOSTIC-only.
+        _timing = os.environ.get("MINISGL_SPEC_TIMING") == "1"
+        if _timing:
+            import time as _time
+            torch.cuda.synchronize(device); _t0 = _time.perf_counter()
 
         # --- 1. propose drafts (proposer-specific: n-gram lookup / MTP head / draft model). The
         # proposer clamps per-req to the remaining budget; an empty list ⇒ plain decode for that req.
@@ -439,6 +454,8 @@ class Scheduler(SchedulerIOMixin):
             if self._spec_capture_layer_ids else None,
         )
         drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
+        if _timing:
+            torch.cuda.synchronize(device); _t1 = _time.perf_counter()
 
         # --- 2. stage: extend each req to K_i+1 query tokens; write drafts into the token pool --
         # Confirmed token sits at position c0 (= cached_len); drafts go at c0+1 .. c0+K_i.
@@ -461,12 +478,21 @@ class Scheduler(SchedulerIOMixin):
         # --- 3. build the verify batch (phase='decode' -> full per-position logits + extend) ---
         batch = Batch(reqs=reqs, phase="decode")
         batch.spec_verify = True  # multi-token; GDN/lm-head treat it like a prefill (see core.py)
-        batch.padded_reqs = reqs  # eager: no graph padding
         self.cache_manager.allocate_paged(reqs)
+        # MLA verify CUDA graph: when every req drafted exactly num_draft (uniform K+1 query tokens)
+        # and the batch fits a captured size, PAD with dummy verify reqs FIRST so positions/out_loc
+        # cover the padded rows (dummy rows point at the dummy page — never stale real KV), then replay
+        # the graph. Otherwise (partial-K step / graphs off) stay eager with dynamic metadata.
+        use_vgraph = self.engine.graph_runner.can_use_verify_graph(batch)
+        if use_vgraph:
+            self.engine.graph_runner.pad_verify(batch)
+        else:
+            batch.padded_reqs = reqs
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not use_vgraph:
+            self.engine.attn_backend.prepare_metadata(batch)
         batch.input_ids = self.token_pool[input_mapping]
 
         # GDN-hybrid: build the per-batch recurrent metadata (varlen, like a prefill — see
@@ -495,6 +521,8 @@ class Scheduler(SchedulerIOMixin):
         else:
             logits = self.engine.forward_verify(batch)
         preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
+        if _timing:
+            _t2 = _time.perf_counter()  # forward already synced by .cpu()
 
         # --- 5. accept + commit + rollback per req --------------------------------------------
         offset = 0
@@ -643,6 +671,22 @@ class Scheduler(SchedulerIOMixin):
             self._free_req_resources(req)
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
+        if _timing:
+            torch.cuda.synchronize(device); _t3 = _time.perf_counter()
+            ph = getattr(self, "_spec_phase", None)
+            if ph is None:
+                ph = self._spec_phase = {"propose": 0.0, "verify": 0.0, "accept": 0.0, "n": 0}
+            ph["propose"] += _t1 - _t0
+            ph["verify"] += _t2 - _t1
+            ph["accept"] += _t3 - _t2
+            ph["n"] += 1
+            if ph["n"] % 50 == 0:
+                n = ph["n"]
+                logger.info_rank0(
+                    f"[spec-timing] step={n} propose={ph['propose']/n*1e3:.1f}ms "
+                    f"verify_fwd={ph['verify']/n*1e3:.1f}ms accept={ph['accept']/n*1e3:.1f}ms "
+                    f"total={ (ph['propose']+ph['verify']+ph['accept'])/n*1e3:.1f}ms"
+                )
         self._spec_debug(reqs, drafts, total_emitted)
 
     def _spec_debug(self, reqs: List[Req], drafts: List[List[int]], emitted: int) -> None:
@@ -664,10 +708,13 @@ class Scheduler(SchedulerIOMixin):
         if st["steps"] % 50 == 0:
             acc_rate = st["accepted"] / max(1, st["proposed"])
             toks_per_step = st["emitted"] / max(1, st["steps"])
+            vinfo = getattr(self.engine.graph_runner, "_verify", None)
+            vreplays = vinfo.get("replays", 0) if vinfo else 0
             logger.info_rank0(
                 f"[spec] step={st['steps']} accept_rate={acc_rate:.2f} "
                 f"draft_accepted={st['accepted']}/{st['proposed']} "
-                f"emitted/step={toks_per_step:.2f} (reqs/step={st['reqs']/st['steps']:.1f})"
+                f"emitted/step={toks_per_step:.2f} (reqs/step={st['reqs']/st['steps']:.1f}) "
+                f"verify_graph_replays={vreplays}"
             )
 
 

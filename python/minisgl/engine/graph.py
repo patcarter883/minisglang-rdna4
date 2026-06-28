@@ -46,6 +46,54 @@ class GraphCaptureBuffer:
         self.positions[_slice] = batch.positions
 
 
+@dataclass
+class VerifyCaptureBuffer:
+    """Static I/O buffers for a captured spec-decode VERIFY forward. Sized for the MAX token count
+    bs*(K+1); a given replay uses the leading `bs*qlen` rows. `last_hidden`/`aux_hidden` are allocated
+    only when the proposer needs target hidden states (MTP/EAGLE3); n-gram MLA spec captures logits
+    only."""
+
+    qlen: int
+    input_ids: torch.Tensor
+    out_loc: torch.Tensor
+    positions: torch.Tensor
+    logits: torch.Tensor
+    last_hidden: torch.Tensor | None
+    aux_hidden: torch.Tensor | None
+
+    @classmethod
+    def init(cls, max_bs, qlen, vocab, hidden, num_aux, dtype, device) -> "VerifyCaptureBuffer":
+        T = max_bs * qlen
+        return cls(
+            qlen=qlen,
+            input_ids=torch.zeros(T, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(T, dtype=torch.int32, device=device),
+            positions=torch.zeros(T, dtype=torch.int32, device=device),
+            logits=torch.empty(T, vocab, dtype=torch.float32, device=device),
+            last_hidden=(torch.empty(T, hidden, dtype=dtype, device=device)
+                         if hidden is not None else None),
+            aux_hidden=(torch.empty(num_aux, T, hidden, dtype=dtype, device=device)
+                        if num_aux else None),
+        )
+
+    def total(self, batch: Batch) -> int:
+        return batch.padded_size * self.qlen
+
+    def set_batch(self, batch: Batch) -> None:
+        s = slice(self.total(batch))
+        batch.input_ids = self.input_ids[s]
+        batch.out_loc = self.out_loc[s]
+        batch.positions = self.positions[s]
+
+    def copy_from(self, batch: Batch) -> None:
+        # batch holds padded_size*(K+1) tokens (scheduler built them over padded_reqs = real + dummy,
+        # so the dummy tail carries valid dummy-page out_loc — never stale real KV slots). Copy ALL.
+        s = slice(self.total(batch))
+        self.input_ids[s] = batch.input_ids
+        self.out_loc[s] = batch.out_loc
+        self.positions[s] = batch.positions
+
+
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
@@ -114,6 +162,11 @@ class GraphRunner:
             from minisgl.cca.graph_capture import CCAGraphCapture
 
             self.cca_capture = CCAGraphCapture(device, self.max_graph_bs)
+        # Spec-decode verify graphs are captured LATER (capture_verify_graphs), after the scheduler
+        # builds the proposer + programs the target's aux-capture layers — None until then.
+        self._verify = None
+        self._verify_max_seq_len = max_seq_len
+        self._verify_vocab = vocab_size
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
@@ -187,7 +240,122 @@ class GraphRunner:
         )
         batch.padded_reqs = batch.reqs + [self.dummy_req] * (padded_size - batch.size)
 
+    # ---- spec-decode VERIFY graph capture (MLA) ---------------------------------------------
+    def capture_verify_graphs(
+        self,
+        model: BaseLLMModel,
+        num_draft: int,
+        bs_list: List[int],
+        needs_hidden: bool,
+        num_aux: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Capture one verify graph per bs in `bs_list`. Called by the scheduler AFTER the proposer is
+        built and aux-capture layers are programmed, so the captured forward stashes the aux/hidden the
+        draft head consumes. Each graph runs model.forward over bs*(num_draft+1) staged tokens; the
+        MLA backend reads precomputed static verify indices (see MLABackend.init_verify_capture)."""
+        if not bs_list or not hasattr(self.attn_backend, "init_verify_capture"):
+            return logger.info_rank0("spec-verify CUDA graph: unsupported backend / disabled")
+        qlen = num_draft + 1
+        dev = self.device
+        max_bs = max(bs_list)
+        self.attn_backend.init_verify_capture(self._verify_max_seq_len, bs_list, num_draft)
+        vbuf = VerifyCaptureBuffer.init(
+            max_bs, qlen, self._verify_vocab,
+            hidden_size if needs_hidden else None,
+            num_aux, dtype, dev,
+        )
+        graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # a dedicated dummy req with extend_len = K+1 (cached_len 0, device_len K+1).
+        vdummy = Req(
+            input_ids=torch.zeros(qlen, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+            sampling_params=None, cache_handle=None,  # type: ignore
+        )
+        torch.cuda.synchronize(dev)
+        free0 = get_free_memory(dev)
+        logger.info_rank0(
+            f"Capturing spec-verify CUDA graphs (qlen={qlen}, hidden={needs_hidden}, aux={num_aux}) "
+            f"sizes={sorted(bs_list)}; free {mem_GB(free0)}"
+        )
+        pool = None
+        for bs in tqdm(sorted(bs_list, reverse=True), desc="Capturing verify graphs",
+                       unit="batch", disable=not get_tp_info().is_primary()):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[vdummy] * bs, phase="decode")
+            batch.spec_verify = True
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_verify_for_capture(batch)
+            vbuf.set_batch(batch)
+            T = vbuf.total(batch)
+            with get_global_ctx().forward_batch(batch):
+                self._run_verify_into(model, vbuf, T, needs_hidden)  # warmup
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    self._run_verify_into(model, vbuf, T, needs_hidden)
+            if pool is None:
+                pool = graph.pool()
+            graph_map[bs] = graph
+        self._verify = {"buf": vbuf, "graphs": graph_map, "qlen": qlen,
+                        "bs_list": sorted(bs_list), "needs_hidden": needs_hidden, "num_aux": num_aux}
+        logger.info_rank0(f"spec-verify graphs captured; free {mem_GB(get_free_memory(dev))}")
+
+    @staticmethod
+    def _run_verify_into(model, vbuf: VerifyCaptureBuffer, T: int, needs_hidden: bool) -> None:
+        if needs_hidden:
+            logits, last_hidden, aux = model.forward(return_hidden=True)
+            vbuf.logits[:T] = logits
+            vbuf.last_hidden[:T] = last_hidden
+            if aux is not None:
+                vbuf.aux_hidden[:, :T] = aux
+        else:
+            vbuf.logits[:T] = model.forward()
+
+    def can_use_verify_graph(self, batch: Batch) -> bool:
+        # capturable iff: graphs exist, every req has exactly num_draft drafts (uniform qlen), and the
+        # req count fits a captured bs. Partial-K steps (near max_tokens / first cold step) fall back
+        # to eager. spec_verify is set by the scheduler.
+        if self._verify is None or not getattr(batch, "spec_verify", False):
+            return False
+        ql = self._verify["qlen"]
+        if batch.size > self._verify["bs_list"][-1]:
+            return False
+        return all(r.extend_len == ql for r in batch.reqs)
+
+    def pad_verify(self, batch: Batch) -> None:
+        bs = next(b for b in self._verify["bs_list"] if b >= batch.size)
+        batch.padded_reqs = batch.reqs + [self._verify_dummy(batch)] * (bs - batch.size)
+
+    def _verify_dummy(self, batch: Batch) -> Req:
+        ql = self._verify["qlen"]
+        return Req(
+            input_ids=torch.zeros(ql, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+            sampling_params=None, cache_handle=None,  # type: ignore
+        )
+
+    def replay_verify(self, batch: Batch, return_hidden: bool):
+        """Replay the captured verify graph for `batch`. The scheduler has already PADDED the batch
+        (pad_verify) and computed batch.input_ids / positions / out_loc over padded_reqs (eager);
+        copy them into the static buffers, refresh the MLA verify metadata, replay, and slice the
+        real-token outputs (the dummy-padded tail rows are discarded)."""
+        v = self._verify
+        v["replays"] = v.get("replays", 0) + 1
+        vbuf: VerifyCaptureBuffer = v["buf"]
+        vbuf.copy_from(batch)
+        self.attn_backend.prepare_verify_for_replay(batch)
+        v["graphs"][batch.padded_size].replay()
+        n = batch.size * v["qlen"]
+        logits = vbuf.logits[:n]
+        if not return_hidden:
+            return logits
+        last_hidden = vbuf.last_hidden[:n] if vbuf.last_hidden is not None else None
+        aux = vbuf.aux_hidden[:, :n] if vbuf.aux_hidden is not None else None
+        return logits, last_hidden, aux
+
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         del self.graph_map
+        if self._verify is not None:
+            del self._verify
         gc.collect()
