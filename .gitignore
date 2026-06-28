@@ -38,3 +38,6 @@ env/
 tools/tp2_results/
 tools/glm_smoke.server.log
 tools/seed_*.log
+tools/spec_sweep.*.log
+tools/qwen35b_smoke.*.log
+tools/sweep_*.window.log
