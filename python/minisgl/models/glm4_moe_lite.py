@@ -376,6 +376,33 @@ class GLMMTPAttention(GLMMLAAttention):
         o = torch.einsum("ths,sthd->thd", probs, Vs)  # [T,H,vhd]
         return self.o_proj.forward(o.reshape(T, H * vhd))
 
+    def seed_kv(
+        self, x: torch.Tensor, positions: torch.Tensor
+    ) -> "list[Tuple[torch.Tensor, torch.Tensor]]":
+        """Per-position (k_full, v) for a batch of prompt positions WITHOUT attention — used to SEED
+        the persistent MTP draft KV from the prompt prefill (MTPProposer.seed_prefill). The q/k/v +
+        RoPE math MUST mirror ``forward_draft`` exactly (keep in sync); only the attention is dropped
+        (the cache stores k/v; attention runs at propose time over the stacked cache).
+
+        x: [S, hidden] (already ``input_layernorm``'d, like forward_draft's input); positions: [S].
+        Returns a list of S ``(k_full [1,H,qk], v [1,H,vhd])`` entries — exactly what forward_draft
+        appends, so the proposer can stack them directly."""
+        S = x.shape[0]
+        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        q = q.view(S, H, self.qk_head_dim)
+        q_rope = q[..., nope:]
+        kv = self.kv_a_proj_with_mqa.forward(x)
+        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
+        k_rope = kv[:, self.kv_lora_rank :]
+        _, k_rope = self.rotary.forward(
+            positions, q_rope.reshape(S, H * rope).contiguous(), k_rope.contiguous()
+        )
+        kvb = self.kv_b_proj.forward(c_kv).view(S, H, nope + vhd)
+        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [S,H,nope], [S,H,vhd]
+        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(S, H, rope)], dim=-1)  # [S,H,qk]
+        return [(k_full[s : s + 1], v[s : s + 1]) for s in range(S)]
+
     def post_load(self) -> None:
         super().post_load()
         self.scale_attn = float(self.qk_head_dim) ** -0.5
@@ -431,6 +458,21 @@ class GLMMTPHead(BaseOP):
         hidden = x + residual  # residual stream after the layer
         logits = self.shared_head.forward(hidden)
         return logits, hidden
+
+    @torch.inference_mode()
+    def seed_kv(
+        self, tokens: torch.Tensor, prev_hidden: torch.Tensor, positions: torch.Tensor
+    ) -> "list[Tuple[torch.Tensor, torch.Tensor]]":
+        """Seed the persistent MTP draft KV from the prompt: for each prompt position build the same
+        fused layer input ``step`` would, then compute its k/v (no attention). Returns the list of
+        (k_full, v) entries the proposer stacks into its per-uid cache.
+
+        tokens: [S] (the token at each seeded position p); prev_hidden: [S, hidden] (the target hidden
+        h_{p-1} that produced it — the standard MTP ``previous_hidden_states``); positions: [S] RoPE
+        positions (= p). Mirrors ``step``'s fuse + input_layernorm before the attention's seed_kv."""
+        fused = self.fuse(self.embed(tokens), prev_hidden)
+        x = self.input_layernorm.forward(fused, None)[0]
+        return self.self_attn.seed_kv(x, positions)
 
 
 class GLMMTPSharedHead(BaseOP):

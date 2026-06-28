@@ -313,11 +313,21 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+    def forward_batch(
+        self, batch: Batch, args: BatchSamplingArgs, return_hidden: bool = False
+    ):
         assert torch.cuda.current_stream() == self.stream
         _maybe_profile()
+        extra = None
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if return_hidden:
+                # Draft-head spec-decode PREFILL SEED path: one forward yields the bonus-token logits
+                # (lm_head still does the prefill last-token reduction internally) AND the per-token
+                # target hidden over the whole prompt — no extra pass. Never a CUDA graph (return_hidden
+                # is spec-only, and spec disables graph capture). See scheduler._spec_prefill_seeded.
+                logits, last_hidden, aux_hidden = self.model.forward(return_hidden=True)
+                extra = (last_hidden, aux_hidden)
+            elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -329,7 +339,8 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return (out, *extra) if return_hidden else out
 
     def forward_verify(self, batch: Batch, return_hidden: bool = False):
         """Eager forward for a speculative-decode verify batch.

@@ -53,6 +53,7 @@ class DraftModelProposer(Proposer):
 
     needs_last_hidden = False
     capture_layer_ids = _GLM47_CAPTURE_LAYER_IDS
+    supports_prefill_seed = True
 
     def __init__(self, engine, num_draft: int, draft_model_path: str) -> None:
         from minisgl.models.glm_eagle3 import GLMEagle3DraftModel
@@ -211,6 +212,30 @@ class DraftModelProposer(Proposer):
                 print(f"[eagle3-dbg] uid={req.uid} conf={conf_tok} base_pos={base_pos} "
                       f"k={k_i} ctx={len(cache) - k_i} draft={drafts}", flush=True)
         return out
+
+    @torch.inference_mode()
+    def seed_prefill(self, req: "Req", last_hidden=None, aux_hidden=None) -> None:
+        # Seed the persistent EAGLE3 draft KV from the prompt prefill so the FIRST draft already sees
+        # full prompt context (otherwise the cache starts empty -> cold early tokens, the ~2% floor's
+        # milder cousin). Same convention as the decode-time propose: the pair (embed(token_p),
+        # fc(aux_{p-1})) lives at RoPE position p (aux_{p-1} = the captured target aux that produced
+        # token_p). We run the draft layer's k/v over prompt pairs p=1..P-1 and mark them committed;
+        # the first decode step then appends position P (the bonus). MINISGL_EAGLE3_NO_CTX disables
+        # the persistent cache entirely, so seeding is a no-op there too.
+        if self._no_ctx or aux_hidden is None:
+            return
+        P = aux_hidden.shape[1]  # aux_hidden: [num_aux, P, hidden]
+        if P < 2:
+            return
+        device = self._device
+        tokens = req.input_ids[1:P].to(device=device, dtype=torch.int64)  # token_p, p=1..P-1
+        # fc(aux_{p-1}): fuse the captured aux at positions 0..P-2. fuse_aux wants [B, num_aux, hidden].
+        aux_prev = aux_hidden[:, 0 : P - 1].to(self._dtype).permute(1, 0, 2).contiguous()
+        fused = self._draft.fuse_aux(aux_prev)  # [P-1, hidden]
+        positions = torch.arange(1, P, dtype=torch.int32, device=device)
+        entries = self._draft.seed_kv(self._draft.embed(tokens), fused, positions)
+        self._cache[req.uid] = entries
+        self._committed[req.uid] = len(entries)
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         # The confirmed token (always committed) plus the n accepted drafts become permanent draft
