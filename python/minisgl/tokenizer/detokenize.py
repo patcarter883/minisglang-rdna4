@@ -1,8 +1,14 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, NamedTuple, Optional
 
 from minisgl.message import DetokenizeMsg
 from transformers import PreTrainedTokenizerBase
+
+
+class DetokResult(NamedTuple):
+    incremental: str  # new text to stream out for this step (truncated before a stop string)
+    completion_tokens: int  # cumulative generated tokens for this uid
+    stop_hit: bool  # a stop string was reached -> the request must finish (and be aborted)
 
 # Borrowed from sglang
 
@@ -58,6 +64,7 @@ class DecodeStatus:
     read_offset: int  # length of read ids
     surr_offset: int  # length of surr ids
     sent_offset: int  # length of sent out string
+    num_tokens: int = 0  # cumulative committed (generated) tokens — for the OpenAI usage block
 
 
 class DetokenizeManager:
@@ -67,7 +74,9 @@ class DetokenizeManager:
         self.tokenizer = tokenizer
         self.eos_token_id = self.tokenizer.eos_token_id
 
-    def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+    def detokenize(
+        self, msgs: List[DetokenizeMsg], stop_map: Optional[Dict[int, List[str]]] = None
+    ) -> List[DetokResult]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
@@ -87,13 +96,14 @@ class DetokenizeManager:
             if msg.finished and toks and toks[-1] == self.eos_token_id:
                 toks = toks[:-1]
             s.decoded_ids.extend(toks)
+            s.num_tokens += len(toks)
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
 
         read_texts = self.tokenizer.batch_decode(read_ids)
         surr_texts = self.tokenizer.batch_decode(surr_ids)
 
-        incremental_strs: List[str] = []
+        results: List[DetokResult] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
@@ -107,10 +117,28 @@ class DetokenizeManager:
                 new_text = find_printable_text(new_text)
                 output_str = s.decoded_str + new_text
 
-            incremental_output = output_str[s.sent_offset :]
-            s.sent_offset = len(output_str)
-            incremental_strs.append(incremental_output)
-            if msg.finished:
+            # Stop strings: finish at the first occurrence of any stop string in the cumulative text,
+            # emitting only the text BEFORE it (the stop string itself is not rendered). Checked over
+            # the whole output_str so a stop string spanning token boundaries is still caught.
+            stop_hit = False
+            stops = stop_map.get(msg.uid) if stop_map else None
+            if stops:
+                cut = -1
+                for ss in stops:
+                    if not ss:
+                        continue
+                    idx = output_str.find(ss)
+                    if idx != -1 and (cut == -1 or idx < cut):
+                        cut = idx
+                if cut != -1:
+                    stop_hit = True
+                    output_str = output_str[:cut]
+
+            incremental_output = output_str[s.sent_offset :] if len(output_str) > s.sent_offset else ""
+            s.sent_offset = max(s.sent_offset, len(output_str))
+            n_tok = s.num_tokens
+            results.append(DetokResult(incremental_output, n_tok, stop_hit))
+            if msg.finished or stop_hit:
                 del self.decode_map[msg.uid]
 
-        return incremental_strs
+        return results

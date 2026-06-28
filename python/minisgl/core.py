@@ -22,10 +22,20 @@ class SamplingParams:
     top_p: float = 1.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    # Stop strings: generation finishes (and the output is truncated) at the first occurrence of any
+    # of these in the decoded text. Matched on the detokenized string, scheduler-agnostic.
+    stop: List[str] = field(default_factory=list)
+    # Structured-output spec: None (free), "json" (any valid JSON object), or a JSON-schema string.
+    # A constrained request bypasses speculative decoding and is masked per-token by a grammar matcher.
+    grammar: str | None = None
 
     @property
     def is_greedy(self) -> bool:
         return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+
+    @property
+    def is_constrained(self) -> bool:
+        return self.grammar is not None
 
 
 @dataclass(eq=False)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-from typing import List
+from typing import Dict, List
 
 import torch
 from minisgl.message import (
@@ -62,6 +62,11 @@ def tokenize_worker(
     tokenize_manager = TokenizeManager(tokenizer)
     detokenize_manager = DetokenizeManager(tokenizer)
 
+    # Per-uid request metadata for the OpenAI usage block + stop strings, set when a prompt is
+    # tokenized and read/cleared when its replies stream back (same process owns both directions).
+    prompt_tokens_map: Dict[int, int] = {}
+    stop_map: Dict[int, List[str]] = {}
+
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
 
@@ -78,23 +83,49 @@ def tokenize_worker(
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
             assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
             if len(detokenize_msg) > 0:
-                replies = detokenize_manager.detokenize(detokenize_msg)
-                batch_output = BatchFrontendMsg(
-                    data=[
+                results = detokenize_manager.detokenize(detokenize_msg, stop_map)
+                replies: List[UserReply] = []
+                stop_abort_uids: List[int] = []
+                for msg, res in zip(detokenize_msg, results, strict=True):
+                    finished = msg.finished or res.stop_hit
+                    # A stop string finished the request before the engine did -> tell the backend to
+                    # abort it (broadcast; idempotent on replicas that don't own the uid).
+                    if res.stop_hit and not msg.finished:
+                        stop_abort_uids.append(msg.uid)
+                    replies.append(
                         UserReply(
                             uid=msg.uid,
-                            incremental_output=reply,
-                            finished=msg.finished,
+                            incremental_output=res.incremental,
+                            finished=finished,
+                            completion_tokens=res.completion_tokens,
+                            prompt_tokens=prompt_tokens_map.get(msg.uid, 0),
+                            finish_reason="stop" if finished else None,
                         )
-                        for msg, reply in zip(detokenize_msg, replies, strict=True)
-                    ]
+                    )
+                    if finished:
+                        prompt_tokens_map.pop(msg.uid, None)
+                        stop_map.pop(msg.uid, None)
+                batch_output: BaseFrontendMsg = (
+                    replies[0] if len(replies) == 1 else BatchFrontendMsg(data=list(replies))
                 )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
                 send_frontend.put(batch_output)
+                if stop_abort_uids:
+                    abort_out: BaseBackendMsg = (
+                        AbortBackendMsg(uid=stop_abort_uids[0])
+                        if len(stop_abort_uids) == 1
+                        else BatchBackendMsg(data=[AbortBackendMsg(uid=u) for u in stop_abort_uids])
+                    )
+                    for sb in send_backends:
+                        sb.put(abort_out)
 
             if len(tokenize_msg) > 0:
                 tensors = tokenize_manager.tokenize(tokenize_msg)
+                # Record prompt length (usage) + stop strings for each new request; consumed when its
+                # replies stream back through the detokenize branch above.
+                for msg, t in zip(tokenize_msg, tensors, strict=True):
+                    prompt_tokens_map[msg.uid] = int(t.numel())
+                    if msg.sampling_params.stop:
+                        stop_map[msg.uid] = list(msg.sampling_params.stop)
                 user_msgs = [
                     UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
                     for msg, t in zip(tokenize_msg, tensors, strict=True)

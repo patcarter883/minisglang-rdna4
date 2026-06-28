@@ -76,11 +76,36 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
-    stop: List[str] = []
+    stop: List[str] | str = []
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
 
+    # Structured output. {"type": "json_object"} -> any valid JSON; {"type": "json_schema",
+    # "json_schema": {"schema": {...}}} -> conform to the schema. None -> unconstrained.
+    response_format: dict | None = None
+
     ignore_eos: bool = False
+
+
+def _grammar_from_response_format(rf: dict | None) -> str | None:
+    """Map an OpenAI ``response_format`` to a SamplingParams.grammar spec ("json" or a JSON-schema
+    string), or None if unconstrained / unrecognized."""
+    if not rf:
+        return None
+    rtype = rf.get("type")
+    if rtype == "json_object":
+        return "json"
+    if rtype == "json_schema":
+        js = rf.get("json_schema") or {}
+        schema = js.get("schema", js)
+        return json.dumps(schema)
+    return None
+
+
+def _norm_stop(stop: list | str | None) -> List[str]:
+    if not stop:
+        return []
+    return [stop] if isinstance(stop, str) else list(stop)
 
 
 class ModelCard(BaseModel):
@@ -159,6 +184,8 @@ class FrontendManager:
 
     async def stream_chat_completions(self, uid: int):
         first_chunk = True
+        prompt_tokens = completion_tokens = 0
+        finish_reason = "stop"
         async for ack in self.wait_for_ack(uid):
             delta = {}
             if first_chunk:
@@ -166,10 +193,14 @@ class FrontendManager:
                 first_chunk = False
             if ack.incremental_output:
                 delta["content"] = ack.incremental_output
+            completion_tokens = max(completion_tokens, ack.completion_tokens)
+            prompt_tokens = ack.prompt_tokens or prompt_tokens
+            if ack.finish_reason:
+                finish_reason = ack.finish_reason
 
             chunk = {
                 "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
+                "object": "chat.completion.chunk",
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
             }
             yield f"data: {json.dumps(chunk)}\n\n".encode()
@@ -177,11 +208,16 @@ class FrontendManager:
             if ack.finished:
                 break
 
-        # send final finish_reason
+        # final chunk: finish_reason + usage (OpenAI carries usage on the terminal chunk)
         end_chunk = {
             "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+            "object": "chat.completion.chunk",
+            "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         }
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
@@ -261,7 +297,6 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -273,6 +308,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 temperature=req.temperature,
                 top_k=req.top_k,
                 top_p=req.top_p,
+                stop=_norm_stop(req.stop),
+                grammar=_grammar_from_response_format(req.response_format),
             ),
         )
     )
@@ -285,8 +322,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
+    prompt_tokens = completion_tokens = 0
+    finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
         full_content += ack.incremental_output
+        completion_tokens = max(completion_tokens, ack.completion_tokens)
+        prompt_tokens = ack.prompt_tokens or prompt_tokens
+        if ack.finish_reason:
+            finish_reason = ack.finish_reason
         if ack.finished:
             break
 
@@ -299,13 +342,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": full_content},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
