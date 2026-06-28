@@ -482,10 +482,34 @@ the same proposer with a different verify dispatch.
 
 ---
 
+## Constrained decoding (structured output) + spec — DONE, GPU-validated (lossless)
+Structured-output requests (`response_format` json_object / json_schema) now SPECULATE instead of
+falling back to plain decode. The key idea that keeps it simple and lossless: **the drafts stay
+UNCONSTRAINED** (the proposer is untouched — its on-device draft chain is unchanged), and the grammar
+is enforced only at the **verify argmax**. Per verify position the target logits are masked by the
+xgrammar matcher's currently-allowed set (its state after the committed prefix), the masked argmax is
+the grammar-valid target token, and a draft is accepted iff it equals that token. So the committed run
+is exactly the masked target argmaxes — == what plain constrained decode emits (lossless) — and a
+draft that violates the grammar simply mismatches and is rejected (lower acceptance, never wrong
+output). `Scheduler._verify_greedy_constrained` walks the K+1 positions on the host (the req's verify
+logits moved to CPU once), advancing the matcher by each committed token and stopping at the bonus /
+first mismatch / EOS (EOS is never fed to the matcher), so it never over-advances past what is kept.
+Mechanics: constrained reqs take the plain (masked) prefill — the matcher is created + advanced by the
+first token there — then enter the spec decode loop like any greedy req; the verify CUDA graph is used
+(masking is post-forward on the CPU'd logits). `compile_json_schema(any_whitespace=False)` (json_object
+maps to `{"type":"object"}`) so a greedy model doesn't stall in unbounded whitespace.
+**Validated (GLM-4.7-Flash-AWQ EAGLE3, TP=2):** json_schema/json_object conform through spec,
+concurrent reqs keep independent matchers, the `[spec]` log shows real draft acceptance +
+`verify_graph_replays` for constrained workloads, and the output is **byte-identical to the non-spec
+constrained path**. Still bypassed for constrained: the prompt-prefill draft-KV seed (the seed forward
+doesn't mask), and constrained reqs need the sync/spec loop (not zero-sync overlap).
+
 ## 5. Invariants / gotchas
 
 - **Greedy-only correctness** today: assert all reqs in a spec batch are greedy; non-greedy reqs
   fall back to plain decode until sampling acceptance lands.
+- **Constrained reqs DO spec now** (greedy): drafts unconstrained, grammar enforced at the verify
+  argmax (`_verify_greedy_constrained`) — lossless. See the "Constrained decoding + spec" section.
 - **Sync loop only**: spec-decode forces the synchronous spec loop; do not mix with overlap.
 - **page_size**: MHA forces 1 (per-token rollback); MLA keeps 16 (the `mla_hip` block size). The
   KV rollback is page-size-aware (frees whole pages beyond the kept run) — see §3 / `_spec_decode_step`.
