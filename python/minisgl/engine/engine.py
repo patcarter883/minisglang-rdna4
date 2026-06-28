@@ -100,6 +100,7 @@ class Engine:
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        self.tp_size = config.tp_info.size
         # Speculative decoding config (None unless --spec-algorithm enables it). The scheduler
         # routes to the synchronous spec loop when this is set; every spec path is gated on it.
         self.spec_config = config.spec_config
@@ -485,7 +486,19 @@ class Engine:
             req.complete_one()
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        if args.grammar_bitmask is not None and self.tp_size > 1:
+            # Structured output at TP>1: the grammar bitmask makes per-rank token selection DIVERGE —
+            # it amplifies tiny cross-rank logit FP differences over the small allowed/renormalized
+            # set, so multinomial sampling (and, at a near-tie, even argmax) can pick a different token
+            # on each rank. Divergent commits desync the decode managers and deadlock the collectives
+            # (and KV would silently differ). Force rank0's tokens onto every rank for an identical
+            # commit (host seq + KV pool). Scoped to constrained batches; they already run the
+            # synchronous decode path, so the extra D2H + CPU broadcast is cheap.
+            next_tokens_cpu = next_tokens_gpu.to("cpu")
+            self.tp_cpu_group.broadcast(next_tokens_cpu, root=0).wait()
+            next_tokens_gpu = next_tokens_cpu.to(next_tokens_gpu.device)
+        else:
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
