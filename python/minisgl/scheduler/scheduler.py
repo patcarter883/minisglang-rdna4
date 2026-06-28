@@ -154,6 +154,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
         self._spec_aux_hidden: dict[int, torch.Tensor] = {}
 
+        # Structured-output (constrained decoding) state. Built lazily on the first constrained
+        # request, so a plain serve never imports xgrammar. uid -> live GrammarMatcher.
+        self._grammar_backend = None
+        self._grammar_matchers: dict[int, object] = {}
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -252,6 +257,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
+                # Structured output: advance this req's grammar matcher with the committed token so the
+                # next step's bitmask reflects the new state. Skip on finish (req is done). A terminated
+                # grammar (complete JSON) is allowed to emit EOS, which the matcher won't accept — guard.
+                if not finished:
+                    m = self._grammar_matchers.get(req.uid)
+                    if m is not None and not m.is_terminated():
+                        m.accept_token(next_token)
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -309,6 +321,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
+        # Release the structured-output grammar matcher (idempotent).
+        self._grammar_matchers.pop(req.uid, None)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -345,12 +359,44 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, self.device)
+        sample_args = self.engine.sampler.prepare(batch)
+        # Structured output: attach the per-row grammar bitmask (None unless a constrained req is in
+        # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
+        # padded_reqs so the row order matches logits[:batch.size]. No-op for a plain serve.
+        sample_args.grammar_bitmask = self._build_grammar_bitmask(batch)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=sample_args,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _build_grammar_bitmask(self, batch: Batch) -> torch.Tensor | None:
+        """Packed xgrammar token bitmask [batch.size, ceil(vocab/32)] on device, or None if no req in
+        the batch is constrained. Constrained rows carry the matcher's currently-allowed token set;
+        every other row (unconstrained reqs + CUDA-graph dummy padding) is left all-ones (no mask).
+        Matchers are created lazily here so a constrained req's FIRST sample (the prefill bonus token)
+        is already masked."""
+        reqs = batch.padded_reqs
+        if not any(r.sampling_params.is_constrained for r in reqs):
+            return None
+        if self._grammar_backend is None:
+            from minisgl.engine.grammar import GrammarBackend
+
+            self._grammar_backend = GrammarBackend(self.tokenizer, self.engine.sampler.vocab_size)
+        backend = self._grammar_backend
+        bitmask = backend.allocate_bitmask(len(reqs))
+        bitmask.fill_(-1)  # all-ones default => unconstrained / dummy rows allow every token
+        for i, r in enumerate(reqs):
+            if not r.sampling_params.is_constrained:
+                continue
+            m = self._grammar_matchers.get(r.uid)
+            if m is None:
+                m = self._grammar_matchers[r.uid] = backend.make_matcher(r.sampling_params.grammar)
+            if not m.is_terminated():
+                m.fill_next_token_bitmask(bitmask, i)
+            # a terminated matcher leaves its row all-ones: nothing left to emit but EOS, allow it.
+        return bitmask.to(self.device)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -386,7 +432,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # prompt-prefill draft-KV seed is enabled, where it runs a hidden-capturing prefill instead.
         batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
         if batch is not None:
-            if self._spec_seed_enabled:
+            # A constrained (structured-output) req must take the plain prefill path so its first token
+            # (the prefill bonus) is grammar-masked — the hidden-capturing seed forward bypasses the
+            # sampler's bitmask. It also isn't a spec req, so seeding its draft KV is pointless.
+            constrained = any(r.sampling_params.is_constrained for r in batch.reqs)
+            if self._spec_seed_enabled and not constrained:
                 self._spec_prefill_seeded(batch)
             else:
                 forward_input = self._prepare_batch(batch)
@@ -397,11 +447,17 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return
 
         reqs = sorted(self.decode_manager.running_reqs, key=lambda req: req.uid)
-        if all(req.sampling_params.is_greedy for req in reqs):
+        # Spec-decode runs only for an all-greedy, fully-UNCONSTRAINED decode set: a non-greedy req
+        # (lossless accept is greedy-only) OR a constrained req (the draft chain would also have to
+        # satisfy the grammar — a later refinement) falls the whole batch back to a plain synchronous
+        # decode step, where the grammar bitmask is applied in the sampler.
+        spec_ok = all(
+            req.sampling_params.is_greedy and not req.sampling_params.is_constrained
+            for req in reqs
+        )
+        if spec_ok:
             self._spec_decode_step(reqs)
         else:
-            # Spec-decode is greedy-only for now (lossless accept). A non-greedy req in the
-            # running set falls the whole batch back to a plain synchronous decode step.
             batch = self.decode_manager.schedule_next_batch()
             forward_input = self._prepare_batch(batch)
             self._process_last_data((forward_input, self._forward(forward_input)))
