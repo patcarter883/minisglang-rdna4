@@ -14,7 +14,7 @@ divergence at token 0 or incoherent text would flag a real mapping/numerics bug.
 dumped for the record.
 
 GPU work — run UNDER a 2-card lease (TP=2), inside the combined image:
-    /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash -c 'docker run ... \
+    gpu-lease -n 2 -- bash -c 'docker run ... \
         python /engine/tools/qwen3_5_moe_vllm_parity.py'
 """
 from __future__ import annotations

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch UNDER the shared lease (TP=2, both cards):
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash tools/run_qwen35b_smoke.sh
+#   gpu-lease -n 2 -- bash tools/run_qwen35b_smoke.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 echo "[run_qwen35b_smoke] HIP=${HIP_VISIBLE_DEVICES:-unset} ROCR=${ROCR_VISIBLE_DEVICES:-unset}"

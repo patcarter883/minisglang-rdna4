@@ -16,7 +16,7 @@
 # Knobs (env): CONC MAXTOK GRAPH PHASE_TO REQ_TO BOOT_TO RUN_DP2NG ATTN_HIP TAIL_HIP
 set -uo pipefail
 
-LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
+LEASE=gpu-lease
 REPO=/home/pat/code/minisgl-rdna4
 MODEL=/models/ZAYA1-8B-fp8
 IMAGE=vllm22-w4a8:combined

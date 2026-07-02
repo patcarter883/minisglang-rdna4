@@ -26,7 +26,7 @@ blocker, not the diff. Hard-won boot recipe for whoever finishes it (4 failed at
     *binaries* for these shapes aren't warm). Give the health poll a >=40-min budget; the workers peg
     CPU (~183%) at 3% GPU during this — that's compile, not a hang. Do NOT kill it early.
 Example (under a 2-card lease, from ~/code/vllm-gfx1201):
-    VLLM_MODEL_ID=cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit scripts/gpu-lease.sh -n 2 --name serve35be -- \\
+    VLLM_MODEL_ID=cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit gpu-lease -n 2 --name serve35be -- \\
       docker compose --profile serve run --rm --service-ports serve \\
         cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit --host=0.0.0.0 --port=8000 --tensor-parallel-size=2 \\
         --enforce-eager --kv-cache-dtype=fp8 --gpu-memory-utilization=0.95 --max-num-seqs=8 \\

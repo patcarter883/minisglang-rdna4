@@ -4,23 +4,29 @@
 
 This box's two discrete gfx1201 cards are **shared across every repo on the machine**, not just
 this one. Agents working in `~/code/vllm-gfx1201` (and its worktrees) are leasing the *same two
-physical cards* you are. There is exactly **one** booking arbiter for the whole box, and it lives
-in the vllm-gfx1201 checkout. So for anything GPU-related, **follow the protocol documented in
-[`/home/pat/code/vllm-gfx1201/CLAUDE.md`](/home/pat/code/vllm-gfx1201/CLAUDE.md)** — specifically
-its **"GPU sharing protocol"** and **"Trace analysis: TraceLens"** sections. The essentials:
+physical cards* you are. There is exactly **one** booking arbiter for the whole box. It now lives in
+its **own canonical repo, [`/home/pat/code/gpu-lease`](/home/pat/code/gpu-lease)** (bare `gpu-lease` /
+`gpu-status` on `$PATH` via `lease install`; unifies local **and** cloud leasing + a monitoring
+console — its `README.md` is authoritative for leasing). For the profiling (TraceLens), container-run,
+and cache conventions, [`/home/pat/code/vllm-gfx1201/CLAUDE.md`](/home/pat/code/vllm-gfx1201/CLAUDE.md)
+remains the source. The essentials:
 
 ### Booking a GPU
 - The box has **two** gfx1201 compute cards: **GPU 0** (RX 9070 XT, 16 GB) and **GPU 1**
   (RX 9070, 16 GB). ROCm device **2** is the Ryzen iGPU — **never** a compute target.
 - **EVERY GPU workload** — a bench, a raw `python`/torch probe, a container, anything that touches a
-  card — **MUST be launched through the shared arbiter, by its absolute path:**
+  card — **MUST be launched through the shared arbiter, now a bare command on `$PATH`:**
   ```
-  /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 1 -- <your command>
+  gpu-lease -n 1 -- <your command>
   ```
-  Call it **by that absolute path** — do NOT copy it into this repo. Its flock lives at the
-  hardcoded `/home/pat/code/vllm-gfx1201/.gpu-locks`, so only the original script coordinates with
-  the other agents on the box. A local copy would book against a private lock and collide with
-  everyone else.
+  The lease tool moved to its **own canonical repo `/home/pat/code/gpu-lease`** and is installed on
+  `$PATH` via `lease install`, so call it **bare as `gpu-lease`** — the old
+  `/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh` path is **gone**. If `gpu-lease` isn't found in
+  your shell, run `lease install` (or open a fresh shell) first; do **not** copy the tool into this
+  repo. Its flock still lives at the hardcoded `/home/pat/code/vllm-gfx1201/.gpu-locks`, so every
+  agent in every worktree coordinates on the same locks — a local copy would book against a private
+  lock and collide with everyone else. Flags, semantics, and env-injection are unchanged from the old
+  script.
 - **`-n` = HOW MANY cards, NOT which card.** `-n 1` (the default) = one card; `-n 2` = both.
   Single-card model/probe/bench → `-n 1`. Only a genuine TP=2 job → `-n 2`. There is **no**
   "pin a specific card" flag and you never need one — the arbiter auto-assigns the lowest free card
@@ -32,7 +38,7 @@ its **"GPU sharing protocol"** and **"Trace analysis: TraceLens"** sections. The
 - **`--detach` for any long-lived `up -d`/server** (binds the lease to container lifetime).
   Foreground jobs (`run --rm`, a script that blocks) need no flag — the lease frees when they exit,
   including on crash/Ctrl-C (flock auto-releases; no stale "reserved" state, no janitor).
-- See who holds what:  `/home/pat/code/vllm-gfx1201/scripts/gpu-status.sh`
+- See who holds what:  `gpu-status` (bare command, same repo/PATH as `gpu-lease`)
 - CPU-only work (builds, static analysis, editing, trace post-processing) needs **no** lease.
 
 ### Profiling — run TraceLens after collecting traces
@@ -42,12 +48,14 @@ its **"GPU sharing protocol"** and **"Trace analysis: TraceLens"** sections. The
   ```
   /home/pat/code/vllm-gfx1201/profiling/run_tracelens.sh <trace_dir>
   ```
-- This is **host-side post-processing — no GPU required. Do NOT wrap it in gpu-lease.sh.**
+- This is **host-side post-processing — no GPU required. Do NOT wrap it in `gpu-lease`.**
 - One-time host install if missing: `uv tool install "git+https://github.com/AMD-AGI/TraceLens.git"`.
 
-> Any vllm-gfx1201 checkout's `gpu-lease.sh` works (main or a worktree, e.g. the README's
-> `…-gpu-lease/scripts/gpu-lease.sh`) — all anchor the same hardcoded `…/vllm-gfx1201/.gpu-locks`,
-> so they coordinate the same two cards. Pick one; don't copy it.
+> The lease interface is now the bare `gpu-lease` / `gpu-status` commands from the canonical
+> **`/home/pat/code/gpu-lease`** repo (installed on `$PATH` via `lease install`; it unifies local
+> **and** cloud leasing plus a monitoring console — its `README.md` is authoritative). Every
+> invocation anchors the same hardcoded `…/vllm-gfx1201/.gpu-locks`, so all agents/worktrees
+> coordinate the same two cards. Never use a `scripts/…gpu-lease.sh` path — it no longer exists.
 
 ## Source isolation — per-task git worktree, NEVER mount the shared `$PWD` (MANDATORY)
 
@@ -92,7 +100,7 @@ kernel as vllm-gfx1201) via hand-rolled `docker run`. The canonical recipe is in
   disables, boot crashes). Always pass the full set:
   `--device /dev/kfd --device /dev/dri --group-add video --security-opt seccomp=unconfined
   --security-opt label=disable --cap-add SYS_PTRACE --ipc host --shm-size 16gb`.
-- **Devices come from the lease, never by hand.** Inside the `gpu-lease.sh -- bash -c '…'` wrapper,
+- **Devices come from the lease, never by hand.** Inside the `gpu-lease -- bash -c '…'` wrapper,
   **forward the arbiter's already-composed pair**:
   `-e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES`.
   Do NOT hardcode `0`/`1`, and do NOT set BOTH to `$LEASE_ROCR_DEVICES` — that is the *physical*

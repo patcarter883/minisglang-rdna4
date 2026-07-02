@@ -6,7 +6,7 @@ agree (max|Δ|) at each length, so this doubles as a long-context correctness ch
 kernel that now drives the serve prefill path.
 
 Run under a 1-card lease (executes HIP kernels):
-    .../gpu-lease.sh -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_hip_bench.py'
+    .../gpu-lease -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_hip_bench.py'
 """
 from __future__ import annotations
 

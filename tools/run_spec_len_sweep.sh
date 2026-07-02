@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spec-length sweep window. Launch UNDER the shared lease (TP=2 -> both cards):
-#   GLM:   ALGO_SET=glm  gpu-lease.sh -n 2 -- env ... bash tools/run_spec_len_sweep.sh
-#   Qwen:  ALGO_SET=qwen gpu-lease.sh -n 2 -- env ... bash tools/run_spec_len_sweep.sh
+#   GLM:   ALGO_SET=glm  gpu-lease -n 2 -- env ... bash tools/run_spec_len_sweep.sh
+#   Qwen:  ALGO_SET=qwen gpu-lease -n 2 -- env ... bash tools/run_spec_len_sweep.sh
 # Forwards the lease device env + a CONFIGS list into vllm22-w4a8:combined and runs spec_len_sweep.sh.
 set -uo pipefail
 cd "$(dirname "$0")/.."

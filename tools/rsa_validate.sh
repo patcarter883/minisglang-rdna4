@@ -3,7 +3,7 @@
 # Serves Zaya on 1919 and exercises a PLAIN call + an RSA call (rsa:{n,k,t,...}) on the same port.
 set -uo pipefail
 
-LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
+LEASE=gpu-lease
 REPO=${REPO:-/home/pat/code/minisgl-rdna4-rsa-engine}
 MODEL=/models/ZAYA1-8B-fp8
 IMAGE=vllm22-w4a8:combined

@@ -10,7 +10,7 @@ to the output magnitude), NOT input rounding. A faithful kernel sits near the dt
 (fp32~1e-3, fp16~1e-2, bf16~5e-2 rel); a real indexing/LDS/register bug or NaN blows past it.
 
 Run inside the combined ROCm image UNDER a 1-card lease (executes HIP kernels):
-    .../gpu-lease.sh -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_hip_parity.py'
+    .../gpu-lease -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_hip_parity.py'
 (The gdn_hip_C*.so must be built first: cd gdn_hip && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace)
 """
 from __future__ import annotations

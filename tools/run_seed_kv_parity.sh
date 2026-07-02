@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # seed_kv KV-parity (batched seed vs autoregressive step) for the prompt-prefill draft-KV seed.
 # Launch UNDER the shared lease (single card):
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 1 -- bash tools/run_seed_kv_parity.sh
+#   gpu-lease -n 1 -- bash tools/run_seed_kv_parity.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 echo "[run_seed_kv_parity] HIP=${HIP_VISIBLE_DEVICES:-unset} ROCR=${ROCR_VISIBLE_DEVICES:-unset}"

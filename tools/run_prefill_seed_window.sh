@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Prompt-prefill draft-KV seed validation window (GLM-4.7-Flash, TP=2). Launch UNDER the shared lease
 # holding BOTH cards (TP=2):
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash tools/run_prefill_seed_window.sh
-#   ALGO=eagle3 /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash tools/run_prefill_seed_window.sh
+#   gpu-lease -n 2 -- bash tools/run_prefill_seed_window.sh
+#   ALGO=eagle3 gpu-lease -n 2 -- bash tools/run_prefill_seed_window.sh
 # Thin wrapper: forwards the lease's device env into vllm22-w4a8:combined, copies the warm Triton
 # cache to a writable throwaway (shared cache stays RO/uncorrupted), and runs spec_prefill_seed.sh.
 set -uo pipefail
