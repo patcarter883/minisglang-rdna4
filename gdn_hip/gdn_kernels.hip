@@ -822,6 +822,110 @@ __global__ void rmsnorm_gated_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// RMSNormGated BACKWARD (analytic). y_j = x_j * inv * w_j * silu(z_j), inv = rsqrt(mean(x^2)+eps).
+// Given go=dL/dy: with A = sum_l go_l x_l w_l silu(z_l),
+//   dx_j = inv*w_j*silu(z_j)*go_j - (inv^3 x_j / D) * A     (the second term = d inv / d x_j coupling)
+//   dz_j = go_j * x_j * inv * w_j * silu'(z_j)
+//   dw_j = sum_m go_j x_j inv silu(z_j)   (reduced over rows via atomicAdd into fp32 dweight[D])
+// grid=(M), block=min(D,1024) (D=head_v_dim is a power of two). dweight MUST be zero-initialised.
+template <typename scalar_t>
+__global__ void rmsnorm_gated_bwd_kernel(
+    const scalar_t* __restrict__ go, const scalar_t* __restrict__ x, const scalar_t* __restrict__ z,
+    const float* __restrict__ weight, scalar_t* __restrict__ dx, scalar_t* __restrict__ dz,
+    float* __restrict__ dweight, int M, int D, float eps) {
+  const int m = blockIdx.x;
+  extern __shared__ float red[];
+  float sq = 0.0f, A = 0.0f;
+  for (int j = threadIdx.x; j < D; j += blockDim.x) {
+    const float xv = (float)x[m * D + j];
+    const float zv = (float)z[m * D + j];
+    const float sz = zv / (1.0f + __expf(-zv));           // silu(z)
+    sq += xv * xv;
+    A += (float)go[m * D + j] * xv * weight[j] * sz;
+  }
+  red[threadIdx.x] = sq; __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(red[0] / D + eps);
+  __syncthreads();
+  red[threadIdx.x] = A; __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float Ared = red[0];
+  __syncthreads();
+  const float inv3 = inv * inv * inv;
+  for (int j = threadIdx.x; j < D; j += blockDim.x) {
+    const float xv = (float)x[m * D + j];
+    const float zv = (float)z[m * D + j];
+    const float sig = 1.0f / (1.0f + __expf(-zv));
+    const float sz = zv * sig;                            // silu(z)
+    const float szp = sig + zv * sig * (1.0f - sig);      // d silu / dz
+    const float wv = weight[j];
+    const float gv = (float)go[m * D + j];
+    dx[m * D + j] = (scalar_t)(inv * wv * sz * gv - inv3 * xv / D * Ared);
+    dz[m * D + j] = (scalar_t)(gv * xv * inv * wv * szp);
+    atomicAdd(&dweight[j], gv * xv * inv * sz);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// causal_conv1d BACKWARD (depthwise, single-seq, zero initial state — the training-wrapper case).
+// Forward: out_t = act(b_c + sum_{d=0..W-1} x_{t-W+1+d} w_c[d]).  Given go=dL/dout, per channel c:
+//   dacc_t = go_t * act'(acc_t)        (act' = 1 if no activation; SiLU' otherwise)
+//   dbias_c = sum_t dacc_t ;  dw_c[d] = sum_t dacc_t x_{t-W+1+d}
+//   dx_s    = sum_{d=0..W-1} dacc_{s+W-1-d} w_c[d]     (transposed conv)
+// One thread per channel (channels are independent). dacc is staged in fp32 scratch [T,C] so the
+// dx pass reads a clean pre-activation gradient. grid=(ceil(C/CT)), block=CT.
+template <typename scalar_t>
+__global__ void causal_conv1d_bwd_kernel(
+    const scalar_t* __restrict__ go, const scalar_t* __restrict__ x, const float* __restrict__ weight,
+    const float* __restrict__ bias, float* __restrict__ dacc, scalar_t* __restrict__ dx,
+    float* __restrict__ dweight, float* __restrict__ dbias, int T, int C, int W, int activation) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const float* wc = weight + c * W;
+  const float bc = bias ? bias[c] : 0.0f;
+  const int Wm1 = W - 1;
+  float gw[16];
+  for (int d = 0; d < W; ++d) gw[d] = 0.0f;
+  float gb = 0.0f;
+  // pass 1: recompute acc via a hist ring (zero init), form dacc, accumulate dw/db.
+  float hist[16];
+  for (int i = 0; i < Wm1; ++i) hist[i] = 0.0f;
+  for (int t = 0; t < T; ++t) {
+    const float xnew = (float)x[t * C + c];
+    float acc = bc;
+    for (int i = 0; i < Wm1; ++i) acc += hist[i] * wc[i];
+    acc += xnew * wc[Wm1];
+    const float go_t = (float)go[t * C + c];
+    float da;
+    if (activation) { const float sig = 1.0f / (1.0f + __expf(-acc)); da = go_t * (sig + acc * sig * (1.0f - sig)); }
+    else da = go_t;
+    dacc[t * C + c] = da;
+    gb += da;
+    for (int i = 0; i < Wm1; ++i) gw[i] += da * hist[i];  // window[d<Wm1] = hist[d]
+    gw[Wm1] += da * xnew;                                 // window[Wm1] = x_t
+    for (int i = 0; i < Wm1 - 1; ++i) hist[i] = hist[i + 1];
+    hist[Wm1 - 1] = xnew;
+  }
+  // pass 2: dx_s = sum_d dacc_{s+W-1-d} wc[d], valid t in [0,T)
+  for (int s = 0; s < T; ++s) {
+    float g = 0.0f;
+    for (int d = 0; d < W; ++d) {
+      const int t = s + Wm1 - d;
+      if (t >= 0 && t < T) g += dacc[t * C + c] * wc[d];
+    }
+    dx[s * C + c] = (scalar_t)g;
+  }
+  for (int d = 0; d < W; ++d) dweight[c * W + d] = gw[d];  // channel c owns its weights (no atomic)
+  if (bias) dbias[c] = gb;
+}
+
 // ============================== launchers (called from bindings.cpp) ==========================
 static inline float* FP(const at::Tensor& t) { return t.data_ptr<float>(); }
 static inline const float* CFP(const at::Tensor& t) { return t.data_ptr<float>(); }
@@ -1009,5 +1113,35 @@ void launch_rmsnorm_gated(const at::Tensor& x, const at::Tensor& z, const at::Te
     hipLaunchKernelGGL((rmsnorm_gated_kernel<scalar_t>), grid, block, shmem, stream,
         x.data_ptr<scalar_t>(), z.data_ptr<scalar_t>(), CFP(weight), out.data_ptr<scalar_t>(), M, D,
         (float)eps);
+  });
+}
+
+void launch_rmsnorm_gated_bwd(const at::Tensor& go, const at::Tensor& x, const at::Tensor& z,
+                              const at::Tensor& weight, at::Tensor& dx, at::Tensor& dz,
+                              at::Tensor& dweight, double eps) {
+  const int M = x.size(0), D = x.size(1);
+  dim3 grid(M), block(D < 1024 ? D : 1024);
+  size_t shmem = block.x * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "rmsnorm_gated_bwd", [&] {
+    hipLaunchKernelGGL((rmsnorm_gated_bwd_kernel<scalar_t>), grid, block, shmem, stream,
+        go.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), z.data_ptr<scalar_t>(), CFP(weight),
+        dx.data_ptr<scalar_t>(), dz.data_ptr<scalar_t>(), FP(dweight), M, D, (float)eps);
+  });
+}
+
+void launch_causal_conv1d_bwd(const at::Tensor& go, const at::Tensor& x, const at::Tensor& weight,
+                              const c10::optional<at::Tensor>& bias, at::Tensor& dx,
+                              at::Tensor& dweight, at::Tensor& dbias, int64_t activation) {
+  const int T = x.size(0), C = x.size(1), W = weight.size(1);
+  auto dacc = at::empty({T, C}, x.options().dtype(at::kFloat));
+  const int CT = C < 256 ? C : 256;
+  dim3 grid((C + CT - 1) / CT), block(CT);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "causal_conv1d_bwd", [&] {
+    hipLaunchKernelGGL((causal_conv1d_bwd_kernel<scalar_t>), grid, block, 0, stream,
+        go.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), CFP(weight),
+        bias.has_value() ? CFP(*bias) : nullptr, FP(dacc), dx.data_ptr<scalar_t>(), FP(dweight),
+        bias.has_value() ? FP(dbias) : nullptr, T, C, W, (int)activation);
   });
 }
