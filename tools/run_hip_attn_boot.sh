@@ -3,7 +3,7 @@
 # paged flash-decode). Mounts both kernel worktrees so `import attn_hip` / `import attn_decode`
 # resolve. BACKEND env selects 'hip' (default) or 'auto' (triton_rdna4) for an A/B token-diff.
 set -euo pipefail
-LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
+LEASE=gpu-lease
 ENGINE=/home/pat/code/minisgl-rdna4
 PREFILL_WT=/home/pat/code/vllm-gfx1201-attn-hip
 DECODE_WT=/home/pat/code/vllm-gfx1201-attn-decode

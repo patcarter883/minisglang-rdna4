@@ -9,7 +9,7 @@ sequences. The op-level parity (tools/gdn_hip_parity.py) already proved max|Δ|~
 this confirms the fp16 prefill doesn't perturb real-model token sampling enough to diverge.
 
 Run inside the combined image UNDER a 1-card lease:
-    .../gpu-lease.sh -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_wmma_serve_smoke.py'
+    .../gpu-lease -n 1 -- bash -c 'docker run ... python /engine/tools/gdn_wmma_serve_smoke.py'
 """
 from __future__ import annotations
 

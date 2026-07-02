@@ -15,7 +15,7 @@
 # Knobs (env): CONC MAXTOK GRAPH PHASE_TO REQ_TO BOOT_TO RUN_EP2NG ATTN_HIP TAIL_HIP
 set -uo pipefail
 
-LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
+LEASE=gpu-lease
 # Source isolation: mount the ISOLATED per-task worktree, NEVER the shared $PWD checkout (a concurrent
 # agent edits that tree mid-run -> the container reads torn code). Override with REPO=... if needed.
 REPO=${REPO:-/home/pat/code/minisgl-rdna4-zaya-dp-ep}

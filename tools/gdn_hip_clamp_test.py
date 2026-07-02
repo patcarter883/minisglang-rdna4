@@ -9,7 +9,7 @@ references — one WITH the same Frobenius clamp, one WITHOUT. A correct clamp m
 The recurrent gdn_hip_parity.py covers the no-op (in-range) path; this covers the engaged path.
 
 Run inside the combined ROCm image UNDER a 1-card lease (executes HIP kernels):
-    .../gpu-lease.sh -n 1 -- bash -c 'docker run ... PYTHONPATH=/engine python /engine/tools/gdn_hip_clamp_test.py'
+    .../gpu-lease -n 1 -- bash -c 'docker run ... PYTHONPATH=/engine python /engine/tools/gdn_hip_clamp_test.py'
 """
 from __future__ import annotations
 

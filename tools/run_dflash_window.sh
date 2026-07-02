@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DFlash spec-decode validation window. Launch UNDER the shared lease (single card):
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 1 -- bash tools/run_dflash_window.sh
+#   gpu-lease -n 1 -- bash tools/run_dflash_window.sh
 # Thin wrapper: forwards the lease's device env into vllm22-w4a8:combined and runs spec_dflash.sh.
 set -uo pipefail
 cd "$(dirname "$0")/.."

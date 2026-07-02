@@ -2,7 +2,7 @@
 # Phase 4 GPU window — TP=2 serve bring-up + parity probe (4-0 / 4-3 / 4-4).
 #
 # Launched UNDER the shared GPU lease, holding BOTH cards for the whole sequence:
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash tools/run_tp2_window.sh
+#   gpu-lease -n 2 -- bash tools/run_tp2_window.sh
 # (-n 2 = both cards, required for TP=2. The lease blocks until both are free, then runs this.)
 #
 # Runs ONE container for the whole escalation (pay image/cache warmup once) and drives
@@ -17,8 +17,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # Args (if any) are forwarded to tp_serve_probe.py as config-name filters, e.g.
-#   gpu-lease.sh -n 1 -- bash tools/run_tp2_window.sh tp1   # single-card TP=1 validation
-#   gpu-lease.sh -n 2 -- bash tools/run_tp2_window.sh       # full TP=2 escalation
+#   gpu-lease -n 1 -- bash tools/run_tp2_window.sh tp1   # single-card TP=1 validation
+#   gpu-lease -n 2 -- bash tools/run_tp2_window.sh       # full TP=2 escalation
 PROBE_ARGS="$*"
 
 mkdir -p tools/tp2_results

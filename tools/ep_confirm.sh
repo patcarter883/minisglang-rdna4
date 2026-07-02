@@ -4,7 +4,7 @@
 # Confirms: boots + captures graphs WITH EP collectives in-graph, coherent output, no hang.
 set -uo pipefail
 
-LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
+LEASE=gpu-lease
 REPO=${REPO:-/home/pat/code/minisgl-rdna4-zaya-dp-ep}
 MODEL=/models/ZAYA1-8B-fp8
 IMAGE=vllm22-w4a8:combined

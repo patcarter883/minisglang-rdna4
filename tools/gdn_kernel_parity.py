@@ -23,7 +23,7 @@ invocation limitation, not a vendoring issue. It is covered by the byte-diff and
 exercised correctly through the real layer in 3b-3.
 
 Run on GPU via the lease:
-  gpu-lease.sh -n 1 -- docker run ... --entrypoint bash IMG -lc \
+  gpu-lease -n 1 -- docker run ... --entrypoint bash IMG -lc \
     'source /app/.venv/bin/activate && PYTHONPATH=/engine/python python /engine/tools/gdn_kernel_parity.py'
 """
 

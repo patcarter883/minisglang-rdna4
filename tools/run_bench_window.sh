@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 2-card serve benchmark window (Task: serving matrix). Launch UNDER the shared lease:
-#   /home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh -n 2 -- bash tools/run_bench_window.sh
-# TP=1 single-card models: gpu-lease.sh -n 1 -- env TP=1 MODEL=Qwen/Qwen3.5-4B bash tools/run_bench_window.sh
+#   gpu-lease -n 2 -- bash tools/run_bench_window.sh
+# TP=1 single-card models: gpu-lease -n 1 -- env TP=1 MODEL=Qwen/Qwen3.5-4B bash tools/run_bench_window.sh
 # Thin wrapper: forwards the lease's device env into the container and runs _bench_inner.sh there.
 set -uo pipefail
 cd "$(dirname "$0")/.."

@@ -33,11 +33,12 @@ progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.m
 
 ## Running (combined image, via the GPU lease)
 
-GPU work goes through the shared-box `flock` lease (never hand-set devices/ports):
+GPU work goes through the shared-box `flock` lease (never hand-set devices/ports). The lease is the
+bare `gpu-lease` command on `$PATH` (canonical repo `/home/pat/code/gpu-lease`, installed via
+`lease install`; the old `.../scripts/gpu-lease.sh` path is gone):
 
 ```bash
-LEASE=/home/pat/code/vllm-gfx1201-gpu-lease/scripts/gpu-lease.sh
-$LEASE -n 1 -- bash -c '
+gpu-lease -n 1 -- bash -c '
   docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
     --security-opt seccomp=unconfined --security-opt label=disable \
     --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
