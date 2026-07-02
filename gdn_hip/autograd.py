@@ -286,6 +286,13 @@ def _make_cu_seqlens(T: int, device) -> torch.Tensor:
     return torch.tensor([0, T], dtype=torch.int32, device=device)
 
 
+def _native_bwd_ok(name: str) -> bool:
+    """True if the native HIP backward op `name` should be used: on by default, off via
+    GDN_HIP_NATIVE_BWD=0, and auto-disabled if the op isn't registered (older .so) so the pure-torch
+    recompute still works. Checked at backward time, when the extension is definitely loaded."""
+    return os.environ.get("GDN_HIP_NATIVE_BWD", "1") != "0" and hasattr(torch.ops.gdn_hip, name)
+
+
 class _GDNPrefillFn(torch.autograd.Function):
     """Differentiable gdn_prefill / gdn_prefill_wmma (recurrent or wmma native forward; reference
     recompute backward). Single-seq, zero-initial-state training case."""
@@ -350,6 +357,12 @@ class _CausalConv1dFwdFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         x, weight, bias_s = ctx.saved_tensors
+        if _native_bwd_ok("causal_conv1d_bwd"):
+            bias = bias_s if ctx.has_bias else None
+            dx, dw, db = torch.ops.gdn_hip.causal_conv1d_bwd(
+                grad_out.contiguous().to(x.dtype), x.contiguous(), weight, bias, int(ctx.activation))
+            gb = db.to(bias_s.dtype) if ctx.has_bias else None
+            return dx, dw.to(weight.dtype), gb, None
         with torch.enable_grad():
             xd = x.detach().to(torch.float32).requires_grad_(True)
             wd = weight.detach().to(torch.float32).requires_grad_(True)
@@ -378,6 +391,10 @@ class _RMSNormGatedFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         x, z, weight = ctx.saved_tensors
+        if _native_bwd_ok("rmsnorm_gated_bwd"):
+            dx, dz, dw = torch.ops.gdn_hip.rmsnorm_gated_bwd(
+                grad_out.contiguous().to(x.dtype), x.contiguous(), z.contiguous(), weight, ctx.eps)
+            return dx, dz, dw.to(weight.dtype), None
         with torch.enable_grad():
             xd = x.detach().to(torch.float32).requires_grad_(True)
             zd = z.detach().to(torch.float32).requires_grad_(True)

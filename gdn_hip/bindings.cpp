@@ -50,6 +50,11 @@ void launch_causal_conv1d_fwd_verify(const at::Tensor&, const at::Tensor&,
                                      at::Tensor&, int64_t);
 void launch_rmsnorm_gated(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                           double);
+void launch_rmsnorm_gated_bwd(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, double);
+void launch_causal_conv1d_bwd(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const c10::optional<at::Tensor>&, at::Tensor&, at::Tensor&, at::Tensor&,
+                              int64_t);
 
 namespace {
 
@@ -152,6 +157,27 @@ at::Tensor rmsnorm_gated(const at::Tensor& x, const at::Tensor& z, const at::Ten
   return out;
 }
 
+// --- native backward ops (analytic; called from gdn_hip/autograd.py's *_train wrappers) ---
+std::tuple<at::Tensor, at::Tensor, at::Tensor> rmsnorm_gated_bwd(
+    const at::Tensor& go, const at::Tensor& x, const at::Tensor& z, const at::Tensor& weight,
+    double eps) {
+  auto dx = at::empty_like(x);
+  auto dz = at::empty_like(z);
+  auto dweight = at::zeros({x.size(1)}, weight.options().dtype(at::kFloat));  // atomicAdd across rows
+  launch_rmsnorm_gated_bwd(go, x, z, weight, dx, dz, dweight, eps);
+  return {dx, dz, dweight};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> causal_conv1d_bwd(
+    const at::Tensor& go, const at::Tensor& x, const at::Tensor& weight,
+    const c10::optional<at::Tensor>& bias, int64_t activation) {
+  auto dx = at::empty_like(x);
+  auto dweight = at::empty({weight.size(0), weight.size(1)}, weight.options().dtype(at::kFloat));
+  auto dbias = at::empty({bias.has_value() ? weight.size(0) : 0}, weight.options().dtype(at::kFloat));
+  launch_causal_conv1d_bwd(go, x, weight, bias, dx, dweight, dbias, activation);
+  return {dx, dweight, dbias};
+}
+
 }  // namespace
 
 TORCH_LIBRARY(gdn_hip, m) {
@@ -178,6 +204,10 @@ TORCH_LIBRARY(gdn_hip, m) {
         "Tensor state_indices, Tensor has_initial_state, Tensor(a!) conv_state, int activation) "
         "-> Tensor");
   m.def("rmsnorm_gated(Tensor x, Tensor z, Tensor weight, float eps) -> Tensor");
+  m.def("rmsnorm_gated_bwd(Tensor go, Tensor x, Tensor z, Tensor weight, float eps) "
+        "-> (Tensor, Tensor, Tensor)");
+  m.def("causal_conv1d_bwd(Tensor go, Tensor x, Tensor weight, Tensor? bias, int activation) "
+        "-> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(gdn_hip, CUDA, m) {
@@ -190,4 +220,6 @@ TORCH_LIBRARY_IMPL(gdn_hip, CUDA, m) {
   m.impl("causal_conv1d_update", causal_conv1d_update);
   m.impl("causal_conv1d_fwd", causal_conv1d_fwd);
   m.impl("rmsnorm_gated", rmsnorm_gated);
+  m.impl("rmsnorm_gated_bwd", rmsnorm_gated_bwd);
+  m.impl("causal_conv1d_bwd", causal_conv1d_bwd);
 }

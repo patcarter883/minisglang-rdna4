@@ -77,6 +77,20 @@ def _rmsnorm_gated_fake(x, z, weight, eps):
     return torch.empty_like(x)
 
 
+@torch.library.register_fake("gdn_hip::rmsnorm_gated_bwd")
+def _rmsnorm_gated_bwd_fake(go, x, z, weight, eps):
+    return (torch.empty_like(x), torch.empty_like(z),
+            torch.empty(x.shape[-1], dtype=torch.float32, device=x.device))
+
+
+@torch.library.register_fake("gdn_hip::causal_conv1d_bwd")
+def _causal_conv1d_bwd_fake(go, x, weight, bias, activation):
+    dbias_n = weight.shape[0] if bias is not None else 0
+    return (torch.empty_like(x),
+            torch.empty(weight.shape[0], weight.shape[1], dtype=torch.float32, device=x.device),
+            torch.empty(dbias_n, dtype=torch.float32, device=x.device))
+
+
 # ---- raw ops ----
 gdn_decode = torch.ops.gdn_hip.gdn_decode
 gdn_prefill = torch.ops.gdn_hip.gdn_prefill
@@ -87,8 +101,11 @@ gdn_prefill_wmma = torch.ops.gdn_hip.gdn_prefill_wmma
 causal_conv1d_update = torch.ops.gdn_hip.causal_conv1d_update
 causal_conv1d_fwd = torch.ops.gdn_hip.causal_conv1d_fwd
 rmsnorm_gated = torch.ops.gdn_hip.rmsnorm_gated
+rmsnorm_gated_bwd = torch.ops.gdn_hip.rmsnorm_gated_bwd
+causal_conv1d_bwd = torch.ops.gdn_hip.causal_conv1d_bwd
 
 __all__ = [
     "gdn_decode", "gdn_prefill", "gdn_prefill_verify", "gdn_prefill_chunked", "gdn_prefill_wmma",
     "causal_conv1d_update", "causal_conv1d_fwd", "causal_conv1d_fwd_verify", "rmsnorm_gated",
+    "rmsnorm_gated_bwd", "causal_conv1d_bwd",
 ]
