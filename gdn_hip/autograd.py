@@ -197,9 +197,14 @@ def ref_gdn_prefill_core(
     dt_bias: torch.Tensor,  # [HV] (fp32)
     scale: float,
     use_l2norm: bool = True,
+    chunk: int | None = None,
 ) -> torch.Tensor:
     """Pure-torch differentiable equivalent of gdn_prefill / gdn_prefill_wmma for ONE full sequence
     starting from ZERO state (cu_seqlens=[0,T], has_initial_state=False). Returns core [T, HV, V].
+
+    `chunk` overrides the GDN_REF_CHUNK env for the chunk width (the batched backward passes a small
+    value so the gradient-checkpointed chunked scan bounds memory — folding B into heads makes the plain
+    recurrent scan retain B× the state and thrash a 16GB card).
 
     Faithful to the recurrent kernel (gdn_prefill_kernel + gdn_step): per value-head hv, GQA head
     hq = hv // (HV // H); q,k l2-normed (kernel eps), q scaled; g/beta from a,b,A_log,dt_bias; the
@@ -232,7 +237,7 @@ def ref_gdn_prefill_core(
     # dispatch: chunked closed-form scan (fast + memory-bounded) for long sequences, exact per-token
     # recurrence otherwise. Both are algebraically identical (parity + gradcheck in
     # tools/gdn_backward_gradcheck.py). GDN_REF_CHUNK sets the chunk width (0 -> always recurrent).
-    chunk = int(os.environ.get("GDN_REF_CHUNK", "64"))
+    chunk = int(os.environ.get("GDN_REF_CHUNK", "64")) if chunk is None else int(chunk)
     if chunk and T > chunk:
         return _gdn_scan_chunked(qh, kh, v, g, beta, chunk)
     return _gdn_scan_recurrent(qh, kh, v, g, beta)
@@ -402,6 +407,143 @@ class _RMSNormGatedFn(torch.autograd.Function):
             ref = ref_rmsnorm_gated(xd, zd, wd, ctx.eps)
             gx, gz, gw = torch.autograd.grad(ref, (xd, zd, wd), grad_out.to(torch.float32))
         return gx.to(x.dtype), gz.to(z.dtype), gw.to(weight.dtype), None
+
+
+# ----------------------------------------------------------------------------------------------
+# BATCHED (rectangular [B,T]) differentiable prefill — kills the NativeGDNShim per-sequence Python loop.
+# The B sequences share length T, so: (a) the native forward op runs ALL B in ONE varlen call
+# (cu_seqlens = [0,T,2T,...,BT], B state slots, zero-init each); (b) the reference backward FOLDS the
+# batch into the value-head dimension ([B,T,HV,...] -> [T, B*HV, ...]) so ref_gdn_prefill_core is reused
+# UNCHANGED (the recurrence is independent per (b, value-head), and GQA / A_log tiling stay consistent
+# under the fold). Algebraically identical to looping the single-seq path per sequence — parity-checked in
+# tools/gdn_batch_train_parity.py. Position-wise ops (in_proj/rmsnorm) batch by flattening in the layer.
+# ----------------------------------------------------------------------------------------------
+
+def ref_causal_conv1d_fwd_batch(x, weight, bias, activation=True):
+    """Batched [B,T,C] equivalent of ref_causal_conv1d_fwd — F.conv1d's batch dim keeps each sequence's
+    causal window isolated (no cross-sequence leakage)."""
+    B, T, C = x.shape
+    W = weight.shape[1]
+    f32 = _compute_dtype(x, weight, bias)
+    xin = F.pad(x.to(f32).transpose(1, 2), (W - 1, 0))    # [B,C,T] left-padded W-1
+    wt = weight.to(f32).unsqueeze(1)                       # [C,1,W]
+    bt = bias.to(f32) if bias is not None else None
+    acc = F.conv1d(xin, wt, bias=bt, groups=C).transpose(1, 2)   # [B,T,C]
+    return F.silu(acc) if activation else acc
+
+
+class _CausalConv1dBatchFn(torch.autograd.Function):
+    """Batched depthwise causal conv: native VARLEN forward, batched-reference recompute backward."""
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, activation):
+        B, T, C = x.shape
+        dev = x.device
+        xf = x.reshape(B * T, C).contiguous()
+        conv_state = torch.zeros(B + 1, C, weight.shape[1] - 1, dtype=torch.float32, device=dev)
+        cu = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
+        state_idx = torch.arange(1, B + 1, dtype=torch.long, device=dev)
+        has_init = torch.zeros(B, dtype=torch.uint8, device=dev)
+        out = torch.ops.gdn_hip.causal_conv1d_fwd(
+            xf, weight, bias, cu, state_idx, has_init, conv_state, int(activation))
+        ctx.save_for_backward(x, weight, bias if bias is not None else torch.empty(0))
+        ctx.has_bias = bias is not None
+        ctx.activation = bool(activation)
+        return out.reshape(B, T, C)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, bias_s = ctx.saved_tensors
+        with torch.enable_grad():
+            xd = x.detach().to(torch.float32).requires_grad_(True)
+            wd = weight.detach().to(torch.float32).requires_grad_(True)
+            if ctx.has_bias:
+                bd = bias_s.detach().to(torch.float32).requires_grad_(True)
+                inputs, ref = (xd, wd, bd), ref_causal_conv1d_fwd_batch(xd, wd, bd, ctx.activation)
+            else:
+                inputs, ref = (xd, wd), ref_causal_conv1d_fwd_batch(xd, wd, None, ctx.activation)
+            grads = torch.autograd.grad(ref, inputs, grad_out.to(torch.float32))
+        gb = grads[2].to(bias_s.dtype) if ctx.has_bias else None
+        return grads[0].to(x.dtype), grads[1].to(weight.dtype), gb, None
+
+
+def _fold_bt(t):
+    """[B,T,X,...] -> [T, B*X, ...] (batch folded into the head dim; B-major)."""
+    p = t.permute(1, 0, *range(2, t.dim()))               # [T,B,X,...]
+    return p.reshape(t.shape[1], t.shape[0] * p.shape[2], *p.shape[3:])
+
+
+class _GDNPrefillBatchFn(torch.autograd.Function):
+    """Batched gdn_prefill / gdn_prefill_wmma: native varlen forward, fold-B-into-heads reference backward."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, a, b, A_log, dt_bias, scale, use_l2norm, wmma):
+        B, T, H, Kk = q.shape
+        HV, Vv = v.shape[2], v.shape[3]
+        dev = q.device
+        ssm_state = torch.zeros(B + 1, HV, Vv, Kk, dtype=torch.float32, device=dev)
+        cu = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
+        state_idx = torch.arange(1, B + 1, dtype=torch.long, device=dev)
+        has_init = torch.zeros(B, dtype=torch.uint8, device=dev)
+        op = torch.ops.gdn_hip.gdn_prefill_wmma if wmma else torch.ops.gdn_hip.gdn_prefill
+        out = op(q.reshape(B * T, H, Kk).contiguous(), k.reshape(B * T, H, Kk).contiguous(),
+                 v.reshape(B * T, HV, Vv).contiguous(), a.reshape(B * T, HV).contiguous(),
+                 b.reshape(B * T, HV).contiguous(), A_log, dt_bias, cu, state_idx, has_init, ssm_state,
+                 float(scale), int(use_l2norm))
+        ctx.save_for_backward(q, k, v, a, b, A_log, dt_bias)
+        ctx.scale, ctx.use_l2norm, ctx.B, ctx.T = float(scale), bool(use_l2norm), B, T
+        return out.reshape(B, T, HV, Vv)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, a, b, A_log, dt_bias = ctx.saved_tensors
+        B, T, HV, H = ctx.B, ctx.T, v.shape[2], q.shape[2]
+        with torch.enable_grad():
+            qd = _fold_bt(q).detach().to(torch.float32).requires_grad_(True)
+            kd = _fold_bt(k).detach().to(torch.float32).requires_grad_(True)
+            vd = _fold_bt(v).detach().to(torch.float32).requires_grad_(True)
+            ad = _fold_bt(a).detach().to(torch.float32).requires_grad_(True)
+            bd = _fold_bt(b).detach().to(torch.float32).requires_grad_(True)
+            Ad = A_log.detach().to(torch.float32).repeat(B).requires_grad_(True)   # [B*HV], B-major tile
+            dd = dt_bias.detach().to(torch.float32).repeat(B).requires_grad_(True)
+            # bounded chunk: folding B into heads B×'s the scan state, so keep B*chunk near the single-seq
+            # budget (chunk 64) -> the gradient-checkpointed chunked scan holds ~one chunk, not the whole
+            # sequence B times (the memory thrash the plain recurrent scan hit at 24 layers on 16GB).
+            cw = max(4, 64 // max(1, B))
+            ref = ref_gdn_prefill_core(qd, kd, vd, ad, bd, Ad, dd, ctx.scale, ctx.use_l2norm, chunk=cw)
+            grads = torch.autograd.grad(ref, (qd, kd, vd, ad, bd, Ad, dd), _fold_bt(grad_out).to(torch.float32))
+        gq, gk, gv, ga, gb, gA, gd = grads
+
+        def unfold(g, X):   # [T, B*X, ...] -> [B,T,X,...]
+            if g is None:
+                return None
+            g = g.reshape(T, B, X, *g.shape[2:])
+            return g.permute(1, 0, *range(2, g.dim()))
+
+        gA = gA.reshape(B, HV).sum(0) if gA is not None else None   # shared param: sum the B copies' grads
+        gd = gd.reshape(B, HV).sum(0) if gd is not None else None
+
+        def cast(g, r):
+            return None if g is None else g.to(r.dtype)
+        return (cast(unfold(gq, H), q), cast(unfold(gk, H), k), cast(unfold(gv, HV), v),
+                cast(unfold(ga, HV), a), cast(unfold(gb, HV), b), cast(gA, A_log), cast(gd, dt_bias),
+                None, None, None)
+
+
+def gdn_prefill_batch_train(q, k, v, a, b, A_log, dt_bias, scale, use_l2norm=1):
+    """Batched [B,T] differentiable gdn_prefill (recurrent native forward). q,k:[B,T,H,K] v:[B,T,HV,V]
+    a,b:[B,T,HV] -> core [B,T,HV,V]. One varlen op call for all B sequences."""
+    return _GDNPrefillBatchFn.apply(q, k, v, a, b, A_log, dt_bias, scale, use_l2norm, False)
+
+
+def gdn_prefill_wmma_batch_train(q, k, v, a, b, A_log, dt_bias, scale, use_l2norm=1):
+    """Batched [B,T] differentiable gdn_prefill_wmma (WMMA native forward)."""
+    return _GDNPrefillBatchFn.apply(q, k, v, a, b, A_log, dt_bias, scale, use_l2norm, True)
+
+
+def causal_conv1d_batch_train(x, weight, bias, activation=1):
+    """Batched [B,T,C] differentiable depthwise causal conv + SiLU. One varlen op call for all B seqs."""
+    return _CausalConv1dBatchFn.apply(x, weight, bias, activation)
 
 
 # ----------------------------------------------------------------------------------------------
