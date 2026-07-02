@@ -190,7 +190,15 @@ class QwenGatedDeltaNet(nn.Module):
             else gdn_bwd.gdn_prefill_wmma_train
         core = train_op(q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
                         self.head_k_dim ** -0.5, 1)  # [T, num_v_heads, head_v_dim]
-        return self._output_projection(core, z, n)
+        # differentiable output projection: the raw gdn.rmsnorm_gated (used by the serve-path
+        # _output_projection) is only differentiable if gdn_hip.autograd.enable() has been called to
+        # register its formula. The training path must NOT depend on that process-wide global, so use
+        # the self-contained rmsnorm_gated_train wrapper here (this was the 24-layer backward-cos drop).
+        out_dtype = self.out_proj.weight.dtype
+        core = core.reshape(-1, core.shape[-1]).contiguous()          # [T*num_v_heads, head_v_dim]
+        z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
+        return self.out_proj(normed.reshape(n, self.value_dim).to(out_dtype))
 
     def _forward_prefill_train(self, hidden_states: torch.Tensor,
                                query_start_loc: torch.Tensor) -> torch.Tensor:
