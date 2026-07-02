@@ -171,6 +171,39 @@ class QwenGatedDeltaNet(nn.Module):
         normed = normed.reshape(n, self.value_dim)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
         return self.out_proj(normed.to(out_dtype))
 
+    # ---- differentiable training prefill: native fwd + recompute-backward via the *_train wrappers ----
+    def _prefill_train_one_seq(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """One sequence, zero initial state, DIFFERENTIABLE. Mirrors forward_prefill's compute but uses
+        the gdn_hip *_train autograd wrappers (recompute-backward) for conv + gated-delta prefill, so
+        grad flows back through the native path to hidden_states. No conv_state/ssm_state carry —
+        training binds a fresh sequence from zero state."""
+        from gdn_hip import autograd as gdn_bwd  # lazy: only the training path needs the wrappers
+
+        n = hidden_states.shape[0]
+        qkvz = self.in_proj_qkvz(hidden_states)
+        ba = self.in_proj_ba(hidden_states)
+        mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        conv_out = gdn_bwd.causal_conv1d_fwd_train(
+            mixed_qkv.contiguous(), self._conv_weights_fp32(), None, 1)  # SiLU
+        q, k, v = self._split_conv_qkv(conv_out, n)
+        train_op = gdn_bwd.gdn_prefill_train if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0" \
+            else gdn_bwd.gdn_prefill_wmma_train
+        core = train_op(q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+                        self.head_k_dim ** -0.5, 1)  # [T, num_v_heads, head_v_dim]
+        return self._output_projection(core, z, n)
+
+    def _forward_prefill_train(self, hidden_states: torch.Tensor,
+                               query_start_loc: torch.Tensor) -> torch.Tensor:
+        """Differentiable prefill over a (possibly multi-sequence) varlen batch: run each sequence
+        independently through the single-seq differentiable path and concatenate. Per-sequence keeps
+        each doc's causal conv + zero-init recurrence isolated (no cross-sequence leakage)."""
+        cu = query_start_loc.tolist()
+        if len(cu) == 2:  # single sequence — the common training/eval case
+            return self._prefill_train_one_seq(hidden_states)
+        return torch.cat(
+            [self._prefill_train_one_seq(hidden_states[cu[i]:cu[i + 1]]) for i in range(len(cu) - 1)],
+            dim=0)
+
     # ---- prefill: chunk-scan over the full sequence, writes final SSM state ----
     def forward_prefill(
         self,
@@ -182,6 +215,14 @@ class QwenGatedDeltaNet(nn.Module):
         has_initial_state: torch.Tensor,  # bool per sequence
         conv_metadata=None,  # GDN conv metadata (nums_dict/batch_ptr/token_chunk_offset_ptr)
     ) -> torch.Tensor:
+        # Differentiable native path: when autograd is tracking the input (tap / LM-loss training), the
+        # in-place conv/prefill ops below cannot carry a backward (Tensor(a!) state; torch rejects a raw
+        # autograd formula on a non-functional op), so route conv+prefill through the *_train recompute
+        # wrappers. Serving runs under no_grad / inference_mode with frozen weights, so requires_grad is
+        # False and this never fires on the hot path (nor during graph capture).
+        if torch.is_grad_enabled() and hidden_states.requires_grad:
+            return self._forward_prefill_train(hidden_states, query_start_loc)
+
         from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
 
         n = hidden_states.shape[0]
