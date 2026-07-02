@@ -338,14 +338,32 @@ _ENABLED = False
 
 
 def enable() -> None:
-    """Register recompute-backward autograd formulas on torch.ops.gdn_hip.{gdn_prefill,
-    gdn_prefill_wmma, causal_conv1d_fwd, rmsnorm_gated}. After this, an UNCHANGED forward call on
-    these ops (as gdn/layer.py makes) participates in autograd, using the pure-torch reference
-    recompute for the backward. Idempotent; does NOT alter the forward numerics (serve path is the
-    native op either way)."""
+    """Register recompute-backward autograd formulas on the FUNCTIONAL gdn_hip ops so an UNCHANGED
+    forward call participates in autograd via the pure-torch reference recompute. Idempotent; does
+    NOT alter forward numerics (serve path is the native op either way).
+
+    IMPORTANT — only functional ops can take a raw autograd formula. `gdn_prefill`,
+    `gdn_prefill_wmma`, and `causal_conv1d_fwd` mutate their state argument in place
+    (`Tensor(a!) ssm_state` / `Tensor(a!) conv_state`), and torch.library.register_autograd rejects
+    a non-functional operator. For those the differentiable entry point is the `*_train`
+    autograd.Function wrapper (single-seq, zero initial state), which the training layer path calls
+    directly — NOT this raw-op registration. Only `rmsnorm_gated` (schema `-> Tensor`, no mutation)
+    is registered here, so the layer's final norm-gate is differentiable for free. Registrations that
+    fail on a non-functional op are logged and skipped, not fatal."""
     global _ENABLED
     if _ENABLED:
         return
+
+    def _try_register(opname, backward, setup):
+        try:
+            torch.library.register_autograd(opname, backward, setup_context=setup)
+            return True
+        except RuntimeError as e:
+            if "non-functional" in str(e):
+                print(f"[gdn_hip.autograd] skip raw-op autograd on {opname} (in-place state mutation; "
+                      f"use the *_train wrapper for the differentiable path)")
+                return False
+            raise
 
     def _prefill_setup(ctx, inputs, output):
         # inputs: (q,k,v,a,b,A_log,dt_bias,cu_seqlens,state_indices,has_initial_state,ssm_state,
@@ -367,10 +385,8 @@ def enable() -> None:
         #            scale,use_l2norm)
         return (*outs, None, None, None, None, None, None)
 
-    torch.library.register_autograd(
-        "gdn_hip::gdn_prefill", _prefill_backward, setup_context=_prefill_setup)
-    torch.library.register_autograd(
-        "gdn_hip::gdn_prefill_wmma", _prefill_backward, setup_context=_prefill_setup)
+    _try_register("gdn_hip::gdn_prefill", _prefill_backward, _prefill_setup)
+    _try_register("gdn_hip::gdn_prefill_wmma", _prefill_backward, _prefill_setup)
 
     def _conv_setup(ctx, inputs, output):
         # inputs: (x, weight, bias, cu_seqlens, state_indices, has_initial_state, conv_state,
@@ -397,8 +413,7 @@ def enable() -> None:
         # grads for (x, weight, bias, cu, state_indices, has_initial_state, conv_state, activation)
         return gx.to(x.dtype), gw.to(weight.dtype), gb, None, None, None, None, None
 
-    torch.library.register_autograd(
-        "gdn_hip::causal_conv1d_fwd", _conv_backward, setup_context=_conv_setup)
+    _try_register("gdn_hip::causal_conv1d_fwd", _conv_backward, _conv_setup)
 
     def _norm_setup(ctx, inputs, output):
         (x, z, weight, eps) = inputs
@@ -416,8 +431,7 @@ def enable() -> None:
         # grads for (x, z, weight, eps)
         return gx.to(x.dtype), gz.to(z.dtype), gw.to(weight.dtype), None
 
-    torch.library.register_autograd(
-        "gdn_hip::rmsnorm_gated", _norm_backward, setup_context=_norm_setup)
+    _try_register("gdn_hip::rmsnorm_gated", _norm_backward, _norm_setup)
 
     _ENABLED = True
 
