@@ -200,6 +200,35 @@ class QwenGatedDeltaNet(nn.Module):
         normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
         return self.out_proj(normed.reshape(n, self.value_dim).to(out_dtype))
 
+    def _prefill_train_batch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """BATCHED [B,T,H] differentiable prefill (all sequences length T). Kills the per-sequence Python
+        loop: position-wise ops (in_proj, split, rmsnorm) run flattened over B*T; the conv and gated-delta
+        recurrence run as ONE varlen op call over all B sequences (batch folded into heads in the backward
+        reference). Algebraically identical to stacking _prefill_train_one_seq over the batch."""
+        from gdn_hip import autograd as gdn_bwd
+
+        B, T, _ = hidden_states.shape
+        n = B * T
+        qkvz = self.in_proj_qkvz(hidden_states.reshape(n, -1))
+        ba = self.in_proj_ba(hidden_states.reshape(n, -1))
+        mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        conv_out = gdn_bwd.causal_conv1d_batch_train(
+            mixed_qkv.reshape(B, T, -1).contiguous(), self._conv_weights_fp32(), None, 1)  # [B,T,conv_dim]
+        q, k, v = self._split_conv_qkv(conv_out.reshape(n, -1), n)
+        train_batch = gdn_bwd.gdn_prefill_batch_train if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0" \
+            else gdn_bwd.gdn_prefill_wmma_batch_train
+        core = train_batch(
+            q.reshape(B, T, self.num_k_heads, self.head_k_dim),
+            k.reshape(B, T, self.num_k_heads, self.head_k_dim),
+            v.reshape(B, T, self.num_v_heads, self.head_v_dim),
+            a.reshape(B, T, self.num_v_heads).contiguous(), b.reshape(B, T, self.num_v_heads).contiguous(),
+            self.A_log, self.dt_bias, self.head_k_dim ** -0.5, 1)  # [B,T,num_v_heads,head_v_dim]
+        out_dtype = self.out_proj.weight.dtype
+        core = core.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
+        z_flat = z.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
+        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
+        return self.out_proj(normed.reshape(B, T, self.value_dim).to(out_dtype))
+
     def _forward_prefill_train(self, hidden_states: torch.Tensor,
                                query_start_loc: torch.Tensor) -> torch.Tensor:
         """Differentiable prefill over a (possibly multi-sequence) varlen batch: run each sequence

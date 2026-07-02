@@ -69,9 +69,14 @@ class NativeGDNShim(nn.Module):
             raise NotImplementedError(
                 "NativeGDNShim is prefill-only (use_cache=False); incremental decode with a cache is "
                 "not supported — CAM/tap-training runs full-sequence teacher-forced.")
-        # HF passes [B, T, hidden] (batched, no varlen packing). Run each sequence independently through
-        # the differentiable native prefill (per-seq keeps causal conv + zero-init recurrence isolated).
+        # HF passes [B, T, hidden] (batched, all sequences length T). Run the whole batch through the
+        # BATCHED differentiable native prefill — one varlen op call for all B sequences (kills the
+        # per-sequence Python loop that made native ~3x slower than the fla-torch fallback). Set
+        # GDN_HIP_BATCH_TRAIN=0 to fall back to the per-seq loop (parity/debug).
         if hidden_states.dim() == 3:
+            import os
+            if os.environ.get("GDN_HIP_BATCH_TRAIN", "1") != "0":
+                return self.ms._prefill_train_batch(hidden_states)
             return torch.stack(
                 [self.ms._prefill_train_one_seq(hidden_states[i]) for i in range(hidden_states.shape[0])],
                 dim=0)
