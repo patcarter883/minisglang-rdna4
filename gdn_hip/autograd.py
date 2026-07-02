@@ -54,8 +54,11 @@ Opt-in — the inference path is untouched:
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 # ----------------------------------------------------------------------------------------------
 # Pure-torch DIFFERENTIABLE references (faithful to gdn_kernels.hip). These are the correctness
@@ -91,6 +94,97 @@ def _l2norm_kernel(x: torch.Tensor) -> torch.Tensor:
     the rsqrt, so we replicate that for a faithful gradient."""
     inv = torch.rsqrt(x.pow(2).sum(-1, keepdim=True) + _L2_EPS)
     return x * inv
+
+
+# ----------------------------------------------------------------------------------------------
+# The gated-delta recurrence, two equivalent scans. Both take the ALREADY-prepared per-token tensors
+# (qh,kh l2-normed + q-scaled + GQA-expanded to [T,HV,K]; g,beta [T,HV]) and return core [T,HV,V].
+# ----------------------------------------------------------------------------------------------
+
+def _gdn_scan_recurrent(qh, kh, v, g, beta):
+    """Exact per-token recurrence (the reference-of-record). O(T) sequential steps; O(T) state tensors
+    retained by autograd -> memory-heavy in the recompute-backward (the OOM lever the chunk fixes)."""
+    T, HV, K = qh.shape
+    Vv = v.shape[2]
+    S = torch.zeros(HV, Vv, K, dtype=v.dtype, device=v.device)
+    outs = []
+    for t in range(T):
+        S = S * torch.exp(g[t]).view(HV, 1, 1)              # decay
+        kt, qt = kh[t], qh[t]                               # [HV,K]
+        Sk = torch.einsum("hvk,hk->hv", S, kt)             # [HV,V]
+        vt = (v[t] - Sk) * beta[t].unsqueeze(-1)           # delta pseudo-value
+        S = S + vt.unsqueeze(-1) * kt.unsqueeze(1)         # rank-1 update
+        outs.append(torch.einsum("hvk,hk->hv", S, qt))     # o = S@q (post-update)
+    return torch.stack(outs, dim=0)                         # [T,HV,V]
+
+
+def _unit_lower_solve(M, RHS):
+    """Solve (I + M) U = RHS for U, where M is strictly-lower-triangular [C,C,HV] and RHS is [C,HV,V],
+    by forward substitution: U_i = RHS_i - sum_{j<i} M[i,j] U_j. BLAS-free (portable CPU+ROCm) and
+    differentiable — the intra-chunk delta-rule coupling is C steps of cheap [HV,V] ops, not the
+    per-token [HV,V,K] state carry the recurrence pays."""
+    C = RHS.shape[0]
+    U = []
+    for i in range(C):
+        u_i = RHS[i]
+        if i > 0:
+            u_i = u_i - torch.einsum("jh,jhv->hv", M[i, :i], torch.stack(U, dim=0))
+        U.append(u_i)
+    return torch.stack(U, dim=0)                            # [C,HV,V]
+
+
+def _gdn_chunk(S_prev, q_c, k_c, v_c, g_c, beta_c):
+    """One chunk of the gated-delta recurrence in closed form (the WY / forward-substitution
+    representation). Returns (S_next, O_c). EXACT — algebraically identical to the per-token scan,
+    just reassociated into matmuls + one unit-lower-triangular solve per head.
+
+    Within-chunk cumulative gate G_i = sum_{l<=i} g_l (<=0). All decay factors used are exp(G_i - G_j)
+    with i>=j, i.e. <=1 (numerically safe); the strictly-upper entries (i<j, would exp to >1) are
+    clamp(max=0)-ed before exp and then masked out, so no inf * 0 -> nan."""
+    C, HV, K = q_c.shape
+    G = torch.cumsum(g_c, dim=0)                            # [C,HV]
+    dG = (G.unsqueeze(1) - G.unsqueeze(0)).clamp(max=0.0)   # [C,C,HV] (i,j)=G_i-G_j, <=0 kept, >0->0
+    decay = torch.exp(dG)                                   # [C,C,HV], entries in (0,1]
+    eG = torch.exp(G)                                       # [C,HV] = b_i (state decay from chunk start)
+    KK = torch.einsum("ihk,jhk->ijh", k_c, k_c)            # k_i . k_j
+    QK = torch.einsum("ihk,jhk->ijh", q_c, k_c)            # q_i . k_j
+    ar = torch.arange(C, device=q_c.device)
+    strict = (ar.unsqueeze(1) > ar.unsqueeze(0)).unsqueeze(-1)   # [C,C,1] i>j
+    lower = (ar.unsqueeze(1) >= ar.unsqueeze(0)).unsqueeze(-1)   # [C,C,1] i>=j
+    # (I + M) U = RHS ; M[i,j] = beta_i * decay_ij * (k_i.k_j), strictly lower.
+    M = (beta_c.unsqueeze(1) * decay * KK) * strict         # [C,C,HV]
+    Spk = torch.einsum("hvk,ihk->ihv", S_prev, k_c)        # [C,HV,V] S_prev @ k_i
+    RHS = beta_c.unsqueeze(-1) * (v_c - eG.unsqueeze(-1) * Spk)   # [C,HV,V]
+    U = _unit_lower_solve(M, RHS)                          # (I+M) U = RHS, forward substitution
+    # O_i = sum_{j<=i} decay_ij (q_i.k_j) u_j   +   b_i (S_prev @ q_i)
+    P = ((decay * QK) * lower).permute(2, 0, 1)            # [HV,C,C]
+    O = torch.einsum("hij,jhv->ihv", P, U) \
+        + eG.unsqueeze(-1) * torch.einsum("hvk,ihk->ihv", S_prev, q_c)
+    # S_next = b_{C-1} S_prev + sum_j exp(G_{C-1}-G_j) u_j k_j^T
+    cfac = torch.exp(G[-1].unsqueeze(0) - G)               # [C,HV], <=1
+    S_next = eG[-1].view(HV, 1, 1) * S_prev \
+        + torch.einsum("jhv,jhk->hvk", cfac.unsqueeze(-1) * U, k_c)
+    return S_next, O
+
+
+def _gdn_scan_chunked(qh, kh, v, g, beta, chunk):
+    """Chunked scan: closed-form intra-chunk (matmuls) + sequential inter-chunk state carry. Faster
+    than the per-token loop (fewer, larger ops) and memory-bounded — each chunk is gradient-
+    checkpointed, so the recompute-backward holds ~one chunk's activations, not the whole sequence."""
+    T, HV, K = qh.shape
+    Vv = v.shape[2]
+    S = torch.zeros(HV, Vv, K, dtype=v.dtype, device=v.device)
+    outs = []
+    use_ckpt = torch.is_grad_enabled()
+    for c0 in range(0, T, chunk):
+        c1 = min(c0 + chunk, T)
+        args = (S, qh[c0:c1], kh[c0:c1], v[c0:c1], g[c0:c1], beta[c0:c1])
+        if use_ckpt:
+            S, O_c = torch.utils.checkpoint.checkpoint(_gdn_chunk, *args, use_reentrant=False)
+        else:
+            S, O_c = _gdn_chunk(*args)
+        outs.append(O_c)
+    return torch.cat(outs, dim=0)                           # [T,HV,V]
 
 
 def ref_gdn_prefill_core(
@@ -135,21 +229,13 @@ def ref_gdn_prefill_core(
     g = -torch.exp(A_log) * _softplus(a + dt_bias)   # [T, HV]
     beta = torch.sigmoid(b)                           # [T, HV]
 
-    S = torch.zeros(HV, Vv, K, dtype=f32, device=q.device)
-    outs = []
-    for t in range(T):
-        eg = torch.exp(g[t]).view(HV, 1, 1)           # [HV,1,1]
-        S = S * eg
-        kt = kh[t]                                    # [HV, K]
-        qt = qh[t]                                    # [HV, K]
-        # delta = v - S@k   ;   S@k = sum_j S[:,:,j]*k[:,j]
-        Sk = torch.einsum("hvk,hk->hv", S, kt)        # [HV, V]
-        vt = (v[t] - Sk) * beta[t].unsqueeze(-1)      # [HV, V]
-        # S += outer(v, k)
-        S = S + vt.unsqueeze(-1) * kt.unsqueeze(1)    # [HV,V,1]*[HV,1,K]
-        o = torch.einsum("hvk,hk->hv", S, qt)         # [HV, V]
-        outs.append(o)
-    return torch.stack(outs, dim=0)                   # [T, HV, V]
+    # dispatch: chunked closed-form scan (fast + memory-bounded) for long sequences, exact per-token
+    # recurrence otherwise. Both are algebraically identical (parity + gradcheck in
+    # tools/gdn_backward_gradcheck.py). GDN_REF_CHUNK sets the chunk width (0 -> always recurrent).
+    chunk = int(os.environ.get("GDN_REF_CHUNK", "64"))
+    if chunk and T > chunk:
+        return _gdn_scan_chunked(qh, kh, v, g, beta, chunk)
+    return _gdn_scan_recurrent(qh, kh, v, g, beta)
 
 
 def ref_causal_conv1d_fwd(

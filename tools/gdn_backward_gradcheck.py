@@ -178,12 +178,51 @@ def check_rmsnorm():
     return ok and g
 
 
+def check_prefill_chunked():
+    """The CHUNKED scan must be algebraically identical to the per-token recurrence. Uses a small
+    chunk width (3) with T=11 so the scan spans 4 chunks incl. a ragged last one, then checks parity
+    vs BOTH the independent oracle and the recurrent reference (chunk=0), and gradchecks the chunk."""
+    print("--- gdn_prefill core (CHUNKED path, GDN_REF_CHUNK=3, T=11) ---")
+    T, H, HV, K, Vv = 11, 2, 4, 3, 3
+    scale = K ** -0.5
+    q = torch.randn(T, H, K, dtype=DT, device=DEV)
+    k = torch.randn(T, H, K, dtype=DT, device=DEV)
+    v = torch.randn(T, HV, Vv, dtype=DT, device=DEV)
+    a = torch.randn(T, HV, dtype=DT, device=DEV)
+    b = torch.randn(T, HV, dtype=DT, device=DEV)
+    A_log = torch.randn(HV, dtype=DT, device=DEV)
+    dt_bias = torch.randn(HV, dtype=DT, device=DEV)
+    old = os.environ.get("GDN_REF_CHUNK")
+    try:
+        os.environ["GDN_REF_CHUNK"] = "3"
+        chunked = gdn_bwd.ref_gdn_prefill_core(q, k, v, a, b, A_log, dt_bias, scale, True)
+        orc = oracle_gdn_prefill(q, k, v, a, b, A_log, dt_bias, scale)
+        ok = _fwd_match("chunked vs oracle", chunked, orc)
+        os.environ["GDN_REF_CHUNK"] = "0"  # force the recurrent reference path
+        recur = gdn_bwd.ref_gdn_prefill_core(q, k, v, a, b, A_log, dt_bias, scale, True)
+        ok &= _fwd_match("chunked vs recurrent-ref", chunked, recur)
+        os.environ["GDN_REF_CHUNK"] = "3"
+        for t in (q, k, v, a, b, A_log, dt_bias):
+            t.requires_grad_(True)
+        gg = torch.autograd.gradcheck(
+            lambda *ins: gdn_bwd.ref_gdn_prefill_core(*ins, scale, True),
+            (q, k, v, a, b, A_log, dt_bias), eps=1e-6, atol=1e-5, rtol=1e-3, raise_exception=False)
+        print(f"  [{'PASS' if gg else 'FAIL'}] gradcheck chunked (q,k,v,a,b,A_log,dt_bias)")
+    finally:
+        if old is None:
+            os.environ.pop("GDN_REF_CHUNK", None)
+        else:
+            os.environ["GDN_REF_CHUNK"] = old
+    return ok and gg
+
+
 def main():
     print(f"=== CPU float64 gradcheck of GDN backward references (device={DEV}, dtype=float64) ===")
     r1 = check_prefill()
+    rc = check_prefill_chunked()
     r2 = check_conv()
     r3 = check_rmsnorm()
-    allok = r1 and r2 and r3
+    allok = r1 and rc and r2 and r3
     print("\n" + "=" * 60)
     print("RESULT:", "ALL PASS — pure-torch GDN backward references are gradient self-consistent"
           if allok else "FAIL (see above)")
