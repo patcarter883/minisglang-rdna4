@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Phase 1a functional boot smoke test.
 
-Loads a small dense model on RDNA4 with the lifted ``triton_rdna4`` attention backend
+Loads a small dense model on RDNA4 with the lifted ``rdna4`` attention backend
 (eager, bf16 KV) and greedy-generates. Exercises the whole stripped path end-to-end:
 embedding -> RMSNorm -> RoPE -> tuned Triton attention -> MLP -> sampling -> paged KV +
 radix scheduler. Prints token ids for a token-diff against the combined image / HF.
@@ -40,7 +40,7 @@ def main() -> None:
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--prompt", action="append", default=None, help="override PROMPTS (repeatable)")
     ap.add_argument("--attn-backend", default="auto",
-                    help="attention backend (auto -> triton_rdna4 on ROCm; 'hip' = native HIP "
+                    help="attention backend (auto -> rdna4 on ROCm; 'hip' = native HIP "
                          "flash-prefill + paged flash-decode, Triton-free)")
     args = ap.parse_args()
     prompts = args.prompt if args.prompt else PROMPTS
@@ -50,10 +50,10 @@ def main() -> None:
     llm = LLM(
         model_path=args.model,
         dtype=torch.bfloat16,
-        cuda_graph_max_bs=0,  # eager: triton_rdna4 has no graph capture yet
-        page_size=args.page_size,  # triton_rdna4 requires a multiple of 16
+        cuda_graph_max_bs=0,  # eager: rdna4 has no graph capture yet
+        page_size=args.page_size,  # rdna4 requires a multiple of 16
         memory_ratio=args.memory_ratio,
-        attention_backend=args.attn_backend,  # 'auto' -> triton_rdna4 on ROCm; 'hip' = Triton-free
+        attention_backend=args.attn_backend,  # 'auto' -> rdna4 on ROCm; 'hip' = Triton-free
         **extra,
     )
     try:

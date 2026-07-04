@@ -46,7 +46,7 @@ def main() -> None:
         cuda_graph_max_bs=0,       # GDN models force eager anyway
         page_size=16,
         memory_ratio=args.memory_ratio,
-        attention_backend="auto",  # -> triton_rdna4 on ROCm
+        attention_backend="auto",  # -> rdna4 on ROCm
         max_running_req=args.max_running_req,
     )
 
