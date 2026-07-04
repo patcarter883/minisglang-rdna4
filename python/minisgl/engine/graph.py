@@ -165,6 +165,10 @@ class GraphRunner:
         # v2: stashed for the spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft).
         self._cca_state = cca_state
         self.cca_verify = None
+        # v2 S4: the FUSED-verify capturer + its CCA-state static buffers (built in
+        # capture_fused_verify_graphs, needs fused_qlen — a distinct Q from the K+1 verify above).
+        self.cca_fused_verify = None
+        self._fused_verify = None
         # Spec-decode verify graphs are captured LATER (capture_verify_graphs), after the scheduler
         # builds the proposer + programs the target's aux-capture layers — None until then.
         self._verify = None
@@ -373,9 +377,118 @@ class GraphRunner:
         aux = vbuf.aux_hidden[:, :n] if vbuf.aux_hidden is not None else None
         return logits, last_hidden, aux
 
+    # ---- FUSED spec-verify graph capture (v2 S4: CCA custom-mask single-forward) -----------------
+    def capture_fused_verify_graphs(
+        self,
+        model: BaseLLMModel,
+        fused_qlen: int,
+        bs_list: List[int],
+    ) -> None:
+        """Capture one FUSED-verify graph per bs in `bs_list`. The fused-TiDAR step stages `fused_qlen`
+        query tokens/seq (`1+B+B²` flat / `1+B+B·(tp+B)` seg) and runs the paged-extend kernel with a
+        dense custom_mask (causal=0). Distinct capture shape from the K+1 verify (`capture_verify_graphs`):
+        qlen=fused_qlen, a static max-width mask buffer (HIPAttnBackend.init_fused_verify_capture), and
+        a CCA-verify capturer at Q=fused_qlen. Logits-only (TiDAR self-draft reads logits, not hidden).
+        Called by the scheduler after the TiDAR proposer is built (it knows B → fused_qlen)."""
+        if not bs_list or not hasattr(self.attn_backend, "init_fused_verify_capture"):
+            return logger.info_rank0("fused-verify CUDA graph: unsupported backend / disabled")
+        dev = self.device
+        max_bs = max(bs_list)
+        self.attn_backend.init_fused_verify_capture(self._verify_max_seq_len, bs_list, fused_qlen)
+        # CCA-hybrid recurrent state through static verify buffers at Q=fused_qlen (parameterised on
+        # num_draft → Q = num_draft+1, so pass fused_qlen-1). Same in-place conv/prev scratch trick.
+        self.cca_fused_verify = None
+        if self._cca_state is not None:
+            from minisgl.cca.graph_capture import CCAVerifyGraphCapture
+
+            cs = self._cca_state
+            self.cca_fused_verify = CCAVerifyGraphCapture(
+                dev, max_bs, fused_qlen - 1,
+                cca_layer_ids=range(cs.num_cca_layers),
+                conv_dim=cs.conv_states.shape[2], conv_width=cs.conv_states.shape[3],
+                hidden=cs.prev_hs.shape[2],
+            )
+        vbuf = VerifyCaptureBuffer.init(
+            max_bs, fused_qlen, self._verify_vocab, None, 0, torch.float32, dev
+        )
+        graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # dummy req with extend_len = fused_qlen (cached_len 0, device_len fused_qlen).
+        fdummy = Req(
+            input_ids=torch.zeros(fused_qlen, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+            sampling_params=None, cache_handle=None,  # type: ignore
+        )
+        torch.cuda.synchronize(dev)
+        free0 = get_free_memory(dev)
+        logger.info_rank0(
+            f"Capturing FUSED-verify CUDA graphs (qlen={fused_qlen}) sizes={sorted(bs_list)}; "
+            f"free {mem_GB(free0)}"
+        )
+        pool = None
+        for bs in tqdm(sorted(bs_list, reverse=True), desc="Capturing fused-verify graphs",
+                       unit="batch", disable=not get_tp_info().is_primary()):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[fdummy] * bs, phase="decode")
+            batch.spec_verify = True
+            batch.fused_verify = True
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_fused_verify_for_capture(batch)
+            if self.cca_fused_verify is not None:
+                self.cca_fused_verify.prepare_verify_for_capture(batch)
+            vbuf.set_batch(batch)
+            T = vbuf.total(batch)
+            with get_global_ctx().forward_batch(batch):
+                self._run_verify_into(model, vbuf, T, False)  # warmup
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    self._run_verify_into(model, vbuf, T, False)
+            if pool is None:
+                pool = graph.pool()
+            graph_map[bs] = graph
+        self._fused_verify = {"buf": vbuf, "graphs": graph_map, "qlen": fused_qlen,
+                              "bs_list": sorted(bs_list)}
+        logger.info_rank0(f"fused-verify graphs captured; free {mem_GB(get_free_memory(dev))}")
+
+    def can_use_fused_verify(self, batch: Batch) -> bool:
+        # capturable iff: fused graphs exist, the batch is a fused-verify step, every req stages exactly
+        # fused_qlen query tokens (uniform), and the req count EXACTLY matches a captured bs. Unlike the
+        # K+1 verify, the fused scheduler builds input_ids/positions/out_loc/custom_mask over `reqs`
+        # (not padded_reqs), so a padded batch would under-fill the static buffers → require an exact bs
+        # match and fall back to eager otherwise (still lossless). NOREP (qlen=1+B), partial/finished
+        # steps, and bootstrap block_predict never set fused_verify / carry fused_qlen, so they fall back.
+        if self._fused_verify is None or not getattr(batch, "fused_verify", False):
+            return False
+        ql = self._fused_verify["qlen"]
+        if batch.size not in self._fused_verify["graphs"]:
+            return False
+        return all(r.extend_len == ql for r in batch.reqs)
+
+    def replay_fused_verify(self, batch: Batch) -> torch.Tensor:
+        """Replay the captured FUSED-verify graph. The scheduler has built input_ids/positions/out_loc
+        + the dense custom_mask + cca_metadata (capture_verify_state=True) eagerly over `batch.reqs`;
+        copy them into the static buffers, refresh the attn (page_table/cache_seqlens/mask) + CCA-state
+        replay metadata, replay, and slice the real-token logits. The mask-build and the post-forward
+        `install_verify_state` stay eager (the scheduler reads the static conv/prev scratch via
+        `batch.cca_metadata`, which prepare_verify_for_replay repoints below)."""
+        v = self._fused_verify
+        v["replays"] = v.get("replays", 0) + 1
+        if v["replays"] == 1:
+            logger.info_rank0(f"fused-verify GRAPH REPLAY engaged (qlen={v['qlen']}, bs={batch.size})")
+        vbuf: VerifyCaptureBuffer = v["buf"]
+        vbuf.copy_from(batch)
+        # attn: page_table/cache_seqlens + copy the dense mask into the static buffer (reads batch's
+        # scheduler-built custom_mask, then swaps batch.attn_metadata for the static one).
+        self.attn_backend.prepare_fused_verify_for_replay(batch)
+        if self.cca_fused_verify is not None:
+            self.cca_fused_verify.prepare_verify_for_replay(batch)
+        v["graphs"][batch.padded_size].replay()
+        n = batch.size * v["qlen"]
+        return vbuf.logits[:n]
+
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         del self.graph_map
         if self._verify is not None:
             del self._verify
+        if self._fused_verify is not None:
+            del self._fused_verify
         gc.collect()

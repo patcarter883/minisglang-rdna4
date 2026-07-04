@@ -38,7 +38,30 @@ forward = the ~4× crown jewel.**
     `has_initial_state` (verify = multi-query varlen, NOT 1-tok decode); guarded zaya.py:307 `.item()`
     host-sync assert with `torch.cuda.is_current_stream_capturing()`.
 
-## NEXT = v2 S4 (the fused custom-mask forward, ~4× crown jewel) — PRECISELY SPEC'D
+## v2 S4 DONE + validated byte-identical (2026-07-04) — the fused custom-mask forward is captured
+The crown-jewel dispatch-free fused forward is now cudagraph-captured. Implemented additively
+(hip.py static max-width mask buffer + full-width-slice constant stride; graph.py
+`capture_fused_verify_graphs`/`can_use_fused_verify`/`replay_fused_verify`; engine.py route +
+`capture_spec_fused_verify_graphs`; scheduler.py `batch.fused_verify` + `__init__` capture trigger).
+GATE PASSED: `FUSED=1 SEG=1 W8A16=1`, GRAPH=8 fused output BYTE-IDENTICAL to GRAPH=0 eager fused on
+all 4 prompts, with `fused-verify GRAPH REPLAY engaged` confirming the captured graph actually ran
+(no false-PASS from eager fallback). Full write-up in `docs/V2_CCA_VERIFY_CAPTURE.md` §"S4 RESULT".
+NOT yet committed — code + docs sit in the working tree. Open items below.
+
+## NEXT after S4 (pick up here)
+- **ITL measurement** — S4 proves lossless; now measure the actual dispatch-tax removal (fused
+  graph-on vs graph-off tok/s). Note the *throughput* payoff is capped until the acceptance-training
+  round lands (fused accept 0.04-0.09 today is model-limited, not a kernel issue) — S4 removes the
+  dispatch tax, training fills emitted/step. Both levers compound.
+- **Multi-req batch (bs>1) fused replay** — S4 replays only at EXACT captured bs (the fused scheduler
+  builds input_ids/positions/out_loc/custom_mask over `reqs`, not `padded_reqs`, so a padded batch
+  under-fills the static buffers). Non-exact bs falls back to eager (still lossless). To capture the
+  padded case, extend the fused staging loop to build the dummy-row tensors (custom_mask/positions/
+  out_loc) — the "dummy-row mask semantics" noted as the S4 open risk. Only needed for concurrent
+  serving; the serial validation path is bs=1.
+- **35B GDN serve smoke-test under `--graph 16`** (still pending — see below).
+
+## (superseded) v2 S4 spec — the fused custom-mask forward, ~4× crown jewel — DONE, see above
 Full plan in `docs/V2_CCA_VERIFY_CAPTURE.md` §S4. It is a SEPARATE capture path from the K+1 verify
 (different qlen `1+B+B²`, a dense `custom_mask`, `causal=0`). Concrete pieces (all additive; validate at
 step 4):
