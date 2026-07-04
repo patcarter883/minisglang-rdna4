@@ -137,4 +137,26 @@ because the fused forward differs on THREE axes the K+1 machinery doesn't cover:
 ### Gate: fused CCA spec, `--graph N`, graph-on output BYTE-IDENTICAL to eager fused (the losslessness
 diff) + the ~4× ITL. Note the fused throughput payoff also needs the acceptance-training round (fused
 accept is model-limited 0.07-0.20 today); S4 removes the dispatch tax, training fills emitted/step.
-STATUS: spec'd, not implemented — a focused multi-step effort needing GPU validation at step 4.
+
+## S4 RESULT (2026-07-04) — GREEN, proven bit-identical.
+Implemented all four pieces additively:
+  1. `HIPAttnBackend.init_fused_verify_capture` / `_fused_verify_metadata_static` /
+     `_fill_fused_verify_static` / `prepare_fused_verify_for_{capture,replay}` (hip.py) — a STATIC
+     max-width mask buffer `[max_bs*fused_qlen, max_pages*ps]`. Key resolution of the open stride risk:
+     always pass the FULL-WIDTH slice `static[:total_q, :]`, so the kernel's `mask_kv_stride`
+     (=`mb.size(1)`, bindings.cpp) is CONSTANT across capture/replay; replay copies the scheduler mask
+     into `static[:tq,:kv]` (kernel bounds reads by cache_seqlens → stale cols ignored). The copy
+     preserves exact values so the captured forward reads bit-identical mask/KV/positions.
+  2. `CCAVerifyGraphCapture` reused at Q=fused_qlen (pass num_draft=fused_qlen-1).
+  3. `GraphRunner.capture_fused_verify_graphs` (+ separate `cca_fused_verify`, logits-only) /
+     `can_use_fused_verify` (gates on `batch.fused_verify` + all `extend_len==fused_qlen` + EXACT
+     captured-bs match — no padding, since the fused scheduler builds tensors over `reqs`, not
+     `padded_reqs`) / `replay_fused_verify` (graph.py). engine.py `forward_verify` routes fused first;
+     `capture_spec_fused_verify_graphs` wrapper. scheduler.py sets `batch.fused_verify = not norep` and
+     triggers the capture in `__init__` (computes fused_qlen once via `fused_paged_layout[_segmented]`).
+Validation (`FUSED=1 SEG=1 W8A16=1`, ZAYA1-8B TiDAR fp8, single card): fused-verify graphs captured
+clean (seg qlen=29, sizes [1,2,4], no stride assert / NaN); `fused-verify GRAPH REPLAY engaged` fired
+(rules out a silent eager fallback → the diff is meaningful); and the DECISIVE gate — GRAPH=8 (fused
+graph-on) output BYTE-IDENTICAL to GRAPH=0 (eager fused) on all 4 prompts. The dispatch-free fused
+forward is lossless. The throughput payoff still needs the acceptance-training round (fused accept
+0.04-0.09 today is model-limited); S4 removes the dispatch tax, training fills emitted/step.

@@ -163,6 +163,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
                          if b <= config.max_running_req]
             self.engine.capture_spec_verify_graphs(needs_hidden, num_aux, verify_bs)
+            # v2 S4: ALSO capture the FUSED-TiDAR custom-mask verify graphs when the fused path is on.
+            # fused_qlen is fixed per (block_size B, layout) — flat 1+B+B², segmented 1+B+B·(tp+B) — so
+            # compute it once here (c0-independent) via the same layout helpers the fused step uses, and
+            # capture logits-only graphs at that qlen. NOREP (qlen 1+B) auto-falls-back to eager.
+            if self._tidar_fused and verify_bs:
+                B = self._proposer.block_size
+                seg = os.environ.get("MINISGL_TIDAR_SEG") == "1"
+                from minisgl.spec.tidar_mask import fused_paged_layout
+                if seg and self.engine.cca_state is not None:
+                    from minisgl.spec.tidar_mask import fused_paged_layout_segmented
+
+                    tp = int(self.engine.cca_state.conv_states.shape[-1])
+                    fused_qlen = fused_paged_layout_segmented(0, B, tp, device=self.device)["n_query"]
+                else:
+                    _, _, fused_qlen, _ = fused_paged_layout(0, B, device=self.device)
+                logger.info_rank0(
+                    f"spec-decode: capturing FUSED-verify graphs (B={B} seg={seg} qlen={fused_qlen})")
+                self.engine.capture_spec_fused_verify_graphs(fused_qlen, verify_bs)
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -778,6 +796,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # --- build the fused batch (eager; graphs off for CCA serve) -------------------------------
         batch = Batch(reqs=reqs, phase="decode")
         batch.spec_verify = True
+        # v2 S4: flag the FUSED custom-mask verify so forward_verify can route it through its captured
+        # graph (can_use_fused_verify additionally checks every req stages fused_qlen tokens, so the
+        # NOREP probe (1+B) and partial-K steps auto-fall-back to eager). No-op when graphs are off.
+        batch.fused_verify = not norep
         self.cache_manager.allocate_paged(reqs)
         batch.padded_reqs = reqs
         batch.positions = torch.tensor(pos_list, dtype=torch.int32, device=device)  # §7.6 RoPE positions
