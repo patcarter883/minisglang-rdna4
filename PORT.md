@@ -245,6 +245,10 @@ integration, not kernel porting. Source extracted to `/home/pat/code/scratch/gdn
     builds `batch.gdn_metadata`; `_free_req_resources` frees the slot (single site covering
     finish AND abort). All hooks are `if self.gdn_slots is not None` no-ops today → dense path
     byte-unchanged (import-smoke verified). Eager only (GDN cudagraph out of 3c scope).
+    **SUPERSEDED (2026-07-04): GDN decode IS cudagraph-captured now** — per-seq recurrent-state
+    slots are threaded through static buffers for capture (`engine/graph.py` `GDNGraphCapture` +
+    `prepare_for_capture`/`prepare_for_replay`, commit `3699388`). The "eager only" / "out of scope"
+    framing below (3c/3d bring-up) reflects the state at those dated milestones, not today.
   - **3c-3 (`e2337ec`) — `QwenGatedDeltaNet.warmup_conv`.** GEMM-free conv warmup on a private
     2-slot scratch (never touches real state) settling `causal_conv1d_fn`'s in-place
     batch_ptr autotune (per-process — NOT in the on-disk Triton JIT cache). Engine calls it

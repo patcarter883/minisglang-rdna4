@@ -44,8 +44,12 @@ oracle exists, replace with fused Triton kernels (or lift vLLM's) and verify cos
   Fuse SwiGLU into one Triton kernel (gate·up·act in a single pass); avoids the extra MLP-width
   memory traffic. Hot path.
 - **[S4] `engine/sample.py`** — full-vocab `torch.sort` per row for top-k/top-p. Fine at low batch;
-  a fused sampling kernel (flashinfer-equivalent) helps at high batch. Greedy path (argmax) is
-  already fine.
+  a fused sampling kernel would help at high batch. Greedy path (argmax) is already fine.
+  **(2026-07-04)** This is pure-torch **by design**, not a stray shim: the serve image
+  (`vllm22-w4a8:combined`) ships no `flashinfer`/`sgl_kernel`/`aiter`, so there is nothing fused to
+  wire to. It stays an OPEN gap whose only closers are (a) install `aiter` + wire
+  `torch.ops.aiter.top_k_top_p_sampling_from_probs` (CDNA-tuned — may be *slower* on RDNA4), or
+  (b) author a gfx1201 HIP fused sampler.
 - **[S5] `layers/embedding.py`** — `torch.where` materializes a full masked embedding tensor for
   the TP>1 vocab-parallel gather. Minor; a masked gather kernel avoids the temporary.
 
