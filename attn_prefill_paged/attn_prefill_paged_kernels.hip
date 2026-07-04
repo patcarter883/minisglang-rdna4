@@ -64,7 +64,9 @@ __global__ __launch_bounds__(kThreads<HEAD_DIM>()) void flash_prefill_paged_kern
     const long kv_block_stride,
     const float inv_sqrt_d,
     const unsigned int causal,
-    const unsigned int sliding_window) {
+    const unsigned int sliding_window,
+    const float* __restrict__ mask_bias,       // [total_q, mask_kv_stride] fp32 additive, or nullptr
+    const unsigned int mask_kv_stride) {        // row stride of mask_bias (>= max context_len)
     constexpr int KSTEPS = HEAD_DIM / WMMA_K;
     constexpr int D_TILES = HEAD_DIM / WMMA_N;
     constexpr int PAD = 8;
@@ -177,6 +179,12 @@ __global__ __launch_bounds__(kThreads<HEAD_DIM>()) void flash_prefill_paged_kern
                 if (causal && kpos > qpos) masked = true;
                 if (causal && sliding_window > 0 && kpos <= qpos && (qpos - kpos) >= sliding_window)
                     masked = true;
+                // TiDAR / structured additive mask: add the [gq, kpos] bias (a -inf entry denies the
+                // cell) where not already tile/causal-masked. Composes with causal; a FUSED TiDAR call
+                // passes causal=0 and lets mask_bias carry the whole block structure (S causal + the
+                // R_r replica predicate). Same contract as attn_hip's mask_bias.
+                if (mask_bias != nullptr && !masked)
+                    s += mask_bias[(size_t)(q_base + q_start + r) * mask_kv_stride + kpos];
                 if (masked) s = -1e30f;
                 smem_S[r][c] = s;
                 rmax = fmaxf(rmax, s);
@@ -241,7 +249,8 @@ void launch_flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
                                 const at::Tensor& cu_seqlens_q, const at::Tensor& context_lens,
                                 at::Tensor& out, double scale, int64_t causal,
                                 int64_t sliding_window, int64_t kv_block_stride,
-                                int64_t max_seqlen_q) {
+                                int64_t max_seqlen_q, const float* mask_bias,
+                                int64_t mask_kv_stride) {
     const unsigned int num_q_heads = q.size(1);
     const unsigned int head_dim = q.size(2);
     const unsigned int block_size = k_cache.size(1);
@@ -269,7 +278,8 @@ void launch_flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
         dim3 block(kThreads<HD>(), 1, 1);                                                   \
         flash_prefill_paged_kernel<HD><<<grid, block, 0, stream>>>(                         \
             qp, kp, vp, btp, cqp, clp, op, num_q_heads, num_kv_heads, block_size, max_blocks, \
-            kvbs, inv, (unsigned)causal, (unsigned)sliding_window);                         \
+            kvbs, inv, (unsigned)causal, (unsigned)sliding_window,                          \
+            mask_bias, (unsigned)mask_kv_stride);                                           \
     } while (0); break
 
     switch (head_dim) {

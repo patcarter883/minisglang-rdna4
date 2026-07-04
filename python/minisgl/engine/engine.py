@@ -104,6 +104,9 @@ class Engine:
         # Speculative decoding config (None unless --spec-algorithm enables it). The scheduler
         # routes to the synchronous spec loop when this is set; every spec path is gated on it.
         self.spec_config = config.spec_config
+        # Served model dir — kept so self-draft proposers (TiDAR) can read sidecar config
+        # (tidar_config.json) from the model folder without re-plumbing the path.
+        self.model_path = config.model_path
         # Expert-parallel coordinates (inert when --enable-ep is off / dp_size==1). The scheduler
         # reads these to drive the per-step common-bs lockstep over self.dp_cpu_group (built in
         # _init_dp_communication). self.ctx.ep carries the in-graph collective group for MoELayer.
@@ -617,9 +620,13 @@ def _adjust_config(config: EngineConfig):
             if config.page_size != 1:
                 override("page_size", 1)
                 logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
-            if config.cuda_graph_max_bs != 0:
+            # v2: CCA hybrids CAN cudagraph-capture the spec-VERIFY forward (S1 attn verify-capture +
+            # S2 CCA recurrent-state static buffers), so keep graphs on for them. The FUSED forward's
+            # non-K+1 qlen auto-falls-back to eager (can_use_verify_graph) until S4. Plain MHA / GDN
+            # (no verify capturer yet) still disable.
+            if config.cuda_graph_max_bs != 0 and not config.model_config.is_cca_hybrid:
                 override("cuda_graph_max_bs", 0)
-                logger.warning_rank0("spec-decode (non-MLA): disabling CUDA graph (verify eager)")
+                logger.warning_rank0("spec-decode (non-MLA/non-CCA): disabling CUDA graph (verify eager)")
         else:
             # Spec batches never exceed max_running_req (all running reqs verify together), so cap the
             # captured graph sizes there — a default 160 would capture huge unused decode graphs and

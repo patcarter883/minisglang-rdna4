@@ -19,6 +19,12 @@ __pycache__/
 build/
 dist/
 *.tar.gz
+*.so
+
+# ephemeral run/bench logs (test output, not source)
+*.out
+tools/*.server.log
+tools/*.oldmoe1.log
 
 # virtual environment
 .venv/

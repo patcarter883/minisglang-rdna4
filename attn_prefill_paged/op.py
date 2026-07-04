@@ -22,7 +22,7 @@ torch.ops.load_library(_so[0])
 
 @torch.library.register_fake("attn_prefill_paged::flash_prefill_paged")
 def _fake(q, k_cache, v_cache, block_table, cu_seqlens_q, context_lens, scale, causal,
-          sliding_window, max_seqlen_q, kv_block_stride=0):
+          sliding_window, max_seqlen_q, kv_block_stride=0, mask_bias=None):
     return torch.empty_like(q)
 
 

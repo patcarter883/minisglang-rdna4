@@ -162,6 +162,9 @@ class GraphRunner:
             from minisgl.cca.graph_capture import CCAGraphCapture
 
             self.cca_capture = CCAGraphCapture(device, self.max_graph_bs)
+        # v2: stashed for the spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft).
+        self._cca_state = cca_state
+        self.cca_verify = None
         # Spec-decode verify graphs are captured LATER (capture_verify_graphs), after the scheduler
         # builds the proposer + programs the target's aux-capture layers — None until then.
         self._verify = None
@@ -261,6 +264,19 @@ class GraphRunner:
         dev = self.device
         max_bs = max(bs_list)
         self.attn_backend.init_verify_capture(self._verify_max_seq_len, bs_list, num_draft)
+        # v2 S3: CCA-hybrid recurrent state through static verify buffers (per-CCA-layer conv/prev
+        # scratch that the captured verify forward writes in place; see CCAVerifyGraphCapture).
+        self.cca_verify = None
+        if self._cca_state is not None:
+            from minisgl.cca.graph_capture import CCAVerifyGraphCapture
+
+            cs = self._cca_state
+            self.cca_verify = CCAVerifyGraphCapture(
+                dev, max_bs, num_draft,
+                cca_layer_ids=range(cs.num_cca_layers),
+                conv_dim=cs.conv_states.shape[2], conv_width=cs.conv_states.shape[3],
+                hidden=cs.prev_hs.shape[2],
+            )
         vbuf = VerifyCaptureBuffer.init(
             max_bs, qlen, self._verify_vocab,
             hidden_size if needs_hidden else None,
@@ -287,6 +303,8 @@ class GraphRunner:
             batch.spec_verify = True
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_verify_for_capture(batch)
+            if self.cca_verify is not None:
+                self.cca_verify.prepare_verify_for_capture(batch)
             vbuf.set_batch(batch)
             T = vbuf.total(batch)
             with get_global_ctx().forward_batch(batch):
@@ -344,6 +362,8 @@ class GraphRunner:
         vbuf: VerifyCaptureBuffer = v["buf"]
         vbuf.copy_from(batch)
         self.attn_backend.prepare_verify_for_replay(batch)
+        if self.cca_verify is not None:
+            self.cca_verify.prepare_verify_for_replay(batch)
         v["graphs"][batch.padded_size].replay()
         n = batch.size * v["qlen"]
         logits = vbuf.logits[:n]

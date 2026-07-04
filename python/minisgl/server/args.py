@@ -261,11 +261,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--spec-algorithm",
         type=str,
         default=ServerArgs.spec_algorithm,
-        choices=["none", "ngram", "mtp", "eagle3", "dflash"],
+        choices=["none", "ngram", "mtp", "eagle3", "dflash", "tidar"],
         help="Speculative-decoding proposer. 'none' disables it; 'ngram' = prompt-lookup; "
         "'mtp' = the model's own appended next-token-prediction head (GLM-4.x / Qwen3.5); "
         "'eagle3' = a separate EAGLE3 draft checkpoint (--spec-draft-model-path); "
-        "'dflash' = a separate DFlash block-diffusion draft checkpoint (--spec-draft-model-path).",
+        "'dflash' = a separate DFlash block-diffusion draft checkpoint (--spec-draft-model-path); "
+        "'tidar' = self-draft block-diffusion on the target (TiDAR; reads tidar_config.json from the "
+        "served model dir — no separate checkpoint).",
     )
     parser.add_argument(
         "--spec-draft-model-path",

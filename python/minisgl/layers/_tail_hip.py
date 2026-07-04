@@ -25,4 +25,8 @@ def active(*tensors: torch.Tensor) -> bool:
     """True when the HIP path should run: enabled AND every tensor is bf16 (the kernels' only
     supported dtype). Contiguity is handled at the call site via ``.contiguous()`` (a no-op when
     already contiguous), so it is not part of the gate."""
-    return ENABLED and all(t.dtype == torch.bfloat16 for t in tensors)
+    ok = ENABLED and all(t.dtype == torch.bfloat16 for t in tensors)
+    if ok:
+        from minisgl._hip_engage import engaged
+        engaged("tail_hip")
+    return ok
