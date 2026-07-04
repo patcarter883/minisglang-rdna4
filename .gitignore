@@ -44,3 +44,6 @@ tools/sweep_*.window.log
 tools/mla_spec_graph.*.log
 tools/*.log
 tools/*.out
+
+# Compiled HIP kernel extensions — built per checkout, never committed
+*.so
