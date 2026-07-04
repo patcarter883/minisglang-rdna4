@@ -1,0 +1,87 @@
+# minisgl-rdna4 LEAN serving stack — a from-scratch image (Dockerfile.lean), NOT the vllm image.
+#
+# Contrast with docker-compose.yml (the legacy path): that mounts this repo into the shared
+# vllm22-w4a8:combined image and pip-installs deps per run. Here the image is purpose-built for
+# minisglang: ROCm 7.2.1 + torch(gfx1201) + the engine's python deps + the custom HIP kernels built
+# from the CANONICAL `rdna4-hip-kernels` repo. No vllm, sglang, flashinfer, triton, or sgl_kernel.
+#
+# The engine SOURCE is still hot-mounted at /engine (edit-and-restart), but the kernels come from the
+# image (/opt/kernels, canonical) — the repo no longer vendors them.
+#
+# Usage (GPU work leased through the shared arbiter; --detach binds the lease to the container):
+#   # build (CPU only — kernel compiles need no GPU/lease):
+#   docker compose -f docker-compose.lean.yml build
+#   # serve (single card):
+#   gpu-lease -n 1 --detach -- docker compose -f docker-compose.lean.yml --profile serve up -d
+#   docker compose -f docker-compose.lean.yml --profile serve logs -f
+#   gpu-lease -n 1 --detach -- docker compose -f docker-compose.lean.yml --profile serve down
+
+x-lean-common: &lean-common
+  image: minisgl-rdna4:lean
+  build:
+    context: .
+    dockerfile: Dockerfile.lean
+    additional_contexts:
+      # The canonical kernels live outside this repo's build context — inject them by name.
+      kernels: ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}
+  restart: "no"
+  working_dir: /engine
+  devices:
+    - /dev/kfd:/dev/kfd
+    - /dev/dri:/dev/dri
+  group_add: [video]
+  security_opt: [seccomp=unconfined, label=disable]
+  cap_add: [SYS_PTRACE]
+  ipc: host
+  shm_size: "16gb"
+  volumes:
+    # Engine source (kernels are NOT here anymore — they come from /opt/kernels in the image).
+    - .:/engine
+    - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+  environment: &lean-env
+    # /opt/kernels (canonical HIP kernels, baked into the image) FIRST so nothing under /engine can
+    # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
+    # moe_bf16 / rxf, still vendored here until ported upstream).
+    PYTHONPATH: /opt/kernels:/engine/python:/engine
+    HF_HUB_OFFLINE: "1"
+    TORCH_BLAS_PREFER_HIPBLASLT: "0"
+    # The lease injects the leased card set; these MUST stay distinct (physical id vs 0-based
+    # re-index) — see CLAUDE.md visible-devices recipe.
+    ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
+    HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
+    MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+
+services:
+  # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
+  serve:
+    <<: *lean-common
+    profiles: ["serve"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-serve
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
+  # Coherence smoke: load a tiny model + greedy-generate (no GPU-graph, single card). Proves the
+  # canonical-kernel cutover boots and produces sane tokens.
+  smoke:
+    <<: *lean-common
+    profiles: ["smoke"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-smoke
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python /engine/tools/boot_smoke.py --model "${MINISGL_SMOKE_MODEL:-Qwen/Qwen3-0.6B}"

@@ -54,13 +54,13 @@ class MLABackend(BaseAttnBackend):
         # Softmax temperature = 1/sqrt(qk_head_dim); the absorbed dot over kv_lora+rope reconstructs
         # the same per-head qk_nope+qk_rope score, so prefill and decode share this scale.
         self.scale = float(config.qk_nope_head_dim + config.qk_rope_head_dim) ** -0.5
-        import mla_hip  # noqa: F401  registers torch.ops.mla_hip.*
+        import mla_hip  # canonical package: ops exposed as module-level callables
 
-        self._decode_op = torch.ops.mla_hip.mla_decode
-        self._decode_fp8_op = torch.ops.mla_hip.mla_decode_fp8
-        self._prefill_op = torch.ops.mla_hip.mla_prefill
-        self._verify_op = torch.ops.mla_hip.mla_verify
-        self._verify_fp8_op = torch.ops.mla_hip.mla_verify_fp8
+        self._decode_op = mla_hip.mla_decode
+        self._decode_fp8_op = mla_hip.mla_decode_fp8
+        self._prefill_op = mla_hip.mla_prefill
+        self._verify_op = mla_hip.mla_verify
+        self._verify_fp8_op = mla_hip.mla_verify_fp8
         # fp8 (e4m3) latent KV cache — opt-in via MINISGL_KV_FP8=1 (the engine allocates the latent
         # pool as float8_e4m3fn). Store is a plain bf16->e4m3 cast (scale 1.0), so decode dequant uses
         # descale 1.0, matching the HIP MHA fp8 path. The prefill rebuild dequants in the model layer.

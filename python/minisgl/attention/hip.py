@@ -38,13 +38,14 @@ class HIPAttnBackend(TritonRDNA4Backend):
     def __init__(self, config: "ModelConfig") -> None:
         super().__init__(config)
         # Import here (not at module top) so the kernel packages are only required when the
-        # "hip" backend is actually selected. These register torch.ops.attn_hip.* / attn_decode.*.
-        import attn_decode  # noqa: F401
-        import attn_hip  # noqa: F401
+        # "hip" backend is actually selected. Canonical rdna4-hip-kernels packages expose their ops
+        # as module-level callables (the ops register under a build-unique torch.ops.<pkg>_C ns).
+        import attn_decode
+        import attn_hip
 
-        self._prefill = torch.ops.attn_hip.flash_prefill
-        self._decode = torch.ops.attn_decode.flash_decode_paged
-        self._decode_fp8 = torch.ops.attn_decode.flash_decode_paged_fp8
+        self._prefill = attn_hip.flash_prefill
+        self._decode = attn_decode.flash_decode_paged
+        self._decode_fp8 = attn_decode.flash_decode_paged_fp8
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: "Batch"

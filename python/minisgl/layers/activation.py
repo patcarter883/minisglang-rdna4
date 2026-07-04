@@ -24,7 +24,7 @@ def _gated(
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     if _tail_hip.active(x):
-        result = torch.ops.tail_hip.silu_and_mul(x.contiguous())  # act(x[:,:d]) * x[:,d:]
+        result = _tail_hip.silu_and_mul(x.contiguous())  # act(x[:,:d]) * x[:,d:]
         if out is not None:
             out.copy_(result)
             return out

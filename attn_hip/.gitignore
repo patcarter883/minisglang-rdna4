@@ -1,5 +1,0 @@
-build/
-*.so
-*_hip.cpp
-*_hip.hip
-__pycache__/

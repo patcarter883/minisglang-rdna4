@@ -159,7 +159,7 @@ class QwenGatedDeltaNet(nn.Module):
 
     # ---- output projection: rmsnorm_gated(core, z) -> flatten -> out_proj ----
     def _output_projection(self, core_attn_out: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
-        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+        import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         out_dtype = self.out_proj.weight.dtype
         # bf16-native rmsnorm_gated: reads x/z at the input dtype, up-casts to fp32 for the norm, writes
@@ -260,7 +260,7 @@ class QwenGatedDeltaNet(nn.Module):
         if torch.is_grad_enabled() and hidden_states.requires_grad:
             return self._forward_prefill_train(hidden_states, query_start_loc)
 
-        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+        import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
@@ -324,7 +324,7 @@ class QwenGatedDeltaNet(nn.Module):
           conv_scratch: [max_qlen, num_seqs, conv_dim, kernel-1] (fp32)
           ssm_scratch:  [max_qlen, num_seqs, num_v_heads, head_v_dim, head_k_dim] (ssm dtype)
         """
-        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+        import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
@@ -365,7 +365,7 @@ class QwenGatedDeltaNet(nn.Module):
         query_start_loc: torch.Tensor,  # int32 (num_decodes+1,)
         state_indices: torch.Tensor,  # slot id per sequence, int32
     ) -> torch.Tensor:
-        from gdn_hip import op as gdn  # lazy: only the engine forward needs the HIP .so
+        import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)

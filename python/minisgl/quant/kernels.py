@@ -205,12 +205,19 @@ def w4a8_moe(
     gemm1_kernel = "gemv" if M <= 2 else kernel
     gemm2_kernel = kernel
 
-    # Fused softmax+topk(+renormalize) in one kernel (vLLM _moe_C.topk_softmax), replacing
-    # torch.softmax+torch.topk+manual-renorm+int32-cast. NB: this image has no sgl_kernel and no
-    # _C.silu_and_mul, but vLLM's _moe_C MoE ops ARE present (same source as the moe_align import).
-    # ids come out int32 directly; renormalize is folded into the kernel.
+    # softmax + top-k (+ renormalize) route. The lean (vllm-free) image has no fused kernel, so this
+    # is pure torch (softmax -> topk -> optional renorm -> int32 ids), matching what the vLLM
+    # _moe_C.topk_softmax fused op computed. When vLLM IS present (the legacy combined image), prefer
+    # its fused kernel — a single launch vs the torch chain.
     def _route():
-        from vllm import _custom_ops as vllm_ops
+        try:
+            from vllm import _custom_ops as vllm_ops
+        except ImportError:
+            probs = torch.softmax(gating_output.float(), dim=-1)
+            tw, ti = torch.topk(probs, top_k, dim=-1)
+            if renormalize:
+                tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+            return tw.contiguous(), ti.to(torch.int32).contiguous()
 
         tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
         ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
@@ -227,17 +234,11 @@ def w4a8_moe(
         topk_weights = topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_ids.to(torch.int32).contiguous()
 
-    # moe_align: native HIP (moe_hip) by default, vLLM reference under MINISGL_MOE_ALIGN=0.
-    if _MOE_ALIGN_HIP:
-        import moe_hip
+    # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone — the
+    # lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that host op.
+    import moe_hip
 
-        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
-    else:
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-
-        sorted_ids, expert_ids, ntp = _moe_time(
-            "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
-        )
+    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
@@ -254,9 +255,9 @@ def w4a8_moe(
     # torch chain (silu+mul+float+cast+contiguous). MINISGL_TAIL_HIP=0 reverts to the torch ref.
     # (The gemm1-epilogue fused silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
     if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
-        import tail_hip  # noqa: F401  registers torch.ops.tail_hip.*
+        import tail_hip  # canonical package: silu_and_mul is a module-level callable
 
-        buf2 = _moe_time("silu", lambda: torch.ops.tail_hip.silu_and_mul(out1.contiguous()))
+        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
     else:
         buf2 = _moe_time(
             "silu",
@@ -274,11 +275,11 @@ def w4a8_moe(
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         if _MOE_SPLITK >= 2 and M == 1:  # split-K only helps the M==1 grid (M>=2 has enough blocks)
-            import moe_splitk_hip  # noqa: F401  registers torch.ops.moe_splitk_hip.*
+            import moe_splitk_hip  # canonical package: op is a module-level callable
 
             _moe_time(
                 "gemm2scat",
-                lambda: torch.ops.moe_splitk_hip.moe_gemm_splitk_scatter(
+                lambda: moe_splitk_hip.moe_gemm_splitk_scatter(
                     buf2, w2, w2_scales, w2_zeros, sorted_ids, expert_ids, ntp, tw_flat, acc,
                     top_k, block_m, _MOE_SPLITK,
                 ),
@@ -344,7 +345,14 @@ def w8a8_moe(
     gemm2_kernel = kernel
 
     def _route():
-        from vllm import _custom_ops as vllm_ops
+        try:
+            from vllm import _custom_ops as vllm_ops
+        except ImportError:
+            probs = torch.softmax(gating_output.float(), dim=-1)
+            tw, ti = torch.topk(probs, top_k, dim=-1)
+            if renormalize:
+                tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+            return tw.contiguous(), ti.to(torch.int32).contiguous()
 
         tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
         ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
@@ -360,17 +368,11 @@ def w8a8_moe(
         topk_weights = topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_ids.to(torch.int32).contiguous()
 
-    # moe_align: native HIP (moe_hip) by default, vLLM reference under MINISGL_MOE_ALIGN=0.
-    if _MOE_ALIGN_HIP:
-        import moe_hip
+    # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone — the
+    # lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that host op.
+    import moe_hip
 
-        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
-    else:
-        from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
-
-        sorted_ids, expert_ids, ntp = _moe_time(
-            "align", lambda: moe_align_block_size(topk_ids, block_m, E, None, pad_sorted_ids=True)
-        )
+    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
@@ -385,9 +387,9 @@ def w8a8_moe(
     # internal, no temps); MINISGL_TAIL_HIP=0 reverts to the torch ref. (The gemm1-epilogue fused
     # silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
     if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
-        import tail_hip  # noqa: F401  registers torch.ops.tail_hip.*
+        import tail_hip  # canonical package: silu_and_mul is a module-level callable
 
-        buf2 = _moe_time("silu", lambda: torch.ops.tail_hip.silu_and_mul(out1.contiguous()))
+        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
     else:
         buf2 = _moe_time(
             "silu",
@@ -480,21 +482,24 @@ def rxf_moe(
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors w4a8_moe's dispatch (vLLM
     topk_softmax + moe_align), int8/NL on the GEMMs. Returns (M, K)."""
     import torch.nn.functional as F
+    import moe_hip
     import rxf_hip  # noqa: F401
-    from vllm import _custom_ops as vllm_ops
-    from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
 
     M, K = x.shape
     E = w13.shape[0]
     dev = x.device
     nl = _rxf_nl(dev)
 
-    tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
-    ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
+    # route: torch softmax+topk (lean image has no vllm; matches the former _moe_C.topk_softmax).
+    probs = torch.softmax(gating_output.float(), dim=-1)
+    tw, ti = torch.topk(probs, top_k, dim=-1)
+    if renormalize:
+        tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+    tw = tw.contiguous()
+    ti = ti.to(torch.int32).contiguous()
 
-    sorted_ids, expert_ids, ntp = moe_align_block_size(ti, block_m, E, None, pad_sorted_ids=True)
+    # align: native HIP drop-in for the former vLLM moe_align_block_size host op.
+    sorted_ids, expert_ids, ntp = moe_hip.moe_align(ti, E, block_m)
     P = sorted_ids.shape[0]
 
     # gemm1: rotate+quant the activation (gathered by sorted_ids inside the GEMM), grouped over w13.
@@ -510,7 +515,7 @@ def rxf_moe(
     from minisgl.layers import _tail_hip
 
     if _tail_hip.active(out1):
-        buf2 = torch.ops.tail_hip.silu_and_mul(out1.contiguous())
+        buf2 = _tail_hip.silu_and_mul(out1.contiguous())
     else:
         buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
 
