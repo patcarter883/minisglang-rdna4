@@ -281,6 +281,8 @@ class ZayaCCAAttn(BaseOP):
         conv = state.conv(self._cca_layer_id)  # [num_slots, C, conv_width] fp32 (mutated in place)
         prev = state.prev(self._cca_layer_id)  # [num_slots, hidden] fp32
 
+        import zaya_cca  # canonical CCA package; ops exposed as module-level callables
+
         cca = self._cca
         nq, gqa = cca._nq, cca._nq // cca._nk
         latent_q, latent_k = cca._latent_q, cca._latent_k
@@ -323,7 +325,7 @@ class ZayaCCAAttn(BaseOP):
             init_states = torch.where(
                 has_init.view(-1, 1, 1), init_states, init_states.new_zeros(())
             ).contiguous()
-            qk_out = torch.ops.zaya_cca.cca_prefill_qk(
+            qk_out = zaya_cca.cca_prefill_qk(
                 qk_new, conv, init_states, seg_pos, req_id, slot, is_last,
                 w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
             )  # [N, C] normalized q|k; conv updated in place (only each seq's last token)
@@ -351,7 +353,7 @@ class ZayaCCAAttn(BaseOP):
                 assert bool((real < state.num_slots).all()), (
                     f"decode: state_indices out of range [1, {state.num_slots})"
                 )
-            qk_out = torch.ops.zaya_cca.cca_decode_qk(
+            qk_out = zaya_cca.cca_decode_qk(
                 qk_new, conv, slot, is_pad,
                 w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
             )  # [N, C] normalized q|k; conv rolled+appended in place
@@ -396,11 +398,11 @@ class ZayaCCAAttn(BaseOP):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
     def post_load(self) -> None:
-        # Importing cca_hip registers torch.ops.zaya_cca.{cca_decode_qk,cca_prefill_qk}. Done at
+        # Importing the canonical zaya_cca package loads its .so + registers the cca ops. Done at
         # load time (not lazily in forward) so a missing/unbuilt .so fails during model load with a
         # clear error, not cryptically on the first decode step. Kept out of module import so
         # `import minisgl.models.zaya` stays GPU-free (the .so only loads when a model is built).
-        import cca_hip.cca_op  # noqa: F401
+        import zaya_cca  # noqa: F401  canonical CCA package (registers the cca ops)
 
         self.o_proj.post_load()
         self._cca.post_load()

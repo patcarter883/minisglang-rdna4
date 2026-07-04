@@ -69,18 +69,19 @@ class TritonRDNA4Backend(BaseAttnBackend):
         # user opted in to default-on, so a missing build is a hard error, not a silent fallback).
         self._attn_hip = os.environ.get("MINISGL_ATTN_HIP", "1") != "0"
         if self._attn_hip:
-            import attn_decode  # noqa: F401  registers torch.ops.attn_decode.*
-            import attn_hip  # noqa: F401  registers torch.ops.attn_hip.*
-            import attn_prefill_paged  # noqa: F401  registers torch.ops.attn_prefill_paged.*
+            # Canonical rdna4-hip-kernels packages: ops exposed as module-level callables.
+            import attn_decode
+            import attn_hip
+            import attn_prefill_paged
 
-            self._hip_decode_op = torch.ops.attn_decode.flash_decode_paged
-            self._hip_decode_fp8_op = torch.ops.attn_decode.flash_decode_paged_fp8
-            self._hip_prefill_op = torch.ops.attn_hip.flash_prefill  # dense cold prefill
+            self._hip_decode_op = attn_decode.flash_decode_paged
+            self._hip_decode_fp8_op = attn_decode.flash_decode_paged_fp8
+            self._hip_prefill_op = attn_hip.flash_prefill  # dense cold prefill
             self._hip_prefill_paged_op = (
-                torch.ops.attn_prefill_paged.flash_prefill_paged  # paged/chunked extend prefill
+                attn_prefill_paged.flash_prefill_paged  # paged/chunked extend prefill
             )
             self._hip_prefill_paged_fp8_op = (
-                torch.ops.attn_prefill_paged.flash_prefill_paged_fp8  # fp8-KV paged extend prefill
+                attn_prefill_paged.flash_prefill_paged_fp8  # fp8-KV paged extend prefill
             )
             # All three attention kernels now cover head_dim 64/128/256: decode (attn_decode), cold
             # prefill (attn_hip) and extend/paged prefill (attn_prefill_paged) — 256 (Qwen3.5/3.6

@@ -62,10 +62,10 @@ class RotaryEmbedding(StateLessOP):
             # tail_hip.rope takes the FULL fp32 cat(cos,sin) cache + int32 positions and does the
             # NeoX partial rotate internally (same convention as _apply below).
             pos = positions.to(torch.int32)
-            q = torch.ops.tail_hip.rope(
+            q = _tail_hip.rope(
                 query.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
             )
-            k = torch.ops.tail_hip.rope(
+            k = _tail_hip.rope(
                 key.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
             )
             return q, k

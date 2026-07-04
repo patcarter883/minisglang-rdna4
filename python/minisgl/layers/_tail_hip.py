@@ -17,8 +17,17 @@ import torch
 
 ENABLED = os.environ.get("MINISGL_TAIL_HIP", "1") != "0"
 
+# The canonical rdna4-hip-kernels `tail_hip` package exposes its ops as module-level callables
+# (rms_norm / rms_norm_add / silu_and_mul / rope); the ops themselves register under the
+# build-unique torch.ops.tail_hip_C namespace. Re-export the callables here so the layer modules
+# have a single import site for the native tail ops (and the MINISGL_TAIL_HIP gate lives in one place).
 if ENABLED:
-    import tail_hip  # noqa: F401  loads tail_hip_C + registers torch.ops.tail_hip.*
+    import tail_hip
+
+    silu_and_mul = tail_hip.silu_and_mul
+    rms_norm = tail_hip.rms_norm
+    rms_norm_add = tail_hip.rms_norm_add
+    rope = tail_hip.rope
 
 
 def active(*tensors: torch.Tensor) -> bool:
