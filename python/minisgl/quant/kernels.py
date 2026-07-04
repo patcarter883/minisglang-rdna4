@@ -28,10 +28,11 @@ _MOE_EVERY = int(_os.environ["MINISGL_MOE_PROF"]) if _os.environ.get("MINISGL_MO
 _moe_buckets: dict = _dd(float)
 _moe_calls = 0
 
-# Decode-path gemm2+gather fusion via mmq_fp8_moe_gemm_scatter (atomic scatter). On by default;
-# MINISGL_MOE_SCATTER=0 reverts to the unfused gemm2 + gather_reduce (set this if CUDA graphs are
-# enabled for decode — the scatter's atomicAdd is not graph-capture-safe).
-_MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "1") != "0"
+# Decode-path gemm2+gather fusion via mmq_fp8_moe_gemm_scatter (atomic scatter). OFF by default so
+# CUDA-graph decode capture works out of the box for MoE models (the scatter's atomicAdd is NOT
+# graph-capture-safe; the unfused gemm2 + gather_reduce fallback reaches ~the same memory bandwidth).
+# Set MINISGL_MOE_SCATTER=1 to force the fused scatter for an eager (non-graph) deployment.
+_MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "0") != "0"
 
 # Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
 # to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks

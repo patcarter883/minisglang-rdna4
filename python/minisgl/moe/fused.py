@@ -153,6 +153,95 @@ def _moe_align_block_size_torch(
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 
+# ----------------------------------------------------------------------------------------------------
+# Full-HIP unquantized (bf16/fp16) fused-MoE path (gfx1201), replacing fused_moe_kernel_triton +
+# moe_sum_reduce_triton for the unquantized fallback. Graph-CAPTURABLE: the moe_bf16 *_out ops write
+# into caller-owned, pre-allocated buffers (no malloc in the op), and the fp32 combine accumulator is
+# zeroed with `.zero_()` on a static buffer (capturable) rather than re-allocated. Buffers are cached
+# by shape and reused across steps. Falls back to Triton for gelu / router-weight-on-input / dtypes
+# other than bf16/fp16, or if the compiled kernel is unavailable.
+# ----------------------------------------------------------------------------------------------------
+
+_MOE_BF16_OK: bool | None = None
+_MOE_BF16_BUFS: Dict[Tuple, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _moe_bf16_available() -> bool:
+    global _MOE_BF16_OK
+    if _MOE_BF16_OK is None:
+        try:
+            import moe_bf16_wmma  # noqa: F401  (loads .so + registers torch.ops.moe_bf16.*)
+
+            _MOE_BF16_OK = True
+        except Exception:
+            _MOE_BF16_OK = False
+    return _MOE_BF16_OK
+
+
+def _moe_bf16_buffers(
+    P: int, twoN: int, N: int, M: int, K: int, device: torch.device, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pre-allocated (inter1[P,2N], inter2[P,N], out_accum[M,K] fp32), cached by shape+dtype+device and
+    reused across steps. Allocated once (outside/at graph-warmup); the captured graph only reads/writes
+    these buffers, never allocates them."""
+    key = (P, twoN, N, M, K, str(device), dtype)
+    bufs = _MOE_BF16_BUFS.get(key)
+    if bufs is None:
+        inter1 = torch.empty((P, twoN), device=device, dtype=dtype)
+        inter2 = torch.empty((P, N), device=device, dtype=dtype)
+        out_accum = torch.empty((M, K), device=device, dtype=torch.float32)
+        bufs = (inter1, inter2, out_accum)
+        _MOE_BF16_BUFS[key] = bufs
+    return bufs
+
+
+def _fused_experts_bf16_hip(
+    hidden_states: torch.Tensor,  # [M, K] bf16/fp16
+    w1: torch.Tensor,             # [E, 2N, K]
+    w2: torch.Tensor,             # [E, K, N]
+    topk_weights: torch.Tensor,   # [M, top_k] f32
+    topk_ids: torch.Tensor,       # [M, top_k]
+    config: Dict[str, int],
+) -> torch.Tensor:
+    """Graph-safe HIP fused MoE: align -> moe_bf16_gemm (gemm1) -> silu_and_mul -> moe_bf16_gemm_scatter
+    (gemm2 + topk-weighted combine). Matches the Triton fused_experts_impl semantics exactly (same
+    w1[E,2N,K]/w2[E,K,N] layout, same offs = m*top_k + k topk indexing)."""
+    from minisgl.layers import silu_and_mul
+
+    from moe_bf16_wmma import moe_bf16_gemm_out, moe_bf16_gemm_scatter_out
+
+    M, K = hidden_states.shape
+    E, twoN, _ = w1.shape
+    N = twoN // 2
+    top_k = topk_ids.shape[1]
+    num_valid = M * top_k
+    block_m = config["BLOCK_SIZE_M"]
+    BN = 128
+
+    sorted_ids, expert_ids, num_pad = moe_align_block_size(topk_ids.to(torch.int32), block_m, E)
+    P = sorted_ids.shape[0]
+    tw = topk_weights.to(torch.float32).reshape(-1).contiguous()  # [M*top_k], indexed by offs
+
+    inter1, inter2, out_accum = _moe_bf16_buffers(
+        P, twoN, N, M, K, hidden_states.device, hidden_states.dtype
+    )
+
+    # gemm1: inter1[P, 2N] = hidden[offs//top_k] @ w1[e]^T  (sorted-padded rows; no router weight)
+    moe_bf16_gemm_out(
+        hidden_states, w1, sorted_ids, expert_ids, num_pad, None, inter1,
+        top_k, block_m, num_valid, BN, 0,
+    )
+    # SwiGLU gate on the sorted-padded intermediate -> inter2[P, N]
+    silu_and_mul(inter1, inter2)
+    # gemm2 + topk-weighted scatter-combine into the fp32 accumulator (zeroed first — capturable).
+    out_accum.zero_()
+    moe_bf16_gemm_scatter_out(
+        inter2, w2, sorted_ids, expert_ids, num_pad, tw, out_accum,
+        top_k, block_m, num_valid, BN, top_k,
+    )
+    return out_accum.to(hidden_states.dtype)
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -197,6 +286,10 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
+    """Unquantized fused-MoE experts. Dispatches the full-HIP, graph-capturable `moe_bf16_wmma`
+    path (`_fused_experts_bf16_hip`) for bf16/fp16 silu experts without router-weight-on-input;
+    everything else (gelu / router-weight-on-input / fp32 / kernel unavailable) falls back to the
+    Triton `fused_moe_kernel_triton` + `moe_sum_reduce_triton` below."""
     from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
@@ -217,6 +310,16 @@ def fused_experts_impl(
         topk_ids.shape[1],
     )
     config = get_config_func(M)
+
+    # Full-HIP graph-capturable path for UNQUANTIZED (bf16/fp16) silu experts without
+    # router-weight-on-input. Everything else (gelu, router-weight-on-input, fp32) uses Triton below.
+    if (
+        activation == "silu"
+        and not apply_router_weight_on_input
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and _moe_bf16_available()
+    ):
+        return _fused_experts_bf16_hip(hidden_states, w1, w2, topk_weights, topk_ids, config)
 
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
