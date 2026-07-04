@@ -87,6 +87,8 @@ class HIPAttnBackend(TritonRDNA4Backend):
         # leaked past the cold_prefill dispatch).
         cu = metadata.cu_seqlens_q.tolist()
         klen = metadata.cache_seqlens.tolist()
+        from minisgl._hip_engage import engaged
+        engaged("attn_hip.flash_prefill")
         out = torch.empty_like(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
@@ -111,9 +113,12 @@ class HIPAttnBackend(TritonRDNA4Backend):
         v_cache = self.kvcache.v_cache(layer_id)
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        from minisgl._hip_engage import engaged
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale folded in the kernel (store uses scale 1.0).
+            engaged("attn_decode.flash_decode_paged_fp8")
             return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0)
+        engaged("attn_decode.flash_decode_paged")
         return self._decode(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
 
     # ---- cudagraph capture (DECODE only) -----------------------------------------------------
@@ -167,3 +172,61 @@ class HIPAttnBackend(TritonRDNA4Backend):
     def prepare_for_replay(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)
         batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
+
+    # ---- spec-verify cudagraph capture (v2 S1: STANDARD K+1 causal verify, no custom mask) --------
+    # The two-forward CCA verify forward stages qlen=K+1 query tokens/seq against the paged prefix with
+    # a prefix-offset causal mask -> the inherited `_hip_prefill_paged` kernel (max_seqlen_q>1 branch).
+    # For capture, the only per-step-varying metadata the kernel reads is cache_seqlens (device_len) and
+    # the page table (a row can gain a page); both live in static buffers refreshed by
+    # `prepare_verify_for_replay` before g.replay(). cu_seqlens_q is a static arange*qlen (all q-lengths
+    # are qlen). max_seqlen_q is the fixed qlen. The kernel bounds reads by cache_seqlens, so a fixed
+    # max-width page table (stale tail ignored) is fine — same trick as decode/MLA-verify. Mirrors
+    # MLABackend.init_verify_capture / _fill_verify_static. NOTE (v2 S4): the FUSED custom-mask forward
+    # needs an additional static mask_bias + §7.6 positions buffer — see docs/V2_CCA_VERIFY_CAPTURE.md.
+    def init_verify_capture(self, max_seq_len: int, bs_list: List[int], num_draft: int) -> None:
+        dev = self.kvcache.device
+        self._vcap_max_bs = max(bs_list)
+        self._vcap_qlen = num_draft + 1
+        self._vcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._vcap_cache_seqlens = torch.ones(self._vcap_max_bs, dtype=torch.int32, device=dev)
+        self._vcap_page_table = torch.zeros(
+            self._vcap_max_bs, self._vcap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._vcap_cu_q = (
+            torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
+        )
+
+    def _verify_metadata_static(self, bs: int) -> RDNA4Metadata:
+        return RDNA4Metadata(
+            cache_seqlens=self._vcap_cache_seqlens[:bs],
+            cu_seqlens_q=self._vcap_cu_q[: bs + 1],
+            max_seqlen_q=self._vcap_qlen,
+            max_seqlen_k=self._vcap_max_pages * self.page_size,
+            page_table=self._vcap_page_table[:bs],
+            cold_prefill=False,
+        )
+
+    def _fill_verify_static(self, batch: "Batch") -> None:
+        """Refresh the static verify buffers from `batch.padded_reqs` (eager, OUTSIDE the graph).
+        cache_seqlens = device_len; page_table = each seq's page row (stale tail beyond cache_seqlens
+        is ignored by the paged-extend kernel's causal bound)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
+        self._vcap_cache_seqlens[:bs].copy_(dls)
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (req.device_len + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._vcap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_verify_for_capture(self, batch: "Batch") -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
+
+    def prepare_verify_for_replay(self, batch: "Batch") -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)

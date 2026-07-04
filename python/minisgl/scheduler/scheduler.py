@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
+import torch.profiler
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.message import (
@@ -133,6 +135,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self._spec_capture_layer_ids = self._proposer.capture_layer_ids
             if self._spec_capture_layer_ids:
                 self.engine.model.set_capture_layers(self._spec_capture_layer_ids)
+            # TiDAR self-draft: the block_predict forward needs this scheduler's batch machinery
+            # (token pool / paged-KV allocate / CCA+attn metadata), so bind it into the proposer.
+            from minisgl.spec.tidar import TiDARProposer
+
+            self._tidar_fused = False
+            if isinstance(self._proposer, TiDARProposer):
+                self._proposer.bind_block_predict(self._tidar_block_predict)
+                # MINISGL_TIDAR_FUSED=1: route to the Phase-C single-forward fused step (verify+draft in
+                # ONE forward) instead of the two-forward propose+verify path. Off by default.
+                self._tidar_fused = os.environ.get("MINISGL_TIDAR_FUSED") == "1"
+                if self._tidar_fused:
+                    logger.info_rank0("spec-decode: TiDAR FUSED single-forward path ENABLED")
             self._spec_seed_enabled = (
                 os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
                 and bool(self._proposer.supports_prefill_seed)
@@ -497,7 +511,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # draft is simply rejected. A non-greedy req still falls the whole batch back to a plain decode.
         spec_ok = all(req.sampling_params.is_greedy for req in reqs)
         if spec_ok:
-            self._spec_decode_step(reqs)
+            if getattr(self, "_tidar_fused", False):
+                self._spec_decode_step_tidar_fused(
+                    reqs, self._proposer.block_size, self._proposer.mask_token_id)
+            else:
+                self._spec_decode_step(reqs)
         else:
             batch = self.decode_manager.schedule_next_batch()
             forward_input = self._prepare_batch(batch)
@@ -547,6 +565,455 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._spec_aux_hidden[req.uid] = ax[:, plen - 1].clone()
 
         self._process_last_data((forward_input, out))
+
+    @torch.inference_mode()
+    def _tidar_block_predict(self, reqs: List[Req], k: int, mask_id: int) -> List[List[int]]:
+        """TiDAR forward #1 (self-draft): one causal target forward over ``[confirmed | mask×k]`` per
+        req → k draft tokens (argmax at the k mask positions). Called by TiDARProposer.propose (bound
+        at construction) because it needs this scheduler's batch machinery (token pool, paged-KV
+        allocate, CCA/attn metadata) which a proposer can't reach.
+
+        STATE-NEUTRAL — the real verify forward (#2) re-runs with the accepted drafts:
+          * CCA/GDN recurrent state is snapshot before the forward and restored after (the mask block's
+            advance is thrown away);
+          * the speculative mask-KV pages allocated here are FREED before returning (allocate_paged is
+            NOT idempotent — the verify path re-allocates cleanly), so no per-step page leak.
+        Eager (verify graphs are off in the CCA/ZAYA serving config). Returns k drafts per req."""
+        device = self.device
+        page_table = self.engine.page_table
+
+        # --- stage [confirmed@c0 | mask×k]: extend each req to k+1 query tokens --------------------
+        saved_lens = [(r.device_len, r.cached_len) for r in reqs]
+        m_rows: List[int] = []
+        m_cols: List[int] = []
+        for req in reqs:
+            c0 = req.cached_len
+            req.device_len = c0 + k + 1
+            for j in range(k):
+                m_rows.append(req.table_idx)
+                m_cols.append(c0 + 1 + j)
+        self.token_pool[
+            torch.tensor(m_rows, dtype=torch.int64, device=device),
+            torch.tensor(m_cols, dtype=torch.int64, device=device),
+        ] = torch.full((len(m_rows),), mask_id, dtype=self.token_pool.dtype, device=device)
+
+        # --- build the (eager) block-predict batch ------------------------------------------------
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.spec_verify = True  # multi-token extend → same paged-extend causal path as verify
+        self.cache_manager.allocate_paged(reqs)
+        batch.padded_reqs = reqs
+        batch.positions = _make_positions(batch, device)
+        input_mapping = _make_input_tuple(batch, device)
+        batch.out_loc = page_table[input_mapping]
+        self.engine.attn_backend.prepare_metadata(batch)
+        batch.input_ids = self.token_pool[input_mapping]
+
+        # recurrent metadata WITHOUT capture (this forward is discarded); snapshot state to roll back.
+        cca_snapshot = gdn_snapshot = None
+        if self.cca_slots is not None:
+            from minisgl.cca.metadata import build_cca_metadata
+
+            cca_idx = self.cca_slots.state_indices(batch)
+            batch.cca_metadata = build_cca_metadata(batch, cca_idx, device)
+            cca_snapshot = self.engine.cca_state.snapshot(cca_idx)
+        if self.gdn_slots is not None:
+            from minisgl.gdn.metadata import build_gdn_metadata
+
+            gdn_idx = self.gdn_slots.state_indices(batch)
+            batch.gdn_metadata = build_gdn_metadata(batch, gdn_idx, device)
+            gdn_snapshot = self.engine.gdn_state.snapshot(gdn_idx)
+
+        # --- one forward; argmax the k mask positions per req -------------------------------------
+        logits = self.engine.forward_verify(batch)  # [sum(k+1), vocab]
+        preds = logits.argmax(dim=-1).to(torch.int32).cpu()
+        drafts: List[List[int]] = []
+        off = 0
+        for _req in reqs:
+            block = preds[off + 1 : off + 1 + k].tolist()  # rows 1..k == the mask positions
+            drafts.append([int(t) for t in block])
+            off += k + 1
+
+        # --- roll back the speculative state (recurrent + KV pages + lens) ------------------------
+        if cca_snapshot is not None:
+            self.engine.cca_state.restore(cca_snapshot)
+        if gdn_snapshot is not None:
+            self.engine.gdn_state.restore(gdn_snapshot)
+        ps = self.cache_manager.page_size
+        free_chunks: List[torch.Tensor] = []
+        for (dl, cl), req in zip(saved_lens, reqs):
+            free_start = div_ceil(cl, ps) * ps
+            free_end = div_ceil(req.device_len, ps) * ps  # req.device_len still = c0+k+1 here
+            if free_end > free_start:
+                free_chunks.append(page_table[req.table_idx, free_start:free_end])
+            req.device_len, req.cached_len = dl, cl
+        if free_chunks:
+            self.cache_manager._free(torch.cat(free_chunks))
+        return drafts
+
+    @torch.inference_mode()
+    def _spec_decode_step_tidar_fused(self, reqs: List[Req], B: int, mask_id: int) -> None:
+        """TiDAR FUSED single-forward step (Phase C): ONE forward over [confirmed | S | R_0..R_{B-1}]
+        per req that BOTH verifies S (the prev block's drafts) AND pre-drafts the next block from B
+        replicas — vs the two-forward path's separate block_predict + verify. The forward-count halves
+        → speedup ≈ avg_accept+1 (vs (avg+1)/2). Lossless: the S-verify rows have correct causal/conv
+        context; only replica draft QUALITY is capped by the flat conv (a later segmented-conv refine).
+
+        Uses the validated pieces: fused_paged_layout (positions + custom_mask), the paged kernel's
+        mask_bias arg (causal=0), verify_greedy (β=1), and the B.0 CCA verify-state capture/install.
+        RoPE positions (§7.6, non-contiguous) are separate from the contiguous KV storage cols."""
+        from minisgl.spec.tidar_mask import fused_paged_layout
+
+        device = self.device
+        page_table = self.engine.page_table
+        # PROBE (MINISGL_TIDAR_FUSED_NOREP=1): drop the replicas -> query only [confirmed | S] and get
+        # next drafts from a separate block_predict (NOT fused-fast). Isolates whether the losslessness
+        # drift comes from replica contamination (mask/conv/KV) or the confirmed/S + state-install path.
+        norep = os.environ.get("MINISGL_TIDAR_FUSED_NOREP") == "1"
+        # SEGMENTED conv (MINISGL_TIDAR_SEG=1): give each replica R_r its correct conv left-context via
+        # inserted ctx tokens (masked from attention) -> recovers draft acceptance (flat conv ~4x lower).
+        seg = os.environ.get("MINISGL_TIDAR_SEG") == "1" and not norep
+        # DUMP (MINISGL_TIDAR_DUMP=1): systematic draft-vs-reference diagnostic (see _tidar_fused_dump).
+        dump = os.environ.get("MINISGL_TIDAR_DUMP") == "1" and not norep
+        # TIME (MINISGL_TIDAR_TIME=1): per-step cost breakdown (stage/mask-build | forward | commit) —
+        # the Step-0.5 cost pivot needs to know where the ~287ms/step goes. Syncs → adds overhead, so
+        # a dedicated flag. Timestamps helper below.
+        timeit = os.environ.get("MINISGL_TIDAR_TIME") == "1"
+
+        def _tstamp():
+            if timeit:
+                torch.cuda.synchronize(device)
+            return time.perf_counter()
+
+        # PROFILE (MINISGL_TIDAR_PROFILE=1): capture a window of fused steps with torch.profiler to get
+        # the per-KERNEL GPU-time breakdown (confirm/size the custom-mask attention hotspot). Enters the
+        # profiler at step PROF_START, captures PROF_N steps, then dumps a key_averages table (sorted by
+        # self CUDA time) + a chrome trace for TraceLens. rocprof is dead on gfx1201, so this is the tool.
+        if os.environ.get("MINISGL_TIDAR_PROFILE") == "1":
+            ps = self._prof_step = getattr(self, "_prof_step", 0) + 1
+            PROF_START, PROF_N = 40, 8
+            if ps == PROF_START:
+                self._prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA])
+                self._prof.__enter__()
+            elif ps == PROF_START + PROF_N:
+                self._prof.__exit__(None, None, None)
+                logger.info_rank0("[tidar-prof] per-kernel GPU time over %d fused steps:" % PROF_N)
+                logger.info_rank0("\n" + self._prof.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=25))
+                try:
+                    self._prof.export_chrome_trace("/engine/tools/fused_prof.pt.trace.json")
+                    logger.info_rank0("[tidar-prof] trace -> /engine/tools/fused_prof.pt.trace.json")
+                except Exception as e:  # noqa: BLE001
+                    logger.info_rank0(f"[tidar-prof] trace export failed: {e}")
+
+        t0 = _tstamp()
+        tp = (int(self.engine.cca_state.conv_states.shape[-1])
+              if (seg and self.engine.cca_state is not None) else 2)
+        if seg:
+            from minisgl.spec.tidar_mask import fused_paged_layout_segmented
+
+        # --- bootstrap: first step has no carried drafts -> one block_predict per fresh req --------
+        fresh = [r for r in reqs if getattr(r, "_tidar_drafts", None) is None]
+        if fresh:
+            boot = self._tidar_block_predict(fresh, B, mask_id)
+            for r, d in zip(fresh, boot):
+                r._tidar_drafts = d
+
+        # DUMP fidelity gate: block_predict on the CURRENT (pre-step) committed == the IDEAL R_0 (both
+        # condition on [committed|confirmed] and predict positions c0+1..c0+B). Captured here, before
+        # staging, via the state-neutral two-forward call; compared to the fused R_0 in _tidar_fused_dump.
+        # R_0 == bp0 => the paged fused forward faithfully reproduces block_predict (no port bug, the low
+        # acceptance is the structural bonus-conditioning cap); a mismatch localizes a fused fidelity bug.
+        bp0_map = {}
+        if dump and getattr(self, "_tidar_dump_count", 0) < 8:
+            for r in reqs:
+                bp0_map[id(r)] = self._tidar_block_predict([r], B, mask_id)[0]
+
+        # --- stage [confirmed | S=drafts | mask×B²] per req; build fused positions + custom_mask ---
+        store_rows: List[int] = []
+        store_cols: List[int] = []
+        tok_vals: List[int] = []
+        pos_list: List[int] = []
+        per_req = []  # (req, c0, n_query, drafts, layout_or_None)
+        for req in reqs:
+            c0 = req.cached_len
+            drafts = list(req._tidar_drafts)
+            layout = None
+            if seg:
+                layout = fused_paged_layout_segmented(c0, B, tp, device=device)
+                fpos = layout["positions"]; n_query = layout["n_query"]
+                toks = []
+                for (kind, _r, loc, abs_pos) in layout["rows"]:
+                    if kind == "confirmed":
+                        toks.append(int(req.input_ids[c0]))
+                    elif kind == "S":
+                        toks.append(drafts[loc])
+                    elif kind == "ctx":  # actual token @ abs_pos (committed/confirmed) or a draft
+                        toks.append(int(req.input_ids[abs_pos]) if abs_pos <= c0
+                                    else drafts[abs_pos - (c0 + 1)])
+                    else:  # R
+                        toks.append(mask_id)
+            else:
+                fpos, _mask, n_query_full, _ = fused_paged_layout(c0, B, device=device)
+                if norep:
+                    n_query = 1 + B                                   # [confirmed | S] only
+                    toks = [int(req.input_ids[c0])] + drafts
+                    fpos = fpos[:n_query]
+                else:
+                    n_query = n_query_full
+                    toks = [int(req.input_ids[c0])] + drafts + [mask_id] * (B * B)  # confirmed | S | R*
+            assert len(toks) == n_query, (len(toks), n_query)
+            for i in range(n_query):
+                store_rows.append(req.table_idx)
+                store_cols.append(c0 + i)
+                tok_vals.append(toks[i])
+            pos_list += fpos
+            req.device_len = c0 + n_query  # extend_len = n_query -> cache_seqlens = context_len
+            per_req.append((req, c0, n_query, drafts, layout))
+        rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
+        cols_t = torch.tensor(store_cols, dtype=torch.int64, device=device)
+        self.token_pool[rows_t, cols_t] = torch.tensor(tok_vals, dtype=self.token_pool.dtype, device=device)
+
+        # --- build the fused batch (eager; graphs off for CCA serve) -------------------------------
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.spec_verify = True
+        self.cache_manager.allocate_paged(reqs)
+        batch.padded_reqs = reqs
+        batch.positions = torch.tensor(pos_list, dtype=torch.int32, device=device)  # §7.6 RoPE positions
+        batch.out_loc = page_table[rows_t, cols_t]                                    # contiguous KV cols
+        self.engine.attn_backend.prepare_metadata(batch)
+        batch.input_ids = self.token_pool[rows_t, cols_t]
+        # assemble the packed custom mask [total_q, max_kv]; each req's [n_query, context_len] block
+        max_kv = int(batch.attn_metadata.max_seqlen_k)
+        total_q = len(store_rows)
+        custom_mask = torch.zeros(total_q, max_kv, dtype=torch.float32, device=device)
+        off = 0
+        for (req, c0, n_query, _drafts, layout) in per_req:
+            if layout is not None:
+                mask_blk = layout["mask"]                                   # segmented [n_query, c0+n_query]
+            else:
+                _, mask_blk, _, _ = fused_paged_layout(c0, B, device=device)  # [nq_full, c0+nq_full]
+            custom_mask[off:off + n_query, : c0 + n_query] = mask_blk[:n_query, : c0 + n_query]
+            off += n_query
+        batch.attn_metadata.custom_mask = custom_mask
+
+        # CCA verify-state capture (B.0) so we can install the accepted-prefix recurrent state.
+        cca_state_indices = None
+        if self.cca_slots is not None:
+            from minisgl.cca.metadata import build_cca_metadata
+
+            cca_state_indices = self.cca_slots.state_indices(batch)
+            batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, device)
+            batch.cca_metadata.capture_verify_state = True
+            batch.cca_metadata.verify_max_qlen = max(nq for (_, _, nq, _, _) in per_req)
+
+        t_stage = _tstamp()
+        logits = self.engine.forward_verify(batch)  # [total_q, vocab]
+        t_fwd = _tstamp()
+        vocab = logits.shape[-1]
+
+        # --- verify S rows + select replica R_k; commit + carry ------------------------------------
+        dump_cap: List[dict] = []
+        bykacc: List[tuple] = []   # STEP-0a: (prev_k, n_drafts, n_accepted) to bucket accept by prior k
+        reply: List[DetokenizeMsg] = []
+        new_finished_reqs: Set[Req] = set()
+        c_rows: List[int] = []
+        c_cols: List[int] = []
+        c_vals: List[int] = []
+        free_chunks: List[torch.Tensor] = []
+        install_batch_idx: List[int] = []
+        install_t_index: List[int] = []
+        ps = self.cache_manager.page_size
+        n_proposed = n_accepted = n_emitted = 0
+        off = 0
+        for i, (req, c0, n_query, drafts, layout) in enumerate(per_req):
+            lg = logits[off:off + n_query]
+            off += n_query
+            p_ar = lg[0:B + 1]                       # confirmed row + S rows -> predict positions c0..c0+B
+            target = p_ar.argmax(dim=-1).to(torch.int32).cpu().tolist()
+            result = verify_greedy(drafts, target)  # emitted = drafts[:k] + bonus; num_accepted = k
+            k = result.num_accepted
+            n_proposed += len(drafts); n_accepted += k
+            # STEP-0a de-risk: attribute THIS step's acceptance to the prior step's k (which selected the
+            # replica that produced these carried drafts). If accept-after-k>=1 >> accept-after-k=0, the
+            # fused cap is the k=0 bonus-conditioning effect and dissolves as diff_acc rises (see
+            # docs/TRAINING_PLAN_ACCEPTANCE.md §"Step 0"). None on the very first (bootstrap) block.
+            prev_k = getattr(req, "_tidar_drafts_from_k", None)
+            if prev_k is not None and not norep:
+                bykacc.append((prev_k, len(drafts), k))
+            # next block starts AFTER the bonus (committed += drafts[:k]+bonus). R_r[0] sits at
+            # position c0+1+r, so the replica drafting the post-bonus block is R_{k+1}, not R_k.
+            r_sel = max(0, min(B - 1, k + 1))
+            if norep:
+                # probe: next drafts from a fresh block_predict (extra fwd) — isolates the verify path
+                next_drafts = None  # filled after the commit (needs updated cached_len); see below
+            elif layout is not None:                    # segmented: R_{r_sel} lives at these packed rows
+                rrows = layout["replica_rows"][r_sel][1]
+                next_drafts = [int(x) for x in lg[rrows].argmax(dim=-1).cpu().tolist()]
+            else:                                       # flat: replicas are the contiguous tail rows
+                rep_rows = lg[B + 1:].reshape(B, B, vocab)  # [replica r, token m, V]
+                next_drafts = [int(x) for x in rep_rows[r_sel].argmax(dim=-1).cpu().tolist()]
+
+            if dump and getattr(self, "_tidar_dump_count", 0) < 8:
+                # capture ALL replicas' argmax [B][B] (not just the selected one) so the dump can tell
+                # a selection/shift bug (some R_r matches gt) from a conditioning/fidelity bug (none do).
+                if layout is not None:
+                    reps_all = [[int(x) for x in lg[rr].argmax(dim=-1).cpu().tolist()]
+                                for (_r, rr) in layout["replica_rows"]]
+                else:
+                    reps_all = lg[B + 1:].reshape(B, B, vocab).argmax(dim=-1).cpu().tolist()
+                dump_cap.append(dict(req=req, c0=c0, drafts=list(drafts), target=list(target),
+                                     k=k, r_sel=r_sel, reps=reps_all, next_drafts=list(next_drafts),
+                                     bp0=bp0_map.get(id(req))))
+
+            # emitted tokens, truncate at EOS
+            keep: List[int] = []
+            eos = False
+            for tok in result.emitted:
+                keep.append(tok)
+                if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
+                    eos = True
+                    break
+            n_emitted += len(keep)
+            # confirmed@c0 already in pool + its KV computed this step; drafts[:k] already staged at
+            # c0+1..c0+k (their KV computed this step); write only the bonus (emitted[-1]) at c0+len(keep).
+            bonus_col = c0 + len(keep)
+            c_rows.append(req.table_idx); c_cols.append(bonus_col); c_vals.append(keep[-1])
+            req.input_ids = torch.cat([req.input_ids, torch.tensor(keep, dtype=req.input_ids.dtype)])
+            req.cached_len = c0 + len(keep)   # KV valid through c0+len(keep)-1 (confirmed + drafts[:k])
+            req.device_len = req.cached_len + 1
+            req._tidar_drafts = next_drafts
+            req._tidar_drafts_from_k = k  # STEP-0a: k that selected R_{r_sel} producing next_drafts
+            finished = eos or (not req.can_decode)
+            # CCA state after the last KV-committed query token = query row len(keep)-1 (confirmed=row0,
+            # drafts[:k] = rows 1..k; len(keep)=k+1 -> last committed row = k).
+            if cca_state_indices is not None and not finished:
+                install_batch_idx.append(i)
+                install_t_index.append(len(keep) - 1)
+            if keep:
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=keep[0], finished=finished,
+                                           extra_tokens=keep[1:]))
+            # free the speculative query KV cols beyond the committed prefix (rejected drafts + replicas)
+            free_start = div_ceil(req.cached_len, ps) * ps
+            free_end = div_ceil(c0 + n_query, ps) * ps
+            if free_end > free_start:
+                free_chunks.append(page_table[req.table_idx, free_start:free_end])
+            if finished:
+                new_finished_reqs.add(req)
+
+        if c_vals:
+            self.token_pool[
+                torch.tensor(c_rows, dtype=torch.int64, device=device),
+                torch.tensor(c_cols, dtype=torch.int64, device=device),
+            ] = torch.tensor(c_vals, dtype=self.token_pool.dtype, device=device)
+        if free_chunks:
+            self.cache_manager._free(torch.cat(free_chunks))
+        if cca_state_indices is not None and install_batch_idx:
+            md = batch.cca_metadata
+            sel = torch.tensor(install_batch_idx, dtype=torch.long, device=device)
+            slots = cca_state_indices.to(torch.long)[sel]
+            t_index = torch.tensor(install_t_index, dtype=torch.long, device=device)
+            self.engine.cca_state.install_verify_state(md.conv_scratch, md.prev_scratch, slots, t_index)
+
+        if dump and dump_cap:
+            self._tidar_fused_dump(dump_cap, B, mask_id, new_finished_reqs)
+
+        if norep:
+            # probe: next drafts from a fresh block_predict on the committed prefix (snapshot/restores
+            # the just-installed CCA state internally). Correctness-only — this makes the step 2-forward.
+            still = [req for (req, _, _, _, _) in per_req if req not in new_finished_reqs]
+            if still:
+                boot = self._tidar_block_predict(still, B, mask_id)
+                for r, d in zip(still, boot):
+                    r._tidar_drafts = d
+
+        for req in new_finished_reqs:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+        self.finished_reqs = new_finished_reqs
+        self.send_result(reply)
+
+        t_end = _tstamp()
+
+        # MINISGL_SPEC_DEBUG=1: fused acceptance stats (the two-forward path logs [spec] separately).
+        # accept_rate = accepted drafts / proposed (B/req/step); emitted/step includes the bonus token.
+        if os.environ.get("MINISGL_SPEC_DEBUG") == "1":
+            st = getattr(self, "_fused_stats", None)
+            if st is None:
+                st = self._fused_stats = {"prop": 0, "acc": 0, "emit": 0, "steps": 0, "byk": {},
+                                          "t_stage": 0.0, "t_fwd": 0.0, "t_commit": 0.0}
+            st["prop"] += n_proposed; st["acc"] += n_accepted; st["emit"] += n_emitted; st["steps"] += 1
+            for pk, nd, ka in bykacc:  # STEP-0a: bucket accept by the prior step's k
+                b = st["byk"].setdefault(pk, [0, 0])
+                b[0] += nd; b[1] += ka
+            if timeit:  # STEP-0.5 cost breakdown (only meaningful with the syncs enabled)
+                st["t_stage"] += t_stage - t0; st["t_fwd"] += t_fwd - t_stage
+                st["t_commit"] += t_end - t_fwd
+            if st["steps"] % 50 == 0:
+                ar = st["acc"] / max(1, st["prop"])
+                # accept-after-prior-k: if k>=1 buckets >> k=0 bucket, the fused cap is the k=0
+                # bonus-conditioning effect → dissolves as diff_acc rises (training gate 0a).
+                byk = "  ".join(f"prevk={pk}:{b[1]}/{b[0]}={b[1]/max(1,b[0]):.2f}"
+                                for pk, b in sorted(st["byk"].items()))
+                logger.info_rank0(
+                    f"[spec-fused] step={st['steps']} accept_rate={ar:.2f} "
+                    f"draft_accepted={st['acc']}/{st['prop']} emitted/step={st['emit']/st['steps']:.2f}")
+                logger.info_rank0(f"[spec-fused-0a] accept-by-prior-k:  {byk}")
+                if timeit:
+                    n = st["steps"]
+                    logger.info_rank0(
+                        f"[spec-fused-time] ms/step  stage={1e3*st['t_stage']/n:.1f}  "
+                        f"forward={1e3*st['t_fwd']/n:.1f}  commit={1e3*st['t_commit']/n:.1f}  "
+                        f"total={1e3*(st['t_stage']+st['t_fwd']+st['t_commit'])/n:.1f}")
+
+    def _tidar_fused_dump(self, cap: List[dict], B: int, mask_id: int, finished: Set[Req]) -> None:
+        """DIAGNOSTIC (MINISGL_TIDAR_DUMP=1): per-step draft-vs-reference dump for the fused replica
+        mechanism — the systematic gate the reference `single_forward_ours.py --check-drafts` runs, to
+        replace the plateaued blind one-at-a-time fixes. For a few steps it compares, POSITION BY
+        POSITION, every replica R_0..R_{B-1} and the SELECTED next_drafts (R_{r_sel}) against:
+          * ``gt`` = a fresh `_tidar_block_predict` on the just-committed prefix (the TWO-FORWARD path
+            that measures 0.20 accept) — the ground-truth next block we WANT next_drafts to equal; and
+          * the verify targets / bonus.
+        It prints, for each R_r, a positionwise match string vs ``gt`` (direct) and vs ``gt`` shifted
+        one position (drop R_r[0]). That separates the hypotheses:
+          * SELECTION bug  — some R_r == gt but r != r_sel  -> fix r_sel.
+          * SHIFT bug      — gt == R_r[1:] (the 'shift' column matches) -> drop the bonus-position token.
+          * CONDITIONING   — no R_r matches gt at any shift, yet R_k[0] == bonus -> the replica for a
+            rejection boundary conditions on the rejected draft[k], not the bonus (structural).
+          * FIDELITY bug   — R_k[0] != bonus -> the fused forward itself diverges from block_predict
+            (mask/positions/conv in the paged port), not an algorithm choice.
+        `_tidar_block_predict` is state-neutral (snapshot/restore + page-free), so calling it here does
+        not perturb the served stream; skip finished reqs (can't re-forward)."""
+        def match(a: List[int], b: List[int]) -> str:
+            return "".join("." if x == y else "X" for x, y in zip(a, b))
+        for e in cap:
+            req = e["req"]
+            if req in finished:
+                continue
+            self._tidar_dump_count = getattr(self, "_tidar_dump_count", 0) + 1
+            k, r_sel, target = e["k"], e["r_sel"], e["target"]
+            drafts, reps, nd = e["drafts"], e["reps"], e["next_drafts"]
+            bonus = target[k]                                  # committed token after k accepts
+            rk = min(k, B - 1)                                 # replica conditioned on the accepted drafts
+            bp0 = e.get("bp0")                                 # block_predict(pre-step committed) == ideal R_0
+            gt = self._tidar_block_predict([req], B, mask_id)[0]   # two-forward next block (conditions on bonus)
+            logger.info_rank0(f"[tidar-dump] #{self._tidar_dump_count} c0={e['c0']} k={k}/{B} r_sel={r_sel}")
+            logger.info_rank0(f"  S drafts   = {drafts}")
+            logger.info_rank0(f"  p_ar targ  = {target}  bonus=target[{k}]={bonus}")
+            if bp0 is not None:
+                logger.info_rank0(
+                    f"  FIDELITY: R_0={reps[0]}  bp0(2fwd)={bp0}  R_0==bp0[{match(reps[0], bp0)}]"
+                    f"  (mismatch => fused forward != block_predict = a PORT bug)")
+            logger.info_rank0(f"  gt(2-fwd)  = {gt}   <- want next_drafts == this")
+            for r in range(B):
+                direct = match(reps[r], gt)
+                shift = match(reps[r][1:], gt[: B - 1])
+                tag = " <== r_sel" if r == r_sel else (" (R_k)" if r == rk else "")
+                logger.info_rank0(f"  R_{r} = {reps[r]}  vs-gt[{direct}] vs-gt-shift1[{shift}]{tag}")
+            logger.info_rank0(
+                f"  next_drafts= {nd}  vs-gt[{match(nd, gt)}]   "
+                f"FIDELITY R_k[0]={reps[rk][0]} bonus={bonus} match={reps[rk][0] == bonus}")
 
     def _spec_decode_step(self, reqs: List[Req]) -> None:
         spec = self.engine.spec_config
@@ -630,6 +1097,20 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             batch.gdn_metadata = build_gdn_metadata(batch, gdn_state_indices, device)
             batch.gdn_metadata.capture_verify_state = True
             batch.gdn_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
+
+        # CCA-hybrid (ZAYA): same lossless-verify pattern as GDN. Build the varlen (prefill-style)
+        # CCA metadata (spec_verify already routes there) with capture ON: the CCA layer stashes the
+        # per-token conv window + prev_hs (reconstructed in torch, no kernel — see capture_cca_verify_state)
+        # and the scheduler installs the accepted-prefix state below. Without this the verify forward
+        # advances CCA state to the last (rejected) draft with no rollback → not lossless.
+        cca_state_indices = None
+        if self.cca_slots is not None:
+            from minisgl.cca.metadata import build_cca_metadata
+
+            cca_state_indices = self.cca_slots.state_indices(batch)
+            batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, device)
+            batch.cca_metadata.capture_verify_state = True
+            batch.cca_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
         # Draft-head proposers also need the target's hidden states at the verified positions; the
@@ -726,7 +1207,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # captured the state after each token; install scratch index committed-1 (state after the
             # last committed token). committed == len(keep) >= 1 (always >= the 1 bonus token) for a
             # non-EOS-truncated, still-running seq. Finished reqs free their slot, so state is moot.
-            if gdn_state_indices is not None and not finished:
+            if (gdn_state_indices is not None or cca_state_indices is not None) and not finished:
                 gdn_install_batch_idx.append(i)
                 gdn_install_t_index.append(len(keep) - 1)
 
@@ -786,6 +1267,17 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             t_index = torch.tensor(gdn_install_t_index, dtype=torch.long, device=device)
             self.engine.gdn_state.install_verify_state(
                 md.conv_scratch, md.ssm_scratch, slots, t_index
+            )
+
+        # CCA: install the captured accepted-prefix conv window + prev_hs into each still-running seq's
+        # slot (same install_batch_idx/t_index bookkeeping — a model is GDN XOR CCA, never both).
+        if cca_state_indices is not None and gdn_install_batch_idx:
+            md = batch.cca_metadata
+            sel = torch.tensor(gdn_install_batch_idx, dtype=torch.long, device=device)
+            slots = cca_state_indices.to(torch.long)[sel]
+            t_index = torch.tensor(gdn_install_t_index, dtype=torch.long, device=device)
+            self.engine.cca_state.install_verify_state(
+                md.conv_scratch, md.prev_scratch, slots, t_index
             )
 
         # Carry the fresh target hidden seeds to the next propose (replaces the consumed step's seeds

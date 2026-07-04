@@ -8,7 +8,7 @@
 
 void launch_flash_prefill_paged(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                 const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
-                                double, int64_t, int64_t, int64_t, int64_t);
+                                double, int64_t, int64_t, int64_t, int64_t, const float*, int64_t);
 void launch_flash_prefill_paged_fp8(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                                     const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                                     double, double, double, int64_t, int64_t, int64_t, int64_t);
@@ -19,7 +19,8 @@ at::Tensor flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
                                const at::Tensor& v_cache, const at::Tensor& block_table,
                                const at::Tensor& cu_seqlens_q, const at::Tensor& context_lens,
                                double scale, int64_t causal, int64_t sliding_window,
-                               int64_t max_seqlen_q, int64_t kv_block_stride) {
+                               int64_t max_seqlen_q, int64_t kv_block_stride,
+                               const std::optional<at::Tensor>& mask_bias) {
   TORCH_CHECK(q.dim() == 3, "q must be [total_q_tokens, num_q_heads, head_dim]");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
               "k/v_cache must be [num_blocks, block_size, num_kv_heads, head_dim]");
@@ -27,9 +28,23 @@ at::Tensor flash_prefill_paged(const at::Tensor& q, const at::Tensor& k_cache,
   TORCH_CHECK(block_table.scalar_type() == at::kInt && cu_seqlens_q.scalar_type() == at::kInt
               && context_lens.scalar_type() == at::kInt, "block_table/cu_seqlens_q/context_lens int32");
   TORCH_CHECK(q.is_contiguous(), "q must be contiguous");  // k/v_cache may be strided (kv_block_stride)
+  // Optional TiDAR / structured additive mask: [total_q, max_kv] fp32, indexed [packed_q_row, kpos].
+  // 0 = allowed, -inf = denied; added to the scaled score pre-softmax (fused calls pass causal=0).
+  const float* mask_ptr = nullptr;
+  int64_t mask_stride = 0;
+  if (mask_bias.has_value()) {
+    const auto& mb = *mask_bias;
+    TORCH_CHECK(mb.dim() == 2 && mb.size(0) == q.size(0),
+                "mask_bias must be [total_q, max_kv] with total_q == q.size(0)");
+    TORCH_CHECK(mb.scalar_type() == at::kFloat && mb.is_contiguous(),
+                "mask_bias must be contiguous float32");
+    mask_ptr = mb.data_ptr<float>();
+    mask_stride = mb.size(1);
+  }
   auto out = at::empty_like(q);
   launch_flash_prefill_paged(q, k_cache, v_cache, block_table, cu_seqlens_q, context_lens, out,
-                             scale, causal, sliding_window, kv_block_stride, max_seqlen_q);
+                             scale, causal, sliding_window, kv_block_stride, max_seqlen_q,
+                             mask_ptr, mask_stride);
   return out;
 }
 
@@ -58,7 +73,7 @@ at::Tensor flash_prefill_paged_fp8(const at::Tensor& q, const at::Tensor& k_cach
 TORCH_LIBRARY(attn_prefill_paged, m) {
   m.def("flash_prefill_paged(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, "
         "Tensor cu_seqlens_q, Tensor context_lens, float scale, int causal, int sliding_window, "
-        "int max_seqlen_q, int kv_block_stride=0) -> Tensor");
+        "int max_seqlen_q, int kv_block_stride=0, Tensor? mask_bias=None) -> Tensor");
   m.def("flash_prefill_paged_fp8(Tensor q, Tensor k_cache, Tensor v_cache, Tensor block_table, "
         "Tensor cu_seqlens_q, Tensor context_lens, float scale, float k_descale, float v_descale, "
         "int causal, int sliding_window, int max_seqlen_q, int kv_block_stride=0) -> Tensor");

@@ -9,9 +9,11 @@ __all__ = ["SpecConfig", "SPEC_ALGORITHMS"]
 # "eagle3" = a SEPARATE EAGLE3 draft checkpoint (3 captured target aux layers fused -> 1-layer GQA
 # trunk -> compressed draft vocab), run as a linear chain. "dflash" = a SEPARATE DFlash draft
 # checkpoint (N captured target aux layers fused as a per-layer KV prefix -> N-layer GQA trunk),
-# block-diffusion: ONE bidirectional forward emits a whole block of candidate tokens. All reuse the
+# block-diffusion: ONE bidirectional forward emits a whole block of candidate tokens. "tidar" =
+# SELF-DRAFT block-diffusion on the target itself (no separate checkpoint): one causal target forward
+# over [confirmed | mask×B] drafts a whole block (the OPD-tuned ZAYA1-8B TiDAR path). All reuse the
 # same verify cycle, only the proposer changes (see SPEC_DECODE.md §4/§6).
-SPEC_ALGORITHMS = ("ngram", "mtp", "eagle3", "dflash")
+SPEC_ALGORITHMS = ("ngram", "mtp", "eagle3", "dflash", "tidar")
 
 
 @dataclass(frozen=True)
