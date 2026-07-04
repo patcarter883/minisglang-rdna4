@@ -160,3 +160,18 @@ clean (seg qlen=29, sizes [1,2,4], no stride assert / NaN); `fused-verify GRAPH 
 graph-on) output BYTE-IDENTICAL to GRAPH=0 (eager fused) on all 4 prompts. The dispatch-free fused
 forward is lossless. The throughput payoff still needs the acceptance-training round (fused accept
 0.04-0.09 today is model-limited); S4 removes the dispatch tax, training fills emitted/step.
+
+**Dispatch-tax win MEASURED (`TIME=1`, steady-state step 200-250, byte-identical output so
+emitted/step is identical → the delta is purely dispatch):**
+
+| GRAPH | forward ms | stage ms | commit ms | total ms | tok/s @ emit 1.33 |
+|-------|-----------:|---------:|----------:|---------:|------------------:|
+| 8 (graph-on) | ~45.7 | ~1.3 | 1.5 | **~48.4** | ~27.6 |
+| 0 (eager)    | ~60.8 | ~2.0 | 1.5 | **~64.3** | ~20.7 |
+
+⇒ **1.33× on the fused forward (60.8→45.7 ms) and 1.33× end-to-end (64.3→48.4 ms).** The forward is
+~95% of the step (stage+commit ≈3 ms combined now that W8A16 killed the OLDMOE dequant flood), so the
+graph win is NOT diluted by the un-captured CPU stage/commit. This COMPOUNDS with the acceptance-
+training lever: the same 48 ms graph-on step at a trained accept ~0.5 (emitted/step ~3-4) ≈ 70 tok/s.
+Today fused graph-on (~27.6 tok/s) is still below AR graph-on (v0 36.7 tok/s) purely because
+emitted/step≈1.33 (accept 0.08) — the fused path only overtakes AR once acceptance is trained up.

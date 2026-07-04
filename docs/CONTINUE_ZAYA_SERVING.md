@@ -49,10 +49,15 @@ all 4 prompts, with `fused-verify GRAPH REPLAY engaged` confirming the captured 
 NOT yet committed — code + docs sit in the working tree. Open items below.
 
 ## NEXT after S4 (pick up here)
-- **ITL measurement** — S4 proves lossless; now measure the actual dispatch-tax removal (fused
-  graph-on vs graph-off tok/s). Note the *throughput* payoff is capped until the acceptance-training
-  round lands (fused accept 0.04-0.09 today is model-limited, not a kernel issue) — S4 removes the
-  dispatch tax, training fills emitted/step. Both levers compound.
+- **ITL measurement — DONE (2026-07-04).** `TIME=1`, byte-identical output → pure-dispatch delta:
+  fused forward 60.8→45.7 ms (**1.33×**), step total 64.3→48.4 ms (**1.33× end-to-end**, tok/s
+  20.7→27.6 @ emitted/step 1.33). Forward is ~95% of the step (stage+commit ≈3 ms), so no dilution.
+  Compounds with acceptance-training (same 48 ms step @ trained accept ~0.5 ≈ 70 tok/s). Details in
+  `docs/V2_CCA_VERIFY_CAPTURE.md` §"S4 RESULT". ⇒ the remaining lever is emitted/step:
+- **Acceptance-training round** (the emitted/step lever) — fused accept 0.04-0.09 is model-limited,
+  not a kernel issue. Round-2 = pos0-protect loss + reasoning on-policy corpus
+  (`docs/TRAINING_PLAN_ACCEPTANCE.md`; `zaya/megatron/tidar_mcore.py` has the pos0-protect hook). This
+  is what makes fused overtake AR (today fused graph-on 27.6 < AR graph-on 36.7 purely on emit≈1.33).
 - **Multi-req batch (bs>1) fused replay** — S4 replays only at EXACT captured bs (the fused scheduler
   builds input_ids/positions/out_loc/custom_mask over `reqs`, not `padded_reqs`, so a padded batch
   under-fills the static buffers). Non-exact bs falls back to eager (still lossless). To capture the
