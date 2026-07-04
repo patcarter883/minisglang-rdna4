@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd /home/pat/code/minisgl-rdna4
+cd "$(dirname "$0")/.."
 echo "########## STEP 1: lossless gate + new propose timing ##########"
 bash tools/run_mla_spec_graph.sh
 echo "########## STEP 2: tok/s sweep EAGER (GRAPH_SPEC=0) ##########"
