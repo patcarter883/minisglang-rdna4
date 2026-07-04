@@ -109,8 +109,32 @@ IDENTICAL to eager on all 4 prompts (`GRAPH VERIFY == EAGER VERIFY: PASS`). The 
 a-captured-verify-graph machinery (S1 attn + S2 CCA-state static buffers + S3 wiring) is correct.
 Run: `FUSED=0 W8A16=1 GRAPH=8 tools/run_tidar_window.sh`.
 
-## S4 — the FUSED custom-mask forward (crown jewel, after S3 is green)
-Add static max-width `mask_bias` + §7.6 positions buffers to `HIPAttnBackend`
-(`prepare_verify_for_replay` recomputes the mask/positions for the current `c0` eagerly into the static
-buffer); route `_spec_decode_step_tidar_fused` through the captured graph. Gate: fused CCA spec, graph
-on, token-identical to eager fused + the ~4× ITL.
+## S4 — the FUSED custom-mask forward (crown jewel) — PRECISE PLAN (mapped 2026-07-04)
+Fully scoped after mapping the fused forward. It is a SEPARATE capture path from the K+1 verify (S1-S3),
+because the fused forward differs on THREE axes the K+1 machinery doesn't cover:
+  * **qlen** = `1+B+B²` (flat, 21 @B4) or `1+B+B·(tp+B)` (seg, 29) — NOT `K+1`. So a distinct capture
+    shape: `VerifyCaptureBuffer.init(max_bs, fused_qlen, ...)` and CCA scratch at `Q=fused_qlen`.
+  * **custom `mask_bias`** `[total_q, max_kv]` (dense, `causal=0`) — its `max_kv=c0+n_query` GROWS each
+    step. Needs a STATIC max-width buffer `[max_bs*fused_qlen, max_seq_len]` in `HIPAttnBackend`; the
+    scheduler-built mask is copied into it per replay (kernel bounds reads by `cache_seqlens`, stale
+    tail ignored — same trick as page_table). The `attn_prefill_paged` mask-bias arg reads it live.
+  * **§7.6 positions** — depend on `c0`; static positions buffer refreshed per step (already in vbuf).
+
+### Concrete pieces (each additive; validate at the routing step)
+1. `HIPAttnBackend.init_fused_verify_capture(max_seq_len, bs_list, fused_qlen)` — static page_table +
+   cache_seqlens + cu_q(=arange*fused_qlen) + **custom_mask buffer** `[max_bs*fused_qlen, max_pages*ps]`;
+   `prepare_fused_verify_for_{capture,replay}(batch)` fill them + copy `batch.attn_metadata.custom_mask`
+   into the static buffer (pad rows to max width) + set `metadata.custom_mask = static[:tq, :max_kv]`.
+2. `CCAVerifyGraphCapture` at `Q=fused_qlen` (already parameterised on num_draft→Q; pass `fused_qlen-1`).
+   seg_lens=[fused_qlen]*bs (uniform), is_prefill=True, has_initial_state, capture_verify_state=True.
+3. `GraphRunner.capture_fused_verify_graphs` (mirror `capture_verify_graphs`) + `can_use_fused_verify`
+   (`spec_verify` AND all `extend_len==fused_qlen`) + `replay_fused_verify`. Scheduler calls the capture
+   after building the TiDAR proposer (knows B → fused_qlen from `fused_paged_layout`).
+4. Route `_spec_decode_step_tidar_fused` `forward_verify` through `can_use_fused_verify`/`replay_fused`
+   (the scheduler already builds positions/out_loc/input_ids/custom_mask/cca_metadata eagerly → copy
+   into the static buffers, replay, slice). The mask-build + verify-state install stay eager.
+
+### Gate: fused CCA spec, `--graph N`, graph-on output BYTE-IDENTICAL to eager fused (the losslessness
+diff) + the ~4× ITL. Note the fused throughput payoff also needs the acceptance-training round (fused
+accept is model-limited 0.07-0.20 today); S4 removes the dispatch tax, training fills emitted/step.
+STATUS: spec'd, not implemented — a focused multi-step effort needing GPU validation at step 4.
