@@ -40,11 +40,17 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
-@SUPPORTED_ATTENTION_BACKENDS.register("triton_rdna4")
-def create_triton_rdna4_backend(config: ModelConfig):
-    from .triton_rdna4 import TritonRDNA4Backend
+def create_rdna4_backend(config: ModelConfig):
+    # RDNA4 attention: native HIP kernels by default (MINISGL_ATTN_HIP=1); the tuned Triton
+    # unified_attention is only the MINISGL_ATTN_HIP=0 opt-out — hence the rename off "triton".
+    from .rdna4 import RDNA4Backend
 
-    return TritonRDNA4Backend(config)
+    return RDNA4Backend(config)
+
+
+SUPPORTED_ATTENTION_BACKENDS.register("rdna4")(create_rdna4_backend)
+# Deprecated alias so existing configs / --attention-backend flags still resolve.
+SUPPORTED_ATTENTION_BACKENDS.register("triton_rdna4")(create_rdna4_backend)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register("mla")

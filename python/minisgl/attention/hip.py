@@ -2,7 +2,7 @@
 (``torch.ops.attn_hip.flash_prefill``) + native HIP paged flash-DECODE
 (``torch.ops.attn_decode.flash_decode_paged``). No Triton kernel is invoked on either path.
 
-Subclasses ``TritonRDNA4Backend`` ONLY to reuse its ``__init__`` (kvcache / scale / page_size /
+Subclasses ``RDNA4Backend`` ONLY to reuse its ``__init__`` (kvcache / scale / page_size /
 fp8 detection) and ``prepare_metadata`` (which builds the ``RDNA4Metadata`` page-table +
 cu_seqlens_q + cache_seqlens that both kernels consume). ``forward`` is fully overridden.
 
@@ -27,14 +27,14 @@ from typing import TYPE_CHECKING, List
 import torch
 from minisgl.core import get_global_ctx
 
-from .triton_rdna4 import RDNA4Metadata, TritonRDNA4Backend
+from .rdna4 import RDNA4Backend, RDNA4Metadata
 
 if TYPE_CHECKING:
     from minisgl.core import Batch
     from minisgl.models import ModelConfig
 
 
-class HIPAttnBackend(TritonRDNA4Backend):
+class HIPAttnBackend(RDNA4Backend):
     def __init__(self, config: "ModelConfig") -> None:
         super().__init__(config)
         # Import here (not at module top) so the kernel packages are only required when the
@@ -61,8 +61,8 @@ class HIPAttnBackend(TritonRDNA4Backend):
                 return self._forward_prefill(q, k, v, metadata)
             # Radix-hit / chunked extend: Q = new tokens, K/V = paged prefix + new (just stored),
             # prefix-offset causal. Native HIP attn_prefill_paged kernel (Triton-free; fp8 variant
-            # folds the per-tensor descale). The helper is inherited from TritonRDNA4Backend but
-            # calls ONLY torch.ops.attn_prefill_paged.* — no Triton kernel runs on this path.
+            # folds the per-tensor descale). The helper is inherited from RDNA4Backend but
+            # calls ONLY attn_prefill_paged.* — no Triton kernel runs on this path.
             return self._hip_prefill_paged(q, layer_id, metadata)
         # Decode phase: a spec-decode VERIFY batch carries max_seqlen_q = K+1 > 1 (multi-query
         # against the paged prefix), so it takes the extend kernel — exactly like a radix-hit

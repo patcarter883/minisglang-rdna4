@@ -27,11 +27,14 @@ class RDNA4Metadata(BaseAttnMetadata):
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
-class TritonRDNA4Backend(BaseAttnBackend):
-    """Tuned RDNA4 (gfx1201) unified prefill+decode attention, lifted from vLLM's
-    ``triton_attn``. Phase 1a: bf16 KV via the engine's torch store, 2D grid, Triton-heuristic
-    tuning (no 3D flash-decode / autotuner yet — those land in Phase 1b/4). cudagraph capture
-    is not yet supported: run with ``--cuda-graph-max-bs 0``."""
+class RDNA4Backend(BaseAttnBackend):
+    """RDNA4 (gfx1201) prefill+decode attention. By DEFAULT (``MINISGL_ATTN_HIP=1``) it dispatches to
+    the native HIP flash kernels (``attn_decode`` / ``attn_hip`` / ``attn_prefill_paged``) — no Triton
+    kernel runs. The tuned Triton ``unified_attention`` path (lifted from vLLM's ``triton_attn``) is
+    the ``MINISGL_ATTN_HIP=0`` opt-out only; hence the rename off the old ``triton_rdna4`` name. A
+    head_dim the HIP prefill kernels don't cover (not 64/128/256) raises rather than silently using
+    Triton. cudagraph capture is not yet supported here: run with ``--cuda-graph-max-bs 0`` (the
+    ``hip`` subclass adds decode capture)."""
 
     # Number of parallel tiled-softmax segments for the 3D flash-decode path
     # (matches vLLM's NUM_PAR_SOFTMAX_SEGMENTS default; the autotuner refines it later).
@@ -128,7 +131,17 @@ class TritonRDNA4Backend(BaseAttnBackend):
                 # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset causal
                 # mask. fp8 variant folds the per-tensor descale (bf16 + fp8 KV both covered).
                 return self._hip_prefill_paged(q, layer_id, metadata)
-            # unsupported head_dim -> fall through to Triton.
+            # Native-HIP is on but there is no HIP prefill kernel for this head_dim. Do NOT silently
+            # fall through to the Triton kernel (a different code path with different numerics) — that
+            # silent fallback was the misleading behaviour behind this backend's old "triton_rdna4"
+            # name. Fail loud instead.
+            raise RuntimeError(
+                f"native-HIP attention (MINISGL_ATTN_HIP=1) has no prefill kernel for head_dim="
+                f"{self.config.head_dim} (supported: 64/128/256). Set MINISGL_ATTN_HIP=0 to use the "
+                f"Triton unified_attention fallback instead."
+            )
+        # Deliberate Triton path: reached ONLY when MINISGL_ATTN_HIP=0 (an explicit opt-out for
+        # A/B / debugging), never as a silent fallback from the native-HIP path above.
         out = torch.empty_like(q)
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
@@ -266,7 +279,7 @@ class TritonRDNA4Backend(BaseAttnBackend):
     # --- cudagraph capture: not yet supported (Phase 4). Boot with --cuda-graph-max-bs 0. ---
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         raise NotImplementedError(
-            "triton_rdna4 cudagraph capture lands in Phase 4; run with --cuda-graph-max-bs 0"
+            "rdna4 cudagraph capture lands in Phase 4; run with --cuda-graph-max-bs 0"
         )
 
     def prepare_for_capture(self, batch: Batch) -> None:
