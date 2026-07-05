@@ -28,32 +28,26 @@ progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.m
 1. Maximise RDNA4 strengths — native fp8/int4 WMMA, 3D flash-decode, `waves_per_eu` tuning.
 2. **Nothing dequants to F16** — I/O bf16, compute fp8 (e4m3fn), accumulate f32.
 3. Clean, tidy, agent+human-maintainable — small typed modules, Protocol-based backends.
-4. The W4A8 kernel is a **dependency** from `vllm-gfx1201/w4a8_fp8_wmma/` (never copied); all
-   quantized GEMMs route through `quant/kernels.py` so a different kernel backend can drop in.
+4. The custom HIP kernels are a **dependency** built from the canonical `rdna4-hip-kernels/` repo
+   (never copied into this repo); all quantized GEMMs route through `quant/kernels.py` so a
+   different kernel backend can drop in.
 
-## Running (combined image, via the GPU lease)
+## Running (via the GPU lease)
 
-GPU work goes through the shared-box `flock` lease (never hand-set devices/ports). The lease is the
-bare `gpu-lease` command on `$PATH` (canonical repo `/home/pat/code/gpu-lease`, installed via
-`lease install`; the old `.../scripts/gpu-lease.sh` path is gone):
+The purpose-built minisglang image (`Dockerfile` + `docker-compose.yml`) is the only serving
+configuration — see `docs/LEAN_IMAGE.md`. GPU work goes through the shared-box `flock` lease (never
+hand-set devices/ports): the bare `gpu-lease` command on `$PATH` (canonical repo
+`/home/pat/code/gpu-lease`, installed via `lease install`).
 
 ```bash
-gpu-lease -n 1 -- bash -c '
-  docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
-    --security-opt seccomp=unconfined --security-opt label=disable \
-    --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
-    -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES \
-    -v '"$PWD"':/engine \
-    -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
-    -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
-    --entrypoint bash vllm22-w4a8:combined -lc "
-      source /app/.venv/bin/activate
-      pip install -q msgpack pyzmq prompt_toolkit accelerate
-      PYTHONPATH=/engine/python python /engine/tools/boot_smoke.py --model Qwen/Qwen3-0.6B"'
-```
+# build (CPU only — kernel compiles need no GPU/lease):
+docker compose build
 
-The engine image should eventually bake the deps (`FROM vllm22-w4a8:combined` + pip install — see
-PERF_NOTES B1) instead of installing per run.
+# 35B AWQ MoE serve (TP=2):
+gpu-lease -n 2 --detach --name leanmoe -- docker compose --profile serve up -d
+docker compose -p lease-leanmoe logs -f serve   # follow boot
+docker compose -p lease-leanmoe down            # stop -> frees the lease
+```
 
 ## Tools
 
