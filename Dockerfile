@@ -1,72 +1,98 @@
-ARG CUDA_VERSION=12.8.1
-ARG UBUNTU_VERSION=24.04
-ARG PYTHON_VERSION=3.12
+# syntax=docker/dockerfile:1
+#
+# minisgl-rdna4 — LEAN serving image. NOT based on the vllm image (vllm22-w4a8:combined); contains
+# ONLY what minisglang needs to run on gfx1201 (RDNA4):
+#
+#   * ROCm 7.2.1 runtime + toolchain (hipcc / rocWMMA / hipBLASLt) — the -complete base
+#   * torch built for ROCm 7.2 with the gfx1201 (RDNA4) fat binary
+#   * the engine's pure-python deps (server + message + tokenizer + model-load)
+#   * the custom HIP kernels, built HERE from the CANONICAL repo `rdna4-hip-kernels` — never the
+#     vendored copies that used to live in this repo or in vllm-gfx1201.
+#
+# No vllm, no sglang, no flashinfer, no triton, no sgl_kernel — the native-HIP serve path needs none
+# of them (fused MoE routing/align + SiLU + attention + GDN + RMSNorm/RoPE all come from the
+# canonical kernels; sampling is pure torch).
+#
+# The canonical kernels are outside this repo's build context, so `docker compose` injects them as a
+# named additional build context (`kernels` -> /home/pat/code/rdna4-hip-kernels). Building standalone:
+#   docker build -f Dockerfile.lean --build-context kernels=/home/pat/code/rdna4-hip-kernels \
+#       -t minisgl-rdna4:lean .
 
-# Build stage
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+FROM rocm/dev-ubuntu-24.04:7.2.1-complete
 
-ARG PYTHON_VERSION
-
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} \
-    python${PYTHON_VERSION}-dev \
-    python${PYTHON_VERSION}-venv \
-    python3-pip \
-    curl \
+        python3 python3-dev python3-venv python3-pip git build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv package manager
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# Isolated venv (Ubuntu's system python is PEP-668 externally-managed).
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/opt/rocm/bin:$PATH \
+    PIP_NO_CACHE_DIR=1
 
-WORKDIR /app
+# --- torch for ROCm 7.2, with the gfx1201 (RDNA4) arch in the fat binary --------------------------
+# Nightly channel: torch 2.10 ROCm stable wheels are not yet published, and this is the same
+# ROCm-7.2 / gfx1201 combination the kernels are compiled against (hipcc 7.2.53211 in this base).
+# Pin TORCH_SPEC to a known-good build after the first green run to make the image reproducible.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/nightly/rocm7.2
+ARG TORCH_SPEC=torch
+RUN pip install --pre ${TORCH_SPEC} --index-url ${TORCH_INDEX} \
+ && python -c "import torch; assert torch.version.hip, 'not a ROCm torch'; \
+print('torch', torch.__version__, 'hip', torch.version.hip)"
 
-# Copy all source files (editable install requires source to exist)
-COPY pyproject.toml ./
-COPY python/ ./python/
+# --- engine runtime deps (only what minisglang imports on the serve path) -------------------------
+# server: fastapi/uvicorn/pydantic/starlette + openai (OpenAI-compatible API) ; message: msgpack/pyzmq ;
+# model load: transformers/tokenizers/safetensors/huggingface-hub/accelerate/modelscope/sentencepiece/
+# einops ; cli: prompt_toolkit ; util: numpy/psutil. NB: NO apache-tvm-ffi (the tvm_ffi paths are the
+# disabled pynccl/JIT build path — the combined image never had it and serve works without it).
+RUN pip install \
+        "transformers>=4.56" tokenizers safetensors "huggingface-hub" accelerate modelscope \
+        sentencepiece einops \
+        numpy msgpack pyzmq psutil \
+        fastapi uvicorn pydantic starlette prompt_toolkit openai
 
-# Create venv and install dependencies
-RUN uv venv --python=python${PYTHON_VERSION} /app/.venv \
-    && . /app/.venv/bin/activate \
-    && uv pip install -e . \
-    && uv pip install torch-c-dlpack-ext
+# --- build the custom HIP kernels from the CANONICAL repo (source of truth) ------------------------
+# Each subdir of rdna4-hip-kernels is an independent kernel-builder package with a no-Nix local
+# build (local/build_local.sh -> hipcc, gfx1201). We build every serve-path package and collect its
+# importable python module (torch-ext/<pyname>) under /opt/kernels, which goes on PYTHONPATH. The
+# import name of each module already matches what the engine imports (gdn_hip, mla_hip, tail_hip, …);
+# only cca is exposed as `zaya_cca` (the engine is repointed to that name in the same change).
+ARG KERNELS_REF=2e12103
+COPY --from=kernels . /opt/rdna4-hip-kernels
+RUN set -eux; mkdir -p /opt/kernels; \
+    for pkg in \
+        gdn:gdn_hip \
+        cca:zaya_cca \
+        mla:mla_hip \
+        attn_hip:attn_hip \
+        attn_decode:attn_decode \
+        attn_prefill_paged:attn_prefill_paged \
+        w4a8_fp8_wmma:w4a8_fp8_wmma \
+        moe:moe_hip \
+        moe_splitk:moe_splitk_hip \
+        swiglu:swiglu_hip \
+        tail:tail_hip ; do \
+      dir="${pkg%%:*}"; mod="${pkg##*:}"; \
+      echo "=== building canonical kernel: ${dir} -> import ${mod} ==="; \
+      ( cd "/opt/rdna4-hip-kernels/${dir}" && GPU_ARCHS=gfx1201 bash local/build_local.sh ); \
+      ln -sfn "/opt/rdna4-hip-kernels/${dir}/torch-ext/${mod}" "/opt/kernels/${mod}"; \
+    done; \
+    python - <<'PY'
+# Import-check every collected kernel module (registers torch.ops.<mod>_C.*). No GPU needed to load.
+import sys; sys.path.insert(0, "/opt/kernels")
+for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
+          "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","swiglu_hip","tail_hip"]:
+    __import__(m); print("ok import", m)
+PY
 
-# Runtime stage
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS runtime
-
-ARG PYTHON_VERSION
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python${PYTHON_VERSION} \
-    python${PYTHON_VERSION}-venv \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash --uid 1001 minisgl
-
-# Copy application from builder
-COPY --from=builder --chown=minisgl:minisgl /app /app
-
-# Create cache directories
-RUN mkdir -p /app/.cache/huggingface /app/.cache/tvm-ffi /app/.cache/flashinfer \
-    && chown -R minisgl:minisgl /app/.cache
-
-WORKDIR /app
-
-# Environment configuration
-ENV CUDA_HOME=/usr/local/cuda
-ENV PATH="${CUDA_HOME}/bin:/app/.venv/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
-ENV PYTHONUNBUFFERED=1
-
-# Set up cache directories
-ENV HF_HOME=/app/.cache/huggingface
-ENV TVM_FFI_CACHE_DIR=/app/.cache/tvm-ffi
-ENV FLASHINFER_WORKSPACE_BASE=/app/.cache/flashinfer
-
-USER minisgl
+# /opt/kernels first so the canonical builds are authoritative; the engine source is mounted at
+# /engine by compose (PYTHONPATH prepended there). ROCm serve needs the RCCL-via-torch path.
+ENV PYTHONPATH=/opt/kernels \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1 \
+    TORCH_BLAS_PREFER_HIPBLASLT=0
 
 EXPOSE 1919
-
-ENTRYPOINT ["python", "-m", "minisgl"]
-CMD ["--help"]
+WORKDIR /engine
+CMD ["python", "-m", "minisgl", "--help"]

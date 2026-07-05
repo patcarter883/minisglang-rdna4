@@ -1,179 +1,75 @@
-# MiniSGL-RDNA4 serving stack (shared ROCm image vllm22-w4a8:combined + this repo's HIP kernels).
+# minisgl-rdna4 serving stack — a from-scratch, purpose-built image (Dockerfile), NOT the vllm image.
 #
-# This repo mounts its source into the shared image (it is NOT baked — see CLAUDE.md "Container-run
-# conventions"). The six native HIP kernel packages (gdn_hip, attn_decode, attn_hip,
-# attn_prefill_paged, tail_hip, moe_hip) are AOT-compiled, and their .so are gitignored, so a checkout must
-# build them once before serving. The `build` profile does exactly that (CPU-only, no GPU/lease).
+# The image is built for minisglang: ROCm 7.2.1 + torch(gfx1201) + the engine's python deps + the
+# custom HIP kernels built from the CANONICAL `rdna4-hip-kernels` repo. No vllm, sglang, flashinfer,
+# triton, or sgl_kernel.
 #
-# GPU work is leased through the shared-box arbiter; launch the serve profile THROUGH it so the
-# lease injects ROCR/HIP_VISIBLE_DEVICES + LEASE_NAME and binds to the container's lifetime:
+# The engine SOURCE is hot-mounted at /engine (edit-and-restart), but the kernels come from the image
+# (/opt/kernels, canonical) — the repo no longer vendors them.
 #
-#   LEASE=/home/pat/code/vllm-gfx1201/scripts/gpu-lease.sh
-#
-#   # 1) one-time AOT build of the HIP kernels (CPU only — NO lease):
-#   docker compose --profile build up --abort-on-container-exit
-#
-#   # 2) serve (radix prefix-cache on). --detach binds the lease to the container:
-#   $LEASE -n 1 --detach -- docker compose --profile serve up -d
-#   docker compose --profile serve logs -f          # follow boot
-#   $LEASE -n 1 --detach -- docker compose --profile serve down   # stop + release
-#
-# `serve` depends_on `build` (service_completed_successfully), so `--profile serve up` alone also
-# builds first if you skip step 1 — the build runs inside the lease then (harmless, CPU-fast on a
-# warm build). Override the model/port/etc via a .env file or the shell (see ${VARS} below).
+# Usage (GPU work leased through the shared arbiter; --detach binds the lease to the container):
+#   # build (CPU only — kernel compiles need no GPU/lease):
+#   docker compose build
+#   # serve (single card):
+#   gpu-lease -n 1 --detach -- docker compose --profile serve up -d
+#   docker compose --profile serve logs -f
+#   gpu-lease -n 1 --detach -- docker compose --profile serve down
 
-x-minisgl-common: &minisgl-common
-  image: vllm22-w4a8:combined
+x-lean-common: &lean-common
+  image: minisgl-rdna4:lean
+  build:
+    context: .
+    dockerfile: Dockerfile
+    additional_contexts:
+      # The canonical kernels live outside this repo's build context — inject them by name.
+      kernels: ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}
   restart: "no"
   working_dir: /engine
+  devices:
+    - /dev/kfd:/dev/kfd
+    - /dev/dri:/dev/dri
+  group_add: [video]
+  security_opt: [seccomp=unconfined, label=disable]
+  cap_add: [SYS_PTRACE]
+  ipc: host
+  shm_size: "16gb"
   volumes:
-    # Mount this repo as /engine (source + the HIP packages' built .so live here).
+    # Engine source (kernels are NOT here anymore — they come from /opt/kernels in the image).
     - .:/engine
-    # HuggingFace cache (model snapshots) — offline at run time.
     - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-  environment: &minisgl-env
-    # gdn_hip + the four serve-path packages import from the repo root; engine from python/.
-    PYTHONPATH: /engine/python:/engine
-    GPU_ARCHS: gfx1201
+  environment: &lean-env
+    # /opt/kernels (canonical HIP kernels, baked into the image) FIRST so nothing under /engine can
+    # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
+    # moe_bf16 / rxf, still vendored here until ported upstream).
+    PYTHONPATH: /opt/kernels:/engine/python:/engine
+    HF_HUB_OFFLINE: "1"
+    TORCH_BLAS_PREFER_HIPBLASLT: "0"
+    # The lease injects the leased card set; these MUST stay distinct (physical id vs 0-based
+    # re-index) — see CLAUDE.md visible-devices recipe.
+    ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
+    HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
+    MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
 
 services:
-  # --- AOT build of the six native HIP kernel packages (CPU only; NO GPU device / lease) ---
-  build:
-    <<: *minisgl-common
-    # In both profiles so `--profile serve up` can resolve+run it via serve's depends_on, while
-    # `--profile build up` runs it standalone (CPU, no lease).
-    profiles: ["build"]
-    container_name: minisgl-hip-build
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        source /app/.venv/bin/activate
-        set -e
-        for pkg in gdn_hip attn_decode attn_hip attn_prefill_paged tail_hip moe_hip mla_hip swiglu_hip; do
-          echo "=== AOT build: $$pkg ==="
-          ( cd /engine/$$pkg && GPU_ARCHS=gfx1201 python setup.py build_ext --inplace )
-        done
-        echo "=== all HIP kernel packages built ==="
-
-  # --- Serve (radix prefix-cache ON; native-HIP Triton-free path on by default) ---
+  # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
   serve:
-    <<: *minisgl-common
+    <<: *lean-common
     profiles: ["serve"]
-    container_name: ${LEASE_NAME:-minisgl}-serve
+    container_name: ${LEASE_NAME:-minisgl-lean}-serve
     restart: unless-stopped
-    # depends_on:
-    #   build:
-    #     condition: service_completed_successfully
-    # ROCm device passthrough is MANDATORY (else is_rocm() -> False and boot crashes).
-    devices:
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
-    group_add: [video]
-    security_opt: [seccomp=unconfined, label=disable]
-    cap_add: [SYS_PTRACE]
-    ipc: host
-    shm_size: "16gb"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
-    volumes:
-      - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-      # Warm Triton cache (the GDN/attention autotune) — shared with vllm-gfx1201's combined image.
-      - ${MINISGL_TRITON_CACHE:-/home/pat/code/vllm-gfx1201/.triton-cache-combined}:/root/.triton
-    environment:
-      <<: *minisgl-env
-      HF_HUB_OFFLINE: "1"
-      TORCH_BLAS_PREFER_HIPBLASLT: "0"
-      # The lease injects the leased card set; these two MUST stay distinct (physical id vs its
-      # 0-based re-index) — setting both to the physical id breaks whenever card 1 is leased.
-      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
-      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
-      # Native-HIP serve path: on by default; set =0 for a pure-Triton / torch debug A/B.
-      MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
-      MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
-      # fp8 (e4m3) KV cache on by default — halves KV bytes; native HIP fp8 paged-decode +
-      # fp8 paged/chunked-prefill carry it end-to-end. Set =0 for bf16 KV.
-      MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
-      # Diagnostics: when set to a path, the engine captures a decode-step Chrome trace then no-ops
-      # (see engine._maybe_profile). Inert/empty on a normal serve.
-      MINISGL_PROFILE: "${MINISGL_PROFILE:-}"
-      MINISGL_PROFILE_SKIP: "${MINISGL_PROFILE_SKIP:-40}"
-      MINISGL_PROFILE_STEPS: "${MINISGL_PROFILE_STEPS:-50}"
-      # Per-layer GPU-time attribution (gdn/attn/ffn split); empty = off. See models/qwen3_5.py.
-      MINISGL_LAYER_PROF: "${MINISGL_LAYER_PROF:-}"
-      # W4A8-MoE sub-step attribution (route/align/cast/gemm/silu/gather); empty = off. quant/kernels.py.
-      MINISGL_MOE_PROF: "${MINISGL_MOE_PROF:-}"
     entrypoint: ["bash", "-lc"]
-    # --disable-pynccl is passed explicitly as a call-site marker; on ROCm it is also the code
-    # default now (see EngineConfig.use_pynccl / server/args.py). The PyNCCL path (pynccl.cu) is
-    # CUDA-only — apache-tvm-ffi (absent from the shared image) + NVIDIA NCCL (nccl227.h / -lnccl,
-    # not RCCL). Off → tp>1 collectives route through torch.distributed backend="nccl" (→ RCCL).
     command:
       - |
-        source /app/.venv/bin/activate
-        pip install -q msgpack pyzmq prompt_toolkit accelerate 2>&1 | tail -1
         exec python -m minisgl \
           --model "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" \
           --host 0.0.0.0 --port 1919 \
           --cache-type radix \
           --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
           --page-size 16 \
-          --tp 2 \
+          --tp "${MINISGL_TP:-2}" \
           --disable-pynccl \
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
-
-  # --- GLM-4.7-Flash (glm4_moe_lite) TP=2: absorbed MLA + AWQ MoE, fp8 latent KV, decode graph ---
-  # The 31B AWQ model (~19 GB) does NOT fit one 16 GB card -> TP=2 only. Own profile so it doesn't
-  # co-launch with `serve`. Launch under a 2-card lease:
-  #   $LEASE -n 2 --detach --name glm -- docker compose --profile glm up -d
-  #   docker compose -p lease-glm logs -f glm     # follow boot (deps + load + capture)
-  #   docker compose -p lease-glm down            # stop -> frees the lease
-  # NO --attention-backend: the engine force-selects the capture-capable 'mla' backend (+ page16).
-  # fp8 KV (MINISGL_KV_FP8=1) ~doubles the latent-KV token pool; MINISGL_MOE_SCATTER=0 keeps the
-  # MoE-decode graph-safe (the scatter atomicAdd is not capturable). Tunables are ${GLM_*}-overridable.
-  glm:
-    <<: *minisgl-common
-    profiles: ["glm"]
-    container_name: glm-${LEASE_NAME:-local}
-    restart: unless-stopped
-    devices:
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
-    group_add: [video]
-    security_opt: [seccomp=unconfined, label=disable]
-    cap_add: [SYS_PTRACE]
-    ipc: host
-    shm_size: "16gb"
-    ports:
-      - "${GLM_HOST_PORT:-1919}:1919"
-    volumes:
-      - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-      - ${MINISGL_TRITON_CACHE:-/home/pat/code/vllm-gfx1201/.triton-cache-combined}:/root/.triton
-    environment:
-      <<: *minisgl-env
-      HF_HUB_OFFLINE: "1"
-      TORCH_BLAS_PREFER_HIPBLASLT: "0"
-      # Physical id vs its 0-based re-index — keep distinct (see CLAUDE.md visible-devices recipe).
-      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0,1}"
-      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0,1}"
-      MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"            # e4m3 latent KV cache (~2x token pool)
-      MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"  # graph-safe gather_reduce MoE decode
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        source /app/.venv/bin/activate
-        pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil 2>&1 | tail -1
-        exec python -m minisgl \
-          --model "${GLM_MODEL:-QuantTrio/GLM-4.7-Flash-AWQ}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --tensor-parallel-size "${GLM_TP:-2}" \
-          --disable-pynccl \
-          --graph "${GLM_GRAPH:-16}" \
-          --memory-ratio "${GLM_MEMRATIO:-0.90}" \
-          --max-running-requests "${GLM_MAXRUN:-64}" \
-          --max-seq-len-override "${GLM_MAXSEQ:-40000}" \
-          ${GLM_EXTRA_ARGS:-}

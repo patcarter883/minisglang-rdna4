@@ -1,8 +1,9 @@
 # Lean serving image + canonical kernel sourcing
 
-`Dockerfile.lean` + `docker-compose.lean.yml` build a purpose-built minisglang image that is **NOT**
-based on the shared vllm image (`vllm22-w4a8:combined`). It contains only what the engine needs to
-run on gfx1201 (RDNA4), and it sources every custom HIP kernel from the **canonical**
+`Dockerfile` + `docker-compose.yml` build the purpose-built minisglang image — the **only** serving
+configuration for this repo. It is **NOT** based on the shared vllm image (`vllm22-w4a8:combined`).
+It contains only what the engine needs to run on gfx1201 (RDNA4), and it sources every custom HIP
+kernel from the **canonical**
 [`rdna4-hip-kernels`](/home/pat/code/rdna4-hip-kernels) repo — not from vendored copies in this repo
 or in `vllm-gfx1201`.
 
@@ -55,16 +56,12 @@ vendored here on non-default paths. To finish the cutover, port each into the ca
 
 ```bash
 # build (CPU only — kernel compiles need no GPU/lease):
-docker compose -f docker-compose.lean.yml build
-
-# tiny dense smoke (single card):
-gpu-lease -n 1 -- docker compose -f docker-compose.lean.yml --profile smoke up \
-  --abort-on-container-exit --exit-code-from smoke
+docker compose build
 
 # 35B AWQ MoE serve (TP=2). max-running-requests bounds the GDN state on 16 GB cards:
 MINISGL_MEM_RATIO=0.8 MINISGL_EXTRA_ARGS="--max-running-requests 16" \
   gpu-lease -n 2 --detach --name leanmoe -- \
-  docker compose -f docker-compose.lean.yml --profile serve up -d
+  docker compose --profile serve up -d
 docker compose -p lease-leanmoe logs -f serve       # follow boot
 docker compose -p lease-leanmoe down                # stop -> frees the lease
 ```
@@ -77,5 +74,5 @@ docker compose -p lease-leanmoe down                # stop -> frees the lease
   `topk_softmax` fallback), `moe_hip`/`moe_splitk_hip`, GDN kernels, and the HIP attention path — all
   from the canonical repo, with the vendored dirs removed.
 
-> The legacy `Dockerfile` (CUDA/NVIDIA upstream) and `docker-compose.yml` (mount into
-> `vllm22-w4a8:combined`) are kept for reference; the lean path above supersedes them for serving.
+> The legacy `Dockerfile` (CUDA/NVIDIA upstream) and its mount-into-`vllm22-w4a8:combined`
+> compose were removed — this purpose-built image is now the only serving configuration.
