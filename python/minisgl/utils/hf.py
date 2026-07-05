@@ -43,7 +43,13 @@ class DisabledTqdm(tqdm):
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    except _CONFIG_FALLBACK_ERRORS:
+        # ZAYA rope_scaling:false wart: AutoTokenizer builds the strict model config internally and
+        # trips validation. Pass a pre-sanitized config so it uses that instead of re-loading the raw
+        # one (cached_load_hf_config restores model_type, so the tokenizer class still resolves).
+        tokenizer = AutoTokenizer.from_pretrained(model_path, config=cached_load_hf_config(model_path))
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
         try:
