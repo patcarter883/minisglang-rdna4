@@ -1,0 +1,22 @@
+# Override: mount local model dirs into the lean serve/smoke services AND forward the ZAYA serving
+# env knobs (W8A16 quality toggle, HIP attention/tail, MoE scatter) that the base compose env block
+# doesn't pass through. Lets MINISGL_MODEL point at an on-disk ZAYA checkpoint (e.g.
+# /models/ZAYA1-8B-fp8) and drive the W8A16-vs-W8A8 A/B from the host env.
+#   docker compose -f docker-compose.lean.yml -f docker-compose.lean.models.yml --profile serve up
+x-zaya-env: &zaya-env
+  MINISGL_ZAYA_W8A16: "${MINISGL_ZAYA_W8A16:-1}"
+  MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
+  MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
+  MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
+  MINISGL_ZAYA_OLDMOE: "${MINISGL_ZAYA_OLDMOE:-0}"
+services:
+  serve:
+    volumes:
+      - /home/pat/models:/models:ro
+      - /home/pat/code/_big:/big:ro
+    environment: *zaya-env
+  smoke:
+    volumes:
+      - /home/pat/models:/models:ro
+      - /home/pat/code/_big:/big:ro
+    environment: *zaya-env
