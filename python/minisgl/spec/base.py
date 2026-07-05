@@ -144,4 +144,16 @@ def make_proposer(spec_config: "SpecConfig", engine=None) -> Proposer:
             num_draft=spec_config.num_draft,
             draft_model_path=spec_config.draft_model_path,
         )
+    if spec_config.algorithm == "tidar":
+        from .tidar import TiDARProposer
+
+        if engine is None:
+            raise ValueError("the TiDAR proposer needs the engine (model + device); none was passed")
+        # Self-draft on the target: tidar_config.json (mask id + block size) is read from the served
+        # model dir by default; --spec-draft-model-path only overrides where that config is read from.
+        return TiDARProposer(
+            engine=engine,
+            num_draft=spec_config.num_draft,
+            draft_model_path=spec_config.draft_model_path,
+        )
     raise ValueError(f"no proposer for spec algorithm {spec_config.algorithm!r}")

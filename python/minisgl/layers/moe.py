@@ -199,12 +199,14 @@ class _GroupedFP8Experts(BaseOP):
         """A/B-reference ONLY (`MINISGL_ZAYA_OLDMOE=1`): dequantize ALL experts to `dtype` -> (E,N,K).
         This materializes the full bf16 stack (every expert, both GEMMs) per forward — the transient
         the fp8 storage scheme exists to avoid. The default path never calls this (native W8A8 kernel
-        consumes `_w_op`/`_scales_op` directly)."""
-        E = self.weight.shape[0]
-        return torch.stack(
-            [(self.weight[e].float() * self.weight_scale[e]).to(dtype) for e in range(E)],
-            dim=0,
-        )
+        consumes `_w_op`/`_scales_op` directly).
+
+        VECTORIZED (2026-07-04): one whole-tensor dequant instead of a Python per-expert loop+stack.
+        The old `torch.stack([... for e in range(E)])` issued ~3E tiny kernels PER dequant × 2 GEMMs ×
+        40 layers = the ~9,300-launch/step op-flood that made the fused OLDMOE step 284ms (vs 55ms
+        native fp8); this collapses it to 3 ops. `weight_scale` (E,N,1) broadcasts over `weight` (E,N,K)
+        exactly as the per-expert `[e]` slices did — bit-identical result."""
+        return (self.weight.float() * self.weight_scale).to(dtype)
 
     def post_load(self) -> None:
         """Build the native W8A8 kernel's op-layout buffers and drop the checkpoint copies.
@@ -331,14 +333,32 @@ class MoELayer(BaseOP):
         # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc computed in the model).
         precomputed = topk_ids is not None
         if self.fp8_experts:
-            # Weight-only fp8 (ZAYA): native W8A8-fp8 grouped-MoE HIP kernel (fp8 e4m3 weights +
-            # per-output-channel f32 scale, fp8 activations) — no bf16 dequant spike, WMMA compute.
-            # Replaces the old fp8->bf16-dequant->Triton path; experts stay ~8 GB fp8 in HBM.
+            # ZAYA fp8 experts. DEFAULT = W8A16 (fp8 weights + bf16 acts): bf16-activation correctness
+            # at ~native-fp8 speed (autotuned ~56ms fused). Opt-outs: W8A16=0 -> native W8A8 fp8-act
+            # kernel (~7% faster AR, fp8-act quality); OLDMOE=1 -> legacy dequant->Triton reference. The
+            # EP (TP>1) path keeps W8A8 (the W8A16 kernel is single-rank; not EP-aware yet).
             from minisgl.quant import kernels
 
             assert precomputed, "fp8 experts use the precomputed-route path (ZAYA top-1 + MOD)"
             w13, w2 = self.gate_up_proj, self.down_proj
-            if os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1":
+            oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
+            w8a16 = os.environ.get("MINISGL_ZAYA_W8A16", "1") != "0"  # DEFAULT ON (opt out with =0)
+            fused_moe_w8a16 = None
+            if w8a16 and not oldmoe and not self.enable_ep:
+                try:  # fail-safe: envs without the built extension fall back to native W8A8 below
+                    from moe_w8a16_wmma import fused_moe_w8a16
+                except ImportError:
+                    fused_moe_w8a16 = None
+            if fused_moe_w8a16 is not None:
+                # W8A16: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack materialize),
+                # routed experts only; bf16 acts. Uses the always-present op-layout fp8 buffers
+                # (_w_op/_scales_op). Fixes the fused-TiDAR OLDMOE=1 284ms/step dequant flood.
+                final_hidden_states = fused_moe_w8a16(
+                    hidden_states.to(torch.bfloat16),
+                    w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
+                    topk_weights, topk_ids.to(torch.int32),
+                )
+            elif oldmoe:
                 # A/B reference: legacy fp8->bf16-dequant->Triton path (weights kept in post_load).
                 from minisgl.moe.fused import fused_experts_impl
 
