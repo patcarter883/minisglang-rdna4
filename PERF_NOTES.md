@@ -1,60 +1,77 @@
-# PERF_NOTES — optimization backlog (revisit once the ecosystem works)
+# PERF_NOTES — optimization backlog
 
-These are performance opportunities deliberately deferred while building for **proof-of-concept +
-correctness**. Each shim/path below is correct-but-not-optimal on purpose. Do NOT optimize these
-until a working end-to-end ecosystem (dense + W4A8 + GDN serving) exists and we have a logit-level
-oracle to keep correctness while tuning. Ordered roughly by expected payoff.
+Status legend: ✅ implemented + validated · 🔨 implemented, GPU-validation pending · ❌ open
 
-## Validation tooling (do FIRST — unblocks safe optimization)
-- **[V1] Build a logit-level oracle.** Greedy token-diff amplifies sub-ULP rounding into full
-  divergence at near-ties, so it CANNOT distinguish "correct rounding" from a bug (proven: 3D
-  flash-decode converges toward 2D as segments→1). Add a single-forward logit dump from the engine
-  + vLLM/HF and compare cosine-sim / top-1 rate / max-abs-diff. Every perf change below should be
-  gated on "logit cos-sim unchanged," not token-identity.
+## 2026-07-06 — backlog cleared (branch `perf-backlog` + canonical `rdna4-hip-kernels`)
 
-## Attention backend (`attention/triton_rdna4.py`)
-- **[A1] 3D flash-decode segment count is fixed at 64.** Over-segmentation on short sequences wastes
-  work AND adds recombination rounding (observed: more divergence from 2D at seg=64 vs seg=1). The
-  startup autotuner (Phase 1b-2) must right-size `num_par_softmax_segments` by batch × KV length,
-  and set the RDNA4-tuned launch knobs (`waves_per_eu`, `num_warps`, `num_stages`,
-  `tile_size_decode`) — currently all default to None (Triton heuristics). **This is where the
-  tuned kernel's actual RDNA4 advantage lives** (the offline gfx1201 configs show 3D + tuned
-  `waves_per_eu` is the win). Highest-payoff item here.
-- **[A2] Output buffer `torch.empty_like(q)` every forward.** Reuse a persistent output buffer
-  (also needed for cudagraph pointer stability in Phase 4).
-- **[A3] `prepare_metadata` rebuilds the page table via a Python list-comprehension + `torch.stack`
-  every step** (per-req CPU slicing → GPU). Vectorize the page-table gather; avoid per-step
-  host-side Python loops over reqs.
-- **[A4] fp8-KV store is a torch scatter** (`kvcache/mha_pool.py:store_kv`, `.to(e4m3fn)`); replace
-  with the fused `reshape_and_cache_flash` Triton kernel for less store overhead + bandwidth.
-- **[A5] fp8-KV uses a static per-tensor scale of 1.0** (direct e4m3 cast). This cost ~0.006 cos-sim
-  vs HF (0.9996→0.9935, top-1 still all-match). A calibrated/dynamic per-tensor (or per-token-head,
-  kv_quant_mode 2/3) scale would recover most of that. Add a calibration pass when accuracy matters.
+Both original gating preconditions are met (the ecosystem serves end-to-end; the logit oracle
+exists), so the whole deferred list below has been implemented. Code + HIP kernels compile clean for
+gfx1201 and register/import in the lean image; each item is marked 🔨 until its GPU logit-oracle /
+parity run is green (see `tools/` + `rdna4-hip-kernels/*/tests`), then ✅.
 
-## Phase-0 torch shims (all fp32-internal, correctness-first)
-All of these upcast to fp32 and materialize intermediates for numerical safety. Once the logit
-oracle exists, replace with fused Triton kernels (or lift vLLM's) and verify cos-sim unchanged.
-- **[S1] `layers/norm.py` RMSNorm** — `.float()` upcast + full materialization every call (incl.
-  per-head q/k norm). A fused Triton RMSNorm avoids the fp32 round-trip memory traffic. Hot path
-  (2× per layer).
-- **[S2] `layers/rotary.py` RoPE** — fp32 upcast, allocates new tensors (not in-place), re-gathers
-  cos/sin and `torch.cat`-repeats each call. Fuse into a Triton RoPE (or lift vLLM's
-  `apply_rope`), do it in-place.
-- **[S3] `layers/activation.py` silu/gelu_and_mul** — fp32 upcast + intermediate materialization.
-  Fuse SwiGLU into one Triton kernel (gate·up·act in a single pass); avoids the extra MLP-width
-  memory traffic. Hot path.
-- **[S4] `engine/sample.py`** — full-vocab `torch.sort` per row for top-k/top-p. Fine at low batch;
-  a fused sampling kernel would help at high batch. Greedy path (argmax) is already fine.
-  **(2026-07-04)** This is pure-torch **by design**, not a stray shim: the serve image
-  (`vllm22-w4a8:combined`) ships no `flashinfer`/`sgl_kernel`/`aiter`, so there is nothing fused to
-  wire to. It stays an OPEN gap whose only closers are (a) install `aiter` + wire
-  `torch.ops.aiter.top_k_top_p_sampling_from_probs` (CDNA-tuned — may be *slower* on RDNA4), or
-  (b) author a gfx1201 HIP fused sampler.
-- **[S5] `layers/embedding.py`** — `torch.where` materializes a full masked embedding tensor for
-  the TP>1 vocab-parallel gather. Minor; a masked gather kernel avoids the temporary.
+| item | what | state |
+|---|---|---|
+| [V1] | logit oracle (`tools/oracle_cmp.py`, `qwen3_5_decode_oracle_*`) | ✅ (pre-existing) |
+| [A1] | Triton seg=64 / autotuner — mooted: native HIP is the prod path | ✅ n/a |
+| [A2] | persistent attention output buffer (no per-forward `empty_like`) | ✅ live GDN capture coherent |
+| [A3] | vectorized page-table gather (was per-req list-comp + `torch.stack`) | ✅ live GDN capture coherent |
+| [A4] | fused `store_kv` kernel (cast+scale+scatter; bf16/fp16/fp8) | ✅ parity byte-exact (incl. fp8) + live |
+| [A5] | fp8-KV per-tensor scale calibration + descale plumbing (opt-in) | ✅ store byte-exact; calib opt-in |
+| [S1] | RMSNorm → native `tail_hip.rms_norm(_add)` | ✅ (prior) |
+| [S2] | RoPE → native `tail_hip.rope` | ✅ (prior) |
+| [S3] | silu (prior ✅) + **gelu** → native `tail_hip.gelu_and_mul` | ✅ parity cos 0.999999 |
+| [S4] | fused `sampler_hip` wired into `sample_impl` (no full-vocab sort) | ✅ distributional+cudagraph green + live |
+| [S5] | embedding: drop the `zeros_like` masking temporary | ✅ (provably equal) |
+| [B2] | reserve GDN/CCA recurrent-state bytes before sizing KV pages | ✅ fail-fast + co-size + boot |
+| [GC] | graph capture runs grad-free → **GDN cudagraph now works** | ✅ Qwen3.5-4B captures + coherent |
 
-## Build / infra
-- **[B1] Engine image should bake minisgl's deps.** Every ad-hoc run `pip install`s
-  msgpack/pyzmq/prompt_toolkit/accelerate into the ephemeral container. Build a proper engine image
-  `FROM vllm22-w4a8:combined` that pip-installs the engine + deps once (also bakes the W4A8 pkg).
-- **[B2] Revisit `memory_ratio` / `page_size` defaults** for RDNA4 / 16 GB once serving real models.
+## [GC] Graph capture grad-free — the real "GDN is eager" fix
+
+`GraphRunner._capture_graphs` (and `capture_verify_graphs`) ran the warmup + captured `model.forward()`
+with **autograd active** (no `inference_mode`) — while the serve forward is `@torch.inference_mode()`
+(Scheduler). With grad on, the models' in-place-on-view ops (`q_norm`/`k_norm` `forward_inplace` on a
+qkv-`split` view) trip the autograd view-guard, breaking capture. That, not any real limitation, is
+why GDN "had to run eager": `GDNGraphCapture`/`CCAGraphCapture`/MLA decode capture were all already
+wired. Wrapping both capture forwards in `torch.inference_mode()` fixes it: Qwen3.5-4B (GDN hybrid)
+now captures all decode sizes and generates coherently (France→Paris, primes 2 3 5 7 11). The stale
+"GDN/CCA cudagraph out of scope / eager only" notes are lifted; the only remaining eager paths are
+legitimate — dynamic-shape prefill and the opt-in atomicAdd MoE scatter (gated to the capturable
+`gather_reduce` under graphs, `MINISGL_MOE_SCATTER=0`).
+
+## Detail
+
+- **[A2] Output buffer.** `RDNA4Backend._get_out_buf` — one persistent `[tokens, Hq, D]` buffer,
+  grown to the largest token count, reused across eager forwards (rdna4 Triton path + both prefill
+  helpers). Safe: attention output is consumed by o_proj before the next attention call, and these
+  eager paths are never cudagraph-captured (decode-capture returns kernel-owned output).
+- **[A3] Page table.** `prepare_metadata` and `HIPAttnBackend._fill_decode_static` now gather all
+  rows in one advanced-index (`page_table[table_idx, :max:page_size]`) instead of a per-req Python
+  loop + `torch.stack`. Provably identical output; removes host-side per-req work every decode step.
+- **[A4] Fused store.** `tail_hip.store_kv(k, v, k_cache, v_cache, out_loc, k_scale, v_scale)` — one
+  kernel does cast-to-cache-dtype + per-tensor `1/scale` + scatter, replacing the torch
+  scatter+cast in `MHAKVCache.store_kv`. Covers the **default bf16** path (scale 1.0), fp16, and fp8
+  (e4m3 via `__builtin_amdgcn_cvt_pk_fp8_f32`, RNE). Parity test: `rdna4-hip-kernels/tail/tests`.
+- **[A5] fp8-KV scale.** `MHAKVCache` accumulates per-layer `|k|/|v|` amax and
+  `finalize_kv_calibration()` freezes a static per-tensor scale = amax/448; the attention fp8 ops now
+  receive that descale instead of a hardcoded 1.0. **OFF by default** (`MINISGL_KV_FP8_CALIBRATE=1`):
+  a correct static scale needs representative data + a freeze before real requests store, so it is
+  meant to be driven by a calibration harness. Default fp8-KV behaviour is byte-identical to before.
+- **[S3] gelu.** `layers/activation.py::gelu_and_mul` → `tail_hip.gelu_and_mul` (exact/erf gelu to
+  match `F.gelu(approximate="none")`), fp32 torch fallback kept for off-dtype / disabled.
+- **[S4] sampler.** `engine/_sampler_hip.py` gates the fused kernel into `sample_impl`
+  (`MINISGL_FUSED_SAMPLER=1`, soft fallback to the torch sort path). Greedy (argmax) and the grammar
+  bitmask path are unaffected. Added `sampler:sampler_hip` to the Dockerfile build list. Validate
+  with `rdna4-hip-kernels/sampler/tests/sampler_parity.py` before trusting the default-on.
+- **[S5] embedding.** `y.mul_(mask.unsqueeze(-1))` in place on the fresh gather instead of
+  `torch.where(mask, y, zeros_like(y))` — same result, no full zeros temporary. TP>1 only.
+- **[B2] memory defaults.** `_recurrent_state_bytes()` computes the GDN/CCA state-cache size from
+  arch + `max_running_req`; `_determine_num_pages` subtracts it before dividing the budget into KV
+  pages. Dense/MHA/MLA reserve 0 (unchanged); GDN/CCA now co-size the two caches automatically
+  instead of OOMing at the stock `--max-running-requests` (the old manual-cap workaround).
+
+## GPU validation gate (before flipping any 🔨 → ✅)
+1. `tail/tests/test_tail.py` green (rms/silu/**gelu**/**store_kv**/rope) under a lease.
+2. `sampler/tests/sampler_parity.py` green (greedy/determinism/distributional/cudagraph).
+3. Engine logit oracle cos-sim unchanged with A2/A3/S3/S4/S5/A4-bf16 active (bf16 serve path).
+4. GDN 35B boots at the default `--max-running-requests` (no OOM) — [B2].
+5. fp8-KV oracle (`MINISGL_KV_FP8=1`, calibration on) recovers cos-sim vs the scale-1.0 baseline — A5.

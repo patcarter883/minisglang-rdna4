@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, List
 import torch
 from minisgl.utils import nvtx_annotate
 
+from . import _sampler_hip
+
 if TYPE_CHECKING:
     from minisgl.core import Batch
 
@@ -46,6 +48,17 @@ def sample_impl(
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
 ) -> torch.Tensor:
+    # Fused native HIP sampler (temperature+softmax+top-k+top-p+multinomial in one kernel, no sort)
+    # when available; otherwise the torch reference below. Only tensor top_k/top_p route to the op
+    # (the int/float scalar forms are unused by the engine's Sampler.prepare).
+    if (
+        _sampler_hip.available()
+        and logits.is_cuda
+        and logits.dtype == torch.float32
+        and not isinstance(top_k, int)
+        and not isinstance(top_p, float)
+    ):
+        return _sampler_hip.sample(logits, temperatures, top_k, top_p)
     # torch port of the former flashinfer.sampling path (greedy goes through argmax in Sampler).
     probs = torch.softmax(logits / temperatures.unsqueeze(-1).clamp_min(1e-6), dim=-1)
     if top_k is not None:

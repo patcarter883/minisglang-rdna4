@@ -22,9 +22,11 @@ compute them on the fly from ``cu_seqlens`` when omitted (verified in 3b-3 with
 ``metadata=None``; `cumsum.py` calls `prepare_chunk_indices` itself when `chunk_indices`
 is None). MVP leaves them None; precompute is a later optimization to drop the GPU↔CPU sync.
 
-Scope (3c): TP=1, eager (no cudagraph — GDN capture is out of scope this phase), no
-spec-decode/MTP. DS-native conv state end-to-end (we own both cache and layer; 3b-3 proved
-DS is bit-exact, so no SD transpose is threaded).
+Scope (3c): TP=1, no spec-decode/MTP. DS-native conv state end-to-end (we own both cache and layer;
+3b-3 proved DS is bit-exact, so no SD transpose is threaded). GDN cudagraph capture IS supported —
+GDNGraphCapture wires the recurrent-state static buffers, and once graph capture runs grad-free
+(see GraphRunner._capture_graphs) Qwen3.5-4B captures all decode sizes + generates coherently. The
+former "eager only / out of scope" note is lifted.
 """
 
 from __future__ import annotations

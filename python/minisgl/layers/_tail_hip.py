@@ -25,6 +25,7 @@ if ENABLED:
     import tail_hip
 
     silu_and_mul = tail_hip.silu_and_mul
+    gelu_and_mul = tail_hip.gelu_and_mul
     rms_norm = tail_hip.rms_norm
     rms_norm_add = tail_hip.rms_norm_add
     rope = tail_hip.rope

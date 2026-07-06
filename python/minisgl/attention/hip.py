@@ -88,7 +88,7 @@ class HIPAttnBackend(RDNA4Backend):
         # leaked past the cold_prefill dispatch).
         cu = metadata.cu_seqlens_q.tolist()
         klen = metadata.cache_seqlens.tolist()
-        out = torch.empty_like(q)
+        out = self._get_out_buf(q)  # persistent buffer (inherited); eager prefill, never captured
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
             qlen = e - s
@@ -113,8 +113,10 @@ class HIPAttnBackend(RDNA4Backend):
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         if self.kv_is_fp8:
-            # fp8 (e4m3) paged KV: per-tensor descale folded in the kernel (store uses scale 1.0).
-            return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0)
+            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
+            # calibration off), folded in the kernel.
+            ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
+            return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0)
         return self._decode(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
 
     # ---- cudagraph capture (DECODE only) -----------------------------------------------------
@@ -154,12 +156,16 @@ class HIPAttnBackend(RDNA4Backend):
             torch.tensor(seqlens_k, dtype=torch.int32, device=dev)
         )
         gpt = get_global_ctx().page_table  # global page_size=1 table
-        for i, req in enumerate(reqs):
-            npages = (seqlens_k[i] + self.page_size - 1) // self.page_size
-            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
-            if self.page_size > 1:
-                row = torch.div(row, self.page_size, rounding_mode="floor")
-            self._cap_page_table[i, :npages].copy_(row.to(torch.int32))
+        # Vectorized gather (was a per-req Python loop): pull all rows' full max-width strided page
+        # ids at once. The captured decode kernel bounds its reads by ctx_lens, so writing the whole
+        # width (incl. the per-seq stale tail beyond npages) is equivalent to the old per-row
+        # [:npages] copy — the tail is ignored either way.
+        table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
+        rows = gpt[table_idx, : self._cap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
+        if self.page_size > 1:
+            rows = torch.div(rows, self.page_size, rounding_mode="floor")
+        ncols = rows.shape[1]
+        self._cap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
 
     def prepare_for_capture(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)

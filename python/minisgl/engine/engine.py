@@ -147,8 +147,9 @@ class Engine:
         # metadata ONLY when this is non-None — see Scheduler.__init__ / _prepare_batch /
         # _free_req_resources — so the dense path stays untouched (gdn_state is None).
         # ★ A GDN-hybrid engine MUST run the non-radix ("naive") prefix cache (GDN state is not
-        # prefix-cacheable — see GDNSlotManager) AND eager (GDN cudagraph out of scope) — both
-        # forced below / in Scheduler.__init__.
+        # prefix-cacheable — see GDNSlotManager). GDN cudagraph capture IS supported (GDNGraphCapture
+        # wires the recurrent-state static buffers; validated once _capture_graphs runs grad-free) —
+        # the old "GDN must run eager" constraint is lifted; only the naive-prefix-cache one remains.
         mc = config.model_config
         if mc.is_gdn_hybrid:
             # GDN is head-parallel under TP: each rank's linear_attn owns conv_dim/tp channels
@@ -403,6 +404,33 @@ class Engine:
 
             return {k: _cast(k, v) for k, v in load_weight(config.model_path, self.device)}
 
+    def _recurrent_state_bytes(self, config: EngineConfig) -> int:
+        """Bytes the fixed GDN/CCA recurrent-state caches will consume (they are allocated AFTER the
+        KV pool). Mirrors GDNStateCache / CCAStateCache buffer shapes so _determine_num_pages can
+        reserve them up front. Returns 0 for models with no recurrent state (dense / MHA / MLA)."""
+        mc = config.model_config
+        tp = config.tp_info.size
+        num_slots = config.max_running_req + 2  # +1 NULL + 1 dummy, matches the cache ctors
+        total = 0
+        if getattr(mc, "is_gdn_hybrid", False):
+            # conv_state (num_gdn_layers, num_slots, conv_dim, conv_kernel-1) fp32 +
+            # ssm_state  (num_gdn_layers, num_slots, num_v_heads, head_v_dim, head_k_dim) ssm_dtype
+            conv_dim = div_even(mc.gdn_conv_dim, tp)
+            conv = mc.num_gdn_layers * num_slots * conv_dim * (mc.linear_conv_kernel_dim - 1) * 4
+            ssm_itemsize = 2 if os.environ.get("MINISGL_SSM_BF16", "0") != "0" else 4
+            ssm = (
+                mc.num_gdn_layers * num_slots * div_even(mc.linear_num_value_heads, tp)
+                * mc.linear_value_head_dim * mc.linear_key_head_dim * ssm_itemsize
+            )
+            total += conv + ssm
+        if getattr(mc, "is_cca_hybrid", False):
+            # conv_states (num_cca_layers, num_slots, conv_dim, conv_kernel) fp32 +
+            # prev_hs     (num_cca_layers, num_slots, hidden_size) fp32
+            conv = mc.num_cca_layers * num_slots * mc.cca_conv_dim * mc.cca_conv_width * 4
+            prev = mc.num_cca_layers * num_slots * mc.hidden_size * 4
+            total += conv + prev
+        return total
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         mc = config.model_config
@@ -427,10 +455,26 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            # Reserve the fixed GDN/CCA recurrent-state cache, which is allocated AFTER the KV pool
+            # and scales with max_running_req. Without this the KV pool takes the whole budget and the
+            # state alloc OOMs — the reason GDN 35B on 16 GB needed a manual --max-running-requests cap
+            # ([B2]). Subtracting it up front co-sizes the two caches automatically; it is 0 for dense/
+            # MHA/MLA models, so their sizing is unchanged.
+            state_memory = self._recurrent_state_bytes(config)
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory - state_memory
+            )
             num_pages = available_memory // cache_per_page
+            if state_memory:
+                logger.info(
+                    f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
+                    f"({config.max_running_req} slots); KV pool gets the remainder"
+                )
 
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
+        assert num_pages > 1, (
+            "Not enough memory for KV cache after reserving recurrent state; reduce "
+            "--max-running-requests or --num-pages"
+        )
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
         logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")

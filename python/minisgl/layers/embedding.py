@@ -37,8 +37,9 @@ class VocabParallelEmbedding(BaseOP):
             start, count = self.vocab_range
             mask = (x >= start) & (x < start + count)
             local_idx = (x - start).clamp_(0, count - 1)
-            y = self.weight[local_idx]
-            y = torch.where(mask.unsqueeze(-1), y, torch.zeros_like(y))
+            y = self.weight[local_idx]  # fresh gather copy; zero out-of-range rows in place
+            # equivalent to torch.where(mask, y, 0) but without the full zeros_like temporary.
+            y.mul_(mask.unsqueeze(-1))
             return self._comm.all_reduce(y)
         return self.weight[x]
 
