@@ -104,6 +104,9 @@ class Engine:
         # Speculative decoding config (None unless --spec-algorithm enables it). The scheduler
         # routes to the synchronous spec loop when this is set; every spec path is gated on it.
         self.spec_config = config.spec_config
+        # Served model dir — kept so self-draft proposers (TiDAR) can read sidecar config
+        # (tidar_config.json) from the model folder without re-plumbing the path.
+        self.model_path = config.model_path
         # Expert-parallel coordinates (inert when --enable-ep is off / dp_size==1). The scheduler
         # reads these to drive the per-step common-bs lockstep over self.dp_cpu_group (built in
         # _init_dp_communication). self.ctx.ep carries the in-graph collective group for MoELayer.
@@ -528,6 +531,11 @@ class Engine:
         scheduler has copied input_ids/positions/out_loc into the static buffers). Otherwise — a
         partial-K step, or a non-MLA backend — it falls back to the eager forward."""
         assert torch.cuda.current_stream() == self.stream
+        # v2 S4: the FUSED-TiDAR custom-mask verify forward has its own captured graph (distinct qlen +
+        # a static dense mask). Check it first — its batch carries `fused_verify=True` and fused_qlen
+        # query tokens, so it never collides with the K+1 two-forward verify graph below. Logits-only.
+        if self.graph_runner.can_use_fused_verify(batch):
+            return self.graph_runner.replay_fused_verify(batch)
         if self.graph_runner.can_use_verify_graph(batch):
             return self.graph_runner.replay_verify(batch, return_hidden)
         with self.ctx.forward_batch(batch):
@@ -553,6 +561,17 @@ class Engine:
                 num_aux=num_aux,
                 hidden_size=hidden_size,
                 dtype=self.dtype,
+            )
+
+    def capture_spec_fused_verify_graphs(self, fused_qlen: int, bs_list: "list[int]") -> None:
+        """Capture the FUSED-TiDAR custom-mask verify graphs (v2 S4). Called by the scheduler when the
+        TiDAR FUSED path is enabled, after the proposer is built (it knows B → fused_qlen). No-op if
+        graphs are disabled. Logits-only (TiDAR self-draft reads verify logits, not target hidden)."""
+        if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
+            return
+        with torch.cuda.stream(self.stream):
+            self.graph_runner.capture_fused_verify_graphs(
+                model=self.model, fused_qlen=fused_qlen, bs_list=bs_list,
             )
 
     def shutdown(self) -> None:
@@ -618,9 +637,13 @@ def _adjust_config(config: EngineConfig):
             if config.page_size != 1:
                 override("page_size", 1)
                 logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
-            if config.cuda_graph_max_bs != 0:
+            # v2: CCA hybrids CAN cudagraph-capture the spec-VERIFY forward (S1 attn verify-capture +
+            # S2 CCA recurrent-state static buffers), so keep graphs on for them. The FUSED forward's
+            # non-K+1 qlen auto-falls-back to eager (can_use_verify_graph) until S4. Plain MHA / GDN
+            # (no verify capturer yet) still disable.
+            if config.cuda_graph_max_bs != 0 and not config.model_config.is_cca_hybrid:
                 override("cuda_graph_max_bs", 0)
-                logger.warning_rank0("spec-decode (non-MLA): disabling CUDA graph (verify eager)")
+                logger.warning_rank0("spec-decode (non-MLA/non-CCA): disabling CUDA graph (verify eager)")
         else:
             # Spec batches never exceed max_running_req (all running reqs verify together), so cap the
             # captured graph sizes there — a default 160 would capture huge unused decode graphs and

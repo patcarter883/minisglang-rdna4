@@ -10,6 +10,7 @@ docker run --rm \
   --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" -e TP="${TP:-2}" \
+  -e GRAPH="${GRAPH:-0}" \
   -v "$PWD":/engine \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/triton-ro:ro \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
