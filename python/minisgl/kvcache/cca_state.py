@@ -84,6 +84,31 @@ class CCAStateCache:
         self.conv_states[:, sl] = conv
         self.prev_hs[:, sl] = prev
 
+    def install_verify_state(
+        self,
+        conv_scratch: dict,
+        prev_scratch: dict,
+        slots: torch.Tensor,
+        t_index: torch.Tensor,
+    ) -> None:
+        """Install the per-token state captured by a spec-decode VERIFY forward into the live slots,
+        for every CCA layer at once (mirrors GDNStateCache.install_verify_state). ``conv_scratch`` /
+        ``prev_scratch`` map cca_layer_id -> the verify scratch ([Q, N, ...], Q=verify_max_qlen,
+        N=num_seqs). ``slots`` (long, [N]) is the CCA slot per sequence (batch order); ``t_index``
+        (long, [N]) is the per-seq token index to install (= accepted_count-1, the state AFTER the
+        last accepted/confirmed token). Replaces the snapshot + re-advance: the verify capture already
+        holds the exact accepted-prefix conv window + prev_hs, so this is a pure gather.
+
+        Vectorized: scratch[t_index[i], i] -> state_cache[layer, slots[i]] for each seq i.
+        """
+        n = slots.numel()
+        seq_ar = torch.arange(n, device=slots.device)
+        for lid in range(self.num_cca_layers):
+            cs = conv_scratch[lid]  # [Q, N, C, TP]
+            ps = prev_scratch[lid]  # [Q, N, hidden]
+            self.conv_states[lid, slots] = cs[t_index, seq_ar].to(self.conv_states.dtype)
+            self.prev_hs[lid, slots] = ps[t_index, seq_ar].to(self.prev_hs.dtype)
+
     def conv(self, cca_layer_id: int) -> torch.Tensor:
         """conv_states for one CCA layer: (num_slots, conv_dim, conv_kernel)."""
         return self.conv_states[cca_layer_id]

@@ -88,7 +88,10 @@ class HIPAttnBackend(RDNA4Backend):
         # leaked past the cold_prefill dispatch).
         cu = metadata.cu_seqlens_q.tolist()
         klen = metadata.cache_seqlens.tolist()
-        out = self._get_out_buf(q)  # persistent buffer (inherited); eager prefill, never captured
+        from minisgl._hip_engage import engaged
+        engaged("attn_hip.flash_prefill")
+        out = self._get_out_buf(q)  # persistent buffer (A2, inherited); eager prefill, never captured
+
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
             qlen = e - s
@@ -112,11 +115,14 @@ class HIPAttnBackend(RDNA4Backend):
         v_cache = self.kvcache.v_cache(layer_id)
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        from minisgl._hip_engage import engaged
         if self.kv_is_fp8:
-            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
+            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
             # calibration off), folded in the kernel.
             ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
+            engaged("attn_decode.flash_decode_paged_fp8")
             return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0)
+        engaged("attn_decode.flash_decode_paged")
         return self._decode(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
 
     # ---- cudagraph capture (DECODE only) -----------------------------------------------------
@@ -174,3 +180,144 @@ class HIPAttnBackend(RDNA4Backend):
     def prepare_for_replay(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)
         batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
+
+    # ---- spec-verify cudagraph capture (v2 S1: STANDARD K+1 causal verify, no custom mask) --------
+    # The two-forward CCA verify forward stages qlen=K+1 query tokens/seq against the paged prefix with
+    # a prefix-offset causal mask -> the inherited `_hip_prefill_paged` kernel (max_seqlen_q>1 branch).
+    # For capture, the only per-step-varying metadata the kernel reads is cache_seqlens (device_len) and
+    # the page table (a row can gain a page); both live in static buffers refreshed by
+    # `prepare_verify_for_replay` before g.replay(). cu_seqlens_q is a static arange*qlen (all q-lengths
+    # are qlen). max_seqlen_q is the fixed qlen. The kernel bounds reads by cache_seqlens, so a fixed
+    # max-width page table (stale tail ignored) is fine — same trick as decode/MLA-verify. Mirrors
+    # MLABackend.init_verify_capture / _fill_verify_static. NOTE (v2 S4): the FUSED custom-mask forward
+    # needs an additional static mask_bias + §7.6 positions buffer — see docs/V2_CCA_VERIFY_CAPTURE.md.
+    def init_verify_capture(self, max_seq_len: int, bs_list: List[int], num_draft: int) -> None:
+        dev = self.kvcache.device
+        self._vcap_max_bs = max(bs_list)
+        self._vcap_qlen = num_draft + 1
+        self._vcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._vcap_cache_seqlens = torch.ones(self._vcap_max_bs, dtype=torch.int32, device=dev)
+        self._vcap_page_table = torch.zeros(
+            self._vcap_max_bs, self._vcap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._vcap_cu_q = (
+            torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
+        )
+
+    def _verify_metadata_static(self, bs: int) -> RDNA4Metadata:
+        return RDNA4Metadata(
+            cache_seqlens=self._vcap_cache_seqlens[:bs],
+            cu_seqlens_q=self._vcap_cu_q[: bs + 1],
+            max_seqlen_q=self._vcap_qlen,
+            max_seqlen_k=self._vcap_max_pages * self.page_size,
+            page_table=self._vcap_page_table[:bs],
+            cold_prefill=False,
+        )
+
+    def _fill_verify_static(self, batch: "Batch") -> None:
+        """Refresh the static verify buffers from `batch.padded_reqs` (eager, OUTSIDE the graph).
+        cache_seqlens = device_len; page_table = each seq's page row (stale tail beyond cache_seqlens
+        is ignored by the paged-extend kernel's causal bound)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
+        self._vcap_cache_seqlens[:bs].copy_(dls)
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (req.device_len + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._vcap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_verify_for_capture(self, batch: "Batch") -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
+
+    def prepare_verify_for_replay(self, batch: "Batch") -> None:
+        self._fill_verify_static(batch)
+        batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
+
+    # ---- FUSED spec-verify cudagraph capture (v2 S4: the custom-mask single-forward) --------------
+    # The fused-TiDAR forward stages `fused_qlen = 1+B+B²` (flat) or `1+B+B·(tp+B)` (segmented) query
+    # tokens/seq and runs the paged-extend kernel with `causal=0` + a DENSE `custom_mask` [total_q,
+    # max_kv] carrying the whole block-diffusion structure. Two axes differ from the K+1 verify above:
+    #   * qlen is `fused_qlen` (fixed per (B, layout)), not `num_draft+1`;
+    #   * the kernel reads `metadata.custom_mask`, whose eager `max_kv = c0 + fused_qlen` GROWS each
+    #     step. For capture the mask must live in a STATIC max-width buffer `[max_bs*fused_qlen,
+    #     max_pages*ps]` (contiguous). Its row stride (= max_pages*ps) is then CONSTANT across capture
+    #     and every replay — the graph bakes `mask_kv_stride` once (bindings.cpp reads `mb.size(1)`),
+    #     so we ALWAYS pass the full-width slice `static[:total_q, :]`. The kernel bounds key reads by
+    #     `cache_seqlens` (= context_len ≤ max_kv), so the stale columns past context_len are ignored
+    #     — the same trick as the page table. On replay the scheduler-built `[total_q, max_kv]` mask is
+    #     copied into the static buffer's leading rows/cols; dummy-padded rows keep all-allowed (0.0)
+    #     from init (their output is discarded). See docs/V2_CCA_VERIFY_CAPTURE.md §S4.
+    def init_fused_verify_capture(self, max_seq_len: int, bs_list: List[int], fused_qlen: int) -> None:
+        dev = self.kvcache.device
+        self._fcap_max_bs = max(bs_list)
+        self._fcap_qlen = fused_qlen
+        self._fcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._fcap_max_kv = self._fcap_max_pages * self.page_size
+        self._fcap_cache_seqlens = torch.ones(self._fcap_max_bs, dtype=torch.int32, device=dev)
+        self._fcap_page_table = torch.zeros(
+            self._fcap_max_bs, self._fcap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._fcap_cu_q = (
+            torch.arange(self._fcap_max_bs + 1, dtype=torch.int32, device=dev) * fused_qlen
+        )
+        # Static max-width mask buffer (contiguous). 0.0 = all-allowed; filled per replay. Full-width
+        # slices keep a constant row stride (max_kv) across capture/replay so the graph is stable.
+        self._fcap_custom_mask = torch.zeros(
+            self._fcap_max_bs * fused_qlen, self._fcap_max_kv, dtype=torch.float32, device=dev
+        )
+
+    def _fused_verify_metadata_static(self, bs: int) -> RDNA4Metadata:
+        tq = bs * self._fcap_qlen
+        return RDNA4Metadata(
+            cache_seqlens=self._fcap_cache_seqlens[:bs],
+            cu_seqlens_q=self._fcap_cu_q[: bs + 1],
+            max_seqlen_q=self._fcap_qlen,
+            max_seqlen_k=self._fcap_max_kv,
+            page_table=self._fcap_page_table[:bs],
+            cold_prefill=False,
+            custom_mask=self._fcap_custom_mask[:tq, :],  # full-width -> constant stride
+        )
+
+    def _fill_fused_verify_static(self, batch: "Batch") -> None:
+        """Refresh cache_seqlens + page_table from `batch.padded_reqs` (eager, OUTSIDE the graph)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
+        self._fcap_cache_seqlens[:bs].copy_(dls)
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (req.device_len + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._fcap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_fused_verify_for_capture(self, batch: "Batch") -> None:
+        # Dummy capture batch: cache_seqlens = fused_qlen (cached_len 0 dummy), page table -> dummy page.
+        # Mask stays all-allowed (0.0) from init so the warmup attention is well-defined (no all-(-inf)
+        # row -> no NaN). Capture records pointers/strides only; replay overwrites the values.
+        self._fill_fused_verify_static(batch)
+        batch.attn_metadata = self._fused_verify_metadata_static(batch.padded_size)
+
+    def prepare_fused_verify_for_replay(self, batch: "Batch") -> None:
+        # The scheduler built `batch.attn_metadata.custom_mask` = [total_q_real, max_kv_real]; grab it
+        # BEFORE swapping in the static metadata, then copy into the static buffer's leading block.
+        src_mask = batch.attn_metadata.custom_mask
+        self._fill_fused_verify_static(batch)
+        tq_pad = batch.padded_size * self._fcap_qlen
+        if src_mask is not None:
+            tq, kv = src_mask.shape
+            self._fcap_custom_mask[:tq, :kv].copy_(src_mask)
+            # dummy-padded rows (if bs was rounded up): reset their read window to all-allowed so a
+            # prior replay's stale mask never denies every key (cache_seqlens bounds reads to fused_qlen
+            # for a cached_len-0 dummy). Real rows past `kv` are bounded away by cache_seqlens.
+            if tq < tq_pad:
+                self._fcap_custom_mask[tq:tq_pad, : self._fcap_qlen].zero_()
+        batch.attn_metadata = self._fused_verify_metadata_static(batch.padded_size)
