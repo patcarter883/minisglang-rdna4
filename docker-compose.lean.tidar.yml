@@ -1,0 +1,81 @@
+# minisgl-rdna4 LEAN — CONSOLIDATED TiDAR spec-decode serve (the shippable ZAYA config).
+#
+# Serves the OPD acceptance-trained TiDAR ZAYA checkpoint via the NON-FUSED self-draft path — the
+# serving-viable one — with one command instead of the ~8 env knobs the A/B harness set by hand.
+#
+# WHY THIS EXACT CONFIG (measured, see docs/zaya + the round-2/3 acceptance evals):
+#   * MODEL = OPD (zaya1-tidar-opd-fp8). OPD is the BEST block-acceptance checkpoint: round-1
+#     (conversion -> OPD) was the real +0.033 offline win; round-2 (OPD -> r2) and round-3
+#     (OPD -> r3, 21.6k MI300X steps) were both NULL/negative on the same-windows gate. So OPD, not r2/r3.
+#   * NON-FUSED self-draft (MINISGL_TIDAR_FUSED=0). The FUSED all-mask path can't realize acceptance —
+#     its mask replicas are mutually blind, accept ~0.08 == the untrained baseline. Non-fused conditions
+#     each draft position on prior accepts and realizes the acceptance the offline metric implies.
+#   * W8A16 experts (MINISGL_ZAYA_W8A16=1) for quality; HIP attn/tail; single card (fp8 fits 16GB).
+#
+# Usage (GPU leased through the shared arbiter; --detach binds the lease to the container):
+#   gpu-lease -n 1 --detach --name ztidar -- \
+#     docker compose -f docker-compose.lean.tidar.yml --profile tidar up -d
+#   docker compose -f docker-compose.lean.tidar.yml --profile tidar logs -f
+#   docker compose -f docker-compose.lean.tidar.yml -p lease-ztidar down
+#
+# Every knob stays env-overridable — the DEFAULTS are the consolidated best. To A/B the (capped)
+# fused path set MINISGL_TIDAR_FUSED=1; to serve a different ckpt set MINISGL_TIDAR_MODEL; to add
+# extra minisgl flags use MINISGL_EXTRA_ARGS. Requires the lean-zaya image (canonical moe_w8a16_wmma
+# + attn_prefill_paged mask_bias baked in): `docker compose -f docker-compose.yml build` then
+# tag/build the lean-zaya variant.
+services:
+  serve-tidar:
+    image: minisgl-rdna4:lean-zaya
+    profiles: ["tidar"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-tidar
+    restart: unless-stopped
+    working_dir: /engine
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add: [video]
+    security_opt: [seccomp=unconfined, label=disable]
+    cap_add: [SYS_PTRACE]
+    ipc: host
+    shm_size: "16gb"
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    volumes:
+      # Engine source hot-mounted (kernels come from /opt/kernels in the image, canonical).
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - /home/pat/models:/models:ro
+      - /home/pat/code/_big:/big:ro          # holds zaya1-tidar-opd-fp8 (the served ckpt)
+    environment:
+      # /opt/kernels (canonical HIP kernels) FIRST so nothing under /engine shadows them.
+      PYTHONPATH: /opt/kernels:/engine/python:/engine
+      HF_HUB_OFFLINE: "1"
+      TORCH_BLAS_PREFER_HIPBLASLT: "0"
+      # The lease injects the leased card set; physical id vs 0-based re-index stay distinct.
+      ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
+      HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
+      MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+      # ZAYA quality / kernel knobs (consolidated best).
+      MINISGL_ZAYA_W8A16: "${MINISGL_ZAYA_W8A16:-1}"
+      MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
+      MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
+      MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
+      MINISGL_ZAYA_OLDMOE: "${MINISGL_ZAYA_OLDMOE:-0}"
+      # TiDAR spec-decode: NON-FUSED (serving-viable) + segmented. FUSED=0 is the whole point.
+      MINISGL_TIDAR_FUSED: "${MINISGL_TIDAR_FUSED:-0}"
+      MINISGL_TIDAR_SEG: "${MINISGL_TIDAR_SEG:-1}"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_TIDAR_MODEL:-/big/zaya1-tidar-opd-fp8}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-1}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
+          --spec-algorithm tidar --spec-num-draft "${MINISGL_SPEC_NUM_DRAFT:-4}" \
+          ${MINISGL_EXTRA_ARGS:-}
