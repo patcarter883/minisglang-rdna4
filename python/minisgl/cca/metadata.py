@@ -25,8 +25,8 @@ computes everything else it needs (seg_pos / req_id / is_last for prefill) from 
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 
@@ -41,6 +41,18 @@ class CCAMetadata:
     query_start_loc: torch.Tensor  # int32 (num_seqs+1,) device — cu_seqlens
     state_indices: torch.Tensor  # int32 (num_seqs,) device — CCA conv slot per seq (all >= 1)
     has_initial_state: torch.Tensor | None = None  # bool (num_seqs,) device, prefill only
+    # ---- spec-decode verify capture (mirrors gdn/metadata.py). When capture_verify_state is True the
+    # CCA layer runs the varlen (prefill-style) path AND stashes, per cca_layer_id, the conv window +
+    # prev-hidden state AFTER each of the K+1 verify tokens into scratch. `verify_max_qlen` = max(K+1).
+    # The scheduler installs the state after the accepted prefix (index = accepted_count-1) into the
+    # slot (CCAStateCache.install_verify_state) — no snapshot + re-advance, bit-exact vs 1-token decode.
+    # Unlike GDN this needs NO new HIP kernel: conv_state is raw qk_new columns (a rolling window — see
+    # cca_kernel.hip), so per-token windows reconstruct in torch; prev_hs is just the prior input hs.
+    capture_verify_state: bool = False
+    verify_max_qlen: int = 0
+    conv_scratch: Dict[int, torch.Tensor] = field(default_factory=dict)  # id -> [Q, N, C, TP] fp32
+    prev_scratch: Dict[int, torch.Tensor] = field(default_factory=dict)  # id -> [Q, N, hidden] fp32
+    seg_lens: List[int] | None = None  # host per-seq extend_len (prefill/verify); sync-free segment walk
 
 
 def build_cca_metadata(
@@ -91,7 +103,60 @@ def build_cca_metadata(
         query_start_loc=query_start_loc,
         state_indices=state_indices,
         has_initial_state=has_initial,
+        seg_lens=extend_lens,
     )
 
 
-__all__ = ["CCAMetadata", "build_cca_metadata"]
+def capture_cca_verify_state(
+    md: CCAMetadata,
+    cca_layer_id: int,
+    qk_new: torch.Tensor,       # [N, C] fp32 — packed q|k inputs to the conv front-end
+    init_states: torch.Tensor,  # [num_seqs, C, TP] fp32 — cached conv window per seq (0 if fresh)
+    hs: torch.Tensor,           # [N, hidden] — input hidden states (model dtype)
+) -> None:
+    """Reconstruct + stash the per-token CCA recurrent state during a spec-decode verify forward.
+
+    NO HIP kernel: ``conv_state`` is a rolling window of RAW ``qk_new`` columns (cca_kernel.hip does
+    ``window[c,TP]=qk_new[s,c]``; ``conv_states[slot,c,i]=window[c,i+1]`` — roll left, new token at
+    tail). So the window AFTER seq i's token j is a plain unfold of ``[init_window ++ qk_new_i]``.
+    ``prev_hs`` after token j is just ``hs[token j]`` (decode does ``prev[slot]=hs``). Stashes into
+    ``md.conv_scratch/prev_scratch[cca_layer_id]`` as ``[Q, num_seqs, ...]`` (Q = verify_max_qlen);
+    the scheduler gathers index ``accepted_count-1`` (state AFTER the last accepted token).
+    """
+    num_seqs = md.num_seqs
+    Q = md.verify_max_qlen
+    C = qk_new.shape[1]
+    TP = init_states.shape[2]
+    hidden = hs.shape[1]
+    seg = md.seg_lens
+    assert seg is not None and len(seg) == num_seqs, "verify capture needs host seg_lens"
+    # v2 S2 (cudagraph): if the scratch is pre-allocated (a persistent static buffer supplied by the
+    # verify-graph capturer), WRITE IN-PLACE so the captured graph's pointer stays valid across replays.
+    # Otherwise (eager path) allocate fresh, as before. Either way the fill loop below is identical.
+    conv_scr = md.conv_scratch.get(cca_layer_id)
+    prev_scr = md.prev_scratch.get(cca_layer_id)
+    if conv_scr is None:
+        conv_scr = qk_new.new_zeros((Q, num_seqs, C, TP))            # fp32 (qk_new is fp32)
+        prev_scr = qk_new.new_zeros((Q, num_seqs, hidden))          # fp32, matches prev_hs dtype
+        md.conv_scratch[cca_layer_id] = conv_scr
+        md.prev_scratch[cca_layer_id] = prev_scr
+    else:
+        conv_scr.zero_()                                            # persistent buffer: reset last step
+        prev_scr.zero_()
+    off = 0
+    for i in range(num_seqs):
+        Li = int(seg[i])
+        s, e = off, off + Li
+        off = e
+        if Li <= 0:
+            continue
+        x = qk_new[s:e]                                             # [Li, C]
+        # stream positions: [oldest_init, ..., newest_init, x0, x1, ...] -> [TP+Li, C]
+        stream = torch.cat([init_states[i].transpose(0, 1), x], dim=0)  # [TP+Li, C]
+        windows = stream.unfold(0, TP, 1)                          # [Li+1, C, TP]; win[m]=stream[m:m+TP]
+        conv_scr[:Li, i] = windows[1 : 1 + Li]                     # window AFTER token j == win[j+1]
+        prev_scr[:Li, i] = hs[s:e].float()                        # prev after token j == hs[token j]
+    # (scratch already bound above: fresh-alloc path set the dict; persistent-buffer path wrote in place)
+
+
+__all__ = ["CCAMetadata", "build_cca_metadata", "capture_cca_verify_state"]

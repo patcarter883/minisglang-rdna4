@@ -22,6 +22,10 @@ class RDNA4Metadata(BaseAttnMetadata):
     max_seqlen_k: int
     page_table: torch.Tensor  # [bs, max_pages] page-indexed block table
     cold_prefill: bool  # prefill with no prefix-cache hit (every seq's KV == its new tokens)
+    # Fused-TiDAR structured attention mask (C.1/C.4): [total_q, max_kv] fp32 additive bias
+    # (0 allowed / -inf denied), indexed [packed_q_row, key_pos]. When set, the paged-extend kernel
+    # runs with causal=0 and lets this carry the whole block structure. None for a normal serve.
+    custom_mask: torch.Tensor | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -159,7 +163,9 @@ class RDNA4Backend(BaseAttnBackend):
             )
         # Deliberate Triton path: reached ONLY when MINISGL_ATTN_HIP=0 (an explicit opt-out for
         # A/B / debugging), never as a silent fallback from the native-HIP path above.
-        out = self._get_out_buf(q)
+        from minisgl._hip_engage import engaged
+        engaged(f"attn:TRITON_unified_FALLBACK(attn_hip={self._attn_hip},hd={q.shape[-1]})")
+        out = self._get_out_buf(q)  # A2 persistent buffer
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
         # (max_seqlen_q>1) to the 2D grid and decode (max_seqlen_q==1) to 3D flash-decode.
@@ -241,17 +247,25 @@ class RDNA4Backend(BaseAttnBackend):
         cu_q = metadata.cu_seqlens_q.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         q = q.contiguous()
+        # Fused-TiDAR: a custom_mask carries the whole block structure -> run causal=0 and let the
+        # kernel's mask_bias arg apply it. None on a normal serve (plain prefix-offset causal).
+        custom_mask = getattr(metadata, "custom_mask", None)
         if self.kv_is_fp8:
-            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
+            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
             # calibration off), folded in the kernel. Descales sit between scale and causal.
+            # fused-TiDAR custom_mask is not wired on the fp8-KV path yet.
+            assert custom_mask is None, "fused-TiDAR custom_mask not wired on the fp8-KV path yet"
             ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
                 self.scale, ks, vs, 1, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
             )
+        causal = 0 if custom_mask is not None else 1
+        from minisgl._hip_engage import engaged
+        engaged("attn_prefill_paged.flash_prefill_paged" + ("(masked)" if custom_mask is not None else ""))
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            self.scale, 1, 0, metadata.max_seqlen_q, 0,  # causal=1, sw=0, kv_block_stride=0
+            self.scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

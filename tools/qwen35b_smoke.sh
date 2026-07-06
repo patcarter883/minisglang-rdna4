@@ -44,7 +44,10 @@ PY
 }
 
 echo "===== Qwen35B base (no spec) coherence ====="
-boot "" "" && probe; stop
+boot "" "" && probe
+echo "[base] graph capture:"; grep -E "Capturing CUDA graphs|graphs captured|CUDA graph is disabled" "$LOG" | tail -3
+cp -f "$LOG" "$LOG.base" 2>/dev/null || true   # preserve before the MTP boot overwrites it
+stop
 echo
 echo "===== Qwen35B MTP (--spec-algorithm mtp --spec-num-draft 3) ====="
 boot "--spec-algorithm mtp --spec-num-draft 3" "MINISGL_SPEC_DEBUG=1" && probe

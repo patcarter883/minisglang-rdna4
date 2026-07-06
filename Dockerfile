@@ -71,6 +71,8 @@ RUN set -eux; mkdir -p /opt/kernels; \
         w4a8_fp8_wmma:w4a8_fp8_wmma \
         moe:moe_hip \
         moe_splitk:moe_splitk_hip \
+        moe_w8a16_wmma:moe_w8a16_wmma \
+        w8a8_fp8_wmma:w8a8_fp8_wmma \
         swiglu:swiglu_hip \
         sampler:sampler_hip \
         tail:tail_hip ; do \
@@ -83,7 +85,8 @@ RUN set -eux; mkdir -p /opt/kernels; \
 # Import-check every collected kernel module (registers torch.ops.<mod>_C.*). No GPU needed to load.
 import sys; sys.path.insert(0, "/opt/kernels")
 for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
-          "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","swiglu_hip","sampler_hip","tail_hip"]:
+          "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","moe_w8a16_wmma","w8a8_fp8_wmma",
+          "swiglu_hip","sampler_hip","tail_hip"]:
     __import__(m); print("ok import", m)
 PY
 

@@ -305,8 +305,10 @@ class ZayaCCAAttn(BaseOP):
             num_seqs = md.num_seqs
             # The per-token tensors below are sized by N; they only line up with the cu_seqlens if the
             # batch is exactly token-major (no padding rows — eager v0). Catch a padded/malformed
-            # batch here rather than as a cryptic kernel IndexError downstream.
-            assert int(qsl[-1].item()) == N, f"prefill cu_seqlens end {int(qsl[-1])} != num_tokens {N}"
+            # batch here rather than as a cryptic kernel IndexError downstream. Skip under cudagraph
+            # capture — `.item()` is a host sync (forbidden mid-capture) and the shapes are static there.
+            if not torch.cuda.is_current_stream_capturing():
+                assert int(qsl[-1].item()) == N, f"prefill cu_seqlens end {int(qsl[-1])} != num_tokens {N}"
             assert md.state_indices.shape[0] == num_seqs, (
                 f"state_indices {tuple(md.state_indices.shape)} must have num_seqs={num_seqs} entries"
             )
@@ -329,6 +331,14 @@ class ZayaCCAAttn(BaseOP):
                 qk_new, conv, init_states, seg_pos, req_id, slot, is_last,
                 w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
             )  # [N, C] normalized q|k; conv updated in place (only each seq's last token)
+            if md.capture_verify_state:
+                # Spec-decode verify: stash the per-token conv window + prev_hs so the scheduler can
+                # install the ACCEPTED-prefix state (no snapshot/re-advance). Uses the SAME qk_new +
+                # init_states the kernel consumed, so it is bit-consistent with the decode recurrence.
+                # The in-place last-token write above is harmless — install_verify_state overwrites it.
+                from minisgl.cca.metadata import capture_cca_verify_state
+
+                capture_cca_verify_state(md, self._cca_layer_id, qk_new, init_states, hs)
             # hs2 = previous-token hidden, per-seq shift; first token seeded by prev[slot] (zero fresh).
             hs2 = torch.empty_like(hs)
             hs2[1:] = hs[:-1]
@@ -353,6 +363,8 @@ class ZayaCCAAttn(BaseOP):
                 assert bool((real < state.num_slots).all()), (
                     f"decode: state_indices out of range [1, {state.num_slots})"
                 )
+            from minisgl._hip_engage import engaged
+            engaged("zaya_cca.cca_decode_qk")
             qk_out = zaya_cca.cca_decode_qk(
                 qk_new, conv, slot, is_pad,
                 w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
