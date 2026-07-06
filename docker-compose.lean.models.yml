@@ -11,11 +11,15 @@ x-zaya-env: &zaya-env
   MINISGL_ZAYA_OLDMOE: "${MINISGL_ZAYA_OLDMOE:-0}"
 services:
   serve:
+    # lean-zaya bakes the canonical moe_w8a16_wmma (+ attn_prefill_paged mask_bias); the vendored
+    # moe_w8a16_wmma was removed from the engine, so ZAYA serving REQUIRES this image tag.
+    image: minisgl-rdna4:lean-zaya
     volumes:
       - /home/pat/models:/models:ro
       - /home/pat/code/_big:/big:ro
     environment: *zaya-env
   smoke:
+    image: minisgl-rdna4:lean-zaya
     volumes:
       - /home/pat/models:/models:ro
       - /home/pat/code/_big:/big:ro
