@@ -33,7 +33,9 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    if _tail_hip.active(x):
+    # `_tail_hip.gelu_and_mul` is None when the baked kernel is silu-only (see _tail_hip.py) — fall
+    # back to the torch path in that case rather than calling None.
+    if _tail_hip.active(x) and _tail_hip.gelu_and_mul is not None:
         result = _tail_hip.gelu_and_mul(x.contiguous())  # exact (erf) gelu(x[:,:d]) * x[:,d:]
         if out is not None:
             out.copy_(result)

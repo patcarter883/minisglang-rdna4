@@ -25,7 +25,11 @@ if ENABLED:
     import tail_hip
 
     silu_and_mul = tail_hip.silu_and_mul
-    gelu_and_mul = tail_hip.gelu_and_mul
+    # gelu_and_mul is OPTIONAL: the canonical rdna4-hip-kernels `tail` kernel is silu-only, so a
+    # hard `tail_hip.gelu_and_mul` crashes the import on that image even for models that never use
+    # gelu (e.g. ZAYA: silu experts + a plain torch F.gelu router). Bind it if present; activation.py
+    # falls back to torch F.gelu when this is None, so a gelu-tail model still runs (just not native).
+    gelu_and_mul = getattr(tail_hip, "gelu_and_mul", None)
     rms_norm = tail_hip.rms_norm
     rms_norm_add = tail_hip.rms_norm_add
     rope = tail_hip.rope
