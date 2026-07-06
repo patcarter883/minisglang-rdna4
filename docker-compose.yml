@@ -73,3 +73,37 @@ services:
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
+
+  # ZAYA1-8B-fp8 (CCA+MoE hybrid). CCA can't tensor-parallelize, so multi-card = DP replicas
+  # (--data-parallel-size 2) behind ONE endpoint, NOT --tp. EP on by default (shards experts 8/card
+  # => ~2.2x KV pool at ~equal tok/s; toggle off by overriding MINISGL_EXTRA_ARGS). Validated serving
+  # env from docs/zaya-port/DP_EP_RESULTS.md: MOE_SCATTER=0, mem-ratio 0.90, CUDA graphs bs 1..16.
+  # The fp8 checkpoint is a local dir (not in the HF cache), so /home/pat/models is mounted at /models.
+  zaya:
+    <<: *lean-common
+    profiles: ["zaya"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-zaya
+    restart: unless-stopped
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${MODELS_DIR:-/home/pat/models}:/models
+    environment:
+      <<: *lean-env
+      MINISGL_MOE_SCATTER: "0"
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-fp8}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
+          --page-size 16 \
+          --data-parallel-size 2 \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.9}" \
+          ${MINISGL_EXTRA_ARGS:---enable-ep}
