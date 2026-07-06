@@ -206,7 +206,12 @@ class GraphRunner:
             if self.cca_capture is not None:
                 self.cca_capture.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
-            with get_global_ctx().forward_batch(batch):
+            # inference_mode around BOTH the warmup and captured forwards: capture never needs
+            # autograd, and with grad active the models' in-place-on-view ops (e.g. q_norm/k_norm
+            # forward_inplace on a qkv-split view) trip the autograd view-guard, breaking capture.
+            # Matches the serve forward path (Scheduler is @torch.inference_mode()); the offline LLM
+            # path constructs the GraphRunner outside that decorator, so make it explicit here.
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
                 self.buffer.logits[:bs] = model.forward()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
@@ -289,7 +294,7 @@ class GraphRunner:
             self.attn_backend.prepare_verify_for_capture(batch)
             vbuf.set_batch(batch)
             T = vbuf.total(batch)
-            with get_global_ctx().forward_batch(batch):
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
                 self._run_verify_into(model, vbuf, T, needs_hidden)  # warmup
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self._run_verify_into(model, vbuf, T, needs_hidden)

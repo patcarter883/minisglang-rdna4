@@ -58,6 +58,9 @@ class RDNA4Backend(BaseAttnBackend):
         else:
             self._kv_quant_mode = KVQuantMode.NONE
             self._k_descale = self._v_descale = None
+        # Persistent attention-output buffer, reused across forwards (eager paths only). See
+        # _get_out_buf; grown to the largest token count seen so no per-forward torch.empty_like.
+        self._out_buf: torch.Tensor | None = None
         # 3D flash-decode segment scratch (f32), lazily sized on first forward.
         self._seq_threshold_3D = 0
         self._segm_output: torch.Tensor | None = None
@@ -91,6 +94,20 @@ class RDNA4Backend(BaseAttnBackend):
             # full-attn) uses head_dim-dependent BR/BC=16 tiling to fit the 64 KB gfx1201 LDS. So no
             # head_dim falls back to Triton on the HIP path.
             self._hip_prefill_ok = config.head_dim in (64, 128, 256)
+
+    def _get_out_buf(self, q: torch.Tensor) -> torch.Tensor:
+        """Persistent [tokens, Hq, D] attention-output buffer, reused across forwards instead of a
+        per-call ``torch.empty_like(q)``. Safe because each layer's attention output is consumed by
+        o_proj before the next attention call (nothing retains it across two attention calls), and
+        the eager paths that use it are never cudagraph-captured (decode-capture in the hip subclass
+        returns the kernel-owned output directly, so it never routes here). Grows to the largest
+        token count seen; returns a contiguous ``[:tokens]`` slice."""
+        n = q.shape[0]
+        buf = self._out_buf
+        if buf is None or buf.shape[0] < n or buf.shape[1:] != q.shape[1:] or buf.dtype != q.dtype:
+            self._out_buf = torch.empty((n, *q.shape[1:]), dtype=q.dtype, device=q.device)
+            return self._out_buf
+        return buf[:n]
 
     def _ensure_segm_scratch(self, q: torch.Tensor) -> None:
         """Allocate the persistent f32 segment scratch for the 3D flash-decode path.
@@ -142,7 +159,7 @@ class RDNA4Backend(BaseAttnBackend):
             )
         # Deliberate Triton path: reached ONLY when MINISGL_ATTN_HIP=0 (an explicit opt-out for
         # A/B / debugging), never as a silent fallback from the native-HIP path above.
-        out = torch.empty_like(q)
+        out = self._get_out_buf(q)
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
         # (max_seqlen_q>1) to the 2D grid and decode (max_seqlen_q==1) to 3D flash-decode.
@@ -181,9 +198,11 @@ class RDNA4Backend(BaseAttnBackend):
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         if self.kv_is_fp8:
-            # fp8 (e4m3) paged KV: per-tensor descale 1.0 (store cast uses scale 1.0).
+            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
+            # MINISGL_KV_FP8_CALIBRATE=0), folded into the score/accumulator by the kernel.
+            ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
             return self._hip_decode_fp8_op(
-                q, k_cache, v_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0
+                q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0
             )
         return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
 
@@ -198,7 +217,7 @@ class RDNA4Backend(BaseAttnBackend):
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         cu = metadata.cu_seqlens_q.tolist()
-        out = torch.empty_like(q)
+        out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
             if e - s <= 0:
@@ -223,11 +242,12 @@ class RDNA4Backend(BaseAttnBackend):
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         q = q.contiguous()
         if self.kv_is_fp8:
-            # fp8 (e4m3) paged KV: per-tensor descale 1.0 (store cast uses scale 1.0), folded
-            # in the kernel. Descales sit between scale and causal in this op's signature.
+            # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
+            # calibration off), folded in the kernel. Descales sit between scale and causal.
+            ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                self.scale, 1.0, 1.0, 1, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+                self.scale, ks, vs, 1, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
             )
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
@@ -260,10 +280,14 @@ class RDNA4Backend(BaseAttnBackend):
             cu_seqlens_q = cu_seqlens_q.to(device, non_blocking=True)
 
         page_table = get_global_ctx().page_table
-        # global page table treats page_size=1; slice + rescale to page indices.
-        new_page_table = torch.stack(
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
-        )
+        # global page table treats page_size=1; gather every req's row in ONE vectorized
+        # advanced-index (was a per-req Python list-comp + torch.stack on the decode hot path),
+        # then stride + rescale to page indices. Equivalent to
+        # torch.stack([page_table[r.table_idx, :max_seqlen_k:page_size] for r in reqs]).
+        table_idx = torch.tensor(
+            [req.table_idx for req in reqs], dtype=torch.long, pin_memory=True
+        ).to(page_table.device, non_blocking=True)
+        new_page_table = page_table[table_idx, : max_seqlen_k : self.page_size]  # [bs, cols], fresh
         if self.page_size > 1:
             new_page_table.div_(self.page_size, rounding_mode="floor")
 

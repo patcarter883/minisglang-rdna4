@@ -33,6 +33,12 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    if _tail_hip.active(x):
+        result = _tail_hip.gelu_and_mul(x.contiguous())  # exact (erf) gelu(x[:,:d]) * x[:,d:]
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     return _gated(x, lambda t: F.gelu(t, approximate="none"), out)
 
 

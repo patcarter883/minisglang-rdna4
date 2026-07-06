@@ -16,8 +16,11 @@ What the CCA layer (`models/zaya.py: ZayaCCAAttn.forward`) consumes:
     recurrent conv/prev_hs state to continue from (chunked-prefill continuation). With the non-radix
     cache forced for CCA models, ``cached_len > 0`` is exactly that predicate.
 
-Scope: TP=1, eager (no cudagraph), no spec-decode/MTP (v0). The kernel computes everything else it
-needs (seg_pos / req_id / is_last for prefill) from these, built in the layer forward.
+Scope: TP=1, no spec-decode/MTP (v0). CCA cudagraph capture is wired (CCAGraphCapture provides the
+recurrent-state static buffers, same shape as GDN's) and shares the grad-free capture fix that
+unblocked GDN — Zaya end-to-end capture validation is still pending (needs the TP=2 boot), but the
+mechanism is present and the "eager only" note no longer reflects a hard limitation. The kernel
+computes everything else it needs (seg_pos / req_id / is_last for prefill) from these.
 """
 
 from __future__ import annotations
