@@ -91,6 +91,10 @@ services:
       # Native-HIP serve path: on by default; set =0 for a pure-Triton / torch debug A/B.
       MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
       MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
+      # MoE decode = graph-safe gather_reduce (default), NOT the atomic-scatter fast path (the
+      # atomicAdd is not cudagraph-capturable). Required for the decode graph capture below to be
+      # safe. Set =1 only for an eager (--cuda-graph-max-bs 0) A/B of the scatter path.
+      MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
       # fp8 (e4m3) KV cache on by default — halves KV bytes; native HIP fp8 paged-decode +
       # fp8 paged/chunked-prefill carry it end-to-end. Set =0 for bf16 KV.
       MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
@@ -120,7 +124,7 @@ services:
           --page-size 16 \
           --tp 2 \
           --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
 

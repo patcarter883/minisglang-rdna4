@@ -58,7 +58,7 @@ RUN pip install \
 # importable python module (torch-ext/<pyname>) under /opt/kernels, which goes on PYTHONPATH. The
 # import name of each module already matches what the engine imports (gdn_hip, mla_hip, tail_hip, …);
 # only cca is exposed as `zaya_cca` (the engine is repointed to that name in the same change).
-ARG KERNELS_REF=77ec5de
+ARG KERNELS_REF=f5bdc15
 COPY --from=kernels . /opt/rdna4-hip-kernels
 RUN set -eux; mkdir -p /opt/kernels; \
     for pkg in \
@@ -71,6 +71,8 @@ RUN set -eux; mkdir -p /opt/kernels; \
         w4a8_fp8_wmma:w4a8_fp8_wmma \
         moe:moe_hip \
         moe_splitk:moe_splitk_hip \
+        moe_w8a16_wmma:moe_w8a16_wmma \
+        w8a8_fp8_wmma:w8a8_fp8_wmma \
         swiglu:swiglu_hip \
         tail:tail_hip ; do \
       dir="${pkg%%:*}"; mod="${pkg##*:}"; \
@@ -82,7 +84,8 @@ RUN set -eux; mkdir -p /opt/kernels; \
 # Import-check every collected kernel module (registers torch.ops.<mod>_C.*). No GPU needed to load.
 import sys; sys.path.insert(0, "/opt/kernels")
 for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
-          "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","swiglu_hip","tail_hip"]:
+          "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","moe_w8a16_wmma","w8a8_fp8_wmma",
+          "swiglu_hip","tail_hip"]:
     __import__(m); print("ok import", m)
 PY
 
