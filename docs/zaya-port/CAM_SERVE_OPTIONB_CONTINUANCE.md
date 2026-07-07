@@ -76,6 +76,28 @@ memory-organ: `docs/serving/integration_design.md` (the data-plane, authoritativ
   `gdn/graph_capture.py`), `--graph N`, byte-identical eager-vs-graph, ~20% TPOT.
 - **Phase 3 (#5) — concurrency/per-row banks/full `/v1/memory/*`/TP** (online_api.md §3 COW swap).
 
+## ★ ALL PHASES COMPLETE 2026-07-07 (branch cam-serve-optionB, pushed) ★
+Option B (first-class residual-tap integration) is built and GPU-validated end-to-end. Commits:
+ea7423c (Task1+de-risk+Phase0), c9d1221 (parity), 1089fcb (Phase1 data plane), 876a554 (Phase1
+control plane), d49384f (Phase2 graph capture), 1a624b3 (Phase3 concurrency+stats+snapshot).
+
+- **Phase 0** — model-share build (CAMMemory from served embed_tokens+lm_head, no HF copy). Boot log
+  fires; memory-off serving coherent. Fixed tied-embed meta lm_head.weight.
+- **Phase 1** — data plane (request-driven seed-once tap via scheduler, 3/3 clean) + control plane
+  (BackendCAMRuntime + LLM.base_logits; /cam/remember|ask|facts|delete over HTTP, model-shared, 8 GB
+  duplicate gone). base_p from served model matches HF.
+- **Phase 2** — decode tap runs INSIDE the CUDA graph (CAMGraphCapture static per-row buffer). Seed-once
+  3/3 clean with --graph; always-inject proves graph-decode injection; zero bank = byte-exact no-op
+  (twosided=false).
+- **Phase 3** — per-token banks (concurrent memory+non-memory each correct, fixed prefill leak); stats
+  (GET /cam/stats crowding guard); snapshot/restore (banks+side index persist, delivery survives).
+- **Validation tools** (all in tools/, run via scratchpad/run_*.sh): tap_check, cam_serve_check
+  (parity), cam_seedonce_check (Phase1), cam_graph_check (Phase2), cam_concurrent_check + cam_phase3_check
+  (Phase3). serve_app.py = the HTTP server (MINISGL_CAM_BACKEND=1 for model-share).
+- **Follow-ons (separate scope, NOT blocking):** TP>1 store replication on rank 0 (4B is TP=1);
+  implicit-subject extraction (research); per-bank COW for edits-under-load; /v1/memory/* REST naming
+  (functionally == /cam/*); overlap-loop seed-once 1-step lag (exact under normal_loop).
+
 ## STATUS 2026-07-07 (commits ea7423c, c9d1221, 1089fcb on cam-serve-optionB)
 - **Phase 0 DONE + boot-validated.** `CAM: backend memory built …` log fires; memory-off `/generate`
   coherent. Model-share confirmed (CAMMemory from served embed_tokens+lm_head, no HF copy). Fixed the
