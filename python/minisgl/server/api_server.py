@@ -132,6 +132,21 @@ def _norm_stop(stop: list | str | None) -> List[str]:
     return [stop] if isinstance(stop, str) else list(stop)
 
 
+def _normalize_tool_args(messages: List[dict]) -> None:
+    """Chat templates expect a tool call's `function.arguments` to be a *mapping* (they call
+    `.items()` on it), but the OpenAI wire format carries it as a JSON *string*. When tool-call
+    history is replayed by a client, parse those strings back to dicts in place so the template
+    renders (else jinja raises "Can only get item pairs from a mapping")."""
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                try:
+                    fn["arguments"] = json.loads(fn["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+
 def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     """The tool specs to hand the chat template, honoring `tool_choice`. `"none"` withholds the tools
     entirely (so the model won't call one); everything else offers them and lets the model / template
@@ -143,10 +158,39 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
-# Hermes / Qwen3-style tool-call emission: one or more `<tool_call>{json}</tool_call>` blocks, each a
-# {"name": ..., "arguments": {...}} object. This is what the tool-trained chat templates instruct the
-# model to produce; we parse them back into OpenAI `tool_calls`.
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+# Tool-trained models emit tool calls inside `<tool_call>...</tool_call>` blocks, but the INNER format
+# varies by family. We parse both we've seen:
+#   (A) Hermes JSON:  {"name": "fn", "arguments": {"k": v}}
+#   (B) Qwen3 XML:    <function=fn><parameter=k>v</parameter></function>
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_XML_FN_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+def _coerce(val: str):
+    """XML params arrive as strings; coerce JSON scalars/objects (numbers, bools, arrays), else keep
+    the raw string."""
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, ValueError):
+        return val
+
+
+def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
+    """Parse one <tool_call> body (either format) -> (name, arguments_dict), or None."""
+    inner = inner.strip()
+    if inner.startswith("{"):  # (A) Hermes JSON
+        try:
+            call = json.loads(inner)
+            if call.get("name"):
+                return call["name"], call.get("arguments", {})
+        except json.JSONDecodeError:
+            pass
+    fn = _XML_FN_RE.search(inner)  # (B) Qwen3 XML
+    if fn:
+        args = {k.strip(): _coerce(v.strip()) for k, v in _XML_PARAM_RE.findall(fn.group(2))}
+        return fn.group(1).strip(), args
+    return None
 
 
 def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
@@ -154,29 +198,22 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     the <tool_call> blocks stripped (None if nothing but calls remain), `tool_calls` is the
     OpenAI-shaped list ([] when the model didn't call a tool)."""
     tool_calls: List[dict] = []
-    for i, m in enumerate(_TOOL_CALL_RE.finditer(text)):
-        try:
-            call = json.loads(m.group(1))
-            name = call.get("name")
-            if not name:
-                continue
-            args = call.get("arguments", {})
-            tool_calls.append(
-                {
-                    "id": f"call_{uid}_{i}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        # OpenAI carries arguments as a JSON *string*.
-                        "arguments": args if isinstance(args, str) else json.dumps(args),
-                    },
-                }
-            )
-        except (json.JSONDecodeError, AttributeError):
+    for i, m in enumerate(_TOOL_CALL_BLOCK_RE.finditer(text)):
+        parsed = _parse_one_tool_call(m.group(1))
+        if parsed is None:
             continue  # malformed block -> ignore, leave it in the text
+        name, args = parsed
+        tool_calls.append(
+            {
+                "id": f"call_{uid}_{i}",
+                "type": "function",
+                # OpenAI carries arguments as a JSON *string*.
+                "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)},
+            }
+        )
     if not tool_calls:
         return text, []
-    content = _TOOL_CALL_RE.sub("", text).strip()
+    content = _TOOL_CALL_BLOCK_RE.sub("", text).strip()
     return (content or None), tool_calls
 
 
@@ -422,6 +459,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         # exclude_none so tool-calling turns render cleanly (assistant content=None + tool_calls; a
         # "tool" result turn) — the chat template checks for absent keys, not explicit nulls.
         prompt = [msg.model_dump(exclude_none=True) for msg in req.messages]
+        _normalize_tool_args(prompt)  # tool_call arguments: JSON string -> dict for the template
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
