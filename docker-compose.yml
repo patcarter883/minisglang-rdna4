@@ -74,19 +74,16 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
 
-  # ZAYA1-8B TiDAR — diffusion-draft spec-decode serving of the OPD acceptance-trained checkpoint.
-  # Serves the OPD fp8 TiDAR ckpt via the NON-FUSED self-draft path (the serving-viable one: the fused
-  # all-mask path's replicas are mutually blind, accept ~0.08 == untrained baseline; non-fused
-  # conditions each draft on prior accepts). OPD is the best block-acceptance ckpt — rounds 2 & 3 were
-  # both null vs it. W8A16 experts (quality) + HIP attn/tail; single card (fp8 fits 16GB) so lease -n 1.
-  # Needs the lean-zaya image (canonical moe_w8a16_wmma + attn_prefill_paged mask_bias) and the OPD ckpt
-  # at /home/pat/code/_big. Every knob is env-overridable — the defaults ARE the consolidated best:
-  # A/B the (capped) fused path with MINISGL_TIDAR_FUSED=1; serve a different ckpt with MINISGL_MODEL
-  # (e.g. the base /models/ZAYA1-8B-fp8, which historically ran DP=2 +EP — see git history).
-  #   gpu-lease -n 1 --detach --name zaya -- docker compose --profile zaya up -d
+  # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8 — NO TiDAR spec-decode. Runs as
+  # DP=2 replicas (one per gfx1201 card) with expert-parallel (EP shards experts across the pair),
+  # so it needs BOTH cards: lease -n 2. This is the validated base-zaya serve restored from git
+  # history (was migrated to the TiDAR variant in 2c58e2e; TiDAR block recoverable from there).
+  # Serves the standard checkpoint at /models/ZAYA1-8B-fp8; override with MINISGL_MODEL. EP is on by
+  # default via the EXTRA_ARGS fallback (set MINISGL_EXTRA_ARGS to override).
+  #   gpu-lease -n 2 --detach --name minisgl-zaya -- docker compose --profile zaya up -d
   zaya:
     <<: *lean-common
-    image: minisgl-rdna4:lean-zaya           # TiDAR needs the ZAYA kernels (moe_w8a16 + mask_bias)
+    image: minisgl-rdna4:lean-zaya           # superset image (ZAYA CCA + MoE kernels)
     profiles: ["zaya"]
     container_name: ${LEASE_NAME:-minisgl-lean}-zaya
     restart: unless-stopped
@@ -94,31 +91,22 @@ services:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
       - ${MODELS_DIR:-/home/pat/models}:/models
-      - /home/pat/code/_big:/big:ro          # holds zaya1-tidar-opd-fp8 (the served ckpt)
     environment:
       <<: *lean-env
-      MINISGL_ZAYA_W8A16: "${MINISGL_ZAYA_W8A16:-1}"
-      MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
-      MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
       MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
-      MINISGL_ZAYA_OLDMOE: "${MINISGL_ZAYA_OLDMOE:-0}"
-      # TiDAR spec-decode: NON-FUSED (serving-viable) + segmented. FUSED=0 is the whole point.
-      MINISGL_TIDAR_FUSED: "${MINISGL_TIDAR_FUSED:-0}"
-      MINISGL_TIDAR_SEG: "${MINISGL_TIDAR_SEG:-1}"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     entrypoint: ["bash", "-lc"]
     command:
       - |
         exec python -m minisgl \
-          --model "${MINISGL_MODEL:-/big/zaya1-tidar-opd-fp8}" \
+          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-fp8}" \
           --host 0.0.0.0 --port 1919 \
           --cache-type radix \
           --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
           --page-size 16 \
-          --tp "${MINISGL_TP:-1}" \
+          --data-parallel-size 2 \
           --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
-          --spec-algorithm tidar --spec-num-draft "${MINISGL_SPEC_NUM_DRAFT:-4}" \
-          ${MINISGL_EXTRA_ARGS:-}
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.9}" \
+          ${MINISGL_EXTRA_ARGS:---enable-ep}
