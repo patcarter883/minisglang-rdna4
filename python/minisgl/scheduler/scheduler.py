@@ -214,6 +214,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        # Grammar-constrained decode cannot overlap: the grammar matcher must be advanced by the
+        # PREVIOUS batch's committed token BEFORE the next batch's bitmask is filled (in
+        # _schedule_next_batch). The overlap order (schedule -> forward -> process-last) leaves the
+        # mask one token stale, so a greedy model re-emits each grammar position before the matcher
+        # catches up -> doubled/garbled output. When a constrained req is live, serialize: commit +
+        # accept the last batch first, then schedule (like the spec-decode / EP host-sync loops).
+        if last_data is not None and self._grammar_matchers:
+            self._process_last_data(last_data)
+            last_data = None
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
