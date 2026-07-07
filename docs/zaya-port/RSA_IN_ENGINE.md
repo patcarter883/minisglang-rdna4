@@ -24,6 +24,10 @@ field that the agent **varies per call**:
 | `max_tokens` | int ≥1 | 8192 | per-rollout completion budget (round 0) |
 | `agg_max_tokens` | int\|null | null | budget for aggregation rounds + final selection; null → use `max_tokens` |
 | `temperature` | float ≥0 | 0.8 | rollout sampling temperature |
+| `top_p` | float (0,1] | 1.0 | nucleus sampling; **set <1.0 (e.g. 0.95) to stop rollouts wandering into never-EOS runaways that burn the full `max_tokens`** |
+| `top_k` | int ≥-1 | -1 | top-k sampling; -1 = disabled (another anti-runaway truncation lever) |
+| `ignore_eos` | bool | false | keep generating to `max_tokens` even after EOS (debugging) |
+| `stop` | list[str] | [] | stop strings; a rollout halts at the first occurrence of any |
 | `selection` | enum | `auto` | `auto` (majority vote if ≥2 boxed answers extract, else a final aggregation call), or force `majority` / `final_agg` / `sample` |
 | `max_concurrency` | int ≥1 | 16 | max in-flight internal generations for this run |
 | `max_retries` | int ≥0 | 1 | retries per failed rollout |

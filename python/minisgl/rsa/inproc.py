@@ -54,6 +54,10 @@ class InProcessBackendClient(BackendClient):
         model: str,
         temperature: float,
         max_tokens: int,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        ignore_eos: bool = False,
+        stop: Optional[List[str]] = None,
         max_retries: int = 1,
     ) -> Optional[Candidate]:
         """One chat generation through the in-process engine. Returns None on
@@ -69,7 +73,12 @@ class InProcessBackendClient(BackendClient):
                         # list of {role, content}; the tokenizer applies the chat template
                         text=messages,
                         sampling_params=SamplingParams(
-                            temperature=temperature, max_tokens=max_tokens
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            ignore_eos=ignore_eos,
+                            max_tokens=max_tokens,
+                            stop=list(stop) if stop else [],
                         ),
                     )
                 )

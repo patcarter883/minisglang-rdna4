@@ -40,6 +40,29 @@ class RSAParams(BaseModel):
         "selection call; None = use max_tokens",
     )
     temperature: float = Field(default=0.8, ge=0.0)
+    top_p: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description="nucleus sampling; <1.0 truncates the low-prob tail. Set this "
+        "(e.g. 0.95) to stop rollouts wandering into never-EOS runaways that burn "
+        "the full max_tokens budget.",
+    )
+    top_k: int = Field(
+        default=-1,
+        ge=-1,
+        description="top-k sampling; -1 = disabled, >=1 keeps only the top-k logits "
+        "(another truncation lever against runaway rollouts)",
+    )
+    ignore_eos: bool = Field(
+        default=False,
+        description="keep generating to max_tokens even after EOS (debugging; leave "
+        "False so well-behaved rollouts stop early)",
+    )
+    stop: list[str] = Field(
+        default_factory=list,
+        description="stop strings; a rollout halts at the first occurrence of any",
+    )
     selection: Selection = Field(
         default="auto",
         description="'auto': majority vote when >=2 boxed answers extract, else a "
@@ -115,6 +138,30 @@ def add_rsa_args(parser: argparse.ArgumentParser) -> None:
     )
     g.add_argument("--rsa-temperature", type=float, default=d.temperature)
     g.add_argument(
+        "--rsa-top-p",
+        type=float,
+        default=d.top_p,
+        help="nucleus sampling for rollouts; <1.0 truncates the tail (anti-runaway)",
+    )
+    g.add_argument(
+        "--rsa-top-k",
+        type=int,
+        default=d.top_k,
+        help="top-k sampling for rollouts; -1 = disabled",
+    )
+    g.add_argument(
+        "--rsa-ignore-eos",
+        action="store_true",
+        default=d.ignore_eos,
+        help="rollouts run to max_tokens even after EOS (debugging)",
+    )
+    g.add_argument(
+        "--rsa-stop",
+        action="append",
+        default=None,
+        help="stop string for rollouts (repeatable)",
+    )
+    g.add_argument(
         "--rsa-selection",
         choices=["auto", "majority", "final_agg", "sample"],
         default=d.selection,
@@ -133,6 +180,10 @@ def params_from_args(args: argparse.Namespace) -> RSAParams:
         max_tokens=args.rsa_max_tokens,
         agg_max_tokens=args.rsa_agg_max_tokens,
         temperature=args.rsa_temperature,
+        top_p=args.rsa_top_p,
+        top_k=args.rsa_top_k,
+        ignore_eos=args.rsa_ignore_eos,
+        stop=list(args.rsa_stop) if args.rsa_stop else [],
         selection=args.rsa_selection,
         max_concurrency=args.rsa_max_concurrency,
         request_timeout=args.rsa_request_timeout,
