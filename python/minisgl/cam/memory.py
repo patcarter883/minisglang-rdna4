@@ -605,6 +605,45 @@ class CAMMemory:
         """List stored (subject_ids, object_ids) associations (for /cam/facts)."""
         return [{"subject_ids": list(k), **v} for k, v in self._facts.items()]
 
+    def stats(self) -> dict:
+        """Per-bank occupancy + crowding health (online_api.md §6.2). Delivery silently degrades when a
+        bank crowds past ~9 edits, so this is the mandatory overflow guard. Counts come from the side
+        index (exact); the subject-hash routing is replayed to attribute each edit to its bank."""
+        loads = [0] * self.n_banks
+        for sids in self._facts:
+            loads[_subject_bank(list(sids), self.n_banks)] += 1
+        total = sum(loads)
+        mx = max(loads) if loads else 0
+        mean = (total / self.n_banks) if self.n_banks else 0.0
+        return {
+            "B": self.n_banks, "total_edits": total, "max_bank_load": mx,
+            "imbalance": (mx / mean) if mean else 0.0,
+            "crowded_banks": [b for b, ln in enumerate(loads) if ln > 9],
+            "banks": [{"index": b, "n_edits": ln} for b, ln in enumerate(loads) if ln > 0],
+        }
+
+    @torch.no_grad()
+    def snapshot(self, path: str) -> int:
+        """Persist the editable state — the B value banks + the side index — to `path` (the trained
+        adapter/tap/router live in the checkpoint, not here). Returns #edits saved."""
+        torch.save({"banks": [b.detach().cpu() for b in self.banks],
+                    "facts": self._facts,
+                    "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
+                             "base_model": self.meta.get("base_model")}}, path)
+        return len(self._facts)
+
+    @torch.no_grad()
+    def restore(self, path: str) -> int:
+        """Load a bank snapshot into this (already-loaded) store. Hard-fails on a bank-count / adapter
+        mismatch — a bank is only meaningful against the projections that wrote it. Returns #edits."""
+        d = torch.load(path, map_location="cpu", weights_only=False)
+        m = d.get("meta", {})
+        if int(m.get("n_banks", self.n_banks)) != self.n_banks:
+            raise ValueError(f"snapshot n_banks={m.get('n_banks')} != store n_banks={self.n_banks}")
+        self.banks = [b.to(self.device, dtype=torch.float32) for b in d["banks"]]
+        self._facts = d.get("facts", {})
+        return len(self._facts)
+
     # --- WS-C API aliases (the edit-plane calls these exact names) ---
     def list_facts(self) -> list:
         return self.facts()

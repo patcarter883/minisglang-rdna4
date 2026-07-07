@@ -307,6 +307,17 @@ async def list_facts() -> List[FactItem]:
                      object=_text(f, "object", "object_ids")) for f in lister()]
 
 
+@cam_router.get("/stats")
+async def stats() -> dict:
+    """Per-bank occupancy + crowding health (mandatory overflow guard — delivery silently degrades when
+    a bank crowds past ~9 edits). Served from the side index."""
+    runtime = _get_runtime()
+    statter = getattr(runtime.memory, "stats", None)
+    if statter is None:
+        raise HTTPException(status_code=503, detail="CAM stats unavailable")
+    return statter()
+
+
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)
 async def delete_fact(subject: str) -> DeleteResponse:
     """Tombstone-forget a subject: it stops being delivered from the serve path (bank residue
