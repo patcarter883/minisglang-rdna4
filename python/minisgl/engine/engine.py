@@ -305,6 +305,7 @@ class Engine:
             dummy_req=self.dummy_req,
             gdn_state=self.gdn_state,
             cca_state=self.cca_state,
+            cam=self.cam,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:

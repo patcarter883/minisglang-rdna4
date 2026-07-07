@@ -296,9 +296,15 @@ class Qwen3_5Model(BaseOP):
         # _capture_layer_ids). Staged per-request BEFORE forward via stage_cam(); a byte-exact no-op
         # when unstaged (guard below skips apply_tap entirely). See python/minisgl/cam/.
         self._cam = None                     # CAMMemory instance (or None)
-        self._cam_bank: torch.Tensor | None = None   # [1,K,mem] read bank for this forward
+        self._cam_bank: torch.Tensor | None = None   # [1,K,mem] single read bank (eager prefill/decode)
         self._cam_conf: torch.Tensor | None = None   # [1] retrieval-strength scalar (or None)
         self._cam_tap_layer: int | None = None       # decoder-layer index to inject after
+        # Graph-capture DECODE path (Phase 2): a static per-ROW buffer [max_bs,K,mem] + conf [max_bs].
+        # Active only while _cam_use_buf (during capture and its baked-in replay ops); eager forwards use
+        # the single-bank path above. Set by stage_cam_buf() from CAMGraphCapture.
+        self._cam_bank_buf: torch.Tensor | None = None
+        self._cam_conf_buf: torch.Tensor | None = None
+        self._cam_use_buf: bool = False
 
     def set_capture_layers(self, ids: List[int] | None) -> None:
         self._capture_layer_ids = list(ids) if ids else None
@@ -314,6 +320,17 @@ class Qwen3_5Model(BaseOP):
     def clear_cam(self) -> None:
         self._cam_bank = None
         self._cam_conf = None
+
+    def stage_cam_buf(self, cam, bank_buf: torch.Tensor | None, conf_buf: torch.Tensor | None,
+                      use_buf: bool = True) -> None:
+        """Point the tap at a static per-row buffer for graph capture/replay (Phase 2). `use_buf=False`
+        (after capture) reverts to the eager single-bank path — the captured graph already baked in the
+        buffer-path ops, so replay reads the buffer regardless of this Python flag."""
+        self._cam = cam
+        self._cam_bank_buf = bank_buf
+        self._cam_conf_buf = conf_buf
+        self._cam_use_buf = use_buf
+        self._cam_tap_layer = getattr(cam, "tap_layer", None) if cam is not None else None
 
     def forward(
         self, input_ids: torch.Tensor, return_hidden: bool = False
@@ -334,11 +351,21 @@ class Qwen3_5Model(BaseOP):
             # staged for this forward, so normal serving is byte-identical. The tap sees the full
             # post-layer hidden h = x + residual and returns h + upd; fold upd into `residual` so the next
             # layer's input_layernorm(x, residual) sums the injected hidden (mirrors the HF output[0] hook).
-            if cam_bank is not None and lid == self._cam_tap_layer:
-                h = x + residual
-                # fold the tap's ADDITIVE update onto residual: apply_tap(h)-h == upd (0 at gamma=0, so
-                # byte-exact even for a staged request); the next input_layernorm sums x+residual as usual.
-                residual = residual + (self._cam.apply_tap(h, cam_bank, self._cam_conf) - h)
+            if lid == self._cam_tap_layer and self._cam is not None:
+                if cam_bank is not None:
+                    # eager single-bank path (prefill / eager decode): one bank broadcast to all rows.
+                    h = x + residual
+                    # fold the tap's ADDITIVE update onto residual: apply_tap(h)-h == upd (0 at gamma=0,
+                    # so byte-exact); the next input_layernorm sums x+residual as usual.
+                    residual = residual + (self._cam.apply_tap(h, cam_bank, self._cam_conf) - h)
+                elif self._cam_use_buf and self._cam_bank_buf is not None:
+                    # graph-capture DECODE path: a static per-ROW buffer (row == batch position). A zero
+                    # row is a tap no-op (padding / non-memory / seed-once-placed). Recorded into the
+                    # captured graph; replay re-runs it over the in-place-refreshed buffer.
+                    h = x + residual
+                    n = h.shape[0]
+                    residual = residual + (
+                        self._cam.apply_tap_rows(h, self._cam_bank_buf[:n], self._cam_conf_buf[:n]) - h)
         # MTP seed = the PRE-final-norm residual stream (x + residual), the Qwen3.5 MTP
         # `previous_hidden_states` input (the MTP's own pre_fc_norm_hidden re-normalizes it).
         pre_norm = (x + residual).clone() if return_hidden else None

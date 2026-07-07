@@ -291,9 +291,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
-                # (subsequent _stage_cam calls skip it; the base continues fluently).
+                # (subsequent _stage_cam calls skip it; the base continues fluently). The
+                # MINISGL_CAM_ALWAYS_INJECT debug knob keeps injecting every step (used to exercise the
+                # captured decode tap, since with seed-once the object lands at prefill).
                 if getattr(req, "mem_bank", None) is not None and not req._mem_placed \
-                        and next_token == req._mem_seed:
+                        and next_token == req._mem_seed \
+                        and os.environ.get("MINISGL_CAM_ALWAYS_INJECT") != "1":
                     req._mem_placed = True
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
