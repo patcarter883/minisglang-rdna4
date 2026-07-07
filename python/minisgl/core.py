@@ -28,6 +28,10 @@ class SamplingParams:
     # Structured-output spec: None (free), "json" (any valid JSON object), or a JSON-schema string.
     # A constrained request bypasses speculative decoding and is masked per-token by a grammar matcher.
     grammar: str | None = None
+    # CAM editable-memory (Option B): the explicit subject to read from the standing store. When set
+    # AND the engine has CAM built, the scheduler computes this request's tap bank at prefill and injects
+    # it at the L24 tap (seed-once). None -> a plain request (tap no-op). Rides UserMsg -> Req like grammar.
+    mem_subject: str | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -58,6 +62,8 @@ class Req:
         # the L24 tap stays a byte-exact no-op (see models/qwen3_5.py stage_cam/clear_cam).
         self.mem_bank: "torch.Tensor | None" = None
         self.mem_conf: "torch.Tensor | None" = None
+        self._mem_seed: "int | None" = None       # the object's first (store-preferred) token
+        self._mem_placed: bool = False            # seed-once: True once _mem_seed has been emitted
 
     @property
     def remain_len(self) -> int:

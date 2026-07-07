@@ -233,7 +233,13 @@ class Engine:
                 and inner is not None and hasattr(inner, "stage_cam")):
             try:
                 from minisgl.cam.memory import CAMMemory
-                cam = CAMMemory(_cam_ckpt, inner.embed_tokens, self.model.lm_head.weight)
+                # Resolve the REAL lm_head weight: Qwen3.5 ties word embeddings, so ParallelLMHead
+                # pops its own weight at load and keeps a meta placeholder — the live table is the tied
+                # embedding's (embed_tokens.weight). Use it; fall back to the head's own weight if untied.
+                _lmh = self.model.lm_head
+                _lm_w = (_lmh.tied_embedding.weight if getattr(_lmh, "tied_embedding", None) is not None
+                         else _lmh.weight)
+                cam = CAMMemory(_cam_ckpt, inner.embed_tokens, _lm_w)
                 if cam.enabled:
                     self.cam = self.ctx.cam_state = cam
                     inner.stage_cam(cam, None, None)  # register the cam + tap_layer; no bank => no-op
