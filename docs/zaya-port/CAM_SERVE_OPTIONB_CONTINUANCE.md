@@ -76,9 +76,38 @@ memory-organ: `docs/serving/integration_design.md` (the data-plane, authoritativ
   `gdn/graph_capture.py`), `--graph N`, byte-identical eager-vs-graph, ~20% TPOT.
 - **Phase 3 (#5) — concurrency/per-row banks/full `/v1/memory/*`/TP** (online_api.md §3 COW swap).
 
+## STATUS 2026-07-07 (commits ea7423c, c9d1221, 1089fcb on cam-serve-optionB)
+- **Phase 0 DONE + boot-validated.** `CAM: backend memory built …` log fires; memory-off `/generate`
+  coherent. Model-share confirmed (CAMMemory from served embed_tokens+lm_head, no HF copy). Fixed the
+  tied-embedding meta-`lm_head.weight` (use `lm_head.tied_embedding.weight`).
+- **Phase 1 DATA PLANE DONE + validated.** `tools/cam_seedonce_check.py`: request-driven
+  (`SamplingParams.mem_subject`) seed-once tap delivers **3/3 CLEAN** through the real scheduler
+  (Dutch/English/Russian then fluent tail), byte-identical to `tap_check`; OFF requests coherent.
+  Scheduler seams live: `_prepare_cam` (bank read at prefill), `_stage_cam` (stage before forward),
+  seed-once clear in `_process_last_data`. Overlap-loop caveat: placed flag lags 1 step (exact under
+  normal_loop); did not cause visible over-injection in validation.
+- **Phase 1 CONTROL PLANE — REMAINING (the next work):**
+  1. Write gate needs base-logits from the SERVED model. Add a synthetic no-tap forward that returns
+     last-position logits for token_ids (build a one-off prefill Batch, read logits pre-sample). Used by
+     `/cam/remember` (base_p) — currently the tools bypass the gate via `cam._write`.
+  2. ZMQ control messages: new `BaseBackendMsg`/`BaseFrontendMsg` dataclasses (auto-register via
+     globals()) for cam_remember/ask/facts/delete; handle in `Scheduler._process_one_msg:322`; WIDEN the
+     tokenizer-worker passthrough (`tokenizer/server.py:81-84` hard-asserts 3 types).
+  3. Repoint the frontend `/cam/*` router (or add `/v1/memory/*` per online_api.md) from the co-located
+     HF runtime to the ZMQ round-trip. Then the 8 GB duplicate is fully gone in production too.
+- Then **Phase 2** (graph capture: CAMGraphCapture static bank buffers, --graph N, ~20% TPOT) and
+  **Phase 3** (per-row banks for concurrent memory+non-memory batches, full /v1/memory/*, TP).
+
+## Validation recipes (scratchpad/, all use the lease-shell var-expansion pattern)
+- `run_bootsmoke.sh` — Phase 0 (build log + memory-off coherence). Note `--max-running-req 4
+  --memory-ratio 0.85` (GDN recurrent-state reservation starves KV at the default 32/0.6 on 16 GB).
+- `run_camserve.sh` (`tools/cam_serve_check.py`) — manual-staging parity probe (always-on tap 3/3).
+- `run_seedonce.sh` (`tools/cam_seedonce_check.py`) — request-driven seed-once 3/3 CLEAN. THE Phase-1
+  acceptance test; re-run it first next session to confirm the data plane still passes.
+
 ## First action next session
-`gpu-status`; re-run `scratchpad/run_tap.sh` to reconfirm tap 3/3; then implement Phase 0 (items 1–3
-above) and boot the full scheduler (`--attn hip --graph 0 --model Qwen/Qwen3.5-4B` + `MINISGL_CAM=1`
-`MINISGL_CAM_CHECKPOINT=/ckpt`) to confirm memory-off serving is unperturbed, then wire Phase 1.
+`gpu-status`; re-run `scratchpad/run_seedonce.sh` → confirm `CAM-SEEDONCE REQUEST-DRIVEN DELIVERY 3/3`;
+then build the Phase-1 control plane (items 1–3 above), starting with the synthetic base-logits forward
+(smallest, unblocks the write gate) and the ZMQ message passthrough.
 </content>
 </invoke>
