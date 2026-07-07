@@ -58,6 +58,26 @@ gpu-lease -n 1 -- docker run --rm --device /dev/kfd --device /dev/dri --group-ad
 ```
 Run this FIRST to confirm the live path still passes (3/3) before starting the remaining tasks.
 
+> **GOTCHA (cost ~15 min, 2026-07-07):** the `-e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES` above only
+> works if `$HIP_VISIBLE_DEVICES` expands **inside the `gpu-lease` shell** (where the arbiter injects
+> it), NOT your outer shell (where it's empty). If you paste the `gpu-lease -n 1 -- docker run …`
+> line directly, your shell expands the vars to empty FIRST → the container sees no GPU → torch CPU
+> fallback → `NotImplementedError: gdn_hip_C::causal_conv1d_fwd … 'CPU' backend` (a device error that
+> masquerades as a kernel regression — it is NOT). Fix: put the `docker run` in a `bash <script>` (or
+> `bash -c '…'`) run under the lease so the vars expand in the lease shell. See the working
+> `scratchpad/run_e2e.sh` / `run_http.sh` pattern. (Matches the `gpu-lease-visible-devices-recipe`
+> memory.)
+
+### Task 1 — DONE (2026-07-07): standalone HTTP server + curl proven
+`python/minisgl/cam/serve_app.py` (new) is a standalone uvicorn app mounting ONLY `cam_router`,
+driven by `get_cam_runtime()`, warmed at boot (no ZMQ/backend). All four `/cam/*` endpoints pass
+over real curl in the lean image: `/health`→`cam_loaded:true` (9s warm); `/cam/remember`→stored w/
+base_p; `/cam/ask`→delivers "English."/"Dutch." 2/2; `/cam/facts`→lists decoded subject/object;
+`DELETE /cam/facts/{subject}`→removes it. Also fixed a `/cam/facts` 500 in `cam_api.py`
+(`list_facts()` returns token-ids; the endpoint now decodes them via the runtime tokenizer). Run it
+with `scratchpad/run_http.sh` (or the recipe above, swapping the `-lc` for
+`python /engine/python/minisgl/cam/serve_app.py` + a `-p 1919:1919`).
+
 ## REMAINING TASKS (priority order)
 
 ### 1. Boot the FastAPI HTTP server + curl the /cam/* endpoints
