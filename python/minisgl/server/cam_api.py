@@ -275,14 +275,28 @@ async def ask(req: AskRequest) -> AskResponse:
 
 @cam_router.get("/facts", response_model=List[FactItem])
 async def list_facts() -> List[FactItem]:
-    """List stored edits from the CAMMemory side index (the bank tensor cannot be enumerated)."""
+    """List stored edits from the CAMMemory side index (the bank tensor cannot be enumerated).
+
+    CAMMemory keeps the side index as raw token-ids (it is deliberately tokenizer-free), so we
+    decode ``subject_ids``/``object_ids`` back to text here with the runtime tokenizer. Subjects and
+    objects were stored space-prefixed (``_encode_sp``); ``.decode`` yields a leading space we strip.
+    Shapes with ready-made ``subject``/``object`` strings are passed through unchanged.
+    """
     runtime = _get_runtime()
     memory = runtime.memory
+    tok = runtime.tokenizer
     lister = getattr(memory, "list_facts", None)
     if lister is None:
         raise HTTPException(status_code=503, detail="CAM side index unavailable")
-    facts = lister()
-    return [FactItem(subject=str(f["subject"]), object=str(f["object"])) for f in facts]
+
+    def _text(f, str_key, ids_key):
+        if str_key in f and f[str_key] is not None:
+            return str(f[str_key])
+        ids = f.get(ids_key)
+        return tok.decode(list(ids)).strip() if ids else ""
+
+    return [FactItem(subject=_text(f, "subject", "subject_ids"),
+                     object=_text(f, "object", "object_ids")) for f in lister()]
 
 
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)
