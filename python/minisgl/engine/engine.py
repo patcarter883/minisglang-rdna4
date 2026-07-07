@@ -646,7 +646,10 @@ def _adjust_config(config: EngineConfig):
 
     if config.attention_backend == "auto":
         if is_rocm():
-            backend = "rdna4"  # native HIP attention on gfx1201 (Triton only via MINISGL_ATTN_HIP=0)
+            # gfx1201: the Triton-free native-HIP backend WITH cudagraph capture (decode + spec-verify).
+            # NOT "rdna4" — that path is eager-only (capture is Phase-4 NotImplemented); select it
+            # explicitly only for the Triton fallback (MINISGL_ATTN_HIP=0) or eager debugging.
+            backend = "hip"
         else:
             backend = (
                 "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
@@ -658,11 +661,11 @@ def _adjust_config(config: EngineConfig):
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
-    # The RDNA4 attention kernels require a KV block size that is a multiple of 16. Matches both the
-    # "rdna4" name and its deprecated "triton_rdna4" alias ("rdna4" is a substring of both).
-    if "rdna4" in config.attention_backend and config.page_size % 16 != 0:
+    # The native-HIP attention kernels require a KV block size that is a multiple of 16 — this covers
+    # the "hip" backend and the "rdna4"/"triton_rdna4" base it subclasses (all share those kernels).
+    if any(b in config.attention_backend for b in ("hip", "rdna4")) and config.page_size % 16 != 0:
         override("page_size", 16)
-        logger.warning_rank0("Page size is overridden to 16 for the rdna4 backend")
+        logger.warning_rank0("Page size is overridden to 16 for the native-HIP attention backend")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
