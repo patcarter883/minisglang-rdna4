@@ -162,6 +162,12 @@ def _encode(tok, text: str) -> List[int]:
     return list(tok(text, add_special_tokens=False).input_ids)
 
 
+def _encode_sp(tok, text: str) -> List[int]:
+    """Space-prefixed encode for SUBJECTS and OBJECTS — the CAM store/tap/router were trained on the
+    mid-sentence ' <s>' encoding (memory-organ `_sp_tokens`). Prompts stay plain (`_encode`)."""
+    return list(tok(" " + text, add_special_tokens=False).input_ids)
+
+
 def _remember(memory, subject_ids, object_ids, prompt_last_logits) -> bool:
     """Call the WRITE GATE, adapting to whichever object-passing form WS-A picked.
 
@@ -194,8 +200,8 @@ async def remember(req: RememberRequest) -> RememberResponse:
     tok = runtime.tokenizer
     memory = runtime.memory
 
-    subject_ids = _encode(tok, req.subject)
-    object_ids = _encode(tok, req.object)
+    subject_ids = _encode_sp(tok, req.subject)
+    object_ids = _encode_sp(tok, req.object)
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
     if not object_ids:
@@ -227,7 +233,7 @@ async def ask(req: AskRequest) -> AskResponse:
     tok = runtime.tokenizer
     memory = runtime.memory
 
-    subject_ids = _encode(tok, req.subject)
+    subject_ids = _encode_sp(tok, req.subject)
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
 
@@ -288,7 +294,7 @@ async def delete_fact(subject: str) -> DeleteResponse:
     tok = runtime.tokenizer
     memory = runtime.memory
 
-    subject_ids = _encode(tok, subject)
+    subject_ids = _encode_sp(tok, subject)
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
 

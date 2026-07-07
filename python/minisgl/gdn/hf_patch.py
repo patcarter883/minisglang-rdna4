@@ -64,11 +64,22 @@ class NativeGDNShim(nn.Module):
         self.ms = _build_native_from_hf(hf)
         self.layer_idx = getattr(hf, "layer_idx", None)
 
-    def forward(self, hidden_states: torch.Tensor, cache_params=None, attention_mask=None):
-        if cache_params is not None:
+    def forward(self, hidden_states: torch.Tensor, cache_params=None, attention_mask=None,
+                use_cache=False, **kwargs):
+        # transformers >=5.13 passes use_cache / cache_position / position_ids etc. to the mixer; this
+        # shim is PREFILL-ONLY (teacher-forced, no KV cache), so absorb + ignore them. A truthy cache is
+        # still an error (incremental decode is unsupported).
+        if cache_params is not None or use_cache:
             raise NotImplementedError(
                 "NativeGDNShim is prefill-only (use_cache=False); incremental decode with a cache is "
                 "not supported — CAM/tap-training runs full-sequence teacher-forced.")
+        # transformers >=5.13 hands the linear-attn mixer fp32 hidden states even on a bf16 base; the native
+        # layer's projections keep the base dtype (bf16). Align input to the native weight dtype and return
+        # the native (base-dtype) output — the surrounding decoder layer's residual + MLP are base-dtype, so
+        # upcasting the output back to fp32 would poison the next linear (float vs bf16 weight).
+        _wdt = self.ms.in_proj_qkvz.weight.dtype
+        if hidden_states.dtype != _wdt:
+            hidden_states = hidden_states.to(_wdt)
         # HF passes [B, T, hidden] (batched, all sequences length T). Run the whole batch through the
         # BATCHED differentiable native prefill — one varlen op call for all B sequences (kills the
         # per-sequence Python loop that made native ~3x slower than the fla-torch fallback). Set
