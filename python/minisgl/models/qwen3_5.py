@@ -296,9 +296,14 @@ class Qwen3_5Model(BaseOP):
         # _capture_layer_ids). Staged per-request BEFORE forward via stage_cam(); a byte-exact no-op
         # when unstaged (guard below skips apply_tap entirely). See python/minisgl/cam/.
         self._cam = None                     # CAMMemory instance (or None)
-        self._cam_bank: torch.Tensor | None = None   # [1,K,mem] single read bank (eager prefill/decode)
+        self._cam_bank: torch.Tensor | None = None   # [1,K,mem] single read bank (manual-staging tools)
         self._cam_conf: torch.Tensor | None = None   # [1] retrieval-strength scalar (or None)
         self._cam_tap_layer: int | None = None       # decoder-layer index to inject after
+        # Per-TOKEN eager banks [num_tokens,K,mem] (+conf [num_tokens]): each token row carries its
+        # owning request's bank, so concurrent memory+non-memory requests in ONE eager batch each get
+        # the right injection (a zero row is a no-op). Built by the scheduler per forward. Phase 3.
+        self._cam_bank_rows: torch.Tensor | None = None
+        self._cam_conf_rows: torch.Tensor | None = None
         # Graph-capture DECODE path (Phase 2): a static per-ROW buffer [max_bs,K,mem] + conf [max_bs].
         # Active only while _cam_use_buf (during capture and its baked-in replay ops); eager forwards use
         # the single-bank path above. Set by stage_cam_buf() from CAMGraphCapture.
@@ -320,6 +325,17 @@ class Qwen3_5Model(BaseOP):
     def clear_cam(self) -> None:
         self._cam_bank = None
         self._cam_conf = None
+        self._cam_bank_rows = None
+        self._cam_conf_rows = None
+
+    def stage_cam_rows(self, cam, bank_rows: torch.Tensor | None, conf_rows: torch.Tensor | None) -> None:
+        """Stage per-TOKEN banks for an EAGER forward (prefill or decode): bank_rows [num_tokens,K,mem]
+        aligned to the flat token order (per-req contiguous over padded_reqs). Takes precedence over the
+        single-bank + graph-buffer paths. None -> cleared (tap no-op)."""
+        self._cam = cam
+        self._cam_bank_rows = bank_rows
+        self._cam_conf_rows = conf_rows
+        self._cam_tap_layer = getattr(cam, "tap_layer", None) if cam is not None else None
 
     def stage_cam_buf(self, cam, bank_buf: torch.Tensor | None, conf_buf: torch.Tensor | None,
                       use_buf: bool = True) -> None:
@@ -342,6 +358,7 @@ class Qwen3_5Model(BaseOP):
         cap_set = set(cap) if cap else None
         grabbed: dict[int, torch.Tensor] = {}
         cam_bank = self._cam_bank
+        cam_rows = self._cam_bank_rows
         for lid, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
             if cap_set is not None and lid in cap_set:
@@ -352,8 +369,14 @@ class Qwen3_5Model(BaseOP):
             # post-layer hidden h = x + residual and returns h + upd; fold upd into `residual` so the next
             # layer's input_layernorm(x, residual) sums the injected hidden (mirrors the HF output[0] hook).
             if lid == self._cam_tap_layer and self._cam is not None:
-                if cam_bank is not None:
-                    # eager single-bank path (prefill / eager decode): one bank broadcast to all rows.
+                if cam_rows is not None:
+                    # eager PER-TOKEN path: row t carries token t's owning request's bank (concurrent
+                    # memory+non-memory correct; zero row = no-op). fold apply_tap_rows()-h onto residual.
+                    h = x + residual
+                    residual = residual + (
+                        self._cam.apply_tap_rows(h, cam_rows, self._cam_conf_rows) - h)
+                elif cam_bank is not None:
+                    # single-bank path (manual-staging tools): one bank broadcast to all rows.
                     h = x + residual
                     # fold the tap's ADDITIVE update onto residual: apply_tap(h)-h == upd (0 at gamma=0,
                     # so byte-exact); the next input_layernorm sums x+residual as usual.

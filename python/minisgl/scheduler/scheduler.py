@@ -514,18 +514,34 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
 
     def _stage_cam(self, batch: Batch) -> None:
-        """Stage the (MVP: single) memory request's bank on the served model BEFORE the forward, so the
-        L24 tap injects. SEED-ONCE: once the object's first token (`_mem_seed`) has landed (`_mem_placed`,
-        set in _process_last_data), stop staging so the base continues fluently. No un-placed memory req
-        -> clear, so a stale bank never leaks into a plain batch. (Under the overlap loop the placed flag
-        lags one step, so injection may persist one extra token past the seed — exact under normal_loop;
-        Phase-2 graph capture uses per-row static buffers, §5.)"""
+        """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +
+        non-memory requests in one batch each get the right injection. Row t (flat, per-req contiguous
+        over padded_reqs, req.extend_len tokens each — matches _make_positions) carries that token's
+        owning request's bank, or ZERO for a non-memory / seed-once-placed / padding row (tap no-op).
+        SEED-ONCE: once `_mem_seed` has landed (`_mem_placed`, set in _process_last_data) the req's rows
+        go zero. Graph-decode replay ignores these Python tensors (it reads the captured static buffer);
+        this path drives eager prefill + eager decode. (Overlap loop: the placed flag lags one step.)"""
         cam, inner = self.engine.cam, self.engine.model.model
-        for req in batch.reqs:
-            if getattr(req, "mem_bank", None) is not None and not req._mem_placed:
-                inner.stage_cam(cam, req.mem_bank, req.mem_conf)
-                return
-        inner.clear_cam()
+        reqs = batch.padded_reqs if batch.padded_reqs is not None else batch.reqs
+        active = [(getattr(r, "mem_bank", None) is not None and not getattr(r, "_mem_placed", False))
+                  for r in reqs]
+        if not any(active):
+            inner.clear_cam()                       # no active memory row -> tap no-op for the whole batch
+            return
+        dev = cam.device
+        K, mem = cam.k_slots, cam.mem_dim
+        bank_chunks, conf_chunks = [], []
+        for r, act in zip(reqs, active):
+            nt = r.extend_len                        # prefill: extend_len tokens; decode: 1
+            if act:
+                bank_chunks.append(r.mem_bank[0].unsqueeze(0).expand(nt, K, mem))   # [nt,K,mem]
+                cv = r.mem_conf.reshape(-1)[0] if r.mem_conf is not None \
+                    else torch.zeros((), device=dev)
+                conf_chunks.append(cv.expand(nt))
+            else:
+                bank_chunks.append(torch.zeros(nt, K, mem, device=dev))
+                conf_chunks.append(torch.zeros(nt, device=dev))
+        inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
 
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
