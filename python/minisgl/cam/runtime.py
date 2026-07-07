@@ -93,8 +93,54 @@ class CAMRuntime:
         return self.tokenizer.decode(list(ids))
 
 
+class BackendCAMRuntime:
+    """Backend-shared CAM runtime: presents the same seam as ``CAMRuntime`` (``.tokenizer``,
+    ``.memory``, ``.base_logits``) but backed by the ACTUAL served minisgl model (an in-process
+    ``LLM``), so there is **no co-located HF copy** — the whole point of Task-2 model-share.
+
+    The store+tap+router (``CAMMemory``) is the one the Engine builds in-process from the served
+    weights (``engine.cam``); ``base_logits`` captures the served model's own logits (``LLM.base_logits``);
+    and ``ask_tap`` delivers via the validated residual-tap seed-once path (a normal generate carrying
+    ``sampling_params.mem_subject``). Enabled by ``MINISGL_CAM_BACKEND=1``.
+    """
+
+    def __init__(self, model_path: str = None):
+        import torch
+        from minisgl.llm import LLM
+
+        meta_ckpt = os.environ.get("MINISGL_CAM_CHECKPOINT")
+        base_model = model_path or os.environ.get("MINISGL_CAM_MODEL")
+        if base_model is None and meta_ckpt:
+            base_model = json.load(open(os.path.join(meta_ckpt, "meta.json"))).get("base_model")
+        base_model = base_model or "Qwen/Qwen3.5-4B"
+        mrr = int(os.environ.get("MINISGL_CAM_MAX_RUNNING_REQ", "4"))
+        mratio = float(os.environ.get("MINISGL_CAM_MEMORY_RATIO", "0.85"))
+        self.llm = LLM(model_path=base_model, dtype=torch.bfloat16, cuda_graph_max_bs=0, page_size=16,
+                       memory_ratio=mratio, attention_backend="hip", max_running_req=mrr)
+        self.tokenizer = self.llm.tokenizer
+        self.memory = self.llm.engine.cam
+        self.device = self.llm.engine.device
+        if self.memory is None or not self.memory.enabled:
+            raise RuntimeError("engine.cam not built — set MINISGL_CAM=1 + MINISGL_CAM_CHECKPOINT")
+        logger.info("BackendCAMRuntime ready: served model=%s (model-share, no HF copy), tap_layer=%s",
+                    base_model, getattr(self.memory, "tap_layer", None))
+
+    def base_logits(self, token_ids):
+        return self.llm.base_logits(list(token_ids))
+
+    def ask_tap(self, prompt: str, subject: str, max_tokens: int = 32) -> str:
+        """Deliver via the residual tap (seed-once) — a normal generate carrying mem_subject."""
+        from minisgl.core import SamplingParams
+
+        sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, mem_subject=subject)
+        return self.llm.generate([prompt], sp)[0]["text"]
+
+
 def get_cam_runtime():
-    """Lazy singleton. Returns None (so /cam/* replies 503) when CAM is not configured or fails to load."""
+    """Lazy singleton. Returns None (so /cam/* replies 503) when CAM is not configured or fails to load.
+
+    Two backends: MINISGL_CAM_BACKEND=1 -> BackendCAMRuntime (shares the served model, no HF copy);
+    otherwise the co-located CAMRuntime (its own frozen HF base — the standalone MVP)."""
     global _RUNTIME
     if _RUNTIME is not None:
         return _RUNTIME
@@ -103,7 +149,10 @@ def get_cam_runtime():
         logger.warning("CAM: MINISGL_CAM_CHECKPOINT unset/missing (%s) — /cam/* disabled.", ckpt)
         return None
     try:
-        _RUNTIME = CAMRuntime(ckpt)
+        if os.environ.get("MINISGL_CAM_BACKEND") == "1":
+            _RUNTIME = BackendCAMRuntime()
+        else:
+            _RUNTIME = CAMRuntime(ckpt)
     except Exception as e:  # noqa
         logger.error("CAM: runtime load failed — /cam/* disabled. (%s)", e)
         return None
