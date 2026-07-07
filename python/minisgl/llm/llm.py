@@ -96,3 +96,28 @@ class LLM(Scheduler):
             output_text = self.tokenizer.decode(status.output_ids)
             results.append({"text": output_text, "token_ids": status.output_ids})
         return results
+
+    def base_logits(self, token_ids: List[int]) -> torch.Tensor:
+        """Last-position logits [vocab] for a single prompt from the SERVED model (no CAM staged).
+
+        The CAM write gate (`/cam/remember`) needs base p(object) with memory OFF. Rather than a second
+        HF copy, capture the served model's own logits by hooking the sampler for a 1-token prefill of
+        the prompt (the logit-oracle pattern, tools/oracle_ours.py). CAM is cleared so the L24 tap is a
+        byte-exact no-op. Returns the last-position logits on the engine device."""
+        from minisgl.core import SamplingParams
+
+        if self.engine.cam is not None:
+            self.engine.model.model.clear_cam()
+        cap: Dict[str, torch.Tensor] = {}
+        orig = self.engine.sampler.sample
+
+        def _hook(logits, args):
+            cap["l"] = logits[0].detach().float().clone()  # [vocab] last position, req 0
+            return orig(logits, args)
+
+        self.engine.sampler.sample = _hook  # type: ignore[method-assign]
+        try:
+            self.generate([list(token_ids)], SamplingParams(temperature=0.0, max_tokens=1))
+        finally:
+            self.engine.sampler.sample = orig  # type: ignore[method-assign]
+        return cap["l"]
