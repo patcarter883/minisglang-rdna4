@@ -469,6 +469,10 @@ class CAMMemory:
                 p.requires_grad_(False)
         self.banks = [self.adapter.store.init_state(1, device, dtype=torch.float32)
                       for _ in range(self.n_banks)]
+        # Bank tensor dims (read()/persistent_bank return [1, K, mem_dim]) — the graph-capture static
+        # buffer [max_bs, K, mem_dim] needs these at engine build (Phase 2).
+        self.k_slots = k_slots
+        self.mem_dim = a_mem
         self.enabled = True
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
@@ -556,6 +560,19 @@ class CAMMemory:
         h3 = h.unsqueeze(0)                                  # [1, N, H]
         out = self.tap.forward(h3, bank, conf)               # [1, N, H]
         return out.squeeze(0)
+
+    @torch.no_grad()
+    def apply_tap_rows(self, h: torch.Tensor, bank: torch.Tensor,
+                       conf: Optional[torch.Tensor]) -> torch.Tensor:
+        """Per-ROW tap: h [N,H] with bank [N,K,mem] (one bank per token row) -> injected [N,H]. Used by
+        the graph-capture decode path where a static [max_bs,K,mem] buffer carries a distinct bank per
+        request row. The tap's forward is already batched over its leading dim, so treat each row as its
+        own batch element (T=1): h[N,1,H] x bank[N,K,mem]. A zero bank row => tap no-op for that row
+        (padding / non-memory / seed-once-placed). For N==1 this is byte-identical to apply_tap."""
+        if not self.enabled:
+            return h
+        out = self.tap.forward(h.unsqueeze(1), bank, conf)   # [N,1,H]
+        return out.squeeze(1)
 
     # ---- router (per-token logit-space injection, at the lm_head) ---------------------------------
     @torch.no_grad()
