@@ -132,6 +132,10 @@ class BackendClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        top_p: float = 1.0,
+        top_k: int = -1,
+        ignore_eos: bool = False,
+        stop: Optional[List[str]] = None,
         max_retries: int = 1,
     ) -> Optional[Candidate]:
         """One chat completion; returns None on permanent failure."""
@@ -143,6 +147,12 @@ class BackendClient:
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    top_p=top_p,
+                    stop=list(stop) if stop else None,
+                    # top_k / ignore_eos are minisgl extensions, not standard OpenAI
+                    # fields, so they ride in extra_body (the api_server reads them off
+                    # the request body).
+                    extra_body={"top_k": top_k, "ignore_eos": ignore_eos},
                 )
                 msg = resp.choices[0].message
                 content = msg.content or ""
@@ -249,6 +259,10 @@ async def _run_round(
                 model=model,
                 temperature=params.temperature,
                 max_tokens=max_tokens,
+                top_p=params.top_p,
+                top_k=params.top_k,
+                ignore_eos=params.ignore_eos,
+                stop=params.stop,
                 max_retries=params.max_retries,
             )
 
@@ -412,8 +426,14 @@ async def _select(
     final = await client.complete(
         msgs,
         model=model,
+        # deliberately cooler than rollouts for a decisive final answer, but reuse
+        # the same truncation knobs so the selection call can't run away either.
         temperature=0.3,
         max_tokens=max_tokens,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        ignore_eos=params.ignore_eos,
+        stop=params.stop,
         max_retries=params.max_retries,
     )
     if final is None:
