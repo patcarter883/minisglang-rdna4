@@ -290,6 +290,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
+                # (subsequent _stage_cam calls skip it; the base continues fluently).
+                if getattr(req, "mem_bank", None) is not None and not req._mem_placed \
+                        and next_token == req._mem_seed:
+                    req._mem_placed = True
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -395,6 +400,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, self.device)
+        # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
+        # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
+        # inside a graph — read here, reuse across decode). Inert when CAM is not built.
+        if self.engine.cam is not None:
+            self._prepare_cam(batch)
         sample_args = self.engine.sampler.prepare(batch)
         # Structured output: attach the per-row grammar bitmask (None unless a constrained req is in
         # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
@@ -482,9 +492,43 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
+    def _prepare_cam(self, batch: Batch) -> None:
+        """Read each memory request's tap bank from the standing store at prefill (once per req).
+
+        Subject rides on sampling_params.mem_subject; it is space-prefixed to match how the store was
+        trained (memory-organ `_sp_tokens`). `_mem_seed` is the store's preferred first token (for the
+        seed-once policy in `_stage_cam`). Requests without a subject are left untouched (tap no-op)."""
+        cam = self.engine.cam
+        for req in batch.reqs:
+            if not hasattr(req, "_mem_placed"):   # ChunkedReq / non-Req rows carry no memory state
+                continue
+            subj = getattr(getattr(req, "sampling_params", None), "mem_subject", None)
+            if not subj or req.mem_bank is not None:
+                continue
+            subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
+            bank, conf = cam.read(subj_ids)
+            req.mem_bank, req.mem_conf = bank, conf
+            req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+
+    def _stage_cam(self, batch: Batch) -> None:
+        """Stage the (MVP: single) memory request's bank on the served model BEFORE the forward, so the
+        L24 tap injects. SEED-ONCE: once the object's first token (`_mem_seed`) has landed (`_mem_placed`,
+        set in _process_last_data), stop staging so the base continues fluently. No un-placed memory req
+        -> clear, so a stale bank never leaks into a plain batch. (Under the overlap loop the placed flag
+        lags one step, so injection may persist one extra token past the seed — exact under normal_loop;
+        Phase-2 graph capture uses per-row static buffers, §5.)"""
+        cam, inner = self.engine.cam, self.engine.model.model
+        for req in batch.reqs:
+            if getattr(req, "mem_bank", None) is not None and not req._mem_placed:
+                inner.stage_cam(cam, req.mem_bank, req.mem_conf)
+                return
+        inner.clear_cam()
+
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        if self.engine.cam is not None:
+            self._stage_cam(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
