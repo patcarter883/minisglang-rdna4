@@ -292,9 +292,28 @@ class Qwen3_5Model(BaseOP):
         # Spec-decode aux capture: decoder-layer ids whose output hidden is stashed (None = off).
         self._capture_layer_ids: List[int] | None = None
         self._aux_hidden: List[torch.Tensor] | None = None
+        # CAM editable-memory tap (leading "_" hides these from BaseOP's state-dict walk, like
+        # _capture_layer_ids). Staged per-request BEFORE forward via stage_cam(); a byte-exact no-op
+        # when unstaged (guard below skips apply_tap entirely). See python/minisgl/cam/.
+        self._cam = None                     # CAMMemory instance (or None)
+        self._cam_bank: torch.Tensor | None = None   # [1,K,mem] read bank for this forward
+        self._cam_conf: torch.Tensor | None = None   # [1] retrieval-strength scalar (or None)
+        self._cam_tap_layer: int | None = None       # decoder-layer index to inject after
 
     def set_capture_layers(self, ids: List[int] | None) -> None:
         self._capture_layer_ids = list(ids) if ids else None
+
+    def stage_cam(self, cam, bank: torch.Tensor | None, conf: torch.Tensor | None) -> None:
+        """Stage a CAM read bank/conf for the NEXT forward (call before model.forward). bank=None ->
+        the tap is skipped (normal serving is unperturbed). `cam` provides apply_tap + tap_layer."""
+        self._cam = cam
+        self._cam_bank = bank
+        self._cam_conf = conf
+        self._cam_tap_layer = getattr(cam, "tap_layer", None) if cam is not None else None
+
+    def clear_cam(self) -> None:
+        self._cam_bank = None
+        self._cam_conf = None
 
     def forward(
         self, input_ids: torch.Tensor, return_hidden: bool = False
@@ -305,11 +324,21 @@ class Qwen3_5Model(BaseOP):
         cap = self._capture_layer_ids if return_hidden else None
         cap_set = set(cap) if cap else None
         grabbed: dict[int, torch.Tensor] = {}
+        cam_bank = self._cam_bank
         for lid, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
             if cap_set is not None and lid in cap_set:
                 # output hidden of layer lid = the residual stream after it (feeds the next layer).
                 grabbed[lid] = residual.clone()
+            # CAM tap: inject into the residual stream after tap_layer. No-op (skipped) unless a bank is
+            # staged for this forward, so normal serving is byte-identical. The tap sees the full
+            # post-layer hidden h = x + residual and returns h + upd; fold upd into `residual` so the next
+            # layer's input_layernorm(x, residual) sums the injected hidden (mirrors the HF output[0] hook).
+            if cam_bank is not None and lid == self._cam_tap_layer:
+                h = x + residual
+                # fold the tap's ADDITIVE update onto residual: apply_tap(h)-h == upd (0 at gamma=0, so
+                # byte-exact even for a staged request); the next input_layernorm sums x+residual as usual.
+                residual = residual + (self._cam.apply_tap(h, cam_bank, self._cam_conf) - h)
         # MTP seed = the PRE-final-norm residual stream (x + residual), the Qwen3.5 MTP
         # `previous_hidden_states` input (the MTP's own pre_fc_norm_hidden re-normalizes it).
         pre_norm = (x + residual).clone() if return_hidden else None
