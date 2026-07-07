@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -368,6 +369,18 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
+
+
+# CAM edit-plane API (/cam/*): additive, OFF by default. Only mounted when MINISGL_CAM=1, and the
+# import is guarded so a server without CAM loaded still starts and /generate + /v1/* are untouched.
+if os.environ.get("MINISGL_CAM") == "1":
+    try:
+        from .cam_api import cam_router
+
+        app.include_router(cam_router)
+        logger.info("CAM edit-plane API mounted at /cam/*")
+    except Exception as e:  # noqa: BLE001 - never let CAM wiring break the base server
+        logger.warning("CAM API not mounted (MINISGL_CAM=1 but import failed): %s", e)
 
 
 @app.post("/generate")
