@@ -76,9 +76,15 @@ class CAMRuntime:
 
     @torch.no_grad()
     def base_logits(self, token_ids) -> torch.Tensor:
-        """One frozen-base forward on token_ids (no CAM staged) -> last-position logits [vocab]."""
+        """One frozen-base forward on token_ids (no CAM staged) -> last-position logits [vocab].
+
+        transformers >=5.13's Qwen3.5 leaks fp32 activations (RMSNorm/rotary) into bf16 linears; autocast
+        casts each matmul's inputs to the base dtype uniformly, so we don't chase per-layer dtype (this is
+        why minisgl ships its own model — the HF path is dtype-fragile). CPU: autocast is a no-op guard."""
         ids = torch.tensor([list(token_ids)], dtype=torch.long, device=self.device)
-        return self.base(inputs_embeds=self.base_embed(ids)).logits[0, -1]
+        use_amp = self.device != "cpu"
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            return self.base(inputs_embeds=self.base_embed(ids)).logits[0, -1]
 
     def encode(self, text: str):
         return self.tokenizer(text, add_special_tokens=False).input_ids
