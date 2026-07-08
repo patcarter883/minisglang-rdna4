@@ -417,7 +417,8 @@ class Qwen3_5MTPHead(BaseOP):
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
     def __init__(
-        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP
+        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP,
+        mtp_mlp_factory: "Callable[[ModelConfig], BaseOP] | None" = None,
     ):
         self.model = Qwen3_5Model(config, mlp_factory=mlp_factory)
         self.lm_head = ParallelLMHead(
@@ -427,11 +428,14 @@ class Qwen3_5ForConditionalGeneration(BaseLLMModel):
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
         # MTP self-speculation head (mtp.* namespace). Built only when the checkpoint ships one
-        # (mtp_num_hidden_layers>0); reuses the target embed + tied lm_head (no dedicated tensors).
+        # (mtp_num_hidden_layers>0); reuses the target embed + tied lm_head (no dedicated tensors). The
+        # MTP head may be a different precision than the backbone (e.g. a bf16/fp16 head on a quantized
+        # model) — mtp_mlp_factory (built by the quantized subclass from the head's ignore-list status)
+        # overrides the backbone factory; falls back to it when unset (dense models / same precision).
         self.mtp = (
             Qwen3_5MTPHead(config, layer_id=config.num_layers,
                            embed=self.model.embed_tokens, lm_head=self.lm_head,
-                           mlp_factory=mlp_factory)
+                           mlp_factory=mtp_mlp_factory or mlp_factory)
             if config.mtp_num_hidden_layers > 0
             else None
         )

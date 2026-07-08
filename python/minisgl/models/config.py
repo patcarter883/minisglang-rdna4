@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import Any, Dict
 from transformers import PretrainedConfig
@@ -220,6 +221,15 @@ class ModelConfig:
         n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
         num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
         mtp_num_hidden_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0
+        # Some checkpoints ship the MTP-head TENSORS but leave the count at 0 in config (e.g. a quant
+        # tool that dropped the field — GLM-4.7-Flash-RXF). MINISGL_NUM_NEXTN / MINISGL_MTP_LAYERS
+        # force the head on so spec-decode can use it. 0/unset -> trust the config.
+        num_nextn_predict_layers = int(
+            os.environ.get("MINISGL_NUM_NEXTN", num_nextn_predict_layers)
+        )
+        mtp_num_hidden_layers = int(
+            os.environ.get("MINISGL_MTP_LAYERS", mtp_num_hidden_layers)
+        )
 
         # RMSNorm eps: Llama/Qwen use `rms_norm_eps`; ZAYA names it `norm_epsilon`.
         rms_norm_eps = getattr(config, "rms_norm_eps", None)
