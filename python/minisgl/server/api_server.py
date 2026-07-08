@@ -196,12 +196,30 @@ async def _cam_auto_augment(prompt):
     return note + "\n\n" + str(prompt)
 
 
+def _looks_like_fact_statement(text: str) -> bool:
+    """Cheap pre-filter for the auto-write path: does `text` plausibly ASSERT a durable fact? Skips the
+    (expensive) extraction generation on chit-chat and questions. Conservative — biased toward returning
+    True so real facts are not dropped: only rejects the clear non-assertions (empty, a question, or no
+    copula at all). "Zephyrina's mother tongue is Klingon" -> True; "hi" / "how are you?" / "summarize
+    this" -> False. Disable with MINISGL_CAM_WRITE_HEURISTIC=0 (always extract)."""
+    if os.environ.get("MINISGL_CAM_WRITE_HEURISTIC", "1") != "1":
+        return True
+    t = (text or "").strip()
+    if not t or t.endswith("?"):
+        return False                                  # empty or a question — not an assertion
+    return re.search(r"\b(is|was|are|were)\b", t, re.IGNORECASE) is not None
+
+
 async def _cam_auto_write(text: str) -> None:
     """TRANSPARENT CAM write (MINISGL_CAM_AUTO_WRITE=1): model-extract durable facts from `text` (the
     latest user turn) and remember them, so facts stated in conversation are learned with NO explicit
-    /cam/remember. No-op when off / no runtime. Best-effort: extraction failures are swallowed. Costs one
-    extraction generation per turn — pair with a fact-statement heuristic if that overhead matters."""
+    /cam/remember. No-op when off / no runtime. Best-effort: extraction failures are swallowed. A cheap
+    fact-statement heuristic (_looks_like_fact_statement) skips the extraction generation on chit-chat and
+    questions so those turns pay no extra latency."""
     if os.environ.get("MINISGL_CAM_AUTO_WRITE") != "1" or not (text and text.strip()):
+        return
+    if not _looks_like_fact_statement(text):
+        logger.debug("CAM auto-write: %r is not a fact statement; skipping extraction.", text[:60])
         return
     try:
         from minisgl.cam import get_cam_runtime
