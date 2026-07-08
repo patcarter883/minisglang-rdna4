@@ -684,13 +684,13 @@ def _adjust_config(config: EngineConfig):
             if config.page_size != 1:
                 override("page_size", 1)
                 logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
-            # v2: CCA hybrids CAN cudagraph-capture the spec-VERIFY forward (S1 attn verify-capture +
-            # S2 CCA recurrent-state static buffers), so keep graphs on for them. The FUSED forward's
-            # non-K+1 qlen auto-falls-back to eager (can_use_verify_graph) until S4. Plain MHA / GDN
-            # (no verify capturer yet) still disable.
-            if config.cuda_graph_max_bs != 0 and not config.model_config.is_cca_hybrid:
-                override("cuda_graph_max_bs", 0)
-                logger.warning_rank0("spec-decode (non-MLA/non-CCA): disabling CUDA graph (verify eager)")
+            # All non-MLA backbones now cudagraph-capture the spec-VERIFY forward: the HIP attn
+            # verify-capture (S1) is model-agnostic (pure MHA works by itself), and the recurrent
+            # backbones thread their per-token state through static scratch buffers — CCA via
+            # CCAVerifyGraphCapture, GDN via GDNVerifyGraphCapture. So keep graphs ON for MHA, GDN,
+            # and CCA alike. (page_size stays 1 above for per-token rollback.) The FUSED TiDAR
+            # forward's non-K+1 qlen auto-falls-back to eager via can_use_verify_graph until S4.
+            pass
         else:
             # Spec batches never exceed max_running_req (all running reqs verify together), so cap the
             # captured graph sizes there — a default 160 would capture huge unused decode graphs and
