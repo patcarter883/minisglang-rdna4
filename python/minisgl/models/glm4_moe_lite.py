@@ -94,7 +94,9 @@ class GLMMLAAttention(BaseOP):
             rotary_dim=self.qk_rope,
             max_position=rc.max_position,
             base=rc.base,
-            rope_scaling=None,
+            # Config-driven, not hardcoded None: a long-context GLM variant (yarn) carries scaling.
+            rope_scaling=tuple(rc.scaling.items()) if rc.scaling else None,
+            interleave=rc.interleave,  # GLM-4.x uses interleaved RoPE (rope_interleave=True)
         )
 
     def post_load(self) -> None:
