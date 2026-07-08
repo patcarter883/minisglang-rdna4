@@ -323,8 +323,10 @@ async def list_facts() -> List[FactItem]:
 
 @cam_router.get("/stats")
 async def stats() -> dict:
-    """Per-bank occupancy + crowding health (mandatory overflow guard — delivery silently degrades when
-    a bank crowds past ~9 edits). Served from the side index."""
+    """Per-bank occupancy + crowding health for the product-key VALUE banks (the router/tap fallback
+    path). NOTE: the PRIMARY /cam/ask delivery is the cosine-NN subject index (exact retrieval, no bank
+    collision), so crowding no longer degrades pointer delivery — this monitors only the value-bank
+    fallback. Served from the side index."""
     runtime = _get_runtime()
     statter = getattr(runtime.memory, "stats", None)
     if statter is None:
