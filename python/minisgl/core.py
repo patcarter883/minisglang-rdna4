@@ -32,6 +32,11 @@ class SamplingParams:
     # AND the engine has CAM built, the scheduler computes this request's tap bank at prefill and injects
     # it at the L24 tap (seed-once). None -> a plain request (tap no-op). Rides UserMsg -> Req like grammar.
     mem_subject: str | None = None
+    # CAM #100 pointer (multi-process model-share): with mem_subject set, mem_remember=object_token_ids
+    # WRITES subject->object into the backend's engine.cam (the store lives in the scheduler process, so
+    # the write must ride the request); None -> a READ/deliver request (the scheduler forces the exact
+    # stored object tokens, then the base continues). Rides UserMsg -> Req like mem_subject.
+    mem_remember: List[int] | None = None
 
     @property
     def is_greedy(self) -> bool:

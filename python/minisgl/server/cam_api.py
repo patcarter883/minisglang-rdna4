@@ -197,6 +197,13 @@ async def remember(req: RememberRequest) -> RememberResponse:
     import torch
 
     runtime = _get_runtime()
+    # MULTI-PROCESS model-share: the store lives in the backend engine.cam; route the write through it
+    # (rides a generate with mem_remember). No local model/store on the frontend.
+    if getattr(runtime, "is_frontend_share", False):
+        if not _encode_sp(runtime.tokenizer, req.subject):
+            raise HTTPException(status_code=422, detail="subject tokenized to empty")
+        stored = await runtime.remember(req.subject, req.object, req.prompt)
+        return RememberResponse(stored=stored, base_p=0.0)
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -230,6 +237,11 @@ async def ask(req: AskRequest) -> AskResponse:
     import torch
 
     runtime = _get_runtime()
+    # MULTI-PROCESS model-share: deliver via the backend engine.cam — a normal generate carrying
+    # mem_subject; the scheduler forces the exact stored object tokens (pointer), then the base continues.
+    if getattr(runtime, "is_frontend_share", False):
+        text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)))
+        return AskResponse(text=text.replace("\n", " ").strip())
     tok = runtime.tokenizer
     memory = runtime.memory
 

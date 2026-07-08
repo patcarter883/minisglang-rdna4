@@ -27,19 +27,29 @@ was redundant with `engine.cam` and is dropped.
    cosine-NN store. `/cam/ask` = `deliver_object_ids` (pointer, exact ids) + `llm.base_logits`
    continuation. **One model copy.** No new code — validation only.
 
-2. **Multi-process (full `api_server`: `/generate` + `/v1/*` + `/cam/*`) — the real GAP.**
-   The backend scheduler process holds `engine.cam`; the FastAPI frontend runs `cam_api`. The
-   **residual-tap** path already crosses the boundary via `sampling_params.mem_subject` (a normal generate
-   request; the scheduler reads `engine.cam` and taps in the backend). But the #100 **pointer**
-   (`deliver_object_ids`) is a frontend-side lookup that needs the backend's `engine.cam` — the frontend's
-   `get_cam_runtime()` today would load a SECOND model (BackendCAMRuntime's own `LLM`, or the standalone
-   HF base). So multi-process pointer delivery is not yet reachable without a second copy.
+2. **Multi-process (full `api_server`: `/generate` + `/v1/*` + `/cam/*`) — IMPLEMENTED (ready-to-validate).**
+   The backend scheduler holds `engine.cam`; the FastAPI frontend runs `cam_api`. Rather than a new
+   control-plane message, both #100 CAM ops **ride the existing generate request** through
+   `sampling_params` (the same seam `mem_subject` already uses for the tap), so there is **no new message
+   type and no second model copy**:
 
-   **Fix (the actual next implementation):** a small **control-plane message** frontend→backend —
-   `CamDeliverMsg(subject_ids) -> object_ids` — answered by the scheduler calling
-   `engine.cam.deliver_object_ids(subject_ids)`; then `/cam/ask` emits those ids and lets the base
-   continue via a normal `/generate`. This reuses `engine.cam` (no second copy) and mirrors how
-   `mem_subject` already rides the request path.
+   - **Deliver** (`/cam/ask`): a generate with `mem_subject=subject`. `scheduler._prepare_cam` calls
+     `engine.cam.deliver_object_ids(subject_ids)`; `_process_last_data` **forces** those exact object tokens
+     as the first N emitted tokens (committed to the KV history), then the served base continues — exactly
+     `_gen_ptr`. Falls back to the residual tap when the subject addresses no stored object.
+   - **Remember** (`/cam/remember`): a `max_tokens=1` generate with `mem_subject=subject` +
+     `mem_remember=object_token_ids`. `_prepare_cam` writes `subject->object` into `engine.cam` at prefill
+     (write-only stub generation). The base-uncertainty gate is skipped for now (storing a base-known fact
+     is harmless — the pointer delivers the same object the base would).
+   - **Frontend:** `FrontendCAMRuntime` (`MINISGL_CAM_FRONTEND=1`) holds only a tokenizer (no model, no local
+     store) and sends these generates via the FrontendManager primitive; `cam_api` routes remember/ask to
+     it (`is_frontend_share`).
+
+   Changed: `core.py` (`SamplingParams.mem_remember`), `scheduler.py` (`_prepare_cam` write/deliver +
+   `_process_last_data` forced tokens), `runtime.py` (`FrontendCAMRuntime`), `cam_api.py` (frontend branches).
+
+   **Still to do:** `/cam/facts` `/forget` `/stats` return data that does not fit a generate, so they need a
+   small control-plane message (follow-up). And full-serve validation (below).
 
 ## Validation plan
 - **Single-process (now):** run `BackendCAMRuntime` (one `LLM`) with `MINISGL_CAM=1 MINISGL_CAM_BACKEND=1`;
@@ -49,5 +59,9 @@ was redundant with `engine.cam` and is dropped.
   share one backend model, and pointer delivery matches.
 
 ## Superseded / reverted
-- The FrontendManager text-gen bridge + `load_input_embed` (embed-only) — `engine.cam` already uses the
-  served model's own embed + logits, so both are unnecessary. Reverted from this branch.
+- `load_input_embed` (embed-only loader) — `engine.cam` already builds its store from the served model's
+  own embed + logits, so a separate embed load is unnecessary. Reverted.
+- The original "generic FrontendManager text-gen bridge + greedy-token gate" is subsumed: the frontend
+  still rides the FrontendManager primitive (`FrontendCAMRuntime`), but the CAM logic (deliver/write)
+  lives in the backend `engine.cam` via `mem_subject`/`mem_remember`, not a generic bridge. No new message
+  type, no embed copy.

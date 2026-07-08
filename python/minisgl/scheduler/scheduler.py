@@ -298,6 +298,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if isinstance(req, ChunkedReq):
                     continue
                 next_token = next_tokens_cpu[i]
+                # #100 POINTER delivery: for the first len(obj) steps, OVERRIDE the sampled token with the
+                # exact object token from engine.cam (deliver_object_ids, computed in _prepare_cam). The
+                # forced token is what's committed to the KV history (append_host) AND emitted, so the base
+                # continuation conditions on the delivered object. After the object, sampling resumes.
+                _dl = getattr(req, "_mem_deliver", None)
+                if _dl is not None and req._mem_deliver_pos < len(_dl):
+                    next_token = next_token.new_tensor(_dl[req._mem_deliver_pos])
+                    req._mem_deliver_pos += 1
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
@@ -516,12 +524,32 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if not hasattr(req, "_mem_placed"):   # ChunkedReq / non-Req rows carry no memory state
                 continue
             subj = getattr(getattr(req, "sampling_params", None), "mem_subject", None)
-            if not subj or req.mem_bank is not None:
+            if not subj or req.mem_bank is not None or getattr(req, "_mem_deliver", None) is not None:
                 continue
             subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
-            bank, conf = cam.read(subj_ids)
-            req.mem_bank, req.mem_conf = bank, conf
-            req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+            # #100 REMEMBER (multi-process write): the store lives in THIS scheduler process, so a write
+            # must ride the request — mem_remember=object_token_ids writes subject->object into engine.cam.
+            # Write-only: no forced tokens (the frontend sends max_tokens=1; the 1-token generation is a stub).
+            mem_remember = getattr(req.sampling_params, "mem_remember", None)
+            if mem_remember:
+                cam._write(subj_ids, list(mem_remember))
+                cam._facts[tuple(int(s) for s in subj_ids)] = {"object_ids": list(mem_remember), "base_p": 0.0}
+                req._mem_deliver, req._mem_deliver_pos = [], 0    # mark processed; deliver nothing
+                continue
+            # #100 POINTER delivery (multi-process): force the EXACT object token sequence retrieved from
+            # the cosine-NN subject index, then release to base continuation — memory supplies the
+            # unknowable object tokens, the served base finishes the sentence. `_process_last_data` overrides
+            # the sampled token with the forced object token for the first len(obj) steps. Falls back to the
+            # residual tap (mem_bank) only when the subject addresses no stored object.
+            _deliver = getattr(cam, "deliver_object_ids", None)
+            obj = _deliver(subj_ids) if _deliver is not None else []
+            if obj:
+                req._mem_deliver, req._mem_deliver_pos = list(obj), 0
+                req.mem_bank = None                          # pointer forces exact tokens; no tap needed
+            else:
+                bank, conf = cam.read(subj_ids)
+                req.mem_bank, req.mem_conf = bank, conf
+                req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
 
     def _stage_cam(self, batch: Batch) -> None:
         """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +
