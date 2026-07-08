@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 import torch.profiler
+from minisgl.cam.memory import _canon_subject   # #10 optional subject canonicalization (env-gated no-op)
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.message import (
@@ -542,7 +543,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             subj = getattr(sp, "mem_subject", None)
             if not subj or req.mem_bank is not None or getattr(req, "_mem_deliver", None) is not None:
                 continue
-            subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
+            subj_ids = list(self.tokenizer(" " + _canon_subject(subj), add_special_tokens=False).input_ids)
             # #100 REMEMBER (multi-process write): the store lives in THIS scheduler process, so a write
             # must ride the request — mem_remember=object_token_ids writes subject->object into engine.cam.
             # Write-only: no forced tokens (the frontend sends max_tokens=1; the 1-token generation is a stub).
@@ -579,7 +580,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         facts: [{subject,object}]; forget: bool; stats: dict; freeze/unfreeze: {frozen}."""
         import json
         if op == "forget":
-            sids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids) if subj else []
+            sids = list(self.tokenizer(" " + _canon_subject(subj), add_special_tokens=False).input_ids) if subj else []
             return json.dumps(bool(cam.forget(sids, ns=ns)) if sids else False)
         if op == "facts":
             out = []
@@ -595,6 +596,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return json.dumps({"frozen": bool(frozen)})
         if op == "save":                        # #7 explicit persistence flush
             return json.dumps({"saved": cam.save() if hasattr(cam, "save") else -1})
+        if op == "reload":                      # #11 pull shared-store writes from another replica
+            return json.dumps({"edits": cam.reload() if hasattr(cam, "reload") else -1})
         if op == "undo":                        # #12 undo the last write in this namespace
             u = cam.undo(ns) if hasattr(cam, "undo") else {}
             return json.dumps({"subject": self.tokenizer.decode(list(u["subject_ids"])).strip(),
@@ -626,7 +629,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                  re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text)}
         seen, out = set(), []
         for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller-name) spans first
-            cids = list(self.tokenizer(" " + c, add_special_tokens=False).input_ids)
+            cids = list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
             oids = deliver(cids, ns)
             if oids:
                 obj = self.tokenizer.decode(oids).strip()

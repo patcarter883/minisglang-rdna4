@@ -28,7 +28,19 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
+
+
+def _canon_subject(text: str) -> str:
+    """#10 OPTIONAL subject canonicalization (MINISGL_CAM_CANON=1): lowercase + strip punctuation +
+    collapse whitespace, so case/punctuation paraphrases of a subject key IDENTICALLY (the tau sweep
+    showed a lowercased restatement drops to cos~0.58 under the pooled-embedding key; canonicalizing at
+    both write and query time makes it 1.0). No-op unless enabled. Applied at the subject-string
+    tokenization sites (scheduler); a trained semantic key is the memory-organ CAM_GTE_KEYS path."""
+    if os.environ.get("MINISGL_CAM_CANON") != "1":
+        return text
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.lower())).strip()
 from typing import List, Optional, Tuple
 
 import torch
@@ -935,6 +947,15 @@ class CAMMemory:
         n = self.snapshot(self.store_path)
         self._dirty = False; self._last_save = time.time()
         return n
+
+    def reload(self) -> int:
+        """#11 DP-scale: re-read the store from store_path to pick up writes made by ANOTHER replica that
+        shares the same backing file — cheap eventual-consistency for a shared-backing DP deployment.
+        Returns total #edits after reload, or -1 without a store file. (Strong consistency + concurrent
+        writes need an external KV backend — see docs/zaya-port/CAM_DP_SCALE.md.)"""
+        if not self.store_path or not os.path.isfile(self.store_path):
+            return -1
+        return self.restore(self.store_path)
 
     # --- WS-C API aliases (the edit-plane calls these exact names) ---
     def list_facts(self, ns: str = None) -> list:
