@@ -336,13 +336,28 @@ class ModelConfig:
             is_cca=is_cca,
             cca_time0=getattr(config, "cca_time0", 2) if is_cca else None,
             cca_time1=getattr(config, "cca_time1", 2) if is_cca else None,
-            cca_num_k_heads=(getattr(config, "num_query_groups", None) if is_cca else None),
+            # ZAYA's HF config names the k/v head count `num_key_value_heads` (the Megatron export
+            # used `num_query_groups`); read the HF name first, fall back to the Megatron one.
+            cca_num_k_heads=(
+                (getattr(config, "num_key_value_heads", None) or getattr(config, "num_query_groups", None))
+                if is_cca
+                else None
+            ),
             cca_num_q_heads=(config.num_attention_heads if is_cca else None),
             cca_head_dim=(head_dim if is_cca else None),
             cca_clamp_temp=bool(getattr(config, "clamp_temp", False)) if is_cca else False,
-            zaya_mlp_expansion=(getattr(config, "zaya_mlp_expansion", 256) if is_cca else None),
-            zaya_use_eda=bool(getattr(config, "zaya_use_eda", False)) if is_cca else False,
-            zaya_use_mod=bool(getattr(config, "zaya_use_mod", False)) if is_cca else False,
+            # ZAYA router MLP width is `router_hidden_size` (the HF name); keep the old key as fallback.
+            zaya_mlp_expansion=(
+                getattr(config, "router_hidden_size", None) or getattr(config, "zaya_mlp_expansion", 256)
+                if is_cca
+                else None
+            ),
+            # EDA + MOD are ARCHITECTURE constants in transformers ZAYA (ZayaRouter always builds
+            # num_experts+1 classes for the MOD skip; use_eda = layer_idx!=0) — there is NO use_eda/
+            # use_mod config flag, so a CCA model defaults them ON (else routing loses the skip expert
+            # and the EDA state thread -> degenerate). Still overridable by an explicit config key.
+            zaya_use_eda=bool(getattr(config, "zaya_use_eda", True)) if is_cca else False,
+            zaya_use_mod=bool(getattr(config, "zaya_use_mod", True)) if is_cca else False,
             scale_residual_merge=bool(getattr(config, "scale_residual_merge", False)),
             residual_in_fp32=bool(getattr(config, "residual_in_fp32", False)),
         )
