@@ -74,6 +74,25 @@ was redundant with `engine.cam` and is dropped.
 Every op crosses the frontend↔backend boundary via the sampling-param ride — no new message type, no
 second model copy.
 
+## Transparent CAM — ambient reads + writes on `/v1/chat` (VALIDATED)
+CAM becomes ambient on the NORMAL endpoints (no `/cam/*`, no `mem_subject`), gated by env flags:
+- **Read** (`MINISGL_CAM_AUTO=1`): `api_server._cam_auto_augment` runs before generation — the backend
+  `retrieve` op (`mem_op="retrieve"`) decodes the prompt, pulls capitalised proper-noun spans, cosine-
+  matches each against the store (tau-gated), and matched facts are prepended as a system note. The base
+  then answers using the in-context fact (it can *copy* the novel object — works for any query shape).
+- **Write** (`MINISGL_CAM_AUTO_WRITE=1`): `_cam_auto_write` extracts durable `(subject,object)` facts from
+  the latest user turn (`FrontendCAMRuntime.extract_facts`: LLM extraction, with a capitalised-"X is Y"
+  regex fallback for small thinking models that don't emit clean JSON) and `remember`s them.
+
+Both additive, off by default; each costs one extra generation per turn (retrieve / extract).
+**Validated end-to-end** (Qwen3.5-4B, one card): baseline "what is X's language?" → model doesn't know;
+after a plain chat that STATES "the mother tongue of Bartholomew Fizzwick is Dothraki", `/cam/facts` shows
+the auto-learned fact and a later plain chat "what language does he speak?" answers **Dothraki** — with
+no CAM params on either turn. Same for an explicitly-remembered fact (Klingon).
+
+Follow-ups: proper thinking-disable for cleaner LLM extraction; the base-uncertainty write gate; a
+fact-statement heuristic to skip the extraction generation on chit-chat turns (latency).
+
 ## Superseded / reverted
 - `load_input_embed` (embed-only loader) — `engine.cam` already builds its store from the served model's
   own embed + logits, so a separate embed load is unnecessary. Reverted.
