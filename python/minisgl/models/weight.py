@@ -278,6 +278,26 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     return t
 
 
+def _ep_expert_shard(config) -> Tuple[bool, int, int]:
+    """EP expert-shard params for the QUANTIZED MoE loaders, mirroring MoELayer's gate exactly (moe.py:
+    `is_ep_enabled() and (fp8 or W4A8/W4A16 quant)`). Returns (should_shard, ep_local, ep_offset): when
+    sharding, each replica keeps only experts [offset : offset+local) and stacks them at local ids
+    0..local-1; off => (False, num_experts, 0) i.e. the full replicated stack (unchanged). Only the
+    EP-eligible quant formats shard — W4A8 (GPTQ/AWQ) and W4A16 (compressed-tensors), which share the
+    w4a8_moe op layout; RXF and unquantized experts are replicated (must match the MoELayer decision or
+    the loaded stack won't fit the buffer). fp8/ZAYA has its own sharded loader (_load_zaya_weight)."""
+    q = getattr(config, "quant", None)
+    ep_quant = q is not None and (q.is_gptq or q.is_awq or q.is_compressed_tensors)
+    if is_ep_enabled() and ep_quant:
+        dp_info = get_dp_info()
+        assert config.num_experts % dp_info.dp_size == 0, (
+            f"EP needs num_experts ({config.num_experts}) divisible by dp_size ({dp_info.dp_size})"
+        )
+        ep_local = config.num_experts // dp_info.dp_size
+        return True, ep_local, dp_info.dp_rank * ep_local
+    return False, config.num_experts, 0
+
+
 def _load_qwen3_5_weight(
     model_folder: str, device: torch.device, config
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -292,6 +312,8 @@ def _load_qwen3_5_weight(
     concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN/dense in_proj concat (qwen3_5_remap)
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}   # MoE gate/up -> gate_up
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # MoE per-expert -> stacked over E
+    # EP: this replica keeps only its expert shard; skip the rest and stack at local ids. Off => full.
+    _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
         # MoE gate/up merge (shared expert: dense .weight -> dim 0; routed experts: AWQ
@@ -305,14 +327,19 @@ def _load_qwen3_5_weight(
             del merge_buf[merged_key]
             cat_dim = 1 if merged_key.endswith((".qweight", ".qzeros", ".scales")) else 0
             native_key, tensor = merged_key, torch.cat(parts, dim=cat_dim)
-        # MoE expert stacking (experts.<e>.<name> -> experts.<name>, stacked over E).
+        # MoE expert stacking (experts.<e>.<name> -> experts.<name>, stacked over E). Under EP, keep
+        # only the local expert shard and re-index to 0..ep_local-1 so the stacked buffer matches the
+        # MoELayer's local_num_experts sizing.
         if config.is_moe and (einfo := _get_expert_stack_info(native_key)) is not None:
             packed_key, idx = einfo
+            if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
+                return  # not this replica's expert
+            local_idx = idx - _ep_offset
             slots = expert_buf.setdefault(packed_key, {})
-            slots[idx] = tensor
-            if len(slots) != config.num_experts:
+            slots[local_idx] = tensor
+            if len(slots) != _ep_local:
                 return
-            experts = [slots[i] for i in range(config.num_experts)]
+            experts = [slots[i] for i in range(_ep_local)]
             del expert_buf[packed_key]
             yield packed_key, torch.stack(experts, dim=0)
         else:
@@ -505,6 +532,8 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    # EP: keep only this replica's expert shard, re-indexed to 0..ep_local-1. Off => full stack.
+    _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for ckpt_name in f.keys():
@@ -555,11 +584,13 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info
+                    if _ep_shard and not (_ep_offset <= expert_idx < _ep_offset + _ep_local):
+                        continue  # not this replica's expert
                     slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
+                    slots[expert_idx - _ep_offset] = out[1]
+                    if len(slots) != _ep_local:
                         continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
+                    experts = [slots[idx] for idx in range(_ep_local)]
                     del expert_buf[packed_key]
                     yield packed_key, torch.stack(experts, dim=0)
                 else:  # Normal dense model

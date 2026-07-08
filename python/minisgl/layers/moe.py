@@ -237,6 +237,7 @@ class MoELayer(BaseOP):
         apply_router_weight_on_input: bool = False,
         quant: "QuantConfig | None" = None,
         fp8_experts: bool = False,
+        force_no_ep: bool = False,
     ):
         super().__init__()
 
@@ -249,10 +250,19 @@ class MoELayer(BaseOP):
         tp_info = get_tp_info()
         self.tp_size = tp_size = tp_info.size
         # Expert parallelism: each DP replica OWNS only experts [dp_rank*E/dp : (dp_rank+1)*E/dp], so
-        # the per-expert weight buffers are sized to the LOCAL count (E/dp). EP is fp8-only (ZAYA);
-        # the dispatch/combine collective in forward() reconstructs the full result. enable_ep is the
-        # process-global toggle (set by the Engine before model build); off => full replicated count.
-        self.enable_ep = is_ep_enabled() and fp8_experts
+        # the per-expert weight buffers are sized to the LOCAL count (E/dp); the dispatch/combine
+        # collective in forward() reconstructs the full result. enable_ep is the process-global toggle
+        # (set by the Engine before model build); off => full replicated count. Every expert buffer
+        # (fp8 AND quantized: _w_op/_scales_op/_zeros_op / weight_packed) puts E on dim 0, and every
+        # grouped kernel reads E = w13.shape[0], so a shard is a pure dim-0 slice — EP is quant-agnostic
+        # for the W4A8 (GPTQ/AWQ) and W4A16 (compressed-tensors) op layouts (shared w4a8_moe kernel) and
+        # the fp8 W8A8/W8A16 layouts. RXF is excluded (no precomputed-topk path, which EP requires).
+        # `force_no_ep` keeps a specific layer replicated even under EP — used for the tiny MTP draft
+        # head, whose EP-sharding would make spec-decode propose issue data-dependent collectives.
+        _ep_quant = quant is not None and (
+            quant.is_gptq or quant.is_awq or quant.is_compressed_tensors
+        )
+        self.enable_ep = is_ep_enabled() and (fp8_experts or _ep_quant) and not force_no_ep
         dp_info = get_dp_info()
         self.ep_dp_rank = dp_info.dp_rank
         self.ep_dp_size = dp_info.dp_size
@@ -303,11 +313,14 @@ class MoELayer(BaseOP):
                 Experts = _GroupedCompressedTensorsExperts
             else:
                 raise AssertionError(f"MoE W4A8 unsupported quant method: {quant.method}")
+            # EP: size to the LOCAL expert shard (E/dp) so this replica loads + runs only its experts;
+            # the loader skips non-local expert ids (see weight.py _store_expert mirror). enable_ep off
+            # (incl. RXF, force_no_ep) => local_num_experts == num_experts (full replicated, unchanged).
             self.gate_up_proj = Experts(
-                num_experts, 2 * intermediate_size_per_partition, hidden_size, quant
+                self.local_num_experts, 2 * intermediate_size_per_partition, hidden_size, quant
             )
             self.down_proj = Experts(
-                num_experts, hidden_size, intermediate_size_per_partition, quant
+                self.local_num_experts, hidden_size, intermediate_size_per_partition, quant
             )
         else:
             self.gate_up_proj = torch.empty(
@@ -320,6 +333,72 @@ class MoELayer(BaseOP):
                 hidden_size,
                 intermediate_size_per_partition,
             )
+
+    def _ep_route(
+        self,
+        router_logits: "torch.Tensor | None",
+        topk_weights: "torch.Tensor | None",
+        topk_ids: "torch.Tensor | None",
+    ):
+        """Return (topk_weights f32, topk_ids i32) for the EP dispatch. EP must all_gather a route, so
+        it can't defer to the kernel's fused softmax+topk — precompute it here (matching the kernel's
+        own torch route: softmax -> top_k -> optional renorm, kernels.py w4a8_moe._route). A model that
+        already provides a route (GLM/DeepSeek noaux_tc) passes it through unchanged; renormalize must
+        happen over ALL top_k here, BEFORE the per-rank local-expert masking in _ep_dispatch."""
+        if topk_ids is not None:
+            assert topk_weights is not None, "topk_weights required when topk_ids is given"
+            return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+        assert router_logits is not None, "EP route needs router_logits or a precomputed topk"
+        probs = torch.softmax(router_logits.float(), dim=-1)
+        tw, ti = torch.topk(probs, self.top_k, dim=-1)
+        if self.renormalize:
+            tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+        return tw.contiguous(), ti.to(torch.int32).contiguous()
+
+    def _ep_dispatch(self, hidden_states, topk_weights, topk_ids, local_kernel):
+        """Expert-parallel dispatch/combine, quant-agnostic. all_gather every replica's token rows +
+        route so each rank sees ALL tokens -> remap global expert id to local (mask non-local by zeroing
+        the route weight) -> run the format-specific grouped kernel over THIS rank's expert shard ->
+        all_reduce(SUM) (each token's k experts each live on exactly one rank, so the sum reconstructs
+        the full top-k result) -> slice our rows. `local_kernel(g_hidden, local_weights, local_ids_i32)
+        -> (dp*N, H)` is the only per-format part (fp8 W8A16/W8A8, W4A8/W4A16 w4a8_moe). Replaces the TP
+        all_reduce epilogue. See MoELayer.forward for the closures; N self-coordination is Part A."""
+        ep = get_global_ctx().ep
+        assert ep is not None, "EP enabled but ctx.ep group not built"
+        real_n = hidden_states.shape[0]
+        ep_w = topk_weights.contiguous()
+        ep_i = topk_ids.to(torch.int32).contiguous()
+        hs = hidden_states
+        # Common token count N every replica pads to before the all_gather (RCCL needs equal shapes):
+        #  1. graph decode: pre-padded to a captured bs -> already equal, no host sync.
+        #  2. eager with a scheduler pre-agreement (ep_loop prefill): ep.pad_tokens.
+        #  3. eager, no pre-agreement (spec-verify / prefix-seed): SELF-COORDINATE via one tiny
+        #     all_gather of real_n. This is what lets EP survive spec-decode (Part A).
+        if torch.cuda.is_current_stream_capturing():
+            common_n = real_n
+        elif ep.pad_tokens is not None:
+            common_n = max(ep.pad_tokens, real_n)
+        else:
+            counts = ep.all_gather(
+                torch.tensor([real_n], device=hs.device, dtype=torch.int64)
+            )
+            common_n = int(counts.max().item())
+        if common_n > real_n:
+            pad = common_n - real_n
+            hs = torch.cat([hs, hs.new_zeros(pad, hs.shape[1])], dim=0)
+            ep_w = torch.cat([ep_w, ep_w.new_zeros(pad, ep_w.shape[1])], dim=0)
+            ep_i = torch.cat([ep_i, ep_i.new_zeros(pad, ep_i.shape[1])], dim=0)
+        N = hs.shape[0]  # common token count, identical on every rank
+        g_hidden = ep.all_gather(hs)  # (dp*N, H)
+        g_weights = ep.all_gather(ep_w)  # (dp*N, top_k)
+        g_ids = ep.all_gather(ep_i)  # (dp*N, top_k)
+        lo, hi = self.local_expert_offset, self.local_expert_offset + self.local_num_experts
+        is_local = (g_ids >= lo) & (g_ids < hi)
+        local_ids = torch.where(is_local, g_ids - lo, torch.zeros_like(g_ids))
+        local_weights = torch.where(is_local, g_weights, torch.zeros_like(g_weights))
+        partial = local_kernel(g_hidden, local_weights, local_ids.to(torch.int32))  # (dp*N, H)
+        partial = ep.all_reduce(partial)  # SUM across ranks -> full result for every token
+        return partial[self.ep_dp_rank * N : self.ep_dp_rank * N + real_n]  # drop padding
 
     def forward(
         self,
@@ -375,86 +454,26 @@ class MoELayer(BaseOP):
                     apply_router_weight_on_input=self.apply_router_weight_on_input,
                 )
             elif self.enable_ep:
-                # Expert-parallel dispatch/combine (graph-capturable, fixed shapes):
-                #   1. all_gather every replica's token rows + top-1 route so each rank sees ALL
-                #      tokens (rank r's own rows are the contiguous slice [r*N : (r+1)*N]).
-                #   2. remap global expert id -> local (gid - offset); a token whose expert is NOT
-                #      on this rank is masked by ZEROING its route weight (and clamping its id to a
-                #      valid local 0) so the gather-reduce contributes nothing for it.
-                #   3. the grouped MoE kernel over the LOCAL expert tensors with the remapped ids —
-                #      W8A16 (quality) when the kernel is built, else native W8A8.
-                #   4. all_reduce(SUM) the partial outputs: each token's top-1 expert lives on
-                #      exactly one rank, so the sum reconstructs the full result; slice OUR rows.
-                # This REPLACES the tp all_reduce epilogue (the EP all_reduce subsumes it).
-                ep = get_global_ctx().ep
-                assert ep is not None, "EP enabled but ctx.ep group not built"
-                real_n = hidden_states.shape[0]
-                # DECODE (graph): batch is already padded to a captured bs -> equal N on every rank,
-                # pad_tokens is None. EAGER PREFILL: token counts differ, so zero-pad rows up to the
-                # scheduler-agreed common N (all_gather requires equal N). Slice back real_n at the end.
-                ep_w = topk_weights.contiguous()
-                ep_i = topk_ids.to(torch.int32).contiguous()
-                hs = hidden_states
-                # Determine the COMMON token count N every replica pads to before the all_gather
-                # (RCCL requires equal shapes). Three cases, fastest first:
-                #  1. Graph decode: the batch was pre-padded to a captured bs, so N is already equal on
-                #     every replica -> no agreement, no host sync (keeps the hot path graph-clean).
-                #  2. Eager with a scheduler pre-agreement (ep_loop prefill): use ep.pad_tokens.
-                #  3. Eager with NO pre-agreement (a spec-verify / prefix-seed forward that bypassed
-                #     ep_loop): SELF-COORDINATE — one tiny all_gather of the per-replica real_n, pad to
-                #     the max. This is what lets EP survive any forward path (incl. spec-decode) without
-                #     the scheduler loop having pre-agreed the size. Costs an extra collective+sync per
-                #     MoE layer, but only on the (already-eager) uncoordinated path.
-                if torch.cuda.is_current_stream_capturing():
-                    common_n = real_n
-                elif ep.pad_tokens is not None:
-                    common_n = max(ep.pad_tokens, real_n)
-                else:
-                    counts = ep.all_gather(
-                        torch.tensor([real_n], device=hs.device, dtype=torch.int64)
-                    )  # (dp,)
-                    common_n = int(counts.max().item())
-                if common_n > real_n:
-                    pad = common_n - real_n
-                    hs = torch.cat([hs, hs.new_zeros(pad, hs.shape[1])], dim=0)
-                    ep_w = torch.cat([ep_w, ep_w.new_zeros(pad, ep_w.shape[1])], dim=0)
-                    # padded rows get expert id 0 with weight 0 -> zero contribution after masking.
-                    ep_i = torch.cat([ep_i, ep_i.new_zeros(pad, ep_i.shape[1])], dim=0)
-                N = hs.shape[0]  # common token count, identical on every rank
-                g_hidden = ep.all_gather(hs)  # (dp*N, H)
-                g_weights = ep.all_gather(ep_w)  # (dp*N, top_k)
-                g_ids = ep.all_gather(ep_i)  # (dp*N, top_k)
-                lo, hi = self.local_expert_offset, self.local_expert_offset + self.local_num_experts
-                is_local = (g_ids >= lo) & (g_ids < hi)
-                local_ids = torch.where(is_local, g_ids - lo, torch.zeros_like(g_ids))
-                local_weights = torch.where(is_local, g_weights, torch.zeros_like(g_weights))
+                # Expert-parallel dispatch/combine over the fp8 W8A16 (quality) / W8A8 (native) kernel
+                # on this rank's local expert shard. The all_gather/mask/all_reduce scaffold + N
+                # self-coordination live in _ep_dispatch; only the local-shard kernel call is fp8-specific
+                # (w13._w_op is already the [E_local,...] shard; local_ids are remapped into [0,E_local)).
                 if fused_moe_w8a16 is not None:
-                    # W8A16 (quality) on the LOCAL expert shard — same EP contract as W8A8 below but
-                    # bf16 activations. w13._w_op is already this rank's [E_local,...] shard and
-                    # local_ids are remapped into [0, E_local), so the kernel's moe_align groups over
-                    # exactly the local experts; non-local tokens carry weight 0 -> zero contribution
-                    # after the topk-weighted scatter (identical masking to the W8A8 path).
-                    partial = fused_moe_w8a16(
-                        g_hidden.to(torch.bfloat16),
-                        w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
-                        local_weights, local_ids.to(torch.int32),
-                    )  # (dp*N, H)
+                    final_hidden_states = self._ep_dispatch(
+                        hidden_states, topk_weights, topk_ids,
+                        lambda gh, lw, li: fused_moe_w8a16(
+                            gh.to(torch.bfloat16),
+                            w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, lw, li,
+                        ),
+                    )
                 else:
-                    partial = kernels.w8a8_moe(
-                        g_hidden,
-                        w13._w_op,
-                        w13._scales_op,
-                        w2._w_op,
-                        w2._scales_op,
-                        None,
-                        self.top_k,
-                        self.renormalize,
-                        topk_weights=local_weights,
-                        topk_ids=local_ids,
-                    )  # (dp*N, H) — only this rank's local-expert tokens are non-zero
-                partial = ep.all_reduce(partial)  # SUM across ranks -> full result for every token
-                # Our rows are the contiguous [dp_rank*N : dp_rank*N+real_n] slice (drop any padding).
-                final_hidden_states = partial[self.ep_dp_rank * N : self.ep_dp_rank * N + real_n]
+                    final_hidden_states = self._ep_dispatch(
+                        hidden_states, topk_weights, topk_ids,
+                        lambda gh, lw, li: kernels.w8a8_moe(
+                            gh, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, None,
+                            self.top_k, self.renormalize, topk_weights=lw, topk_ids=li,
+                        ),
+                    )
             else:
                 final_hidden_states = kernels.w8a8_moe(
                     hidden_states,
@@ -484,6 +503,22 @@ class MoELayer(BaseOP):
                     self.top_k,
                     self.renormalize,
                     span=self.quant.rotation_span,
+                )
+            elif self.enable_ep:
+                # W4A8 (GPTQ/AWQ) / W4A16 (compressed-tensors) expert-parallel: same all_gather/mask/
+                # all_reduce scaffold as the fp8 path (_ep_dispatch), but the local-shard kernel is
+                # w4a8_moe with the _w_op/_scales_op/_zeros_op triple. EP can't defer routing to the
+                # kernel (it must all_gather a route), so precompute topk here — renormalized over ALL
+                # top_k BEFORE the local-expert masking, then passed precomputed so the kernel doesn't
+                # re-route. w13._w_op etc. are already this rank's [E_local,...] shard.
+                ep_w, ep_i = self._ep_route(router_logits, topk_weights, topk_ids)
+                final_hidden_states = self._ep_dispatch(
+                    hidden_states, ep_w, ep_i,
+                    lambda gh, lw, li: kernels.w4a8_moe(
+                        gh, w13._w_op, w13._scales_op, w13._zeros_op,
+                        w2._w_op, w2._scales_op, w2._zeros_op,
+                        None, self.top_k, self.renormalize, topk_weights=lw, topk_ids=li,
+                    ),
                 )
             else:
                 final_hidden_states = kernels.w4a8_moe(
