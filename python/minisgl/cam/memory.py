@@ -184,6 +184,30 @@ class _ProductKeyStore(nn.Module):
         out = self.read_out_norm(out)
         return out, head_norms, conf
 
+    # ---- POINTER id-bank (#100): exact token id at the addressed slot, no value reconstruction ----
+    def init_ids(self, batch: int, device) -> torch.Tensor:
+        """A parallel per-slot token-ID bank [B,N] (init -1 = empty). Records WHICH token each slot owns
+        so delivery can look up the exact id at the addressed slot instead of reconstructing a lossy value
+        — decoupling the store's (reliable) ADDRESSING from its (lossy) value reconstruction (#100)."""
+        return torch.full((batch, self.N), -1, dtype=torch.long, device=device)
+
+    def write_ids(self, Vid: torch.Tensor, keys: torch.Tensor, ids: torch.Tensor,
+                  addr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Record token `ids` [B,A] at each association's TOP-1 addressed slot (the argmax-weight slot the
+        read selects). Same head-query addressing as the K1 value write ⇒ write-slot == read-slot."""
+        wk = self.head_query(keys) if addr is None else addr
+        slot_idx, slot_w = self._address(wk)                 # [B,A,topk]
+        top = slot_w.argmax(dim=-1, keepdim=True)            # [B,A,1]
+        top_slot = torch.gather(slot_idx, -1, top).squeeze(-1)  # [B,A]
+        return Vid.scatter(1, top_slot, ids)
+
+    def read_ids(self, Vid: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """Look up the exact token id at the TOP-1 addressed slot (head-0 read addressing). [B,Q]->[B,Q]."""
+        slot_idx, slot_w = self._address(self.head_query(query))
+        top = slot_w.argmax(dim=-1, keepdim=True)
+        top_slot = torch.gather(slot_idx, -1, top).squeeze(-1)
+        return torch.gather(Vid, 1, top_slot)                # -1 where the slot is empty
+
 
 # --------------------------------------------------------------------------------------------------
 # PK adapter read/write front-end (ported from cam/pk_store_adapter.py) — persistent path only
@@ -257,6 +281,17 @@ class _PKAdapter(nn.Module):
         pq = self.readout_q.unsqueeze(0).expand(B, -1, -1)
         attn = torch.softmax(pq @ read.transpose(1, 2) / (self.mem_dim ** 0.5), dim=-1)
         return attn @ read
+
+    def persistent_write_ids(self, Vid: torch.Tensor, keys: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """POINTER write (#100): record token `ids` [B,A] at the addressed slots of the id-bank Vid,
+        using the SAME K1 head-query addressing as persistent_write so write-slot == read-slot."""
+        addr = self.store.head_query(keys, 0) if self.write_at_read else None
+        return self.store.write_ids(Vid, keys, ids, addr=addr)
+
+    def persistent_read_ids(self, Vid: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        """POINTER read: exact token id at the addressed slot -> [B,Q]. Uses the store's reliable
+        ADDRESSING, skipping the lossy value reconstruction that floored multi-token delivery at ~0.5/tok."""
+        return self.store.read_ids(Vid, q)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -411,6 +446,10 @@ class CAMMemory:
         self.value_suppress = float(meta.get("value_suppress", 0.0))
         pooled_subj_key = bool(meta.get("pooled_subj_key", True))
         self._pooled_subj_key = pooled_subj_key
+        # POINTER id-bank (#100): the max object length the per-position id-banks retain. Position
+        # separation comes from SEPARATE id-banks per position (subject-keyed), so no learned pos_tag is
+        # needed — the pointer stores exact ids, so its only requirement is write-slot == read-slot.
+        self.mt_cap = int(meta.get("mt_positions", 0)) or 16
 
         # --- load raw tensors ---
         tap_sd = _strip_modctdict_prefix(torch.load(os.path.join(checkpoint_dir, "tap.pt"),
@@ -469,6 +508,10 @@ class CAMMemory:
                 p.requires_grad_(False)
         self.banks = [self.adapter.store.init_state(1, device, dtype=torch.float32)
                       for _ in range(self.n_banks)]
+        # POINTER id-banks (#100): id_banks[t][b] = per-slot token id for answer position t, subject
+        # bucket b. Separate bank per position ⇒ positions never collide; subject key addresses within.
+        self.id_banks = [[self.adapter.store.init_ids(1, device) for _ in range(self.n_banks)]
+                         for _ in range(self.mt_cap)]
         self.enabled = True
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
@@ -524,6 +567,35 @@ class CAMMemory:
             val = val.expand(-1, key.shape[1], -1)
         b = _subject_bank(list(subject_ids), self.n_banks)
         self.banks[b] = self.adapter.persistent_write(self.banks[b], key, val)
+        # POINTER id-bank (#100): record the EXACT object token at each answer position, addressed by the
+        # subject key in that position's own id-bank — so /cam/ask delivers the whole multi-token object
+        # losslessly (the value bank above only carries the first-token seed for the router/tap path).
+        key1 = key[:, :1]                                    # single-vector key for the id addressing
+        for t in range(min(len(object_ids), self.mt_cap)):
+            idt = torch.tensor([[int(object_ids[t])]], dtype=torch.long, device=dev)
+            self.id_banks[t][b] = self.adapter.persistent_write_ids(self.id_banks[t][b], key1, idt)
+
+    # ---- POINTER delivery (#100): exact multi-token object via the store's addressing ----------------
+    @torch.no_grad()
+    def deliver_object_ids(self, subject_ids: List[int]) -> List[int]:
+        """The exact object token sequence for a subject, retrieved from the per-position id-banks via the
+        store's addressing (not reconstructed). Stops at the first empty slot (-1). Returns [] when the
+        subject addresses no stored object. This is the #100 unlock in serving: memory supplies the
+        unknowable object tokens, the base then continues the sentence."""
+        if not self.enabled or not getattr(self, "id_banks", None):
+            return []
+        dev = self.adapter.device
+        tids = torch.tensor([list(subject_ids)], dtype=torch.long, device=dev)
+        q = self.adapter._e(tids)
+        key1 = (self.adapter._pool_subject(q, keepdim=True) if self._pooled_subj_key else q[:, -1:])[:, :1]
+        b = _subject_bank(list(subject_ids), self.n_banks)
+        out: List[int] = []
+        for t in range(self.mt_cap):
+            pid = int(self.adapter.persistent_read_ids(self.id_banks[t][b], key1)[0, 0].item())
+            if pid < 0:
+                break
+            out.append(pid)
+        return out
 
     # ---- read (once per request, at prefill) -----------------------------------------------------
     @torch.no_grad()
@@ -605,6 +677,8 @@ class CAMMemory:
             return
         self.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
                       for _ in range(self.n_banks)]
+        self.id_banks = [[self.adapter.store.init_ids(1, self.device) for _ in range(self.n_banks)]
+                         for _ in range(self.mt_cap)]
         self._facts = {}
 
     @torch.no_grad()
@@ -619,6 +693,8 @@ class CAMMemory:
         b = _subject_bank(list(subject_ids), self.n_banks)
         del self._facts[key]
         self.banks[b] = self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+        for t in range(self.mt_cap):                          # clear the pointer id-banks for this bucket too
+            self.id_banks[t][b] = self.adapter.store.init_ids(1, self.device)
         for subj, rec in list(self._facts.items()):
             if _subject_bank(list(subj), self.n_banks) == b:
                 self._write(list(subj), rec["object_ids"])
