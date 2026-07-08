@@ -16,8 +16,11 @@ class TokenizeManager:
         # TODO: batch tokenization
         for msg in msgs:
             if isinstance(msg.text, list):
+                # `tools` (when set) render the tool specs into the chat template for tool-trained
+                # models; None is the transformers default (no tools) and is safe for every template.
                 prompt = self.tokenizer.apply_chat_template(
                     msg.text,
+                    tools=getattr(msg, "tools", None),
                     tokenize=False,
                     add_generation_prompt=True,
                 )
