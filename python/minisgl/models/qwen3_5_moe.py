@@ -66,7 +66,11 @@ class Qwen3_5MoeSparseBlock(BaseOP):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
+            # ALWAYS renormalize: the Qwen3.5-MoE router (transformers Qwen3_5MoeTopKRouter) divides
+            # the top-k softmax probs by their sum UNCONDITIONALLY — there is no norm_topk_prob toggle
+            # for this architecture, and the config omits the key (minisgl would default it False).
+            # Skipping it leaves the routed weights summing to <1 -> mis-scaled experts -> degenerate.
+            renormalize=True,
             quant=expert_quant,
         )
         self.shared_expert = Qwen3_5MoeSharedExpert(config)
