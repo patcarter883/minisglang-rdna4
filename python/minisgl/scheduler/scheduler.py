@@ -547,8 +547,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # Write-only: no forced tokens (the frontend sends max_tokens=1; the 1-token generation is a stub).
             mem_remember = getattr(req.sampling_params, "mem_remember", None)
             if mem_remember:
-                cam._write(subj_ids, list(mem_remember))
-                cam._facts[tuple(int(s) for s in subj_ids)] = {"object_ids": list(mem_remember), "base_p": 0.0}
+                # WRITE GATING: explicit ingest (mem_write_mode="force") always writes; ambient auto-write
+                # ("auto"/None) is refused when the store is frozen or (no-clobber) the subject is already
+                # curated — so conversational chatter can't overwrite a deliberately-ingested store.
+                mode = getattr(sp, "mem_write_mode", None) or "auto"
+                if cam.write_allowed(subj_ids, source=mode):
+                    cam._write(subj_ids, list(mem_remember))
+                    cam._facts[tuple(int(s) for s in subj_ids)] = {"object_ids": list(mem_remember), "base_p": 0.0}
                 req._mem_deliver, req._mem_deliver_pos = [], 0    # mark processed; deliver nothing
                 continue
             # #100 POINTER delivery (multi-process): force the EXACT object token sequence retrieved from
@@ -584,6 +589,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if op == "stats":
             statter = getattr(cam, "stats", None)
             return json.dumps(statter() if statter else {})
+        if op in ("freeze", "unfreeze"):        # read-only toggle: protect a curated store from auto-write
+            fn = getattr(cam, op, None)
+            if fn:
+                fn()
+            return json.dumps({"frozen": bool(getattr(cam, "frozen", False))})
         return json.dumps(None)
 
     def _cam_retrieve(self, cam, prompt_ids) -> str:
