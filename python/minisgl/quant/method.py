@@ -12,6 +12,18 @@ if TYPE_CHECKING:
     from minisgl.layers.base import BaseOP
 
 
+def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
+    """Decide a compressed-tensors int4 checkpoint's packed sign convention from the nibble
+    distribution. Returns True if the packed nibbles are already uint4b8 (q+8; mode at 8 for
+    symmetric weights) -> pass through; False for two's-complement (mode at 0) -> XOR 0x88.
+    Samples a slice (the decision is uniform across a tensor's nibbles)."""
+    flat = packed.flatten()
+    sample = flat[: min(flat.numel(), 1 << 16)].to(torch.int64) & 0xFFFFFFFF
+    nib = torch.cat([(sample >> (4 * p)) & 0xF for p in range(8)])
+    counts = torch.bincount(nib, minlength=16)
+    return bool(counts[8] >= counts[0])
+
+
 @runtime_checkable
 class LinearMethod(Protocol):
     """How a parallel-linear layer allocates its weights and computes its matmul.
@@ -99,18 +111,28 @@ class W4A8LinearMethod:
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         if self.quant.is_compressed_tensors:
-            # CT DENSE -> op layout: signed int4 -> unsigned (q+8) by flipping each nibble's top bit
-            # (XOR 0x88 per byte); constant zero-point 8 (zeros_op all 0x88). Mirrors the MoE-expert
-            # post_load without the E dim; then w4a8_linear consumes _w_packed_op/_scales_op/_zeros_op.
+            # CT DENSE -> op layout (constant zero-point 8; zeros_op all 0x88; scales as-is).
+            # The op wants weights as uint4b8 (nibble = q + 8). compressed-tensors "pack-quantized"
+            # ships int4 in one of TWO packings, per producer, that we must distinguish per checkpoint:
+            #   * two's-complement signed int4 (nibble = q & 0xF): convert to uint4b8 by flipping each
+            #     nibble's top bit — XOR 0x88 per byte — since (q&0xF)^8 == q+8 for q in [-8,7].
+            #   * already-offset uint4b8 (nibble = q + 8; AWQ-style zero_point=8, e.g. cyankiwi's
+            #     Qwen3.5/3.6 "AWQ-*-INT4" dense checkpoints): pass through UNCHANGED — an XOR here
+            #     would scramble it (it re-flips the top bit) and produce garbage.
+            # Symmetric weights make the two trivially separable by the packed nibble distribution:
+            # uint4b8 is a bell curve with its mode at 8 (q=0); two's-complement's mode is at 0.
             pf = 32 // self.quant.bits
             N, Kp = layer.weight_packed.shape  # type: ignore[attr-defined]
             G = layer.weight_scale.shape[-1]  # type: ignore[attr-defined]
-            flipped = (layer.weight_packed.contiguous().view(torch.uint8) ^ 0x88).view(torch.int32)
-            layer._w_packed_op = flipped.contiguous()
+            wp = layer.weight_packed.contiguous()  # type: ignore[attr-defined]
+            if _ct_packed_is_uint4b8(wp):
+                layer._w_packed_op = wp
+            else:
+                layer._w_packed_op = (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
             layer._scales_op = layer.weight_scale.to(torch.float16).contiguous()  # type: ignore[attr-defined]
             zeros = torch.empty((N // pf, G), dtype=torch.int32)
             zeros.view(torch.uint8).fill_(0x88)
-            layer._zeros_op = zeros.to(layer.weight_packed.device)
+            layer._zeros_op = zeros.to(wp.device)
             del layer.weight_packed, layer.weight_scale
             return
         qz = getattr(layer, "qzeros", None)
