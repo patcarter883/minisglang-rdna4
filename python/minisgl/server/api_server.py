@@ -166,7 +166,7 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
-async def _cam_auto_augment(prompt):
+async def _cam_auto_augment(prompt, ns=None):
     """TRANSPARENT CAM read (MINISGL_CAM_AUTO=1): fold relevant remembered facts into the request context
     so /v1/chat and /generate use CAM with NO special params. `prompt` is a chat-messages list or a raw
     string. Retrieves cosine-matched facts for the query text and prepends them as a system note (chat) or
@@ -189,7 +189,7 @@ async def _cam_auto_augment(prompt):
     if not query.strip():
         return prompt
     try:
-        facts = await rt.retrieve(query)
+        facts = await rt.retrieve(query, namespace=ns)
     except Exception as e:  # noqa: BLE001
         logger.debug("CAM auto-retrieve failed: %s", e)
         return prompt
@@ -226,7 +226,7 @@ def _auto_write_enabled(override: bool | None) -> bool:
     return os.environ.get("MINISGL_CAM_AUTO_WRITE") == "1"
 
 
-async def _cam_auto_write(text: str, override: bool | None = None) -> None:
+async def _cam_auto_write(text: str, override: bool | None = None, ns: str = None) -> None:
     """TRANSPARENT CAM write: model-extract durable facts from `text` (the latest user turn) and remember
     them (mode='auto', so the store's freeze/no-clobber gates apply — a curated store is not overwritten
     by conversation). Gated by the per-request `cam_write` override or MINISGL_CAM_AUTO_WRITE=1. No-op when
@@ -247,7 +247,7 @@ async def _cam_auto_write(text: str, override: bool | None = None) -> None:
         return
     try:
         for subj, obj in await rt.extract_facts(text):
-            await rt.remember(subj, obj, mode="auto")     # ambient -> subject to freeze/no-clobber gates
+            await rt.remember(subj, obj, mode="auto", namespace=ns)   # ambient -> freeze/no-clobber gates
             logger.debug("CAM auto-write: remembered %r -> %r", subj, obj)
     except Exception as e:  # noqa: BLE001
         logger.debug("CAM auto-write failed: %s", e)
@@ -481,8 +481,9 @@ if os.environ.get("MINISGL_CAM") == "1":
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
-    await _cam_auto_write(req.prompt, override=req.cam_write)   # ambient write (gated; no-op unless enabled)
-    prompt = await _cam_auto_augment(req.prompt)   # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
+    _cam_ns = request.headers.get("x-cam-namespace")   # #6 per-tenant/session store (None -> default)
+    await _cam_auto_write(req.prompt, override=req.cam_write, ns=_cam_ns)   # ambient write (gated)
+    prompt = await _cam_auto_augment(req.prompt, ns=_cam_ns)   # TRANSPARENT CAM read (no-op unless enabled)
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -578,8 +579,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         _last_user = next((m.get("content") for m in reversed(prompt) if m.get("role") == "user"), None)
     else:
         _last_user = prompt
-    await _cam_auto_write(_last_user or "", override=req.cam_write)   # gated ambient write (per-req + freeze/no-clobber)
-    prompt = await _cam_auto_augment(prompt)     # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
+    _cam_ns = request.headers.get("x-cam-namespace")   # #6 per-tenant/session store (None -> default)
+    await _cam_auto_write(_last_user or "", override=req.cam_write, ns=_cam_ns)   # gated ambient write
+    prompt = await _cam_auto_augment(prompt, ns=_cam_ns)     # TRANSPARENT CAM read (no-op unless enabled)
 
     uid = state.new_user()
     await state.send_one(
