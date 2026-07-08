@@ -697,9 +697,10 @@ class CAMMemory:
         return [{"subject_ids": list(k), **v} for k, v in self._facts.items()]
 
     def stats(self) -> dict:
-        """Per-bank occupancy + crowding health (online_api.md §6.2). Delivery silently degrades when a
-        bank crowds past ~9 edits, so this is the mandatory overflow guard. Counts come from the side
-        index (exact); the subject-hash routing is replayed to attribute each edit to its bank."""
+        """Per-bank occupancy + crowding health for the product-key VALUE banks (online_api.md §6.2). The
+        value-bank read degrades past ~9 edits/bank — but that only affects the router/tap FALLBACK now;
+        the primary /cam/ask delivery is the cosine-NN subject index (exact, collision-free). Counts come
+        from the side index (exact); the subject-hash routing is replayed to attribute each edit to a bank."""
         loads = [0] * self.n_banks
         for sids in self._facts:
             loads[_subject_bank(list(sids), self.n_banks)] += 1
