@@ -166,6 +166,17 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._tidar_ddtree = os.environ.get("MINISGL_TIDAR_DDTREE") == "1"
                 if self._tidar_ddtree:
                     logger.info_rank0("spec-decode: TiDAR DDTree draft-tree path ENABLED")
+            # MINISGL_DFLASH_DDTREE=1: route DFlash (block-diffusion drafter) through the same DDTree
+            # draft-tree step — its one denoising forward emits per-position top-K marginals, from which
+            # we build a B-budget tree, verify it in one ancestor-masked target forward, and commit the
+            # accepted path via the linear verify. Off by default (vanilla DFlash = argmax chain).
+            from minisgl.spec.dflash import DFlashProposer
+
+            self._dflash_ddtree = False
+            if isinstance(self._proposer, DFlashProposer):
+                self._dflash_ddtree = os.environ.get("MINISGL_DFLASH_DDTREE") == "1"
+                if self._dflash_ddtree:
+                    logger.info_rank0("spec-decode: DFlash DDTree draft-tree path ENABLED")
             self._spec_seed_enabled = (
                 os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
                 and bool(self._proposer.supports_prefill_seed)
@@ -579,6 +590,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if getattr(self, "_tidar_ddtree", False):
                 self._spec_decode_step_ddtree(
                     reqs, self._proposer.block_size, self._proposer.mask_token_id)
+            elif getattr(self, "_dflash_ddtree", False):
+                self._spec_decode_step_dflash_ddtree(reqs)
             elif getattr(self, "_tidar_fused", False):
                 self._spec_decode_step_tidar_fused(
                     reqs, self._proposer.block_size, self._proposer.mask_token_id)
@@ -1005,6 +1018,62 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # forward 3: commit the accepted path per req via the linear verify (drafts = tree path)
         for req in reqs:
             req._tidar_drafts = accepted[id(req)][0]  # the accepted tokens as the drafts to commit
+        self._spec_decode_step(reqs, ddtree_drafts=True)
+
+    @torch.inference_mode()
+    def _spec_decode_step_dflash_ddtree(self, reqs: List[Req]) -> None:
+        """DDTree spec step for the DFlash block-diffusion drafter (MINISGL_DFLASH_DDTREE=1). Reuses the
+        drafter-agnostic tree machinery (_ddtree_tree_verify) — the only DFlash-specific piece is where
+        the per-position top-K MARGINALS come from: DFlash's ONE denoising forward inside propose (vs
+        TiDAR's block_predict). Three forwards, mirroring _spec_decode_step_ddtree:
+          1. DFlash propose(topk=K) -> per-position top-K marginals (ids+log-probs) stashed on the
+             proposer, keyed by id(req). No persistent draft KV (DFlash rebuilds from captured aux).
+          2. _ddtree_tree_verify: build a B-budget draft TREE (build_draft_tree, root = the confirmed
+             token at cached_len) and discover the accepted path via ONE ancestor-masked target forward.
+          3. commit: the linear verify over [bonus | accepted-path] (_spec_decode_step ddtree_drafts) —
+             correct causal context, re-captures the target aux for the next block, emits + rolls back.
+        K=MINISGL_DDTREE_TOPK (default 8), budget=MINISGL_DDTREE_BUDGET (default 32)."""
+        K = int(os.environ.get("MINISGL_DDTREE_TOPK", "8"))
+        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET", "32"))
+        from minisgl.spec.ddtree import build_draft_tree
+
+        spec = self.engine.spec_config
+        assert spec is not None and self._proposer is not None
+        # ctx carries the target aux hidden captured at the PREVIOUS verify (DFlash's cross-block context).
+        ctx = ProposeContext(
+            self.device,
+            last_hidden={r.uid: self._spec_last_hidden[r.uid]
+                         for r in reqs if r.uid in self._spec_last_hidden}
+            if self._spec_needs_last_hidden else None,
+            aux_hidden={r.uid: self._spec_aux_hidden[r.uid]
+                        for r in reqs if r.uid in self._spec_aux_hidden}
+            if self._spec_capture_layer_ids else None,
+        )
+        # forward 1: DFlash denoise -> per-position top-K marginals (ignore the argmax chain it returns).
+        self._proposer.propose(reqs, spec.num_draft, ctx, topk=K)
+        topk_map = getattr(self._proposer, "_ddtree_topk", {})
+        # forward 2: build the tree per req (root = confirmed token @cached_len) + tree-verify walk.
+        trees = {}
+        for req in reqs:
+            root = int(req.input_ids[req.cached_len])
+            entry = topk_map.get(id(req))
+            if entry is None:  # no aux yet / budget-0 req -> root-only tree (commit degrades to plain decode)
+                trees[id(req)] = build_draft_tree([], [], 0, root)
+            else:
+                ids, logp = entry
+                trees[id(req)] = build_draft_tree(logp, ids, budget, root)
+        accepted = self._ddtree_tree_verify(reqs, trees)
+        # metric: mean tree accept-len (the DDTree win at block-16 vs the argmax chain).
+        st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
+        for r in reqs:
+            st["tree"] += len(accepted[id(r)][0]); st["n"] += 1
+        self._ddtree_stat = st
+        if st["n"] % 100 == 0:
+            logger.info_rank0(f"[ddtree] mean tree accept-len={st['tree']/st['n']:.2f} over {st['n']} reqs "
+                              f"(B={budget} K={K} block={self._proposer._block_size})")
+        # forward 3: commit the accepted path per req via the linear verify (drafts = tree path).
+        for req in reqs:
+            req._tidar_drafts = accepted[id(req)][0]
         self._spec_decode_step(reqs, ddtree_drafts=True)
 
     @torch.inference_mode()
@@ -1667,6 +1736,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # n-gram; MTP/DFlash/EAGLE truncate their draft KV. (GDN backbone-state rollback is handled
         # separately in the verify forward path, not here — it is the target's state, not the draft's.)
         self._proposer.on_accept(reqs, accepted_counts)
+
+        # Mean accepted-draft length (diagnostic, same 100-req cadence as the [ddtree] log). Gated to
+        # the plain propose→verify path (ddtree_drafts=True is DDTree's commit forward — those drafts
+        # are the already-discovered tree path, counted by the [ddtree] metric instead, so skip here).
+        if not ddtree_drafts:
+            ast = getattr(self, "_spec_accept_stat", None) or {"acc": 0.0, "n": 0}
+            for na in accepted_counts:
+                ast["acc"] += na; ast["n"] += 1
+            self._spec_accept_stat = ast
+            if ast["n"] % 100 == 0:
+                logger.info_rank0(
+                    f"[spec] mean accept-len={ast['acc']/ast['n']:.2f} over {ast['n']} reqs")
 
         for req in new_finished_reqs:
             self.decode_manager.remove_req(req)
