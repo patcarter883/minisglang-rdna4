@@ -532,11 +532,18 @@ class CAMMemory:
         # ---- write gating (protect a curated/ingested store from ambient auto-write) -------------------
         # frozen: read-only — refuse AMBIENT auto-write (explicit force ingest still writes). Flip at
         #   runtime via freeze()/unfreeze() (POST /cam/freeze) or start frozen with MINISGL_CAM_FROZEN=1.
-        # write_policy 'no-clobber': auto-write may ADD a genuinely-new subject but never overwrite/shadow
-        #   an existing one (cosine >= protect_tau to a stored key). 'overwrite' (default) = prior behaviour.
+        # write_policy 'no-clobber' (DEFAULT): auto-write may ADD a genuinely-new subject but never
+        #   overwrite/shadow an existing one (exact id match, or cosine >= protect_tau to a stored key).
+        #   Set MINISGL_CAM_WRITE_POLICY=overwrite for the old always-write behaviour.
+        # protect_tau DEFAULTS TO deliver_tau (0.70): "refuse to re-write what the store would already
+        #   deliver for this subject." Measured on real Qwen3.5-4B subject keys (tau_sweep): 0.70 sits above
+        #   distinct subjects (<=0.51) and different-people-sharing-a-name (<=0.62), and catches confident
+        #   same-subject paraphrases (reorder/trailing/"the"/titles). A missed rewording only appends a
+        #   redundant entry (_write overwrites only on EXACT subject-id match); a false refuse would silently
+        #   drop a new fact — so the default errs toward learning. Override with MINISGL_CAM_PROTECT_TAU.
         self.frozen = os.environ.get("MINISGL_CAM_FROZEN") == "1"
-        self.write_policy = os.environ.get("MINISGL_CAM_WRITE_POLICY", "overwrite")
-        self.protect_tau = float(os.environ.get("MINISGL_CAM_PROTECT_TAU", "0.9"))
+        self.write_policy = os.environ.get("MINISGL_CAM_WRITE_POLICY", "no-clobber")
+        self.protect_tau = float(os.environ.get("MINISGL_CAM_PROTECT_TAU", str(self.deliver_tau)))
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
