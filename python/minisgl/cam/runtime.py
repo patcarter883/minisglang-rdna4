@@ -299,6 +299,9 @@ class FrontendCAMRuntime:
     async def save(self) -> dict:                       # #7 explicit persistence flush
         return (await self._ctrl("save")) or {}
 
+    async def reload(self) -> dict:                     # #11 pull shared-store writes from another replica
+        return (await self._ctrl("reload")) or {}
+
     async def undo(self, namespace: str = None) -> dict:   # #12 undo last write
         return (await self._ctrl("undo", namespace=namespace)) or {}
 

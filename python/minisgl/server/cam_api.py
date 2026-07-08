@@ -390,6 +390,19 @@ async def save() -> dict:
     return {"saved": saver()}
 
 
+@cam_router.post("/reload")
+async def reload_store() -> dict:
+    """#11 DP-scale: re-read the store from MINISGL_CAM_STORE_PATH to pick up writes made by another
+    replica sharing the backing file (eventual consistency). See docs/zaya-port/CAM_DP_SCALE.md."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.reload()
+    reloader = getattr(runtime.memory, "reload", None)
+    if reloader is None:
+        raise HTTPException(status_code=503, detail="CAM reload unavailable")
+    return {"edits": reloader()}
+
+
 @cam_router.post("/undo")
 async def undo(x_cam_namespace: str = Header(None)) -> dict:
     """#12: undo the most-recent write in a namespace (forget that subject). Returns the undone fact or {}."""
