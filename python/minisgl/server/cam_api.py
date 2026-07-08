@@ -237,37 +237,51 @@ async def ask(req: AskRequest) -> AskResponse:
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
 
-    bank, conf = memory.read(subject_ids)
     cur = _bos_ids(tok) + _encode(tok, req.prompt)
     eos_id = getattr(tok, "eos_token_id", None)
     max_tokens = max(1, int(req.max_tokens))
-
-    seed_fn = getattr(memory, "seed_token", None)
-    seed_tok = None
     out: List[int] = []
-    placed = False
+
+    # POINTER delivery (#100): the exact stored object token sequence, retrieved via the store's
+    # ADDRESSING (not a lossy value reconstruction — that floored genuine multi-token delivery at
+    # ~0.5/token). Emit the object tokens straight from memory, then release to the base to continue the
+    # sentence. Validated 4/4 span-exact offline. Falls back to the router-gated seed-once path when the
+    # subject addresses no stored object (nothing to deliver).
+    deliver = getattr(memory, "deliver_object_ids", None)
+    obj_ids = deliver(subject_ids) if deliver is not None else []
 
     with torch.no_grad():
-        for _ in range(max_tokens):
-            logits = runtime.base_logits(cur).float()
-            if not placed:
-                delta = memory.router_delta(logits, bank, conf)
-                if seed_tok is None:
-                    # The store's preferred first token: prefer an explicit CAMMemory.seed_token;
-                    # else derive it from the injection delta (its argmax is the store's top token,
-                    # matching serve_gen's ``store_tok``).
-                    if seed_fn is not None:
-                        seed_tok = int(seed_fn(bank, conf))
-                    else:
-                        seed_tok = int(torch.as_tensor(delta).reshape(-1).argmax().item())
-                logits = logits + torch.as_tensor(delta).to(logits.device)
-            nxt = int(logits.reshape(-1).argmax().item())
-            if seed_tok is not None and nxt == seed_tok:
-                placed = True  # seed-once: object's first token landed, stop injecting
-            if eos_id is not None and nxt == eos_id:
-                break
-            out.append(nxt)
-            cur = cur + [nxt]
+        if obj_ids:
+            for i in range(max_tokens):
+                if i < len(obj_ids):
+                    nxt = int(obj_ids[i])                        # exact object token from memory (pointer)
+                else:
+                    nxt = int(runtime.base_logits(cur).float().reshape(-1).argmax().item())  # base continues
+                if eos_id is not None and nxt == eos_id:
+                    break
+                out.append(nxt)
+                cur = cur + [nxt]
+        else:
+            # --- fallback: router-gated seed-once decode (unstored subject / no pointer) ---
+            bank, conf = memory.read(subject_ids)
+            seed_fn = getattr(memory, "seed_token", None)
+            seed_tok = None
+            placed = False
+            for _ in range(max_tokens):
+                logits = runtime.base_logits(cur).float()
+                if not placed:
+                    delta = memory.router_delta(logits, bank, conf)
+                    if seed_tok is None:
+                        seed_tok = (int(seed_fn(bank, conf)) if seed_fn is not None
+                                    else int(torch.as_tensor(delta).reshape(-1).argmax().item()))
+                    logits = logits + torch.as_tensor(delta).to(logits.device)
+                nxt = int(logits.reshape(-1).argmax().item())
+                if seed_tok is not None and nxt == seed_tok:
+                    placed = True                                # seed-once: first token landed, stop injecting
+                if eos_id is not None and nxt == eos_id:
+                    break
+                out.append(nxt)
+                cur = cur + [nxt]
 
     text = tok.decode(out).replace("\n", " ").strip()
     return AskResponse(text=text)
@@ -275,14 +289,28 @@ async def ask(req: AskRequest) -> AskResponse:
 
 @cam_router.get("/facts", response_model=List[FactItem])
 async def list_facts() -> List[FactItem]:
-    """List stored edits from the CAMMemory side index (the bank tensor cannot be enumerated)."""
+    """List stored edits from the CAMMemory side index (the bank tensor cannot be enumerated).
+
+    CAMMemory keeps the side index as raw token-ids (it is deliberately tokenizer-free), so we
+    decode ``subject_ids``/``object_ids`` back to text here with the runtime tokenizer. Subjects and
+    objects were stored space-prefixed (``_encode_sp``); ``.decode`` yields a leading space we strip.
+    Shapes with ready-made ``subject``/``object`` strings are passed through unchanged.
+    """
     runtime = _get_runtime()
     memory = runtime.memory
+    tok = runtime.tokenizer
     lister = getattr(memory, "list_facts", None)
     if lister is None:
         raise HTTPException(status_code=503, detail="CAM side index unavailable")
-    facts = lister()
-    return [FactItem(subject=str(f["subject"]), object=str(f["object"])) for f in facts]
+
+    def _text(f, str_key, ids_key):
+        if str_key in f and f[str_key] is not None:
+            return str(f[str_key])
+        ids = f.get(ids_key)
+        return tok.decode(list(ids)).strip() if ids else ""
+
+    return [FactItem(subject=_text(f, "subject", "subject_ids"),
+                     object=_text(f, "object", "object_ids")) for f in lister()]
 
 
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)
