@@ -20,6 +20,7 @@ docker run --rm \
   -e CONFIGS="${CONFIGS:?set CONFIGS}" -e TAG="${TAG:-out}" \
   -e GRAPH_SPEC="${GRAPH_SPEC:-16}" \
   -e MINISGL_NUM_NEXTN="${MINISGL_NUM_NEXTN:-}" -e MINISGL_MTP_LAYERS="${MINISGL_MTP_LAYERS:-}" \
+  -e MINISGL_DISABLE_ROPE_INTERLEAVE="${MINISGL_DISABLE_ROPE_INTERLEAVE:-}" \
   -v "$PWD":/engine \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
