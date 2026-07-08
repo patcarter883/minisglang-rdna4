@@ -173,6 +173,23 @@ class FrontendCAMRuntime:
     def _sp(self, s: str):
         return list(self.tokenizer(" " + s, add_special_tokens=False).input_ids)
 
+    def _render_nothink(self, messages) -> str:
+        """Render chat messages to a raw prompt string with THINKING DISABLED, so a thinking model
+        (Qwen3.x) answers directly instead of emitting a `<think>…</think>` monologue that swamps the
+        JSON. `/no_think` in the prompt is unreliable — the template kwarg is the real switch. Falls back
+        to the plain template (thinking on; the regex fallback in extract_facts then covers it), then to a
+        joined string, if the tokenizer's template doesn't accept `enable_thinking`. We render here (not in
+        the backend TokenizeManager, which never passes the kwarg) and send the resulting string."""
+        tok = self.tokenizer
+        try:
+            return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                           enable_thinking=False)
+        except TypeError:
+            try:
+                return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception:  # noqa: BLE001
+                return "\n".join(str(m.get("content") or "") for m in messages)
+
     async def _generate(self, prompt: str, max_tokens: int, *, mem_subject: str = None,
                         mem_remember=None, mem_op: str = None) -> str:
         """One raw-prompt generation through the backend, carrying the CAM sampling params (mirrors
@@ -207,7 +224,7 @@ class FrontendCAMRuntime:
             logger.warning("CAM %s: could not parse backend reply as JSON: %r", op, txt[:200])
             return None
 
-    async def extract_facts(self, text: str, max_tokens: int = 512) -> list:
+    async def extract_facts(self, text: str, max_tokens: int = 256) -> list:
         """TRANSPARENT write: model-assisted extraction of durable (subject, object) facts stated in
         `text` (a plain generation — no CAM params). Returns [(subject, object), ...]; [] on none/parse
         failure. Deliberately conservative so chit-chat doesn't pollute the store."""
@@ -216,9 +233,12 @@ class FrontendCAMRuntime:
         instr = ('Extract only DURABLE factual statements the text asserts, as a JSON array of '
                  '{"subject","object"} objects (e.g. a person\'s language, a place\'s country). Ignore '
                  'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array, no '
-                 f'prose. /no_think\n\nText: {text}')
-        # chat format (better instruction-following than a raw completion) with thinking disabled.
-        out = await self._generate([{"role": "user", "content": instr}], max_tokens=max_tokens)
+                 f'prose.\n\nText: {text}')
+        # Render with thinking OFF (a raw string carrying the chat template) so the model emits the JSON
+        # directly; strip any residual <think> block before parsing (defence in depth).
+        prompt = self._render_nothink([{"role": "user", "content": instr}])
+        out = await self._generate(prompt, max_tokens=max_tokens)
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
         m = re.search(r"\[.*\]", out, re.DOTALL)
         facts = []
         if m:
@@ -264,10 +284,23 @@ class FrontendCAMRuntime:
         return (await self._ctrl("stats")) or {}
 
     async def remember(self, subject: str, object_str: str, prompt: str = None) -> bool:
-        """Write subject->object into the backend engine.cam. The base-uncertainty gate is skipped in the
-        multi-process path for now (storing a base-known fact is harmless — the pointer delivers the same
-        object the base would); a scheduler-side probe can add it back later."""
-        await self._generate(prompt or f"The mother tongue of {subject} is", max_tokens=1,
+        """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
+
+        Base-uncertainty gate (opt-in, MINISGL_CAM_WRITE_GATE=1): before writing, probe the served base
+        with the relation prompt (one short no-CAM generation). If the base ALREADY produces `object_str`,
+        the fact is base-known — storing it wastes a slot and the pointer would only re-deliver what the
+        base says anyway — so skip. Off by default (the delivery contract is harmless on base-known facts).
+        The probe rides the normal generate path (no base_logits seam needed in the multi-process frontend);
+        it is a "does the base emit this object" test, which is exactly the delivery-relevant signal."""
+        probe = prompt or f"The mother tongue of {subject} is"
+        if os.environ.get("MINISGL_CAM_WRITE_GATE") == "1":
+            n = len(self._sp(object_str))
+            cont = await self._generate(probe, max_tokens=max(4, n + 2))
+            if object_str.strip().lower() in cont.strip().lower():
+                logger.debug("CAM write-gate: base already emits %r for %r; skipping store.",
+                             object_str, subject)
+                return False
+        await self._generate(probe, max_tokens=1,
                              mem_subject=subject, mem_remember=self._sp(object_str))
         return True
 

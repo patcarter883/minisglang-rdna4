@@ -90,8 +90,28 @@ after a plain chat that STATES "the mother tongue of Bartholomew Fizzwick is Dot
 the auto-learned fact and a later plain chat "what language does he speak?" answers **Dothraki** — with
 no CAM params on either turn. Same for an explicitly-remembered fact (Klingon).
 
-Follow-ups: proper thinking-disable for cleaner LLM extraction; the base-uncertainty write gate; a
-fact-statement heuristic to skip the extraction generation on chit-chat turns (latency).
+### Transparent-write follow-ups — DONE (commit on branch cam-followups)
+All four hardening follow-ups are implemented (additive; off-by-default or no-op at the default single-
+replica deployment). Off-GPU validated (template + regex in the lean image / on host); a live serve pass
+is queued behind GPU availability but the mechanisms are confirmed:
+1. **Thinking-disable extraction** — `FrontendCAMRuntime.extract_facts` pre-renders the chat template with
+   `enable_thinking=False` (`_render_nothink`) and sends a raw string, instead of the ignored `/no_think`
+   hint (the backend `TokenizeManager` never passed the kwarg). Confirmed Qwen3.5-4B's template honors it
+   (renders an empty `<think></think>` → the model emits JSON directly); residual `<think>…</think>` is
+   stripped before parse. Reduces reliance on the regex fallback.
+2. **Base-uncertainty write gate** (opt-in `MINISGL_CAM_WRITE_GATE=1`) — `remember` probes the served base
+   with the relation prompt first; if the base already emits the object, the fact is base-known and the
+   write is skipped. Rides the normal generate path (no `base_logits` seam in the frontend). Off by default.
+3. **Chit-chat skip heuristic** — `api_server._looks_like_fact_statement` pre-filters the auto-write path so
+   questions / copula-free chit-chat pay no extraction generation (disable with
+   `MINISGL_CAM_WRITE_HEURISTIC=0`). Validated on 8 cases incl. the e2e sentence.
+4. **DP multi-replica store pinning** — the tokenizer round-robin now pins CAM store ops
+   (`mem_subject`/`mem_remember`/`mem_op`) to one replica (`MINISGL_CAM_DP_RANK`, default 0) so writes and
+   reads hit the same per-replica `engine.cam`. No-op at `dp_size=1`.
+
+Remaining (smaller): the write gate's probe uses the generic relation prompt for auto-write (the
+extraction doesn't yet return the source sentence to probe with); a replicated (vs pinned) store for
+multi-replica CAM read scale-out.
 
 ## Superseded / reverted
 - `load_input_embed` (embed-only loader) — `engine.cam` already builds its store from the served model's
