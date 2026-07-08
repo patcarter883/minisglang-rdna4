@@ -292,6 +292,11 @@ class Qwen3_5Model(BaseOP):
         # Spec-decode aux capture: decoder-layer ids whose output hidden is stashed (None = off).
         self._capture_layer_ids: List[int] | None = None
         self._aux_hidden: List[torch.Tensor] | None = None
+        # Capture the FULL post-layer residual stream (x + residual = z-lab's hidden_states[lid+1]) —
+        # this fused layer returns residual = stream+attn with the MLP output still in x, so `residual`
+        # alone is missing the captured layer's MLP add and is OOD for a drafter trained on the full
+        # stream. MINISGL_AUX_POSTMLP=0 restores the legacy residual-only capture (for A/B).
+        self._aux_postmlp = _os.environ.get("MINISGL_AUX_POSTMLP", "1") not in ("0", "false", "no")
 
     def set_capture_layers(self, ids: List[int] | None) -> None:
         self._capture_layer_ids = list(ids) if ids else None
@@ -308,8 +313,9 @@ class Qwen3_5Model(BaseOP):
         for lid, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
             if cap_set is not None and lid in cap_set:
-                # output hidden of layer lid = the residual stream after it (feeds the next layer).
-                grabbed[lid] = residual.clone()
+                # Full post-layer stream (x + residual) == z-lab hidden_states[lid+1] (attn AND mlp
+                # folded in); `residual` alone omits this layer's MLP. Legacy path = residual only.
+                grabbed[lid] = ((x + residual) if self._aux_postmlp else residual).clone()
         # MTP seed = the PRE-final-norm residual stream (x + residual), the Qwen3.5 MTP
         # `previous_hidden_states` input (the MTP's own pre_fc_norm_hidden re-normalizes it).
         pre_norm = (x + residual).clone() if return_hidden else None
