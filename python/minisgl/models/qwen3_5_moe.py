@@ -101,7 +101,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         def mlp_factory(cfg: "ModelConfig") -> BaseOP:
             return Qwen3_5MoeSparseBlock(cfg, expert_quant)
 
-        super().__init__(backbone_cfg, mlp_factory=mlp_factory)
+        # The MTP head follows the checkpoint's precision: quantized only if mtp.* is NOT in the quant
+        # ignore list. A bf16/fp16 MTP head on a quantized backbone builds unquantized so its full-
+        # precision experts load (QuantConfig.is_module_quantized; universal across quant methods).
+        mtp_quant = expert_quant
+        if expert_quant is not None and not expert_quant.is_module_quantized(
+            "mtp.layers.0.mlp.experts.0.gate_proj"
+        ):
+            mtp_quant = None
+
+        def mtp_mlp_factory(cfg: "ModelConfig") -> BaseOP:
+            return Qwen3_5MoeSparseBlock(cfg, mtp_quant)
+
+        super().__init__(backbone_cfg, mlp_factory=mlp_factory, mtp_mlp_factory=mtp_mlp_factory)
 
 
 __all__ = ["Qwen3_5MoeForConditionalGeneration"]

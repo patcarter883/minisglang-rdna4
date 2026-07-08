@@ -510,10 +510,18 @@ class Glm4MoeLiteForCausalLM(BaseLLMModel):
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
         )
-        # MTP self-speculation head (model.layers.<num_layers>). Built only when the checkpoint
-        # ships one (num_nextn_predict_layers>0); the routed experts in its MoE follow expert_quant.
+        # MTP self-speculation head (model.layers.<num_layers>). Built only when the checkpoint ships
+        # one (num_nextn_predict_layers>0). Its MoE follows the checkpoint's precision: quantized only
+        # if the head's module is NOT in the quant ignore list. A checkpoint may keep the MTP head
+        # bf16/fp16 on a quantized backbone (e.g. GLM-RXF keeps layers.<num_layers> unquantized) — then
+        # build it unquantized so its full-precision weights load (QuantConfig.is_module_quantized).
+        mtp_quant = expert_quant
+        if expert_quant is not None and not expert_quant.is_module_quantized(
+            f"model.layers.{config.num_layers}.mlp.experts.0.gate_proj"
+        ):
+            mtp_quant = None
         self.mtp = (
-            GLMMTPHead(backbone_cfg, layer_id=config.num_layers, expert_quant=expert_quant)
+            GLMMTPHead(backbone_cfg, layer_id=config.num_layers, expert_quant=mtp_quant)
             if config.num_nextn_predict_layers > 0
             else None
         )

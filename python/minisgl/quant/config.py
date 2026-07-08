@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,23 @@ class QuantConfig:
     def is_compressed_tensors(self) -> bool:
         return self.method == "compressed-tensors"
 
+    def is_module_quantized(self, name: str) -> bool:
+        """Is the weight module `name` (e.g. 'model.layers.47.mlp.experts.0.gate_proj') quantized
+        under this config? False if `name` matches any `ignore` entry — a `re:`-prefixed regex
+        (compressed-tensors / RXF) or a plain substring (AWQ/GPTQ `modules_to_not_convert`). This lets
+        a checkpoint keep specific modules at full precision (bf16/fp16) on an otherwise-quantized
+        backbone — an MTP / draft head, the router gate, dense early layers — and the model build it
+        unquantized accordingly (universal: not tied to any one model or quant method)."""
+        for pat in self.ignore:
+            if not pat:
+                continue
+            if pat.startswith("re:"):
+                if re.search(pat[3:], name):
+                    return False
+            elif pat in name:
+                return False
+        return True
+
     @staticmethod
     def _as_dict(qc: Any) -> dict:
         if isinstance(qc, dict):
@@ -59,12 +77,17 @@ class QuantConfig:
         d = cls._as_dict(qc)
         method = str(d.get("quant_method", "")).lower()
 
+        # modules_to_not_convert (AWQ/GPTQ): plain module-name substrings kept at full precision
+        # (attn, router gate, an unquantized MTP/draft head). Folded into `ignore` so is_module_quantized
+        # is uniform across methods.
+        not_convert = tuple(d.get("modules_to_not_convert") or ())
         if method == "awq":
             return cls(
                 method="awq",
                 bits=int(d.get("bits", 4)),
                 group_size=int(d.get("group_size", 128)),
                 sym=not bool(d.get("zero_point", True)),  # AWQ is asymmetric by default
+                ignore=not_convert,
             )
         if method == "gptq":
             # GPTQ int4: qweight int32 packed along INPUT (K//pf, N), per-group scales (K//g, N),
@@ -76,6 +99,7 @@ class QuantConfig:
                 group_size=int(d.get("group_size", 128)),
                 sym=bool(d.get("sym", True)),
                 desc_act=bool(d.get("desc_act", False)),
+                ignore=not_convert,
             )
         if method == "rxf":
             # RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) with a fixed Hadamard rotation.
@@ -87,6 +111,7 @@ class QuantConfig:
                 group_size=32,
                 sym=True,
                 rotation_span=int(d.get("rotation_span", 32)),
+                ignore=tuple(d.get("ignore", ()) or ()),  # e.g. a bf16 MTP head (re:^model\.layers\.47\.)
             )
         if method in ("compressed-tensors", "compressed_tensors"):
             # Minimal parse; full per-group/ignore handling is Phase 3 (the 35B).
