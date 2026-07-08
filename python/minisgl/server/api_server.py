@@ -59,6 +59,9 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
     ignore_eos: bool = False
+    # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
+    # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
+    cam_write: bool | None = None
 
 
 class Message(BaseModel):
@@ -82,6 +85,10 @@ class OpenAICompletionRequest(BaseModel):
 
     max_tokens: int = 16
     temperature: float = 1.0
+
+    # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
+    # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
+    cam_write: bool | None = None
 
     top_k: int = -1
     top_p: float = 1.0
@@ -210,13 +217,22 @@ def _looks_like_fact_statement(text: str) -> bool:
     return re.search(r"\b(is|was|are|were)\b", t, re.IGNORECASE) is not None
 
 
-async def _cam_auto_write(text: str) -> None:
-    """TRANSPARENT CAM write (MINISGL_CAM_AUTO_WRITE=1): model-extract durable facts from `text` (the
-    latest user turn) and remember them, so facts stated in conversation are learned with NO explicit
-    /cam/remember. No-op when off / no runtime. Best-effort: extraction failures are swallowed. A cheap
-    fact-statement heuristic (_looks_like_fact_statement) skips the extraction generation on chit-chat and
-    questions so those turns pay no extra latency."""
-    if os.environ.get("MINISGL_CAM_AUTO_WRITE") != "1" or not (text and text.strip()):
+def _auto_write_enabled(override: bool | None) -> bool:
+    """Resolve whether ambient auto-write runs THIS turn: a per-request `cam_write` (True/False) overrides
+    the server default (MINISGL_CAM_AUTO_WRITE=1). Lets a client suppress learning on a given call (e.g.
+    a read-only task turn over an ingested store) or force it on for a one-off."""
+    if override is not None:
+        return bool(override)
+    return os.environ.get("MINISGL_CAM_AUTO_WRITE") == "1"
+
+
+async def _cam_auto_write(text: str, override: bool | None = None) -> None:
+    """TRANSPARENT CAM write: model-extract durable facts from `text` (the latest user turn) and remember
+    them (mode='auto', so the store's freeze/no-clobber gates apply — a curated store is not overwritten
+    by conversation). Gated by the per-request `cam_write` override or MINISGL_CAM_AUTO_WRITE=1. No-op when
+    off / no runtime. Best-effort: extraction failures are swallowed. A cheap fact-statement heuristic
+    (_looks_like_fact_statement) skips the extraction generation on chit-chat and questions."""
+    if not _auto_write_enabled(override) or not (text and text.strip()):
         return
     if not _looks_like_fact_statement(text):
         logger.debug("CAM auto-write: %r is not a fact statement; skipping extraction.", text[:60])
@@ -231,7 +247,7 @@ async def _cam_auto_write(text: str) -> None:
         return
     try:
         for subj, obj in await rt.extract_facts(text):
-            await rt.remember(subj, obj)
+            await rt.remember(subj, obj, mode="auto")     # ambient -> subject to freeze/no-clobber gates
             logger.debug("CAM auto-write: remembered %r -> %r", subj, obj)
     except Exception as e:  # noqa: BLE001
         logger.debug("CAM auto-write failed: %s", e)
@@ -465,6 +481,7 @@ if os.environ.get("MINISGL_CAM") == "1":
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
+    await _cam_auto_write(req.prompt, override=req.cam_write)   # ambient write (gated; no-op unless enabled)
     prompt = await _cam_auto_augment(req.prompt)   # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
     uid = state.new_user()
     await state.send_one(
@@ -561,7 +578,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         _last_user = next((m.get("content") for m in reversed(prompt) if m.get("role") == "user"), None)
     else:
         _last_user = prompt
-    await _cam_auto_write(_last_user or "")     # no-op unless MINISGL_CAM_AUTO_WRITE=1
+    await _cam_auto_write(_last_user or "", override=req.cam_write)   # gated ambient write (per-req + freeze/no-clobber)
     prompt = await _cam_auto_augment(prompt)     # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
 
     uid = state.new_user()

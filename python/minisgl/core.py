@@ -41,6 +41,10 @@ class SamplingParams:
     # result from the backend engine.cam and FORCE-EMITS it (tokenised) as the reply text + EOS, so the
     # data-returning ops need no new message type. mem_subject supplies the subject for "forget".
     mem_op: str | None = None
+    # CAM write mode for a mem_remember write: "force" = explicit ingest (always writes, bypasses gates);
+    # "auto"/None = ambient auto-write (subject to the store's freeze + no-clobber policy). Lets a curated
+    # store be protected from conversational overwrite while explicit /cam/remember still curates.
+    mem_write_mode: str | None = None
 
     @property
     def is_greedy(self) -> bool:

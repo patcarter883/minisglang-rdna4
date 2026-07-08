@@ -351,6 +351,22 @@ async def stats() -> dict:
     return statter()
 
 
+@cam_router.post("/freeze")
+async def freeze(frozen: bool = True) -> dict:
+    """Freeze (or with ?frozen=false, unfreeze) the store: while frozen, ambient transparent auto-write is
+    refused so a curated/ingested store is not overwritten by conversation — explicit /cam/remember still
+    curates. The natural switch after ingesting a knowledge base: POST /cam/freeze, then serve."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):        # multi-process: toggle the backend engine.cam
+        return {"frozen": (await runtime.freeze()) if frozen else (await runtime.unfreeze())}
+    mem = runtime.memory
+    fn = getattr(mem, "freeze" if frozen else "unfreeze", None)
+    if fn is None:
+        raise HTTPException(status_code=503, detail="CAM freeze unavailable")
+    fn()
+    return {"frozen": bool(getattr(mem, "frozen", False))}
+
+
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)
 async def delete_fact(subject: str) -> DeleteResponse:
     """Tombstone-forget a subject: it stops being delivered from the serve path (bank residue

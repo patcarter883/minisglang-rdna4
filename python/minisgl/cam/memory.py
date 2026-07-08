@@ -529,6 +529,14 @@ class CAMMemory:
         self._subj_tuple: List[tuple] = []                   # parallel tuple(subject_ids) (update/forget)
         self.deliver_tau = float(os.environ.get("MINISGL_CAM_DELIVER_TAU", "0.7"))
         self.enabled = True
+        # ---- write gating (protect a curated/ingested store from ambient auto-write) -------------------
+        # frozen: read-only — refuse AMBIENT auto-write (explicit force ingest still writes). Flip at
+        #   runtime via freeze()/unfreeze() (POST /cam/freeze) or start frozen with MINISGL_CAM_FROZEN=1.
+        # write_policy 'no-clobber': auto-write may ADD a genuinely-new subject but never overwrite/shadow
+        #   an existing one (cosine >= protect_tau to a stored key). 'overwrite' (default) = prior behaviour.
+        self.frozen = os.environ.get("MINISGL_CAM_FROZEN") == "1"
+        self.write_policy = os.environ.get("MINISGL_CAM_WRITE_POLICY", "overwrite")
+        self.protect_tau = float(os.environ.get("MINISGL_CAM_PROTECT_TAU", "0.9"))
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
@@ -603,6 +611,40 @@ class CAMMemory:
         ids = torch.tensor([list(subject_ids)], dtype=torch.long, device=self.device)
         e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
         return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
+
+    # ---- write gating (freeze / no-clobber) ------------------------------------------------------
+    @torch.no_grad()
+    def has_subject(self, subject_ids: List[int], tau: float = None) -> bool:
+        """True if a sufficiently-similar subject is already stored — exact id match, or cosine >= tau to
+        an existing subject key. Used by the no-clobber policy to protect curated entries."""
+        tau = self.protect_tau if tau is None else tau
+        if tuple(int(s) for s in subject_ids) in self._subj_tuple:
+            return True
+        if not self._subj_keys:
+            return False
+        q = self._subj_key(subject_ids)
+        sims = torch.stack(self._subj_keys).to(q.device) @ q
+        return bool(float(sims.max().item()) >= tau)
+
+    def write_allowed(self, subject_ids: List[int], *, source: str = "auto") -> bool:
+        """Gate an incoming write. Explicit ingest (source='force') always writes — freeze/no-clobber only
+        constrain AMBIENT auto-write (source='auto'): refused when the store is frozen, or (no-clobber
+        policy) when the subject is already curated so the existing value is preserved."""
+        if source == "force":
+            return True
+        if self.frozen:
+            return False
+        if self.write_policy == "no-clobber" and self.has_subject(subject_ids):
+            return False
+        return True
+
+    def freeze(self) -> bool:
+        self.frozen = True
+        return self.frozen
+
+    def unfreeze(self) -> bool:
+        self.frozen = False
+        return self.frozen
 
     # ---- POINTER delivery (#100): exact object via cosine-NN over the subject index ------------------
     @torch.no_grad()
@@ -712,6 +754,7 @@ class CAMMemory:
             "imbalance": (mx / mean) if mean else 0.0,
             "crowded_banks": [b for b, ln in enumerate(loads) if ln > 9],
             "banks": [{"index": b, "n_edits": ln} for b, ln in enumerate(loads) if ln > 0],
+            "frozen": self.frozen, "write_policy": self.write_policy,
         }
 
     @torch.no_grad()

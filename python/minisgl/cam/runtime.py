@@ -191,9 +191,9 @@ class FrontendCAMRuntime:
                 return "\n".join(str(m.get("content") or "") for m in messages)
 
     async def _generate(self, prompt: str, max_tokens: int, *, mem_subject: str = None,
-                        mem_remember=None, mem_op: str = None) -> str:
+                        mem_remember=None, mem_op: str = None, mem_write_mode: str = None) -> str:
         """One raw-prompt generation through the backend, carrying the CAM sampling params (mirrors
-        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op)."""
+        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op/mem_write_mode)."""
         from minisgl.core import SamplingParams
         from minisgl.message import TokenizeMsg
 
@@ -204,7 +204,7 @@ class FrontendCAMRuntime:
                 uid=uid, text=prompt,
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=max(1, max_tokens),
                                                mem_subject=mem_subject, mem_remember=mem_remember,
-                                               mem_op=mem_op)))
+                                               mem_op=mem_op, mem_write_mode=mem_write_mode)))
             text = ""
             async for ack in state.wait_for_ack(uid):
                 text += ack.incremental_output
@@ -283,8 +283,22 @@ class FrontendCAMRuntime:
     async def stats(self) -> dict:
         return (await self._ctrl("stats")) or {}
 
-    async def remember(self, subject: str, object_str: str, prompt: str = None) -> bool:
+    async def freeze(self) -> bool:
+        """Freeze the backend store: ambient auto-write is refused (explicit remember still curates)."""
+        r = await self._ctrl("freeze")
+        return bool(r.get("frozen")) if isinstance(r, dict) else False
+
+    async def unfreeze(self) -> bool:
+        r = await self._ctrl("unfreeze")
+        return bool(r.get("frozen")) if isinstance(r, dict) else False
+
+    async def remember(self, subject: str, object_str: str, prompt: str = None,
+                       mode: str = "force") -> bool:
         """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
+
+        `mode`: "force" (default — explicit ingest via /cam/remember; always writes, bypasses the store's
+        freeze/no-clobber gates) or "auto" (ambient transparent auto-write; subject to those gates so a
+        curated store is not overwritten by conversation).
 
         Base-uncertainty gate (opt-in, MINISGL_CAM_WRITE_GATE=1): before writing, probe the served base
         with the relation prompt (one short no-CAM generation). If the base ALREADY produces `object_str`,
@@ -300,8 +314,8 @@ class FrontendCAMRuntime:
                 logger.debug("CAM write-gate: base already emits %r for %r; skipping store.",
                              object_str, subject)
                 return False
-        await self._generate(probe, max_tokens=1,
-                             mem_subject=subject, mem_remember=self._sp(object_str))
+        await self._generate(probe, max_tokens=1, mem_subject=subject,
+                             mem_remember=self._sp(object_str), mem_write_mode=mode)
         return True
 
     async def ask(self, prompt: str, subject: str, max_tokens: int = 32) -> str:
