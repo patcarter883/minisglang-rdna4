@@ -220,14 +220,28 @@ class FrontendCAMRuntime:
         # chat format (better instruction-following than a raw completion) with thinking disabled.
         out = await self._generate([{"role": "user", "content": instr}], max_tokens=max_tokens)
         m = re.search(r"\[.*\]", out, re.DOTALL)
-        if not m:
-            return []
-        try:
-            arr = json.loads(m.group(0))
-        except (json.JSONDecodeError, ValueError):
-            return []
-        return [(str(f["subject"]).strip(), str(f["object"]).strip()) for f in arr
-                if isinstance(f, dict) and f.get("subject") and f.get("object")]
+        facts = []
+        if m:
+            try:
+                arr = json.loads(m.group(0))
+                facts = [(str(f["subject"]).strip(), str(f["object"]).strip()) for f in arr
+                         if isinstance(f, dict) and f.get("subject") and f.get("object")]
+            except (json.JSONDecodeError, ValueError):
+                facts = []
+        if facts:
+            return facts
+        # Deterministic fallback (small thinking models extract JSON unreliably): explicit fact statements
+        # "the <attr> of SUBJECT is OBJECT" / "SUBJECT's <attr> is OBJECT" / "SUBJECT is OBJECT", where both
+        # SUBJECT and OBJECT are capitalised (proper-noun-shaped) — filters out "X is nice" style non-facts.
+        pat = re.compile(r"(?:the\s+[\w ]+?\s+of\s+)?"
+                         r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+)*)(?:'s\s+[\w ]+?)?"
+                         r"\s+(?:is|was|are|were)\s+([A-Z][A-Za-z.'-]+)")
+        seen = set()
+        for mm in pat.finditer(text):
+            s, o = mm.group(1).strip(), mm.group(2).strip()
+            if (s, o) not in seen:
+                seen.add((s, o)); facts.append((s, o))
+        return facts
 
     async def retrieve(self, prompt: str, max_tokens: int = 512) -> list:
         """TRANSPARENT read: ask the backend which stored subjects this prompt mentions (cosine-matched,
