@@ -77,6 +77,18 @@ class W4A8LinearMethod:
             if self.quant.desc_act:
                 layer.g_idx = torch.empty((K,), dtype=torch.int32)
             return
+        if self.quant.is_compressed_tensors:
+            # compressed-tensors W4A16 DENSE linear: weight_packed (N, K//pf) int32 (8 SIGNED int4 per
+            # int32, natural K order) + weight_scale (N, K//g). Already the op's natural nibble order,
+            # so post_load is a whole-tensor fixup (XOR 0x88 + constant zero-point 8) — the same
+            # conversion _GroupedCompressedTensorsExperts uses, minus the E dim. `weight_shape` in the
+            # checkpoint is ignored by the loader.
+            assert K % pf == 0 and K % g == 0 and N % pf == 0, (
+                f"CT dense needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
+            )
+            layer.weight_packed = torch.empty((N, K // pf), dtype=torch.int32)
+            layer.weight_scale = torch.empty((N, K // g), dtype=torch.bfloat16)
+            return
         # AWQ "gemm" layout: qweight (K, N//pf) i32, scales (K//group, N) f16,
         # qzeros (K//group, N//pf) i32 (asymmetric only).
         assert N % pf == 0 and K % g == 0, f"W4A8 needs N%{pf}==0,K%{g}==0; got N={N},K={K}"
@@ -86,6 +98,21 @@ class W4A8LinearMethod:
             layer.qzeros = torch.empty((K // g, N // pf), dtype=torch.int32)
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
+        if self.quant.is_compressed_tensors:
+            # CT DENSE -> op layout: signed int4 -> unsigned (q+8) by flipping each nibble's top bit
+            # (XOR 0x88 per byte); constant zero-point 8 (zeros_op all 0x88). Mirrors the MoE-expert
+            # post_load without the E dim; then w4a8_linear consumes _w_packed_op/_scales_op/_zeros_op.
+            pf = 32 // self.quant.bits
+            N, Kp = layer.weight_packed.shape  # type: ignore[attr-defined]
+            G = layer.weight_scale.shape[-1]  # type: ignore[attr-defined]
+            flipped = (layer.weight_packed.contiguous().view(torch.uint8) ^ 0x88).view(torch.int32)
+            layer._w_packed_op = flipped.contiguous()
+            layer._scales_op = layer.weight_scale.to(torch.float16).contiguous()  # type: ignore[attr-defined]
+            zeros = torch.empty((N // pf, G), dtype=torch.int32)
+            zeros.view(torch.uint8).fill_(0x88)
+            layer._zeros_op = zeros.to(layer.weight_packed.device)
+            del layer.weight_packed, layer.weight_scale
+            return
         qz = getattr(layer, "qzeros", None)
         if self.quant.is_gptq:
             # GPTQ -> op layout (2M-2). desc_act is asserted off (g_idx identity) by the converter.
