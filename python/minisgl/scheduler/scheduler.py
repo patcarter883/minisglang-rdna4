@@ -300,6 +300,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
+                # (subsequent _stage_cam calls skip it; the base continues fluently). The
+                # MINISGL_CAM_ALWAYS_INJECT debug knob keeps injecting every step (used to exercise the
+                # captured decode tap, since with seed-once the object lands at prefill).
+                if getattr(req, "mem_bank", None) is not None and not req._mem_placed \
+                        and next_token == req._mem_seed \
+                        and os.environ.get("MINISGL_CAM_ALWAYS_INJECT") != "1":
+                    req._mem_placed = True
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -405,6 +413,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, self.device)
+        # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
+        # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
+        # inside a graph — read here, reuse across decode). Inert when CAM is not built.
+        if self.engine.cam is not None:
+            self._prepare_cam(batch)
         sample_args = self.engine.sampler.prepare(batch)
         # Structured output: attach the per-row grammar bitmask (None unless a constrained req is in
         # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
@@ -492,9 +505,59 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
+    def _prepare_cam(self, batch: Batch) -> None:
+        """Read each memory request's tap bank from the standing store at prefill (once per req).
+
+        Subject rides on sampling_params.mem_subject; it is space-prefixed to match how the store was
+        trained (memory-organ `_sp_tokens`). `_mem_seed` is the store's preferred first token (for the
+        seed-once policy in `_stage_cam`). Requests without a subject are left untouched (tap no-op)."""
+        cam = self.engine.cam
+        for req in batch.reqs:
+            if not hasattr(req, "_mem_placed"):   # ChunkedReq / non-Req rows carry no memory state
+                continue
+            subj = getattr(getattr(req, "sampling_params", None), "mem_subject", None)
+            if not subj or req.mem_bank is not None:
+                continue
+            subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
+            bank, conf = cam.read(subj_ids)
+            req.mem_bank, req.mem_conf = bank, conf
+            req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+
+    def _stage_cam(self, batch: Batch) -> None:
+        """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +
+        non-memory requests in one batch each get the right injection. Row t (flat, per-req contiguous
+        over padded_reqs, req.extend_len tokens each — matches _make_positions) carries that token's
+        owning request's bank, or ZERO for a non-memory / seed-once-placed / padding row (tap no-op).
+        SEED-ONCE: once `_mem_seed` has landed (`_mem_placed`, set in _process_last_data) the req's rows
+        go zero. Graph-decode replay ignores these Python tensors (it reads the captured static buffer);
+        this path drives eager prefill + eager decode. (Overlap loop: the placed flag lags one step.)"""
+        cam, inner = self.engine.cam, self.engine.model.model
+        reqs = batch.padded_reqs if batch.padded_reqs is not None else batch.reqs
+        active = [(getattr(r, "mem_bank", None) is not None and not getattr(r, "_mem_placed", False))
+                  for r in reqs]
+        if not any(active):
+            inner.clear_cam()                       # no active memory row -> tap no-op for the whole batch
+            return
+        dev = cam.device
+        K, mem = cam.k_slots, cam.mem_dim
+        bank_chunks, conf_chunks = [], []
+        for r, act in zip(reqs, active):
+            nt = r.extend_len                        # prefill: extend_len tokens; decode: 1
+            if act:
+                bank_chunks.append(r.mem_bank[0].unsqueeze(0).expand(nt, K, mem))   # [nt,K,mem]
+                cv = r.mem_conf.reshape(-1)[0] if r.mem_conf is not None \
+                    else torch.zeros((), device=dev)
+                conf_chunks.append(cv.expand(nt))
+            else:
+                bank_chunks.append(torch.zeros(nt, K, mem, device=dev))
+                conf_chunks.append(torch.zeros(nt, device=dev))
+        inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
+
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        if self.engine.cam is not None:
+            self._stage_cam(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
