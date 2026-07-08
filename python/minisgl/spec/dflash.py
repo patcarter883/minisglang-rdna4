@@ -31,10 +31,15 @@ class DFlashProposer(Proposer):
       4. drafts = argmax(logits[1:])  -> B-1 candidate tokens (position 0 is the known anchor).
          Compressed-vocab (Checkpoint B): argmax over draft vocab j -> target id j + d2t[j].
 
-    The captured target hidden states ARE the cross-block context (injected as the per-layer KV prefix
-    at the anchor position), so this proposer keeps NO persistent draft KV — each block is rebuilt from
-    the fresh anchor + captured aux. `on_accept` is therefore a no-op, and verification stays the
-    existing linear verify_greedy (DFlash is a linear block, not a tree).
+    The captured target hidden states ARE the cross-block context, injected as the per-layer KV prefix.
+    FULL-CONTEXT conditioning (the z-lab fix, MINISGL_DFLASH_FULLCTX=1, default): the scheduler
+    accumulates the target aux over ALL committed positions and feeds the whole prefix ([num_aux, P,
+    hidden], P = committed length) at its true absolute RoPE positions, so the drafter attends over the
+    entire context it was trained on. Feeding only the last-token vector (legacy, FULLCTX=0) ran the
+    drafter out-of-distribution → ~0.33 accept-len. There is still NO persistent draft KV — the full
+    prefix is recomputed each step from the accumulated aux — so `on_accept` is a no-op and verification
+    stays the existing linear verify_greedy (DFlash is a linear block, not a tree). Perf follow-up: a
+    persistent draft KV (z-lab's crop-per-step) would make this O(new) instead of O(P) per block.
 
     `capture_layer_ids` programs the target model to stash the configured decoder layers' residual-
     stream hidden during the verify forward; the scheduler feeds them back per-uid via `ctx.aux_hidden`.
@@ -234,25 +239,39 @@ class DFlashProposer(Proposer):
         for i, req in enumerate(reqs):
             # Block emits up to B-1 drafts; clamp to the per-step draft budget and the req budget.
             k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))
-            aux = ctx.aux_hidden.get(req.uid)  # [num_aux, hidden] at the last confirmed token
+            # aux: 3D [num_aux, P, hidden] over all committed positions (full-context, the z-lab fix),
+            # or legacy 2D [num_aux, hidden] at the last confirmed token (MINISGL_DFLASH_FULLCTX=0).
+            aux = ctx.aux_hidden.get(req.uid)
             if k_i <= 0 or aux is None:
                 continue
 
             anchor_tok = int(req.input_ids[req.cached_len])
             base_pos = req.cached_len + self._pos_off
 
-            # target_hidden = hidden_norm(fc(concat)) — the per-layer KV prefix (P=1 anchor position).
-            target_hidden = draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden]
+            # target_hidden = hidden_norm(fc(concat)) — the per-layer KV prefix.
+            if aux.dim() == 3:
+                # Full context: prefix = aux of committed positions [cached_len-P .. cached_len-1], at
+                # their TRUE absolute RoPE positions; the block [anchor, mask...] follows at [base_pos..].
+                P = aux.shape[1]
+                aux_t = aux.permute(1, 0, 2).contiguous().to(self._dtype)  # [P, num_aux, hidden]
+                target_hidden = draft.fuse_aux(aux_t)  # [P, hidden]
+                ctx_start = req.cached_len - P
+                ctx_pos = torch.arange(
+                    ctx_start, ctx_start + P, dtype=torch.int32, device=device
+                )
+            else:
+                # Legacy single-position prefix (P=1) at the anchor's own position.
+                target_hidden = draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden]
+                ctx_pos_val = (
+                    int(self._ctx_pos_env) if self._ctx_pos_env is not None else base_pos
+                )
+                ctx_pos = torch.tensor([ctx_pos_val], dtype=torch.int32, device=device)
 
             # noise block = [anchor, mask*(B-1)]; one denoising forward emits all B hidden vectors.
             block_ids = torch.full((B,), mask_id, dtype=torch.int64, device=device)
             block_ids[0] = anchor_tok
             noise_embed = draft.embed(block_ids).to(self._dtype)  # [B, hidden]
             block_pos = torch.arange(base_pos, base_pos + B, dtype=torch.int32, device=device)
-            ctx_pos_val = (
-                int(self._ctx_pos_env) if self._ctx_pos_env is not None else base_pos
-            )
-            ctx_pos = torch.tensor([ctx_pos_val], dtype=torch.int32, device=device)
 
             hidden = draft.denoise(noise_embed, target_hidden, block_pos, ctx_pos)  # [B, hidden]
             logits = draft.head(hidden)  # [B, vocab]
