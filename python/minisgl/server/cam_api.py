@@ -317,6 +317,9 @@ async def list_facts() -> List[FactItem]:
     Shapes with ready-made ``subject``/``object`` strings are passed through unchanged.
     """
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: facts come from the backend engine.cam
+        return [FactItem(subject=f.get("subject", ""), object=f.get("object", ""))
+                for f in await runtime.facts()]
     memory = runtime.memory
     tok = runtime.tokenizer
     lister = getattr(memory, "list_facts", None)
@@ -340,6 +343,8 @@ async def stats() -> dict:
     collision), so crowding no longer degrades pointer delivery — this monitors only the value-bank
     fallback. Served from the side index."""
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: stats from the backend engine.cam
+        return await runtime.stats()
     statter = getattr(runtime.memory, "stats", None)
     if statter is None:
         raise HTTPException(status_code=503, detail="CAM stats unavailable")
@@ -352,6 +357,10 @@ async def delete_fact(subject: str) -> DeleteResponse:
     stays; the serve path never reads a tombstoned subject). Exact erase (rebuild) is a full-surface
     item, not MVP."""
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: forget in the backend engine.cam
+        if not _encode_sp(runtime.tokenizer, subject):
+            raise HTTPException(status_code=422, detail="subject tokenized to empty")
+        return DeleteResponse(deleted=await runtime.forget(subject))
     tok = runtime.tokenizer
     memory = runtime.memory
 

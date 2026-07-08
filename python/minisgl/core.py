@@ -37,6 +37,10 @@ class SamplingParams:
     # the write must ride the request); None -> a READ/deliver request (the scheduler forces the exact
     # stored object tokens, then the base continues). Rides UserMsg -> Req like mem_subject.
     mem_remember: List[int] | None = None
+    # CAM #100 control op riding a generate: "facts" | "forget" | "stats". The scheduler computes the
+    # result from the backend engine.cam and FORCE-EMITS it (tokenised) as the reply text + EOS, so the
+    # data-returning ops need no new message type. mem_subject supplies the subject for "forget".
+    mem_op: str | None = None
 
     @property
     def is_greedy(self) -> bool:

@@ -174,9 +174,9 @@ class FrontendCAMRuntime:
         return list(self.tokenizer(" " + s, add_special_tokens=False).input_ids)
 
     async def _generate(self, prompt: str, max_tokens: int, *, mem_subject: str = None,
-                        mem_remember=None) -> str:
+                        mem_remember=None, mem_op: str = None) -> str:
         """One raw-prompt generation through the backend, carrying the CAM sampling params (mirrors
-        InProcessBackendClient but raw-prompt + mem_subject/mem_remember)."""
+        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op)."""
         from minisgl.core import SamplingParams
         from minisgl.message import TokenizeMsg
 
@@ -186,7 +186,8 @@ class FrontendCAMRuntime:
             await state.send_one(TokenizeMsg(
                 uid=uid, text=prompt,
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=max(1, max_tokens),
-                                               mem_subject=mem_subject, mem_remember=mem_remember)))
+                                               mem_subject=mem_subject, mem_remember=mem_remember,
+                                               mem_op=mem_op)))
             text = ""
             async for ack in state.wait_for_ack(uid):
                 text += ack.incremental_output
@@ -195,6 +196,25 @@ class FrontendCAMRuntime:
             state.ack_map.pop(uid, None)
             state.event_map.pop(uid, None)
             raise
+
+    async def _ctrl(self, op: str, subject: str = None, max_tokens: int = 2048):
+        """A control op (facts/forget/stats): the backend force-emits the JSON result as the reply text."""
+        import json
+        txt = await self._generate(".", max_tokens=max_tokens, mem_subject=subject, mem_op=op)
+        try:
+            return json.loads(txt.strip())
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("CAM %s: could not parse backend reply as JSON: %r", op, txt[:200])
+            return None
+
+    async def facts(self) -> list:
+        return (await self._ctrl("facts")) or []
+
+    async def forget(self, subject: str) -> bool:
+        return bool(await self._ctrl("forget", subject=subject))
+
+    async def stats(self) -> dict:
+        return (await self._ctrl("stats")) or {}
 
     async def remember(self, subject: str, object_str: str, prompt: str = None) -> bool:
         """Write subject->object into the backend engine.cam. The base-uncertainty gate is skipped in the
