@@ -46,12 +46,38 @@ from minisgl.layers.base import BaseOP
 class _PlainLinear(BaseOP):
     """A replicated nn.Linear-shaped weight [out, in], no bias, no TP sharding. The draft is tiny and
     REPLICATED on every rank — its argmax is identical per rank, so drafts stay in sync with no
-    collective."""
+    collective.
+
+    Optional weight-only quant (fp8 E4M3 or int8, per-output-channel scale) via `load_quant`: the
+    drafter's output is verified by the target, so this is LOSSLESS — it trades a little draft
+    acceptance for ~half the drafter memory (needed to fit big drafters replicated on 16 GB cards).
+    Dequant to the activation dtype happens in-forward (no fp8 GEMM needed)."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
         self.weight = torch.empty(out_features, in_features)
+        self._wq = None   # [out, in] fp8_e4m3 / int8 quantized weight
+        self._ws = None   # [out, 1] per-output-channel scale (compute dtype)
+
+    def load_quant(self, w: torch.Tensor, mode: str, compute_dtype, device) -> None:
+        """RTN weight-only quant of a loaded [out, in] weight (pass it on CPU so the fp16 transient
+        stays in host RAM and only the 1-byte packed weight lands on GPU). mode: 'fp8' | 'int8'."""
+        wf = w.float()
+        amax = wf.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)  # [out,1]
+        if mode == "fp8":
+            fmax = 448.0  # E4M3 max
+            s = amax / fmax
+            wq = (wf / s).clamp(-fmax, fmax).to(torch.float8_e4m3fn)
+        else:  # int8
+            s = amax / 127.0
+            wq = (wf / s).round().clamp(-127, 127).to(torch.int8)
+        self._wq = wq.contiguous().to(device)
+        self._ws = s.to(compute_dtype).to(device)
+        self.weight = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._wq is not None:
+            w = self._wq.to(x.dtype) * self._ws  # dequant [out,in] * [out,1]
+            return F.linear(x, w)
         return F.linear(x, self.weight)
 
 
