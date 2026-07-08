@@ -184,6 +184,30 @@ class _ProductKeyStore(nn.Module):
         out = self.read_out_norm(out)
         return out, head_norms, conf
 
+    # ---- POINTER id-bank (#100): exact token id at the addressed slot, no value reconstruction ----
+    def init_ids(self, batch: int, device) -> torch.Tensor:
+        """A parallel per-slot token-ID bank [B,N] (init -1 = empty). Records WHICH token each slot owns
+        so delivery can look up the exact id at the addressed slot instead of reconstructing a lossy value
+        — decoupling the store's (reliable) ADDRESSING from its (lossy) value reconstruction (#100)."""
+        return torch.full((batch, self.N), -1, dtype=torch.long, device=device)
+
+    def write_ids(self, Vid: torch.Tensor, keys: torch.Tensor, ids: torch.Tensor,
+                  addr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Record token `ids` [B,A] at each association's TOP-1 addressed slot (the argmax-weight slot the
+        read selects). Same head-query addressing as the K1 value write ⇒ write-slot == read-slot."""
+        wk = self.head_query(keys) if addr is None else addr
+        slot_idx, slot_w = self._address(wk)                 # [B,A,topk]
+        top = slot_w.argmax(dim=-1, keepdim=True)            # [B,A,1]
+        top_slot = torch.gather(slot_idx, -1, top).squeeze(-1)  # [B,A]
+        return Vid.scatter(1, top_slot, ids)
+
+    def read_ids(self, Vid: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """Look up the exact token id at the TOP-1 addressed slot (head-0 read addressing). [B,Q]->[B,Q]."""
+        slot_idx, slot_w = self._address(self.head_query(query))
+        top = slot_w.argmax(dim=-1, keepdim=True)
+        top_slot = torch.gather(slot_idx, -1, top).squeeze(-1)
+        return torch.gather(Vid, 1, top_slot)                # -1 where the slot is empty
+
 
 # --------------------------------------------------------------------------------------------------
 # PK adapter read/write front-end (ported from cam/pk_store_adapter.py) — persistent path only
@@ -257,6 +281,17 @@ class _PKAdapter(nn.Module):
         pq = self.readout_q.unsqueeze(0).expand(B, -1, -1)
         attn = torch.softmax(pq @ read.transpose(1, 2) / (self.mem_dim ** 0.5), dim=-1)
         return attn @ read
+
+    def persistent_write_ids(self, Vid: torch.Tensor, keys: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """POINTER write (#100): record token `ids` [B,A] at the addressed slots of the id-bank Vid,
+        using the SAME K1 head-query addressing as persistent_write so write-slot == read-slot."""
+        addr = self.store.head_query(keys, 0) if self.write_at_read else None
+        return self.store.write_ids(Vid, keys, ids, addr=addr)
+
+    def persistent_read_ids(self, Vid: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        """POINTER read: exact token id at the addressed slot -> [B,Q]. Uses the store's reliable
+        ADDRESSING, skipping the lossy value reconstruction that floored multi-token delivery at ~0.5/tok."""
+        return self.store.read_ids(Vid, q)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -403,7 +438,12 @@ class CAMMemory:
 
         # --- scalar/knob config (baked into meta by the exporter; see README) ---
         self.tap_layer = int(meta["tap_layer"])
-        self.n_banks = int(meta.get("n_banks", 1))
+        # n_banks is a pure SERVING knob (subject-bucket count): the store codebooks/projections are
+        # bucket-agnostic (banks are just parallel value/id states), so more banks = fewer subjects per
+        # bank = far less pointer-delivery collision at scale — with NO re-export/re-training. The
+        # robustness sweep measured n_banks=32 -> 0.37 vs 512 -> 0.91 span-exact @ N=400. Override via
+        # MINISGL_CAM_NBANKS to scale to the deployment's fact count (~4x expected N is a good rule).
+        self.n_banks = int(os.environ.get("MINISGL_CAM_NBANKS") or meta.get("n_banks", 1))
         self.remember_tau = float(meta.get("remember_tau", 0.5))
         self.router_alpha = float(meta.get("router_alpha", 1.5))
         self.router_topk = int(meta.get("topk", 16))         # router multigate top-k (NOT the store topk)
@@ -411,6 +451,10 @@ class CAMMemory:
         self.value_suppress = float(meta.get("value_suppress", 0.0))
         pooled_subj_key = bool(meta.get("pooled_subj_key", True))
         self._pooled_subj_key = pooled_subj_key
+        # POINTER id-bank (#100): the max object length the per-position id-banks retain. Position
+        # separation comes from SEPARATE id-banks per position (subject-keyed), so no learned pos_tag is
+        # needed — the pointer stores exact ids, so its only requirement is write-slot == read-slot.
+        self.mt_cap = int(meta.get("mt_positions", 0)) or 16
 
         # --- load raw tensors ---
         tap_sd = _strip_modctdict_prefix(torch.load(os.path.join(checkpoint_dir, "tap.pt"),
@@ -473,6 +517,17 @@ class CAMMemory:
         # buffer [max_bs, K, mem_dim] needs these at engine build (Phase 2).
         self.k_slots = k_slots
         self.mem_dim = a_mem
+        # POINTER delivery via a COSINE-NN SUBJECT INDEX (#100): a stored subject key = L2-normalised mean
+        # of the base model's INPUT embeddings over the subject tokens; delivery returns the object of the
+        # nearest stored subject by cosine (above deliver_tau). This is EXACT retrieval (no product-key
+        # slot collision → span-exact stays 1.0 to N=500) and order/title/case robust (reordered / "Ms. X"
+        # deliver 1.0; unknown subjects max-cos ≤0.51 so tau=0.7 rejects them). Supersedes the per-position
+        # product-key id-bank for delivery — no new model, uses the base embeds we already hold.
+        self._embed_w = embed_weight
+        self._subj_keys: List[torch.Tensor] = []             # [base_hidden] normalised pooled subject keys
+        self._subj_objs: List[List[int]] = []                # parallel object-id sequences
+        self._subj_tuple: List[tuple] = []                   # parallel tuple(subject_ids) (update/forget)
+        self.deliver_tau = float(os.environ.get("MINISGL_CAM_DELIVER_TAU", "0.7"))
         self.enabled = True
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
@@ -528,6 +583,42 @@ class CAMMemory:
             val = val.expand(-1, key.shape[1], -1)
         b = _subject_bank(list(subject_ids), self.n_banks)
         self.banks[b] = self.adapter.persistent_write(self.banks[b], key, val)
+        # POINTER delivery index: store the subject's cosine key + its EXACT object token sequence, so
+        # /cam/ask delivers the whole multi-token object losslessly and paraphrase-robustly (the value
+        # bank above only carries the first-token seed for the router/tap fallback). Update-in-place on
+        # re-remember of the same subject.
+        k = tuple(int(s) for s in subject_ids)
+        obj = [int(o) for o in object_ids]
+        key_vec = self._subj_key(subject_ids)
+        if k in self._subj_tuple:
+            i = self._subj_tuple.index(k)
+            self._subj_keys[i], self._subj_objs[i] = key_vec, obj
+        else:
+            self._subj_tuple.append(k); self._subj_keys.append(key_vec); self._subj_objs.append(obj)
+
+    @torch.no_grad()
+    def _subj_key(self, subject_ids: List[int]) -> torch.Tensor:
+        """Paraphrase-robust subject key: L2-normalised MEAN of the base input embeddings over the subject
+        tokens (order-invariant, title/case robust under cosine). [base_hidden]."""
+        ids = torch.tensor([list(subject_ids)], dtype=torch.long, device=self.device)
+        e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
+        return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
+
+    # ---- POINTER delivery (#100): exact object via cosine-NN over the subject index ------------------
+    @torch.no_grad()
+    def deliver_object_ids(self, subject_ids: List[int]) -> List[int]:
+        """The exact object token sequence for a subject, via nearest stored subject by cosine (>=
+        deliver_tau). Exact retrieval (no slot collision at scale) + paraphrase-robust; returns [] for an
+        unknown subject (max-cos < tau) so /cam/ask falls back cleanly. The #100 serving unlock: memory
+        supplies the unknowable object tokens, the base then continues the sentence."""
+        if not self.enabled or not self._subj_objs:
+            return []
+        q = self._subj_key(subject_ids)                      # [d]
+        sims = torch.stack(self._subj_keys).to(q.device) @ q  # [M] cosine (keys + q are unit-norm)
+        j = int(sims.argmax().item())
+        if float(sims[j].item()) < self.deliver_tau:
+            return []                                        # unknown subject -> no confident delivery
+        return list(self._subj_objs[j])
 
     # ---- read (once per request, at prefill) -----------------------------------------------------
     @torch.no_grad()
@@ -661,21 +752,26 @@ class CAMMemory:
             return
         self.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
                       for _ in range(self.n_banks)]
+        self._subj_keys, self._subj_objs, self._subj_tuple = [], [], []
         self._facts = {}
 
     @torch.no_grad()
     def forget(self, subject_ids: List[int]) -> bool:
-        """Remove one subject: re-init its bank and replay the OTHER facts routed to that bank (the store's
-        delta write has no per-slot erase, so we rebuild the affected bank from the surviving edits)."""
+        """Remove one subject: drop it from the delivery index (exact), and re-init its value bank + replay
+        the OTHER facts routed to that bank (the store's delta write has no per-slot erase, so we rebuild
+        the affected bank from the surviving edits — the router/tap fallback)."""
         if not self.enabled:
             return False
         key = tuple(int(s) for s in subject_ids)
         if key not in self._facts:
             return False
-        b = _subject_bank(list(subject_ids), self.n_banks)
         del self._facts[key]
+        if key in self._subj_tuple:                           # drop from the cosine-NN delivery index
+            i = self._subj_tuple.index(key)
+            del self._subj_tuple[i]; del self._subj_keys[i]; del self._subj_objs[i]
+        b = _subject_bank(list(subject_ids), self.n_banks)
         self.banks[b] = self.adapter.store.init_state(1, self.device, dtype=torch.float32)
         for subj, rec in list(self._facts.items()):
             if _subject_bank(list(subj), self.n_banks) == b:
-                self._write(list(subj), rec["object_ids"])
+                self._write(list(subj), rec["object_ids"])   # rebuild value bank; index update is in-place
         return True
