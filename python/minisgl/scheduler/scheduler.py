@@ -215,6 +215,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
         self._spec_aux_hidden: dict[int, torch.Tensor] = {}
+        # DFlash full-context conditioning (the z-lab fix): accumulate the target aux over ALL committed
+        # positions and feed the whole prefix to the drafter, instead of a single last-token vector. The
+        # drafter was trained/eval'd conditioned on the full context, so the 1-token feed ran it OOD
+        # (~0.33 accept-len). Stored aux becomes 3D [num_aux, P, hidden] (P = committed positions); the
+        # DFlash proposer branches on aux.dim(). MINISGL_DFLASH_FULLCTX=0 restores the legacy 1-token
+        # feed (for A/B). MINISGL_DFLASH_CTX_WINDOW>0 caps P to the last W positions (perf/memory).
+        self._dflash_fullctx = os.environ.get("MINISGL_DFLASH_FULLCTX", "1") not in ("0", "false", "no")
+        self._dflash_ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
 
         # Structured-output (constrained decoding) state. Built lazily on the first constrained
         # request, so a plain serve never imports xgrammar. uid -> live GrammarMatcher.
@@ -797,7 +805,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if self._spec_needs_last_hidden and lh is not None:
                 self._spec_last_hidden[req.uid] = lh[plen - 1].clone()
             if self._spec_capture_layer_ids and ax is not None:
-                self._spec_aux_hidden[req.uid] = ax[:, plen - 1].clone()
+                # Full-context: seed the buffer with the WHOLE prompt aux [num_aux, plen, hidden] so the
+                # first block's drafter attends over the entire prompt (matches z-lab's prefill prefix).
+                # Legacy: just the last prompt position [num_aux, hidden].
+                self._spec_aux_hidden[req.uid] = (
+                    ax[:, :plen].clone() if self._dflash_fullctx else ax[:, plen - 1].clone()
+                )
 
         self._process_last_data((forward_input, out))
 
@@ -1663,7 +1676,23 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if last_hidden is not None:
                     new_last_hidden[req.uid] = last_hidden[row].clone()
                 if aux_hidden is not None:
-                    new_aux_hidden[req.uid] = aux_hidden[:, row].clone()
+                    if self._dflash_fullctx:
+                        # Append THIS step's accepted positions' aux [num_aux, len(keep), hidden] to the
+                        # running buffer. We only ever append ACCEPTED positions, so the buffer length
+                        # stays == cached_len (committed) — no rollback needed on rejection.
+                        new_slice = aux_hidden[:, block_start : block_start + len(keep)].clone()
+                        prev = self._spec_aux_hidden.get(req.uid)
+                        buf = (
+                            torch.cat([prev, new_slice], dim=1)
+                            if (prev is not None and prev.dim() == 3)
+                            else new_slice
+                        )
+                        w = self._dflash_ctx_window
+                        if w and buf.shape[1] > w:
+                            buf = buf[:, -w:].contiguous()
+                        new_aux_hidden[req.uid] = buf
+                    else:
+                        new_aux_hidden[req.uid] = aux_hidden[:, row].clone()
 
             # One message carries all of this step's committed tokens (the detokenizer keys
             # streaming state by uid and assumes one message per uid per batch).
