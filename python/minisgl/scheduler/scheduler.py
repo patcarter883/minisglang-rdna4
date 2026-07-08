@@ -674,15 +674,37 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             else:
                 self._spec_decode_step(local_reqs)
         else:
+            # Idle replica: issue n_fwd dummy forwards that take the SAME spec_verify-DECODE model path
+            # as the busy replica's block_predict+verify. A dummy PREFILL forward diverges in the CCA
+            # path (md.is_prefill branch, zaya.py) so the per-layer MoE collectives desync and both
+            # ranks wedge (rank A finished block_predict while rank B is still in the prefill CCA path).
+            # _tidar_block_predict IS the spec_verify-decode path and is state-neutral; run it on the
+            # dummy_req with skip_alloc (null page, frees nothing). It reads decode-phase recurrent
+            # state, so ensure the dummy has a registered slot (a prior dummy prefill registers it, but
+            # don't rely on ordering). num_draft==0 short-circuits to a bare forward, so guard k>=1.
             n_fwd = self._spec_num_forwards()
             dr = engine.dummy_req
-            saved_lens = (dr.cached_len, dr.device_len)
-            try:
+            if self.cca_slots is not None and dr.uid not in self.cca_slots._slot_of:
+                self.cca_slots._ensure_slots([dr])
+            if self.gdn_slots is not None and dr.uid not in self.gdn_slots._slot_of:
+                self.gdn_slots._ensure_slots([dr])
+            proposer = self._proposer
+            if proposer is not None and hasattr(proposer, "block_size"):
+                k = max(1, min(engine.spec_config.num_draft, proposer.block_size))
+                mask_id = proposer.mask_token_id
                 for _ in range(n_fwd):
-                    forward_input = self._ep_prepare_dummy_prefill()
-                    self._forward(forward_input, track_reqs=False)
-            finally:
-                dr.cached_len, dr.device_len = saved_lens
+                    self._tidar_block_predict([dr], k, mask_id, skip_alloc=True)
+            else:
+                # Non-TiDAR proposer under EP: fall back to dummy prefills. NOTE: on a CCA/GDN model
+                # the prefill-vs-decode CCA path divergence can still desync — TiDAR is the validated
+                # spec+EP path; other proposers need a matching decode-shaped dummy (follow-up).
+                saved_lens = (dr.cached_len, dr.device_len)
+                try:
+                    for _ in range(n_fwd):
+                        forward_input = self._ep_prepare_dummy_prefill()
+                        self._forward(forward_input, track_reqs=False)
+                finally:
+                    dr.cached_len, dr.device_len = saved_lens
 
     def _spec_prefill_seeded(self, batch: Batch) -> None:
         """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the
@@ -730,7 +752,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._process_last_data((forward_input, out))
 
     @torch.inference_mode()
-    def _tidar_block_predict(self, reqs: List[Req], k: int, mask_id: int) -> List[List[int]]:
+    def _tidar_block_predict(
+        self, reqs: List[Req], k: int, mask_id: int, skip_alloc: bool = False
+    ) -> List[List[int]]:
         """TiDAR forward #1 (self-draft): one causal target forward over ``[confirmed | mask×k]`` per
         req → k draft tokens (argmax at the k mask positions). Called by TiDARProposer.propose (bound
         at construction) because it needs this scheduler's batch machinery (token pool, paged-KV
@@ -763,7 +787,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # --- build the (eager) block-predict batch ------------------------------------------------
         batch = Batch(reqs=reqs, phase="decode")
         batch.spec_verify = True  # multi-token extend → same paged-extend causal path as verify
-        self.cache_manager.allocate_paged(reqs)
+        # skip_alloc: an EP idle-replica dummy call (see _spec_ep_loop). The reqs are the shared
+        # dummy_req whose page_table row already points at the reserved NULL page; allocating real
+        # pages here would leave stale (later-freed) page ids in that row and corrupt a subsequent
+        # dummy forward. Reuse the null page (like _ep_prepare_dummy_prefill) and free nothing. The
+        # forward's output is discarded — only its per-layer MoE collectives matter.
+        if not skip_alloc:
+            self.cache_manager.allocate_paged(reqs)
         batch.padded_reqs = reqs
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
@@ -804,10 +834,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         ps = self.cache_manager.page_size
         free_chunks: List[torch.Tensor] = []
         for (dl, cl), req in zip(saved_lens, reqs):
-            free_start = div_ceil(cl, ps) * ps
-            free_end = div_ceil(req.device_len, ps) * ps  # req.device_len still = c0+k+1 here
-            if free_end > free_start:
-                free_chunks.append(page_table[req.table_idx, free_start:free_end])
+            # skip_alloc allocated nothing (null-page dummy) → free nothing; just restore lengths.
+            if not skip_alloc:
+                free_start = div_ceil(cl, ps) * ps
+                free_end = div_ceil(req.device_len, ps) * ps  # req.device_len still = c0+k+1 here
+                if free_end > free_start:
+                    free_chunks.append(page_table[req.table_idx, free_start:free_end])
             req.device_len, req.cached_len = dl, cl
         if free_chunks:
             self.cache_manager._free(torch.cat(free_chunks))
