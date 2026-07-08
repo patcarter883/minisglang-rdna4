@@ -184,10 +184,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             )
             if self._spec_seed_enabled:
                 logger.info_rank0("spec-decode: prompt-prefill draft-KV seed ENABLED")
-            # Capture the MLA verify CUDA graphs NOW — after the aux-capture layers are programmed
-            # above, so the captured forward stashes the hidden/aux the draft head consumes. No-op for
-            # non-MLA spec (graph disabled in _adjust_config) or pure n-gram with graphs off. Verify
-            # batches are all-running-reqs, so cap the captured sizes at max_running_req.
+            # Capture the verify CUDA graphs NOW — after the aux-capture layers are programmed above, so
+            # the captured forward stashes the hidden/aux the draft head consumes. Supported for every
+            # backbone now: MLA, pure MHA (generic attn verify-capture), and the recurrent hybrids CCA
+            # (CCAVerifyGraphCapture) / GDN (GDNVerifyGraphCapture). No-op only when graphs are off
+            # (--graph 0). Verify batches are all-running-reqs, so cap the captured sizes at
+            # max_running_req.
             needs_hidden = self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
             num_aux = len(self._spec_capture_layer_ids) if self._spec_capture_layer_ids else 0
             verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
