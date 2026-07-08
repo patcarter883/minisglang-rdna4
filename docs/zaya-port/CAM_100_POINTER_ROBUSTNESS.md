@@ -63,8 +63,35 @@ embedding, not paraphrase-invariant), and a single bucket tanks even exact deliv
 memory-organ's `CAM_GTE_KEYS` (a GTE-ModernColBERT table decoupling addressing from the base embed) or
 subject canonicalization/normalization at the API layer. This is a real feature, not a knob.
 
+## RESOLUTION — a cosine-NN subject index fixes BOTH (implemented + validated)
+Both problems were the product-key id-bank's, not fundamentals. Two fixes landed:
+
+1. **`MINISGL_CAM_NBANKS` serving knob** (commit 4cade96) — n_banks is a pure serving parameter (banks
+   are just states; codebooks are shared), so scaling it cuts id-bank collision with no re-export. But it
+   is superseded by:
+2. **Cosine-NN subject index** (commit c3ad0ed) — the delivery mechanism is now nearest stored subject by
+   cosine over `key = L2-norm(mean(base input embeds over subject tokens))`, ≥ `deliver_tau` (0.7,
+   `MINISGL_CAM_DELIVER_TAU`). It replaces the product-key id-bank for delivery and fixes both:
+
+| metric | id-bank (before) | **cosine-NN index (now)** |
+|---|---|---|
+| exact @ N=400 | 0.37 (n_banks=32) | **1.00** (exact retrieval, no slot collision to N=500) |
+| reordered / with-title / trailing-punct | 0.00 | **1.00** |
+| lowercased | 0.00 | ~1.0 (weakest cases fall back) |
+| unknown false-deliver | — | **0** (unknown max-cos ≤0.51 « tau 0.7) |
+
+Cosine-value calibration (N=60): exact/reorder 1.00, trailing 0.79, title 0.72, last-only 0.68 — all
+clean of unknowns (max 0.51); lowercase-with-retokenization (min 0.43) and bare first/last-name overlap
+the unknown band, so they conservatively fall back (no false delivery). **tau=0.7 gives a ~0.19 margin.**
+
+Validated end-to-end over HTTP (Qwen3.5-4B): remember Klingon/Sindarin, then ask **"Quillsworth
+Zephyrina"** (reordered) → "Klingon. ==History==…" and **"Ms. Cornelius Blackwood"** (title) →
+"Sindarin, a language of the Lord of the Rings…" — both paraphrases deliver the right object + coherent
+continuation. No new model — uses the base embeddings already held.
+
 ## Bottom line
-- **Exact subjects (the primary serving case): production-viable — just export more banks.** n_banks=512
-  holds ~400 facts at 0.91 span-exact; scale it to the deployment's fact count.
-- **Paraphrased subjects: not supported by the base-embedding pointer.** Needs GTE semantic keys or
-  API-side subject normalization. Track as a follow-up.
+- **Exact + structural paraphrases (reorder, title, trailing punct, case): delivered, N-scale-free** via
+  the cosine-NN index. Production-viable, no tuning.
+- **Aggressive variations (bare first/last name, heavy re-tokenisation): conservatively fall back** (no
+  wrong delivery). API-side subject canonicalisation would extend coverage; a semantic encoder is NOT
+  needed (the base pooled embedding already generalises, and Qwen3-Embedding-0.6B tested WORSE).
