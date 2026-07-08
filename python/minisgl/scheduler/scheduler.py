@@ -523,7 +523,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for req in batch.reqs:
             if not hasattr(req, "_mem_placed"):   # ChunkedReq / non-Req rows carry no memory state
                 continue
-            subj = getattr(getattr(req, "sampling_params", None), "mem_subject", None)
+            sp = getattr(req, "sampling_params", None)
+            # #100 CONTROL op (facts/forget/stats): compute the result from engine.cam and FORCE-EMIT it
+            # (tokenised) as the reply text + EOS — the data-returning ops ride the generate path too, no new
+            # message type. Handled before the subject guard (facts/stats carry no subject).
+            mem_op = getattr(sp, "mem_op", None)
+            if mem_op and getattr(req, "_mem_deliver", None) is None:
+                result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
+                toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
+                if self.eos_token_id is not None:
+                    toks = toks + [self.eos_token_id]                 # terminate after the result string
+                req._mem_deliver, req._mem_deliver_pos = toks, 0
+                continue
+            subj = getattr(sp, "mem_subject", None)
             if not subj or req.mem_bank is not None or getattr(req, "_mem_deliver", None) is not None:
                 continue
             subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
@@ -550,6 +562,26 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 bank, conf = cam.read(subj_ids)
                 req.mem_bank, req.mem_conf = bank, conf
                 req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+
+    def _cam_ctrl_result(self, cam, op: str, subj: str | None) -> str:
+        """#100 control op -> JSON string (force-emitted as the reply). facts: [{subject,object}] (ids
+        decoded to text here, tokenizer-side); forget: bool; stats: the value-bank occupancy dict."""
+        import json
+        if op == "forget":
+            sids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids) if subj else []
+            deleter = getattr(cam, "forget", None) or getattr(cam, "delete", None)
+            return json.dumps(bool(deleter(sids)) if (sids and deleter) else False)
+        if op == "facts":
+            out = []
+            for f in (getattr(cam, "list_facts", lambda: [])() or []):
+                sids, oids = f.get("subject_ids"), f.get("object_ids")
+                out.append({"subject": self.tokenizer.decode(list(sids)).strip() if sids else "",
+                            "object": self.tokenizer.decode(list(oids)).strip() if oids else ""})
+            return json.dumps(out)
+        if op == "stats":
+            statter = getattr(cam, "stats", None)
+            return json.dumps(statter() if statter else {})
+        return json.dumps(None)
 
     def _stage_cam(self, batch: Batch) -> None:
         """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +

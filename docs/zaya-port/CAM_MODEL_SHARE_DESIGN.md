@@ -45,11 +45,19 @@ was redundant with `engine.cam` and is dropped.
      store) and sends these generates via the FrontendManager primitive; `cam_api` routes remember/ask to
      it (`is_frontend_share`).
 
-   Changed: `core.py` (`SamplingParams.mem_remember`), `scheduler.py` (`_prepare_cam` write/deliver +
-   `_process_last_data` forced tokens), `runtime.py` (`FrontendCAMRuntime`), `cam_api.py` (frontend branches).
+   - **Data ops** (`/cam/facts`, `/forget`, `/stats`): a `mem_op` sampling param ("facts"|"forget"|"stats").
+     `_prepare_cam` computes the result from `engine.cam`, tokenises the JSON, and force-emits it as the
+     reply text + EOS (reusing the same forced-token path) — so even the data-returning ops need NO new
+     message type or reply channel. `FrontendCAMRuntime.facts/forget/stats` send the op and JSON-parse the
+     reply.
 
-   **Still to do:** `/cam/facts` `/forget` `/stats` return data that does not fit a generate, so they need a
-   small control-plane message (follow-up). And full-serve validation (below).
+   Changed: `core.py` (`SamplingParams.mem_remember`, `mem_op`), `scheduler.py` (`_prepare_cam`
+   write/deliver/control + `_cam_ctrl_result` + `_process_last_data` forced tokens), `runtime.py`
+   (`FrontendCAMRuntime` remember/ask/facts/forget/stats), `cam_api.py` (frontend branches on all endpoints).
+
+   **Still to do:** full-serve validation (below). Note: CAM state is per-scheduler-replica, so a multi-
+   replica (DP) deployment needs CAM requests pinned to one replica (or a replicated store) for a
+   consistent view — single-replica (dp_size=1, the eager CAM contract) is unaffected.
 
 ## Validation plan
 - **Single-process (now):** run `BackendCAMRuntime` (one `LLM`) with `MINISGL_CAM=1 MINISGL_CAM_BACKEND=1`;
