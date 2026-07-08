@@ -191,9 +191,10 @@ class FrontendCAMRuntime:
                 return "\n".join(str(m.get("content") or "") for m in messages)
 
     async def _generate(self, prompt: str, max_tokens: int, *, mem_subject: str = None,
-                        mem_remember=None, mem_op: str = None, mem_write_mode: str = None) -> str:
+                        mem_remember=None, mem_op: str = None, mem_write_mode: str = None,
+                        mem_namespace: str = None) -> str:
         """One raw-prompt generation through the backend, carrying the CAM sampling params (mirrors
-        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op/mem_write_mode)."""
+        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op/mem_write_mode/mem_namespace)."""
         from minisgl.core import SamplingParams
         from minisgl.message import TokenizeMsg
 
@@ -204,7 +205,8 @@ class FrontendCAMRuntime:
                 uid=uid, text=prompt,
                 sampling_params=SamplingParams(temperature=0.0, max_tokens=max(1, max_tokens),
                                                mem_subject=mem_subject, mem_remember=mem_remember,
-                                               mem_op=mem_op, mem_write_mode=mem_write_mode)))
+                                               mem_op=mem_op, mem_write_mode=mem_write_mode,
+                                               mem_namespace=mem_namespace)))
             text = ""
             async for ack in state.wait_for_ack(uid):
                 text += ack.incremental_output
@@ -214,10 +216,12 @@ class FrontendCAMRuntime:
             state.event_map.pop(uid, None)
             raise
 
-    async def _ctrl(self, op: str, subject: str = None, max_tokens: int = 2048):
-        """A control op (facts/forget/stats): the backend force-emits the JSON result as the reply text."""
+    async def _ctrl(self, op: str, subject: str = None, max_tokens: int = 2048, namespace: str = None):
+        """A control op (facts/forget/stats/freeze), scoped to `namespace` (#6): the backend force-emits
+        the JSON result as the reply text."""
         import json
-        txt = await self._generate(".", max_tokens=max_tokens, mem_subject=subject, mem_op=op)
+        txt = await self._generate(".", max_tokens=max_tokens, mem_subject=subject, mem_op=op,
+                                   mem_namespace=namespace)
         try:
             return json.loads(txt.strip())
         except (json.JSONDecodeError, ValueError):
@@ -264,36 +268,36 @@ class FrontendCAMRuntime:
                 seen.add((s, o)); facts.append((s, o))
         return facts
 
-    async def retrieve(self, prompt: str, max_tokens: int = 512) -> list:
-        """TRANSPARENT read: ask the backend which stored subjects this prompt mentions (cosine-matched,
-        tau-gated) -> [{subject, object}]. The prompt itself is the query (backend extracts spans)."""
+    async def retrieve(self, prompt: str, max_tokens: int = 512, namespace: str = None) -> list:
+        """TRANSPARENT read: ask the backend which stored subjects (in `namespace`) this prompt mentions
+        (cosine-matched, tau-gated) -> [{subject, object}]. The prompt itself is the query."""
         import json
-        txt = await self._generate(prompt, max_tokens=max_tokens, mem_op="retrieve")
+        txt = await self._generate(prompt, max_tokens=max_tokens, mem_op="retrieve", mem_namespace=namespace)
         try:
             return json.loads(txt.strip()) or []
         except (json.JSONDecodeError, ValueError):
             return []
 
-    async def facts(self) -> list:
-        return (await self._ctrl("facts")) or []
+    async def facts(self, namespace: str = None) -> list:
+        return (await self._ctrl("facts", namespace=namespace)) or []
 
-    async def forget(self, subject: str) -> bool:
-        return bool(await self._ctrl("forget", subject=subject))
+    async def forget(self, subject: str, namespace: str = None) -> bool:
+        return bool(await self._ctrl("forget", subject=subject, namespace=namespace))
 
-    async def stats(self) -> dict:
-        return (await self._ctrl("stats")) or {}
+    async def stats(self, namespace: str = None) -> dict:
+        return (await self._ctrl("stats", namespace=namespace)) or {}
 
-    async def freeze(self) -> bool:
-        """Freeze the backend store: ambient auto-write is refused (explicit remember still curates)."""
-        r = await self._ctrl("freeze")
+    async def freeze(self, namespace: str = None) -> bool:
+        """Freeze the namespace's store: ambient auto-write is refused (explicit remember still curates)."""
+        r = await self._ctrl("freeze", namespace=namespace)
         return bool(r.get("frozen")) if isinstance(r, dict) else False
 
-    async def unfreeze(self) -> bool:
-        r = await self._ctrl("unfreeze")
+    async def unfreeze(self, namespace: str = None) -> bool:
+        r = await self._ctrl("unfreeze", namespace=namespace)
         return bool(r.get("frozen")) if isinstance(r, dict) else False
 
     async def remember(self, subject: str, object_str: str, prompt: str = None,
-                       mode: str = "force") -> bool:
+                       mode: str = "force", namespace: str = None) -> bool:
         """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
 
         `mode`: "force" (default — explicit ingest via /cam/remember; always writes, bypasses the store's
@@ -315,12 +319,13 @@ class FrontendCAMRuntime:
                              object_str, subject)
                 return False
         await self._generate(probe, max_tokens=1, mem_subject=subject,
-                             mem_remember=self._sp(object_str), mem_write_mode=mode)
+                             mem_remember=self._sp(object_str), mem_write_mode=mode, mem_namespace=namespace)
         return True
 
-    async def ask(self, prompt: str, subject: str, max_tokens: int = 32) -> str:
+    async def ask(self, prompt: str, subject: str, max_tokens: int = 32, namespace: str = None) -> str:
         """Retrieve: the backend forces the stored object tokens (pointer), then the base continues."""
-        return await self._generate(prompt, max_tokens=max_tokens, mem_subject=subject)
+        return await self._generate(prompt, max_tokens=max_tokens, mem_subject=subject,
+                                    mem_namespace=namespace)
 
 
 def get_cam_runtime():
