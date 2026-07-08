@@ -59,12 +59,20 @@ was redundant with `engine.cam` and is dropped.
    replica (DP) deployment needs CAM requests pinned to one replica (or a replicated store) for a
    consistent view — single-replica (dp_size=1, the eager CAM contract) is unaffected.
 
-## Validation plan
-- **Single-process (now):** run `BackendCAMRuntime` (one `LLM`) with `MINISGL_CAM=1 MINISGL_CAM_BACKEND=1`;
-  remember Klingon/Sindarin, `/cam/ask` → assert pointer delivery == the standalone path, and assert the
-  process holds ONE model (no co-located HF base). Needs a free GPU.
-- **Multi-process (after the control-plane message):** full `api_server`; assert `/generate` + `/cam/ask`
-  share one backend model, and pointer delivery matches.
+## Validation — DONE (multi-process, gfx1201)
+`MINISGL_CAM=1 MINISGL_CAM_CHECKPOINT=/ckpt MINISGL_CAM_FRONTEND=1 python -m minisgl --model Qwen/Qwen3.5-4B
+--attention-backend hip` (full api_server: backend scheduler + tokenizer/detokenizer + frontend). curl:
+- **VRAM: 14.3 GB on ONE card, GPU 1 free** — a single model copy (no co-located base). Model-share confirmed.
+- `remember` Klingon/Sindarin (mem_remember write) → `{"stored":true}` (writes to the backend engine.cam).
+- `ask` (mem_subject forced tokens) → `"Klingon and she is a member of the Quillsworth family…"` — the
+  exact object delivered from memory + coherent base continuation.
+- `ask` PARAPHRASE (reordered subject "Quillsworth Zephyrina") → `"Klingon…"` — paraphrase delivery works.
+- `facts` (mem_op) → `[{Zephyrina:Klingon},{Cornelius:Sindarin}]`; `stats` (mem_op) →
+  `{"B":32,"total_edits":2,…}`; `forget` Cornelius (mem_op) → `{"deleted":true}`; `facts` after → only
+  Zephyrina remains. All data ops correctly reflect/mutate the backend engine.cam.
+
+Every op crosses the frontend↔backend boundary via the sampling-param ride — no new message type, no
+second model copy.
 
 ## Superseded / reverted
 - `load_input_embed` (embed-only loader) — `engine.cam` already builds its store from the served model's
