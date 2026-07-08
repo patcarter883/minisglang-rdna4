@@ -19,6 +19,7 @@ docker run --rm \
   -e MEMRATIO="${MEMRATIO:-0.82}" -e MAXRUN="${MAXRUN:-4}" -e MAXTOK="${MAXTOK:-256}" \
   -e CONFIGS="${CONFIGS:?set CONFIGS}" -e TAG="${TAG:-out}" \
   -e GRAPH_SPEC="${GRAPH_SPEC:-16}" \
+  -e MINISGL_NUM_NEXTN="${MINISGL_NUM_NEXTN:-}" -e MINISGL_MTP_LAYERS="${MINISGL_MTP_LAYERS:-}" \
   -v "$PWD":/engine \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/root/.triton \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
