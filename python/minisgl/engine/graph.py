@@ -165,6 +165,10 @@ class GraphRunner:
         # v2: stashed for the spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft).
         self._cca_state = cca_state
         self.cca_verify = None
+        # GDN-hybrid spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft). Mirrors
+        # the CCA verify capturer: per-GDN-layer conv/ssm static scratch threaded through the graph.
+        self._gdn_state = gdn_state
+        self.gdn_verify = None
         # v2 S4: the FUSED-verify capturer + its CCA-state static buffers (built in
         # capture_fused_verify_graphs, needs fused_qlen — a distinct Q from the K+1 verify above).
         self.cca_fused_verify = None
@@ -286,6 +290,23 @@ class GraphRunner:
                 conv_dim=cs.conv_states.shape[2], conv_width=cs.conv_states.shape[3],
                 hidden=cs.prev_hs.shape[2],
             )
+        # GDN-hybrid recurrent state through static verify buffers (per-GDN-layer conv/ssm scratch the
+        # captured verify forward writes in place; see GDNVerifyGraphCapture). conv_state shape is
+        # (L, slots, conv_dim, conv_kernel-1); ssm_state (L, slots, num_v_heads, head_v_dim, head_k_dim).
+        self.gdn_verify = None
+        if self._gdn_state is not None:
+            from minisgl.gdn.graph_capture import GDNVerifyGraphCapture
+
+            gs = self._gdn_state
+            cshape = gs.conv_state.shape
+            sshape = gs.ssm_state.shape
+            self.gdn_verify = GDNVerifyGraphCapture(
+                dev, max_bs, num_draft,
+                gdn_layer_ids=range(gs.num_gdn_layers),
+                conv_dim=cshape[2], conv_width=cshape[3],
+                num_v_heads=sshape[2], head_v_dim=sshape[3], head_k_dim=sshape[4],
+                ssm_dtype=gs.ssm_dtype,
+            )
         vbuf = VerifyCaptureBuffer.init(
             max_bs, qlen, self._verify_vocab,
             hidden_size if needs_hidden else None,
@@ -314,6 +335,8 @@ class GraphRunner:
             self.attn_backend.prepare_verify_for_capture(batch)
             if self.cca_verify is not None:
                 self.cca_verify.prepare_verify_for_capture(batch)
+            if self.gdn_verify is not None:
+                self.gdn_verify.prepare_verify_for_capture(batch)
             vbuf.set_batch(batch)
             T = vbuf.total(batch)
             with get_global_ctx().forward_batch(batch), torch.inference_mode():
@@ -373,6 +396,8 @@ class GraphRunner:
         self.attn_backend.prepare_verify_for_replay(batch)
         if self.cca_verify is not None:
             self.cca_verify.prepare_verify_for_replay(batch)
+        if self.gdn_verify is not None:
+            self.gdn_verify.prepare_verify_for_replay(batch)
         v["graphs"][batch.padded_size].replay()
         n = batch.size * v["qlen"]
         logits = vbuf.logits[:n]
