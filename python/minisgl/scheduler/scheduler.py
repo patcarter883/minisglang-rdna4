@@ -153,6 +153,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             from minisgl.spec.tidar import TiDARProposer
 
             self._tidar_fused = False
+            self._tidar_ddtree = False
             if isinstance(self._proposer, TiDARProposer):
                 self._proposer.bind_block_predict(self._tidar_block_predict)
                 # MINISGL_TIDAR_FUSED=1: route to the Phase-C single-forward fused step (verify+draft in
@@ -160,6 +161,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._tidar_fused = os.environ.get("MINISGL_TIDAR_FUSED") == "1"
                 if self._tidar_fused:
                     logger.info_rank0("spec-decode: TiDAR FUSED single-forward path ENABLED")
+                # MINISGL_TIDAR_DDTREE=1: route to the DDTree draft-tree step (block_predict top-K ->
+                # draft tree -> ancestor-mask verify -> walk -> linear commit). Off by default.
+                self._tidar_ddtree = os.environ.get("MINISGL_TIDAR_DDTREE") == "1"
+                if self._tidar_ddtree:
+                    logger.info_rank0("spec-decode: TiDAR DDTree draft-tree path ENABLED")
             self._spec_seed_enabled = (
                 os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
                 and bool(self._proposer.supports_prefill_seed)
@@ -570,7 +576,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # draft is simply rejected. A non-greedy req still falls the whole batch back to a plain decode.
         spec_ok = all(req.sampling_params.is_greedy for req in reqs)
         if spec_ok:
-            if getattr(self, "_tidar_fused", False):
+            if getattr(self, "_tidar_ddtree", False):
+                self._spec_decode_step_ddtree(
+                    reqs, self._proposer.block_size, self._proposer.mask_token_id)
+            elif getattr(self, "_tidar_fused", False):
                 self._spec_decode_step_tidar_fused(
                     reqs, self._proposer.block_size, self._proposer.mask_token_id)
             else:
@@ -781,7 +790,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
     @torch.inference_mode()
     def _tidar_block_predict(
-        self, reqs: List[Req], k: int, mask_id: int, skip_alloc: bool = False
+        self, reqs: List[Req], k: int, mask_id: int, skip_alloc: bool = False, topk: int = 0
     ) -> List[List[int]]:
         """TiDAR forward #1 (self-draft): one causal target forward over ``[confirmed | mask×k]`` per
         req → k draft tokens (argmax at the k mask positions). Called by TiDARProposer.propose (bound
@@ -847,11 +856,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # --- one forward; argmax the k mask positions per req -------------------------------------
         logits = self.engine.forward_verify(batch)  # [sum(k+1), vocab]
         preds = logits.argmax(dim=-1).to(torch.int32).cpu()
+        # DDTree: also stash the per-position top-K MARGINALS (ids + log-probs) of the k mask rows per
+        # req, keyed by id(req), for build_draft_tree. Rows off+1..off+k are the block's L=k positions.
+        self._ddtree_topk: dict[int, tuple] = {}
+        if topk > 0:
+            lp = torch.log_softmax(logits.float(), dim=-1)
+            tv, ti = lp.topk(topk, dim=-1)  # [sum(k+1), topk]
+            tv = tv.cpu().tolist(); ti = ti.cpu().tolist()
         drafts: List[List[int]] = []
         off = 0
         for _req in reqs:
             block = preds[off + 1 : off + 1 + k].tolist()  # rows 1..k == the mask positions
             drafts.append([int(t) for t in block])
+            if topk > 0:
+                rows = range(off + 1, off + 1 + k)
+                self._ddtree_topk[id(_req)] = ([ti[r] for r in rows], [tv[r] for r in rows])
             off += k + 1
 
         # --- roll back the speculative state (recurrent + KV pages + lens) ------------------------
@@ -872,6 +891,121 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if free_chunks:
             self.cache_manager._free(torch.cat(free_chunks))
         return drafts
+
+    @torch.inference_mode()
+    def _ddtree_tree_verify(self, reqs, trees):
+        """Forward 2 of DDTree: run ONE target forward over [bonus | tree nodes] per req with an
+        ANCESTOR-ONLY custom_mask, then greedy-walk each tree. STATE-NEUTRAL/throwaway — the tree KV is
+        scattered and (on CCA) its conv reads wrong neighbours, so this ONLY discovers the accepted path;
+        recurrent state is snapshot+restored and the speculative KV pages freed (like block_predict).
+        Returns {id(req): (accepted_tokens, next_bonus)}."""
+        from minisgl.spec.ddtree import ddtree_paged_layout, ddtree_walk
+        device = self.device
+        page_table = self.engine.page_table
+        saved_lens = [(r.device_len, r.cached_len) for r in reqs]
+        store_rows, store_cols, tok_vals, pos_list = [], [], [], []
+        per_req = []  # (req, c0, tree, n, mask)
+        for req in reqs:
+            c0 = req.cached_len
+            tree = trees[id(req)]
+            pos, mask, _cols = ddtree_paged_layout(c0, tree, device=device)
+            n = tree.n_nodes
+            for j in range(n):
+                store_rows.append(req.table_idx); store_cols.append(c0 + j); tok_vals.append(tree.token[j])
+            pos_list += pos
+            req.device_len = c0 + n
+            per_req.append((req, c0, tree, n, mask))
+        rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
+        cols_t = torch.tensor(store_cols, dtype=torch.int64, device=device)
+        self.token_pool[rows_t, cols_t] = torch.tensor(tok_vals, dtype=self.token_pool.dtype, device=device)
+        batch = Batch(reqs=reqs, phase="decode"); batch.spec_verify = True
+        self.cache_manager.allocate_paged(reqs)
+        batch.padded_reqs = reqs
+        batch.positions = torch.tensor(pos_list, dtype=torch.int32, device=device)
+        batch.out_loc = page_table[rows_t, cols_t]
+        self.engine.attn_backend.prepare_metadata(batch)
+        batch.input_ids = self.token_pool[rows_t, cols_t]
+        max_kv = int(batch.attn_metadata.max_seqlen_k)
+        # zeros base (like the fused path): cols beyond a req's context [c0+n, max_kv) are never read
+        # (the kernel bounds by per-req cache_seqlen); the mask block carries the 0/-inf ancestor mask.
+        custom_mask = torch.zeros((len(store_rows), max_kv), dtype=torch.float32, device=device)
+        off = 0
+        for (req, c0, tree, n, mask) in per_req:
+            custom_mask[off:off + n, : c0 + n] = mask[:, : c0 + n]
+            off += n
+        batch.attn_metadata.custom_mask = custom_mask
+        # recurrent state snapshot for rollback (this forward is discarded)
+        cca_snap = gdn_snap = None
+        if self.cca_slots is not None:
+            from minisgl.cca.metadata import build_cca_metadata
+            cca_idx = self.cca_slots.state_indices(batch)
+            batch.cca_metadata = build_cca_metadata(batch, cca_idx, device)
+            cca_snap = self.engine.cca_state.snapshot(cca_idx)
+        if self.gdn_slots is not None:
+            from minisgl.gdn.metadata import build_gdn_metadata
+            gdn_idx = self.gdn_slots.state_indices(batch)
+            batch.gdn_metadata = build_gdn_metadata(batch, gdn_idx, device)
+            gdn_snap = self.engine.gdn_state.snapshot(gdn_idx)
+        logits = self.engine.forward_verify(batch)
+        argmax = logits.argmax(dim=-1).to(torch.int32).cpu().tolist()
+        out = {}
+        off = 0
+        for (req, c0, tree, n, mask) in per_req:
+            acc, nb = ddtree_walk(argmax[off:off + n], tree)
+            out[id(req)] = (acc, nb)
+            off += n
+        # rollback recurrent state + speculative KV + lengths (throwaway)
+        if cca_snap is not None:
+            self.engine.cca_state.restore(cca_snap)
+        if gdn_snap is not None:
+            self.engine.gdn_state.restore(gdn_snap)
+        ps = self.cache_manager.page_size
+        free_chunks = []
+        for (dl, cl), req in zip(saved_lens, reqs):
+            fs = div_ceil(cl, ps) * ps
+            fe = div_ceil(req.device_len, ps) * ps
+            if fe > fs:
+                free_chunks.append(page_table[req.table_idx, fs:fe])
+            req.device_len, req.cached_len = dl, cl
+        if free_chunks:
+            self.cache_manager._free(torch.cat(free_chunks))
+        return out
+
+    @torch.inference_mode()
+    def _spec_decode_step_ddtree(self, reqs: List[Req], B: int, mask_id: int) -> None:
+        """DDTree spec step for TiDAR (correctness-first v1; MINISGL_TIDAR_DDTREE=1). Three forwards:
+          1. block_predict(topk=K) -> per-position top-K MARGINALS + the argmax chain (state-neutral).
+          2. _ddtree_tree_verify: build a B-budget draft TREE (build_draft_tree) and discover the
+             accepted path (longest prefix of the target's argmax chain the tree covers).
+          3. commit: a LINEAR verify over the contiguous [bonus | accepted-path] (correct causal + conv/
+             CCA state) via _spec_decode_step's proven machinery, injected with the tree path as the
+             drafts — it accepts all and commits KV/state/bonus.
+        The tree buys a longer accepted path than the argmax chain; the 2-forward segmented-tree variant
+        (removing forward 3) is the follow-up. K=MINISGL_DDTREE_TOPK, budget=MINISGL_DDTREE_BUDGET."""
+        K = int(os.environ.get("MINISGL_DDTREE_TOPK", "8"))
+        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET", "24"))
+        from minisgl.spec.ddtree import build_draft_tree
+        # forward 1: marginals + argmax chain
+        argmax_drafts = self._tidar_block_predict(reqs, B, mask_id, topk=K)
+        topk_map = self._ddtree_topk
+        # forward 2: tree-verify -> accepted path
+        trees = {}
+        for req in reqs:
+            ids, logp = topk_map[id(req)]
+            trees[id(req)] = build_draft_tree(logp, ids, budget, int(req.input_ids[req.cached_len]))
+        accepted = self._ddtree_tree_verify(reqs, trees)
+        # metrics: tree accept-len vs argmax chain accept-len (the argmax chain is verified in forward 3)
+        st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
+        for r in reqs:
+            st["tree"] += len(accepted[id(r)][0]); st["n"] += 1
+        self._ddtree_stat = st
+        if st["n"] % 100 == 0:
+            logger.info_rank0(f"[ddtree] mean tree accept-len={st['tree']/st['n']:.2f} over {st['n']} reqs "
+                              f"(B={budget} K={K} block={B})")
+        # forward 3: commit the accepted path per req via the linear verify (drafts = tree path)
+        for req in reqs:
+            req._tidar_drafts = accepted[id(req)][0]  # the accepted tokens as the drafts to commit
+        self._spec_decode_step(reqs, ddtree_drafts=True)
 
     @torch.inference_mode()
     def _spec_decode_step_tidar_fused(self, reqs: List[Req], B: int, mask_id: int) -> None:
@@ -1242,7 +1376,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 f"  next_drafts= {nd}  vs-gt[{match(nd, gt)}]   "
                 f"FIDELITY R_k[0]={reps[rk][0]} bonus={bonus} match={reps[rk][0] == bonus}")
 
-    def _spec_decode_step(self, reqs: List[Req]) -> None:
+    def _spec_decode_step(self, reqs: List[Req], ddtree_drafts: bool = False) -> None:
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
         device = self.device
@@ -1268,7 +1402,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                         for r in reqs if r.uid in self._spec_aux_hidden}
             if self._spec_capture_layer_ids else None,
         )
-        drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
+        # DDTree forward 3: commit a pre-discovered accepted path (set on req._tidar_drafts by
+        # _spec_decode_step_ddtree) instead of proposing — the linear verify accepts all + commits.
+        if ddtree_drafts:
+            drafts = [list(getattr(r, "_tidar_drafts", []) or []) for r in reqs]
+        else:
+            drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
 
