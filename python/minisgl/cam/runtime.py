@@ -296,6 +296,18 @@ class FrontendCAMRuntime:
         r = await self._ctrl("unfreeze", namespace=namespace)
         return bool(r.get("frozen")) if isinstance(r, dict) else False
 
+    async def save(self) -> dict:                       # #7 explicit persistence flush
+        return (await self._ctrl("save")) or {}
+
+    async def undo(self, namespace: str = None) -> dict:   # #12 undo last write
+        return (await self._ctrl("undo", namespace=namespace)) or {}
+
+    async def rebuild(self, namespace: str = None) -> dict:  # #12 true-erase / compact
+        return (await self._ctrl("rebuild", namespace=namespace)) or {}
+
+    async def audit(self, namespace: str = None) -> list:    # #12 recent events
+        return (await self._ctrl("audit", namespace=namespace)) or []
+
     async def remember(self, subject: str, object_str: str, prompt: str = None,
                        mode: str = "force", namespace: str = None) -> bool:
         """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
