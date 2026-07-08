@@ -438,7 +438,12 @@ class CAMMemory:
 
         # --- scalar/knob config (baked into meta by the exporter; see README) ---
         self.tap_layer = int(meta["tap_layer"])
-        self.n_banks = int(meta.get("n_banks", 1))
+        # n_banks is a pure SERVING knob (subject-bucket count): the store codebooks/projections are
+        # bucket-agnostic (banks are just parallel value/id states), so more banks = fewer subjects per
+        # bank = far less pointer-delivery collision at scale — with NO re-export/re-training. The
+        # robustness sweep measured n_banks=32 -> 0.37 vs 512 -> 0.91 span-exact @ N=400. Override via
+        # MINISGL_CAM_NBANKS to scale to the deployment's fact count (~4x expected N is a good rule).
+        self.n_banks = int(os.environ.get("MINISGL_CAM_NBANKS") or meta.get("n_banks", 1))
         self.remember_tau = float(meta.get("remember_tau", 0.5))
         self.router_alpha = float(meta.get("router_alpha", 1.5))
         self.router_topk = int(meta.get("topk", 16))         # router multigate top-k (NOT the store topk)
