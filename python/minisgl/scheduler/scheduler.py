@@ -131,6 +131,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # corrects every draft, so the seed can only change acceptance, never output). Only engages for
         # a proposer that owns a seedable per-req draft KV (MTP / EAGLE3 -> supports_prefill_seed).
         self._spec_seed_enabled = False
+        # Under EP, an MTP draft HEAD that is a full EP-sharded MoE layer issues a data-dependent
+        # number of collectives in propose, which an idle replica can't match with a fixed count. The
+        # fix is to build that draft MoE REPLICATED (all experts local, no EP shard) so propose issues
+        # no collectives — then MTP+EP reduces to matching only the verify forward (like EAGLE3). Detect
+        # it by introspecting the MTP head's MoE. False for a dense/lookup draft (EAGLE3/DFlash/n-gram)
+        # or when the MTP MoE is still EP-sharded. See _spec_num_ep_forwards.
+        self._spec_draft_ep_replicated = False
+        _mtp = getattr(self.engine.model, "mtp", None)
+        if _mtp is not None:
+            _experts = getattr(getattr(_mtp, "mlp", None), "experts", None)
+            if _experts is not None and not getattr(_experts, "enable_ep", True):
+                self._spec_draft_ep_replicated = True
         if self._proposer is not None:
             self._spec_needs_last_hidden = bool(self._proposer.needs_last_hidden)
             self._spec_capture_layer_ids = self._proposer.capture_layer_ids
@@ -261,6 +273,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # works — _spec_loop issues MoE collectives with no cross-replica agreement (deadlock), ep_loop
         # has no spec step. Must be checked BEFORE the spec-only / ep-only branches below.
         if self.engine.spec_config is not None and self.engine.enable_ep:
+            # Fail fast on the one unsupported combo: MTP with an EP-SHARDED draft head. Its propose
+            # issues a data-dependent number of MoE collectives that the idle-replica lockstep can't
+            # match; it needs the draft MoE built replicated. TiDAR/EAGLE3/DFlash/n-gram are fine.
+            if self.engine.spec_config.algorithm == "mtp" and not self._spec_draft_ep_replicated:
+                raise RuntimeError(
+                    "MTP spec-decode + expert parallelism (--enable-ep) is unsupported unless the MTP "
+                    "draft MoE is built REPLICATED (all experts local). Serve MTP without --enable-ep, "
+                    "or use EAGLE3/DFlash/TiDAR under EP."
+                )
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -559,23 +580,27 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             forward_input = self._prepare_batch(batch)
             self._process_last_data((forward_input, self._forward(forward_input)))
 
-    def _spec_num_forwards(self) -> int:
-        """How many full-model forwards a single spec decode step issues (propose forwards + 1 verify).
-        DETERMINISTIC per config (same on every replica), so an idle EP replica can issue exactly this
-        many matching dummy forwards to line up the per-layer MoE collectives — see _spec_ep_loop.
+    def _spec_num_ep_forwards(self) -> int:
+        """How many FULL-TARGET forwards a spec step issues that hit the EP-sharded MoE — i.e. how many
+        sets of per-layer MoE collectives an idle EP replica must mirror. This is NOT the total forward
+        count: a draft head/model with a DENSE MLP issues NO EP collectives in propose, so only its
+        verify forward counts. DETERMINISTIC per config (same on every replica) EXCEPT MTP.
 
-          * TiDAR non-fused: block_predict (1) + verify (1) = 2; fused: 1 (verify+draft in one forward).
-          * n-gram: no propose forward, verify only = 1.
-          * MTP / EAGLE3 / DFlash / draft-model: num_draft sequential draft forwards + verify = K+1.
+          * TiDAR: block_predict + verify, both run the FULL target = 2 (fused: 1).
+          * EAGLE3 / DFlash / n-gram: verify only — the draft is a dense 1-layer model / a table
+            lookup, no EP-MoE in propose = 1.
+          * MTP: verify (1) PLUS a data-dependent number of MoE draft-HEAD steps (the head is a full
+            MoE decoder layer, EP-sharded). A fixed count can't match it -> return -1 (the caller
+            replicates the draft MoE so propose issues no collectives; see _spec_ep_loop / MoELayer).
         """
         spec = self.engine.spec_config
         assert spec is not None
         algo = spec.algorithm
         if algo == "tidar":
             return 1 if getattr(self, "_tidar_fused", False) else 2
-        if algo == "ngram":
-            return 1
-        return spec.num_draft + 1
+        if algo == "mtp":
+            return 1 if self._spec_draft_ep_replicated else -1
+        return 1  # eagle3, dflash, ngram: dense/lookup draft -> verify only
 
     def _spec_ep_loop(self) -> None:
         """Spec-decode under expert parallelism. Runs when BOTH spec_config and enable_ep are set (see
@@ -674,37 +699,40 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             else:
                 self._spec_decode_step(local_reqs)
         else:
-            # Idle replica: issue n_fwd dummy forwards that take the SAME spec_verify-DECODE model path
-            # as the busy replica's block_predict+verify. A dummy PREFILL forward diverges in the CCA
-            # path (md.is_prefill branch, zaya.py) so the per-layer MoE collectives desync and both
-            # ranks wedge (rank A finished block_predict while rank B is still in the prefill CCA path).
-            # _tidar_block_predict IS the spec_verify-decode path and is state-neutral; run it on the
-            # dummy_req with skip_alloc (null page, frees nothing). It reads decode-phase recurrent
-            # state, so ensure the dummy has a registered slot (a prior dummy prefill registers it, but
-            # don't rely on ordering). num_draft==0 short-circuits to a bare forward, so guard k>=1.
-            n_fwd = self._spec_num_forwards()
+            # Idle replica: issue n_ep dummy forwards that take the SAME spec_verify-DECODE model path
+            # as the busy replica's FULL-TARGET (EP-collective-issuing) forwards. A dummy PREFILL
+            # forward diverges in the CCA path (md.is_prefill branch, zaya.py) so the per-layer MoE
+            # collectives desync and both ranks wedge — so we replay _tidar_block_predict on the dummy
+            # instead: it IS the spec_verify-decode path, state-neutral, and works for ANY proposer
+            # (the busy VERIFY forward is the same full-target spec_verify-decode shape regardless of
+            # how drafts were proposed). skip_alloc uses the reserved null page (frees nothing). It reads
+            # decode-phase recurrent state, so ensure the dummy has a registered slot (a prior dummy
+            # prefill registers it, but don't rely on ordering).
+            #   n_ep counts only the FULL-TARGET forwards: TiDAR=2 (block_predict+verify), EAGLE3/DFlash/
+            #   n-gram=1 (dense draft -> verify only). MTP with an EP-sharded draft head is unsupported
+            #   (n_ep<0) — it needs the draft MoE replicated (build-time), which makes it n_ep=1.
+            n_ep = self._spec_num_ep_forwards()
+            if n_ep < 0:
+                raise RuntimeError(
+                    "MTP spec-decode under EP requires the MTP draft MoE to be built REPLICATED "
+                    "(not EP-sharded); its propose issues a data-dependent number of MoE collectives "
+                    "that an idle replica cannot match. Serve MTP without --enable-ep, or use a build "
+                    "that replicates the MTP experts. (EAGLE3/DFlash/TiDAR work under EP.)"
+                )
             dr = engine.dummy_req
             if self.cca_slots is not None and dr.uid not in self.cca_slots._slot_of:
                 self.cca_slots._ensure_slots([dr])
             if self.gdn_slots is not None and dr.uid not in self.gdn_slots._slot_of:
                 self.gdn_slots._ensure_slots([dr])
             proposer = self._proposer
+            # num_draft==0 short-circuits _tidar_block_predict, so guard k>=1. For TiDAR clamp to the
+            # block size; other proposers verify K+1 = num_draft+1 query rows, so k = num_draft.
+            k = max(1, engine.spec_config.num_draft)
             if proposer is not None and hasattr(proposer, "block_size"):
                 k = max(1, min(engine.spec_config.num_draft, proposer.block_size))
-                mask_id = proposer.mask_token_id
-                for _ in range(n_fwd):
-                    self._tidar_block_predict([dr], k, mask_id, skip_alloc=True)
-            else:
-                # Non-TiDAR proposer under EP: fall back to dummy prefills. NOTE: on a CCA/GDN model
-                # the prefill-vs-decode CCA path divergence can still desync — TiDAR is the validated
-                # spec+EP path; other proposers need a matching decode-shaped dummy (follow-up).
-                saved_lens = (dr.cached_len, dr.device_len)
-                try:
-                    for _ in range(n_fwd):
-                        forward_input = self._ep_prepare_dummy_prefill()
-                        self._forward(forward_input, track_reqs=False)
-                finally:
-                    dr.cached_len, dr.device_len = saved_lens
+            mask_id = int(getattr(proposer, "mask_token_id", 0))
+            for _ in range(n_ep):
+                self._tidar_block_predict([dr], k, mask_id, skip_alloc=True)
 
     def _spec_prefill_seeded(self, batch: Batch) -> None:
         """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the
