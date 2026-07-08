@@ -233,6 +233,14 @@ async def ask(req: AskRequest) -> AskResponse:
     tok = runtime.tokenizer
     memory = runtime.memory
 
+    # Backend-shared runtime: deliver via the residual TAP + seed-once (the validated path — a normal
+    # generate carrying mem_subject through the served model). The co-located HF runtime has no served
+    # decode loop, so it falls through to the logit-only router path below.
+    ask_tap = getattr(runtime, "ask_tap", None)
+    if ask_tap is not None:
+        text = ask_tap(req.prompt, req.subject, max(1, int(req.max_tokens)))
+        return AskResponse(text=text.replace("\n", " ").strip())
+
     subject_ids = _encode_sp(tok, req.subject)
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
@@ -311,6 +319,17 @@ async def list_facts() -> List[FactItem]:
 
     return [FactItem(subject=_text(f, "subject", "subject_ids"),
                      object=_text(f, "object", "object_ids")) for f in lister()]
+
+
+@cam_router.get("/stats")
+async def stats() -> dict:
+    """Per-bank occupancy + crowding health (mandatory overflow guard — delivery silently degrades when
+    a bank crowds past ~9 edits). Served from the side index."""
+    runtime = _get_runtime()
+    statter = getattr(runtime.memory, "stats", None)
+    if statter is None:
+        raise HTTPException(status_code=503, detail="CAM stats unavailable")
+    return statter()
 
 
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)

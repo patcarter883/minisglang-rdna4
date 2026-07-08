@@ -513,12 +513,16 @@ class CAMMemory:
                 p.requires_grad_(False)
         self.banks = [self.adapter.store.init_state(1, device, dtype=torch.float32)
                       for _ in range(self.n_banks)]
+        # Bank tensor dims (read()/persistent_bank return [1, K, mem_dim]) — the graph-capture static
+        # buffer [max_bs, K, mem_dim] needs these at engine build (Phase 2).
+        self.k_slots = k_slots
+        self.mem_dim = a_mem
         # POINTER delivery via a COSINE-NN SUBJECT INDEX (#100): a stored subject key = L2-normalised mean
         # of the base model's INPUT embeddings over the subject tokens; delivery returns the object of the
         # nearest stored subject by cosine (above deliver_tau). This is EXACT retrieval (no product-key
         # slot collision → span-exact stays 1.0 to N=500) and order/title/case robust (reordered / "Ms. X"
-        # / lowercased all 1.0; unknown subjects max-cos <0.63 so tau=0.9 rejects them). Supersedes the
-        # per-position product-key id-bank for delivery — no new model, uses the base embeds we already hold.
+        # deliver 1.0; unknown subjects max-cos ≤0.51 so tau=0.7 rejects them). Supersedes the per-position
+        # product-key id-bank for delivery — no new model, uses the base embeds we already hold.
         self._embed_w = embed_weight
         self._subj_keys: List[torch.Tensor] = []             # [base_hidden] normalised pooled subject keys
         self._subj_objs: List[List[int]] = []                # parallel object-id sequences
@@ -648,6 +652,19 @@ class CAMMemory:
         out = self.tap.forward(h3, bank, conf)               # [1, N, H]
         return out.squeeze(0)
 
+    @torch.no_grad()
+    def apply_tap_rows(self, h: torch.Tensor, bank: torch.Tensor,
+                       conf: Optional[torch.Tensor]) -> torch.Tensor:
+        """Per-ROW tap: h [N,H] with bank [N,K,mem] (one bank per token row) -> injected [N,H]. Used by
+        the graph-capture decode path where a static [max_bs,K,mem] buffer carries a distinct bank per
+        request row. The tap's forward is already batched over its leading dim, so treat each row as its
+        own batch element (T=1): h[N,1,H] x bank[N,K,mem]. A zero bank row => tap no-op for that row
+        (padding / non-memory / seed-once-placed). For N==1 this is byte-identical to apply_tap."""
+        if not self.enabled:
+            return h
+        out = self.tap.forward(h.unsqueeze(1), bank, conf)   # [N,1,H]
+        return out.squeeze(1)
+
     # ---- router (per-token logit-space injection, at the lm_head) ---------------------------------
     @torch.no_grad()
     def router_delta(self, base_last_logits: torch.Tensor, bank: Optional[torch.Tensor],
@@ -678,6 +695,45 @@ class CAMMemory:
     def facts(self) -> list:
         """List stored (subject_ids, object_ids) associations (for /cam/facts)."""
         return [{"subject_ids": list(k), **v} for k, v in self._facts.items()]
+
+    def stats(self) -> dict:
+        """Per-bank occupancy + crowding health (online_api.md §6.2). Delivery silently degrades when a
+        bank crowds past ~9 edits, so this is the mandatory overflow guard. Counts come from the side
+        index (exact); the subject-hash routing is replayed to attribute each edit to its bank."""
+        loads = [0] * self.n_banks
+        for sids in self._facts:
+            loads[_subject_bank(list(sids), self.n_banks)] += 1
+        total = sum(loads)
+        mx = max(loads) if loads else 0
+        mean = (total / self.n_banks) if self.n_banks else 0.0
+        return {
+            "B": self.n_banks, "total_edits": total, "max_bank_load": mx,
+            "imbalance": (mx / mean) if mean else 0.0,
+            "crowded_banks": [b for b, ln in enumerate(loads) if ln > 9],
+            "banks": [{"index": b, "n_edits": ln} for b, ln in enumerate(loads) if ln > 0],
+        }
+
+    @torch.no_grad()
+    def snapshot(self, path: str) -> int:
+        """Persist the editable state — the B value banks + the side index — to `path` (the trained
+        adapter/tap/router live in the checkpoint, not here). Returns #edits saved."""
+        torch.save({"banks": [b.detach().cpu() for b in self.banks],
+                    "facts": self._facts,
+                    "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
+                             "base_model": self.meta.get("base_model")}}, path)
+        return len(self._facts)
+
+    @torch.no_grad()
+    def restore(self, path: str) -> int:
+        """Load a bank snapshot into this (already-loaded) store. Hard-fails on a bank-count / adapter
+        mismatch — a bank is only meaningful against the projections that wrote it. Returns #edits."""
+        d = torch.load(path, map_location="cpu", weights_only=False)
+        m = d.get("meta", {})
+        if int(m.get("n_banks", self.n_banks)) != self.n_banks:
+            raise ValueError(f"snapshot n_banks={m.get('n_banks')} != store n_banks={self.n_banks}")
+        self.banks = [b.to(self.device, dtype=torch.float32) for b in d["banks"]]
+        self._facts = d.get("facts", {})
+        return len(self._facts)
 
     # --- WS-C API aliases (the edit-plane calls these exact names) ---
     def list_facts(self) -> list:

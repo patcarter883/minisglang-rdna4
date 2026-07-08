@@ -28,6 +28,10 @@ class SamplingParams:
     # Structured-output spec: None (free), "json" (any valid JSON object), or a JSON-schema string.
     # A constrained request bypasses speculative decoding and is masked per-token by a grammar matcher.
     grammar: str | None = None
+    # CAM editable-memory (Option B): the explicit subject to read from the standing store. When set
+    # AND the engine has CAM built, the scheduler computes this request's tap bank at prefill and injects
+    # it at the L24 tap (seed-once). None -> a plain request (tap no-op). Rides UserMsg -> Req like grammar.
+    mem_subject: str | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -53,6 +57,13 @@ class Req:
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+        # CAM editable-memory (Option B): the per-request tap bank+conf, computed once at prefill from
+        # the request's explicit subject and reused across decode. None for every non-memory request, so
+        # the L24 tap stays a byte-exact no-op (see models/qwen3_5.py stage_cam/clear_cam).
+        self.mem_bank: "torch.Tensor | None" = None
+        self.mem_conf: "torch.Tensor | None" = None
+        self._mem_seed: "int | None" = None       # the object's first (store-preferred) token
+        self._mem_placed: bool = False            # seed-once: True once _mem_seed has been emitted
 
     @property
     def remain_len(self) -> int:
@@ -136,6 +147,10 @@ class Context:
     # ZAYA CCA recurrent-state cache (conv_states + prev_hs) — set by the Engine ONLY for CCA-hybrid
     # models, reached via `get_global_ctx().cca_state`. Stays None for every non-Zaya model.
     cca_state: "CCAStateCache | None" = field(default=None, init=False)
+    # CAM editable-memory (Option B) — the built CAMMemory (store+tap+router), set by the Engine ONLY
+    # when MINISGL_CAM=1 + a checkpoint is given. The model's L24 tap reaches it via stage_cam; stays
+    # None for every non-memory run, where the tap is a byte-exact no-op.
+    cam_state: "object | None" = field(default=None, init=False)
     # Expert-parallel (EP) state — set by the Engine ONLY when --enable-ep (dp_size>1). MoELayer.forward
     # reaches it via get_global_ctx().ep so the EP dispatch/combine (all_gather token rows over the EP
     # group, masked local-expert compute, all_reduce(SUM)) runs INSIDE the captured decode graph. None

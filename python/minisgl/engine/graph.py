@@ -138,6 +138,7 @@ class GraphRunner:
         dummy_req: Req,
         gdn_state: object | None = None,
         cca_state: object | None = None,
+        cam: object | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -162,6 +163,14 @@ class GraphRunner:
             from minisgl.cca.graph_capture import CCAGraphCapture
 
             self.cca_capture = CCAGraphCapture(device, self.max_graph_bs)
+        # CAM editable-memory decode tap: thread a static per-row bank buffer through the graph so the
+        # L24 tap runs inside the captured decode (Phase 2). None when CAM is off or graphs are disabled.
+        self.cam_capture = None
+        if cam is not None and getattr(cam, "enabled", False) and self.max_graph_bs > 0:
+            from minisgl.cam.graph_capture import CAMGraphCapture
+
+            inner = getattr(model, "model", model)
+            self.cam_capture = CAMGraphCapture(cam, inner, device, self.max_graph_bs)
         # v2: stashed for the spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft).
         self._cca_state = cca_state
         self.cca_verify = None
@@ -212,6 +221,8 @@ class GraphRunner:
                 self.gdn_capture.prepare_for_capture(batch)
             if self.cca_capture is not None:
                 self.cca_capture.prepare_for_capture(batch)
+            if self.cam_capture is not None:
+                self.cam_capture.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             # inference_mode around BOTH the warmup and captured forwards: capture never needs
             # autograd, and with grad active the models' in-place-on-view ops (e.g. q_norm/k_norm
@@ -225,6 +236,9 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+
+        if self.cam_capture is not None:
+            self.cam_capture.after_capture()  # revert Python hook to eager single-bank path
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -241,6 +255,8 @@ class GraphRunner:
             self.gdn_capture.prepare_for_replay(batch)
         if self.cca_capture is not None:
             self.cca_capture.prepare_for_replay(batch)
+        if self.cam_capture is not None:
+            self.cam_capture.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
 
