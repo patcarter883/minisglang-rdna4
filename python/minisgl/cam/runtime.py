@@ -238,8 +238,9 @@ class FrontendCAMRuntime:
                          r"\s+(?:is|was|are|were)\s+([A-Z][A-Za-z.'-]+)")
         seen = set()
         for mm in pat.finditer(text):
-            s, o = mm.group(1).strip(), mm.group(2).strip()
-            if (s, o) not in seen:
+            s = mm.group(1).strip().strip(".,;:!?'\"")
+            o = mm.group(2).strip().strip(".,;:!?'\"")
+            if s and o and (s, o) not in seen:
                 seen.add((s, o)); facts.append((s, o))
         return facts
 
