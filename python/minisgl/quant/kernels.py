@@ -471,16 +471,22 @@ def rxf_moe(
     w13_scales: torch.Tensor,  # (E, 2*inter, K/32) fp16
     w2: torch.Tensor,  # (E, K, inter/2) uint8
     w2_scales: torch.Tensor,  # (E, K, inter/32) fp16
-    gating_output: torch.Tensor,  # (M, E)
+    gating_output: torch.Tensor | None,  # (M, E); ignored when topk_ids/topk_weights are given
     top_k: int,
     renormalize: bool,
     *,
+    topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 — precomputed route (e.g. noaux_tc)
+    topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     span: int = 32,
     block_m: int = 16,
 ) -> torch.Tensor:
     """Grouped RXF W4A8 MoE: rotate+quant -> grouped GEMM(w13) -> silu_and_mul -> rotate+quant
-    -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors w4a8_moe's dispatch (vLLM
-    topk_softmax + moe_align), int8/NL on the GEMMs. Returns (M, K)."""
+    -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors w4a8_moe's dispatch (moe_align),
+    int8/NL on the GEMMs. Returns (M, K).
+
+    Either pass raw ``gating_output`` (softmax+topk computed here) OR a precomputed
+    ``topk_weights``/``topk_ids`` route (GLM/DeepSeek noaux_tc computed in the model — its normalize
+    + scaling are already folded in, so pass them through unchanged; renormalize is ignored)."""
     import torch.nn.functional as F
     import moe_hip
     import rxf_hip  # noqa: F401
@@ -490,13 +496,19 @@ def rxf_moe(
     dev = x.device
     nl = _rxf_nl(dev)
 
-    # route: torch softmax+topk (lean image has no vllm; matches the former _moe_C.topk_softmax).
-    probs = torch.softmax(gating_output.float(), dim=-1)
-    tw, ti = torch.topk(probs, top_k, dim=-1)
-    if renormalize:
-        tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
-    tw = tw.contiguous()
-    ti = ti.to(torch.int32).contiguous()
+    # Precomputed route (GLM/DeepSeek noaux_tc) or torch softmax+topk fallback (lean image has no
+    # vllm; matches the former _moe_C.topk_softmax).
+    if topk_ids is not None:
+        assert topk_weights is not None, "topk_weights required when topk_ids is given"
+        tw = topk_weights.to(torch.float32).contiguous()
+        ti = topk_ids.to(torch.int32).contiguous()
+    else:
+        probs = torch.softmax(gating_output.float(), dim=-1)
+        tw, ti = torch.topk(probs, top_k, dim=-1)
+        if renormalize:
+            tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+        tw = tw.contiguous()
+        ti = ti.to(torch.int32).contiguous()
 
     # align: native HIP drop-in for the former vLLM moe_align_block_size host op.
     sorted_ids, expert_ids, ntp = moe_hip.moe_align(ti, E, block_m)
