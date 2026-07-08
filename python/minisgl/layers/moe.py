@@ -395,8 +395,27 @@ class MoELayer(BaseOP):
                 ep_w = topk_weights.contiguous()
                 ep_i = topk_ids.to(torch.int32).contiguous()
                 hs = hidden_states
-                if ep.pad_tokens is not None and ep.pad_tokens > real_n:
-                    pad = ep.pad_tokens - real_n
+                # Determine the COMMON token count N every replica pads to before the all_gather
+                # (RCCL requires equal shapes). Three cases, fastest first:
+                #  1. Graph decode: the batch was pre-padded to a captured bs, so N is already equal on
+                #     every replica -> no agreement, no host sync (keeps the hot path graph-clean).
+                #  2. Eager with a scheduler pre-agreement (ep_loop prefill): use ep.pad_tokens.
+                #  3. Eager with NO pre-agreement (a spec-verify / prefix-seed forward that bypassed
+                #     ep_loop): SELF-COORDINATE — one tiny all_gather of the per-replica real_n, pad to
+                #     the max. This is what lets EP survive any forward path (incl. spec-decode) without
+                #     the scheduler loop having pre-agreed the size. Costs an extra collective+sync per
+                #     MoE layer, but only on the (already-eager) uncoordinated path.
+                if torch.cuda.is_current_stream_capturing():
+                    common_n = real_n
+                elif ep.pad_tokens is not None:
+                    common_n = max(ep.pad_tokens, real_n)
+                else:
+                    counts = ep.all_gather(
+                        torch.tensor([real_n], device=hs.device, dtype=torch.int64)
+                    )  # (dp,)
+                    common_n = int(counts.max().item())
+                if common_n > real_n:
+                    pad = common_n - real_n
                     hs = torch.cat([hs, hs.new_zeros(pad, hs.shape[1])], dim=0)
                     ep_w = torch.cat([ep_w, ep_w.new_zeros(pad, ep_w.shape[1])], dim=0)
                     # padded rows get expert id 0 with weight 0 -> zero contribution after masking.
