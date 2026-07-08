@@ -492,7 +492,8 @@ class MoELayer(BaseOP):
 
             w13, w2 = self.gate_up_proj, self.down_proj
             if self.quant.is_rxf:
-                assert not precomputed, "RXF MoE precomputed-topk path not wired yet"
+                # RXF accepts EITHER raw router_logits (fused softmax+topk) OR a precomputed route
+                # (GLM/DeepSeek noaux_tc — computed in the model, passed through unchanged).
                 final_hidden_states = kernels.rxf_moe(
                     hidden_states,
                     w13.weight_packed,
@@ -502,6 +503,8 @@ class MoELayer(BaseOP):
                     router_logits,
                     self.top_k,
                     self.renormalize,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
                     span=self.quant.rotation_span,
                 )
             elif self.enable_ep:
