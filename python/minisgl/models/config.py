@@ -313,7 +313,8 @@ class ModelConfig:
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=scaling,
-                interleave=bool(getattr(config, "rope_interleave", False)),
+                interleave=bool(getattr(config, "rope_interleave", False))
+                and not os.environ.get("MINISGL_DISABLE_ROPE_INTERLEAVE"),
             ),
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
