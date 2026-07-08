@@ -219,12 +219,18 @@ class DFlashProposer(Proposer):
                 d.t2d = sd["t2d"].to(torch.bool)
 
     @torch.inference_mode()
-    def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
+    def propose(
+        self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, topk: int = 0
+    ) -> List[List[int]]:
         out: List[List[int]] = [[] for _ in reqs]
         draft = self._draft
         device = self._device
         mask_id = self._mask_token_id
         B = self._block_size
+        # DDTree (topk>0): stash the per-position top-K MARGINALS (target-vocab ids + log-probs) of the
+        # k_i drafted positions per req, keyed by id(req), for build_draft_tree. Mirrors the scheduler's
+        # _tidar_block_predict topk path. Cleared each call.
+        self._ddtree_topk: dict[int, tuple] = {}
         for i, req in enumerate(reqs):
             # Block emits up to B-1 drafts; clamp to the per-step draft budget and the req budget.
             k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))
@@ -251,11 +257,18 @@ class DFlashProposer(Proposer):
             hidden = draft.denoise(noise_embed, target_hidden, block_pos, ctx_pos)  # [B, hidden]
             logits = draft.head(hidden)  # [B, vocab]
             # Positions 1..B-1 are the speculation (position 0 is the known anchor).
-            ids = logits[1 : 1 + k_i].argmax(dim=-1)  # [k_i] draft-vocab ids
+            block_logits = logits[1 : 1 + k_i]  # [k_i, vocab]
+            ids = block_logits.argmax(dim=-1)  # [k_i] draft-vocab ids
             if self._compressed:
                 ids = ids + self._d2t[ids]  # draft id -> target id (delta map)
             drafts = [int(x) for x in ids.tolist()]
             out[i] = drafts
+            if topk > 0 and k_i > 0:
+                lp = torch.log_softmax(block_logits.float(), dim=-1)  # [k_i, vocab]
+                tv, ti = lp.topk(topk, dim=-1)  # [k_i, topk], descending
+                if self._compressed:
+                    ti = ti + self._d2t[ti]  # draft ids -> target ids (delta map)
+                self._ddtree_topk[id(req)] = (ti.cpu().tolist(), tv.cpu().tolist())
             if self._dbg:
                 print(f"[dflash-dbg] uid={req.uid} anchor={anchor_tok} base_pos={base_pos} "
                       f"B={B} k={k_i} draft={drafts}", flush=True)
