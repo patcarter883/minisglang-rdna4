@@ -207,7 +207,7 @@ class FrontendCAMRuntime:
             logger.warning("CAM %s: could not parse backend reply as JSON: %r", op, txt[:200])
             return None
 
-    async def extract_facts(self, text: str, max_tokens: int = 200) -> list:
+    async def extract_facts(self, text: str, max_tokens: int = 512) -> list:
         """TRANSPARENT write: model-assisted extraction of durable (subject, object) facts stated in
         `text` (a plain generation — no CAM params). Returns [(subject, object), ...]; [] on none/parse
         failure. Deliberately conservative so chit-chat doesn't pollute the store."""
