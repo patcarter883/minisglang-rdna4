@@ -197,6 +197,13 @@ async def remember(req: RememberRequest) -> RememberResponse:
     import torch
 
     runtime = _get_runtime()
+    # MULTI-PROCESS model-share: the store lives in the backend engine.cam; route the write through it
+    # (rides a generate with mem_remember). No local model/store on the frontend.
+    if getattr(runtime, "is_frontend_share", False):
+        if not _encode_sp(runtime.tokenizer, req.subject):
+            raise HTTPException(status_code=422, detail="subject tokenized to empty")
+        stored = await runtime.remember(req.subject, req.object, req.prompt)
+        return RememberResponse(stored=stored, base_p=0.0)
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -230,6 +237,11 @@ async def ask(req: AskRequest) -> AskResponse:
     import torch
 
     runtime = _get_runtime()
+    # MULTI-PROCESS model-share: deliver via the backend engine.cam — a normal generate carrying
+    # mem_subject; the scheduler forces the exact stored object tokens (pointer), then the base continues.
+    if getattr(runtime, "is_frontend_share", False):
+        text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)))
+        return AskResponse(text=text.replace("\n", " ").strip())
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -305,6 +317,9 @@ async def list_facts() -> List[FactItem]:
     Shapes with ready-made ``subject``/``object`` strings are passed through unchanged.
     """
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: facts come from the backend engine.cam
+        return [FactItem(subject=f.get("subject", ""), object=f.get("object", ""))
+                for f in await runtime.facts()]
     memory = runtime.memory
     tok = runtime.tokenizer
     lister = getattr(memory, "list_facts", None)
@@ -323,9 +338,13 @@ async def list_facts() -> List[FactItem]:
 
 @cam_router.get("/stats")
 async def stats() -> dict:
-    """Per-bank occupancy + crowding health (mandatory overflow guard — delivery silently degrades when
-    a bank crowds past ~9 edits). Served from the side index."""
+    """Per-bank occupancy + crowding health for the product-key VALUE banks (the router/tap fallback
+    path). NOTE: the PRIMARY /cam/ask delivery is the cosine-NN subject index (exact retrieval, no bank
+    collision), so crowding no longer degrades pointer delivery — this monitors only the value-bank
+    fallback. Served from the side index."""
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: stats from the backend engine.cam
+        return await runtime.stats()
     statter = getattr(runtime.memory, "stats", None)
     if statter is None:
         raise HTTPException(status_code=503, detail="CAM stats unavailable")
@@ -338,6 +357,10 @@ async def delete_fact(subject: str) -> DeleteResponse:
     stays; the serve path never reads a tombstoned subject). Exact erase (rebuild) is a full-surface
     item, not MVP."""
     runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):     # multi-process: forget in the backend engine.cam
+        if not _encode_sp(runtime.tokenizer, subject):
+            raise HTTPException(status_code=422, detail="subject tokenized to empty")
+        return DeleteResponse(deleted=await runtime.forget(subject))
     tok = runtime.tokenizer
     memory = runtime.memory
 

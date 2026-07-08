@@ -136,14 +136,162 @@ class BackendCAMRuntime:
         return self.llm.generate([prompt], sp)[0]["text"]
 
 
+class FrontendCAMRuntime:
+    """MULTI-PROCESS model-share (#100): the CAM store (`engine.cam`) lives in the BACKEND scheduler
+    process; this frontend runtime holds NO model and NO local store — only a tokenizer — and routes the
+    two CAM ops through the backend by riding a normal generate request (the same seam `mem_subject`
+    already uses for the tap):
+
+      * remember(subject, object)  -> generate(mem_subject=subject, mem_remember=object_ids, max_tokens=1);
+        the scheduler writes subject->object into engine.cam at prefill (write-only stub generation).
+      * ask(prompt, subject)       -> generate(prompt, mem_subject=subject); the scheduler FORCES the exact
+        stored object tokens (engine.cam.deliver_object_ids), then the served base continues the sentence.
+
+    No second model copy, no new message types. Enabled by MINISGL_CAM_FRONTEND=1 (inside the full
+    api_server). facts/forget/stats need a small control-plane message (follow-up) — they return data that
+    does not fit a generate. `_state` (the FrontendManager) is resolved lazily at first request."""
+
+    is_frontend_share = True
+
+    def __init__(self, model_path: str = None):
+        from transformers import AutoTokenizer
+
+        meta_ckpt = os.environ.get("MINISGL_CAM_CHECKPOINT")
+        if model_path is None and meta_ckpt and os.path.isfile(os.path.join(meta_ckpt, "meta.json")):
+            model_path = json.load(open(os.path.join(meta_ckpt, "meta.json"))).get("base_model")
+        self.model_path = model_path or os.environ.get("MINISGL_CAM_MODEL") or "Qwen/Qwen3.5-4B"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        self._state = None
+        logger.info("FrontendCAMRuntime ready: routes /cam/* to the backend engine.cam (no model copy).")
+
+    def _get_state(self):
+        if self._state is None:
+            from minisgl.server.api_server import get_global_state
+            self._state = get_global_state()
+        return self._state
+
+    def _sp(self, s: str):
+        return list(self.tokenizer(" " + s, add_special_tokens=False).input_ids)
+
+    async def _generate(self, prompt: str, max_tokens: int, *, mem_subject: str = None,
+                        mem_remember=None, mem_op: str = None) -> str:
+        """One raw-prompt generation through the backend, carrying the CAM sampling params (mirrors
+        InProcessBackendClient but raw-prompt + mem_subject/mem_remember/mem_op)."""
+        from minisgl.core import SamplingParams
+        from minisgl.message import TokenizeMsg
+
+        state = self._get_state()
+        uid = state.new_user()
+        try:
+            await state.send_one(TokenizeMsg(
+                uid=uid, text=prompt,
+                sampling_params=SamplingParams(temperature=0.0, max_tokens=max(1, max_tokens),
+                                               mem_subject=mem_subject, mem_remember=mem_remember,
+                                               mem_op=mem_op)))
+            text = ""
+            async for ack in state.wait_for_ack(uid):
+                text += ack.incremental_output
+            return text
+        except Exception:
+            state.ack_map.pop(uid, None)
+            state.event_map.pop(uid, None)
+            raise
+
+    async def _ctrl(self, op: str, subject: str = None, max_tokens: int = 2048):
+        """A control op (facts/forget/stats): the backend force-emits the JSON result as the reply text."""
+        import json
+        txt = await self._generate(".", max_tokens=max_tokens, mem_subject=subject, mem_op=op)
+        try:
+            return json.loads(txt.strip())
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("CAM %s: could not parse backend reply as JSON: %r", op, txt[:200])
+            return None
+
+    async def extract_facts(self, text: str, max_tokens: int = 512) -> list:
+        """TRANSPARENT write: model-assisted extraction of durable (subject, object) facts stated in
+        `text` (a plain generation — no CAM params). Returns [(subject, object), ...]; [] on none/parse
+        failure. Deliberately conservative so chit-chat doesn't pollute the store."""
+        import json
+        import re
+        instr = ('Extract only DURABLE factual statements the text asserts, as a JSON array of '
+                 '{"subject","object"} objects (e.g. a person\'s language, a place\'s country). Ignore '
+                 'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array, no '
+                 f'prose. /no_think\n\nText: {text}')
+        # chat format (better instruction-following than a raw completion) with thinking disabled.
+        out = await self._generate([{"role": "user", "content": instr}], max_tokens=max_tokens)
+        m = re.search(r"\[.*\]", out, re.DOTALL)
+        facts = []
+        if m:
+            try:
+                arr = json.loads(m.group(0))
+                facts = [(str(f["subject"]).strip(), str(f["object"]).strip()) for f in arr
+                         if isinstance(f, dict) and f.get("subject") and f.get("object")]
+            except (json.JSONDecodeError, ValueError):
+                facts = []
+        if facts:
+            return facts
+        # Deterministic fallback (small thinking models extract JSON unreliably): explicit fact statements
+        # "the <attr> of SUBJECT is OBJECT" / "SUBJECT's <attr> is OBJECT" / "SUBJECT is OBJECT", where both
+        # SUBJECT and OBJECT are capitalised (proper-noun-shaped) — filters out "X is nice" style non-facts.
+        pat = re.compile(r"(?:the\s+[\w ]+?\s+of\s+)?"
+                         r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+)*)(?:'s\s+[\w ]+?)?"
+                         r"\s+(?:is|was|are|were)\s+([A-Z][A-Za-z.'-]+)")
+        seen = set()
+        for mm in pat.finditer(text):
+            s = mm.group(1).strip().strip(".,;:!?'\"")
+            o = mm.group(2).strip().strip(".,;:!?'\"")
+            if s and o and (s, o) not in seen:
+                seen.add((s, o)); facts.append((s, o))
+        return facts
+
+    async def retrieve(self, prompt: str, max_tokens: int = 512) -> list:
+        """TRANSPARENT read: ask the backend which stored subjects this prompt mentions (cosine-matched,
+        tau-gated) -> [{subject, object}]. The prompt itself is the query (backend extracts spans)."""
+        import json
+        txt = await self._generate(prompt, max_tokens=max_tokens, mem_op="retrieve")
+        try:
+            return json.loads(txt.strip()) or []
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    async def facts(self) -> list:
+        return (await self._ctrl("facts")) or []
+
+    async def forget(self, subject: str) -> bool:
+        return bool(await self._ctrl("forget", subject=subject))
+
+    async def stats(self) -> dict:
+        return (await self._ctrl("stats")) or {}
+
+    async def remember(self, subject: str, object_str: str, prompt: str = None) -> bool:
+        """Write subject->object into the backend engine.cam. The base-uncertainty gate is skipped in the
+        multi-process path for now (storing a base-known fact is harmless — the pointer delivers the same
+        object the base would); a scheduler-side probe can add it back later."""
+        await self._generate(prompt or f"The mother tongue of {subject} is", max_tokens=1,
+                             mem_subject=subject, mem_remember=self._sp(object_str))
+        return True
+
+    async def ask(self, prompt: str, subject: str, max_tokens: int = 32) -> str:
+        """Retrieve: the backend forces the stored object tokens (pointer), then the base continues."""
+        return await self._generate(prompt, max_tokens=max_tokens, mem_subject=subject)
+
+
 def get_cam_runtime():
     """Lazy singleton. Returns None (so /cam/* replies 503) when CAM is not configured or fails to load.
 
-    Two backends: MINISGL_CAM_BACKEND=1 -> BackendCAMRuntime (shares the served model, no HF copy);
-    otherwise the co-located CAMRuntime (its own frozen HF base — the standalone MVP)."""
+    Three modes: MINISGL_CAM_FRONTEND=1 -> FrontendCAMRuntime (multi-process; routes to the backend
+    engine.cam, no model copy); MINISGL_CAM_BACKEND=1 -> BackendCAMRuntime (single-process in-engine share,
+    no HF copy); otherwise the co-located CAMRuntime (its own frozen HF base — the standalone MVP)."""
     global _RUNTIME
     if _RUNTIME is not None:
         return _RUNTIME
+    if os.environ.get("MINISGL_CAM_FRONTEND") == "1":
+        try:
+            _RUNTIME = FrontendCAMRuntime()               # store is in the backend; no checkpoint dir needed
+            return _RUNTIME
+        except Exception as e:  # noqa
+            logger.error("CAM: frontend runtime load failed — /cam/* disabled. (%s)", e)
+            return None
     ckpt = os.environ.get("MINISGL_CAM_CHECKPOINT")
     if not ckpt or not os.path.isdir(ckpt):
         logger.warning("CAM: MINISGL_CAM_CHECKPOINT unset/missing (%s) — /cam/* disabled.", ckpt)
