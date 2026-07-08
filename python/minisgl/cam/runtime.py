@@ -207,6 +207,37 @@ class FrontendCAMRuntime:
             logger.warning("CAM %s: could not parse backend reply as JSON: %r", op, txt[:200])
             return None
 
+    async def extract_facts(self, text: str, max_tokens: int = 200) -> list:
+        """TRANSPARENT write: model-assisted extraction of durable (subject, object) facts stated in
+        `text` (a plain generation — no CAM params). Returns [(subject, object), ...]; [] on none/parse
+        failure. Deliberately conservative so chit-chat doesn't pollute the store."""
+        import json
+        import re
+        instr = ('Extract only DURABLE factual statements the text asserts, as a JSON array of '
+                 '{"subject","object"} objects (e.g. a person\'s language, a place\'s country). Ignore '
+                 'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array.\n\n'
+                 f'Text: {text}\n\nJSON:')
+        out = await self._generate(instr, max_tokens=max_tokens)
+        m = re.search(r"\[.*\]", out, re.DOTALL)
+        if not m:
+            return []
+        try:
+            arr = json.loads(m.group(0))
+        except (json.JSONDecodeError, ValueError):
+            return []
+        return [(str(f["subject"]).strip(), str(f["object"]).strip()) for f in arr
+                if isinstance(f, dict) and f.get("subject") and f.get("object")]
+
+    async def retrieve(self, prompt: str, max_tokens: int = 512) -> list:
+        """TRANSPARENT read: ask the backend which stored subjects this prompt mentions (cosine-matched,
+        tau-gated) -> [{subject, object}]. The prompt itself is the query (backend extracts spans)."""
+        import json
+        txt = await self._generate(prompt, max_tokens=max_tokens, mem_op="retrieve")
+        try:
+            return json.loads(txt.strip()) or []
+        except (json.JSONDecodeError, ValueError):
+            return []
+
     async def facts(self) -> list:
         return (await self._ctrl("facts")) or []
 

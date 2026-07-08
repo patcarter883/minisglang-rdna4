@@ -529,7 +529,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # message type. Handled before the subject guard (facts/stats carry no subject).
             mem_op = getattr(sp, "mem_op", None)
             if mem_op and getattr(req, "_mem_deliver", None) is None:
-                result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
+                if mem_op == "retrieve":         # TRANSPARENT read: match stored subjects that appear in
+                    result = self._cam_retrieve(cam, req.input_ids)   # the prompt -> facts for auto-RAG
+                else:
+                    result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
                 toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
                 if self.eos_token_id is not None:
                     toks = toks + [self.eos_token_id]                 # terminate after the result string
@@ -582,6 +585,30 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             statter = getattr(cam, "stats", None)
             return json.dumps(statter() if statter else {})
         return json.dumps(None)
+
+    def _cam_retrieve(self, cam, prompt_ids) -> str:
+        """TRANSPARENT read: which stored subjects does this prompt mention? Decode the prompt, pull
+        candidate proper-noun spans (capitalised word runs — the common subject shape), and query each
+        against the store's cosine-NN subject index (deliver_object_ids, tau-gated). Returns the matched
+        facts as JSON [{subject,object}] for the frontend to fold into context (auto-RAG). Empty when
+        nothing confidently matches — the tau threshold keeps it quiet on unrelated prompts."""
+        import json
+        import re
+        deliver = getattr(cam, "deliver_object_ids", None)
+        if deliver is None:
+            return json.dumps([])
+        text = self.tokenizer.decode(list(prompt_ids))
+        cands = {m.group(0) for m in
+                 re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text)}
+        seen, out = set(), []
+        for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller-name) spans first
+            cids = list(self.tokenizer(" " + c, add_special_tokens=False).input_ids)
+            oids = deliver(cids)
+            if oids:
+                obj = self.tokenizer.decode(oids).strip()
+                if (c, obj) not in seen:
+                    seen.add((c, obj)); out.append({"subject": c, "object": obj})
+        return json.dumps(out)
 
     def _stage_cam(self, batch: Batch) -> None:
         """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +

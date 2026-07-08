@@ -159,6 +159,66 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
+async def _cam_auto_augment(prompt):
+    """TRANSPARENT CAM read (MINISGL_CAM_AUTO=1): fold relevant remembered facts into the request context
+    so /v1/chat and /generate use CAM with NO special params. `prompt` is a chat-messages list or a raw
+    string. Retrieves cosine-matched facts for the query text and prepends them as a system note (chat) or
+    a short preface (raw). No-op when auto is off, no CAM runtime, or nothing confidently matches (the
+    store's tau threshold keeps it quiet on unrelated prompts). Costs one extra retrieve round-trip."""
+    if os.environ.get("MINISGL_CAM_AUTO") != "1":
+        return prompt
+    try:
+        from minisgl.cam import get_cam_runtime
+
+        rt = get_cam_runtime()
+    except Exception:  # noqa: BLE001
+        return prompt
+    if rt is None or not hasattr(rt, "retrieve"):
+        return prompt
+    if isinstance(prompt, list):
+        query = " ".join(str(m.get("content") or "") for m in prompt if m.get("role") in ("user", "system"))
+    else:
+        query = str(prompt)
+    if not query.strip():
+        return prompt
+    try:
+        facts = await rt.retrieve(query)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("CAM auto-retrieve failed: %s", e)
+        return prompt
+    if not facts:
+        return prompt
+    note = "Relevant known facts (use if helpful):\n" + "\n".join(
+        f"- {f.get('subject')}: {f.get('object')}" for f in facts)
+    logger.debug("CAM auto-RAG: injected %d fact(s)", len(facts))
+    if isinstance(prompt, list):
+        return [{"role": "system", "content": note}, *prompt]
+    return note + "\n\n" + str(prompt)
+
+
+async def _cam_auto_write(text: str) -> None:
+    """TRANSPARENT CAM write (MINISGL_CAM_AUTO_WRITE=1): model-extract durable facts from `text` (the
+    latest user turn) and remember them, so facts stated in conversation are learned with NO explicit
+    /cam/remember. No-op when off / no runtime. Best-effort: extraction failures are swallowed. Costs one
+    extraction generation per turn — pair with a fact-statement heuristic if that overhead matters."""
+    if os.environ.get("MINISGL_CAM_AUTO_WRITE") != "1" or not (text and text.strip()):
+        return
+    try:
+        from minisgl.cam import get_cam_runtime
+
+        rt = get_cam_runtime()
+    except Exception:  # noqa: BLE001
+        return
+    if rt is None or not hasattr(rt, "extract_facts"):
+        return
+    try:
+        for subj, obj in await rt.extract_facts(text):
+            await rt.remember(subj, obj)
+            logger.debug("CAM auto-write: remembered %r -> %r", subj, obj)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("CAM auto-write failed: %s", e)
+
+
 # Tool-trained models emit tool calls inside `<tool_call>...</tool_call>` blocks, but the INNER format
 # varies by family. We parse both we've seen:
 #   (A) Hermes JSON:  {"name": "fn", "arguments": {"k": v}}
@@ -387,11 +447,12 @@ if os.environ.get("MINISGL_CAM") == "1":
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
+    prompt = await _cam_auto_augment(req.prompt)   # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
             uid=uid,
-            text=req.prompt,
+            text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -476,6 +537,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
+
+    # TRANSPARENT CAM: learn facts from the latest user turn, then fold relevant known facts into context.
+    if isinstance(prompt, list):
+        _last_user = next((m.get("content") for m in reversed(prompt) if m.get("role") == "user"), None)
+    else:
+        _last_user = prompt
+    await _cam_auto_write(_last_user or "")     # no-op unless MINISGL_CAM_AUTO_WRITE=1
+    prompt = await _cam_auto_augment(prompt)     # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
 
     uid = state.new_user()
     await state.send_one(
