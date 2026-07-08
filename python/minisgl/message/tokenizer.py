@@ -41,6 +41,9 @@ class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, str]]
     sampling_params: SamplingParams
+    # OpenAI tool specs to inject into the chat template (tool-trained models emit <tool_call> blocks
+    # the api_server parses back). None = no tools offered. Defaulted so existing senders are unchanged.
+    tools: List[Dict] | None = None
 
 
 @dataclass

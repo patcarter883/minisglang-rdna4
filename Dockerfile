@@ -44,12 +44,14 @@ print('torch', torch.__version__, 'hip', torch.version.hip)"
 # --- engine runtime deps (only what minisglang imports on the serve path) -------------------------
 # server: fastapi/uvicorn/pydantic/starlette + openai (OpenAI-compatible API) ; message: msgpack/pyzmq ;
 # model load: transformers/tokenizers/safetensors/huggingface-hub/accelerate/modelscope/sentencepiece/
-# einops ; cli: prompt_toolkit ; util: numpy/psutil. NB: NO apache-tvm-ffi (the tvm_ffi paths are the
-# disabled pynccl/JIT build path — the combined image never had it and serve works without it).
+# einops ; cli: prompt_toolkit ; util: numpy/psutil ; guided decoding: xgrammar (grammar compiler;
+# minisgl does the bitmask masking device-agnostically in torch, so no xgrammar CUDA kernel needed).
+# NB: NO apache-tvm-ffi (the tvm_ffi paths are the disabled pynccl/JIT build path — the combined image
+# never had it and serve works without it).
 RUN pip install \
         "transformers>=4.56" tokenizers safetensors "huggingface-hub" accelerate modelscope \
         sentencepiece einops \
-        numpy msgpack pyzmq psutil \
+        numpy msgpack pyzmq psutil xgrammar \
         fastapi uvicorn pydantic starlette prompt_toolkit openai
 
 # --- build the custom HIP kernels from the CANONICAL repo (source of truth) ------------------------
