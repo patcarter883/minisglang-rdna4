@@ -224,12 +224,10 @@ class ModelConfig:
         # Some checkpoints ship the MTP-head TENSORS but leave the count at 0 in config (e.g. a quant
         # tool that dropped the field — GLM-4.7-Flash-RXF). MINISGL_NUM_NEXTN / MINISGL_MTP_LAYERS
         # force the head on so spec-decode can use it. 0/unset -> trust the config.
-        num_nextn_predict_layers = int(
-            os.environ.get("MINISGL_NUM_NEXTN", num_nextn_predict_layers)
-        )
-        mtp_num_hidden_layers = int(
-            os.environ.get("MINISGL_MTP_LAYERS", mtp_num_hidden_layers)
-        )
+        if (_nn := os.environ.get("MINISGL_NUM_NEXTN")):
+            num_nextn_predict_layers = int(_nn)
+        if (_ml := os.environ.get("MINISGL_MTP_LAYERS")):
+            mtp_num_hidden_layers = int(_ml)
 
         # RMSNorm eps: Llama/Qwen use `rms_norm_eps`; ZAYA names it `norm_epsilon`.
         rms_norm_eps = getattr(config, "rms_norm_eps", None)
