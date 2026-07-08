@@ -5,6 +5,7 @@ import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
+import torch.distributed as dist
 import torch.profiler
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
@@ -255,6 +256,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Speculative decoding runs in a dedicated synchronous loop: acceptance is a
         # data-dependent host-sync that fundamentally conflicts with the zero-sync overlap path
         # (see SPEC_DECODE.md §1). All GPU work runs on the engine stream, like the eager path.
+        # Spec-decode AND expert-parallelism together: a single loop that both agrees the per-step
+        # EP phase/size across replicas AND runs the spec step. Neither _spec_loop nor ep_loop alone
+        # works — _spec_loop issues MoE collectives with no cross-replica agreement (deadlock), ep_loop
+        # has no spec step. Must be checked BEFORE the spec-only / ep-only branches below.
+        if self.engine.spec_config is not None and self.engine.enable_ep:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self._spec_ep_loop()
         if self.engine.spec_config is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -548,6 +558,131 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             batch = self.decode_manager.schedule_next_batch()
             forward_input = self._prepare_batch(batch)
             self._process_last_data((forward_input, self._forward(forward_input)))
+
+    def _spec_num_forwards(self) -> int:
+        """How many full-model forwards a single spec decode step issues (propose forwards + 1 verify).
+        DETERMINISTIC per config (same on every replica), so an idle EP replica can issue exactly this
+        many matching dummy forwards to line up the per-layer MoE collectives — see _spec_ep_loop.
+
+          * TiDAR non-fused: block_predict (1) + verify (1) = 2; fused: 1 (verify+draft in one forward).
+          * n-gram: no propose forward, verify only = 1.
+          * MTP / EAGLE3 / DFlash / draft-model: num_draft sequential draft forwards + verify = K+1.
+        """
+        spec = self.engine.spec_config
+        assert spec is not None
+        algo = spec.algorithm
+        if algo == "tidar":
+            return 1 if getattr(self, "_tidar_fused", False) else 2
+        if algo == "ngram":
+            return 1
+        return spec.num_draft + 1
+
+    def _spec_ep_loop(self) -> None:
+        """Spec-decode under expert parallelism. Runs when BOTH spec_config and enable_ep are set (see
+        run_forever). Combines the EP lockstep (every replica agrees phase+size each step, or the MoE
+        collectives deadlock) with the synchronous spec step.
+
+        Prefill uses the EP prefill lockstep (identical to ep_loop). A DECODE step is one of:
+          * plain decode (any replica has a non-greedy req) — the EP graph decode, exactly like ep_loop.
+          * spec decode (all replicas all-greedy) — the busy replica runs the real propose→verify→accept
+            (forced EAGER under EP so the MoE self-coordinates its token count per layer, moe.py case 3);
+            an idle replica issues _spec_num_forwards() EAGER dummy prefills so its per-layer MoE
+            all_gathers line up 1:1 with the busy replica's propose+verify forwards. Dummy prefills reuse
+            the proven _ep_prepare_dummy_prefill machinery (skip_alloc, allocates the dummy's recurrent
+            slot on first use, snapshot/restore lengths) — the shapes differ from a verify forward but
+            the MoE self-agreement equalizes N, which is the only cross-replica collective under EP
+            (attention/CCA are DP-local; EP shards only the experts).
+        """
+        engine = self.engine
+        ep = engine.ctx.ep
+
+        for msg in self.receive_msg(blocking=False):
+            self._process_one_msg(msg)
+
+        prefill_batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        local_prefill_tokens = (
+            sum(r.extend_len for r in prefill_batch.reqs) if prefill_batch is not None else 0
+        )
+        local_reqs: List[Req] = (
+            sorted(self.decode_manager.running_reqs, key=lambda r: r.uid)
+            if self.decode_manager.runnable
+            else []
+        )
+        local_decode_bs = len(local_reqs)
+        # A replica with decode work vetoes spec iff ANY of its reqs is non-greedy; a replica with NO
+        # decode work has nothing to veto (treat as greedy so it doesn't force the whole box to plain
+        # decode). Agreed via MAX over (1 - all_greedy): any 1 -> some replica is non-greedy.
+        local_nongreedy = (
+            1 if (local_reqs and not all(r.sampling_params.is_greedy for r in local_reqs)) else 0
+        )
+        t = torch.tensor(
+            [local_prefill_tokens, local_decode_bs, local_nongreedy], dtype=torch.int64
+        )
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=engine.dp_cpu_group)
+        max_prefill, max_decode, any_nongreedy = int(t[0]), int(t[1]), int(t[2])
+
+        if max_prefill == 0 and max_decode == 0:
+            self.run_when_idle()
+            return
+
+        if max_prefill > 0:
+            # ---- PREFILL lockstep (eager) — identical to ep_loop's prefill branch --------------------
+            is_real = prefill_batch is not None
+            ep.pad_tokens = max_prefill
+            dr = engine.dummy_req
+            saved_lens = None if is_real else (dr.cached_len, dr.device_len)
+            try:
+                forward_input = (
+                    self._prepare_batch(prefill_batch)
+                    if is_real
+                    else self._ep_prepare_dummy_prefill()
+                )
+                data = (forward_input, self._forward(forward_input, track_reqs=is_real))
+            finally:
+                ep.pad_tokens = None
+                if saved_lens is not None:
+                    dr.cached_len, dr.device_len = saved_lens
+            if is_real:
+                self._process_last_data(data)
+            return
+
+        # ---- DECODE lockstep ----------------------------------------------------------------------
+        ep.pad_tokens = None
+        if any_nongreedy:
+            # Some replica has a non-greedy req -> ALL fall back to the EP graph decode (one forward),
+            # exactly like ep_loop's decode branch. Keeps every replica issuing one matching forward.
+            graph_bs_list: List[int] = engine.graph_runner.graph_bs_list
+            common_bs = max_decode
+            if graph_bs_list:
+                bigger = [b for b in graph_bs_list if b >= max_decode]
+                if bigger:
+                    common_bs = min(bigger)
+            batch = Batch(reqs=local_reqs, phase="decode") if local_reqs else None
+            forward_input = self._ep_prepare_decode(batch, common_bs)
+            data = (forward_input, self._forward(forward_input, track_reqs=bool(local_reqs)))
+            if local_reqs:
+                self._process_last_data(data)
+            return
+
+        # SPEC decode lockstep: busy replica runs the real step; idle replica issues F matching dummy
+        # forwards. Both stay eager (ep.pad_tokens None) so the per-layer MoE self-agrees N.
+        if local_reqs:
+            if getattr(self, "_tidar_fused", False):
+                self._spec_decode_step_tidar_fused(
+                    local_reqs, self._proposer.block_size, self._proposer.mask_token_id
+                )
+            else:
+                self._spec_decode_step(local_reqs)
+        else:
+            n_fwd = self._spec_num_forwards()
+            dr = engine.dummy_req
+            saved_lens = (dr.cached_len, dr.device_len)
+            try:
+                for _ in range(n_fwd):
+                    forward_input = self._ep_prepare_dummy_prefill()
+                    self._forward(forward_input, track_reqs=False)
+            finally:
+                dr.cached_len, dr.device_len = saved_lens
 
     def _spec_prefill_seeded(self, batch: Batch) -> None:
         """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the
@@ -1103,7 +1238,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # and the batch fits a captured size, PAD with dummy verify reqs FIRST so positions/out_loc
         # cover the padded rows (dummy rows point at the dummy page — never stale real KV), then replay
         # the graph. Otherwise (partial-K step / graphs off) stay eager with dynamic metadata.
-        use_vgraph = self.engine.graph_runner.can_use_verify_graph(batch)
+        # Under EP the verify MUST run eager: the in-graph MoE all_gather uses a FIXED N (the captured
+        # bs), but an idle replica coordinates via the eager self-agreement path (moe.py case 3). Graph
+        # (fixed N) vs eager (self-agreed N) would mismatch shapes across replicas and wedge the
+        # collective. Eager verify -> every replica hits the self-coordinating path -> N agrees. The
+        # _spec_ep_loop drives the idle replica's matching dummy forwards.
+        use_vgraph = (
+            self.engine.graph_runner.can_use_verify_graph(batch) and not self.engine.enable_ep
+        )
         if use_vgraph:
             self.engine.graph_runner.pad_verify(batch)
         else:
