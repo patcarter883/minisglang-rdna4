@@ -570,6 +570,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 bank, conf = cam.read(subj_ids, ns=ns)
                 req.mem_bank, req.mem_conf = bank, conf
                 req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+        autosave = getattr(cam, "autosave", None)   # #7 debounced persistence after any writes this batch
+        if autosave is not None:
+            autosave()
 
     def _cam_ctrl_result(self, cam, op: str, subj: str | None, ns: str | None = None) -> str:
         """#100 control op -> JSON string (force-emitted as the reply), scoped to namespace `ns` (#6).
@@ -590,6 +593,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if op in ("freeze", "unfreeze"):        # read-only toggle: protect a curated namespace from auto-write
             frozen = cam.freeze(ns) if op == "freeze" else cam.unfreeze(ns)
             return json.dumps({"frozen": bool(frozen)})
+        if op == "save":                        # #7 explicit persistence flush
+            return json.dumps({"saved": cam.save() if hasattr(cam, "save") else -1})
+        if op == "undo":                        # #12 undo the last write in this namespace
+            u = cam.undo(ns) if hasattr(cam, "undo") else {}
+            return json.dumps({"subject": self.tokenizer.decode(list(u["subject_ids"])).strip(),
+                               "object": self.tokenizer.decode(list(u["object_ids"])).strip()} if u else {})
+        if op == "rebuild":                     # #12 true-erase / compact this namespace's banks
+            return json.dumps({"rebuilt": cam.rebuild(ns) if hasattr(cam, "rebuild") else 0})
+        if op == "audit":                       # #12 recent write/forget/evict events for this namespace
+            out = []
+            for r in (cam.audit_log(ns) if hasattr(cam, "audit_log") else []):
+                out.append({"op": r["op"], "ts": r["ts"],
+                            "subject": self.tokenizer.decode(list(r["subject_ids"])).strip(),
+                            "object": self.tokenizer.decode(list(r["object_ids"])).strip() if r["object_ids"] else ""})
+            return json.dumps(out)
         return json.dumps(None)
 
     def _cam_retrieve(self, cam, prompt_ids, ns: str | None = None) -> str:

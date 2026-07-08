@@ -81,7 +81,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("minisgl.cam_api")
@@ -180,7 +180,19 @@ def _remember(memory, subject_ids, object_ids, prompt_last_logits, ns=None) -> b
 # --------------------------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------------------------- #
-cam_router = APIRouter(prefix="/cam", tags=["cam"])
+def _require_cam_auth(authorization: str = Header(None)) -> None:
+    """#8 auth: when MINISGL_CAM_API_TOKEN is set, require `Authorization: Bearer <token>` on EVERY /cam/*
+    route (the edit-plane mutates shared memory). Unset -> open (localhost/dev default). Applied as a
+    router-level dependency so read and write routes are covered uniformly."""
+    import os
+    token = os.environ.get("MINISGL_CAM_API_TOKEN")
+    if not token:
+        return
+    if authorization != f"Bearer {token}":
+        raise HTTPException(status_code=401, detail="invalid or missing CAM API token")
+
+
+cam_router = APIRouter(prefix="/cam", tags=["cam"], dependencies=[Depends(_require_cam_auth)])
 
 
 @cam_router.post("/remember", response_model=RememberResponse)
@@ -363,6 +375,56 @@ async def freeze(frozen: bool = True, x_cam_namespace: str = Header(None)) -> di
     if fn is None:
         raise HTTPException(status_code=503, detail="CAM freeze unavailable")
     return {"frozen": bool(fn(x_cam_namespace))}
+
+
+@cam_router.post("/save")
+async def save() -> dict:
+    """#7 persistence: force a snapshot to MINISGL_CAM_STORE_PATH now (all namespaces). Returns #edits
+    saved, or -1 when no store path is configured. (Autosave also runs debounced after writes.)"""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.save()
+    saver = getattr(runtime.memory, "save", None)
+    if saver is None:
+        raise HTTPException(status_code=503, detail="CAM persistence unavailable")
+    return {"saved": saver()}
+
+
+@cam_router.post("/undo")
+async def undo(x_cam_namespace: str = Header(None)) -> dict:
+    """#12: undo the most-recent write in a namespace (forget that subject). Returns the undone fact or {}."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.undo(x_cam_namespace)
+    u = runtime.memory.undo(x_cam_namespace)
+    tok = runtime.tokenizer
+    return {"subject": tok.decode(list(u["subject_ids"])).strip(),
+            "object": tok.decode(list(u["object_ids"])).strip()} if u else {}
+
+
+@cam_router.post("/rebuild")
+async def rebuild(x_cam_namespace: str = Header(None)) -> dict:
+    """#12 TRUE ERASE / compaction: re-init a namespace's banks and replay only the surviving facts,
+    discarding delta residue from forgotten/overwritten edits."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.rebuild(x_cam_namespace)
+    return {"rebuilt": runtime.memory.rebuild(x_cam_namespace)}
+
+
+@cam_router.get("/audit")
+async def audit(x_cam_namespace: str = Header(None)) -> List[dict]:
+    """#12: recent write/forget/evict events for a namespace (most-recent last)."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.audit(x_cam_namespace)
+    tok = runtime.tokenizer
+    out = []
+    for r in runtime.memory.audit_log(x_cam_namespace):
+        out.append({"op": r["op"], "ts": r["ts"],
+                    "subject": tok.decode(list(r["subject_ids"])).strip(),
+                    "object": tok.decode(list(r["object_ids"])).strip() if r["object_ids"] else ""})
+    return out
 
 
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)

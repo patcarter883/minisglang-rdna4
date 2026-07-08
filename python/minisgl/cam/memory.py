@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from typing import List, Optional, Tuple
 
 import torch
@@ -406,7 +407,9 @@ class _NsState:
     weights are SHARED across namespaces; only this — the value banks, the cosine-NN subject index, the
     fact table, and the freeze flag — is partitioned per tenant/session so one conversation cannot read
     or overwrite another's memory."""
-    __slots__ = ("banks", "subj_keys", "subj_objs", "subj_tuple", "facts", "frozen")
+    # seq: monotonic LRU clock (#9); evicted: count dropped for capacity; last_key: most-recent write (#12 undo)
+    __slots__ = ("banks", "subj_keys", "subj_objs", "subj_tuple", "facts", "frozen",
+                 "seq", "evicted", "last_key")
 
     def __init__(self, banks, frozen=False, subj_keys=None, subj_objs=None, subj_tuple=None, facts=None):
         self.banks = banks
@@ -415,6 +418,9 @@ class _NsState:
         self.subj_tuple = [] if subj_tuple is None else subj_tuple
         self.facts = {} if facts is None else facts
         self.frozen = frozen
+        self.seq = 0
+        self.evicted = 0
+        self.last_key = None
 
 
 class CAMMemory:
@@ -571,9 +577,26 @@ class CAMMemory:
         self._init_banks = [b.detach().clone() for b in self.banks]
         self._ns_states = {"default": _NsState(self.banks, self.frozen, self._subj_keys,
                                                self._subj_objs, self._subj_tuple, self._facts)}
+        # #9 capacity: per-namespace fact cap (0 = unlimited); LRU eviction on overflow.
+        self.max_facts = int(os.environ.get("MINISGL_CAM_MAX_FACTS", "0"))
+        # #12 audit: append-only ring buffer of write/forget/evict events (subject/object/source/ns/ts).
+        self._audit: list = []
+        self._audit_max = int(os.environ.get("MINISGL_CAM_AUDIT_MAX", "2000"))
+        # #7 persistence: load-on-boot + debounced autosave to MINISGL_CAM_STORE_PATH.
+        self.store_path = os.environ.get("MINISGL_CAM_STORE_PATH")
+        self._save_interval = float(os.environ.get("MINISGL_CAM_SAVE_INTERVAL", "5"))
+        self._dirty = False
+        self._last_save = 0.0
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
+        if self.store_path and os.path.isfile(self.store_path):   # #7 load-on-boot
+            try:
+                n = self.restore(self.store_path)
+                logger.info("CAMMemory: restored %d edits across %d namespace(s) from %s",
+                            n, len(self._ns_states), self.store_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("CAMMemory: store restore failed (%s) — starting empty.", e)
 
     # ---- object supply for the write gate --------------------------------------------------------
     def set_pending_object(self, object_ids: List[int]) -> None:
@@ -646,12 +669,65 @@ class CAMMemory:
         k = tuple(int(s) for s in subject_ids)
         obj = [int(o) for o in object_ids]
         key_vec = self._subj_key(subject_ids)
+        st.seq += 1
         if k in st.subj_tuple:
             i = st.subj_tuple.index(k)
             st.subj_keys[i], st.subj_objs[i] = key_vec, obj
         else:
             st.subj_tuple.append(k); st.subj_keys.append(key_vec); st.subj_objs.append(obj)
-        st.facts[k] = {"object_ids": obj, "base_p": float(base_p)}   # side index (#6: per-namespace)
+        st.facts[k] = {"object_ids": obj, "base_p": float(base_p), "used": st.seq}  # #6 index + #9 LRU clock
+        st.last_key = k                                          # #12 undo target
+        self._audit_add("write", ns, k, obj)                    # #12 audit
+        self._maybe_evict(st, ns)                               # #9 capacity
+        self._dirty = True                                      # #7 persistence
+
+    # ---- #9 capacity / eviction --------------------------------------------------------------------
+    @torch.no_grad()
+    def _maybe_evict(self, st, ns: str) -> None:
+        """Evict least-recently-used facts from a namespace once it exceeds max_facts (0 = unlimited).
+        Delivery-correct: drops from the cosine-NN index + fact table (bank residue is the router/tap
+        fallback only; a full rebuild is the #12 true-erase path)."""
+        if self.max_facts <= 0:
+            return
+        while len(st.facts) > self.max_facts:
+            victim = min(st.facts, key=lambda kk: st.facts[kk].get("used", 0))   # LRU
+            obj = st.facts[victim]["object_ids"]
+            del st.facts[victim]
+            if victim in st.subj_tuple:
+                i = st.subj_tuple.index(victim)
+                del st.subj_tuple[i]; del st.subj_keys[i]; del st.subj_objs[i]
+            st.evicted += 1
+            self._audit_add("evict", ns, victim, obj)
+
+    # ---- #12 audit ---------------------------------------------------------------------------------
+    def _audit_add(self, op: str, ns: str, subject_ids, object_ids) -> None:
+        self._audit.append({"ts": time.time(), "op": op, "ns": ns or "default",
+                            "subject_ids": list(subject_ids), "object_ids": list(object_ids)})
+        if len(self._audit) > self._audit_max:
+            del self._audit[:len(self._audit) - self._audit_max]
+
+    def audit_log(self, ns: str = None, limit: int = 100) -> list:
+        """Recent write/forget/evict events (most-recent last), optionally filtered to a namespace (#12)."""
+        rows = self._audit if ns is None else [r for r in self._audit if r["ns"] == (ns or "default")]
+        return rows[-limit:]
+
+    # ---- #7 persistence: debounced autosave --------------------------------------------------------
+    def autosave(self, force: bool = False) -> bool:
+        """Snapshot to store_path if dirty and the debounce interval elapsed (or force). Returns whether it
+        saved. Cheap no-op when no store_path / not dirty."""
+        if not self.store_path or (not self._dirty and not force):
+            return False
+        now = time.time()
+        if not force and (now - self._last_save) < self._save_interval:
+            return False
+        try:
+            self.snapshot(self.store_path)
+            self._dirty = False
+            self._last_save = now
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CAMMemory autosave failed: %s", e)
+            return False
 
     @torch.no_grad()
     def _subj_key(self, subject_ids: List[int]) -> torch.Tensor:
@@ -711,6 +787,9 @@ class CAMMemory:
         j = int(sims.argmax().item())
         if float(sims[j].item()) < self.deliver_tau:
             return []                                        # unknown subject -> no confident delivery
+        rec = st.facts.get(st.subj_tuple[j])                 # #9 LRU: mark this fact recently used
+        if rec is not None:
+            st.seq += 1; rec["used"] = st.seq
         return list(st.subj_objs[j])
 
     # ---- read (once per request, at prefill) -----------------------------------------------------
@@ -809,6 +888,8 @@ class CAMMemory:
             "banks": [{"index": b, "n_edits": ln} for b, ln in enumerate(loads) if ln > 0],
             "frozen": st.frozen, "write_policy": self.write_policy,
             "namespace": ns or "default", "namespaces": len(self._ns_states),
+            "max_facts": self.max_facts, "evicted": st.evicted,            # #9 capacity
+            "persistent": bool(self.store_path), "dirty": self._dirty,     # #7 persistence
         }
 
     @torch.no_grad()
@@ -843,7 +924,17 @@ class CAMMemory:
                 key_vec = self._subj_key(list(k))
                 st.subj_tuple.append(tuple(k)); st.subj_keys.append(key_vec)
                 st.subj_objs.append(list(rec["object_ids"])); st.facts[tuple(k)] = rec
+            st.seq = max([r.get("used", 0) for r in st.facts.values()] or [0])   # #9 continue the LRU clock
         return sum(len(st.facts) for st in self._ns_states.values())
+
+    def save(self) -> int:
+        """Force a persistence snapshot now (explicit flush, e.g. POST /cam/save). Returns #edits, or -1
+        when no store_path is configured."""
+        if not self.store_path:
+            return -1
+        n = self.snapshot(self.store_path)
+        self._dirty = False; self._last_save = time.time()
+        return n
 
     # --- WS-C API aliases (the edit-plane calls these exact names) ---
     def list_facts(self, ns: str = None) -> list:
@@ -886,4 +977,35 @@ class CAMMemory:
         for subj, rec in list(st.facts.items()):
             if _subject_bank(list(subj), self.n_banks) == b:
                 self._write(list(subj), rec["object_ids"], ns=ns)   # rebuild value bank; index in-place
+        self._audit_add("forget", ns, key, [])                # #12 audit
+        self._dirty = True                                    # #7 persistence
         return True
+
+    @torch.no_grad()
+    def undo(self, ns: str = None) -> dict:
+        """#12: undo the most-recent WRITE in a namespace (forget that subject). Returns the undone
+        {subject_ids, object_ids} or {} if there is nothing to undo."""
+        st = self._state(ns)
+        k = st.last_key
+        if not k or k not in st.facts:
+            return {}
+        obj = list(st.facts[k]["object_ids"])
+        self.forget(list(k), ns=ns)
+        st.last_key = None
+        return {"subject_ids": list(k), "object_ids": obj}
+
+    @torch.no_grad()
+    def rebuild(self, ns: str = None) -> int:
+        """#12 TRUE ERASE / compaction: fully re-init a namespace's banks and replay only the surviving
+        facts, discarding all delta residue from forgotten/overwritten edits. Returns #facts replayed."""
+        if not self.enabled:
+            return 0
+        st = self._state(ns)
+        survivors = list(st.facts.items())
+        st.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+                    for _ in range(self.n_banks)]
+        st.subj_keys, st.subj_objs, st.subj_tuple, st.facts = [], [], [], {}
+        for k, rec in survivors:
+            self._write(list(k), rec["object_ids"], ns=ns, base_p=rec.get("base_p", 0.0))
+        self._dirty = True
+        return len(survivors)
