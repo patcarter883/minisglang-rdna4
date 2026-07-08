@@ -13,6 +13,9 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # Interleaved RoPE pairing (GLM-4.x `rope_interleave=True`) vs NeoX rotate-half. Applying the
+    # wrong pairing scrambles relative position -> grammatical-but-degenerate generation.
+    interleave: bool = False
 
 
 @dataclass(frozen=True)
@@ -287,6 +290,7 @@ class ModelConfig:
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=scaling,
+                interleave=bool(getattr(config, "rope_interleave", False)),
             ),
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,

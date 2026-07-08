@@ -40,6 +40,7 @@ class AttentionLayer(StateLessOP):
             max_position=rotary_config.max_position,
             base=rotary_config.base,
             rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+            interleave=rotary_config.interleave,  # GLM-style interleaved RoPE, else NeoX
         )
         self.q_norm = q_norm
         self.k_norm = k_norm

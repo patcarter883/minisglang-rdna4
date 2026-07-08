@@ -18,10 +18,18 @@ class RotaryEmbedding(StateLessOP):
         max_position_embeddings: int,
         base: float,
         post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        interleave: bool = False,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
+        # Interleaved RoPE (GLM-4.x `rope_interleave=True`): the rotary dims are laid out as adjacent
+        # pairs (x0,x1),(x2,x3),... each rotated by ONE frequency, vs the NeoX/Llama "rotate-half"
+        # split ([:d] | [d:]). Same rotation formula, DIFFERENT input pairing — applying NeoX to an
+        # interleaved-weight model mis-assigns every frequency and scrambles relative position
+        # (grammatical output that loses precise reasoning). The tail_hip.rope kernel is NeoX-only, so
+        # the interleaved path stays in torch.
+        self.interleave = interleave
         # Partial rotary (Qwen3.5: rotary_dim < head_size): rotate the first rotary_dim dims of
         # each head, pass the rest through. rotary_dim == head_size is the full-rotary default.
         assert rotary_dim <= head_size and rotary_dim % 2 == 0
@@ -52,12 +60,38 @@ class RotaryEmbedding(StateLessOP):
         out = torch.cat((out_rot, x[..., rd:]), dim=-1) if rd < self.head_size else out_rot
         return out.view(n, -1).to(orig_dtype)
 
+    def _apply_interleave(
+        self, x: torch.Tensor, cos_half: torch.Tensor, sin_half: torch.Tensor
+    ) -> torch.Tensor:
+        # Interleaved RoPE: pairs (x0,x1),(x2,x3),... rotated by cos_half/sin_half (rotary_dim//2 wide).
+        # Matches transformers apply_rotary_pos_emb_interleave (output de-interleaved to [evens|odds];
+        # consistent for q and k, so the q·k dot is exact). cos/sin are the per-pair angles, NOT
+        # doubled. x: [n, num_heads*head_size].
+        n = x.shape[0]
+        orig_dtype = x.dtype
+        x = x.view(n, -1, self.head_size).float()
+        rd = self.rotary_dim
+        x_rot = x[..., :rd]
+        x1, x2 = x_rot[..., 0::2], x_rot[..., 1::2]  # even, odd -> [n, H, rd//2]
+        c = cos_half.view(n, 1, rd // 2)
+        s = sin_half.view(n, 1, rd // 2)
+        out_rot = torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
+        out = torch.cat((out_rot, x[..., rd:]), dim=-1) if rd < self.head_size else out_rot
+        return out.view(n, -1).to(orig_dtype)
+
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.interleave:
+            # NeoX tail_hip kernel can't express interleaved pairing -> torch path.
+            cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
+            return (
+                self._apply_interleave(query, cos_half, sin_half),
+                self._apply_interleave(key, cos_half, sin_half),
+            )
         if _tail_hip.active(query, key):
             # tail_hip.rope takes the FULL fp32 cat(cos,sin) cache + int32 positions and does the
             # NeoX partial rotate internally (same convention as _apply below).
@@ -82,9 +116,10 @@ def _get_rope(
     max_position: int,
     base: float,
     rope_scaling: Dict[str, Any] | None = None,
+    interleave: bool = False,
 ) -> RotaryEmbedding:
     if rope_scaling is None:
-        return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
+        return RotaryEmbedding(head_dim, rotary_dim, max_position, base, interleave=interleave)
     # need to test some cases:
     match rope_scaling["rope_type"]:
         case "default":
@@ -153,6 +188,7 @@ def get_rope(
     max_position: int,
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
+    interleave: bool = False,
 ) -> RotaryEmbedding:
     rope_map = dict(rope_scaling) if rope_scaling is not None else None
     t = torch.tensor([])
@@ -163,8 +199,8 @@ def get_rope(
                 "We cannot use meta device for rope. Please call set_rope_device() first."
             )
         with torch.device(_ROPE_DEVICE):
-            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
-    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map)
+            return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, interleave)
+    return _get_rope(head_dim, rotary_dim, max_position, base, rope_map, interleave)
 
 
 __all__ = ["get_rope", "RotaryEmbedding", "set_rope_device"]
