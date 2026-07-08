@@ -215,9 +215,10 @@ class FrontendCAMRuntime:
         import re
         instr = ('Extract only DURABLE factual statements the text asserts, as a JSON array of '
                  '{"subject","object"} objects (e.g. a person\'s language, a place\'s country). Ignore '
-                 'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array.\n\n'
-                 f'Text: {text}\n\nJSON:')
-        out = await self._generate(instr, max_tokens=max_tokens)
+                 'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array, no '
+                 f'prose. /no_think\n\nText: {text}')
+        # chat format (better instruction-following than a raw completion) with thinking disabled.
+        out = await self._generate([{"role": "user", "content": instr}], max_tokens=max_tokens)
         m = re.search(r"\[.*\]", out, re.DOTALL)
         if not m:
             return []
