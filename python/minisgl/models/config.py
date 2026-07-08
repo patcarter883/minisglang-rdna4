@@ -233,10 +233,25 @@ class ModelConfig:
         rope_scaling = getattr(config, "rope_scaling", None) or None
         rope_params = getattr(config, "rope_parameters", None) or None
         rope_theta = getattr(config, "rope_theta", None)
-        if rope_theta is None and rope_params is not None:
-            rope_theta = rope_params.get("rope_theta")
-        if rope_theta is None and rope_scaling is not None:
-            rope_theta = rope_scaling["rope_theta"]
+        for _rope_d in (rope_params, rope_scaling):
+            if rope_theta is not None or _rope_d is None:
+                continue
+            rope_theta = _rope_d.get("rope_theta")
+            if rope_theta is None:
+                # ZAYA nests rope_theta PER layer_type: rope_parameters =
+                # {'hybrid': {rope_theta 5e6, ...}, 'hybrid_sliding': {rope_theta 1e4, ...},
+                # 'rope_type': 'default'}. Pick the theta of the layer type the model actually uses
+                # (ZAYA1-8B is all 'hybrid'); fall back to the first nested rope_theta. minisgl builds
+                # ONE rope, so a genuinely mixed-theta model would need per-layer rope — not the case
+                # for shipped ZAYA, but assert-worthy if a future config carries >1 distinct theta.
+                lts = getattr(config, "layer_types", None) or []
+                cand = _rope_d.get(lts[0]) if lts else None
+                if not (isinstance(cand, dict) and "rope_theta" in cand):
+                    cand = next(
+                        (v for v in _rope_d.values() if isinstance(v, dict) and "rope_theta" in v),
+                        None,
+                    )
+                rope_theta = cand.get("rope_theta") if isinstance(cand, dict) else None
         # Partial rotary (Qwen3.5: rotary_dim = head_dim * partial_rotary_factor, e.g. 0.25 -> 64).
         # Plain models leave it None -> full rotary (rotary_dim == head_dim).
         partial = getattr(config, "partial_rotary_factor", None)
