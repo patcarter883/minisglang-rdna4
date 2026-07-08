@@ -268,6 +268,28 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     if name.endswith(".down_proj.weight"):
         return t.chunk(n, dim=1)[r].clone()
 
+    # ---- FULLY-dense-quantized (compressed-tensors) linears: the dense 27B quantizes q/k/v/o AND
+    # the MLP, so their weight_packed [N, K//pf] / weight_scale [N, K//g] (N-major, output on dim 0)
+    # need the SAME TP splits as the bf16 .weight rules above — column-parallel q/k/v + gate/up split
+    # the output N (dim 0); row-parallel o + down split the input K (packed/group dim 1). Without
+    # this the quantized dense weights fall through to REPLICATE and every rank loads the whole model
+    # (~13.5 GB int4) -> OOM at load. (`.mlp.experts.*` is handled + returned above, so these
+    # unqualified suffixes only match the dense linears.) q_proj carries q+gate per head; output-dim
+    # chunk keeps whole heads on a rank, as for the bf16 path. ----
+    if name.endswith(
+        (".q_proj.weight_packed", ".q_proj.weight_scale",
+         ".k_proj.weight_packed", ".k_proj.weight_scale",
+         ".v_proj.weight_packed", ".v_proj.weight_scale",
+         ".gate_proj.weight_packed", ".gate_proj.weight_scale",
+         ".up_proj.weight_packed", ".up_proj.weight_scale")
+    ):
+        return t.chunk(n, dim=0)[r].clone()
+    if name.endswith(
+        (".o_proj.weight_packed", ".o_proj.weight_scale",
+         ".down_proj.weight_packed", ".down_proj.weight_scale")
+    ):
+        return t.chunk(n, dim=1)[r].clone()
+
     # ---- vocab-parallel embedding + untied lm_head ----
     if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
         num = t.shape[0]
