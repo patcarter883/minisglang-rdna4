@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from typing import Dict, List
 
 import torch
@@ -25,6 +26,16 @@ def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
     if isinstance(msg, BatchTokenizerMsg):
         return msg.data
     return [msg]
+
+
+def _is_cam_msg(sampling_params) -> bool:
+    """A request that touches the per-replica CAM store: it carries a subject to deliver/write, an
+    object to write, or a control op (facts/forget/stats/retrieve). These must all be pinned to ONE
+    DP replica (below) because `engine.cam` is per-scheduler-replica — round-robining them would split
+    a user's writes and reads across independent stores."""
+    return bool(getattr(sampling_params, "mem_subject", None)
+                or getattr(sampling_params, "mem_remember", None)
+                or getattr(sampling_params, "mem_op", None))
 
 
 @torch.inference_mode()
@@ -131,11 +142,18 @@ def tokenize_worker(
                     for msg, t in zip(tokenize_msg, tensors, strict=True)
                 ]
                 # Per-replica routing: bucket each UserMsg to ONE replica (round-robin), then flush one
-                # batch per replica. Each request is delivered to exactly one DP replica.
+                # batch per replica. Each request is delivered to exactly one DP replica. EXCEPTION: CAM
+                # store ops are PINNED to a single replica (MINISGL_CAM_DP_RANK, default 0) so every
+                # remember/ask/retrieve sees the same per-replica engine.cam — round-robin would scatter a
+                # user's writes and reads across independent stores. (dp_size==1 -> cam_rank 0 == no-op.)
+                cam_rank = int(os.environ.get("MINISGL_CAM_DP_RANK", "0")) % dp_size
                 per_replica: List[List[UserMsg]] = [[] for _ in range(dp_size)]
                 for um in user_msgs:
-                    per_replica[rr_cursor].append(um)
-                    rr_cursor = (rr_cursor + 1) % dp_size
+                    if _is_cam_msg(um.sampling_params):
+                        per_replica[cam_rank].append(um)
+                    else:
+                        per_replica[rr_cursor].append(um)
+                        rr_cursor = (rr_cursor + 1) % dp_size
                 for dp_rank, msgs in enumerate(per_replica):
                     if not msgs:
                         continue
