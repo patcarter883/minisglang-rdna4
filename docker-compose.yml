@@ -16,7 +16,7 @@
 #   gpu-lease -n 1 --detach -- docker compose --profile serve down
 
 x-lean-common: &lean-common
-  image: minisgl-rdna4:lean
+  image: ${MINISGL_IMAGE:-minisgl-rdna4:lean}
   build:
     context: .
     dockerfile: Dockerfile
