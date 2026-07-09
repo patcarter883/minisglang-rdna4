@@ -266,6 +266,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # delimiter string (generic; keyed off the reasoning parser, no model-name branch).
         self._grammar_think_gate: dict[int, int] = {}
         self._think_close_ids: dict[str, int | None] = {}
+        # Reasoning BUDGET backstop: this model often reasons in long/unstructured prose and never
+        # emits a clean `</think>`, so the gate above would never open → pages of CoT and NO JSON. We
+        # count generated tokens WHILE a uid is gated (uid -> count) and, once it reaches the uid's
+        # budget (uid -> budget; per-request override or the MINISGL_THINK_BUDGET default), FORCE the
+        # think-close token into the stream and open the gate so the schema engages on the answer.
+        self._grammar_think_count: dict[int, int] = {}
+        self._grammar_think_budget: dict[int, int] = {}
+        self._grammar_think_budget_default = int(
+            os.environ.get("MINISGL_THINK_BUDGET", "1024") or 1024
+        )
         # Escape hatch / A-B toggle: MINISGL_GRAMMAR_THINK_GATE=0 reverts to applying the schema from
         # token 0 even with thinking on (the pre-fix behavior — for demonstrating before/after).
         self._grammar_think_gate_enabled = (
@@ -472,9 +482,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                         gate = self._grammar_think_gate.get(req.uid)
                         if gate is not None:
                             # Reasoning phase: don't feed think tokens to the matcher. Open the gate
-                            # once </think> is emitted so the NEXT token is grammar-constrained.
+                            # once </think> is emitted (either the model's own close, or the budget-
+                            # forced one masked in _build_grammar_bitmask) so the NEXT token is
+                            # grammar-constrained. Otherwise count this reasoning token toward the budget.
                             if next_token == gate:
-                                del self._grammar_think_gate[req.uid]
+                                self._clear_think_gate(req.uid)
+                            else:
+                                self._grammar_think_count[req.uid] = (
+                                    self._grammar_think_count.get(req.uid, 0) + 1
+                                )
                         elif not m.is_terminated():
                             m.accept_token(next_token)
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
@@ -543,9 +559,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
-        # Release the structured-output grammar matcher + reasoning gate (idempotent).
+        # Release the structured-output grammar matcher + reasoning gate/budget (idempotent).
         self._grammar_matchers.pop(req.uid, None)
-        self._grammar_think_gate.pop(req.uid, None)
+        self._clear_think_gate(req.uid)
 
     def _restore_rec_states(self, batch: Batch) -> None:
         """Install cached recurrent-state snapshots into the slots of prefill reqs that hit the
@@ -682,6 +698,37 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         tid = self._resolve_think_close_id(delim)
         if tid is not None:
             self._grammar_think_gate[req.uid] = tid
+            # Arm the reasoning budget: per-request override (>0) else the env default. Count starts at 0
+            # and is incremented per reasoning token committed on both the plain-decode and spec paths.
+            self._grammar_think_count[req.uid] = 0
+            per_req = getattr(req.sampling_params, "think_budget", None)
+            budget = per_req if (isinstance(per_req, int) and per_req > 0) else self._grammar_think_budget_default
+            self._grammar_think_budget[req.uid] = budget
+
+    def _clear_think_gate(self, uid: int) -> None:
+        """Drop all reasoning-gate state for ``uid`` (gate open / req finished). Idempotent."""
+        self._grammar_think_gate.pop(uid, None)
+        self._grammar_think_count.pop(uid, None)
+        self._grammar_think_budget.pop(uid, None)
+
+    def _think_gate_over_budget(self, uid: int) -> bool:
+        """True once ``uid`` has emitted >= its budget reasoning tokens — the backstop must now FORCE
+        the think-close token so the gate opens and the schema engages."""
+        budget = self._grammar_think_budget.get(uid)
+        if budget is None:
+            return False
+        return self._grammar_think_count.get(uid, 0) >= budget
+
+    def _mask_only_token(self, bitmask: torch.Tensor, row: int, tid: int) -> None:
+        """Rewrite ``bitmask[row]`` to allow ONLY token ``tid`` (bit==1), matching the packing that
+        ``apply_token_bitmask`` unpacks (bit i of word w is token w*32+i). Used to force-emit the
+        think-close token at the reasoning budget."""
+        bitmask[row].zero_()
+        word, bit = divmod(int(tid), 32)
+        val = 1 << bit
+        if val >= 0x80000000:  # bit 31 -> wrap to signed int32
+            val -= 0x100000000
+        bitmask[row, word] = val
 
     def _build_grammar_bitmask(self, batch: Batch) -> torch.Tensor | None:
         """Packed xgrammar token bitmask [batch.size, ceil(vocab/32)] on device, or None if no req in
@@ -708,7 +755,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._arm_think_gate(r)  # gate the schema until </think> if thinking is active
             # Reasoning gate: while still inside <think>…</think>, leave this row all-ones (free
             # reasoning) and do NOT advance the matcher — the schema starts fresh on the answer.
+            # BACKSTOP: once the reasoning budget is spent, force the think-close token by masking this
+            # row to allow ONLY that id. The sampler emits it, _process_last_data sees next_token==gate
+            # and opens the gate, and the next step is schema-constrained.
             if r.uid in self._grammar_think_gate:
+                if self._think_gate_over_budget(r.uid):
+                    self._mask_only_token(bitmask, i, self._grammar_think_gate[r.uid])
                 continue
             if not m.is_terminated():
                 m.fill_next_token_bitmask(bitmask, i)
@@ -743,13 +795,23 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for i in range(K + 1):
             gate = self._grammar_think_gate.get(uid)
             if gate is not None:
+                # BACKSTOP: reasoning budget spent -> FORCE the think-close token here (overriding the
+                # unconstrained argmax) and open the gate. It's the bonus of this spec step; the next
+                # step verifies schema-constrained. (The draft is unconstrained, so it won't match the
+                # forced close -> the walk ends, which is exactly what we want.)
+                if self._think_gate_over_budget(uid):
+                    emitted.append(gate)
+                    self._clear_think_gate(uid)
+                    break
                 # Reasoning phase: unconstrained greedy verify; matcher stays at its initial state.
                 t_i = int(logits_block[i].argmax().item())
                 emitted.append(t_i)
                 if (not ignore_eos) and t_i == self.eos_token_id:
                     break
                 if t_i == gate:
-                    del self._grammar_think_gate[uid]  # open gate: NEXT position is schema-constrained
+                    self._clear_think_gate(uid)  # open gate: NEXT position is schema-constrained
+                else:
+                    self._grammar_think_count[uid] = self._grammar_think_count.get(uid, 0) + 1
                 if i < K and draft[i] == t_i:
                     n_acc += 1
                     continue
