@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
+from .reasoning import get_reasoning_parser
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -105,6 +106,14 @@ class OpenAICompletionRequest(BaseModel):
     tools: List[dict] | None = None
     tool_choice: str | dict | None = None
 
+    # Reasoning / "thinking" control for chain-of-thought models. `chat_template_kwargs` is forwarded
+    # verbatim to the chat template (vLLM-compatible), e.g. {"enable_thinking": false} to disable
+    # thinking. `enable_thinking` is a convenience alias folded into chat_template_kwargs. When
+    # thinking is on (the reasoning-model default), the completion's `<think>…</think>` scratch is
+    # split out into `reasoning_content` on the response (see --reasoning-parser).
+    chat_template_kwargs: dict | None = None
+    enable_thinking: bool | None = None
+
     # Per-call Markovian-RSA control (in-engine, same port). Absent / null -> ordinary single
     # completion. `true` -> run RSA with the server's --rsa-* defaults. An object patches those
     # defaults for THIS call: {n, k, t, tail_tokens, max_tokens, agg_max_tokens, temperature,
@@ -157,6 +166,40 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     if req.tool_choice == "none":
         return None
     return req.tools
+
+
+def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None:
+    """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
+    the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3)."""
+    kwargs = dict(req.chat_template_kwargs or {})
+    if req.enable_thinking is not None and "enable_thinking" not in kwargs:
+        kwargs["enable_thinking"] = req.enable_thinking
+    return kwargs or None
+
+
+def _thinking_active(req: "OpenAICompletionRequest") -> bool:
+    """Whether reasoning is expected in the output (thinking mode engaged). Governs streaming reasoning
+    routing. Default True (reasoning models open `<think>` in the generation prompt); explicit
+    enable_thinking=False (top-level or in chat_template_kwargs) turns it off."""
+    if req.enable_thinking is False:
+        return False
+    if (req.chat_template_kwargs or {}).get("enable_thinking") is False:
+        return False
+    return True
+
+
+_REASONING_PARSER = None
+_REASONING_PARSER_SET = False
+
+
+def _reasoning_parser():
+    """Cached ReasoningParser built from the server's --reasoning-parser (None when disabled)."""
+    global _REASONING_PARSER, _REASONING_PARSER_SET
+    if not _REASONING_PARSER_SET:
+        cfg = get_global_state().config
+        _REASONING_PARSER = get_reasoning_parser(getattr(cfg, "reasoning_parser", "auto"))
+        _REASONING_PARSER_SET = True
+    return _REASONING_PARSER
 
 
 async def _cam_auto_augment(prompt):
@@ -370,7 +413,7 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(self, uid: int, reasoning_stream=None):
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
@@ -380,7 +423,16 @@ class FrontendManager:
                 delta["role"] = "assistant"
                 first_chunk = False
             if ack.incremental_output:
-                delta["content"] = ack.incremental_output
+                # Reasoning models: route the pre-</think> scratch to `reasoning_content` and the
+                # answer to `content`, in the streaming delta (buffers a partial closing tag).
+                if reasoning_stream is not None:
+                    r_delta, c_delta = reasoning_stream.push(ack.incremental_output)
+                    if r_delta:
+                        delta["reasoning_content"] = r_delta
+                    if c_delta:
+                        delta["content"] = c_delta
+                else:
+                    delta["content"] = ack.incremental_output
             completion_tokens = max(completion_tokens, ack.completion_tokens)
             prompt_tokens = ack.prompt_tokens or prompt_tokens
             if ack.finish_reason:
@@ -396,11 +448,15 @@ class FrontendManager:
             if ack.finished:
                 break
 
-        # final chunk: finish_reason + usage (OpenAI carries usage on the terminal chunk)
+        # final chunk: flush any buffered reasoning tail (model never closed </think>), then
+        # finish_reason + usage (OpenAI carries usage on the terminal chunk)
+        final_delta: dict = {}
+        if reasoning_stream is not None and (tail := reasoning_stream.flush()):
+            final_delta["reasoning_content"] = tail
         end_chunk = {
             "id": f"cmpl-{uid}",
             "object": "chat.completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": finish_reason}],
+            "choices": [{"delta": final_delta, "index": 0, "finish_reason": finish_reason}],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -570,6 +626,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             uid=uid,
             text=prompt,
             tools=_tools_for_template(req),
+            chat_template_kwargs=_resolve_chat_template_kwargs(req),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
@@ -583,8 +640,16 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
 
     if req.stream:
+        parser = _reasoning_parser()
+        reasoning_stream = (
+            parser.stream_state(active=True)
+            if parser is not None and _thinking_active(req)
+            else None
+        )
         return StreamingResponse(
-            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            state.stream_with_cancellation(
+                state.stream_chat_completions(uid, reasoning_stream), request, uid
+            ),
             media_type="text/event-stream",
         )
 
@@ -601,13 +666,25 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if ack.finished:
             break
 
-    # Tool calling: if tools were offered, parse any <tool_call> blocks the model emitted into
-    # OpenAI-shaped tool_calls and flip finish_reason. No tools offered -> plain text (untouched).
-    message = {"role": "assistant", "content": full_content}
+    # Reasoning: split a thinking model's `<think>…</think>` scratch out of the answer into a
+    # separate reasoning_content field (the opening tag is in the prompt, so the completion carries
+    # only the closing </think> + answer). No-op when disabled / no closing tag / thinking off.
+    reasoning_content: str | None = None
+    body = full_content
+    parser = _reasoning_parser()
+    if parser is not None and _thinking_active(req):
+        reasoning_content, body = parser.parse(full_content)
+
+    # Tool calling: if tools were offered, parse any <tool_call> blocks the model emitted (AFTER the
+    # reasoning split) into OpenAI-shaped tool_calls and flip finish_reason. No tools -> untouched.
+    message: dict = {"role": "assistant", "content": body}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
     if req.tools and finish_reason != "length":
-        content, tool_calls = _parse_tool_calls(full_content, uid)
+        content, tool_calls = _parse_tool_calls(body, uid)
         if tool_calls:
-            message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+            message["content"] = content
+            message["tool_calls"] = tool_calls
             finish_reason = "tool_calls"
 
     return {

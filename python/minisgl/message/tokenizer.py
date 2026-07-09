@@ -44,6 +44,9 @@ class TokenizeMsg(BaseTokenizerMsg):
     # OpenAI tool specs to inject into the chat template (tool-trained models emit <tool_call> blocks
     # the api_server parses back). None = no tools offered. Defaulted so existing senders are unchanged.
     tools: List[Dict] | None = None
+    # Extra kwargs forwarded verbatim to `apply_chat_template` (e.g. {"enable_thinking": False} to
+    # turn a reasoning model's thinking mode off). None = template defaults (thinking ON for Qwen3).
+    chat_template_kwargs: Dict | None = None
 
 
 @dataclass
