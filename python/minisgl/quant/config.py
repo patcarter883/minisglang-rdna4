@@ -26,7 +26,7 @@ class QuantConfig:
     native layout (op group_size=32)."""
 
     method: str  # "awq" | "compressed-tensors" | "gptq" | "rxf"
-    bits: int  # 4
+    bits: int  # 4 (int4 W4A8/W4A16 family) | 8 (fp8 W8A8, compressed-tensors float-quantized)
     group_size: int  # 128 (AWQ/GPTQ) / 32 (compressed-tensors, rxf)
     sym: bool  # symmetric (no zero-point) vs asymmetric (AWQ zero_point=True -> False)
     ignore: tuple[str, ...] = ()  # module-name suffixes left unquantized (CT); () for AWQ
@@ -37,6 +37,16 @@ class QuantConfig:
     # RXF only: block-diagonal Hadamard rotation span (offline weights + runtime activations are
     # rotated by the same orthonormal FWHT-span; it cancels in the dot). 32 is the shipped default.
     rotation_span: int = 32
+    # WEIGHT storage element type (compressed-tensors `config_groups[*].weights.type`):
+    #   "int"   -> integer-quantized (int4 W4A8/W4A16, int8) — the AWQ/GPTQ/CT-int4 path.
+    #   "float" -> float-quantized (fp8 e4m3 weights, e.g. ZAYA's W8A8; MXFP4 e2m1 in future).
+    # AWQ/GPTQ/RXF are always integer, so this defaults "int"; only compressed-tensors reads it.
+    weight_type: str = "int"
+    # ACTIVATION scheme the checkpoint DECLARES for its quantized GEMMs (compressed-tensors
+    # `input_activations`): "fp8" -> per-token dynamic fp8 acts (W8A8 — MUST be honored, the acts
+    # are calibrated for it); None -> weight-only (activations stay in the compute dtype, W4A16/W8A16).
+    # An env var must NEVER substitute a different activation scheme than the checkpoint declares.
+    act_type: str | None = None
 
     @property
     def is_awq(self) -> bool:
@@ -53,6 +63,28 @@ class QuantConfig:
     @property
     def is_compressed_tensors(self) -> bool:
         return self.method == "compressed-tensors"
+
+    @property
+    def is_fp8_w8a8(self) -> bool:
+        """True for the fp8 W8A8 scheme: compressed-tensors *float-quantized* 8-bit weights
+        (F8_E4M3) with per-token fp8 activations (e.g. ZAYA). Routed to the native w8a8_moe /
+        w8a8 fp8-WMMA kernels — NOT the int4 W4A8 path. `act_type == 'fp8'` marks the calibrated
+        per-token activation quant that MUST be honored (an env may pick W8A16 as a perf opt-in but
+        never silently swap the declared activation scheme)."""
+        return self.is_compressed_tensors and self.weight_type == "float" and self.bits == 8
+
+    @property
+    def weight_is_e2m1(self) -> bool:
+        """Hook for MXFP4 (compressed-tensors float-quantized 4-bit, e2m1 microscaled weights).
+        Not yet implemented here — a distinct kernel path from both int4-W4A8 and fp8-W8A8. Kept as
+        a config-level predicate so the MoE/linear selectors can route to it once the kernel lands."""
+        return self.is_compressed_tensors and self.weight_type == "float" and self.bits == 4
+
+    @property
+    def is_int4(self) -> bool:
+        """Integer 4-bit weight family (AWQ / GPTQ / compressed-tensors int4) — the shared W4A8
+        expert/linear kernel (int4 weight x per-token fp8 act, or true W4A16 where flagged)."""
+        return self.bits == 4 and self.weight_type == "int" and not self.is_rxf
 
     def is_module_quantized(self, name: str) -> bool:
         """Is the weight module `name` (e.g. 'model.layers.47.mlp.experts.0.gate_proj') quantized
@@ -133,6 +165,7 @@ class QuantConfig:
             # constant zero-point 8). Config-driven, not model-specific.
             ignore = tuple(d.get("ignore", ()) or ())
             gs, bits, sym = 32, 4, True
+            wtype, atype = "int", None
             groups = d.get("config_groups") or {}
             for g in groups.values():
                 w = (g or {}).get("weights") or {}
@@ -144,9 +177,19 @@ class QuantConfig:
                     bits = int(w["num_bits"])
                 if "symmetric" in w and w["symmetric"] is not None:
                     sym = bool(w["symmetric"])
+                # WEIGHT element type: "float" (fp8 e4m3 W8A8, e.g. ZAYA — `format:float-quantized`)
+                # vs "int" (int4/int8). Drives the fp8-vs-int4 kernel selection downstream.
+                if w.get("type"):
+                    wtype = str(w["type"]).lower()
+                # ACTIVATION scheme the checkpoint declares (per-token fp8 -> W8A8). Honor it: an env
+                # var never substitutes a different act scheme than declared (W8A16 is only an OPT-IN
+                # perf override, never the default). Present + float type -> "fp8"; else weight-only.
+                ia = (g or {}).get("input_activations") or {}
+                if ia and str(ia.get("type", "")).lower() == "float":
+                    atype = "fp8"
                 break
             return cls(
                 method="compressed-tensors", bits=bits, group_size=gs, sym=sym,
-                ignore=_norm_ignore(ignore),
+                ignore=_norm_ignore(ignore), weight_type=wtype, act_type=atype,
             )
         return None  # unsupported scheme -> treat as unquantized (will likely fail to load)
