@@ -173,6 +173,49 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         del self.weight_packed, self.weight_scale
 
 
+class _GroupedMxFp4Experts(BaseOP):
+    """MXFP4 (OCP E2M1 weights + E8M0 per-32-block scale) experts for one MoE GEMM (w13 or w2),
+    STACKED over E. The compressed-tensors `mxfp4-pack-quantized` checkpoint ships (per expert,
+    merged gate|up into w13 / down into w2 by the loader):
+        weight_packed (E, N, K//2) uint8 — 2 E2M1 nibbles/byte, low nibble = lower K index.
+        weight_scale  (E, N, K//32) uint8 — E8M0, one shared exponent per 32-element block.
+    (N=out, K=in per expert.) `post_load` runs the MXFP4 converter (nibbles -> (E,N,K//8) int32 codes
+    verbatim; E8M0 -> fp16 group scale) so `kernels.w4a8_moe(..., weight_is_e2m1=True)` consumes
+    `_w_op/_scales_op` exactly as the int4 experts do. Symmetric -> no zero-points."""
+
+    def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
+        g = quant.group_size  # 32
+        N, K = out_features, in_features
+        assert K % 2 == 0 and K % g == 0 and N % 8 == 0, (
+            f"grouped MXFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
+        )
+        # CHECKPOINT layout (uint8); E8M0 scale is an integer exponent, NOT a float, so the engine's
+        # _cast leaves both uint8 buffers untouched.
+        self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.uint8)
+        self._quant = quant
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
+        raise RuntimeError("_GroupedMxFp4Experts holds weights; call kernels.w4a8_moe instead")
+
+    def post_load(self) -> None:
+        from minisgl.quant import mxfp4
+
+        conv = mxfp4.convert_mxfp4_moe(self.weight_packed, self.weight_scale)
+        info = conv["scale_info"]
+        if not info["fp16_range_ok"]:
+            from minisgl.utils import init_logger
+
+            init_logger("mxfp4").info_rank0(
+                f"[mxfp4-moe] E8M0 group scales exceed the fp16 store "
+                f"(exp {info['exp_min']}..{info['exp_max']}, {info['fp16_overflow_groups']} overflow "
+                f"/ {info['e8m0_nan_groups']} e8m0-NaN groups); an fp32 group-scale path may be needed."
+            )
+        self._w_op = conv["w_packed"]  # (E, N, K//8) int32
+        self._scales_op = conv["scales"]  # (E, N, K//32) fp16
+        del self.weight_packed, self.weight_scale
+
+
 class _GroupedFP8Experts(BaseOP):
     """Weight-only fp8 (F8_E4M3) experts for one MoE GEMM (w13 or w2), STACKED over E.
 
@@ -333,6 +376,46 @@ class _W4A8MoEMethod(MoEQuantMethod):
         )
 
 
+class _MxFp4MoEMethod(MoEQuantMethod):
+    """MXFP4 (OCP E2M1) grouped experts through the shared `kernels.w4a8_moe` with
+    `weight_is_e2m1=True` — the same W4A8 fp8-WMMA kernel the int4 experts use, only a different
+    4-bit decode table + E8M0->fp16 group scale (done at load in `_GroupedMxFp4Experts.post_load`).
+    Symmetric, so no zero-points (None). EP-capable exactly like the int4 W4A8 path (E on dim 0 of
+    every expert buffer; a shard is a pure dim-0 slice)."""
+
+    supports_ep = True
+
+    def __init__(self, quant: "QuantConfig"):
+        self._quant = quant
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return _GroupedMxFp4Experts(num_experts, out_features, in_features, self._quant)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        assert activation == "silu" and not apply_router_weight_on_input, (
+            "MoE MXFP4 path is silu-only without router-weight-on-input"
+        )
+        from minisgl.quant import kernels
+
+        return kernels.w4a8_moe(
+            hidden_states, w13._w_op, w13._scales_op, None,
+            w2._w_op, w2._scales_op, None,
+            router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+            weight_is_e2m1=True,
+        )
+
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        from minisgl.quant import kernels
+
+        return kernels.w4a8_moe(
+            g_hidden, w13._w_op, w13._scales_op, None,
+            w2._w_op, w2._scales_op, None,
+            None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
+            weight_is_e2m1=True,
+        )
+
+
 class _RXFMoEMethod(MoEQuantMethod):
     """RXF W4(NL)-A8 grouped experts (`kernels.rxf_moe`). No EP path (RXF has no precomputed-topk
     shard route, which EP requires) — stays replicated."""
@@ -435,7 +518,8 @@ def create_moe_quant_method(
       * fp8 W8A8 (compressed-tensors float-quantized 8-bit, or the explicit `fp8_experts` signal) ->
         native w8a8_moe (per-token fp8 acts; W8A16 is an env opt-in, never the default);
       * RXF -> rxf_moe;
-      * MXFP4 (e2m1) -> reserved hook (weight_is_e2m1), not yet implemented;
+      * MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the shared w4a8_moe kernel with
+        weight_is_e2m1=True (same kernel, e2m1 decode + E8M0->fp16 group scale);
       * int4 AWQ / GPTQ / compressed-tensors int4 -> the shared w4a8_moe kernel;
       * no quant -> the unquantized fused backend.
     Selection is purely config-driven: no model-name branch, and no env that substitutes a different
@@ -447,9 +531,7 @@ def create_moe_quant_method(
     if quant.is_rxf:
         return _RXFMoEMethod(quant)
     if quant.weight_is_e2m1:
-        raise NotImplementedError(
-            "MXFP4 (e2m1) MoE experts not yet implemented (weight_is_e2m1 hook reserved)"
-        )
+        return _MxFp4MoEMethod(quant)
     if quant.is_int4:
         return _W4A8MoEMethod(quant)
     raise AssertionError(

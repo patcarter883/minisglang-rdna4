@@ -142,6 +142,16 @@ for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
     _merged = f".linear_attn.in_proj_qkvz.{_fld}"
     _QWEN35_CONCAT[_qz[0]] = (_merged, _qz, 0)
     _QWEN35_CONCAT[_qz[1]] = (_merged, _qz, 0)
+# QUANTIZED GDN in_proj_ba (MXFP4 35B): unlike AWQ/CT-int4 (where the tiny per-v-head b/a gates stay
+# bf16, in the ignore list and concatenated via `.weight` above), the MXFP4 checkpoint ALSO quantizes
+# in_proj_b + in_proj_a — so their weight_packed / weight_scale concat into in_proj_ba.<field> along
+# the OUTPUT dim (0), same [b, a] order as the bf16 _BA members. (No weight_zero_point: MXFP4 is
+# symmetric; that key simply never appears, so its map entry is inert.)
+for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
+    _ba = (f".linear_attn.in_proj_b.{_fld}", f".linear_attn.in_proj_a.{_fld}")
+    _merged = f".linear_attn.in_proj_ba.{_fld}"
+    _QWEN35_CONCAT[_ba[0]] = (_merged, _ba, 0)
+    _QWEN35_CONCAT[_ba[1]] = (_merged, _ba, 0)
 
 
 def _gate_up_merge(key: str):
@@ -261,6 +271,13 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
              ".linear_attn.in_proj_z.weight_zero_point")
         ):
             return t.chunk(n, dim=0)[r].clone()  # z: col-parallel (output value_dim)
+        if name.endswith(
+            (".linear_attn.in_proj_b.weight_packed", ".linear_attn.in_proj_b.weight_scale",
+             ".linear_attn.in_proj_b.weight_zero_point",
+             ".linear_attn.in_proj_a.weight_packed", ".linear_attn.in_proj_a.weight_scale",
+             ".linear_attn.in_proj_a.weight_zero_point")
+        ):
+            return t.chunk(n, dim=0)[r].clone()  # b/a: col-parallel (output per v-head), MXFP4 35B
         if name.endswith(
             (".linear_attn.out_proj.weight_packed", ".linear_attn.out_proj.weight_scale",
              ".linear_attn.out_proj.weight_zero_point")
