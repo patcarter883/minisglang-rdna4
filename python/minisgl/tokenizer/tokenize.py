@@ -18,11 +18,15 @@ class TokenizeManager:
             if isinstance(msg.text, list):
                 # `tools` (when set) render the tool specs into the chat template for tool-trained
                 # models; None is the transformers default (no tools) and is safe for every template.
+                # `chat_template_kwargs` (e.g. {"enable_thinking": False}) is forwarded verbatim so
+                # a request can control reasoning-model thinking mode. None -> template defaults
+                # (Qwen3 opens `<think>` in the generation prompt, i.e. thinking ON).
                 prompt = self.tokenizer.apply_chat_template(
                     msg.text,
                     tools=getattr(msg, "tools", None),
                     tokenize=False,
                     add_generation_prompt=True,
+                    **(getattr(msg, "chat_template_kwargs", None) or {}),
                 )
                 assert isinstance(prompt, str)
             else:
