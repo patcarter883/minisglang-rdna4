@@ -77,6 +77,11 @@ class RecurrentSlotManager:
         # in `new_uids`, so their accumulated recurrent state is preserved.
         self.state_cache.reset_slots(slots)
 
+    def slot_for(self, uid: int) -> int | None:
+        """The (>=1) recurrent slot currently held for `uid`, or None if the uid is not active.
+        Used by recurrent-radix prefix caching to clone/restore a sequence's state at its slot."""
+        return self._slot_of.get(uid)
+
     def free(self, uid: int) -> None:
         """Release the slot for `uid`. Idempotent: a second free (overlap scheduling) is a no-op,
         so a freed slot can't be reused while a stale free is still in flight."""

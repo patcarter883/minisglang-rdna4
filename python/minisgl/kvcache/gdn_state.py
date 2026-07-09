@@ -101,6 +101,24 @@ class GDNStateCache:
         self.conv_state[:, sl] = conv
         self.ssm_state[:, sl] = ssm
 
+    def clone_slot(self, slot: int):
+        """Slot-agnostic snapshot of ONE slot's conv+ssm state across all GDN layers, for radix
+        prefix-caching. Returns an opaque handle (cloned tensors, no source-slot binding) that
+        `load_slot` can install into a DIFFERENT slot — a future request that hits the cached prefix
+        restores this exact recurrent state instead of re-prefilling the shared prefix. ~17 MB / slot
+        for the 35B (all 30 GDN layers, per rank)."""
+        s = int(slot)
+        return (self.conv_state[:, s : s + 1].clone(), self.ssm_state[:, s : s + 1].clone())
+
+    def load_slot(self, slot: int, snap) -> None:
+        """Install a `clone_slot` snapshot into `slot` (conv + ssm, all GDN layers). The recurrent
+        state is decomposition-invariant under the bit-exact recurrent kernel, so continuing a prefill
+        from this restored state is byte-identical to prefilling the shared prefix from zero."""
+        s = int(slot)
+        conv, ssm = snap
+        self.conv_state[:, s : s + 1] = conv
+        self.ssm_state[:, s : s + 1] = ssm
+
     def install_verify_state(
         self,
         conv_scratch: dict,
