@@ -31,6 +31,15 @@ class RadixTreeNode:
         self._value: torch.Tensor
         self._length: int
 
+        # Recurrent-state radix (GDN/CCA prefix caching): an opaque per-node snapshot of the
+        # linear-attention recurrent state (conv+ssm / conv+prev_hs, all layers) AFTER exactly this
+        # node's cumulative-from-root token count — set ONLY when that boundary is page-aligned so the
+        # snapshot corresponds to the node boundary exactly. None for a dense/MLA node and for any node
+        # we could not snapshot at an aligned boundary. Cleared when the node is evicted (frees ~17 MB
+        # for the 35B). Split preserves it on the DEEP child (whose boundary is unchanged); the new
+        # shallow parent keeps None (we hold no state at the split point). See RadixPrefixCache.
+        self.rec_state: Any = None
+
     def set_key_value(self, key: torch.Tensor, value: torch.Tensor) -> None:
         assert len(key) == len(value)
         self._key = key
@@ -87,6 +96,11 @@ class RadixTreeNode:
 @dataclass(frozen=True)
 class RadixCacheHandle(BaseCacheHandle):
     node: RadixTreeNode
+    # Recurrent-radix ONLY: the recurrent-state snapshot to restore for this matched prefix (the
+    # deepest ancestor-or-self node with a snapshot at a boundary <= the KV match). None for a dense
+    # match, or a recurrent match with no aligned snapshot (-> full recompute, cached_len capped to
+    # that snapshot boundary so KV + recurrent stay consistent). Not part of node identity.
+    rec_state: Any = None
 
     def get_matched_indices(self) -> torch.Tensor:
         node = self.node
@@ -99,7 +113,7 @@ class RadixCacheHandle(BaseCacheHandle):
 
 
 class RadixPrefixCache(BasePrefixCache):
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, recurrent: bool = False, max_rec_snapshots: int = 64):
         super().__init__()
         self.device = device
         self.page_size = get_global_ctx().page_size
@@ -109,6 +123,15 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+
+        # Recurrent-state radix (GDN/CCA). When True, match_prefix additionally caps the returned
+        # prefix to the deepest node carrying a recurrent-state snapshot (so KV reuse and recurrent
+        # reuse stay consistent), and the scheduler attaches/restores snapshots at commit points.
+        # A bounded LRU of nodes holding snapshots keeps recurrent-state HBM in check (~17 MB each for
+        # the 35B); the oldest is dropped when the cap is hit or when its node is evicted.
+        self.recurrent = recurrent
+        self.max_rec_snapshots = max_rec_snapshots
+        self._rec_nodes: List[RadixTreeNode] = []  # nodes with a live rec_state (LRU-ish, pruned lazily)
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
@@ -131,7 +154,43 @@ class RadixPrefixCache(BasePrefixCache):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         node, prefix_len = self._tree_walk(input_ids)
-        return MatchResult(RadixCacheHandle(prefix_len, node))
+        if not self.recurrent:
+            return MatchResult(RadixCacheHandle(prefix_len, node))
+        # Recurrent radix: KV alone is NOT enough — reusing a prefix requires the recurrent state at
+        # that boundary too. Walk UP from the KV-matched node to the deepest node carrying a snapshot
+        # and CAP the match there, so attention KV reuse and recurrent-state restore share one
+        # cached_len (fully consistent; the small [cap, prefix_len) gap, if any, is simply recomputed).
+        # No aligned snapshot on the path -> cached_len 0 (full recompute from zero state = naive).
+        cur, cap_len = node, prefix_len
+        while not cur.is_root() and cur.rec_state is None:
+            cap_len -= cur.length
+            cur = cur.parent
+        if cur.is_root():
+            return MatchResult(RadixCacheHandle(0, self.root_node, rec_state=None))
+        return MatchResult(RadixCacheHandle(cap_len, cur, rec_state=cur.rec_state))
+
+    def attach_rec_state(self, handle: RadixCacheHandle, rec_state: Any) -> None:
+        """Attach a recurrent-state snapshot to the node the scheduler just inserted (its boundary ==
+        the committed, page-aligned prefix length, so the snapshot corresponds to the boundary
+        exactly). Enforces the LRU cap by dropping the oldest live snapshot. No-op for a dense cache
+        or a root/empty handle."""
+        if not self.recurrent:
+            return
+        node = handle.node
+        if node is None or node.is_root() or handle.cached_len == 0:
+            return
+        was_none = node.rec_state is None
+        node.rec_state = rec_state
+        if was_none:
+            self._rec_nodes.append(node)
+        self._enforce_rec_cap()
+
+    def _enforce_rec_cap(self) -> None:
+        # Prune dead/cleared entries, then evict the oldest live snapshot(s) until under the cap.
+        self._rec_nodes = [n for n in self._rec_nodes if n.rec_state is not None]
+        while len(self._rec_nodes) > self.max_rec_snapshots:
+            victim = self._rec_nodes.pop(0)  # oldest-attached
+            victim.rec_state = None
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
@@ -166,6 +225,7 @@ class RadixPrefixCache(BasePrefixCache):
             evicted_size += node.length
             evicted_indices.append(node.value)
             self.evictable_size -= node.length
+            node.rec_state = None  # drop any recurrent snapshot with the node (frees ~17 MB)
             parent = node.parent
             del parent.children[self.key_fn(node._key)]
             # NOTE: root is always protected, so won't be evicted

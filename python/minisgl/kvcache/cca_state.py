@@ -84,6 +84,20 @@ class CCAStateCache:
         self.conv_states[:, sl] = conv
         self.prev_hs[:, sl] = prev
 
+    def clone_slot(self, slot: int):
+        """Slot-agnostic snapshot of ONE slot's conv+prev_hs state (all CCA layers) for radix
+        prefix-caching — mirrors GDNStateCache.clone_slot. Returns an opaque handle installable into a
+        DIFFERENT slot via `load_slot`."""
+        s = int(slot)
+        return (self.conv_states[:, s : s + 1].clone(), self.prev_hs[:, s : s + 1].clone())
+
+    def load_slot(self, slot: int, snap) -> None:
+        """Install a `clone_slot` snapshot into `slot` (conv + prev_hs, all CCA layers)."""
+        s = int(slot)
+        conv, prev = snap
+        self.conv_states[:, s : s + 1] = conv
+        self.prev_hs[:, s : s + 1] = prev
+
     def install_verify_state(
         self,
         conv_scratch: dict,
