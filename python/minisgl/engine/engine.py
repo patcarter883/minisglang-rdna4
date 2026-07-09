@@ -382,8 +382,14 @@ class Engine:
                 # ZAYA experts stay fp8: the F8_E4M3 weight must NOT be upcast (that re-inflates
                 # ~8 GB fp8 -> ~16 GB bf16 and OOMs the 16 GB card), and its per-channel fp32
                 # weight_scale must keep fp32. Dequant is deferred to compute (_GroupedFP8Experts).
-                if v.dtype == torch.float8_e4m3fn or k.endswith(".weight_scale"):
+                if v.dtype == torch.float8_e4m3fn:
                     return v
+                if k.endswith(".weight_scale"):
+                    # fp8 (ZAYA) per-channel scales are fp32 and MUST stay fp32; compressed-tensors
+                    # int4 scales ship fp16 OR bf16 -> normalize to fp16 (the op's + the linear
+                    # buffer's declared scale dtype) so a bf16-scale head and an fp16-scale backbone
+                    # both load against the same float16 buffer.
+                    return v if v.dtype == torch.float32 else v.to(torch.float16)
                 # GDN gating params stay fp32 (A_log ships fp32; dt_bias ships bf16 -> upcast).
                 # The kernels + the model's nn.Parameter dtype both require fp32 here.
                 if k.endswith((".A_log", ".dt_bias")):
