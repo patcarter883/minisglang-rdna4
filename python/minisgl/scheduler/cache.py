@@ -39,6 +39,16 @@ class CacheManager:
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.prefix_cache.lock_handle(handle, unlock=True)
 
+    @property
+    def is_recurrent_radix(self) -> bool:
+        return getattr(self.prefix_cache, "recurrent", False)
+
+    def attach_rec_state(self, handle: BaseCacheHandle, rec_state) -> None:
+        """Attach a recurrent-state snapshot to an inserted prefix node (recurrent radix only)."""
+        attach = getattr(self.prefix_cache, "attach_rec_state", None)
+        if attach is not None:
+            attach(handle, rec_state)
+
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
@@ -52,7 +62,7 @@ class CacheManager:
             allocated = self._page_to_token(self._allocate(needed_pages))
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
-    def cache_req(self, req: Req, *, finished: bool) -> None:
+    def cache_req(self, req: Req, *, finished: bool) -> BaseCacheHandle:
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
@@ -77,6 +87,9 @@ class CacheManager:
         else:  # keep the tail part, update the handle
             req.cache_handle = new_handle
             self.lock(new_handle)
+        # Return the freshly-inserted prefix handle so a recurrent-radix scheduler can attach this
+        # sequence's recurrent-state snapshot to the inserted node (its boundary == cached_len).
+        return new_handle
 
     def check_integrity(self) -> None:
         self.prefix_cache.check_integrity()
