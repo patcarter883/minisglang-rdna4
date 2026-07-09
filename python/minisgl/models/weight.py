@@ -590,13 +590,20 @@ def _load_zaya_weight(
     assert not expert_buf, f"incomplete Zaya expert stacks: {list(expert_buf.keys())}"
 
 
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+def load_weight(
+    model_path: str, device: torch.device, spec_algorithm: str = "mtp"
+) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory: one full tensor + a small merge buffer."""
+    and on device. Peak CPU memory: one full tensor + a small merge buffer.
+
+    `spec_algorithm` must match the value used to build the model so load_mtp agrees (the MTP
+    head is only built under --spec-algorithm mtp; see ModelConfig.from_hf)."""
     from .config import ModelConfig
 
     model_folder = download_hf_weight(model_path)
-    config = ModelConfig.from_hf(cached_load_hf_config(model_path))
+    config = ModelConfig.from_hf(
+        cached_load_hf_config(model_path), spec_algorithm=spec_algorithm
+    )
     if config.is_gdn_hybrid:
         yield from _load_qwen3_5_weight(model_folder, device, config)
         return

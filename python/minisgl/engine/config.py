@@ -72,7 +72,7 @@ class EngineConfig:
     def model_config(self) -> ModelConfig:
         from minisgl.models import ModelConfig
 
-        return ModelConfig.from_hf(self.hf_config)
+        return ModelConfig.from_hf(self.hf_config, spec_algorithm=self.spec_algorithm)
 
     @property
     def max_seq_len(self) -> int:

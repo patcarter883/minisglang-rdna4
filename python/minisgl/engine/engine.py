@@ -411,7 +411,12 @@ class Engine:
                     return v.to(torch.float32)
                 return v.to(self.dtype)
 
-            return {k: _cast(k, v) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: _cast(k, v)
+                for k, v in load_weight(
+                    config.model_path, self.device, spec_algorithm=config.spec_algorithm
+                )
+            }
 
     def _recurrent_state_bytes(self, config: EngineConfig) -> int:
         """Bytes the fixed GDN/CCA recurrent-state caches will consume (they are allocated AFTER the
