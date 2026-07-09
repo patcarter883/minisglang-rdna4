@@ -13,13 +13,34 @@ def fused_topk(
     renormalize: bool,
     num_token_non_padded: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sgl_kernel import topk_softmax
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
-    topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
+    dev = hidden_states.device
+    # softmax + top-k route with graceful fallback (mirrors quant/kernels.py::_route). This path is
+    # taken by UNQUANTIZED (bf16) MoE blocks — e.g. the MTP head, whose experts the checkpoint leaves
+    # unquantized. The lean image has NEITHER sgl_kernel NOR vllm, so try the fused kernels first and
+    # fall back to pure torch (identical math: softmax -> topk -> optional renorm -> int32 ids).
+    try:
+        from sgl_kernel import topk_softmax
+    except ImportError:
+        topk_softmax = None
+    if topk_softmax is not None:
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=dev)
+        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=dev)
+        topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
+    else:
+        try:
+            from vllm import _custom_ops as vllm_ops
+
+            topk_weights = torch.empty(M, topk, dtype=torch.float32, device=dev)
+            topk_ids = torch.empty(M, topk, dtype=torch.int32, device=dev)
+            tei = torch.empty(M, topk, dtype=torch.int32, device=dev)  # token_expert_indices scratch
+            vllm_ops.topk_softmax(topk_weights, topk_ids, tei, gating_output.float(), renormalize)
+        except ImportError:
+            probs = torch.softmax(gating_output.float(), dim=-1)
+            topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+            topk_weights = topk_weights.contiguous()
+            topk_ids = topk_ids.to(torch.int32).contiguous()
     if renormalize:
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
     if num_token_non_padded is not None:
