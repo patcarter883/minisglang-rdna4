@@ -225,6 +225,239 @@ class _GroupedFP8Experts(BaseOP):
             del self.weight, self.weight_scale
 
 
+# =====================================================================================
+# Config-driven MoE-expert quant selector (mirrors quant.method.create_linear_method for the
+# dense linears and the GDN in_proj dispatch). ALL three module families now pick their scheme +
+# kernel from the SAME declared QuantConfig the same way — no scattered per-scheme `if`s in the
+# layer, no env var that substitutes a different scheme than the checkpoint declares, no model-name
+# branches. A `MoEQuantMethod` owns one scheme family: which per-expert weight CONTAINER to
+# allocate (__init__) and which grouped kernel to run (forward, both the plain TP path and the
+# per-rank EP shard). `create_moe_quant_method` maps the config to the subclass.
+# =====================================================================================
+class MoEQuantMethod:
+    """How a MoE expert GEMM pair (w13 gate|up, w2 down) allocates its weights and runs its matmul.
+    The MoELayer owns routing, EP dispatch/combine and the TP all-reduce; the method owns the
+    per-expert weight layout + the grouped GEMM."""
+
+    supports_ep: bool = False  # can this scheme run the EP all_gather/mask/all_reduce shard path?
+    needs_precomputed_route: bool = False  # True -> forward MUST be handed topk_weights/topk_ids
+
+    def create_experts(self, num_experts: int, out_features: int, in_features: int):
+        """Allocate the per-expert weight container for ONE GEMM (STACKED over `num_experts` on
+        dim 0; caller passes the LOCAL count under EP). Returns a BaseOP container (quantized) or a
+        plain stacked bf16/fp16 tensor (unquantized)."""
+        raise NotImplementedError
+
+    def apply(
+        self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+        top_k: int, renormalize: bool, activation: str, apply_router_weight_on_input: bool,
+    ) -> "torch.Tensor":
+        """Plain (non-EP) forward over the full replicated expert stack."""
+        raise NotImplementedError
+
+    def ep_local(
+        self, w13, w2, g_hidden, local_weights, local_ids, *, top_k: int, renormalize: bool
+    ) -> "torch.Tensor":
+        """EP per-rank shard kernel: run THIS rank's local expert stack (w13/w2 already the
+        [E_local,...] shard) over the all_gather'd tokens with local-remapped ids/weights."""
+        raise NotImplementedError(f"{type(self).__name__} does not support expert parallelism")
+
+
+class _UnquantizedMoEMethod(MoEQuantMethod):
+    """bf16/fp16 stacked experts — the fused moe_backend (or the precomputed-route stacked kernel)."""
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return torch.empty(num_experts, out_features, in_features)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        if topk_ids is not None:
+            # Route computed in the model (Zaya top-1 + MOD, GLM noaux_tc). The moe_backend fuses
+            # softmax+topk internally so it can't take a precomputed route — call the stacked kernel.
+            from minisgl.moe.fused import fused_experts_impl
+
+            return fused_experts_impl(
+                hidden_states, w13, w2, topk_weights, topk_ids,
+                activation=activation, apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        ctx = get_global_ctx()
+        return ctx.moe_backend.forward(
+            hidden_states=hidden_states, w1=w13, w2=w2, gating_output=router_logits,
+            topk=top_k, renormalize=renormalize, activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
+
+
+class _W4A8MoEMethod(MoEQuantMethod):
+    """int4-weight grouped experts through the shared `kernels.w4a8_moe` (int4 weight x per-token fp8
+    act). Covers GPTQ (K-major qweight), AWQ-gemm (N-major, interleaved, asymmetric) and
+    compressed-tensors int4 (W4A16 weights served through the same W4A8 kernel) — they differ only in
+    CHECKPOINT layout (the container's post_load converts each to the op's grouped triple)."""
+
+    supports_ep = True
+
+    def __init__(self, quant: "QuantConfig"):
+        self._quant = quant
+        if quant.is_gptq:
+            self._cls = _GroupedGPTQExperts
+        elif quant.is_awq:
+            self._cls = _GroupedAWQExperts
+        elif quant.is_compressed_tensors:
+            self._cls = _GroupedCompressedTensorsExperts
+        else:
+            raise AssertionError(f"W4A8 MoE unsupported quant method: {quant.method}")
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return self._cls(num_experts, out_features, in_features, self._quant)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        assert activation == "silu" and not apply_router_weight_on_input, (
+            "MoE W4A8 path is silu-only without router-weight-on-input"
+        )
+        from minisgl.quant import kernels
+
+        return kernels.w4a8_moe(
+            hidden_states, w13._w_op, w13._scales_op, w13._zeros_op,
+            w2._w_op, w2._scales_op, w2._zeros_op,
+            router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+        )
+
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        from minisgl.quant import kernels
+
+        return kernels.w4a8_moe(
+            g_hidden, w13._w_op, w13._scales_op, w13._zeros_op,
+            w2._w_op, w2._scales_op, w2._zeros_op,
+            None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
+        )
+
+
+class _RXFMoEMethod(MoEQuantMethod):
+    """RXF W4(NL)-A8 grouped experts (`kernels.rxf_moe`). No EP path (RXF has no precomputed-topk
+    shard route, which EP requires) — stays replicated."""
+
+    supports_ep = False
+
+    def __init__(self, quant: "QuantConfig"):
+        self._quant = quant
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return _GroupedRXFExperts(num_experts, out_features, in_features, self._quant)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        assert activation == "silu" and not apply_router_weight_on_input, (
+            "MoE RXF path is silu-only without router-weight-on-input"
+        )
+        from minisgl.quant import kernels
+
+        return kernels.rxf_moe(
+            hidden_states, w13.weight_packed, w13.weight_scale, w2.weight_packed, w2.weight_scale,
+            router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+            span=self._quant.rotation_span,
+        )
+
+
+class _FP8MoEMethod(MoEQuantMethod):
+    """fp8 W8A8 experts (ZAYA): F8_E4M3 weights + a per-output-channel f32 scale, fed to the native
+    `kernels.w8a8_moe` fp8-WMMA kernel with per-token fp8 activations — the CHECKPOINT-DECLARED
+    scheme, and the DEFAULT. Two opt-outs, both env-gated PERF toggles (never a scheme substitution
+    picked silently): MINISGL_ZAYA_W8A16=1 -> fp8 weights dequantized in-register to bf16 acts
+    (W8A16, quality/latency trade); MINISGL_ZAYA_OLDMOE=1 -> legacy fp8->bf16 dequant->fused Triton
+    A/B reference. W8A16 used to be the default (an env silently swapping the declared act scheme) —
+    that was a bug; it is now an explicit opt-in."""
+
+    supports_ep = True
+    needs_precomputed_route = True  # ZAYA top-1 + MOD route is computed model-side
+
+    def __init__(self):
+        self._oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
+        # W8A16 is now OPT-IN (=1); default is the checkpoint-declared native W8A8 fp8-act kernel.
+        self._w8a16_fn = None
+        if not self._oldmoe and os.environ.get("MINISGL_ZAYA_W8A16", "0") == "1":
+            try:  # fail-safe: an env without the built extension falls back to native W8A8
+                from moe_w8a16_wmma import fused_moe_w8a16
+
+                self._w8a16_fn = fused_moe_w8a16
+            except ImportError:
+                self._w8a16_fn = None
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return _GroupedFP8Experts(num_experts, out_features, in_features)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        assert topk_ids is not None, "fp8 experts use the precomputed-route path (ZAYA top-1 + MOD)"
+        from minisgl.quant import kernels
+
+        if self._w8a16_fn is not None:
+            # W8A16 opt-in: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack
+            # materialize), routed experts only; bf16 acts. Uses the always-present op-layout buffers.
+            return self._w8a16_fn(
+                hidden_states.to(torch.bfloat16),
+                w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
+                topk_weights, topk_ids.to(torch.int32),
+            )
+        if self._oldmoe:
+            # A/B reference: legacy fp8->bf16-dequant->Triton path (weights kept in post_load).
+            from minisgl.moe.fused import fused_experts_impl
+
+            return fused_experts_impl(
+                hidden_states, w13.dequant(hidden_states.dtype), w2.dequant(hidden_states.dtype),
+                topk_weights, topk_ids,
+                activation=activation, apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        return kernels.w8a8_moe(
+            hidden_states, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
+            None, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+        )
+
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        from minisgl.quant import kernels
+
+        if self._w8a16_fn is not None:
+            return self._w8a16_fn(
+                g_hidden.to(torch.bfloat16),
+                w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, local_weights, local_ids,
+            )
+        return kernels.w8a8_moe(
+            g_hidden, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
+            None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
+        )
+
+
+def create_moe_quant_method(
+    quant: "QuantConfig | None", *, fp8_experts: bool = False
+) -> MoEQuantMethod:
+    """Pick the MoE-expert quant method from the checkpoint's DECLARED scheme (the analogue of
+    quant.method.create_linear_method for dense linears). Route:
+      * fp8 W8A8 (compressed-tensors float-quantized 8-bit, or the explicit `fp8_experts` signal) ->
+        native w8a8_moe (per-token fp8 acts; W8A16 is an env opt-in, never the default);
+      * RXF -> rxf_moe;
+      * MXFP4 (e2m1) -> reserved hook (weight_is_e2m1), not yet implemented;
+      * int4 AWQ / GPTQ / compressed-tensors int4 -> the shared w4a8_moe kernel;
+      * no quant -> the unquantized fused backend.
+    Selection is purely config-driven: no model-name branch, and no env that substitutes a different
+    scheme than the checkpoint declares."""
+    if fp8_experts or (quant is not None and quant.is_fp8_w8a8):
+        return _FP8MoEMethod()
+    if quant is None:
+        return _UnquantizedMoEMethod()
+    if quant.is_rxf:
+        return _RXFMoEMethod(quant)
+    if quant.weight_is_e2m1:
+        raise NotImplementedError(
+            "MXFP4 (e2m1) MoE experts not yet implemented (weight_is_e2m1 hook reserved)"
+        )
+    if quant.is_int4:
+        return _W4A8MoEMethod(quant)
+    raise AssertionError(
+        f"MoE: unsupported declared quant scheme (method={quant.method}, bits={quant.bits}, "
+        f"weight_type={quant.weight_type})"
+    )
+
+
 class MoELayer(BaseOP):
     def __init__(
         self,
@@ -259,10 +492,12 @@ class MoELayer(BaseOP):
         # the fp8 W8A8/W8A16 layouts. RXF is excluded (no precomputed-topk path, which EP requires).
         # `force_no_ep` keeps a specific layer replicated even under EP — used for the tiny MTP draft
         # head, whose EP-sharding would make spec-decode propose issue data-dependent collectives.
-        _ep_quant = quant is not None and (
-            quant.is_gptq or quant.is_awq or quant.is_compressed_tensors
+        # Config-driven expert quant method (mirrors create_linear_method for the dense linears): it
+        # owns the container class + the grouped kernel, and declares whether the scheme can run EP.
+        self._moe_method = create_moe_quant_method(quant, fp8_experts=fp8_experts)
+        self.enable_ep = (
+            is_ep_enabled() and self._moe_method.supports_ep and not force_no_ep
         )
-        self.enable_ep = is_ep_enabled() and (fp8_experts or _ep_quant) and not force_no_ep
         dp_info = get_dp_info()
         self.ep_dp_rank = dp_info.dp_rank
         self.ep_dp_size = dp_info.dp_size
@@ -281,58 +516,18 @@ class MoELayer(BaseOP):
         self.quant = quant
         self.fp8_experts = fp8_experts
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
-        if fp8_experts:
-            assert quant is None, "fp8_experts is its own storage path (not a QuantConfig)"
-            # Weight-only fp8 (ZAYA): store F8_E4M3 + per-channel F32 scale (~8 GB) and feed the native
-            # W8A8 grouped-MoE kernel directly (post_load builds the op layout). The legacy
-            # dequant->Triton path is kept only behind MINISGL_ZAYA_OLDMOE=1 (A/B reference).
-            # EP: size to the LOCAL expert shard (E/dp); EP off => full E. The streaming loader
-            # (_store_expert) yields a stack of exactly this many experts.
-            self.gate_up_proj = _GroupedFP8Experts(
-                self.local_num_experts, 2 * intermediate_size_per_partition, hidden_size
-            )
-            self.down_proj = _GroupedFP8Experts(
-                self.local_num_experts, hidden_size, intermediate_size_per_partition
-            )
-        elif quant is not None:
-            # int4 W4A8 grouped experts (silu-only SwiGLU MoE, the proven w4a8_fp8_wmma path).
-            # GPTQ (K-major qweight) and AWQ-gemm (N-major qweight, interleaved, asymmetric) differ
-            # only in checkpoint layout; both convert to the op's grouped layout in post_load.
-            assert activation == "silu" and not apply_router_weight_on_input, (
-                "MoE W4A8 path is silu-only without router-weight-on-input"
-            )
-            if quant.is_gptq:
-                Experts = _GroupedGPTQExperts
-            elif quant.is_awq:
-                Experts = _GroupedAWQExperts
-            elif quant.is_rxf:
-                Experts = _GroupedRXFExperts
-            elif quant.is_compressed_tensors:
-                # int4 weight-only (W4A16) experts — convert to the op layout in post_load and run
-                # through the same w4a8_moe kernel as GPTQ/AWQ (the `else` forward branch).
-                Experts = _GroupedCompressedTensorsExperts
-            else:
-                raise AssertionError(f"MoE W4A8 unsupported quant method: {quant.method}")
-            # EP: size to the LOCAL expert shard (E/dp) so this replica loads + runs only its experts;
-            # the loader skips non-local expert ids (see weight.py _store_expert mirror). enable_ep off
-            # (incl. RXF, force_no_ep) => local_num_experts == num_experts (full replicated, unchanged).
-            self.gate_up_proj = Experts(
-                self.local_num_experts, 2 * intermediate_size_per_partition, hidden_size, quant
-            )
-            self.down_proj = Experts(
-                self.local_num_experts, hidden_size, intermediate_size_per_partition, quant
-            )
-        else:
-            self.gate_up_proj = torch.empty(
-                num_experts,
-                2 * intermediate_size_per_partition,
-                hidden_size,
-            )
-            self.down_proj = torch.empty(
-                num_experts,
-                hidden_size,
-                intermediate_size_per_partition,
-            )
+        # The method allocates the per-expert container for each GEMM (config-driven: fp8 F8_E4M3,
+        # int4 W4A8/W4A16 grouped, RXF NL, or a plain stacked bf16/fp16 tensor). EP: size to the LOCAL
+        # expert shard (E/dp) so this replica loads + runs only its experts; the streaming loader skips
+        # non-local ids (weight.py mirror). enable_ep off (unquantized, RXF, force_no_ep) =>
+        # local_num_experts == num_experts (full replicated). Both GEMMs, w13 = gate|up (2*inter), w2 =
+        # down (hidden), share the method and the silu_and_mul convention.
+        self.gate_up_proj = self._moe_method.create_experts(
+            self.local_num_experts, 2 * intermediate_size_per_partition, hidden_size
+        )
+        self.down_proj = self._moe_method.create_experts(
+            self.local_num_experts, hidden_size, intermediate_size_per_partition
+        )
 
     def _ep_route(
         self,
@@ -409,159 +604,34 @@ class MoELayer(BaseOP):
         topk_ids: torch.Tensor | None = None,
     ):
         # Either pass raw `router_logits` (fused softmax+topk inside the kernel) OR a precomputed
-        # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc computed in the model).
-        precomputed = topk_ids is not None
-        if self.fp8_experts:
-            # ZAYA fp8 experts. DEFAULT = W8A16 (fp8 weights + bf16 acts): bf16-activation correctness
-            # at ~native-fp8 speed (autotuned ~56ms fused). Opt-outs: W8A16=0 -> native W8A8 fp8-act
-            # kernel (~7% faster AR, fp8-act quality); OLDMOE=1 -> legacy dequant->Triton reference. The
-            # EP (TP>1) path ALSO uses W8A16 (quality) on the local expert shard when the kernel is
-            # built (see the enable_ep branch below); falls back to native W8A8 if it isn't.
-            from minisgl.quant import kernels
-
-            assert precomputed, "fp8 experts use the precomputed-route path (ZAYA top-1 + MOD)"
-            w13, w2 = self.gate_up_proj, self.down_proj
-            oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
-            w8a16 = os.environ.get("MINISGL_ZAYA_W8A16", "1") != "0"  # DEFAULT ON (opt out with =0)
-            fused_moe_w8a16 = None
-            if w8a16 and not oldmoe:
-                try:  # fail-safe: envs without the built extension fall back to native W8A8 below
-                    from moe_w8a16_wmma import fused_moe_w8a16
-                except ImportError:
-                    fused_moe_w8a16 = None
-            if fused_moe_w8a16 is not None and not self.enable_ep:
-                # W8A16: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack materialize),
-                # routed experts only; bf16 acts. Uses the always-present op-layout fp8 buffers
-                # (_w_op/_scales_op). Fixes the fused-TiDAR OLDMOE=1 284ms/step dequant flood.
-                final_hidden_states = fused_moe_w8a16(
-                    hidden_states.to(torch.bfloat16),
-                    w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
-                    topk_weights, topk_ids.to(torch.int32),
-                )
-            elif oldmoe:
-                # A/B reference: legacy fp8->bf16-dequant->Triton path (weights kept in post_load).
-                from minisgl.moe.fused import fused_experts_impl
-
-                w13_bf16 = w13.dequant(hidden_states.dtype)
-                w2_bf16 = w2.dequant(hidden_states.dtype)
-                final_hidden_states = fused_experts_impl(
-                    hidden_states,
-                    w13_bf16,
-                    w2_bf16,
-                    topk_weights,
-                    topk_ids,
-                    activation=self.activation,
-                    apply_router_weight_on_input=self.apply_router_weight_on_input,
-                )
-            elif self.enable_ep:
-                # Expert-parallel dispatch/combine over the fp8 W8A16 (quality) / W8A8 (native) kernel
-                # on this rank's local expert shard. The all_gather/mask/all_reduce scaffold + N
-                # self-coordination live in _ep_dispatch; only the local-shard kernel call is fp8-specific
-                # (w13._w_op is already the [E_local,...] shard; local_ids are remapped into [0,E_local)).
-                if fused_moe_w8a16 is not None:
-                    final_hidden_states = self._ep_dispatch(
-                        hidden_states, topk_weights, topk_ids,
-                        lambda gh, lw, li: fused_moe_w8a16(
-                            gh.to(torch.bfloat16),
-                            w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, lw, li,
-                        ),
-                    )
-                else:
-                    final_hidden_states = self._ep_dispatch(
-                        hidden_states, topk_weights, topk_ids,
-                        lambda gh, lw, li: kernels.w8a8_moe(
-                            gh, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, None,
-                            self.top_k, self.renormalize, topk_weights=lw, topk_ids=li,
-                        ),
-                    )
+        # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc, ZAYA top-1 computed in the model).
+        # The expert scheme + kernel are owned by the config-driven `self._moe_method`; MoELayer only
+        # owns routing + the EP dispatch/combine + the TP all-reduce.
+        method = self._moe_method
+        w13, w2 = self.gate_up_proj, self.down_proj
+        if self.enable_ep:
+            # Expert-parallel dispatch/combine (only schemes with method.supports_ep reach here). EP
+            # can't defer routing to the kernel (it must all_gather a route), so precompute topk here —
+            # renormalized over ALL top_k BEFORE the per-rank local-expert masking, then passed
+            # precomputed. fp8 already REQUIRES the model-side route; W4A8/W4A16 derive it via _ep_route.
+            # The all_gather/mask/all_reduce scaffold + N self-coordination live in _ep_dispatch; only
+            # the local-shard kernel (method.ep_local) is scheme-specific.
+            if method.needs_precomputed_route:
+                assert topk_ids is not None, "EP fp8 experts need the model-side precomputed route"
+                ep_w, ep_i = topk_weights, topk_ids
             else:
-                final_hidden_states = kernels.w8a8_moe(
-                    hidden_states,
-                    w13._w_op,
-                    w13._scales_op,
-                    w2._w_op,
-                    w2._scales_op,
-                    None,
-                    self.top_k,
-                    self.renormalize,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                )
-        elif self.quant is not None:
-            from minisgl.quant import kernels
-
-            w13, w2 = self.gate_up_proj, self.down_proj
-            if self.quant.is_rxf:
-                # RXF accepts EITHER raw router_logits (fused softmax+topk) OR a precomputed route
-                # (GLM/DeepSeek noaux_tc — computed in the model, passed through unchanged).
-                final_hidden_states = kernels.rxf_moe(
-                    hidden_states,
-                    w13.weight_packed,
-                    w13.weight_scale,
-                    w2.weight_packed,
-                    w2.weight_scale,
-                    router_logits,
-                    self.top_k,
-                    self.renormalize,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    span=self.quant.rotation_span,
-                )
-            elif self.enable_ep:
-                # W4A8 (GPTQ/AWQ) / W4A16 (compressed-tensors) expert-parallel: same all_gather/mask/
-                # all_reduce scaffold as the fp8 path (_ep_dispatch), but the local-shard kernel is
-                # w4a8_moe with the _w_op/_scales_op/_zeros_op triple. EP can't defer routing to the
-                # kernel (it must all_gather a route), so precompute topk here — renormalized over ALL
-                # top_k BEFORE the local-expert masking, then passed precomputed so the kernel doesn't
-                # re-route. w13._w_op etc. are already this rank's [E_local,...] shard.
                 ep_w, ep_i = self._ep_route(router_logits, topk_weights, topk_ids)
-                final_hidden_states = self._ep_dispatch(
-                    hidden_states, ep_w, ep_i,
-                    lambda gh, lw, li: kernels.w4a8_moe(
-                        gh, w13._w_op, w13._scales_op, w13._zeros_op,
-                        w2._w_op, w2._scales_op, w2._zeros_op,
-                        None, self.top_k, self.renormalize, topk_weights=lw, topk_ids=li,
-                    ),
-                )
-            else:
-                final_hidden_states = kernels.w4a8_moe(
-                    hidden_states,
-                    w13._w_op,
-                    w13._scales_op,
-                    w13._zeros_op,
-                    w2._w_op,
-                    w2._scales_op,
-                    w2._zeros_op,
-                    router_logits,
-                    self.top_k,
-                    self.renormalize,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                )
-        elif precomputed:
-            # Unquantized experts with a route computed in the model (Zaya top-1 + MOD, GLM
-            # noaux_tc). The moe_backend fuses softmax+topk internally, so it can't take a
-            # precomputed route — call the stacked-expert kernel directly with our topk tensors.
-            from minisgl.moe.fused import fused_experts_impl
-
-            final_hidden_states = fused_experts_impl(
-                hidden_states,
-                self.gate_up_proj,
-                self.down_proj,
-                topk_weights,
-                topk_ids,
-                activation=self.activation,
-                apply_router_weight_on_input=self.apply_router_weight_on_input,
+            final_hidden_states = self._ep_dispatch(
+                hidden_states, ep_w, ep_i,
+                lambda gh, lw, li: method.ep_local(
+                    w13, w2, gh, lw, li, top_k=self.top_k, renormalize=self.renormalize
+                ),
             )
         else:
-            ctx = get_global_ctx()
-            final_hidden_states = ctx.moe_backend.forward(
-                hidden_states=hidden_states,
-                w1=self.gate_up_proj,
-                w2=self.down_proj,
-                gating_output=router_logits,
-                topk=self.top_k,
-                renormalize=self.renormalize,
+            final_hidden_states = method.apply(
+                w13, w2, hidden_states,
+                router_logits=router_logits, topk_weights=topk_weights, topk_ids=topk_ids,
+                top_k=self.top_k, renormalize=self.renormalize,
                 activation=self.activation,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
             )

@@ -437,9 +437,13 @@ class ZayaMoEBlock(BaseOP):
             device=torch.device("meta"),
         )
         # Experts stay fp8 (F8_E4M3 + per-channel F32 scale, ~8 GB): dequant-to-bf16 at load is
-        # ~16 GB and OOMs the 16 GB card. Weights are dequantized per-expert at compute and run on
-        # the unquantized fused Triton path (PORT_PLAN §7.3; native W8A8-fp8 kernel is Step 3 v1).
+        # ~16 GB and OOMs the 16 GB card. Weights feed the native W8A8 fp8 grouped kernel directly.
+        # The fp8 W8A8 scheme is CONFIG-DRIVEN — the ZAYA checkpoint declares compressed-tensors
+        # float-quantized 8-bit weights + per-token fp8 activations (config.quant.is_fp8_w8a8). No
+        # model-name branch: the expert scheme falls out of the declared quantization_config, exactly
+        # like the dense/GDN linears and the AWQ/GPTQ MoE (create_moe_quant_method routes it).
         # renormalize=False, silu.
+        fp8 = config.quant is not None and config.quant.is_fp8_w8a8
         self.experts = MoELayer(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,  # 1
@@ -447,7 +451,7 @@ class ZayaMoEBlock(BaseOP):
             intermediate_size=config.moe_intermediate_size,  # ffn_hidden_size // 2 = 2048
             renormalize=False,
             activation="silu",
-            fp8_experts=True,
+            fp8_experts=fp8,
         )
 
     @nvtx_annotate("ZayaMoE")

@@ -232,4 +232,12 @@ def create_linear_method(
         return UnquantizedLinearMethod()
     if quant.is_rxf:
         return RXFLinearMethod(quant)
+    # fp8 W8A8 (compressed-tensors float-quantized 8-bit) has no dense linear kernel here — only the
+    # MoE expert path (create_moe_quant_method) implements it. ZAYA's dense/attn linears are all in
+    # the quant `ignore` list, so a quantized fp8 config never reaches a dense linear; guard anyway so
+    # it can't silently misroute into the int4 W4A8 layout.
+    if quant.is_fp8_w8a8:
+        raise NotImplementedError(
+            "fp8 W8A8 dense linear not implemented (MoE-expert-only); fp8 modules must be unquantized"
+        )
     return W4A8LinearMethod(quant)
