@@ -14,6 +14,7 @@ _MODEL_REGISTRY = {
     "ZayaForCausalLM": (".zaya", "ZayaForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
+    "LagunaForCausalLM": (".laguna", "LagunaForCausalLM"),
 }
 
 
