@@ -14,6 +14,8 @@ from minisgl.message import (
     BatchFrontendMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
+    StatsFrontendMsg,
+    StatsMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -81,7 +83,28 @@ def tokenize_worker(
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
+            # Scheduler metrics snapshots (only reach the detokenizer worker, which owns the frontend
+            # link): forward each to the frontend as a StatsFrontendMsg for the /metrics endpoint.
+            stats_msg = [m for m in pending_msg if isinstance(m, StatsMsg)]
+            for sm in stats_msg:
+                send_frontend.put(
+                    StatsFrontendMsg(
+                        dp_rank=sm.dp_rank,
+                        spec_draft_tokens=sm.spec_draft_tokens,
+                        spec_accepted_tokens=sm.spec_accepted_tokens,
+                        spec_emitted_tokens=sm.spec_emitted_tokens,
+                        spec_steps=sm.spec_steps,
+                        running_requests=sm.running_requests,
+                        waiting_requests=sm.waiting_requests,
+                        kv_tokens_total=sm.kv_tokens_total,
+                        kv_tokens_used=sm.kv_tokens_used,
+                        gdn_slots_total=sm.gdn_slots_total,
+                        gdn_slots_used=sm.gdn_slots_used,
+                    )
+                )
+            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + len(stats_msg) == len(
+                pending_msg
+            )
             if len(detokenize_msg) > 0:
                 results = detokenize_manager.detokenize(detokenize_msg, stop_map)
                 replies: List[UserReply] = []
