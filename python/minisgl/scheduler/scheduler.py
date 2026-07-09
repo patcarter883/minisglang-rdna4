@@ -68,17 +68,37 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # is not prefix-cacheable, and a radix hit would report cached_len>0 with no state behind
         # it (silent garbage). Force it here; dense models keep config.cache_type.
         cache_type = config.cache_type
-        # GDN AND CCA recurrent state are both non-prefix-cacheable: a radix hit would report
-        # cached_len>0 with no recurrent state behind it (silent garbage). Force naive for either.
+        # GDN AND CCA recurrent state are both non-prefix-cacheable UNLESS we checkpoint it: a plain
+        # radix hit would report cached_len>0 with no recurrent state behind it (silent garbage).
+        # MINISGL_GDN_RADIX=1 opts into the recurrent-radix cache, which snapshots the linear-attention
+        # recurrent state at page-aligned prefix-commit boundaries and restores it on a hit (lossless
+        # under the bit-exact recurrent kernel; see radix_cache.py). Default OFF -> force 'naive' as
+        # before, so the recurrent path is byte-unchanged unless explicitly enabled.
         has_recurrent_state = (
             self.engine.gdn_state is not None or self.engine.cca_state is not None
         )
+        self._rec_radix = False
+        # Recurrent radix is gated to the plain (synchronous normal-loop) serve path: spec-decode and
+        # expert-parallelism run their own dedicated loops and already manipulate the recurrent state
+        # (spec verify-state install), an untested interaction — force naive there.
+        _rec_radix_ok = self.engine.spec_config is None and not self.engine.enable_ep
         if has_recurrent_state and cache_type != "naive":
-            logger.warning_rank0(
-                f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
-                "GDN/CCA recurrent state is not prefix-cacheable"
-            )
-            cache_type = "naive"
+            if os.environ.get("MINISGL_GDN_RADIX") == "1" and _rec_radix_ok:
+                self._rec_radix = True
+                cache_type = "recurrent_radix"
+                logger.warning_rank0(
+                    "recurrent-state hybrid model: MINISGL_GDN_RADIX=1 -> using recurrent radix "
+                    "prefix cache (page-aligned recurrent-state snapshots reused on prefix hits)"
+                )
+            else:
+                why = "GDN/CCA recurrent state is not prefix-cacheable (set MINISGL_GDN_RADIX=1 to enable)"
+                if os.environ.get("MINISGL_GDN_RADIX") == "1" and not _rec_radix_ok:
+                    why = "recurrent radix is not supported with spec-decode / expert-parallelism"
+                logger.warning_rank0(
+                    f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
+                    + why
+                )
+                cache_type = "naive"
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
@@ -102,6 +122,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if self.engine.cca_state is not None
             else None
         )
+        # Recurrent-radix prefix caching binds to the single active recurrent state cache + its slot
+        # manager (a model is GDN xor CCA, never both). None unless MINISGL_GDN_RADIX enabled it above.
+        if self._rec_radix and self.gdn_slots is not None:
+            self._rec_cache, self._rec_slots = self.engine.gdn_state, self.gdn_slots
+        elif self._rec_radix and self.cca_slots is not None:
+            self._rec_cache, self._rec_slots = self.engine.cca_state, self.cca_slots
+        else:
+            self._rec_cache, self._rec_slots = None, None
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -341,7 +369,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self.ep_loop()
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        # Recurrent radix caches a sequence's linear-attention state at commit points by cloning its
+        # live slot. That clone must be ordered AFTER the sequence's own forward and BEFORE any next
+        # forward that could advance the slot — which the synchronous normal loop guarantees (schedule
+        # -> forward -> process/commit, no forward launched ahead) but the overlap loop does not. So
+        # run the non-overlap loop when recurrent radix is enabled.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -432,7 +465,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    self.cache_manager.cache_req(req, finished=False)
+                    inserted = self.cache_manager.cache_req(req, finished=False)
+                    # Recurrent radix: snapshot this prefix's recurrent state onto the inserted node so
+                    # a future request sharing it can restore instead of re-prefilling.
+                    if self._rec_cache is not None:
+                        self._maybe_capture_rec_state(req, inserted)
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
@@ -470,7 +507,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
-        self.cache_manager.cache_req(req, finished=True)
+        inserted = self.cache_manager.cache_req(req, finished=True)
+        # Recurrent radix: snapshot the FINISHED sequence's recurrent state onto its inserted prefix
+        # node BEFORE the slot is freed below, so the next turn of a multi-turn conversation (prompt =
+        # this full sequence + new tokens) restores it instead of re-prefilling the whole history.
+        if self._rec_cache is not None:
+            self._maybe_capture_rec_state(req, inserted)
         # Release the GDN state slot (idempotent — overlap scheduling can free a req twice).
         # This single site covers both normal finish (via _process_last_data) and abort.
         if self.gdn_slots is not None:
@@ -483,6 +525,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self._proposer.free(req.uid)
         # Release the structured-output grammar matcher (idempotent).
         self._grammar_matchers.pop(req.uid, None)
+
+    def _restore_rec_states(self, batch: Batch) -> None:
+        """Install cached recurrent-state snapshots into the slots of prefill reqs that hit the
+        recurrent radix. Only reqs with a snapshot (cache_handle.rec_state) and cached_len>0 restore;
+        everyone else keeps their zeroed/continuation slot untouched."""
+        for req in batch.reqs:
+            handle = getattr(req, "cache_handle", None)
+            rec_state = getattr(handle, "rec_state", None)
+            if rec_state is None or req.cached_len == 0:
+                continue
+            # Restore ONLY on the initial prefix-hit pass (req.cached_len == the matched boundary). A
+            # chunked continuation carries the SAME handle but a larger cached_len; re-restoring there
+            # would clobber the state advanced by earlier chunks.
+            if req.cached_len != handle.cached_len:
+                continue
+            slot = self._rec_slots.slot_for(req.uid)
+            if slot is not None:
+                self._rec_cache.load_slot(slot, rec_state)
+                logger.info_rank0(
+                    f"recurrent-radix HIT: uid={req.uid} restored recurrent state at "
+                    f"cached_len={req.cached_len} (skips re-prefill of the shared prefix)"
+                )
+
+    def _maybe_capture_rec_state(self, req: Req, handle) -> None:
+        """Snapshot a sequence's recurrent state at a page-aligned prefix-commit boundary and attach it
+        to the inserted radix node, so a later request that shares this prefix restores it instead of
+        re-prefilling. Guard: only when the committed length is page-aligned (so the slot state
+        corresponds to the node boundary EXACTLY — the losslessness precondition) and the slot is still
+        live. Runs at synchronous commit points (recurrent radix forces the non-overlap loop), so the
+        slot holds this req's post-forward state with no in-flight advance."""
+        if self._rec_cache is None or handle is None:
+            return
+        cached_len = req.cached_len
+        if cached_len == 0 or (cached_len % self.cache_manager.page_size) != 0:
+            return
+        slot = self._rec_slots.slot_for(req.uid)
+        if slot is None:
+            return
+        snap = self._rec_cache.clone_slot(slot)
+        self.cache_manager.attach_rec_state(handle, snap)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -519,6 +601,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, self.device)
+        # Recurrent-radix RESTORE: for any prefill req that hit a page-aligned recurrent-state snapshot
+        # (cache_handle.rec_state set, cached_len>0), install that snapshot into its freshly-allocated
+        # slot BEFORE the forward. state_indices() above zero-inited the new slot; we overwrite it with
+        # the cached prefix state, and has_initial_state (cached_len>0) makes the GDN/CCA kernels
+        # continue from it — byte-identical to prefilling the shared prefix from zero (recurrent kernel).
+        if self._rec_cache is not None and batch.is_prefill and not batch.spec_verify:
+            self._restore_rec_states(batch)
         sample_args = self.engine.sampler.prepare(batch)
         # Structured output: attach the per-row grammar bitmask (None unless a constrained req is in
         # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
