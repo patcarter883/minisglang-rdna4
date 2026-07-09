@@ -114,14 +114,27 @@ class CCAStateCache:
         holds the exact accepted-prefix conv window + prev_hs, so this is a pure gather.
 
         Vectorized: scratch[t_index[i], i] -> state_cache[layer, slots[i]] for each seq i.
+
+        Batched across ALL CCA layers in one shot (was a per-layer Python loop, each a separate
+        gather+cast+scatter). The per-layer scratch tensors are stacked into a leading layer dim,
+        gathered once with the SAME (t_index, seq_ar) advanced index shared by every layer, cast once,
+        and scattered once into the stacked state cache. Byte-identical to the loop: for each layer L,
+        ``conv_all[L] == conv_scratch[L]`` (stack is a copy), ``conv_all[L, t_index, seq_ar] ==
+        conv_scratch[L][t_index, seq_ar]``, and ``conv_states[:, slots][L] == conv_states[L, slots]``.
         """
         n = slots.numel()
         seq_ar = torch.arange(n, device=slots.device)
-        for lid in range(self.num_cca_layers):
-            cs = conv_scratch[lid]  # [Q, N, C, TP]
-            ps = prev_scratch[lid]  # [Q, N, hidden]
-            self.conv_states[lid, slots] = cs[t_index, seq_ar].to(self.conv_states.dtype)
-            self.prev_hs[lid, slots] = ps[t_index, seq_ar].to(self.prev_hs.dtype)
+        L = self.num_cca_layers
+        # Stack per-layer scratch into a leading layer dim: [L, Q, N, ...]. Keys are contiguous
+        # cca_layer_id 0..L-1 (every layer stashes its scratch during the verify forward).
+        conv_all = torch.stack([conv_scratch[lid] for lid in range(L)], dim=0)  # [L, Q, N, C, TP]
+        prev_all = torch.stack([prev_scratch[lid] for lid in range(L)], dim=0)  # [L, Q, N, hidden]
+        # dim0 full slice, dims 1-2 adjacent advanced indices (t_index, seq_ar) -> [L, N, ...].
+        conv_pick = conv_all[:, t_index, seq_ar]  # [L, N, C, TP]
+        prev_pick = prev_all[:, t_index, seq_ar]  # [L, N, hidden]
+        # One batched scatter over the stacked [L, num_slots, ...] state cache.
+        self.conv_states[:, slots] = conv_pick.to(self.conv_states.dtype)
+        self.prev_hs[:, slots] = prev_pick.to(self.prev_hs.dtype)
 
     def conv(self, cca_layer_id: int) -> torch.Tensor:
         """conv_states for one CCA layer: (num_slots, conv_dim, conv_kernel)."""

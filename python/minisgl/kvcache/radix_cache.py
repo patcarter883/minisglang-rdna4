@@ -25,6 +25,10 @@ class RadixTreeNode:
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+        # Persistent-leaf-heap bookkeeping: set True the moment this node is evicted (unlinked from its
+        # parent). Stale heap entries pointing at an already-evicted node are skipped on pop so a node
+        # is never double-evicted (a node can hold several lazy heap entries).
+        self._evicted: bool = False
 
         # these fields should be updated later
         self._key: torch.Tensor
@@ -133,6 +137,27 @@ class RadixPrefixCache(BasePrefixCache):
         self.max_rec_snapshots = max_rec_snapshots
         self._rec_nodes: List[RadixTreeNode] = []  # nodes with a live rec_state (LRU-ish, pruned lazily)
 
+        # Persistent leaf min-heap for eviction. Replaces rebuilding the leaf set (a full root->leaf
+        # tree walk + heapify) on EVERY evict() call — under memory pressure evict() is called
+        # repeatedly, so the old approach was O(total nodes) per call. Instead we maintain the heap
+        # incrementally: a leaf candidate is pushed as (timestamp, uuid, node) whenever it becomes an
+        # evictable leaf (created, re-accessed with a bumped timestamp, or an interior node that loses
+        # its last child), and evict() pops least-recently-used first. Entries are NEVER mutated or
+        # deleted in place; instead each popped entry is validated against the LIVE node (must be a
+        # non-root leaf, ref_count 0, not already evicted, and key == node.timestamp) and skipped if
+        # stale. This standard lazy-heap trick keeps the evicted SET and ORDER identical to the old
+        # full-rebuild: both pop the unreferenced leaf with the smallest timestamp, cascading to a
+        # parent as it becomes a leaf.
+        self._evict_heap: List[Tuple[int, int, RadixTreeNode]] = []
+
+    def _push_leaf(self, node: RadixTreeNode) -> None:
+        """Push a leaf eviction candidate onto the persistent heap, keyed by (timestamp, uuid). The
+        uuid tiebreaker keeps heapq from ever comparing two RadixTreeNodes. Safe to over-push (e.g. a
+        referenced node): evict() validates every entry on pop and skips those no longer evictable."""
+        if node.is_root():
+            return
+        heapq.heappush(self._evict_heap, (node.timestamp, node.uuid, node))
+
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
         node = handle.node
@@ -143,6 +168,11 @@ class RadixPrefixCache(BasePrefixCache):
                 if node.ref_count == 0:
                     self.evictable_size += node.length
                     self.protected_size -= node.length
+                    # Just became unreferenced: if it is a leaf it is now evictable, so (re)arm its
+                    # heap entry. Any entry pushed earlier while it was referenced was skipped on pop;
+                    # this guarantees a released leaf re-enters the eviction candidate set.
+                    if node.is_leaf():
+                        self._push_leaf(node)
                 node = node.parent
         else:
             while not node.is_root():
@@ -201,6 +231,9 @@ class RadixPrefixCache(BasePrefixCache):
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.evictable_size += new_node.length
+            # Fresh unreferenced leaf -> eviction candidate. (Its parent, if it was a leaf, stops
+            # being one; its stale heap entry is skipped on pop by the is_leaf() check.)
+            self._push_leaf(new_node)
             node = new_node
         return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
@@ -211,17 +244,33 @@ class RadixPrefixCache(BasePrefixCache):
             size <= self.evictable_size
         ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
 
-        leave_nodes = self._collect_leave_nodes_for_evict()
-        heapq.heapify(leave_nodes)
+        heap = self._evict_heap
         evicted_indices: List[torch.Tensor] = []
         evicted_size = 0
 
         while evicted_size < size:
+            # Pop the least-recently-used valid candidate, skipping stale entries (lazy heap): a node
+            # that has since gained a child, been re-referenced, been re-accessed (timestamp bumped so
+            # a newer entry supersedes this one), or already evicted. This yields exactly the node the
+            # old full-rebuild+heapify would have chosen: the unreferenced leaf with the smallest
+            # timestamp.
+            node = None
+            while heap:
+                key, _uuid, cand = heapq.heappop(heap)
+                if (
+                    cand._evicted
+                    or cand.is_root()
+                    or not cand.is_leaf()
+                    or cand.ref_count != 0
+                    or key != cand.timestamp  # re-accessed since push -> a fresher entry exists
+                ):
+                    continue
+                node = cand
+                break
             assert (
-                leave_nodes
+                node is not None
             ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
-            node = heapq.heappop(leave_nodes)
-            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            node._evicted = True
             evicted_size += node.length
             evicted_indices.append(node.value)
             self.evictable_size -= node.length
@@ -230,7 +279,9 @@ class RadixPrefixCache(BasePrefixCache):
             del parent.children[self.key_fn(node._key)]
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
-                heapq.heappush(leave_nodes, parent)
+                # Parent just became an evictable leaf -> arm it (mirrors the old heappush). A parent
+                # that becomes a leaf while still referenced is armed later by lock_handle on release.
+                self._push_leaf(parent)
 
         return torch.cat(evicted_indices)
 
@@ -283,10 +334,17 @@ class RadixPrefixCache(BasePrefixCache):
             if match_len != node.length:
                 node = node.split_at(match_len)
                 node.timestamp = tic
+                # split's returned node is the new (interior) parent, never a leaf; guard anyway.
+                if node.is_leaf():
+                    self._push_leaf(node)
                 return node, prefix_len
 
             # update timestamp for accessed node
             node.timestamp = tic
+            # Re-accessed: bump makes any older heap entry stale, so arm a fresh entry keyed by the new
+            # timestamp (only leaves are eviction candidates). Preserves LRU order under the lazy heap.
+            if node.is_leaf():
+                self._push_leaf(node)
 
         return node, prefix_len
 
