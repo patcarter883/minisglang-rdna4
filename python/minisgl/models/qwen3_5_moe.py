@@ -49,8 +49,10 @@ class Qwen3_5MoeSharedExpert(BaseOP):
             inter, config.hidden_size, has_bias=False, quant_method=qm
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
+        # reduce=False -> return the row-parallel down_proj PARTIAL so the MoE block can fuse it with
+        # the routed-expert partial into a single all_reduce.
+        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)), reduce=reduce)
 
 
 class Qwen3_5MoeSparseBlock(BaseOP):
@@ -80,15 +82,29 @@ class Qwen3_5MoeSparseBlock(BaseOP):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        experts = self.experts
+        # Fuse the shared + routed TP all-reduces into ONE. Both down-projections are row-parallel, so
+        # each rank holds a partial; summing the two partials locally and reducing once is exact
+        # (sum_r(routed_r + shared_r) == routed_full + shared_full). Saves one all_reduce/layer — 40
+        # fewer collectives/step on the 40-layer 35B at TP=2. Only in the pure-TP path: EP reduces the
+        # routed experts over a DIFFERENT (dp/EP) group, so there the two must stay separate.
+        fuse = experts.tp_size > 1 and not experts.enable_ep
         # "shared" sub-bucket of the layer-prof "ffn" total (MINISGL_LAYER_PROF). Summed over all
         # layers, reported per-step -> direct per-step shared-expert cost (Task B #18 attribution).
-        shared_out = _lp_timed("shared", self.shared_expert.forward, hidden_states)
+        shared_out = _lp_timed(
+            "shared", lambda h: self.shared_expert.forward(h, reduce=not fuse), hidden_states
+        )
+        # shared_expert_gate is replicated (identical per rank), so gating the local partial before the
+        # fused reduce is exact: sum_r(g * shared_r) == g * sum_r(shared_r).
         shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
         router_logits = self.gate.forward(hidden_states)
-        routed_out = self.experts.forward(
-            hidden_states=hidden_states, router_logits=router_logits
+        routed_out = experts.forward(
+            hidden_states=hidden_states, router_logits=router_logits, reduce=not fuse
         )
-        return (routed_out + shared_out).view(num_tokens, hidden_dim)
+        combined = routed_out + shared_out
+        if fuse:
+            combined = experts._comm.all_reduce(combined)
+        return combined.view(num_tokens, hidden_dim)
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):

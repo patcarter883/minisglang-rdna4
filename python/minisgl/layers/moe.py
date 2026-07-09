@@ -477,8 +477,11 @@ class _FP8MoEMethod(MoEQuantMethod):
         if self._w8a16_fn is not None:
             # W8A16 opt-in: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack
             # materialize), routed experts only; bf16 acts. Uses the always-present op-layout buffers.
+            # The kernel requires bf16 activations, so guard the cast (no-op when the model is already
+            # bf16 — the norm for W8A16 checkpoints) instead of hardcoding an unconditional conversion.
+            acts = hidden_states if hidden_states.dtype == torch.bfloat16 else hidden_states.to(torch.bfloat16)
             return self._w8a16_fn(
-                hidden_states.to(torch.bfloat16),
+                acts,
                 w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
                 topk_weights, topk_ids.to(torch.int32),
             )
@@ -500,8 +503,10 @@ class _FP8MoEMethod(MoEQuantMethod):
         from minisgl.quant import kernels
 
         if self._w8a16_fn is not None:
+            # Kernel requires bf16 acts; guard the cast (no-op when already bf16) — see forward().
+            acts = g_hidden if g_hidden.dtype == torch.bfloat16 else g_hidden.to(torch.bfloat16)
             return self._w8a16_fn(
-                g_hidden.to(torch.bfloat16),
+                acts,
                 w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, local_weights, local_ids,
             )
         return kernels.w8a8_moe(
@@ -684,6 +689,7 @@ class MoELayer(BaseOP):
         *,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        reduce: bool = True,
     ):
         # Either pass raw `router_logits` (fused softmax+topk inside the kernel) OR a precomputed
         # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc, ZAYA top-1 computed in the model).
@@ -718,7 +724,9 @@ class MoELayer(BaseOP):
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
             )
         # EP already all_reduce'd over the dp/EP group (which subsumes any per-replica TP reduce —
-        # ZAYA is tp_size=1 anyway), so skip the TP epilogue when the EP path ran.
-        if self.tp_size > 1 and not self.enable_ep:
+        # ZAYA is tp_size=1 anyway), so skip the TP epilogue when the EP path ran. reduce=False also
+        # skips it so the caller can fuse this partial with another row-parallel partial (shared expert)
+        # and all_reduce once — the row-parallel down-proj output is a per-rank partial either way.
+        if self.tp_size > 1 and not self.enable_ep and reduce:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states

@@ -152,8 +152,11 @@ class LinearRowParallel(_LinearTPImpl):
             input_size, output_size, local_input_size, local_output_size, has_bias, quant_method
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
+        # reduce=False returns the per-rank PARTIAL (pre-all-reduce) so a caller can sum several
+        # row-parallel partials and all_reduce ONCE (fuse a MoE block's shared+routed reduce).
+        # sum_r(a_r + b_r) == sum_r a_r + sum_r b_r, so the fused reduce is exact.
         y = self._method.apply(self, x, self.bias)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and reduce:
             y = self._comm.all_reduce(y)
         return y

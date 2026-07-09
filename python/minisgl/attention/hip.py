@@ -229,12 +229,17 @@ class HIPAttnBackend(RDNA4Backend):
         dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
         self._vcap_cache_seqlens[:bs].copy_(dls)
         gpt = get_global_ctx().page_table  # global page_size=1 table
-        for i, req in enumerate(reqs):
-            npages = (req.device_len + self.page_size - 1) // self.page_size
-            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
-            if self.page_size > 1:
-                row = torch.div(row, self.page_size, rounding_mode="floor")
-            self._vcap_page_table[i, :npages].copy_(row.to(torch.int32))
+        # Vectorized gather (was a per-req Python loop): same trick as _fill_decode_static — pull all
+        # rows' full max-width strided page ids in one advanced-index op. The paged-extend verify kernel
+        # bounds its key reads by cache_seqlens, so writing the whole width (incl. the per-seq stale tail
+        # beyond npages) is equivalent to the old per-row [:npages] copy. This runs every spec-decode
+        # verify step, so the per-req loop was pure overhead on the hot path.
+        table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
+        rows = gpt[table_idx, : self._vcap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
+        if self.page_size > 1:
+            rows = torch.div(rows, self.page_size, rounding_mode="floor")
+        ncols = rows.shape[1]
+        self._vcap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
 
     def prepare_verify_for_capture(self, batch: "Batch") -> None:
         self._fill_verify_static(batch)
@@ -297,12 +302,15 @@ class HIPAttnBackend(RDNA4Backend):
         dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
         self._fcap_cache_seqlens[:bs].copy_(dls)
         gpt = get_global_ctx().page_table  # global page_size=1 table
-        for i, req in enumerate(reqs):
-            npages = (req.device_len + self.page_size - 1) // self.page_size
-            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
-            if self.page_size > 1:
-                row = torch.div(row, self.page_size, rounding_mode="floor")
-            self._fcap_page_table[i, :npages].copy_(row.to(torch.int32))
+        # Vectorized gather (was a per-req Python loop) — identical trick to _fill_decode_static /
+        # _fill_verify_static: one advanced-index op over all rows; the kernel bounds key reads by
+        # cache_seqlens so the stale per-seq tail beyond npages is ignored.
+        table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
+        rows = gpt[table_idx, : self._fcap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
+        if self.page_size > 1:
+            rows = torch.div(rows, self.page_size, rounding_mode="floor")
+        ncols = rows.shape[1]
+        self._fcap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
 
     def prepare_fused_verify_for_capture(self, batch: "Batch") -> None:
         # Dummy capture batch: cache_seqlens = fused_qlen (cached_len 0 dummy), page table -> dummy page.

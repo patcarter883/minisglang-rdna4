@@ -69,6 +69,12 @@ x-lean-common: &lean-common
     # MTP-head layer count override (config.py knob): forces the Qwen3.5 MTP head on/off through
     # compose. Empty -> trust the checkpoint (default). 0 -> no MTP head (serve the base decoder only).
     MINISGL_MTP_LAYERS: "${MINISGL_MTP_LAYERS:-}"
+    # torch.profiler window (diagnostic): MINISGL_PROFILE=<path under /engine> captures SKIP..SKIP+STEPS
+    # forward/verify steps into a chrome trace. Inert unless set. Point at /engine/... so it lands in
+    # the mounted worktree; name it *.pt.trace.json.gz so torch gzips it and TraceLens ingests it.
+    MINISGL_PROFILE: "${MINISGL_PROFILE:-}"
+    MINISGL_PROFILE_SKIP: "${MINISGL_PROFILE_SKIP:-40}"
+    MINISGL_PROFILE_STEPS: "${MINISGL_PROFILE_STEPS:-50}"
 
 services:
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
