@@ -244,14 +244,16 @@ def w4a8_moe(
     sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
     P = sorted_ids.shape[0]
 
-    x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
+    # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their
+    # NATIVE dtype — a bf16 model no longer round-trips bf16->fp16->bf16 here (out1 follows x's dtype).
+    x16 = _moe_time("cast", lambda: x.contiguous())
     out1 = _moe_time(
         "gemm1",
         lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
             x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
             kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
         ),
-    )  # (P, 2*inter)
+    )  # (P, 2*inter) in x's dtype
     d = out1.shape[1] // 2
     # Gated SiLU-mul: the fp16 MoE intermediates (out1 is fp16) now route through the dtype-generic
     # native HIP tail_hip.silu_and_mul (one launch, fp32-internal, no temps) — replacing the multi-op
@@ -264,7 +266,7 @@ def w4a8_moe(
     else:
         buf2 = _moe_time(
             "silu",
-            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(out1.dtype).contiguous(),
         )
 
     tw_flat = topk_weights.reshape(-1).float().contiguous()
@@ -577,13 +579,14 @@ def w4a8_linear(
     kernel: str | None = None,
     weight_is_e2m1: bool = False,  # True -> decode nibbles as MXFP4 (OCP E2M1); w_zeros must be None
 ) -> torch.Tensor:
-    """Dense W4A8 GEMM: (M, K) @ (N, K)^T -> (M, N). Returns the op's fp16 output;
-    the caller casts back to the activation dtype. `weight_is_e2m1=True` selects the kernel's MXFP4
-    (E2M1) weight decode instead of uniform int4 (scales are the E8M0 group exponents folded to
-    fp16; w_zeros MUST be None — the op asserts symmetric)."""
+    """Dense W4A8 GEMM: (M, K) @ (N, K)^T -> (M, N). Output follows the activation dtype (fp16 OR
+    bf16 — the kernel is activation-dtype-generic), so a bf16 model runs cast-free (the caller's
+    out.to(x.dtype) is then a no-op). `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight
+    decode instead of uniform int4 (scales are the E8M0 group exponents folded to fp16; w_zeros MUST
+    be None — the op asserts symmetric)."""
     import w4a8_fp8_wmma
 
-    x2d = x if x.dtype == torch.float16 else x.to(torch.float16)  # op computes in fp16
+    x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
         kernel = _pick_dense_kernel(x2d.shape[0])
     return w4a8_fp8_wmma.mmq_fp8_gemm(
