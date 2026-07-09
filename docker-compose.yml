@@ -58,7 +58,11 @@ x-lean-common: &lean-common
     MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
     # DDTree: route DFlash through the drafter-agnostic draft-TREE step (per-position top-K marginals
     # -> best-first tree -> ancestor-mask verify) for a higher accept-len than the linear K chain.
+    # Forwarded so the scheduler's os.environ read sees it inside the container; topk/budget default
+    # in the scheduler when unset.
     MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-}"
+    MINISGL_DDTREE_TOPK: "${MINISGL_DDTREE_TOPK:-}"
+    MINISGL_DDTREE_BUDGET: "${MINISGL_DDTREE_BUDGET:-}"
     # MTP-head layer count override (config.py knob): forces the Qwen3.5 MTP head on/off through
     # compose. Empty -> trust the checkpoint (default). 0 -> no MTP head (serve the base decoder only).
     MINISGL_MTP_LAYERS: "${MINISGL_MTP_LAYERS:-}"
