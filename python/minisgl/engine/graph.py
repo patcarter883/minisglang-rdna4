@@ -98,13 +98,25 @@ def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
+    max_running_req: int | None = None,
 ) -> List[int]:
     if cuda_graph_bs is not None:
         return cuda_graph_bs
 
     free_memory_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
-        if free_memory_gb > 80:  # H200
+        # Co-derive graph coverage from the admission cap so NO admissible decode batch size runs
+        # fully eager. can_use_cuda_graph() gates on batch.size <= max_graph_bs; with the old hard
+        # default (160 on non-H200) but max_running_req defaulting to 256, decode batches of 161..256
+        # concurrent reqs silently fell back to a fully-eager forward — the worst case for launch
+        # overhead. Cover max_running_req exactly instead: the graph-memory reservation in
+        # Engine._graph_capture_bytes reproduces this same bs_list, so the KV pool is sized around the
+        # larger capture (no capture-time OOM), and graph coverage scales with the concurrency the
+        # operator actually configured. Fall back to the old free-memory heuristic only for direct
+        # callers that don't supply max_running_req.
+        if max_running_req is not None:
+            cuda_graph_max_bs = max_running_req
+        elif free_memory_gb > 80:  # H200
             cuda_graph_max_bs = 256
         else:
             cuda_graph_max_bs = 160
@@ -138,11 +150,13 @@ class GraphRunner:
         dummy_req: Req,
         gdn_state: object | None = None,
         cca_state: object | None = None,
+        max_running_req: int | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
+            max_running_req=max_running_req,
         )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0

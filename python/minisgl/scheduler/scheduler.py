@@ -883,7 +883,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if not self.decode_manager.runnable:
             return
 
-        reqs = sorted(self.decode_manager.running_reqs, key=lambda req: req.uid)
+        reqs = self.decode_manager.ordered_reqs
         # Spec-decode runs for an all-greedy decode set (lossless accept is greedy-only). Constrained
         # (structured-output) reqs now spec-decode too: their drafts are proposed UNCONSTRAINED and the
         # grammar is enforced at the verify argmax (_verify_greedy_constrained), so a grammar-violating
@@ -954,9 +954,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             sum(r.extend_len for r in prefill_batch.reqs) if prefill_batch is not None else 0
         )
         local_reqs: List[Req] = (
-            sorted(self.decode_manager.running_reqs, key=lambda r: r.uid)
-            if self.decode_manager.runnable
-            else []
+            self.decode_manager.ordered_reqs if self.decode_manager.runnable else []
         )
         local_decode_bs = len(local_reqs)
         # A replica with decode work vetoes spec iff ANY of its reqs is non-greedy; a replica with NO
@@ -1618,7 +1616,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # c0+1..c0+k (their KV computed this step); write only the bonus (emitted[-1]) at c0+len(keep).
             bonus_col = c0 + len(keep)
             c_rows.append(req.table_idx); c_cols.append(bonus_col); c_vals.append(keep[-1])
-            req.input_ids = torch.cat([req.input_ids, torch.tensor(keep, dtype=req.input_ids.dtype)])
+            req.append_host(torch.tensor(keep, dtype=req.input_ids.dtype))
             req.cached_len = c0 + len(keep)   # KV valid through c0+len(keep)-1 (confirmed + drafts[:k])
             req.device_len = req.cached_len + 1
             req._tidar_drafts = next_drafts
@@ -1946,9 +1944,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 c_rows.append(req.table_idx)
                 c_cols.append(c0 + 1 + j)
                 c_vals.append(tok)
-            req.input_ids = torch.cat(
-                [req.input_ids, torch.tensor(keep, dtype=req.input_ids.dtype)]
-            )
+            req.append_host(torch.tensor(keep, dtype=req.input_ids.dtype))
             req.cached_len = c0 + len(keep)  # KV valid through cached_len-1
             req.device_len = req.cached_len + 1
             total_emitted += len(keep)
