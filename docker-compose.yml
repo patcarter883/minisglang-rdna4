@@ -56,6 +56,9 @@ x-lean-common: &lean-common
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
     # DFlash drafter weight-only quant (fp8|int8) — halves the replicated drafter to fit big pairs.
     MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
+    # DDTree: route DFlash through the drafter-agnostic draft-TREE step (per-position top-K marginals
+    # -> best-first tree -> ancestor-mask verify) for a higher accept-len than the linear K chain.
+    MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-}"
     # MTP-head layer count override (config.py knob): forces the Qwen3.5 MTP head on/off through
     # compose. Empty -> trust the checkpoint (default). 0 -> no MTP head (serve the base decoder only).
     MINISGL_MTP_LAYERS: "${MINISGL_MTP_LAYERS:-}"
