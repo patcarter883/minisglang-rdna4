@@ -649,12 +649,21 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        # `request.is_disconnected()` is an event-loop receive() round-trip; awaiting it on EVERY
+        # token is pure per-token overhead. Poll it on a cadence instead — at most once per
+        # _DISCONNECT_POLL_INTERVAL seconds. Detecting a disconnect up to one interval late is fine:
+        # over-running the generation briefly is cheap, and the next poll aborts + cleans up.
+        _DISCONNECT_POLL_INTERVAL = 0.5
+        last_disconnect_check = 0.0
         try:
             async for chunk in generator:
-                # detect if the client has disconnected
-                if await request.is_disconnected():
-                    logger.info("Client disconnected for user %s", uid)
-                    raise asyncio.CancelledError
+                # detect if the client has disconnected (rate-limited)
+                now = time.monotonic()
+                if now - last_disconnect_check >= _DISCONNECT_POLL_INTERVAL:
+                    last_disconnect_check = now
+                    if await request.is_disconnected():
+                        logger.info("Client disconnected for user %s", uid)
+                        raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
             asyncio.create_task(self.abort_user(uid))
@@ -820,18 +829,21 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             media_type="text/event-stream",
         )
 
-    # Non-streaming: collect all chunks and return a single JSON response
-    full_content = ""
+    # Non-streaming: collect all chunks and return a single JSON response. Accumulate the incremental
+    # chunks in a list and "".join once at the end — string `+=` in the loop is O(n^2) in the output
+    # length for long completions.
+    content_chunks: List[str] = []
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
     async for ack in state.wait_for_ack(uid):
-        full_content += ack.incremental_output
+        content_chunks.append(ack.incremental_output)
         completion_tokens = max(completion_tokens, ack.completion_tokens)
         prompt_tokens = ack.prompt_tokens or prompt_tokens
         if ack.finish_reason:
             finish_reason = ack.finish_reason
         if ack.finished:
             break
+    full_content = "".join(content_chunks)
 
     # Reasoning: split a thinking model's `<think>…</think>` scratch out of the answer into a
     # separate reasoning_content field (the opening tag is in the prompt, so the completion carries
