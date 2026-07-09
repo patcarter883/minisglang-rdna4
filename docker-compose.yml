@@ -44,6 +44,11 @@ x-lean-common: &lean-common
     PYTHONPATH: /opt/kernels:/engine/python:/engine
     HF_HUB_OFFLINE: "1"
     TORCH_BLAS_PREFER_HIPBLASLT: "0"
+    # Fragmentation guard: on the 16 GB cards a full-model + graph-capture footprint (e.g. the 35B
+    # MXFP4 GDN-hybrid) can leave enough free memory but too little CONTIGUOUS free after capture —
+    # a tiny post-capture alloc then OOMs on fragmentation. expandable_segments lets the allocator
+    # grow segments instead. Overridable/empty-safe.
+    PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
     # The lease injects the leased card set; these MUST stay distinct (physical id vs 0-based
     # re-index) — see CLAUDE.md visible-devices recipe.
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
