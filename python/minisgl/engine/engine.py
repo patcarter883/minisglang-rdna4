@@ -445,6 +445,33 @@ class Engine:
             total += conv + prev
         return total
 
+    def _draft_model_bytes(self, config: EngineConfig) -> int:
+        """Reserve the separate speculative DRAFT model (DFlash / EAGLE3). The proposer loads it
+        AFTER the KV pool and REPLICATES it per TP rank, so — exactly like the GDN/CCA recurrent
+        state above — the KV pool must leave room or the drafter OOMs on load (the base weights
+        already fill most of a 16 GB card). 0 when no external draft checkpoint is used (ngram /
+        mtp / tidar carry no separate weights)."""
+        if config.spec_algorithm not in ("dflash", "eagle3") or not config.spec_draft_model_path:
+            return 0
+        import glob
+
+        from minisgl.utils import download_hf_weight
+
+        try:
+            folder = download_hf_weight(config.spec_draft_model_path)
+        except Exception:
+            return 0
+        weight_bytes = sum(
+            os.path.getsize(f) for f in glob.glob(os.path.join(folder, "*.safetensors"))
+        )
+        # MINISGL_DFLASH_QUANT=fp8|int8 weight-only quantizes the draft linears to ~half memory.
+        if (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip():
+            weight_bytes //= 2
+        # + headroom for the drafter's forward / spec-verify graph working set (a fraction of the
+        # weights). Tunable via MINISGL_DRAFT_RESERVE_MARGIN_GB if a big drafter needs more.
+        margin = int(float(os.environ.get("MINISGL_DRAFT_RESERVE_MARGIN_GB", "0.7")) * 1024**3)
+        return weight_bytes + margin
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         mc = config.model_config
@@ -475,14 +502,23 @@ class Engine:
             # ([B2]). Subtracting it up front co-sizes the two caches automatically; it is 0 for dense/
             # MHA/MLA models, so their sizing is unchanged.
             state_memory = self._recurrent_state_bytes(config)
+            draft_memory = self._draft_model_bytes(config)
             available_memory = (
-                int(config.memory_ratio * old_free_memory) - model_memory - state_memory
+                int(config.memory_ratio * old_free_memory)
+                - model_memory
+                - state_memory
+                - draft_memory
             )
             num_pages = available_memory // cache_per_page
             if state_memory:
                 logger.info(
                     f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
                     f"({config.max_running_req} slots); KV pool gets the remainder"
+                )
+            if draft_memory:
+                logger.info(
+                    f"Reserved {mem_GB(draft_memory)} for the {config.spec_algorithm} draft model; "
+                    f"KV pool gets the remainder"
                 )
 
         assert num_pages > 1, (
