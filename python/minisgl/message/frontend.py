@@ -34,3 +34,22 @@ class UserReply(BaseFrontendMsg):
     completion_tokens: int = 0
     prompt_tokens: int = 0
     finish_reason: str | None = None
+
+
+@dataclass
+class StatsFrontendMsg(BaseFrontendMsg):
+    """Scheduler metrics snapshot forwarded by the detokenizer to the frontend (one per DP replica per
+    flush). Mirrors message.tokenizer.StatsMsg; consumed by FrontendManager.listen() to update the
+    Prometheus /metrics backend snapshot. See server/metrics.py."""
+
+    dp_rank: int
+    spec_draft_tokens: int
+    spec_accepted_tokens: int
+    spec_emitted_tokens: int
+    spec_steps: int
+    running_requests: int
+    waiting_requests: int
+    kv_tokens_total: int
+    kv_tokens_used: int
+    gdn_slots_total: int
+    gdn_slots_used: int

@@ -194,6 +194,20 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
+        # ---- Prometheus metrics (backend-observed) ------------------------------------------------
+        # Cumulative spec-decode counters (see server/metrics.py) + a wall-clock-throttled snapshot
+        # push. Only the tp-primary emits (it owns the detokenizer link); the frontend sums replicas.
+        # Cheap: the counters below are int adds at the accept site, and the gauge sample + StatsMsg
+        # push happen at most once per MINISGL_METRICS_INTERVAL seconds — nothing per-token.
+        self._metrics_enabled = os.environ.get("MINISGL_METRICS", "1") != "0"
+        self._metrics_interval = float(os.environ.get("MINISGL_METRICS_INTERVAL", "0.5"))
+        self._metrics_last_flush = 0.0
+        self._m_dp_rank = config.dp_info.dp_rank
+        self._m_spec_draft_tokens = 0
+        self._m_spec_accepted_tokens = 0
+        self._m_spec_emitted_tokens = 0
+        self._m_spec_steps = 0
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
@@ -284,6 +298,48 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+
+    def _flush_stats(self) -> None:
+        """Wall-clock-throttled scheduler metrics snapshot -> StatsMsg on the detokenizer link.
+
+        Called from the I/O receive path (every loop variant funnels through receive_msg), so it fires
+        during active serving without touching the per-token decode path. Only the tp-primary has the
+        detokenizer socket; every other rank / offline scheduler no-ops via _emit_stats' guard. Gauges
+        are sampled here (instantaneous); the spec counters are cumulative."""
+        if not self._metrics_enabled:
+            return
+        now = time.time()
+        if now - self._metrics_last_flush < self._metrics_interval:
+            return
+        self._metrics_last_flush = now
+
+        cm = self.cache_manager
+        kv_total = cm.num_pages * cm.page_size
+        kv_used = (cm.num_pages - len(cm.free_slots)) * cm.page_size
+        gdn_total = gdn_used = 0
+        slots = self.gdn_slots or self.cca_slots  # a model is GDN XOR CCA, never both
+        if slots is not None:
+            gdn_used = slots.num_active
+            # slot 0 is the reserved NULL block -> subtract it from the advertised capacity.
+            gdn_total = max(int(getattr(slots.state_cache, "num_slots", 0)) - 1, 0)
+
+        from minisgl.message import StatsMsg
+
+        self._emit_stats(
+            StatsMsg(
+                dp_rank=self._m_dp_rank,
+                spec_draft_tokens=self._m_spec_draft_tokens,
+                spec_accepted_tokens=self._m_spec_accepted_tokens,
+                spec_emitted_tokens=self._m_spec_emitted_tokens,
+                spec_steps=self._m_spec_steps,
+                running_requests=len(self.decode_manager.running_reqs),
+                waiting_requests=len(self.prefill_manager.pending_list),
+                kv_tokens_total=int(kv_total),
+                kv_tokens_used=int(kv_used),
+                gdn_slots_total=int(gdn_total),
+                gdn_slots_used=int(gdn_used),
+            )
+        )
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -1476,6 +1532,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # n-gram; MTP/DFlash/EAGLE truncate their draft KV. (GDN backbone-state rollback is handled
         # separately in the verify forward path, not here — it is the target's state, not the draft's.)
         self._proposer.on_accept(reqs, accepted_counts)
+
+        # Metrics: one verify step for the batch; per-req draft/accepted/emitted totals (see
+        # server/metrics.py -> minisgl_spec_*). Cheap int adds off the per-token path.
+        if self._metrics_enabled:
+            self._m_spec_steps += 1
+            self._m_spec_draft_tokens += sum(len(d) for d in drafts)
+            self._m_spec_accepted_tokens += sum(accepted_counts)
+            self._m_spec_emitted_tokens += total_emitted
 
         for req in new_finished_reqs:
             self.decode_manager.remove_req(req)
