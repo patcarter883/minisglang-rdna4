@@ -144,6 +144,35 @@ class Engine:
             dtype=self.kv_dtype,
         )
 
+        # ======================= SWA (sliding-window) ring KV pool ========================
+        # A SWA-hybrid model (Laguna) keeps its FULL-attention layers in the main pool above (sized by
+        # num_kv_layers = the full-attn count) and its SLIDING layers in this SEPARATE window-bounded
+        # pool: one fixed per-sequence ring of `sliding_window` slots (page_size=1), indexed like the
+        # GDN/CCA state cache by table_idx (slot = table_idx*window + pos%window). This is what avoids
+        # allocating full-context KV for the 30 window-512 sliding layers (~3.8x at 32k). Its bytes are
+        # reserved up front in _determine_num_pages (like the recurrent-state caches), so the main pool
+        # gets the remainder. None for every non-SWA model, so other paths are untouched.
+        mc0 = config.model_config
+        if mc0.is_swa_hybrid:
+            from minisgl.kvcache.mha_pool import MHAKVCache
+
+            swa_slots = (config.max_running_req + 2) * mc0.sliding_window  # +1 NULL, +1 dummy
+            self.ctx.swa_kv_cache = self.swa_kv_cache = MHAKVCache(
+                num_kv_heads=mc0.num_kv_heads,
+                num_layers=mc0.num_swa_layers,
+                head_dim=mc0.head_dim,
+                num_pages=swa_slots,
+                page_size=1,  # ring is addressed by absolute slot; no page grouping
+                device=self.device,
+                dtype=self.kv_dtype,
+            )
+            logger.info_rank0(
+                f"SWA ring KV: {mc0.num_swa_layers} layers x {swa_slots} slots "
+                f"(window={mc0.sliding_window}, {config.max_running_req} seqs)"
+            )
+        else:
+            self.swa_kv_cache = None  # type: ignore[assignment]
+
         # ======================= GDN recurrent-state cache (Phase 3c/3d) ========================
         # GDN-hybrid models keep a fixed per-sequence recurrent state (conv + ssm) alongside
         # the paged MHA KV cache. The scheduler wires GDN slot alloc/free + per-batch GDN
@@ -443,6 +472,14 @@ class Engine:
             conv = mc.num_cca_layers * num_slots * mc.cca_conv_dim * mc.cca_conv_width * 4
             prev = mc.num_cca_layers * num_slots * mc.hidden_size * 4
             total += conv + prev
+        if getattr(mc, "is_swa_hybrid", False):
+            # SWA ring KV pool (allocated AFTER the main pool): 2 (K+V) * num_swa_layers * num_slots *
+            # sliding_window * local_kv_heads * head_dim * kv_dtype.itemsize. num_slots as above.
+            local_kv = div_even(mc.num_kv_heads, tp, allow_replicate=True)
+            total += (
+                2 * mc.num_swa_layers * num_slots * mc.sliding_window
+                * local_kv * mc.head_dim * self.kv_dtype.itemsize
+            )
         return total
 
     def _draft_model_bytes(self, config: EngineConfig) -> int:
