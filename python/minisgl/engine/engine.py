@@ -482,7 +482,7 @@ class Engine:
                 (mc.kv_lora_rank + mc.qk_rope_head_dim)
                 * config.page_size
                 * self.kv_dtype.itemsize
-                * mc.num_layers
+                * mc.num_kv_layers  # == num_layers for MLA (all-attention); matches pool alloc
             )
         else:
             cache_per_page = (
@@ -491,7 +491,7 @@ class Engine:
                 * div_even(mc.num_kv_heads, config.tp_info.size, allow_replicate=True)
                 * config.page_size
                 * self.kv_dtype.itemsize
-                * mc.num_layers
+                * mc.num_kv_layers  # only full-attn layers keep paged KV (GDN hybrid: 10, not 40)
             )
         num_pages = config.num_page_override
         if num_pages is None:
