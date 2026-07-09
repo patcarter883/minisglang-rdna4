@@ -12,6 +12,18 @@ if TYPE_CHECKING:
     from minisgl.layers.base import BaseOP
 
 
+def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
+    """Decide a compressed-tensors int4 checkpoint's packed sign convention from the nibble
+    distribution. Returns True if the packed nibbles are already uint4b8 (q+8; mode at 8 for
+    symmetric weights) -> pass through; False for two's-complement (mode at 0) -> XOR 0x88.
+    Samples a slice (the decision is uniform across a tensor's nibbles)."""
+    flat = packed.flatten()
+    sample = flat[: min(flat.numel(), 1 << 16)].to(torch.int64) & 0xFFFFFFFF
+    nib = torch.cat([(sample >> (4 * p)) & 0xF for p in range(8)])
+    counts = torch.bincount(nib, minlength=16)
+    return bool(counts[8] >= counts[0])
+
+
 @runtime_checkable
 class LinearMethod(Protocol):
     """How a parallel-linear layer allocates its weights and computes its matmul.
@@ -87,7 +99,13 @@ class W4A8LinearMethod:
                 f"CT dense needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
             )
             layer.weight_packed = torch.empty((N, K // pf), dtype=torch.int32)
-            layer.weight_scale = torch.empty((N, K // g), dtype=torch.bfloat16)
+            # pack-quantized scales ship fp16 (some heads ship bf16); the loader normalizes both to
+            # fp16 (engine._cast) so this one declared dtype matches every CT checkpoint.
+            layer.weight_scale = torch.empty((N, K // g), dtype=torch.float16)
+            if not self.quant.sym:
+                # ASYMMETRIC: per-group weight_zero_point, int4-packed 8-per-int32 along the OUTPUT
+                # dim (shape [N//pf, G]) — already the op's zeros layout. Loaded + used in process().
+                layer.weight_zero_point = torch.empty((N // pf, K // g), dtype=torch.int32)
             return
         # AWQ "gemm" layout: qweight (K, N//pf) i32, scales (K//group, N) f16,
         # qzeros (K//group, N//pf) i32 (asymmetric only).
@@ -99,18 +117,40 @@ class W4A8LinearMethod:
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         if self.quant.is_compressed_tensors:
-            # CT DENSE -> op layout: signed int4 -> unsigned (q+8) by flipping each nibble's top bit
-            # (XOR 0x88 per byte); constant zero-point 8 (zeros_op all 0x88). Mirrors the MoE-expert
-            # post_load without the E dim; then w4a8_linear consumes _w_packed_op/_scales_op/_zeros_op.
+            # CT DENSE -> op layout (constant zero-point 8; zeros_op all 0x88; scales as-is).
+            # The op wants weights as uint4b8 (nibble = q + 8). compressed-tensors "pack-quantized"
+            # ships int4 in one of TWO packings, per producer, that we must distinguish per checkpoint:
+            #   * two's-complement signed int4 (nibble = q & 0xF): convert to uint4b8 by flipping each
+            #     nibble's top bit — XOR 0x88 per byte — since (q&0xF)^8 == q+8 for q in [-8,7].
+            #   * already-offset uint4b8 (nibble = q + 8; AWQ-style zero_point=8, e.g. cyankiwi's
+            #     Qwen3.5/3.6 "AWQ-*-INT4" dense checkpoints): pass through UNCHANGED — an XOR here
+            #     would scramble it (it re-flips the top bit) and produce garbage.
+            # Symmetric weights make the two trivially separable by the packed nibble distribution:
+            # uint4b8 is a bell curve with its mode at 8 (q=0); two's-complement's mode is at 0.
             pf = 32 // self.quant.bits
             N, Kp = layer.weight_packed.shape  # type: ignore[attr-defined]
             G = layer.weight_scale.shape[-1]  # type: ignore[attr-defined]
-            flipped = (layer.weight_packed.contiguous().view(torch.uint8) ^ 0x88).view(torch.int32)
-            layer._w_packed_op = flipped.contiguous()
+            wp = layer.weight_packed.contiguous()  # type: ignore[attr-defined]
+            uint4b8 = _ct_packed_is_uint4b8(wp)
+            if uint4b8:
+                layer._w_packed_op = wp
+            else:
+                layer._w_packed_op = (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
             layer._scales_op = layer.weight_scale.to(torch.float16).contiguous()  # type: ignore[attr-defined]
-            zeros = torch.empty((N // pf, G), dtype=torch.int32)
-            zeros.view(torch.uint8).fill_(0x88)
-            layer._zeros_op = zeros.to(layer.weight_packed.device)
+            zp = getattr(layer, "weight_zero_point", None)
+            if zp is None:
+                # SYMMETRIC: constant zero-point 8 (uint4b8), zeros_op all 0x88.
+                zeros = torch.empty((N // pf, G), dtype=torch.int32)
+                zeros.view(torch.uint8).fill_(0x88)
+                layer._zeros_op = zeros.to(wp.device)
+            else:
+                # ASYMMETRIC: real per-group zero_point, already int4-packed [N//pf, G] along N (the
+                # op's zeros layout). It shares the weight's sign convention (same quantizer), so apply
+                # the SAME uint4b8-vs-two's-complement transform: W_u and Z_u then live in one unsigned
+                # domain and the op computes scale*(W_u - Z_u) = scale*(q - zp), exact.
+                zp = zp.contiguous()
+                layer._zeros_op = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+                del layer.weight_zero_point
             del layer.weight_packed, layer.weight_scale
             return
         qz = getattr(layer, "qzeros", None)

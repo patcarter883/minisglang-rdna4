@@ -5,6 +5,19 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def _norm_ignore(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """Strip the multimodal wrapper infix so ignore entries — stored in the checkpoint's native
+    key space (e.g. 'model.language_model.layers.0.linear_attn.in_proj_b') — match the loader's
+    de-wrapped module names ('model.layers.0.linear_attn.in_proj_b'; the loader strips
+    'language_model.'). `re:`-prefixed regexes are left untouched (the author controls them)."""
+    out = []
+    for p in patterns:
+        if p and not p.startswith("re:"):
+            p = p.replace("language_model.", "")
+        out.append(p)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class QuantConfig:
     """Parsed weight-quantization config (W4A8 family). Phase 2 targets AWQ (dense,
@@ -87,7 +100,7 @@ class QuantConfig:
                 bits=int(d.get("bits", 4)),
                 group_size=int(d.get("group_size", 128)),
                 sym=not bool(d.get("zero_point", True)),  # AWQ is asymmetric by default
-                ignore=not_convert,
+                ignore=_norm_ignore(not_convert),
             )
         if method == "gptq":
             # GPTQ int4: qweight int32 packed along INPUT (K//pf, N), per-group scales (K//g, N),
@@ -99,7 +112,7 @@ class QuantConfig:
                 group_size=int(d.get("group_size", 128)),
                 sym=bool(d.get("sym", True)),
                 desc_act=bool(d.get("desc_act", False)),
-                ignore=not_convert,
+                ignore=_norm_ignore(not_convert),
             )
         if method == "rxf":
             # RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) with a fixed Hadamard rotation.
@@ -111,19 +124,29 @@ class QuantConfig:
                 group_size=32,
                 sym=True,
                 rotation_span=int(d.get("rotation_span", 32)),
-                ignore=tuple(d.get("ignore", ()) or ()),  # e.g. a bf16 MTP head (re:^model\.layers\.47\.)
+                ignore=_norm_ignore(tuple(d.get("ignore", ()) or ())),  # e.g. a bf16 MTP head
             )
         if method in ("compressed-tensors", "compressed_tensors"):
-            # Minimal parse; full per-group/ignore handling is Phase 3 (the 35B).
+            # Read group_size / num_bits / symmetric off the FIRST weights group (uniform across
+            # groups for these checkpoints). ASYMMETRIC (symmetric:false) ships a per-group
+            # weight_zero_point tensor; the linear method loads and uses it (vs the symmetric
+            # constant zero-point 8). Config-driven, not model-specific.
             ignore = tuple(d.get("ignore", ()) or ())
-            gs = 32
+            gs, bits, sym = 32, 4, True
             groups = d.get("config_groups") or {}
             for g in groups.values():
                 w = (g or {}).get("weights") or {}
+                if not w:
+                    continue
                 if w.get("group_size"):
                     gs = int(w["group_size"])
-                    break
+                if w.get("num_bits"):
+                    bits = int(w["num_bits"])
+                if "symmetric" in w and w["symmetric"] is not None:
+                    sym = bool(w["symmetric"])
+                break
             return cls(
-                method="compressed-tensors", bits=4, group_size=gs, sym=True, ignore=ignore
+                method="compressed-tensors", bits=bits, group_size=gs, sym=sym,
+                ignore=_norm_ignore(ignore),
             )
         return None  # unsupported scheme -> treat as unquantized (will likely fail to load)

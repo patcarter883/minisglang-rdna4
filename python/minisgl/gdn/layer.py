@@ -28,13 +28,64 @@ re-verified against the live RDNA4 path in 3b-3.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
+if TYPE_CHECKING:
+    from minisgl.quant.method import LinearMethod
+
 # The GDN compute kernels (conv, gated-delta-rule prefill/decode, the gated RMSNorm) are now native
 # HIP (torch.ops.gdn_hip.*), AOT-compiled, no Triton JIT. Importing this layer no longer drags in the
 # vendored Triton tree at all.
+
+
+class _MethodLinear(nn.Module):
+    """A quantized linear that lives INSIDE the GDN nn.Module (so the existing nn.Module state
+    bridge — GDNLinearAttn delegating to the wrapped module with assign=True — loads it), but
+    delegates weight layout + the GEMM to the GENERIC minisgl `LinearMethod` (the same
+    `create_linear_method` the dense/MoE linears use: W4A8 for AWQ/GPTQ/compressed-tensors int4,
+    RXF for rxf, any future scheme for free). It registers the method's CHECKPOINT buffers
+    (weight_packed/scale[/zero_point]) as nn buffers so load reaches them; `process_quant()`
+    converts them to op layout (post-load); forward runs the method's quantized matmul.
+
+    No dequant-to-bf16 at load: the int4 packs + scales load as-is and the kernel dequants
+    in-register during the GEMM (int4 weight x fp8 activation, exactly like the dense linears)."""
+
+    def __init__(self, in_features: int, out_features: int, method: "LinearMethod", *, device) -> None:
+        super().__init__()
+        self._method = method
+
+        class _Holder:  # create_weights sets plain attrs; we lift them to nn buffers
+            pass
+
+        holder = _Holder()
+        with torch.device(device):  # build on meta -> no real allocation until load(assign=True)
+            method.create_weights(holder, out_features, in_features)
+        for name, t in vars(holder).items():
+            self.register_buffer(name, t)
+
+    def process_quant(self) -> None:
+        proc = getattr(self._method, "process_weights_after_load", None)
+        if proc is not None:
+            proc(self)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._method.apply(self, x, None)
+
+
+def _make_proj(
+    in_features: int, out_features: int, method: "LinearMethod | None", dtype, device
+) -> nn.Module:
+    """Build one GDN projection. Unquantized (or no method) -> a plain bf16/fp16 `nn.Linear` (the
+    35B path, and the CAM-training path which needs a differentiable `F.linear` on `.weight`).
+    A quantized method -> `_MethodLinear` (int4 packs + the shared quant kernel)."""
+    from minisgl.quant.method import UnquantizedLinearMethod
+
+    if method is None or isinstance(method, UnquantizedLinearMethod):
+        return nn.Linear(in_features, out_features, bias=False, dtype=dtype, device=device)
+    return _MethodLinear(in_features, out_features, method, device=device)
 
 
 class GatedRMSNormWeight(nn.Module):
@@ -64,6 +115,9 @@ class QwenGatedDeltaNet(nn.Module):
         activation: str = "silu",
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cuda",
+        qkvz_method: "LinearMethod | None" = None,
+        ba_method: "LinearMethod | None" = None,
+        out_proj_method: "LinearMethod | None" = None,
     ) -> None:
         super().__init__()
         # Tensor parallel: GDN is purely HEAD-parallel — each rank owns num_*_heads/tp_size key &
@@ -83,18 +137,22 @@ class QwenGatedDeltaNet(nn.Module):
         self.head_v_dim = head_v_dim
         self.conv_kernel_size = conv_kernel_size
         self.activation = activation
+        self._proj_dtype = dtype  # output dtype of the projections (== model dtype)
 
         self.key_dim = head_k_dim * self.num_k_heads
         self.value_dim = head_v_dim * self.num_v_heads
         self.conv_dim = self.key_dim * 2 + self.value_dim
 
-        # Projections (bias-free, like the reference). in_proj_qkvz packs q,k,v,z;
-        # in_proj_ba packs b,a (per-v-head scalars).
-        self.in_proj_qkvz = nn.Linear(
-            hidden_size, self.key_dim * 2 + self.value_dim * 2, bias=False, dtype=dtype, device=device
+        # Projections (bias-free, like the reference). in_proj_qkvz packs q,k,v,z; in_proj_ba packs
+        # b,a (per-v-head scalars). Each is either bf16 `nn.Linear` (35B / CAM) or a quantized
+        # `_MethodLinear` — config-driven, decided by the caller via create_linear_method. in_proj_ba
+        # (the tiny per-head beta/decay scalars) is kept full precision in every shipped GDN
+        # checkpoint, so its method is normally unquantized; qkvz/out_proj follow the config.
+        self.in_proj_qkvz = _make_proj(
+            hidden_size, self.key_dim * 2 + self.value_dim * 2, qkvz_method, dtype, device
         )
-        self.in_proj_ba = nn.Linear(
-            hidden_size, 2 * self.num_v_heads, bias=False, dtype=dtype, device=device
+        self.in_proj_ba = _make_proj(
+            hidden_size, 2 * self.num_v_heads, ba_method, dtype, device
         )
         # conv1d weight mirrors the checkpoint shape (conv_dim, 1, kernel); the kernels
         # take a (conv_dim, kernel) view. Depthwise causal short-conv, bias-free here.
@@ -107,9 +165,7 @@ class QwenGatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32, device=device))
 
         self.norm = GatedRMSNormWeight(head_v_dim, eps=eps, device=device, dtype=dtype)
-        self.out_proj = nn.Linear(
-            self.value_dim, hidden_size, bias=False, dtype=dtype, device=device
-        )
+        self.out_proj = _make_proj(self.value_dim, hidden_size, out_proj_method, dtype, device)
 
         # fp32 caches of the two FROZEN weights the gdn_hip kernels consume at fp32: the depthwise
         # conv weight and the gated-RMSNorm weight. Both are model parameters — constant after the
@@ -161,7 +217,7 @@ class QwenGatedDeltaNet(nn.Module):
     def _output_projection(self, core_attn_out: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
-        out_dtype = self.out_proj.weight.dtype
+        out_dtype = self._proj_dtype
         # bf16-native rmsnorm_gated: reads x/z at the input dtype, up-casts to fp32 for the norm, writes
         # back at the input dtype. .contiguous() (was implicit in the old .float() copy) is required:
         # core is a reshape of the gdn output, and z is a strided slice of the qkvz projection.
@@ -194,7 +250,7 @@ class QwenGatedDeltaNet(nn.Module):
         # _output_projection) is only differentiable if gdn_hip.autograd.enable() has been called to
         # register its formula. The training path must NOT depend on that process-wide global, so use
         # the self-contained rmsnorm_gated_train wrapper here (this was the 24-layer backward-cos drop).
-        out_dtype = self.out_proj.weight.dtype
+        out_dtype = self._proj_dtype
         core = core.reshape(-1, core.shape[-1]).contiguous()          # [T*num_v_heads, head_v_dim]
         z_flat = z.reshape(-1, z.shape[-1]).contiguous()
         normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
@@ -223,7 +279,7 @@ class QwenGatedDeltaNet(nn.Module):
             v.reshape(B, T, self.num_v_heads, self.head_v_dim),
             a.reshape(B, T, self.num_v_heads).contiguous(), b.reshape(B, T, self.num_v_heads).contiguous(),
             self.A_log, self.dt_bias, self.head_k_dim ** -0.5, 1)  # [B,T,num_v_heads,head_v_dim]
-        out_dtype = self.out_proj.weight.dtype
+        out_dtype = self._proj_dtype
         core = core.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
         z_flat = z.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
         normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
@@ -389,6 +445,14 @@ class QwenGatedDeltaNet(nn.Module):
             ssm_state, state_idx, self.head_k_dim ** -0.5, 1,
         )  # [B, num_v_heads, head_v_dim] at the input (model) dtype
         return self._output_projection(core, z, n)
+
+    # ---- post-load: convert any quantized projection to its op layout (int4 packs -> kernel buffers) ----
+    def process_quant(self) -> None:
+        """Finalize the quantized projections after the checkpoint load (called by the
+        GDNLinearAttn bridge's post_load). A no-op for bf16 (`nn.Linear`) projections."""
+        for proj in (self.in_proj_qkvz, self.in_proj_ba, self.out_proj):
+            if isinstance(proj, _MethodLinear):
+                proj.process_quant()
 
     # ---- warmup hook — no-op now that the conv is AOT HIP (no Triton autotune to settle) ----
     @torch.no_grad()

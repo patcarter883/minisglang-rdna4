@@ -132,6 +132,16 @@ _QWEN35_CONCAT = {
     _GATE_UP[0]: (".mlp.gate_up_proj.weight", _GATE_UP, 0),
     _GATE_UP[1]: (".mlp.gate_up_proj.weight", _GATE_UP, 0),
 }
+# QUANTIZED GDN in_proj (compressed-tensors 27B): in_proj_qkv + in_proj_z are quantized, so their
+# weight_packed / weight_scale / weight_zero_point concat into in_proj_qkvz.<field> along the OUTPUT
+# dim (0) — output channels are independent under group-wise W4A16, and the zero_point is int4-packed
+# 8-per-int32 ALONG N (each part's N is a multiple of 8: 10240 & 6144), so the packed-row concat is
+# exact. Same ordered [qkv, z] members as the bf16 _QKVZ; in_proj_a/b stay bf16 (.weight, above).
+for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
+    _qz = (f".linear_attn.in_proj_qkv.{_fld}", f".linear_attn.in_proj_z.{_fld}")
+    _merged = f".linear_attn.in_proj_qkvz.{_fld}"
+    _QWEN35_CONCAT[_qz[0]] = (_merged, _qz, 0)
+    _QWEN35_CONCAT[_qz[1]] = (_merged, _qz, 0)
 
 
 def _gate_up_merge(key: str):
@@ -230,6 +240,32 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
         return t.chunk(n, dim=0)[r].clone()  # z (value_dim) / b,a,A_log,dt_bias (per v-head)
     if name.endswith(".linear_attn.out_proj.weight"):
         return t.chunk(n, dim=1)[r].clone()  # row-parallel (input value_dim/n) + all-reduce
+
+    # QUANTIZED GDN in_proj (compressed-tensors 27B): the same head-parallel splits as the bf16
+    # rules, applied per checkpoint field. in_proj_qkv is the [q|k|v] head-block col split (output N,
+    # dim 0); in_proj_z is a plain col split (z, value_dim); out_proj is row-parallel (input, dim 1).
+    # weight_zero_point is int4-packed 8-per-int32 ALONG N, so its qkv head-blocks are in PACKED units
+    # (key_dim//pf, value_dim//pf) — each block is a multiple of pf and divisible by n, keeping whole
+    # heads on a rank. Applied at READ, BEFORE the qkvz concat above, so the concat composes the
+    # pre-sharded parts. (n==1 already returned; nothing runs at TP=1.)
+    if config.quant is not None:
+        pf = 32 // config.quant.bits
+        if name.endswith(
+            (".linear_attn.in_proj_qkv.weight_packed", ".linear_attn.in_proj_qkv.weight_scale")
+        ):
+            return _shard_blocks_dim0(t, [key_dim, key_dim, value_dim], r, n)
+        if name.endswith(".linear_attn.in_proj_qkv.weight_zero_point"):
+            return _shard_blocks_dim0(t, [key_dim // pf, key_dim // pf, value_dim // pf], r, n)
+        if name.endswith(
+            (".linear_attn.in_proj_z.weight_packed", ".linear_attn.in_proj_z.weight_scale",
+             ".linear_attn.in_proj_z.weight_zero_point")
+        ):
+            return t.chunk(n, dim=0)[r].clone()  # z: col-parallel (output value_dim)
+        if name.endswith(
+            (".linear_attn.out_proj.weight_packed", ".linear_attn.out_proj.weight_scale",
+             ".linear_attn.out_proj.weight_zero_point")
+        ):
+            return t.chunk(n, dim=1)[r].clone()  # out_proj: row-parallel (input value_dim/group)
     # .linear_attn.norm.weight (head_v_dim) is per-head -> replicate (falls through)
 
     # ---- full attention (head-parallel; same rules as the dense path) ----
@@ -266,6 +302,31 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     if name.endswith((".gate_proj.weight", ".up_proj.weight")):
         return t.chunk(n, dim=0)[r].clone()
     if name.endswith(".down_proj.weight"):
+        return t.chunk(n, dim=1)[r].clone()
+
+    # ---- FULLY-dense-quantized (compressed-tensors) linears: the dense 27B quantizes q/k/v/o AND
+    # the MLP, so their weight_packed [N, K//pf] / weight_scale [N, K//g] (N-major, output on dim 0)
+    # need the SAME TP splits as the bf16 .weight rules above — column-parallel q/k/v + gate/up split
+    # the output N (dim 0); row-parallel o + down split the input K (packed/group dim 1). Without
+    # this the quantized dense weights fall through to REPLICATE and every rank loads the whole model
+    # (~13.5 GB int4) -> OOM at load. (`.mlp.experts.*` is handled + returned above, so these
+    # unqualified suffixes only match the dense linears.) q_proj carries q+gate per head; output-dim
+    # chunk keeps whole heads on a rank, as for the bf16 path. ----
+    # weight_zero_point (asymmetric CT, [N//pf, G]) follows the SAME axis: for a column-parallel
+    # linear it is packed along the OUTPUT N, so it splits dim 0 with weight_packed/scale; for a
+    # row-parallel linear the output N (packed dim 0) is replicated and the input group dim 1 splits.
+    if name.endswith(
+        (".q_proj.weight_packed", ".q_proj.weight_scale", ".q_proj.weight_zero_point",
+         ".k_proj.weight_packed", ".k_proj.weight_scale", ".k_proj.weight_zero_point",
+         ".v_proj.weight_packed", ".v_proj.weight_scale", ".v_proj.weight_zero_point",
+         ".gate_proj.weight_packed", ".gate_proj.weight_scale", ".gate_proj.weight_zero_point",
+         ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point")
+    ):
+        return t.chunk(n, dim=0)[r].clone()
+    if name.endswith(
+        (".o_proj.weight_packed", ".o_proj.weight_scale", ".o_proj.weight_zero_point",
+         ".down_proj.weight_packed", ".down_proj.weight_scale", ".down_proj.weight_zero_point")
+    ):
         return t.chunk(n, dim=1)[r].clone()
 
     # ---- vocab-parallel embedding + untied lm_head ----
