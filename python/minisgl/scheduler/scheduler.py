@@ -1155,8 +1155,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
              drafts — it accepts all and commits KV/state/bonus.
         The tree buys a longer accepted path than the argmax chain; the 2-forward segmented-tree variant
         (removing forward 3) is the follow-up. K=MINISGL_DDTREE_TOPK, budget=MINISGL_DDTREE_BUDGET."""
-        K = int(os.environ.get("MINISGL_DDTREE_TOPK", "8"))
-        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET", "24"))
+        K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
+        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "24")
         from minisgl.spec.ddtree import build_draft_tree
         # forward 1: marginals + argmax chain
         argmax_drafts = self._tidar_block_predict(reqs, B, mask_id, topk=K)
@@ -1193,8 +1193,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
           3. commit: the linear verify over [bonus | accepted-path] (_spec_decode_step ddtree_drafts) —
              correct causal context, re-captures the target aux for the next block, emits + rolls back.
         K=MINISGL_DDTREE_TOPK (default 8), budget=MINISGL_DDTREE_BUDGET (default 32)."""
-        K = int(os.environ.get("MINISGL_DDTREE_TOPK", "8"))
-        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET", "32"))
+        K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
+        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "32")
         from minisgl.spec.ddtree import build_draft_tree
 
         spec = self.engine.spec_config
