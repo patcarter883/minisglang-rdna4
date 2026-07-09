@@ -49,3 +49,23 @@ class TokenizeMsg(BaseTokenizerMsg):
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+
+
+@dataclass
+class StatsMsg(BaseTokenizerMsg):
+    """Periodic scheduler-side metrics snapshot, piggybacked on the scheduler -> detokenizer ZMQ path
+    (no new socket). The detokenizer forwards it to the frontend as a StatsFrontendMsg, where it feeds
+    the /metrics endpoint. One per DP replica per flush; the frontend sums across replicas. Counters
+    are cumulative (monotonic); the running/waiting/kv/gdn fields are instantaneous gauges."""
+
+    dp_rank: int
+    spec_draft_tokens: int
+    spec_accepted_tokens: int
+    spec_emitted_tokens: int
+    spec_steps: int
+    running_requests: int
+    waiting_requests: int
+    kv_tokens_total: int
+    kv_tokens_used: int
+    gdn_slots_total: int
+    gdn_slots_used: int

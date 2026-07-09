@@ -3,7 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final, List
 
 import torch
-from minisgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg
+from minisgl.message import (
+    BaseBackendMsg,
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeMsg,
+    StatsMsg,
+)
 from minisgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
 if TYPE_CHECKING:
@@ -78,7 +84,20 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
+    def _flush_stats(self) -> None:
+        """Metrics snapshot hook. Overridden with the real sampler on the Scheduler; a bare mixin (or
+        a scheduler built before metrics wiring) no-ops."""
+        return
+
+    def _emit_stats(self, msg: StatsMsg) -> None:
+        """Push a scheduler metrics snapshot down the detokenizer link (tp-primary only). Rides the
+        existing scheduler -> detokenizer PUSH socket; the detokenizer forwards it to the frontend."""
+        sock = getattr(self, "_send_into_tokenizer", None)
+        if sock is not None:
+            sock.put(msg)
+
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
+        self._flush_stats()
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
@@ -94,6 +113,7 @@ class SchedulerIOMixin:
         # PUB/SUB stream. (The old code special-cased the blocking first message — sending it
         # out-of-band before the count broadcast — which hard-deadlocked whenever rank0's and rank1's
         # `blocking` differed: rank0 stuck in broadcast() while rank1 waited forever in get().)
+        self._flush_stats()
         raw_msgs: List[bytes] = []
         if blocking:
             self.run_when_idle()
