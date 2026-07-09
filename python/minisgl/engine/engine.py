@@ -261,6 +261,39 @@ class Engine:
         else:
             self.cca_state = None  # type: ignore[var-annotated]  # CCAStateCache | None
 
+        # ======================= CAM editable-memory (Option B, Phase 0) ========================
+        # Build the CAM store+tap+router IN THE BACKEND, reusing the SERVED model's weights (no
+        # co-located 8 GB HF base — that is the whole point of the backend model-share). Gated OFF by
+        # default: only when MINISGL_CAM=1 + MINISGL_CAM_CHECKPOINT is a real dir AND the model exposes
+        # the L24 tap seam (stage_cam). Off → cam_state stays None → the tap hook is a byte-exact no-op,
+        # so dense/GDN serving is completely unperturbed. Per-request staging + seed-once decode is
+        # Phase 1 (scheduler); this block only builds the state and registers the tap layer.
+        self.cam = None
+        _cam_ckpt = os.environ.get("MINISGL_CAM_CHECKPOINT")
+        inner = getattr(self.model, "model", None)
+        if (os.environ.get("MINISGL_CAM") == "1" and _cam_ckpt and os.path.isdir(_cam_ckpt)
+                and inner is not None and hasattr(inner, "stage_cam")):
+            try:
+                from minisgl.cam.memory import CAMMemory
+                # Resolve the REAL lm_head weight: Qwen3.5 ties word embeddings, so ParallelLMHead
+                # pops its own weight at load and keeps a meta placeholder — the live table is the tied
+                # embedding's (embed_tokens.weight). Use it; fall back to the head's own weight if untied.
+                _lmh = self.model.lm_head
+                _lm_w = (_lmh.tied_embedding.weight if getattr(_lmh, "tied_embedding", None) is not None
+                         else _lmh.weight)
+                cam = CAMMemory(_cam_ckpt, inner.embed_tokens, _lm_w)
+                if cam.enabled:
+                    self.cam = self.ctx.cam_state = cam
+                    inner.stage_cam(cam, None, None)  # register the cam + tap_layer; no bank => no-op
+                    logger.info_rank0(
+                        f"CAM: backend memory built from {_cam_ckpt} "
+                        f"(tap_layer={cam.tap_layer}, n_banks={cam.n_banks}) — model-share, no HF copy"
+                    )
+                else:
+                    logger.warning_rank0(f"CAM: checkpoint {_cam_ckpt} loaded DISABLED — memory off")
+            except Exception as e:  # noqa: BLE001 — CAM must never break normal serving
+                logger.warning_rank0(f"CAM: backend build failed ({e}) — memory off, serving unaffected")
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -314,6 +347,7 @@ class Engine:
             dummy_req=self.dummy_req,
             gdn_state=self.gdn_state,
             cca_state=self.cca_state,
+            cam=self.cam,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
