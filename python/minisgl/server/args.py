@@ -18,6 +18,10 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    # Reasoning-content extraction for thinking models. "auto"/"qwen3"/"deepseek_r1"/"glm" split the
+    # completion on `</think>` into reasoning_content + content; "none" disables it. See
+    # server/reasoning.py. Safe no-op on models that never emit the closing tag.
+    reasoning_parser: str = "auto"
     # Server-side DEFAULT Markovian-RSA parameters (set by the --rsa-* flags). A per-request `rsa`
     # field on /v1/chat/completions patches these; RSA runs ONLY when a request opts in (rsa present
     # and enabled), so a normal call is an ordinary single completion. See api_server.v1_completions.
@@ -254,6 +258,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
+    )
+
+    parser.add_argument(
+        "--reasoning-parser",
+        type=str,
+        dest="reasoning_parser",
+        default=ServerArgs.reasoning_parser,
+        choices=["auto", "none", "qwen3", "qwen", "deepseek_r1", "deepseek-r1", "glm"],
+        help="Reasoning-content parser for thinking models. Splits a completion on the closing "
+        "think tag (</think>) into reasoning_content + content on /v1/chat/completions. 'auto' "
+        "(default) uses <think>/</think> and is a safe no-op on models that never emit the tag; "
+        "'none' disables it.",
     )
 
     # --- speculative decoding (off by default; see SPEC_DECODE.md) -------------------------------
