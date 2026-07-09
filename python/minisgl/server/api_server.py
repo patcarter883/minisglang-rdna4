@@ -30,7 +30,7 @@ from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from .metrics import BackendSnapshot, FrontendMetrics
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
@@ -83,7 +83,12 @@ class OpenAICompletionRequest(BaseModel):
     prompt: str | None = None
     messages: List[Message] | None = None
 
-    max_tokens: int = 16
+    # OpenAI renamed `max_tokens` -> `max_completion_tokens` (max_tokens is deprecated but still sent
+    # by older clients). Accept BOTH and coalesce: max_tokens ?? max_completion_tokens ?? 16. Kept as
+    # `int | None` so the validator can tell "unset" from an explicit value; downstream code reads the
+    # coalesced int `max_tokens`.
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     temperature: float = 1.0
 
     top_k: int = -1
@@ -121,6 +126,14 @@ class OpenAICompletionRequest(BaseModel):
     # defaults for THIS call: {n, k, t, tail_tokens, max_tokens, agg_max_tokens, temperature,
     # selection, max_concurrency, max_retries, enabled}. `false` -> force a plain completion.
     rsa: bool | dict | None = None
+
+    @model_validator(mode="after")
+    def _coalesce_max_tokens(self) -> "OpenAICompletionRequest":
+        """max_tokens ?? max_completion_tokens ?? 16 — accept the OpenAI-renamed field. After this,
+        `self.max_tokens` is always the resolved int the rest of the code reads."""
+        if self.max_tokens is None:
+            self.max_tokens = self.max_completion_tokens if self.max_completion_tokens is not None else 16
+        return self
 
 
 def _grammar_from_response_format(rf: dict | None) -> str | None:
