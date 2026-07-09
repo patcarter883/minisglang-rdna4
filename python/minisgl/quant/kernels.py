@@ -184,10 +184,13 @@ def w4a8_moe(
     topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
     block_m: int = 16,
+    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
 ) -> torch.Tensor:
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
     w4a8_fp8_wmma `_run_grouped_moe` (non-GEMV, unfused-silu) path. Returns (M, K).
+    `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight decode instead of uniform int4
+    (the scales are the E8M0 group exponents folded to fp16; w13_zeros/w2_zeros MUST be None).
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
@@ -246,7 +249,7 @@ def w4a8_moe(
         "gemm1",
         lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
             x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
-            kernel=gemm1_kernel, w_zeros=w13_zeros,
+            kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, 2*inter)
     d = out1.shape[1] // 2
@@ -275,6 +278,7 @@ def w4a8_moe(
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         if _MOE_SPLITK >= 2 and M == 1:  # split-K only helps the M==1 grid (M>=2 has enough blocks)
+            assert not weight_is_e2m1, "moe_splitk scatter has no MXFP4 (e2m1) decode path"
             import moe_splitk_hip  # canonical package: op is a module-level callable
 
             _moe_time(
@@ -289,7 +293,7 @@ def w4a8_moe(
                 "gemm2scat",
                 lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
                     buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
-                    kernel=gemm2_kernel, w_zeros=w2_zeros,
+                    kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
                 ),
             )  # writes acc in place
         _moe_report()
@@ -300,7 +304,7 @@ def w4a8_moe(
         "gemm2",
         lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
             buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
-            kernel=gemm2_kernel, w_zeros=w2_zeros,
+            kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, K)
     acc = _moe_time(
@@ -571,12 +575,17 @@ def w4a8_linear(
     w_zeros: torch.Tensor | None,  # (N/8, K/group) int32 (AWQ asym) or None (sym)
     group_size: int,
     kernel: str | None = None,
+    weight_is_e2m1: bool = False,  # True -> decode nibbles as MXFP4 (OCP E2M1); w_zeros must be None
 ) -> torch.Tensor:
     """Dense W4A8 GEMM: (M, K) @ (N, K)^T -> (M, N). Returns the op's fp16 output;
-    the caller casts back to the activation dtype."""
+    the caller casts back to the activation dtype. `weight_is_e2m1=True` selects the kernel's MXFP4
+    (E2M1) weight decode instead of uniform int4 (scales are the E8M0 group exponents folded to
+    fp16; w_zeros MUST be None — the op asserts symmetric)."""
     import w4a8_fp8_wmma
 
     x2d = x if x.dtype == torch.float16 else x.to(torch.float16)  # op computes in fp16
     if kernel is None:
         kernel = _pick_dense_kernel(x2d.shape[0])
-    return w4a8_fp8_wmma.mmq_fp8_gemm(x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros)
+    return w4a8_fp8_wmma.mmq_fp8_gemm(
+        x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
+    )

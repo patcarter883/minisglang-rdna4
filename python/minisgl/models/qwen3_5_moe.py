@@ -14,7 +14,6 @@ Serve is gated on TP=2 (the 35B does not fit one 16 GB card); weight map = Phase
 """
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -55,9 +54,10 @@ class Qwen3_5MoeSharedExpert(BaseOP):
 
 
 class Qwen3_5MoeSparseBlock(BaseOP):
-    """Router gate + shared gate + shared expert are F16; only the routed experts carry the AWQ
-    int4 quant (MoELayer's W4A8 grouped path). `expert_quant` is threaded in separately because
-    the surrounding backbone config has quant=None (the backbone is unquantized)."""
+    """Router gate + shared gate + shared expert are F16 (in the checkpoint's quant ignore list);
+    only the routed experts carry the int4/mxfp4 quant (MoELayer's grouped path). `expert_quant` is
+    threaded in separately so the routed-expert precision is explicit here — the surrounding backbone
+    config now keeps the real quant (per-module is_module_quantized gates each backbone linear)."""
 
     def __init__(self, config: "ModelConfig", expert_quant: "QuantConfig | None"):
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
@@ -93,10 +93,14 @@ class Qwen3_5MoeSparseBlock(BaseOP):
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     def __init__(self, config: "ModelConfig"):
-        # Only the routed experts are quantized; build the GDN/attention/norm backbone in F16
-        # (quant=None) and hand the real AWQ quant to the experts via the mlp_factory closure.
+        # Config-driven per-module quant across the WHOLE model. The backbone keeps the real quant
+        # config; each GDN/attention projection is gated by is_module_quantized (the checkpoint's
+        # ignore list), so the AWQ 35B (entire backbone in modules_to_not_convert) stays bf16 while
+        # the MXFP4 checkpoint (GDN in_proj_qkv/z/a/b + out_proj quantized; self_attn, conv1d, norm,
+        # gates, shared_expert in the ignore list) builds exactly those projections mxfp4. The routed
+        # experts still get the quant via the mlp_factory closure. No model-name branch.
         expert_quant = config.quant
-        backbone_cfg = dataclasses.replace(config, quant=None)
+        backbone_cfg = config
 
         def mlp_factory(cfg: "ModelConfig") -> BaseOP:
             return Qwen3_5MoeSparseBlock(cfg, expert_quant)

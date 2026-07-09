@@ -99,16 +99,27 @@ class Qwen3_5Attn(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         head_dim = config.head_dim
         nqo, nkv = config.num_qo_heads, config.num_kv_heads
-        qm = create_linear_method(config.quant)
+        # Per-projection quant is CONFIG-DRIVEN (like the GDN in_proj below): a self_attn projection
+        # is quantized iff the checkpoint's quant config declares its module quantized (NOT in the
+        # `ignore` list). The AWQ 35B keeps q/k/v/o bf16 (whole backbone in modules_to_not_convert);
+        # the MXFP4 checkpoint ALSO keeps self_attn bf16 (its q/k/v/o sit in the ignore list) while
+        # quantizing the GDN in_proj — the precision falls out of the config, no model-name branch.
+        q = config.quant
+
+        def _attn_method(module: str) -> "object":
+            name = f"model.layers.{layer_id}.self_attn.{module}"
+            quantized = q is not None and q.is_module_quantized(name)
+            return create_linear_method(q, quantized=quantized)
+
         # q_proj emits q + gate (2x), interleaved per head: [head_h q | head_h gate].
         self.q_proj = LinearColParallelMerged(
-            config.hidden_size, [2 * nqo * head_dim], has_bias=False, quant_method=qm
+            config.hidden_size, [2 * nqo * head_dim], has_bias=False, quant_method=_attn_method("q_proj")
         )
         self.k_proj = LinearColParallelMerged(
-            config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=qm
+            config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=_attn_method("k_proj")
         )
         self.v_proj = LinearColParallelMerged(
-            config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=qm
+            config.hidden_size, [nkv * head_dim], has_bias=False, quant_method=_attn_method("v_proj")
         )
         # Qwen3.5 RMSNorm uses the (1 + weight) gain convention (weight init 0), UNLIKE the dense
         # Qwen3 plain-weight norm. Applies to all Qwen3_5RMSNorm sites (q/k norm, input/post/final
@@ -125,7 +136,7 @@ class Qwen3_5Attn(BaseOP):
             k_norm=self.k_norm,
         )
         self.o_proj = LinearOProj(
-            head_dim * nqo, config.hidden_size, has_bias=False, quant_method=qm
+            head_dim * nqo, config.hidden_size, has_bias=False, quant_method=_attn_method("o_proj")
         )
         self._head_dim = head_dim
         # LOCAL qo-head count: q_proj is column-parallel, so under TP each rank emits nqo/tp heads

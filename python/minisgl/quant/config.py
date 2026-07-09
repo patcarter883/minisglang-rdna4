@@ -75,9 +75,10 @@ class QuantConfig:
 
     @property
     def weight_is_e2m1(self) -> bool:
-        """Hook for MXFP4 (compressed-tensors float-quantized 4-bit, e2m1 microscaled weights).
-        Not yet implemented here — a distinct kernel path from both int4-W4A8 and fp8-W8A8. Kept as
-        a config-level predicate so the MoE/linear selectors can route to it once the kernel lands."""
+        """MXFP4: compressed-tensors float-quantized 4-bit (OCP E2M1 weights + E8M0 per-32-block
+        scale, `format: mxfp4-pack-quantized`). Served through the SAME W4A8 fp8-WMMA kernel as int4
+        with `weight_is_e2m1=True` — a different 4-bit decode table + E8M0->fp16 group scale, not a
+        new kernel. Routes MxFp4LinearMethod (dense) / _MxFp4MoEMethod (experts)."""
         return self.is_compressed_tensors and self.weight_type == "float" and self.bits == 4
 
     @property

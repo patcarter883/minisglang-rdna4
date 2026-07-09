@@ -188,6 +188,64 @@ class W4A8LinearMethod:
         return out
 
 
+class MxFp4LinearMethod:
+    """MXFP4 (OCP E2M1 weights + E8M0 per-32-block scale) dense linear, served through the SAME
+    W4A8 fp8-WMMA kernel as int4 with `weight_is_e2m1=True` (per-token fp8 activations). The
+    checkpoint (compressed-tensors `mxfp4-pack-quantized`) ships weights ALREADY in a compact
+    packed form — weight_packed uint8 (N, K//2) 2 E2M1 nibbles/byte + weight_scale uint8 (N, K//32)
+    E8M0 group exponent — so `process_weights_after_load` runs the MXFP4 converter (nibbles ->
+    (N,K//8) int32 codes verbatim; E8M0 -> fp16 group scale) and drops the checkpoint copies.
+    Symmetric (no zero-points). Config-selected purely from `quant.weight_is_e2m1`."""
+
+    def __init__(self, quant: QuantConfig) -> None:
+        self.quant = quant
+
+    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
+        N, K = out_features, in_features
+        g = self.quant.group_size  # 32 (OCP MX block)
+        assert K % 2 == 0 and K % g == 0 and N % 8 == 0, (
+            f"MXFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
+        )
+        # CHECKPOINT layout (uint8), so BaseOP load matches. E8M0 scale is an integer exponent, NOT
+        # a float — declared uint8 so the engine's _cast leaves it untouched (see engine._cast).
+        layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
+        layer.weight_scale = torch.empty((N, K // g), dtype=torch.uint8)
+
+    def process_weights_after_load(self, layer: "BaseOP") -> None:
+        from . import mxfp4
+
+        conv = mxfp4.convert_mxfp4_weight(layer.weight_packed, layer.weight_scale)  # type: ignore[attr-defined]
+        info = conv["scale_info"]
+        if not info["fp16_range_ok"]:
+            from minisgl.utils import init_logger
+
+            init_logger("mxfp4").info_rank0(
+                f"[mxfp4] E8M0 group scales exceed the fp16 store on "
+                f"{getattr(layer, 'prefix', '<linear>')} (exp {info['exp_min']}..{info['exp_max']}, "
+                f"{info['fp16_overflow_groups']} overflow / {info['e8m0_nan_groups']} e8m0-NaN "
+                f"groups); an fp32 group-scale path may be needed for this checkpoint."
+            )
+        layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32
+        layer._scales_op = conv["scales"]  # (N, K//32) fp16
+        del layer.weight_packed, layer.weight_scale
+
+    def apply(
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        out = kernels.w4a8_linear(
+            x,
+            layer._w_packed_op,  # type: ignore[attr-defined]
+            layer._scales_op,  # type: ignore[attr-defined]
+            None,  # symmetric — no zero-points
+            self.quant.group_size,
+            weight_is_e2m1=True,
+        )
+        out = out.to(x.dtype)
+        if bias is not None:
+            out = out + bias
+        return out
+
+
 class RXFLinearMethod:
     """RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) linear, native HIP (rxf_hip).
 
@@ -232,6 +290,11 @@ def create_linear_method(
         return UnquantizedLinearMethod()
     if quant.is_rxf:
         return RXFLinearMethod(quant)
+    # MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the W4A8 kernel with the e2m1
+    # decode. Config-selected from the DECLARED scheme (no model-name branch); disjoint from the int4
+    # W4A8 path below (weight_type=="int") and the fp8 W8A8 path (bits==8).
+    if quant.weight_is_e2m1:
+        return MxFp4LinearMethod(quant)
     # fp8 W8A8 (compressed-tensors float-quantized 8-bit) has no dense linear kernel here — only the
     # MoE expert path (create_moe_quant_method) implements it. ZAYA's dense/attn linears are all in
     # the quant `ignore` list, so a quantized fp8 config never reaches a dense linear; guard anyway so
