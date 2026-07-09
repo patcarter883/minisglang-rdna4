@@ -194,6 +194,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._tidar_ddtree = os.environ.get("MINISGL_TIDAR_DDTREE") == "1"
                 if self._tidar_ddtree:
                     logger.info_rank0("spec-decode: TiDAR DDTree draft-tree path ENABLED")
+                    self._ddtree_budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "24")
             # MINISGL_DFLASH_DDTREE=1: route DFlash (block-diffusion drafter) through the same DDTree
             # draft-tree step — its one denoising forward emits per-position top-K marginals, from which
             # we build a B-budget tree, verify it in one ancestor-masked target forward, and commit the
@@ -201,10 +202,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             from minisgl.spec.dflash import DFlashProposer
 
             self._dflash_ddtree = False
+            self._ddtree_budget = getattr(self, "_ddtree_budget", 0)
             if isinstance(self._proposer, DFlashProposer):
                 self._dflash_ddtree = os.environ.get("MINISGL_DFLASH_DDTREE") == "1"
                 if self._dflash_ddtree:
                     logger.info_rank0("spec-decode: DFlash DDTree draft-tree path ENABLED")
+                    self._ddtree_budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "32")
             self._spec_seed_enabled = (
                 os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
                 and bool(self._proposer.supports_prefill_seed)
@@ -241,6 +244,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 logger.info_rank0(
                     f"spec-decode: capturing FUSED-verify graphs (B={B} seg={seg} qlen={fused_qlen})")
                 self.engine.capture_spec_fused_verify_graphs(fused_qlen, verify_bs)
+            # ALSO capture the DDTree draft-TREE verify graphs when a DDTree path is on. tree_qlen =
+            # budget+1 is fixed (budget read once at init above). The ancestor mask carries a per-key
+            # column over the whole context, so the static mask buffer width is CAPPED at
+            # MINISGL_DDTREE_MAXCTX (default 4096) — sequences past it fall back to eager (lossless).
+            if (self._dflash_ddtree or self._tidar_ddtree) and verify_bs and self._ddtree_budget:
+                tree_qlen = self._ddtree_budget + 1
+                max_ctx = int(os.environ.get("MINISGL_DDTREE_MAXCTX") or "2048")
+                # The ancestor mask keeps a per-key column over the whole context, so the static buffer
+                # (max_bs*tree_qlen*max_ctx*4 B) is the dominant cost — cap the captured DDTree bs
+                # (MINISGL_DDTREE_MAXBS, default 4) independently of the decode/linear-verify graphs.
+                # Batches beyond the cap fall back to eager (lossless). Bench (bs=1) is unaffected.
+                dmaxbs = int(os.environ.get("MINISGL_DDTREE_MAXBS") or "4")
+                ddtree_bs = [b for b in verify_bs if b <= dmaxbs]
+                logger.info_rank0(
+                    f"spec-decode: capturing DDTREE-verify graphs "
+                    f"(budget={self._ddtree_budget} qlen={tree_qlen} mask_ctx<={max_ctx} "
+                    f"bs={ddtree_bs})")
+                self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -1157,27 +1178,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         ANCESTOR-ONLY custom_mask, then greedy-walk each tree. STATE-NEUTRAL/throwaway — the tree KV is
         scattered and (on CCA) its conv reads wrong neighbours, so this ONLY discovers the accepted path;
         recurrent state is snapshot+restored and the speculative KV pages freed (like block_predict).
-        Returns {id(req): (accepted_tokens, next_bonus)}."""
-        from minisgl.spec.ddtree import ddtree_paged_layout, ddtree_walk
+        Returns {id(req): (accepted_tokens, next_bonus)}.
+
+        CUDA-graph-capturable at a FIXED tree size: each req's real tree (n_nodes ≤ budget+1) is PADDED
+        up to ``tree_qlen = budget+1`` query rows so every verify batch has the same shape. Pad rows carry
+        a dummy token at position c0 with an all-allowed mask row (their logits are discarded — the walk
+        reads only the real n rows), so the padded forward is numerically identical to the exact-size one.
+        The ancestor mask is fed through the captured graph's static mask buffer (see
+        GraphRunner.capture_ddtree_verify_graphs); state neutrality is preserved by the snapshot/restore
+        below (eager, around the replay) — the tree-verify never installs recurrent state."""
+        from minisgl.spec.ddtree import ddtree_walk
         device = self.device
         page_table = self.engine.page_table
+        NEG_INF = float("-inf")
+        # Fixed padded query length = budget+1 (matches the captured graph). Fall back to the max real
+        # tree size when no budget is configured (DDTree disabled path — should not happen here).
+        budget = getattr(self, "_ddtree_budget", 0)
+        tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
         saved_lens = [(r.device_len, r.cached_len) for r in reqs]
         store_rows, store_cols, tok_vals, pos_list = [], [], [], []
-        per_req = []  # (req, c0, tree, n, mask)
+        per_req = []  # (req, c0, tree, n)
         for req in reqs:
             c0 = req.cached_len
             tree = trees[id(req)]
-            pos, mask, _cols = ddtree_paged_layout(c0, tree, device=device)
             n = tree.n_nodes
-            for j in range(n):
-                store_rows.append(req.table_idx); store_cols.append(c0 + j); tok_vals.append(tree.token[j])
-            pos_list += pos
-            req.device_len = c0 + n
-            per_req.append((req, c0, tree, n, mask))
+            assert n <= tree_qlen, f"tree n_nodes={n} exceeds tree_qlen={tree_qlen} (budget={budget})"
+            # real nodes j<n: token at col c0+j, RoPE pos c0+depth[j]. pad rows j>=n: dummy token 0 at
+            # col c0+j, pos c0 (root) — their KV/logits are throwaway.
+            for j in range(tree_qlen):
+                store_rows.append(req.table_idx)
+                store_cols.append(c0 + j)
+                tok_vals.append(tree.token[j] if j < n else 0)
+                pos_list.append(c0 + (tree.depth[j] if j < n else 0))
+            req.device_len = c0 + tree_qlen
+            per_req.append((req, c0, tree, n))
         rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
         cols_t = torch.tensor(store_cols, dtype=torch.int64, device=device)
         self.token_pool[rows_t, cols_t] = torch.tensor(tok_vals, dtype=self.token_pool.dtype, device=device)
-        batch = Batch(reqs=reqs, phase="decode"); batch.spec_verify = True
+        batch = Batch(reqs=reqs, phase="decode")
+        batch.spec_verify = True
+        batch.ddtree_verify = True  # routes forward_verify to the DDTree tree-verify graph when capturable
         self.cache_manager.allocate_paged(reqs)
         batch.padded_reqs = reqs
         batch.positions = torch.tensor(pos_list, dtype=torch.int32, device=device)
@@ -1185,34 +1225,49 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.engine.attn_backend.prepare_metadata(batch)
         batch.input_ids = self.token_pool[rows_t, cols_t]
         max_kv = int(batch.attn_metadata.max_seqlen_k)
-        # zeros base (like the fused path): cols beyond a req's context [c0+n, max_kv) are never read
-        # (the kernel bounds by per-req cache_seqlen); the mask block carries the 0/-inf ancestor mask.
-        custom_mask = torch.zeros((len(store_rows), max_kv), dtype=torch.float32, device=device)
+        # zeros base (all-allowed): cols beyond a req's context [c0+tree_qlen, max_kv) are never read
+        # (the kernel bounds by per-req cache_seqlen). Pad rows stay all-allowed; real rows get the
+        # ancestor mask (own+ancestor tree cols allowed, every other tree-local col denied).
+        custom_mask = torch.zeros((tree_qlen * len(reqs), max_kv),
+                                  dtype=torch.float32, device=device)
         off = 0
-        for (req, c0, tree, n, mask) in per_req:
-            custom_mask[off:off + n, : c0 + n] = mask[:, : c0 + n]
-            off += n
+        for (req, c0, tree, n) in per_req:
+            block = custom_mask[off:off + tree_qlen]
+            for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
+                block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
+                a = j
+                while a != -1:  # then re-allow own column + the ancestor chain to the root
+                    block[j, c0 + a] = 0.0
+                    a = tree.parent[a]
+            off += tree_qlen
         batch.attn_metadata.custom_mask = custom_mask
-        # recurrent state snapshot for rollback (this forward is discarded)
+        # recurrent metadata with per-token verify-state capture (capture_verify_state=True routes the
+        # GDN/CCA layers through the bit-stable verify kernels that write only SCRATCH; the real slots are
+        # additionally snapshot+restored below, so the tree-verify is throwaway/state-neutral). This same
+        # verify path is what the captured graph threads through static scratch buffers.
         cca_snap = gdn_snap = None
         if self.cca_slots is not None:
             from minisgl.cca.metadata import build_cca_metadata
             cca_idx = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_idx, device)
+            batch.cca_metadata.capture_verify_state = True
+            batch.cca_metadata.verify_max_qlen = tree_qlen
             cca_snap = self.engine.cca_state.snapshot(cca_idx)
         if self.gdn_slots is not None:
             from minisgl.gdn.metadata import build_gdn_metadata
             gdn_idx = self.gdn_slots.state_indices(batch)
             batch.gdn_metadata = build_gdn_metadata(batch, gdn_idx, device)
+            batch.gdn_metadata.capture_verify_state = True
+            batch.gdn_metadata.verify_max_qlen = tree_qlen
             gdn_snap = self.engine.gdn_state.snapshot(gdn_idx)
         logits = self.engine.forward_verify(batch)
         argmax = logits.argmax(dim=-1).to(torch.int32).cpu().tolist()
         out = {}
         off = 0
-        for (req, c0, tree, n, mask) in per_req:
-            acc, nb = ddtree_walk(argmax[off:off + n], tree)
+        for (req, c0, tree, n) in per_req:
+            acc, nb = ddtree_walk(argmax[off:off + n], tree)  # walk reads only the real n rows
             out[id(req)] = (acc, nb)
-            off += n
+            off += tree_qlen
         # rollback recurrent state + speculative KV + lengths (throwaway)
         if cca_snap is not None:
             self.engine.cca_state.restore(cca_snap)
@@ -1229,6 +1284,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if free_chunks:
             self.cache_manager._free(torch.cat(free_chunks))
         return out
+        return out
 
     @torch.inference_mode()
     def _spec_decode_step_ddtree(self, reqs: List[Req], B: int, mask_id: int) -> None:
@@ -1242,7 +1298,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         The tree buys a longer accepted path than the argmax chain; the 2-forward segmented-tree variant
         (removing forward 3) is the follow-up. K=MINISGL_DDTREE_TOPK, budget=MINISGL_DDTREE_BUDGET."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
-        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "24")
+        budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
         from minisgl.spec.ddtree import build_draft_tree
         # forward 1: marginals + argmax chain
         argmax_drafts = self._tidar_block_predict(reqs, B, mask_id, topk=K)
@@ -1280,7 +1336,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
              correct causal context, re-captures the target aux for the next block, emits + rolls back.
         K=MINISGL_DDTREE_TOPK (default 8), budget=MINISGL_DDTREE_BUDGET (default 32)."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
-        budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "32")
+        budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
         from minisgl.spec.ddtree import build_draft_tree
 
         spec = self.engine.spec_config
