@@ -2137,15 +2137,23 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
+    reqs = batch.padded_reqs
+    # DECODE fast path: every req extends by exactly one token, so positions == [cached_len per req].
+    # One build over num_reqs elements — no per-req torch op (the hot path, run every decode step).
+    if all(req.extend_len == 1 for req in reqs):
+        indices_host = torch.tensor(
+            [req.cached_len for req in reqs], dtype=torch.int32, pin_memory=True
+        )
+        return indices_host.to(device, non_blocking=True)
+    # PREFILL / varlen: keep the per-req C-speed arange into the pinned buffer. A per-TOKEN Python
+    # comprehension would be O(sum(extend_len)) Python — a real regression for long prompts (60k ctx).
+    needed_size = sum(req.extend_len for req in reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
-    for req in batch.padded_reqs:
+    for req in reqs:
         length = req.extend_len
         torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
+            req.cached_len, req.device_len, dtype=torch.int32,
             out=indices_host[offset : offset + length],
         )
         offset += length
@@ -2153,12 +2161,12 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        mapping_host[offset : offset + length].fill_(req.table_idx)
-        offset += length
+    # Vectorized: repeat each req.table_idx extend_len times via repeat_interleave — C-speed for both
+    # decode (extend_len==1) and varlen prefill, no per-req .fill_() and no per-token Python list.
+    reqs = batch.padded_reqs
+    idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.int64, pin_memory=True)
+    lens = torch.tensor([req.extend_len for req in reqs], dtype=torch.int64)
+    mapping_host = idx.repeat_interleave(lens)  # length == sum(extend_len) == len(batch.positions)
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
 

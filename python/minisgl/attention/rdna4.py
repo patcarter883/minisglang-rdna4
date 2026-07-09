@@ -36,6 +36,27 @@ class RDNA4Metadata(BaseAttnMetadata):
     swa_out_loc: torch.Tensor | None = None
     swa_page_table: torch.Tensor | None = None
     swa_cache_seqlens: torch.Tensor | None = None
+    # Lazy per-forward host-sync caches. A metadata object is built ONCE per forward and shared
+    # across every attention layer, so the cold-prefill kernels' `.tolist()` slicing would re-sync
+    # the same tensor ~40 times (once per layer). Memoize the first sync here; all later layers of
+    # the SAME forward reuse it. (A fresh RDNA4Metadata is built each prepare_metadata, so the cache
+    # never leaks across forwards; cu_seqlens_q / cache_seqlens are never mutated between layers.)
+    _cu_seqlens_q_list: List[int] | None = None
+    _cache_seqlens_list: List[int] | None = None
+
+    def cu_seqlens_q_list(self) -> List[int]:
+        """`cu_seqlens_q.tolist()`, computed once per forward and cached (host sync)."""
+        lst = self._cu_seqlens_q_list
+        if lst is None:
+            lst = self._cu_seqlens_q_list = self.cu_seqlens_q.tolist()
+        return lst
+
+    def cache_seqlens_list(self) -> List[int]:
+        """`cache_seqlens.tolist()`, computed once per forward and cached (host sync)."""
+        lst = self._cache_seqlens_list
+        if lst is None:
+            lst = self._cache_seqlens_list = self.cache_seqlens.tolist()
+        return lst
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -241,7 +262,7 @@ class RDNA4Backend(BaseAttnBackend):
         D = self.config.head_dim
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
-        cu = metadata.cu_seqlens_q.tolist()
+        cu = metadata.cu_seqlens_q_list()  # memoized once per forward (was per-layer .tolist())
         out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
@@ -348,7 +369,7 @@ class RDNA4Backend(BaseAttnBackend):
         D = self.config.head_dim
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
-        cu = metadata.cu_seqlens_q.tolist()
+        cu = metadata.cu_seqlens_q_list()  # memoized once per forward (was per-layer .tolist())
         out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]

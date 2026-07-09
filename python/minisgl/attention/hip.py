@@ -91,8 +91,8 @@ class HIPAttnBackend(RDNA4Backend):
         # prefix-cache hits to _hip_prefill_paged), so each seq's keys are exactly its current
         # tokens. Assert that invariant: cache_seqlens == query lengths (a violation means a hit
         # leaked past the cold_prefill dispatch).
-        cu = metadata.cu_seqlens_q.tolist()
-        klen = metadata.cache_seqlens.tolist()
+        cu = metadata.cu_seqlens_q_list()  # memoized once per forward (was per-layer .tolist())
+        klen = metadata.cache_seqlens_list()  # memoized once per forward (was per-layer .tolist())
         from minisgl._hip_engage import engaged
         engaged("attn_hip.flash_prefill")
         out = self._get_out_buf(q)  # persistent buffer (A2, inherited); eager prefill, never captured

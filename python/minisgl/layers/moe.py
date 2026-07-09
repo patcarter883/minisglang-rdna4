@@ -664,6 +664,8 @@ class MoELayer(BaseOP):
             counts = ep.all_gather(
                 torch.tensor([real_n], device=hs.device, dtype=torch.int64)
             )
+            # Inherent host sync: `common_n` sizes the `pad` for the torch.cat below, so the padded
+            # tensor's shape must be known host-side — it cannot be removed without a device sync.
             common_n = int(counts.max().item())
         if common_n > real_n:
             pad = common_n - real_n
