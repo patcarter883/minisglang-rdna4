@@ -174,7 +174,8 @@ class FlashInferBackend(BaseAttnBackend):
         return self.cached_ones_cpu[:bs]
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch,
+        sliding_window: int = 0,
     ) -> torch.Tensor:
         def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
             return cache.view(-1, 1, cache.shape[2], cache.shape[3])

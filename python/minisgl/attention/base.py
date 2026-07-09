@@ -18,7 +18,13 @@ class BaseAttnMetadata(ABC):
 class BaseAttnBackend(ABC):
     @abstractmethod
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        sliding_window: int = 0,
     ) -> torch.Tensor: ...
 
     @abstractmethod
@@ -44,10 +50,16 @@ class HybridBackend(BaseAttnBackend):
         self.decode_backend = decode_backend
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+        sliding_window: int = 0,
     ) -> torch.Tensor:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
-        return backend.forward(q, k, v, layer_id, batch)
+        return backend.forward(q, k, v, layer_id, batch, sliding_window=sliding_window)
 
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend

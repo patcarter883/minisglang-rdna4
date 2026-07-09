@@ -48,10 +48,15 @@ class HIPAttnBackend(RDNA4Backend):
         self._decode_fp8 = attn_decode.flash_decode_paged_fp8
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: "Batch"
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: "Batch",
+        sliding_window: int = 0,
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, RDNA4Metadata)
+        # SWA (sliding-window) layer: store/read the window-bounded ring pool (ctx.swa_kv_cache) with
+        # a windowed mask, instead of the full-context main pool. layer_id is the compact swa id.
+        if sliding_window > 0 and self.swa_kv is not None:
+            return self._swa_forward(q, k, v, layer_id, metadata, sliding_window)
         # Persist the current tokens' K/V into the paged cache (decode + extend prefill read it back).
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if batch.is_prefill:

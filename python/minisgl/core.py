@@ -130,6 +130,11 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    # Window-bounded SWA KV pool (Laguna) — set by the Engine ONLY for SWA-hybrid models. Holds the
+    # sliding layers' paged KV as a per-sequence ring of `sliding_window` slots (indexed table_idx*W
+    # + pos%W), so long-context serving does not allocate a full-context slot per sliding layer. The
+    # attention backend reaches it via get_global_ctx().kv_cache's sibling; None for every non-SWA model.
+    swa_kv_cache: "BaseKVCachePool | None" = field(default=None, init=False)
     # GDN recurrent-state cache — set by the Engine ONLY for GDN-hybrid models, so a layer
     # forward reaches it via `get_global_ctx().gdn_state`. Stays None for every dense model.
     gdn_state: "GDNStateCache | None" = field(default=None, init=False)

@@ -25,10 +25,16 @@ class AttentionLayer(StateLessOP):
         rotary_config: RotaryConfig,
         q_norm: RMSNorm | None = None,
         k_norm: RMSNorm | None = None,
+        sliding_window: int = 0,
     ):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
         self.head_dim = head_dim
+        # Per-layer sliding window (Laguna SWA layers: 512). 0 = global/full attention (dense, MLA,
+        # GDN full layers, and every non-SWA model). When >0 the backend (a) masks the attention to
+        # the last `sliding_window` keys and (b) routes this layer's paged KV to the window-bounded
+        # SWA ring pool instead of the full-context main pool. `layer_id` then indexes the SWA pool.
+        self.sliding_window = sliding_window
         tp_size = get_tp_info().size
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
         self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
@@ -54,5 +60,7 @@ class AttentionLayer(StateLessOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        o = ctx.attn_backend.forward(
+            q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
+        )
         return o.view(-1, self.qo_attn_dim)
