@@ -154,7 +154,7 @@ class ModelConfig:
         return (self.cca_time0 - 1) + (self.cca_time1 - 1)
 
     @classmethod
-    def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+    def from_hf(cls, config: PretrainedConfig, spec_algorithm: str = "mtp") -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
@@ -224,10 +224,22 @@ class ModelConfig:
         # Some checkpoints ship the MTP-head TENSORS but leave the count at 0 in config (e.g. a quant
         # tool that dropped the field — GLM-4.7-Flash-RXF). MINISGL_NUM_NEXTN / MINISGL_MTP_LAYERS
         # force the head on so spec-decode can use it. 0/unset -> trust the config.
+        _mtp_forced = False
         if (_nn := os.environ.get("MINISGL_NUM_NEXTN")):
             num_nextn_predict_layers = int(_nn)
+            _mtp_forced = True
         if (_ml := os.environ.get("MINISGL_MTP_LAYERS")):
             mtp_num_hidden_layers = int(_ml)
+            _mtp_forced = True
+        # The MTP / next-n head is a SELF-speculation head — only useful under --spec-algorithm mtp.
+        # For any other serve (plain decode, dflash, eagle3, ngram, tidar) it wastes memory and, on a
+        # quantized checkpoint that ships a bf16 MTP head, mismatches the quantized-backbone loader
+        # (KeyError on mtp.self_attn.q_proj.weight_packed). So build it ONLY when MTP spec is active,
+        # unless an explicit env override forced it on. Applied inside from_hf so the model builder
+        # AND the streaming weight loader (both go through from_hf) agree on load_mtp.
+        if spec_algorithm != "mtp" and not _mtp_forced:
+            mtp_num_hidden_layers = 0
+            num_nextn_predict_layers = 0
 
         # RMSNorm eps: Llama/Qwen use `rms_norm_eps`; ZAYA names it `norm_epsilon`.
         rms_norm_eps = getattr(config, "rms_norm_eps", None)

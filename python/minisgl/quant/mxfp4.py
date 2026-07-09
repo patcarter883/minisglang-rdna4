@@ -128,21 +128,40 @@ def convert_mxfp4_moe(weight_packed: torch.Tensor,
 
     weight_packed (E, N, K//2) uint8, weight_scale (E, N, K//32) uint8 ->
     {w_packed (E,N,K//8) int32, scales (E,N,K//32) fp16, w_zeros None, group_size 32}.
-    kernels.w4a8_moe takes exactly this 3D (E,N,*) layout. Flattens E into the row dim, reuses the
-    2D path, reshapes back (the repack/scale math is per-row, E-independent).
+    kernels.w4a8_moe takes exactly this 3D (E,N,*) layout.
+
+    PER-EXPERT loop (not a flatten-to-2D): the repack/scale math is per-row (E-independent), but a
+    single flattened `convert_mxfp4_weight` over (E*N, K) would materialise the int64 nibble-widen
+    transient for the WHOLE stack at once (a multi-GB spike that OOMs the 16 GB card when the model
+    weights are already resident). Writing each expert into the pre-allocated output keeps the
+    transient to one (N, K) matrix; the output is ~the same bytes as the input, so no net growth.
     """
     assert weight_packed.ndim == 3 and weight_scale.ndim == 3, (
         weight_packed.shape, weight_scale.shape)
     e, n, k_half = weight_packed.shape
     k = k_half * 2
-    flat = convert_mxfp4_weight(weight_packed.reshape(e * n, k_half),
-                                weight_scale.reshape(e * n, k // OCP_MX_BLOCK_SIZE))
+    dev = weight_packed.device
+    w_out = torch.empty((e, n, k // 8), dtype=torch.int32, device=dev)
+    s_out = torch.empty((e, n, k // OCP_MX_BLOCK_SIZE), dtype=torch.float16, device=dev)
+    exp_min, exp_max, over, under, nan = 127, -128, 0, 0, 0
+    for i in range(e):
+        conv = convert_mxfp4_weight(weight_packed[i], weight_scale[i])
+        w_out[i] = conv["w_packed"]
+        s_out[i] = conv["scales"]
+        si = conv["scale_info"]
+        exp_min = min(exp_min, si["exp_min"]); exp_max = max(exp_max, si["exp_max"])
+        over += si["fp16_overflow_groups"]; under += si["fp16_subnormal_groups"]
+        nan += si["e8m0_nan_groups"]
     return {
-        "w_packed": flat["w_packed"].reshape(e, n, k // 8).contiguous(),
-        "scales": flat["scales"].reshape(e, n, k // OCP_MX_BLOCK_SIZE).contiguous(),
+        "w_packed": w_out,
+        "scales": s_out,
         "w_zeros": None,
         "group_size": OCP_MX_BLOCK_SIZE,
-        "scale_info": flat["scale_info"],
+        "scale_info": {
+            "exp_min": exp_min, "exp_max": exp_max, "fp16_overflow_groups": over,
+            "fp16_subnormal_groups": under, "e8m0_nan_groups": nan,
+            "fp16_range_ok": over == 0 and nan == 0,
+        },
         "shape": (e, n, k),
     }
 
