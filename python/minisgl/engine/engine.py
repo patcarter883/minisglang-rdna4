@@ -35,6 +35,19 @@ from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
 
+# --- CUDA-graph reservation heuristics (see Engine._graph_capture_bytes) ------------------------
+# Peak transient (activation-pool) memory a captured decode/verify forward folds into its graph
+# memory pool, estimated as this multiple of tokens*hidden*dtype. The exact static I/O buffers
+# (logits especially, for large vocabularies) dominate; this term is a modest, conservative pad for
+# the per-forward activations the pool must also hold. Bumped by _GRAPH_ROUNDUP + the env margin.
+_GRAPH_ACT_MULT = 8
+# We can't know the proposer's aux-capture count at KV-sizing time (it's built later), so assume up
+# to this many aux-hidden layers for the spec-verify buffer. Over-reserving is harmless: the aux
+# buffer is tokens*hidden*dtype, tiny next to the vocab-wide logits buffer.
+_GRAPH_ASSUMED_AUX = 8
+# Slight round-up so the estimate errs toward preventing OOM rather than over-starving KV.
+_GRAPH_ROUNDUP = 1.1
+
 
 # --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
 # MINISGL_PROFILE=<trace.json> captures a window of forward steps on the primary rank into a Chrome
@@ -468,6 +481,95 @@ class Engine:
             total += conv + prev
         return total
 
+    def _draft_model_bytes(self, config: EngineConfig) -> int:
+        """Bytes the speculative DRAFT model (EAGLE3 / DFlash) will consume. The proposer loads it in
+        ``Scheduler.__init__`` — AFTER the engine has built and the KV pool is allocated — so, like the
+        recurrent state, it is NOT part of ``model_memory`` and must be reserved up front or it eats the
+        ``(1-memory_ratio)`` slack and OOMs at proposer build / first request. Returns 0 for no-spec and
+        for proposers with no separate checkpoint (n-gram / target-embedded MTP).
+
+        Estimate = sum of the cached checkpoint's ``*.safetensors`` bytes (a conservative proxy: on-disk
+        bf16 >= an fp8 runtime). Resolved from the HF cache without downloading under ``HF_HUB_OFFLINE``.
+        Override with ``MINISGL_DRAFT_RESERVE_GB=<float>`` (e.g. to correct an fp8-runtime vs bf16-on-disk
+        mismatch, or to reserve when the checkpoint can't be sized here)."""
+        override = os.environ.get("MINISGL_DRAFT_RESERVE_GB")
+        if override is not None:
+            return int(float(override) * (1 << 30))
+        sc = config.spec_config
+        draft_path = getattr(sc, "draft_model_path", None) if sc is not None else None
+        if not draft_path:
+            return 0
+        try:
+            from minisgl.utils import download_hf_weight
+
+            folder = download_hf_weight(draft_path)
+            total = 0
+            for name in os.listdir(folder):
+                if name.endswith(".safetensors"):
+                    total += os.path.getsize(os.path.join(folder, name))  # follows symlink into blobs/
+            return total
+        except Exception as e:  # noqa: BLE001 — sizing must never block boot
+            logger.warning_rank0(
+                f"Draft-model reserve: could not size {draft_path} ({e}); reserving 0 — set "
+                "MINISGL_DRAFT_RESERVE_GB to reserve explicitly"
+            )
+            return 0
+
+    def _graph_capture_bytes(self, config: EngineConfig, free_memory: int) -> int:
+        """Bytes the CUDA-graph STATIC buffers will consume. Graph capture runs AFTER the KV pool is
+        allocated (decode graphs at the end of ``Engine.__init__``; spec-verify graphs later, from the
+        scheduler once the proposer is built), so its buffers come out of the ``(1-memory_ratio)`` slack
+        unless reserved here — the capture-time / first-request OOM this prevents. Mirrors the
+        ``GraphCaptureBuffer`` / ``VerifyCaptureBuffer`` shapes in ``engine/graph.py``.
+
+        Returns 0 when capture is off (``cuda_graph_max_bs == 0`` — ``_adjust_config`` has already zeroed
+        it for the non-MLA/non-CCA spec case where verify graphs aren't captured). Conservative by design
+        (round-up + assume spec-verify captures last_hidden/aux); add headroom with
+        ``MINISGL_GRAPH_RESERVE_MARGIN_GB`` or replace the whole estimate with ``MINISGL_GRAPH_RESERVE_GB``.
+        General: works for dense / MLA / GDN / CCA, spec and non-spec."""
+        full = os.environ.get("MINISGL_GRAPH_RESERVE_GB")
+        if full is not None:
+            return int(float(full) * (1 << 30))
+        if config.cuda_graph_max_bs == 0:
+            return 0
+        # Reproduce the captured batch-size set the GraphRunner will pick (same inputs it is handed).
+        from .graph import _determine_cuda_graph_bs
+
+        bs_list = _determine_cuda_graph_bs(
+            config.cuda_graph_bs, config.cuda_graph_max_bs, free_memory
+        )
+        if not bs_list:
+            return 0
+        mc = config.model_config
+        vocab = mc.vocab_size
+        hidden = mc.hidden_size
+        f32 = 4
+        i32 = 4
+        dt = self.dtype.itemsize
+        max_bs = max(bs_list)
+        # Decode graphs share ONE GraphCaptureBuffer sized at max_bs (logits [max_bs, vocab] fp32 +
+        # three [max_bs] int32 buffers); the shared graph pool holds the largest forward's activations.
+        total = max_bs * vocab * f32 + 3 * max_bs * i32
+        total += _GRAPH_ACT_MULT * max_bs * hidden * dt
+        # Spec-verify graphs (MLA / CCA today; GDN when enabled): ONE VerifyCaptureBuffer at
+        # (verify_bs, qlen=K+1). verify_bs is the graph bs-set capped at max_running_req (scheduler).
+        # Reaching here with spec set implies verify capture is on (the unsupported case was zeroed in
+        # _adjust_config). Assume last_hidden + aux — draft-head proposers need them (n-gram over-
+        # reserves harmlessly). These are the big buffers for spec (T = verify_bs*(K+1) rows of vocab).
+        sc = config.spec_config
+        if sc is not None:
+            qlen = sc.num_draft + 1
+            vbs = max((b for b in bs_list if b <= config.max_running_req), default=max_bs)
+            T = vbs * qlen
+            total += T * vocab * f32 + 3 * T * i32
+            total += (1 + _GRAPH_ASSUMED_AUX) * T * hidden * dt  # last_hidden + aux_hidden
+            total += _GRAPH_ACT_MULT * T * hidden * dt
+        total = int(total * _GRAPH_ROUNDUP)
+        margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
+        if margin is not None:
+            total += int(float(margin) * (1 << 30))
+        return total
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         mc = config.model_config
@@ -498,8 +600,18 @@ class Engine:
             # ([B2]). Subtracting it up front co-sizes the two caches automatically; it is 0 for dense/
             # MHA/MLA models, so their sizing is unchanged.
             state_memory = self._recurrent_state_bytes(config)
+            # Reserve the spec draft model (EAGLE3/DFlash) and the CUDA-graph static buffers, both of
+            # which are allocated AFTER the KV pool (proposer build / graph capture) and otherwise come
+            # out of the (1-memory_ratio) slack — the cause of capture-time and first-request OOMs that
+            # forced manual mem-ratio tuning. Both are 0 when not applicable (no spec / no capture).
+            draft_memory = self._draft_model_bytes(config)
+            graph_memory = self._graph_capture_bytes(config, old_free_memory)
             available_memory = (
-                int(config.memory_ratio * old_free_memory) - model_memory - state_memory
+                int(config.memory_ratio * old_free_memory)
+                - model_memory
+                - state_memory
+                - draft_memory
+                - graph_memory
             )
             num_pages = available_memory // cache_per_page
             if state_memory:
@@ -507,10 +619,26 @@ class Engine:
                     f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
                     f"({config.max_running_req} slots); KV pool gets the remainder"
                 )
+            if draft_memory:
+                logger.info(
+                    f"Reserved {mem_GB(draft_memory)} for the spec draft model "
+                    f"({config.spec_algorithm}); KV pool gets the remainder"
+                )
+            if graph_memory:
+                spec_note = (
+                    f", spec-verify qlen={config.spec_num_draft + 1}"
+                    if config.spec_config is not None
+                    else ""
+                )
+                logger.info(
+                    f"Reserved {mem_GB(graph_memory)} for CUDA graph capture "
+                    f"(max_bs={config.cuda_graph_max_bs}{spec_note}); KV pool gets the remainder"
+                )
 
         assert num_pages > 1, (
-            "Not enough memory for KV cache after reserving recurrent state; reduce "
-            "--max-running-requests or --num-pages"
+            "Not enough memory for KV cache after reserving recurrent state / draft model / "
+            "CUDA-graph buffers; reduce --max-running-requests, lower --memory-ratio, or set "
+            "--num-pages"
         )
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
