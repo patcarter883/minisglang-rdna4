@@ -137,7 +137,8 @@ class MLABackend(BaseAttnBackend):
         )
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch,
+        sliding_window: int = 0,
     ) -> torch.Tensor:  # pragma: no cover
         raise NotImplementedError(
             "MLA attention uses MLABackend.{store_latent, prefill, decode} directly, not forward()"

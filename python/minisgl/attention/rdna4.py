@@ -26,6 +26,16 @@ class RDNA4Metadata(BaseAttnMetadata):
     # (0 allowed / -inf denied), indexed [packed_q_row, key_pos]. When set, the paged-extend kernel
     # runs with causal=0 and lets this carry the whole block structure. None for a normal serve.
     custom_mask: torch.Tensor | None = None
+    # ---- SWA (sliding-window) ring-pool metadata — populated ONLY for a SWA-hybrid model. The
+    # sliding layers store/read from the separate window-bounded ring pool (ctx.swa_kv_cache), not
+    # the full-context main pool, so they need their own out_loc / page_table / cache_seqlens:
+    #   swa_out_loc      [total_new_tokens]  ring slot per new token = table_idx*W + pos%W
+    #   swa_page_table   [bs, max_win]       per-seq ring block = arange(table_idx*W, +min(seqlen,W))
+    #   swa_cache_seqlens[bs]                per-seq valid key count = min(seqlen, W)
+    # None for every non-SWA layer/model (the full layers + all other models use the main-pool fields).
+    swa_out_loc: torch.Tensor | None = None
+    swa_page_table: torch.Tensor | None = None
+    swa_cache_seqlens: torch.Tensor | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -49,6 +59,11 @@ class RDNA4Backend(BaseAttnBackend):
         ctx = get_global_ctx()
         self.config = config
         self.kvcache = ctx.kv_cache
+        # SWA (Laguna) sliding-window ring KV pool — set by the Engine only for a SWA-hybrid model.
+        # The sliding layers route their paged KV here (window-bounded), keyed by the layer's compact
+        # swa id. None for every non-SWA model (the full-context main pool serves every layer).
+        self.swa_kv = getattr(ctx, "swa_kv_cache", None)
+        self.swa_window = config.sliding_window or 0
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
         # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. Per-tensor
@@ -133,10 +148,14 @@ class RDNA4Backend(BaseAttnBackend):
         self._segm_expsum = torch.empty((rows, num_heads_q, seg), dtype=torch.float32, device=dev)
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch,
+        sliding_window: int = 0,
     ) -> torch.Tensor:
         metadata = batch.attn_metadata
         assert isinstance(metadata, RDNA4Metadata)
+        # SWA (sliding-window) layer: store/read the window-bounded ring pool, not the main pool.
+        if sliding_window > 0 and self.swa_kv is not None:
+            return self._swa_forward(q, k, v, layer_id, metadata, sliding_window)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         # Native-HIP per-op dispatch (default on). store_kv above already persisted the new
         # tokens' K/V into the paged cache, so the decode kernel reads them back; the cold-prefill
@@ -277,6 +296,70 @@ class RDNA4Backend(BaseAttnBackend):
             self.scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
         )
 
+    # ---- SWA (sliding-window) ring-pool attention (Laguna sliding layers) ----------------------
+    # A sliding layer stores/reads its paged KV in the SEPARATE window-bounded ring pool (self.swa_kv)
+    # instead of the full-context main pool. `layer_id` here is the layer's COMPACT swa id (position
+    # among the sliding layers). Reached from forward() when sliding_window > 0. Requires the native
+    # HIP ops (self._attn_hip); a SWA model must run --attention-backend hip.
+    def _swa_forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int,
+        metadata: RDNA4Metadata, sliding_window: int,
+    ) -> torch.Tensor:
+        assert self._attn_hip, (
+            "SWA (sliding-window) attention requires the native-HIP backend (MINISGL_ATTN_HIP=1). "
+            "The Triton unified path does not wire the SWA ring pool."
+        )
+        assert metadata.swa_out_loc is not None, "SWA metadata missing (is_swa_hybrid not wired?)"
+        # Persist the new tokens' K/V into the ring pool at the ring slots (table_idx*W + pos%W).
+        self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
+        if metadata.max_seqlen_q == 1:
+            return self._swa_decode(q, layer_id, metadata)
+        if metadata.cold_prefill:
+            return self._swa_prefill_cold(q, k, v, metadata, sliding_window)
+        raise NotImplementedError(
+            "SWA extend/chunked prefill is not supported: a SWA-hybrid model must run the naive "
+            "prefix cache (whole-prompt cold prefill). Radix reuse across the window boundary is "
+            "unsound, and the ring pool holds only the last `window` tokens."
+        )
+
+    def _swa_decode(
+        self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
+    ) -> torch.Tensor:
+        k_cache = self.swa_kv.k_cache(layer_id)  # [num_swa_slots, 1, kv_heads, head_dim]
+        v_cache = self.swa_kv.v_cache(layer_id)
+        block_table = metadata.swa_page_table.to(torch.int32)
+        ctx_lens = metadata.swa_cache_seqlens.to(torch.int32)
+        # The ring block IS the window (<= W recent keys, all causal-valid for the newest query), so
+        # no extra window mask is needed — sliding_window=0. Byte-identical to a full decode over a
+        # <=W-length cache.
+        if self.swa_kv.dtype == torch.float8_e4m3fn:
+            ks, vs = self.swa_kv.k_scale[layer_id], self.swa_kv.v_scale[layer_id]
+            return self._hip_decode_fp8_op(
+                q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0
+            )
+        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+
+    def _swa_prefill_cold(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        metadata: RDNA4Metadata, window: int,
+    ) -> torch.Tensor:
+        # Dense cold prefill over the inline prompt K/V with a CAUSAL + WINDOW mask (the kernel's
+        # native sliding_window arg). The ring store above kept the last `window` tokens for decode.
+        D = self.config.head_dim
+        k = k.view(-1, k.shape[-1] // D, D)
+        v = v.view(-1, v.shape[-1] // D, D)
+        cu = metadata.cu_seqlens_q.tolist()
+        out = self._get_out_buf(q)
+        for i in range(len(cu) - 1):
+            s, e = cu[i], cu[i + 1]
+            if e - s <= 0:
+                continue
+            out[s:e] = self._hip_prefill_op(
+                q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
+                self.scale, 1, window,  # causal=1, sliding_window=window
+            )
+        return out
+
     def prepare_metadata(self, batch: Batch) -> None:
         # Lifted from the FlashAttention backend: the page-table slicing + cu_seqlens
         # construction is backend-agnostic (the global page table is page_size=1).
@@ -314,6 +397,12 @@ class RDNA4Backend(BaseAttnBackend):
         if self.page_size > 1:
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
+        swa_out_loc = swa_page_table = swa_cache_seqlens = None
+        if self.swa_kv is not None and self.swa_window > 0:
+            swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
+                reqs, seqlens_q, cached_lens, device
+            )
+
         batch.attn_metadata = RDNA4Metadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
@@ -321,7 +410,42 @@ class RDNA4Backend(BaseAttnBackend):
             max_seqlen_k=max_seqlen_k,
             page_table=new_page_table,
             cold_prefill=cold_prefill,
+            swa_out_loc=swa_out_loc,
+            swa_page_table=swa_page_table,
+            swa_cache_seqlens=swa_cache_seqlens,
         )
+
+    def _build_swa_metadata(self, reqs, seqlens_q, cached_lens, device):
+        """Ring-pool metadata for the sliding layers (SWA-hybrid only). Each request owns a fixed
+        `window`-slot block [table_idx*W, table_idx*W + W); token at absolute position p writes slot
+        table_idx*W + (p % W) (the ring). The read block for a request of length S is the first
+        min(S, W) slots (when S >= W every slot holds one of the last W positions; when S < W slots
+        0..S-1 hold positions 0..S-1) with cache_seqlen = min(S, W). Order within the block is
+        irrelevant — each stored key already carries its RoPE at absolute position, and a decode
+        query's softmax over keys is permutation-invariant."""
+        W = self.swa_window
+        out_slots: list[int] = []
+        table_rows: list[list[int]] = []
+        seqlens_win: list[int] = []
+        max_win = 0
+        for req, qlen, c0 in zip(reqs, seqlens_q, cached_lens):
+            t = req.table_idx
+            base = t * W
+            # new tokens this batch: absolute positions [c0, c0+qlen) -> ring slots
+            out_slots.extend(base + (p % W) for p in range(c0, c0 + qlen))
+            S = c0 + qlen  # device_len
+            cnt = min(S, W)
+            seqlens_win.append(cnt)
+            table_rows.append([base + s for s in range(cnt)])
+            max_win = max(max_win, cnt)
+        CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        swa_out_loc = torch.tensor(out_slots, **CPU).to(device, non_blocking=True)
+        # rectangular [bs, max_win] page table (short rows padded with 0 = the NULL slot; the kernel
+        # bounds reads by swa_cache_seqlens so the pad is never attended).
+        padded = [row + [0] * (max_win - len(row)) for row in table_rows]
+        swa_page_table = torch.tensor(padded, **CPU).to(device, non_blocking=True)
+        swa_cache_seqlens = torch.tensor(seqlens_win, **CPU).to(device, non_blocking=True)
+        return swa_out_loc, swa_page_table, swa_cache_seqlens
 
     # --- cudagraph capture: not yet supported (Phase 4). Boot with --cuda-graph-max-bs 0. ---
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
