@@ -12,8 +12,9 @@ class TokenizeManager:
         self.tokenizer = tokenizer
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
-        # TODO: batch tokenization
+        # Chat-template RENDERING stays per-msg (tools / chat_template_kwargs differ per request),
+        # but the final encode of the rendered prompt STRINGS is batched into one tokenizer call.
+        prompts: List[str] = []
         for msg in msgs:
             if isinstance(msg.text, list):
                 # `tools` (when set) render the tool specs into the chat template for tool-trained
@@ -31,8 +32,11 @@ class TokenizeManager:
                 assert isinstance(prompt, str)
             else:
                 prompt = msg.text
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(prompt, return_tensors="pt")
-            )
-            results.append(input_ids.view(-1).to(torch.int32))
-        return results
+            prompts.append(prompt)
+        if not prompts:
+            return []
+        # ONE batched encode of all prompt strings (no padding / no return_tensors -> per-prompt
+        # id lists, identical to calling tokenizer.encode(prompt) on each; add_special_tokens keeps
+        # the encode() default of True). Each result -> the same flat int32 tensor as before.
+        encoded = self.tokenizer(prompts)["input_ids"]
+        return [torch.tensor(ids, dtype=torch.int32) for ids in encoded]
