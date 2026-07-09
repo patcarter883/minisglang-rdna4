@@ -96,7 +96,7 @@ def _concat(prefix: str, name: str) -> str:
 class Qwen3_5Attn(BaseOP):
     """Gated, partial-rotary GQA. q_proj carries a per-head sigmoid output gate."""
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, name_prefix: str | None = None):
         head_dim = config.head_dim
         nqo, nkv = config.num_qo_heads, config.num_kv_heads
         # Per-projection quant is CONFIG-DRIVEN (like the GDN in_proj below): a self_attn projection
@@ -104,10 +104,16 @@ class Qwen3_5Attn(BaseOP):
         # `ignore` list). The AWQ 35B keeps q/k/v/o bf16 (whole backbone in modules_to_not_convert);
         # the MXFP4 checkpoint ALSO keeps self_attn bf16 (its q/k/v/o sit in the ignore list) while
         # quantizing the GDN in_proj — the precision falls out of the config, no model-name branch.
+        # `name_prefix` is the checkpoint namespace for is_module_quantized: the backbone decoder uses
+        # `model.layers.<id>`, but the MTP head's self_attn lives under `mtp.layers.0.*` in the
+        # checkpoint (its ignore entries are `mtp.layers.0.self_attn.*`), so Qwen3_5MTPAttn overrides
+        # it — else the MTP layer id (== num_layers) matches no ignore entry and mis-quantizes a bf16
+        # MTP head (both AWQ and MXFP4 ship the whole MTP head unquantized).
         q = config.quant
+        prefix = name_prefix if name_prefix is not None else f"model.layers.{layer_id}"
 
         def _attn_method(module: str) -> "object":
-            name = f"model.layers.{layer_id}.self_attn.{module}"
+            name = f"{prefix}.self_attn.{module}"
             quantized = q is not None and q.is_module_quantized(name)
             return create_linear_method(q, quantized=quantized)
 
@@ -371,7 +377,10 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
     SHORT per-request draft chain (no paged KV / attn backend)."""
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        super().__init__(config, layer_id)
+        # The MTP head's self_attn lives under `mtp.layers.0.*` in the checkpoint — gate its quant on
+        # THAT namespace (not `model.layers.<num_layers>`, which matches no ignore entry) so a bf16
+        # MTP head stays bf16 under a quantized backbone (AWQ + MXFP4 both ship it unquantized).
+        super().__init__(config, layer_id, name_prefix="mtp.layers.0")
         self._num_kv_heads = div_even(config.num_kv_heads, get_tp_info().size)
         self._scale = float(self._head_dim) ** -0.5
 
