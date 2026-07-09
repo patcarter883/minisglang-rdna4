@@ -49,6 +49,10 @@ x-lean-common: &lean-common
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+    # Draft-model (DFlash) quantization + optional DDTree draft-tree — forwarded so the validated
+    # spec-decode config reaches the container (default empty = engine default).
+    MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
+    MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-}"
 
 services:
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
