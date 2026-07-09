@@ -115,6 +115,27 @@ class ModelConfig:
         return len(self.gdn_layer_ids)
 
     @property
+    def full_attn_layer_ids(self) -> list[int]:
+        """Global indices of the FULL-attention layers, in order. The paged KV pool is indexed by
+        position in THIS list (a compact kv id) — the GDN/linear layers keep no paged KV, so
+        indexing the pool by the global layer_id would allocate (and strand) a KV slot for every
+        linear layer. For a non-hybrid model every layer is full-attention, so this is the identity
+        [0..num_layers)."""
+        if self.layer_types is None:
+            return list(range(self.num_layers))
+        return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
+
+    @property
+    def num_kv_layers(self) -> int:
+        """Number of layers that keep a paged KV cache = the pool's layer dimension. For a GDN
+        hybrid only the full-attention layers do (the 3-in-4 linear layers keep fixed recurrent
+        state instead); every other family keeps num_layers unchanged (dense/MLA are all-attention,
+        and CCA already indexes its pool by its own compact cca_layer_id)."""
+        if self.is_gdn_hybrid:
+            return len(self.full_attn_layer_ids)
+        return self.num_layers
+
+    @property
     def gdn_conv_dim(self) -> int:
         """conv_dim = 2*key_dim + value_dim — the causal-conv channel count."""
         assert self.linear_key_head_dim is not None and self.linear_num_key_heads is not None

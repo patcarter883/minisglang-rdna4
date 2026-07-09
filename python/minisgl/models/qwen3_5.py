@@ -96,7 +96,14 @@ def _concat(prefix: str, name: str) -> str:
 class Qwen3_5Attn(BaseOP):
     """Gated, partial-rotary GQA. q_proj carries a per-head sigmoid output gate."""
 
-    def __init__(self, config: ModelConfig, layer_id: int, *, name_prefix: str | None = None):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_id: int,
+        *,
+        name_prefix: str | None = None,
+        attn_kv_id: int | None = None,
+    ):
         head_dim = config.head_dim
         nqo, nkv = config.num_qo_heads, config.num_kv_heads
         # Per-projection quant is CONFIG-DRIVEN (like the GDN in_proj below): a self_attn projection
@@ -133,7 +140,10 @@ class Qwen3_5Attn(BaseOP):
         self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
         self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps, plus_one=True)
         self.attn = AttentionLayer(
-            layer_id=layer_id,
+            # Index the paged KV pool by the COMPACT full-attn position (GDN hybrid: 0..9 over the
+            # 10 full-attn layers), not the global layer_id (3,7,..,39) — the pool has one slot per
+            # full-attn layer. Non-hybrid: attn_kv_id is None -> identity layer_id.
+            layer_id=attn_kv_id if attn_kv_id is not None else layer_id,
             head_dim=head_dim,
             num_qo_heads=nqo,
             num_kv_heads=nkv,
@@ -253,6 +263,7 @@ class Qwen3_5DecoderLayer(BaseOP):
         *,
         is_gdn: bool,
         gdn_layer_id: int | None,
+        attn_kv_id: int | None = None,
         mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP,
     ):
         if is_gdn:
@@ -289,7 +300,8 @@ class Qwen3_5DecoderLayer(BaseOP):
             self.linear_attn = GDNLinearAttn(gdn, gdn_layer_id)
             self._attn_op: BaseOP = self.linear_attn
         else:
-            self.self_attn = Qwen3_5Attn(config, layer_id)
+            assert attn_kv_id is not None
+            self.self_attn = Qwen3_5Attn(config, layer_id, attn_kv_id=attn_kv_id)
             self._attn_op = self.self_attn
         # Dense SwiGLU for the 4B; the MoE variants pass a sparse-block factory (the MLP is the
         # ONLY structural difference between qwen3_5 and qwen3_5_moe decoder layers).
@@ -323,11 +335,15 @@ class Qwen3_5Model(BaseOP):
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
         )
         gdn_pos = {gid: pos for pos, gid in enumerate(config.gdn_layer_ids)}
+        # Compact KV index per FULL-attention layer (mirrors gdn_pos): the paged KV pool has one
+        # slot per full-attn layer, so a full-attn layer at global id `lid` stores/reads at
+        # attn_pos[lid]. For a non-hybrid model this is the identity (every layer is full-attn).
+        attn_pos = {aid: pos for pos, aid in enumerate(config.full_attn_layer_ids)}
         self.layers = OPList(
             [
                 Qwen3_5DecoderLayer(
                     config, lid, is_gdn=lid in gdn_pos, gdn_layer_id=gdn_pos.get(lid),
-                    mlp_factory=mlp_factory,
+                    attn_kv_id=attn_pos.get(lid), mlp_factory=mlp_factory,
                 )
                 for lid in range(config.num_layers)
             ]
