@@ -19,6 +19,25 @@ class RotaryConfig:
     interleave: bool = False
 
 
+def _rotary_from_subdict(
+    sub: Dict[str, Any], head_dim: int, max_position: int
+) -> RotaryConfig:
+    """Build a RotaryConfig from one rope sub-dict (Laguna nests two: full_attention → yarn,
+    sliding_attention → default). Handles per-scheme partial rotary + scaling independently."""
+    rope_theta = sub["rope_theta"]
+    partial = sub.get("partial_rotary_factor")
+    rotary_dim = int(head_dim * partial) if partial is not None else head_dim
+    rope_type = sub.get("rope_type", "default")
+    scaling = sub if rope_type not in (None, "default") else None
+    return RotaryConfig(
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        max_position=max_position,
+        base=rope_theta,
+        scaling=scaling,
+    )
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
@@ -69,6 +88,19 @@ class ModelConfig:
     linear_value_head_dim: int | None = None
     linear_conv_kernel_dim: int | None = None
     layer_types: tuple[str, ...] | None = None
+    # ---- Sliding-window attention (SWA) hybrid (Laguna: repeating [full, sliding×3]). None for a
+    # non-SWA model. `layer_types[i]` is "sliding_attention" (windowed) or "full_attention" (global);
+    # a SWA layer keeps paged KV but capped at `sliding_window` tokens (its own ring pool), NOT full
+    # context. Distinct from the GDN `layer_types` vocabulary ("linear_attention"/"full_attention") —
+    # is_gdn_hybrid now REQUIRES a linear layer, so a SWA schedule never routes through the GDN path.
+    sliding_window: int | None = None
+    # Per-layer query/output head count (Laguna: 48 on full layers, 64 on sliding). None -> uniform
+    # num_qo_heads for every layer. The model builder sizes each layer's q_proj from this.
+    attn_head_counts: tuple[int, ...] | None = None
+    # Second RoPE scheme for the SLIDING layers (Laguna: default θ=1e4, full-rotary). `rotary_config`
+    # carries the FULL-attention rope (Laguna: yarn θ=5e5, partial-0.5). None -> every layer shares
+    # `rotary_config`. The model builder picks per-layer by the attn schedule.
+    sliding_rotary_config: RotaryConfig | None = None
     # ---- ZAYA CCA hybrid (cross-channel attention conv front-end + EDA/MOD MoE). None for non-Zaya.
     # Populated by from_hf ONLY when model_type == "zaya", so every other model keeps is_cca_hybrid
     # False. The schedule is implicit (even layer -> CCA attention, odd -> MoE), so there is no
@@ -99,8 +131,37 @@ class ModelConfig:
 
     @property
     def is_gdn_hybrid(self) -> bool:
-        """True for a GDN/linear-attention hybrid (interleaved linear + full layers)."""
-        return self.layer_types is not None
+        """True for a GDN/linear-attention hybrid (interleaved linear + full layers). Keyed on the
+        presence of an actual "linear_attention" layer, NOT merely `layer_types is not None` — a SWA
+        model (Laguna) also carries a `layer_types` list ("sliding_attention"/"full_attention"), and
+        must NOT be mistaken for a GDN hybrid (that would strand its 30 sliding layers out of the KV
+        pool → OOB crash). The two schedules are disjoint by their layer-type vocabulary."""
+        return self.layer_types is not None and any(
+            t == "linear_attention" for t in self.layer_types
+        )
+
+    @property
+    def is_swa_hybrid(self) -> bool:
+        """True for a sliding-window-attention hybrid (Laguna). Its full layers keep a full-context
+        paged KV cache; its sliding layers keep only a `sliding_window`-token ring. Disjoint from the
+        GDN path (which has no `sliding_window` and uses "linear_attention" layers)."""
+        return (
+            self.sliding_window is not None
+            and self.layer_types is not None
+            and any(t == "sliding_attention" for t in self.layer_types)
+        )
+
+    @property
+    def swa_layer_ids(self) -> list[int]:
+        """Global indices of the SLIDING-window layers, in order. The SWA ring KV pool is indexed by
+        position in THIS list (a compact swa id), mirroring gdn_layer_ids / full_attn_layer_ids."""
+        if self.layer_types is None:
+            return []
+        return [i for i, t in enumerate(self.layer_types) if t == "sliding_attention"]
+
+    @property
+    def num_swa_layers(self) -> int:
+        return len(self.swa_layer_ids)
 
     @property
     def gdn_layer_ids(self) -> list[int]:
@@ -127,11 +188,14 @@ class ModelConfig:
 
     @property
     def num_kv_layers(self) -> int:
-        """Number of layers that keep a paged KV cache = the pool's layer dimension. For a GDN
-        hybrid only the full-attention layers do (the 3-in-4 linear layers keep fixed recurrent
-        state instead); every other family keeps num_layers unchanged (dense/MLA are all-attention,
-        and CCA already indexes its pool by its own compact cca_layer_id)."""
-        if self.is_gdn_hybrid:
+        """Number of layers that keep a FULL-CONTEXT paged KV cache = the main pool's layer dimension.
+        For a GDN hybrid only the full-attention layers do (the 3-in-4 linear layers keep fixed
+        recurrent state instead). For a SWA hybrid (Laguna) only the full-attention layers keep a
+        full-context pool; the sliding layers keep a SEPARATE window-bounded ring pool (num_swa_layers,
+        sized by `sliding_window`, not full context) — so sizing the main pool by num_layers would
+        over-allocate full-context KV for all 30 sliding layers (~3.8x waste at 32k). Every other
+        family keeps num_layers unchanged (dense/MLA are all-attention; CCA uses its own compact id)."""
+        if self.is_gdn_hybrid or self.is_swa_hybrid:
             return len(self.full_attn_layer_ids)
         return self.num_layers
 
@@ -237,7 +301,13 @@ class ModelConfig:
         # noaux_tc / fine-grained MoE knobs (defaults = plain top-k, no shared expert).
         n_group = getattr(config, "n_group", 1) or 1
         topk_group = getattr(config, "topk_group", 1) or 1
-        routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0) or 1.0
+        # Laguna names it `moe_routed_scaling_factor` (2.5); GLM/DeepSeek use `routed_scaling_factor`.
+        # Read the moe-prefixed key first so Laguna's 2.5 isn't silently defaulted to 1.0.
+        routed_scaling_factor = (
+            getattr(config, "moe_routed_scaling_factor", None)
+            or getattr(config, "routed_scaling_factor", 1.0)
+            or 1.0
+        )
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0) or 0
         n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
         num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
@@ -329,6 +399,36 @@ class ModelConfig:
                 ]
             layer_types = tuple(layer_types)
 
+        # Sliding-window-attention hybrid (Laguna): an UN-gated `layer_types` of "full_attention" /
+        # "sliding_attention" plus a top-level `sliding_window`. Kept separate from the GDN branch
+        # above (which is gated on linear_num_key_heads) so the two schedules never collide; a SWA
+        # config has no linear dims, so this is the branch that populates layer_types for it.
+        sliding_window = getattr(config, "sliding_window", None)
+        attn_head_counts = None
+        sliding_rotary_config = None
+        _full_rope_override: RotaryConfig | None = None
+        if layer_types is None and sliding_window is not None:
+            _lts = getattr(config, "layer_types", None)
+            if _lts is not None and any(t == "sliding_attention" for t in _lts):
+                layer_types = tuple(_lts)
+        if layer_types is not None and any(t == "sliding_attention" for t in layer_types):
+            # Per-layer QO head counts (Laguna: 48 full / 64 sliding).
+            _heads = getattr(config, "num_attention_heads_per_layer", None)
+            if _heads is not None:
+                attn_head_counts = tuple(int(h) for h in _heads)
+            # Two RoPE schemes: rope_parameters nests one sub-dict per attention type. Build the
+            # FULL rope into rotary_config below (override the generic single-rope parse) and the
+            # SLIDING rope into sliding_rotary_config.
+            if isinstance(rope_params, dict) and "full_attention" in rope_params:
+                _maxpos = config.max_position_embeddings
+                _full_rope_override = _rotary_from_subdict(
+                    rope_params["full_attention"], head_dim, _maxpos
+                )
+                if "sliding_attention" in rope_params:
+                    sliding_rotary_config = _rotary_from_subdict(
+                        rope_params["sliding_attention"], head_dim, _maxpos
+                    )
+
         return cls(
             num_layers=config.num_hidden_layers,
             num_qo_heads=config.num_attention_heads,
@@ -340,7 +440,11 @@ class ModelConfig:
             hidden_act=getattr(config, "hidden_act", "silu"),
             rms_norm_eps=rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
-            rotary_config=RotaryConfig(
+            # SWA models (Laguna) override this with the FULL-attention rope (yarn); the sliding
+            # layers use `sliding_rotary_config`. Every other model builds the single generic rope.
+            rotary_config=_full_rope_override
+            if _full_rope_override is not None
+            else RotaryConfig(
                 head_dim=head_dim,
                 rotary_dim=rotary_dim,
                 max_position=config.max_position_embeddings,
@@ -363,6 +467,14 @@ class ModelConfig:
             linear_value_head_dim=getattr(config, "linear_value_head_dim", None),
             linear_conv_kernel_dim=getattr(config, "linear_conv_kernel_dim", None),
             layer_types=layer_types,
+            sliding_window=(
+                sliding_window
+                if layer_types is not None
+                and any(t == "sliding_attention" for t in layer_types)
+                else None
+            ),
+            attn_head_counts=attn_head_counts,
+            sliding_rotary_config=sliding_rotary_config,
             kv_lora_rank=kv_lora_rank,
             q_lora_rank=q_lora_rank,
             qk_nope_head_dim=qk_nope_head_dim,
