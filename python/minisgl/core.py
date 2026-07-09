@@ -66,9 +66,21 @@ class Req:
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
-        self.device_len = len(self.input_ids)
-        self.max_device_len = len(self.input_ids) + self.output_len
+        n = len(self.input_ids)
+        self.device_len = n
+        self.max_device_len = n + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+        # Host token buffer, preallocated to the max length this sequence can ever reach (prompt +
+        # output_len committed tokens). `input_ids` is ALWAYS a length-prefix VIEW into this buffer,
+        # so committing a token is an O(1) amortized in-place write instead of the O(seq_len) full
+        # realloc+copy a growing `torch.cat` incurred (which made one generation O(seq_len^2)). Every
+        # reader sees a byte-identical tensor (same values, dtype, cpu device); only the backing
+        # store changed. Appends past the preallocated max (a speculative accept near the end) grow
+        # the buffer by doubling — see _append_host_ids.
+        self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)
+        self._ids_buf[:n] = self.input_ids
+        self._ids_len = n
+        self.input_ids = self._ids_buf[:n]
 
     @property
     def remain_len(self) -> int:
@@ -82,8 +94,24 @@ class Req:
         self.cached_len = self.device_len
         self.device_len += 1
 
+    def _append_host_ids(self, tokens: torch.Tensor) -> None:
+        # Append one or more committed tokens into the preallocated host buffer in O(1) amortized
+        # time. `tokens` is a 1-D cpu tensor whose dtype already matches input_ids (callers build it
+        # that way — exactly as the old torch.cat required). Grows (doubling) only in the rare case a
+        # path commits past max_device_len, keeping the result identical to a torch.cat either way.
+        n = self._ids_len
+        end = n + tokens.numel()
+        if end > self._ids_buf.numel():
+            new_cap = max(end, self._ids_buf.numel() * 2)
+            grown = torch.empty(new_cap, dtype=self._ids_buf.dtype)
+            grown[:n] = self._ids_buf[:n]
+            self._ids_buf = grown
+        self._ids_buf[n:end] = tokens
+        self._ids_len = end
+        self.input_ids = self._ids_buf[:end]
+
     def append_host(self, next_token: torch.Tensor) -> None:
-        self.input_ids = torch.cat([self.input_ids, next_token])
+        self._append_host_ids(next_token)
 
     @property
     def can_decode(self) -> bool:

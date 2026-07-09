@@ -314,6 +314,7 @@ class Engine:
             dummy_req=self.dummy_req,
             gdn_state=self.gdn_state,
             cca_state=self.cca_state,
+            max_running_req=config.max_running_req,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -543,7 +544,7 @@ class Engine:
         from .graph import _determine_cuda_graph_bs
 
         bs_list = _determine_cuda_graph_bs(
-            config.cuda_graph_bs, config.cuda_graph_max_bs, free_memory
+            config.cuda_graph_bs, config.cuda_graph_max_bs, free_memory, config.max_running_req
         )
         if not bs_list:
             return 0

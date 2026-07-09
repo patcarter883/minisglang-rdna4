@@ -388,6 +388,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if kwargs["enable_ep"]:
         assert dp_size > 1, "--enable-ep requires --data-parallel-size > 1"
 
+    # Co-derive the CUDA-graph coverage and the admission cap so no decode batch size runs fully
+    # eager. When a graph cap is explicitly requested BELOW the running cap, admit no more reqs than
+    # the graph covers — otherwise decode batches in (cuda_graph_max_bs, max_running_req] fall back to
+    # a fully-eager forward (the worst launch-overhead case). The complementary direction (an AUTO
+    # graph cap RAISED to cover max_running_req) is handled in engine/graph._determine_cuda_graph_bs.
+    # cuda_graph_max_bs==0 (graphs disabled) is left alone: that path is uniformly eager by choice, so
+    # there is no coverage band to close.
+    _cg = kwargs.get("cuda_graph_max_bs")
+    if _cg is not None and _cg >= 1 and _cg < kwargs["max_running_req"]:
+        kwargs["max_running_req"] = _cg
+
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
