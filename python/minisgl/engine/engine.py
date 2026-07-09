@@ -744,6 +744,7 @@ class Engine:
         scheduler has copied input_ids/positions/out_loc into the static buffers). Otherwise — a
         partial-K step, or a non-MLA backend — it falls back to the eager forward."""
         assert torch.cuda.current_stream() == self.stream
+        _maybe_profile()  # count verify steps too, so MINISGL_PROFILE can trace the spec-verify path
         # v2 S4: the FUSED-TiDAR custom-mask verify forward has its own captured graph (distinct qlen +
         # a static dense mask). Check it first — its batch carries `fused_verify=True` and fused_qlen
         # query tokens, so it never collides with the K+1 two-forward verify graph below. Logits-only.
