@@ -99,7 +99,13 @@ class W4A8LinearMethod:
                 f"CT dense needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
             )
             layer.weight_packed = torch.empty((N, K // pf), dtype=torch.int32)
-            layer.weight_scale = torch.empty((N, K // g), dtype=torch.bfloat16)
+            # pack-quantized scales ship fp16 (some heads ship bf16); the loader normalizes both to
+            # fp16 (engine._cast) so this one declared dtype matches every CT checkpoint.
+            layer.weight_scale = torch.empty((N, K // g), dtype=torch.float16)
+            if not self.quant.sym:
+                # ASYMMETRIC: per-group weight_zero_point, int4-packed 8-per-int32 along the OUTPUT
+                # dim (shape [N//pf, G]) — already the op's zeros layout. Loaded + used in process().
+                layer.weight_zero_point = torch.empty((N // pf, K // g), dtype=torch.int32)
             return
         # AWQ "gemm" layout: qweight (K, N//pf) i32, scales (K//group, N) f16,
         # qzeros (K//group, N//pf) i32 (asymmetric only).
@@ -125,14 +131,26 @@ class W4A8LinearMethod:
             N, Kp = layer.weight_packed.shape  # type: ignore[attr-defined]
             G = layer.weight_scale.shape[-1]  # type: ignore[attr-defined]
             wp = layer.weight_packed.contiguous()  # type: ignore[attr-defined]
-            if _ct_packed_is_uint4b8(wp):
+            uint4b8 = _ct_packed_is_uint4b8(wp)
+            if uint4b8:
                 layer._w_packed_op = wp
             else:
                 layer._w_packed_op = (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
             layer._scales_op = layer.weight_scale.to(torch.float16).contiguous()  # type: ignore[attr-defined]
-            zeros = torch.empty((N // pf, G), dtype=torch.int32)
-            zeros.view(torch.uint8).fill_(0x88)
-            layer._zeros_op = zeros.to(wp.device)
+            zp = getattr(layer, "weight_zero_point", None)
+            if zp is None:
+                # SYMMETRIC: constant zero-point 8 (uint4b8), zeros_op all 0x88.
+                zeros = torch.empty((N // pf, G), dtype=torch.int32)
+                zeros.view(torch.uint8).fill_(0x88)
+                layer._zeros_op = zeros.to(wp.device)
+            else:
+                # ASYMMETRIC: real per-group zero_point, already int4-packed [N//pf, G] along N (the
+                # op's zeros layout). It shares the weight's sign convention (same quantizer), so apply
+                # the SAME uint4b8-vs-two's-complement transform: W_u and Z_u then live in one unsigned
+                # domain and the op computes scale*(W_u - Z_u) = scale*(q - zp), exact.
+                zp = zp.contiguous()
+                layer._zeros_op = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+                del layer.weight_zero_point
             del layer.weight_packed, layer.weight_scale
             return
         qz = getattr(layer, "qzeros", None)

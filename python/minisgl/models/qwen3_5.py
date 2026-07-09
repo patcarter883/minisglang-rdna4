@@ -214,8 +214,8 @@ class GDNLinearAttn(BaseOP):
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
-    def post_load(self) -> None:  # GDN keeps bf16/fp32 weights as-loaded; nothing to finalize
-        pass
+    def post_load(self) -> None:  # convert any quantized GDN projection to op layout (bf16: no-op)
+        self._gdn.process_quant()
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -230,6 +230,20 @@ class Qwen3_5DecoderLayer(BaseOP):
     ):
         if is_gdn:
             assert gdn_layer_id is not None
+            # Per-projection quant is CONFIG-DRIVEN, via the same generic dispatcher the dense
+            # linears use: a projection is quantized iff the checkpoint's quant config declares its
+            # module quantized (i.e. it is NOT in the `ignore` list). The 35B (qwen3_5_moe) nulls
+            # config.quant for the backbone, so create_linear_method returns UnquantizedLinearMethod
+            # and the GDN stays bf16; the dense 27B (compressed-tensors) quantizes in_proj_qkv/z +
+            # out_proj (int4 packs served through the W4A8 kernel) and keeps in_proj_a/b bf16 (they
+            # sit in the ignore list). No model-name branch — the precision falls out of the config.
+            q = config.quant
+
+            def _gdn_method(module: str) -> "object":
+                name = f"model.layers.{layer_id}.linear_attn.{module}"
+                quantized = q is not None and q.is_module_quantized(name)
+                return create_linear_method(q, quantized=quantized)
+
             gdn = QwenGatedDeltaNet(
                 hidden_size=config.hidden_size,
                 num_k_heads=config.linear_num_key_heads,
@@ -239,8 +253,11 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=config.linear_conv_kernel_dim,
                 tp_size=get_tp_info().size,  # head-parallel: local heads + out_proj all-reduce
                 eps=config.rms_norm_eps,
-                dtype=torch.get_default_dtype(),  # bf16 under the engine's build context
+                dtype=torch.get_default_dtype(),  # bf16/fp16 under the engine's build context
                 device=torch.device("meta"),  # built on meta; real tensors via load(assign=True)
+                qkvz_method=_gdn_method("in_proj_qkv"),
+                ba_method=_gdn_method("in_proj_b"),
+                out_proj_method=_gdn_method("out_proj"),
             )
             self.linear_attn = GDNLinearAttn(gdn, gdn_layer_id)
             self._attn_op: BaseOP = self.linear_attn
