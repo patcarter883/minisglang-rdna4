@@ -530,6 +530,16 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     }
 
 
+@app.get("/health")
+async def health():
+    """Liveness probe. 200 once the frontend is up and wired to the backend (global state
+    initialized). uvicorn only accepts connections after the lifespan startup that populates the
+    global state and launches the backend, so a 200 here means the server is serving. Agents /
+    monitors / load balancers should poll this."""
+    state = get_global_state()
+    return {"status": "ok", "model": state.config.model_path}
+
+
 @app.get("/v1/models")
 async def available_models():
     state = get_global_state()
