@@ -138,6 +138,25 @@ def _grammar_from_response_format(rf: dict | None) -> str | None:
     return None
 
 
+def _grammar_think_gate_delim(req: "OpenAICompletionRequest") -> str | None:
+    """Reasoning + structured output: when a request is BOTH grammar-constrained AND has thinking
+    active, return the reasoning parser's close delimiter (e.g. "</think>") so the scheduler gates
+    grammar enforcement until reasoning ends. Applying a JSON schema from token 0 would otherwise
+    mask out the `<think>…</think>` scratch a reasoning model opens with (→ truncated / CoT-leaked
+    output). Returns None — grammar from token 0, unchanged — when the request is unconstrained,
+    thinking is off, or no reasoning parser is configured (non-reasoning models). Generic/config-
+    driven: the delimiter comes from `--reasoning-parser` (auto/qwen3/deepseek/glm), no model-name
+    branch."""
+    if _grammar_from_response_format(req.response_format) is None:
+        return None
+    if not _thinking_active(req):
+        return None
+    parser = _reasoning_parser()
+    if parser is None:
+        return None
+    return parser.end_token
+
+
 def _norm_stop(stop: list | str | None) -> List[str]:
     if not stop:
         return []
@@ -566,6 +585,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 top_p=req.top_p,
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
+                think_close_delim=_grammar_think_gate_delim(req),
             ),
         )
     )
