@@ -68,11 +68,27 @@ class Message(BaseModel):
     # "tool" carries a tool result back into the conversation (agent loop); assistant messages may
     # carry tool_calls with content=None.
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    # OpenAI-spec content: either a plain string OR an array of content parts
+    # ([{"type":"text","text":...}, {"type":"image_url",...}]). Middleware (prompt-caching / memory
+    # injection) commonly rewrites a string into the array form — spec-legal, so accept it and
+    # flatten the text parts to a string below (rejecting it was a 422).
+    content: "str | List[dict] | None" = None
     # Tool-calling conversation history (echoed straight into the chat template):
     tool_calls: List[dict] | None = None  # on a prior assistant turn
     tool_call_id: str | None = None  # on a "tool" turn — which call this result answers
     name: str | None = None  # tool/function name on a "tool" turn
+
+    @model_validator(mode="after")
+    def _flatten_content_parts(self) -> "Message":
+        """OpenAI array-of-parts content -> a plain string the chat template consumes. Concatenates the
+        `text` parts (in order); non-text parts (e.g. image_url) are ignored for this text model. A
+        plain-string content is left untouched."""
+        if isinstance(self.content, list):
+            self.content = "".join(
+                p.get("text", "") for p in self.content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return self
 
 
 class OpenAICompletionRequest(BaseModel):
