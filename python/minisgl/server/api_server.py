@@ -121,6 +121,15 @@ class OpenAICompletionRequest(BaseModel):
     chat_template_kwargs: dict | None = None
     enable_thinking: bool | None = None
 
+    # Reasoning BUDGET (backstop): for a grammar-constrained + thinking request, cap the free reasoning
+    # phase at this many tokens — after it, the scheduler force-emits the reasoning-close token so the
+    # JSON schema engages (a rambling model that never emits a clean `</think>` still yields JSON).
+    # `reasoning_max_tokens` is the explicit token count; the OpenAI `reasoning_effort`
+    # ("low"/"medium"/"high") maps to a token budget; a `reasoning_max_tokens` in `chat_template_kwargs`
+    # is also honored. Unset -> the server's MINISGL_THINK_BUDGET default.
+    reasoning_max_tokens: int | None = None
+    reasoning_effort: str | None = None
+
     # Per-call Markovian-RSA control (in-engine, same port). Absent / null -> ordinary single
     # completion. `true` -> run RSA with the server's --rsa-* defaults. An object patches those
     # defaults for THIS call: {n, k, t, tail_tokens, max_tokens, agg_max_tokens, temperature,
@@ -168,6 +177,22 @@ def _grammar_think_gate_delim(req: "OpenAICompletionRequest") -> str | None:
     if parser is None:
         return None
     return parser.end_token
+
+
+def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
+    """Per-request reasoning-token budget for the think-gate backstop, or None to use the server's
+    MINISGL_THINK_BUDGET default. Precedence: explicit `reasoning_max_tokens` > the same key inside
+    `chat_template_kwargs` > OpenAI `reasoning_effort` (low/medium/high -> a token budget). Only takes
+    effect for grammar-constrained + thinking requests (the scheduler ignores it otherwise)."""
+    if isinstance(req.reasoning_max_tokens, int) and req.reasoning_max_tokens > 0:
+        return req.reasoning_max_tokens
+    ck = req.chat_template_kwargs or {}
+    ck_budget = ck.get("reasoning_max_tokens")
+    if isinstance(ck_budget, int) and ck_budget > 0:
+        return ck_budget
+    if req.reasoning_effort:
+        return {"low": 256, "medium": 1024, "high": 4096}.get(req.reasoning_effort.lower())
+    return None
 
 
 def _norm_stop(stop: list | str | None) -> List[str]:
@@ -756,6 +781,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
                 think_close_delim=_grammar_think_gate_delim(req),
+                think_budget=_resolve_think_budget(req),
             ),
         )
     )

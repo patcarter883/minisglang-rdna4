@@ -37,6 +37,13 @@ class SamplingParams:
     # enforced only on the post-`</think>` answer. None => grammar applies from token 0 (non-reasoning
     # models, thinking-off requests, or unconstrained reqs — all unchanged).
     think_close_delim: str | None = None
+    # Reasoning BUDGET (backstop for the gate above): a reasoning model often rambles in long/loose
+    # prose and never emits a clean `</think>`, so the gate never opens and no JSON is produced. When
+    # set (or via the scheduler's MINISGL_THINK_BUDGET default), after this many reasoning tokens the
+    # scheduler FORCE-emits the think-close token, opening the gate so the schema engages. None => the
+    # scheduler's env default applies; <=0 also falls back to the default. Only meaningful together with
+    # `think_close_delim` (constrained + thinking); ignored otherwise.
+    think_budget: int | None = None
 
     @property
     def is_greedy(self) -> bool:
