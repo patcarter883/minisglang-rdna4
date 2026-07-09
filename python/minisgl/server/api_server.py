@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.rsa.config import merge_params
@@ -21,10 +21,13 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    StatsFrontendMsg,
     TokenizeMsg,
     UserReply,
 )
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
+
+from .metrics import BackendSnapshot, FrontendMetrics
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from pydantic import BaseModel, Field
@@ -239,22 +242,49 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    metrics: FrontendMetrics = field(default_factory=FrontendMetrics)
 
     def new_user(self) -> int:
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
+        self.metrics.on_request_start(uid)
         return uid
 
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
-            for msg in _unwrap_msg(msg):
-                if msg.uid not in self.ack_map:
+            # Scheduler metrics snapshot (piggybacked on the detokenizer link) — feed /metrics, no uid.
+            if isinstance(msg, StatsFrontendMsg):
+                self.metrics.update_backend(
+                    BackendSnapshot(
+                        dp_rank=msg.dp_rank,
+                        spec_draft_tokens=msg.spec_draft_tokens,
+                        spec_accepted_tokens=msg.spec_accepted_tokens,
+                        spec_emitted_tokens=msg.spec_emitted_tokens,
+                        spec_steps=msg.spec_steps,
+                        running_requests=msg.running_requests,
+                        waiting_requests=msg.waiting_requests,
+                        kv_tokens_total=msg.kv_tokens_total,
+                        kv_tokens_used=msg.kv_tokens_used,
+                        gdn_slots_total=msg.gdn_slots_total,
+                        gdn_slots_used=msg.gdn_slots_used,
+                    )
+                )
+                continue
+            for reply in _unwrap_msg(msg):
+                if reply.uid not in self.ack_map:
                     continue
-                self.ack_map[msg.uid].append(msg)
-                self.event_map[msg.uid].set()
+                self.metrics.on_reply(
+                    reply.uid,
+                    reply.completion_tokens,
+                    reply.prompt_tokens,
+                    bool(reply.incremental_output),
+                    reply.finished,
+                )
+                self.ack_map[reply.uid].append(reply)
+                self.event_map[reply.uid].set()
 
     def _create_listener_once(self):
         if not self.initialized:
@@ -346,6 +376,7 @@ class FrontendManager:
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
+        self.metrics.on_abort(uid)
         if uid in self.ack_map:
             del self.ack_map[uid]
         if uid in self.event_map:
@@ -540,6 +571,16 @@ async def health():
     return {"status": "ok", "model": state.config.model_path}
 
 
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text-exposition endpoint (hand-rolled; no prometheus_client dependency). Frontend
+    counters/histograms + the latest per-DP-replica scheduler snapshot. See server/metrics.py."""
+    state = get_global_state()
+    return PlainTextResponse(
+        state.metrics.render(), media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
+
 @app.get("/v1/models")
 async def available_models():
     state = get_global_state()
@@ -660,6 +701,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     assert _GLOBAL_STATE is None, "Global state is already initialized"
     _GLOBAL_STATE = FrontendManager(
         config=config,
+        metrics=FrontendMetrics(config.model_path),
         recv_tokenizer=ZmqAsyncPullQueue(
             config.zmq_frontend_addr,
             create=True,
