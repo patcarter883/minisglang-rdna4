@@ -70,7 +70,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         cache_type = config.cache_type
         # GDN AND CCA recurrent state are both non-prefix-cacheable UNLESS we checkpoint it: a plain
         # radix hit would report cached_len>0 with no recurrent state behind it (silent garbage).
-        # MINISGL_GDN_RADIX=1 opts into the recurrent-radix cache, which snapshots the linear-attention
+        # The --gdn-radix flag (default on) opts into the recurrent-radix cache, which snapshots the linear-attention
         # recurrent state at page-aligned prefix-commit boundaries and restores it on a hit (lossless
         # under the bit-exact recurrent kernel; see radix_cache.py). Default OFF -> force 'naive' as
         # before, so the recurrent path is byte-unchanged unless explicitly enabled.
@@ -83,16 +83,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # (spec verify-state install), an untested interaction — force naive there.
         _rec_radix_ok = self.engine.spec_config is None and not self.engine.enable_ep
         if has_recurrent_state and cache_type != "naive":
-            if os.environ.get("MINISGL_GDN_RADIX") == "1" and _rec_radix_ok:
+            if config.gdn_radix and _rec_radix_ok:
                 self._rec_radix = True
                 cache_type = "recurrent_radix"
                 logger.warning_rank0(
-                    "recurrent-state hybrid model: MINISGL_GDN_RADIX=1 -> using recurrent radix "
-                    "prefix cache (page-aligned recurrent-state snapshots reused on prefix hits)"
+                    "recurrent-state hybrid model: using recurrent radix prefix cache (page-aligned "
+                    "recurrent-state snapshots reused on prefix hits; --no-gdn-radix to disable)"
                 )
             else:
-                why = "GDN/CCA recurrent state is not prefix-cacheable (set MINISGL_GDN_RADIX=1 to enable)"
-                if os.environ.get("MINISGL_GDN_RADIX") == "1" and not _rec_radix_ok:
+                why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
+                if config.gdn_radix and not _rec_radix_ok:
                     why = "recurrent radix is not supported with spec-decode / expert-parallelism"
                 logger.warning_rank0(
                     f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
@@ -123,7 +123,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             else None
         )
         # Recurrent-radix prefix caching binds to the single active recurrent state cache + its slot
-        # manager (a model is GDN xor CCA, never both). None unless MINISGL_GDN_RADIX enabled it above.
+        # manager (a model is GDN xor CCA, never both). None unless --gdn-radix enabled it above.
         if self._rec_radix and self.gdn_slots is not None:
             self._rec_cache, self._rec_slots = self.engine.gdn_state, self.gdn_slots
         elif self._rec_radix and self.cca_slots is not None:
