@@ -11,6 +11,7 @@ from minisgl.distributed import (
     get_tp_info,
     is_ep_enabled,
 )
+from minisgl.quant import kernels
 from minisgl.utils import div_even
 
 from .base import BaseOP
@@ -46,8 +47,6 @@ class _GroupedGPTQExperts(BaseOP):
         raise RuntimeError("_GroupedGPTQExperts holds weights; call kernels.w4a8_moe instead")
 
     def post_load(self) -> None:
-        from minisgl.quant import kernels
-
         assert not self._quant.desc_act, "GPTQ desc_act (act-order) not supported"
         E = self.qweight.shape[0]
         w_op, s_op, z_op = [], [], []
@@ -87,8 +86,6 @@ class _GroupedAWQExperts(BaseOP):
         raise RuntimeError("_GroupedAWQExperts holds weights; call kernels.w4a8_moe instead")
 
     def post_load(self) -> None:
-        from minisgl.quant import kernels
-
         E = self.qweight.shape[0]
         w_op, s_op, z_op = [], [], []
         for e in range(E):
@@ -358,8 +355,6 @@ class _W4A8MoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE W4A8 path is silu-only without router-weight-on-input"
         )
-        from minisgl.quant import kernels
-
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
@@ -367,8 +362,6 @@ class _W4A8MoEMethod(MoEQuantMethod):
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
-        from minisgl.quant import kernels
-
         return kernels.w4a8_moe(
             g_hidden, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
@@ -396,8 +389,6 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE MXFP4 path is silu-only without router-weight-on-input"
         )
-        from minisgl.quant import kernels
-
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
@@ -406,8 +397,6 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
-        from minisgl.quant import kernels
-
         return kernels.w4a8_moe(
             g_hidden, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
@@ -433,8 +422,6 @@ class _RXFMoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE RXF path is silu-only without router-weight-on-input"
         )
-        from minisgl.quant import kernels
-
         return kernels.rxf_moe(
             hidden_states, w13.weight_packed, w13.weight_scale, w2.weight_packed, w2.weight_scale,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
@@ -472,8 +459,6 @@ class _FP8MoEMethod(MoEQuantMethod):
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
               top_k, renormalize, activation, apply_router_weight_on_input):
         assert topk_ids is not None, "fp8 experts use the precomputed-route path (ZAYA top-1 + MOD)"
-        from minisgl.quant import kernels
-
         if self._w8a16_fn is not None:
             # W8A16 opt-in: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack
             # materialize), routed experts only; bf16 acts. Uses the always-present op-layout buffers.
@@ -500,8 +485,6 @@ class _FP8MoEMethod(MoEQuantMethod):
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
-        from minisgl.quant import kernels
-
         if self._w8a16_fn is not None:
             # Kernel requires bf16 acts; guard the cast (no-op when already bf16) — see forward().
             acts = g_hidden if g_hidden.dtype == torch.bfloat16 else g_hidden.to(torch.bfloat16)

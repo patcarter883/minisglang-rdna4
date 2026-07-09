@@ -124,7 +124,20 @@ def _determine_cuda_graph_bs(
     if cuda_graph_max_bs < 1:
         return []
 
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    # Decode graph bs-buckets: FINER granularity in the low range (small concurrent-decode batches),
+    # coarser above. can_use_cuda_graph() replays the smallest bucket >= batch.size, so with the old
+    # grid ([1,2,4] + range(8, max, 8)) a bs=9 decode replayed the bs=16 graph and pushed 7 dummy rows
+    # through attention/GEMM/logits. The low buckets [1,2,4,8,12,16,24,32] cut worst-case low-bs padding
+    # (bs 9-12 now pad to 12, not 16); the step widens to 16 past bs=32 because proportional padding is
+    # small on big batches AND it keeps the graph COUNT bounded (each bucket costs capture time + a slice
+    # of graph-pool memory). For max=256 this is ~22 graphs vs the old 35 — FEWER, despite the finer low
+    # range. Engine._graph_capture_bytes reproduces THIS same list (calls this function), so the KV-pool
+    # reservation stays matched to what is actually captured. Filter+append(max) also fixes a latent
+    # over-reach in the old list (it returned [1,2,4] verbatim for max<4, capturing a bs above the cap).
+    buckets = [1, 2, 4, 8, 12, 16, 24, 32]
+    buckets += list(range(48, cuda_graph_max_bs + 1, 16))
+    buckets.append(cuda_graph_max_bs)  # always cover the operator-configured max exactly
+    return sorted({b for b in buckets if 1 <= b <= cuda_graph_max_bs})
 
 
 def mem_GB(size: int) -> str:
