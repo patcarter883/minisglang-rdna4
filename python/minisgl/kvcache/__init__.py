@@ -75,7 +75,7 @@ def create_radix_cache(device: torch.device):
 @SUPPORTED_CACHE_MANAGER.register("recurrent_radix")
 def create_recurrent_radix_cache(device: torch.device):
     # Radix prefix cache with per-node recurrent-state (GDN/CCA) snapshots — reuses a shared prefix's
-    # paged KV AND its linear-attention recurrent state (opt-in via MINISGL_GDN_RADIX; the scheduler
+    # paged KV AND its linear-attention recurrent state (via the --gdn-radix flag; the scheduler
     # selects this only for recurrent-hybrid models, else forces "naive"). See radix_cache.py.
     import os
 

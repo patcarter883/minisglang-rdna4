@@ -248,6 +248,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--gdn-radix",
+        action=argparse.BooleanOptionalAction,
+        default=ServerArgs.gdn_radix,
+        help="Recurrent-radix prefix cache for GDN/CCA hybrid models (reuse linear-attention state on "
+        "prefix hits). ON by default; forces the synchronous scheduler loop, so pass --no-gdn-radix to "
+        "keep overlap scheduling. Inert for non-recurrent models and under spec-decode / EP.",
+    )
+
+    parser.add_argument(
         "--moe-backend",
         default=ServerArgs.moe_backend,
         choices=["auto"] + SUPPORTED_MOE_BACKENDS.supported_names(),

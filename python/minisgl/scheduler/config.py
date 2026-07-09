@@ -16,6 +16,11 @@ class SchedulerConfig(EngineConfig):
     max_extend_tokens: int = 8192
     cache_type: str = "radix"
     offline_mode: bool = False
+    # Recurrent-radix prefix cache for GDN/CCA hybrid models: snapshot the linear-attention recurrent
+    # state at page-aligned prefix boundaries so prefix hits are reusable (lossless). ON by default;
+    # it forces the synchronous (non-overlap) scheduler loop, so `--no-gdn-radix` opts back out. Inert
+    # for non-recurrent models and auto-disabled under spec-decode / expert-parallelism (untested combo).
+    gdn_radix: bool = True
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
