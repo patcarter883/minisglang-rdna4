@@ -163,6 +163,20 @@ class DFlashProposer(Proposer):
         # carries the right RoPE phase); override for diagnostics.
         self._ctx_pos_env = os.environ.get("MINISGL_DFLASH_CTX_POS")
 
+        # --- Persistent per-request draft KV (the z-lab crop-per-step fix) -------------------------
+        # The fc+k/v-proj+rotary of a committed position's captured aux is FIXED once committed (the
+        # scheduler only ever APPENDS accepted positions to the aux buffer — never rolls back), so it
+        # is cacheable. Instead of re-projecting the whole [num_aux, P, hidden] prefix every propose
+        # (O(P) per generated token — the ~47 GFLOP/step re-feed that made DFlash a net LOSS), we keep
+        # a per-uid, per-layer prefix K/V and project ONLY the newly-accepted tail each step (O(new)).
+        # _kv[uid] = list over layers of [k_ctx, v_ctx]; _kv_plen[uid] = #positions already projected.
+        # Only active on the full-context (aux.dim()==3) path with no ctx window; disable via
+        # MINISGL_DFLASH_PERSIST_KV=0 to fall back to the recompute path (diagnostic).
+        self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
+        self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
+        self._kv: dict[int, list] = {}
+        self._kv_plen: dict[int, int] = {}
+
     def _load_draft_weights(self, folder: str) -> None:
         """Load the DFlash checkpoint directly. fc/hidden_norm/norm + per-layer Qwen3 decoder tensors
         map onto the DFlashDraftModel attributes; the whole draft is replicated on every TP rank."""
@@ -249,16 +263,44 @@ class DFlashProposer(Proposer):
             base_pos = req.cached_len + self._pos_off
 
             # target_hidden = hidden_norm(fc(concat)) — the per-layer KV prefix.
+            prefix_kv = None
             if aux.dim() == 3:
                 # Full context: prefix = aux of committed positions [cached_len-P .. cached_len-1], at
                 # their TRUE absolute RoPE positions; the block [anchor, mask...] follows at [base_pos..].
                 P = aux.shape[1]
-                aux_t = aux.permute(1, 0, 2).contiguous().to(self._dtype)  # [P, num_aux, hidden]
-                target_hidden = draft.fuse_aux(aux_t)  # [P, hidden]
                 ctx_start = req.cached_len - P
-                ctx_pos = torch.arange(
-                    ctx_start, ctx_start + P, dtype=torch.int32, device=device
-                )
+                if self._persist and self._ctx_window == 0:
+                    # FAST PATH: project only the newly-accepted tail [cached .. P-1] and append it to
+                    # the per-uid persistent K/V; reuse the cached prefix for the rest. The scheduler
+                    # only appends accepted positions to `aux`, so aux[:, :cached] is unchanged from the
+                    # previous step and needs no re-projection. free(uid) drops the cache on finish.
+                    uid = req.uid
+                    cached = self._kv_plen.get(uid, 0)
+                    if P < cached:  # uid reuse without free (defensive): rebuild from scratch
+                        cached = 0
+                        self._kv.pop(uid, None)
+                    if P > cached:
+                        new_aux = aux[:, cached:P].permute(1, 0, 2).contiguous().to(self._dtype)
+                        new_pos = torch.arange(
+                            ctx_start + cached, ctx_start + P, dtype=torch.int32, device=device
+                        )
+                        new_kv = draft.project_prefix(new_aux, new_pos)  # per-layer (k_ctx, v_ctx)
+                        if cached == 0:
+                            self._kv[uid] = [[k, v] for (k, v) in new_kv]
+                        else:
+                            cache = self._kv[uid]
+                            for l, (k, v) in enumerate(new_kv):
+                                cache[l][0] = torch.cat([cache[l][0], k], dim=0)
+                                cache[l][1] = torch.cat([cache[l][1], v], dim=0)
+                        self._kv_plen[uid] = P
+                    prefix_kv = self._kv[uid]
+                else:
+                    # Recompute path (persist disabled or ctx-window active): project the whole prefix.
+                    aux_t = aux.permute(1, 0, 2).contiguous().to(self._dtype)  # [P, num_aux, hidden]
+                    target_hidden = draft.fuse_aux(aux_t)  # [P, hidden]
+                    ctx_pos = torch.arange(
+                        ctx_start, ctx_start + P, dtype=torch.int32, device=device
+                    )
             else:
                 # Legacy single-position prefix (P=1) at the anchor's own position.
                 target_hidden = draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden]
@@ -273,7 +315,10 @@ class DFlashProposer(Proposer):
             noise_embed = draft.embed(block_ids).to(self._dtype)  # [B, hidden]
             block_pos = torch.arange(base_pos, base_pos + B, dtype=torch.int32, device=device)
 
-            hidden = draft.denoise(noise_embed, target_hidden, block_pos, ctx_pos)  # [B, hidden]
+            if prefix_kv is not None:
+                hidden = draft.denoise_cached(noise_embed, prefix_kv, block_pos)  # [B, hidden]
+            else:
+                hidden = draft.denoise(noise_embed, target_hidden, block_pos, ctx_pos)  # [B, hidden]
             logits = draft.head(hidden)  # [B, vocab]
             # Positions 1..B-1 are the speculation (position 0 is the known anchor).
             block_logits = logits[1 : 1 + k_i]  # [k_i, vocab]
@@ -294,9 +339,13 @@ class DFlashProposer(Proposer):
         return out
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
-        # No persistent draft KV: the captured target aux (refreshed each step by the scheduler) is
-        # the cross-block context, so there is nothing to roll back.
+        # Nothing to roll back: the persistent draft K/V holds only COMMITTED (accepted) positions.
+        # The scheduler appends this step's accepted-tail aux to `ctx.aux_hidden`, and the NEXT propose
+        # lazily projects that delta into the cache (see the fast path in `propose`). Rejected drafts
+        # never enter the prefix, so there is no draft tail to truncate.
         return
 
     def free(self, uid: int) -> None:
-        return
+        # Drop the finished/aborted request's persistent draft K/V (and its projected-length counter).
+        self._kv.pop(uid, None)
+        self._kv_plen.pop(uid, None)
