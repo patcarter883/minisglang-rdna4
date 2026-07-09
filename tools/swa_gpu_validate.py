@@ -69,7 +69,17 @@ def test_prefill_window():
     got = attn_hip.flash_prefill(q.contiguous(), k.contiguous(), v.contiguous(), SCALE, 1, W).float()
     ref = ref_windowed_causal_prefill(q, k, v, W)
     d = (got - ref).abs().max().item()
-    _record("cold prefill windowed causal (S=700,W=512)", d <= 5e-3, f"max|Δ|={d:.3e}")
+    # bf16 in / fp32 accumulate over a 700-length windowed softmax -> a few e-3 is expected (the
+    # canonical attn_hip SWA test uses 4e-3 at S=160; ~4.4x longer here). 1.5e-2 is the bf16 floor.
+    _record("cold prefill windowed causal (S=700,W=512)", d <= 1.5e-2, f"max|Δ|={d:.3e}")
+
+    # OFF-BY-ONE DISCRIMINATOR: the kernel's window boundary must match the W reference MUCH better
+    # than the W-1 / W+1 references. A boundary bug would flip which side matches. (This is what
+    # proves the ~8e-3 above is bf16 noise, not a masked-key-count error.)
+    d_wm1 = (got - ref_windowed_causal_prefill(q, k, v, W - 1)).abs().max().item()
+    d_wp1 = (got - ref_windowed_causal_prefill(q, k, v, W + 1)).abs().max().item()
+    _record("boundary == W (not W±1)", d < d_wm1 * 0.5 and d < d_wp1 * 0.5,
+            f"Δ(W)={d:.3e}  Δ(W-1)={d_wm1:.3e}  Δ(W+1)={d_wp1:.3e}")
 
     # Sanity: with sliding_window=0 (no window) the last query attends to ALL keys, so its output
     # must DIFFER from the windowed one (proves the window arg actually changes behaviour).
