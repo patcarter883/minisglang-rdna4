@@ -54,6 +54,9 @@ x-lean-common: &lean-common
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+    # Reasoning + structured output: gate the JSON grammar until </think> (default on). Set 0 to
+    # apply the schema from token 0 even with thinking on (the pre-fix behavior / A-B toggle).
+    MINISGL_GRAMMAR_THINK_GATE: "${MINISGL_GRAMMAR_THINK_GATE:-1}"
     # DFlash drafter weight-only quant (fp8|int8) — halves the replicated drafter to fit big pairs.
     MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
     # DDTree: route DFlash through the drafter-agnostic draft-TREE step (per-position top-K marginals
