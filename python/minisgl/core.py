@@ -26,8 +26,17 @@ class SamplingParams:
     # of these in the decoded text. Matched on the detokenized string, scheduler-agnostic.
     stop: List[str] = field(default_factory=list)
     # Structured-output spec: None (free), "json" (any valid JSON object), or a JSON-schema string.
-    # A constrained request bypasses speculative decoding and is masked per-token by a grammar matcher.
+    # A constrained request is masked per-token by a grammar matcher (drafts propose unconstrained and
+    # the grammar is enforced at the spec verify argmax).
     grammar: str | None = None
+    # Reasoning + structured output: when a grammar is combined with an active thinking phase, the
+    # model opens `<think>…</think>` reasoning BEFORE the answer, and masking JSON from token 0 would
+    # suppress that reasoning (truncated / CoT-leaked output). This carries the reasoning parser's
+    # close delimiter (e.g. "</think>"); the scheduler resolves it to a token id and does NOT
+    # advance/mask the grammar matcher until that token is emitted — reasoning is free, the schema is
+    # enforced only on the post-`</think>` answer. None => grammar applies from token 0 (non-reasoning
+    # models, thinking-off requests, or unconstrained reqs — all unchanged).
+    think_close_delim: str | None = None
 
     @property
     def is_greedy(self) -> bool:
