@@ -253,12 +253,21 @@ class RDNA4Backend(BaseAttnBackend):
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
             # calibration off), folded in the kernel. Descales sit between scale and causal.
-            # fused-TiDAR custom_mask is not wired on the fp8-KV path yet.
-            assert custom_mask is None, "fused-TiDAR custom_mask not wired on the fp8-KV path yet"
+            # DDTree / fused-TiDAR: the fp8 kernel applies the SAME additive mask_bias as the bf16
+            # path (attn_prefill_paged_kernels.hip fp8 branch, "same contract as the bf16 kernel"),
+            # so pass custom_mask straight through as mask_bias and run causal=0 when it is present
+            # (the mask carries the whole ancestor/block structure). The per-tensor descale composes
+            # cleanly: it is folded into the scores BEFORE the additive mask, so the -inf/0 mask
+            # entries mask the already-descaled scores exactly as on the bf16 path.
             ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
+            fp8_causal = 0 if custom_mask is not None else 1
+            from minisgl._hip_engage import engaged
+            engaged("attn_prefill_paged.flash_prefill_paged_fp8"
+                    + ("(masked)" if custom_mask is not None else ""))
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                self.scale, ks, vs, 1, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+                self.scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+                custom_mask,  # mask_bias (None on a normal serve; the DDTree/TiDAR ancestor mask otherwise)
             )
         causal = 0 if custom_mask is not None else 1
         from minisgl._hip_engage import engaged
