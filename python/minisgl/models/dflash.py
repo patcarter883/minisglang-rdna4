@@ -127,41 +127,54 @@ class _DFlashLayer(BaseOP):
         up = self.up_proj.forward(x)
         return self.down_proj.forward(silu_and_mul(torch.cat([gate, up], dim=-1)))
 
-    def forward(
+    def project_ctx(
         self,
-        hidden: torch.Tensor,         # [B, hidden]  noise block hidden
-        target_hidden: torch.Tensor,  # [P, hidden]  fc+hidden_norm'd captured context (shared)
-        block_pos: torch.Tensor,      # [B]  RoPE positions for the noise block
-        ctx_pos: torch.Tensor,        # [P]  RoPE positions for the target prefix
+        target_hidden: torch.Tensor,  # [m, hidden]  fc+hidden_norm'd captured context
+        ctx_pos: torch.Tensor,        # [m]  RoPE positions for these prefix rows
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project prefix rows through THIS layer's k/v_proj (+ k_norm + rotary). The result depends
+        ONLY on the (fixed) captured target hidden of already-committed positions, so it is CACHEABLE:
+        the persistent-KV proposer projects each committed position exactly ONCE and appends it, instead
+        of re-projecting the whole context every step (the O(P)-per-token re-feed this replaces).
+        Returns (k_ctx [m, Hkv, hd] post-rotary, v_ctx [m, Hkv, hd])."""
+        m = target_hidden.shape[0]
+        Hkv, hd = self.num_kv_heads, self.head_dim
+        k_ctx = self.k_proj.forward(target_hidden).view(m, Hkv, hd)
+        v_ctx = self.v_proj.forward(target_hidden).view(m, Hkv, hd)
+        self.k_norm.forward_inplace(k_ctx)
+        _, kc_flat = self._rotary.forward(
+            ctx_pos, k_ctx.reshape(m, Hkv * hd).contiguous(), k_ctx.reshape(m, Hkv * hd).contiguous()
+        )
+        return kc_flat.view(m, Hkv, hd), v_ctx
+
+    def attend_block(
+        self,
+        hidden: torch.Tensor,     # [B, hidden]  noise block hidden
+        block_pos: torch.Tensor,  # [B]  RoPE positions for the noise block
+        k_ctx: torch.Tensor,      # [P, Hkv, hd]  post-rotary prefix K (cached or freshly projected)
+        v_ctx: torch.Tensor,      # [P, Hkv, hd]  prefix V
     ) -> torch.Tensor:
+        """The block half of the layer forward: project the noise queries/KV, then attend
+        bidirectionally over [prefix K/V | noise K/V]. `k_ctx`/`v_ctx` is the (possibly persistent)
+        target-context prefix from `project_ctx`."""
         B = hidden.shape[0]
-        P = target_hidden.shape[0]
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
 
         residual = hidden
         x = self.input_layernorm.forward(hidden)
 
-        # Noise queries + KV; target-context KV prefix (projected through THIS layer's k/v_proj).
         q = self.q_proj.forward(x).view(B, H, hd)
         k_noise = self.k_proj.forward(x).view(B, Hkv, hd)
         v_noise = self.v_proj.forward(x).view(B, Hkv, hd)
-        k_ctx = self.k_proj.forward(target_hidden).view(P, Hkv, hd)
-        v_ctx = self.v_proj.forward(target_hidden).view(P, Hkv, hd)
 
-        # Per-head q_norm/k_norm over head_dim, then rotary (noise at block_pos, prefix at ctx_pos).
+        # Per-head q_norm/k_norm over head_dim, then rotary on the noise block (prefix already rotated).
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k_noise)
-        self.k_norm.forward_inplace(k_ctx)
         q_flat, kn_flat = self._rotary.forward(
             block_pos, q.reshape(B, H * hd).contiguous(), k_noise.reshape(B, Hkv * hd).contiguous()
         )
-        # The prefix shares k_proj; apply rotary to it at its own positions (q unused -> reuse a slot).
-        _, kc_flat = self._rotary.forward(
-            ctx_pos, k_ctx.reshape(P, Hkv * hd).contiguous(), k_ctx.reshape(P, Hkv * hd).contiguous()
-        )
         q = q_flat.view(B, H, hd)
         k_noise = kn_flat.view(B, Hkv, hd)
-        k_ctx = kc_flat.view(P, Hkv, hd)
 
         # K/V = [ctx prefix | noise]  along the key sequence; bidirectional (no causal mask).
         K = torch.cat([k_ctx, k_noise], dim=0)  # [P+B, Hkv, hd]
@@ -179,6 +192,18 @@ class _DFlashLayer(BaseOP):
         residual = hidden
         normed = self.post_attention_layernorm.forward(hidden)
         return residual + self._mlp(normed)
+
+    def forward(
+        self,
+        hidden: torch.Tensor,         # [B, hidden]  noise block hidden
+        target_hidden: torch.Tensor,  # [P, hidden]  fc+hidden_norm'd captured context (shared)
+        block_pos: torch.Tensor,      # [B]  RoPE positions for the noise block
+        ctx_pos: torch.Tensor,        # [P]  RoPE positions for the target prefix
+    ) -> torch.Tensor:
+        # Recompute-every-step path (no persistent KV): project the whole prefix, then attend. Kept
+        # byte-identical for the legacy/window fallback; the fast path caches project_ctx across steps.
+        k_ctx, v_ctx = self.project_ctx(target_hidden, ctx_pos)
+        return self.attend_block(hidden, block_pos, k_ctx, v_ctx)
 
 
 class DFlashDraftModel(BaseOP):
@@ -294,6 +319,34 @@ class DFlashDraftModel(BaseOP):
         hidden = noise_embed
         for layer in self.layers:
             hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos)
+        return self.norm.forward(hidden)
+
+    @torch.inference_mode()
+    def project_prefix(
+        self,
+        aux_slice: torch.Tensor,   # [m, num_aux, hidden]  captured target aux for m committed positions
+        positions: torch.Tensor,   # [m]  absolute RoPE positions of those rows
+    ) -> List[tuple]:
+        """fc+hidden_norm the captured aux of m committed positions, then project each layer's prefix
+        K/V once. Returns a per-layer list of (k_ctx [m, Hkv, hd], v_ctx [m, Hkv, hd]). The persistent-
+        KV proposer calls this ONCE per position (on the newly-accepted tail each step) and appends the
+        result to its cache — turning the O(P) per-step re-feed into O(new)."""
+        target_hidden = self.fuse_aux(aux_slice)  # [m, hidden]
+        return [layer.project_ctx(target_hidden, positions) for layer in self.layers]
+
+    @torch.inference_mode()
+    def denoise_cached(
+        self,
+        noise_embed: torch.Tensor,  # [B, hidden]
+        prefix_kv: List[tuple],     # per-layer (k_ctx [P, Hkv, hd], v_ctx [P, Hkv, hd]) from project_prefix
+        block_pos: torch.Tensor,    # [B]
+    ) -> torch.Tensor:
+        """Denoising forward against a PRECOMPUTED (persistent) per-layer prefix K/V — the fast path.
+        Byte-identical to `denoise` for the same effective prefix, but the prefix projection is reused
+        across decode steps instead of recomputed."""
+        hidden = noise_embed
+        for layer, (k_ctx, v_ctx) in zip(self.layers, prefix_kv):
+            hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx)
         return self.norm.forward(hidden)
 
 
