@@ -209,6 +209,9 @@ def _reasoning_parser():
 #   (A) Hermes JSON:  {"name": "fn", "arguments": {"k": v}}
 #   (B) Qwen3 XML:    <function=fn><parameter=k>v</parameter></function>
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# A bare `<function=…></function>` block (Qwen3 XML emitted WITHOUT a `<tool_call>` wrapper). Kept in
+# lock-step with the streaming parser, which also accepts the unwrapped opener.
+_BARE_FN_BLOCK_RE = re.compile(r"<function=[^>\s]+\s*>.*?</function>", re.DOTALL)
 _XML_FN_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.DOTALL)
 
@@ -244,23 +247,153 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     the <tool_call> blocks stripped (None if nothing but calls remain), `tool_calls` is the
     OpenAI-shaped list ([] when the model didn't call a tool)."""
     tool_calls: List[dict] = []
-    for i, m in enumerate(_TOOL_CALL_BLOCK_RE.finditer(text)):
-        parsed = _parse_one_tool_call(m.group(1))
+
+    def _add(inner: str) -> None:
+        parsed = _parse_one_tool_call(inner)
         if parsed is None:
-            continue  # malformed block -> ignore, leave it in the text
+            return  # malformed block -> ignore, leave it in the text
         name, args = parsed
         tool_calls.append(
             {
-                "id": f"call_{uid}_{i}",
+                "id": f"call_{uid}_{len(tool_calls)}",
                 "type": "function",
                 # OpenAI carries arguments as a JSON *string*.
                 "function": {"name": name, "arguments": args if isinstance(args, str) else json.dumps(args)},
             }
         )
+
+    for m in _TOOL_CALL_BLOCK_RE.finditer(text):
+        _add(m.group(1))
+    # Bare `<function=…>` blocks (no `<tool_call>` wrapper) in whatever text remains after removing
+    # the wrapped blocks (so an inner `<function=>` is not double-counted).
+    remainder = _TOOL_CALL_BLOCK_RE.sub("", text)
+    for m in _BARE_FN_BLOCK_RE.finditer(remainder):
+        _add(m.group(0))
     if not tool_calls:
         return text, []
-    content = _TOOL_CALL_BLOCK_RE.sub("", text).strip()
+    content = _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text)).strip()
     return (content or None), tool_calls
+
+
+# --- streaming tool-call parsing ------------------------------------------------------------------
+# The block openers we recognise, mapped to their closers. `<tool_call>` wraps either inner format
+# (Hermes JSON or Qwen3 `<function=…>` XML); a bare `<function=…>` (no wrapper) is also accepted so
+# the parser degrades to whatever the model actually emits. Detection mirrors the reasoning streamer:
+# text before any opener flows through as `content`; once inside a block the markup is withheld and,
+# on the closing tag, re-emitted as OpenAI streaming `delta.tool_calls`.
+_TOOL_OPENERS = ("<tool_call>", "<function=")
+_TOOL_CLOSERS = {"<tool_call>": "</tool_call>", "<function=": "</function>"}
+
+
+def _earliest_opener(text: str) -> Tuple[int, str | None]:
+    """Index + token of the earliest complete tool-block opener in ``text`` (``(-1, None)`` if none)."""
+    best_idx, best_tok = -1, None
+    for tok in _TOOL_OPENERS:
+        j = text.find(tok)
+        if j != -1 and (best_idx == -1 or j < best_idx):
+            best_idx, best_tok = j, tok
+    return best_idx, best_tok
+
+
+def _opener_partial_len(text: str) -> int:
+    """Largest k>0 such that ``text`` ends with a *strict* prefix of some opener (a start marker
+    straddling a streaming boundary). 0 when no suffix could begin an opener. Complete openers are
+    handled by ``_earliest_opener`` before this is consulted."""
+    best = 0
+    for tok in _TOOL_OPENERS:
+        for k in range(min(len(text), len(tok) - 1), 0, -1):
+            if text.endswith(tok[:k]):
+                best = max(best, k)
+                break
+    return best
+
+
+class ToolCallStreamState:
+    """Incremental tool-call splitter for the streaming path — the tool-call analogue of
+    ``ReasoningStreamState``. Feed each *content* chunk (post reasoning-split); get back
+    ``(content_delta, tool_deltas)`` where ``content_delta`` is text to stream verbatim as
+    ``delta.content`` (None if none this chunk) and ``tool_deltas`` is a list of OpenAI streaming
+    ``delta.tool_calls`` entries (each a dict to wrap as its own chunk).
+
+    A tool call is emitted as two deltas: an opener carrying ``index``/``id``/``type``/
+    ``function.name`` (empty arguments), then the full ``function.arguments`` JSON string as one
+    fragment. Arguments are not streamed token-by-token because the Qwen3 XML form only yields a
+    well-formed JSON object once the whole block is parsed; a single complete fragment reassembles
+    identically on any OpenAI client. Sequential blocks increment ``index``."""
+
+    def __init__(self, uid: int) -> None:
+        self.uid = uid
+        self.buf = ""            # partial opener (outside a block) OR accumulating block body (inside)
+        self.in_tool = False
+        self.opener: str | None = None
+        self.next_index = 0
+        self.emitted = False     # any tool call emitted -> finish_reason becomes "tool_calls"
+
+    def _parse_block(self, block: str) -> Tuple[str, dict] | None:
+        if self.opener == "<tool_call>":
+            inner = block[len("<tool_call>"):-len("</tool_call>")]
+            return _parse_one_tool_call(inner)
+        return _parse_one_tool_call(block)  # <function=…></function>, regex finds the fn tag
+
+    def _emit_call(self, block: str) -> List[dict]:
+        parsed = self._parse_block(block)
+        if parsed is None:
+            return []  # malformed block -> drop it (never leak markup into content)
+        name, args = parsed
+        args_str = args if isinstance(args, str) else json.dumps(args)
+        i = self.next_index
+        self.next_index += 1
+        self.emitted = True
+        return [
+            {"index": i, "id": f"call_{self.uid}_{i}", "type": "function",
+             "function": {"name": name, "arguments": ""}},
+            {"index": i, "function": {"arguments": args_str}},
+        ]
+
+    def push(self, delta: str) -> Tuple[str | None, List[dict]]:
+        content_parts: List[str] = []
+        tool_deltas: List[dict] = []
+        text = self.buf + delta
+        self.buf = ""
+        while text:
+            if not self.in_tool:
+                idx, opener = _earliest_opener(text)
+                if idx == -1:
+                    keep = _opener_partial_len(text)
+                    if keep:
+                        content_parts.append(text[:-keep])
+                        self.buf = text[-keep:]
+                    else:
+                        content_parts.append(text)
+                    break
+                if idx > 0:
+                    content_parts.append(text[:idx])
+                self.in_tool = True
+                self.opener = opener
+                text = text[idx:]  # keep the opener token as the head of the block buffer
+            else:
+                closer = _TOOL_CLOSERS[self.opener]  # type: ignore[index]
+                cidx = text.find(closer)
+                if cidx == -1:
+                    self.buf = text  # block still open; hold the whole body
+                    break
+                block = text[: cidx + len(closer)]
+                text = text[cidx + len(closer):]
+                tool_deltas.extend(self._emit_call(block))
+                self.in_tool = False
+                self.opener = None
+        return ("".join(content_parts) or None), tool_deltas
+
+    def flush(self) -> Tuple[str | None, List[dict]]:
+        """At stream end: an unclosed block (truncated mid-call) is dropped; a buffered partial opener
+        turned out to be literal ``content`` and is emitted."""
+        if self.in_tool:
+            self.buf, self.in_tool, self.opener = "", False, None
+            return None, []
+        if self.buf:
+            out, self.buf = self.buf, ""
+            return out, []
+        return None, []
 
 
 class ModelCard(BaseModel):
@@ -364,15 +497,25 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int, reasoning_stream=None):
+    async def stream_chat_completions(self, uid: int, reasoning_stream=None, tool_stream=None):
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
+
+        def _chunk(delta: dict) -> bytes:
+            payload = {
+                "id": f"cmpl-{uid}",
+                "object": "chat.completion.chunk",
+                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
+            }
+            return f"data: {json.dumps(payload)}\n\n".encode()
+
         async for ack in self.wait_for_ack(uid):
-            delta = {}
+            delta: dict = {}
             if first_chunk:
                 delta["role"] = "assistant"
                 first_chunk = False
+            tool_deltas: List[dict] = []
             if ack.incremental_output:
                 # Reasoning models: route the pre-</think> scratch to `reasoning_content` and the
                 # answer to `content`, in the streaming delta (buffers a partial closing tag).
@@ -380,30 +523,44 @@ class FrontendManager:
                     r_delta, c_delta = reasoning_stream.push(ack.incremental_output)
                     if r_delta:
                         delta["reasoning_content"] = r_delta
-                    if c_delta:
-                        delta["content"] = c_delta
                 else:
-                    delta["content"] = ack.incremental_output
+                    c_delta = ack.incremental_output
+                # Tool calling: split completed <tool_call>/<function=> blocks out of `content` and
+                # re-emit them as OpenAI streaming `delta.tool_calls` (buffers a partial opener).
+                if c_delta:
+                    if tool_stream is not None:
+                        content_out, tool_deltas = tool_stream.push(c_delta)
+                        if content_out:
+                            delta["content"] = content_out
+                    else:
+                        delta["content"] = c_delta
             completion_tokens = max(completion_tokens, ack.completion_tokens)
             prompt_tokens = ack.prompt_tokens or prompt_tokens
             if ack.finish_reason:
                 finish_reason = ack.finish_reason
 
-            chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "chat.completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            # Emit the content/reasoning delta (if any), then one chunk per tool-call fragment.
+            if delta:
+                yield _chunk(delta)
+            for td in tool_deltas:
+                yield _chunk({"tool_calls": [td]})
 
             if ack.finished:
                 break
 
-        # final chunk: flush any buffered reasoning tail (model never closed </think>), then
-        # finish_reason + usage (OpenAI carries usage on the terminal chunk)
+        # final chunk: flush any buffered reasoning tail (model never closed </think>) and any tool
+        # tail, then finish_reason + usage (OpenAI carries usage on the terminal chunk).
         final_delta: dict = {}
         if reasoning_stream is not None and (tail := reasoning_stream.flush()):
             final_delta["reasoning_content"] = tail
+        if tool_stream is not None:
+            c_tail, t_tail = tool_stream.flush()
+            if c_tail:
+                final_delta["content"] = final_delta.get("content", "") + c_tail
+            for td in t_tail:
+                yield _chunk({"tool_calls": [td]})
+            if tool_stream.emitted and finish_reason != "length":
+                finish_reason = "tool_calls"
         end_chunk = {
             "id": f"cmpl-{uid}",
             "object": "chat.completion.chunk",
@@ -577,9 +734,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             if parser is not None and _thinking_active(req)
             else None
         )
+        # Stateful tool-call parser: only when tools are actually offered to the model (mirrors the
+        # non-streaming path's `if req.tools`). `tool_choice:"none"` withholds the tools from the
+        # template, so no blocks are emitted and this stays a no-op even when constructed.
+        tool_stream = ToolCallStreamState(uid) if req.tools and req.tool_choice != "none" else None
         return StreamingResponse(
             state.stream_with_cancellation(
-                state.stream_chat_completions(uid, reasoning_stream), request, uid
+                state.stream_chat_completions(uid, reasoning_stream, tool_stream), request, uid
             ),
             media_type="text/event-stream",
         )
