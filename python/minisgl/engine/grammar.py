@@ -62,6 +62,13 @@ def apply_token_bitmask(logits: torch.Tensor, bitmask: torch.Tensor) -> torch.Te
     bs, vocab = logits.shape
     device = logits.device
     bm = bitmask.to(device)
+    # The bitmask is built for the PADDED batch (len(batch.padded_reqs) — includes CUDA-graph dummy
+    # rows), but `logits` holds only the ACTUAL sampled rows, so bm can have MORE rows than bs (e.g.
+    # a graph-padded 128-row bitmask vs a 3-row eager prefill sample). Padding is appended, so align
+    # by taking the first bs rows — otherwise bits.reshape(bs, -1) fails when the padded element count
+    # isn't divisible by bs (the '[3, -1]' invalid-shape crash on multi-request constrained batches).
+    if bm.shape[0] != bs:
+        bm = bm[:bs]
     shifts = torch.arange(32, device=device, dtype=torch.int32)
     # [bs, n32, 32] -> [bs, n32*32] -> [bs, vocab]; bit i of word w is token w*32+i.
     bits = (bm.unsqueeze(-1) >> shifts) & 1
