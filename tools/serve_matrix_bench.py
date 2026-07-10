@@ -102,10 +102,11 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--m", default="1,2,4,8,16")
     ap.add_argument("--max-concurrency", type=int, default=0,
-                    help="the server's --max-running-requests. Beyond it requests QUEUE (wait), so a "
-                         "sweep point M > this measures queueing latency, NOT M-way concurrency. When "
-                         "set (>0) the sweep is capped to M <= this AND this value is appended as the "
-                         "top point, so every measurement is genuinely concurrent (no waiting).")
+                    help="the concurrency ceiling = min(--max-running-requests, --cuda-graph-max-bs): "
+                         "beyond max-running a request QUEUES (not concurrent), beyond graph-max-bs a "
+                         "decode batch falls to EAGER (not graph-captured). When set (>0) the sweep is "
+                         "capped to M <= this AND this value is appended as the top point, so every "
+                         "measurement is genuinely concurrent AND graph-captured.")
     ap.add_argument("--workloads", default="prefill,decode,mixed")
     ap.add_argument("--decode-tokens", type=int, default=128)
     ap.add_argument("--prefill-words", type=int, default=480)
