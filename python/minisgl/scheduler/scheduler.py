@@ -19,7 +19,7 @@ from minisgl.message import (
 )
 from minisgl.spec import AcceptResult, ProposeContext, make_proposer, verify_greedy
 from minisgl.spec.accept_gpu import accept_greedy_ondevice, truncate_at_eos_ondevice
-from minisgl.utils import div_ceil, init_logger, load_tokenizer
+from minisgl.utils import div_ceil, init_logger, load_tokenizer, resolve_stop_token_ids
 
 from .cache import CacheManager
 from .cca_slots import CCASlotManager
@@ -135,7 +135,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
-        self.eos_token_id = self.tokenizer.eos_token_id
+        # FULL end-of-generation set: generation_config `eos_token_id` (often a LIST) ∪ tokenizer ∪
+        # config. Multi-EOS models (GLM-4.x: [154820,154827,154829]) end turns on a token other than
+        # the tokenizer's single EOS, so honouring only that one leaves them generating forever.
+        self.eos_token_ids = set(resolve_stop_token_ids(config.model_path, self.tokenizer))
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -518,7 +521,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     req._mem_placed = True
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
+                    finished |= next_token in self.eos_token_ids
                 # Structured output: advance this req's grammar matcher with the committed token so the
                 # next step's bitmask reflects the new state. Skip on finish (req is done). A terminated
                 # grammar (complete JSON) is allowed to emit EOS, which the matcher won't accept — guard.

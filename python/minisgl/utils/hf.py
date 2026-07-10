@@ -50,15 +50,84 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
         # trips validation. Pass a pre-sanitized config so it uses that instead of re-loading the raw
         # one (cached_load_hf_config restores model_type, so the tokenizer class still resolves).
         tokenizer = AutoTokenizer.from_pretrained(model_path, config=cached_load_hf_config(model_path))
-    # Some Mistral models store chat_template in a separate JSON file
+    # Ensure a chat template is present. Recent transformers auto-loads `chat_template.jinja` into
+    # `tokenizer.chat_template`, but older transformers and some checkpoints leave it unset while
+    # shipping the template in a SIDE FILE — `chat_template.json` (Mistral-style, JSON-wrapped) or
+    # `chat_template.jinja` (raw Jinja, e.g. GLM-4.x). Without it, `apply_chat_template` falls back to
+    # a wrong/empty prompt and the model degenerates. Load whichever side file exists (JSON first,
+    # then raw Jinja), local dir or hub.
     if not getattr(tokenizer, "chat_template", None):
+        tokenizer.chat_template = _load_side_chat_template(model_path)
+    return tokenizer
+
+
+def _resolve_repo_file(model_path: str, filename: str) -> str | None:
+    """Path to `filename` for a local dir or a hub repo id, or None if absent."""
+    if os.path.isdir(model_path):
+        p = os.path.join(model_path, filename)
+        return p if os.path.isfile(p) else None
+    try:
+        return hf_hub_download(repo_id=model_path, filename=filename)
+    except Exception:
+        return None
+
+
+def _load_side_chat_template(model_path: str) -> str | None:
+    """Load a chat template shipped as a side file: `chat_template.json` (JSON with a
+    `chat_template` key) or `chat_template.jinja` (raw Jinja). Returns the template string or None."""
+    if (p := _resolve_repo_file(model_path, "chat_template.json")) is not None:
         try:
-            path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
-                tokenizer.chat_template = json.load(f)["chat_template"]
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)["chat_template"]
         except Exception:
             pass
-    return tokenizer
+    if (p := _resolve_repo_file(model_path, "chat_template.jinja")) is not None:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            pass
+    return None
+
+
+@functools.cache
+def load_generation_config(model_path: str) -> dict:
+    """Load the model's `generation_config.json` as a plain dict (cached; {} if absent/unreadable).
+    Carries the model author's serving defaults: `eos_token_id` (often a LIST of stop tokens),
+    `pad_token_id`, and sampling defaults (`temperature`/`top_p`/`top_k`). minisgl historically
+    ignored this file, so multi-EOS models (e.g. GLM-4.x: [154820,154827,154829]) never stopped on
+    their secondary end-of-turn tokens and the recommended sampling was not applied."""
+    p = _resolve_repo_file(model_path, "generation_config.json")
+    if p is None:
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def resolve_stop_token_ids(model_path: str, tokenizer: PreTrainedTokenizerBase) -> list[int]:
+    """The FULL set of end-of-generation token ids, unioned across every source: the
+    `generation_config.json` `eos_token_id` (int OR list — the authoritative serving list), the
+    tokenizer's `eos_token_id`, and the model config's `eos_token_id`. Deduped, order-stable.
+    A model that ends turns with a token other than the tokenizer's single EOS (GLM-4.x, many
+    chat/'thinking' models) will not terminate unless ALL of these are treated as stops."""
+    ids: list[int] = []
+
+    def _add(v) -> None:
+        for t in v if isinstance(v, (list, tuple)) else [v]:
+            if isinstance(t, int) and t not in ids:
+                ids.append(t)
+
+    _add(load_generation_config(model_path).get("eos_token_id"))
+    _add(getattr(tokenizer, "eos_token_id", None))
+    try:
+        _add(getattr(cached_load_hf_config(model_path), "eos_token_id", None))
+    except Exception:
+        pass
+    return ids
 
 
 @functools.cache
