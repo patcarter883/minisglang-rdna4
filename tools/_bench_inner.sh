@@ -5,7 +5,8 @@
 # Runs the prefill/decode/mixed x M matrix once. (Split-K is irrelevant under graphs — same atomic
 # constraint — so it is NOT benchmarked here.)
 set -uo pipefail
-source /app/.venv/bin/activate
+# Activate the serving venv: lean image (/opt/venv, the infra serving all day) or legacy (/app/.venv).
+source /opt/venv/bin/activate 2>/dev/null || source /app/.venv/bin/activate
 
 MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
 TP="${TP:-2}"
@@ -29,8 +30,12 @@ else
   echo "[setup] warm Triton cache (RO -> writable copy; only for the legacy triton_rdna4 backend) ..."
   mkdir -p /root/.triton && cp -a /triton-ro/. /root/.triton/ 2>/dev/null || true
 fi
-echo "[setup] server deps (pip install, ~1 min) ..."
-pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil
+# The lean serving image already ships every server dep; only pip-install if something is missing
+# (and don't hard-fail offline — the import check below is the real gate).
+if ! python -c "import msgpack,zmq,fastapi,uvicorn,pydantic,starlette,psutil,accelerate" 2>/dev/null; then
+  echo "[setup] server deps missing — pip install ..."
+  pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil || true
+fi
 python -c "import gdn_hip, moe_hip, tail_hip, mla_hip; print('[setup] hip pkgs import OK')" \
   || { echo '[setup] hip pkg import FAILED'; exit 1; }
 

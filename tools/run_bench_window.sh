@@ -18,8 +18,7 @@ docker run --rm \
   -e ATTN="${ATTN:-hip}" \
   -e SKIP_TRITON_COPY="${SKIP_TRITON_COPY:-1}" \
   -v "$PWD":/engine \
-  -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/triton-ro:ro \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
-  -e PYTHONPATH=/engine/python:/engine \
-  --entrypoint bash vllm22-w4a8:combined /engine/tools/_bench_inner.sh
+  -e PYTHONPATH=/opt/kernels:/engine/python:/engine \
+  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" /engine/tools/_bench_inner.sh
 echo "[run_bench_window] exited rc=$?"
