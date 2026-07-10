@@ -900,7 +900,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 # Reasoning phase: unconstrained greedy verify; matcher stays at its initial state.
                 t_i = int(logits_block[i].argmax().item())
                 emitted.append(t_i)
-                if (not ignore_eos) and t_i == self.eos_token_id:
+                if (not ignore_eos) and t_i in self.eos_token_ids:
                     break
                 if t_i == gate:
                     self._clear_think_gate(uid)  # open gate: NEXT position is schema-constrained
@@ -918,7 +918,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             masked = apply_token_bitmask(logits_block[i : i + 1].float(), bitmask)
             t_i = int(masked[0].argmax().item())
             emitted.append(t_i)
-            is_eos = (not ignore_eos) and t_i == self.eos_token_id
+            is_eos = (not ignore_eos) and t_i in self.eos_token_ids
             if not is_eos and not terminated:
                 matcher.accept_token(t_i)
             if is_eos:
@@ -958,8 +958,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 else:
                     result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
                 toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
-                if self.eos_token_id is not None:
-                    toks = toks + [self.eos_token_id]                 # terminate after the result string
+                _eos = next(iter(self.eos_token_ids), None)
+                if _eos is not None:
+                    toks = toks + [_eos]                             # terminate after the result string
                 req._mem_deliver, req._mem_deliver_pos = toks, 0
                 continue
             subj = getattr(sp, "mem_subject", None)
@@ -1866,7 +1867,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             eos = False
             for tok in result.emitted:
                 keep.append(tok)
-                if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
+                if (not req.sampling_params.ignore_eos) and tok in self.eos_token_ids:
                     eos = True
                     break
             n_emitted += len(keep)
@@ -2139,8 +2140,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # constrained req (or the FORCE_N0 / ddtree diagnostics) falls back to the per-req host path.
         force_n0 = os.environ.get("MINISGL_SPEC_FORCE_N0") == "1"
         any_constrained = any(r.sampling_params.is_constrained for r in reqs)
+        # The on-device EOS-truncate primitive compares against a SINGLE id; a multi-EOS model
+        # (eos_token_ids is a set from generation_config) must use the host path to honor every stop
+        # token. len<=1 => the on-device path is exact.
         use_ondevice = (
             self._spec_ondevice and not any_constrained and not ddtree_drafts and not force_n0
+            and len(self.eos_token_ids) <= 1
         )
         preds = None
         od_accepts: List[int] = []
@@ -2155,9 +2160,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             drafts_flat = [t for d in drafts for t in d]
             drafts_t = torch.tensor(drafts_flat, dtype=torch.int32, device=device)
             acc = accept_greedy_ondevice(target_argmax, drafts_t, q_lens_t, device)
-            # Host compares `tok == self.eos_token_id`; a non-int (None / list) never matches, so a
-            # sentinel -1 (no real token id is negative) reproduces "never truncate" on-device.
-            eos_id = self.eos_token_id if isinstance(self.eos_token_id, int) else -1
+            # use_ondevice already required len(eos_token_ids) <= 1, so there is exactly one stop id
+            # (or none). Pull it; -1 (no real token id is negative) reproduces "never truncate".
+            eos_id = next(iter(self.eos_token_ids), -1)
             ignore_mask = torch.tensor(
                 [r.sampling_params.ignore_eos for r in reqs], dtype=torch.bool, device=device
             )
@@ -2237,7 +2242,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 eos = False
                 for tok in result.emitted:
                     keep.append(tok)
-                    if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
+                    if (not req.sampling_params.ignore_eos) and tok in self.eos_token_ids:
                         eos = True
                         break
 
