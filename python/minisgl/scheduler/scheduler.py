@@ -477,8 +477,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if isinstance(req, ChunkedReq):
                     continue
                 next_token = next_tokens_cpu[i]
+                # #100 POINTER delivery: for the first len(obj) steps, OVERRIDE the sampled token with the
+                # exact object token from engine.cam (deliver_object_ids, computed in _prepare_cam). The
+                # forced token is what's committed to the KV history (append_host) AND emitted, so the base
+                # continuation conditions on the delivered object. After the object, sampling resumes.
+                _dl = getattr(req, "_mem_deliver", None)
+                if _dl is not None and req._mem_deliver_pos < len(_dl):
+                    next_token = next_token.new_tensor(_dl[req._mem_deliver_pos])
+                    req._mem_deliver_pos += 1
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
+                # (subsequent _stage_cam calls skip it; the base continues fluently). The
+                # MINISGL_CAM_ALWAYS_INJECT debug knob keeps injecting every step (used to exercise the
+                # captured decode tap, since with seed-once the object lands at prefill).
+                if getattr(req, "mem_bank", None) is not None and not req._mem_placed \
+                        and next_token == req._mem_seed \
+                        and os.environ.get("MINISGL_CAM_ALWAYS_INJECT") != "1":
+                    req._mem_placed = True
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
@@ -654,6 +670,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # continue from it — byte-identical to prefilling the shared prefix from zero (recurrent kernel).
         if self._rec_cache is not None and batch.is_prefill and not batch.spec_verify:
             self._restore_rec_states(batch)
+        # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
+        # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
+        # inside a graph — read here, reuse across decode). Inert when CAM is not built.
+        if self.engine.cam is not None:
+            self._prepare_cam(batch)
         sample_args = self.engine.sampler.prepare(batch)
         # Structured output: attach the per-row grammar bitmask (None unless a constrained req is in
         # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
@@ -852,9 +873,138 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
+    def _prepare_cam(self, batch: Batch) -> None:
+        """Read each memory request's tap bank from the standing store at prefill (once per req).
+
+        Subject rides on sampling_params.mem_subject; it is space-prefixed to match how the store was
+        trained (memory-organ `_sp_tokens`). `_mem_seed` is the store's preferred first token (for the
+        seed-once policy in `_stage_cam`). Requests without a subject are left untouched (tap no-op)."""
+        cam = self.engine.cam
+        for req in batch.reqs:
+            if not hasattr(req, "_mem_placed"):   # ChunkedReq / non-Req rows carry no memory state
+                continue
+            sp = getattr(req, "sampling_params", None)
+            # #100 CONTROL op (facts/forget/stats): compute the result from engine.cam and FORCE-EMIT it
+            # (tokenised) as the reply text + EOS — the data-returning ops ride the generate path too, no new
+            # message type. Handled before the subject guard (facts/stats carry no subject).
+            mem_op = getattr(sp, "mem_op", None)
+            if mem_op and getattr(req, "_mem_deliver", None) is None:
+                if mem_op == "retrieve":         # TRANSPARENT read: match stored subjects that appear in
+                    result = self._cam_retrieve(cam, req.input_ids)   # the prompt -> facts for auto-RAG
+                else:
+                    result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
+                toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
+                if self.eos_token_id is not None:
+                    toks = toks + [self.eos_token_id]                 # terminate after the result string
+                req._mem_deliver, req._mem_deliver_pos = toks, 0
+                continue
+            subj = getattr(sp, "mem_subject", None)
+            if not subj or req.mem_bank is not None or getattr(req, "_mem_deliver", None) is not None:
+                continue
+            subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
+            # #100 REMEMBER (multi-process write): the store lives in THIS scheduler process, so a write
+            # must ride the request — mem_remember=object_token_ids writes subject->object into engine.cam.
+            # Write-only: no forced tokens (the frontend sends max_tokens=1; the 1-token generation is a stub).
+            mem_remember = getattr(req.sampling_params, "mem_remember", None)
+            if mem_remember:
+                cam._write(subj_ids, list(mem_remember))
+                cam._facts[tuple(int(s) for s in subj_ids)] = {"object_ids": list(mem_remember), "base_p": 0.0}
+                req._mem_deliver, req._mem_deliver_pos = [], 0    # mark processed; deliver nothing
+                continue
+            # #100 POINTER delivery (multi-process): force the EXACT object token sequence retrieved from
+            # the cosine-NN subject index, then release to base continuation — memory supplies the
+            # unknowable object tokens, the served base finishes the sentence. `_process_last_data` overrides
+            # the sampled token with the forced object token for the first len(obj) steps. Falls back to the
+            # residual tap (mem_bank) only when the subject addresses no stored object.
+            _deliver = getattr(cam, "deliver_object_ids", None)
+            obj = _deliver(subj_ids) if _deliver is not None else []
+            if obj:
+                req._mem_deliver, req._mem_deliver_pos = list(obj), 0
+                req.mem_bank = None                          # pointer forces exact tokens; no tap needed
+            else:
+                bank, conf = cam.read(subj_ids)
+                req.mem_bank, req.mem_conf = bank, conf
+                req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+
+    def _cam_ctrl_result(self, cam, op: str, subj: str | None) -> str:
+        """#100 control op -> JSON string (force-emitted as the reply). facts: [{subject,object}] (ids
+        decoded to text here, tokenizer-side); forget: bool; stats: the value-bank occupancy dict."""
+        import json
+        if op == "forget":
+            sids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids) if subj else []
+            deleter = getattr(cam, "forget", None) or getattr(cam, "delete", None)
+            return json.dumps(bool(deleter(sids)) if (sids and deleter) else False)
+        if op == "facts":
+            out = []
+            for f in (getattr(cam, "list_facts", lambda: [])() or []):
+                sids, oids = f.get("subject_ids"), f.get("object_ids")
+                out.append({"subject": self.tokenizer.decode(list(sids)).strip() if sids else "",
+                            "object": self.tokenizer.decode(list(oids)).strip() if oids else ""})
+            return json.dumps(out)
+        if op == "stats":
+            statter = getattr(cam, "stats", None)
+            return json.dumps(statter() if statter else {})
+        return json.dumps(None)
+
+    def _cam_retrieve(self, cam, prompt_ids) -> str:
+        """TRANSPARENT read: which stored subjects does this prompt mention? Decode the prompt, pull
+        candidate proper-noun spans (capitalised word runs — the common subject shape), and query each
+        against the store's cosine-NN subject index (deliver_object_ids, tau-gated). Returns the matched
+        facts as JSON [{subject,object}] for the frontend to fold into context (auto-RAG). Empty when
+        nothing confidently matches — the tau threshold keeps it quiet on unrelated prompts."""
+        import json
+        import re
+        deliver = getattr(cam, "deliver_object_ids", None)
+        if deliver is None:
+            return json.dumps([])
+        text = self.tokenizer.decode(list(prompt_ids))
+        cands = {m.group(0) for m in
+                 re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text)}
+        seen, out = set(), []
+        for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller-name) spans first
+            cids = list(self.tokenizer(" " + c, add_special_tokens=False).input_ids)
+            oids = deliver(cids)
+            if oids:
+                obj = self.tokenizer.decode(oids).strip()
+                if (c, obj) not in seen:
+                    seen.add((c, obj)); out.append({"subject": c, "object": obj})
+        return json.dumps(out)
+
+    def _stage_cam(self, batch: Batch) -> None:
+        """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +
+        non-memory requests in one batch each get the right injection. Row t (flat, per-req contiguous
+        over padded_reqs, req.extend_len tokens each — matches _make_positions) carries that token's
+        owning request's bank, or ZERO for a non-memory / seed-once-placed / padding row (tap no-op).
+        SEED-ONCE: once `_mem_seed` has landed (`_mem_placed`, set in _process_last_data) the req's rows
+        go zero. Graph-decode replay ignores these Python tensors (it reads the captured static buffer);
+        this path drives eager prefill + eager decode. (Overlap loop: the placed flag lags one step.)"""
+        cam, inner = self.engine.cam, self.engine.model.model
+        reqs = batch.padded_reqs if batch.padded_reqs is not None else batch.reqs
+        active = [(getattr(r, "mem_bank", None) is not None and not getattr(r, "_mem_placed", False))
+                  for r in reqs]
+        if not any(active):
+            inner.clear_cam()                       # no active memory row -> tap no-op for the whole batch
+            return
+        dev = cam.device
+        K, mem = cam.k_slots, cam.mem_dim
+        bank_chunks, conf_chunks = [], []
+        for r, act in zip(reqs, active):
+            nt = r.extend_len                        # prefill: extend_len tokens; decode: 1
+            if act:
+                bank_chunks.append(r.mem_bank[0].unsqueeze(0).expand(nt, K, mem))   # [nt,K,mem]
+                cv = r.mem_conf.reshape(-1)[0] if r.mem_conf is not None \
+                    else torch.zeros((), device=dev)
+                conf_chunks.append(cv.expand(nt))
+            else:
+                bank_chunks.append(torch.zeros(nt, K, mem, device=dev))
+                conf_chunks.append(torch.zeros(nt, device=dev))
+        inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
+
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        if self.engine.cam is not None:
+            self._stage_cam(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
