@@ -69,6 +69,10 @@ x-lean-common: &lean-common
     # MTP-head layer count override (config.py knob): forces the Qwen3.5 MTP head on/off through
     # compose. Empty -> trust the checkpoint (default). 0 -> no MTP head (serve the base decoder only).
     MINISGL_MTP_LAYERS: "${MINISGL_MTP_LAYERS:-}"
+    # Spec-decode on-device accept+EOS chain (spec/accept_gpu.py): 1 = replace the per-position
+    # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
+    # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
+    MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
     # torch.profiler window (diagnostic): MINISGL_PROFILE=<path under /engine> captures SKIP..SKIP+STEPS
     # forward/verify steps into a chrome trace. Inert unless set. Point at /engine/... so it lands in
     # the mounted worktree; name it *.pt.trace.json.gz so torch gzips it and TraceLens ingests it.
