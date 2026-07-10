@@ -99,6 +99,7 @@ launch graph || exit 1
 # confirm graph capture actually engaged (not a silent eager fallback)
 grep -iE 'captur|cuda.?graph' "$RESULTS/bench_graph.server.log" | head -4 || true
 python /engine/tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" \
-  --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M"
+  --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M" \
+  --max-concurrency "$MAXRUN"
 stop
 echo "[done] logs in $RESULTS/"
