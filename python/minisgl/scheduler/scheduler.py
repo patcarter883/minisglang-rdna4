@@ -628,6 +628,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         snap = self._rec_cache.clone_slot(slot)
         self.cache_manager.attach_rec_state(handle, snap)
 
+    def _restore_rec_states(self, batch: Batch) -> None:
+        """Install cached recurrent-state snapshots into the slots of prefill reqs that hit the
+        recurrent radix. Only reqs with a snapshot (cache_handle.rec_state) and cached_len>0 restore;
+        everyone else keeps their zeroed/continuation slot untouched."""
+        for req in batch.reqs:
+            handle = getattr(req, "cache_handle", None)
+            rec_state = getattr(handle, "rec_state", None)
+            if rec_state is None or req.cached_len == 0:
+                continue
+            # Restore ONLY on the initial prefix-hit pass (req.cached_len == the matched boundary). A
+            # chunked continuation carries the SAME handle but a larger cached_len; re-restoring there
+            # would clobber the state advanced by earlier chunks.
+            if req.cached_len != handle.cached_len:
+                continue
+            slot = self._rec_slots.slot_for(req.uid)
+            if slot is not None:
+                self._rec_cache.load_slot(slot, rec_state)
+                logger.info_rank0(
+                    f"recurrent-radix HIT: uid={req.uid} restored recurrent state at "
+                    f"cached_len={req.cached_len} (skips re-prefill of the shared prefix)"
+                )
+
+    def _maybe_capture_rec_state(self, req: Req, handle) -> None:
+        """Snapshot a sequence's recurrent state at a page-aligned prefix-commit boundary and attach it
+        to the inserted radix node, so a later request that shares this prefix restores it instead of
+        re-prefilling. Guard: only when the committed length is page-aligned (so the slot state
+        corresponds to the node boundary EXACTLY — the losslessness precondition) and the slot is still
+        live. Runs at synchronous commit points (recurrent radix forces the non-overlap loop), so the
+        slot holds this req's post-forward state with no in-flight advance."""
+        if self._rec_cache is None or handle is None:
+            return
+        cached_len = req.cached_len
+        if cached_len == 0 or (cached_len % self.cache_manager.page_size) != 0:
+            return
+        slot = self._rec_slots.slot_for(req.uid)
+        if slot is None:
+            return
+        snap = self._rec_cache.clone_slot(slot)
+        self.cache_manager.attach_rec_state(handle, snap)
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         return self._finish_prepare(batch)
