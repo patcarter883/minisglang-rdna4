@@ -75,6 +75,8 @@ RUN set -eux; mkdir -p /opt/kernels; \
         moe_splitk:moe_splitk_hip \
         moe_w8a16_wmma:moe_w8a16_wmma \
         w8a8_fp8_wmma:w8a8_fp8_wmma \
+        moe_bf16:moe_bf16_wmma \
+        rxf:rxf_hip \
         swiglu:swiglu_hip \
         sampler:sampler_hip \
         tail:tail_hip ; do \
