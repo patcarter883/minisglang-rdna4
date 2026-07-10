@@ -70,14 +70,22 @@ why" over a silent correctness break.
 - `bd010fb` attention kernels **dtype-generic fp16+bf16** (`attn_decode`, `attn_hip`, `attn_prefill_paged`); rocwmma f16/bf16 fragments both work on gfx1201; bf16 path bit-unchanged.
 - `aaad74d` + `7016733` **W4A8 fp8 GEMM/MoE dtype-generic activations** (fp16+bf16, output follows input); `7016733` fixed the missed `gather_reduce` `out2` fp16 check.
 
-### Spec-overlap branch (committed `f94cdc0`, isolated worktree)
+### Spec-overlap branch (committed `d34508c`, isolated worktree)
 - **Phase 1** `spec/accept_gpu.py::accept_greedy_ondevice` — on-device greedy acceptance (segmented
   mismatch-cumsum → leading-run), `(num_accepted, committed_flat, committed_offsets, committed_lens)`,
   zero host syncs. **Byte-lossless 4008 cases** vs host `verify_greedy`.
 - **Phase 2a** `spec/accept_gpu.py::truncate_at_eos_ondevice` — per-req EOS truncation respecting
   `ignore_eos` → `(kept_lens, kept_finished_eos, kept ids)`. **Byte-lossless 6011 cases** vs the host
   `keep`/EOS loop. Shared `_leading_zero_run_per_segment` helper used by both.
-  Validators: `tools/validate_ondevice_accept.py`, `tools/validate_eos_trunc.py`.
+- **Phase 2b** `spec/accept_gpu.py::build_commit_ondevice` (`d34508c`) — on-device commit layout:
+  token-pool scatter `(scatter_rows, scatter_cols, scatter_vals)` in the SAME req-then-token order
+  the host `c_rows/c_cols/c_vals` loop made + advanced `new_cached_len`/`new_device_len` + GDN install
+  `gdn_t_index (=kept_lens-1)` + draft-head `seed_rows (=target_offset+kept_lens-1)`, all from GPU
+  `kept_lens`, zero host syncs. **Byte-lossless 5007 cases** (chains accept→truncate→commit) vs the
+  host loop. Also fixed a latent Phase-1 crash: `_leading_zero_run_per_segment` indexed an empty
+  `excl` when the flat buffer is length 0 (all-K=0 / ngram all-miss batch) → guard `total==0`.
+  Validators: `tools/validate_ondevice_accept.py`, `tools/validate_eos_trunc.py`,
+  `tools/validate_commit_layout.py`.
 
 ---
 
@@ -101,8 +109,11 @@ why" over a silent correctness break.
 ---
 
 ## IN FLIGHT (as of session end)
-- **Nothing running.** Phase 1 + 2a done, validated, committed to `spec-overlap` (`f94cdc0`). Next is
-  **Phase 2b** (on-device commit) — start there.
+- **Nothing running.** Phases 1, 2a, 2b done, validated, committed to `spec-overlap` (`d34508c`).
+  Next is **Phase 2c** (next-batch layout from GPU lengths — the crux) — start there. NB: all three
+  primitives so far are STANDALONE (validated in isolation); NONE is wired into `scheduler.py` yet.
+  The wiring + GPU coherence pass happens once 2c gives a layout the scheduler can consume without a
+  count sync (2b's scatter/lengths land at the same wiring point).
 
 ---
 
@@ -114,9 +125,10 @@ is host-side) **stay on the sync path** — overlap targets unconstrained greedy
 - **1 ✅** on-device accept (`accept_greedy_ondevice`) — done, lossless (4008).
 - **2a ✅** on-device EOS truncation (`truncate_at_eos_ondevice`) → `kept_lens` + `kept_finished_eos` per
   req on GPU, respects per-req `ignore_eos`. Done, lossless (6011). Committed `f94cdc0`.
-- **2b** on-device **commit**: scatter committed ids into the GPU token-pool + advance `cached_len`/
-  `device_len` from GPU lengths (replaces host `c_rows/cols/vals` + `append_host`). Also GDN install
-  `t_index = committed_len-1` and draft-head seed row `= block_start + committed_len-1` from GPU lengths.
+- **2b ✅** on-device **commit** (`build_commit_ondevice`, `d34508c`): scatter committed ids into the
+  GPU token-pool + advance `cached_len`/`device_len` from GPU lengths (replaces host `c_rows/cols/vals`
+  + `append_host`). GDN install `t_index = kept_lens-1` and draft-head seed row `= target_offset +
+  kept_lens-1` from GPU lengths. Done, lossless (5007). Still a standalone primitive — not yet wired.
 - **2c** **next-batch layout from GPU lengths** (the crux): build next positions/page_table without
   syncing counts, so the CPU schedules step N+1 while N's copy is in flight.
 - **2d** **lazy detok (FutureMap)**: committed ids copied host-async (a per-req "future"); detok resolves
@@ -148,10 +160,14 @@ is host-side) **stay on the sync path** — overlap targets unconstrained greedy
   range is `_tidar_dump`, a diagnostic (debug-flag) function, not the hot path.
 
 ## Resume checklist
-1. Phase 1+2a are committed to `spec-overlap` (`f94cdc0`), byte-lossless. **Start Phase 2b** (on-device
-   commit: scatter committed ids into the GPU token-pool + advance cached_len/device_len + GDN install
-   t_index + draft-seed row, all from GPU lengths) as the next validated primitive in the worktree.
-2. Keep constrained reqs on the sync path; measure the overlap win at **concurrency**, not bs=1.
-3. Boot a **one-card** validation (recipe above) before trusting anything unvalidated in prod.
-4. When ready: redo #12 with a pre-stacked scratch buffer in gdn/metadata.py; bake dtype-generic kernels
+1. Phases 1+2a+2b are committed to `spec-overlap` (`d34508c`), byte-lossless. **Start Phase 2c**
+   (next-batch layout from GPU lengths — positions/page_table built without syncing counts, so the CPU
+   schedules step N+1 while N's copy is in flight). This is the crux that actually unblocks run-ahead.
+2. After 2c, WIRE the standalone primitives (1/2a/2b/2c) into `scheduler._spec_decode_step` behind an
+   env gate (unconstrained greedy path only) and run the FIRST GPU coherence + concurrency-throughput
+   pass — everything so far is validated in isolation, never end-to-end in the engine.
+3. Keep constrained reqs (`_verify_greedy_constrained`) on the host sync path; measure the overlap win
+   at **concurrency**, not bs=1 (verify compute ~28-30ms is the bs=1 floor — see KEY FINDINGS).
+4. Boot a **one-card** validation (recipe above) before trusting anything unvalidated in prod.
+5. When ready: redo #12 with a pre-stacked scratch buffer in gdn/metadata.py; bake dtype-generic kernels
    into the `:lean` image (retire the override).
