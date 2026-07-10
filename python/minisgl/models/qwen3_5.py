@@ -413,6 +413,11 @@ class Qwen3_5Model(BaseOP):
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor | None]:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
+        # --- per-layer residual-stream dump (debug harness): MINISGL_DUMP_LAYERS=<path>, prefill only ---
+        import os as _os
+        _dump_path = _os.environ.get("MINISGL_DUMP_LAYERS")
+        _do_dump = bool(_dump_path) and input_ids.numel() > 1
+        _rows = [("embed", x[-1].detach().float().cpu())] if _do_dump else None
         # Aux capture is OFF unless return_hidden AND layers are programmed: zero cost otherwise.
         cap = self._capture_layer_ids if return_hidden else None
         cap_set = set(cap) if cap else None
@@ -420,7 +425,10 @@ class Qwen3_5Model(BaseOP):
         cam_bank = self._cam_bank
         cam_rows = self._cam_bank_rows
         for lid, layer in enumerate(self.layers.op_list):
-            x, residual = layer.forward(x, residual)
+            x, layer_res = layer.forward(x, residual)
+            residual = layer_res
+            if _do_dump:
+                _rows.append((lid, (x + residual)[-1].detach().float().cpu()))
             if cap_set is not None and lid in cap_set:
                 # The captured aux MUST be the full post-layer residual stream (x + residual), which
                 # equals z-lab's hidden_states[lid+1] (this layer's attn AND mlp folded in) — the exact

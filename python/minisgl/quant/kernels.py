@@ -34,6 +34,11 @@ _moe_calls = 0
 # Set MINISGL_MOE_SCATTER=1 to force the fused scatter for an eager (non-graph) deployment.
 _MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "0") != "0"
 
+# W4A16 MoE (fp16 activations, no act-quant) for the routed experts — the fix for the fp8-act decode
+# degradation on activation-sensitive models (GLM-4.7-Flash). "1" = all M; "decode" = M<=2 only
+# (mirrors vLLM's low-M W4A16 crossover). Off by default. Requires group_size>=64 (g=128 -> wide 8).
+MOE_W4A16 = _os.environ.get("MINISGL_MOE_W4A16", "0")
+
 # Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
 # to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks
 # to lift occupancy (gemm2 is ~15% of peak BW at M=1). 0/unset = the vendored w4a8_fp8_wmma scatter.
@@ -319,6 +324,107 @@ def w4a8_moe(
     return acc.to(x.dtype)
 
 
+def _w4a16_wide(group_size: int) -> int:
+    """Pick the W4A16 register-direct b-load width. The kernel processes group_size/16 k-tiles per
+    group and requires `wide` to divide that: 8=2x b128 (g=128), 4=b128 (g=64), 2=b64 (g=32; added
+    in rdna4-hip-kernels 13fba94). g must be a multiple of 32."""
+    ks = group_size // 16
+    if ks % 8 == 0:
+        return 8
+    if ks % 4 == 0:
+        return 4
+    if ks % 2 == 0:
+        return 2
+    raise AssertionError(f"W4A16 wide MoE kernel needs group_size>=32 & %32==0 (got {group_size})")
+
+
+def w4a16_moe(
+    x: torch.Tensor,  # (M, K) activations — kept fp16, NO activation quant (the whole point)
+    w13_rep: torch.Tensor,  # (E, 2*inter/16, K/16, 32, wide) register-direct (built in post_load)
+    w13_scales: torch.Tensor,  # (E, 2*inter, K//g) fp16
+    w13_zeros: torch.Tensor | None,  # (E, (2*inter)//8, K//g) int32 (AWQ) or None (symmetric)
+    w2_rep: torch.Tensor,  # (E, K/16, inter/16, 32, wide)
+    w2_scales: torch.Tensor,  # (E, K, inter//g) fp16
+    w2_zeros: torch.Tensor | None,
+    hidden: int,
+    inter: int,
+    group_size: int,
+    *,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Grouped W4A16 MoE: fp16 activations DIRECT (no act-quant) via the register-direct
+    mmq_regdirect_w4a16_moe kernel. This is the fix for the fp8-activation decode degradation on
+    activation-sensitive models (GLM-4.7-Flash): int4 weights, fp16 acts, matching vLLM's W4A16.
+    Weights are pre-repacked to w_rep_wide in post_load. block_m is fixed 16; `wide` from group_size.
+    Route is always precomputed (GLM noaux_tc). Returns (M, K)."""
+    import moe_hip
+    import w4a8_fp8_wmma
+
+    M = x.shape[0]
+    E = w13_rep.shape[0]
+    dev = x.device
+    block_m = 16
+    wide = _w4a16_wide(group_size)
+    top_k = topk_ids.shape[1]
+    tw = topk_weights.to(torch.float32).contiguous()
+    ti = topk_ids.to(torch.int32).contiguous()
+    _empty = torch.empty(0, dtype=torch.int32, device=dev)
+
+    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
+    x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
+
+    out1 = _moe_time(
+        "gemm1",
+        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+            x16, w13_rep, w13_scales, w13_zeros if w13_zeros is not None else _empty,
+            sorted_ids, expert_ids, ntp, 2 * inter, top_k, block_m, wide,
+        ),
+    )  # (P, 2*inter) fp16
+    d = out1.shape[1] // 2
+    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        import tail_hip
+
+        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
+    else:
+        buf2 = _moe_time(
+            "silu",
+            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+        )
+
+    tw_flat = tw.reshape(-1).contiguous()
+    # gemm2 + topk-weight + reduce via the fused scatter epilogue (eager decode). The atomicAdd is
+    # not HIP-graph-safe; a gather twin (mmq_regdirect_w4a16_moe + gather_reduce) is the graph path.
+    output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
+    _moe_time(
+        "gemm2scat",
+        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
+            buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, output,
+            hidden, top_k, block_m, wide, w_zeros=w2_zeros,
+        ),
+    )  # writes output in place
+    _moe_report()
+    return output.to(x.dtype)
+
+
+def w4a16_linear(
+    x: torch.Tensor,  # (M, K) fp16 activations — DIRECT (no act-quant)
+    w_rep_wide: torch.Tensor,  # register-direct wide weights (built in process_weights_after_load)
+    scales: torch.Tensor,  # (N, K//g) fp16
+    w_zeros: torch.Tensor | None,  # (N//8, K//g) int32 (AWQ) or None (symmetric)
+    group_size: int,
+    N: int,
+) -> torch.Tensor:
+    """Dense W4A16 GEMM (fp16 acts direct) via mmq_regdirect_w4a16_wide — the fp16-act twin of
+    w4a8_linear, for the GLM shared expert / dense layers when MINISGL_MOE_W4A16 is on."""
+    import w4a8_fp8_wmma
+
+    wide = _w4a16_wide(group_size)
+    x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+    z = w_zeros if w_zeros is not None else torch.empty(0, dtype=torch.int32, device=x.device)
+    return w4a8_fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
+
+
 def w8a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K) f8_e4m3 — gate|up stacked, op layout (natural)
@@ -439,7 +545,7 @@ def w8a8_moe(
 # Distinct from the fp8 W4A8 above: weights are an NL (non-uniform) int4 codebook, activations are
 # int8 (not fp8), and a fixed block-diagonal Hadamard rotation is applied to the activation at
 # runtime (and was applied to the weights offline) so it cancels in the dot while spreading
-# activation outliers. Native HIP via the vendored rxf_hip package (torch.ops.rxf_hip.*).
+# activation outliers. Native HIP via the vendored rxf_hip package (rxf_hip.*).
 
 _RXF_NL: dict = {}
 
@@ -465,10 +571,10 @@ def rxf_linear(
 ) -> torch.Tensor:
     """Dense RXF W4A8: rotate+int8-quant the activation, then int8 . NL-int4 GEMM -> bf16 (M,N).
     The rotate_quant fuses FWHT-span + per-token int8 quant; linear picks WMMA (M>2) / GEMV (M<=2)."""
-    import rxf_hip  # noqa: F401  registers torch.ops.rxf_hip.*
+    import rxf_hip  # noqa: F401  registers rxf_hip.*
 
-    q, a_scale = torch.ops.rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    return torch.ops.rxf_hip.linear(q, a_scale, w_packed, w_scale, _rxf_nl(x.device), bias)
+    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
+    return rxf_hip.linear(q, a_scale, w_packed, w_scale, _rxf_nl(x.device), bias)
 
 
 def rxf_moe(
@@ -523,8 +629,8 @@ def rxf_moe(
     # gemm1: rotate+quant the activation (gathered by sorted_ids inside the GEMM), grouped over w13.
     # Per-GEMM kernel selection (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a
     # few real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles.
-    q, a_scale = torch.ops.rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    gemm1 = torch.ops.rxf_hip.moe_gemv if M <= 2 else torch.ops.rxf_hip.moe_gemm
+    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
+    gemm1 = rxf_hip.moe_gemv if M <= 2 else rxf_hip.moe_gemm
     out1 = gemm1(
         q, a_scale, w13, w13_scales, nl, sorted_ids, expert_ids, ntp, top_k, block_m, M * top_k
     )  # (P, 2*inter) bf16
@@ -538,7 +644,7 @@ def rxf_moe(
         buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
 
     # gemm2: rotate+quant the intermediate (w2 was rotated offline too).
-    q2, a_scale2 = torch.ops.rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    q2, a_scale2 = rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
     tw_flat = tw.reshape(-1).float().contiguous()
 
     # DECODE fast path (mirrors w4a8_moe): fuse gemm2 + topk-weight + reduce into ONE kernel via the
@@ -546,7 +652,7 @@ def rxf_moe(
     # NOT HIP-graph-capture-safe -> gated to eager decode (M<=2) and MINISGL_MOE_SCATTER.
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        torch.ops.rxf_hip.moe_gemm_scatter(
+        rxf_hip.moe_gemm_scatter(
             q2, a_scale2, w2, w2_scales, nl, sorted_ids, expert_ids, ntp, tw_flat, acc,
             top_k, block_m, M * top_k
         )  # writes acc in place
@@ -554,10 +660,10 @@ def rxf_moe(
 
     # PREFILL: unfused gemm2 (identity gather) + contention-free gather-reduce (graph-safe).
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    out2 = torch.ops.rxf_hip.moe_gemm(
+    out2 = rxf_hip.moe_gemm(
         q2, a_scale2, w2, w2_scales, nl, ident, expert_ids, ntp, 1, block_m, P
     )  # (P, K) bf16
-    acc = torch.ops.rxf_hip.moe_gather_reduce(
+    acc = rxf_hip.moe_gather_reduce(
         out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k
     )  # (M, K) fp32
     return acc.to(x.dtype)

@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
+from minisgl.utils import load_generation_config
 from minisgl.rsa.config import merge_params
 from minisgl.rsa.core import RSAError, run_markovian_rsa
 from minisgl.rsa.inproc import InProcessBackendClient
@@ -216,6 +217,18 @@ def _norm_stop(stop: list | str | None) -> List[str]:
     if not stop:
         return []
     return [stop] if isinstance(stop, str) else list(stop)
+
+
+def _resolve_sampling(req: "OpenAICompletionRequest", model_path: str) -> tuple:
+    """Effective (temperature, top_p, top_k): the request value when the client set it, else the
+    model author's `generation_config.json` default, else the neutral default. Lets a bare request
+    inherit the model's recommended sampling (e.g. GLM-4.x top_p 0.95 / top_k 50) instead of the
+    generic 1.0 / -1 that can push reasoning models toward degenerate output."""
+    gen = load_generation_config(model_path)
+    temperature = req.temperature if req.temperature is not None else float(gen.get("temperature", 1.0))
+    top_p = req.top_p if req.top_p is not None else float(gen.get("top_p", 1.0))
+    top_k = req.top_k if req.top_k is not None else int(gen.get("top_k", -1) or -1)
+    return temperature, top_p, top_k
 
 
 def _normalize_tool_args(messages: List[dict]) -> None:
@@ -898,9 +911,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
+                **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
                 think_close_delim=_grammar_think_gate_delim(req),
@@ -1024,9 +1035,7 @@ async def shell_completion(req: OpenAICompletionRequest):
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
+                **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
             ),
         )
     )

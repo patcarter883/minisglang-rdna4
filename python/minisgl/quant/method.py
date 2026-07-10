@@ -168,6 +168,16 @@ class W4A8LinearMethod:
         layer._w_packed_op = w_packed
         layer._scales_op = scales_op
         layer._zeros_op = zeros_op
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) dense path: repack -> register-direct wide weights, drop the op-layout.
+            import w4a8_fp8_wmma
+
+            N, K8 = w_packed.shape
+            wide = kernels._w4a16_wide(self.quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep(w_packed, N, K8 * 8)
+            layer._w_rep_wide = w4a8_fp8_wmma.repack_w_rep_wide(w_rep, wide)
+            layer._n_out = N
+            del layer._w_packed_op
         del layer.qweight, layer.scales
         if qz is not None:
             del layer.qzeros
@@ -175,13 +185,23 @@ class W4A8LinearMethod:
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        out = kernels.w4a8_linear(
-            x,
-            layer._w_packed_op,  # type: ignore[attr-defined]
-            layer._scales_op,  # type: ignore[attr-defined]
-            layer._zeros_op,  # type: ignore[attr-defined]
-            self.quant.group_size,
-        )
+        if getattr(layer, "_w_rep_wide", None) is not None:
+            out = kernels.w4a16_linear(
+                x,
+                layer._w_rep_wide,  # type: ignore[attr-defined]
+                layer._scales_op,  # type: ignore[attr-defined]
+                layer._zeros_op,  # type: ignore[attr-defined]
+                self.quant.group_size,
+                layer._n_out,  # type: ignore[attr-defined]
+            )
+        else:
+            out = kernels.w4a8_linear(
+                x,
+                layer._w_packed_op,  # type: ignore[attr-defined]
+                layer._scales_op,  # type: ignore[attr-defined]
+                layer._zeros_op,  # type: ignore[attr-defined]
+                self.quant.group_size,
+            )
         out = out.to(x.dtype)
         if bias is not None:
             out = out + bias

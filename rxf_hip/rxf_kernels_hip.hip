@@ -28,7 +28,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include <torch/extension.h>
 
 namespace {
@@ -539,7 +539,7 @@ void launch_rotate_quant(const at::Tensor& x, at::Tensor& q, at::Tensor& scale, 
     const size_t shmem = (size_t)K * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "rxf_rotate_quant", [&] {
-        rotate_quant_kernel<scalar_t, 32><<<M, threads, shmem, stream>>>(
+       hipLaunchKernelGGL(( rotate_quant_kernel<scalar_t, 32>), dim3(M), dim3(threads), shmem, stream, 
             x.data_ptr<scalar_t>(), q.data_ptr<int8_t>(), scale.data_ptr<float>(), M, K, norm);
     });
 }
@@ -555,7 +555,7 @@ void launch_linear(const at::Tensor& q, const at::Tensor& a_scale, const at::Ten
     if (M <= 2) {
         constexpr int TPB = 256;
         dim3 grid((N + TPB - 1) / TPB, M);
-        linear_gemv_kernel<<<grid, TPB, 0, stream>>>(
+       hipLaunchKernelGGL(( linear_gemv_kernel), dim3(grid), dim3(TPB), 0, stream, 
             q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
             nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
     } else {
@@ -565,11 +565,11 @@ void launch_linear(const at::Tensor& q, const at::Tensor& a_scale, const at::Ten
         // BK_TILE decouples the LDS staging chunk from the 32-wide scale group (== fp8's
         // group_size staging): 128 when K divides it, else fall back to 32.
         if (K % 128 == 0)
-            linear_tiled_kernel<BM, BN, 128, WARPS_N><<<grid, threads, 0, stream>>>(
+           hipLaunchKernelGGL(( linear_tiled_kernel<BM, BN, 128, WARPS_N>), dim3(grid), dim3(threads), 0, stream, 
                 q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
                 nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
         else
-            linear_tiled_kernel<BM, BN, 32, WARPS_N><<<grid, threads, 0, stream>>>(
+           hipLaunchKernelGGL(( linear_tiled_kernel<BM, BN, 32, WARPS_N>), dim3(grid), dim3(threads), 0, stream, 
                 q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(), wsc_ptr,
                 nl.data_ptr<int8_t>(), bias_ptr, out_ptr, M, N, K);
     }
@@ -601,7 +601,7 @@ static void launch_moe_common(const at::Tensor& q, const at::Tensor& a_scale,
     auto* eip = expert_ids.data_ptr<int>();
     auto* ntpp = ntp.data_ptr<int>();
     #define RXF_MOE_LAUNCH(BKT, SCAT)                                                          \
-        moe_gemm_tiled_kernel<BN, BKT, WARPS_N, SCAT><<<grid, threads, shmem, stream>>>(      \
+       hipLaunchKernelGGL(( moe_gemm_tiled_kernel<BN, BKT, WARPS_N, SCAT>), dim3(grid), dim3(threads), shmem, stream,       \
             qp, asp, wp, wsp, nlp, sip, eip, ntpp, out, out_scatter, topk_w,                  \
             N, K, top_k, block_m, num_valid)
     if (scatter) {
@@ -631,7 +631,7 @@ void launch_moe_gemv(const at::Tensor& q, const at::Tensor& a_scale, const at::T
     const size_t shmem = (size_t)K * sizeof(int8_t);
     dim3 grid((N + COLS - 1) / COLS, P);
     auto stream = at::cuda::getCurrentCUDAStream();
-    moe_gemv_kernel<<<grid, COLS * 32, shmem, stream>>>(
+   hipLaunchKernelGGL(( moe_gemv_kernel), dim3(grid), dim3(COLS * 32), shmem, stream, 
         q.data_ptr<int8_t>(), a_scale.data_ptr<float>(), wpk.data_ptr<uint8_t>(),
         reinterpret_cast<const __half*>(wsc.data_ptr()), nl.data_ptr<int8_t>(),
         sorted_ids.data_ptr<int>(), expert_ids.data_ptr<int>(), ntp.data_ptr<int>(),
@@ -658,7 +658,7 @@ void launch_moe_gather_reduce(const at::Tensor& out2, const at::Tensor& sorted_i
     constexpr int TPB = 256;
     dim3 grid((N + TPB - 1) / TPB, P);
     auto stream = at::cuda::getCurrentCUDAStream();
-    moe_gather_reduce_kernel<<<grid, TPB, 0, stream>>>(
+   hipLaunchKernelGGL(( moe_gather_reduce_kernel), dim3(grid), dim3(TPB), 0, stream, 
         reinterpret_cast<const bf16*>(out2.data_ptr()), sorted_ids.data_ptr<int>(),
         topk_weights.data_ptr<float>(), ntp.data_ptr<int>(), out.data_ptr<float>(),
         P, N, (int)top_k, (int)num_valid_tokens);

@@ -60,6 +60,16 @@ class _GroupedGPTQExperts(BaseOP):
         self._w_op = torch.stack(w_op, dim=0)
         self._scales_op = torch.stack(s_op, dim=0)
         self._zeros_op = torch.stack(z_op, dim=0)
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
+            import w4a8_fp8_wmma
+
+            N, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
         del self.qweight, self.scales, self.qzeros
 
 
@@ -98,6 +108,16 @@ class _GroupedAWQExperts(BaseOP):
         self._w_op = torch.stack(w_op, dim=0)
         self._scales_op = torch.stack(s_op, dim=0)
         self._zeros_op = torch.stack(z_op, dim=0)
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
+            import w4a8_fp8_wmma
+
+            N, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
         del self.qweight, self.scales, self.qzeros
 
 
@@ -156,6 +176,8 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         raise RuntimeError("_GroupedCompressedTensorsExperts holds weights; call kernels.w4a8_moe")
 
     def post_load(self) -> None:
+        from minisgl.quant import kernels
+
         pf = 32 // self._quant.bits
         E, N, Kp = self.weight_packed.shape
         G = self.weight_scale.shape[-1]
@@ -168,6 +190,16 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         zeros.view(torch.uint8).fill_(0x88)
         self._zeros_op = zeros.to(self.weight_packed.device)
         del self.weight_packed, self.weight_scale
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (same as _GroupedAWQExperts). g=32 -> wide 2 (b64, kernel 13fba94).
+            import w4a8_fp8_wmma
+
+            N2, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N2, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
 
 
 class _GroupedMxFp4Experts(BaseOP):

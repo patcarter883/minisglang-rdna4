@@ -68,11 +68,20 @@ class DecodeStatus:
 
 
 class DetokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, stop_token_ids: "Optional[List[int]]" = None
+    ) -> None:
         # uid -> DecodeStatus
         self.decode_map: Dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
-        self.eos_token_id = self.tokenizer.eos_token_id
+        # The FULL end-of-generation set (generation_config eos_token_id list ∪ tokenizer ∪ config),
+        # so a trailing end-of-turn token from a multi-EOS model (GLM-4.x) isn't rendered. Falls back
+        # to the tokenizer's single EOS when the resolved set isn't supplied.
+        self.eos_token_ids = set(
+            stop_token_ids
+            if stop_token_ids
+            else ([tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else [])
+        )
 
     def detokenize(
         self, msgs: List[DetokenizeMsg], stop_map: Optional[Dict[int, List[str]]] = None
@@ -93,7 +102,7 @@ class DetokenizeManager:
             # Drop only a trailing EOS on a finished req so it isn't rendered (matches the prior
             # single-token skip). Spec truncates at EOS, so EOS is always last when present.
             toks = [msg.next_token, *msg.extra_tokens]
-            if msg.finished and toks and toks[-1] == self.eos_token_id:
+            if msg.finished and toks and toks[-1] in self.eos_token_ids:
                 toks = toks[:-1]
             s.decoded_ids.extend(toks)
             s.num_tokens += len(toks)
