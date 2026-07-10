@@ -147,9 +147,7 @@ class SchedulerEPMixin:
         # in-graph EP collectives match. pad_tokens stays None (graph shapes already equal N=common_bs).
         ep.pad_tokens = None
         local_reqs: List[Req] = (
-            sorted(self.decode_manager.running_reqs, key=lambda r: r.uid)
-            if self.decode_manager.runnable
-            else []
+            self.decode_manager.ordered_reqs if self.decode_manager.runnable else []
         )
         batch = Batch(reqs=local_reqs, phase="decode") if local_reqs else None
         forward_input = self._ep_prepare_decode(batch, common_bs)

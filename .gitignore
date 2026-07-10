@@ -10,6 +10,8 @@ __pycache__/
 # json files
 *.json
 *.jsonl
+# ...but keep version-controlled monitoring dashboards
+!monitoring/grafana/*.json
 
 # profiling data
 *.nsys-rep
