@@ -61,6 +61,16 @@ class _GroupedGPTQExperts(BaseOP):
         self._w_op = torch.stack(w_op, dim=0)
         self._scales_op = torch.stack(s_op, dim=0)
         self._zeros_op = torch.stack(z_op, dim=0)
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
+            import w4a8_fp8_wmma
+
+            N, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
         del self.qweight, self.scales, self.qzeros
 
 
@@ -101,6 +111,16 @@ class _GroupedAWQExperts(BaseOP):
         self._w_op = torch.stack(w_op, dim=0)
         self._scales_op = torch.stack(s_op, dim=0)
         self._zeros_op = torch.stack(z_op, dim=0)
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
+            import w4a8_fp8_wmma
+
+            N, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
         del self.qweight, self.scales, self.qzeros
 
 
@@ -159,6 +179,8 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         raise RuntimeError("_GroupedCompressedTensorsExperts holds weights; call kernels.w4a8_moe")
 
     def post_load(self) -> None:
+        from minisgl.quant import kernels
+
         pf = 32 // self._quant.bits
         E, N, Kp = self.weight_packed.shape
         G = self.weight_scale.shape[-1]
@@ -171,6 +193,16 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         zeros.view(torch.uint8).fill_(0x88)
         self._zeros_op = zeros.to(self.weight_packed.device)
         del self.weight_packed, self.weight_scale
+        if kernels.MOE_W4A16 != "0":
+            # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
+            # fp8 op-layout (same as _GroupedAWQExperts). g=32 -> wide 2 (b64, kernel 13fba94).
+            import w4a8_fp8_wmma
+
+            N2, K8 = self._w_op.shape[1], self._w_op.shape[2]
+            wide = kernels._w4a16_wide(self._quant.group_size)
+            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N2, K8 * 8)
+            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            del self._w_op
 
 
 class _GroupedFP8Experts(BaseOP):
@@ -454,7 +486,6 @@ class MoELayer(BaseOP):
 
             w13, w2 = self.gate_up_proj, self.down_proj
             if self.quant.is_rxf:
-                assert not precomputed, "RXF MoE precomputed-topk path not wired yet"
                 final_hidden_states = kernels.rxf_moe(
                     hidden_states,
                     w13.weight_packed,
@@ -464,7 +495,39 @@ class MoELayer(BaseOP):
                     router_logits,
                     self.top_k,
                     self.renormalize,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
                     span=self.quant.rotation_span,
+                )
+            elif kernels.MOE_W4A16 != "0" and hasattr(w13, "_w_rep"):
+                # W4A16 (fp16-act) routed experts — the fix for fp8-act decode degradation on
+                # activation-sensitive models. post_load built _w_rep + freed _w_op, so this runs for
+                # ALL M. GLM/DeepSeek pass a precomputed noaux_tc route; Qwen-style MoE passes raw
+                # router_logits, so compute softmax+topk(+renorm) here (mirrors w4a8_moe's _route).
+                if topk_ids is None:
+                    assert router_logits is not None, "W4A16 MoE needs a route or router_logits"
+                    import torch.nn.functional as _F
+
+                    probs = _F.softmax(router_logits.float(), dim=-1)
+                    topk_weights, topk_ids = torch.topk(probs, self.top_k, dim=-1)
+                    if self.renormalize:
+                        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+                    topk_weights = topk_weights.contiguous()
+                    topk_ids = topk_ids.to(torch.int32).contiguous()
+                inter_pp = w13._scales_op.shape[1] // 2  # gate_up output = 2*inter (per-partition)
+                final_hidden_states = kernels.w4a16_moe(
+                    hidden_states,
+                    w13._w_rep,
+                    w13._scales_op,
+                    w13._zeros_op,
+                    w2._w_rep,
+                    w2._scales_op,
+                    w2._zeros_op,
+                    self.hidden_size,
+                    inter_pp,
+                    self.quant.group_size,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
                 )
             else:
                 final_hidden_states = kernels.w4a8_moe(
