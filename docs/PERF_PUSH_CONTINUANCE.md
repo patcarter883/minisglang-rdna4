@@ -135,9 +135,21 @@ why" over a silent correctness break.
   concurrent coherence with NO added nondeterminism (ondevice diverges from host exactly as host
   diverges from itself). The on-device change is lossless. Harnesses: `<scratchpad>/spec_ab_inner.sh`
   (bs=1 A/B), `tools/spec_conc_client.py` (in-container async client, hits internal :1919, `NREQ` env).
-- **Remaining before "complete":** the actual overlap (**2c/2d**) is not built — the wired path still
-  does ONE sync (see the 2c/2d BLOCKER section). Flipping `MINISGL_SPEC_ONDEVICE` on by default is safe
-  correctness-wise but tok/s-neutral until 2c/2d, so it stays default-OFF for now.
+- **DECISION (director, this session): STOP — freeze at `65f8252`, on-device gated OFF, 2c/2d SHELVED.**
+  Backed by a `MINISGL_SPEC_TIMING` measurement (Qwen3.5-4B GDN + ngram, MEM=0.70): **forward=24-29ms,
+  accept(host)=1.5ms, propose+stage=0.4ms → total ~26-30ms.** So the accept/host phase 2c/2d could hide
+  is **~1.5ms ≈ 5% of the step** — and only at a concurrency this box can't reach (memory-capped 3-4).
+  The full zero-sync overlap (page-allocator rewrite + loop-pipeline + FutureMap detok, real KV-corruption
+  risk) is **not worth a ≤5% ceiling** here → shelved with evidence, NOT a punt. Revisit only if a
+  higher-memory box or a much higher concurrency target changes the economics.
+  Second finding from the same run: the wired on-device path measured **~15% SLOWER than host at bs=1/N3
+  (30ms vs 26ms)** because it did **5 separate `.cpu()` syncs** (each a full ROCm round-trip) vs host's
+  one; the per-req Python it removes only matters at high batch this box can't run. **If on-device is
+  ever revisited, the FIRST fix is to consolidate those 5 syncs → 1** (pack num_accepted|kept_lens|eos|
+  kept_flat into one int32 tensor, single `.cpu()`, derive offsets via host cumsum) — that patch was
+  written + syntax-clean but reverted unvalidated when we stopped, so redo+GPU-validate it before trusting.
+  Net: `MINISGL_SPEC_ONDEVICE` stays default-OFF; the Phase 1/2a/2b primitives remain committed, lossless,
+  and validated as a substrate for if/when the overlap economics improve.
 
 ---
 
