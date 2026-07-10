@@ -13,7 +13,9 @@ TP="${TP:-2}"
 PORT="${PORT:-21009}"
 MEMRATIO="${MEMRATIO:-0.82}"
 MAXRUN="${MAXRUN:-24}"
-GRAPH="${GRAPH:-16}"            # cuda_graph_max_bs; capture set = [1,2,4]+range(8,GRAPH+1,8)
+GRAPH="${GRAPH:-24}"            # cuda_graph_max_bs; base rows default 24 so the sweep can reach M=24
+                               # STILL graph-captured (M>GRAPH would fall back to eager). Spec rows
+                               # override to their memory-safe value (MTP 8, DFlash 4).
 MMS="${MOE_SCATTER:-0}"        # MINISGL_MOE_SCATTER: 0 = graph-safe gather_reduce decode path
 # Attention backend. 'hip' = native HIP flash (the only capture-capable GQA/MHA backend, for
 # dense/Qwen). MLA models (GLM-4.7-Flash) MUST use 'auto' — the engine force-selects the capture-
@@ -98,8 +100,13 @@ echo "######## $MODEL  PRODUCTION (cuda-graph capture, graph-safe MoE) ########"
 launch graph || exit 1
 # confirm graph capture actually engaged (not a silent eager fallback)
 grep -iE 'captur|cuda.?graph' "$RESULTS/bench_graph.server.log" | head -4 || true
+# Concurrency ceiling for the sweep = min(max-running-requests, cuda-graph-max-bs): beyond MAXRUN a
+# request QUEUES (not concurrent), beyond GRAPH a decode batch falls to EAGER (not the graph-captured
+# production path). Cap at the smaller so every point is BOTH concurrent AND graph-captured.
+CAP="$MAXRUN"; [ "${GRAPH:-0}" -gt 0 ] && [ "$GRAPH" -lt "$CAP" ] && CAP="$GRAPH"
+echo "[bench] concurrency ceiling = min(MAXRUN=$MAXRUN, GRAPH=$GRAPH) = $CAP"
 python /engine/tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" \
   --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M" \
-  --max-concurrency "$MAXRUN"
+  --max-concurrency "$CAP"
 stop
 echo "[done] logs in $RESULTS/"
