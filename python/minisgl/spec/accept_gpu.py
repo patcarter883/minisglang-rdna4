@@ -6,8 +6,10 @@ import torch
 
 __all__ = [
     "OnDeviceAccept",
+    "OnDeviceCommit",
     "OnDeviceTruncate",
     "accept_greedy_ondevice",
+    "build_commit_ondevice",
     "gather_committed_ids",
     "truncate_at_eos_ondevice",
 ]
@@ -56,6 +58,11 @@ def _leading_zero_run_per_segment(
     stays on ``stop_flag.device`` — no host sync.
     """
     total = stop_flag.shape[0]
+    if total == 0:
+        # Empty flat buffer (every segment length 0 — e.g. all reqs have K=0, an ngram all-miss
+        # batch). Each segment's leading-zero run is its length, which is 0. Guard before indexing
+        # ``excl`` (size 0) below.
+        return torch.zeros(num_reqs, dtype=torch.int32, device=stop_flag.device)
     incl = torch.cumsum(stop_flag, dim=0)  # [total] global inclusive
     excl = incl - stop_flag  # [total] global exclusive
     # Flag-count strictly BEFORE each segment starts (0 for the first). Clamp guards a possible
@@ -245,4 +252,108 @@ def truncate_at_eos_ondevice(
         kept_finished_eos=has_eos,
         kept_flat=kept_flat,
         kept_offsets=kept_offsets,
+    )
+
+
+class OnDeviceCommit(NamedTuple):
+    """Pure-GPU result of laying out the token-pool scatter + advancing per-req lengths.
+
+    All tensors live on ``device``. ``scatter_rows``/``scatter_cols``/``scatter_vals`` are a
+    ready-to-apply flattened indexed assignment into the ``[num_seqs, max_ctx]`` token pool:
+    ``token_pool[scatter_rows, scatter_cols] = scatter_vals``. The rest are per-req vectors the
+    scheduler previously advanced with a host loop (``req.cached_len``, ``req.device_len``, the GDN
+    install ``t_index``, and the draft-head seed row).
+    """
+
+    scatter_rows: torch.Tensor
+    """int64 [sum(kept_lens)]: token-pool ROW (== req.table_idx) per committed token."""
+    scatter_cols: torch.Tensor
+    """int64 [sum(kept_lens)]: token-pool COLUMN (== c0 + 1 + within-req index) per committed token."""
+    scatter_vals: torch.Tensor
+    """int32 [sum(kept_lens)]: the committed token ids (== the input ``kept_flat``), in row-major
+    req-then-token order — the SAME order the host ``c_rows/c_cols/c_vals`` loop produced."""
+    new_cached_len: torch.Tensor
+    """int32 [num_reqs]: ``c0 + kept_lens`` — KV valid through ``new_cached_len - 1``."""
+    new_device_len: torch.Tensor
+    """int32 [num_reqs]: ``new_cached_len + 1`` (the bonus row recomputed next step)."""
+    gdn_t_index: torch.Tensor
+    """int32 [num_reqs]: ``kept_lens - 1`` — the captured scratch index to install (state AFTER the
+    last committed token). Only meaningful for still-running reqs (caller masks by ``finished``)."""
+    seed_rows: torch.Tensor
+    """int64 [num_reqs]: ``target_offset_r + kept_lens - 1`` — the verify-output row that produced
+    each req's last committed token (draft-head hidden-state seed). Caller masks by ``finished``."""
+
+
+def build_commit_ondevice(
+    kept_flat: torch.Tensor,
+    kept_lens: torch.Tensor,
+    table_idx: torch.Tensor,
+    cached_len_c0: torch.Tensor,
+    target_offsets: torch.Tensor,
+    device: torch.device,
+) -> OnDeviceCommit:
+    """Lay out the GPU token-pool scatter + advance per-req lengths, fully on-device.
+
+    Replaces the host commit loop in ``scheduler._spec_decode_step`` (the
+    ``c_rows/c_cols/c_vals`` append + ``req.cached_len``/``req.device_len`` advance + the GDN
+    ``install`` ``t_index`` + the draft-head seed row), all of which previously read
+    ``.tolist()``-ed per-req scalars on the host.
+
+    Layout (mirrors the host loop, per req r with ``c0 = req.cached_len`` BEFORE this step):
+      * committed token j of req r lands at ``token_pool[table_idx[r], c0[r] + 1 + j]``.
+      * ``req.cached_len`` advances to ``c0[r] + kept_lens[r]`` (KV valid through cached_len-1).
+      * ``req.device_len`` advances to ``cached_len + 1``.
+      * the GDN/CCA install index is ``kept_lens[r] - 1`` (state after the last committed token).
+      * the draft-head seed row is ``target_offset[r] + kept_lens[r] - 1`` (``target_offset`` is the
+        req's ``block_start`` in the ``[sum(q_len)]`` verify output — cumsum of ``q_len``).
+
+    Args:
+      * ``kept_flat`` / ``kept_lens``: the Phase-2a truncated committed buffer (``kept_lens`` all
+        ``>= 1``, in req order; ``kept_flat`` concatenated in req-then-token order).
+      * ``table_idx``: int ``[num_reqs]`` — each req's token-pool / page-table row (``req.table_idx``).
+      * ``cached_len_c0``: int ``[num_reqs]`` — each req's ``cached_len`` BEFORE the commit.
+      * ``target_offsets``: int ``[num_reqs]`` — the verify-output ``block_start`` per req
+        (``_exclusive_cumsum(q_lens)`` from Phase-1). Used only for the draft-head seed row.
+
+    The scatter triple comes out in req-then-token order (``repeat_interleave`` of ``arange``), the
+    identical order the host ``for i in reqs: for j in keep`` loop produced — so a validator can
+    compare element-wise, not just as a set.
+
+    No ``.cpu()/.item()/.tolist()`` anywhere — everything stays on ``device``.
+    """
+    kept_flat = kept_flat.to(device=device, dtype=torch.int32)
+    kept_lens = kept_lens.to(device=device, dtype=torch.int32)
+    table_idx = table_idx.to(device=device, dtype=torch.int64)
+    cached_len_c0 = cached_len_c0.to(device=device, dtype=torch.int32)
+    target_offsets = target_offsets.to(device=device, dtype=torch.int32)
+
+    num_reqs = kept_lens.shape[0]
+    kept_offsets = _exclusive_cumsum(kept_lens)  # [num_reqs] start of each req's kept slice
+
+    # Owning-req per committed token (repeat_interleave is a device op; never .item()).
+    seg_ids = torch.arange(num_reqs, device=device, dtype=torch.int64)
+    seg = torch.repeat_interleave(seg_ids, kept_lens.to(torch.int64))  # [total]
+
+    # within-req token index, built cumsum-of-ones so we never need the host-side total length.
+    ones = torch.ones_like(seg)
+    global_pos = torch.cumsum(ones, dim=0) - 1  # 0..total-1
+    within = global_pos - kept_offsets.to(torch.int64)[seg]  # [total] j inside its req
+
+    scatter_rows = table_idx[seg]  # [total]
+    scatter_cols = cached_len_c0.to(torch.int64)[seg] + 1 + within  # [total] c0 + 1 + j
+    scatter_vals = kept_flat  # already req-then-token order
+
+    new_cached_len = cached_len_c0 + kept_lens  # [num_reqs]
+    new_device_len = new_cached_len + 1
+    gdn_t_index = kept_lens - 1
+    seed_rows = (target_offsets + kept_lens - 1).to(torch.int64)
+
+    return OnDeviceCommit(
+        scatter_rows=scatter_rows,
+        scatter_cols=scatter_cols,
+        scatter_vals=scatter_vals,
+        new_cached_len=new_cached_len,
+        new_device_len=new_device_len,
+        gdn_t_index=gdn_t_index,
+        seed_rows=seed_rows,
     )
