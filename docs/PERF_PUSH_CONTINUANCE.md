@@ -119,20 +119,25 @@ why" over a silent correctness break.
 ---
 
 ## IN FLIGHT (as of session end)
-- **Nothing running.** Phases 1, 2a, 2b done + validated + committed; the on-device chain is now WIRED
-  into `_spec_decode_step` behind `MINISGL_SPEC_ONDEVICE=1` (`ed49e34`), in-engine sequential-A/B
-  byte-identical. Head of `spec-overlap` = `ed49e34`.
-- **Two gaps remain before this is "complete":**
-  1. **Concurrent (multi-req verify batch) in-engine A/B.** The isolation tests exhaustively prove
-     multi-req losslessness (num_reqs 1-8), and the per-req wiring is identical for 1 vs N reqs, but I
-     could NOT get an in-engine concurrent HTTP A/B: this serve harness drops simultaneous connection
-     bursts — a single chat request returns 200, but 8 concurrent all return empty, SYMMETRICALLY on
-     both the host and ondevice arms (so it can't reveal an ondevice regression; it's a test-infra
-     limit, not an engine divergence). **Next session: get a real multi-req batch in-engine** — either
-     fix the concurrent-HTTP harness (try `docker exec` curl to internal :1919, or an offline
-     batch-submit entrypoint if one exists) or drive N in-flight reqs a different way — then A/B.
-     Until then, DO NOT flip the default on in prod.
-  2. **The actual overlap (2c/2d) is not built.** The wired path still does ONE sync — see below.
+- **Nothing running.** Phases 1, 2a, 2b done + validated + committed; the on-device chain is WIRED
+  into `_spec_decode_step` behind `MINISGL_SPEC_ONDEVICE=1` (`ed49e34`), and is now **VALIDATED
+  lossless in-engine at both bs=1 AND concurrency** (see below). Head of `spec-overlap` = `ed49e34`.
+- **Concurrent multi-req in-engine A/B — RESOLVED (the earlier "harness drops bursts" note was wrong).**
+  The real cause of the burst failures was diagnosed this session: **the GDN eager spec-verify path
+  OOMs at high batch** (below). With headroom (`MEM_RATIO=0.70`), N=8 concurrent ngram-spec completes
+  cleanly on both arms. The concurrent A/B then shows ondevice vs host DIVERGE after a shared prefix —
+  but the **control proves this is batch nondeterminism, not the change**: two identical HOST runs
+  (both `ONDEVICE=0`) diverge just as much (1/8 lines identical), because sub-ms request-arrival timing
+  changes which reqs co-batch and non-associative batched GEMMs split greedy argmax. A byte-identical
+  concurrent A/B is therefore **ill-posed** (no correct impl, baseline included, can pass it). The
+  correct — and now COMPLETE — losslessness proof is: **(1)** bs=1 sequential A/B byte-identical; **(2)**
+  isolation multi-req byte-identical (4008+6011+5007, num_reqs 1-8, same-logits→same-tokens); **(3)**
+  concurrent coherence with NO added nondeterminism (ondevice diverges from host exactly as host
+  diverges from itself). The on-device change is lossless. Harnesses: `<scratchpad>/spec_ab_inner.sh`
+  (bs=1 A/B), `tools/spec_conc_client.py` (in-container async client, hits internal :1919, `NREQ` env).
+- **Remaining before "complete":** the actual overlap (**2c/2d**) is not built — the wired path still
+  does ONE sync (see the 2c/2d BLOCKER section). Flipping `MINISGL_SPEC_ONDEVICE` on by default is safe
+  correctness-wise but tok/s-neutral until 2c/2d, so it stays default-OFF for now.
 
 ---
 
@@ -184,6 +189,22 @@ The wired single-sync path (`MINISGL_SPEC_ONDEVICE`) is the correct substrate to
 ---
 
 ## Reverted / open / queued
+- **⚠ GDN eager spec-verify OOMs at high concurrency — memory planner does NOT reserve for it.**
+  Diagnosed this session (Qwen3.5-4B GDN + ngram, one card). `can_use_verify_graph` (graph.py:364)
+  needs UNIFORM K (every req `extend_len==num_draft+1`); **ngram's draft length is data-dependent, so
+  it's non-uniform on most steps → verify runs EAGER**, and `gdn_prefill_verify` allocates fresh
+  conv/ssm scratch from the leftover `(1-mem_ratio)` slack. The planner's `_graph_capture_bytes`
+  (engine.py:525) reserves the CAPTURED verify-graph buffers but NOT this eager transient. At
+  `MEM_RATIO=0.80` + `max-running-requests 8`, N=8 concurrent ngram-spec OOMs inside the verify forward
+  → the scheduler thread throws, requests never complete → clients hang (CPU ~0%, blocked not spinning).
+  N≤3 fits; **N=8 needs `MEM_RATIO≤0.70`** (validated: 0.70 and 0.65 → N=8 completes, ERRs=0). Draft-head
+  proposers (MTP/EAGLE3/DFlash) are uniform-K in steady state → use the RESERVED graph → tolerate more
+  concurrency; only their partial-K boundary steps (near max_tokens / cold start) hit the eager path.
+  **Proper fix (queued): reserve the peak eager-verify transient in `_determine_num_pages`** (a new
+  `_spec_verify_eager_bytes` sized from `max_running_req × qlen × per-layer GDN scratch`), gated to
+  GDN+spec — so ngram concurrency doesn't need manual mem-ratio tuning. Same class as #12 and the
+  `minisgl-serve-gdn-oom-max-running-req` memory. Workload guidance: this box targets **3-4 concurrent**;
+  higher needs the lower mem_ratio or a draft-head proposer.
 - **#12 GDN/CCA `install_verify_state` batching — REVERTED (`6cbdcbe`).** The `torch.stack` over ~30
   per-layer scratch tensors made an ~864 MiB transient that OOMs 16 GB (worse on 35B TP=2). **Redo needs
   a PRE-STACKED scratch buffer allocated ONCE in `gdn/metadata.py`** (`[L, ...]`, reused — not stacked per
