@@ -21,6 +21,17 @@ MMS="${MOE_SCATTER:-0}"        # MINISGL_MOE_SCATTER: 0 = graph-safe gather_redu
 # backend's decode cudagraph capture is wired, so GRAPH>0 works for GLM too.
 ATTN="${ATTN:-hip}"
 BENCH_M="${BENCH_M:-1,2,4,8,16}"
+# Spec-decode: SPEC=mtp | dflash | "" (base, no spec). SPEC_K = draft length (MTP 4, DFlash 15).
+# DFLASH_MODEL = the drafter checkpoint (required for dflash). Adds --reasoning-parser auto so the
+# thinking models terminate. Graph-captured verify like the compose serve profiles.
+SPEC="${SPEC:-}"
+SPEC_ARGS=""
+case "$SPEC" in
+  mtp)    SPEC_ARGS="--spec-algorithm mtp --spec-num-draft ${SPEC_K:-4} --reasoning-parser auto" ;;
+  dflash) SPEC_ARGS="--spec-algorithm dflash --spec-draft-model-path ${DFLASH_MODEL:?DFLASH_MODEL required for SPEC=dflash} --spec-num-draft ${SPEC_K:-15} --reasoning-parser auto" ;;
+  "")     : ;;
+  *)      echo "[setup] unknown SPEC='$SPEC' (want mtp|dflash|empty)"; exit 1 ;;
+esac
 RESULTS=/engine/tools/tp2_results
 mkdir -p "$RESULTS"
 
@@ -52,6 +63,7 @@ launch() {  # $1 = log tag
   setsid env MINISGL_MOE_SCATTER="$MMS" python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" \
     --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
+    $SPEC_ARGS \
     > "$log" 2>&1 &
   SRV=$!
   for _ in $(seq 1 400); do   # graph capture adds boot time (captures each bs in the set)
@@ -84,6 +96,6 @@ launch graph || exit 1
 # confirm graph capture actually engaged (not a silent eager fallback)
 grep -iE 'captur|cuda.?graph' "$RESULTS/bench_graph.server.log" | head -4 || true
 python /engine/tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" \
-  --label "$(basename "$MODEL") graph_max_bs=$GRAPH" --m "$BENCH_M"
+  --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M"
 stop
 echo "[done] logs in $RESULTS/"
