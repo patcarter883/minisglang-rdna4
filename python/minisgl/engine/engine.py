@@ -874,6 +874,12 @@ class Engine:
         # query tokens, so it never collides with the K+1 two-forward verify graph below. Logits-only.
         if self.graph_runner.can_use_fused_verify(batch):
             return self.graph_runner.replay_fused_verify(batch)
+        # DDTree draft-TREE verify: its own captured graph (fixed tree_qlen + a static ancestor mask +
+        # state-neutral recurrent scratch). Batch carries `ddtree_verify=True`; logits-only. Under EP the
+        # in-graph MoE all_gather uses a fixed captured N while an idle replica self-agrees N eagerly →
+        # keep the tree-verify eager there too (same reasoning as the K+1 verify's EP gate).
+        if self.graph_runner.can_use_ddtree_verify(batch) and not self.enable_ep:
+            return self.graph_runner.replay_ddtree_verify(batch)
         if self.graph_runner.can_use_verify_graph(batch):
             return self.graph_runner.replay_verify(batch, return_hidden)
         with self.ctx.forward_batch(batch):
@@ -910,6 +916,19 @@ class Engine:
         with torch.cuda.stream(self.stream):
             self.graph_runner.capture_fused_verify_graphs(
                 model=self.model, fused_qlen=fused_qlen, bs_list=bs_list,
+            )
+
+    def capture_spec_ddtree_verify_graphs(
+        self, tree_qlen: int, bs_list: "list[int]", max_ctx: int
+    ) -> None:
+        """Capture the DDTree draft-TREE verify graphs. Called by the scheduler when the DDTree path
+        (DFlash/TiDAR + MINISGL_*_DDTREE=1) is enabled, after the proposer is built (it knows the node
+        budget → tree_qlen = budget+1). No-op if graphs are disabled. Logits-only."""
+        if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
+            return
+        with torch.cuda.stream(self.stream):
+            self.graph_runner.capture_ddtree_verify_graphs(
+                model=self.model, tree_qlen=tree_qlen, bs_list=bs_list, max_ctx=max_ctx,
             )
 
     def shutdown(self) -> None:

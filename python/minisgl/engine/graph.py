@@ -209,6 +209,12 @@ class GraphRunner:
         # capture_fused_verify_graphs, needs fused_qlen — a distinct Q from the K+1 verify above).
         self.cca_fused_verify = None
         self._fused_verify = None
+        # DDTree draft-TREE verify capturer (built in capture_ddtree_verify_graphs, needs tree_qlen =
+        # budget+1). State-NEUTRAL: the scheduler snapshots+restores the real recurrent slots around the
+        # replay and NEVER installs, so the per-layer verify scratch is throwaway (pointer-stability only).
+        self.gdn_ddtree_verify = None
+        self.cca_ddtree_verify = None
+        self._ddtree_verify = None
         # Spec-decode verify graphs are captured LATER (capture_verify_graphs), after the scheduler
         # builds the proposer + programs the target's aux-capture layers — None until then.
         self._verify = None
@@ -557,6 +563,133 @@ class GraphRunner:
         n = batch.size * v["qlen"]
         return vbuf.logits[:n]
 
+    # ---- DDTREE draft-TREE spec-verify graph capture (ancestor-mask single-forward, GDN/CCA) -------
+    def capture_ddtree_verify_graphs(
+        self,
+        model: BaseLLMModel,
+        tree_qlen: int,
+        bs_list: List[int],
+        max_ctx: int,
+    ) -> None:
+        """Capture one DDTree tree-verify graph per bs in `bs_list`. The DDTree step stages a draft TREE
+        PADDED to a fixed `tree_qlen = budget+1` query tokens/seq and runs the paged-extend kernel with a
+        dense ancestor `custom_mask` (causal=0). Distinct capture shape from the K+1 linear verify:
+        qlen=tree_qlen, a static (capped-width) mask buffer (init_ddtree_verify_capture), and a recurrent
+        verify capturer at Q=tree_qlen. STATE-NEUTRAL: the recurrent slots are snapshot/restored by the
+        scheduler around replay and never installed, so the per-layer scratch is throwaway. Logits-only
+        (DDTree reads the per-node argmax to walk the tree). Called by the scheduler after the proposer is
+        built (it knows budget → tree_qlen)."""
+        if not bs_list or not hasattr(self.attn_backend, "init_ddtree_verify_capture"):
+            return logger.info_rank0("ddtree-verify CUDA graph: unsupported backend / disabled")
+        dev = self.device
+        max_bs = max(bs_list)
+        self.attn_backend.init_ddtree_verify_capture(
+            self._verify_max_seq_len, bs_list, tree_qlen, max_ctx
+        )
+        # GDN-hybrid recurrent state through static verify buffers at Q=tree_qlen (param on num_draft →
+        # Q=num_draft+1, so pass tree_qlen-1). Same in-place conv/ssm scratch trick as the K+1 verify.
+        self.gdn_ddtree_verify = None
+        if self._gdn_state is not None:
+            from minisgl.gdn.graph_capture import GDNVerifyGraphCapture
+
+            gs = self._gdn_state
+            cshape = gs.conv_state.shape
+            sshape = gs.ssm_state.shape
+            self.gdn_ddtree_verify = GDNVerifyGraphCapture(
+                dev, max_bs, tree_qlen - 1,
+                gdn_layer_ids=range(gs.num_gdn_layers),
+                conv_dim=cshape[2], conv_width=cshape[3],
+                num_v_heads=sshape[2], head_v_dim=sshape[3], head_k_dim=sshape[4],
+                ssm_dtype=gs.ssm_dtype,
+            )
+        # CCA-hybrid (ZAYA) analog — TiDAR-DDTree over a CCA backbone. Same throwaway scratch.
+        self.cca_ddtree_verify = None
+        if self._cca_state is not None:
+            from minisgl.cca.graph_capture import CCAVerifyGraphCapture
+
+            cs = self._cca_state
+            self.cca_ddtree_verify = CCAVerifyGraphCapture(
+                dev, max_bs, tree_qlen - 1,
+                cca_layer_ids=range(cs.num_cca_layers),
+                conv_dim=cs.conv_states.shape[2], conv_width=cs.conv_states.shape[3],
+                hidden=cs.prev_hs.shape[2],
+            )
+        vbuf = VerifyCaptureBuffer.init(
+            max_bs, tree_qlen, self._verify_vocab, None, 0, torch.float32, dev
+        )
+        graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        ddummy = Req(
+            input_ids=torch.zeros(tree_qlen, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+            sampling_params=None, cache_handle=None,  # type: ignore
+        )
+        torch.cuda.synchronize(dev)
+        free0 = get_free_memory(dev)
+        logger.info_rank0(
+            f"Capturing DDTREE-verify CUDA graphs (qlen={tree_qlen}, "
+            f"mask_ctx={self.attn_backend._dcap_max_kv}) sizes={sorted(bs_list)}; free {mem_GB(free0)}"
+        )
+        pool = None
+        for bs in tqdm(sorted(bs_list, reverse=True), desc="Capturing ddtree-verify graphs",
+                       unit="batch", disable=not get_tp_info().is_primary()):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[ddummy] * bs, phase="decode")
+            batch.spec_verify = True
+            batch.ddtree_verify = True
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_ddtree_verify_for_capture(batch)
+            if self.gdn_ddtree_verify is not None:
+                self.gdn_ddtree_verify.prepare_verify_for_capture(batch)
+            if self.cca_ddtree_verify is not None:
+                self.cca_ddtree_verify.prepare_verify_for_capture(batch)
+            vbuf.set_batch(batch)
+            T = vbuf.total(batch)
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
+                self._run_verify_into(model, vbuf, T, False)  # warmup
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    self._run_verify_into(model, vbuf, T, False)
+            if pool is None:
+                pool = graph.pool()
+            graph_map[bs] = graph
+        self._ddtree_verify = {"buf": vbuf, "graphs": graph_map, "qlen": tree_qlen,
+                               "bs_list": sorted(bs_list)}
+        logger.info_rank0(f"ddtree-verify graphs captured; free {mem_GB(get_free_memory(dev))}")
+
+    def can_use_ddtree_verify(self, batch: Batch) -> bool:
+        # capturable iff: ddtree graphs exist, the batch is a ddtree-verify step, every req stages exactly
+        # tree_qlen query tokens (padded), the req count EXACTLY matches a captured bs, AND every req's
+        # context fits the capped static mask width. Beyond the cap (or a non-exact bs / partial step) it
+        # falls back to eager — still lossless. Mirrors can_use_fused_verify's exact-bs contract (the
+        # scheduler builds input_ids/positions/mask over `reqs`, not padded_reqs).
+        if self._ddtree_verify is None or not getattr(batch, "ddtree_verify", False):
+            return False
+        ql = self._ddtree_verify["qlen"]
+        if batch.size not in self._ddtree_verify["graphs"]:
+            return False
+        max_kv = self.attn_backend._dcap_max_kv
+        return all(r.extend_len == ql and r.device_len <= max_kv for r in batch.reqs)
+
+    def replay_ddtree_verify(self, batch: Batch) -> torch.Tensor:
+        """Replay the captured DDTree tree-verify graph. The scheduler built input_ids/positions/out_loc
+        + the dense ancestor custom_mask + recurrent metadata (capture_verify_state=True) eagerly over
+        `batch.reqs`; copy them into the static buffers, refresh attn (page_table/cache_seqlens/mask) +
+        recurrent-state replay metadata, replay, and slice the real-token logits. State-neutral: the
+        scheduler snapshots the real slots before and restores after (no install)."""
+        v = self._ddtree_verify
+        v["replays"] = v.get("replays", 0) + 1
+        if v["replays"] == 1:
+            logger.info_rank0(f"ddtree-verify GRAPH REPLAY engaged (qlen={v['qlen']}, bs={batch.size})")
+        vbuf: VerifyCaptureBuffer = v["buf"]
+        vbuf.copy_from(batch)
+        self.attn_backend.prepare_ddtree_verify_for_replay(batch)
+        if self.gdn_ddtree_verify is not None:
+            self.gdn_ddtree_verify.prepare_verify_for_replay(batch)
+        if self.cca_ddtree_verify is not None:
+            self.cca_ddtree_verify.prepare_verify_for_replay(batch)
+        v["graphs"][batch.padded_size].replay()
+        n = batch.size * v["qlen"]
+        return vbuf.logits[:n]
+
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         del self.graph_map
@@ -564,4 +697,6 @@ class GraphRunner:
             del self._verify
         if self._fused_verify is not None:
             del self._fused_verify
+        if self._ddtree_verify is not None:
+            del self._ddtree_verify
         gc.collect()
