@@ -18,6 +18,7 @@ from minisgl.message import (
     UserMsg,
 )
 from minisgl.spec import AcceptResult, ProposeContext, make_proposer, verify_greedy
+from minisgl.spec.accept_gpu import accept_greedy_ondevice, truncate_at_eos_ondevice
 from minisgl.utils import div_ceil, init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -253,6 +254,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # feed (for A/B). MINISGL_DFLASH_CTX_WINDOW>0 caps P to the last W positions (perf/memory).
         self._dflash_fullctx = os.environ.get("MINISGL_DFLASH_FULLCTX", "1") not in ("0", "false", "no")
         self._dflash_ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
+
+        # MINISGL_SPEC_ONDEVICE=1: compute greedy acceptance + EOS truncation with the on-device
+        # vectorized chain (spec/accept_gpu.py) instead of the per-position argmax .cpu() + per-req
+        # Python verify_greedy/keep loop. Byte-lossless (validated in tools/validate_*), and one
+        # batched sync of small [num_reqs]/[sum kept] results replaces the per-req Python that scales
+        # with batch — the concurrency lever, and the substrate for the future zero-sync overlap.
+        # Falls back to the host path for constrained/ddtree/FORCE_N0 batches. Default OFF.
+        self._spec_ondevice = os.environ.get("MINISGL_SPEC_ONDEVICE") == "1"
 
         # Structured-output (constrained decoding) state. Built lazily on the first constrained
         # request, so a plain serve never imports xgrammar. uid -> live GrammarMatcher.
@@ -1872,9 +1881,55 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
         else:
             logits = self.engine.forward_verify(batch)
-        preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
+
+        # Greedy acceptance + EOS truncation: either the on-device vectorized chain (one batched sync
+        # of small per-req results — the concurrency lever) or the legacy per-position argmax .cpu() +
+        # per-req Python verify_greedy/keep loop. The on-device path is byte-lossless (validated in
+        # tools/validate_ondevice_accept.py + validate_eos_trunc.py) and only taken for an all-greedy,
+        # unconstrained, non-ddtree batch — constrained reqs need the host matcher, so a batch with any
+        # constrained req (or the FORCE_N0 / ddtree diagnostics) falls back to the per-req host path.
+        force_n0 = os.environ.get("MINISGL_SPEC_FORCE_N0") == "1"
+        any_constrained = any(r.sampling_params.is_constrained for r in reqs)
+        use_ondevice = (
+            self._spec_ondevice and not any_constrained and not ddtree_drafts and not force_n0
+        )
+        preds = None
+        od_accepts: List[int] = []
+        od_keeps: List[List[int]] = []
+        od_eos: List[bool] = []
+        if use_ondevice:
+            # argmax stays on-device; the accept/EOS chain reads it and syncs only the small results.
+            target_argmax = logits.argmax(dim=-1).to(torch.int32)  # [sum(K_i+1)], on GPU
+            q_lens_t = torch.tensor(
+                [len(d) + 1 for d in drafts], dtype=torch.int32, device=device
+            )
+            drafts_flat = [t for d in drafts for t in d]
+            drafts_t = torch.tensor(drafts_flat, dtype=torch.int32, device=device)
+            acc = accept_greedy_ondevice(target_argmax, drafts_t, q_lens_t, device)
+            # Host compares `tok == self.eos_token_id`; a non-int (None / list) never matches, so a
+            # sentinel -1 (no real token id is negative) reproduces "never truncate" on-device.
+            eos_id = self.eos_token_id if isinstance(self.eos_token_id, int) else -1
+            ignore_mask = torch.tensor(
+                [r.sampling_params.ignore_eos for r in reqs], dtype=torch.bool, device=device
+            )
+            trunc = truncate_at_eos_ondevice(
+                acc.committed_flat, acc.committed_offsets, acc.committed_lens,
+                eos_id, ignore_mask, device,
+            )
+            # The one batched sync: small [num_reqs] / [sum kept] host copies (vs the old per-position
+            # preds + per-req Python). Replaces verify_greedy + the EOS keep-loop for every req.
+            od_accepts = acc.num_accepted.cpu().tolist()
+            kept_lens_host = trunc.kept_lens.cpu().tolist()
+            kept_offsets_host = trunc.kept_offsets.cpu().tolist()
+            kept_flat_host = trunc.kept_flat.cpu().tolist()
+            od_eos = [bool(x) for x in trunc.kept_finished_eos.cpu().tolist()]
+            od_keeps = [
+                kept_flat_host[o : o + L] for o, L in zip(kept_offsets_host, kept_lens_host)
+            ]
+        else:
+            preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
         if _timing:
-            _t2 = _time.perf_counter()  # forward already synced by .cpu()
+            _t2 = _time.perf_counter()  # forward already synced by the .cpu() above
 
         # --- 5. accept + commit + rollback per req --------------------------------------------
         offset = 0
@@ -1898,46 +1953,55 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             q_len = len(d) + 1
             block_start = offset  # this req's first query row in the [sum(K_i+1)] verify output
             offset += q_len
-            matcher = (
-                self._grammar_matchers.get(req.uid)
-                if req.sampling_params.is_constrained
-                else None
-            )
-            if matcher is not None:
-                # Structured output + spec: grammar-mask the verify argmax per position and advance the
-                # matcher through the accepted chain (lossless; see _verify_greedy_constrained). Needs
-                # the raw logit rows on host, not the precomputed unmasked argmax.
-                block = logits[block_start : block_start + q_len].float().cpu()
-                result = self._verify_greedy_constrained(
-                    matcher, d, block, req.sampling_params.ignore_eos, req.uid
-                )
+            if use_ondevice:
+                # On-device chain already produced num_accepted + the EOS-truncated keep list for this
+                # req (batch is unconstrained by the use_ondevice gate, so no matcher path). Byte-
+                # identical to the host verify_greedy + keep-loop below.
+                num_accepted_i = od_accepts[i]
+                keep = list(od_keeps[i])
+                eos = od_eos[i]
             else:
-                target = preds[block_start : block_start + q_len].tolist()
-                result = verify_greedy(d, target)
-            if os.environ.get("MINISGL_SPEC_FORCE_N0") == "1":
-                # Diagnostic: stage+verify drafts but accept none (emit only the bonus). Should be
-                # byte-identical to plain decode through the multi-query kernel — isolates whether
-                # the bug is in the verify forward vs. the accept/commit path.
-                result = result._replace(emitted=result.emitted[:1], num_accepted=0)
-            accepted_counts.append(result.num_accepted)
+                matcher = (
+                    self._grammar_matchers.get(req.uid)
+                    if req.sampling_params.is_constrained
+                    else None
+                )
+                if matcher is not None:
+                    # Structured output + spec: grammar-mask the verify argmax per position and advance
+                    # the matcher through the accepted chain (lossless; see _verify_greedy_constrained).
+                    # Needs the raw logit rows on host, not the precomputed unmasked argmax.
+                    block = logits[block_start : block_start + q_len].float().cpu()
+                    result = self._verify_greedy_constrained(
+                        matcher, d, block, req.sampling_params.ignore_eos, req.uid
+                    )
+                else:
+                    target = preds[block_start : block_start + q_len].tolist()
+                    result = verify_greedy(d, target)
+                if force_n0:
+                    # Diagnostic: stage+verify drafts but accept none (emit only the bonus). Should be
+                    # byte-identical to plain decode through the multi-query kernel — isolates whether
+                    # the bug is in the verify forward vs. the accept/commit path.
+                    result = result._replace(emitted=result.emitted[:1], num_accepted=0)
+                num_accepted_i = result.num_accepted
+                # Decide which emitted tokens to keep, truncating at EOS.
+                keep = []
+                eos = False
+                for tok in result.emitted:
+                    keep.append(tok)
+                    if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
+                        eos = True
+                        break
+
+            accepted_counts.append(num_accepted_i)
             c0 = req.cached_len
             old_device_len = c0 + len(d) + 1
 
             if os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3"):
                 logger.info_rank0(
                     f"[spec-dbg] uid={req.uid} c0={c0} dev={req.device_len} "
-                    f"conf={int(req.input_ids[c0])} k={len(d)} n={result.num_accepted} "
-                    f"emit={result.emitted}"
+                    f"conf={int(req.input_ids[c0])} k={len(d)} n={num_accepted_i} "
+                    f"emit={keep}"
                 )
-
-            # Decide which emitted tokens to keep, truncating at EOS.
-            keep: List[int] = []
-            eos = False
-            for tok in result.emitted:
-                keep.append(tok)
-                if (not req.sampling_params.ignore_eos) and tok == self.eos_token_id:
-                    eos = True
-                    break
 
             # Commit kept tokens to the host sequence + GPU token pool (positions c0+1 .. c0+len).
             for j, tok in enumerate(keep):
