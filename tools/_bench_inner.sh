@@ -60,8 +60,11 @@ launch() {  # $1 = log tag
   # --attn hip: the HIP attention backend (attn_hip prefill + attn_decode paged) is the ONLY
   # capture-capable backend; the default 'auto' resolves to triton_rdna4, whose cudagraph capture
   # is a Phase-4 stub (NotImplementedError). So production graph mode REQUIRES --attn hip.
+  # --host 0.0.0.0: bind all interfaces so the published -p 1919 port is reachable from the host and
+  # from Prometheus (host.docker.internal:1919). The default 127.0.0.1 binds container-loopback only,
+  # so the serve is invisible to the monitored path (metrics never scraped).
   setsid env MINISGL_MOE_SCATTER="$MMS" python -m minisgl \
-    --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" \
+    --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --host 0.0.0.0 --graph "$GRAPH" \
     --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
     $SPEC_ARGS \
     > "$log" 2>&1 &
