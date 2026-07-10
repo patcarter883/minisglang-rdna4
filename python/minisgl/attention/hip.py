@@ -334,3 +334,81 @@ class HIPAttnBackend(RDNA4Backend):
             if tq < tq_pad:
                 self._fcap_custom_mask[tq:tq_pad, : self._fcap_qlen].zero_()
         batch.attn_metadata = self._fused_verify_metadata_static(batch.padded_size)
+
+    # ---- DDTREE spec-verify cudagraph capture (draft-TREE ancestor-mask single-forward) -----------
+    # The DDTree tree-verify stages `tree_qlen = budget+1` query tokens/seq (each req's real tree nodes
+    # PADDED up to that fixed count) and runs the paged-extend kernel with `causal=0` + an ancestor-only
+    # `custom_mask`. Identical static-mask machinery to the FUSED path (init_fused_verify_capture) with
+    # two differences:
+    #   * qlen is `tree_qlen` (budget+1), not a TiDAR-block-derived fused_qlen; and
+    #   * the mask width is CAPPED at `max_ctx` (MINISGL_DDTREE_MAXCTX). The custom_mask carries one
+    #     column per key over the WHOLE per-seq context, so an uncapped model-max width (e.g. 40960)
+    #     would blow the static buffer (max_bs*qlen*max_kv*4 B) on a 16 GB card. Sequences whose context
+    #     exceeds the cap fall back to EAGER (still lossless) — see GraphRunner.can_use_ddtree_verify.
+    def init_ddtree_verify_capture(
+        self, max_seq_len: int, bs_list: List[int], tree_qlen: int, max_ctx: int
+    ) -> None:
+        dev = self.kvcache.device
+        self._dcap_max_bs = max(bs_list)
+        self._dcap_qlen = tree_qlen
+        full = ((max_seq_len + self.page_size - 1) // self.page_size) * self.page_size
+        self._dcap_max_kv = min(full, max_ctx)
+        self._dcap_max_pages = (self._dcap_max_kv + self.page_size - 1) // self.page_size
+        self._dcap_cache_seqlens = torch.ones(self._dcap_max_bs, dtype=torch.int32, device=dev)
+        self._dcap_page_table = torch.zeros(
+            self._dcap_max_bs, self._dcap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._dcap_cu_q = (
+            torch.arange(self._dcap_max_bs + 1, dtype=torch.int32, device=dev) * tree_qlen
+        )
+        self._dcap_custom_mask = torch.zeros(
+            self._dcap_max_bs * tree_qlen, self._dcap_max_kv, dtype=torch.float32, device=dev
+        )
+
+    def _ddtree_verify_metadata_static(self, bs: int) -> RDNA4Metadata:
+        tq = bs * self._dcap_qlen
+        return RDNA4Metadata(
+            cache_seqlens=self._dcap_cache_seqlens[:bs],
+            cu_seqlens_q=self._dcap_cu_q[: bs + 1],
+            max_seqlen_q=self._dcap_qlen,
+            max_seqlen_k=self._dcap_max_kv,
+            page_table=self._dcap_page_table[:bs],
+            cold_prefill=False,
+            custom_mask=self._dcap_custom_mask[:tq, :],  # full-width -> constant stride
+        )
+
+    def _fill_ddtree_verify_static(self, batch: "Batch") -> None:
+        """Refresh cache_seqlens + page_table from `batch.padded_reqs` (eager, OUTSIDE the graph)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
+        self._dcap_cache_seqlens[:bs].copy_(dls)
+        gpt = get_global_ctx().page_table  # global page_size=1 table
+        for i, req in enumerate(reqs):
+            npages = (req.device_len + self.page_size - 1) // self.page_size
+            row = gpt[req.table_idx, : npages * self.page_size : self.page_size]
+            if self.page_size > 1:
+                row = torch.div(row, self.page_size, rounding_mode="floor")
+            self._dcap_page_table[i, :npages].copy_(row.to(torch.int32))
+
+    def prepare_ddtree_verify_for_capture(self, batch: "Batch") -> None:
+        # Dummy capture batch: cache_seqlens = tree_qlen (cached_len 0 dummy), page table -> dummy page.
+        # Mask stays all-allowed (0.0) from init so the warmup attention is well-defined.
+        self._fill_ddtree_verify_static(batch)
+        batch.attn_metadata = self._ddtree_verify_metadata_static(batch.padded_size)
+
+    def prepare_ddtree_verify_for_replay(self, batch: "Batch") -> None:
+        # The scheduler built `batch.attn_metadata.custom_mask` = [total_q_real, ctx_real]; grab it
+        # BEFORE swapping in the static metadata, then copy into the static buffer's leading block.
+        src_mask = batch.attn_metadata.custom_mask
+        self._fill_ddtree_verify_static(batch)
+        tq_pad = batch.padded_size * self._dcap_qlen
+        if src_mask is not None:
+            tq, kv = src_mask.shape
+            self._dcap_custom_mask[:tq, :kv].copy_(src_mask)
+            # dummy-padded rows (if bs rounded up): reset their window to all-allowed. Real rows past
+            # `kv` are bounded away by cache_seqlens (= ctx_real = kv), so no stale-column zeroing needed.
+            if tq < tq_pad:
+                self._dcap_custom_mask[tq:tq_pad, : self._dcap_qlen].zero_()
+        batch.attn_metadata = self._ddtree_verify_metadata_static(batch.padded_size)

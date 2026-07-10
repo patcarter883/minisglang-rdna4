@@ -55,3 +55,14 @@ tools/*.out
 
 # Compiled HIP kernel extensions — built per checkout, never committed
 *.so
+
+# ddtree validation run artifacts
+tools/_ddtree_run/
+tools/.triton-ddtree-cap/
+tools/ddtree_cap.*.log
+
+# ddtree validation run artifacts (worktree-root triton copy + logs)
+.triton-ddtree-cap/
+tools/_ddtree_run/
+tools/ddtree_cap.*.log
+tools/ll.*.json
