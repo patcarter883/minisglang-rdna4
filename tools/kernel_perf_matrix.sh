@@ -20,6 +20,15 @@ BENCH_M=1,2,4,8,16            # concurrency sweep -> M=1 decode, M=16 mixed/batc
 # rows: "LABEL|MODEL|TP|EXTRA_ENV"  — TP=1 only listed where the model fits a single 16 GB card.
 # EXTRA_ENV passes model-specific knobs to run_bench_window.sh (e.g. mem-ratio, EP for ZAYA).
 ROWS=(
+  # ===== MTP vs DFlash spec-decode comparison (27B + 35B, TP=2, graph-captured) — run FIRST =====
+  # Same target, two proposers: MTP (in-model head, K=4, uniform-K -> reserved verify graph, tolerates
+  # MEM=0.85/GRAPH=8) vs DFlash (external z-lab drafter, K=15, memory-razor-thin -> GRAPH=4/MEM=0.80).
+  # 35B = MXFP4 GDN+MoE; 27B = AWQ-INT4 GDN-hybrid. Compare decode/mixed tok/s across concurrency.
+  "qwen3.6-35b-mxfp4-mtp|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.85 MAXRUN=6"
+  "qwen3.6-35b-mxfp4-dflash|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-35B-A3B-DFlash GRAPH=4 MEMRATIO=0.80 MAXRUN=8"
+  "qwen3.6-27b-awq-mtp|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.85 MAXRUN=6"
+  "qwen3.6-27b-awq-dflash|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-27B-DFlash GRAPH=4 MEMRATIO=0.80 MAXRUN=8"
+  # ===== base kernel-coverage matrix (no spec-decode) =====
   # --- GDN linear-attn + MHA paged attn + tail (small, fits TP=1 AND TP=2) ---
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|1|"
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|2|"
@@ -59,8 +68,11 @@ for row in "${ROWS[@]}"; do
   log="$OUT/${LABEL}_tp${TP}.log"
   echo "[kperf] === $(date -u +%T) $LABEL TP=$TP  ($MODEL) $EXTRA ==="
   # DP2+EP for ZAYA TP=2: run_bench_window forwards --data-parallel-size/--enable-ep via env if set.
-  env $EXTRA MODEL="$MODEL" TP="$TP" GRAPH="$GRAPH" BENCH_M="$BENCH_M" \
-    gpu-lease -n "$TP" -- env $EXTRA MODEL="$MODEL" TP="$TP" GRAPH="$GRAPH" BENCH_M="$BENCH_M" \
+  # Pass ONLY MODEL/TP/BENCH_M here; GRAPH/MEMRATIO/MAXRUN/SPEC/... come from $EXTRA (or default in
+  # run_bench_window/_bench_inner). Passing GRAPH here too would DUPLICATE it in the env when a row's
+  # $EXTRA also sets GRAPH, and env keeps the FIRST → the row override silently lost. So EXTRA is the
+  # sole source of those knobs. GRAPH default is 16 (matches the matrix's graph-capture intent).
+  gpu-lease -n "$TP" -- env MODEL="$MODEL" TP="$TP" BENCH_M="$BENCH_M" $EXTRA \
       bash tools/run_bench_window.sh > "$log" 2>&1
   rc=$?
   echo "[kperf]     exit=$rc -> $log $([ $rc -ne 0 ] && echo '(FAILED — continuing)')"
