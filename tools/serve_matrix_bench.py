@@ -101,6 +101,11 @@ def main():
     ap.add_argument("--url", required=True)
     ap.add_argument("--label", default="")
     ap.add_argument("--m", default="1,2,4,8,16")
+    ap.add_argument("--max-concurrency", type=int, default=0,
+                    help="the server's --max-running-requests. Beyond it requests QUEUE (wait), so a "
+                         "sweep point M > this measures queueing latency, NOT M-way concurrency. When "
+                         "set (>0) the sweep is capped to M <= this AND this value is appended as the "
+                         "top point, so every measurement is genuinely concurrent (no waiting).")
     ap.add_argument("--workloads", default="prefill,decode,mixed")
     ap.add_argument("--decode-tokens", type=int, default=128)
     ap.add_argument("--prefill-words", type=int, default=480)
@@ -118,6 +123,14 @@ def main():
         raise SystemExit(f"server at {args.url} not ready within {args.ready_timeout}s")
 
     Ms = [int(x) for x in args.m.split(",")]
+    if args.max_concurrency > 0:
+        # Keep only sweep points the server can run WITHOUT queueing, and include the ceiling itself
+        # as the top point (real max-concurrency throughput). E.g. cap=24 -> …,16,24; cap=6 -> 1,2,4,6.
+        dropped = [m for m in Ms if m > args.max_concurrency]
+        Ms = sorted({m for m in Ms if m <= args.max_concurrency} | {args.max_concurrency})
+        if dropped:
+            print(f"[bench] max-running-requests={args.max_concurrency}: dropped M={dropped} "
+                  f"(would queue, not concurrent); sweeping M={Ms}", flush=True)
     wls = args.workloads.split(",")
     long_prompt = _WORD * args.prefill_words
     short_prompt = _WORD * 8
