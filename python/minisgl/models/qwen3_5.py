@@ -301,15 +301,28 @@ class Qwen3_5Model(BaseOP):
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor | None]:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
+        # --- per-layer residual-stream dump (debug harness): MINISGL_DUMP_LAYERS=<path>, prefill only ---
+        import os as _os
+        _dump_path = _os.environ.get("MINISGL_DUMP_LAYERS")
+        _do_dump = bool(_dump_path) and input_ids.numel() > 1
+        _rows = [("embed", x[-1].detach().float().cpu())] if _do_dump else None
         # Aux capture is OFF unless return_hidden AND layers are programmed: zero cost otherwise.
         cap = self._capture_layer_ids if return_hidden else None
         cap_set = set(cap) if cap else None
         grabbed: dict[int, torch.Tensor] = {}
         for lid, layer in enumerate(self.layers.op_list):
-            x, residual = layer.forward(x, residual)
+            x, layer_res = layer.forward(x, residual)
+            residual = layer_res
+            if _do_dump:
+                _rows.append((lid, (x + residual)[-1].detach().float().cpu()))
             if cap_set is not None and lid in cap_set:
                 # output hidden of layer lid = the residual stream after it (feeds the next layer).
                 grabbed[lid] = residual.clone()
+        if _do_dump:
+            import torch as _t
+            _rows.append(("final_prenorm", (x + residual)[-1].detach().float().cpu()))
+            _t.save({"rows": _rows, "n_tokens": int(input_ids.numel())}, _dump_path)
+            print(f"[dump] wrote {len(_rows)} layer hidden states -> {_dump_path}", flush=True)
         # MTP seed = the PRE-final-norm residual stream (x + residual), the Qwen3.5 MTP
         # `previous_hidden_states` input (the MTP's own pre_fc_norm_hidden re-normalizes it).
         pre_norm = (x + residual).clone() if return_hidden else None

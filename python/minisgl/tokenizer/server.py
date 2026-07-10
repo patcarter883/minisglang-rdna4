@@ -18,7 +18,13 @@ from minisgl.message import (
     UserMsg,
     UserReply,
 )
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
+from minisgl.utils import (
+    ZmqPullQueue,
+    ZmqPushQueue,
+    init_logger,
+    load_tokenizer,
+    resolve_stop_token_ids,
+)
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
@@ -60,7 +66,9 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer)
-    detokenize_manager = DetokenizeManager(tokenizer)
+    detokenize_manager = DetokenizeManager(
+        tokenizer, resolve_stop_token_ids(tokenizer_path, tokenizer)
+    )
 
     # Per-uid request metadata for the OpenAI usage block + stop strings, set when a prompt is
     # tokenized and read/cleared when its replies stream back (same process owns both directions).
