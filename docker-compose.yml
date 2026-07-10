@@ -164,6 +164,72 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.82}" \
           ${MINISGL_EXTRA_ARGS:-}
 
+  # Qwen3.6-35B-A3B-MXFP4 (GDN-hybrid + 128-expert MoE; MXFP4 weights, bf16-native, MTP head left
+  # UNQUANTIZED) at TP=2 with MTP spec-decode UNDER CUDA graph capture. This is the prod spec config —
+  # MTP K=4 gives the best real-text tok/s on this GDN+MoE target (memory spec-decode-breakeven-gdn-moe;
+  # DFlash K=15 is a wider-verify tax — use the qwen35b-dflash profile for that). MTP is uniform-K so it
+  # replays the RESERVED verify graph and tolerates the GRAPH_BS=8/MEM=0.85 config (the validated stable
+  # point for this model+spec). Needs BOTH cards (TP=2): lease -n 2.
+  #   gpu-lease -n 2 --detach --name qwen35b-mtp -- docker compose --profile qwen35b-mtp up -d
+  qwen35b-mtp:
+    <<: *lean-common
+    profiles: ["qwen35b-mtp"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-qwen35b-mtp
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-4}" \
+          --reasoning-parser auto \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-6}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
+  # Same Qwen3.6-35B-A3B-MXFP4 target, but DFlash block-diffusion spec-decode with a SEPARATE trained
+  # drafter (z-lab/Qwen3.6-35B-A3B-DFlash). K=15 = the drafter's block size (memory dflash-fullctx-fix).
+  # MEMORY-RAZOR-THIN at TP=2/16GB: GRAPH_BS=4 MEM=0.80 boots; MEM>=0.82 or GRAPH_BS=8 runtime-OOMs the
+  # GDN verify (continuance Gotcha). MINISGL_DFLASH_QUANT=fp8|int8 weight-only-quantizes the replicated
+  # drafter to ~half if a bigger pair is needed; MINISGL_DFLASH_DDTREE=1 routes it through the draft-TREE
+  # step. Needs BOTH cards (TP=2): lease -n 2.
+  #   gpu-lease -n 2 --detach --name qwen35b-dflash -- docker compose --profile qwen35b-dflash up -d
+  qwen35b-dflash:
+    <<: *lean-common
+    profiles: ["qwen35b-dflash"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-qwen35b-dflash
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --spec-algorithm dflash \
+          --spec-draft-model-path "${MINISGL_DFLASH_MODEL:-z-lab/Qwen3.6-35B-A3B-DFlash}" \
+          --spec-num-draft "${MINISGL_SPEC_K:-15}" \
+          --reasoning-parser auto \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-4}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
   # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8 — NO TiDAR spec-decode. Runs as
   # DP=2 replicas (one per gfx1201 card) with expert-parallel (EP shards experts across the pair),
   # so it needs BOTH cards: lease -n 2. This is the validated base-zaya serve restored from git
