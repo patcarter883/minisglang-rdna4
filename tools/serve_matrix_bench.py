@@ -77,6 +77,25 @@ def _agg_tpot(ok):
     return (sum(gaps) / len(gaps)) if gaps else float("nan")
 
 
+def _prompt_tokens(url: str, prompt: str) -> int:
+    """Exact prompt-token count from one non-stream request's usage.prompt_tokens; word-count
+    fallback if the server omits usage. PREFILL throughput = these tokens / TTFT, NOT the 1 output
+    token — the old harness reported output tok/s for prefill (~M/wall), which is meaningless."""
+    payload = json.dumps({"model": "", "prompt": prompt, "max_tokens": 1,
+                          "temperature": 0.0, "stream": False}).encode()
+    req = urllib.request.Request(url + "/v1/chat/completions", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            d = json.loads(r.read())
+        pt = (d.get("usage") or {}).get("prompt_tokens")
+        if pt:
+            return int(pt)
+    except Exception:  # noqa: BLE001
+        pass
+    return max(1, len(prompt.split()))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -114,23 +133,31 @@ def main():
         "decode": (short_prompt, D, True),
         "mixed": (long_prompt, D, True),
     }
+    # PREFILL throughput needs the real prompt-token count (measured once from the server's usage).
+    prefill_ptoks = _prompt_tokens(args.url, long_prompt)
     print(f"\n===== serve matrix [{args.label}] {args.url}  "
-          f"(prefill≈{args.prefill_words}w, decode={D} tok) =====")
+          f"(prefill={prefill_ptoks} prompt tok, decode={D} tok) =====")
+    print("  tok/s: prefill = prompt tokens processed / wall (prompt throughput); "
+          "decode/mixed = output tokens / wall")
     for wl in wls:
         prompt, maxtok, ieos = spec[wl]
         print(f"\n--- {wl} ---")
-        print(f"{'M':>3} {'TTFT ms':>9} {'TPOT ms':>9} {'out tok/s':>10} {'fails':>6}")
+        print(f"{'M':>3} {'TTFT ms':>9} {'TPOT ms':>9} {'tok/s':>12} {'fails':>6}")
         for M in Ms:
             ok, wall, bad = _run(args.url, M, prompt, maxtok, ieos)
             if not ok:
-                print(f"{M:>3} {'--':>9} {'--':>9} {'--':>10} {len(bad):>6}  ALL FAILED")
+                print(f"{M:>3} {'--':>9} {'--':>9} {'--':>12} {len(bad):>6}  ALL FAILED")
                 continue
             ttft = sum(r["ttft"] for r in ok) / len(ok) * 1000
             tpot = _agg_tpot(ok)
-            out_toks = sum(r["n"] for r in ok)
-            tps = out_toks / wall
+            # prefill: total PROMPT tokens processed / wall (real prefill throughput). decode/mixed:
+            # output tokens / wall. wall is the concurrent wall-clock for all M streams.
+            if wl == "prefill":
+                tps = prefill_ptoks * len(ok) / wall
+            else:
+                tps = sum(r["n"] for r in ok) / wall
             tpot_s = f"{tpot:9.2f}" if tpot == tpot else f"{'n/a':>9}"
-            print(f"{M:>3} {ttft:9.2f} {tpot_s} {tps:10.1f} {len(bad):>6}")
+            print(f"{M:>3} {ttft:9.2f} {tpot_s} {tps:12.1f} {len(bad):>6}")
 
 
 if __name__ == "__main__":

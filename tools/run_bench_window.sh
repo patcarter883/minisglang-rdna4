@@ -10,8 +10,11 @@ docker run --rm \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
   --ipc host --shm-size 16gb \
+  --add-host host.docker.internal:host-gateway \
+  -p "${METRICS_HOST_PORT:-1919}:1919" \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 \
+  -e PORT=1919 \
   -e MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" -e TP="${TP:-2}" \
   -e MEMRATIO="${MEMRATIO:-0.82}" -e MAXRUN="${MAXRUN:-24}" \
   -e GRAPH="${GRAPH:-16}" -e MOE_SCATTER="${MOE_SCATTER:-0}" -e BENCH_M="${BENCH_M:-1,2,4,8,16}" \
