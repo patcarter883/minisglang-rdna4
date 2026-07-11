@@ -77,6 +77,7 @@ RUN set -eux; mkdir -p /opt/kernels; \
         w8a8_fp8_wmma:w8a8_fp8_wmma \
         moe_bf16:moe_bf16_wmma \
         rxf:rxf_hip \
+        custom_ar:custom_ar \
         swiglu:swiglu_hip \
         sampler:sampler_hip \
         tail:tail_hip ; do \
@@ -90,7 +91,7 @@ RUN set -eux; mkdir -p /opt/kernels; \
 import sys; sys.path.insert(0, "/opt/kernels")
 for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
           "w4a8_fp8_wmma","moe_hip","moe_splitk_hip","moe_w8a16_wmma","w8a8_fp8_wmma",
-          "swiglu_hip","sampler_hip","tail_hip"]:
+          "custom_ar","swiglu_hip","sampler_hip","tail_hip"]:
     __import__(m); print("ok import", m)
 PY
 

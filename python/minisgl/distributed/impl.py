@@ -128,6 +128,109 @@ class EPCommunicator:
         return x
 
 
+@dataclass
+class CustomARDistributedImpl(DistributedImpl):
+    """Custom 2-GPU one-shot all-reduce (custom_ar) over PCIe P2P — a low-latency, GRAPH-CAPTURABLE
+    drop-in for RCCL on the small TP=2 decode tensors (~1.3x faster; see custom_ar). all_gather is not
+    provided here, so it stays on the previous plugin (RCCL); only all_reduce is overridden.
+
+    DOUBLE-BUFFERED: back-to-back all_reduces (62+/forward) would race on a single shared buffer (the
+    peer may still be reading slot K's data when call K+1 overwrites it). Two slots + a per-call counter
+    alternate them; the intervening call's flag handshake guarantees the peer finished reading the slot
+    two calls ago before it is reused. The counter advances only on eager calls / at graph CAPTURE — a
+    captured graph bakes a fixed slot per call site, so replays are consistent across both ranks."""
+
+    self_data: "torch.Tensor"      # [2, max_elems] uint8 fine-grained IPC (2 double-buffer slots)
+    self_flags: "torch.Tensor"     # [>=BLOCKS] int32 fine-grained IPC
+    peer_data_ptr: "list[int]"     # peer's 2 slot base pointers
+    peer_flags_ptr: int
+    slot_bytes: int
+    _ops: "object"
+    _ctr: int = 0
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        from .info import get_tp_info
+        if get_tp_info().size == 1:
+            return x
+        n = x.numel()
+        nb = n * x.element_size()
+        if not x.is_contiguous() or nb > self.slot_bytes:
+            # Oversized (rare: only long prefills) or non-contiguous → fall back to RCCL for this call.
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+            return x
+        slot = self._ctr & 1
+        self._ctr += 1
+        sb = self.self_data[slot].view(x.dtype)[:n]   # reinterpret the byte slot as x's dtype
+        self._ops.one_shot_ar(x, x, sb, self.peer_data_ptr[slot], self.self_flags, self.peer_flags_ptr)
+        return x
+
+    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        # custom_ar has no all_gather; defer to RCCL (the historical plugin's behaviour).
+        tp_size = self._tp_size_or_1()
+        if tp_size == 1:
+            return x
+        shape = list(x.shape)
+        shape[0] = shape[0] * tp_size
+        out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        dist.all_gather_into_tensor(out, x.contiguous())
+        return out
+
+    @staticmethod
+    def _tp_size_or_1() -> int:
+        from .info import get_tp_info
+        return get_tp_info().size
+
+
+def enable_custom_ar_distributed(
+    tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
+) -> None:
+    """Install the custom_ar one-shot all-reduce as the active all_reduce plugin, if it is usable:
+    TP==2 and the two GPUs have working P2P. Falls back silently (keeps RCCL) otherwise. Called by the
+    engine AFTER the TP process group is up."""
+    if tp_info.size != 2:
+        return
+    try:
+        import custom_ar as car
+    except Exception:
+        return
+    dev = torch.cuda.current_device()
+    peer_dev = 1 - dev
+    if peer_dev < 0 or peer_dev >= torch.cuda.device_count() \
+            or not torch.cuda.can_device_access_peer(dev, peer_dev):
+        return  # no GPU-to-GPU P2P → keep RCCL (the cross-GPU flag handshake would deadlock)
+    try:
+        BLOCKS_SLACK = 64
+        slot_bytes = ((max_bytes + 255) // 256) * 256
+        self_data = car.alloc_shared(2 * slot_bytes, 0).view(2, slot_bytes)   # uint8 [2, slot_bytes]
+        self_flags = car.alloc_shared(BLOCKS_SLACK * 4, 3)                     # int32 [64]
+
+        def _exchange(buf):
+            h = car.get_ipc_handle(buf)
+            gathered = [None, None]
+            dist.all_gather_object(gathered, h.numpy().tobytes(), group=tp_cpu_group)
+            peer_bytes = torch.frombuffer(bytearray(gathered[1 - tp_info.rank]), dtype=torch.uint8).clone()
+            return car.open_ipc_handle(peer_bytes)
+
+        # peer's two data-slot base pointers (the peer's slot i starts at base + i*slot_bytes)
+        peer_data_base = _exchange(self_data)
+        peer_flags_ptr = _exchange(self_flags)
+        peer_data_ptr = [peer_data_base, peer_data_base + slot_bytes]
+        dist.barrier(group=tp_cpu_group)
+    except Exception as e:  # noqa: BLE001
+        from minisgl.utils import init_logger
+        init_logger(__name__).info_rank0(f"custom_ar all-reduce unavailable ({e!r}) — using RCCL")
+        return
+
+    DistributedCommunicator.plugins.append(
+        CustomARDistributedImpl(
+            self_data=self_data, self_flags=self_flags, peer_data_ptr=peer_data_ptr,
+            peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, _ops=car,
+        )
+    )
+    from minisgl.utils import init_logger
+    init_logger(__name__).info_rank0("custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.3x vs RCCL)")
+
+
 def enable_pynccl_distributed(
     tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
 ) -> None:
