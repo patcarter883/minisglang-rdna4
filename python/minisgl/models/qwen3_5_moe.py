@@ -61,13 +61,18 @@ class Qwen3_5MoeSparseBlock(BaseOP):
     threaded in separately so the routed-expert precision is explicit here — the surrounding backbone
     config now keeps the real quant (per-module is_module_quantized gates each backbone linear)."""
 
-    def __init__(self, config: "ModelConfig", expert_quant: "QuantConfig | None"):
+    def __init__(self, config: "ModelConfig", expert_quant: "QuantConfig | None",
+                 force_no_ep: bool = False):
         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
         self.experts = MoELayer(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            # The MTP draft head is built REPLICATED (all experts local) even under EP — it is tiny, and
+            # replicating avoids the loader/layer EP-shard inconsistency for a bf16 draft head under a
+            # quantized (EP-sharded) backbone. Propose then issues plain-TP all_reduces (deterministic).
+            force_no_ep=force_no_ep,
             # ALWAYS renormalize: the Qwen3.5-MoE router (transformers Qwen3_5MoeTopKRouter) divides
             # the top-k softmax probs by their sum UNCONDITIONALLY — there is no norm_topk_prob toggle
             # for this architecture, and the config omits the key (minisgl would default it False).
@@ -131,7 +136,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             mtp_quant = None
 
         def mtp_mlp_factory(cfg: "ModelConfig") -> BaseOP:
-            return Qwen3_5MoeSparseBlock(cfg, mtp_quant)
+            return Qwen3_5MoeSparseBlock(cfg, mtp_quant, force_no_ep=True)
 
         super().__init__(backbone_cfg, mlp_factory=mlp_factory, mtp_mlp_factory=mtp_mlp_factory)
 

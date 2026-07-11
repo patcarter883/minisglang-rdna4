@@ -400,18 +400,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         from minisgl.distributed import is_ep_over_tp
         if self.engine.spec_config is not None and self.engine.enable_ep and is_ep_over_tp():
             # EP-over-TP (dp=1): the TP ranks always run the SAME batch in lockstep, so the MoE
-            # collectives are deterministic and match — the normal spec loop is safe (no cross-replica
-            # agreement needed, unlike DP+EP). MTP is NOT yet supported here: its bf16 draft head can't be
-            # EP-loaded consistently (the weight loader EP-shards the experts while the bf16 MoELayer, with
-            # supports_ep=False, builds them replicated → a load-time shape mismatch). Follow-up: make the
-            # loader EP-decision match the layer (supports_ep/force_no_ep) for the draft head.
-            if self.engine.spec_config.algorithm == "mtp":
-                raise RuntimeError(
-                    "MTP + EP-over-TP is not yet supported (the bf16 draft head can't be EP-loaded "
-                    "consistently). Use EAGLE3/DFlash/TiDAR under EP-over-TP, or serve MTP without "
-                    "--enable-ep."
-                )
-            # non-MTP proposers fall through to the normal _spec_loop below.
+            # collectives are deterministic and match — the normal _spec_loop is safe (no cross-replica
+            # agreement needed, unlike DP+EP). MTP works too: its draft head is built REPLICATED
+            # (force_no_ep, Qwen3_5MoeSparseBlock), so propose issues plain-TP all_reduces while the
+            # backbone verify does EP dispatch — all deterministic. So ALL proposers fall through to
+            # _spec_loop below (no _spec_ep_loop, no MTP block).
+            pass
         elif self.engine.spec_config is not None and self.engine.enable_ep:
             # DP+EP (independent replicas, different per-step batches): needs the cross-replica agreement
             # loop. Fail fast on the one unsupported combo: MTP with an EP-SHARDED draft head — its propose
