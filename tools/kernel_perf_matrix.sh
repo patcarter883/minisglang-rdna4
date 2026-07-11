@@ -20,10 +20,22 @@ BENCH_M=1,2,4,8,16            # concurrency sweep -> M=1 decode, M=16 mixed/batc
 # rows: "LABEL|MODEL|TP|EXTRA_ENV"  — TP=1 only listed where the model fits a single 16 GB card.
 # EXTRA_ENV passes model-specific knobs to run_bench_window.sh (e.g. mem-ratio, EP for ZAYA).
 ROWS=(
+  # ===== MTP vs DFlash spec-decode (35B + 27B) — under EP-over-TP for VRAM headroom (run FIRST) =====
+  # EP-over-TP (--enable-ep, EP=1) shards the experts across BOTH cards (~half the MoE weight/card), so
+  # the KV pool is bigger AND the DFlash K=15 memory razor no longer OOMs (was MEM=0.80 to dodge it; EP
+  # lets it go back to 0.85). Also exercises this session's landed features: MTP propose graph-capture
+  # (default on), the custom_ar graph-safe all_reduce (default), and MTP+EP-over-TP (replicated draft
+  # head). DFlash is a non-MTP proposer → the normal _spec_loop under EP-over-TP; its external drafter is
+  # separate from the EP-sharded target. 35B = MXFP4 GDN+MoE; 27B = AWQ-INT4 GDN-hybrid.
+  # CONFIG NOTE (16 GB card, memory-tight): MTP runs NON-EP — it fits and gets the full propose-capture
+  # win (35B: 19->47->85 tok/s M=1->4); EP+MTP at high MAXRUN OOMs the unreserved GDN verify scratch (a
+  # follow-up: reserve it in _graph_capture_bytes). DFlash runs WITH EP for the VRAM headroom its K=15
+  # wide-verify actually needs (the razor that OOM'd non-EP). Conservative MAXRUN=6 so every point fits.
+  "qwen3.6-35b-mxfp4-mtp|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.82 MAXRUN=6"
+  "qwen3.6-35b-mxfp4-dflash-ep|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|EP=1 SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-35B-A3B-DFlash GRAPH=4 MEMRATIO=0.75 MAXRUN=6"
+  "qwen3.6-27b-awq-mtp|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.82 MAXRUN=6"
+  "qwen3.6-27b-awq-dflash-ep|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|EP=1 SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-27B-DFlash GRAPH=4 MEMRATIO=0.75 MAXRUN=6"
   # ===== base kernel-coverage matrix (no spec-decode) =====
-  # NOTE: the 4 MTP-vs-DFlash spec-decode rows are TEMPORARILY REMOVED — we take clean baseline
-  # figures first while auditing the spec-decode path (35B MTP measured 19.5 tok/s < base ~49, i.e. a
-  # net loss → accept-len ≈ 1 suspected). Re-add them once the spec path is fixed.
   # --- GDN linear-attn + MHA paged attn + tail (small, fits TP=1 AND TP=2) ---
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|1|"
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|2|"
