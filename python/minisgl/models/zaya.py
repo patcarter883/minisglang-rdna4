@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 import torch.nn as nn
 from minisgl.core import get_global_ctx
+from minisgl.distributed import get_tp_info
 from minisgl.layers import (
     AttentionLayer,
     BaseOP,
@@ -39,7 +40,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
 )
 from minisgl.layers.norm import _rms_norm
-from minisgl.utils import init_logger, nvtx_annotate
+from minisgl.utils import div_even, init_logger, nvtx_annotate
 
 from .base import BaseLLMModel
 
@@ -101,15 +102,26 @@ class CCAConv(nn.Module):
     def __init__(self, config: ModelConfig, dtype: torch.dtype, device: torch.device):
         super().__init__()
         hidden = config.hidden_size
-        nq, nk, hd = config.cca_num_q_heads, config.cca_num_k_heads, config.cca_head_dim
-        latent_q = nq * hd  # 1024
-        latent_k = nk * hd  # 256
-        conv_dim = config.cca_conv_dim  # C = 1280
+        # TP: CCA is HEAD-PARALLEL (analog of GLM-MLA / the GDN linear_attn). Each rank owns
+        # cca_num_q_heads/tp query heads and cca_num_k_heads/tp key/value heads; the conv front-end,
+        # its packed q|k channels (conv_dim), and the per-key temperature all shard by the SAME head
+        # split. latent_q/latent_k/conv_dim/ng below are the rank-LOCAL sizes (== full sizes at tp=1).
+        # gqa = nq//nk is TP-invariant (both scale by tp). val_proj1/val_proj2 stay FULL (replicated):
+        # they are per-KV-head [hd, hidden] and the forward SELECTS this rank's KV head(s) from the
+        # [val_proj1 | val_proj2] value pair, so no per-rank weight split (see ZayaCCAAttn.forward).
+        tp_size = get_tp_info().size
+        nq = div_even(config.cca_num_q_heads, tp_size)  # local q heads
+        nk = div_even(config.cca_num_k_heads, tp_size)  # local k/v heads
+        hd = config.cca_head_dim
+        latent_q = nq * hd  # local (1024 at tp=1, 512 at tp=2)
+        latent_k = nk * hd  # local (256 at tp=1, 128 at tp=2)
+        conv_dim = div_even(config.cca_conv_dim, tp_size)  # local C (== (nq+nk)*hd)
         k0, k1 = config.cca_time0, config.cca_time1  # 2, 2
-        ng = nq + nk  # grouped-conv groups H = 10
+        ng = nq + nk  # local grouped-conv groups (H = 10 at tp=1, 5 at tp=2)
 
         f = dict(dtype=dtype, device=device)
-        # Input projections (bf16 dense). 2048 -> {q:1024, k:256, v1:128, v2:128}.
+        # Input projections (bf16 dense), rank-local head slice. 2048 -> {q:latent_q, k:latent_k}.
+        # val_proj1/val_proj2 are per-head [hd, hidden] and REPLICATED (full) on every rank.
         self.linear_q = nn.Parameter(torch.empty(latent_q, hidden, **f))
         self.linear_k = nn.Parameter(torch.empty(latent_k, hidden, **f))
         self.val_proj1 = nn.Parameter(torch.empty(hd, hidden, **f))
@@ -253,6 +265,8 @@ class ZayaCCAAttn(BaseOP):
         nqo, nkv, hd = config.cca_num_q_heads, config.cca_num_k_heads, config.cca_head_dim
         # q/k are pre-normed by the CCA kernel -> q_norm/k_norm = None. The CCA-attn id is BOTH the
         # conv-state index and the paged-KV layer_id (contiguous over attention-bearing layers).
+        # AttentionLayer TP-shards nqo/nkv internally (div_even), so pass FULL head counts here — it
+        # sizes the local paged-KV pool to num_kv_heads/tp (the per-card KV saving that motivates TP).
         self.attn = AttentionLayer(
             layer_id=cca_layer_id,
             head_dim=hd,
@@ -262,8 +276,16 @@ class ZayaCCAAttn(BaseOP):
             q_norm=None,
             k_norm=None,
         )
+        # LinearOProj is row-parallel: full input nqo*hd, local_isize = nqo*hd/tp, all_reduce after.
         self.o_proj = LinearOProj(nqo * hd, config.hidden_size, has_bias=False)
         self._sqrt_head_dim = float(hd) ** 0.5  # kernel sqrt_d arg (= sqrt(head_dim), NOT inverse)
+        # This rank's KV-head slice into the full [val_proj1 | val_proj2] value pair (hd-wide columns
+        # per KV head). The value stream is [head0 = val_proj1(current hs) | head1 = val_proj2(prev hs)];
+        # each rank keeps its num_kv_heads/tp heads. At tp=1 this is the whole [0 : nkv*hd] range.
+        tp = get_tp_info()
+        nkv_local = div_even(nkv, tp.size)
+        self._v_lo = tp.rank * nkv_local * hd
+        self._v_hi = self._v_lo + nkv_local * hd
 
     @nvtx_annotate("CCA")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -373,10 +395,14 @@ class ZayaCCAAttn(BaseOP):
             hs2 = prev[slot].to(model_dtype)  # [N, hidden] (OLD prev_hs)
             prev[slot] = hs.float()
 
-        # Values from the two time streams: val_proj1 on current hs, val_proj2 on previous hs.
-        v1 = F.linear(hs, cca.val_proj1)  # [N, head_dim] = latent_k/2
+        # Values from the two time streams: val_proj1 on current hs, val_proj2 on previous hs. The
+        # two streams ARE the two KV heads ([head0 = v1 | head1 = v2]); under TP each rank keeps only
+        # its num_kv_heads/tp heads, so slice the full pair to this rank's [_v_lo:_v_hi] column range
+        # (the whole [0:latent_k] at tp=1). Both projections are computed on every rank — they are tiny
+        # [hd, hidden] matmuls and keeping both graphs shape-uniform simplifies cudagraph capture.
+        v1 = F.linear(hs, cca.val_proj1)  # [N, head_dim]
         v2 = F.linear(hs2, cca.val_proj2)  # [N, head_dim]
-        v = torch.cat([v1, v2], dim=-1)  # [N, latent_k]
+        v = torch.cat([v1, v2], dim=-1)[:, self._v_lo : self._v_hi]  # [N, nkv_local*head_dim]
 
         # Assemble qkv for the paged GQA attention (q|k pre-normed by the kernel -> q_norm/k_norm None).
         qf = qk_out[:, :latent_q].to(model_dtype)
