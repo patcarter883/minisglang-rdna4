@@ -109,11 +109,14 @@ class MTPProposer(Proposer):
             self._graphs: Dict[int, "torch.cuda.CUDAGraph"] = {}   # one captured graph per exact bs
             self._pool = None
             # MINISGL_SPEC_PROPOSE_NOCAPTURE=1 keeps the batched buffer path but runs it EAGER (A/B the
-            # capture win vs the buffering alone). Under EP the captured MoE all_gather would pin a fixed
-            # N vs an idle replica's self-agreed N (same reason verify stays eager under EP) — keep eager.
+            # capture win vs the buffering alone). DP+EP keeps propose eager (the captured MoE all_gather
+            # would pin a fixed N vs an idle replica's self-agreed N). EP-OVER-TP is fine: its MTP draft
+            # head is built REPLICATED (force_no_ep) so propose issues NO EP collective — just a plain-TP
+            # all_reduce — and the TP ranks capture in lockstep. So capture is allowed under EP-over-TP.
+            from minisgl.distributed import is_ep_over_tp
             self._capture_ok = (
                 os.environ.get("MINISGL_SPEC_PROPOSE_NOCAPTURE") != "1"
-                and not getattr(engine, "enable_ep", False))
+                and (not getattr(engine, "enable_ep", False) or is_ep_over_tp()))
             from minisgl.utils import init_logger
             init_logger(__name__).info_rank0(
                 f"spec-decode: MTP BUFFERED propose ENABLED (slots={self._max_slots}, "
