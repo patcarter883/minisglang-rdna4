@@ -23,6 +23,7 @@ docstring's "remaining stubs" and PORT_PLAN.md §6-§7).
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -45,6 +46,31 @@ from minisgl.utils import div_even, init_logger, nvtx_annotate
 from .base import BaseLLMModel
 
 logger = init_logger(__name__)
+
+# MEASUREMENT-ONLY: env-gated cuda-Event timing to split GPU compute between ZAYA's two mixers — CCA
+# attention (O(N^2)) vs MoE (O(N)) — which the ROCm torch.profiler can't reveal (it captures no GPU
+# kernel events here). MINISGL_ZAYA_TIME=1 wraps each mixer call in start/end events with a per-call
+# synchronize (like quant.kernels._moe_time): elapsed_time IS that mixer's GPU execution time, so the
+# CCA/MoE RATIO is exact even though the per-call sync inflates wall. ZayaModel.forward logs the running
+# split each step. Off by default => zero cost, no sync, byte-identical to the untimed path.
+_ZAYA_TIME = os.environ.get("MINISGL_ZAYA_TIME", "0") != "0"
+_zaya_buckets = {"cca": 0.0, "moe": 0.0}
+
+
+def _zaya_time(bucket: str, fn):
+    # Event record/synchronize is illegal mid-cudagraph-capture; skip it there (decode graphs) — we
+    # only want the EAGER prefill split anyway, which is never captured.
+    if not _ZAYA_TIME or torch.cuda.is_current_stream_capturing():
+        return fn()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    r = fn()
+    e.record()
+    e.synchronize()
+    _zaya_buckets[bucket] += s.elapsed_time(e)
+    return r
+
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -599,10 +625,10 @@ class ZayaDecoderLayer(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states, residual = self._merge_and_norm(residual, hidden_states)
         if self._is_cca:
-            hidden_states = self.self_attn.forward(hidden_states)
+            hidden_states = _zaya_time("cca", lambda: self.self_attn.forward(hidden_states))
             return hidden_states, residual, prev_router_states  # CCA passes router state through
-        hidden_states, router_states_next = self.zaya_block.forward(
-            hidden_states, prev_router_states
+        hidden_states, router_states_next = _zaya_time(
+            "moe", lambda: self.zaya_block.forward(hidden_states, prev_router_states)
         )
         return hidden_states, residual, router_states_next
 
@@ -656,6 +682,12 @@ class ZayaModel(BaseOP):
             )
             if cap_set is not None and lid in cap_set:
                 grabbed[lid] = residual.clone()
+        if _ZAYA_TIME:  # cumulative GPU-time split across the 40 CCA + 40 MoE mixers (measurement)
+            c, m = _zaya_buckets["cca"], _zaya_buckets["moe"]
+            logger.info_rank0(
+                f"[zaya-time] cca={c:.0f}ms moe={m:.0f}ms cca_frac={c / (c + m + 1e-9):.1%} "
+                f"(N={input_ids.shape[0]})"
+            )
         # Final fp32 merge + final_norm (PORT_PLAN §3 final block; reference zaya.py:723-736). The
         # merged sum is normed; whether it lands in `residual` or `hidden_states` is irrelevant
         # (addition is commutative and the norm sees the same fp32 value either way).
