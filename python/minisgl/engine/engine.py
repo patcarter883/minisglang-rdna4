@@ -11,6 +11,7 @@ from minisgl.distributed import (
     EPCommunicator,
     destroy_distributed,
     enable_pynccl_distributed,
+    enable_custom_ar_distributed,
     set_dp_info,
     set_tp_info,
 )
@@ -408,6 +409,15 @@ class Engine:
                     num_experts=config.model_config.num_experts,
                 )
                 self.dp_cpu_group = tp_cpu_group
+            # Install the custom_ar one-shot all-reduce as the default all_reduce (TP==2 + P2P only;
+            # falls back to RCCL otherwise). Graph-safe + ~1.3x on the small decode/verify tensors; large
+            # (prefill) all_reduces exceed the slot and self-fall-back to RCCL. Cap the IPC slot at 8 MB
+            # (covers any decode/verify batch) so the fine-grained buffers stay small.
+            car_max_bytes = min(
+                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize,
+                8 * 1024 * 1024,
+            )
+            enable_custom_ar_distributed(config.tp_info, tp_cpu_group, car_max_bytes)
         return tp_cpu_group
 
     def _init_dp_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
