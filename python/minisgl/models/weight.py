@@ -299,8 +299,9 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
         # Under EP the experts are sharded by EXPERT INDEX (the per-expert stack + _ep_expert_shard),
         # NOT tensor-sharded — each rank holds its expert subset at FULL intermediate. So skip the TP
         # gate/up/down intermediate split here (DP+EP has tp=1 so this was a no-op; EP-over-TP has tp>1
-        # and MUST keep full intermediate to match the MoELayer's EP buffer sizing).
-        if is_ep_enabled():
+        # and MUST keep full intermediate to match the MoELayer's EP buffer sizing). EXCEPT the MTP draft
+        # head, which is built REPLICATED (force_no_ep) → plain-TP tensor-split, NOT EP — so fall through.
+        if is_ep_enabled() and not name.startswith("mtp"):
             return t
         if name.endswith(
             (".gate_proj.qweight", ".gate_proj.scales", ".gate_proj.qzeros",
@@ -416,14 +417,21 @@ def _load_qwen3_5_weight(
         # MoELayer's local_num_experts sizing.
         if config.is_moe and (einfo := _get_expert_stack_info(native_key)) is not None:
             packed_key, idx = einfo
-            if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
+            # The MTP draft head is REPLICATED (force_no_ep) — keep ALL its experts local, even when the
+            # backbone (config quant) is EP-sharded. Matches the bf16 MTP MoELayer's full local_num_experts
+            # (else a load-time count mismatch: model 256 vs loader-sharded 128).
+            mtp_head = packed_key.startswith("mtp")
+            e_shard = _ep_shard and not mtp_head
+            e_local = config.num_experts if mtp_head else _ep_local
+            e_offset = 0 if mtp_head else _ep_offset
+            if e_shard and not (e_offset <= idx < e_offset + e_local):
                 return  # not this replica's expert
-            local_idx = idx - _ep_offset
+            local_idx = idx - e_offset
             slots = expert_buf.setdefault(packed_key, {})
             slots[local_idx] = tensor
-            if len(slots) != _ep_local:
+            if len(slots) != e_local:
                 return
-            experts = [slots[i] for i in range(_ep_local)]
+            experts = [slots[i] for i in range(e_local)]
             del expert_buf[packed_key]
             yield packed_key, torch.stack(experts, dim=0)
         else:
