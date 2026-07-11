@@ -397,15 +397,29 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # EP phase/size across replicas AND runs the spec step. Neither _spec_loop nor ep_loop alone
         # works — _spec_loop issues MoE collectives with no cross-replica agreement (deadlock), ep_loop
         # has no spec step. Must be checked BEFORE the spec-only / ep-only branches below.
-        if self.engine.spec_config is not None and self.engine.enable_ep:
-            # Fail fast on the one unsupported combo: MTP with an EP-SHARDED draft head. Its propose
-            # issues a data-dependent number of MoE collectives that the idle-replica lockstep can't
-            # match; it needs the draft MoE built replicated. TiDAR/EAGLE3/DFlash/n-gram are fine.
+        from minisgl.distributed import is_ep_over_tp
+        if self.engine.spec_config is not None and self.engine.enable_ep and is_ep_over_tp():
+            # EP-over-TP (dp=1): the TP ranks always run the SAME batch in lockstep, so the MoE
+            # collectives are deterministic and match — the normal spec loop is safe (no cross-replica
+            # agreement needed, unlike DP+EP). MTP is NOT yet supported here: its bf16 draft head can't be
+            # EP-loaded consistently (the weight loader EP-shards the experts while the bf16 MoELayer, with
+            # supports_ep=False, builds them replicated → a load-time shape mismatch). Follow-up: make the
+            # loader EP-decision match the layer (supports_ep/force_no_ep) for the draft head.
+            if self.engine.spec_config.algorithm == "mtp":
+                raise RuntimeError(
+                    "MTP + EP-over-TP is not yet supported (the bf16 draft head can't be EP-loaded "
+                    "consistently). Use EAGLE3/DFlash/TiDAR under EP-over-TP, or serve MTP without "
+                    "--enable-ep."
+                )
+            # non-MTP proposers fall through to the normal _spec_loop below.
+        elif self.engine.spec_config is not None and self.engine.enable_ep:
+            # DP+EP (independent replicas, different per-step batches): needs the cross-replica agreement
+            # loop. Fail fast on the one unsupported combo: MTP with an EP-SHARDED draft head — its propose
+            # issues a data-dependent number of MoE collectives the idle-replica lockstep can't match.
             if self.engine.spec_config.algorithm == "mtp" and not self._spec_draft_ep_replicated:
                 raise RuntimeError(
-                    "MTP spec-decode + expert parallelism (--enable-ep) is unsupported unless the MTP "
-                    "draft MoE is built REPLICATED (all experts local). Serve MTP without --enable-ep, "
-                    "or use EAGLE3/DFlash/TiDAR under EP."
+                    "MTP spec-decode + DP+EP is unsupported unless the MTP draft MoE is built REPLICATED "
+                    "(all experts local). Serve MTP without --enable-ep, or use EAGLE3/DFlash/TiDAR."
                 )
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
