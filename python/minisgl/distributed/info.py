@@ -58,18 +58,44 @@ _DP_INFO: DpInfo | None = None
 # context — knows to SIZE itself to the local expert shard). Set by the Engine alongside set_dp_info;
 # stays False for every DP-off / DP-only run (experts replicated, full count loaded).
 _ENABLE_EP: bool = False
+# EP-OVER-TP mode (vllm-style TP+EP): with dp_size==1 and tp_size>1, shard the experts across the TP
+# ranks (each rank holds a FULL subset of experts, attention stays TP-sharded) instead of across DP
+# replicas. The EP sharding group is then the TP group. False => the historical DP+EP (experts across
+# dp replicas, attention replicated). get_ep_size/get_ep_rank abstract the two so MoELayer/weight
+# loader are mode-agnostic.
+_EP_OVER_TP: bool = False
 
 
-def set_dp_info(dp_rank: int, dp_size: int, enable_ep: bool = False) -> None:
-    global _DP_INFO, _ENABLE_EP
+def set_dp_info(dp_rank: int, dp_size: int, enable_ep: bool = False,
+                ep_over_tp: bool = False) -> None:
+    global _DP_INFO, _ENABLE_EP, _EP_OVER_TP
     if _DP_INFO is not None:
         raise RuntimeError("DP info has been set")
     _DP_INFO = DpInfo(dp_rank, dp_size)
-    _ENABLE_EP = bool(enable_ep) and dp_size > 1
+    _EP_OVER_TP = bool(enable_ep) and bool(ep_over_tp) and dp_size == 1
+    _ENABLE_EP = bool(enable_ep) and (dp_size > 1 or _EP_OVER_TP)
 
 
 def is_ep_enabled() -> bool:
     return _ENABLE_EP
+
+
+def is_ep_over_tp() -> bool:
+    return _EP_OVER_TP
+
+
+def get_ep_size() -> int:
+    """Expert-sharding degree: TP size under EP-over-TP, else DP size. 1 when EP is off."""
+    if not _ENABLE_EP:
+        return 1
+    return get_tp_info().size if _EP_OVER_TP else get_dp_info().dp_size
+
+
+def get_ep_rank() -> int:
+    """This rank's index within the expert-sharding group (tp_rank under EP-over-TP, else dp_rank)."""
+    if not _ENABLE_EP:
+        return 0
+    return get_tp_info().rank if _EP_OVER_TP else get_dp_info().dp_rank
 
 
 def get_dp_info() -> DpInfo:
@@ -94,4 +120,7 @@ __all__ = [
     "get_dp_info",
     "try_get_dp_info",
     "is_ep_enabled",
+    "is_ep_over_tp",
+    "get_ep_size",
+    "get_ep_rank",
 ]

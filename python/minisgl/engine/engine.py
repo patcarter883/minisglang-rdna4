@@ -98,10 +98,15 @@ class Engine:
         # Register this replica's DP coordinates (inert DpInfo(0,1) when dp_size=1). Done before any
         # CUDA init so EP (later) can build its dp collective group; also lets get_dp_info() resolve
         # to the real replica everywhere instead of the default.
+        # EP-over-TP (vllm-style TP+EP): with dp=1 and tp>1, --enable-ep shards the experts across the
+        # TP ranks (attention stays TP-sharded) instead of across DP replicas. Otherwise EP means DP+EP.
+        self._ep_over_tp = (
+            config.enable_ep and config.dp_info.dp_size == 1 and config.tp_info.size > 1)
         set_dp_info(
             dp_rank=config.dp_info.dp_rank,
             dp_size=config.dp_info.dp_size,
             enable_ep=config.enable_ep,
+            ep_over_tp=self._ep_over_tp,
         )
         _adjust_config(config)
 
@@ -123,7 +128,7 @@ class Engine:
         # Expert-parallel coordinates (inert when --enable-ep is off / dp_size==1). The scheduler
         # reads these to drive the per-step common-bs lockstep over self.dp_cpu_group (built in
         # _init_dp_communication). self.ctx.ep carries the in-graph collective group for MoELayer.
-        self.enable_ep = config.enable_ep and config.dp_info.dp_size > 1
+        self.enable_ep = config.enable_ep and (config.dp_info.dp_size > 1 or self._ep_over_tp)
         self.dp_rank = config.dp_info.dp_rank
         self.dp_size = config.dp_info.dp_size
         # fp8 (e4m3fn) KV cache — opt-in via MINISGL_KV_FP8=1 (the "no-F16" KV path:
@@ -389,6 +394,20 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+            if self._ep_over_tp:
+                # EP-over-TP: the expert-sharding group IS the TP group (all ranks, since dp=1). Build the
+                # nccl EP collective group MoELayer._ep_dispatch reduces over, and reuse the TP gloo group
+                # as dp_cpu_group so the scheduler's per-step ep lockstep (all_reduce MAX) has a valid
+                # group (trivially agrees — the TP ranks run the same batch in lockstep).
+                ep_grp = torch.distributed.new_group(
+                    ranks=list(range(config.tp_info.size)), backend="nccl")
+                self.ctx.ep = EPCommunicator(
+                    group=ep_grp,
+                    dp_rank=config.tp_info.rank,
+                    dp_size=config.tp_info.size,
+                    num_experts=config.model_config.num_experts,
+                )
+                self.dp_cpu_group = tp_cpu_group
         return tp_cpu_group
 
     def _init_dp_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -427,9 +446,10 @@ class Engine:
             grp = torch.distributed.new_group(ranks=ranks, backend="gloo")
             if tr == config.tp_info.rank:
                 self.dp_cpu_group = grp
+        # (EP-over-TP builds its ctx.ep in the single-replica path; this dp>1 method is DP+EP only.)
         if config.enable_ep:
-            # new_group must be called on EVERY process for each group (collective construction), so
-            # build all tp_size nccl dp-subgroups and keep the one this process belongs to. An nccl
+            # DP+EP: new_group must be called on EVERY process for each group (collective construction),
+            # so build all tp_size nccl dp-subgroups and keep the one this process belongs to. An nccl
             # group off a gloo world is supported by torch.distributed (the reverse of the single-
             # replica path, which builds a gloo group off an nccl world).
             for tr in range(tp_size):

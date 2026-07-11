@@ -10,6 +10,9 @@ from .info import (
     get_dp_info,
     get_tp_info,
     is_ep_enabled,
+    is_ep_over_tp,
+    get_ep_size,
+    get_ep_rank,
     set_dp_info,
     set_tp_info,
     try_get_dp_info,
@@ -30,4 +33,7 @@ __all__ = [
     "set_dp_info",
     "try_get_dp_info",
     "is_ep_enabled",
+    "is_ep_over_tp",
+    "get_ep_size",
+    "get_ep_rank",
 ]

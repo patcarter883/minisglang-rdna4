@@ -6,7 +6,7 @@ from typing import Dict, Iterator, Tuple
 
 import safetensors
 import torch
-from minisgl.distributed import get_dp_info, get_tp_info, is_ep_enabled
+from minisgl.distributed import get_dp_info, get_ep_rank, get_ep_size, get_tp_info, is_ep_enabled
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -296,6 +296,12 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
 
     # ---- routed experts (AWQ): gate/up split packed N (dim 1); down split K (dim 0) ----
     if ".mlp.experts." in name:
+        # Under EP the experts are sharded by EXPERT INDEX (the per-expert stack + _ep_expert_shard),
+        # NOT tensor-sharded — each rank holds its expert subset at FULL intermediate. So skip the TP
+        # gate/up/down intermediate split here (DP+EP has tp=1 so this was a no-op; EP-over-TP has tp>1
+        # and MUST keep full intermediate to match the MoELayer's EP buffer sizing).
+        if is_ep_enabled():
+            return t
         if name.endswith(
             (".gate_proj.qweight", ".gate_proj.scales", ".gate_proj.qzeros",
              ".up_proj.qweight", ".up_proj.scales", ".up_proj.qzeros")
@@ -367,12 +373,12 @@ def _ep_expert_shard(config) -> Tuple[bool, int, int]:
     q = getattr(config, "quant", None)
     ep_quant = q is not None and (q.is_gptq or q.is_awq or q.is_compressed_tensors)
     if is_ep_enabled() and ep_quant:
-        dp_info = get_dp_info()
-        assert config.num_experts % dp_info.dp_size == 0, (
-            f"EP needs num_experts ({config.num_experts}) divisible by dp_size ({dp_info.dp_size})"
+        ep_size, ep_rank = get_ep_size(), get_ep_rank()   # TP group (EP-over-TP) or DP replicas
+        assert config.num_experts % ep_size == 0, (
+            f"EP needs num_experts ({config.num_experts}) divisible by ep_size ({ep_size})"
         )
-        ep_local = config.num_experts // dp_info.dp_size
-        return True, ep_local, dp_info.dp_rank * ep_local
+        ep_local = config.num_experts // ep_size
+        return True, ep_local, ep_rank * ep_local
     return False, config.num_experts, 0
 
 
@@ -536,15 +542,15 @@ def _load_zaya_weight(
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
-    # Expert parallelism: each replica loads ONLY its expert shard [offset : offset+local). EP off
-    # (single replica or DP-only) loads the full E. is_ep_enabled() already gates on dp_size>1.
-    dp_info = get_dp_info()
+    # Expert parallelism: each rank loads ONLY its expert shard [offset : offset+local). EP off loads
+    # the full E. The shard group is the DP replicas (DP+EP) or the TP ranks (EP-over-TP) — abstracted.
     if is_ep_enabled():
-        assert config.num_experts % dp_info.dp_size == 0, (
-            f"EP needs num_experts ({config.num_experts}) divisible by dp_size ({dp_info.dp_size})"
+        ep_size, ep_rank = get_ep_size(), get_ep_rank()
+        assert config.num_experts % ep_size == 0, (
+            f"EP needs num_experts ({config.num_experts}) divisible by ep_size ({ep_size})"
         )
-        ep_local = config.num_experts // dp_info.dp_size
-        ep_offset = dp_info.dp_rank * ep_local
+        ep_local = config.num_experts // ep_size
+        ep_offset = ep_rank * ep_local
     else:
         ep_local, ep_offset = config.num_experts, 0
 

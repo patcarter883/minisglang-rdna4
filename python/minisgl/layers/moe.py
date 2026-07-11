@@ -8,8 +8,11 @@ from minisgl.core import get_global_ctx
 from minisgl.distributed import (
     DistributedCommunicator,
     get_dp_info,
+    get_ep_rank,
+    get_ep_size,
     get_tp_info,
     is_ep_enabled,
+    is_ep_over_tp,
 )
 from minisgl.quant import kernels
 from minisgl.utils import div_even
@@ -600,15 +603,19 @@ class MoELayer(BaseOP):
         self.enable_ep = (
             is_ep_enabled() and self._moe_method.supports_ep and not force_no_ep
         )
-        dp_info = get_dp_info()
-        self.ep_dp_rank = dp_info.dp_rank
-        self.ep_dp_size = dp_info.dp_size
+        # Expert-sharding group: DP replicas (DP+EP) OR the TP ranks (EP-over-TP, vllm-style TP+EP).
+        # get_ep_size/get_ep_rank abstract the two; ep_rank indexes this rank's expert shard (used for
+        # the _ep_dispatch output slice). ep_dp_rank kept as an alias for the existing dispatch code.
+        self.ep_size = get_ep_size()
+        self.ep_rank = get_ep_rank()
+        self.ep_dp_rank = self.ep_rank
+        self.ep_dp_size = self.ep_size
         if self.enable_ep:
-            assert num_experts % dp_info.dp_size == 0, (
-                f"EP needs num_experts ({num_experts}) divisible by dp_size ({dp_info.dp_size})"
+            assert num_experts % self.ep_size == 0, (
+                f"EP needs num_experts ({num_experts}) divisible by ep_size ({self.ep_size})"
             )
-            self.local_num_experts = num_experts // dp_info.dp_size
-            self.local_expert_offset = dp_info.dp_rank * self.local_num_experts
+            self.local_num_experts = num_experts // self.ep_size
+            self.local_expert_offset = self.ep_rank * self.local_num_experts
         else:
             self.local_num_experts = num_experts
             self.local_expert_offset = 0
@@ -617,7 +624,10 @@ class MoELayer(BaseOP):
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.quant = quant
         self.fp8_experts = fp8_experts
-        intermediate_size_per_partition = div_even(intermediate_size, tp_size)
+        # Under EP each rank holds FULL experts (its expert subset); only plain TP tensor-splits each
+        # expert's FFN across the TP ranks. EP-over-TP therefore keeps the full intermediate size.
+        intermediate_size_per_partition = (
+            intermediate_size if self.enable_ep else div_even(intermediate_size, tp_size))
         # The method allocates the per-expert container for each GEMM (config-driven: fp8 F8_E4M3,
         # int4 W4A8/W4A16 grouped, RXF NL, or a plain stacked bf16/fp16 tensor). EP: size to the LOCAL
         # expert shard (E/dp) so this replica loads + runs only its experts; the streaming loader skips
@@ -666,6 +676,18 @@ class MoELayer(BaseOP):
         ep_w = topk_weights.contiguous()
         ep_i = topk_ids.to(torch.int32).contiguous()
         hs = hidden_states
+        if is_ep_over_tp():
+            # EP-over-TP: the TP ranks share IDENTICAL tokens (replicated hidden after the attention
+            # all-reduce) and an identical route (replicated gate), so there is NO all_gather — each rank
+            # already sees every token. Run its expert shard (non-local masked to weight 0) and all_reduce
+            # the partials (each token's k experts each live on exactly one rank → the sum is exact). No
+            # pad/self-coordination (all ranks have the same real_n) and no output slice (all rows are ours).
+            lo, hi = self.local_expert_offset, self.local_expert_offset + self.local_num_experts
+            is_local = (ep_i >= lo) & (ep_i < hi)
+            local_ids = torch.where(is_local, ep_i - lo, torch.zeros_like(ep_i))
+            local_weights = torch.where(is_local, ep_w, torch.zeros_like(ep_w))
+            partial = local_kernel(hs, local_weights, local_ids.to(torch.int32))
+            return ep.all_reduce(partial)
         # Common token count N every replica pads to before the all_gather (RCCL needs equal shapes):
         #  1. graph decode: pre-padded to a captured bs -> already equal, no host sync.
         #  2. eager with a scheduler pre-agreement (ep_loop prefill): ep.pad_tokens.
