@@ -68,7 +68,7 @@ launch() {  # $1 = log tag
   setsid env MINISGL_MOE_SCATTER="$MMS" python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --host 0.0.0.0 --graph "$GRAPH" \
     --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
-    $SPEC_ARGS \
+    $SPEC_ARGS ${EP:+--enable-ep} \
     > "$log" 2>&1 &
   SRV=$!
   for _ in $(seq 1 400); do   # graph capture adds boot time (captures each bs in the set)

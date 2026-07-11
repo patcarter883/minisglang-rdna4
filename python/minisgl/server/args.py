@@ -386,7 +386,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     assert dp_size >= 1, f"--data-parallel-size must be >= 1, got {dp_size}"
     kwargs["dp_info"] = DpInfo(0, dp_size)
     if kwargs["enable_ep"]:
-        assert dp_size > 1, "--enable-ep requires --data-parallel-size > 1"
+        assert dp_size > 1 or kwargs["tp_info"].size > 1, (
+            "--enable-ep needs --data-parallel-size > 1 (DP+EP: experts across replicas) OR "
+            "--tensor-parallel-size > 1 (EP-over-TP: experts across the TP ranks, vllm-style)")
 
     # Co-derive the CUDA-graph coverage and the admission cap so no decode batch size runs fully
     # eager. When a graph cap is explicitly requested BELOW the running cap, admit no more reqs than
