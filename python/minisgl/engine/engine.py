@@ -857,7 +857,10 @@ class Engine:
 
         Returns the full logits ``[sum(extend_len), vocab]``. With ``return_hidden=True`` (draft-head
         proposers — MTP / EAGLE3 / DFlash) returns ``(logits, last_hidden, aux_hidden)`` where
-        ``last_hidden`` is the post-final-norm hidden ``[sum(extend_len), hidden]`` (pre-lm_head) and
+        ``last_hidden`` is the PRE-final-norm residual ``[sum(extend_len), hidden]`` (NOT post-norm:
+        the model returns the pre-norm residual stream so the MTP head's own ``pre_fc_norm_hidden``
+        re-normalizes it; feeding a post-norm hidden here would double-norm the seed and collapse
+        acceptance — see qwen3_5.py:599-606) and
         ``aux_hidden`` is the stacked captured decoder layers ``[num_capture_layers, sum(extend_len),
         hidden]`` (or ``None`` if no capture layers are programmed). Capture layers are programmed via
         ``model.set_capture_layers`` at proposer init. No sampling and no ``complete_one``: the
