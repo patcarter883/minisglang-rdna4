@@ -461,6 +461,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         during active serving without touching the per-token decode path. Only the tp-primary has the
         detokenizer socket; every other rank / offline scheduler no-ops via _emit_stats' guard. Gauges
         are sampled here (instantaneous); the spec counters are cumulative."""
+        # MINISGL_BATCH_DEBUG=1: fine-grained batch-composition log on its OWN fast cadence (independent
+        # of Prometheus / _metrics_enabled). For diagnosing RSA aggregation batching: align these lines
+        # with the "[rsa] round N:" logs — kv_per_seq = kv_used/running exposes when long-context
+        # aggregation prompts crowd the KV pool and collapse the effective batch to ~single-request.
+        if os.environ.get("MINISGL_BATCH_DEBUG") == "1":
+            _bd_now = time.time()
+            if _bd_now - getattr(self, "_bd_last", 0.0) >= 0.2:
+                self._bd_last = _bd_now
+                _cm = self.cache_manager
+                _run = len(self.decode_manager.running_reqs)
+                _wait = len(self.prefill_manager.pending_list)
+                _kvt = _cm.num_pages * _cm.page_size
+                _kvu = (_cm.num_pages - len(_cm.free_slots)) * _cm.page_size
+                _per = int(_kvu / _run) if _run else 0
+                logger.info_rank0(
+                    f"[batch] running={_run} waiting={_wait} kv={_kvu}/{_kvt} "
+                    f"({100 * _kvu / max(_kvt, 1):.0f}%) kv_per_seq={_per}"
+                )
         if not self._metrics_enabled:
             return
         now = time.time()

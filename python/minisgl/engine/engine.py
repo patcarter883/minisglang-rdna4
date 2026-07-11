@@ -247,10 +247,16 @@ class Engine:
         # Guarded on getattr so the engine stays import-safe until ModelConfig grows the CCA fields
         # (PORT_PLAN §8): a model without is_cca_hybrid leaves cca_state None.
         if getattr(mc, "is_cca_hybrid", False):
+            # CCA is head-parallel under TP (like GDN above): each rank's conv front-end owns
+            # conv_dim/tp channels ((nq+nk)/tp heads), so its recurrent conv slot matches. prev_hs
+            # stays FULL hidden_size — it feeds val_proj (replicated, full-hidden input), not the
+            # sharded conv. conv_dim = (nq+nk)*hd is linear in the tp-divisible head counts, so
+            # div_even(conv_dim, tp) == the layer's local conv_dim exactly.
+            tp = config.tp_info.size
             self.ctx.cca_state = self.cca_state = CCAStateCache(
                 num_cca_layers=mc.num_cca_layers,
                 num_slots=config.max_running_req + 2,  # +1 NULL block, +1 dummy
-                conv_dim=mc.cca_conv_dim,
+                conv_dim=div_even(mc.cca_conv_dim, tp),
                 conv_kernel=mc.cca_conv_width,
                 hidden_size=mc.hidden_size,
                 # fp32 recurrent state: the cca_hip conv kernels read/update conv_states in fp32.
@@ -262,7 +268,7 @@ class Engine:
                 cca.warmup_conv(_GDN_WARMUP_TOKENS)
             logger.info_rank0(
                 f"CCA state: {mc.num_cca_layers} layers x {config.max_running_req + 2} slots "
-                f"(conv_dim={mc.cca_conv_dim}, conv_width={mc.cca_conv_width})"
+                f"(conv_dim={div_even(mc.cca_conv_dim, tp)}, conv_width={mc.cca_conv_width})"
             )
         else:
             self.cca_state = None  # type: ignore[var-annotated]  # CCAStateCache | None
@@ -545,9 +551,9 @@ class Engine:
             )
             total += conv + ssm
         if getattr(mc, "is_cca_hybrid", False):
-            # conv_states (num_cca_layers, num_slots, conv_dim, conv_kernel) fp32 +
-            # prev_hs     (num_cca_layers, num_slots, hidden_size) fp32
-            conv = mc.num_cca_layers * num_slots * mc.cca_conv_dim * mc.cca_conv_width * 4
+            # conv_states (num_cca_layers, num_slots, conv_dim/tp, conv_kernel) fp32 +
+            # prev_hs     (num_cca_layers, num_slots, hidden_size) fp32  (prev_hs stays FULL hidden)
+            conv = mc.num_cca_layers * num_slots * div_even(mc.cca_conv_dim, tp) * mc.cca_conv_width * 4
             prev = mc.num_cca_layers * num_slots * mc.hidden_size * 4
             total += conv + prev
         if getattr(mc, "is_swa_hybrid", False):
@@ -558,88 +564,6 @@ class Engine:
                 2 * mc.num_swa_layers * num_slots * mc.sliding_window
                 * local_kv * mc.head_dim * self.kv_dtype.itemsize
             )
-        return total
-
-    def _draft_model_bytes(self, config: EngineConfig) -> int:
-        """Reserve the separate speculative DRAFT model (DFlash / EAGLE3). The proposer loads it
-        AFTER the KV pool and REPLICATES it per TP rank, so — exactly like the GDN/CCA recurrent
-        state above — the KV pool must leave room or the drafter OOMs on load (the base weights
-        already fill most of a 16 GB card). 0 when no external draft checkpoint is used (ngram /
-        mtp / tidar carry no separate weights)."""
-        if config.spec_algorithm not in ("dflash", "eagle3") or not config.spec_draft_model_path:
-            return 0
-        import glob
-
-        from minisgl.utils import download_hf_weight
-
-        try:
-            folder = download_hf_weight(config.spec_draft_model_path)
-        except Exception:
-            return 0
-        weight_bytes = sum(
-            os.path.getsize(f) for f in glob.glob(os.path.join(folder, "*.safetensors"))
-        )
-        # MINISGL_DFLASH_QUANT=fp8|int8 weight-only quantizes the draft linears to ~half memory.
-        if (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip():
-            weight_bytes //= 2
-        # + headroom for the drafter's forward / spec-verify graph working set (a fraction of the
-        # weights). Tunable via MINISGL_DRAFT_RESERVE_MARGIN_GB if a big drafter needs more.
-        margin = int(float(os.environ.get("MINISGL_DRAFT_RESERVE_MARGIN_GB", "0.7")) * 1024**3)
-        return weight_bytes + margin
-
-    def _graph_capture_bytes(self, config: EngineConfig, free_memory: int) -> int:
-        """Bytes the CUDA-graph STATIC buffers will consume. Graph capture runs AFTER the KV pool is
-        allocated (decode graphs at the end of ``Engine.__init__``; spec-verify graphs later, from the
-        scheduler once the proposer is built), so its buffers come out of the ``(1-memory_ratio)`` slack
-        unless reserved here — the capture-time / first-request OOM this prevents. Mirrors the
-        ``GraphCaptureBuffer`` / ``VerifyCaptureBuffer`` shapes in ``engine/graph.py``.
-
-        Returns 0 when capture is off (``cuda_graph_max_bs == 0`` — ``_adjust_config`` has already zeroed
-        it for the non-MLA/non-CCA spec case where verify graphs aren't captured). Conservative by design
-        (round-up + assume spec-verify captures last_hidden/aux); add headroom with
-        ``MINISGL_GRAPH_RESERVE_MARGIN_GB`` or replace the whole estimate with ``MINISGL_GRAPH_RESERVE_GB``.
-        General: works for dense / MLA / GDN / CCA, spec and non-spec."""
-        full = os.environ.get("MINISGL_GRAPH_RESERVE_GB")
-        if full:  # non-empty (empty env string is ignored)
-            return int(float(full) * (1 << 30))
-        if config.cuda_graph_max_bs == 0:
-            return 0
-        # Reproduce the captured batch-size set the GraphRunner will pick (same inputs it is handed).
-        from .graph import _determine_cuda_graph_bs
-
-        bs_list = _determine_cuda_graph_bs(
-            config.cuda_graph_bs, config.cuda_graph_max_bs, free_memory, config.max_running_req
-        )
-        if not bs_list:
-            return 0
-        mc = config.model_config
-        vocab = mc.vocab_size
-        hidden = mc.hidden_size
-        f32 = 4
-        i32 = 4
-        dt = self.dtype.itemsize
-        max_bs = max(bs_list)
-        # Decode graphs share ONE GraphCaptureBuffer sized at max_bs (logits [max_bs, vocab] fp32 +
-        # three [max_bs] int32 buffers); the shared graph pool holds the largest forward's activations.
-        total = max_bs * vocab * f32 + 3 * max_bs * i32
-        total += _GRAPH_ACT_MULT * max_bs * hidden * dt
-        # Spec-verify graphs (MLA / CCA today; GDN when enabled): ONE VerifyCaptureBuffer at
-        # (verify_bs, qlen=K+1). verify_bs is the graph bs-set capped at max_running_req (scheduler).
-        # Reaching here with spec set implies verify capture is on (the unsupported case was zeroed in
-        # _adjust_config). Assume last_hidden + aux — draft-head proposers need them (n-gram over-
-        # reserves harmlessly). These are the big buffers for spec (T = verify_bs*(K+1) rows of vocab).
-        sc = config.spec_config
-        if sc is not None:
-            qlen = sc.num_draft + 1
-            vbs = max((b for b in bs_list if b <= config.max_running_req), default=max_bs)
-            T = vbs * qlen
-            total += T * vocab * f32 + 3 * T * i32
-            total += (1 + _GRAPH_ASSUMED_AUX) * T * hidden * dt  # last_hidden + aux_hidden
-            total += _GRAPH_ACT_MULT * T * hidden * dt
-        total = int(total * _GRAPH_ROUNDUP)
-        margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
-        if margin:  # non-empty (empty env string is ignored)
-            total += int(float(margin) * (1 << 30))
         return total
 
     def _draft_model_bytes(self, config: EngineConfig) -> int:
@@ -668,7 +592,15 @@ class Engine:
             for name in os.listdir(folder):
                 if name.endswith(".safetensors"):
                     total += os.path.getsize(os.path.join(folder, name))  # follows symlink into blobs/
-            return total
+            # MINISGL_DFLASH_QUANT=fp8|int8 weight-only quantizes the draft linears to ~half memory.
+            if (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip():
+                total //= 2
+            # + working-set headroom for the drafter's EAGER forward (DFlash denoise / EAGLE3 step) and
+            # its spec-verify transient. This is NOT covered by the captured-graph reserve (propose runs
+            # eager for DFlash/EAGLE3), and it is the ~340 MB that OOMs a tight 27B+DFlash boot at warmup
+            # (past capture). Default 0.7 GB; tune via MINISGL_DRAFT_RESERVE_MARGIN_GB (0 disables).
+            margin = int(float(os.environ.get("MINISGL_DRAFT_RESERVE_MARGIN_GB", "0.7")) * (1 << 30))
+            return total + margin
         except Exception as e:  # noqa: BLE001 — sizing must never block boot
             logger.warning_rank0(
                 f"Draft-model reserve: could not size {draft_path} ({e}); reserving 0 — set "

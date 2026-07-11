@@ -536,10 +536,54 @@ def _zaya_remap(ckpt_key: str) -> str | None:
     return ckpt_key
 
 
+def _shard_zaya(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Extract rank r's TP head-shard of a ZAYA CCA-hybrid NATIVE (post-`_zaya_remap`) tensor.
+
+    CCA is head-parallel (analog of `_shard_qwen3_5`'s GDN splits). Applied AFTER the remap, so it
+    keys on the native flat param names. n==1 is the identity (TP=1, unchanged). The fp8 experts are
+    EP-sharded by index in the loader (NOT tensor-sharded), so they never reach here.
+
+      - qkv.linear_q / linear_k: column-parallel (output = q|k head latents), split dim 0 into the
+        rank's contiguous head group. gqa is preserved (q heads 0..3 -> kv head 0 stays on rank 0).
+      - qkv.conv_qk_0/1_{weight,bias}: the packed conv over [q(latent_q) | k(latent_k)] channels.
+        Block-shard dim 0 by [latent_q, latent_k] so each rank keeps its q-head AND k-head channels
+        (a naive chunk would hand rank 0 all q and rank 1 all k — corrupting the head grouping).
+      - qkv.temp: per-KV-head temperature, split dim 0.
+      - qkv.val_proj1/val_proj2: REPLICATED (per-head [hd, hidden]; the model selects this rank's KV
+        head from the [val_proj1|val_proj2] value pair — see ZayaCCAAttn.forward).
+      - self_attn.o_proj.weight: row-parallel (input = q-head latent), split dim 1 + all_reduce.
+      - embed_tokens.weight: vocab-parallel (tied lm_head shares it), split dim 0.
+      - res_scale / input_norm / final_norm / zaya_block.router.* : hidden-wide or route-side ->
+        REPLICATED (fall through).
+    """
+    if n == 1:
+        return t
+    hd = config.cca_head_dim
+    latent_q = config.cca_num_q_heads * hd  # full
+    latent_k = config.cca_num_k_heads * hd  # full
+    if name.endswith((".self_attn.qkv.linear_q", ".self_attn.qkv.linear_k")):
+        return t.chunk(n, dim=0)[r].clone()  # col-parallel: contiguous head group
+    if name.endswith(
+        (".self_attn.qkv.conv_qk_0_weight", ".self_attn.qkv.conv_qk_0_bias",
+         ".self_attn.qkv.conv_qk_1_weight", ".self_attn.qkv.conv_qk_1_bias")
+    ):
+        return _shard_blocks_dim0(t, [latent_q, latent_k], r, n)  # [q|k] channel block shard
+    if name.endswith(".self_attn.qkv.temp"):
+        return t.chunk(n, dim=0)[r].clone()  # per-KV-head temperature
+    if name.endswith(".self_attn.o_proj.weight"):
+        return t.chunk(n, dim=1)[r].clone()  # row-parallel (input head latent) + all_reduce
+    if name.endswith("embed_tokens.weight"):
+        num = t.shape[0]
+        per = div_ceil(num, n)
+        return t[r * per : min((r + 1) * per, num)].clone()  # vocab-parallel (tied lm_head)
+    # val_proj1/val_proj2, res_scale, input_norm, final_norm, router.* -> replicated
+    return t
+
+
 def _load_zaya_weight(
     model_folder: str, device: torch.device, config
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Streaming loader for the ZAYA1-8B CCA-hybrid fp8 checkpoint (TP=1).
+    """Streaming loader for the ZAYA1-8B CCA-hybrid fp8 checkpoint (TP head-parallel; EP-over-TP).
 
     Plain keys are renamed by `_zaya_remap`. The fp8 routed experts STAY fp8: the raw F8_E4M3
     `weight` and per-output-channel F32 `weight_scale` are stacked over the 16 experts into
@@ -599,7 +643,10 @@ def _load_zaya_weight(
                 native = _zaya_remap(ckpt_name)
                 if native is None:
                     continue
-                yield native, f.get_tensor(ckpt_name)
+                # Head-shard the CCA/o_proj/embed tensors for this rank (no-op at TP=1); experts are
+                # EP-sharded above and never reach here.
+                raw = _shard_zaya(native, f.get_tensor(ckpt_name), tp_info.rank, tp_info.size, config)
+                yield native, raw
 
     assert not expert_buf, f"incomplete Zaya expert stacks: {list(expert_buf.keys())}"
 
