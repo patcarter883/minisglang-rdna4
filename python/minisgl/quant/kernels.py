@@ -173,6 +173,40 @@ def gptq_to_op_layout(
     return w_packed, scales_op, zeros_op
 
 
+# Grouped-MoE WMMA tile heights. These are HARDWARE/KERNEL limits, not tunables: the WMMA M-dim is
+# WMMA_DIM=16 and the kernel launches up to MV5_MAX_WARPS=8 warps (block_m = warps * 16, so 128 max).
+_MOE_WMMA_DIM = 16
+_MOE_BLOCK_M_CHOICES = (16, 32, 64, 128)  # multiples of WMMA_DIM up to 8 warps
+
+
+def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
+    """Choose the grouped-MoE tile height from the WORKLOAD rather than a fixed constant.
+
+    ``moe_align`` pads EACH expert's routed rows up to a multiple of ``block_m`` and the WMMA kernel
+    then grinds one expert's weight slab per ``block_m``-row tile (n_warps = block_m/16). So the tile
+    height trades padding waste against weight reuse + occupancy:
+      * a tile taller than an expert's row count is mostly PADDING — decode (M<=2 => ~0 rows/expert)
+        wants the 16-row minimum (and gemm1 is GEMV there anyway);
+      * prefill routes thousands of rows/expert, so a taller tile reuses each fp8 weight slab across
+        more rows and runs more warps => higher throughput.
+    Pick the largest supported tile (16..128) not exceeding the average rows-per-expert
+    (num_tokens*top_k / num_experts). Pure function of static shapes => cudagraph-capture-safe (a
+    captured decode graph always sees small M => 16, exactly as before). ``MINISGL_MOE_BLOCK_M`` forces
+    a value (16/32/64/128) for autotuning / to restore the historical fixed 16.
+    """
+    forced = _os.environ.get("MINISGL_MOE_BLOCK_M")
+    if forced:
+        bm = int(forced)
+        assert bm in _MOE_BLOCK_M_CHOICES, f"MINISGL_MOE_BLOCK_M must be one of {_MOE_BLOCK_M_CHOICES}"
+        return bm
+    rows_per_expert = (num_tokens * top_k) / max(num_experts, 1)
+    bm = _MOE_WMMA_DIM
+    for choice in _MOE_BLOCK_M_CHOICES:
+        if choice <= rows_per_expert:
+            bm = choice
+    return bm
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
@@ -188,7 +222,7 @@ def w4a8_moe(
     topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 — precomputed route (e.g. noaux_tc)
     topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
-    block_m: int = 16,
+    block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
     weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
 ) -> torch.Tensor:
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
@@ -204,6 +238,8 @@ def w4a8_moe(
     M, K = x.shape
     E = w13.shape[0]
     dev = x.device
+    if block_m is None:  # derive the grouped-GEMM tile from the workload (16 at decode, up to 128 at prefill)
+        block_m = _moe_block_m(M, E, top_k)
     # Decode fast path is PER-GEMM: the two grouped GEMMs want OPPOSITE kernels at M<=2 (measured on
     # gfx1201, Qwen3.6-35B). gemm1 (w13, wide 2*inter output, gather-by-sorted, top_k>1): the scalar
     # GEMV is ~8.7x faster than the prefill WMMA (35us vs 306us). gemm2 (w2, K output, identity
@@ -438,7 +474,7 @@ def w8a8_moe(
     topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 — precomputed route
     topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
-    block_m: int = 16,
+    block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
 ) -> torch.Tensor:
     """Grouped W8A8-fp8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. A strict simplification of `w4a8_moe`
@@ -450,6 +486,8 @@ def w8a8_moe(
     M, K = x.shape
     E = w13.shape[0]
     dev = x.device
+    if block_m is None:  # derive the grouped-GEMM tile from the workload (16 at decode, up to 128 at prefill)
+        block_m = _moe_block_m(M, E, top_k)
     # Per-GEMM kernel pick (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a few
     # real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles; gemm2's
     # K output favours WMMA. Prefill (M>2) keeps the passed/default kernel for both.
