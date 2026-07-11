@@ -600,7 +600,7 @@ class Engine:
         ``MINISGL_GRAPH_RESERVE_MARGIN_GB`` or replace the whole estimate with ``MINISGL_GRAPH_RESERVE_GB``.
         General: works for dense / MLA / GDN / CCA, spec and non-spec."""
         full = os.environ.get("MINISGL_GRAPH_RESERVE_GB")
-        if full is not None:
+        if full:  # non-empty (empty env string is ignored)
             return int(float(full) * (1 << 30))
         if config.cuda_graph_max_bs == 0:
             return 0
@@ -638,7 +638,7 @@ class Engine:
             total += _GRAPH_ACT_MULT * T * hidden * dt
         total = int(total * _GRAPH_ROUNDUP)
         margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
-        if margin is not None:
+        if margin:  # non-empty (empty env string is ignored)
             total += int(float(margin) * (1 << 30))
         return total
 
@@ -689,7 +689,7 @@ class Engine:
         ``MINISGL_GRAPH_RESERVE_MARGIN_GB`` or replace the whole estimate with ``MINISGL_GRAPH_RESERVE_GB``.
         General: works for dense / MLA / GDN / CCA, spec and non-spec."""
         full = os.environ.get("MINISGL_GRAPH_RESERVE_GB")
-        if full is not None:
+        if full:  # non-empty (empty env string is ignored)
             return int(float(full) * (1 << 30))
         if config.cuda_graph_max_bs == 0:
             return 0
@@ -727,7 +727,7 @@ class Engine:
             total += _GRAPH_ACT_MULT * T * hidden * dt
         total = int(total * _GRAPH_ROUNDUP)
         margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
-        if margin is not None:
+        if margin:  # non-empty (empty env string is ignored)
             total += int(float(margin) * (1 << 30))
         return total
 
