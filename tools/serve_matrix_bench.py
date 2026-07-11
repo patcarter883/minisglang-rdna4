@@ -20,12 +20,42 @@ import threading
 import time
 import urllib.request
 
-_WORD = "benchmark "  # ~1 token/word; prompt length approximated by word count
+# Real-world-representative prompts (chat format), NOT "benchmark benchmark …" garbage — spec
+# accept-len depends heavily on how predictable the generated text is, so a repetitive filler prompt
+# gives an unrepresentative (usually too-easy) accept-len. A genuine instruction produces structured
+# natural-language generation, which is what a served workload actually decodes.
+_DECODE_PROMPT = (
+    "Explain, step by step and in depth, how a modern CPU executes a program: cover fetch/decode/"
+    "execute, pipelining, branch prediction, caches, and out-of-order execution. Use clear prose."
+)
+# A realistic long CONTEXT (~480 tokens of coherent prose) for the prefill / mixed (RAG-style) workloads.
+_CTX_PARA = (
+    "The transformer architecture, introduced in 2017, replaced recurrence with self-attention, "
+    "letting every token attend to every other token in a sequence in parallel. This removed the "
+    "sequential bottleneck of RNNs and made large-scale pre-training practical on modern accelerators. "
+    "A transformer block interleaves multi-head attention with a position-wise feed-forward network, "
+    "each wrapped in residual connections and layer normalization. Attention computes query, key, and "
+    "value projections, scores every query against every key, normalizes with softmax, and mixes the "
+    "values accordingly. Multiple heads let the model attend to different relationships at once. "
+    "Because attention is permutation-invariant, positional information is injected through learned or "
+    "rotary position encodings. Scaling laws showed that loss falls predictably as parameters, data, "
+    "and compute grow together, motivating ever-larger models. Mixture-of-experts layers scale capacity "
+    "without scaling per-token compute: a router sends each token to a small subset of expert feed-"
+    "forward networks, so only a fraction of the weights activate per token. Linear-attention and "
+    "state-space hybrids further cut the quadratic cost of full attention for long contexts. Inference "
+    "is dominated by the autoregressive decode loop, where each step produces one token conditioned on "
+    "all previous ones, making it memory-bandwidth bound at small batch sizes. Speculative decoding "
+    "accelerates this by drafting several tokens cheaply and verifying them in a single parallel pass. "
+)
+
+
+def _messages(prompt: str):
+    return [{"role": "user", "content": prompt}]
 
 
 def _stream(url: str, prompt: str, max_tokens: int, ignore_eos: bool, barrier: threading.Barrier):
     payload = json.dumps({
-        "model": "", "prompt": prompt, "max_tokens": max_tokens,
+        "model": "", "messages": _messages(prompt), "max_tokens": max_tokens,
         "temperature": 0.0, "ignore_eos": ignore_eos, "stream": True,
     }).encode()
     req = urllib.request.Request(url + "/v1/chat/completions", data=payload,
@@ -81,7 +111,7 @@ def _prompt_tokens(url: str, prompt: str) -> int:
     """Exact prompt-token count from one non-stream request's usage.prompt_tokens; word-count
     fallback if the server omits usage. PREFILL throughput = these tokens / TTFT, NOT the 1 output
     token — the old harness reported output tok/s for prefill (~M/wall), which is meaningless."""
-    payload = json.dumps({"model": "", "prompt": prompt, "max_tokens": 1,
+    payload = json.dumps({"model": "", "messages": _messages(prompt), "max_tokens": 1,
                           "temperature": 0.0, "stream": False}).encode()
     req = urllib.request.Request(url + "/v1/chat/completions", data=payload,
                                  headers={"Content-Type": "application/json"})
@@ -133,8 +163,12 @@ def main():
             print(f"[bench] max-running-requests={args.max_concurrency}: dropped M={dropped} "
                   f"(would queue, not concurrent); sweeping M={Ms}", flush=True)
     wls = args.workloads.split(",")
-    long_prompt = _WORD * args.prefill_words
-    short_prompt = _WORD * 8
+    # decode: a genuine instruction (short prompt, real generation). prefill/mixed: a realistic long
+    # CONTEXT (~prefill_words tokens of coherent prose, by repeating the paragraph) + a question over it.
+    short_prompt = _DECODE_PROMPT
+    reps = max(1, round(args.prefill_words / max(1, len(_CTX_PARA.split()))))
+    long_prompt = (_CTX_PARA * reps) + "\nBased on the passage above, explain speculative decoding " \
+                                       "and why decode is memory-bandwidth bound, in your own words."
     D = args.decode_tokens
 
     # Warm up: absorb first-request JIT/cold-compile so it doesn't skew the M=1 prefill cell.

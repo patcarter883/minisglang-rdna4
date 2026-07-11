@@ -2084,8 +2084,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # (fixed N) vs eager (self-agreed N) would mismatch shapes across replicas and wedge the
         # collective. Eager verify -> every replica hits the self-coordinating path -> N agrees. The
         # _spec_ep_loop drives the idle replica's matching dummy forwards.
-        use_vgraph = (
-            self.engine.graph_runner.can_use_verify_graph(batch) and not self.engine.enable_ep
+        # EP verify stays EAGER under DP+EP (the in-graph MoE all_gather pins a fixed N vs an idle
+        # replica's self-agreed N). But EP-OVER-TP has no idle replica — the TP ranks run the SAME padded
+        # bs in lockstep, so the captured fixed-N verify graph is safe (and needed: without it,
+        # forward_verify still takes the graph path but the unpadded odd bs=3 isn't captured -> KeyError).
+        from minisgl.distributed import is_ep_over_tp
+        use_vgraph = self.engine.graph_runner.can_use_verify_graph(batch) and (
+            not self.engine.enable_ep or is_ep_over_tp()
         )
         if use_vgraph:
             self.engine.graph_runner.pad_verify(batch)
