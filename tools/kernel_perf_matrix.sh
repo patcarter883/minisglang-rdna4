@@ -20,21 +20,18 @@ BENCH_M=1,2,4,8,16            # concurrency sweep -> M=1 decode, M=16 mixed/batc
 # rows: "LABEL|MODEL|TP|EXTRA_ENV"  — TP=1 only listed where the model fits a single 16 GB card.
 # EXTRA_ENV passes model-specific knobs to run_bench_window.sh (e.g. mem-ratio, EP for ZAYA).
 ROWS=(
-  # ===== MTP vs DFlash spec-decode comparison (27B + 35B, TP=2, graph-captured) — run FIRST =====
-  # Same target, two proposers: MTP (in-model head, K=4, uniform-K -> reserved verify graph, tolerates
-  # MEM=0.85/GRAPH=8) vs DFlash (external z-lab drafter, K=15, memory-razor-thin -> GRAPH=4/MEM=0.80).
-  # 35B = MXFP4 GDN+MoE; 27B = AWQ-INT4 GDN-hybrid. Compare decode/mixed tok/s across concurrency.
-  "qwen3.6-35b-mxfp4-mtp|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.85 MAXRUN=6"
-  "qwen3.6-35b-mxfp4-dflash|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4|2|SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-35B-A3B-DFlash GRAPH=4 MEMRATIO=0.80 MAXRUN=8"
-  "qwen3.6-27b-awq-mtp|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|SPEC=mtp SPEC_K=4 GRAPH=8 MEMRATIO=0.85 MAXRUN=6"
-  "qwen3.6-27b-awq-dflash|cyankiwi/Qwen3.6-27B-AWQ-INT4|2|SPEC=dflash SPEC_K=15 DFLASH_MODEL=z-lab/Qwen3.6-27B-DFlash GRAPH=4 MEMRATIO=0.80 MAXRUN=8"
   # ===== base kernel-coverage matrix (no spec-decode) =====
+  # NOTE: the 4 MTP-vs-DFlash spec-decode rows are TEMPORARILY REMOVED — we take clean baseline
+  # figures first while auditing the spec-decode path (35B MTP measured 19.5 tok/s < base ~49, i.e. a
+  # net loss → accept-len ≈ 1 suspected). Re-add them once the spec path is fixed.
   # --- GDN linear-attn + MHA paged attn + tail (small, fits TP=1 AND TP=2) ---
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|1|"
   "qwen3.5-4b-bf16|Qwen/Qwen3.5-4B|2|"
-  # + w4a8_fp8_wmma (int4xfp8) on the same GDN+MHA arch
-  "qwen3.5-4b-awq|QuantTrio/Qwen3.5-4B-AWQ|1|"
-  "qwen3.5-4b-awq|QuantTrio/Qwen3.5-4B-AWQ|2|"
+  # NOTE: the small w4a8 (int4) rows are REMOVED — the only cached Qwen3.5-4B AWQ checkpoints
+  # (QuantTrio/Qwen3.5-4B-AWQ, cyankiwi/Qwen3.5-4B-AWQ-BF16-INT4) are Qwen3.5-VL multimodal builds
+  # (Qwen3_5ForConditionalGeneration; weights under model.language_model.layers.*, plus a visual tower),
+  # which minisgl's text loader can't map (KeyError model.layers.0.mlp.gate_up_proj). Serving the
+  # Qwen3.5-VL text tower is a separate bring-up. w4a8_fp8_wmma is still exercised by the 27B/35B AWQ rows.
   # --- pure dense MHA (no GDN) — isolates attn_hip prefill/decode ---
   "qwen3-4b-dense|Qwen/Qwen3-4B-Instruct-2507|1|"
   "qwen3-4b-dense|Qwen/Qwen3-4B-Instruct-2507|2|"
@@ -48,8 +45,11 @@ ROWS=(
   # --- MLA + MoE + w4a8 (GLM: TP=2 only) ---
   "glm-4.7-flash-awq|QuantTrio/GLM-4.7-Flash-AWQ|2|MEMRATIO=0.85"
   # --- CCA + w8a8_fp8_wmma + MoE (ZAYA 8B): TP=1 fits; TP=2 is DP2+EP (validated config) ---
-  "zaya1-8b-fp8|pat883/zaya1-tidar-megatron|1|"
-  "zaya1-8b-fp8|pat883/zaya1-tidar-megatron|2|DP=2 EP=1"
+  # DISABLED: pat883/zaya1-tidar-megatron is not present offline (its HF-hub cache dir is empty; the
+  # sibling zaya1-tidar-opd* repos are single-shard/incomplete). Re-enable after re-downloading the
+  # megatron checkpoint. CCA (zaya_cca) kernel coverage is deferred with it.
+  # "zaya1-8b-fp8|pat883/zaya1-tidar-megatron|1|"
+  # "zaya1-8b-fp8|pat883/zaya1-tidar-megatron|2|DP=2 EP=1"
   # --- STANDARD w8a8 (fp8xfp8), NOT ZAYA's CCA ---------------------------------------------------
   # (a) cached DENSE fp8 SMOKE: minisgl wires fp8-W8A8 on the MoE-EXPERT path only, so a dense fp8
   #     model may NOT serve (dense fp8 linear unwired). If it boots -> clean small standard-arch

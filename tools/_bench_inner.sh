@@ -76,6 +76,14 @@ launch() {  # $1 = log tag
       echo "[launch] ready"; return 0
     fi
     kill -0 "$SRV" 2>/dev/null || { echo "[launch] server PID $SRV DIED:"; tail -40 "$log"; return 1; }
+    # Fail FAST on a worker/scheduler SUBPROCESS crash. The parent `python -m minisgl` survives a dead
+    # scheduler child (kill -0 above still passes), so without this the loop polls the full ~20-min
+    # timeout holding the shared GPU lease — the repeated "benchmark wedged" failure mode. The mp.Process
+    # death banner ("Process minisgl-...:") + a traceback is a precise, low-false-positive crash signal;
+    # OOM / no-HIP-GPU / CUDA-error cover the other fatal boot failures.
+    if grep -qE '^Process minisgl-|^Traceback \(most recent call last\)|torch\.OutOfMemoryError|RuntimeError: No HIP GPUs|^[A-Za-z_.]*Error: |CUDA error:' "$log" 2>/dev/null; then
+      echo "[launch] worker subprocess CRASHED — failing fast (see log):"; tail -40 "$log"; return 1
+    fi
     sleep 3
   done
   echo "[launch] not ready in time:"; tail -40 "$log"; return 1
