@@ -315,12 +315,49 @@ def create_linear_method(
     # W4A8 path below (weight_type=="int") and the fp8 W8A8 path (bits==8).
     if quant.weight_is_e2m1:
         return MxFp4LinearMethod(quant)
-    # fp8 W8A8 (compressed-tensors float-quantized 8-bit) has no dense linear kernel here — only the
-    # MoE expert path (create_moe_quant_method) implements it. ZAYA's dense/attn linears are all in
-    # the quant `ignore` list, so a quantized fp8 config never reaches a dense linear; guard anyway so
-    # it can't silently misroute into the int4 W4A8 layout.
+    # fp8 W8A8 (compressed-tensors float-quantized 8-bit) dense linear — served through the SAME
+    # W8A8 WMMA core as the fp8 MoE experts (single-expert grouped GEMM). ZAYA's dense/attn linears
+    # stay in the quant `ignore` list (-> unquantized), so this only fires for a checkpoint that
+    # actually declares fp8-W8A8 dense linears (e.g. RedHatAI *-FP8-dynamic).
     if quant.is_fp8_w8a8:
-        raise NotImplementedError(
-            "fp8 W8A8 dense linear not implemented (MoE-expert-only); fp8 modules must be unquantized"
-        )
+        return Fp8W8A8LinearMethod(quant)
     return W4A8LinearMethod(quant)
+
+
+class Fp8W8A8LinearMethod:
+    """Dense fp8 W8A8 linear: per-output-channel fp8 (e4m3) weights + dynamic per-token fp8
+    activations (the RedHatAI *-FP8-dynamic scheme: weights `strategy:channel`, activations
+    `dynamic:token`). Served through kernels.w8a8_dense_linear — the same validated W8A8 WMMA core as
+    the fp8 MoE experts, reused as a single-expert grouped GEMM (no dedicated dense kernel needed).
+    Config-selected purely from `quant.is_fp8_w8a8` (float-quantized, 8-bit)."""
+
+    def __init__(self, quant: QuantConfig) -> None:
+        self.quant = quant
+
+    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
+        # CHECKPOINT layout so the BaseOP loader lands tensors directly: fp8 e4m3 weight (N,K) +
+        # per-output-channel scale (N,1). compressed-tensors fp8 ships the scale fp16 (some heads
+        # bf16); declare fp16 like the CT W4A8 path — the engine._cast normalizes both to fp16 —
+        # then process_weights_after_load promotes it to the f32 the kernel ABI wants. (N=out, K=in
+        # are the LOCAL/per-TP sizes.)
+        N, K = out_features, in_features
+        layer.weight = torch.empty((N, K), dtype=torch.float8_e4m3fn)
+        layer.weight_scale = torch.empty((N, 1), dtype=torch.float16)
+
+    def process_weights_after_load(self, layer: "BaseOP") -> None:
+        # op layout == natural row-major e4m3 (the GEMM indexes [n*K+k]); the kernel takes the e4m3
+        # bytes as uint8 (zero-copy bitcast preserving the bit pattern) + a flat (N,) f32 channel
+        # scale — the same op layout _GroupedFP8Experts.post_load builds, minus the E dim.
+        layer._w_op = layer.weight.contiguous().view(torch.uint8)  # type: ignore[attr-defined]
+        layer._scales_op = layer.weight_scale.squeeze(-1).contiguous().float()  # (N,1)->(N,)
+        del layer.weight, layer.weight_scale
+
+    def apply(
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        out = kernels.w8a8_dense_linear(
+            x, layer._w_op, layer._scales_op  # type: ignore[attr-defined]
+        )
+        if bias is not None:
+            out = out + bias
+        return out
