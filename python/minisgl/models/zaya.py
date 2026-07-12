@@ -54,7 +54,9 @@ logger = init_logger(__name__)
 # CCA/MoE RATIO is exact even though the per-call sync inflates wall. ZayaModel.forward logs the running
 # split each step. Off by default => zero cost, no sync, byte-identical to the untimed path.
 _ZAYA_TIME = os.environ.get("MINISGL_ZAYA_TIME", "0") != "0"
-_zaya_buckets = {"cca": 0.0, "moe": 0.0}
+# "cca_attn" is a SUB-bucket of "cca" (the paged flash attention only); cca - cca_attn = the conv
+# front-end + q/k/v projections + o_proj, to locate the O(N^2) cost within the CCA mixer.
+_zaya_buckets = {"cca": 0.0, "cca_attn": 0.0, "moe": 0.0}
 
 
 def _zaya_time(bucket: str, fn):
@@ -434,7 +436,7 @@ class ZayaCCAAttn(BaseOP):
         qf = qk_out[:, :latent_q].to(model_dtype)
         kf = qk_out[:, latent_q : latent_q + latent_k].to(model_dtype)
         qkv = torch.cat([qf, kf, v.to(model_dtype)], dim=-1)  # [N, latent_q + 2*latent_k]
-        o = self.attn.forward(qkv)  # partial RoPE(0.5) + store K/V to paged pool + GQA attention
+        o = _zaya_time("cca_attn", lambda: self.attn.forward(qkv))  # RoPE + store KV + GQA attn kernel
         return self.o_proj.forward(o)  # [N, hidden]
 
     def warmup_conv(self, num_tokens: int) -> None:
@@ -683,9 +685,10 @@ class ZayaModel(BaseOP):
             if cap_set is not None and lid in cap_set:
                 grabbed[lid] = residual.clone()
         if _ZAYA_TIME:  # cumulative GPU-time split across the 40 CCA + 40 MoE mixers (measurement)
-            c, m = _zaya_buckets["cca"], _zaya_buckets["moe"]
+            c, m, ca = _zaya_buckets["cca"], _zaya_buckets["moe"], _zaya_buckets["cca_attn"]
             logger.info_rank0(
-                f"[zaya-time] cca={c:.0f}ms moe={m:.0f}ms cca_frac={c / (c + m + 1e-9):.1%} "
+                f"[zaya-time] cca={c:.0f}ms (attn={ca:.0f}ms rest={c - ca:.0f}ms) moe={m:.0f}ms "
+                f"cca_frac={c / (c + m + 1e-9):.1%} attn_frac_of_cca={ca / (c + 1e-9):.1%} "
                 f"(N={input_ids.shape[0]})"
             )
         # Final fp32 merge + final_norm (PORT_PLAN §3 final block; reference zaya.py:723-736). The
