@@ -707,11 +707,46 @@ def rxf_moe(
     return acc.to(x.dtype)
 
 
-def _pick_dense_kernel(m: int) -> str:
-    """Per-M dense kernel selection. The served WMMA prefill kernel handles all M; the
-    scalar-dot GEMV is the decode (M<=2) fast path. (The full vllm_adapter also has env
-    tuning + a Triton W4A16 small-M/large-group fallback — PERF_NOTES.)"""
-    return "decode_gemv" if m <= 2 else "prefill_wmma"
+def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 128) -> str:
+    """Per-M dense-linear kernel selection, at the MEASURED gemv<->wmma crossover.
+
+    The old two-way split (decode_gemv for M<=2, else prefill_wmma) fell off a cliff across the
+    DECODE-BATCH band: prefill_wmma uses BM=256, so at M=4-8 it runs 256 WMMA rows for a few real
+    (~32-64x wasted throughput) — a non-monotonic decode regression (27B W4A8 dense: 41 tok/s @M=2
+    -> 34 @M=4). decode_gemv (the M<=2 fast path) actually serves M<=16 in-kernel: a streaming GEMV
+    that reads each weight once and dots it against all M rows (amortizing the weight read) and
+    writes straight to `out` — no extra buffer. But the GEMV is scalar-compute, so past a crossover
+    M its per-row compute loses to the WMMA tile. The crossover DIFFERS by decode path (measured,
+    27B/35B TP=2, gfx1201):
+      * int4  (uniform W4A8): gemv wins M<=8 (27B M=4 34->56, M=8 62->66); WMMA reclaims M=16
+        (61 gemv vs 100 wmma — the BM=256 tile finally amortizes) -> gemv only up to 8.
+      * e2m1  (MXFP4): gemv wins through M=16 (35B M=4 102->147, M=8 193->255, M=16 343->401) and
+        is the ONLY e2m1-capable small-M kernel anyway -> gemv up to 16 (decode_gemv's in-kernel cap).
+    Above the crossover -> prefill_wmma (the real prefill regime). NOTE the WMMA small-M variants
+    (nsplit_smallm/splitk_smallm/regdirect_shuffle) are DELIBERATELY not used: they accumulate into
+    an `at::zeros((M,N),f32)` allocated inside the op, which under CUDA-graph capture reserves a
+    persistent fp32 buffer per captured decode size x every linear — that VRAM blowup OOM'd the 27B
+    M=16 prefill transient. Reachable via MINISGL_W4A8_DENSE_SMALLM=<name> for A/B on models with
+    headroom; =off restores the old decode_gemv(M<=2)/prefill_wmma split. (The full vllm_adapter also
+    has a Triton W4A16 large-group fallback — PERF_NOTES.)
+    """
+    override = _os.environ.get("MINISGL_W4A8_DENSE_SMALLM")
+    if override == "off":
+        return "decode_gemv" if m <= 2 else "prefill_wmma"
+    gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
+    if m > gemv_max:
+        return "prefill_wmma"
+    if override and m > 2:
+        # e2m1 has no WMMA small-M kernel; never misroute it to one even under an override.
+        return override if not weight_is_e2m1 else "decode_gemv"
+    return "decode_gemv"
+
+
+# gemv<->wmma crossover per decode path (measured). decode_gemv asserts M<=16 in-kernel, so E2M1 caps
+# at 16; int4 crosses lower because its WMMA tile reclaims M=16 on a dense model. Both >= the M<=2
+# decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
+_W4A8_GEMV_MAX_INT4 = 8
+_W4A8_GEMV_MAX_E2M1 = 16
 
 
 def w4a8_linear(
@@ -732,7 +767,47 @@ def w4a8_linear(
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
-        kernel = _pick_dense_kernel(x2d.shape[0])
+        kernel = _pick_dense_kernel(x2d.shape[0], weight_is_e2m1, group_size)
     return w4a8_fp8_wmma.mmq_fp8_gemm(
         x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
     )
+
+
+def w8a8_dense_linear(
+    x: torch.Tensor,  # (M, K) fp16/bf16 activations
+    w_fp8: torch.Tensor,  # (N, K) uint8 (e4m3 bits), op layout (natural row-major)
+    scales: torch.Tensor,  # (N,) f32 per-output-channel weight scale
+    kernel: str | None = None,
+) -> torch.Tensor:
+    """Dense W8A8-fp8 linear: (M, K) @ (N, K)^T -> (M, N). fp8 (e4m3) weights carrying a per-output-
+    channel f32 scale, with dynamic per-token fp8 activations quantized INSIDE the kernel (the
+    RedHatAI *-FP8-dynamic scheme). The w8a8_fp8_wmma package ships only a grouped-MoE GEMM — but a
+    grouped GEMM over a SINGLE expert (E=1, top_k=1, identity routing) IS a dense GEMM, so this reuses
+    the validated W8A8 WMMA core with no new kernel. Same small-M dispatch lesson as the W4A8 dense
+    path [[_pick_dense_kernel]]: the streaming GEMV amortizes the weight read across the decode band,
+    while the BM=big WMMA tile wastes throughput on a few decode rows (the measured batching cliff),
+    so route M<=SMALLM -> gemv, prefill -> wmma."""
+    import w8a8_fp8_wmma
+
+    M, K = x.shape
+    N = w_fp8.shape[0]
+    dev = x.device
+    block_m = _moe_block_m(M, 1, 1)
+    if kernel is None:
+        # Mirror the int4 dense crossover (measured 8): streaming GEMV amortizes the weight read for
+        # the decode band, the WMMA tile reclaims larger M. w8a8's grouped "gemv"/"wmma" are the
+        # analogues of decode_gemv/prefill_wmma.
+        kernel = "gemv" if M <= _W4A8_GEMV_MAX_INT4 else "wmma"
+    # Single-expert identity routing built directly (no moe_align): token t -> sorted row t; the
+    # padding rows (id == M == num_valid) are skipped by the kernel, so out[:M] is the dense result
+    # already in token order. All-device tensor construction is CUDA-graph-capture safe (no host sync).
+    P = ((M + block_m - 1) // block_m) * block_m
+    sorted_ids = torch.full((P,), M, dtype=torch.int32, device=dev)
+    sorted_ids[:M] = torch.arange(M, dtype=torch.int32, device=dev)
+    expert_ids = torch.zeros(P // block_m, dtype=torch.int32, device=dev)
+    ntp = torch.full((1,), P, dtype=torch.int32, device=dev)
+    x16 = x.to(torch.float16).contiguous()
+    out = w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+        x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
+    )  # (P, N) fp16
+    return out[:M].to(x.dtype)
