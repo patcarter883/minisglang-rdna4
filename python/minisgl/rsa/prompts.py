@@ -41,6 +41,28 @@ Below are {k} candidate solutions:
 Select or synthesize the single best final answer to the problem above. \
 Respond with only the final answer."""
 
+# Tool-calling variant. The plain FINAL_SELECTION prompt ("respond with only the final answer")
+# elicits PROSE, so a tool-augmented request would fabricate an answer instead of calling the tool
+# (the rollout candidates are generated tools-free, so they can't be trusted for tool-dependent facts).
+# This variant reframes the final generation as an ACTION: call the tool when the request needs it.
+TOOL_SELECTION_SYSTEM = (
+    "You are given a request, a set of available tools, and several candidate solutions. The "
+    "candidates were written WITHOUT access to the tools, so any facts they assert that would "
+    "require a tool may be fabricated. Determine the single best final response to the request. If "
+    "fulfilling it needs information or actions a tool provides, you MUST call the appropriate tool "
+    "using the provided interface rather than guessing. Answer directly only when no tool is needed."
+)
+
+TOOL_SELECTION_USER = """\
+{query}
+
+Below are {k} candidate solutions (written without tool access):
+
+{candidates}
+
+Produce the single best final response to the request above. If a tool is required to answer \
+correctly, call it; otherwise respond with only the final answer."""
+
 TRUNCATION_MARKER = "[...truncated...]\n"
 
 
@@ -139,11 +161,12 @@ def build_final_selection_messages(
     query: str,
     candidate_tails: List[str],
     request_system: Optional[str] = None,
+    *,
+    for_tools: bool = False,
 ) -> List[dict]:
-    return _build(
-        FINAL_SELECTION_SYSTEM,
-        FINAL_SELECTION_USER,
-        query,
-        candidate_tails,
-        request_system,
-    )
+    # A tool-augmented request needs an ACTION-framed prompt so the model emits a tool call instead of
+    # fabricating a prose answer from the (tools-free) candidates; everything else uses the plain
+    # "pick the best answer" framing.
+    system = TOOL_SELECTION_SYSTEM if for_tools else FINAL_SELECTION_SYSTEM
+    user = TOOL_SELECTION_USER if for_tools else FINAL_SELECTION_USER
+    return _build(system, user, query, candidate_tails, request_system)

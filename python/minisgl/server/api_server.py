@@ -367,11 +367,14 @@ async def _cam_auto_write(text: str) -> None:
         logger.debug("CAM auto-write failed: %s", e)
 
 
-# Tool-trained models emit tool calls inside `<tool_call>...</tool_call>` blocks, but the INNER format
-# varies by family. We parse both we've seen:
+# Tool-trained models emit tool calls inside a wrapper block, but both the WRAPPER tag and the INNER
+# format vary by family. Wrappers we've seen: `<tool_call>` (Hermes/Qwen3) and `<zyphra_tool_call>`
+# (ZAYA/Zyphra). Inner formats we parse:
 #   (A) Hermes JSON:  {"name": "fn", "arguments": {"k": v}}
-#   (B) Qwen3 XML:    <function=fn><parameter=k>v</parameter></function>
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+#   (B) Qwen3 XML:    <function=fn><parameter=k>v</parameter></function>  (ZAYA nests this in its wrapper)
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<(?:zyphra_)?tool_call>\s*(.*?)\s*</(?:zyphra_)?tool_call>", re.DOTALL
+)
 # A bare `<function=…></function>` block (Qwen3 XML emitted WITHOUT a `<tool_call>` wrapper). Kept in
 # lock-step with the streaming parser, which also accepts the unwrapped opener.
 _BARE_FN_BLOCK_RE = re.compile(r"<function=[^>\s]+\s*>.*?</function>", re.DOTALL)
@@ -444,8 +447,12 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
 # the parser degrades to whatever the model actually emits. Detection mirrors the reasoning streamer:
 # text before any opener flows through as `content`; once inside a block the markup is withheld and,
 # on the closing tag, re-emitted as OpenAI streaming `delta.tool_calls`.
-_TOOL_OPENERS = ("<tool_call>", "<function=")
-_TOOL_CLOSERS = {"<tool_call>": "</tool_call>", "<function=": "</function>"}
+_TOOL_OPENERS = ("<tool_call>", "<zyphra_tool_call>", "<function=")
+_TOOL_CLOSERS = {
+    "<tool_call>": "</tool_call>",
+    "<zyphra_tool_call>": "</zyphra_tool_call>",
+    "<function=": "</function>",
+}
 
 
 def _earliest_opener(text: str) -> Tuple[int, str | None]:
@@ -493,8 +500,9 @@ class ToolCallStreamState:
         self.emitted = False     # any tool call emitted -> finish_reason becomes "tool_calls"
 
     def _parse_block(self, block: str) -> Tuple[str, dict] | None:
-        if self.opener == "<tool_call>":
-            inner = block[len("<tool_call>"):-len("</tool_call>")]
+        if self.opener in ("<tool_call>", "<zyphra_tool_call>"):
+            closer = _TOOL_CLOSERS[self.opener]
+            inner = block[len(self.opener):-len(closer)]
             return _parse_one_tool_call(inner)
         return _parse_one_tool_call(block)  # <function=…></function>, regex finds the fn tag
 
