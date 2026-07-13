@@ -56,10 +56,14 @@ are reasoning-only** (the last τ tokens *before* `</think>`), matching the pape
 - `tools: [...]` with **`tool_choice: "required"`** (or a specific `{"type":"function","function":
   {"name": …}}`) → the final answer is **grammar-constrained to a complete, schema-checked tool call**
   (same treatment as `response_format`): the arguments are forced to match the tool's `parameters`
-  schema and the generation terminates. Returned as OpenAI `tool_calls`, `finish_reason:
-  "tool_calls"`. **Use `tool_choice: "required"` for reliable tool calls** — with `"auto"` there is no
-  grammar (the model must be free to *not* call), so it can draft prose to the cap without emitting a
-  clean call, exactly like a JSON request without `response_format`.
+  schema and the generation terminates. Returned as OpenAI `tool_calls`, `finish_reason: "tool_calls"`.
+- `tools` with **`tool_choice: "auto"`** (or default) → an xgrammar **structural tag**: the model may
+  answer in prose OR call a tool, and *if* it opens a JSON tool-call wrapper (`<tool_call>` / `<tools>`)
+  its arguments are forced to the tool's schema. Free text is unaffected (no regression). **Caveat for
+  ZAYA:** its native tool format is `<zyphra_tool_call>` **XML** (not JSON), so the structural tag
+  doesn't trigger and ZAYA `auto` calls stay best-effort (it also tends to *reason about* calling
+  without committing). This path fully helps JSON-native tool models (Qwen3-style). **On ZAYA, use
+  `tool_choice: "required"` for a guaranteed, schema-valid call.**
 - `think_budget` still applies, so structured/tool answers can't get stuck reasoning forever.
 
 ## Caching note (why C and canonical ordering matter)

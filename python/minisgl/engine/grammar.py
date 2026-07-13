@@ -39,8 +39,23 @@ class GrammarBackend:
 
     def make_matcher(self, spec: str):
         """Compile ``spec`` and return a fresh stateful GrammarMatcher. ``spec`` == "json" -> any JSON
-        object; otherwise ``spec`` is a JSON-schema string."""
+        object; a ``{"__structural_tag__": …}`` blob -> an xgrammar structural tag (constrain to a
+        schema ONLY after a trigger string, else free text — the `tool_choice:"auto"` case); otherwise
+        ``spec`` is a JSON-schema string."""
         xgr = self._xgr
+        # Structural tag: free generation until the model emits one of the trigger strings (a tool-call
+        # opener), then the wrapped content is constrained to the tool schema. Lets the model choose to
+        # call or not, but forces schema-valid arguments when it does.
+        if spec.startswith('{"__structural_tag__"'):
+            import json as _json
+
+            st = _json.loads(spec)["__structural_tag__"]
+            tags = [
+                xgr.StructuralTagItem(begin=t["begin"], schema=t["schema"], end=t["end"])
+                for t in st["tags"]
+            ]
+            compiled = self._compiler.compile_structural_tag(tags, st["triggers"])
+            return xgr.GrammarMatcher(compiled)
         # any_whitespace=False -> compact JSON: forbids the unbounded-whitespace runs a greedy (temp 0)
         # model otherwise stalls in, so the value completes within max_tokens. json_object maps to "any
         # JSON object"; the builtin grammar is avoided because it has no whitespace bound and loops the
