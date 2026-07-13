@@ -173,6 +173,11 @@ class CCAConv(nn.Module):
         self._w1b: torch.Tensor | None = None  # b128 wide-load repack of _w1 (opt-in, see post_load)
         self._b1: torch.Tensor | None = None  # [C]
         self._temp_eff: torch.Tensor | None = None  # [num_k_heads] fp32
+        # Transposed projection weights for the FULL fused decode mega-kernel (cca_decode_fused),
+        # built opt-in in post_load under MINISGL_CCA_DECODE_FUSED. Wqk = cat(linear_q,linear_k).T
+        # [hidden, C]; Wv = cat(val_proj1,val_proj2).T [hidden, 2*hd]; both bf16 (F.linear numerics).
+        self._Wqk_T: torch.Tensor | None = None
+        self._Wv_T: torch.Tensor | None = None
 
     @torch.no_grad()
     def post_load(self) -> None:
@@ -205,6 +210,15 @@ class CCAConv(nn.Module):
             import zaya_cca
 
             self._w1b = zaya_cca.repack_w1_wide(self._w1, 1).contiguous()
+        # Opt-in FULL fused decode: build the transposed q/k + v projection weights once. The kernel
+        # projects channel c as dot(hs, Wqk[:, c]), so hidden must be the outer (row) stride for
+        # coalesced consecutive-c weight loads (hence the transpose). bf16 -> the kernel accumulates
+        # fp32 to match F.linear(hs, ...).float(). See ZayaCCAAttn.forward decode branch.
+        if os.environ.get("MINISGL_CCA_DECODE_FUSED", "0") != "0":
+            import zaya_cca
+
+            self._Wqk_T = zaya_cca.repack_cca_qk_proj(self.linear_q, self.linear_k).contiguous()
+            self._Wv_T = zaya_cca.repack_cca_v_proj(self.val_proj1, self.val_proj2).contiguous()
 
     def conv_weights_fp32(self):
         """(w0, b0, w1, b1) fp32 kernel weights — built by post_load."""
@@ -214,6 +228,12 @@ class CCAConv(nn.Module):
     def conv_w1_b128(self):
         """b128 wide-load repack of w1, or None unless MINISGL_CCA_DECODE_B128 is set (post_load)."""
         return self._w1b
+
+    def decode_fused_weights(self):
+        """(Wqk_T, Wv_T) for cca_decode_fused, or None unless MINISGL_CCA_DECODE_FUSED (post_load)."""
+        if self._Wqk_T is None:
+            return None
+        return self._Wqk_T, self._Wv_T
 
     def temp_eff(self) -> torch.Tensor:
         assert self._temp_eff is not None, "CCAConv.post_load() must run before forward"
@@ -357,10 +377,17 @@ class ZayaCCAAttn(BaseOP):
         model_dtype = hs.dtype
         N = hs.shape[0]
 
+        # FULL fused decode mega-kernel: q/k + v projections folded into the conv kernel (one launch/
+        # layer). Only on the decode path and only when MINISGL_CCA_DECODE_FUSED built the transposed
+        # projection weights in post_load; otherwise fall back to the unfused GEMVs below.
+        fused_w = None if md.is_prefill else cca.decode_fused_weights()
+
         # Packed q|k for the conv kernel (fp32). v is computed AFTER the kernel (it needs prev_hs).
-        q = F.linear(hs, cca.linear_q)  # [N, latent_q]
-        k = F.linear(hs, cca.linear_k)  # [N, latent_k]
-        qk_new = torch.cat([q, k], dim=-1).float().contiguous()  # [N, C] fp32
+        # Skipped on the fused decode path — the kernel projects q/k/v from hs internally.
+        if fused_w is None:
+            q = F.linear(hs, cca.linear_q)  # [N, latent_q]
+            k = F.linear(hs, cca.linear_k)  # [N, latent_k]
+            qk_new = torch.cat([q, k], dim=-1).float().contiguous()  # [N, C] fp32
 
         if md.is_prefill:
             qsl = md.query_start_loc  # int32 [num_seqs+1]
@@ -427,31 +454,43 @@ class ZayaCCAAttn(BaseOP):
                     f"decode: state_indices out of range [1, {state.num_slots})"
                 )
             from minisgl._hip_engage import engaged
-            w1b = cca.conv_w1_b128()  # None unless MINISGL_CCA_DECODE_B128 (bit-exact wide-load twin)
-            if w1b is not None:
-                engaged("zaya_cca.cca_decode_qk_b128")
-                qk_out = zaya_cca.cca_decode_qk_b128(
-                    qk_new, conv, slot, is_pad,
-                    w0, b0, w1b, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
-                )  # [N, C] normalized q|k; conv rolled+appended in place
-            else:
-                engaged("zaya_cca.cca_decode_qk")
-                qk_out = zaya_cca.cca_decode_qk(
-                    qk_new, conv, slot, is_pad,
-                    w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
-                )  # [N, C] normalized q|k; conv rolled+appended in place
             # previous-hidden for val_proj2 = the cached prev_hs of each slot, THEN store current.
             hs2 = prev[slot].to(model_dtype)  # [N, hidden] (OLD prev_hs)
             prev[slot] = hs.float()
+            if fused_w is not None:
+                # ONE launch: q/k/v projections + conv + means + rmsnorm. v_out is cat(v1,v2) fp32.
+                Wqk_T, Wv_T = fused_w
+                engaged("zaya_cca.cca_decode_fused")
+                qk_out, v_out = zaya_cca.cca_decode_fused(
+                    hs.contiguous(), hs2.contiguous(), conv, slot, is_pad,
+                    Wqk_T, Wv_T, w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
+                )  # [N, C] normalized q|k, [N, 2*hd] v; conv rolled+appended in place
+                v = v_out[:, self._v_lo : self._v_hi].to(model_dtype)  # [N, nkv_local*head_dim]
+            else:
+                w1b = cca.conv_w1_b128()  # None unless MINISGL_CCA_DECODE_B128 (wide-load twin)
+                if w1b is not None:
+                    engaged("zaya_cca.cca_decode_qk_b128")
+                    qk_out = zaya_cca.cca_decode_qk_b128(
+                        qk_new, conv, slot, is_pad,
+                        w0, b0, w1b, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
+                    )  # [N, C] normalized q|k; conv rolled+appended in place
+                else:
+                    engaged("zaya_cca.cca_decode_qk")
+                    qk_out = zaya_cca.cca_decode_qk(
+                        qk_new, conv, slot, is_pad,
+                        w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
+                    )  # [N, C] normalized q|k; conv rolled+appended in place
 
         # Values from the two time streams: val_proj1 on current hs, val_proj2 on previous hs. The
         # two streams ARE the two KV heads ([head0 = v1 | head1 = v2]); under TP each rank keeps only
         # its num_kv_heads/tp heads, so slice the full pair to this rank's [_v_lo:_v_hi] column range
         # (the whole [0:latent_k] at tp=1). Both projections are computed on every rank — they are tiny
         # [hd, hidden] matmuls and keeping both graphs shape-uniform simplifies cudagraph capture.
-        v1 = F.linear(hs, cca.val_proj1)  # [N, head_dim]
-        v2 = F.linear(hs2, cca.val_proj2)  # [N, head_dim]
-        v = torch.cat([v1, v2], dim=-1)[:, self._v_lo : self._v_hi]  # [N, nkv_local*head_dim]
+        # On the fused decode path, v was already produced by the mega-kernel above.
+        if md.is_prefill or fused_w is None:
+            v1 = F.linear(hs, cca.val_proj1)  # [N, head_dim]
+            v2 = F.linear(hs2, cca.val_proj2)  # [N, head_dim]
+            v = torch.cat([v1, v2], dim=-1)[:, self._v_lo : self._v_hi]  # [N, nkv_local*head_dim]
 
         # Assemble qkv for the paged GQA attention (q|k pre-normed by the kernel -> q_norm/k_norm None).
         qf = qk_out[:, :latent_q].to(model_dtype)
