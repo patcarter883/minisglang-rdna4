@@ -34,19 +34,42 @@ Point `MODEL` at any supported Hugging Face repo id or local path; large quantiz
 two-card with `TP=2`. **Full guide: [`docs/SERVING.md`](docs/SERVING.md)** (prerequisites, model
 recipes, knobs, troubleshooting).
 
-**Status:** dense engine working + numerically validated (Phase 1); W4A8 quantized serving in
-progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.md`. Full design:
-`vllm-gfx1201/docs/RDNA4_ENGINE_DESIGN.md`.
+**Status:** quantized MoE serving works and is validated end-to-end. Dense and quantized models
+serve coherently under CUDA-graph capture, single- and two-card, with speculative decoding and
+structured output. It remains a research fork (moving fast, not a hardened release). Live tracker:
+`PORT.md`. Optimization backlog: `PERF_NOTES.md`.
 
 ## What works today
 
-- **Dense bf16** (Qwen2/Qwen3/Llama/Mistral), eager, TP=1 — boots and generates coherent output;
-  logits match HF transformers to **cos-sim 0.9996** (the standing oracle).
-- **Tuned RDNA4 attention** — the vLLM `triton_attn` unified prefill+decode kernel, lifted and
-  running under HIP, with **3D flash-decode** and an **fp8 (e4m3) KV cache** (`MINISGL_KV_FP8=1`;
-  e4m3 → bf16 → f32 accumulate, nothing dequants to F16).
-- **W4A8 (AWQ) dense** — `quant/` package: swappable kernel provider + `LinearMethod` protocol +
-  AWQ→op weight conversion (validation in progress).
+Everything below serves through the OpenAI-compatible API and is validated on gfx1201.
+
+**Model families** (architecture-detected, quantization read from the checkpoint):
+
+- **Dense** bf16/fp8 — Qwen2 / Qwen2.5 / Qwen3, Llama, Mistral. Logits match HF transformers to
+  **cos-sim 0.9996** (the standing oracle).
+- **MoE** — Qwen3-MoE and the **Qwen3.5 / Qwen3.6-35B-A3B GDN-hybrid MoE** (gated delta-net + 128
+  experts), **GLM-4.7-Flash** (MoE + **MLA**), and **ZAYA1-8B** (Zyphra **CCA** MoE).
+- **Laguna**.
+
+**Quantization** — AWQ **W4A8**, compressed-tensors **W4A16**, **MXFP4**, and **W8A8-fp8**, all via
+native RDNA4 WMMA GEMMs (int4/fp8 compute, f32 accumulate — nothing dequants to F16).
+
+**Tensor / data parallelism** — TP=1 single card; **TP=2** across both cards for the 35B AWQ/MXFP4
+MoE and GLM-4.7-Flash (head-parallel MLA/CCA, EP-over-TP experts, one-shot `custom_ar` allreduce);
+**DP=2 + expert-parallel** for ZAYA.
+
+**Speculative decoding** — ngram, **MTP** (model's own next-token head, Qwen3.5/GLM), **EAGLE3**,
+**DFlash** (block-diffusion drafter), and **TiDAR** — all coherent and **graph-captured** (propose
+and verify), with per-model sweep-optimal draft lengths.
+
+**Serving features** — CUDA-graph capture across MHA / MLA / GDN / CCA; **radix prefix cache**
+(including recurrent GDN/CCA state reuse); **fp8 (e4m3) KV cache** (`MINISGL_KV_FP8=1`); structured
+output (JSON-schema / grammar via xgrammar) and **tool calling**; reasoning-content parsing; and
+**Markovian RSA** (self-refinement) in-engine for ZAYA.
+
+**Custom HIP kernels** (built from the canonical `rdna4-hip-kernels/` repo) — paged prefill + decode
+attention, W4A8 / W8A8 / MXFP4 / bf16 grouped-MoE and dense GEMMs, GDN, MLA, CCA, fused
+SiLU/RMSNorm/RoPE, sampling, and the `custom_ar` allreduce.
 
 ## Design principles
 
