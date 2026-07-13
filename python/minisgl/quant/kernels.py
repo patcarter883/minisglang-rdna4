@@ -39,6 +39,25 @@ _MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "0") != "0"
 # (mirrors vLLM's low-M W4A16 crossover). Off by default. Requires group_size>=64 (g=128 -> wide 8).
 MOE_W4A16 = _os.environ.get("MINISGL_MOE_W4A16", "0")
 
+# W8A8-fp8 MoE register-direct b128 (LDS-bypass) path for the routed experts — the fp8 twin of the
+# W4A16 register-direct kernel. Bit-exact vs the LDS-staged w8a8_moe (same act-fp8 quant, same fp8
+# e4m3 weights, same WMMA chain; weights just pre-permuted into WMMA-B lane order) and ~2x faster at
+# ZAYA decode (gemm1 T1 148->55us). ON by default (the served ZAYA1-8B-fp8 path); =0 reverts to the
+# LDS-staged w8a8_moe. Weights are pre-repacked to _w_rep in _GroupedFP8Experts.post_load.
+MOE_W8A8_REGDIRECT = _os.environ.get("MINISGL_MOE_W8A8_REGDIRECT", "1") != "0"
+
+# RXF (W4-NL x int8) MoE register-direct b128 — the RXF twin of the above (moe_gemm_regdirect, no
+# LDS-staged B / no K-loop barrier). Bit-exact vs the LDS-staged rxf_moe, gemm1 T1 89->44us (2.02x).
+# ON by default; =0 reverts to LDS-staged rxf_moe. Weights repacked to _w_rep in post_load.
+RXF_REGDIRECT = _os.environ.get("MINISGL_RXF_REGDIRECT", "1") != "0"
+
+# MXFP4 (OCP E2M1) MoE register-direct b128 — routes the e2m1 experts through the register-direct
+# W4A16 kernel (mmq_regdirect_w4a16_moe, weight_is_e2m1=True): fp16 acts DIRECT (no act-quant, unlike
+# the old w4a8_moe e2m1 path which fp8-quantized acts) + b128 weight loads. Both faster AND higher
+# quality (fp16 acts, matching vLLM/MLX MXFP4). ON by default; =0 reverts to the LDS-staged
+# w4a8_moe(weight_is_e2m1=True). Weights repacked to _w_rep/_scales_rd in post_load.
+MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "1") != "0"
+
 # Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
 # to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks
 # to lift occupancy (gemm2 is ~15% of peak BW at M=1). 0/unset = the vendored w4a8_fp8_wmma scatter.
@@ -388,12 +407,15 @@ def w4a16_moe(
     *,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1)
 ) -> torch.Tensor:
     """Grouped W4A16 MoE: fp16 activations DIRECT (no act-quant) via the register-direct
     mmq_regdirect_w4a16_moe kernel. This is the fix for the fp8-activation decode degradation on
     activation-sensitive models (GLM-4.7-Flash): int4 weights, fp16 acts, matching vLLM's W4A16.
     Weights are pre-repacked to w_rep_wide in post_load. block_m is fixed 16; `wide` from group_size.
-    Route is always precomputed (GLM noaux_tc). Returns (M, K)."""
+    Route is always precomputed (GLM noaux_tc). `weight_is_e2m1=True` decodes the weights as MXFP4
+    (OCP E2M1) — the register-direct MXFP4 path (fp16 acts, e2m1 weight decode, symmetric so no
+    zeros). Returns (M, K)."""
     import moe_hip
     import w4a8_fp8_wmma
 
@@ -408,6 +430,7 @@ def w4a16_moe(
     _empty = torch.empty(0, dtype=torch.int32, device=dev)
 
     sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
+    P = sorted_ids.shape[0]
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
 
     out1 = _moe_time(
@@ -415,6 +438,7 @@ def w4a16_moe(
         lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
             x16, w13_rep, w13_scales, w13_zeros if w13_zeros is not None else _empty,
             sorted_ids, expert_ids, ntp, 2 * inter, top_k, block_m, wide,
+            weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, 2*inter) fp16
     d = out1.shape[1] // 2
@@ -429,16 +453,34 @@ def w4a16_moe(
         )
 
     tw_flat = tw.reshape(-1).contiguous()
-    # gemm2 + topk-weight + reduce via the fused scatter epilogue (eager decode). The atomicAdd is
-    # not HIP-graph-safe; a gather twin (mmq_regdirect_w4a16_moe + gather_reduce) is the graph path.
-    output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
-    _moe_time(
-        "gemm2scat",
-        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
-            buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, output,
-            hidden, top_k, block_m, wide, w_zeros=w2_zeros,
+    # DECODE fast path: fused gemm2 + topk-weight + atomic scatter (NOT graph-capture-safe -> gated to
+    # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
+    if M <= 2 and _MOE_SCATTER:
+        output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
+        _moe_time(
+            "gemm2scat",
+            lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
+                buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, output,
+                hidden, top_k, block_m, wide, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # writes output in place
+        _moe_report()
+        return output.to(x.dtype)
+
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = _moe_time(
+        "gemm2",
+        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+            buf2.contiguous(), w2_rep, w2_scales, w2_zeros if w2_zeros is not None else _empty,
+            ident, expert_ids, ntp, hidden, 1, block_m, wide, weight_is_e2m1=weight_is_e2m1,
         ),
-    )  # writes output in place
+    )  # (P, hidden) fp16
+    output = _moe_time(
+        "gather",
+        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+            out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
+        ),
+    )  # (M, hidden) fp32
     _moe_report()
     return output.to(x.dtype)
 
@@ -579,6 +621,88 @@ def w8a8_moe(
     return acc.to(x.dtype)
 
 
+def w8a8_moe_regdirect(
+    x: torch.Tensor,  # (M, K) activations (fp16/bf16); act-fp8-quantized inside the op
+    w13_rep: torch.Tensor,  # (E, 2*inter/16, K/16, 32, wide) register-direct fp8 (built in post_load)
+    w13_scales: torch.Tensor,  # (E, 2*inter) f32 per-output-channel
+    w2_rep: torch.Tensor,  # (E, K/16, inter/16, 32, wide)
+    w2_scales: torch.Tensor,  # (E, K) f32 per-output-channel
+    top_k: int,
+    *,
+    topk_weights: torch.Tensor,  # (M, top_k) f32 — precomputed route (ZAYA top-1 + MOD)
+    topk_ids: torch.Tensor,  # (M, top_k) i32
+    block_m: int = 16,
+    wide: int = 2,  # b128 (fp8: 2 K16-tiles/lane); 1=b64, 4=2x b128
+) -> torch.Tensor:
+    """Register-direct b128 (LDS-bypass) W8A8-fp8 grouped MoE — the fp8 twin of w4a16_moe and a
+    drop-in for w8a8_moe. gemm1 (mmq_regdirect_w8a8_moe) -> silu_and_mul -> gemm2 (fused atomic
+    scatter at eager decode, or unfused gemm2 + gather_reduce for the graph-safe / prefill path).
+    Bit-exact vs w8a8_moe (same act-fp8 quant + fp8 weights + WMMA chain; weights pre-permuted into
+    WMMA-B lane order). Route is always precomputed (ZAYA). Returns (M, K)."""
+    import torch.nn.functional as F
+    import moe_hip
+    import w8a8_fp8_wmma
+
+    M, K = x.shape
+    E = w13_rep.shape[0]
+    dev = x.device
+    N13 = w13_scales.shape[1]  # 2*inter (gemm1 output width)
+    tw = topk_weights.to(torch.float32).contiguous()
+    ti = topk_ids.to(torch.int32).contiguous()
+
+    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
+    P = sorted_ids.shape[0]
+
+    x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
+    out1 = _moe_time(
+        "gemm1",
+        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+            x16, w13_rep, w13_scales, sorted_ids, expert_ids, ntp, N13, top_k, block_m, wide,
+        ),
+    )  # (P, 2*inter) fp16
+    d = out1.shape[1] // 2
+    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        import tail_hip
+
+        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
+    else:
+        buf2 = _moe_time(
+            "silu",
+            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
+        )
+
+    tw_flat = tw.reshape(-1).contiguous()
+    # DECODE fast path: fused gemm2 + topk-weight + atomic scatter (NOT graph-capture-safe -> gated to
+    # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
+    if M <= 2 and _MOE_SCATTER:
+        acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
+        _moe_time(
+            "gemm2scat",
+            lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe_scatter(
+                buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc,
+                K, top_k, block_m, wide,
+            ),
+        )  # writes acc in place
+        _moe_report()
+        return acc.to(x.dtype)
+
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = _moe_time(
+        "gemm2",
+        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+            buf2, w2_rep, w2_scales, ident, expert_ids, ntp, K, 1, block_m, wide,
+        ),
+    )  # (P, K)
+    acc = _moe_time(
+        "gather",
+        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+            out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
+        ),
+    )  # (M, K) fp32
+    _moe_report()
+    return acc.to(x.dtype)
+
+
 # --- RXF (Rotated eXtra Fast) W4(NL)-A8(int8) path -------------------------------------------
 # Distinct from the fp8 W4A8 above: weights are an NL (non-uniform) int4 codebook, activations are
 # int8 (not fp8), and a fixed block-diagonal Hadamard rotation is applied to the activation at
@@ -704,6 +828,65 @@ def rxf_moe(
     acc = rxf_hip.moe_gather_reduce(
         out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k
     )  # (M, K) fp32
+    return acc.to(x.dtype)
+
+
+def rxf_moe_regdirect(
+    x: torch.Tensor,  # (M, K) activations
+    w13_rep: torch.Tensor,  # (E, 2*inter/16, ktiles/wide, 32, wide) register-direct NL codes
+    w13_scales: torch.Tensor,  # (E, 2*inter, K/32) fp16 per-group scale
+    w2_rep: torch.Tensor,  # (E, K/16, ktiles/wide, 32, wide)
+    w2_scales: torch.Tensor,  # (E, K, inter/32) fp16
+    top_k: int,
+    *,
+    topk_weights: torch.Tensor,  # (M, top_k) f32 — precomputed route
+    topk_ids: torch.Tensor,  # (M, top_k) i32
+    span: int = 32,
+    block_m: int = 16,
+    wide: int = 4,  # b128 (RXF: 4 K16-tiles/lane); 2=b64
+) -> torch.Tensor:
+    """Register-direct b128 (LDS-bypass) RXF W4(NL)-A8 grouped MoE — a drop-in for rxf_moe. Same
+    rotate+quant -> grouped GEMM -> silu_and_mul -> rotate+quant -> grouped GEMM -> gather-reduce
+    contract, but the WMMA weight operand is loaded direct from global into registers (b128) with no
+    B in LDS and no K-loop __syncthreads. moe_gemm_regdirect has no fused-scatter twin, so this always
+    uses the graph-safe unfused gemm2 + gather_reduce (no eager-only atomic path). Bit-exact vs
+    rxf_moe. Route is always precomputed. Returns (M, K)."""
+    import torch.nn.functional as F
+    import moe_hip
+    import rxf_hip  # noqa: F401
+
+    M, K = x.shape
+    E = w13_rep.shape[0]
+    dev = x.device
+    nl = _rxf_nl(dev)
+    tw = topk_weights.to(torch.float32).contiguous()
+    ti = topk_ids.to(torch.int32).contiguous()
+
+    sorted_ids, expert_ids, ntp = moe_hip.moe_align(ti, E, block_m)
+    P = sorted_ids.shape[0]
+
+    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
+    out1 = rxf_hip.moe_gemm_regdirect(
+        q, a_scale, w13_rep, w13_scales, nl, sorted_ids, expert_ids, ntp,
+        top_k, block_m, M * top_k, wide,
+    )  # (P, 2*inter) bf16
+    d = out1.shape[1] // 2
+
+    from minisgl.layers import _tail_hip
+
+    if _tail_hip.active(out1):
+        buf2 = _tail_hip.silu_and_mul(out1.contiguous())
+    else:
+        buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
+
+    q2, a_scale2 = rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    tw_flat = tw.reshape(-1).float().contiguous()
+    ident = torch.arange(P, dtype=torch.int32, device=dev)
+    out2 = rxf_hip.moe_gemm_regdirect(
+        q2, a_scale2, w2_rep, w2_scales, nl, ident, expert_ids, ntp,
+        1, block_m, P, wide,
+    )  # (P, K) bf16
+    acc = rxf_hip.moe_gather_reduce(out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k)  # (M, K) f32
     return acc.to(x.dtype)
 
 

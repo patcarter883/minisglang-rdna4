@@ -170,6 +170,7 @@ class CCAConv(nn.Module):
         self._w0: torch.Tensor | None = None  # [C, K0]
         self._b0: torch.Tensor | None = None  # [C]
         self._w1: torch.Tensor | None = None  # [H, d_out, d_in, K1] (pre-transposed for coalescing)
+        self._w1b: torch.Tensor | None = None  # b128 wide-load repack of _w1 (opt-in, see post_load)
         self._b1: torch.Tensor | None = None  # [C]
         self._temp_eff: torch.Tensor | None = None  # [num_k_heads] fp32
 
@@ -196,11 +197,23 @@ class CCAConv(nn.Module):
         if self._clamp_temp:
             t = torch.exp(torch.clamp(t, 1e-7, 2.0))
         self._temp_eff = t.contiguous()  # [num_k_heads]
+        # Opt-in b128 wide-load decode: pre-permute _w1 so a thread's taps are fetched by float4
+        # (b128) loads. Bit-exact vs cca_decode_qk (pure permutation) but only ~1.05x — CCA decode is
+        # launch-overhead-bound, not w1-bytes-bound — so it's off by default. Needs K1==2 & even d_in.
+        if os.environ.get("MINISGL_CCA_DECODE_B128", "0") != "0" and self._w1.shape[-1] == 2 \
+                and self._w1.shape[1] % 2 == 0:
+            import zaya_cca
+
+            self._w1b = zaya_cca.repack_w1_wide(self._w1, 1).contiguous()
 
     def conv_weights_fp32(self):
         """(w0, b0, w1, b1) fp32 kernel weights — built by post_load."""
         assert self._w0 is not None, "CCAConv.post_load() must run before forward"
         return self._w0, self._b0, self._w1, self._b1
+
+    def conv_w1_b128(self):
+        """b128 wide-load repack of w1, or None unless MINISGL_CCA_DECODE_B128 is set (post_load)."""
+        return self._w1b
 
     def temp_eff(self) -> torch.Tensor:
         assert self._temp_eff is not None, "CCAConv.post_load() must run before forward"
@@ -414,11 +427,19 @@ class ZayaCCAAttn(BaseOP):
                     f"decode: state_indices out of range [1, {state.num_slots})"
                 )
             from minisgl._hip_engage import engaged
-            engaged("zaya_cca.cca_decode_qk")
-            qk_out = zaya_cca.cca_decode_qk(
-                qk_new, conv, slot, is_pad,
-                w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
-            )  # [N, C] normalized q|k; conv rolled+appended in place
+            w1b = cca.conv_w1_b128()  # None unless MINISGL_CCA_DECODE_B128 (bit-exact wide-load twin)
+            if w1b is not None:
+                engaged("zaya_cca.cca_decode_qk_b128")
+                qk_out = zaya_cca.cca_decode_qk_b128(
+                    qk_new, conv, slot, is_pad,
+                    w0, b0, w1b, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
+                )  # [N, C] normalized q|k; conv rolled+appended in place
+            else:
+                engaged("zaya_cca.cca_decode_qk")
+                qk_out = zaya_cca.cca_decode_qk(
+                    qk_new, conv, slot, is_pad,
+                    w0, b0, w1, b1, temp_eff, nq, gqa, latent_q, sqrt_d,
+                )  # [N, C] normalized q|k; conv rolled+appended in place
             # previous-hidden for val_proj2 = the cached prev_hs of each slot, THEN store current.
             hs2 = prev[slot].to(model_dtype)  # [N, hidden] (OLD prev_hs)
             prev[slot] = hs.float()

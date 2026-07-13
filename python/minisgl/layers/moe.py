@@ -145,6 +145,22 @@ class _GroupedRXFExperts(BaseOP):
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
 
+    def post_load(self) -> None:
+        # Register-direct b128: pre-permute the NL codes into WMMA-B lane order (repack_rxf_w_rep_moe)
+        # for kernels.rxf_moe_regdirect (~2x the LDS-staged rxf_moe at decode). weight_scale stays in
+        # its native layout. Drop weight_packed (the LDS path's buffer) — never both. Off -> keep the
+        # as-is buffers for the LDS rxf_moe.
+        if not kernels.RXF_REGDIRECT:
+            return
+        import rxf_hip
+
+        E, N, Kp = self.weight_packed.shape
+        ktiles = (Kp * 2) // 16
+        wide = 4 if ktiles % 4 == 0 else 2  # b128 when K%64==0 (ZAYA), else b64
+        self._w_rep = rxf_hip.repack_rxf_w_rep_moe(self.weight_packed.contiguous(), wide)
+        self._wide = wide
+        del self.weight_packed
+
 
 class _GroupedCompressedTensorsExperts(BaseOP):
     """compressed-tensors int4 *weight-only* (W4A16) experts for one MoE GEMM (w13 or w2), STACKED
@@ -231,6 +247,24 @@ class _GroupedMxFp4Experts(BaseOP):
         raise RuntimeError("_GroupedMxFp4Experts holds weights; call kernels.w4a8_moe instead")
 
     def post_load(self) -> None:
+        from minisgl.quant import kernels
+
+        N = self.weight_packed.shape[1]
+        K = self.weight_packed.shape[2] * 2
+        if kernels.MOE_MXFP4_REGDIRECT:
+            # Register-direct b128: E2M1 nibbles -> WMMA-B lane-order w_rep_wide + E8M0->fp16 group
+            # scales, consumed by kernels.w4a16_moe(weight_is_e2m1=True). fp16 acts DIRECT (no
+            # act-quant) — faster AND higher quality than the LDS w4a8_moe e2m1 path. group=32 -> wide
+            # 2 (b64). Symmetric MXFP4 -> no zero-points.
+            import w4a8_fp8_wmma
+
+            wide = kernels._w4a16_wide(self._quant.group_size)  # g=32 -> 2
+            self._w_rep, self._scales_rd = w4a8_fp8_wmma.mxfp4_to_w_rep_moe(
+                self.weight_packed, self.weight_scale, N, K, wide
+            )
+            del self.weight_packed, self.weight_scale
+            return
+
         from minisgl.quant import mxfp4
 
         conv = mxfp4.convert_mxfp4_moe(self.weight_packed, self.weight_scale)
@@ -294,9 +328,23 @@ class _GroupedFP8Experts(BaseOP):
         — a zero-copy bitcast that preserves the exact e4m3 bit pattern."""
         self._w_op = self.weight.contiguous().view(torch.uint8)
         self._scales_op = self.weight_scale.squeeze(-1).contiguous().float()  # (E, N, 1) -> (E, N)
+        # Register-direct b128: pre-permute the per-expert fp8 weights into WMMA-B lane order (the fp8
+        # twin of the W4A16 _w_rep path) and DROP the plain op-layout copy — same ~8 GB footprint, just
+        # reordered, so we must never hold BOTH or the 8B OOMs the 16 GB card. Consumed by
+        # kernels.w8a8_moe_regdirect. Skipped when an env opt-out (W8A16/OLDMOE) still needs plain
+        # _w_op/weight. (Per-container repack transient is one GEMM's ~128 MB, not the whole model.)
+        _oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
+        _w8a16 = os.environ.get("MINISGL_ZAYA_W8A16", "0") == "1"
+        if kernels.MOE_W8A8_REGDIRECT and not _oldmoe and not _w8a16:
+            import w8a8_fp8_wmma
+
+            E, N, K = self._w_op.shape
+            w_rep = w8a8_fp8_wmma.repack_fp8_to_w_rep_moe(self._w_op, N, K)
+            self._w_rep = w8a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, 2)  # b128
+            del self._w_op
         # A/B toggle: MINISGL_ZAYA_OLDMOE=1 keeps the checkpoint fp8 weights for the legacy
         # dequant->Triton path (forward branch). Default drops them (native W8A8 kernel only).
-        if os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "0":
+        if not _oldmoe:
             del self.weight, self.weight_scale
 
 
@@ -424,6 +472,14 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE MXFP4 path is silu-only without router-weight-on-input"
         )
+        if getattr(w13, "_w_rep", None) is not None:
+            # Register-direct b128, fp16 acts direct (see _GroupedMxFp4Experts.post_load).
+            inter = w13._scales_rd.shape[1] // 2  # 2*inter -> inter
+            return kernels.w4a16_moe(
+                hidden_states, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
+                hidden_states.shape[1], inter, self._quant.group_size,
+                topk_weights=topk_weights, topk_ids=topk_ids, weight_is_e2m1=True,
+            )
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
@@ -432,6 +488,13 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        if getattr(w13, "_w_rep", None) is not None:
+            inter = w13._scales_rd.shape[1] // 2
+            return kernels.w4a16_moe(
+                g_hidden, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
+                g_hidden.shape[1], inter, self._quant.group_size,
+                topk_weights=local_weights, topk_ids=local_ids, weight_is_e2m1=True,
+            )
         return kernels.w4a8_moe(
             g_hidden, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
@@ -457,6 +520,14 @@ class _RXFMoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE RXF path is silu-only without router-weight-on-input"
         )
+        if getattr(w13, "_w_rep", None) is not None:
+            # Register-direct b128 (LDS-bypass) — the default RXF path (~2x rxf_moe at decode,
+            # bit-exact). post_load built _w_rep/_wide and dropped weight_packed.
+            return kernels.rxf_moe_regdirect(
+                hidden_states, w13._w_rep, w13.weight_scale, w2._w_rep, w2.weight_scale,
+                top_k, topk_weights=topk_weights, topk_ids=topk_ids,
+                span=self._quant.rotation_span, wide=w13._wide,
+            )
         return kernels.rxf_moe(
             hidden_states, w13.weight_packed, w13.weight_scale, w2.weight_packed, w2.weight_scale,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
@@ -514,6 +585,13 @@ class _FP8MoEMethod(MoEQuantMethod):
                 topk_weights, topk_ids,
                 activation=activation, apply_router_weight_on_input=apply_router_weight_on_input,
             )
+        if getattr(w13, "_w_rep", None) is not None:
+            # Register-direct b128 (LDS-bypass) — the default native W8A8 path (~2x the LDS-staged
+            # w8a8_moe at decode, bit-exact). post_load built _w_rep and dropped _w_op.
+            return kernels.w8a8_moe_regdirect(
+                hidden_states, w13._w_rep, w13._scales_op, w2._w_rep, w2._scales_op,
+                top_k, topk_weights=topk_weights, topk_ids=topk_ids,
+            )
         return kernels.w8a8_moe(
             hidden_states, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
             None, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
@@ -526,6 +604,11 @@ class _FP8MoEMethod(MoEQuantMethod):
             return self._w8a16_fn(
                 acts,
                 w13._w_op, w13._scales_op, w2._w_op, w2._scales_op, local_weights, local_ids,
+            )
+        if getattr(w13, "_w_rep", None) is not None:
+            return kernels.w8a8_moe_regdirect(
+                g_hidden, w13._w_rep, w13._scales_op, w2._w_rep, w2._scales_op,
+                top_k, topk_weights=local_weights, topk_ids=local_ids,
             )
         return kernels.w8a8_moe(
             g_hidden, w13._w_op, w13._scales_op, w2._w_op, w2._scales_op,
