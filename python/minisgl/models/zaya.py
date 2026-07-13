@@ -54,9 +54,13 @@ logger = init_logger(__name__)
 # CCA/MoE RATIO is exact even though the per-call sync inflates wall. ZayaModel.forward logs the running
 # split each step. Off by default => zero cost, no sync, byte-identical to the untimed path.
 _ZAYA_TIME = os.environ.get("MINISGL_ZAYA_TIME", "0") != "0"
+# Fuse the per-layer fp32 residual-affine merge + fp32 RMSNorm + bf16 cast into ONE HIP launch
+# (zaya_cca.zaya_merge_norm), collapsing the ~10-15 tiny torch elementwise kernels/layer of
+# ZayaDecoderLayer._merge_and_norm. The residual stream STAYS fp32 (residual_in_fp32). Default OFF.
+_ZAYA_FUSED_MERGE = os.environ.get("MINISGL_ZAYA_FUSED_MERGE", "0") != "0"
 # "cca_attn" is a SUB-bucket of "cca" (the paged flash attention only); cca - cca_attn = the conv
 # front-end + q/k/v projections + o_proj, to locate the O(N^2) cost within the CCA mixer.
-_zaya_buckets = {"cca": 0.0, "cca_attn": 0.0, "moe": 0.0}
+_zaya_buckets = {"cca": 0.0, "cca_attn": 0.0, "moe": 0.0, "merge": 0.0}
 
 
 def _zaya_time(bucket: str, fn):
@@ -650,6 +654,11 @@ class ZayaDecoderLayer(BaseOP):
         self._scale_residual_merge = bool(getattr(config, "scale_residual_merge", True))
         if self._scale_residual_merge:
             self.res_scale = ResidualScaling(config.hidden_size, layer_n=layer_id)
+        self._eps = float(config.rms_norm_eps)
+        # fp32 param bundle for the fused merge+norm op (zaya_merge_norm), filled by post_load when
+        # MINISGL_ZAYA_FUSED_MERGE is on. None => use the torch path. Only for has-residual layers
+        # (layer 0 has no residual affine, so it stays on the torch path — a single layer, negligible).
+        self._mn_bundle = None
         if is_cca:
             assert cca_layer_id is not None
             self.self_attn = ZayaCCAAttn(config, cca_layer_id)
@@ -658,9 +667,36 @@ class ZayaDecoderLayer(BaseOP):
             self.zaya_block = ZayaMoEBlock(config, use_eda=use_eda)
             self._mixer = self.zaya_block
 
+    def post_load(self) -> None:
+        super().post_load()  # descend into input_norm / res_scale / mixer (BaseOP recursion)
+        # Cache the fp32 param bundle for the fused merge+norm (constants — built once). Only for
+        # has-residual layers under the gate; layer 0 (no residual affine) stays on the torch path.
+        if _ZAYA_FUSED_MERGE and self._scale_residual_merge and self.res_scale._has_residual:
+            rs = self.res_scale
+            self._mn_bundle = (
+                rs.hidden_states_scale.float().contiguous(),
+                rs.hidden_states_bias.float().contiguous(),
+                rs.residual_scale.float().contiguous(),
+                rs.residual_bias.float().contiguous(),
+                self.input_norm.weight.float().contiguous(),
+            )
+
     def _merge_and_norm(
         self, residual: torch.Tensor | None, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Fused path: fp32 affine-merge + fp32 RMSNorm + bf16 cast in ONE launch. The residual stream
+        # stays fp32 (residual_in_fp32); only `normed` is bf16. Bit-close to the torch chain below.
+        if self._mn_bundle is not None and residual is not None \
+                and hidden_states.dtype == torch.bfloat16:
+            import zaya_cca
+            from minisgl._hip_engage import engaged
+            hs_scale, hs_bias, res_scale, res_bias, norm_w = self._mn_bundle
+            engaged("zaya_cca.zaya_merge_norm")
+            normed, residual = zaya_cca.zaya_merge_norm(
+                hidden_states.contiguous(), residual.contiguous(),
+                hs_scale, hs_bias, res_scale, res_bias, norm_w, self._eps,
+            )  # normed bf16 [N,H]; residual fp32 [N,H] (new residual stream)
+            return normed, residual
         if self._scale_residual_merge:
             # ResidualScaling already upcasts both streams to fp32 (its affine runs in fp32).
             residual, hidden_states = self.res_scale.forward(residual, hidden_states)
@@ -685,7 +721,9 @@ class ZayaDecoderLayer(BaseOP):
         residual: torch.Tensor | None,
         prev_router_states: torch.Tensor | None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        hidden_states, residual = self._merge_and_norm(residual, hidden_states)
+        hidden_states, residual = _zaya_time(
+            "merge", lambda: self._merge_and_norm(residual, hidden_states)
+        )
         if self._is_cca:
             hidden_states = _zaya_time("cca", lambda: self.self_attn.forward(hidden_states))
             return hidden_states, residual, prev_router_states  # CCA passes router state through
@@ -746,8 +784,10 @@ class ZayaModel(BaseOP):
                 grabbed[lid] = residual.clone()
         if _ZAYA_TIME:  # cumulative GPU-time split across the 40 CCA + 40 MoE mixers (measurement)
             c, m, ca = _zaya_buckets["cca"], _zaya_buckets["moe"], _zaya_buckets["cca_attn"]
+            mg = _zaya_buckets["merge"]
             logger.info_rank0(
                 f"[zaya-time] cca={c:.0f}ms (attn={ca:.0f}ms rest={c - ca:.0f}ms) moe={m:.0f}ms "
+                f"merge={mg:.0f}ms merge_frac={mg / (c + m + mg + 1e-9):.1%} "
                 f"cca_frac={c / (c + m + 1e-9):.1%} attn_frac_of_cca={ca / (c + 1e-9):.1%} "
                 f"(N={input_ids.shape[0]})"
             )
