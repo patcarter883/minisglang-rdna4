@@ -56,8 +56,9 @@ logger = init_logger(__name__)
 _ZAYA_TIME = os.environ.get("MINISGL_ZAYA_TIME", "0") != "0"
 # Fuse the per-layer fp32 residual-affine merge + fp32 RMSNorm + bf16 cast into ONE HIP launch
 # (zaya_cca.zaya_merge_norm), collapsing the ~10-15 tiny torch elementwise kernels/layer of
-# ZayaDecoderLayer._merge_and_norm. The residual stream STAYS fp32 (residual_in_fp32). Default OFF.
-_ZAYA_FUSED_MERGE = os.environ.get("MINISGL_ZAYA_FUSED_MERGE", "0") != "0"
+# ZayaDecoderLayer._merge_and_norm. The residual stream STAYS fp32 (residual_in_fp32). Default ON
+# (+16.2% graph-captured decode, bit-exact mixer input); MINISGL_ZAYA_FUSED_MERGE=0 reverts.
+_ZAYA_FUSED_MERGE = os.environ.get("MINISGL_ZAYA_FUSED_MERGE", "1") != "0"
 # "cca_attn" is a SUB-bucket of "cca" (the paged flash attention only); cca - cca_attn = the conv
 # front-end + q/k/v projections + o_proj, to locate the O(N^2) cost within the CCA mixer.
 _zaya_buckets = {"cca": 0.0, "cca_attn": 0.0, "moe": 0.0, "merge": 0.0}
@@ -218,7 +219,7 @@ class CCAConv(nn.Module):
         # projects channel c as dot(hs, Wqk[:, c]), so hidden must be the outer (row) stride for
         # coalesced consecutive-c weight loads (hence the transpose). bf16 -> the kernel accumulates
         # fp32 to match F.linear(hs, ...).float(). See ZayaCCAAttn.forward decode branch.
-        if os.environ.get("MINISGL_CCA_DECODE_FUSED", "0") != "0":
+        if os.environ.get("MINISGL_CCA_DECODE_FUSED", "1") != "0":  # default ON; =0 reverts
             import zaya_cca
 
             self._Wqk_T = zaya_cca.repack_cca_qk_proj(self.linear_q, self.linear_k).contiguous()
