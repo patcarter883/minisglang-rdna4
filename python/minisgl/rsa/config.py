@@ -12,23 +12,42 @@ Selection = Literal["auto", "majority", "final_agg", "sample"]
 
 
 class RSAParams(BaseModel):
-    """Tunable Markovian-RSA parameters.
+    """Tunable Markovian-RSA parameters (arXiv:2605.05365).
 
-    Defaults follow the ZAYA1-8B report's Markovian RSA configuration
-    (N=16, K=4, T=2, tail=4096). Set ``tail_tokens=0`` to carry the full
-    previous-round traces into aggregation (generalized RSA, still Markovian
-    over rounds).
+    Paper-symbol mapping (the field names keep minisgl's historical spelling; the
+    paper's Greek/Latin symbols are given so the two can be read together):
+        N  = ``n``            population size (candidates kept each round)
+        C  = ``k``            aggregation subset size (C<=N tails per new candidate)
+        T  = ``t``            total rounds (round 0 = expand, 1..T-1 = aggregate)
+        tau= ``tail_tokens``  tail length: last tau tokens of each REASONING trace carried forward
+        beta = ``think_budget`` per-rollout thinking budget: reasoning is force-closed
+               (</think> emitted) after beta tokens so the model always finishes
+               reasoning and emits an answer (the paper's "bounded-workspace principle")
+
+    Defaults follow the ZAYA1-8B report's Markovian RSA config (N=16, C=4, T=2,
+    tau=4096). Set ``tail_tokens=0`` to carry the full previous-round reasoning trace
+    into aggregation (generalized RSA, still Markovian over rounds).
     """
 
     enabled: bool = True
     n: int = Field(default=16, ge=1, description="population size N")
-    k: int = Field(default=4, ge=1, description="aggregation set size K")
+    k: int = Field(default=4, ge=1, description="aggregation subset size C (C<=N)")
     t: int = Field(default=2, ge=1, description="total rounds T (round 0 = expand)")
     tail_tokens: int = Field(
         default=4096,
         ge=0,
-        description="carry only the final tail_tokens of each previous-round trace "
-        "into aggregation; 0 = full trace",
+        description="tau: carry only the final tail_tokens of each previous-round "
+        "REASONING trace into aggregation; 0 = full trace",
+    )
+    think_budget: int | None = Field(
+        default=None,
+        ge=1,
+        description="beta: per-rollout thinking budget. After this many reasoning "
+        "tokens the scheduler force-emits the think-close delimiter (</think>) so the "
+        "model stops reasoning and produces its answer/solution — bounding the workspace "
+        "and preventing truncated-thinking-with-no-answer. None = the server's "
+        "MINISGL_THINK_BUDGET default (1024); applies to every rollout AND the final "
+        "aggregation.",
     )
     max_tokens: int = Field(
         default=8192, ge=1, description="per-rollout completion budget (round 0)"
@@ -121,7 +140,16 @@ def add_rsa_args(parser: argparse.ArgumentParser) -> None:
         "--rsa-tail-tokens",
         type=int,
         default=d.tail_tokens,
-        help="tail tokens of each previous-round trace fed to aggregation (0 = full)",
+        help="tau: tail tokens of each previous-round REASONING trace fed to "
+        "aggregation (0 = full)",
+    )
+    g.add_argument(
+        "--rsa-think-budget",
+        type=int,
+        default=d.think_budget,
+        help="beta: per-rollout thinking budget; </think> is force-emitted after this "
+        "many reasoning tokens so the model always produces an answer (None = "
+        "MINISGL_THINK_BUDGET default)",
     )
     g.add_argument(
         "--rsa-max-tokens",
@@ -177,6 +205,7 @@ def params_from_args(args: argparse.Namespace) -> RSAParams:
         k=args.rsa_k,
         t=args.rsa_t,
         tail_tokens=args.rsa_tail_tokens,
+        think_budget=args.rsa_think_budget,
         max_tokens=args.rsa_max_tokens,
         agg_max_tokens=args.rsa_agg_max_tokens,
         temperature=args.rsa_temperature,

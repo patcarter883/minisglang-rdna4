@@ -287,6 +287,8 @@ async def _run_round(
     usage: UsageTotals,
     round_idx: int,
     chat_template_kwargs: Optional[dict] = None,
+    think_close_delim: Optional[str] = None,
+    think_budget: Optional[int] = None,
 ) -> List[Candidate]:
     """Fan out one rollout per message set, bounded by *semaphore*."""
 
@@ -303,8 +305,12 @@ async def _run_round(
                 stop=params.stop,
                 max_retries=params.max_retries,
                 # thinking-mode is threaded to every rollout for consistency; the exploration rounds
-                # stay grammar/tools-FREE (structured output is applied only to the final answer).
+                # stay grammar/tools-FREE (structured output is applied only to the final answer). The
+                # think-close delim + β budget ARE threaded so the scheduler force-closes reasoning at β
+                # (bounded workspace) — every rollout emits a real solution, not truncated thinking.
                 chat_template_kwargs=chat_template_kwargs,
+                think_close_delim=think_close_delim,
+                think_budget=think_budget,
             )
         return c, time.monotonic()  # (candidate, absolute finish time) for straggler analysis
 
@@ -339,14 +345,27 @@ async def _run_round(
     return population
 
 
+def reasoning_trace(text: str, close_delim: Optional[str]) -> str:
+    """The REASONING portion of a rollout: everything before the think-close delimiter (</think>).
+    With β on, the delimiter is always emitted (force-closed at the budget); if it is absent (thinking
+    off, or a non-reasoning model) the whole text is the trace. Paper: the tail is taken over the
+    reasoning trace, not the post-</think> answer."""
+    if close_delim and close_delim in text:
+        return text.split(close_delim, 1)[0]
+    return text
+
+
 async def _tails_for(
     client: BackendClient,
     population: List[Candidate],
     params: RSAParams,
+    close_delim: Optional[str] = None,
 ) -> dict:
-    """Compute each candidate's tail once per round (keyed by identity)."""
+    """Compute each candidate's tail once per round (keyed by identity): the last τ (``tail_tokens``)
+    of its REASONING trace (paper ``tail_τ(y)``), so aggregation carries recent reasoning forward
+    rather than the finished-answer prose."""
     tails = await asyncio.gather(
-        *(client.tail(c.text, params.tail_tokens) for c in population)
+        *(client.tail(reasoning_trace(c.text, close_delim), params.tail_tokens) for c in population)
     )
     return {id(c): t for c, t in zip(population, tails)}
 
@@ -376,6 +395,13 @@ async def run_markovian_rsa(
     semaphore = asyncio.Semaphore(params.max_concurrency)
     query = prompts.render_query(messages)
     request_system = prompts.extract_request_system(messages)
+    # β (bounded-workspace thinking budget) + the </think> close delim, threaded to EVERY rollout and
+    # the final aggregation so the scheduler force-closes reasoning at β and each generation emits a
+    # real solution (never truncated thinking). RSA-level β wins; else the request's reasoning budget;
+    # else None -> the scheduler's MINISGL_THINK_BUDGET default. The close delim also drives tail
+    # extraction (the tail is the last τ tokens of the REASONING trace, before </think>).
+    beta = params.think_budget if params.think_budget is not None else think_budget
+    close_delim = think_close_delim
     # phase timers (s): gen_s = GPU generation (the structural T-rounds cost); tail_s/build_s =
     # recoverable event-loop orchestration (tail re-tokenization + aggregation-prompt building).
     _wall0 = time.monotonic()
@@ -393,6 +419,8 @@ async def run_markovian_rsa(
         usage=usage,
         round_idx=0,
         chat_template_kwargs=chat_template_kwargs,
+        think_close_delim=close_delim,
+        think_budget=beta,
     )
     gen_s += time.monotonic() - _t
     rounds = [population]
@@ -403,12 +431,18 @@ async def run_markovian_rsa(
         # Markov step: sample ONLY from the previous round's population.
         prev = rounds[-1]
         _t = time.monotonic()
-        tails = await _tails_for(client, prev, params)
+        tails = await _tails_for(client, prev, params, close_delim)
         tail_s += time.monotonic() - _t
         _t = time.monotonic()
         message_sets = []
         for _ in range(params.n):
-            chosen = rng.sample(prev, k=min(params.k, len(prev)))
+            # Sample a C-subset uniformly at random (the Markov step), then order the chosen tails
+            # CANONICALLY by their position in `prev`. Ordering is unspecified by the paper, and a
+            # stable order makes aggregation prompts that share tails also share a PREFIX — so the radix
+            # prefix cache (incl. the recurrent CCA state) can reuse it, a win that grows with C (at C=N
+            # every prompt is the same sorted tail block). No effect on the sampled subset itself.
+            idx = sorted(rng.sample(range(len(prev)), k=min(params.k, len(prev))))
+            chosen = [prev[i] for i in idx]
             message_sets.append(
                 prompts.build_aggregation_messages(
                     query, [tails[id(c)] for c in chosen], request_system
@@ -426,6 +460,8 @@ async def run_markovian_rsa(
             usage=usage,
             round_idx=t,
             chat_template_kwargs=chat_template_kwargs,
+            think_close_delim=close_delim,
+            think_budget=beta,
         )
         gen_s += time.monotonic() - _t
         rounds.append(population)
@@ -436,7 +472,7 @@ async def run_markovian_rsa(
         client, params, rounds[-1], query, request_system, model, rng, usage,
         max_tokens=agg_budget,
         grammar=grammar, tools=tools, chat_template_kwargs=chat_template_kwargs,
-        think_close_delim=think_close_delim, think_budget=think_budget,
+        think_close_delim=close_delim, think_budget=beta,
     )
     sel_s = time.monotonic() - _t
     logger.info(
@@ -524,7 +560,7 @@ async def _select(
     # applying the grammar/tools/thinking constraints so the final answer honors response_format /
     # json_schema / tool-calling exactly like the plain lane.
     chosen = rng.sample(population, k=min(params.k, len(population)))
-    tails = await _tails_for(client, chosen, params)
+    tails = await _tails_for(client, chosen, params, think_close_delim)
     msgs = prompts.build_final_selection_messages(
         query, [tails[id(c)] for c in chosen], request_system,
         for_tools=tools is not None,
