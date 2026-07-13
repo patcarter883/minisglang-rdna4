@@ -178,6 +178,61 @@ def _grammar_from_response_format(rf: dict | None) -> str | None:
     return None
 
 
+def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
+    """Build a JSON-schema grammar for a FORCED tool call so `tools` gets the same constrained-decoding
+    treatment `response_format` gets — the final answer is masked to a complete, valid call (name +
+    schema-checked arguments) that terminates, instead of the model drafting prose to the token cap.
+
+    Applies only when the request FORCES a call: `tool_choice: "required"` (any tool) or a specific
+    `{"type":"function","function":{"name": …}}`. For `"auto"`/`"none"`/absent it returns None — auto
+    must stay free to NOT call (and the XML wrapper parser handles those). The grammar constrains the
+    output to `{"name": <one of the allowed tools>, "arguments": <that tool's parameters schema>}`."""
+    tools = req.tools
+    if not tools:
+        return None
+    choice = req.tool_choice
+    forced_name: str | None = None
+    if isinstance(choice, dict):
+        forced_name = (choice.get("function") or {}).get("name")
+    elif choice != "required":
+        return None  # "auto" / "none" / None -> not forced
+    variants = []
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name or (forced_name and name != forced_name):
+            continue
+        variants.append({
+            "type": "object",
+            "properties": {
+                "name": {"const": name},
+                "arguments": fn.get("parameters") or {"type": "object"},
+            },
+            "required": ["name", "arguments"],
+            "additionalProperties": False,
+        })
+    if not variants:
+        return None
+    return json.dumps(variants[0] if len(variants) == 1 else {"anyOf": variants})
+
+
+def _parse_json_tool_call(body: str, uid: int) -> dict | None:
+    """Parse a grammar-constrained tool call — a bare JSON object `{"name": …, "arguments": {…}}`
+    (what `_grammar_from_tools` forces) — into an OpenAI `tool_calls` entry. None if it isn't that."""
+    try:
+        call = json.loads(body.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(call, dict) or not call.get("name"):
+        return None
+    args = call.get("arguments", {})
+    return {
+        "id": f"call_{uid}_0",
+        "type": "function",
+        "function": {"name": call["name"], "arguments": args if isinstance(args, str) else json.dumps(args)},
+    }
+
+
 def _grammar_think_gate_delim(req: "OpenAICompletionRequest") -> str | None:
     """Reasoning + structured output: when a request is BOTH grammar-constrained AND has thinking
     active, return the reasoning parser's close delimiter (e.g. "</think>") so the scheduler gates
@@ -875,10 +930,16 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             # Thread the SAME structured transports the plain lane uses: thinking-mode applies to every
             # rollout; the grammar (response_format / json_schema) + tools are applied to the FINAL
             # answer so RSA honors structured output / tool-calling instead of returning raw prose.
+            # Constrained decoding for the FINAL answer: response_format wins; else a FORCED tool call
+            # (tool_choice required / specific) gets its own JSON-schema grammar so the call's arguments
+            # are schema-checked and terminate — the same treatment response_format gets (auto/none tool
+            # choice stays grammar-free and is parsed from the XML wrapper below).
+            rf_grammar = _grammar_from_response_format(req.response_format)
+            tool_grammar = _grammar_from_tools(req) if rf_grammar is None else None
             result = await run_markovian_rsa(
                 client, rsa_params, messages, req.model,
                 chat_template_kwargs=_resolve_chat_template_kwargs(req),
-                grammar=_grammar_from_response_format(req.response_format),
+                grammar=rf_grammar or tool_grammar,
                 tools=_tools_for_template(req),
                 # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
                 # grammar-free rollout, not just the structured final answer.
@@ -901,7 +962,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         message: dict = {"role": "assistant", "content": body}
         if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
-        if req.tools and req.tool_choice != "none":
+        if tool_grammar is not None:
+            # Forced tool call: the grammar constrained `body` to `{"name": …, "arguments": {…}}`.
+            tc = _parse_json_tool_call(body, state.uid_counter)
+            if tc is not None:
+                message["content"] = None
+                message["tool_calls"] = [tc]
+                finish_reason = "tool_calls"
+        elif req.tools and req.tool_choice != "none":
             _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
             if tool_calls:
                 message["content"] = _tc_content
@@ -959,6 +1027,10 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     prompt = await _cam_auto_augment(prompt)     # TRANSPARENT CAM read (no-op unless MINISGL_CAM_AUTO=1)
 
     uid = state.new_user()
+    # Constrained decoding: response_format wins; else a FORCED tool call (tool_choice required /
+    # specific) gets its own JSON-schema grammar so the arguments are schema-checked and terminate.
+    _pl_rf_grammar = _grammar_from_response_format(req.response_format)
+    _pl_tool_grammar = _grammar_from_tools(req) if _pl_rf_grammar is None else None
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -970,7 +1042,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 max_tokens=req.max_tokens,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
-                grammar=_grammar_from_response_format(req.response_format),
+                grammar=_pl_rf_grammar or _pl_tool_grammar,
                 # UNCONDITIONAL close delim (was grammar-only): β-bounds reasoning on the PLAIN lane
                 # too, so a thinking request without response_format can't run reasoning to max_tokens
                 # and truncate with no answer. For grammar requests this is the same delim (it also
@@ -1029,7 +1101,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     message: dict = {"role": "assistant", "content": body}
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
-    if req.tools and finish_reason != "length":
+    if _pl_tool_grammar is not None:
+        # Forced tool call: the grammar constrained `body` to `{"name": …, "arguments": {…}}`.
+        tc = _parse_json_tool_call(body, uid)
+        if tc is not None:
+            message["content"] = None
+            message["tool_calls"] = [tc]
+            finish_reason = "tool_calls"
+    elif req.tools and finish_reason != "length":
         content, tool_calls = _parse_tool_calls(body, uid)
         if tool_calls:
             message["content"] = content

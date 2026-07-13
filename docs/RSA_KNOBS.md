@@ -53,9 +53,13 @@ are reasoning-only** (the last τ tokens *before* `</think>`), matching the pape
 
 - `response_format: {type: "json_schema", …}` → the **final** answer is grammar-constrained to valid
   JSON (rollouts stay free-form for exploration).
-- `tools: [...]` → the final answer is an action: the model calls a tool when the request needs one
-  (returned as OpenAI `tool_calls`, `finish_reason: "tool_calls"`), instead of fabricating an answer
-  from the tools-free rollouts.
+- `tools: [...]` with **`tool_choice: "required"`** (or a specific `{"type":"function","function":
+  {"name": …}}`) → the final answer is **grammar-constrained to a complete, schema-checked tool call**
+  (same treatment as `response_format`): the arguments are forced to match the tool's `parameters`
+  schema and the generation terminates. Returned as OpenAI `tool_calls`, `finish_reason:
+  "tool_calls"`. **Use `tool_choice: "required"` for reliable tool calls** — with `"auto"` there is no
+  grammar (the model must be free to *not* call), so it can draft prose to the cap without emitting a
+  clean call, exactly like a JSON request without `response_format`.
 - `think_budget` still applies, so structured/tool answers can't get stuck reasoning forever.
 
 ## Caching note (why C and canonical ordering matter)
