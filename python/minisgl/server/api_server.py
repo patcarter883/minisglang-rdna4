@@ -843,14 +843,45 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 status_code=400,
                 content={"error": "RSA requires `messages` (chat format), not a raw `prompt`"},
             )
-        messages = [msg.model_dump() for msg in req.messages]
+        # Same message normalization as the plain lane so tool-call / tool-result history renders in
+        # the template (exclude_none + JSON-string tool args -> dict).
+        messages = [msg.model_dump(exclude_none=True) for msg in req.messages]
+        _normalize_tool_args(messages)
         client = InProcessBackendClient(state, state.config.model_path)
         try:
-            result = await run_markovian_rsa(client, rsa_params, messages, req.model)
+            # Thread the SAME structured transports the plain lane uses: thinking-mode applies to every
+            # rollout; the grammar (response_format / json_schema) + tools are applied to the FINAL
+            # answer so RSA honors structured output / tool-calling instead of returning raw prose.
+            result = await run_markovian_rsa(
+                client, rsa_params, messages, req.model,
+                chat_template_kwargs=_resolve_chat_template_kwargs(req),
+                grammar=_grammar_from_response_format(req.response_format),
+                tools=_tools_for_template(req),
+                think_close_delim=_grammar_think_gate_delim(req),
+                think_budget=_resolve_think_budget(req),
+            )
         except RSAError as e:
             return JSONResponse(status_code=502, content={"error": f"RSA failed: {e}"})
         finally:
             await client.close()
+        # Parse the final answer exactly like the plain lane: split the <think>…</think> reasoning out
+        # of content into reasoning_content, then (if tools were offered) parse <tool_call> blocks into
+        # OpenAI-shaped tool_calls. Fixes "thinking stays in content" + tool calls ignored on this lane.
+        finish_reason = "stop"
+        reasoning_content: str | None = None
+        body = result.final_text
+        parser = _reasoning_parser()
+        if parser is not None and _thinking_active(req):
+            reasoning_content, body = parser.parse(result.final_text)
+        message: dict = {"role": "assistant", "content": body}
+        if reasoning_content is not None:
+            message["reasoning_content"] = reasoning_content
+        if req.tools and req.tool_choice != "none":
+            _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
+            if tool_calls:
+                message["content"] = _tc_content
+                message["tool_calls"] = tool_calls
+                finish_reason = "tool_calls"
         return {
             "id": f"chatcmpl-rsa-{state.uid_counter}",
             "object": "chat.completion",
@@ -859,8 +890,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": result.final_text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {

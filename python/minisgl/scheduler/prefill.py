@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req
-from minisgl.utils import init_logger
+from minisgl.utils import align_down, init_logger
 
 from .utils import PendingReq
 
@@ -71,6 +71,17 @@ class PrefillAdder:
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        # Recurrent radix (GDN/CCA): keep every prefill SEGMENT boundary page-aligned so the linear-
+        # attention recurrent-state slot can be snapshotted at that exact boundary (the losslessness
+        # precondition — a snapshot at an unaligned length attached to the align_down radix node would
+        # double-count the sub-page tail). Round this segment down to a page multiple, deferring the
+        # <page_size remainder to the next (final) chunk. Guarded so it only fires when there IS an
+        # aligned body AND tokens remain after it; the sub-page tail itself is never split again. Inert
+        # for dense/MLA caches (is_recurrent_radix False) — those keep the historical single-forward.
+        if self.cache_manager.is_recurrent_radix:
+            aligned_end = align_down(cached_len + chunk_size, self.cache_manager.page_size)
+            if cached_len < aligned_end < pending_req.input_len:
+                chunk_size = aligned_end - cached_len
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size

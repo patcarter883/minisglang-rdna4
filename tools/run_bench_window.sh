@@ -26,7 +26,9 @@ docker run --rm \
   -e MINISGL_SSM_BF16="${MINISGL_SSM_BF16:-}" -e MINISGL_GRAPH_RESERVE_MARGIN_GB="${MINISGL_GRAPH_RESERVE_MARGIN_GB:-}" -e MINISGL_PROFILE="${MINISGL_PROFILE:-}" -e MINISGL_PROFILE_SKIP="${MINISGL_PROFILE_SKIP:-}" -e MINISGL_PROFILE_STEPS="${MINISGL_PROFILE_STEPS:-}" \
   -e SKIP_TRITON_COPY="${SKIP_TRITON_COPY:-1}" \
   -v "$PWD":/engine \
+  -v "${KERNELS_DIR:-/home/pat/code/rdna4-hip-kernels}":/kernels \
+  -v /home/pat/models:/models \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
-  -e PYTHONPATH=/opt/kernels:/engine/python:/engine \
-  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" /engine/tools/_bench_inner.sh
+  -e PYTHONPATH="${KERNEL_PYPATH:-/kernels/_kernels}:/engine/python:/engine" \
+  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean-zaya}" /engine/tools/_bench_inner.sh
 echo "[run_bench_window] exited rc=$?"

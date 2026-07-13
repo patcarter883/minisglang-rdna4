@@ -239,7 +239,10 @@ services:
   #   gpu-lease -n 2 --detach --name minisgl-zaya -- docker compose --profile zaya up -d
   zaya:
     <<: *lean-common
-    image: minisgl-rdna4:lean-zaya           # superset image (ZAYA CCA + MoE kernels)
+    # No image override: ZAYA uses the SAME lean image as every other serve. Its kernels (zaya_cca /
+    # w8a8 / moe_w8a16 / attn_prefill_paged etc.) come from the canonical /kernels/_kernels mount
+    # below, so there is no ZAYA-specific baked-kernel image anymore (the old `lean-zaya` tag). The
+    # lean image also carries xgrammar, so structured output / json_schema / tools work on this lane.
     profiles: ["zaya"]
     container_name: ${LEASE_NAME:-minisgl-lean}-zaya
     restart: unless-stopped
@@ -247,9 +250,17 @@ services:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
       - ${MODELS_DIR:-/home/pat/models}:/models
+      # Canonical HIP kernels LIVE (not the image's baked /opt/kernels) so this serve picks up the
+      # latest builds — the register-resident attn_prefill_paged, MXFP4 branch-free decode, and the
+      # GDN prefill critical-path fixes — without rebuilding the image. PYTHONPATH below points at the
+      # _kernels aggregation dir (relative symlinks to every package's torch-ext).
+      - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
     environment:
       <<: *lean-env
       MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
+      # Override the image's /opt/kernels: canonical /kernels/_kernels FIRST so `import gdn_hip` etc.
+      # resolve to the mounted latest builds; /engine keeps the 3 not-yet-canonical fallbacks.
+      PYTHONPATH: /kernels/_kernels:/engine/python:/engine
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     entrypoint: ["bash", "-lc"]
