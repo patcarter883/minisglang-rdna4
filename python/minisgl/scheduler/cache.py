@@ -77,6 +77,15 @@ class CacheManager:
         insert_ids = req.input_ids[: req.cached_len]
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
+        # Ephemeral output (RSA rollouts, sampling_params.cache_output=False): do NOT insert the
+        # generated tail into the prefix cache — its unique continuation is never reused, so caching it
+        # only pollutes the radix and inflates KV occupancy (finished rollouts wouldn't "drop"). The
+        # shared prompt prefix (old_handle) was already inserted at prefill; keep it evictable and free
+        # everything allocated past it (uncached prompt tail + all generated pages).
+        if finished and not req.sampling_params.cache_output:
+            self.unlock(old_handle)
+            self._free(page_indices[old_handle.cached_len :])
+            return old_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         # unlock until all operations on handle is done
         self.unlock(old_handle)

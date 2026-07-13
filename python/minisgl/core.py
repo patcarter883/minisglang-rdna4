@@ -57,6 +57,13 @@ class SamplingParams:
     # result from the backend engine.cam and FORCE-EMITS it (tokenised) as the reply text + EOS, so the
     # data-returning ops need no new message type. mem_subject supplies the subject for "forget".
     mem_op: str | None = None
+    # Prefix-cache policy: whether this request's GENERATED output is inserted into the radix prefix
+    # cache when it finishes. True (default) = normal caching. False = ephemeral output: the already-
+    # cached shared PROMPT prefix is kept (evictable, for cross-request reuse) but the unique generated
+    # tail is freed directly instead of being inserted. Used by RSA rollouts, whose per-rollout
+    # generations are never reused — inserting them just pollutes the cache and inflates KV occupancy
+    # (finished rollouts wouldn't "drop" on the KV graph). Rides UserMsg -> Req like the fields above.
+    cache_output: bool = True
 
     @property
     def is_greedy(self) -> bool:
