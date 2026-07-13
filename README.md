@@ -9,6 +9,31 @@ kernel-call layer kept swappable for an incoming custom kernel framework.
 > This README documents the RDNA4 fork. The original CUDA-targeted mini-SGLang README is in git
 > history and on the `upstream` remote.
 
+## Quickstart — serve a model in one command
+
+A **prebuilt image** (engine + all custom gfx1201 HIP kernels baked in) is published to GHCR, so
+serving is a single `docker compose up` — no building, no CUDA, no extra toolchain. You need an
+**AMD RDNA4 GPU** (RX 9070 / 9070 XT) with the ROCm kernel driver (`/dev/kfd` + `/dev/dri`).
+
+```bash
+git clone https://github.com/patcarter883/minisglang-rdna4.git
+cd minisglang-rdna4
+MODEL=Qwen/Qwen3-4B docker compose -f docker-compose.example.yml up
+```
+
+This pulls `ghcr.io/patcarter883/minisglang-rdna4:latest`, downloads the model from Hugging Face on
+first run, and serves an **OpenAI-compatible API** at `http://localhost:1919/v1`:
+
+```bash
+curl -s http://localhost:1919/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen3-4B","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+Point `MODEL` at any supported Hugging Face repo id or local path; large quantized MoE models run
+two-card with `TP=2`. **Full guide: [`docs/SERVING.md`](docs/SERVING.md)** (prerequisites, model
+recipes, knobs, troubleshooting).
+
 **Status:** dense engine working + numerically validated (Phase 1); W4A8 quantized serving in
 progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.md`. Full design:
 `vllm-gfx1201/docs/RDNA4_ENGINE_DESIGN.md`.
@@ -32,7 +57,13 @@ progress (Phase 2). Live tracker: `PORT.md`. Optimization backlog: `PERF_NOTES.m
    (never copied into this repo); all quantized GEMMs route through `quant/kernels.py` so a
    different kernel backend can drop in.
 
-## Running (via the GPU lease)
+## Running (maintainer dev workflow — shared-box GPU lease)
+
+> Most users want the **[Quickstart](#quickstart--serve-a-model-in-one-command)** above. This
+> section is the maintainer's development workflow on a specific shared two-card box: it builds the
+> image locally from the canonical kernels repo and books the cards through a `flock` lease. The
+> `gpu-lease`/`gpu-status` commands and hardcoded `/home/pat/...` paths are box-specific and are not
+> needed to run the published image.
 
 The purpose-built minisglang image (`Dockerfile` + `docker-compose.yml`) is the only serving
 configuration — see `docs/LEAN_IMAGE.md`. GPU work goes through the shared-box `flock` lease (never
