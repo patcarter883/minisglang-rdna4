@@ -25,7 +25,7 @@
 # tag/build the lean-zaya variant.
 services:
   serve-tidar:
-    image: minisgl-rdna4:lean-zaya
+    image: ${MINISGL_IMAGE:-minisgl-rdna4:lean}
     profiles: ["tidar"]
     container_name: ${LEASE_NAME:-minisgl-lean}-tidar
     restart: unless-stopped

@@ -133,3 +133,20 @@ stays entirely within "train the bolt-on" — the base is never touched, so the 
   lease time; each stage is one bind+train+eval (~10–20 min) but there are 4.
 - DEEPEST frontier (not in B, flagged): lever 4 (test-time surprise update on the tap's memory) — the
   actual Titans core. Only if B3/B4 plateau.
+
+## Cross-base / translator: HYBRID bases are a SPECIAL CASE (design constraint, 2026-07-11)
+The 1c findings force a rethink of the translator (`recall_v1.py`, T8/#13, "Titans for everyone"):
+- **Injection must be TYPE-matched across bases, not depth-matched.** Qwen3.5 is a HYBRID (24 GDN +
+  8 full-attn at [3,7,11,15,19,23,27,31]); residual ripples BEST at a GDN layer (L12=0.31 > full-attn
+  L11=0.21). The residual statistics + integration behaviour differ by pathway type, so a memory
+  trained to inject at a GDN layer of base-1 can't be affine-translated to an arbitrary depth of
+  base-2 — it must map GDN→GDN, full-attn→full-attn. A hybrid→standard-transformer transfer (no GDN
+  layers on the target) has NO type-match for the GDN-layer memory → degraded or needs a different
+  injection point.
+- **The translator likely needs per-pathway parameters** (a GDN-layer translator vs a full-attn-layer
+  translator), not one affine map — because the two pathways carry the edit differently.
+- **GDN-STATE memory (Priority-2 frontier) is NON-PORTABLE** to non-GDN targets: the recurrent state is
+  a GDN-architecture-specific object; a standard transformer has no equivalent. If GDN-state injection
+  wins, cross-base transfer to a non-hybrid target would need a wholly different target-side mechanism.
+- ⇒ TREAT HYBRID BASES AS A DISTINCT TRANSLATOR CASE. Does NOT block the current single-base
+  experiments; MUST be handled before the cross-base ("any base") promise. Flag on T8/#13.

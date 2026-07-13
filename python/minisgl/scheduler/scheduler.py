@@ -79,10 +79,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self.engine.gdn_state is not None or self.engine.cca_state is not None
         )
         self._rec_radix = False
-        # Recurrent radix is gated to the plain (synchronous normal-loop) serve path: spec-decode and
-        # expert-parallelism run their own dedicated loops and already manipulate the recurrent state
-        # (spec verify-state install), an untested interaction — force naive there.
-        _rec_radix_ok = self.engine.spec_config is None and not self.engine.enable_ep
+        # Recurrent radix COMPOSES with expert-parallelism: EP's ep_loop runs the SAME shared prep path
+        # as the normal loop — _finish_prepare (recurrent-state RESTORE) + _process_last_data /
+        # _free_req_resources (SNAPSHOT) — and it is synchronous (the ordering the snapshot needs). EP
+        # shards only the MoE experts; the CCA/GDN recurrent state is DP-local and untouched by EP, so
+        # the per-replica snapshots/restores stay consistent (EP-over-TP ranks run lockstep-identical
+        # batches). Spec-decode is DIFFERENT and stays gated: it runs its OWN decode-time snapshot/
+        # restore over the same recurrent state (verify-state install) with prompt-dependent
+        # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
+        _rec_radix_ok = self.engine.spec_config is None
         if has_recurrent_state and cache_type != "naive":
             if config.gdn_radix and _rec_radix_ok:
                 self._rec_radix = True
@@ -94,7 +99,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             else:
                 why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
                 if config.gdn_radix and not _rec_radix_ok:
-                    why = "recurrent radix is not supported with spec-decode / expert-parallelism"
+                    why = "recurrent radix is not supported with spec-decode (both snapshot the recurrent state)"
                 logger.warning_rank0(
                     f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
                     + why
@@ -291,6 +296,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # request, so a plain serve never imports xgrammar. uid -> live GrammarMatcher.
         self._grammar_backend = None
         self._grammar_matchers: dict[int, object] = {}
+        # Recurrent radix: in-flight recurrent-state checkpoints keyed by uid -> (page-aligned boundary,
+        # cloned slot state). Stashed when a sequence's prefill crosses a page boundary (the slot then
+        # holds state@boundary EXACTLY), and attached to the align_down radix node when its prefix is
+        # inserted (tail/finish commit). Decouples "capture the aligned state" from "a node exists to
+        # hang it on", and avoids mutating pages on a chunk commit. Popped on attach / free / abort.
+        self._pending_rec_snap: dict[int, tuple[int, object]] = {}
         # Reasoning + structured output: while a constrained req is still inside its `<think>…</think>`
         # reasoning span, the grammar matcher must NOT advance or mask (else the JSON schema suppresses
         # the reasoning phase → truncated / CoT-leaked answers). uid -> think-close token id, present
@@ -334,7 +345,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
-        logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        # debug, not info: this fires every idle loop and otherwise floods the log (drowning e.g. the
+        # [rsa-timing] breakdown). Enable debug logging if you want the idle heartbeat back.
+        logger.debug_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
@@ -525,6 +538,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
+                    # Recurrent radix: a chunk that just committed a page-aligned prefix left the slot
+                    # holding state@boundary EXACTLY (complete_one advanced req.cached_len to the chunk
+                    # end, which the forced page-aligned split keeps on a page multiple). Clone + stash
+                    # it now; it attaches to the node@boundary when this sequence's prefix is inserted
+                    # (tail/finish commit). No cache_req here → no page/handle mutation on the chunk.
+                    if self._rec_cache is not None:
+                        self._stash_rec_state(req)
                     continue
                 next_token = next_tokens_cpu[i]
                 # #100 POINTER delivery: for the first len(obj) steps, OVERRIDE the sampled token with the
@@ -637,6 +657,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release the structured-output grammar matcher + reasoning gate/budget (idempotent).
         self._grammar_matchers.pop(req.uid, None)
         self._clear_think_gate(req.uid)
+        # Drop any un-attached recurrent-state checkpoint (idempotent; frees the cloned slot state).
+        self._pending_rec_snap.pop(req.uid, None)
 
     def _restore_rec_states(self, batch: Batch) -> None:
         """Install cached recurrent-state snapshots into the slots of prefill reqs that hit the
@@ -660,63 +682,48 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"cached_len={req.cached_len} (skips re-prefill of the shared prefix)"
                 )
 
-    def _maybe_capture_rec_state(self, req: Req, handle) -> None:
-        """Snapshot a sequence's recurrent state at a page-aligned prefix-commit boundary and attach it
-        to the inserted radix node, so a later request that shares this prefix restores it instead of
-        re-prefilling. Guard: only when the committed length is page-aligned (so the slot state
-        corresponds to the node boundary EXACTLY — the losslessness precondition) and the slot is still
-        live. Runs at synchronous commit points (recurrent radix forces the non-overlap loop), so the
-        slot holds this req's post-forward state with no in-flight advance."""
-        if self._rec_cache is None or handle is None:
-            return
+    def _stash_rec_state(self, req: Req) -> None:
+        """Checkpoint a sequence's recurrent state at a page-aligned prefill boundary. Called at a
+        chunk commit, when complete_one has set req.cached_len to the (forced page-aligned) chunk end
+        and the slot holds state@that-boundary EXACTLY. We clone the slot and stash it by uid; it is
+        attached to the align_down radix node when this sequence's prefix is later inserted (tail /
+        finish commit). Overwriting a prior stash is correct — only the DEEPEST boundary matches the
+        single node the eventual insert creates (align_down of the full committed length)."""
         cached_len = req.cached_len
         if cached_len == 0 or (cached_len % self.cache_manager.page_size) != 0:
             return
         slot = self._rec_slots.slot_for(req.uid)
         if slot is None:
             return
-        snap = self._rec_cache.clone_slot(slot)
-        self.cache_manager.attach_rec_state(handle, snap)
-
-    def _restore_rec_states(self, batch: Batch) -> None:
-        """Install cached recurrent-state snapshots into the slots of prefill reqs that hit the
-        recurrent radix. Only reqs with a snapshot (cache_handle.rec_state) and cached_len>0 restore;
-        everyone else keeps their zeroed/continuation slot untouched."""
-        for req in batch.reqs:
-            handle = getattr(req, "cache_handle", None)
-            rec_state = getattr(handle, "rec_state", None)
-            if rec_state is None or req.cached_len == 0:
-                continue
-            # Restore ONLY on the initial prefix-hit pass (req.cached_len == the matched boundary). A
-            # chunked continuation carries the SAME handle but a larger cached_len; re-restoring there
-            # would clobber the state advanced by earlier chunks.
-            if req.cached_len != handle.cached_len:
-                continue
-            slot = self._rec_slots.slot_for(req.uid)
-            if slot is not None:
-                self._rec_cache.load_slot(slot, rec_state)
-                logger.info_rank0(
-                    f"recurrent-radix HIT: uid={req.uid} restored recurrent state at "
-                    f"cached_len={req.cached_len} (skips re-prefill of the shared prefix)"
-                )
+        self._pending_rec_snap[req.uid] = (cached_len, self._rec_cache.clone_slot(slot))
 
     def _maybe_capture_rec_state(self, req: Req, handle) -> None:
-        """Snapshot a sequence's recurrent state at a page-aligned prefix-commit boundary and attach it
-        to the inserted radix node, so a later request that shares this prefix restores it instead of
-        re-prefilling. Guard: only when the committed length is page-aligned (so the slot state
-        corresponds to the node boundary EXACTLY — the losslessness precondition) and the slot is still
-        live. Runs at synchronous commit points (recurrent radix forces the non-overlap loop), so the
-        slot holds this req's post-forward state with no in-flight advance."""
+        """Attach a page-aligned recurrent-state checkpoint to the freshly-inserted radix node so a
+        later request sharing this prefix restores it instead of re-prefilling. The node's boundary is
+        handle.cached_len (insert_prefix already align_down's), and the losslessness precondition is
+        that the attached state be exactly state@boundary. Two sources, in order:
+          1. A stash from _stash_rec_state at that boundary (the common path — the forced page-aligned
+             split leaves the sub-page tail unaligned, so the aligned state lives in the stash).
+          2. Fallback: the req's own committed length is itself page-aligned and equals the node
+             boundary, so the live slot holds state@boundary directly (e.g. a prompt whose length is a
+             page multiple, no split needed)."""
         if self._rec_cache is None or handle is None:
             return
-        cached_len = req.cached_len
-        if cached_len == 0 or (cached_len % self.cache_manager.page_size) != 0:
+        boundary = handle.cached_len
+        if boundary == 0:
+            return
+        stash = self._pending_rec_snap.get(req.uid)
+        if stash is not None and stash[0] == boundary:
+            self.cache_manager.attach_rec_state(handle, stash[1])
+            self._pending_rec_snap.pop(req.uid, None)
+            return
+        # Fallback: no stash at this boundary, but the live slot IS at the boundary (aligned commit).
+        if req.cached_len != boundary or (boundary % self.cache_manager.page_size) != 0:
             return
         slot = self._rec_slots.slot_for(req.uid)
         if slot is None:
             return
-        snap = self._rec_cache.clone_slot(slot)
-        self.cache_manager.attach_rec_state(handle, snap)
+        self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
@@ -860,9 +867,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if not any(r.sampling_params.is_constrained for r in reqs):
             return None
         if self._grammar_backend is None:
-            from minisgl.engine.grammar import GrammarBackend
+            try:
+                from minisgl.engine.grammar import GrammarBackend
 
-            self._grammar_backend = GrammarBackend(self.tokenizer, self.engine.sampler.vocab_size)
+                self._grammar_backend = GrammarBackend(self.tokenizer, self.engine.sampler.vocab_size)
+            except Exception as e:  # noqa: BLE001
+                # A missing/broken grammar backend (e.g. xgrammar not installed) must NOT crash the
+                # serve. Latch a False sentinel (so we don't retry every batch) and fall back to
+                # UNCONSTRAINED decoding for structured requests, with one clear warning.
+                self._grammar_backend = False
+                logger.warning_rank0(
+                    "structured output requested but the grammar backend is unavailable (%r); serving "
+                    "these requests UNCONSTRAINED. Install xgrammar in the serve image to enable it.", e
+                )
+        if self._grammar_backend is False:
+            return None  # unconstrained fallback; every row stays all-ones (no mask)
         backend = self._grammar_backend
         bitmask = backend.allocate_bitmask(len(reqs))
         bitmask.fill_(-1)  # all-ones default => unconstrained / dummy rows allow every token

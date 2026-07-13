@@ -59,9 +59,17 @@ class InProcessBackendClient(BackendClient):
         ignore_eos: bool = False,
         stop: Optional[List[str]] = None,
         max_retries: int = 1,
+        grammar: Optional[str] = None,
+        tools: Optional[List[dict]] = None,
+        chat_template_kwargs: Optional[dict] = None,
+        think_close_delim: Optional[str] = None,
+        think_budget: Optional[int] = None,
     ) -> Optional[Candidate]:
         """One chat generation through the in-process engine. Returns None on
-        permanent failure (RSA tolerates dropped rollouts)."""
+        permanent failure (RSA tolerates dropped rollouts). The structured knobs
+        (grammar/tools/chat_template_kwargs/think_*) let the RSA lane honor
+        response_format / json_schema / tools / thinking-mode exactly like the plain
+        /v1/chat/completions lane — same SamplingParams + TokenizeMsg fields."""
         state = self._state
         attempt = 0
         while True:
@@ -72,6 +80,8 @@ class InProcessBackendClient(BackendClient):
                         uid=uid,
                         # list of {role, content}; the tokenizer applies the chat template
                         text=messages,
+                        tools=tools,
+                        chat_template_kwargs=chat_template_kwargs,
                         sampling_params=SamplingParams(
                             temperature=temperature,
                             top_p=top_p,
@@ -79,23 +89,33 @@ class InProcessBackendClient(BackendClient):
                             ignore_eos=ignore_eos,
                             max_tokens=max_tokens,
                             stop=list(stop) if stop else [],
+                            grammar=grammar,
+                            think_close_delim=think_close_delim,
+                            think_budget=think_budget,
                         ),
                     )
                 )
                 text = ""
+                comp_tokens = prompt_tokens = 0
+                finish_reason = "stop"
                 # Do NOT break on `finished`: letting wait_for_ack run to its natural
                 # StopAsyncIteration is what triggers its del ack_map/event_map[uid]
                 # cleanup. A manual early break would leak one entry per rollout across
                 # the N*T+ generations a single RSA call issues.
                 async for ack in state.wait_for_ack(uid):
                     text += ack.incremental_output
+                    # Capture real token accounting + the stop/length split from the acks
+                    # (same fields the plain /v1/chat/completions lane reads) so RSA usage
+                    # isn't blind and selection can prefer a genuine "stop" finish.
+                    comp_tokens = max(comp_tokens, ack.completion_tokens)
+                    prompt_tokens = ack.prompt_tokens or prompt_tokens
+                    if ack.finish_reason:
+                        finish_reason = ack.finish_reason
                 return Candidate(
                     text=text,
-                    # the front-end UserReply carries no stop/length split; default to
-                    # "stop" (selection only prefers, never requires, a "stop" finish).
-                    finish_reason="stop",
-                    prompt_tokens=0,
-                    completion_tokens=0,
+                    finish_reason=finish_reason,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=comp_tokens,
                 )
             except Exception as e:  # noqa: BLE001 - mirror the HTTP client's resilience
                 state.ack_map.pop(uid, None)
