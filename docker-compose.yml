@@ -276,4 +276,11 @@ services:
           --disable-pynccl \
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.9}" \
+          --rsa-n "${MINISGL_RSA_N:-4}" \
+          --rsa-t "${MINISGL_RSA_T:-1}" \
+          --rsa-think-budget "${MINISGL_RSA_THINK_BUDGET:-512}" \
+          --rsa-max-tokens "${MINISGL_RSA_MAX_TOKENS:-1024}" \
+          --rsa-agg-max-tokens "${MINISGL_RSA_AGG_MAX_TOKENS:-640}" \
+          --rsa-tail-tokens "${MINISGL_RSA_TAIL_TOKENS:-2048}" \
+          --rsa-top-p "${MINISGL_RSA_TOP_P:-0.95}" \
           ${MINISGL_EXTRA_ARGS:---enable-ep}
