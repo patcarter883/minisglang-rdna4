@@ -53,7 +53,12 @@ class ReasoningParser:
         """
         if not text or self.end_token not in text:
             return None, text
-        pre, _, post = text.partition(self.end_token)
+        # Split on the LAST close tag, not the first: a model (esp. after a β-forced </think> in RSA)
+        # may RE-OPEN <think>…</think> before its final answer. rpartition keeps ALL reasoning — the
+        # original span plus any re-opened blocks — in reasoning_content and leaves only the final
+        # answer as content, so the visible response never looks like leftover thinking. Identical to
+        # partition for the normal single-</think> case.
+        pre, _, post = text.rpartition(self.end_token)
         # If the model echoed an opening <think> (some do), keep only what follows it.
         if self.start_token and self.start_token in pre:
             pre = pre.split(self.start_token, 1)[-1]

@@ -197,6 +197,18 @@ def _grammar_think_gate_delim(req: "OpenAICompletionRequest") -> str | None:
     return parser.end_token
 
 
+def _reasoning_close_delim(req: "OpenAICompletionRequest") -> str | None:
+    """The reasoning parser's close delimiter (e.g. "</think>") when thinking is active — UNCONDITIONAL,
+    unlike `_grammar_think_gate_delim` which returns it only for grammar-constrained requests. RSA uses
+    this to β-bound reasoning on EVERY rollout (the exploration rollouts are grammar-free), so the
+    scheduler force-closes </think> at the budget and each rollout yields an answer instead of running
+    reasoning to max_tokens. None when thinking is off or no reasoning parser is configured."""
+    if not _thinking_active(req):
+        return None
+    parser = _reasoning_parser()
+    return parser.end_token if parser is not None else None
+
+
 def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
     """Per-request reasoning-token budget for the think-gate backstop, or None to use the server's
     MINISGL_THINK_BUDGET default. Precedence: explicit `reasoning_max_tokens` > the same key inside
@@ -372,8 +384,10 @@ async def _cam_auto_write(text: str) -> None:
 # (ZAYA/Zyphra). Inner formats we parse:
 #   (A) Hermes JSON:  {"name": "fn", "arguments": {"k": v}}
 #   (B) Qwen3 XML:    <function=fn><parameter=k>v</parameter></function>  (ZAYA nests this in its wrapper)
+_TOOL_WRAPPERS = ("zyphra_tool_call", "tool_call", "tools")
 _TOOL_CALL_BLOCK_RE = re.compile(
-    r"<(?:zyphra_)?tool_call>\s*(.*?)\s*</(?:zyphra_)?tool_call>", re.DOTALL
+    r"<(?:" + "|".join(_TOOL_WRAPPERS) + r")>\s*(.*?)\s*</(?:" + "|".join(_TOOL_WRAPPERS) + r")>",
+    re.DOTALL,
 )
 # A bare `<function=…></function>` block (Qwen3 XML emitted WITHOUT a `<tool_call>` wrapper). Kept in
 # lock-step with the streaming parser, which also accepts the unwrapped opener.
@@ -447,10 +461,11 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
 # the parser degrades to whatever the model actually emits. Detection mirrors the reasoning streamer:
 # text before any opener flows through as `content`; once inside a block the markup is withheld and,
 # on the closing tag, re-emitted as OpenAI streaming `delta.tool_calls`.
-_TOOL_OPENERS = ("<tool_call>", "<zyphra_tool_call>", "<function=")
+_TOOL_OPENERS = ("<tool_call>", "<zyphra_tool_call>", "<tools>", "<function=")
 _TOOL_CLOSERS = {
     "<tool_call>": "</tool_call>",
     "<zyphra_tool_call>": "</zyphra_tool_call>",
+    "<tools>": "</tools>",
     "<function=": "</function>",
 }
 
@@ -500,7 +515,7 @@ class ToolCallStreamState:
         self.emitted = False     # any tool call emitted -> finish_reason becomes "tool_calls"
 
     def _parse_block(self, block: str) -> Tuple[str, dict] | None:
-        if self.opener in ("<tool_call>", "<zyphra_tool_call>"):
+        if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
             closer = _TOOL_CLOSERS[self.opener]
             inner = block[len(self.opener):-len(closer)]
             return _parse_one_tool_call(inner)
@@ -865,7 +880,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 chat_template_kwargs=_resolve_chat_template_kwargs(req),
                 grammar=_grammar_from_response_format(req.response_format),
                 tools=_tools_for_template(req),
-                think_close_delim=_grammar_think_gate_delim(req),
+                # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
+                # grammar-free rollout, not just the structured final answer.
+                think_close_delim=_reasoning_close_delim(req),
                 think_budget=_resolve_think_budget(req),
             )
         except RSAError as e:
@@ -913,6 +930,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 "k": rsa_params.k,
                 "t": rsa_params.t,
                 "tail_tokens": rsa_params.tail_tokens,
+                "think_budget": rsa_params.think_budget,
                 "temperature": rsa_params.temperature,
                 "top_p": rsa_params.top_p,
                 "top_k": rsa_params.top_k,
