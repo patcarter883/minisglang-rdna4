@@ -1,0 +1,69 @@
+# minisglang-rdna4 — turnkey serving compose for AMD RDNA4 (gfx1201 / Radeon RX 9070 / 9070 XT).
+#
+# This pulls the PREBUILT image (engine + custom HIP kernels baked in) from GHCR — no build step,
+# no cloning of the kernels repo. Point it at any Hugging Face model id (or a local path) and it
+# serves an OpenAI-compatible API on http://localhost:1919/v1.
+#
+#   MODEL=Qwen/Qwen3-4B docker compose -f docker-compose.example.yml up
+#
+# See docs/SERVING.md for the full guide (prerequisites, model recipes, TP=2, troubleshooting).
+
+services:
+  minisglang:
+    image: ${MINISGL_IMAGE:-ghcr.io/patcarter883/minisglang-rdna4:latest}
+    container_name: minisglang
+    restart: unless-stopped
+
+    # --- AMD ROCm GPU passthrough (required — without these torch sees no HIP GPU and boot fails) ---
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add: [video]
+    security_opt: [seccomp=unconfined, label=disable]
+    cap_add: [SYS_PTRACE]
+    ipc: host
+    shm_size: "16gb"
+
+    ports:
+      - "${PORT:-1919}:1919"
+
+    volumes:
+      # Hugging Face model/download cache. A named volume "just works" with zero host setup and
+      # persists pulled weights across restarts. To reuse an existing host cache instead, replace
+      # this line with:  - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - hf-cache:/root/.cache/huggingface
+      # To serve a model from local disk, uncomment and set MODEL=/models/<your-model-dir>:
+      # - /path/to/your/models:/models:ro
+
+    environment:
+      # Allow first-run downloads from Hugging Face. The image bakes HF_HUB_OFFLINE=1 for pre-cached
+      # boxes; a fresh install needs it OFF to pull the model. Set an HF_TOKEN for gated models.
+      HF_HUB_OFFLINE: "0"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      # Fragmentation guard for graph capture on 16 GB cards.
+      PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+      # Multi-GPU / APU boxes: pin which card(s) to use (0-based over the DISCRETE GPUs). Leave unset
+      # to let ROCm see every GPU. On systems with an integrated GPU you usually want to pin the
+      # discrete card, e.g. HIP_VISIBLE_DEVICES=0.
+      HIP_VISIBLE_DEVICES: "${HIP_VISIBLE_DEVICES:-}"
+
+    # Sensible single-card defaults. Override any of MODEL / TP / MEM_RATIO / GRAPH_BS / EXTRA_ARGS
+    # from your shell or a .env file. See docs/SERVING.md for TP=2 and quantized-MoE recipes.
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MODEL:-Qwen/Qwen3-4B}" \
+          --host 0.0.0.0 --port 1919 \
+          --tensor-parallel-size "${TP:-1}" \
+          --cache-type radix \
+          --page-size 16 \
+          --attention-backend "${ATTN_BACKEND:-auto}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${GRAPH_BS:-8}" \
+          --memory-ratio "${MEM_RATIO:-0.8}" \
+          --reasoning-parser "${REASONING_PARSER:-auto}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
+volumes:
+  hf-cache:

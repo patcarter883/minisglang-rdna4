@@ -95,13 +95,23 @@ for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_
     __import__(m); print("ok import", m)
 PY
 
-# /opt/kernels first so the canonical builds are authoritative; the engine source is mounted at
-# /engine by compose (PYTHONPATH prepended there). ROCm serve needs the RCCL-via-torch path.
-ENV PYTHONPATH=/opt/kernels \
+# --- bake the engine source so the image is SELF-CONTAINED (turnkey `docker compose up`) ----------
+# The internal dev compose hot-mounts the repo at /engine and prepends /engine/python to PYTHONPATH
+# (edit-and-restart). But the PUBLIC prebuilt image must run with NO source mount and NO repo clone,
+# so we also COPY the engine into the image at /opt/minisgl/python and put it on the DEFAULT
+# PYTHONPATH below. A dev mount that overrides PYTHONPATH still wins; the baked copy is the fallback.
+# .dockerignore (see the repo) already strips __pycache__/*.so/logs from this COPY.
+COPY python /opt/minisgl/python
+
+# /opt/kernels first so the canonical builds are authoritative, then the baked engine. The dev
+# compose OVERRIDES PYTHONPATH to /opt/kernels:/engine/python:/engine (mounted source + the 3
+# not-yet-canonical vendored kernels); the default below is what the turnkey image runs with.
+# ROCm serve needs the RCCL-via-torch path.
+ENV PYTHONPATH=/opt/kernels:/opt/minisgl/python \
     PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
     TORCH_BLAS_PREFER_HIPBLASLT=0
 
 EXPOSE 1919
-WORKDIR /engine
+WORKDIR /opt/minisgl
 CMD ["python", "-m", "minisgl", "--help"]
