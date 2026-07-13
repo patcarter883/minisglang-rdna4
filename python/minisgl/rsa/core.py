@@ -526,7 +526,8 @@ async def _select(
     chosen = rng.sample(population, k=min(params.k, len(population)))
     tails = await _tails_for(client, chosen, params)
     msgs = prompts.build_final_selection_messages(
-        query, [tails[id(c)] for c in chosen], request_system
+        query, [tails[id(c)] for c in chosen], request_system,
+        for_tools=tools is not None,
     )
     final = await client.complete(
         msgs,
@@ -549,4 +550,8 @@ async def _select(
     if final is None:
         return rng.choice(population).text, "sample", None
     usage.add(final)
+    logger.info(
+        "[rsa-timing] final-aggregation gen: %d prompt + %d completion tok, finish=%s, structured=%s",
+        final.prompt_tokens, final.completion_tokens, final.finish_reason, structured,
+    )
     return final.text, ("structured_aggregation" if structured else "final_aggregation"), None
