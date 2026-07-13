@@ -92,6 +92,11 @@ class InProcessBackendClient(BackendClient):
                             grammar=grammar,
                             think_close_delim=think_close_delim,
                             think_budget=think_budget,
+                            # RSA rollouts/aggregation are ephemeral: their unique generations are never
+                            # reused, so don't insert them into the prefix cache (avoids polluting the
+                            # radix + inflating KV; finished rollouts release cleanly). The shared prompt
+                            # prefix is still cached at prefill for cross-rollout reuse.
+                            cache_output=False,
                         ),
                     )
                 )
