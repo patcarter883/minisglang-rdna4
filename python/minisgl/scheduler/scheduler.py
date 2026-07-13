@@ -852,6 +852,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._grammar_think_count[uid] = 0
         per_req = getattr(req.sampling_params, "think_budget", None)
         budget = per_req if (isinstance(per_req, int) and per_req > 0) else self._grammar_think_budget_default
+        # Reserve room for the ANSWER: if the reasoning budget is >= this request's whole completion
+        # budget, force-closing </think> would land exactly at max_tokens and truncate before any
+        # answer. Cap the budget to ~3/4 of max_tokens so the answer always has space.
+        mt = int(getattr(req.sampling_params, "max_tokens", 0) or 0)
+        if mt > 0 and budget >= mt:
+            budget = max(1, (mt * 3) // 4)
         self._grammar_think_budget[uid] = budget
 
     def _clear_think_gate(self, uid: int) -> None:

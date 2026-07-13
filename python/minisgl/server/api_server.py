@@ -971,7 +971,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
-                think_close_delim=_grammar_think_gate_delim(req),
+                # UNCONDITIONAL close delim (was grammar-only): β-bounds reasoning on the PLAIN lane
+                # too, so a thinking request without response_format can't run reasoning to max_tokens
+                # and truncate with no answer. For grammar requests this is the same delim (it also
+                # gates the schema until </think>); for plain thinking it's a pure backstop.
+                think_close_delim=_reasoning_close_delim(req),
                 think_budget=_resolve_think_budget(req),
             ),
         )

@@ -68,9 +68,40 @@ higher C costs more compute per candidate but caches better.
 
 ## Server defaults
 
-Set fleet-wide defaults with `--rsa-n / --rsa-k / --rsa-t / --rsa-tail-tokens / --rsa-think-budget /
---rsa-max-tokens / --rsa-agg-max-tokens` (or `MINISGL_THINK_BUDGET` for the global β fallback). Any
-per-request `rsa` field overrides them.
+The **`Default` column above is the library/paper default (N=16, C=4, T=2, τ=4096, β=1024)** — the
+ZAYA-report max-quality config. This 16 GB / DP=2 deployment intentionally serves a **lighter,
+concurrency-safe default** (the paper config OOMs the box under load and is slow for routine work):
+
+| Knob | This deployment | Paper/library |
+|------|-----------------|---------------|
+| N (`n`) | **4** | 16 |
+| T (`t`) | **1** | 2 |
+| β (`think_budget`) | **512** | 1024 |
+| `max_tokens` (rollout) | **1024** | 8192 |
+| `agg_max_tokens` | **640** | `max_tokens` |
+| τ (`tail_tokens`) | **2048** | 4096 |
+| `top_p` | **0.95** | 1.0 |
+
+> **`top_p=0.95`** is deliberate: ZAYA is a verbose reasoning model and at `top_p=1.0` its rollouts
+> wander into never-EOS runaways that burn the whole budget (slow + truncated). 0.95 lets them stop
+> naturally. β also caps reasoning at ¾ of `max_tokens` so the answer always has room.
+
+> ## ⚠️ For JSON / structured output, you MUST pass `response_format`
+> Asking for JSON only in the system prompt ("Return ONLY valid JSON…") is **not reliable** — a
+> reasoning model rambles and never commits clean JSON (this was the classifier bug). Pass
+> `response_format: {type:"json_schema", json_schema:{…}}` so the **final** answer is grammar-
+> constrained to your schema. RSA rollouts stay free-form for exploration; only the final answer is
+> constrained. Validated: RSA + `response_format` → valid JSON; RSA + prose-only → rambling prose.
+
+Rationale: at N=4, 25 concurrent requests = 100 rollouts, which fits the 128 decode slots
+(`max_running_req=64` × 2 DP replicas, all graph-captured up to bs=64) with no queueing and no OOM.
+**Override per request for hard problems** (e.g. `rsa:{n:16, t:2, think_budget:2048}`) — the
+per-request `rsa` field always wins.
+
+These are set on the serve command (`docker-compose.yml`) and are individually overridable by env:
+`MINISGL_RSA_N / _T / _THINK_BUDGET / _MAX_TOKENS / _AGG_MAX_TOKENS / _TAIL_TOKENS` (and the CLI flags
+`--rsa-n / --rsa-t / --rsa-k / --rsa-tail-tokens / --rsa-think-budget / --rsa-max-tokens /
+--rsa-agg-max-tokens`; `MINISGL_THINK_BUDGET` is the global β fallback).
 
 ## Quick recipes
 
