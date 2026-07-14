@@ -41,7 +41,10 @@ class LinearMethod(Protocol):
 
 
 class UnquantizedLinearMethod:
-    """bf16/f16 dense `F.linear` — the default, unchanged behavior."""
+    """bf16/f16 dense linear. Routes through the engine's M-invariant WMMA GEMM (layers/minv.py) so a
+    chunked / prefix-cached / spec-verify forward matches a fresh one bit-for-bit; falls back to
+    F.linear for dtypes/shapes/contexts the kernel doesn't cover (fp32, IN%16!=0, cudagraph capture).
+    This is the single chokepoint every unquantized Linear in every model flows through."""
 
     def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
         layer.weight = torch.empty(out_features, in_features)
@@ -49,7 +52,9 @@ class UnquantizedLinearMethod:
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
+        from minisgl.layers.minv import minv_linear
+
+        return minv_linear(x, layer.weight, bias)
 
 
 class W4A8LinearMethod:

@@ -95,7 +95,9 @@ class ParallelLMHead(VocabParallelEmbedding):
         would diverge and desync the verify batch (collective deadlock). Mirrors the all_gather in
         ``forward`` but keeps every row."""
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)  # [rows, vocab//tp]
+        from minisgl.layers.minv import minv_linear  # M-invariant so verify logits match decode
+
+        logits = minv_linear(x, module.weight, self.bias)  # [rows, vocab//tp]
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
@@ -116,7 +118,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        from minisgl.layers.minv import minv_linear  # M-invariant: verify(M=K+1) logits == decode(M=1)
+
+        logits = minv_linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
