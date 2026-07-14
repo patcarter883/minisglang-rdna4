@@ -292,6 +292,35 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Falls back to the host path for constrained/ddtree/FORCE_N0 batches. Default OFF.
         self._spec_ondevice = os.environ.get("MINISGL_SPEC_ONDEVICE") == "1"
 
+        # DFlash-drafter training-data CAPTURE (MINISGL_ZAYA_CAPTURE_DIR=<dir>): dump the target's aux
+        # taps + tokens per prefill position to seedbuf_<pid>_<n>.pt — the exact format
+        # train_cca_drafter.py --seed-dir ingests. This lets the drafter be re-distilled ON minisgl's
+        # OWN aux trajectory (the cross-engine fidelity fix: the drafter was OOD at 0.26 accept because
+        # it trained on vLLM-ZAYA aux). Teacher-forcing capture — the driver re-feeds prompt+greedy-
+        # continuation as one prefill; this hook forces the aux taps on and dumps every position. Serve
+        # with --cache-type naive so the re-fed text is a full prefill (naive.match_prefix returns no
+        # match -> no reuse; a radix hit would skip the forward -> no aux). Inert (a pure passthrough in
+        # _forward) when the env is unset.
+        self._capture_dir = os.environ.get("MINISGL_ZAYA_CAPTURE_DIR") or None
+        self._capture_buf: List[dict] = []
+        self._capture_n = 0
+        if self._capture_dir:
+            ids_env = os.environ.get("MINISGL_ZAYA_CAPTURE_LAYERS", "1,39,76")
+            self._capture_layer_ids = [int(x) for x in ids_env.split(",") if x.strip()]
+            if hasattr(self.engine.model, "set_capture_layers"):
+                os.makedirs(self._capture_dir, exist_ok=True)
+                self.engine.model.set_capture_layers(self._capture_layer_ids)
+                import atexit
+                atexit.register(self._flush_capture)
+                logger.info_rank0(
+                    f"DFlash CAPTURE on: aux layers {self._capture_layer_ids} -> {self._capture_dir}"
+                )
+            else:
+                logger.warning_rank0(
+                    "MINISGL_ZAYA_CAPTURE_DIR set but model has no set_capture_layers; capture OFF"
+                )
+                self._capture_dir = None
+
         # Structured-output (constrained decoding) state. Built lazily on the first constrained
         # request, so a plain serve never imports xgrammar. uid -> live GrammarMatcher.
         self._grammar_backend = None
@@ -1145,13 +1174,61 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.engine.cam is not None:
             self._stage_cam(batch)
-        forward_output = self.engine.forward_batch(batch, sample_args)
+        if self._capture_dir and batch.is_prefill and not getattr(batch, "spec_verify", False):
+            # DFlash training-data capture: prefill WITH aux (forces eager, no graph), dump per position.
+            out, _lh, aux = self.engine.forward_batch(batch, sample_args, return_hidden=True)
+            if aux is not None:
+                self._dump_capture(batch, aux)
+            forward_output = out
+        else:
+            forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
         # promoted into the decode running set (it would pollute every subsequent decode step).
         if track_reqs:
             self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _dump_capture(self, batch: Batch, aux_hidden: torch.Tensor) -> None:
+        """Buffer this prefill's per-position aux + token for DFlash re-distillation. aux_hidden is
+        [num_aux, T, hidden] over the batch rows (padded_reqs order, extend_len each). seed_in[j] =
+        concat of the num_aux layer taps at position j (the SAME order set_capture_layers used, so it
+        matches the drafter's fc input); bonus[j] = the token AT position j (teacher-forced input_ids);
+        pos[j] = absolute position; slot = uid (separates concurrent sequences for the trainer)."""
+        num_aux, _T, H = aux_hidden.shape
+        ids = batch.input_ids
+        positions = getattr(batch, "positions", None)
+        off = 0
+        seed_l, tok_l, pos_l, slot_l = [], [], [], []
+        for req in batch.padded_reqs:
+            ext = req.extend_len
+            uid = getattr(req, "uid", -1)
+            if uid is not None and uid >= 0:
+                sl = aux_hidden[:, off:off + ext]                              # [num_aux, ext, H]
+                seed_l.append(sl.permute(1, 0, 2).reshape(ext, num_aux * H).half().cpu())
+                tok_l.append(ids[off:off + ext].to(torch.long).cpu())
+                if positions is not None:
+                    pos_l.append(positions[off:off + ext].to(torch.long).cpu())
+                else:  # forward_batch already advanced cached_len by ext
+                    c0 = req.cached_len - ext
+                    pos_l.append(torch.arange(c0, c0 + ext, dtype=torch.long))
+                slot_l.append(torch.full((ext,), int(uid), dtype=torch.long))
+            off += ext
+        if seed_l:
+            self._capture_buf.append({
+                "seed_in": torch.cat(seed_l), "bonus": torch.cat(tok_l),
+                "pos": torch.cat(pos_l), "slot": torch.cat(slot_l),
+            })
+            if sum(int(r["bonus"].numel()) for r in self._capture_buf) >= 2048:
+                self._flush_capture()
+
+    def _flush_capture(self) -> None:
+        if not self._capture_buf:
+            return
+        path = os.path.join(self._capture_dir, f"seedbuf_{os.getpid()}_{self._capture_n:05d}.pt")
+        torch.save(self._capture_buf, path)
+        self._capture_n += 1
+        self._capture_buf = []
 
     # ===================================================================================
     # Speculative decoding (synchronous loop). See SPEC_DECODE.md for the full design.
