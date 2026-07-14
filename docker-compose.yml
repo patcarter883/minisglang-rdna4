@@ -73,6 +73,11 @@ x-lean-common: &lean-common
     # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
     # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
     MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
+    # TiDAR logit-mixing "Trust-Diffusion" verify (fused-TiDAR path only): verify each draft position
+    # against argmax(beta*p_ar + (1-beta)*R_i[0]). 1.0 (default) = the lossless-vs-AR-greedy path
+    # (bit-identical); beta<1.0 leans on the diffusion self-draft for higher acceptance but is NOT
+    # lossless. Inert for the non-TiDAR profiles here (they don't run the fused path). A tunable knob.
+    MINISGL_TIDAR_MIX_BETA: "${MINISGL_TIDAR_MIX_BETA:-1.0}"
     # torch.profiler window (diagnostic): MINISGL_PROFILE=<path under /engine> captures SKIP..SKIP+STEPS
     # forward/verify steps into a chrome trace. Inert unless set. Point at /engine/... so it lands in
     # the mounted worktree; name it *.pt.trace.json.gz so torch gzips it and TraceLens ingests it.
@@ -196,8 +201,17 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
           ${MINISGL_EXTRA_ARGS:-}
 
-  # Same Qwen3.6-35B-A3B-MXFP4 target, but DFlash block-diffusion spec-decode with a SEPARATE trained
-  # drafter (z-lab/Qwen3.6-35B-A3B-DFlash). K=15 = the drafter's block size (memory dflash-fullctx-fix).
+  # PRIMARY spec serve. Qwen3.6-35B-A3B-MXFP4 target + DFlash block-diffusion spec-decode with a
+  # SEPARATE trained drafter (z-lab/Qwen3.6-35B-A3B-DFlash). K=15 = the drafter's block size (memory
+  # dflash-fullctx-fix). DFlash's accept-len (~4.67) beats MTP's (~2) on this GDN+MoE target, so this
+  # is the throughput-preferred spec config when it fits.
+  # CONCURRENCY IS UNBLOCKED (2026-07-14): the TP>1 verify desync that GPU-faulted at bs>1 is FIXED —
+  # 65915b6 broadcasts rank0's drafts so every TP rank verifies the identical batch, and 98ea775 pads
+  # partial-K steps to uniform num_draft so they replay the GDN verify GRAPH instead of the eager path.
+  # DFlash-on-MoE at concurrency c~3-4 is the literature's winning spec regime (expert saturation makes
+  # the wide verify ~free); MAX_RUNNING defaults to 8 (c<=4 is graph-captured at GRAPH_BS=4, 5-8 eager
+  # but now crash-safe). GPU-VALIDATION of the concurrency fix is still pending; the throughput knee and
+  # the VRAM ceiling on 2x16GB want a measurement window before pushing MAX_RUNNING/GRAPH_BS higher.
   # MEMORY-RAZOR-THIN at TP=2/16GB: GRAPH_BS=4 MEM=0.80 boots; MEM>=0.82 or GRAPH_BS=8 runtime-OOMs the
   # GDN verify (continuance Gotcha). MINISGL_DFLASH_QUANT=fp8|int8 weight-only-quantizes the replicated
   # drafter to ~half if a bigger pair is needed; MINISGL_DFLASH_DDTREE=1 routes it through the draft-TREE

@@ -64,6 +64,11 @@ services:
       # TiDAR spec-decode: NON-FUSED (serving-viable) + segmented. FUSED=0 is the whole point.
       MINISGL_TIDAR_FUSED: "${MINISGL_TIDAR_FUSED:-0}"
       MINISGL_TIDAR_SEG: "${MINISGL_TIDAR_SEG:-1}"
+      # Logit-mixing "Trust-Diffusion" verify — only active on the FUSED path (FUSED=1). 1.0 (default)
+      # = lossless-vs-AR-greedy; beta<1.0 leans on the diffusion self-draft (higher accept, NOT
+      # lossless). Exposed for A/B: set FUSED=1 MINISGL_TIDAR_MIX_BETA=0.5 to test whether logit-mix
+      # rescues the fused path's acceptance (its all-mask replicas otherwise accept ~0.08).
+      MINISGL_TIDAR_MIX_BETA: "${MINISGL_TIDAR_MIX_BETA:-1.0}"
     entrypoint: ["bash", "-lc"]
     command:
       - |
