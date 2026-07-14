@@ -31,8 +31,12 @@ PROMPTS="${PROMPTS:-/home/pat/code/_capture_prompts.txt}"
 GENTOK="${GENTOK:-256}"
 WORKERS="${WORKERS:-16}"
 mkdir -p "$CAPDIR"
+CNAME="${LEASE_NAME:-dflash-cap}-cap"
+# Kill the container if THIS wrapper is signaled (TaskStop/Ctrl-C) — otherwise `docker run` can outlive
+# the bash and orphan a GPU-holding container after the lease already freed.
+trap 'docker rm -f "$CNAME" >/dev/null 2>&1 || true' EXIT INT TERM
 echo "[capture] HIP=${HIP_VISIBLE_DEVICES:-unset} ROCR=${ROCR_VISIBLE_DEVICES:-unset} -> $CAPDIR"
-docker run --rm \
+docker run --rm --name "$CNAME" \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
   --ipc host --shm-size 16gb \

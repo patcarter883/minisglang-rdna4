@@ -17,7 +17,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 echo "[samp-validate] HIP=${HIP_VISIBLE_DEVICES:-unset} ROCR=${ROCR_VISIBLE_DEVICES:-unset}"
-docker run --rm \
+CNAME="${LEASE_NAME:-samp-validate}-validate"
+trap 'docker rm -f "$CNAME" >/dev/null 2>&1 || true' EXIT INT TERM
+docker run --rm --name "$CNAME" \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
   --ipc host --shm-size 16gb \
