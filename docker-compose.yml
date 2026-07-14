@@ -245,11 +245,12 @@ services:
           ${MINISGL_EXTRA_ARGS:-}
 
   # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8 — NO TiDAR spec-decode. Runs as
-  # DP=2 replicas (one per gfx1201 card) with expert-parallel (EP shards experts across the pair),
-  # so it needs BOTH cards: lease -n 2. This is the validated base-zaya serve restored from git
-  # history (was migrated to the TiDAR variant in 2c58e2e; TiDAR block recoverable from there).
-  # Serves the standard checkpoint at /models/ZAYA1-8B-fp8; override with MINISGL_MODEL. EP is on by
-  # default via the EXTRA_ARGS fallback (set MINISGL_EXTRA_ARGS to override).
+  # DP=2 replicas (one per gfx1201 card), NO expert-parallel. Default checkpoint is the RXF 4-bit
+  # quant (ZAYA1-8B-RXF-h32): _RXFMoEMethod has no EP path, the ~5.7 GB 4-bit weights replicate fine
+  # per card, and DP-only avoids the EP all-to-all single-stream tax. Still needs BOTH cards (DP=2):
+  # lease -n 2. Register-direct RXF + the CCA fusions are default-on. Override with MINISGL_MODEL
+  # (e.g. /models/ZAYA1-8B-fp8 — but fp8 needs EP to fit, so also set MINISGL_EXTRA_ARGS=--enable-ep).
+  # (Base fp8+EP serve recoverable from git history; TiDAR variant in 2c58e2e.)
   #   gpu-lease -n 2 --detach --name minisgl-zaya -- docker compose --profile zaya up -d
   zaya:
     <<: *lean-common
@@ -281,7 +282,7 @@ services:
     command:
       - |
         exec python -m minisgl \
-          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-fp8}" \
+          --model "${MINISGL_MODEL:-/root/.cache/huggingface/ZAYA1-8B-RXF-h32}" \
           --host 0.0.0.0 --port 1919 \
           --cache-type radix \
           --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
@@ -297,4 +298,4 @@ services:
           --rsa-agg-max-tokens "${MINISGL_RSA_AGG_MAX_TOKENS:-640}" \
           --rsa-tail-tokens "${MINISGL_RSA_TAIL_TOKENS:-2048}" \
           --rsa-top-p "${MINISGL_RSA_TOP_P:-0.95}" \
-          ${MINISGL_EXTRA_ARGS:---enable-ep}
+          ${MINISGL_EXTRA_ARGS:-}
