@@ -65,8 +65,13 @@ def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
         return False
     if weight.shape[-1] % 16 != 0:  # IN must be WMMA-friendly (full-K reduction in 16-wide steps)
         return False
-    # A malloc (arange/route tensors) is illegal mid-capture; static-shape decode is self-consistent.
-    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+    # Under CUDA-graph capture we STILL use dense_gemm (the whole point of removing rocBLAS): its only
+    # allocations are F.pad + the output tensor, both via torch's caching allocator, which is capture-
+    # safe (the graph memory pool). The old F.linear fallback here reintroduced rocBLAS/hipblaslt AND
+    # faulted the spec-verify capture (hipblaslt's own workspace malloc is illegal mid-capture). Set
+    # MINISGL_MINV_CAPTURE=0 to restore the fallback if a capture regression appears.
+    if (os.environ.get("MINISGL_MINV_CAPTURE", "1") == "0"
+            and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
         return False
     return True
 
