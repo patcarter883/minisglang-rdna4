@@ -21,7 +21,7 @@ docker run --rm --name "$CNAME" \
   -e INIT="$INIT" -e OUT="$OUT" -e NUM_SPEC="$NUM_SPEC" -e EPOCHS="$EPOCHS" -e BATCH="$BATCH" \
   -v /home/pat/code/vllm-gfx1201-zaya-dflash:/trainrepo:ro \
   -v /home/pat/code/_models:/models_rw \
-  -v /home/pat/code/_dflash_capture_minisgl:/seedbuf:ro \
+  -v "${SEEDBUF_HOST:-/home/pat/code/_dflash_capture_minisgl}":/seedbuf:ro \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface:ro \
   --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" -lc '
     set -uo pipefail
