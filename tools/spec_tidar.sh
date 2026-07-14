@@ -78,12 +78,15 @@ echo "===== TiDAR (self-draft block-diffusion, num_draft=$NUM_DRAFT, FUSED=$FUSE
 boot tidar env MINISGL_SPEC_DEBUG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 MINISGL_TIDAR_FUSED="$FUSED" \
   MINISGL_TIDAR_FUSED_NOREP="${NOREP:-0}" MINISGL_ZAYA_OLDMOE="${OLDMOE:-0}" MINISGL_TIDAR_SEG="${SEG:-0}" \
   MINISGL_TIDAR_DUMP="${DUMP:-0}" MINISGL_TIDAR_PROFILE="${PROFILE:-0}" MINISGL_TIDAR_TIME="${TIME:-0}" \
-  MINISGL_ZAYA_W8A16="${W8A16:-0}" \
+  MINISGL_ZAYA_W8A16="${W8A16:-0}" MINISGL_TIDAR_MIX_BETA="${MIX:-1.0}" \
   python -m minisgl --spec-algorithm tidar --spec-num-draft "$NUM_DRAFT"
 probe "$OUTDIR/tidar.spec.json"
 echo "[tidar] acceptance:"; grep -E "\[spec\]" "$LOG" | tail -8 || echo "  (no [spec] lines)"; stop
 
 echo "===== DIFF baseline vs tidar (greedy must be prefix-exact -> LOSSLESS) ====="
+# NOTE: only the DEFAULT MIX=1.0 (pure-AR verify) is lossless. MIX<1.0 = logit-mixing "Trust-Diffusion"
+# verify, which is INTENTIONALLY not lossless vs base AR — a MISMATCH below is EXPECTED for MIX<1.0
+# (judge those runs by acceptance / tok-s / coherence, not this prefix gate).
 # Rigorous gate: the shorter output must be an EXACT PREFIX of the longer. A spec step emits up to
 # K+1 tokens at once, so with a fixed max_tokens the spec run can overshoot the exact token budget by
 # up to K (a longer identical tail) — that length delta is a harness boundary, NOT a divergence. A

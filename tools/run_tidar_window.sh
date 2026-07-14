@@ -16,7 +16,7 @@ docker run --rm \
   -e NUM_DRAFT="${NUM_DRAFT:-4}" -e MAXTOK="${MAXTOK:-64}" -e MEMRATIO="${MEMRATIO:-0.85}" \
   -e FUSED="${FUSED:-0}" -e NOREP="${NOREP:-0}" -e OLDMOE="${OLDMOE:-0}" -e SEG="${SEG:-0}" \
   -e DUMP="${DUMP:-0}" -e PROFILE="${PROFILE:-0}" -e TIME="${TIME:-0}" -e W8A16="${W8A16:-0}" \
-  -e GRAPH="${GRAPH:-0}" \
+  -e GRAPH="${GRAPH:-0}" -e MIX="${MIX:-1.0}" \
   -v "$PWD":/engine \
   -v /home/pat/code/_big:/big:ro \
   -v /home/pat/code/vllm-gfx1201/.triton-cache-combined:/triton-ro:ro \

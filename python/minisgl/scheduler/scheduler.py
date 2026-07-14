@@ -1744,6 +1744,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # the Step-0.5 cost pivot needs to know where the ~287ms/step goes. Syncs → adds overhead, so
         # a dedicated flag. Timestamps helper below.
         timeit = os.environ.get("MINISGL_TIDAR_TIME") == "1"
+        # MIX (MINISGL_TIDAR_MIX_BETA < 1.0): logit-mixing "Trust-Diffusion" verify (TiDAR paper
+        # §4.4.3 / Zyphra ZAYA1-8B-Diffusion's 7.7x sampler). Verify each draft position against
+        # argmax(beta*p_ar + (1-beta)*R_i[0]) instead of pure p_ar. beta=1.0 (default) == the current
+        # lossless-vs-AR-greedy path (bit-identical); beta<1.0 leans on the diffusion self-draft ->
+        # higher acceptance but NOT lossless vs base AR. norep has no replicas -> forced back to 1.0.
+        mix_beta = float(os.environ.get("MINISGL_TIDAR_MIX_BETA", "1.0"))
+        if norep:
+            mix_beta = 1.0
 
         def _tstamp():
             if timeit:
@@ -1901,6 +1909,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             lg = logits[off:off + n_query]
             off += n_query
             p_ar = lg[0:B + 1]                       # confirmed row + S rows -> predict positions c0..c0+B
+            if mix_beta < 1.0:
+                # Diffusion prediction of draft position i (conditioned on S[:i]) = R_i[0], the first
+                # token of replica R_i — same conditioning AND predicted position as p_ar[i] (§4.4.3,
+                # the "E->E''" case). Mix only the B draft rows; the bonus row (B) stays pure-AR.
+                if layout is not None:                                                  # segmented
+                    diff0 = lg[[layout["replica_rows"][r][1][0] for r in range(B)]]     # [B,V] = R_r[0]
+                else:                                                                   # flat
+                    diff0 = lg[B + 1:].reshape(B, B, vocab)[:, 0, :]                     # [B,V] = R_r[0]
+                p_ar = p_ar.clone()  # lg is a view into logits — don't write the forward output in place
+                p_ar[:B] = mix_beta * p_ar[:B] + (1.0 - mix_beta) * diff0
             target = p_ar.argmax(dim=-1).to(torch.int32).cpu().tolist()
             result = verify_greedy(drafts, target)  # emitted = drafts[:k] + bonus; num_accepted = k
             k = result.num_accepted
