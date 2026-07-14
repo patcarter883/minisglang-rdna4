@@ -98,6 +98,9 @@ class MHAKVCache(BaseKVCachePool):
         ks, vs = self.k_scale[layer_id], self.v_scale[layer_id]
 
         if _STORE_KV is not None and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16:
+            from minisgl._hip_engage import engaged
+
+            engaged("tail_hip.store_kv")
             _STORE_KV(
                 kv.contiguous(), vv.contiguous(), k_cache, v_cache, out_loc.to(torch.int32), ks, vs
             )

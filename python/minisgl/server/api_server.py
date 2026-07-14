@@ -1330,6 +1330,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
 
     logger.info(f"API server is ready to serve on {host}:{port}")
     if not run_shell:
-        uvicorn.run(app, host=host, port=port)
+        # uvicorn's per-request HTTP access log (one INFO line per POST /v1/... or /generate) is the
+        # ~200-lines-per-run noise; default it OFF. MINISGL_HTTP_ACCESS_LOG=1 re-enables it.
+        _access_log = os.environ.get("MINISGL_HTTP_ACCESS_LOG", "0") != "0"
+        uvicorn.run(app, host=host, port=port, access_log=_access_log)
     else:
         asyncio.run(shell())

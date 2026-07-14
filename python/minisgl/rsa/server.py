@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -307,7 +308,12 @@ def main() -> None:
         defaults=params_from_args(args),
     )
     app = create_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level)
+    # Per-request HTTP access log OFF by default (the ~200-lines-per-run noise); MINISGL_HTTP_ACCESS_LOG=1
+    # re-enables it.
+    _access_log = os.environ.get("MINISGL_HTTP_ACCESS_LOG", "0") != "0"
+    uvicorn.run(
+        app, host=config.host, port=config.port, log_level=config.log_level, access_log=_access_log
+    )
 
 
 if __name__ == "__main__":

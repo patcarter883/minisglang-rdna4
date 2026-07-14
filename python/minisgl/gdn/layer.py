@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from minisgl._hip_engage import engaged
+
 if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod
 
@@ -223,6 +225,7 @@ class QwenGatedDeltaNet(nn.Module):
         # core is a reshape of the gdn output, and z is a strided slice of the qkvz projection.
         core = core_attn_out.reshape(-1, core_attn_out.shape[-1]).contiguous()  # [n*HV, head_v_dim]
         z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+        engaged("gdn_hip.rmsnorm_gated")
         normed = gdn.rmsnorm_gated(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
         normed = normed.reshape(n, self.value_dim)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
         return self.out_proj(normed.to(out_dtype))
@@ -331,6 +334,7 @@ class QwenGatedDeltaNet(nn.Module):
         # in-register, so mixed_qkv/a/b/core/z flow through at the model dtype (no .float() HBM
         # round-trip). .contiguous() is still required — the conv kernel reads token-major contiguous,
         # and it also replaces the contiguity the old .float() copy used to provide for the views below.
+        engaged("gdn_hip.causal_conv1d_fwd")
         conv_out = gdn.causal_conv1d_fwd(
             mixed_qkv.contiguous(),
             self._conv_weights_fp32(),
@@ -353,6 +357,8 @@ class QwenGatedDeltaNet(nn.Module):
         q, k, v = self._split_conv_qkv(conv_out, n)
         prefill_op = gdn.gdn_prefill if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0" \
             else gdn.gdn_prefill_wmma
+        engaged("gdn_hip.gdn_prefill" if os.environ.get("GDN_HIP_WMMA_PREFILL") == "0"
+                else "gdn_hip.gdn_prefill_wmma")
         core = prefill_op(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
             query_start_loc, state_idx, has_init,
@@ -390,6 +396,7 @@ class QwenGatedDeltaNet(nn.Module):
         has_init = has_initial_state.to(torch.uint8)
 
         # Conv: bit-identical to forward_prefill's causal_conv1d_fwd, plus per-token window capture.
+        engaged("gdn_hip.causal_conv1d_fwd_verify")
         conv_out, conv_scratch = gdn.causal_conv1d_fwd_verify(
             mixed_qkv.contiguous(),
             self._conv_weights_fp32(),
@@ -405,6 +412,7 @@ class QwenGatedDeltaNet(nn.Module):
         # verify. Captures the ssm state after each token. (No WMMA path: the chunk-size dependence is
         # exactly the non-bit-exactness this kernel removes.)
         q, k, v = self._split_conv_qkv(conv_out, n)
+        engaged("gdn_hip.gdn_prefill_verify")
         core, ssm_scratch = gdn.gdn_prefill_verify(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
             query_start_loc, state_idx, has_init,
@@ -430,6 +438,7 @@ class QwenGatedDeltaNet(nn.Module):
         state_idx = state_indices.long()  # int32->int64 once, reused by both kernels below
 
         # One-step depthwise causal conv update (state roll) + SiLU; conv_state (fp32) in place.
+        engaged("gdn_hip.causal_conv1d_update")
         conv_out = gdn.causal_conv1d_update(
             mixed_qkv.contiguous(),  # bf16-native; .contiguous() supplies the token-major layout
             self._conv_weights_fp32(),
@@ -440,6 +449,7 @@ class QwenGatedDeltaNet(nn.Module):
         )
         # One-step gated-delta-rule (l2norm + g/beta folded in); ssm_state updated in place per slot.
         q, k, v = self._split_conv_qkv(conv_out, n)
+        engaged("gdn_hip.gdn_decode")
         core = gdn.gdn_decode(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
             ssm_state, state_idx, self.head_k_dim ** -0.5, 1,

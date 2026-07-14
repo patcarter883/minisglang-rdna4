@@ -24,23 +24,49 @@ ENABLED = os.environ.get("MINISGL_TAIL_HIP", "1") != "0"
 if ENABLED:
     import tail_hip
 
-    silu_and_mul = tail_hip.silu_and_mul
+    from minisgl._hip_engage import engaged as _engaged
+
+    # Wrap each native op in a thin per-op shim that fires `engaged("tail_hip.<op>")` on first call, so
+    # the [hip-engage] manifest distinguishes WHICH tail kernel fired (rms_norm vs rope vs silu_and_mul
+    # ...) instead of a single generic `tail_hip` line. The shim just tags + delegates (no dtype/shape
+    # handling — the callers already gate via active() and pass .contiguous() bf16 tensors).
+    _silu_and_mul = tail_hip.silu_and_mul
     # gelu_and_mul is OPTIONAL: the canonical rdna4-hip-kernels `tail` kernel is silu-only, so a
     # hard `tail_hip.gelu_and_mul` crashes the import on that image even for models that never use
     # gelu (e.g. ZAYA: silu experts + a plain torch F.gelu router). Bind it if present; activation.py
     # falls back to torch F.gelu when this is None, so a gelu-tail model still runs (just not native).
-    gelu_and_mul = getattr(tail_hip, "gelu_and_mul", None)
-    rms_norm = tail_hip.rms_norm
-    rms_norm_add = tail_hip.rms_norm_add
-    rope = tail_hip.rope
+    _gelu_and_mul = getattr(tail_hip, "gelu_and_mul", None)
+    _rms_norm = tail_hip.rms_norm
+    _rms_norm_add = tail_hip.rms_norm_add
+    _rope = tail_hip.rope
+
+    def silu_and_mul(*args, **kwargs):
+        _engaged("tail_hip.silu_and_mul")
+        return _silu_and_mul(*args, **kwargs)
+
+    def rms_norm(*args, **kwargs):
+        _engaged("tail_hip.rms_norm")
+        return _rms_norm(*args, **kwargs)
+
+    def rms_norm_add(*args, **kwargs):
+        _engaged("tail_hip.rms_norm_add")
+        return _rms_norm_add(*args, **kwargs)
+
+    def rope(*args, **kwargs):
+        _engaged("tail_hip.rope")
+        return _rope(*args, **kwargs)
+
+    if _gelu_and_mul is not None:
+        def gelu_and_mul(*args, **kwargs):
+            _engaged("tail_hip.gelu_and_mul")
+            return _gelu_and_mul(*args, **kwargs)
+    else:
+        gelu_and_mul = None
 
 
 def active(*tensors: torch.Tensor) -> bool:
     """True when the HIP path should run: enabled AND every tensor is bf16 (the kernels' only
     supported dtype). Contiguity is handled at the call site via ``.contiguous()`` (a no-op when
-    already contiguous), so it is not part of the gate."""
-    ok = ENABLED and all(t.dtype == torch.bfloat16 for t in tensors)
-    if ok:
-        from minisgl._hip_engage import engaged
-        engaged("tail_hip")
-    return ok
+    already contiguous), so it is not part of the gate. The per-op engaged() now lives in the op
+    shims above, so this gate no longer emits a generic `tail_hip` engage line."""
+    return ENABLED and all(t.dtype == torch.bfloat16 for t in tensors)
