@@ -11,11 +11,10 @@
 # MATCH it. (RXF ZAYA works now — the old "RXF serves garbage" handoff is obsolete.) W8A16 is an fp8-
 # only knob and is IGNORED on the RXF path.
 #
-# TOPOLOGY: this captures at TP=1 for one card. The serve runs DP=2+EP; EP's all_reduce reconstructs the
-# exact per-token MoE result and the router (expert SELECTION) is on the replicated gate, so TP=1 aux is
-# representative (fp8 base was byte-identical TP=1 vs DP+EP). For a byte-exact topology match, capture on
-# the DP=2 serve instead: add MINISGL_ZAYA_CAPTURE_DIR + --cache-type naive to the `zaya` compose profile
-# (the _forward capture hook fires in the EP loop's prefill too; both replicas dump, slot=uid separates).
+# TOPOLOGY: this captures at TP=1 for one card, and that is EXACT here — the serve runs DP=2 with NO EP
+# (compose da64b34), so each DP replica runs ALL experts locally and IS a full TP=1 model; DP just fans
+# requests across two identical replicas. So a TP=1 capture computes byte-identical aux to a serve
+# replica (no EP all_reduce, no expert sharding to reconcile). One card suffices.
 #
 # Launch under the shared lease (single card), foreground so the lease frees on exit:
 #   gpu-lease -n 1 -- bash tools/run_dflash_capture.sh
