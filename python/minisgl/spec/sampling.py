@@ -33,21 +33,23 @@ def probs_from_logits(
         out = torch.zeros_like(logits)
         out.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
         return out
-    logits = logits / temperature
     V = logits.shape[-1]
+    # Mirror engine/sample.py::sample_impl EXACTLY (the torch reference the fused HIP sampler matches):
+    # softmax(logits/T) -> top_k (rank mask, NO renorm) -> top_p (nucleus on the un-renormalized probs)
+    # -> normalize. Applying top_p to un-renormalized top_k probs is load-bearing: renormalizing between
+    # top_k and top_p shifts the nucleus and skews the distribution (caught by validate_sampled_spec).
+    probs = torch.softmax(logits / temperature, dim=-1)
     if top_k and 0 < top_k < V:
-        kth = torch.topk(logits, top_k, dim=-1).values[..., -1:]  # kth-largest per row
-        logits = logits.masked_fill(logits < kth, float("-inf"))
-    probs = torch.softmax(logits, dim=-1)
+        sp, si = torch.sort(probs, descending=True, dim=-1)
+        ranks = torch.arange(V, device=probs.device).expand_as(sp)
+        sp = sp.masked_fill(ranks >= top_k, 0.0)  # keep exactly the top_k by RANK (matches _apply_top_k)
+        probs = torch.zeros_like(probs).scatter_(-1, si, sp)
     if top_p and 0.0 < top_p < 1.0:
         sp, si = torch.sort(probs, descending=True, dim=-1)
-        # keep a token iff the cumulative mass BEFORE it is < top_p (so the token that crosses top_p is
-        # kept, matching nucleus sampling); everything after is dropped.
-        keep = (sp.cumsum(dim=-1) - sp) < top_p
-        sp = sp * keep
-        sp = sp / sp.sum(dim=-1, keepdim=True)
+        cumsum = sp.cumsum(dim=-1)
+        sp = sp.masked_fill((cumsum - sp) > top_p, 0.0)  # keep the nucleus (matches _apply_top_p)
         probs = torch.zeros_like(probs).scatter_(-1, si, sp)
-    return probs
+    return probs / probs.sum(dim=-1, keepdim=True)
 
 
 def verify_sampled(
