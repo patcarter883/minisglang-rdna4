@@ -2175,6 +2175,28 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # TP>1 lockstep: every rank verifies rank0's drafts so the eager lm-head all_gather sees an
         # identical row count on all ranks (else the verify batch desyncs → illegal-address fault).
         drafts = self._bcast_drafts_tp(reqs, drafts)
+
+        # Partial-K → uniform padding for the verify GRAPH. `can_use_verify_graph` needs every req to
+        # have exactly num_draft drafts (uniform qlen); a partial-K step (a req clamped near max_tokens
+        # / a cold first block) otherwise falls to the EAGER verify — slower, and (under TP) the eager
+        # lm-head all_gather is the desync surface the broadcast above guards. Padding each req's drafts
+        # up to num_draft (filler 0 at the tail) makes the step uniform so it hits the captured GDN/CCA/
+        # MLA verify graph instead. LOSSLESS: `drafts` (REAL) still drives accept — the target is sliced
+        # to the real length per req, so the padded tail rows are verified-then-freed (their KV is
+        # released by the normal rollback), and the bonus at the real length is causally correct (its
+        # query position's input is the last REAL draft; the filler only ever feeds strictly-later,
+        # discarded positions). Only when it actually helps: graphs captured, padded bs fits, real spec
+        # work exists, and the step isn't already uniform. Skipped for the on-device accept path (it keys
+        # accept on q_lens; padding would need a separate real-length arg) and for ddtree.
+        staged_drafts = drafts
+        pad_active = False
+        if not ddtree_drafts:
+            vbs = self.engine.graph_runner.verify_bs_list
+            lens = [len(d) for d in drafts]
+            if (vbs and len(reqs) <= vbs[-1] and any(L >= 1 for L in lens)
+                    and not all(L == spec.num_draft for L in lens)):
+                staged_drafts = [d + [0] * (spec.num_draft - len(d)) for d in drafts]
+                pad_active = True
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
 
@@ -2183,9 +2205,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         d_rows: List[int] = []
         d_cols: List[int] = []
         d_vals: List[int] = []
-        for req, d in zip(reqs, drafts):
+        for req, d in zip(reqs, staged_drafts):  # staged (padded) drives the forward layout/qlen
             c0 = req.cached_len
-            req.device_len = c0 + len(d) + 1  # extend_len = K_i+1
+            req.device_len = c0 + len(d) + 1  # extend_len = staged K_i+1 (uniform when pad_active)
             for j, tok in enumerate(d):
                 d_rows.append(req.table_idx)
                 d_cols.append(c0 + 1 + j)
@@ -2241,7 +2263,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             gdn_state_indices = self.gdn_slots.state_indices(batch)
             batch.gdn_metadata = build_gdn_metadata(batch, gdn_state_indices, device)
             batch.gdn_metadata.capture_verify_state = True
-            batch.gdn_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
+            batch.gdn_metadata.verify_max_qlen = max(len(d) + 1 for d in staged_drafts)
 
         # CCA-hybrid (ZAYA): same lossless-verify pattern as GDN. Build the varlen (prefill-style)
         # CCA metadata (spec_verify already routes there) with capture ON: the CCA layer stashes the
@@ -2255,7 +2277,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, device)
             batch.cca_metadata.capture_verify_state = True
-            batch.cca_metadata.verify_max_qlen = max(len(d) + 1 for d in drafts)
+            batch.cca_metadata.verify_max_qlen = max(len(d) + 1 for d in staged_drafts)
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
         # Draft-head proposers also need the target's hidden states at the verified positions; the
@@ -2283,6 +2305,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # token. len<=1 => the on-device path is exact.
         use_ondevice = (
             self._spec_ondevice and not any_constrained and not ddtree_drafts and not force_n0
+            and not pad_active  # padded layout: accept keys on real per-req len, not the staged q_lens
             and len(self.eos_token_ids) <= 1
         )
         preds = None
@@ -2341,10 +2364,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Fresh per-uid target hidden seeds for the NEXT step's propose (draft-head proposers only).
         new_last_hidden: dict[int, torch.Tensor] = {}
         new_aux_hidden: dict[int, torch.Tensor] = {}
-        for i, (req, d) in enumerate(zip(reqs, drafts)):
-            q_len = len(d) + 1
-            block_start = offset  # this req's first query row in the [sum(K_i+1)] verify output
-            offset += q_len
+        for i, (req, d, sd) in enumerate(zip(reqs, drafts, staged_drafts)):
+            q_len = len(d) + 1            # REAL rows: drives accept (target slice + verify_greedy)
+            staged_q_len = len(sd) + 1    # rows the forward actually laid out (== q_len unless padded)
+            block_start = offset  # this req's first query row in the verify output ([sum staged q_len])
+            offset += staged_q_len
             if use_ondevice:
                 # On-device chain already produced num_accepted + the EOS-truncated keep list for this
                 # req (batch is unconstrained by the use_ondevice gate, so no matcher path). Byte-
@@ -2386,7 +2410,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             accepted_counts.append(num_accepted_i)
             c0 = req.cached_len
-            old_device_len = c0 + len(d) + 1
+            old_device_len = c0 + staged_q_len  # forward extended device_len by the STAGED qlen;
+            #                                     free the padded tail pages too (rollback below)
 
             if os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3"):
                 logger.info_rank0(
