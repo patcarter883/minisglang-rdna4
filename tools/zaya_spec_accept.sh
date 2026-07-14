@@ -27,6 +27,12 @@ MODEL="${MODEL:?set MODEL}"; SPEC_ALGO="${SPEC_ALGO:?set SPEC_ALGO}"
 DRAFT="${DRAFT:-}"; NUM_DRAFT="${NUM_DRAFT:-4}"; GRAPH="${GRAPH:-0}"
 MEMRATIO="${MEMRATIO:-0.85}"; GENTOK="${GENTOK:-96}"; PORT="${PORT:-21977}"
 KV_FP8="${KV_FP8:-1}"; MOE_SCATTER="${MOE_SCATTER:-0}"; CACHE="${CACHE:-naive}"
+# SAMPLED=1: probe at ZAYA's native temp 1.0/top_p 0.95 with rejection-sampling verify
+# (MINISGL_SPEC_SAMPLED). This is the RSA production regime — greedy losslessness is the wrong gate for
+# a high-entropy RSA model (near-ties flip under residual verify-M); sampled verify is robust to it.
+SAMPLED="${SAMPLED:-0}"
+if [ "$SAMPLED" = "1" ]; then PROBE_TEMP="${PROBE_TEMP:-1.0}"; PROBE_TOPP="${PROBE_TOPP:-0.95}"
+else PROBE_TEMP="${PROBE_TEMP:-0.0}"; PROBE_TOPP="${PROBE_TOPP:-1.0}"; fi
 LOG=/engine/tools/zaya_spec_accept.server.log
 OUTDIR=/engine/tools
 
@@ -57,9 +63,10 @@ boot(){ # $1=label  $2...=extra env+args verbatim
   done; echo "[launch:$label] not ready:"; tail -80 "$LOG"; exit 1
 }
 
-probe(){ PORT=$PORT OUT=$1 MODEL=$MODEL GENTOK=$GENTOK python - <<'PY'
+probe(){ PORT=$PORT OUT=$1 MODEL=$MODEL GENTOK=$GENTOK PTEMP=$PROBE_TEMP PTOPP=$PROBE_TOPP python - <<'PY'
 import json,os,urllib.request
 PORT,OUT,MODEL,GENTOK=os.environ["PORT"],os.environ["OUT"],os.environ["MODEL"],int(os.environ["GENTOK"])
+TEMP,PTOPP=float(os.environ["PTEMP"]),float(os.environ["PTOPP"])
 prompts=[
  "The capital of France is",
  "Question: What is 17 plus 26? Answer:",
@@ -69,8 +76,8 @@ prompts=[
 ]
 res=[]
 for p in prompts:
-    body=json.dumps({"model":MODEL,"temperature":0.0,"max_tokens":GENTOK,
-                     "messages":[{"role":"user","content":p}]}).encode()
+    body=json.dumps({"model":MODEL,"temperature":TEMP,"top_p":PTOPP,"max_tokens":GENTOK,
+                     "seed":1234,"messages":[{"role":"user","content":p}]}).encode()
     r=urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",data=body,
                              headers={"Content-Type":"application/json"})
     txt=json.load(urllib.request.urlopen(r,timeout=300))["choices"][0]["message"]["content"]
@@ -100,20 +107,27 @@ PY
 # One spec mode: boot -> probe -> report accept-len -> losslessness vs baseline. $1=label $2=out $3...=extra env
 run_spec(){
   local label="$1"; local out="$2"; shift 2
-  echo "===== SPEC: $label (algo=$SPEC_ALGO num_draft=$NUM_DRAFT) ====="
+  local samp=(); [ "$SAMPLED" = "1" ] && samp=(MINISGL_SPEC_SAMPLED=1)
+  echo "===== SPEC: $label (algo=$SPEC_ALGO num_draft=$NUM_DRAFT sampled=$SAMPLED) ====="
   if [ "$SPEC_ALGO" = "dflash" ]; then
     [ -n "$DRAFT" ] || { echo "[accept] dflash requires DRAFT"; exit 1; }
-    boot "$label" env MINISGL_SPEC_DEBUG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 "$@" python -m minisgl \
+    boot "$label" env MINISGL_SPEC_DEBUG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 "${samp[@]}" "$@" python -m minisgl \
       --spec-algorithm dflash --spec-draft-model-path "$DRAFT" --spec-num-draft "$NUM_DRAFT"
   else
-    boot "$label" env MINISGL_SPEC_DEBUG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 "$@" python -m minisgl \
+    boot "$label" env MINISGL_SPEC_DEBUG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 "${samp[@]}" "$@" python -m minisgl \
       --spec-algorithm tidar --spec-num-draft "$NUM_DRAFT"
   fi
   probe "$out"
   echo "[accept:$label] acceptance lines:"
   grep -E "\[spec\]|\[ddtree\]|emitted/step|accept-len|draft_accepted" "$LOG" | tail -10 || echo "  (none)"
   stop
-  echo "[accept:$label] losslessness vs baseline:"; losscheck "$out" "$label"
+  if [ "$SAMPLED" = "1" ]; then
+    echo "[accept:$label] sampled (temp=$PROBE_TEMP top_p=$PROBE_TOPP): text-match losslessness N/A —"
+    echo "  rejection-sampling verify is distributionally lossless (validate_sampled_spec.py); accept-len"
+    echo "  above is the RSA-regime number, robust to residual verify-M. coherence sample in probe output."
+  else
+    echo "[accept:$label] losslessness vs baseline:"; losscheck "$out" "$label"
+  fi
 }
 
 # DFlash: measure BOTH the linear block verify AND the DDTree draft-tree walk (MINISGL_DFLASH_DDTREE=1,
