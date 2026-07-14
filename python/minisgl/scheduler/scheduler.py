@@ -95,6 +95,27 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # restore over the same recurrent state (verify-state install) with prompt-dependent
         # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
         _rec_radix_ok = self.engine.spec_config is None
+        # CCA (ZAYA) is EXCLUDED from recurrent radix. This is NOT the recurrent state's fault: the
+        # (conv_states, prev_hs) snapshot is captured/restored byte-faithfully AND the reused prefix
+        # keys are bit-identical to a fresh forward (both verified: tools/cca_radix_whitebox.py and
+        # tools/cca_kv_seam.py -> 0.0 diff). The real cause is that a radix HIT routes the request
+        # through the CHUNKED / paged-extend prefill path (attn_prefill_paged._hip_prefill_paged, the
+        # cached_len>0 branch in attention/hip.py) instead of the single-pass full-prefill kernel
+        # (attn_hip.flash_prefill) a naive short-prompt request uses. The two attention kernels are only
+        # ULP-equal (flash block-wise online-softmax vs single-pass), and that tiny per-token difference
+        # COMPOUNDS through the 40-layer CCA network + long greedy chain-of-thought into DIFFERENT (and,
+        # per GSM8K, systematically worse) final answers. Evidence it is the chunked-vs-single-pass path,
+        # not fp8 / cudagraph / concurrency:
+        #   * GSM8K n=200 radix-ON: bf16 KV 25.5%, fp8 KV 37.5% (both << naive 45%) -> not fp8.
+        # NOTE (2026-07-14): the earlier "CCA prefix reuse is fundamentally lossy" gate was WRONG about
+        # the cause. The chunked/paged-extend prefill divergence was NOT attention-softmax reassociation
+        # — it was rocBLAS bf16 GEMM M-dependence in the CCA projections + router + lm_head (a chunk runs
+        # those at a different M than a single pass; non-associative float => ~1 ULP, amplified by the
+        # int8/fp8 downcast). Routing those dense linears through the engine's fixed-tile WMMA GEMM
+        # (layers/minv.py::minv_linear) makes chunked prefill BIT-IDENTICAL to single-pass (verified 0.0
+        # across all 40 CCA layers, tools/cca_chunk_bisect.py), so recurrent radix is now lossless for
+        # CCA too. Both GDN and CCA recurrent state are prefix-cacheable; the only remaining gate is
+        # spec-decode (both snapshot the recurrent state). See [[cca-prefix-cache-gemm-m-dependence]].
         if has_recurrent_state and cache_type != "naive":
             if config.gdn_radix and _rec_radix_ok:
                 self._rec_radix = True
