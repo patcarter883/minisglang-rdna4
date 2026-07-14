@@ -2652,6 +2652,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     # byte-identical to plain decode through the multi-query kernel — isolates whether
                     # the bug is in the verify forward vs. the accept/commit path.
                     result = result._replace(emitted=result.emitted[:1], num_accepted=0)
+
+            if not use_ondevice:
+                # Shared unpack for the sampled AND greedy/constrained branches (both produce `result`);
+                # the use_ondevice branch already set num_accepted_i/keep/eos directly. This was the
+                # site of the sampled+DDTree UnboundLocalError — the sampled branch never unpacked.
                 num_accepted_i = result.num_accepted
                 # Decide which emitted tokens to keep, truncating at EOS.
                 keep = []
