@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
+from minisgl._hip_engage import engaged
 from minisgl.core import Batch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -78,7 +79,9 @@ class MLABackend(BaseAttnBackend):
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         if self.kv_is_fp8:
             # e4m3 latent cache: k_descale=v_descale=1.0 (store was a scale-1.0 cast).
+            engaged("mla_hip.mla_decode_fp8")
             return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0, 0)
+        engaged("mla_hip.mla_decode")
         return self._decode_op(q, latent_cache, block_table, ctx_lens, self.scale, 0, 0)
 
     def verify(self, q: torch.Tensor, layer_id: int, metadata: MLAMetadata) -> torch.Tensor:
@@ -94,9 +97,11 @@ class MLABackend(BaseAttnBackend):
         else:
             q_seq_idx, q_kbound = self._verify_indices(metadata)
         if self.kv_is_fp8:
+            engaged("mla_hip.mla_verify_fp8")
             return self._verify_fp8_op(
                 q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 1.0, 1.0, 0, 0
             )
+        engaged("mla_hip.mla_verify")
         return self._verify_op(q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 0, 0)
 
     def _verify_indices(self, metadata: MLAMetadata):
@@ -124,6 +129,7 @@ class MLABackend(BaseAttnBackend):
         max_seqlen_q: int,
     ) -> torch.Tensor:
         # causal=1, sliding_window=0; the prefix offset (k_len - q_len) is carried by cu_seqlens.
+        engaged("mla_hip.mla_prefill")
         return self._prefill_op(
             q.contiguous(),
             k.contiguous(),

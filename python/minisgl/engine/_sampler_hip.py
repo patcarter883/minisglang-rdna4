@@ -53,8 +53,11 @@ def sample(
     so pass pre-temperature logits + the temperatures tensor — do not pre-divide. The caller owns the
     per-round uniform deviates; identical uniforms in => identical tokens out (capturable), but
     sampling runs eager here (it is outside the decode attention graph)."""
+    from minisgl._hip_engage import engaged
+
     bs = logits.shape[0]
     u = torch.rand(MAX_ROUNDS, bs, device=logits.device, dtype=torch.float32, generator=generator)
     out = torch.empty(bs, device=logits.device, dtype=torch.int32)
+    engaged("sampler_hip.top_k_top_p_sampling_from_logits_")
     _OP(logits.contiguous(), temperatures, top_k, top_p, u, out)
     return out
