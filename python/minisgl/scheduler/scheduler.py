@@ -17,7 +17,14 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
-from minisgl.spec import AcceptResult, ProposeContext, make_proposer, verify_greedy
+from minisgl.spec import (
+    AcceptResult,
+    ProposeContext,
+    make_proposer,
+    probs_from_logits,
+    verify_greedy,
+    verify_sampled,
+)
 from minisgl.spec.accept_gpu import accept_greedy_ondevice, truncate_at_eos_ondevice
 from minisgl.utils import div_ceil, init_logger, load_tokenizer, resolve_stop_token_ids
 
@@ -291,6 +298,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # with batch — the concurrency lever, and the substrate for the future zero-sync overlap.
         # Falls back to the host path for constrained/ddtree/FORCE_N0 batches. Default OFF.
         self._spec_ondevice = os.environ.get("MINISGL_SPEC_ONDEVICE") == "1"
+
+        # MINISGL_SPEC_SAMPLED=1: sampled (rejection-sampling) speculative verify — lets spec-decode
+        # engage for NON-greedy reqs (temperature>0 / top_p<1, e.g. every RSA rollout) instead of
+        # falling back to plain decode. Lossless DISTRIBUTIONALLY (the emitted tokens are drawn from
+        # exactly the target's temp/top_k/top_p distribution; NOT byte-identical). v1: standard linear
+        # verify only (not DDTree / fused-TiDAR), unconstrained reqs, host accept path. Default OFF.
+        # See docs/SAMPLED_SPEC_VERIFY.md. Per-step generator seeded identically on every TP rank so the
+        # rejection draws stay in lockstep (drafts are already broadcast; p is identical post-all_gather).
+        self._spec_sampled = (
+            os.environ.get("MINISGL_SPEC_SAMPLED") == "1"
+            and not getattr(self, "_tidar_fused", False)
+            and not getattr(self, "_dflash_ddtree", False)
+            and not getattr(self, "_tidar_ddtree", False)
+        )
+        self._spec_step = 0
+        self._spec_seed_base = int(os.environ.get("MINISGL_SPEC_SAMPLED_SEED", "42"))
+        if self._spec_sampled:
+            logger.info_rank0("spec-decode: SAMPLED (rejection-sampling) verify ENABLED")
 
         # DFlash-drafter training-data CAPTURE (MINISGL_ZAYA_CAPTURE_DIR=<dir>): dump the target's aux
         # taps + tokens per prefill position to seedbuf_<pid>_<n>.pt — the exact format
@@ -1260,11 +1285,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return
 
         reqs = self.decode_manager.ordered_reqs
-        # Spec-decode runs for an all-greedy decode set (lossless accept is greedy-only). Constrained
-        # (structured-output) reqs now spec-decode too: their drafts are proposed UNCONSTRAINED and the
-        # grammar is enforced at the verify argmax (_verify_greedy_constrained), so a grammar-violating
-        # draft is simply rejected. A non-greedy req still falls the whole batch back to a plain decode.
-        spec_ok = all(req.sampling_params.is_greedy for req in reqs)
+        # Spec-decode runs for an all-greedy decode set (lossless accept is greedy-only) UNLESS sampled
+        # spec is enabled (MINISGL_SPEC_SAMPLED), which lets non-greedy unconstrained reqs spec-decode
+        # via rejection sampling. Constrained (structured-output) reqs spec-decode greedily too (grammar
+        # enforced at the verify argmax); a constrained-AND-sampled req falls back to plain decode.
+        spec_ok = all(self._req_spec_ok(req) for req in reqs)
         if spec_ok:
             if getattr(self, "_tidar_ddtree", False):
                 self._spec_decode_step_ddtree(
@@ -1333,11 +1358,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self.decode_manager.ordered_reqs if self.decode_manager.runnable else []
         )
         local_decode_bs = len(local_reqs)
-        # A replica with decode work vetoes spec iff ANY of its reqs is non-greedy; a replica with NO
-        # decode work has nothing to veto (treat as greedy so it doesn't force the whole box to plain
-        # decode). Agreed via MAX over (1 - all_greedy): any 1 -> some replica is non-greedy.
+        # A replica with decode work vetoes spec iff ANY of its reqs can't spec-decode (non-greedy with
+        # sampled-spec OFF, or constrained-and-sampled); a replica with NO decode work has nothing to
+        # veto. Agreed via MAX over (1 - all_spec_ok): any 1 -> some replica must fall back.
         local_nongreedy = (
-            1 if (local_reqs and not all(r.sampling_params.is_greedy for r in local_reqs)) else 0
+            1 if (local_reqs and not all(self._req_spec_ok(r) for r in local_reqs)) else 0
         )
         t = torch.tensor(
             [local_prefill_tokens, local_decode_bs, local_nongreedy], dtype=torch.int64
@@ -2180,6 +2205,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 f"  next_drafts= {nd}  vs-gt[{match(nd, gt)}]   "
                 f"FIDELITY R_k[0]={reps[rk][0]} bonus={bonus} match={reps[rk][0] == bonus}")
 
+    def _req_spec_ok(self, req: Req) -> bool:
+        """Whether a req may run through the spec step. Greedy reqs always can (lossless greedy verify).
+        A non-greedy req can only when sampled spec is enabled (rejection-sampling verify) AND it isn't
+        constrained (grammar + sampled residual is a v1 carve-out — see docs/SAMPLED_SPEC_VERIFY.md)."""
+        sp = req.sampling_params
+        return sp.is_greedy or (self._spec_sampled and not sp.is_constrained)
+
     def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
         """TP>1 lockstep: force every TP rank to verify rank0's drafts.
 
@@ -2377,12 +2409,25 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # constrained req (or the FORCE_N0 / ddtree diagnostics) falls back to the per-req host path.
         force_n0 = os.environ.get("MINISGL_SPEC_FORCE_N0") == "1"
         any_constrained = any(r.sampling_params.is_constrained for r in reqs)
+        # Sampled (rejection-sampling) verify engages for the non-greedy reqs in the batch. Per-step
+        # generator seeded identically on every TP rank (same _spec_step) so the accept draws + residual/
+        # bonus samples match across ranks (drafts are broadcast, p is identical post-all_gather) without
+        # an outcome broadcast. Greedy reqs in the same batch still take verify_greedy below.
+        any_sampled = self._spec_sampled and any(
+            not r.sampling_params.is_greedy for r in reqs
+        )
+        gen: "torch.Generator | None" = None
+        if any_sampled:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self._spec_seed_base + self._spec_step)
+        self._spec_step += 1
         # The on-device EOS-truncate primitive compares against a SINGLE id; a multi-EOS model
         # (eos_token_ids is a set from generation_config) must use the host path to honor every stop
         # token. len<=1 => the on-device path is exact.
         use_ondevice = (
             self._spec_ondevice and not any_constrained and not ddtree_drafts and not force_n0
             and not pad_active  # padded layout: accept keys on real per-req len, not the staged q_lens
+            and not any_sampled  # sampled reqs take the host rejection path (verify_sampled)
             and len(self.eos_token_ids) <= 1
         )
         preds = None
@@ -2453,6 +2498,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 num_accepted_i = od_accepts[i]
                 keep = list(od_keeps[i])
                 eos = od_eos[i]
+            elif gen is not None and not req.sampling_params.is_greedy:
+                # Sampled rejection verify: build the target dist p [K+1, V] with THIS req's
+                # temp/top_k/top_p, accept draft_j with prob min(1, p_j(draft_j)/q) (q = onehot(draft)),
+                # residual/bonus sampled from p. Distributionally lossless. Constrained-sampled reqs are
+                # excluded upstream (_req_spec_ok), so no matcher here.
+                sp = req.sampling_params
+                pblock = probs_from_logits(
+                    logits[block_start : block_start + q_len], sp.temperature, sp.top_k, sp.top_p
+                )
+                result = verify_sampled(d, pblock, gen)
             else:
                 matcher = (
                     self._grammar_matchers.get(req.uid)

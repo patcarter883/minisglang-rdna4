@@ -13,10 +13,13 @@ from .base import Proposer, ProposeContext, make_proposer
 from .config import SPEC_ALGORITHMS, SpecConfig
 from .mtp import MTPProposer
 from .proposer import NgramProposer, propose_ngram
+from .sampling import probs_from_logits, verify_sampled
 
 __all__ = [
     "AcceptResult",
     "verify_greedy",
+    "verify_sampled",
+    "probs_from_logits",
     "propose_ngram",
     "NgramProposer",
     "MTPProposer",
