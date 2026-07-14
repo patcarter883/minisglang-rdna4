@@ -410,6 +410,13 @@ class GraphRunner:
         else:
             vbuf.logits[:T] = model.forward()
 
+    @property
+    def verify_bs_list(self) -> "list[int]":
+        """Captured spec-verify batch sizes (empty if verify graphs weren't captured). The scheduler
+        reads this to decide whether padding a partial-K step up to uniform num_draft is worthwhile
+        (only when the padded bs fits a captured size → the step hits the verify graph)."""
+        return self._verify["bs_list"] if self._verify is not None else []
+
     def can_use_verify_graph(self, batch: Batch) -> bool:
         # capturable iff: graphs exist, every req has exactly num_draft drafts (uniform qlen), and the
         # req count fits a captured bs. Partial-K steps (near max_tokens / first cold step) fall back
