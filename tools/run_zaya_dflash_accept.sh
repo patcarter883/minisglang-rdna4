@@ -15,6 +15,8 @@ cd "$(dirname "$0")/.."
 MODEL="${MODEL:-/root/.cache/huggingface/ZAYA1-8B-RXF-h32}"
 DRAFT_HOST="${DRAFT_HOST:-/home/pat/code/_models/ZAYA1-8B-DFlash-CCA-5L-m4dss-ep14-opd-r1}"
 NUM_DRAFT="${NUM_DRAFT:-4}"; GRAPH="${GRAPH:-0}"; MEMRATIO="${MEMRATIO:-0.82}"; GENTOK="${GENTOK:-96}"
+MINV="${MINV:-1}"   # 1 = M-invariant dense_gemm FIX (default); 0 = rocBLAS floor (old broken path)
+KHEAD="$(git -C /home/pat/code/rdna4-hip-kernels rev-parse --short HEAD 2>/dev/null || echo unknown)"
 CNAME="${LEASE_NAME:-zaya-dflash-accept}-accept"
 trap 'docker rm -f "$CNAME" >/dev/null 2>&1 || true' EXIT INT TERM
 echo "[dflash-accept] HIP=${HIP_VISIBLE_DEVICES:-unset} draft=$DRAFT_HOST num_draft=$NUM_DRAFT graph=$GRAPH"
@@ -26,6 +28,8 @@ docker run --rm --name "$CNAME" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 \
   -e MODEL="$MODEL" -e SPEC_ALGO=dflash -e DRAFT=/draft -e NUM_DRAFT="$NUM_DRAFT" \
   -e GRAPH="$GRAPH" -e MEMRATIO="$MEMRATIO" -e GENTOK="$GENTOK" -e KV_FP8=1 -e MOE_SCATTER=0 \
+  -e MINISGL_MINV_GEMM="$MINV" -e KHEAD="$KHEAD" \
+  -e DDTREE="${DDTREE:-1}" -e DDTREE_BUDGET="${DDTREE_BUDGET:-32}" \
   -v "$PWD":/engine \
   -v /home/pat/code/rdna4-hip-kernels:/kernels:ro \
   -v "$DRAFT_HOST":/draft:ro \

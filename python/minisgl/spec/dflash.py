@@ -80,6 +80,14 @@ class DFlashProposer(Proposer):
 
         hidden = int(cfg("hidden_size"))
         num_layers = int(cfg("num_hidden_layers"))
+        # CCA-recurrent drafter (the trained ZAYA DFlashCCADraftModel) has no attention/rope/block_size
+        # — a fundamentally different arch from the z-lab Qwen3-GQA drafter. Build it on its own path.
+        architectures = getattr(hf, "architectures", []) or []
+        self._is_cca = "DFlashCCADraftModel" in architectures or bool(getattr(hf, "cca_config", None))
+        if self._is_cca:
+            self._build_cca(engine, hf, cfg, dfc, folder, hidden, num_layers)
+            return
+        self._is_cca = False
         num_heads = int(cfg("num_attention_heads"))
         num_kv_heads = int(cfg("num_key_value_heads"))
         head_dim = int(cfg("head_dim", default=hidden // num_heads))
@@ -104,6 +112,12 @@ class DFlashProposer(Proposer):
         max_pos = int(cfg("max_position_embeddings", default=262144))
 
         self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 0)
+        if self._block_size < 2:
+            # The ZAYA DFlash checkpoints don't record block_size in dflash_config; the trained block is
+            # num_spec masks + 1 anchor. --spec-num-draft carries the trained num_spec, and the propose
+            # step emits min(block-1, num_draft) drafts, so block = num_draft+1 makes --spec-num-draft
+            # set the width exactly and matches training (m4dss num_spec=4 -> block 5; ns15=15 -> 16).
+            self._block_size = self._num_draft + 1
         assert self._block_size >= 2, f"DFlash block_size must be >= 2, got {self._block_size}"
         self._mask_token_id = int(
             dfc.get("mask_token_id") if "mask_token_id" in dfc else getattr(hf, "mask_token_id")
@@ -176,6 +190,90 @@ class DFlashProposer(Proposer):
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
         self._kv: dict[int, list] = {}
         self._kv_plen: dict[int, int] = {}
+
+    def _build_cca(self, engine, hf, cfg, dfc, folder, hidden, num_layers) -> None:
+        """Build + load the CCA-recurrent DFlash drafter (ZAYA DFlashCCADraftModel). B = 1 + num_draft
+        (no fixed block_size in the ckpt); the seed = fc(single committed-position aux) is the drafter's
+        WHOLE context — it was trained on one seed, so NO full-context prefix (unlike the Qwen path)."""
+        from minisgl.models.dflash_cca import DFlashCCADraftModel
+
+        cca = dict(getattr(hf, "cca_config", None) or {})
+        inter = int(cfg("intermediate_size"))
+        eps = float(cfg("rms_norm_eps", default=1e-6))
+        head_dim = int(cca.get("head_dim") or cfg("head_dim"))
+        num_q_heads = int(cca.get("num_q_heads") or (hidden // head_dim))
+        num_k_heads = int(cca.get("num_k_heads", 2))
+
+        ids = dfc.get("target_layer_ids")
+        if (env_ids := os.environ.get("MINISGL_DFLASH_CAPTURE_LAYERS")):
+            ids = [int(x) for x in env_ids.split(",") if x.strip() != ""]
+        assert ids, "CCA DFlash ckpt has no target_layer_ids"
+        self.capture_layer_ids = [int(x) for x in ids]
+        target_hidden = engine.model.model.embed_tokens.weight.shape[1]
+
+        self._block_size = 1 + self._num_draft  # block = [anchor, mask*num_draft]
+        self._mask_token_id = int(dfc.get("mask_token_id", 0))
+        self._compressed = False
+        self._d2t = None
+
+        with torch.device(self._device):
+            self._draft = DFlashCCADraftModel(
+                hidden_size=hidden, intermediate_size=inter, num_layers=num_layers,
+                num_q_heads=num_q_heads, num_k_heads=num_k_heads, head_dim=head_dim,
+                num_aux_layers=len(self.capture_layer_ids), target_hidden=target_hidden,
+                conv_kernel=int(cca.get("block_conv_kernel", 3)),
+                rms_norm_eps=eps, clamp_temp=bool(cca.get("clamp_temp", True)),
+                block_mixer=str(cca.get("block_mixer", "attn")),
+            )
+        self._load_cca_weights(folder)
+        self._draft.bind_embed(engine.model.model.embed_tokens)
+        self._draft.bind_lm_head(engine.model.lm_head)
+
+        self._dbg = os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3")
+        self._pos_off = 0
+        self._ctx_pos_env = None
+        # rdna4's on_accept/free reference the persistent-KV dicts (Qwen path); the CCA drafter has no
+        # persistent KV, so init them empty so free()/on_accept are safe no-ops for CCA reqs.
+        self._kv = {}
+        self._kv_plen = {}
+
+    def _load_cca_weights(self, folder: str) -> None:
+        """Load the CCA drafter checkpoint (keys: fc, norm, layers.i.{linear_q,linear_k,val_proj,o_proj,
+        input_layernorm,post_attention_layernorm,gate_proj,up_proj,down_proj}.weight + conv_qk.weight/bias
+        + temp). Replicated on every TP rank."""
+        import safetensors.torch as st
+
+        path = next((os.path.join(folder, f) for f in sorted(os.listdir(folder))
+                     if f.endswith(".safetensors")), None)
+        assert path is not None, f"no .safetensors in CCA DFlash folder {folder}"
+        sd = st.load_file(path, device=str(self._device))
+        d = self._draft
+
+        def put(obj, leaf, key):
+            assert key in sd, f"CCA DFlash ckpt missing {key}"
+            t = sd[key].to(self._dtype).contiguous()
+            cur = getattr(obj, leaf)
+            assert cur.shape == t.shape, (
+                f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
+            )
+            setattr(obj, leaf, t.to(self._device))
+
+        put(d.fc, "weight", "fc.weight")
+        put(d.norm, "weight", "norm.weight")
+        for i, layer in enumerate(d.layers):
+            p = f"layers.{i}."
+            put(layer.input_layernorm, "weight", p + "input_layernorm.weight")
+            put(layer.post_attention_layernorm, "weight", p + "post_attention_layernorm.weight")
+            put(layer.linear_q, "weight", p + "linear_q.weight")
+            put(layer.linear_k, "weight", p + "linear_k.weight")
+            put(layer.val_proj, "weight", p + "val_proj.weight")
+            put(layer.o_proj, "weight", p + "o_proj.weight")
+            put(layer.gate_proj, "weight", p + "gate_proj.weight")
+            put(layer.up_proj, "weight", p + "up_proj.weight")
+            put(layer.down_proj, "weight", p + "down_proj.weight")
+            put(layer, "conv_qk_weight", p + "conv_qk.weight")
+            put(layer, "conv_qk_bias", p + "conv_qk.bias")
+            put(layer, "temp", p + "temp")
 
     def _load_draft_weights(self, folder: str) -> None:
         """Load the DFlash checkpoint directly. fc/hidden_norm/norm + per-layer Qwen3 decoder tensors
@@ -250,6 +348,8 @@ class DFlashProposer(Proposer):
         # k_i drafted positions per req, keyed by id(req), for build_draft_tree. Mirrors the scheduler's
         # _tidar_block_predict topk path. Cleared each call.
         self._ddtree_topk: dict[int, tuple] = {}
+        if self._is_cca:
+            return self._propose_cca(reqs, num_draft, ctx, topk, out)
         for i, req in enumerate(reqs):
             # Block emits up to B-1 drafts; clamp to the per-step draft budget and the req budget.
             k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))
@@ -336,6 +436,52 @@ class DFlashProposer(Proposer):
             if self._dbg:
                 print(f"[dflash-dbg] uid={req.uid} anchor={anchor_tok} base_pos={base_pos} "
                       f"B={B} k={k_i} draft={drafts}", flush=True)
+        return out
+
+    def _propose_cca(self, reqs, num_draft, ctx, topk, out):
+        """CCA-recurrent single-seed propose. seed = fc(aux at the committed position) is the drafter's
+        whole context; one bidirectional block forward over [anchor, mask*num_draft] emits B hidden
+        vectors; argmax(logits[1:1+k]) are the drafts (+ top-K marginals for DDTree)."""
+        draft = self._draft
+        device = self._device
+        mask_id = self._mask_token_id
+        B = self._block_size
+        for i, req in enumerate(reqs):
+            k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))
+            aux = ctx.aux_hidden.get(req.uid)
+            if k_i <= 0 or aux is None:
+                continue
+            if aux.dim() == 3:
+                aux = aux[:, -1]  # CCA wants a SINGLE committed-position seed (last, if accumulated)
+            anchor_tok = int(req.input_ids[req.cached_len])
+            # Diagnostic: MINISGL_CCA_NO_SEED=1 runs the drafter UNCONTEXTUALIZED (seed=None). If
+            # accept-len barely changes vs the seeded run, the aux->seed conditioning isn't helping.
+            seed = (
+                None if os.environ.get("MINISGL_CCA_NO_SEED") == "1"
+                else draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden]
+            )
+            block_ids = torch.full((B,), mask_id, dtype=torch.int64, device=device)
+            block_ids[0] = anchor_tok
+            noise_embed = draft.embed(block_ids).to(self._dtype).unsqueeze(0)  # [1, B, hidden]
+            hidden = draft.denoise(noise_embed, seed)  # [1, B, hidden]
+            logits = draft.head(hidden[0])  # [B, vocab]
+            block_logits = logits[1 : 1 + k_i]  # [k_i, vocab]
+            ids = block_logits.argmax(dim=-1)
+            out[i] = [int(x) for x in ids.tolist()]
+            if topk > 0 and k_i > 0:
+                lp = torch.log_softmax(block_logits.float(), dim=-1)
+                tvals, ti = lp.topk(topk, dim=-1)
+                self._ddtree_topk[id(req)] = (ti.cpu().tolist(), tvals.cpu().tolist())
+            if self._dbg:
+                a = aux.float(); l0 = block_logits[0].float()
+                top = l0.topk(5)
+                sst = "None" if seed is None else (
+                    f"mean={seed.float().mean():.3f} std={seed.float().std():.3f} amax={seed.float().abs().max():.1f}")
+                print(f"[dflash-cca-dbg] uid={req.uid} anchor={anchor_tok} k={k_i} "
+                      f"aux{tuple(aux.shape)} mean={a.mean():.3f} std={a.std():.3f} amax={a.abs().max():.1f} "
+                      f"seed {sst} "
+                      f"d0_top5={top.indices.tolist()} lp={[round(float(x),2) for x in top.values.tolist()]} "
+                      f"drafts={out[i]}", flush=True)
         return out
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
