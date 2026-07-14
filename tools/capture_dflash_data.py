@@ -40,11 +40,22 @@ SEED_PROMPTS = [
 _lock = threading.Lock()
 
 
-def post(url, payload, timeout=300.0):
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+def generate(base, prompt, max_tokens, timeout=300.0):
+    """POST minisgl's /generate (RAW text in — no chat template, exactly what teacher-forcing needs) and
+    concatenate its SSE delta stream (`data: <incremental text>\\n` ... `data: [DONE]`)."""
+    body = json.dumps({"prompt": prompt, "max_tokens": max_tokens}).encode()
+    req = urllib.request.Request(base, data=body, headers={"Content-Type": "application/json"})
+    out = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+        for raw in r:
+            s = raw.decode("utf-8", "replace")
+            if not s.startswith("data: "):
+                continue
+            payload = s[6:]
+            if payload.rstrip("\n") == "[DONE]":
+                break
+            out.append(payload.rstrip("\n"))
+    return "".join(out)
 
 
 def main():
@@ -58,7 +69,7 @@ def main():
     args = ap.parse_args()
 
     ports = [int(p) for p in args.ports.split(",") if p.strip()]
-    bases = [f"http://{args.host}:{p}/v1/completions" for p in ports]
+    bases = [f"http://{args.host}:{p}/generate" for p in ports]
     prompts = SEED_PROMPTS
     if args.prompts_file:
         with open(args.prompts_file) as f:
@@ -72,12 +83,11 @@ def main():
     def process(i, prompt):
         base = bases[i % len(bases)]
         try:
-            # 1. greedy rollout -> minisgl-ZAYA's own continuation (the labels)
-            r = post(base, {"model": args.model, "prompt": prompt,
-                            "max_tokens": args.gen_tokens, "temperature": 0})
-            full = prompt + r["choices"][0]["text"]
+            # 1. greedy rollout -> minisgl-RXF's own continuation (the labels)
+            cont = generate(base, prompt, args.gen_tokens)
+            full = prompt + cont
             # 2. teacher-forcing re-feed -> one full prefill; the capture hook dumps aux per position
-            post(base, {"model": args.model, "prompt": full, "max_tokens": 1, "temperature": 0})
+            generate(base, full, 1)
         except Exception as e:  # noqa: BLE001
             with _lock:
                 errs[0] += 1
