@@ -59,6 +59,12 @@ _ZAYA_TIME = os.environ.get("MINISGL_ZAYA_TIME", "0") != "0"
 # ZayaDecoderLayer._merge_and_norm. The residual stream STAYS fp32 (residual_in_fp32). Default ON
 # (+16.2% graph-captured decode, bit-exact mixer input); MINISGL_ZAYA_FUSED_MERGE=0 reverts.
 _ZAYA_FUSED_MERGE = os.environ.get("MINISGL_ZAYA_FUSED_MERGE", "1") != "0"
+# M-invariance: the CCA q/k/v projections and the router gates are raw nn.Parameter matmuls (not the
+# engine's Linear op), so route them through the shared M-invariant WMMA GEMM directly. See
+# layers/minv.py for the full rationale (rocBLAS reduction order is M-variant -> chunked/cached prefill
+# diverges by ~1 bf16 ULP, amplified by the int8/fp8 downcast into flipped tokens; GSM8K 45->25 with CCA
+# caching). The o_proj / down_proj / any Linear-op weights are M-invariant automatically via
+# UnquantizedLinearMethod. minv_linear self-gates (dtype / IN%16 / cudagraph capture -> F.linear).
 # "cca_attn" is a SUB-bucket of "cca" (the paged flash attention only); cca - cca_attn = the conv
 # front-end + q/k/v projections + o_proj, to locate the O(N^2) cost within the CCA mixer.
 _zaya_buckets = {"cca": 0.0, "cca_attn": 0.0, "moe": 0.0, "merge": 0.0}
@@ -294,18 +300,20 @@ class ZayaRouter(nn.Module):
         (the fused-MoE topk-weight convention; the kernel casts to compute dtype internally)."""
         import torch.nn.functional as F
 
-        hs = F.linear(hidden_states, self.down_proj_weight, self.down_proj_bias)  # [N, r]
+        from minisgl.layers.minv import minv_linear  # M-invariant: a router ULP flip reroutes experts
+
+        hs = minv_linear(hidden_states, self.down_proj_weight, self.down_proj_bias)  # [N, r]
         if self._use_eda and prev_router_states is not None:
             hs = hs + prev_router_states * self.router_states_scale
         # Stash the PRE-norm router state — this is what threads to the next MoE layer's EDA.
         router_states_next = hs.clone()
 
         hs_norm = _rms_norm(hs, self.rmsnorm_eda_weight, self._eps)  # RMSNorm(r), no residual
-        x = F.linear(hs_norm, self.router_mlp_0_weight, self.router_mlp_0_bias)
+        x = minv_linear(hs_norm, self.router_mlp_0_weight, self.router_mlp_0_bias)
         x = F.gelu(x)
-        x = F.linear(x, self.router_mlp_2_weight, self.router_mlp_2_bias)
+        x = minv_linear(x, self.router_mlp_2_weight, self.router_mlp_2_bias)
         x = F.gelu(x)
-        logits = F.linear(x, self.router_mlp_4_weight)  # [N, ne+1] (no bias)
+        logits = minv_linear(x, self.router_mlp_4_weight)  # [N, ne+1] (no bias)
 
         # zaya_high_prec -> fp32 softmax (selection-stable); biases affect CHOICE only.
         probs = torch.softmax(logits, dim=-1, dtype=torch.float32)  # [N, ne+1]
@@ -387,11 +395,16 @@ class ZayaCCAAttn(BaseOP):
         # projection weights in post_load; otherwise fall back to the unfused GEMVs below.
         fused_w = None if md.is_prefill else cca.decode_fused_weights()
 
+        # M-invariant q/k/v projections: route through the shared fixed-tile WMMA GEMM so a chunked /
+        # prefix-cached prefill matches a fresh single-pass bit-for-bit (minv_linear self-gates to
+        # F.linear under cudagraph capture / unsupported shapes — decode is static-M anyway).
+        from minisgl.layers.minv import minv_linear as _proj
+
         # Packed q|k for the conv kernel (fp32). v is computed AFTER the kernel (it needs prev_hs).
         # Skipped on the fused decode path — the kernel projects q/k/v from hs internally.
         if fused_w is None:
-            q = F.linear(hs, cca.linear_q)  # [N, latent_q]
-            k = F.linear(hs, cca.linear_k)  # [N, latent_k]
+            q = _proj(hs, cca.linear_q)  # [N, latent_q]
+            k = _proj(hs, cca.linear_k)  # [N, latent_k]
             qk_new = torch.cat([q, k], dim=-1).float().contiguous()  # [N, C] fp32
 
         if md.is_prefill:
@@ -493,8 +506,8 @@ class ZayaCCAAttn(BaseOP):
         # [hd, hidden] matmuls and keeping both graphs shape-uniform simplifies cudagraph capture.
         # On the fused decode path, v was already produced by the mega-kernel above.
         if md.is_prefill or fused_w is None:
-            v1 = F.linear(hs, cca.val_proj1)  # [N, head_dim]
-            v2 = F.linear(hs2, cca.val_proj2)  # [N, head_dim]
+            v1 = _proj(hs, cca.val_proj1)  # [N, head_dim]  (M-invariant on prefill; see _proj above)
+            v2 = _proj(hs2, cca.val_proj2)  # [N, head_dim]
             v = torch.cat([v1, v2], dim=-1)[:, self._v_lo : self._v_hi]  # [N, nkv_local*head_dim]
 
         # Assemble qkv for the paged GQA attention (q|k pre-normed by the kernel -> q_norm/k_norm None).
