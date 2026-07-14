@@ -27,7 +27,7 @@ import torch
 
 NEG_INF = float("-inf")
 
-__all__ = ["Tree", "build_draft_tree", "ddtree_paged_layout", "ddtree_walk"]
+__all__ = ["Tree", "build_draft_tree", "ddtree_paged_layout", "ddtree_walk", "ddtree_walk_sampled"]
 
 
 @dataclass
@@ -156,3 +156,59 @@ def ddtree_walk(argmax_per_node: Sequence[int], tree: Tree) -> Tuple[List[int], 
             return accepted, t  # target's choice not drafted -> it's the next bonus
         accepted.append(t)
         cur = nxt
+
+
+def ddtree_walk_sampled(
+    node_logits: torch.Tensor,
+    tree: Tree,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    gen: "torch.Generator",
+) -> Tuple[List[int], int]:
+    """Sampled multi-candidate tree walk (SpecTr / SpecInfer-style) — the SAMPLING analogue of
+    ddtree_walk. ``node_logits`` [n_nodes, V] are the target's per-node logit rows from the tree-verify
+    forward. At each node build the target dist ``p`` (temp/top_k/top_p) and do MULTI-CANDIDATE rejection
+    over the node's children: try each child token ``c``, accept it with prob equal to the current
+    residual mass at ``c``; on reject zero ``c`` out of the residual and renormalize; on accept descend.
+    If every child is rejected, sample the next token (the bonus) from the residual — the walk ends.
+
+    LOSSLESS given exact per-node logits: at each node the emitted token (a descended child OR the bonus)
+    is distributed EXACTLY as ``p``, for ANY children set — telescoping proof: P(emit c_j) =
+    P(reject c_1..c_{j-1}) * p_res(c_j) = p(c_j); the leftover mass samples the bonus ~ p. This is the
+    tree analogue of verify_sampled's single-candidate accept, and it needs ONLY the target ``p`` (no
+    drafter q). Reduces to ddtree_walk at temperature -> 0 (p one-hot: the argmax child, if drafted, is
+    accepted w.p. 1 and descended; otherwise every child is rejected and the bonus == the argmax).
+
+    NOTE the tree's higher-acceptance benefit is realized only when the walk's output is COMMITTED (a
+    2-forward direct commit): under the 3-forward re-verify the linear verify_sampled re-samples, and
+    greedy discovery would then dominate. Returns (accepted token ids in order, next bonus token).
+    """
+    from .sampling import probs_from_logits
+
+    accepted: List[int] = []
+    cur = 0
+    while True:
+        p = probs_from_logits(
+            node_logits[cur : cur + 1], temperature, top_k, top_p
+        )[0].clone()  # [V], normalized target dist at this node
+        descended = False
+        for c_tok, child in tree.children[cur].items():  # best-first insertion order
+            s = float(p.sum())
+            if s <= 0.0:
+                break
+            r = float(torch.rand(1, generator=gen, device=p.device).item())
+            if r < float(p[c_tok]) / s:  # accept c_tok w.p. renormalized residual mass p_res(c_tok)
+                accepted.append(int(c_tok))
+                cur = child
+                descended = True
+                break
+            p[c_tok] = 0.0  # reject: drop this candidate from the residual, try the next child
+        if not descended:
+            s = float(p.sum())
+            if s > 0.0:
+                bonus = int(torch.multinomial(p / s, 1, generator=gen).item())
+            else:  # residual exhausted (all mass was on rejected children) -> fall back to full p
+                pf = probs_from_logits(node_logits[cur : cur + 1], temperature, top_k, top_p)[0]
+                bonus = int(torch.multinomial(pf, 1, generator=gen).item())
+            return accepted, bonus
