@@ -7,7 +7,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 INIT="${INIT:-/models_rw/ZAYA1-8B-DFlash-CCA-5L-init}"
 OUT="${OUT:-/models_rw/ZAYA1-8B-DFlash-CCA-5L-minisgl-rxf}"
-NUM_SPEC="${NUM_SPEC:-4}"; EPOCHS="${EPOCHS:-14}"; BATCH="${BATCH:-512}"
+NUM_SPEC="${NUM_SPEC:-4}"; EPOCHS="${EPOCHS:-14}"; BATCH="${BATCH:-512}"; LR="${LR:-5e-5}"
 echo "[redistill] HIP=${HIP_VISIBLE_DEVICES:-unset} -> $OUT (num_spec=$NUM_SPEC epochs=$EPOCHS)"
 CNAME="${LEASE_NAME:-dflash-redistill}-redistill"
 trap 'docker rm -f "$CNAME" >/dev/null 2>&1 || true' EXIT INT TERM
@@ -18,7 +18,7 @@ docker run --rm --name "$CNAME" \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 \
   -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
-  -e INIT="$INIT" -e OUT="$OUT" -e NUM_SPEC="$NUM_SPEC" -e EPOCHS="$EPOCHS" -e BATCH="$BATCH" \
+  -e INIT="$INIT" -e OUT="$OUT" -e NUM_SPEC="$NUM_SPEC" -e EPOCHS="$EPOCHS" -e BATCH="$BATCH" -e LR="$LR" \
   -v /home/pat/code/vllm-gfx1201-zaya-dflash:/trainrepo:ro \
   -v /home/pat/code/_models:/models_rw \
   -v "${SEEDBUF_HOST:-/home/pat/code/_dflash_capture_minisgl}":/seedbuf:ro \
@@ -29,6 +29,6 @@ docker run --rm --name "$CNAME" \
     python /trainrepo/zaya/dflash/train_cca_drafter.py \
       --init "$INIT" --out "$OUT" --seed-dir /seedbuf \
       --zaya /root/.cache/huggingface/ZAYA1-8B-RXF-h32 \
-      --num-spec "$NUM_SPEC" --epochs "$EPOCHS" --batch "$BATCH"
+      --num-spec "$NUM_SPEC" --epochs "$EPOCHS" --batch "$BATCH" --lr "$LR"
   '
 echo "[redistill] exited rc=$?; drafter -> ${OUT/\/models_rw//home/pat/code/_models}"
