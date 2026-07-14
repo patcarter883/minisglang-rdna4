@@ -506,7 +506,7 @@ _ZAYA_ROUTER_RENAME = {
 # Expert key (both fields): local_experts.{e}.linear_fc{1,2}.{weight,weight_scale}.
 _ZAYA_EXPERT_PATTERN = re.compile(
     r"^(?P<prefix>model\.layers\.\d+\.zaya_block\.experts)\.local_experts\."
-    r"(?P<idx>\d+)\.(?P<fc>linear_fc1|linear_fc2)\.(?P<field>weight|weight_scale)$"
+    r"(?P<idx>\d+)\.(?P<fc>linear_fc1|linear_fc2)\.(?P<field>weight|weight_scale|weight_packed)$"
 )
 
 
@@ -622,15 +622,17 @@ def _load_zaya_weight(
         local_id = gid - ep_offset
         native_key = f"{m.group('prefix')}.{_FC_TO_NATIVE[m.group('fc')]}"
         field = m.group("field")
-        fields = expert_buf.setdefault(native_key, {"weight": {}, "weight_scale": {}})
-        slots = fields[field]
+        # Field-agnostic: fp8 experts ship {weight, weight_scale}; RXF experts ship {weight_packed,
+        # weight_scale}. Accumulate whatever fields the checkpoint has, stack each independently over E.
+        fields = expert_buf.setdefault(native_key, {})
+        slots = fields.setdefault(field, {})
         slots[local_id] = tensor
         if len(slots) != ep_local:
             return
-        # weight: [N,K] fp8 -> stack [local,N,K] fp8. weight_scale: [N,1] f32 -> [local,N,1] f32.
+        # weight/weight_packed: [N,K(/2)] -> stack [local,N,K(/2)]; weight_scale -> [local,...].
         stacked = torch.stack([slots[e] for e in range(ep_local)], dim=0).contiguous()
         del fields[field]
-        if not fields.get("weight") and not fields.get("weight_scale"):
+        if not fields:
             del expert_buf[native_key]
         yield f"{native_key}.{field}", stacked
 
