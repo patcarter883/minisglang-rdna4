@@ -35,6 +35,14 @@ import torch
 _MINV_ON = os.environ.get("MINISGL_MINV_GEMM", "1") != "0"
 _BLOCK_M = int(os.environ.get("MINISGL_MINV_BLOCK_M", "64"))  # WMMA M-tile (mult of 16, <=128)
 _BN = int(os.environ.get("MINISGL_MINV_BN", "64"))            # WMMA N-tile (divides most OUT dims)
+# Large-M path: the deep-pipelined dense_gemm_pipe kernel runs at rocBLAS parity at large M (gate_up
+# M=4096: ~113 vs rocBLAS ~114 TFLOPS, cca_q/down M=1024 BEAT it) after the RDNA4 LDS bank-conflict pad.
+# It is BIT-IDENTICAL to the register-direct (rd) and LDS kernels (same 16-wide K-reduction order, no
+# split-K), so switching rd<->pipe by M stays M-invariant. rd still wins the small-M decode hot path
+# (register-direct, no LDS staging / __syncthreads overhead), so we only reach for pipe at M >= _PIPE_M.
+_PIPE_M = int(os.environ.get("MINISGL_MINV_PIPE_M", "512"))   # M threshold to switch rd -> pipe
+_PIPE_MI = int(os.environ.get("MINISGL_MINV_PIPE_MI", "2"))   # pipe register-block M-subtiles/warp
+_PIPE_PBK = int(os.environ.get("MINISGL_MINV_PIPE_PBK", "64"))  # pipe K-chunk (needs IN % PBK == 0)
 _warned: set[str] = set()
 
 
@@ -82,17 +90,26 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     x2 = x.reshape(-1, orig_shape[-1]).contiguous()
     M, IN = x2.shape
     OUT = weight.shape[0]
-    # ONE fixed tile (block_m=BN => trivially M-invariant: single algorithm, single reduction order).
-    # Register-direct (LDS-bypass) beats rocBLAS across the serving-relevant M range (decode batch +
-    # chunked prefill) but needs full tiles (block_m | M, BN | OUT). Pad M up to block_m (rows sliced
-    # off; they never touch the real rows) when OUT is BN-aligned; otherwise use the LDS kernel, which
-    # masks ragged OUT. Both kernels share the identical K-reduction order -> bit-identical.
-    if OUT % BN == 0:
+    # All three dense_gemm kernels (rd / pipe / lds) run the FULL K-reduction per output tile in the
+    # identical fixed 16-wide order with NO split-K, so every one is bit-identical per output row and
+    # interchangeable -> the dispatch below is M-invariant regardless of which kernel a given M picks.
+    #   * ragged OUT (OUT % BN != 0): the LDS kernel masks it (register-direct can't mask a ragged tile).
+    #   * large M (>= _PIPE_M, full tiles, IN % PBK == 0): the deep-pipelined kernel at ~rocBLAS parity.
+    #   * else (small-M decode hot path): register-direct (LDS-bypass), which wins there.
+    # Full-tile kernels need block_m | M and BN | OUT; pad M up to the tile (padded rows are sliced off
+    # and never touch the real rows).
+    if OUT % BN != 0:
+        out = _dg.dense_gemm(x2, weight, block_m, BN)  # LDS kernel: handles ragged OUT
+    elif M >= _PIPE_M and IN % _PIPE_PBK == 0:
+        pbm = 256 if M >= 1024 else 128                # deeper M -> more warps sharing the LDS B tile
+        pbn = 128 if OUT % 128 == 0 else BN            # wider N-tile when OUT allows (fewer A reloads)
+        Mp = ((M + pbm - 1) // pbm) * pbm
+        xp = x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
+        out = _dg.dense_gemm_pipe(xp, weight, pbm, pbn, _PIPE_MI, _PIPE_PBK)[:M]
+    else:
         Mp = ((M + block_m - 1) // block_m) * block_m
         xp = x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
         out = _dg.dense_gemm_rd(xp, weight, block_m, BN)[:M]
-    else:
-        out = _dg.dense_gemm(x2, weight, block_m, BN)  # LDS kernel: handles ragged OUT
     if bias is not None:
         out = out + bias
     return out.reshape(*orig_shape[:-1], OUT)
