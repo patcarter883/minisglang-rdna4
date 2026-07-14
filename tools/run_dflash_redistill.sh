@@ -17,6 +17,7 @@ docker run --rm --name "$CNAME" \
   --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 \
+  -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   -e INIT="$INIT" -e OUT="$OUT" -e NUM_SPEC="$NUM_SPEC" -e EPOCHS="$EPOCHS" -e BATCH="$BATCH" \
   -v /home/pat/code/vllm-gfx1201-zaya-dflash:/trainrepo:ro \
   -v /home/pat/code/_models:/models_rw \
