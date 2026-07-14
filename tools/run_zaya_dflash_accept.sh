@@ -29,7 +29,7 @@ docker run --rm --name "$CNAME" \
   -e MODEL="$MODEL" -e SPEC_ALGO=dflash -e DRAFT=/draft -e NUM_DRAFT="$NUM_DRAFT" \
   -e GRAPH="$GRAPH" -e MEMRATIO="$MEMRATIO" -e GENTOK="$GENTOK" -e KV_FP8=1 -e MOE_SCATTER=0 \
   -e MINISGL_MINV_GEMM="$MINV" -e KHEAD="$KHEAD" \
-  -e DDTREE="${DDTREE:-1}" -e DDTREE_BUDGET="${DDTREE_BUDGET:-32}" \
+  -e DDTREE="${DDTREE:-1}" -e DDTREE_BUDGET="${DDTREE_BUDGET:-32}" -e SAMPLED="${SAMPLED:-0}" \
   -v "$PWD":/engine \
   -v /home/pat/code/rdna4-hip-kernels:/kernels:ro \
   -v "$DRAFT_HOST":/draft:ro \
