@@ -15,6 +15,8 @@ cd "$(dirname "$0")/.."
 MODEL="${MODEL:-/big/zaya1-tidar-opd-fp8}"
 NUM_DRAFT="${NUM_DRAFT:-4}"; GRAPH="${GRAPH:-0}"; MEMRATIO="${MEMRATIO:-0.85}"; GENTOK="${GENTOK:-96}"
 FUSED="${FUSED:-0}"; MIX="${MIX:-1.0}"
+MINV="${MINV:-1}"   # 1 = M-invariant dense_gemm FIX (default); 0 = rocBLAS floor (old broken path)
+KHEAD="$(git -C /home/pat/code/rdna4-hip-kernels rev-parse --short HEAD 2>/dev/null || echo unknown)"
 CNAME="${LEASE_NAME:-zaya-tidar-accept}-accept"
 trap 'docker rm -f "$CNAME" >/dev/null 2>&1 || true' EXIT INT TERM
 echo "[tidar-accept] HIP=${HIP_VISIBLE_DEVICES:-unset} model=$MODEL num_draft=$NUM_DRAFT fused=$FUSED graph=$GRAPH"
@@ -27,6 +29,7 @@ docker run --rm --name "$CNAME" \
   -e MODEL="$MODEL" -e SPEC_ALGO=tidar -e NUM_DRAFT="$NUM_DRAFT" \
   -e GRAPH="$GRAPH" -e MEMRATIO="$MEMRATIO" -e GENTOK="$GENTOK" -e KV_FP8=1 -e MOE_SCATTER=0 \
   -e MINISGL_TIDAR_FUSED="$FUSED" -e MINISGL_TIDAR_MIX_BETA="$MIX" \
+  -e MINISGL_MINV_GEMM="$MINV" -e KHEAD="$KHEAD" \
   -v "$PWD":/engine \
   -v /home/pat/code/rdna4-hip-kernels:/kernels:ro \
   -v /home/pat/code/_big:/big:ro \
