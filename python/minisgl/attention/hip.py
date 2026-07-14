@@ -61,8 +61,17 @@ class HIPAttnBackend(RDNA4Backend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if batch.is_prefill:
             if metadata.cold_prefill:
-                # No prefix-cache hit: each seq's KV == its own new tokens -> dense contiguous
-                # prefill over the inline K/V (attn_hip.flash_prefill).
+                # No prefix-cache hit: each seq's KV == its own new tokens.
+                # fp8 KV: attend over the fp8-quantized K/V we JUST stored (via the paged fp8 kernel,
+                # cached_len=0 -> full causal), NOT the inline bf16. Otherwise a cold/naive prefill
+                # attends full-precision bf16 while a prefix-cached request attends the fp8 the cache
+                # holds -> the two diverge (observed: GSM8K 6/8 answers differ under fp8 KV). Routing
+                # cold through the same paged kernel makes cached == naive bit-for-bit under fp8. bf16
+                # KV keeps the dense contiguous flash_prefill (bf16 store is lossless, cold == extend
+                # already: GSM8K 0/8), and it is faster for the cold shape.
+                if self.kv_is_fp8:
+                    return self._hip_prefill_paged(q, layer_id, metadata)
+                # dense contiguous prefill over the inline K/V (attn_hip.flash_prefill).
                 return self._forward_prefill(q, k, v, metadata)
             # Radix-hit / chunked extend: Q = new tokens, K/V = paged prefix + new (just stored),
             # prefix-offset causal. Native HIP attn_prefill_paged kernel (Triton-free; fp8 variant

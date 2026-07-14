@@ -223,11 +223,15 @@ def _fused_experts_bf16_hip(
     topk_weights: torch.Tensor,   # [M, top_k] f32
     topk_ids: torch.Tensor,       # [M, top_k]
     config: Dict[str, int],
+    activation: str = "silu",
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
-    """Graph-safe HIP fused MoE: align -> moe_bf16_gemm (gemm1) -> silu_and_mul -> moe_bf16_gemm_scatter
-    (gemm2 + topk-weighted combine). Matches the Triton fused_experts_impl semantics exactly (same
-    w1[E,2N,K]/w2[E,K,N] layout, same offs = m*top_k + k topk indexing)."""
-    from minisgl.layers import silu_and_mul
+    """Graph-safe HIP fused MoE: align -> moe_bf16_gemm (gemm1) -> {silu,gelu}_and_mul ->
+    moe_bf16_gemm_scatter (gemm2 + combine). Matches the Triton fused_experts_impl semantics exactly
+    (same w1[E,2N,K]/w2[E,K,N] layout, offs = m*top_k + k topk indexing). Covers silu AND gelu, and
+    apply_router_weight_on_input (the weight scales the INPUT, top_k==1; the scatter then combines with
+    weight 1). The moe_bf16 GEMMs do full-K reduction / no split-K -> M-invariant (no Triton autotune)."""
+    from minisgl.layers import gelu_and_mul, silu_and_mul
 
     from moe_bf16_wmma import moe_bf16_gemm_out, moe_bf16_gemm_scatter_out
 
@@ -239,9 +243,14 @@ def _fused_experts_bf16_hip(
     block_m = config["BLOCK_SIZE_M"]
     BN = 128
 
+    if apply_router_weight_on_input:
+        assert top_k == 1, "apply_router_weight_on_input requires top_k == 1"
+        hidden_states = (hidden_states.float() * topk_weights.reshape(-1, 1)).to(hidden_states.dtype)
+
     sorted_ids, expert_ids, num_pad = moe_align_block_size(topk_ids.to(torch.int32), block_m, E)
     P = sorted_ids.shape[0]
-    tw = topk_weights.to(torch.float32).reshape(-1).contiguous()  # [M*top_k], indexed by offs
+    # tw = None when the weight was already folded into the input (scatter combines with weight 1).
+    tw = None if apply_router_weight_on_input else topk_weights.to(torch.float32).reshape(-1).contiguous()
 
     inter1, inter2, out_accum = _moe_bf16_buffers(
         P, twoN, N, M, K, hidden_states.device, hidden_states.dtype
@@ -252,8 +261,8 @@ def _fused_experts_bf16_hip(
         hidden_states, w1, sorted_ids, expert_ids, num_pad, None, inter1,
         top_k, block_m, num_valid, BN, 0,
     )
-    # SwiGLU gate on the sorted-padded intermediate -> inter2[P, N]
-    silu_and_mul(inter1, inter2)
+    # gated activation on the sorted-padded intermediate -> inter2[P, N]
+    (gelu_and_mul if activation == "gelu" else silu_and_mul)(inter1, inter2)
     # gemm2 + topk-weighted scatter-combine into the fp32 accumulator (zeroed first — capturable).
     out_accum.zero_()
     moe_bf16_gemm_scatter_out(
@@ -307,10 +316,11 @@ def fused_experts_impl(
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
-    """Unquantized fused-MoE experts. Dispatches the full-HIP, graph-capturable `moe_bf16_wmma`
-    path (`_fused_experts_bf16_hip`) for bf16/fp16 silu experts without router-weight-on-input;
-    everything else (gelu / router-weight-on-input / fp32 / kernel unavailable) falls back to the
-    Triton `fused_moe_kernel_triton` + `moe_sum_reduce_triton` below."""
+    """Unquantized fused-MoE experts. Dispatches the full-HIP, graph-capturable `moe_bf16_wmma` path
+    (`_fused_experts_bf16_hip`, M-invariant: full-K WMMA, no split-K, no Triton autotune) for ALL
+    bf16/fp16/fp32(cast) silu AND gelu experts, with or without router-weight-on-input. The Triton
+    `fused_moe_kernel_triton` + `moe_sum_reduce_triton` path below is now reached ONLY when the kernel
+    is unavailable (non-gfx1201 / unbuilt) — production serving is Triton-FREE and M-invariant."""
     from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
@@ -332,15 +342,18 @@ def fused_experts_impl(
     )
     config = get_config_func(M)
 
-    # Full-HIP graph-capturable path for UNQUANTIZED (bf16/fp16) silu experts without
-    # router-weight-on-input. Everything else (gelu, router-weight-on-input, fp32) uses Triton below.
-    if (
-        activation == "silu"
-        and not apply_router_weight_on_input
-        and hidden_states.dtype in (torch.bfloat16, torch.float16)
-        and _moe_bf16_available()
-    ):
-        return _fused_experts_bf16_hip(hidden_states, w1, w2, topk_weights, topk_ids, config)
+    # Full-HIP graph-capturable path (moe_bf16_wmma: full-K WMMA, no split-K -> M-invariant, no Triton
+    # autotune). Covers silu AND gelu, with/without router-weight-on-input. fp32 experts (rare) are cast
+    # to bf16 for the WMMA GEMMs (fp32 accumulate internally). The Triton path below is now only reached
+    # when the kernel is unavailable (non-gfx1201 / unbuilt) — production serving is Triton-FREE.
+    if activation in ("silu", "gelu") and _moe_bf16_available():
+        hs = hidden_states
+        if hs.dtype not in (torch.bfloat16, torch.float16):
+            hs = hs.to(torch.bfloat16)  # fp32 MoE -> bf16 WMMA (fp32-accumulate); w1/w2 recast below
+        return _fused_experts_bf16_hip(
+            hs, w1.to(hs.dtype), w2.to(hs.dtype), topk_weights, topk_ids, config,
+            activation=activation, apply_router_weight_on_input=apply_router_weight_on_input,
+        ).to(hidden_states.dtype)
 
     cache = torch.empty(
         M * topk_ids.shape[1] * max(N, w2.shape[1]),
