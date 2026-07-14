@@ -570,6 +570,10 @@ class ZayaMoEBlock(BaseOP):
             intermediate_size=config.moe_intermediate_size,  # ffn_hidden_size // 2 = 2048
             renormalize=False,
             activation="silu",
+            # Pass the declared quant so non-fp8 ZAYA quants route correctly (RXF -> _RXFMoEMethod).
+            # fp8/W8A8 is unchanged: create_moe_quant_method returns _FP8MoEMethod when fp8_experts is
+            # set OR quant.is_fp8_w8a8, both of which win before the is_rxf branch.
+            quant=config.quant,
             fp8_experts=fp8,
         )
 
