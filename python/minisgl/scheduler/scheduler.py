@@ -2103,6 +2103,43 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 f"  next_drafts= {nd}  vs-gt[{match(nd, gt)}]   "
                 f"FIDELITY R_k[0]={reps[rk][0]} bonus={bonus} match={reps[rk][0] == bonus}")
 
+    def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
+        """TP>1 lockstep: force every TP rank to verify rank0's drafts.
+
+        The eager spec-verify's vocab-parallel lm-head all_gather (embedding.py `forward`/
+        `logits_all_rows`) is sized by the number of scored rows = ``sum(len(draft)+1)``. The TP ranks
+        run the SAME reqs, but each proposes drafts INDEPENDENTLY — a nondeterministic draft/verify
+        kernel (atomics → an argmax near-tie flip) can make rank0 and rank1 disagree on a draft, so
+        their verify batches get different row counts and the all_gather faults with an illegal
+        address (the DFlash + EP-over-TP crash; same class as the structured-spec TP=2 divergence).
+        Broadcasting rank0's drafts makes every rank build the byte-identical verify batch → identical
+        collectives forever. LOSSLESS: ``verify_greedy`` corrects any draft, so the committed tokens
+        are the target's greedy tokens regardless of which rank's drafts were verified — only the
+        (already-nondeterministic) acceptance rate can move, never the output."""
+        if self._tp_size <= 1:
+            return drafts
+        g = self.tp_cpu_group
+        n = len(reqs)
+        lens = torch.tensor(
+            [len(d) for d in drafts] if self._tp_is_primary else [0] * n, dtype=torch.int64
+        )
+        g.broadcast(lens, root=0).wait()
+        lens_l = [int(x) for x in lens.tolist()]
+        total = sum(lens_l)
+        if total == 0:
+            return [[] for _ in range(n)]
+        flat = (
+            torch.tensor([t for d in drafts for t in d], dtype=torch.int64)
+            if self._tp_is_primary else torch.zeros(total, dtype=torch.int64)
+        )
+        g.broadcast(flat, root=0).wait()
+        out: List[List[int]] = []
+        off = 0
+        for L in lens_l:
+            out.append([int(x) for x in flat[off:off + L]])
+            off += L
+        return out
+
     def _spec_decode_step(self, reqs: List[Req], ddtree_drafts: bool = False) -> None:
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
@@ -2135,6 +2172,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             drafts = [list(getattr(r, "_tidar_drafts", []) or []) for r in reqs]
         else:
             drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
+        # TP>1 lockstep: every rank verifies rank0's drafts so the eager lm-head all_gather sees an
+        # identical row count on all ranks (else the verify batch desyncs → illegal-address fault).
+        drafts = self._bcast_drafts_tp(reqs, drafts)
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
 
