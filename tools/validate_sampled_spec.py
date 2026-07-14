@@ -116,6 +116,42 @@ def test_greedy_reduction(device) -> bool:
     return good
 
 
+def test_ddtree_walk_sampled(device, M=80_000) -> bool:
+    print("\n[Test 4] ddtree_walk_sampled: first emitted token ~ p[root] (SpecTr losslessness)")
+    from minisgl.spec.ddtree import build_draft_tree, ddtree_walk, ddtree_walk_sampled
+
+    V = 48
+    torch.manual_seed(5)
+    # a small tree: top-4 marginals over 3 depths, budget 8, root = token 0
+    K, depth = 4, 3
+    node_logits = torch.randn(16, V, device=device) * 1.5  # >= n_nodes rows
+    topk_logp, topk_ids = [], []
+    for d in range(depth):
+        lp = torch.log_softmax(torch.randn(V) * 1.5, dim=-1)
+        tvals, ti = lp.topk(K)  # NOT `tv` — that's the total-variation fn above
+        topk_logp.append(tvals.tolist())
+        topk_ids.append([int(x) for x in ti.tolist()])
+    tree = build_draft_tree(topk_logp, topk_ids, budget=8, root_token=0)
+    p_root = probs_from_logits(node_logits[0:1], 0.9, -1, 0.95)[0].cpu()
+    g = torch.Generator(device=device).manual_seed(11)
+    counts = torch.zeros(V, device="cpu")
+    for _ in range(M):
+        acc, bonus = ddtree_walk_sampled(node_logits, tree, 0.9, -1, 0.95, g)
+        first = acc[0] if acc else bonus  # the token committed at the ROOT level
+        counts[first] += 1
+    d = tv(counts / M, p_root)
+    tol = 4.0 / (M ** 0.5)
+    ok = d < tol
+    print(f"  TV(first_emitted, p[root])={d:.5f} (tol {tol:.5f}) {'OK' if ok else 'FAIL'}")
+    # greedy reduction: temp->0 walk == ddtree_walk on the argmax
+    g0 = torch.Generator(device=device).manual_seed(0)
+    acc_s, b_s = ddtree_walk_sampled(node_logits, tree, 1e-6, -1, 1.0, g0)
+    acc_g, b_g = ddtree_walk(node_logits.argmax(-1).cpu().tolist(), tree)
+    red = acc_s == acc_g and b_s == b_g
+    print(f"  temp->0: sampled=({acc_s},{b_s}) greedy=({acc_g},{b_g}) {'OK' if red else 'FAIL'}")
+    return ok and red
+
+
 def main() -> int:
     assert torch.cuda.is_available(), "no HIP GPU visible"
     device = torch.device("cuda")
@@ -129,6 +165,7 @@ def main() -> int:
     ok &= test_probs_match_sampler(device)
     ok &= test_verify_sampled_lossless(device)
     ok &= test_greedy_reduction(device)
+    ok &= test_ddtree_walk_sampled(device)
     print("\n==== SAMPLED-SPEC VALIDATION:", "PASS" if ok else "FAIL", "====")
     return 0 if ok else 1
 
