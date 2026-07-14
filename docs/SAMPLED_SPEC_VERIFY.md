@@ -70,12 +70,18 @@ more than argmax. So drafts must be **sampled from `q` at the req's sampling par
   num_accepted) to all ranks — simplest and guarantees lockstep. (`p` is identical on all ranks after
   the lm-head all_gather, so only `u`/`q`/residual RNG needs syncing; broadcasting the outcome subsumes
   all of it.)
-- **Constrained (grammar) + sampled:** the grammar bitmask must be applied to `p_i` (and the residual
-  must stay within the mask). v1 restricts sampled-spec to **unconstrained** reqs; a constrained
-  sampled req falls back to plain constrained decode (still correct, just unaccelerated). RSA applies
-  grammar only to the final answer, so the rollouts (the bulk) are unconstrained → fine for RSA.
-- **DDTree:** the draft-TREE walk is a greedy longest-match; sampled tree verify (SpecTr-style) is a
-  separate, larger design. v1 keeps DDTree greedy-only (gate DDTree on `is_greedy`).
+- **Constrained (grammar) + sampled: SUPPORTED** (`_verify_sampled_constrained`). Per position the
+  grammar bitmask masks the logits, `p_i` is built from the masked logits, and the draft is rejection-
+  accepted (a grammar-violating draft has masked `p=0` → always rejected, exactly as the greedy
+  masked-argmax rejects it); residual/bonus sample from the masked `p`; the matcher advances on every
+  committed token. Same think-gate/reasoning scaffolding as `_verify_greedy_constrained`. RSA applies
+  grammar only to the final answer, so this covers the structured RSA answer.
+- **DDTree + sampled: SUPPORTED (lossless-commit).** The tree DISCOVERY stays greedy (a heuristic for a
+  good draft path) and the lossless LINEAR COMMIT (`_spec_decode_step(ddtree_drafts=True)`) routes the
+  discovered path through `verify_sampled` like any other req — so DDTree engages under sampling and is
+  distributionally lossless. The tree's *higher-acceptance* benefit under sampling (multi-candidate
+  rejection down the tree) needs SpecTr (`ddtree_walk_sampled`), a follow-up; today the tree buys draft
+  quality, not extra sampled acceptance.
 - **TiDAR fused:** already has its own β/logit-mix greedy verify; sampled TiDAR is out of scope for v1.
 - **On-device accept:** `accept_greedy_ondevice` has no sampled analogue yet; sampled-spec v1 uses the
   host accept path (the on-device gate already excludes non-greedy — extend later with a vectorized

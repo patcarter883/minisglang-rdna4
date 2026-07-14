@@ -95,6 +95,22 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # restore over the same recurrent state (verify-state install) with prompt-dependent
         # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
         _rec_radix_ok = self.engine.spec_config is None
+        # CCA (ZAYA) is EXCLUDED from recurrent radix. The recurrent (conv_states, prev_hs) snapshot
+        # itself is captured/restored byte-faithfully (verified: clone_slot == the fresh state@boundary
+        # to 0.0), so the recurrent state is NOT the problem. But recurrent radix ALSO turns on
+        # cross-request PAGED-KV prefix reuse, which the naive cache never did for CCA. A CCA layer
+        # stores per-head RMS-normed + key-temperature-scaled q|k (the conv front-end's qk_out) into the
+        # KV pool; reusing those keys after fp8 KV quantization (the served default, MINISGL_KV_FP8=1)
+        # corrupts a diverging continuation off a SHORT shared prefix — the exact GSM8K few-shot regime
+        # (shared few-shot prompt + a different question right at the boundary). Repro (tools/
+        # cca_radix_repro.py): a 32-token shared prefix + diverging continuation gives cos 0.79 /
+        # max|Δlogit| 7.0 vs naive under fp8 KV (and still flips greedy under bf16 KV); longer prefixes
+        # happen to survive. This matches the serving report (fp8 12.5% vs 36% naive; RXF 32% vs 45%),
+        # and fp8 hurting more than RXF is the fp8-KV amplification. GDN keeps recurrent radix (its KV is
+        # plain attention K/V, validated lossless in tools/rec_radix_validate.py). So: recurrent radix
+        # is GDN-only; CCA falls back to the naive cache its own slot lifecycle already assumes
+        # (see kvcache/cca_state.py + scheduler/cca_slots.py: "CCA recurrent state is not prefix-cacheable").
+        _rec_radix_ok = _rec_radix_ok and self.engine.cca_state is None
         if has_recurrent_state and cache_type != "naive":
             if config.gdn_radix and _rec_radix_ok:
                 self._rec_radix = True
@@ -105,7 +121,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 )
             else:
                 why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
-                if config.gdn_radix and not _rec_radix_ok:
+                if config.gdn_radix and self.engine.cca_state is not None:
+                    why = ("CCA (ZAYA) prefix-KV reuse corrupts diverging continuations off short shared "
+                           "prefixes under fp8 KV (recurrent snapshot is faithful; the paged-KV reuse is not)")
+                elif config.gdn_radix and not _rec_radix_ok:
                     why = "recurrent radix is not supported with spec-decode (both snapshot the recurrent state)"
                 logger.warning_rank0(
                     f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
@@ -306,11 +325,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # verify only (not DDTree / fused-TiDAR), unconstrained reqs, host accept path. Default OFF.
         # See docs/SAMPLED_SPEC_VERIFY.md. Per-step generator seeded identically on every TP rank so the
         # rejection draws stay in lockstep (drafts are already broadcast; p is identical post-all_gather).
+        # DDTree paths (dflash/tidar) are supported: their tree DISCOVERY stays greedy (a heuristic for
+        # a good draft path) and the lossless LINEAR COMMIT routes through verify_sampled like any other
+        # req — so DDTree engages under sampling (the tree's higher-acceptance benefit under sampling
+        # needs SpecTr multi-candidate rejection, a follow-up). Fused-TiDAR has its own accept path
+        # (_spec_decode_step_tidar_fused) that this route doesn't cover, so it stays excluded for now.
         self._spec_sampled = (
             os.environ.get("MINISGL_SPEC_SAMPLED") == "1"
             and not getattr(self, "_tidar_fused", False)
-            and not getattr(self, "_dflash_ddtree", False)
-            and not getattr(self, "_tidar_ddtree", False)
         )
         self._spec_step = 0
         self._spec_seed_base = int(os.environ.get("MINISGL_SPEC_SAMPLED_SEED", "42"))
@@ -1056,6 +1078,82 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 n_acc += 1
                 continue
             break  # bonus token (t_i != draft[i], or i == K)
+        return AcceptResult(emitted=emitted, num_accepted=n_acc)
+
+    def _verify_sampled_constrained(
+        self, matcher, draft: List[int], logits_block: torch.Tensor, sp, gen, uid: int
+    ) -> AcceptResult:
+        """Sampled (rejection-sampling) analogue of _verify_greedy_constrained (structured output +
+        SAMPLED spec). Identical think-gate / matcher-advance / EOS scaffolding; per position the target
+        dist p is built from the GRAMMAR-MASKED logits with the req's temp/top_k/top_p, and the draft is
+        accepted with prob min(1, p(draft)/q), q=onehot(draft) — a grammar-violating draft has masked
+        p=0 so it is ALWAYS rejected, exactly as the greedy masked-argmax rejects it. On reject/bonus the
+        token is sampled from the (masked) p; the matcher is advanced by every committed token. Output is
+        distributed as plain constrained sampled decode (distributionally lossless). ``logits_block``
+        [K+1, V] on device."""
+        from minisgl.engine.grammar import apply_token_bitmask
+
+        backend = self._grammar_backend
+        emitted: List[int] = []
+        n_acc = 0
+        K = len(draft)
+
+        def _reject_sample(p: torch.Tensor, di):
+            # accept draft di w.p. p[di] (q=onehot); else residual = renorm(relu(p - onehot(di))).
+            # di is None at the bonus position -> straight sample from p. Returns (token, accepted).
+            if di is not None:
+                u = float(torch.rand(1, generator=gen, device=p.device).item())
+                if u < float(p[di]):
+                    return di, True
+                resid = p.clone()
+                resid[di] = 0.0
+                s = resid.sum()
+                dist = resid / s if float(s) > 0.0 else p
+                return int(torch.multinomial(dist, 1, generator=gen).item()), False
+            return int(torch.multinomial(p, 1, generator=gen).item()), False
+
+        for i in range(K + 1):
+            di = int(draft[i]) if i < K else None
+            gate = self._grammar_think_gate.get(uid)
+            if gate is not None:
+                if self._think_gate_over_budget(uid):
+                    emitted.append(gate)
+                    self._clear_think_gate(uid)
+                    break
+                # Reasoning phase: UNCONSTRAINED sampled rejection; matcher stays at its initial state.
+                p = probs_from_logits(
+                    logits_block[i : i + 1], sp.temperature, sp.top_k, sp.top_p
+                )[0]
+                t_i, acc = _reject_sample(p, di)
+                emitted.append(t_i)
+                if (not sp.ignore_eos) and t_i in self.eos_token_ids:
+                    break
+                if t_i == gate:
+                    self._clear_think_gate(uid)  # open gate: NEXT position is schema-constrained
+                else:
+                    self._grammar_think_count[uid] = self._grammar_think_count.get(uid, 0) + 1
+                if i < K and acc:
+                    n_acc += 1
+                    continue
+                break
+            bitmask = backend.allocate_bitmask(1)
+            bitmask.fill_(-1)
+            terminated = matcher.is_terminated()
+            if not terminated:
+                matcher.fill_next_token_bitmask(bitmask, 0)
+            masked = apply_token_bitmask(logits_block[i : i + 1].float(), bitmask)  # disallowed -> -inf
+            p = probs_from_logits(masked, sp.temperature, sp.top_k, sp.top_p)[0]  # grammar-masked dist
+            t_i, acc = _reject_sample(p, di)
+            emitted.append(t_i)
+            is_eos = (not sp.ignore_eos) and t_i in self.eos_token_ids
+            if not is_eos and not terminated:
+                matcher.accept_token(t_i)
+            if is_eos:
+                break
+            if i < K and acc:
+                n_acc += 1
+                continue
+            break  # bonus token (rejected draft, or i == K)
         return AcceptResult(emitted=emitted, num_accepted=n_acc)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
@@ -2207,10 +2305,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
     def _req_spec_ok(self, req: Req) -> bool:
         """Whether a req may run through the spec step. Greedy reqs always can (lossless greedy verify).
-        A non-greedy req can only when sampled spec is enabled (rejection-sampling verify) AND it isn't
-        constrained (grammar + sampled residual is a v1 carve-out — see docs/SAMPLED_SPEC_VERIFY.md)."""
+        A non-greedy req can when sampled spec is enabled — unconstrained via verify_sampled, constrained
+        via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md."""
         sp = req.sampling_params
-        return sp.is_greedy or (self._spec_sampled and not sp.is_constrained)
+        return sp.is_greedy or self._spec_sampled
 
     def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
         """TP>1 lockstep: force every TP rank to verify rank0's drafts.
@@ -2499,15 +2597,20 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 keep = list(od_keeps[i])
                 eos = od_eos[i]
             elif gen is not None and not req.sampling_params.is_greedy:
-                # Sampled rejection verify: build the target dist p [K+1, V] with THIS req's
-                # temp/top_k/top_p, accept draft_j with prob min(1, p_j(draft_j)/q) (q = onehot(draft)),
-                # residual/bonus sampled from p. Distributionally lossless. Constrained-sampled reqs are
-                # excluded upstream (_req_spec_ok), so no matcher here.
+                # Sampled rejection verify: accept draft_j w.p. min(1, p_j(draft_j)/q) (q=onehot(draft)),
+                # residual/bonus sampled from p. Distributionally lossless.
                 sp = req.sampling_params
-                pblock = probs_from_logits(
-                    logits[block_start : block_start + q_len], sp.temperature, sp.top_k, sp.top_p
+                lblock = logits[block_start : block_start + q_len]
+                matcher = (
+                    self._grammar_matchers.get(req.uid) if sp.is_constrained else None
                 )
-                result = verify_sampled(d, pblock, gen)
+                if matcher is not None:
+                    # Constrained + sampled: grammar-masked rejection (masked p per position + matcher
+                    # advance). A grammar-violating draft has masked p=0 -> always rejected.
+                    result = self._verify_sampled_constrained(matcher, d, lblock, sp, gen, req.uid)
+                else:
+                    pblock = probs_from_logits(lblock, sp.temperature, sp.top_k, sp.top_p)
+                    result = verify_sampled(d, pblock, gen)
             else:
                 matcher = (
                     self._grammar_matchers.get(req.uid)
