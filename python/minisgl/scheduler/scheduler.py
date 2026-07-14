@@ -95,22 +95,6 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # restore over the same recurrent state (verify-state install) with prompt-dependent
         # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
         _rec_radix_ok = self.engine.spec_config is None
-        # CCA (ZAYA) is EXCLUDED from recurrent radix. The recurrent (conv_states, prev_hs) snapshot
-        # itself is captured/restored byte-faithfully (verified: clone_slot == the fresh state@boundary
-        # to 0.0), so the recurrent state is NOT the problem. But recurrent radix ALSO turns on
-        # cross-request PAGED-KV prefix reuse, which the naive cache never did for CCA. A CCA layer
-        # stores per-head RMS-normed + key-temperature-scaled q|k (the conv front-end's qk_out) into the
-        # KV pool; reusing those keys after fp8 KV quantization (the served default, MINISGL_KV_FP8=1)
-        # corrupts a diverging continuation off a SHORT shared prefix — the exact GSM8K few-shot regime
-        # (shared few-shot prompt + a different question right at the boundary). Repro (tools/
-        # cca_radix_repro.py): a 32-token shared prefix + diverging continuation gives cos 0.79 /
-        # max|Δlogit| 7.0 vs naive under fp8 KV (and still flips greedy under bf16 KV); longer prefixes
-        # happen to survive. This matches the serving report (fp8 12.5% vs 36% naive; RXF 32% vs 45%),
-        # and fp8 hurting more than RXF is the fp8-KV amplification. GDN keeps recurrent radix (its KV is
-        # plain attention K/V, validated lossless in tools/rec_radix_validate.py). So: recurrent radix
-        # is GDN-only; CCA falls back to the naive cache its own slot lifecycle already assumes
-        # (see kvcache/cca_state.py + scheduler/cca_slots.py: "CCA recurrent state is not prefix-cacheable").
-        _rec_radix_ok = _rec_radix_ok and self.engine.cca_state is None
         if has_recurrent_state and cache_type != "naive":
             if config.gdn_radix and _rec_radix_ok:
                 self._rec_radix = True
@@ -121,10 +105,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 )
             else:
                 why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
-                if config.gdn_radix and self.engine.cca_state is not None:
-                    why = ("CCA (ZAYA) prefix-KV reuse corrupts diverging continuations off short shared "
-                           "prefixes under fp8 KV (recurrent snapshot is faithful; the paged-KV reuse is not)")
-                elif config.gdn_radix and not _rec_radix_ok:
+                if config.gdn_radix and not _rec_radix_ok:
                     why = "recurrent radix is not supported with spec-decode (both snapshot the recurrent state)"
                 logger.warning_rank0(
                     f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
@@ -427,6 +408,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # debug, not info: this fires every idle loop and otherwise floods the log (drowning e.g. the
         # [rsa-timing] breakdown). Enable debug logging if you want the idle heartbeat back.
         logger.debug_rank0("Scheduler is idle, waiting for new reqs...")
+        # DFlash capture: flush the seedbuf buffer whenever idle (the driver pauses between prompts and
+        # is fully idle at the end) — atexit does NOT run on the container's SIGTERM, so this is how the
+        # tail lands. Cheap no-op when not capturing / buffer empty.
+        if self._capture_dir and self._capture_buf:
+            self._flush_capture()
         self.cache_manager.check_integrity()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
@@ -1297,11 +1283,22 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.engine.cam is not None:
             self._stage_cam(batch)
-        if self._capture_dir and batch.is_prefill and not getattr(batch, "spec_verify", False):
-            # DFlash training-data capture: prefill WITH aux (forces eager, no graph), dump per position.
+        # DFlash training-data capture: run the forward WITH aux (eager, no graph) whenever the batch has
+        # any EXTEND (prefill/teacher-forcing) rows — NOT only pure-prefill batches, since under
+        # concurrency prefills get batched with decodes (batch.is_prefill=False) and would otherwise be
+        # skipped. _dump_capture picks out the extend_len>1 rows.
+        if (self._capture_dir and not getattr(batch, "spec_verify", False)
+                and any(r.extend_len > 1 for r in batch.reqs)):
+            # Snapshot the extend spans BEFORE the forward: forward_batch calls complete_one() which sets
+            # cached_len=device_len, collapsing extend_len to 1 — so the post-forward req can't tell us
+            # the prefill length. (uid, row offset, ext, cached_len) in padded_reqs order.
+            spans, off = [], 0
+            for r in batch.padded_reqs:
+                spans.append((getattr(r, "uid", -1), off, r.extend_len, r.cached_len))
+                off += r.extend_len
             out, _lh, aux = self.engine.forward_batch(batch, sample_args, return_hidden=True)
             if aux is not None:
-                self._dump_capture(batch, aux)
+                self._dump_capture(batch, aux, spans)
             forward_output = out
         else:
             forward_output = self.engine.forward_batch(batch, sample_args)
@@ -1312,31 +1309,30 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
-    def _dump_capture(self, batch: Batch, aux_hidden: torch.Tensor) -> None:
-        """Buffer this prefill's per-position aux + token for DFlash re-distillation. aux_hidden is
-        [num_aux, T, hidden] over the batch rows (padded_reqs order, extend_len each). seed_in[j] =
-        concat of the num_aux layer taps at position j (the SAME order set_capture_layers used, so it
-        matches the drafter's fc input); bonus[j] = the token AT position j (teacher-forced input_ids);
-        pos[j] = absolute position; slot = uid (separates concurrent sequences for the trainer)."""
+    def _dump_capture(self, batch: Batch, aux_hidden: torch.Tensor, spans) -> None:
+        """Buffer this batch's EXTEND (prefill/teacher-forced) per-position aux + token for DFlash
+        re-distillation. aux_hidden [num_aux, T, hidden] over the batch rows (padded_reqs order).
+        ``spans`` = [(uid, row_offset, ext, cached_len)] snapshot BEFORE the forward (complete_one
+        collapses extend_len afterward). seed_in[j] = concat of the num_aux layer taps at position j (the
+        SAME order set_capture_layers used → matches the drafter's fc); bonus[j] = the token AT position
+        j (teacher-forced input_ids); pos[j] = absolute position; slot = uid (separates sequences)."""
         num_aux, _T, H = aux_hidden.shape
         ids = batch.input_ids
         positions = getattr(batch, "positions", None)
-        off = 0
         seed_l, tok_l, pos_l, slot_l = [], [], [], []
-        for req in batch.padded_reqs:
-            ext = req.extend_len
-            uid = getattr(req, "uid", -1)
-            if uid is not None and uid >= 0:
-                sl = aux_hidden[:, off:off + ext]                              # [num_aux, ext, H]
-                seed_l.append(sl.permute(1, 0, 2).reshape(ext, num_aux * H).half().cpu())
-                tok_l.append(ids[off:off + ext].to(torch.long).cpu())
-                if positions is not None:
-                    pos_l.append(positions[off:off + ext].to(torch.long).cpu())
-                else:  # forward_batch already advanced cached_len by ext
-                    c0 = req.cached_len - ext
-                    pos_l.append(torch.arange(c0, c0 + ext, dtype=torch.long))
-                slot_l.append(torch.full((ext,), int(uid), dtype=torch.long))
-            off += ext
+        for uid, off, ext, c0 in spans:
+            # Only extend rows (ext>1). Decode rows (ext==1, mixed-batch neighbours) and dummy/padding
+            # rows (uid<0) are skipped — the teacher-forcing re-feed gives the dense per-position aux.
+            if uid is None or uid < 0 or ext <= 1:
+                continue
+            sl = aux_hidden[:, off:off + ext]                              # [num_aux, ext, H]
+            seed_l.append(sl.permute(1, 0, 2).reshape(ext, num_aux * H).half().cpu())
+            tok_l.append(ids[off:off + ext].to(torch.long).cpu())
+            if positions is not None:
+                pos_l.append(positions[off:off + ext].to(torch.long).cpu())
+            else:
+                pos_l.append(torch.arange(c0, c0 + ext, dtype=torch.long))
+            slot_l.append(torch.full((ext,), int(uid), dtype=torch.long))
         if seed_l:
             self._capture_buf.append({
                 "seed_in": torch.cat(seed_l), "bonus": torch.cat(tok_l),
@@ -1349,7 +1345,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if not self._capture_buf:
             return
         path = os.path.join(self._capture_dir, f"seedbuf_{os.getpid()}_{self._capture_n:05d}.pt")
+        npos = sum(int(r["bonus"].numel()) for r in self._capture_buf)
         torch.save(self._capture_buf, path)
+        logger.info_rank0(f"[capture] flushed {npos} positions -> {path}")
         self._capture_n += 1
         self._capture_buf = []
 

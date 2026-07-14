@@ -41,6 +41,7 @@ docker run --rm \
   -e MINISGL_ZAYA_CAPTURE_DIR=/capture \
   -e MINISGL_KV_FP8="${KV_FP8:-1}" -e MINISGL_MOE_SCATTER=0 \
   -e GENTOK="$GENTOK" -e WORKERS="$WORKERS" -e MODEL="$MODEL" \
+  -e MAXRUN="${MAXRUN:-64}" -e MEMRATIO="${MEMRATIO:-0.9}" \
   -v "$PWD":/engine \
   -v /home/pat/models:/models:ro \
   -v /home/pat/code/_big:/big:ro \
@@ -58,7 +59,8 @@ docker run --rm \
       MINISGL_MOE_SCATTER=0 MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 \
       python -m minisgl --model "$MODEL" --host 127.0.0.1 --port 1919 \
         --cache-type naive --attention-backend hip --page-size 16 --tp 1 --disable-pynccl \
-        --cuda-graph-max-bs 0 --memory-ratio 0.85 > "$LOG" 2>&1 &
+        --max-running-requests "'"${MAXRUN:-64}"'" \
+        --cuda-graph-max-bs 0 --memory-ratio "'"${MEMRATIO:-0.9}"'" > "$LOG" 2>&1 &
     SRV=$!
     for _ in $(seq 1 400); do
       python -c "import urllib.request;urllib.request.urlopen(\"http://127.0.0.1:1919/v1/models\",timeout=3)" 2>/dev/null && break
