@@ -294,6 +294,10 @@ services:
       # accepted tokens/step than the linear block. Only consulted when MINISGL_ZAYA_SPEC=1.
       MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-1}"
       MINISGL_DDTREE_BUDGET: "${MINISGL_DDTREE_BUDGET:-32}"
+      # On-policy Draft-OPD capture: when set (+ MINISGL_ZAYA_SPEC=1, MINISGL_DFLASH_DDTREE=0), the
+      # scheduler dumps the drafter's own trajectory per verify step as opdbuf_*.pt for retraining
+      # (dflash-drafter). Write under /engine (the `.:/engine` mount) to reach the host. Inert unset.
+      MINISGL_ZAYA_OPD_CAPTURE_DIR: "${MINISGL_ZAYA_OPD_CAPTURE_DIR:-}"
       # Override the image's /opt/kernels: canonical /kernels/_kernels FIRST so `import gdn_hip` etc.
       # resolve to the mounted latest builds; /engine keeps the 3 not-yet-canonical fallbacks.
       PYTHONPATH: /kernels/_kernels:/engine/python:/engine
