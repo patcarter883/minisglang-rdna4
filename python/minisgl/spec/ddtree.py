@@ -227,6 +227,60 @@ def ddtree_paged_layout(
     return positions, mask, node_cols
 
 
+def ddtree_paged_layout_segmented(
+    cached_len: int, tree: Tree, conv_width: int, device=None
+) -> dict:
+    """SEGMENTED ddtree layout (brief #3, parent-indexed recurrence for CCA). The CCA conv reads PACKED
+    neighbours ``qk_new[row-TP..row]`` (cca_kernel.hip), so a tree node's conv window is its packed
+    neighbours — the WRONG context (siblings/other branches), not its ancestor chain. Fix WITHOUT a
+    kernel change (CCA state is a raw rolling qk window + prev_hs, no recurrent accumulator — see
+    cca/metadata.py): before each node j insert its ``conv_width-1`` closest ancestors (shallow->deep,
+    so the parent lands immediately before j) as CONV-CONTEXT rows, so the packed window becomes j's TRUE
+    ancestor conv context. Same trick as tidar_mask.fused_paged_layout_segmented, generalized to an
+    arbitrary tree. NO fix needed for a recurrent accumulator — CCA has none (GDN would need a kernel).
+
+    Every row represents a node ``m`` (a real node, or a ctx COPY of an ancestor) and attends
+    ``[committed prefix | the node-columns of m's ancestor chain incl m]`` — identical to m's own
+    attention, so a ctx copy's q/k EQUAL the real node's (feeding j's conv the correct value). ctx rows
+    are attended by NOBODY (conv-only); their own conv/logits are discarded. Node rows never attend ctx
+    columns. n_query is FIXED for a fixed topology (static template) -> capturable.
+
+    Returns dict: positions[list], mask[n_query, cached_len+n_query] additive, n_query, node_rows[n]
+    (packed row whose logit == node j's target logit), tokens_of(fn) helper unused (scheduler stages)."""
+    TP = conv_width
+    n = tree.n_nodes
+    # packed rows: (represented_node_id, is_ctx). parents precede children (node-id order), so an
+    # ancestor's real-node row always exists before any ctx copy that references it.
+    rep: List[int] = []
+    is_ctx: List[bool] = []
+    node_rows = [0] * n
+    for j in range(n):
+        anc: List[int] = []                       # j's closest TP-1 ancestors, deep..shallow
+        a = tree.parent[j]
+        while a != -1 and len(anc) < TP - 1:
+            anc.append(a)
+            a = tree.parent[a]
+        for c in reversed(anc):                   # shallow -> deep: parent ends up right before j
+            rep.append(c); is_ctx.append(True)
+        node_rows[j] = len(rep)
+        rep.append(j); is_ctx.append(False)
+    n_query = len(rep)
+    context_len = cached_len + n_query
+    positions = [cached_len + tree.depth[m] for m in rep]
+    mask = torch.full((n_query, context_len), NEG_INF, dtype=torch.float32, device=device)
+    if cached_len > 0:
+        mask[:, :cached_len] = 0.0                # every row sees the committed prefix
+    for r, m in enumerate(rep):
+        a = m                                     # attend m's own node column + its ancestor node columns
+        while a != -1:
+            mask[r, cached_len + node_rows[a]] = 0.0
+            a = tree.parent[a]
+    return {
+        "positions": positions, "mask": mask, "n_query": n_query,
+        "node_rows": node_rows, "rep": rep, "is_ctx": is_ctx,
+    }
+
+
 def ddtree_walk(argmax_per_node: Sequence[int], tree: Tree) -> Tuple[List[int], int]:
     """Greedy verifier walk (temperature 0, lossless). argmax_per_node[j] = the target model's argmax
     at node j's logit row. Start at the root: the target picks a token; if it is a child in the tree,
