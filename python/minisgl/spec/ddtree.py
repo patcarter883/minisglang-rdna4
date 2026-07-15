@@ -27,7 +27,10 @@ import torch
 
 NEG_INF = float("-inf")
 
-__all__ = ["Tree", "build_draft_tree", "ddtree_paged_layout", "ddtree_walk", "ddtree_walk_sampled"]
+__all__ = [
+    "Tree", "build_draft_tree", "ddtree_paged_layout", "ddtree_walk", "ddtree_walk_sampled",
+    "StaticTemplate", "build_static_template", "fill_static_template", "template_ancestor_block",
+]
 
 
 @dataclass
@@ -108,6 +111,89 @@ def build_draft_tree(
             heapq.heappush(heap, (-ch_score, tie, ch))
             tie += 1
     return tree
+
+
+@dataclass(frozen=True)
+class StaticTemplate:
+    """A FIXED-topology draft-tree template (Medusa-style). The best-first tree's SHAPE depends only on
+    the RANK ordering of the marginals, not the token ids — so freeze it once (parent/depth/rank arrays)
+    and each step only fill the token ids (fill_static_template). The ancestor mask is then a compile-time
+    CONSTANT (bake once, no per-step O(n*depth) host rebuild — the brief's "bake the mask" for DDTree),
+    and the parent indices become compile-time constants (the substrate for parent-indexed tree recurrence).
+
+    Arrays are indexed by node id (0 = root/bonus, parent[0] = -1):
+      parent[j] — parent node id.        depth[j] — 0 (root) or the future-position depth d>=1.
+      rank[j]   — which rank of position (depth-1)'s top-K marginals node j takes (root: -1).
+    Trades the per-step heap's adaptivity for capture + a baked mask; the published tree-method results
+    say most of the gain is chain->tree, not the fine-grained node selection."""
+
+    parent: Tuple[int, ...]
+    depth: Tuple[int, ...]
+    rank: Tuple[int, ...]
+
+    @property
+    def n_nodes(self) -> int:
+        return len(self.parent)
+
+
+def build_static_template(budget: int, top_k: int, block_len: int, decay: float = 1.0) -> StaticTemplate:
+    """Freeze a fixed tree topology = the best-first tree for a CANONICAL geometric marginal
+    (logp[i][k] = -decay*k, identical at every depth). Because build_draft_tree's shape is a pure
+    function of the rank ordering, feeding it monotone synthetic marginals yields the average-case
+    best-first topology once; the per-step fill then reuses it for the real (differently-valued but
+    same-ranked-on-average) marginals. Uses synthetic ids == ranks so the returned tokens ARE the ranks.
+
+    budget non-root nodes over depth<=block_len, branching<=top_k. Requires the shape to reach exactly
+    ``budget`` (true for the served K=8/L>=4/budget<=32); asserts otherwise so a misconfig fails loudly
+    rather than silently mismatching the captured tree_qlen."""
+    assert budget > 0 and top_k > 0 and block_len > 0, (budget, top_k, block_len)
+    logp = [[-decay * k for k in range(top_k)] for _ in range(block_len)]
+    ids = [[k for k in range(top_k)] for _ in range(block_len)]  # id == rank
+    tree = build_draft_tree(logp, ids, budget, root_token=-1)
+    assert tree.n_draft == budget, (
+        f"static template reached {tree.n_draft} non-root nodes, need budget={budget} "
+        f"(raise top_k/block_len or lower budget)"
+    )
+    # tree.token[j] == rank[j] for j>=1 (synthetic ids); root rank = -1.
+    return StaticTemplate(
+        parent=tuple(tree.parent), depth=tuple(tree.depth), rank=tuple(tree.token)
+    )
+
+
+def fill_static_template(
+    t: StaticTemplate, topk_ids: Sequence[Sequence[int]], root_token: int
+) -> Tree:
+    """Fill the fixed template's token slots from THIS step's marginals: node j (depth d, rank r) takes
+    ``topk_ids[d-1][r]``. Topology (parent/depth) is the template's; only tokens + the children dict vary.
+    Cheap (no heap): O(n). Two sibling ranks can map to the same token id when the marginals tie at a
+    position — setdefault keeps the first (higher-rank-order) as the walk child, matching build_draft_tree."""
+    n = t.n_nodes
+    tree = Tree(
+        token=[root_token] + [0] * (n - 1),
+        parent=list(t.parent),
+        depth=list(t.depth),
+        children=[{} for _ in range(n)],
+    )
+    for j in range(1, n):
+        tok = int(topk_ids[t.depth[j] - 1][t.rank[j]])
+        tree.token[j] = tok
+        tree.children[t.parent[j]].setdefault(tok, j)
+    return tree
+
+
+def template_ancestor_block(t: StaticTemplate, device=None, dtype=torch.float32) -> torch.Tensor:
+    """Baked tree-LOCAL ancestor mask [n_nodes, n_nodes] additive bias (0 = allowed, -inf = denied),
+    prefix-INDEPENDENT: block[j, a] = 0 iff a is j itself or an ancestor of j, else -inf. Constant across
+    steps (parent-derived), so build once and slice-place at [.., c0:c0+n] each step instead of the
+    per-node O(n*depth) host loop. Column semantics match ddtree_paged_layout's tree-local block."""
+    n = t.n_nodes
+    m = torch.full((n, n), NEG_INF, dtype=dtype, device=device)
+    for j in range(n):
+        a = j
+        while a != -1:
+            m[j, a] = 0.0
+            a = t.parent[a]
+    return m
 
 
 def ddtree_paged_layout(

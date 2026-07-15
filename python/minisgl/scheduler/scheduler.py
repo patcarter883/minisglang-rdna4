@@ -299,6 +299,26 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"(budget={self._ddtree_budget} qlen={tree_qlen} mask_ctx<={max_ctx} "
                     f"bs={ddtree_bs})")
                 self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
+                # MINISGL_DDTREE_STATIC=1: FIXED-topology draft tree (Medusa-style) instead of the
+                # per-step best-first heap. Freezes the tree shape once so the ancestor mask is a
+                # compile-time CONSTANT — the per-step O(n*depth) host mask rebuild becomes a slice-copy
+                # of a baked [n,n] block (the brief's "bake the mask" for DDTree), and the parent indices
+                # become compile-time constants (substrate for parent-indexed tree recurrence). Trades the
+                # heap's per-step adaptivity for a baked mask; default OFF (dynamic heap) — A/B once the
+                # retrained drafter lands. L = the drafter block width (TiDAR block_size / DFlash num_draft).
+                self._ddtree_template = None
+                self._ddtree_template_block = None
+                if os.environ.get("MINISGL_DDTREE_STATIC") == "1":
+                    from minisgl.spec.ddtree import build_static_template, template_ancestor_block
+                    K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
+                    L = int(getattr(self._proposer, "block_size", None)
+                            or self.engine.spec_config.num_draft)
+                    self._ddtree_template = build_static_template(self._ddtree_budget, K, L)
+                    self._ddtree_template_block = template_ancestor_block(
+                        self._ddtree_template, device=self.device)
+                    logger.info_rank0(
+                        f"spec-decode: DDTree STATIC template ENABLED (budget={self._ddtree_budget} "
+                        f"K={K} L={L} n_nodes={self._ddtree_template.n_nodes}); ancestor mask BAKED")
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -1871,15 +1891,22 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # ancestor mask (own+ancestor tree cols allowed, every other tree-local col denied).
         custom_mask = torch.zeros((tree_qlen * len(reqs), max_kv),
                                   dtype=torch.float32, device=device)
+        # STATIC template: the ancestor structure is fixed, so slice-place the BAKED [n,n] block instead
+        # of the per-node O(n*depth) host rebuild (the tree is full — n == tree_qlen, no pad rows). DYNAMIC
+        # heap: build the ancestor mask per step (topology varies).
+        tmpl_block = getattr(self, "_ddtree_template_block", None)
         off = 0
         for (req, c0, tree, n) in per_req:
             block = custom_mask[off:off + tree_qlen]
-            for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
-                block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
-                a = j
-                while a != -1:  # then re-allow own column + the ancestor chain to the root
-                    block[j, c0 + a] = 0.0
-                    a = tree.parent[a]
+            if tmpl_block is not None:
+                block[:tree_qlen, c0 : c0 + tree_qlen] = tmpl_block  # baked deny/allow ancestor mask
+            else:
+                for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
+                    block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
+                    a = j
+                    while a != -1:  # then re-allow own column + the ancestor chain to the root
+                        block[j, c0 + a] = 0.0
+                        a = tree.parent[a]
             off += tree_qlen
         batch.attn_metadata.custom_mask = custom_mask
         # recurrent metadata with per-token verify-state capture (capture_verify_state=True routes the
@@ -1940,7 +1967,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         (removing forward 3) is the follow-up. K=MINISGL_DDTREE_TOPK, budget=MINISGL_DDTREE_BUDGET."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
         budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
-        from minisgl.spec.ddtree import build_draft_tree
+        from minisgl.spec.ddtree import build_draft_tree, fill_static_template
+        tmpl = getattr(self, "_ddtree_template", None)
         # forward 1: marginals + argmax chain
         argmax_drafts = self._tidar_block_predict(reqs, B, mask_id, topk=K)
         topk_map = self._ddtree_topk
@@ -1948,7 +1976,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         trees = {}
         for req in reqs:
             ids, logp = topk_map[id(req)]
-            trees[id(req)] = build_draft_tree(logp, ids, budget, int(req.input_ids[req.cached_len]))
+            root = int(req.input_ids[req.cached_len])
+            trees[id(req)] = (fill_static_template(tmpl, ids, root) if tmpl is not None
+                              else build_draft_tree(logp, ids, budget, root))
         accepted = self._ddtree_tree_verify(reqs, trees)
         # metrics: tree accept-len vs argmax chain accept-len (the argmax chain is verified in forward 3)
         st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
@@ -1978,7 +2008,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         K=MINISGL_DDTREE_TOPK (default 8), budget=MINISGL_DDTREE_BUDGET (default 32)."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
         budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
-        from minisgl.spec.ddtree import build_draft_tree
+        from minisgl.spec.ddtree import build_draft_tree, fill_static_template
+        tmpl = getattr(self, "_ddtree_template", None)
 
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
@@ -2001,10 +2032,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             root = int(req.input_ids[req.cached_len])
             entry = topk_map.get(id(req))
             if entry is None:  # no aux yet / budget-0 req -> root-only tree (commit degrades to plain decode)
-                trees[id(req)] = build_draft_tree([], [], 0, root)
+                trees[id(req)] = build_draft_tree([], [], 0, root)  # static mask is topology-only; pad rows discarded
             else:
                 ids, logp = entry
-                trees[id(req)] = build_draft_tree(logp, ids, budget, root)
+                trees[id(req)] = (fill_static_template(tmpl, ids, root) if tmpl is not None
+                                  else build_draft_tree(logp, ids, budget, root))
         accepted = self._ddtree_tree_verify(reqs, trees)
         # metric: mean tree accept-len (the DDTree win at block-16 vs the argmax chain).
         st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
