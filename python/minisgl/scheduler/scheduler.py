@@ -1530,16 +1530,28 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._process_last_data(data)
             return
 
-        # SPEC decode lockstep: busy replica runs the real step; idle replica issues F matching dummy
-        # forwards. Both stay eager (ep.pad_tokens None) so the per-layer MoE self-agrees N.
-        if local_reqs:
+        # SPEC decode lockstep: busy replica runs the real step; idle replica issues n_ep matching dummy
+        # forwards. Two regimes, chosen IDENTICALLY on every replica (same config + agreed max_decode):
+        #   * CAPTURED (ep_cap_bs set): the two-forward path where every EP forward is the SAME captured
+        #     K+1 verify graph (busy = block_predict + verify; idle = n_ep× block_predict). All replicas
+        #     agree one verify bs and replay that graph, so the fixed-N MoE all_gather matches — the same
+        #     mechanism as the plain-decode EP capture (ep.py). _ep_common_bs threads the agreed bs into
+        #     block_predict + verify (lifts their EP eager gate, forces pad-to-ep_cap_bs, lets the idle
+        #     dummy capture). Big TPOT win: the wide draft/verify forwards stop paying eager host dispatch.
+        #   * EAGER (ep_cap_bs None): fused/ddtree (distinct or own graph), MTP, or max_decode past the
+        #     largest captured verify bs — the per-layer MoE self-agrees N across replicas (moe.py case 3),
+        #     exactly the prior behavior.
+        ep_cap_bs = self._ep_spec_common_verify_bs(max_decode)
+        self._ep_common_bs = ep_cap_bs
+        try:
+          if local_reqs:
             if getattr(self, "_tidar_fused", False):
                 self._spec_decode_step_tidar_fused(
                     local_reqs, self._proposer.block_size, self._proposer.mask_token_id
                 )
             else:
                 self._spec_decode_step(local_reqs)
-        else:
+          else:
             # Idle replica: issue n_ep dummy forwards that take the SAME spec_verify-DECODE model path
             # as the busy replica's FULL-TARGET (EP-collective-issuing) forwards. A dummy PREFILL
             # forward diverges in the CCA path (md.is_prefill branch, zaya.py) so the per-layer MoE
@@ -1573,7 +1585,33 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 k = max(1, min(engine.spec_config.num_draft, proposer.block_size))
             mask_id = int(getattr(proposer, "mask_token_id", 0))
             for _ in range(n_ep):
+                # Captured @ ep_cap_bs when set (matches the busy replica's block_predict+verify graph),
+                # else eager self-agreed-N (the prior behavior). block_predict reads self._ep_common_bs.
                 self._tidar_block_predict([dr], k, mask_id, skip_alloc=True)
+        finally:
+            self._ep_common_bs = None
+
+    def _ep_spec_common_verify_bs(self, max_decode: int) -> "int | None":
+        """The captured verify bs every replica pads to for a CAPTURED EP spec step, or None to stay
+        EAGER (self-agreed-N). Deterministic per config + agreed max_decode, so every replica returns the
+        SAME value (identical branch on all replicas — a divergence would wedge the MoE collective).
+
+        Capturable ONLY when every EP-collective-issuing forward of the step is the SAME captured K+1
+        verify graph — i.e. the two-forward path (busy: block_predict + verify; idle: n_ep× block_predict,
+        all qlen=num_draft+1). Fused TiDAR (distinct fused_qlen graph) and the DDTree paths (own
+        tree_qlen graph) mix graph shapes between busy and idle, so they keep the eager self-agreement;
+        MTP (n_ep<0) can't match a fixed count. None also when verify graphs are off (--graph 0) or
+        max_decode exceeds the largest captured verify bs (fall back to eager at N=max_decode)."""
+        if (getattr(self, "_tidar_fused", False) or getattr(self, "_tidar_ddtree", False)
+                or getattr(self, "_dflash_ddtree", False)):
+            return None
+        if self._spec_num_ep_forwards() < 0:  # MTP under EP — handled (raises) in the idle branch
+            return None
+        vbs = self.engine.graph_runner.verify_bs_list
+        if not vbs or max_decode <= 0:
+            return None
+        bigger = [b for b in vbs if b >= max_decode]
+        return min(bigger) if bigger else None
 
     def _spec_prefill_seeded(self, batch: Batch) -> None:
         """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the
@@ -1684,17 +1722,25 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # never installs; the snapshot/restore below still rolls back the live slots either way.
         from minisgl.distributed import is_ep_over_tp
 
+        # ep_bs: set by _spec_ep_loop during the coordinated EP spec lockstep — every replica agrees one
+        # captured verify bs and replays the IDENTICAL graph, so the fixed-N MoE all_gather matches and
+        # capture is safe under DP+EP (mirrors the plain-decode EP capture, ep.py). None off the EP
+        # lockstep. When set it (a) LIFTS the EP eager gate and (b) forces pad to exactly ep_bs; it also
+        # lets the skip_alloc idle-replica dummy CAPTURE (it must, to match the busy replica's forwards —
+        # off the lockstep the dummy stays eager, self-agreed-N).
+        ep_bs = getattr(self, "_ep_common_bs", None)
         use_vgraph = (
-            not skip_alloc
-            and self.engine.graph_runner.can_use_verify_graph(batch)
-            and (not self.engine.enable_ep or is_ep_over_tp())
+            self.engine.graph_runner.can_use_verify_graph(batch)
+            and (not self.engine.enable_ep or is_ep_over_tp() or ep_bs is not None)
+            and (not skip_alloc or ep_bs is not None)
         )
         if use_vgraph:
             if not getattr(self, "_tidar_bp_capture_logged", False):
                 self._tidar_bp_capture_logged = True
                 logger.info_rank0(
-                    f"spec-decode: TiDAR block_predict CAPTURED (K+1 verify graph, qlen={k + 1})")
-            self.engine.graph_runner.pad_verify(batch)
+                    f"spec-decode: TiDAR block_predict CAPTURED (K+1 verify graph, qlen={k + 1}"
+                    f"{', EP-coordinated' if ep_bs is not None else ''})")
+            self.engine.graph_runner.pad_verify(batch, ep_bs)
         else:
             batch.padded_reqs = reqs
         batch.positions = _make_positions(batch, device)
@@ -2496,15 +2542,17 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # collective. Eager verify -> every replica hits the self-coordinating path -> N agrees. The
         # _spec_ep_loop drives the idle replica's matching dummy forwards.
         # EP verify stays EAGER under DP+EP (the in-graph MoE all_gather pins a fixed N vs an idle
-        # replica's self-agreed N). But EP-OVER-TP has no idle replica — the TP ranks run the SAME padded
-        # bs in lockstep, so the captured fixed-N verify graph is safe (and needed: without it,
-        # forward_verify still takes the graph path but the unpadded odd bs=3 isn't captured -> KeyError).
+        # replica's self-agreed N) — UNLESS the EP spec lockstep coordinated a common verify bs
+        # (_ep_common_bs): then every replica pads to that same captured bs and replays the IDENTICAL
+        # graph, so the fixed-N all_gather matches (mirrors the plain-decode EP capture, ep.py). EP-OVER-TP
+        # has no idle replica — the TP ranks run the SAME padded bs in lockstep, so capture is always safe.
         from minisgl.distributed import is_ep_over_tp
+        ep_bs = getattr(self, "_ep_common_bs", None)
         use_vgraph = self.engine.graph_runner.can_use_verify_graph(batch) and (
-            not self.engine.enable_ep or is_ep_over_tp()
+            not self.engine.enable_ep or is_ep_over_tp() or ep_bs is not None
         )
         if use_vgraph:
-            self.engine.graph_runner.pad_verify(batch)
+            self.engine.graph_runner.pad_verify(batch, ep_bs)
         else:
             batch.padded_reqs = reqs
         batch.positions = _make_positions(batch, device)
