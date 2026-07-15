@@ -197,10 +197,48 @@ def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
         forced_name = (choice.get("function") or {}).get("name")
     elif choice != "required":
         return None  # "auto" / "none" / None -> not forced (see _structural_tag_from_tools)
+    if _TOOL_FORMAT == "zaya_xml":
+        ebnf = _zaya_xml_grammar(tools, forced_name)  # native <zyphra_tool_call> XML, not JSON
+        return json.dumps({"__ebnf__": ebnf}) if ebnf else None
     variants = _tool_call_variants(tools, forced_name)
     if not variants:
         return None
     return json.dumps(variants[0] if len(variants) == 1 else {"anyOf": variants})
+
+
+def _ebnf_lit(s: str) -> str:
+    """GBNF-escape a Python string into a double-quoted EBNF terminal."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def _zaya_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str | None:
+    """EBNF constraining ZAYA's NATIVE tool call to its trained format:
+        <zyphra_tool_call>\\n<function=NAME>\\n(<parameter=P>\\nVALUE\\n</parameter>\\n)*</function>\\n</zyphra_tool_call>
+    Function NAME is constrained to the allowed tools and parameter names to the known params (structure
+    is guaranteed parseable by `_parse_tool_calls`); VALUES stay permissive ([^<]*) so the model isn't
+    boxed on content. Any-order/any-subset params (a fixed order would reject valid calls). None if no
+    tool matches. Respects ZAYA's RL training instead of forcing an unfamiliar JSON shape."""
+    fns: List[str] = []
+    pnames: set[str] = set()
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name or (forced_name and name != forced_name):
+            continue
+        fns.append(name)
+        pnames.update((fn.get("parameters") or {}).get("properties", {}) or {})
+    if not fns:
+        return None
+    fname_alt = " | ".join(_ebnf_lit(n) for n in fns)
+    pname_alt = " | ".join(_ebnf_lit(p) for p in sorted(pnames)) if pnames else _ebnf_lit("_")
+    return "\n".join([
+        'root ::= "<zyphra_tool_call>\\n<function=" fname ">\\n" params "</function>\\n</zyphra_tool_call>"',
+        f"fname ::= {fname_alt}",
+        "params ::= param*",
+        'param ::= "<parameter=" pname ">\\n" pval "\\n</parameter>\\n"',
+        f"pname ::= {pname_alt}",
+        "pval ::= [^<]*",
+    ])
 
 
 def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> List[dict]:
@@ -225,9 +263,23 @@ def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> Li
 
 # Tool-call wrappers we constrain in `auto` mode: a trigger opener -> JSON call -> closer. The model
 # stays free to answer in prose (no trigger); if it opens one of these, xgrammar forces the wrapped
-# content to a schema-valid call. (ZAYA's native <zyphra_tool_call> XML args aren't JSON, so its XML
-# mode isn't constrained here — use tool_choice:"required" for a guaranteed call; see RSA_KNOBS.md.)
-_TOOL_STRUCT_WRAPPERS = (("<tool_call>", "</tool_call>"), ("<tools>", "</tools>"))
+# content to a schema-valid JSON call. MUST include ZAYA's native `<zyphra_tool_call>` — otherwise the
+# trigger never fires for ZAYA (`<tool_call>` is NOT a substring of `<zyphra_tool_call>`), the auto
+# grammar is effectively OFF, and the model free-forms into unparseable tool calls (the explore_do
+# format chaos). Structural tags are JSON-schema-only, so the wrapped content is forced to JSON (ZAYA
+# emits valid JSON when constrained — cf. the forced path); the XML `<function=…>` parser recovers any
+# native-XML that still slips through. For a GUARANTEED native-XML forced call see `_zaya_xml_grammar`
+# (MINISGL_TOOL_FORMAT=zaya_xml).
+_TOOL_STRUCT_WRAPPERS = (
+    ("<zyphra_tool_call>", "</zyphra_tool_call>"),
+    ("<tool_call>", "</tool_call>"),
+    ("<tools>", "</tools>"),
+)
+# Model-native forced-tool-call format. "json" (default) -> `{"name": …, "arguments": …}`; "zaya_xml" ->
+# ZAYA's trained `<zyphra_tool_call><function=NAME><parameter=P>…</parameter></function></zyphra_tool_call>`
+# via a custom EBNF (`_zaya_xml_grammar`). Set per serve (the ZAYA compose service sets zaya_xml); JSON is
+# correct for every other family, so the default is a no-op change.
+_TOOL_FORMAT = os.environ.get("MINISGL_TOOL_FORMAT", "json")
 
 
 def _structural_tag_from_tools(req: "OpenAICompletionRequest") -> str | None:
@@ -1052,12 +1104,20 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
         if forced_tool_grammar is not None:
-            # Forced tool call: the grammar constrained `body` to `{"name": …, "arguments": {…}}`.
-            tc = _parse_json_tool_call(body, state.uid_counter)
-            if tc is not None:
-                message["content"] = None
-                message["tool_calls"] = [tc]
-                finish_reason = "tool_calls"
+            # Forced tool call: grammar constrained `body` to a complete call. zaya_xml -> native XML
+            # (<function=…><parameter=…>), parsed by the wrapper parser; else JSON {"name","arguments"}.
+            if '"__ebnf__"' in forced_tool_grammar:
+                _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
+                if tool_calls:
+                    message["content"] = _tc_content
+                    message["tool_calls"] = tool_calls
+                    finish_reason = "tool_calls"
+            else:
+                tc = _parse_json_tool_call(body, state.uid_counter)
+                if tc is not None:
+                    message["content"] = None
+                    message["tool_calls"] = [tc]
+                    finish_reason = "tool_calls"
         elif req.tools and req.tool_choice != "none":
             # auto: the model chose; if it opened a wrapper its args were structural-tag-constrained.
             _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
@@ -1196,12 +1256,19 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     if reasoning_content is not None:
         message["reasoning_content"] = reasoning_content
     if _pl_forced_tool_grammar is not None:
-        # Forced tool call: the grammar constrained `body` to `{"name": …, "arguments": {…}}`.
-        tc = _parse_json_tool_call(body, uid)
-        if tc is not None:
-            message["content"] = None
-            message["tool_calls"] = [tc]
-            finish_reason = "tool_calls"
+        # Forced tool call: zaya_xml -> native XML (wrapper parser); else JSON {"name","arguments"}.
+        if '"__ebnf__"' in _pl_forced_tool_grammar:
+            content, tool_calls = _parse_tool_calls(body, uid)
+            if tool_calls:
+                message["content"] = content
+                message["tool_calls"] = tool_calls
+                finish_reason = "tool_calls"
+        else:
+            tc = _parse_json_tool_call(body, uid)
+            if tc is not None:
+                message["content"] = None
+                message["tool_calls"] = [tc]
+                finish_reason = "tool_calls"
     elif req.tools and finish_reason != "length":
         content, tool_calls = _parse_tool_calls(body, uid)
         if tool_calls:

@@ -279,6 +279,10 @@ services:
     environment:
       <<: *lean-env
       MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
+      # Forced tool calls emit ZAYA's NATIVE <zyphra_tool_call><function=NAME><parameter=P>…</parameter>
+      # XML (via a custom EBNF grammar) instead of JSON — respects ZAYA's RL training and is guaranteed
+      # parseable. Auto tool calls additionally now trigger on <zyphra_tool_call> (was never firing).
+      MINISGL_TOOL_FORMAT: "${MINISGL_TOOL_FORMAT:-zaya_xml}"
       # Spec-decode is OPT-IN and OFF by default: on the served numbers DFlash spec makes ZAYA ~4x
       # SLOWER (43 -> 11 tok/s). ZAYA is compute-cheap (~1.3B active/token, ~23ms/step decode) so the
       # per-step spec cost (drafter forward + K-wide verify + DDTree) dwarfs the accept gain: the -ep4
