@@ -353,6 +353,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._capture_dir = os.environ.get("MINISGL_ZAYA_CAPTURE_DIR") or None
         self._capture_buf: List[dict] = []
         self._capture_n = 0
+        # On-policy Draft-OPD capture (MINISGL_ZAYA_OPD_CAPTURE_DIR=<dir>): during DFlash spec decode,
+        # dump the drafter's OWN trajectory per verify step — the seed aux at the last committed
+        # position, the anchor token, the draft block, num_accepted, the target's correction, and the
+        # target top-K logits — to opdbuf_<pid>_<n>.pt, the schema train_drafter.py --opd-dir ingests
+        # (dflash-drafter/docs/CAPTURE_CONTRACT.md). Enables on-policy OPD + soft-KL ON minisgl. Inert
+        # (guarded) unless the env is set; run the rollout with MINISGL_DFLASH_DDTREE=0 so the LINEAR
+        # block maps 1:1 to the opdbuf schema (the tree path has no linear num_accepted).
+        self._opd_dir = os.environ.get("MINISGL_ZAYA_OPD_CAPTURE_DIR") or None
+        self._opd_buf: List[dict] = []
+        self._opd_n = 0
+        if self._opd_dir:
+            os.makedirs(self._opd_dir, exist_ok=True)
+            import atexit
+            atexit.register(self._flush_opd)
+            logger.info_rank0(f"DFlash on-policy OPD CAPTURE on -> {self._opd_dir}")
         if self._capture_dir:
             ids_env = os.environ.get("MINISGL_ZAYA_CAPTURE_LAYERS", "1,39,76")
             self._capture_layer_ids = [int(x) for x in ids_env.split(",") if x.strip()]
@@ -434,6 +449,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # tail lands. Cheap no-op when not capturing / buffer empty.
         if self._capture_dir and self._capture_buf:
             self._flush_capture()
+        if self._opd_dir and self._opd_buf:
+            self._flush_opd()
         self.cache_manager.check_integrity()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
@@ -1371,6 +1388,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         logger.info_rank0(f"[capture] flushed {npos} positions -> {path}")
         self._capture_n += 1
         self._capture_buf = []
+
+    def _flush_opd(self) -> None:
+        if not self._opd_buf:
+            return
+        path = os.path.join(self._opd_dir, f"opdbuf_{os.getpid()}_{self._opd_n:05d}.pt")
+        torch.save(self._opd_buf, path)
+        logger.info_rank0(f"[opd-capture] flushed {len(self._opd_buf)} steps -> {path}")
+        self._opd_n += 1
+        self._opd_buf = []
 
     # ===================================================================================
     # Speculative decoding (synchronous loop). See SPEC_DECODE.md for the full design.
@@ -2755,6 +2781,39 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
             accepted_counts.append(num_accepted_i)
             c0 = req.cached_len
+
+            # On-policy Draft-OPD capture (guarded; DFlash linear block only). One opdbuf record per
+            # verify step: seed = target aux at the last committed position (what the CCA drafter's fc
+            # seed conditions on — spec/dflash.py:454-461 slices aux[:, -1] then fuse_aux), anchor =
+            # the confirmed token (input_ids[cached_len]), plus the drafter's block, its acceptance,
+            # the target's correction, and the target top-K logits (soft-KL teacher). This matches the
+            # train_drafter.py seed-fold recipe 1:1. See dflash-drafter/docs/CAPTURE_CONTRACT.md.
+            if (self._opd_dir is not None and self._spec_capture_layer_ids and not use_ondevice
+                    and req.sampling_params.is_greedy
+                    and self._grammar_matchers.get(req.uid) is None):
+                ax = self._spec_aux_hidden.get(req.uid)
+                if ax is not None and 0 <= c0 < req.input_ids.shape[0]:
+                    Kd = len(d)
+                    seed = (ax[:, -1] if ax.dim() == 3 else ax).reshape(1, -1).half().cpu()
+                    rc = int(target[num_accepted_i]) if num_accepted_i < Kd else -1
+                    rec = {
+                        "seed_in": seed,                                              # [1, n_aux*H]
+                        "bonus": torch.tensor([int(req.input_ids[c0])], dtype=torch.long),
+                        "draft_tokens": torch.tensor([list(d)], dtype=torch.long),    # [1, Kd]
+                        "num_accepted": torch.tensor([int(num_accepted_i)], dtype=torch.long),
+                        "reject_correct": torch.tensor([rc], dtype=torch.long),
+                    }
+                    if Kd > 0:
+                        tk = min(16, logits.shape[-1])
+                        lb = logits[block_start:block_start + Kd].float()             # [Kd, V]
+                        idx = lb.topk(tk, dim=-1).indices
+                        rec["target_topk_ids"] = idx.to(torch.long).cpu().unsqueeze(0)  # [1, Kd, tk]
+                        rec["target_topk_logprob"] = (
+                            torch.log_softmax(lb, -1).gather(-1, idx).cpu().unsqueeze(0))
+                    self._opd_buf.append(rec)
+                    if len(self._opd_buf) >= 512:
+                        self._flush_opd()
+
             old_device_len = c0 + staged_q_len  # forward extended device_len by the STAGED qlen;
             #                                     free the padded tail pages too (rollback below)
 
