@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
@@ -477,8 +478,52 @@ _TOOL_CALL_BLOCK_RE = re.compile(
 # A bare `<function=…></function>` block (Qwen3 XML emitted WITHOUT a `<tool_call>` wrapper). Kept in
 # lock-step with the streaming parser, which also accepts the unwrapped opener.
 _BARE_FN_BLOCK_RE = re.compile(r"<function=[^>\s]+\s*>.*?</function>", re.DOTALL)
-_XML_FN_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_XML_FN_RE = re.compile(r"<function=([^>\s(]+)\s*>(.*?)</function>", re.DOTALL)
 _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.DOTALL)
+# ZAYA DEVIATION recovery. Under RSA / long-context / quant the model drops its trained
+# `<function=NAME><parameter=X>v</parameter></function>` form and emits a self-contained inline
+# python-call instead — `<function=NAME(a='x', b=1)>` with args in parens, NO </function> and NO
+# <parameter> blocks — often wrapped in SQUARE `[zyphra_tool_call]` rather than angle
+# `<zyphra_tool_call>` (and frequently with no closer at all). Parse that so a recoverable-but-malformed
+# call still lands as a real tool_call instead of leaking to `content`. The canonical parsers above stay
+# the primary path; this is a fallback. `[/?zyphra_tool_call]` square wrappers are normalized to angle
+# in `_parse_tool_calls` before the block scan.
+_INLINE_FN_RE = re.compile(r"<function\s*=\s*([A-Za-z_][\w.]*)\s*\((.*?)\)\s*/?>", re.DOTALL)
+_SQUARE_WRAP_RE = re.compile(r"\[(/?(?:" + "|".join(_TOOL_WRAPPERS) + r"))\]")
+# Orphan wrapper open/close tags left in content after a call is parsed (e.g. the model emitted an opener
+# but no closer around an inline function) — strip them so `content` isn't polluted with dangling markup.
+_ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>")
+_KV_FALLBACK_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^,]+))")
+
+
+def _parse_pycall_args(argstr: str) -> dict:
+    """Parse inline python-call kwargs (`a='x', b=1, c=[1,2]`) into a dict. Prefer `ast` (safe literal
+    eval per value); fall back to a permissive key=value regex when the args aren't clean literals
+    (truncated string, unquoted value). Positional args are ignored (ZAYA emits kwargs)."""
+    argstr = argstr.strip()
+    if not argstr:
+        return {}
+    try:
+        call = ast.parse(f"_f({argstr})", mode="eval").body
+        out: dict = {}
+        ok = True
+        for kw in getattr(call, "keywords", []):
+            if kw.arg is None:
+                continue
+            try:
+                out[kw.arg] = ast.literal_eval(kw.value)
+            except Exception:
+                ok = False
+                break
+        if ok and out:
+            return out
+    except Exception:
+        pass
+    out = {}
+    for m in _KV_FALLBACK_RE.finditer(argstr):
+        v = next((g for g in m.groups()[1:] if g is not None), "")
+        out[m.group(1)] = _coerce(v.strip())
+    return out
 
 
 def _coerce(val: str):
@@ -500,10 +545,13 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
                 return call["name"], call.get("arguments", {})
         except json.JSONDecodeError:
             pass
-    fn = _XML_FN_RE.search(inner)  # (B) Qwen3 XML
+    fn = _XML_FN_RE.search(inner)  # (B) Qwen3 XML: <function=NAME>…<parameter=…>…</function>
     if fn:
         args = {k.strip(): _coerce(v.strip()) for k, v in _XML_PARAM_RE.findall(fn.group(2))}
         return fn.group(1).strip(), args
+    inl = _INLINE_FN_RE.search(inner)  # (C) ZAYA deviation: inline <function=NAME(a='x', b=1)>
+    if inl:
+        return inl.group(1).strip(), _parse_pycall_args(inl.group(2))
     return None
 
 
@@ -527,16 +575,23 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
             }
         )
 
+    # Normalize ZAYA's occasional SQUARE `[zyphra_tool_call]` wrapper to the angle form so the block
+    # regex catches it (a deviation from the trained `<zyphra_tool_call>`; if the model also dropped the
+    # closer, the bare/inline scans below still recover the inner `<function=…>`).
+    text = _SQUARE_WRAP_RE.sub(r"<\1>", text)
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         _add(m.group(1))
-    # Bare `<function=…>` blocks (no `<tool_call>` wrapper) in whatever text remains after removing
-    # the wrapped blocks (so an inner `<function=>` is not double-counted).
+    # Bare blocks in whatever text remains after removing the wrapped blocks (so an inner block is not
+    # double-counted): canonical `<function=…></function>`, then the inline `<function=NAME(...)>` form.
     remainder = _TOOL_CALL_BLOCK_RE.sub("", text)
     for m in _BARE_FN_BLOCK_RE.finditer(remainder):
         _add(m.group(0))
+    for m in _INLINE_FN_RE.finditer(_BARE_FN_BLOCK_RE.sub("", remainder)):
+        _add(m.group(0))
     if not tool_calls:
         return text, []
-    content = _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text)).strip()
+    content = _INLINE_FN_RE.sub("", _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text)))
+    content = _ORPHAN_WRAP_RE.sub("", content).strip()  # drop any dangling wrapper opener/closer
     return (content or None), tool_calls
 
 
