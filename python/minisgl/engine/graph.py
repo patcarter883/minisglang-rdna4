@@ -428,8 +428,14 @@ class GraphRunner:
             return False
         return all(r.extend_len == ql for r in batch.reqs)
 
-    def pad_verify(self, batch: Batch) -> None:
-        bs = next(b for b in self._verify["bs_list"] if b >= batch.size)
+    def pad_verify(self, batch: Batch, bs: "int | None" = None) -> None:
+        # bs=None: pad to the smallest captured verify size >= batch.size (the normal DP-local choice).
+        # bs=<int>: pad to EXACTLY that captured size — used by the EP spec lockstep so every replica
+        # replays the IDENTICAL verify graph (fixed-N MoE all_gather matches; see _spec_ep_loop). The
+        # caller guarantees bs is a captured verify size and bs >= batch.size.
+        if bs is None:
+            bs = next(b for b in self._verify["bs_list"] if b >= batch.size)
+        assert bs >= batch.size and bs in self._verify["bs_list"], (bs, batch.size)
         batch.padded_reqs = batch.reqs + [self._verify_dummy(batch)] * (bs - batch.size)
 
     def _verify_dummy(self, batch: Batch) -> Req:
