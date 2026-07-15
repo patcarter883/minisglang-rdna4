@@ -276,8 +276,15 @@ services:
     environment:
       <<: *lean-env
       MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
+      # Spec-decode is OPT-IN and OFF by default: on the served numbers DFlash spec makes ZAYA ~4x
+      # SLOWER (43 -> 11 tok/s). ZAYA is compute-cheap (~1.3B active/token, ~23ms/step decode) so the
+      # per-step spec cost (drafter forward + K-wide verify + DDTree) dwarfs the accept gain: the -ep4
+      # drafter delivers only ~1.11 emitted/step / ddtree accept-len ~0.11 on the DP=2 graph serve.
+      # Set MINISGL_ZAYA_SPEC=1 to turn the DFlash+DDTree lane back on (drafter mount + envs below are
+      # inert when it's off). Break-even needs emitted/step well above ~2 AND a cheaper per-step path.
+      MINISGL_ZAYA_SPEC: "${MINISGL_ZAYA_SPEC:-}"
       # DFlash draft-TREE verify (DDTree): per-position top-K marginals -> best-first tree -> more
-      # accepted tokens/step than the linear block (measured ~1.46 vs ~1.19 emitted/step). On by default.
+      # accepted tokens/step than the linear block. Only consulted when MINISGL_ZAYA_SPEC=1.
       MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-1}"
       MINISGL_DDTREE_BUDGET: "${MINISGL_DDTREE_BUDGET:-32}"
       # Override the image's /opt/kernels: canonical /kernels/_kernels FIRST so `import gdn_hip` etc.
@@ -288,6 +295,12 @@ services:
     entrypoint: ["bash", "-lc"]
     command:
       - |
+        # Spec-decode is opt-in (net-negative on ZAYA — see MINISGL_ZAYA_SPEC note above). Only append
+        # the DFlash+DDTree args when explicitly enabled; the default serve is plain DP=2 (~43 tok/s).
+        SPEC_ARGS=""
+        if [ -n "${MINISGL_ZAYA_SPEC:-}" ]; then
+          SPEC_ARGS="--spec-algorithm dflash --spec-draft-model-path /draft --spec-num-draft ${MINISGL_SPEC_K:-4}"
+        fi
         exec python -m minisgl \
           --model "${MINISGL_MODEL:-/root/.cache/huggingface/ZAYA1-8B-RXF-h32}" \
           --host 0.0.0.0 --port 1919 \
@@ -305,6 +318,5 @@ services:
           --rsa-agg-max-tokens "${MINISGL_RSA_AGG_MAX_TOKENS:-640}" \
           --rsa-tail-tokens "${MINISGL_RSA_TAIL_TOKENS:-2048}" \
           --rsa-top-p "${MINISGL_RSA_TOP_P:-0.95}" \
-          --spec-algorithm dflash --spec-draft-model-path /draft \
-          --spec-num-draft "${MINISGL_SPEC_K:-4}" \
+          $SPEC_ARGS \
           ${MINISGL_EXTRA_ARGS:-}
