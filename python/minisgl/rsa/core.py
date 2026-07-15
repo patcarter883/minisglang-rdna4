@@ -402,6 +402,21 @@ async def run_markovian_rsa(
     # extraction (the tail is the last τ tokens of the REASONING trace, before </think>).
     beta = params.think_budget if params.think_budget is not None else think_budget
     close_delim = think_close_delim
+    # β≫τ COHERENCE GUARD. β is the Markovian reasoning CHUNK (the model reasons this many tokens per
+    # rollout before </think> is force-closed); τ=tail_tokens is the SHORT tail of that chunk carried
+    # into the next round. Both source papers keep chunk ≫ tail: Markovian-Thinker (arXiv:2510.06557)
+    # C=8K / m=4K (2×); ZAYA Markovian-RSA (arXiv:2605.05365) β=40K / τ=4K (10×). A β < τ is incoherent
+    # (you can't carry a tail longer than the chunk that produced it) and starves the reasoning the model
+    # was RL-trained to do — the ZAYA "..."/degenerate-aggregation regime. Clamp β up to τ at minimum and
+    # warn; a healthy β is several × τ.
+    if beta is not None and params.tail_tokens > 0 and beta < params.tail_tokens:
+        logger.warning(
+            "[rsa] think_budget β=%d < tail_tokens τ=%d — incoherent (chunk must exceed the carried "
+            "tail; papers use β≈2–10×τ). Clamping β→%d; set β well above τ (τ=%d ⇒ β≳%d) for real "
+            "Markovian-RSA reasoning.",
+            beta, params.tail_tokens, params.tail_tokens, params.tail_tokens, 4 * params.tail_tokens,
+        )
+        beta = params.tail_tokens
     # phase timers (s): gen_s = GPU generation (the structural T-rounds cost); tail_s/build_s =
     # recoverable event-loop orchestration (tail re-tokenization + aggregation-prompt building).
     _wall0 = time.monotonic()
@@ -556,15 +571,28 @@ async def _select(
             if params.selection == "majority":
                 return rng.choice(population).text, "sample", None
 
-    # Fallback (selection == "final_agg", OR any structured request): one final aggregation call,
-    # applying the grammar/tools/thinking constraints so the final answer honors response_format /
-    # json_schema / tool-calling exactly like the plain lane.
+    # Fallback (selection == "final_agg", OR any structured request): one final aggregation call over
+    # the sampled candidate tails.
     chosen = rng.sample(population, k=min(params.k, len(population)))
     tails = await _tails_for(client, chosen, params, think_close_delim)
     msgs = prompts.build_final_selection_messages(
         query, [tails[id(c)] for c in chosen], request_system,
         for_tools=tools is not None,
     )
+    # STRUCTURED (grammar/tools) => DECISIVE EXTRACTION, not a re-reasoned generation. RSA already did
+    # the thinking across the rollouts (their tails are IN `msgs`); running a SECOND reasoning phase here
+    # only gets β-guillotined and the grammar then fires on an unfinished thought → a schema shaped but
+    # placeholder-filled ("..." fields — the reported bug). Neither paper (RSA arXiv:2509.26626 /
+    # ZAYA arXiv:2605.05365) runs a grammar under a bounded think budget: they SAMPLE/vote the final
+    # answer from the population. We need a generation to hit the schema, so we format it thinking-OFF,
+    # grammar from token 0 (no think gate, no β) — a decisive commit over the aggregated reasoning.
+    # Free-form final_agg keeps the reasoning phase (β) as before.
+    if structured:
+        _final_ct = dict(chat_template_kwargs or {})
+        _final_ct["enable_thinking"] = False
+        _final_close, _final_budget = None, None
+    else:
+        _final_ct, _final_close, _final_budget = chat_template_kwargs, think_close_delim, think_budget
     final = await client.complete(
         msgs,
         model=model,
@@ -579,9 +607,9 @@ async def _select(
         max_retries=params.max_retries,
         grammar=grammar,
         tools=tools,
-        chat_template_kwargs=chat_template_kwargs,
-        think_close_delim=think_close_delim,
-        think_budget=think_budget,
+        chat_template_kwargs=_final_ct,
+        think_close_delim=_final_close,
+        think_budget=_final_budget,
     )
     if final is None:
         return rng.choice(population).text, "sample", None

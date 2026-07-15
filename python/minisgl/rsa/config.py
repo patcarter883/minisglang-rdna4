@@ -20,13 +20,25 @@ class RSAParams(BaseModel):
         C  = ``k``            aggregation subset size (C<=N tails per new candidate)
         T  = ``t``            total rounds (round 0 = expand, 1..T-1 = aggregate)
         tau= ``tail_tokens``  tail length: last tau tokens of each REASONING trace carried forward
-        beta = ``think_budget`` per-rollout thinking budget: reasoning is force-closed
-               (</think> emitted) after beta tokens so the model always finishes
-               reasoning and emits an answer (the paper's "bounded-workspace principle")
+        beta = ``think_budget`` per-rollout reasoning CHUNK: reasoning is force-closed
+               (</think> emitted) after beta tokens (the "bounded-workspace principle").
+               MUST be ≫ tau — beta is the chunk, tau is the small tail carried forward.
+               Papers: Markovian-Thinker (arXiv:2510.06557) C=8K/m=4K (2×); ZAYA
+               Markovian-RSA (arXiv:2605.05365) beta=40K/tau=4K (10×). A beta < tau is
+               incoherent and is clamped up (see run_markovian_rsa's β≫τ guard); a
+               1024-token beta below a 4096 tail is the degenerate-aggregation regime.
 
     Defaults follow the ZAYA1-8B report's Markovian RSA config (N=16, C=4, T=2,
-    tau=4096). Set ``tail_tokens=0`` to carry the full previous-round reasoning trace
+    tau=4096) — but note the report's beta is 40K; running beta≈tau (or below) starves
+    the reasoning. Set ``tail_tokens=0`` to carry the full previous-round reasoning trace
     into aggregation (generalized RSA, still Markovian over rounds).
+
+    STRUCTURED OUTPUT (response_format / tools): the FINAL answer is produced by a
+    decisive thinking-OFF extraction over the aggregated candidate tails (grammar from
+    token 0, no beta) — NOT a re-reasoned generation, which would be beta-guillotined and
+    emit a schema of "..." placeholders. Reasoning happens in the rollouts; the final call
+    only formats. (The papers sample/vote the final answer and never grammar-constrain a
+    bounded think phase — structured output is minisgl's extension.)
     """
 
     enabled: bool = True
@@ -46,8 +58,9 @@ class RSAParams(BaseModel):
         "tokens the scheduler force-emits the think-close delimiter (</think>) so the "
         "model stops reasoning and produces its answer/solution — bounding the workspace "
         "and preventing truncated-thinking-with-no-answer. None = the server's "
-        "MINISGL_THINK_BUDGET default (1024); applies to every rollout AND the final "
-        "aggregation.",
+        "MINISGL_THINK_BUDGET default (1024); applies to every rollout and the free-form "
+        "final aggregation. Must be >= tail_tokens (clamped up if below). NOT applied to a "
+        "STRUCTURED final answer, which is a thinking-OFF extraction.",
     )
     max_tokens: int = Field(
         default=8192, ge=1, description="per-rollout completion budget (round 0)"
