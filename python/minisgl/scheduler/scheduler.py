@@ -1639,7 +1639,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             advance is thrown away);
           * the speculative mask-KV pages allocated here are FREED before returning (allocate_paged is
             NOT idempotent — the verify path re-allocates cleanly), so no per-step page leak.
-        Eager (verify graphs are off in the CCA/ZAYA serving config). Returns k drafts per req."""
+        Routes through the captured K+1 verify graph when shape+bs fit (k == num_draft, graphs on,
+        EP gate); falls back to an eager forward otherwise. Both are state-neutral. Returns k drafts."""
         device = self.device
         page_table = self.engine.page_table
 
@@ -1658,7 +1659,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             torch.tensor(m_cols, dtype=torch.int64, device=device),
         ] = torch.full((len(m_rows),), mask_id, dtype=self.token_pool.dtype, device=device)
 
-        # --- build the (eager) block-predict batch ------------------------------------------------
+        # --- build the block-predict batch --------------------------------------------------------
         batch = Batch(reqs=reqs, phase="decode")
         batch.spec_verify = True  # multi-token extend → same paged-extend causal path as verify
         # skip_alloc: an EP idle-replica dummy call (see _spec_ep_loop). The reqs are the shared
@@ -1668,26 +1669,63 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # forward's output is discarded — only its per-layer MoE collectives matter.
         if not skip_alloc:
             self.cache_manager.allocate_paged(reqs)
-        batch.padded_reqs = reqs
+
+        # CAPTURE the block-predict forward (the advice's dispatch-tier fix). block_predict stages
+        # [confirmed | mask×k] = k+1 uniform query tokens/req — the SAME fixed shape as the K+1 verify
+        # graph — so when k == num_draft and the batch fits a captured bs it replays that captured graph
+        # instead of an eager per-layer wide forward. This is the second (and last) eager wide forward in
+        # the two-forward TiDAR path: the verify half already captures; block_predict was the only launch-
+        # bound step left. Mirror the real verify's gating EXACTLY (_spec_decode_step): same use_vgraph
+        # predicate, same pad_verify vs prepare_metadata branch, same EP gate. forward_verify re-checks
+        # can_use_verify_graph internally, so consistency is by construction (block_predict inherits the
+        # shipped verify path's behavior in every EP mode). Never captures on the skip_alloc dummy path
+        # (the idle-replica MoE-lockstep call is self-agreed-N eager). STATE-NEUTRAL is preserved: the
+        # verify capturer writes recurrent state to per-layer SCRATCH (not the live slots) and this call
+        # never installs; the snapshot/restore below still rolls back the live slots either way.
+        from minisgl.distributed import is_ep_over_tp
+
+        use_vgraph = (
+            not skip_alloc
+            and self.engine.graph_runner.can_use_verify_graph(batch)
+            and (not self.engine.enable_ep or is_ep_over_tp())
+        )
+        if use_vgraph:
+            if not getattr(self, "_tidar_bp_capture_logged", False):
+                self._tidar_bp_capture_logged = True
+                logger.info_rank0(
+                    f"spec-decode: TiDAR block_predict CAPTURED (K+1 verify graph, qlen={k + 1})")
+            self.engine.graph_runner.pad_verify(batch)
+        else:
+            batch.padded_reqs = reqs
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not use_vgraph:
+            self.engine.attn_backend.prepare_metadata(batch)
         batch.input_ids = self.token_pool[input_mapping]
 
-        # recurrent metadata WITHOUT capture (this forward is discarded); snapshot state to roll back.
+        # recurrent metadata; snapshot state to roll back (this forward is discarded, never installed).
+        # Under the captured path the recurrent verify capturer expects capture_verify_state metadata
+        # (it stashes per-token conv/ssm into scratch during replay); the accepted-prefix install the real
+        # verify does afterward is SKIPPED here, and the snapshot/restore makes the step state-neutral.
         cca_snapshot = gdn_snapshot = None
         if self.cca_slots is not None:
             from minisgl.cca.metadata import build_cca_metadata
 
             cca_idx = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_idx, device)
+            if use_vgraph:
+                batch.cca_metadata.capture_verify_state = True
+                batch.cca_metadata.verify_max_qlen = k + 1
             cca_snapshot = self.engine.cca_state.snapshot(cca_idx)
         if self.gdn_slots is not None:
             from minisgl.gdn.metadata import build_gdn_metadata
 
             gdn_idx = self.gdn_slots.state_indices(batch)
             batch.gdn_metadata = build_gdn_metadata(batch, gdn_idx, device)
+            if use_vgraph:
+                batch.gdn_metadata.capture_verify_state = True
+                batch.gdn_metadata.verify_max_qlen = k + 1
             gdn_snapshot = self.engine.gdn_state.snapshot(gdn_idx)
 
         # --- one forward; argmax the k mask positions per req -------------------------------------
