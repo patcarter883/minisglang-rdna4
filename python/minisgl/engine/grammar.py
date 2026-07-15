@@ -46,6 +46,15 @@ class GrammarBackend:
         # Structural tag: free generation until the model emits one of the trigger strings (a tool-call
         # opener), then the wrapped content is constrained to the tool schema. Lets the model choose to
         # call or not, but forces schema-valid arguments when it does.
+        # Custom EBNF (GBNF) grammar: `{"__ebnf__": "root ::= …"}` -> a hard grammar constraining the
+        # WHOLE output (e.g. ZAYA's native <zyphra_tool_call><function=…><parameter=…> XML tool call,
+        # which a JSON-schema structural tag can't express). Used for forced tool calls when the model's
+        # native tool format is XML rather than JSON.
+        if spec.startswith('{"__ebnf__"'):
+            import json as _json
+
+            ebnf = _json.loads(spec)["__ebnf__"]
+            return xgr.GrammarMatcher(self._compiler.compile_grammar(ebnf))
         if spec.startswith('{"__structural_tag__"'):
             import json as _json
 
