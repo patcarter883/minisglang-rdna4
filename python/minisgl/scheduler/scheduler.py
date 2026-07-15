@@ -298,7 +298,6 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"spec-decode: capturing DDTREE-verify graphs "
                     f"(budget={self._ddtree_budget} qlen={tree_qlen} mask_ctx<={max_ctx} "
                     f"bs={ddtree_bs})")
-                self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
                 # MINISGL_DDTREE_STATIC=1: FIXED-topology draft tree (Medusa-style) instead of the
                 # per-step best-first heap. Freezes the tree shape once so the ancestor mask is a
                 # compile-time CONSTANT — the per-step O(n*depth) host mask rebuild becomes a slice-copy
@@ -306,10 +305,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 # become compile-time constants (substrate for parent-indexed tree recurrence). Trades the
                 # heap's per-step adaptivity for a baked mask; default OFF (dynamic heap) — A/B once the
                 # retrained drafter lands. L = the drafter block width (TiDAR block_size / DFlash num_draft).
+                # MINISGL_DDTREE_SEG=1 (implies STATIC): parent-indexed CCA tree recurrence (brief #3) —
+                # the SEGMENTED ancestor-conv-context layout, so the tree conv reads each node's true
+                # ancestor window (not packed neighbours). Fixed n_query (from the template) → capturable.
                 self._ddtree_template = None
                 self._ddtree_template_block = None
-                if os.environ.get("MINISGL_DDTREE_STATIC") == "1":
-                    from minisgl.spec.ddtree import build_static_template, template_ancestor_block
+                self._ddtree_seg = False
+                self._ddtree_seg_layout = None
+                self._ddtree_seg_block = None
+                _seg = os.environ.get("MINISGL_DDTREE_SEG") == "1"
+                if os.environ.get("MINISGL_DDTREE_STATIC") == "1" or _seg:
+                    from minisgl.spec.ddtree import (build_static_template, template_ancestor_block,
+                                                     fill_static_template, ddtree_paged_layout_segmented)
                     K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
                     L = int(getattr(self._proposer, "block_size", None)
                             or self.engine.spec_config.num_draft)
@@ -319,6 +326,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     logger.info_rank0(
                         f"spec-decode: DDTree STATIC template ENABLED (budget={self._ddtree_budget} "
                         f"K={K} L={L} n_nodes={self._ddtree_template.n_nodes}); ancestor mask BAKED")
+                    if _seg:
+                        tp = int(self.engine.cca_state.conv_states.shape[-1]
+                                 if self.engine.cca_state is not None else 2)
+                        # Structure is topology-only (c0=0): precompute the seg layout + its tree-local
+                        # [n_query,n_query] mask block ONCE; per step only fill token ids + offset by c0.
+                        dummy = fill_static_template(self._ddtree_template, [[0] * K] * L, 0)
+                        self._ddtree_seg_layout = ddtree_paged_layout_segmented(0, dummy, tp, device=self.device)
+                        self._ddtree_seg_block = self._ddtree_seg_layout["mask"]  # [n_query, n_query]
+                        self._ddtree_seg = True
+                        logger.info_rank0(
+                            f"spec-decode: DDTree SEGMENTED CCA recurrence ENABLED (conv_width={tp} "
+                            f"n_query={self._ddtree_seg_layout['n_query']} vs n_nodes="
+                            f"{self._ddtree_template.n_nodes}); ancestor conv-context inserted")
+                # Capture the ddtree verify graph at the ACTUAL query length (seg n_query if segmented,
+                # else tree_qlen=budget+1). Moved after the template/seg setup so the seg qlen is known.
+                if self._ddtree_seg:
+                    tree_qlen = self._ddtree_seg_layout["n_query"]
+                self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -1855,7 +1880,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Fixed padded query length = budget+1 (matches the captured graph). Fall back to the max real
         # tree size when no budget is configured (DDTree disabled path — should not happen here).
         budget = getattr(self, "_ddtree_budget", 0)
-        tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
+        # SEGMENTED (brief #3): stage seg_layout["n_query"] rows/req (real nodes + inserted ancestor
+        # conv-context rows) so the CCA conv reads each node's true ancestor window. Fixed-topology only
+        # (n_query is constant) → capturable. Else the plain node-per-row layout (tree_qlen = budget+1).
+        seg = getattr(self, "_ddtree_seg", False)
+        seg_lay = getattr(self, "_ddtree_seg_layout", None)
+        if seg:
+            rep = seg_lay["rep"]; seg_pos = seg_lay["positions"]; node_rows = seg_lay["node_rows"]
+            tree_qlen = seg_lay["n_query"]
+        else:
+            tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
         saved_lens = [(r.device_len, r.cached_len) for r in reqs]
         store_rows, store_cols, tok_vals, pos_list = [], [], [], []
         per_req = []  # (req, c0, tree, n)
@@ -1864,13 +1898,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             tree = trees[id(req)]
             n = tree.n_nodes
             assert n <= tree_qlen, f"tree n_nodes={n} exceeds tree_qlen={tree_qlen} (budget={budget})"
-            # real nodes j<n: token at col c0+j, RoPE pos c0+depth[j]. pad rows j>=n: dummy token 0 at
-            # col c0+j, pos c0 (root) — their KV/logits are throwaway.
-            for j in range(tree_qlen):
+            for r in range(tree_qlen):
                 store_rows.append(req.table_idx)
-                store_cols.append(c0 + j)
-                tok_vals.append(tree.token[j] if j < n else 0)
-                pos_list.append(c0 + (tree.depth[j] if j < n else 0))
+                store_cols.append(c0 + r)
+                if seg:
+                    # row r represents node rep[r] (a real node OR an ancestor ctx COPY); token = that
+                    # node's id, RoPE pos c0 + its depth (seg_pos is c0=0-relative). Fixed n_query rows.
+                    m = rep[r]
+                    tok_vals.append(tree.token[m])
+                    pos_list.append(c0 + seg_pos[r])
+                else:
+                    # real nodes r<n: token/pos of node r. pad rows r>=n: dummy token 0 at pos c0 (root).
+                    tok_vals.append(tree.token[r] if r < n else 0)
+                    pos_list.append(c0 + (tree.depth[r] if r < n else 0))
             req.device_len = c0 + tree_qlen
             per_req.append((req, c0, tree, n))
         rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
@@ -1895,10 +1935,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # of the per-node O(n*depth) host rebuild (the tree is full — n == tree_qlen, no pad rows). DYNAMIC
         # heap: build the ancestor mask per step (topology varies).
         tmpl_block = getattr(self, "_ddtree_template_block", None)
+        seg_block = getattr(self, "_ddtree_seg_block", None)  # [n_query, n_query] baked seg mask (c0=0)
         off = 0
         for (req, c0, tree, n) in per_req:
             block = custom_mask[off:off + tree_qlen]
-            if tmpl_block is not None:
+            if seg_block is not None:
+                block[:tree_qlen, c0 : c0 + tree_qlen] = seg_block  # baked seg ancestor+ctx mask
+            elif tmpl_block is not None:
                 block[:tree_qlen, c0 : c0 + tree_qlen] = tmpl_block  # baked deny/allow ancestor mask
             else:
                 for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
@@ -1933,7 +1976,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         out = {}
         off = 0
         for (req, c0, tree, n) in per_req:
-            acc, nb = ddtree_walk(argmax[off:off + n], tree)  # walk reads only the real n rows
+            if seg:
+                # node j's logit is at packed row node_rows[j] (real nodes are interleaved with ctx rows).
+                node_argmax = [argmax[off + node_rows[j]] for j in range(n)]
+            else:
+                node_argmax = argmax[off:off + n]  # node j at row j
+            acc, nb = ddtree_walk(node_argmax, tree)
             out[id(req)] = (acc, nb)
             off += tree_qlen
         # rollback recurrent state + speculative KV + lengths (throwaway)
