@@ -298,6 +298,76 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"spec-decode: capturing DDTREE-verify graphs "
                     f"(budget={self._ddtree_budget} qlen={tree_qlen} mask_ctx<={max_ctx} "
                     f"bs={ddtree_bs})")
+                # MINISGL_DDTREE_STATIC=1: FIXED-topology draft tree (Medusa-style) instead of the
+                # per-step best-first heap. Freezes the tree shape once so the ancestor mask is a
+                # compile-time CONSTANT — the per-step O(n*depth) host mask rebuild becomes a slice-copy
+                # of a baked [n,n] block (the brief's "bake the mask" for DDTree), and the parent indices
+                # become compile-time constants (substrate for parent-indexed tree recurrence). Trades the
+                # heap's per-step adaptivity for a baked mask; default OFF (dynamic heap) — A/B once the
+                # retrained drafter lands. L = the drafter block width (TiDAR block_size / DFlash num_draft).
+                # MINISGL_DDTREE_SEG=1 (implies STATIC): parent-indexed CCA tree recurrence (brief #3) —
+                # the SEGMENTED ancestor-conv-context layout, so the tree conv reads each node's true
+                # ancestor window (not packed neighbours). Fixed n_query (from the template) → capturable.
+                self._ddtree_template = None
+                self._ddtree_template_block = None
+                self._ddtree_seg = False
+                self._ddtree_seg_layout = None
+                self._ddtree_seg_block = None
+                # FUSE implies SEG (the fused replicas are appended to the segmented tree layout).
+                _seg = (os.environ.get("MINISGL_DDTREE_SEG") == "1"
+                        or os.environ.get("MINISGL_DDTREE_FUSE") == "1")
+                if os.environ.get("MINISGL_DDTREE_STATIC") == "1" or _seg:
+                    from minisgl.spec.ddtree import (build_static_template, template_ancestor_block,
+                                                     fill_static_template, ddtree_paged_layout_segmented)
+                    K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
+                    L = int(getattr(self._proposer, "block_size", None)
+                            or self.engine.spec_config.num_draft)
+                    self._ddtree_template = build_static_template(self._ddtree_budget, K, L)
+                    self._ddtree_template_block = template_ancestor_block(
+                        self._ddtree_template, device=self.device)
+                    logger.info_rank0(
+                        f"spec-decode: DDTree STATIC template ENABLED (budget={self._ddtree_budget} "
+                        f"K={K} L={L} n_nodes={self._ddtree_template.n_nodes}); ancestor mask BAKED")
+                    self._ddtree_fuse = False
+                    self._ddtree_fused_layout = None
+                    self._ddtree_rank0 = None
+                    self._ddtree_block_len = L
+                    self._ddtree_mask_id = int(getattr(self._proposer, "mask_token_id", 0))
+                    if _seg:
+                        tp = int(self.engine.cca_state.conv_states.shape[-1]
+                                 if self.engine.cca_state is not None else 2)
+                        # Structure is topology-only (c0=0): precompute the seg layout + its tree-local
+                        # [n_query,n_query] mask block ONCE; per step only fill token ids + offset by c0.
+                        dummy = fill_static_template(self._ddtree_template, [[0] * K] * L, 0)
+                        self._ddtree_seg_layout = ddtree_paged_layout_segmented(0, dummy, tp, device=self.device)
+                        self._ddtree_seg_block = self._ddtree_seg_layout["mask"]  # [n_query, n_query]
+                        self._ddtree_seg = True
+                        logger.info_rank0(
+                            f"spec-decode: DDTree SEGMENTED CCA recurrence ENABLED (conv_width={tp} "
+                            f"n_query={self._ddtree_seg_layout['n_query']} vs n_nodes="
+                            f"{self._ddtree_template.n_nodes}); ancestor conv-context inserted")
+                        # MINISGL_DDTREE_FUSE=1 (implies SEG): fuse the next-block draft off the rank-0
+                        # top path (brief #2) — append R_0..R_L replicas to the captured verify. On-path
+                        # steps reuse R_{k+1} as the next tree's marginals (skip block_predict); off-path
+                        # steps fall back to block_predict. Fixed shape (rank-0 path) -> still capturable.
+                        if os.environ.get("MINISGL_DDTREE_FUSE") == "1":
+                            from minisgl.spec.ddtree import (template_rank0_path,
+                                                             ddtree_fused_paged_layout_segmented)
+                            self._ddtree_rank0 = template_rank0_path(self._ddtree_template)
+                            self._ddtree_fused_layout = ddtree_fused_paged_layout_segmented(
+                                0, dummy, tp, self._ddtree_rank0, L, device=self.device)
+                            self._ddtree_fused_block = self._ddtree_fused_layout["mask"]
+                            self._ddtree_fuse = True
+                            logger.info_rank0(
+                                f"spec-decode: DDTree FUSED next-block ENABLED (rank0_depth="
+                                f"{len(self._ddtree_rank0) - 1} replicas={len(self._ddtree_fused_layout['replica_rows'])} "
+                                f"n_query={self._ddtree_fused_layout['n_query']}); next block off the top path")
+                # Capture the ddtree verify graph at the ACTUAL query length (fused n_query if fused, seg
+                # n_query if segmented, else tree_qlen=budget+1). After the template/seg/fuse setup.
+                if getattr(self, "_ddtree_fuse", False):
+                    tree_qlen = self._ddtree_fused_layout["n_query"]
+                elif self._ddtree_seg:
+                    tree_qlen = self._ddtree_seg_layout["n_query"]
                 self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
@@ -1861,7 +1931,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Fixed padded query length = budget+1 (matches the captured graph). Fall back to the max real
         # tree size when no budget is configured (DDTree disabled path — should not happen here).
         budget = getattr(self, "_ddtree_budget", 0)
-        tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
+        # SEGMENTED (brief #3): stage seg_layout["n_query"] rows/req (real nodes + inserted ancestor
+        # conv-context rows) so the CCA conv reads each node's true ancestor window. Fixed-topology only
+        # (n_query is constant) → capturable. Else the plain node-per-row layout (tree_qlen = budget+1).
+        seg = getattr(self, "_ddtree_seg", False)
+        fuse = getattr(self, "_ddtree_fuse", False)
+        seg_lay = getattr(self, "_ddtree_seg_layout", None)
+        if fuse:
+            # FUSED (#2): base seg tree rows + rank-0 replica rows. base rows carry tree tokens; repctx
+            # rows carry the copied rank-0 node's token; replica mask rows carry mask_id.
+            lay = self._ddtree_fused_layout
+            rep = lay["rep"]; lpos = lay["positions"]; node_rows = lay["node_rows"]
+            extra = lay["extra"]; n_base = lay["n_base"]; mask_id = self._ddtree_mask_id
+            tree_qlen = lay["n_query"]
+        elif seg:
+            rep = seg_lay["rep"]; seg_pos = seg_lay["positions"]; node_rows = seg_lay["node_rows"]
+            tree_qlen = seg_lay["n_query"]
+        else:
+            tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
         saved_lens = [(r.device_len, r.cached_len) for r in reqs]
         store_rows, store_cols, tok_vals, pos_list = [], [], [], []
         per_req = []  # (req, c0, tree, n)
@@ -1870,13 +1957,26 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             tree = trees[id(req)]
             n = tree.n_nodes
             assert n <= tree_qlen, f"tree n_nodes={n} exceeds tree_qlen={tree_qlen} (budget={budget})"
-            # real nodes j<n: token at col c0+j, RoPE pos c0+depth[j]. pad rows j>=n: dummy token 0 at
-            # col c0+j, pos c0 (root) — their KV/logits are throwaway.
-            for j in range(tree_qlen):
+            for r in range(tree_qlen):
                 store_rows.append(req.table_idx)
-                store_cols.append(c0 + j)
-                tok_vals.append(tree.token[j] if j < n else 0)
-                pos_list.append(c0 + (tree.depth[j] if j < n else 0))
+                store_cols.append(c0 + r)
+                if fuse:
+                    if r < n_base:                             # base seg tree row
+                        tok_vals.append(tree.token[rep[r]]); pos_list.append(c0 + lpos[r])
+                    else:                                      # replica / repctx row
+                        e = extra[r - n_base]
+                        tok_vals.append(tree.token[e[3]] if e[0] == "repctx" else mask_id)
+                        pos_list.append(c0 + lpos[r])
+                elif seg:
+                    # row r represents node rep[r] (a real node OR an ancestor ctx COPY); token = that
+                    # node's id, RoPE pos c0 + its depth (seg_pos is c0=0-relative). Fixed n_query rows.
+                    m = rep[r]
+                    tok_vals.append(tree.token[m])
+                    pos_list.append(c0 + seg_pos[r])
+                else:
+                    # real nodes r<n: token/pos of node r. pad rows r>=n: dummy token 0 at pos c0 (root).
+                    tok_vals.append(tree.token[r] if r < n else 0)
+                    pos_list.append(c0 + (tree.depth[r] if r < n else 0))
             req.device_len = c0 + tree_qlen
             per_req.append((req, c0, tree, n))
         rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
@@ -1897,15 +1997,28 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # ancestor mask (own+ancestor tree cols allowed, every other tree-local col denied).
         custom_mask = torch.zeros((tree_qlen * len(reqs), max_kv),
                                   dtype=torch.float32, device=device)
+        # STATIC template: the ancestor structure is fixed, so slice-place the BAKED [n,n] block instead
+        # of the per-node O(n*depth) host rebuild (the tree is full — n == tree_qlen, no pad rows). DYNAMIC
+        # heap: build the ancestor mask per step (topology varies).
+        tmpl_block = getattr(self, "_ddtree_template_block", None)
+        seg_block = getattr(self, "_ddtree_seg_block", None)  # [n_query, n_query] baked seg mask (c0=0)
+        fused_block = getattr(self, "_ddtree_fused_block", None) if fuse else None
         off = 0
         for (req, c0, tree, n) in per_req:
             block = custom_mask[off:off + tree_qlen]
-            for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
-                block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
-                a = j
-                while a != -1:  # then re-allow own column + the ancestor chain to the root
-                    block[j, c0 + a] = 0.0
-                    a = tree.parent[a]
+            if fused_block is not None:
+                block[:tree_qlen, c0 : c0 + tree_qlen] = fused_block  # baked tree+replica mask
+            elif seg_block is not None:
+                block[:tree_qlen, c0 : c0 + tree_qlen] = seg_block  # baked seg ancestor+ctx mask
+            elif tmpl_block is not None:
+                block[:tree_qlen, c0 : c0 + tree_qlen] = tmpl_block  # baked deny/allow ancestor mask
+            else:
+                for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
+                    block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
+                    a = j
+                    while a != -1:  # then re-allow own column + the ancestor chain to the root
+                        block[j, c0 + a] = 0.0
+                        a = tree.parent[a]
             off += tree_qlen
         batch.attn_metadata.custom_mask = custom_mask
         # recurrent metadata with per-token verify-state capture (capture_verify_state=True routes the
@@ -1931,9 +2044,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         argmax = logits.argmax(dim=-1).to(torch.int32).cpu().tolist()
         out = {}
         off = 0
+        r0 = getattr(self, "_ddtree_rank0", None)
+        replica_rows = self._ddtree_fused_layout["replica_rows"] if fuse else None
+        Kfuse = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
         for (req, c0, tree, n) in per_req:
-            acc, nb = ddtree_walk(argmax[off:off + n], tree)  # walk reads only the real n rows
+            if fuse or seg:
+                # node j's logit is at packed row node_rows[j] (real nodes are interleaved with ctx rows).
+                node_argmax = [argmax[off + node_rows[j]] for j in range(n)]
+            else:
+                node_argmax = argmax[off:off + n]  # node j at row j
+            acc, nb = ddtree_walk(node_argmax, tree)
             out[id(req)] = (acc, nb)
+            if fuse:
+                # FUSED next-block (#2): the replicas were drafted off the rank-0 top path. If the walk
+                # DESCENDED rank-0 (each accepted token is the rank-0 child) AND the bonus CONTINUES
+                # rank-0, the committed sequence == rank0[1..k+1], so replica R_{k+1} drafted the correct
+                # next block — reuse its top-K as the next tree's marginals (skip block_predict next step,
+                # ON-PATH). Otherwise the replicas are stale -> block_predict re-drafts next step (off-path).
+                k = len(acc)
+                depth_cap = len(replica_rows) - 1
+                # ON-PATH = the walk DESCENDED the rank-0 chain (each accepted token is the rank-0 child)
+                # and a replica R_{k+1} exists. R_{k+1} was drafted conditioned on rank0[1..k+1]; the
+                # committed sequence is rank0[1..k] + bonus, so the last conditioning token differs from
+                # the bonus — the SAME one-token speculation the shipping fused-TiDAR path makes (the tree
+                # is a heuristic; F3 commits losslessly regardless). NOT requiring bonus==rank0[k+1] (which
+                # can't hold: the walk stops precisely because the bonus is not a tree child).
+                on_path = (k + 1 <= depth_cap
+                           and all(acc[i] == tree.token[r0[i + 1]] for i in range(k)))
+                fst = getattr(self, "_ddtree_fuse_stat", None) or {"on": 0, "tot": 0}
+                fst["tot"] += 1; fst["on"] += int(on_path)
+                self._ddtree_fuse_stat = fst
+                if fst["tot"] % 100 == 0:
+                    logger.info_rank0(f"[ddtree-fuse] on-path (F1 skipped) {fst['on']}/{fst['tot']} = "
+                                      f"{fst['on'] / fst['tot']:.2f}")
+                if on_path:
+                    rr = replica_rows[k + 1]                       # R_{k+1}: block_len next-block rows
+                    rowlog = torch.log_softmax(logits[[off + x for x in rr]].float(), dim=-1)
+                    tv, ti = rowlog.topk(Kfuse, dim=-1)
+                    req._ddtree_fused_next = (ti.cpu().tolist(), tv.cpu().tolist())  # [L][K] ids, logp
+                else:
+                    req._ddtree_fused_next = None
             off += tree_qlen
         # rollback recurrent state + speculative KV + lengths (throwaway)
         if cca_snap is not None:
@@ -1966,15 +2116,44 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         (removing forward 3) is the follow-up. K=MINISGL_DDTREE_TOPK, budget=MINISGL_DDTREE_BUDGET."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
         budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
-        from minisgl.spec.ddtree import build_draft_tree
-        # forward 1: marginals + argmax chain
-        argmax_drafts = self._tidar_block_predict(reqs, B, mask_id, topk=K)
+        from minisgl.spec.ddtree import build_draft_tree, fill_static_template
+        tmpl = getattr(self, "_ddtree_template", None)
+        fuse = getattr(self, "_ddtree_fuse", False)
+        # FUSED (#2): a req that carries valid on-path fused marginals from the PREVIOUS step's rank-0
+        # replica skips block_predict (F1) — that draft was already computed by the prior fused verify.
+        # Off-path (or first step / fidelity check) reqs still run F1. Never fuses under a fidelity A/B.
+        check = os.environ.get("MINISGL_DDTREE_FUSE_CHECK") == "1"
+        fused_reqs = ([r for r in reqs if getattr(r, "_ddtree_fused_next", None) is not None]
+                      if fuse and not check else [])
+        need_f1 = [r for r in reqs if r not in fused_reqs]
+        if need_f1:
+            self._tidar_block_predict(need_f1, B, mask_id, topk=K)  # forward 1 (marginals) for these
         topk_map = self._ddtree_topk
-        # forward 2: tree-verify -> accepted path
+        # FIDELITY CHECK: on-path fused marginals must match a fresh block_predict at the committed
+        # position. When set, F1 runs for ALL reqs and we compare the stored fused top-K to it.
+        if check and fuse:
+            fmatch = getattr(self, "_ddtree_fmatch", None) or {"hit": 0, "tot": 0}
+            for req in reqs:
+                fn = getattr(req, "_ddtree_fused_next", None)
+                if fn is None:
+                    continue
+                bp_ids, _ = topk_map[id(req)]
+                fmatch["tot"] += 1
+                # top-1 agreement per next-block position (the draft the tree's rank-0 child would take)
+                if all(fn[0][m][0] == bp_ids[m][0] for m in range(len(bp_ids))):
+                    fmatch["hit"] += 1
+            self._ddtree_fmatch = fmatch
+            if fmatch["tot"] and fmatch["tot"] % 20 == 0:
+                logger.info_rank0(f"[ddtree-fuse-check] on-path fused==block_predict top-1 "
+                                  f"{fmatch['hit']}/{fmatch['tot']} = {fmatch['hit']/fmatch['tot']:.3f}")
+        # forward 2: tree-verify -> accepted path (build tree from fused marginals if present, else F1)
         trees = {}
         for req in reqs:
-            ids, logp = topk_map[id(req)]
-            trees[id(req)] = build_draft_tree(logp, ids, budget, int(req.input_ids[req.cached_len]))
+            fn = getattr(req, "_ddtree_fused_next", None) if (fuse and not check) else None
+            ids, logp = fn if fn is not None else topk_map[id(req)]
+            root = int(req.input_ids[req.cached_len])
+            trees[id(req)] = (fill_static_template(tmpl, ids, root) if tmpl is not None
+                              else build_draft_tree(logp, ids, budget, root))
         accepted = self._ddtree_tree_verify(reqs, trees)
         # metrics: tree accept-len vs argmax chain accept-len (the argmax chain is verified in forward 3)
         st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
@@ -2004,7 +2183,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         K=MINISGL_DDTREE_TOPK (default 8), budget=MINISGL_DDTREE_BUDGET (default 32)."""
         K = int(os.environ.get("MINISGL_DDTREE_TOPK") or "8")
         budget = self._ddtree_budget  # fixed at init so the tree size matches the captured tree_qlen
-        from minisgl.spec.ddtree import build_draft_tree
+        from minisgl.spec.ddtree import build_draft_tree, fill_static_template
+        tmpl = getattr(self, "_ddtree_template", None)
 
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
@@ -2027,10 +2207,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             root = int(req.input_ids[req.cached_len])
             entry = topk_map.get(id(req))
             if entry is None:  # no aux yet / budget-0 req -> root-only tree (commit degrades to plain decode)
-                trees[id(req)] = build_draft_tree([], [], 0, root)
+                trees[id(req)] = build_draft_tree([], [], 0, root)  # static mask is topology-only; pad rows discarded
             else:
                 ids, logp = entry
-                trees[id(req)] = build_draft_tree(logp, ids, budget, root)
+                trees[id(req)] = (fill_static_template(tmpl, ids, root) if tmpl is not None
+                                  else build_draft_tree(logp, ids, budget, root))
         accepted = self._ddtree_tree_verify(reqs, trees)
         # metric: mean tree accept-len (the DDTree win at block-16 vs the argmax chain).
         st = getattr(self, "_ddtree_stat", None) or {"tree": 0.0, "n": 0}
