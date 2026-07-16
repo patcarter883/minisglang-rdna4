@@ -685,6 +685,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         from minisgl.message import StatsMsg
 
+        _cam = self.engine.cam
+        _cam_s = _cam.metrics_summary() if _cam is not None else {}
         self._emit_stats(
             StatsMsg(
                 dp_rank=self._m_dp_rank,
@@ -698,6 +700,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 kv_tokens_used=int(kv_used),
                 gdn_slots_total=int(gdn_total),
                 gdn_slots_used=int(gdn_used),
+                cam_facts=int(_cam_s.get("facts", 0)),
+                cam_namespaces=int(_cam_s.get("namespaces", 0)),
+                cam_evicted=int(_cam_s.get("evicted", 0)),
+                cam_max_bank_load=int(_cam_s.get("max_bank_load", 0)),
+                cam_crowded_banks=int(_cam_s.get("crowded_banks", 0)),
             )
         )
 

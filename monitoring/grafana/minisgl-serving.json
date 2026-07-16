@@ -1492,6 +1492,324 @@
           "legendFormat": "gdn util %"
         }
       ]
+    },
+    {
+      "id": 27,
+      "type": "row",
+      "title": "CAM editable memory",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      }
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Stored facts",
+      "description": "minisgl_cam_facts \u2014 subject\u2192object edits across all namespaces.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 55
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(minisgl_cam_facts{model_name=~\"$model\"})"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Namespaces",
+      "description": "minisgl_cam_namespaces \u2014 per-tenant/session isolated stores.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 55
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(minisgl_cam_namespaces{model_name=~\"$model\"})"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "stat",
+      "title": "Facts evicted",
+      "description": "minisgl_cam_evicted \u2014 LRU-evicted under capacity pressure (0 = uncapped).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 55
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(minisgl_cam_evicted{model_name=~\"$model\"})"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "stat",
+      "title": "Max bank load",
+      "description": "minisgl_cam_max_bank_load \u2014 product-key crowding; delivery-fallback degrades past ~9/bank.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 55
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 9
+              },
+              {
+                "color": "red",
+                "value": 12
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "max(minisgl_cam_max_bank_load{model_name=~\"$model\"})"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Crowded banks",
+      "description": "minisgl_cam_crowded_banks \u2014 banks past the crowding knee (>9 edits).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 55
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(minisgl_cam_crowded_banks{model_name=~\"$model\"})"
+        }
+      ]
     }
   ]
 }
