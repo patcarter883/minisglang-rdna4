@@ -64,6 +64,14 @@ class SamplingParams:
     # generations are never reused — inserting them just pollutes the cache and inflates KV occupancy
     # (finished rollouts wouldn't "drop" on the KV graph). Rides UserMsg -> Req like the fields above.
     cache_output: bool = True
+    # CAM write mode for a mem_remember write: "force" = explicit ingest (always writes, bypasses gates);
+    # "auto"/None = ambient auto-write (subject to the store's freeze + no-clobber policy). Lets a curated
+    # store be protected from conversational overwrite while explicit /cam/remember still curates.
+    mem_write_mode: str | None = None
+    # CAM namespace (#6 multi-tenant isolation): which per-tenant/session store this op reads/writes.
+    # None -> "default" (single-store back-compat). Every CAM op (deliver/write/facts/forget/stats/retrieve)
+    # is scoped to this namespace so one conversation cannot read or overwrite another's memory.
+    mem_namespace: str | None = None
 
     @property
     def is_greedy(self) -> bool:

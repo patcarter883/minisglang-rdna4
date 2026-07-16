@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 import torch
 import torch.distributed as dist
 import torch.profiler
+from minisgl.cam.memory import _canon_subject   # #10 optional subject canonicalization (env-gated no-op)
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.message import (
@@ -1272,12 +1273,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # #100 CONTROL op (facts/forget/stats): compute the result from engine.cam and FORCE-EMIT it
             # (tokenised) as the reply text + EOS — the data-returning ops ride the generate path too, no new
             # message type. Handled before the subject guard (facts/stats carry no subject).
+            ns = getattr(sp, "mem_namespace", None)          # #6: per-tenant/session store scope
             mem_op = getattr(sp, "mem_op", None)
             if mem_op and getattr(req, "_mem_deliver", None) is None:
                 if mem_op == "retrieve":         # TRANSPARENT read: match stored subjects that appear in
-                    result = self._cam_retrieve(cam, req.input_ids)   # the prompt -> facts for auto-RAG
+                    result = self._cam_retrieve(cam, req.input_ids, ns)   # the prompt -> facts for auto-RAG
                 else:
-                    result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None))
+                    result = self._cam_ctrl_result(cam, mem_op, getattr(sp, "mem_subject", None), ns)
                 toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
                 _eos = next(iter(self.eos_token_ids), None)
                 if _eos is not None:
@@ -1287,14 +1289,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             subj = getattr(sp, "mem_subject", None)
             if not subj or req.mem_bank is not None or getattr(req, "_mem_deliver", None) is not None:
                 continue
-            subj_ids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids)
+            subj_ids = list(self.tokenizer(" " + _canon_subject(subj), add_special_tokens=False).input_ids)
             # #100 REMEMBER (multi-process write): the store lives in THIS scheduler process, so a write
             # must ride the request — mem_remember=object_token_ids writes subject->object into engine.cam.
             # Write-only: no forced tokens (the frontend sends max_tokens=1; the 1-token generation is a stub).
             mem_remember = getattr(req.sampling_params, "mem_remember", None)
             if mem_remember:
-                cam._write(subj_ids, list(mem_remember))
-                cam._facts[tuple(int(s) for s in subj_ids)] = {"object_ids": list(mem_remember), "base_p": 0.0}
+                # WRITE GATING: explicit ingest (mem_write_mode="force") always writes; ambient auto-write
+                # ("auto"/None) is refused when the namespace is frozen or (no-clobber) the subject is already
+                # curated — so conversational chatter can't overwrite a deliberately-ingested store.
+                mode = getattr(sp, "mem_write_mode", None) or "auto"
+                if cam.write_allowed(subj_ids, source=mode, ns=ns):
+                    cam._write(subj_ids, list(mem_remember), ns=ns)   # records the fact in this namespace
                 req._mem_deliver, req._mem_deliver_pos = [], 0    # mark processed; deliver nothing
                 continue
             # #100 POINTER delivery (multi-process): force the EXACT object token sequence retrieved from
@@ -1303,38 +1309,59 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # the sampled token with the forced object token for the first len(obj) steps. Falls back to the
             # residual tap (mem_bank) only when the subject addresses no stored object.
             _deliver = getattr(cam, "deliver_object_ids", None)
-            obj = _deliver(subj_ids) if _deliver is not None else []
+            obj = _deliver(subj_ids, ns) if _deliver is not None else []
             if obj:
                 req._mem_deliver, req._mem_deliver_pos = list(obj), 0
                 req.mem_bank = None                          # pointer forces exact tokens; no tap needed
             elif not getattr(cam, "pointer_only", False):
                 # Residual-tap fallback (tap+router path only). Skipped in pointer-only mode: cam.read
                 # runs the checkpoint-dimensioned adapter, which mismatches a different served base.
-                bank, conf = cam.read(subj_ids)
+                bank, conf = cam.read(subj_ids, ns=ns)
                 req.mem_bank, req.mem_conf = bank, conf
                 req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+        autosave = getattr(cam, "autosave", None)   # #7 debounced persistence after any writes this batch
+        if autosave is not None:
+            autosave()
 
-    def _cam_ctrl_result(self, cam, op: str, subj: str | None) -> str:
-        """#100 control op -> JSON string (force-emitted as the reply). facts: [{subject,object}] (ids
-        decoded to text here, tokenizer-side); forget: bool; stats: the value-bank occupancy dict."""
+    def _cam_ctrl_result(self, cam, op: str, subj: str | None, ns: str | None = None) -> str:
+        """#100 control op -> JSON string (force-emitted as the reply), scoped to namespace `ns` (#6).
+        facts: [{subject,object}]; forget: bool; stats: dict; freeze/unfreeze: {frozen}."""
         import json
         if op == "forget":
-            sids = list(self.tokenizer(" " + subj, add_special_tokens=False).input_ids) if subj else []
-            deleter = getattr(cam, "forget", None) or getattr(cam, "delete", None)
-            return json.dumps(bool(deleter(sids)) if (sids and deleter) else False)
+            sids = list(self.tokenizer(" " + _canon_subject(subj), add_special_tokens=False).input_ids) if subj else []
+            return json.dumps(bool(cam.forget(sids, ns=ns)) if sids else False)
         if op == "facts":
             out = []
-            for f in (getattr(cam, "list_facts", lambda: [])() or []):
+            for f in (cam.list_facts(ns) or []):
                 sids, oids = f.get("subject_ids"), f.get("object_ids")
                 out.append({"subject": self.tokenizer.decode(list(sids)).strip() if sids else "",
                             "object": self.tokenizer.decode(list(oids)).strip() if oids else ""})
             return json.dumps(out)
         if op == "stats":
-            statter = getattr(cam, "stats", None)
-            return json.dumps(statter() if statter else {})
+            return json.dumps(cam.stats(ns))
+        if op in ("freeze", "unfreeze"):        # read-only toggle: protect a curated namespace from auto-write
+            frozen = cam.freeze(ns) if op == "freeze" else cam.unfreeze(ns)
+            return json.dumps({"frozen": bool(frozen)})
+        if op == "save":                        # #7 explicit persistence flush
+            return json.dumps({"saved": cam.save() if hasattr(cam, "save") else -1})
+        if op == "reload":                      # #11 pull shared-store writes from another replica
+            return json.dumps({"edits": cam.reload() if hasattr(cam, "reload") else -1})
+        if op == "undo":                        # #12 undo the last write in this namespace
+            u = cam.undo(ns) if hasattr(cam, "undo") else {}
+            return json.dumps({"subject": self.tokenizer.decode(list(u["subject_ids"])).strip(),
+                               "object": self.tokenizer.decode(list(u["object_ids"])).strip()} if u else {})
+        if op == "rebuild":                     # #12 true-erase / compact this namespace's banks
+            return json.dumps({"rebuilt": cam.rebuild(ns) if hasattr(cam, "rebuild") else 0})
+        if op == "audit":                       # #12 recent write/forget/evict events for this namespace
+            out = []
+            for r in (cam.audit_log(ns) if hasattr(cam, "audit_log") else []):
+                out.append({"op": r["op"], "ts": r["ts"],
+                            "subject": self.tokenizer.decode(list(r["subject_ids"])).strip(),
+                            "object": self.tokenizer.decode(list(r["object_ids"])).strip() if r["object_ids"] else ""})
+            return json.dumps(out)
         return json.dumps(None)
 
-    def _cam_retrieve(self, cam, prompt_ids) -> str:
+    def _cam_retrieve(self, cam, prompt_ids, ns: str | None = None) -> str:
         """TRANSPARENT read: which stored subjects does this prompt mention? Decode the prompt, pull
         candidate proper-noun spans (capitalised word runs — the common subject shape), and query each
         against the store's cosine-NN subject index (deliver_object_ids, tau-gated). Returns the matched
@@ -1350,8 +1377,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                  re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text)}
         seen, out = set(), []
         for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller-name) spans first
-            cids = list(self.tokenizer(" " + c, add_special_tokens=False).input_ids)
-            oids = deliver(cids)
+            cids = list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
+            oids = deliver(cids, ns)
             if oids:
                 obj = self.tokenizer.decode(oids).strip()
                 if (c, obj) not in seen:

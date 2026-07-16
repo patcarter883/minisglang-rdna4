@@ -28,6 +28,19 @@ import hashlib
 import json
 import logging
 import os
+import re
+import time
+
+
+def _canon_subject(text: str) -> str:
+    """#10 OPTIONAL subject canonicalization (MINISGL_CAM_CANON=1): lowercase + strip punctuation +
+    collapse whitespace, so case/punctuation paraphrases of a subject key IDENTICALLY (the tau sweep
+    showed a lowercased restatement drops to cos~0.58 under the pooled-embedding key; canonicalizing at
+    both write and query time makes it 1.0). No-op unless enabled. Applied at the subject-string
+    tokenization sites (scheduler); a trained semantic key is the memory-organ CAM_GTE_KEYS path."""
+    if os.environ.get("MINISGL_CAM_CANON") != "1":
+        return text
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", text.lower())).strip()
 from typing import List, Optional, Tuple
 
 import torch
@@ -401,6 +414,27 @@ def _load_filtered(module: nn.Module, sd: dict, name: str) -> None:
         logger.warning("CAM %s: MISSING params after load: %s", name, real_missing)
 
 
+class _NsState:
+    """Per-namespace EDITABLE store state (#6 multi-tenant isolation). Trained adapter/tap/router/embed
+    weights are SHARED across namespaces; only this — the value banks, the cosine-NN subject index, the
+    fact table, and the freeze flag — is partitioned per tenant/session so one conversation cannot read
+    or overwrite another's memory."""
+    # seq: monotonic LRU clock (#9); evicted: count dropped for capacity; last_key: most-recent write (#12 undo)
+    __slots__ = ("banks", "subj_keys", "subj_objs", "subj_tuple", "facts", "frozen",
+                 "seq", "evicted", "last_key")
+
+    def __init__(self, banks, frozen=False, subj_keys=None, subj_objs=None, subj_tuple=None, facts=None):
+        self.banks = banks
+        self.subj_keys = [] if subj_keys is None else subj_keys
+        self.subj_objs = [] if subj_objs is None else subj_objs
+        self.subj_tuple = [] if subj_tuple is None else subj_tuple
+        self.facts = {} if facts is None else facts
+        self.frozen = frozen
+        self.seq = 0
+        self.evicted = 0
+        self.last_key = None
+
+
 class CAMMemory:
     """Serve-side editable memory: a standing product-key store (B disjoint banks) + trained tap + router.
 
@@ -427,6 +461,10 @@ class CAMMemory:
         self.banks: Optional[List[torch.Tensor]] = None
         self._facts: dict = {}                               # tuple(subject_ids) -> {"object_ids", ...}
         self._pending_object: Optional[List[int]] = None
+        # #6 safe defaults so _state() never AttributeErrors on a DISABLED store (populated when enabled).
+        self._ns_states: dict = {}
+        self._init_banks: list = []
+        self._default_frozen = False
 
         if checkpoint_dir is None or not os.path.isdir(checkpoint_dir):
             logger.warning("CAMMemory: no checkpoint dir (%s) — constructing DISABLED (memory off).",
@@ -546,9 +584,48 @@ class CAMMemory:
         self._subj_tuple: List[tuple] = []                   # parallel tuple(subject_ids) (update/forget)
         self.deliver_tau = float(os.environ.get("MINISGL_CAM_DELIVER_TAU", "0.7"))
         self.enabled = True
+        # ---- write gating (protect a curated/ingested store from ambient auto-write) -------------------
+        # frozen: read-only — refuse AMBIENT auto-write (explicit force ingest still writes). Flip at
+        #   runtime via freeze()/unfreeze() (POST /cam/freeze) or start frozen with MINISGL_CAM_FROZEN=1.
+        # write_policy 'no-clobber' (DEFAULT): auto-write may ADD a genuinely-new subject but never
+        #   overwrite/shadow an existing one (exact id match, or cosine >= protect_tau to a stored key).
+        #   Set MINISGL_CAM_WRITE_POLICY=overwrite for the old always-write behaviour.
+        # protect_tau DEFAULTS TO deliver_tau (0.70): "refuse to re-write what the store would already
+        #   deliver for this subject." Measured on real Qwen3.5-4B subject keys (tau_sweep): 0.70 sits above
+        #   distinct subjects (<=0.51) and different-people-sharing-a-name (<=0.62), and catches confident
+        #   same-subject paraphrases (reorder/trailing/"the"/titles). A missed rewording only appends a
+        #   redundant entry (_write overwrites only on EXACT subject-id match); a false refuse would silently
+        #   drop a new fact — so the default errs toward learning. Override with MINISGL_CAM_PROTECT_TAU.
+        self.frozen = os.environ.get("MINISGL_CAM_FROZEN") == "1"
+        self.write_policy = os.environ.get("MINISGL_CAM_WRITE_POLICY", "no-clobber")
+        self.protect_tau = float(os.environ.get("MINISGL_CAM_PROTECT_TAU", str(self.deliver_tau)))
+        # --- per-namespace editable state (#6) --- the DEFAULT namespace WRAPS the objects built above,
+        # so single-store callers are byte-unchanged; new namespaces clone the checkpoint's initial banks
+        # and start with an empty index (shared trained weights are never duplicated).
+        self._default_frozen = self.frozen
+        self._init_banks = [b.detach().clone() for b in self.banks]
+        self._ns_states = {"default": _NsState(self.banks, self.frozen, self._subj_keys,
+                                               self._subj_objs, self._subj_tuple, self._facts)}
+        # #9 capacity: per-namespace fact cap (0 = unlimited); LRU eviction on overflow.
+        self.max_facts = int(os.environ.get("MINISGL_CAM_MAX_FACTS", "0"))
+        # #12 audit: append-only ring buffer of write/forget/evict events (subject/object/source/ns/ts).
+        self._audit: list = []
+        self._audit_max = int(os.environ.get("MINISGL_CAM_AUDIT_MAX", "2000"))
+        # #7 persistence: load-on-boot + debounced autosave to MINISGL_CAM_STORE_PATH.
+        self.store_path = os.environ.get("MINISGL_CAM_STORE_PATH")
+        self._save_interval = float(os.environ.get("MINISGL_CAM_SAVE_INTERVAL", "5"))
+        self._dirty = False
+        self._last_save = 0.0
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
+        if self.store_path and os.path.isfile(self.store_path):   # #7 load-on-boot
+            try:
+                n = self.restore(self.store_path)
+                logger.info("CAMMemory: restored %d edits across %d namespace(s) from %s",
+                            n, len(self._ns_states), self.store_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("CAMMemory: store restore failed (%s) — starting empty.", e)
 
     # ---- object supply for the write gate --------------------------------------------------------
     def set_pending_object(self, object_ids: List[int]) -> None:
@@ -558,8 +635,21 @@ class CAMMemory:
 
     # ---- write gate ------------------------------------------------------------------------------
     @torch.no_grad()
+    def _state(self, ns: str = None) -> "_NsState":
+        """Editable state for a namespace (#6), lazily created (cloned initial banks + empty index) on first
+        use. ns=None/"default" -> the shared default store, so single-store callers are unchanged."""
+        ns = ns or "default"
+        st = self._ns_states.get(ns)
+        if st is None:
+            st = _NsState([b.clone() for b in self._init_banks], self._default_frozen)
+            self._ns_states[ns] = st
+        return st
+
+    def namespaces(self) -> list:
+        return list(self._ns_states.keys())
+
     def remember(self, subject_ids: List[int], prompt_last_logits: torch.Tensor,
-                 object_ids: Optional[List[int]] = None) -> bool:
+                 object_ids: Optional[List[int]] = None, ns: str = None) -> bool:
         """Base-uncertainty WRITE GATE: store subject->object iff the base can't already recall the object
         (softmax(prompt_last_logits)[object first token] < remember_tau). Returns whether it was stored.
 
@@ -577,12 +667,13 @@ class CAMMemory:
         p = float(torch.softmax(prompt_last_logits.float().reshape(-1), -1)[obj_first])
         if p >= self.remember_tau:
             return False                                     # base already knows it -> store the unknowable only
-        self._write(subject_ids, obj)
-        self._facts[tuple(int(s) for s in subject_ids)] = {"object_ids": [int(o) for o in obj], "base_p": p}
+        self._write(subject_ids, obj, ns=ns, base_p=p)
         return True
 
     @torch.no_grad()
-    def _write(self, subject_ids: List[int], object_ids: List[int]) -> None:
+    def _write(self, subject_ids: List[int], object_ids: List[int], ns: str = None,
+               base_p: float = 0.0) -> None:
+        st = self._state(ns)
         # Value-store / product-key write (feeds the tap+router fallback). Skipped in pointer-only mode:
         # the adapter is sized to the CHECKPOINT's base hidden, so `_e`/`persistent_write` would matmul-
         # mismatch a different served base (e.g. a 4B checkpoint on a 35B serve). The pointer index below
@@ -601,7 +692,7 @@ class CAMMemory:
             if key.shape[1] > 1:                                 # multi-vector keys: same value to H slots
                 val = val.expand(-1, key.shape[1], -1)
             b = _subject_bank(list(subject_ids), self.n_banks)
-            self.banks[b] = self.adapter.persistent_write(self.banks[b], key, val)
+            st.banks[b] = self.adapter.persistent_write(st.banks[b], key, val)
         # POINTER delivery index: store the subject's cosine key + its EXACT object token sequence, so
         # /cam/ask delivers the whole multi-token object losslessly and paraphrase-robustly (the value
         # bank above only carries the first-token seed for the router/tap fallback). Update-in-place on
@@ -609,11 +700,65 @@ class CAMMemory:
         k = tuple(int(s) for s in subject_ids)
         obj = [int(o) for o in object_ids]
         key_vec = self._subj_key(subject_ids)
-        if k in self._subj_tuple:
-            i = self._subj_tuple.index(k)
-            self._subj_keys[i], self._subj_objs[i] = key_vec, obj
+        st.seq += 1
+        if k in st.subj_tuple:
+            i = st.subj_tuple.index(k)
+            st.subj_keys[i], st.subj_objs[i] = key_vec, obj
         else:
-            self._subj_tuple.append(k); self._subj_keys.append(key_vec); self._subj_objs.append(obj)
+            st.subj_tuple.append(k); st.subj_keys.append(key_vec); st.subj_objs.append(obj)
+        st.facts[k] = {"object_ids": obj, "base_p": float(base_p), "used": st.seq}  # #6 index + #9 LRU clock
+        st.last_key = k                                          # #12 undo target
+        self._audit_add("write", ns, k, obj)                    # #12 audit
+        self._maybe_evict(st, ns)                               # #9 capacity
+        self._dirty = True                                      # #7 persistence
+
+    # ---- #9 capacity / eviction --------------------------------------------------------------------
+    @torch.no_grad()
+    def _maybe_evict(self, st, ns: str) -> None:
+        """Evict least-recently-used facts from a namespace once it exceeds max_facts (0 = unlimited).
+        Delivery-correct: drops from the cosine-NN index + fact table (bank residue is the router/tap
+        fallback only; a full rebuild is the #12 true-erase path)."""
+        if self.max_facts <= 0:
+            return
+        while len(st.facts) > self.max_facts:
+            victim = min(st.facts, key=lambda kk: st.facts[kk].get("used", 0))   # LRU
+            obj = st.facts[victim]["object_ids"]
+            del st.facts[victim]
+            if victim in st.subj_tuple:
+                i = st.subj_tuple.index(victim)
+                del st.subj_tuple[i]; del st.subj_keys[i]; del st.subj_objs[i]
+            st.evicted += 1
+            self._audit_add("evict", ns, victim, obj)
+
+    # ---- #12 audit ---------------------------------------------------------------------------------
+    def _audit_add(self, op: str, ns: str, subject_ids, object_ids) -> None:
+        self._audit.append({"ts": time.time(), "op": op, "ns": ns or "default",
+                            "subject_ids": list(subject_ids), "object_ids": list(object_ids)})
+        if len(self._audit) > self._audit_max:
+            del self._audit[:len(self._audit) - self._audit_max]
+
+    def audit_log(self, ns: str = None, limit: int = 100) -> list:
+        """Recent write/forget/evict events (most-recent last), optionally filtered to a namespace (#12)."""
+        rows = self._audit if ns is None else [r for r in self._audit if r["ns"] == (ns or "default")]
+        return rows[-limit:]
+
+    # ---- #7 persistence: debounced autosave --------------------------------------------------------
+    def autosave(self, force: bool = False) -> bool:
+        """Snapshot to store_path if dirty and the debounce interval elapsed (or force). Returns whether it
+        saved. Cheap no-op when no store_path / not dirty."""
+        if not self.store_path or (not self._dirty and not force):
+            return False
+        now = time.time()
+        if not force and (now - self._last_save) < self._save_interval:
+            return False
+        try:
+            self.snapshot(self.store_path)
+            self._dirty = False
+            self._last_save = now
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("CAMMemory autosave failed: %s", e)
+            return False
 
     @torch.no_grad()
     def _subj_key(self, subject_ids: List[int]) -> torch.Tensor:
@@ -623,36 +768,77 @@ class CAMMemory:
         e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
         return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
 
+    # ---- write gating (freeze / no-clobber) ------------------------------------------------------
+    @torch.no_grad()
+    def has_subject(self, subject_ids: List[int], tau: float = None, ns: str = None) -> bool:
+        """True if a sufficiently-similar subject is already stored IN THIS NAMESPACE — exact id match, or
+        cosine >= tau to an existing subject key. Used by the no-clobber policy to protect curated entries."""
+        tau = self.protect_tau if tau is None else tau
+        st = self._state(ns)
+        if tuple(int(s) for s in subject_ids) in st.subj_tuple:
+            return True
+        if not st.subj_keys:
+            return False
+        q = self._subj_key(subject_ids)
+        sims = torch.stack(st.subj_keys).to(q.device) @ q
+        return bool(float(sims.max().item()) >= tau)
+
+    def write_allowed(self, subject_ids: List[int], *, source: str = "auto", ns: str = None) -> bool:
+        """Gate an incoming write. Explicit ingest (source='force') always writes — freeze/no-clobber only
+        constrain AMBIENT auto-write (source='auto'): refused when the namespace is frozen, or (no-clobber
+        policy) when the subject is already curated so the existing value is preserved."""
+        if source == "force":
+            return True
+        if self._state(ns).frozen:
+            return False
+        if self.write_policy == "no-clobber" and self.has_subject(subject_ids, ns=ns):
+            return False
+        return True
+
+    def freeze(self, ns: str = None) -> bool:
+        self._state(ns).frozen = True
+        return True
+
+    def unfreeze(self, ns: str = None) -> bool:
+        self._state(ns).frozen = False
+        return False
+
     # ---- POINTER delivery (#100): exact object via cosine-NN over the subject index ------------------
     @torch.no_grad()
-    def deliver_object_ids(self, subject_ids: List[int]) -> List[int]:
-        """The exact object token sequence for a subject, via nearest stored subject by cosine (>=
-        deliver_tau). Exact retrieval (no slot collision at scale) + paraphrase-robust; returns [] for an
-        unknown subject (max-cos < tau) so /cam/ask falls back cleanly. The #100 serving unlock: memory
-        supplies the unknowable object tokens, the base then continues the sentence."""
-        if not self.enabled or not self._subj_objs:
+    def deliver_object_ids(self, subject_ids: List[int], ns: str = None) -> List[int]:
+        """The exact object token sequence for a subject IN THIS NAMESPACE, via nearest stored subject by
+        cosine (>= deliver_tau). Exact retrieval (no slot collision at scale) + paraphrase-robust; returns
+        [] for an unknown subject (max-cos < tau) so /cam/ask falls back cleanly. The #100 serving unlock:
+        memory supplies the unknowable object tokens, the base then continues the sentence."""
+        st = self._state(ns)
+        if not self.enabled or not st.subj_objs:
             return []
         q = self._subj_key(subject_ids)                      # [d]
-        sims = torch.stack(self._subj_keys).to(q.device) @ q  # [M] cosine (keys + q are unit-norm)
+        sims = torch.stack(st.subj_keys).to(q.device) @ q     # [M] cosine (keys + q are unit-norm)
         j = int(sims.argmax().item())
         if float(sims[j].item()) < self.deliver_tau:
             return []                                        # unknown subject -> no confident delivery
-        return list(self._subj_objs[j])
+        rec = st.facts.get(st.subj_tuple[j])                 # #9 LRU: mark this fact recently used
+        if rec is not None:
+            st.seq += 1; rec["used"] = st.seq
+        return list(st.subj_objs[j])
 
     # ---- read (once per request, at prefill) -----------------------------------------------------
     @torch.no_grad()
-    def read(self, subject_ids: List[int]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def read(self, subject_ids: List[int], ns: str = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """subject_ids -> (bank [1,K,mem], conf [1]). Returns (None, None) when disabled. Cheap B=1
-        product-key read; run on the scheduler at prefill and reuse across the request's decode steps."""
+        product-key read from THIS NAMESPACE's banks; run on the scheduler at prefill and reuse across the
+        request's decode steps."""
         if not self.enabled:
             return None, None
+        st = self._state(ns)
         dev = self.adapter.device
         tids = torch.tensor([list(subject_ids)], dtype=torch.long, device=dev)
         q = self.adapter._e(tids)
         if self.adapter.learned_key_pool:
             q = self.adapter._pool_subject(q, keepdim=True)  # symmetric with the pooled write key
         b = _subject_bank(list(subject_ids), self.n_banks)
-        bank = self.adapter.persistent_bank(self.banks[b], q)         # [1,K,mem]
+        bank = self.adapter.persistent_bank(st.banks[b], q)         # [1,K,mem]
         conf = self.adapter._last_conf                               # [1] or None
         if conf is None:
             conf = torch.zeros(1, device=dev)
@@ -711,17 +897,17 @@ class CAMMemory:
         raw = (self.adapter.out_proj(bank).mean(1).to(lm.device, lm.dtype) @ lm.t()).float()
         return int(raw.argmax(-1).reshape(-1)[0].item())
 
-    def facts(self) -> list:
-        """List stored (subject_ids, object_ids) associations (for /cam/facts)."""
-        return [{"subject_ids": list(k), **v} for k, v in self._facts.items()]
+    def facts(self, ns: str = None) -> list:
+        """List stored (subject_ids, object_ids) associations for a namespace (for /cam/facts)."""
+        return [{"subject_ids": list(k), **v} for k, v in self._state(ns).facts.items()]
 
-    def stats(self) -> dict:
-        """Per-bank occupancy + crowding health for the product-key VALUE banks (online_api.md §6.2). The
-        value-bank read degrades past ~9 edits/bank — but that only affects the router/tap FALLBACK now;
-        the primary /cam/ask delivery is the cosine-NN subject index (exact, collision-free). Counts come
-        from the side index (exact); the subject-hash routing is replayed to attribute each edit to a bank."""
+    def stats(self, ns: str = None) -> dict:
+        """Per-bank occupancy + crowding health for a namespace's product-key VALUE banks. The value-bank
+        read degrades past ~9 edits/bank — but that only affects the router/tap FALLBACK now; the primary
+        /cam/ask delivery is the cosine-NN subject index (exact, collision-free)."""
+        st = self._state(ns)
         loads = [0] * self.n_banks
-        for sids in self._facts:
+        for sids in st.facts:
             loads[_subject_bank(list(sids), self.n_banks)] += 1
         total = sum(loads)
         mx = max(loads) if loads else 0
@@ -731,67 +917,135 @@ class CAMMemory:
             "imbalance": (mx / mean) if mean else 0.0,
             "crowded_banks": [b for b, ln in enumerate(loads) if ln > 9],
             "banks": [{"index": b, "n_edits": ln} for b, ln in enumerate(loads) if ln > 0],
+            "frozen": st.frozen, "write_policy": self.write_policy,
+            "namespace": ns or "default", "namespaces": len(self._ns_states),
+            "max_facts": self.max_facts, "evicted": st.evicted,            # #9 capacity
+            "persistent": bool(self.store_path), "dirty": self._dirty,     # #7 persistence
         }
 
     @torch.no_grad()
     def snapshot(self, path: str) -> int:
-        """Persist the editable state — the B value banks + the side index — to `path` (the trained
-        adapter/tap/router live in the checkpoint, not here). Returns #edits saved."""
-        torch.save({"banks": [b.detach().cpu() for b in self.banks],
-                    "facts": self._facts,
+        """Persist the editable state of ALL namespaces to `path` (the trained adapter/tap/router live in
+        the checkpoint, not here). Returns total #edits saved. (Cosine-NN index is rebuilt from facts on
+        restore.) See #7 for lifecycle wiring."""
+        ns_blob = {ns: {"banks": [b.detach().cpu() for b in st.banks], "facts": st.facts,
+                        "frozen": st.frozen} for ns, st in self._ns_states.items()}
+        torch.save({"ns_states": ns_blob,
                     "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
                              "base_model": self.meta.get("base_model")}}, path)
-        return len(self._facts)
+        return sum(len(st.facts) for st in self._ns_states.values())
 
     @torch.no_grad()
     def restore(self, path: str) -> int:
-        """Load a bank snapshot into this (already-loaded) store. Hard-fails on a bank-count / adapter
-        mismatch — a bank is only meaningful against the projections that wrote it. Returns #edits."""
+        """Load a snapshot (all namespaces). Hard-fails on a bank-count mismatch. Rebuilds each namespace's
+        cosine-NN delivery index from its facts. Returns total #edits."""
         d = torch.load(path, map_location="cpu", weights_only=False)
         m = d.get("meta", {})
         if int(m.get("n_banks", self.n_banks)) != self.n_banks:
             raise ValueError(f"snapshot n_banks={m.get('n_banks')} != store n_banks={self.n_banks}")
-        self.banks = [b.to(self.device, dtype=torch.float32) for b in d["banks"]]
-        self._facts = d.get("facts", {})
-        return len(self._facts)
+        blob = d.get("ns_states")
+        if blob is None:                                      # legacy single-store snapshot (banks+facts)
+            blob = {"default": {"banks": d["banks"], "facts": d.get("facts", {}), "frozen": False}}
+        self._ns_states = {}
+        for ns, s in blob.items():
+            st = _NsState([b.to(self.device, dtype=torch.float32) for b in s["banks"]],
+                          bool(s.get("frozen", False)))
+            self._ns_states[ns] = st
+            for k, rec in s.get("facts", {}).items():         # rebuild the cosine-NN index from facts
+                key_vec = self._subj_key(list(k))
+                st.subj_tuple.append(tuple(k)); st.subj_keys.append(key_vec)
+                st.subj_objs.append(list(rec["object_ids"])); st.facts[tuple(k)] = rec
+            st.seq = max([r.get("used", 0) for r in st.facts.values()] or [0])   # #9 continue the LRU clock
+        return sum(len(st.facts) for st in self._ns_states.values())
+
+    def save(self) -> int:
+        """Force a persistence snapshot now (explicit flush, e.g. POST /cam/save). Returns #edits, or -1
+        when no store_path is configured."""
+        if not self.store_path:
+            return -1
+        n = self.snapshot(self.store_path)
+        self._dirty = False; self._last_save = time.time()
+        return n
+
+    def reload(self) -> int:
+        """#11 DP-scale: re-read the store from store_path to pick up writes made by ANOTHER replica that
+        shares the same backing file — cheap eventual-consistency for a shared-backing DP deployment.
+        Returns total #edits after reload, or -1 without a store file. (Strong consistency + concurrent
+        writes need an external KV backend — see docs/zaya-port/CAM_DP_SCALE.md.)"""
+        if not self.store_path or not os.path.isfile(self.store_path):
+            return -1
+        return self.restore(self.store_path)
 
     # --- WS-C API aliases (the edit-plane calls these exact names) ---
-    def list_facts(self) -> list:
-        return self.facts()
+    def list_facts(self, ns: str = None) -> list:
+        return self.facts(ns)
 
     def seed_token(self, bank: torch.Tensor, conf=None) -> int:
         return self.store_token_of(bank)
 
-    def delete(self, subject_ids: List[int]) -> bool:
-        return self.forget(subject_ids)
+    def delete(self, subject_ids: List[int], ns: str = None) -> bool:
+        return self.forget(subject_ids, ns=ns)
 
     @torch.no_grad()
-    def reset(self) -> None:
-        """Re-init empty banks (drop all edits)."""
+    def reset(self, ns: str = None) -> None:
+        """Re-init empty banks (drop all edits) for a namespace."""
         if not self.enabled:
             return
-        self.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
-                      for _ in range(self.n_banks)]
-        self._subj_keys, self._subj_objs, self._subj_tuple = [], [], []
-        self._facts = {}
+        st = self._state(ns)
+        st.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+                    for _ in range(self.n_banks)]
+        st.subj_keys, st.subj_objs, st.subj_tuple = [], [], []
+        st.facts = {}
 
     @torch.no_grad()
-    def forget(self, subject_ids: List[int]) -> bool:
-        """Remove one subject: drop it from the delivery index (exact), and re-init its value bank + replay
-        the OTHER facts routed to that bank (the store's delta write has no per-slot erase, so we rebuild
-        the affected bank from the surviving edits — the router/tap fallback)."""
+    def forget(self, subject_ids: List[int], ns: str = None) -> bool:
+        """Remove one subject from a namespace: drop it from the delivery index (exact), and re-init its
+        value bank + replay the OTHER facts routed to that bank (the store's delta write has no per-slot
+        erase, so we rebuild the affected bank from the surviving edits — the router/tap fallback)."""
         if not self.enabled:
             return False
+        st = self._state(ns)
         key = tuple(int(s) for s in subject_ids)
-        if key not in self._facts:
+        if key not in st.facts:
             return False
-        del self._facts[key]
-        if key in self._subj_tuple:                           # drop from the cosine-NN delivery index
-            i = self._subj_tuple.index(key)
-            del self._subj_tuple[i]; del self._subj_keys[i]; del self._subj_objs[i]
+        del st.facts[key]
+        if key in st.subj_tuple:                              # drop from the cosine-NN delivery index
+            i = st.subj_tuple.index(key)
+            del st.subj_tuple[i]; del st.subj_keys[i]; del st.subj_objs[i]
         b = _subject_bank(list(subject_ids), self.n_banks)
-        self.banks[b] = self.adapter.store.init_state(1, self.device, dtype=torch.float32)
-        for subj, rec in list(self._facts.items()):
+        st.banks[b] = self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+        for subj, rec in list(st.facts.items()):
             if _subject_bank(list(subj), self.n_banks) == b:
-                self._write(list(subj), rec["object_ids"])   # rebuild value bank; index update is in-place
+                self._write(list(subj), rec["object_ids"], ns=ns)   # rebuild value bank; index in-place
+        self._audit_add("forget", ns, key, [])                # #12 audit
+        self._dirty = True                                    # #7 persistence
         return True
+
+    @torch.no_grad()
+    def undo(self, ns: str = None) -> dict:
+        """#12: undo the most-recent WRITE in a namespace (forget that subject). Returns the undone
+        {subject_ids, object_ids} or {} if there is nothing to undo."""
+        st = self._state(ns)
+        k = st.last_key
+        if not k or k not in st.facts:
+            return {}
+        obj = list(st.facts[k]["object_ids"])
+        self.forget(list(k), ns=ns)
+        st.last_key = None
+        return {"subject_ids": list(k), "object_ids": obj}
+
+    @torch.no_grad()
+    def rebuild(self, ns: str = None) -> int:
+        """#12 TRUE ERASE / compaction: fully re-init a namespace's banks and replay only the surviving
+        facts, discarding all delta residue from forgotten/overwritten edits. Returns #facts replayed."""
+        if not self.enabled:
+            return 0
+        st = self._state(ns)
+        survivors = list(st.facts.items())
+        st.banks = [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+                    for _ in range(self.n_banks)]
+        st.subj_keys, st.subj_objs, st.subj_tuple, st.facts = [], [], [], {}
+        for k, rec in survivors:
+            self._write(list(k), rec["object_ids"], ns=ns, base_p=rec.get("base_p", 0.0))
+        self._dirty = True
+        return len(survivors)
