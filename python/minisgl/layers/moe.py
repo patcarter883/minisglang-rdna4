@@ -282,6 +282,39 @@ class _GroupedMxFp4Experts(BaseOP):
         del self.weight_packed, self.weight_scale
 
 
+class _GroupedNvFp4Experts(BaseOP):
+    """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') experts for one MoE GEMM (w13 or w2), STACKED
+    over E. NVFP4 has the IDENTICAL 4-bit E2M1 weight codes as MXFP4; only the scale differs, and the
+    WEIGHT LOADER folds NVFP4's e4m3 block scale / per-tensor global into one fp16 per-group scale at
+    the leaf (before the gate/up merge + expert stack), so by load time these are MXFP4-shaped:
+        weight_packed (E, N, K//2) uint8 — 2 E2M1 nibbles/byte.
+        weight_scale  (E, N, K//16) fp16 — per-16-group scale (folded).
+    `post_load` packs the nibbles to (E,N,K//8) int32 codes and passes the fp16 scale through, so
+    `kernels.w4a8_moe(..., weight_is_e2m1=True)` at group_size 16 consumes `_w_op/_scales_op` exactly as
+    the MXFP4 experts do (group-16 rides the generic runtime-group_size e2m1 instance). Symmetric."""
+
+    def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
+        g = quant.group_size  # 16
+        N, K = out_features, in_features
+        assert K % 2 == 0 and K % g == 0 and N % 8 == 0, (
+            f"grouped NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
+        )
+        self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float16)
+        self._quant = quant
+
+    def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
+        raise RuntimeError("_GroupedNvFp4Experts holds weights; call kernels.w4a8_moe instead")
+
+    def post_load(self) -> None:
+        from minisgl.quant import nvfp4
+
+        conv = nvfp4.convert_nvfp4_moe(self.weight_packed, self.weight_scale)
+        self._w_op = conv["w_packed"]  # (E, N, K//8) int32
+        self._scales_op = conv["scales"]  # (E, N, K//16) fp16
+        del self.weight_packed, self.weight_scale
+
+
 class _GroupedFP8Experts(BaseOP):
     """Weight-only fp8 (F8_E4M3) experts for one MoE GEMM (w13 or w2), STACKED over E.
 
@@ -507,6 +540,43 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         )
 
 
+class _NvFp4MoEMethod(MoEQuantMethod):
+    """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') grouped experts through `kernels.w4a8_moe`
+    with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay 4-bit;
+    the loader folded NVFP4's two-level scale to one fp16 per-group scale). Always the LDS path (the
+    register-direct b128 wide-load requires group_size%32, which NVFP4's 16 is not — see
+    `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE hands raw router_logits, which w4a8_moe routes
+    internally (topk_ids None). EP-capable like the other e2m1 experts (E on dim 0)."""
+
+    supports_ep = True
+
+    def __init__(self, quant: "QuantConfig"):
+        self._quant = quant
+
+    def create_experts(self, num_experts, out_features, in_features):
+        return _GroupedNvFp4Experts(num_experts, out_features, in_features, self._quant)
+
+    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
+              top_k, renormalize, activation, apply_router_weight_on_input):
+        assert activation == "silu" and not apply_router_weight_on_input, (
+            "MoE NVFP4 path is silu-only without router-weight-on-input"
+        )
+        return kernels.w4a8_moe(
+            hidden_states, w13._w_op, w13._scales_op, None,
+            w2._w_op, w2._scales_op, None,
+            router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+            weight_is_e2m1=True,
+        )
+
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        return kernels.w4a8_moe(
+            g_hidden, w13._w_op, w13._scales_op, None,
+            w2._w_op, w2._scales_op, None,
+            None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
+            weight_is_e2m1=True,
+        )
+
+
 class _RXFMoEMethod(MoEQuantMethod):
     """RXF W4(NL)-A8 grouped experts (`kernels.rxf_moe`). No EP path (RXF has no precomputed-topk
     shard route, which EP requires) — stays replicated."""
@@ -639,12 +709,10 @@ def create_moe_quant_method(
     if quant is None:
         return _UnquantizedMoEMethod()
     if quant.is_nvfp4:
-        raise NotImplementedError(
-            "NVFP4 (compressed-tensors 'nvfp4-pack-quantized') MoE experts are not supported on this "
-            "backend: W4A4 (E2M1 weights + FP4 activations, per-16-group FP8-E4M3 block scale + "
-            "per-tensor FP32 global scale) and gfx1201 has no FP4 kernel. Use an MXFP4, AWQ/GPTQ int4, "
-            "or fp8 W8A8 checkpoint instead."
-        )
+        # NVFP4 -> the MXFP4 e2m1 kernel at group-16 (weights stay 4-bit; the loader folded the
+        # two-level scale to one fp16 per-group scale at the leaf, which also lets the gate/up merge +
+        # expert stack just work — see _GroupedNvFp4Experts / nvfp4.fold_nvfp4_scale).
+        return _NvFp4MoEMethod(quant)
     if quant.is_rxf:
         return _RXFMoEMethod(quant)
     if quant.weight_is_e2m1:
