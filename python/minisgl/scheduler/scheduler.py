@@ -1357,9 +1357,73 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 bank, conf = cam.read(subj_ids, ns=ns)
                 req.mem_bank, req.mem_conf = bank, conf
                 req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
+        # TP>1: make the forced-token deliveries rank0-AUTHORITATIVE before the forward, so a per-rank
+        # store drift can't desync the batch (see _bcast_cam_deliver_tp).
+        if self._tp_size > 1:
+            self._bcast_cam_deliver_tp(batch)
         autosave = getattr(cam, "autosave", None)   # #7 debounced persistence after any writes this batch
         if autosave is not None:
             autosave()
+
+    def _bcast_cam_deliver_tp(self, batch: Batch) -> None:
+        """TP>1 lockstep for CAM: make each req's forced-token delivery rank0-AUTHORITATIVE.
+
+        Pointer delivery + control-op results are computed per-rank from engine.cam. The stores are
+        built + written symmetrically, so they are USUALLY identical — but any drift (an FP edge at the
+        deliver_tau gate, or a write applied asymmetrically under concurrency) makes the two ranks force
+        a DIFFERENT number of tokens. Different generation lengths -> the ranks' decode batches diverge
+        in size -> the forward's TP all_reduce/all_gather shapes mismatch and gloo-deadlock to the 1800s
+        timeout (the tp2-cam-op-sched-divergence outage, 2026-07-17). Broadcasting rank0's `_mem_deliver`
+        for every req makes all ranks force the IDENTICAL sequence regardless of store state — the same
+        rank0-authoritative pattern the spec path already uses for drafts (_bcast_drafts_tp), and it
+        removes the fragile cross-rank-determinism assumption noted at engine.py `_cam_gather_full_vocab`.
+        Overrides only the VALUE, never `_mem_deliver_pos` (each rank then advances it identically in
+        _process_last_data since the forced tokens now match). Scope: the pointer/control `_mem_deliver`
+        path (production pointer_only mode); the tap `mem_bank` path is not broadcast (inactive there)."""
+        if self._tp_size <= 1:
+            return
+        reqs = [r for r in batch.reqs if hasattr(r, "_mem_placed")]
+        # Symmetric gate: sampling_params are broadcast with the batch, so both ranks agree whether this
+        # batch carries any CAM request and thus whether to run the (collective) broadcast at all — the
+        # decision itself can't drift. Skips the per-step cost on the common no-CAM batch.
+        def _is_cam(sp) -> bool:
+            return bool(sp is not None and (getattr(sp, "mem_op", None) or getattr(sp, "mem_subject", None)
+                                            or getattr(sp, "mem_remember", None)))
+        if not any(_is_cam(getattr(r, "sampling_params", None)) for r in reqs):
+            return
+        g = self.tp_cpu_group
+        prim = self._tp_is_primary
+        # per-req length: -1 = no _mem_deliver (non-CAM / unset), >=0 = forced-token count (0 = write stub).
+        if prim:
+            lens = torch.tensor(
+                [(len(r._mem_deliver) if getattr(r, "_mem_deliver", None) is not None else -1)
+                 for r in reqs], dtype=torch.int64)
+        else:
+            lens = torch.zeros(len(reqs), dtype=torch.int64)
+        g.broadcast(lens, root=0).wait()
+        lens_l = [int(x) for x in lens.tolist()]
+        total = sum(L for L in lens_l if L > 0)
+        if prim:
+            flat = torch.tensor([t for r in reqs if getattr(r, "_mem_deliver", None)
+                                 for t in r._mem_deliver], dtype=torch.int64)
+        else:
+            flat = torch.zeros(total, dtype=torch.int64)
+        if total > 0:
+            g.broadcast(flat, root=0).wait()
+        if prim:
+            return
+        off = 0
+        for r, L in zip(reqs, lens_l):
+            if L < 0:
+                continue                              # rank0 had no delivery here -> keep local state
+            if L == 0:
+                r._mem_deliver = []                   # write stub: deliver nothing (max_tokens=1 finishes it)
+            else:
+                r._mem_deliver = [int(x) for x in flat[off:off + L]]
+                off += L
+                r.mem_bank = None                     # pointer forces exact tokens; no tap (matches rank0)
+            if getattr(r, "_mem_deliver_pos", None) is None:
+                r._mem_deliver_pos = 0                # first sync starts at 0; hereafter each rank advances it
 
     def _cam_ctrl_result(self, cam, op: str, subj: str | None, ns: str | None = None) -> str:
         """#100 control op -> JSON string (force-emitted as the reply), scoped to namespace `ns` (#6).
