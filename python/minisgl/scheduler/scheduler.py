@@ -1455,10 +1455,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if all(w.lower() in _STOP for w in span):
                     continue
                 cands.add(" ".join(span))
+        ordered = sorted(cands, key=len, reverse=True)        # prefer longer (fuller) spans first
+        cids_list = [list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
+                     for c in ordered]
+        # Batched cosine: one [C,d]@[d,M] over all candidate keys instead of a per-candidate stack+matmul
+        # (deliver_object_ids in a Python loop) — same per-row argmax/tau/LRU + same order, so byte-identical
+        # results, but O(candidates×facts) collapses to one matmul (fixes the big-prompt retrieve wedge).
+        # Falls back to the singular deliver if a batched method isn't present (older store build).
+        batch = getattr(cam, "deliver_object_ids_batch", None)
+        oids_list = (batch(cids_list, ns) if batch is not None
+                     else [deliver(cids, ns) for cids in cids_list])
         seen_obj, out = set(), []
-        for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller) spans first
-            cids = list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
-            oids = deliver(cids, ns)
+        for c, oids in zip(ordered, oids_list):
             if oids:
                 obj = self.tokenizer.decode(oids).strip()
                 if obj and obj not in seen_obj:               # dedupe by delivered fact (longest span wins)
