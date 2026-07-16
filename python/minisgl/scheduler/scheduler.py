@@ -1376,7 +1376,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                             "object": self.tokenizer.decode(list(oids)).strip() if oids else ""})
             return json.dumps(out)
         if op == "stats":
-            return json.dumps(cam.stats(ns))
+            # Control-op results are force-emitted ONE TOKEN PER DECODE STEP (see _process_last_data),
+            # so a verbose result costs one scheduler step per token. stats()'s per-bank "banks" array
+            # grows with the store (one entry per non-empty bank × every namespace) and dominated the
+            # token count — /cam/stats crept to ~7-9s on a grown store while the summary is what callers
+            # read. Drop the bulky per-bank enumeration from the emitted result (crowded_banks + the
+            # summary counts stay); the full per-bank breakdown remains available via cam.stats() itself.
+            s = cam.stats(ns)
+            s.pop("banks", None)
+            return json.dumps(s)
         if op in ("freeze", "unfreeze"):        # read-only toggle: protect a curated namespace from auto-write
             frozen = cam.freeze(ns) if op == "freeze" else cam.unfreeze(ns)
             return json.dumps({"frozen": bool(frozen)})
