@@ -923,6 +923,21 @@ class CAMMemory:
             "persistent": bool(self.store_path), "dirty": self._dirty,     # #7 persistence
         }
 
+    def list_namespaces(self) -> list:
+        """Enumerate every live namespace store with its fact count + freeze state (ops / test hygiene;
+        spine feedback #4). 'default' always exists."""
+        return [{"namespace": ns, "facts": self.stats(ns)["total_edits"],
+                 "frozen": bool(self._state(ns).frozen)} for ns in list(self._ns_states)]
+
+    def drop_namespace(self, ns: str) -> bool:
+        """Delete a namespace's editable store (scratch/test cleanup; spine feedback #4). Refuses to drop
+        'default'/None. Returns True if a store was removed. Marks dirty for the next autosave."""
+        if not ns or ns == "default" or ns not in self._ns_states:
+            return False
+        del self._ns_states[ns]
+        self._dirty = True
+        return True
+
     @torch.no_grad()
     def snapshot(self, path: str) -> int:
         """Persist the editable state of ALL namespaces to `path` (the trained adapter/tap/router live in
