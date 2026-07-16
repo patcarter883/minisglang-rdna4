@@ -47,6 +47,12 @@ class QuantConfig:
     # are calibrated for it); None -> weight-only (activations stay in the compute dtype, W4A16/W8A16).
     # An env var must NEVER substitute a different activation scheme than the checkpoint declares.
     act_type: str | None = None
+    # compressed-tensors `format` string (e.g. "mxfp4-pack-quantized", "nvfp4-pack-quantized",
+    # "pack-quantized", "float-quantized"). It disambiguates the two float-4bit packings that
+    # num_bits+type ALONE conflate: MXFP4 (group-32, E8M0 exponent scale, no global scale) vs NVFP4
+    # (group-16, FP8-E4M3 block scale + per-tensor FP32 global scale, W4A4). Only compressed-tensors
+    # sets it; None for every other method.
+    ct_format: str | None = None
 
     @property
     def is_awq(self) -> bool:
@@ -74,12 +80,25 @@ class QuantConfig:
         return self.is_compressed_tensors and self.weight_type == "float" and self.bits == 8
 
     @property
+    def is_nvfp4(self) -> bool:
+        """NVFP4 (compressed-tensors `nvfp4-pack-quantized`): E2M1 4-bit weights with a per-16-group
+        FP8-E4M3 block scale AND a per-tensor FP32 global scale, plus FP4 activations (a W4A4 scheme).
+        This is a DIFFERENT format from MXFP4 (group-32 E8M0 exponent scale, no global scale) that
+        num_bits+weight_type alone cannot tell apart — hence the `format` gate. gfx1201 has no FP4
+        WMMA / FP4-activation path, so NVFP4 is DETECTED here and rejected explicitly at method
+        creation rather than silently misrouted into the MXFP4 W4A8 kernel (which would crash deep in
+        the loader on the FP8 scale dtype / group-16 mismatch / orphaned global-scale tensors)."""
+        return self.is_compressed_tensors and self.ct_format == "nvfp4-pack-quantized"
+
+    @property
     def weight_is_e2m1(self) -> bool:
         """MXFP4: compressed-tensors float-quantized 4-bit (OCP E2M1 weights + E8M0 per-32-block
         scale, `format: mxfp4-pack-quantized`). Served through the SAME W4A8 fp8-WMMA kernel as int4
         with `weight_is_e2m1=True` — a different 4-bit decode table + E8M0->fp16 group scale, not a
-        new kernel. Routes MxFp4LinearMethod (dense) / _MxFp4MoEMethod (experts)."""
-        return self.is_compressed_tensors and self.weight_type == "float" and self.bits == 4
+        new kernel. Routes MxFp4LinearMethod (dense) / _MxFp4MoEMethod (experts). EXCLUDES NVFP4
+        (also float-4bit) — that format has an incompatible scale layout and is handled by is_nvfp4."""
+        return (self.is_compressed_tensors and self.weight_type == "float"
+                and self.bits == 4 and not self.is_nvfp4)
 
     @property
     def is_int4(self) -> bool:
@@ -165,6 +184,7 @@ class QuantConfig:
             # weight_zero_point tensor; the linear method loads and uses it (vs the symmetric
             # constant zero-point 8). Config-driven, not model-specific.
             ignore = tuple(d.get("ignore", ()) or ())
+            fmt = str(d.get("format", "")).lower() or None
             gs, bits, sym = 32, 4, True
             wtype, atype = "int", None
             groups = d.get("config_groups") or {}
@@ -191,6 +211,6 @@ class QuantConfig:
                 break
             return cls(
                 method="compressed-tensors", bits=bits, group_size=gs, sym=sym,
-                ignore=_norm_ignore(ignore), weight_type=wtype, act_type=atype,
+                ignore=_norm_ignore(ignore), weight_type=wtype, act_type=atype, ct_format=fmt,
             )
         return None  # unsupported scheme -> treat as unquantized (will likely fail to load)
