@@ -823,6 +823,34 @@ class CAMMemory:
             st.seq += 1; rec["used"] = st.seq
         return list(st.subj_objs[j])
 
+    @torch.no_grad()
+    def deliver_object_ids_batch(self, subjects_ids: List[List[int]],
+                                 ns: str = None) -> List[Optional[List[int]]]:
+        """Batched deliver_object_ids for the transparent-read path (which queries MANY n-gram-span
+        candidates per prompt). SEMANTICALLY IDENTICAL to calling deliver_object_ids on each candidate
+        in the given order — same per-row argmax, same deliver_tau gate, same LRU bump order — but stacks
+        the stored [M,d] key matrix ONCE and does a single [C,d]@[d,M] matmul instead of rebuilding the
+        stack + matmul per candidate (the O(candidates×facts) cost that made big-prompt retrieves heavy
+        under concurrency). Returns a list aligned to `subjects_ids`: object ids on a confident match
+        (>= deliver_tau), else None."""
+        st = self._state(ns)
+        if not self.enabled or not st.subj_objs or not subjects_ids:
+            return [None] * len(subjects_ids)
+        K = torch.stack(st.subj_keys)                              # [M,d] (unit-norm keys), stacked ONCE
+        Q = torch.stack([self._subj_key(s) for s in subjects_ids]).to(K.device)  # [C,d] (unit-norm)
+        sims = Q @ K.t()                                           # [C,M] cosine
+        out: List[Optional[List[int]]] = []
+        for i in range(len(subjects_ids)):
+            j = int(sims[i].argmax().item())
+            if float(sims[i, j].item()) < self.deliver_tau:
+                out.append(None)                                   # unknown subject -> no confident match
+                continue
+            rec = st.facts.get(st.subj_tuple[j])                   # #9 LRU: mark recently used (same as singular)
+            if rec is not None:
+                st.seq += 1; rec["used"] = st.seq
+            out.append(list(st.subj_objs[j]))
+        return out
+
     # ---- read (once per request, at prefill) -----------------------------------------------------
     @torch.no_grad()
     def read(self, subject_ids: List[int], ns: str = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
