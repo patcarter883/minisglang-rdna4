@@ -1383,16 +1383,40 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if deliver is None:
             return json.dumps([])
         text = self.tokenizer.decode(list(prompt_ids))
-        cands = {m.group(0) for m in
-                 re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text)}
-        seen, out = set(), []
-        for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller-name) spans first
+        cands = set()
+        # (a) capitalised proper-noun spans — high precision (names / places).
+        for m in re.finditer(r"[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,4}", text):
+            cands.add(m.group(0))
+        # (b) content-word n-gram WINDOWS — recall for PHRASE subjects like "capital of zorbia" that a
+        # question ("What is the capital of Zorbia?") never surfaces as a proper-noun span (#10). The
+        # cosine subject key is case/order-robust and tau-gated, so windows that address nothing self-
+        # reject (unknown subjects max-cos ~0.5 < deliver_tau 0.7). Bound the word budget so a huge agent
+        # prompt can't explode the candidate count.
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'.\-]*", text)[:160]
+        _STOP = {"a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was",
+                 "were", "be", "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+                 "does", "do", "did", "that", "this", "these", "those", "it", "its", "his", "her", "their",
+                 "your", "my", "you", "he", "she", "they", "we", "as", "by", "with", "from", "about",
+                 "tell", "me", "please", "can", "could", "would", "will", "s"}
+        n = len(words)
+        for i in range(n):
+            for L in range(2, 7):                             # 2..6-word windows (1-word covered by (a))
+                if i + L > n:
+                    break
+                span = words[i:i + L]
+                if span[0].lower() in _STOP or span[-1].lower() in _STOP:
+                    continue                                  # trim stopword boundaries -> "capital of Zorbia"
+                if all(w.lower() in _STOP for w in span):
+                    continue
+                cands.add(" ".join(span))
+        seen_obj, out = set(), []
+        for c in sorted(cands, key=len, reverse=True):        # prefer longer (fuller) spans first
             cids = list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
             oids = deliver(cids, ns)
             if oids:
                 obj = self.tokenizer.decode(oids).strip()
-                if (c, obj) not in seen:
-                    seen.add((c, obj)); out.append({"subject": c, "object": obj})
+                if obj and obj not in seen_obj:               # dedupe by delivered fact (longest span wins)
+                    seen_obj.add(obj); out.append({"subject": c, "object": obj})
         return json.dumps(out)
 
     def _stage_cam(self, batch: Batch) -> None:
