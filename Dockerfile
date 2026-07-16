@@ -60,7 +60,7 @@ RUN pip install \
 # importable python module (torch-ext/<pyname>) under /opt/kernels, which goes on PYTHONPATH. The
 # import name of each module already matches what the engine imports (gdn_hip, mla_hip, tail_hip, …);
 # only cca is exposed as `zaya_cca` (the engine is repointed to that name in the same change).
-ARG KERNELS_REF=2e12103
+ARG KERNELS_REF=d2f3bb1
 COPY --from=kernels . /opt/rdna4-hip-kernels
 RUN set -eux; mkdir -p /opt/kernels; \
     for pkg in \
