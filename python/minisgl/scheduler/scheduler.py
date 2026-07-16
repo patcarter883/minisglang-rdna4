@@ -836,6 +836,17 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
             logger.debug_rank0("Received user msg: %s", msg)
+            # CAM control ops (mem_op: stats/facts/forget/namespaces/lookup/retrieve/...) produce a JSON
+            # result computed from engine.cam — NO model generation. Answer them DIRECTLY here, before the
+            # req ever enters a batch, instead of tokenising the result and force-emitting it one token per
+            # 35B forward through the decode loop (O(result_tokens) forwards; a big facts/stats/audit dump
+            # cost hundreds of decode steps — the /cam/stats-slow symptom). Deliveries (mem_subject) and
+            # writes (mem_remember) carry NO mem_op and still take the normal generate path. TP-safe: the
+            # req never joins the batch (nothing to diverge), both ranks apply side effects (forget/drop
+            # stay in sync), and only rank0 emits the reply.
+            if self.engine.cam is not None and getattr(msg.sampling_params, "mem_op", None):
+                self._cam_direct_control(msg)
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -1546,6 +1557,35 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if obj and obj not in seen_obj:               # dedupe by delivered fact (longest span wins)
                     seen_obj.add(obj); out.append({"subject": c, "object": obj})
         return json.dumps(out)
+
+    def _cam_direct_control(self, msg: "UserMsg") -> None:
+        """Answer a CAM control op (mem_op) DIRECTLY — no forward, no decode loop. Computes the JSON
+        result from engine.cam and sends it as ONE finished reply (next_token + extra_tokens, the same
+        multi-token message spec-decode uses), so a control op costs O(1) instead of one 35B forward per
+        result token. Both TP ranks run this (side effects like forget/drop stay in sync); only rank0
+        emits the reply to the frontend. The req never enters a batch, so there is no per-rank batch to
+        diverge — inherently TP-safe."""
+        cam = self.engine.cam
+        sp = msg.sampling_params
+        op = sp.mem_op
+        ns = getattr(sp, "mem_namespace", None)
+        if op == "retrieve":
+            result = self._cam_retrieve(cam, msg.input_ids, ns)
+        else:
+            result = self._cam_ctrl_result(cam, op, getattr(sp, "mem_subject", None), ns)
+        autosave = getattr(cam, "autosave", None)   # #7 persist mutating ops (forget/drop/undo/...)
+        if autosave is not None:
+            autosave()
+        if not self._tp_is_primary:
+            return                                  # only rank0 emits replies to the frontend
+        toks = list(self.tokenizer(result, add_special_tokens=False).input_ids)
+        eos = next(iter(self.eos_token_ids), None)
+        if eos is not None:
+            toks = toks + [eos]                     # terminate the reply after the result string
+        if not toks:
+            toks = [eos if eos is not None else 0]
+        self.send_result([DetokenizeMsg(uid=msg.uid, next_token=int(toks[0]),
+                                        extra_tokens=[int(t) for t in toks[1:]], finished=True)])
 
     def _stage_cam(self, batch: Batch) -> None:
         """Build PER-TOKEN tap banks for an EAGER forward and stage them, so concurrent memory +
