@@ -815,6 +815,9 @@ class FrontendManager:
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
     metrics: FrontendMetrics = field(default_factory=FrontendMetrics)
+    # Strong refs to fire-and-forget cleanup tasks: a bare asyncio.create_task can be garbage-collected
+    # before it runs (the disconnect-abort bug), so keep the task alive until it completes.
+    _bg_tasks: set = field(default_factory=set)
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -872,23 +875,46 @@ class FrontendManager:
         self._create_listener_once()
         await self.send_tokenizer.put(msg)
 
+    def _spawn_bg(self, coro) -> None:
+        """Schedule a fire-and-forget coroutine while holding a strong reference to its task, so the
+        event loop can't garbage-collect it mid-flight (the disconnect-abort leak)."""
+        t = asyncio.ensure_future(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
+        finished = False
+        try:
+            while True:
+                await event.wait()
+                event.clear()
 
-        while True:
-            await event.wait()
-            event.clear()
-
-            pending = self.ack_map[uid]
-            self.ack_map[uid] = []
-            ack = None
-            for ack in pending:
-                yield ack
-            if ack and ack.finished:
-                break
-
-        del self.ack_map[uid]
-        del self.event_map[uid]
+                pending = self.ack_map[uid]
+                self.ack_map[uid] = []
+                ack = None
+                for ack in pending:
+                    yield ack
+                if ack and ack.finished:
+                    finished = True
+                    break
+        finally:
+            # GUARANTEED terminal cleanup on ANY exit — normal finish, client disconnect (GeneratorExit
+            # when the response body iterator is aclose()d), or a mid-stream error. Every streaming path
+            # (stream_generate, stream_chat_completions, and their RSA/plain callers) funnels through
+            # here, so this is the one place that frees the per-request state and keeps
+            # minisgl_requests_inflight honest. Previously the del below ran ONLY on a normal break, so a
+            # disconnect leaked ack_map/event_map, and the metrics _req record leaked too (its only other
+            # release was a fire-and-forget abort_user task that could be GC'd) — inflight then climbed
+            # monotonically + the dicts grew unbounded over a long run. Sync (no await): safe under
+            # GeneratorExit. If the request never finished (client bailed mid-generation), reconcile the
+            # metrics (on_abort pops _req + counts the abort iff still present — idempotent, never
+            # double-counts a finished req) and tell the backend to abort so it stops wasting compute + KV.
+            self.ack_map.pop(uid, None)
+            self.event_map.pop(uid, None)
+            if not finished:
+                self.metrics.on_abort(uid)
+                self._spawn_bg(self.send_one(AbortMsg(uid=uid)))
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
