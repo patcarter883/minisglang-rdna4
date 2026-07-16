@@ -79,6 +79,7 @@ Start the server with CAM enabled (``MINISGL_CAM=1 python -m minisgl.server ...`
 from __future__ import annotations
 
 import logging
+import os
 from typing import List
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -102,6 +103,13 @@ class RememberRequest(BaseModel):
 class RememberResponse(BaseModel):
     stored: bool
     base_p: float
+    # The write mode the server actually honored (spine #2) — "pointer" on this deployment (the tap
+    # needs a base-matched checkpoint). Future hybrid: "pointer"|"tap"|"both".
+    mode_served: str = "pointer"
+    # Why the fact was/wasn't stored (spine #3) — the real gate verdict, since base_p is 0.0 (noise) in
+    # frontend mode. "novel" (base didn't know it -> stored), "base-known" (gate skipped), "forced"
+    # (write-gate off -> always stored), "frozen"/"no-clobber" (policy refused).
+    gate_reason: str = ""
 
 
 class AskRequest(BaseModel):
@@ -114,6 +122,11 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     text: str
+    # Whether the pointer index matched the subject and forced the object (spine #1). When True, `object`
+    # is the EXACT delivered object text (the base then continues past it in `text`) — so a client can
+    # verify readback exactly instead of substring-matching the confabulated continuation.
+    delivered: bool = False
+    object: str = ""
 
 
 class FactItem(BaseModel):
@@ -212,7 +225,10 @@ async def remember(req: RememberRequest, x_cam_namespace: str = Header(None)) ->
         if not _encode_sp(runtime.tokenizer, req.subject):
             raise HTTPException(status_code=422, detail="subject tokenized to empty")
         stored = await runtime.remember(req.subject, req.object, req.prompt, namespace=x_cam_namespace)
-        return RememberResponse(stored=stored, base_p=0.0)
+        # base_p is 0.0 in frontend mode (no logit seam), so report the real gate verdict instead (#3).
+        gated = os.environ.get("MINISGL_CAM_WRITE_GATE") == "1"
+        gate_reason = ("novel" if stored else "base-known") if gated else "forced"
+        return RememberResponse(stored=stored, base_p=0.0, mode_served="pointer", gate_reason=gate_reason)
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -249,9 +265,13 @@ async def ask(req: AskRequest, x_cam_namespace: str = Header(None)) -> AskRespon
     # MULTI-PROCESS model-share: deliver via the backend engine.cam — a normal generate carrying
     # mem_subject; the scheduler forces the exact stored object tokens (pointer), then the base continues.
     if getattr(runtime, "is_frontend_share", False):
+        # Dry-run the subject first so we can echo the EXACT delivered object (#1) — the base confabulates
+        # past it in `text`, so substring-matching is lossy; `object` gives the client an exact readback.
+        lk = await runtime.lookup(req.subject, namespace=x_cam_namespace)
         text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)),
                                  namespace=x_cam_namespace)
-        return AskResponse(text=text.replace("\n", " ").strip())
+        return AskResponse(text=text.replace("\n", " ").strip(),
+                           delivered=bool(lk.get("delivered")), object=lk.get("object", ""))
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -461,3 +481,47 @@ async def delete_fact(subject: str, x_cam_namespace: str = Header(None)) -> Dele
         raise HTTPException(status_code=503, detail="CAM delete unavailable")
     deleted = bool(deleter(subject_ids, ns=x_cam_namespace))
     return DeleteResponse(deleted=deleted)
+
+
+@cam_router.get("/lookup")
+async def lookup(subject: str = None, text: str = None, x_cam_namespace: str = Header(None)):
+    """DRY-RUN what a query would match (spine #5). `?subject=` -> the exact object /cam/ask WOULD deliver
+    ({delivered, object}); `?text=` -> the transparent-read span matches ([{subject, object}]). Neither
+    mutates the store; lets a client debug why a match did/didn't happen."""
+    runtime = _get_runtime()
+    if subject:
+        if hasattr(runtime, "lookup"):
+            return await runtime.lookup(subject, namespace=x_cam_namespace)
+        memory, tok = getattr(runtime, "memory", None), getattr(runtime, "tokenizer", None)
+        if memory is None or tok is None:
+            raise HTTPException(status_code=503, detail="CAM lookup unavailable")
+        oids = memory.deliver_object_ids(_encode_sp(tok, subject), x_cam_namespace)
+        return {"delivered": bool(oids), "subject": subject,
+                "object": tok.decode(oids).strip() if oids else ""}
+    if text:
+        if hasattr(runtime, "retrieve"):
+            return {"matches": await runtime.retrieve(text, namespace=x_cam_namespace)}
+        raise HTTPException(status_code=503, detail="CAM text lookup unavailable (backend-share)")
+    raise HTTPException(status_code=422, detail="provide ?subject= or ?text=")
+
+
+@cam_router.get("/namespaces")
+async def list_namespaces() -> list:
+    """Enumerate live namespaces + fact counts + freeze state (spine #4)."""
+    runtime = _get_runtime()
+    if hasattr(runtime, "namespaces"):
+        return await runtime.namespaces()
+    memory = getattr(runtime, "memory", None)
+    return memory.list_namespaces() if (memory and hasattr(memory, "list_namespaces")) else []
+
+
+@cam_router.delete("/namespaces/{ns}")
+async def drop_namespace(ns: str) -> dict:
+    """Delete a namespace's store (spine #4; refuses 'default'). {dropped: bool}."""
+    runtime = _get_runtime()
+    if hasattr(runtime, "drop_namespace"):
+        return await runtime.drop_namespace(ns)
+    memory = getattr(runtime, "memory", None)
+    if memory and hasattr(memory, "drop_namespace"):
+        return {"dropped": bool(memory.drop_namespace(ns))}
+    return {"dropped": False}

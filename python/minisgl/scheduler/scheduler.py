@@ -1359,6 +1359,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                             "subject": self.tokenizer.decode(list(r["subject_ids"])).strip(),
                             "object": self.tokenizer.decode(list(r["object_ids"])).strip() if r["object_ids"] else ""})
             return json.dumps(out)
+        if op == "lookup":                      # spine #1/#5: subject-direct dry-run — does this subject deliver?
+            sids = list(self.tokenizer(" " + _canon_subject(subj),
+                                       add_special_tokens=False).input_ids) if subj else []
+            oids = cam.deliver_object_ids(sids, ns) if sids else []
+            return json.dumps({"delivered": bool(oids), "subject": subj or "",
+                               "object": self.tokenizer.decode(oids).strip() if oids else ""})
+        if op == "namespaces":                  # spine #4: enumerate namespaces + fact counts
+            return json.dumps(cam.list_namespaces() if hasattr(cam, "list_namespaces") else [])
+        if op == "drop_ns":                     # spine #4: delete a namespace's store
+            return json.dumps({"dropped": bool(cam.drop_namespace(ns)) if hasattr(cam, "drop_namespace") else False})
         return json.dumps(None)
 
     def _cam_retrieve(self, cam, prompt_ids, ns: str | None = None) -> str:

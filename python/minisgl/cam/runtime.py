@@ -311,6 +311,17 @@ class FrontendCAMRuntime:
     async def audit(self, namespace: str = None) -> list:    # #12 recent events
         return (await self._ctrl("audit", namespace=namespace)) or []
 
+    async def lookup(self, subject: str, namespace: str = None) -> dict:
+        """Subject-direct dry-run (spine #1/#5): what /cam/ask WOULD deliver for `subject` —
+        {delivered: bool, object: str, subject}. No generation, no store mutation."""
+        return (await self._ctrl("lookup", subject=subject, namespace=namespace)) or {}
+
+    async def namespaces(self) -> list:                      # spine #4: enumerate stores
+        return (await self._ctrl("namespaces")) or []
+
+    async def drop_namespace(self, namespace: str) -> dict:  # spine #4: delete a scratch namespace
+        return (await self._ctrl("drop_ns", namespace=namespace)) or {}
+
     async def remember(self, subject: str, object_str: str, prompt: str = None,
                        mode: str = "force", namespace: str = None) -> bool:
         """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
