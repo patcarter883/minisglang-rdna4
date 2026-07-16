@@ -104,6 +104,11 @@ class BackendSnapshot:
     kv_tokens_used: int = 0
     gdn_slots_total: int = 0
     gdn_slots_used: int = 0
+    cam_facts: int = 0
+    cam_namespaces: int = 0
+    cam_evicted: int = 0
+    cam_max_bank_load: int = 0
+    cam_crowded_banks: int = 0
 
 
 class FrontendMetrics:
@@ -178,6 +183,12 @@ class FrontendMetrics:
             total.kv_tokens_used += s.kv_tokens_used
             total.gdn_slots_total += s.gdn_slots_total
             total.gdn_slots_used += s.gdn_slots_used
+            # CAM stores are per-replica (DP-pinned): sum counts (idle replicas report 0), max the load.
+            total.cam_facts += s.cam_facts
+            total.cam_namespaces += s.cam_namespaces
+            total.cam_evicted += s.cam_evicted
+            total.cam_crowded_banks += s.cam_crowded_banks
+            total.cam_max_bank_load = max(total.cam_max_bank_load, s.cam_max_bank_load)
         return total
 
     def render(self) -> str:
@@ -255,6 +266,19 @@ class FrontendMetrics:
               "GDN/CCA recurrent-state slot capacity.", b.gdn_slots_total)
         gauge("minisgl_gdn_state_used_slots",
               "GDN/CCA recurrent-state slots in use.", b.gdn_slots_used)
+
+        # ---- CAM editable-memory store (backend; all 0 when CAM is off) --------------------------
+        gauge("minisgl_cam_facts",
+              "CAM stored facts (subject->object edits) across all namespaces.", b.cam_facts)
+        gauge("minisgl_cam_namespaces",
+              "CAM namespaces (per-tenant/session isolated stores).", b.cam_namespaces)
+        gauge("minisgl_cam_evicted",
+              "CAM facts LRU-evicted so far (capacity pressure; 0 when uncapped).", b.cam_evicted)
+        gauge("minisgl_cam_max_bank_load",
+              "Max product-key bank load (crowding; delivery degrades past ~9 edits/bank).",
+              b.cam_max_bank_load)
+        gauge("minisgl_cam_crowded_banks",
+              "Product-key banks past the crowding knee (>9 edits).", b.cam_crowded_banks)
 
         return "\n".join(lines) + "\n"
 

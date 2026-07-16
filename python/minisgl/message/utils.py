@@ -38,6 +38,11 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "kv_tokens_used",
         "gdn_slots_total",
         "gdn_slots_used",
+        "cam_facts",
+        "cam_namespaces",
+        "cam_evicted",
+        "cam_max_bank_load",
+        "cam_crowded_banks",
     ),
     "StatsFrontendMsg": (
         "dp_rank",
@@ -51,6 +56,11 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "kv_tokens_used",
         "gdn_slots_total",
         "gdn_slots_used",
+        "cam_facts",
+        "cam_namespaces",
+        "cam_evicted",
+        "cam_max_bank_load",
+        "cam_crowded_banks",
     ),
 }
 
