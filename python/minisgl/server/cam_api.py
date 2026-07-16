@@ -127,6 +127,9 @@ class AskResponse(BaseModel):
     # verify readback exactly instead of substring-matching the confabulated continuation.
     delivered: bool = False
     object: str = ""
+    # Which store path served this ask (spine verify-r1) — "pointer" on this build (the residual tap
+    # needs a base-matched checkpoint). Mirrors /cam/remember's mode_served; future hybrid: pointer|tap.
+    mode_served: str = "pointer"
 
 
 class FactItem(BaseModel):
@@ -271,7 +274,8 @@ async def ask(req: AskRequest, x_cam_namespace: str = Header(None)) -> AskRespon
         text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)),
                                  namespace=x_cam_namespace)
         return AskResponse(text=text.replace("\n", " ").strip(),
-                           delivered=bool(lk.get("delivered")), object=lk.get("object", ""))
+                           delivered=bool(lk.get("delivered")), object=lk.get("object", ""),
+                           mode_served="pointer")
     tok = runtime.tokenizer
     memory = runtime.memory
 
