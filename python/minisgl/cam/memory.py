@@ -939,6 +939,20 @@ class CAMMemory:
         self.autosave(force=True)   # durable: persist the drop so a restart can't resurrect the namespace
         return True
 
+    def metrics_summary(self) -> dict:
+        """Store totals across ALL namespaces for the Prometheus /metrics snapshot (cheap; iterates
+        the per-namespace fact dicts). facts/evicted/crowded are summed; max_bank_load is the max."""
+        facts = evicted = crowded = 0
+        max_load = 0
+        for ns in list(self._ns_states):
+            s = self.stats(ns)
+            facts += s["total_edits"]
+            evicted += int(s.get("evicted", 0))
+            crowded += len(s.get("crowded_banks", []))
+            max_load = max(max_load, int(s["max_bank_load"]))
+        return {"facts": facts, "namespaces": len(self._ns_states), "evicted": evicted,
+                "max_bank_load": max_load, "crowded_banks": crowded}
+
     @torch.no_grad()
     def snapshot(self, path: str) -> int:
         """Persist the editable state of ALL namespaces to `path` (the trained adapter/tap/router live in
