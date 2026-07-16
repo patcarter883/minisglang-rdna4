@@ -283,23 +283,53 @@ class Engine:
         self.cam = None
         _cam_ckpt = os.environ.get("MINISGL_CAM_CHECKPOINT")
         inner = getattr(self.model, "model", None)
+
+        def _cam_gather_full_vocab(mod):
+            # CAM's cosine subject index needs the FULL vocab embedding table, but under TP the embedding
+            # is vocab-parallel sharded (each rank holds vocab/tp rows). All-gather the shards once here —
+            # a build-time collective every SPMD rank reaches symmetrically — so both ranks build an
+            # IDENTICAL full-vocab store (this is what keeps their pointer-delivery decisions in lockstep,
+            # so no per-rank broadcast of the forced tokens is needed). tp_size==1 leaves the table whole.
+            w = mod.weight
+            tp = getattr(mod, "tp_size", 1)
+            if tp <= 1:
+                return w
+            g = mod._comm.all_gather(w)                          # rank-ordered concat along dim0
+            g = g.view(tp, mod.num_embeddings_tp, w.shape[1]).reshape(tp * mod.num_embeddings_tp, w.shape[1])
+            # Land the full-vocab table on CPU: it is allocated AFTER the KV pool is sized, so keeping
+            # ~1.2 GB/card on-GPU steals the headroom runtime activations need (OOMs the first forward on
+            # a 16 GB card). The pointer cosine reads (_subj_key) are tiny + prefill-only, so CPU is free.
+            # NOTE: TP>1 is currently always pointer_only (dim-mismatch); a future matching-dim TP>1 tap
+            # checkpoint would need this back on-device (the adapter runs on GPU) — gate on that then.
+            return g[: mod.num_embeddings].contiguous().to("cpu")
+
         if (os.environ.get("MINISGL_CAM") == "1" and _cam_ckpt and os.path.isdir(_cam_ckpt)
-                and inner is not None and hasattr(inner, "stage_cam")):
+                and inner is not None and hasattr(inner, "embed_tokens")):
             try:
                 from minisgl.cam.memory import CAMMemory
-                # Resolve the REAL lm_head weight: Qwen3.5 ties word embeddings, so ParallelLMHead
-                # pops its own weight at load and keeps a meta placeholder — the live table is the tied
-                # embedding's (embed_tokens.weight). Use it; fall back to the head's own weight if untied.
+                # Model-share: build the store from the SERVED model's own embedding + lm_head (all-gathered
+                # to full vocab under TP). Qwen3.5 ties word embeddings, so the tied embedding weight IS the
+                # lm_head table; gather the head separately only when untied.
+                _full_embed = _cam_gather_full_vocab(inner.embed_tokens)
                 _lmh = self.model.lm_head
-                _lm_w = (_lmh.tied_embedding.weight if getattr(_lmh, "tied_embedding", None) is not None
-                         else _lmh.weight)
-                cam = CAMMemory(_cam_ckpt, inner.embed_tokens, _lm_w)
+                _full_lm = (_full_embed if getattr(_lmh, "tied_embedding", None) is not None
+                            else _cam_gather_full_vocab(_lmh))
+                # The residual tap needs the model's `stage_cam` seam (dense qwen3_5 only). MoE models (35B)
+                # lack it → build in POINTER/RETRIEVE-ONLY mode: exact-object delivery + ambient retrieve
+                # run from the cosine subject index alone (dimension-independent, no tap, no 35B-trained
+                # checkpoint). The tap/router path stays off until both a ported seam and a 35B ckpt exist.
+                _has_seam = hasattr(inner, "stage_cam")
+                cam = CAMMemory(_cam_ckpt, _full_embed, _full_lm, pointer_only=not _has_seam)
                 if cam.enabled:
                     self.cam = self.ctx.cam_state = cam
-                    inner.stage_cam(cam, None, None)  # register the cam + tap_layer; no bank => no-op
+                    # CAMMemory may downgrade to pointer_only when the checkpoint hidden != served hidden,
+                    # so gate the tap-seam registration on the RESOLVED mode, not just seam presence.
+                    if _has_seam and not cam.pointer_only:
+                        inner.stage_cam(cam, None, None)  # register the cam + tap_layer; no bank => no-op
                     logger.info_rank0(
                         f"CAM: backend memory built from {_cam_ckpt} "
-                        f"(tap_layer={cam.tap_layer}, n_banks={cam.n_banks}) — model-share, no HF copy"
+                        f"(tap_layer={cam.tap_layer}, n_banks={cam.n_banks}, "
+                        f"mode={'pointer/retrieve-only' if cam.pointer_only else 'tap+pointer'}) — model-share"
                     )
                 else:
                     logger.warning_rank0(f"CAM: checkpoint {_cam_ckpt} loaded DISABLED — memory off")

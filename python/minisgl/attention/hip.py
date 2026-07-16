@@ -132,8 +132,9 @@ class HIPAttnBackend(RDNA4Backend):
         from minisgl._hip_engage import engaged
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
-            # calibration off), folded in the kernel.
-            ks, vs = self.kvcache.k_scale[layer_id], self.kvcache.v_scale[layer_id]
+            # calibration off), folded in the kernel. Pass the PERSISTENT device descale tensors
+            # (0-dim views) the canonical op now requires — stable address, graph-safe.
+            ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]
             engaged("attn_decode.flash_decode_paged_fp8")
             return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0)
         engaged("attn_decode.flash_decode_paged")

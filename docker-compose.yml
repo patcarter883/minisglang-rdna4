@@ -331,3 +331,51 @@ services:
           --rsa-top-p "${MINISGL_RSA_TOP_P:-0.95}" \
           $SPEC_ARGS \
           ${MINISGL_EXTRA_ARGS:---enable-ep}
+
+  # CAM editable-memory serve: Qwen3.6-35B-A3B-AWQ + the CAM #100 pointer/retrieve memory plane
+  # (namespaces #6, persistence #7, write-gate, freeze/no-clobber, audit/undo). Recall-only on this
+  # base: the 4B-trained checkpoint's hidden (2560) != served (2048), so CAM auto-falls-back to
+  # pointer/retrieve-only (the residual tap needs a 35B-trained checkpoint). The /cam/* edit plane
+  # mounts when MINISGL_CAM=1; transparent read/write ride /v1/*. Validated 5/5 recall + 7/7 hardening
+  # surface under graph capture (docs/zaya-port/CAM_35B_TP2_GAP.md). Needs BOTH cards (TP=2): lease -n 2.
+  #   gpu-lease -n 2 --detach --name cam -- docker compose --profile cam up -d
+  # The 4B pointer checkpoint (MINISGL_CAM_CHECKPOINT_HOST) and the persist dir (MINISGL_CAM_STORE_HOST,
+  # survives restart via load-on-boot + debounced autosave) are bind-mounted; override either via env.
+  cam:
+    <<: *lean-common
+    profiles: ["cam"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-cam
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${MINISGL_CAM_CHECKPOINT_HOST:-/home/pat/code/memory-organ-softsteer/cam_ckpt}:/cam_ckpt:ro
+      - ${MINISGL_CAM_STORE_HOST:-./.cam_store}:/cam_store
+    environment:
+      <<: *lean-env
+      MINISGL_CAM: "1"
+      MINISGL_CAM_CHECKPOINT: /cam_ckpt
+      MINISGL_CAM_FRONTEND: "1"                                # route /cam/* to the backend engine.cam
+      MINISGL_CAM_AUTO: "${MINISGL_CAM_AUTO:-1}"               # transparent read on /v1/*
+      MINISGL_CAM_AUTO_WRITE: "${MINISGL_CAM_AUTO_WRITE:-1}"   # gated ambient write on /v1/* (per-req cam_write wins)
+      MINISGL_CAM_WRITE_GATE: "${MINISGL_CAM_WRITE_GATE:-1}"   # base-uncertainty gate (opt-in in frontend mode)
+      MINISGL_CAM_STORE_PATH: /cam_store/store.pt              # #7 load-on-boot + debounced autosave
+      MINISGL_CAM_MAX_FACTS: "${MINISGL_CAM_MAX_FACTS:-0}"     # 0 = no LRU eviction cap
+      MINISGL_MOE_SCATTER: "0"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-6}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
+          ${MINISGL_EXTRA_ARGS:-}
