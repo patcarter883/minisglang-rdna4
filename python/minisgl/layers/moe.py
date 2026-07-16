@@ -638,6 +638,13 @@ def create_moe_quant_method(
         return _FP8MoEMethod()
     if quant is None:
         return _UnquantizedMoEMethod()
+    if quant.is_nvfp4:
+        raise NotImplementedError(
+            "NVFP4 (compressed-tensors 'nvfp4-pack-quantized') MoE experts are not supported on this "
+            "backend: W4A4 (E2M1 weights + FP4 activations, per-16-group FP8-E4M3 block scale + "
+            "per-tensor FP32 global scale) and gfx1201 has no FP4 kernel. Use an MXFP4, AWQ/GPTQ int4, "
+            "or fp8 W8A8 checkpoint instead."
+        )
     if quant.is_rxf:
         return _RXFMoEMethod(quant)
     if quant.weight_is_e2m1:
