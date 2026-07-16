@@ -473,12 +473,16 @@ class _MxFp4MoEMethod(MoEQuantMethod):
             "MoE MXFP4 path is silu-only without router-weight-on-input"
         )
         if getattr(w13, "_w_rep", None) is not None:
-            # Register-direct b128, fp16 acts direct (see _GroupedMxFp4Experts.post_load).
+            # Register-direct b128, fp16 acts direct (see _GroupedMxFp4Experts.post_load). Qwen3.5-MoE
+            # hands raw router_logits (no model-side route), so forward them + top_k/renormalize and let
+            # w4a16_moe fuse softmax+topk (topk_ids stays None); a noaux_tc precomputed route passes through.
             inter = w13._scales_rd.shape[1] // 2  # 2*inter -> inter
             return kernels.w4a16_moe(
                 hidden_states, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
                 hidden_states.shape[1], inter, self._quant.group_size,
-                topk_weights=topk_weights, topk_ids=topk_ids, weight_is_e2m1=True,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+                router_logits=router_logits, top_k=top_k, renormalize=renormalize,
+                weight_is_e2m1=True,
             )
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, None,
