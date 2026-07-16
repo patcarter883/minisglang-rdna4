@@ -958,11 +958,15 @@ class CAMMemory:
         """Persist the editable state of ALL namespaces to `path` (the trained adapter/tap/router live in
         the checkpoint, not here). Returns total #edits saved. (Cosine-NN index is rebuilt from facts on
         restore.) See #7 for lifecycle wiring."""
-        ns_blob = {ns: {"banks": [b.detach().cpu() for b in st.banks], "facts": st.facts,
-                        "frozen": st.frozen} for ns, st in self._ns_states.items()}
+        # In pointer-only mode the value banks are unused (delivery is the cosine index, rebuilt from
+        # facts on restore) — skip them: they are ~all of the snapshot's hundreds of MB, so this makes the
+        # force-save-on-delete + debounced autosave cheap (store.pt -> KB). restore() re-inits empty banks.
+        ns_blob = {ns: {"banks": (None if self.pointer_only else [b.detach().cpu() for b in st.banks]),
+                        "facts": st.facts, "frozen": st.frozen} for ns, st in self._ns_states.items()}
         torch.save({"ns_states": ns_blob,
                     "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
-                             "base_model": self.meta.get("base_model")}}, path)
+                             "base_model": self.meta.get("base_model"),
+                             "pointer_only": self.pointer_only}}, path)
         return sum(len(st.facts) for st in self._ns_states.values())
 
     @torch.no_grad()
@@ -978,8 +982,11 @@ class CAMMemory:
             blob = {"default": {"banks": d["banks"], "facts": d.get("facts", {}), "frozen": False}}
         self._ns_states = {}
         for ns, s in blob.items():
-            st = _NsState([b.to(self.device, dtype=torch.float32) for b in s["banks"]],
-                          bool(s.get("frozen", False)))
+            _b = s.get("banks")                               # None -> pointer-mode slim snapshot: re-init
+            banks = ([b.to(self.device, dtype=torch.float32) for b in _b] if _b is not None
+                     else [self.adapter.store.init_state(1, self.device, dtype=torch.float32)
+                           for _ in range(self.n_banks)])
+            st = _NsState(banks, bool(s.get("frozen", False)))
             self._ns_states[ns] = st
             for k, rec in s.get("facts", {}).items():         # rebuild the cosine-NN index from facts
                 key_vec = self._subj_key(list(k))
