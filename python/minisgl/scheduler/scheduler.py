@@ -1438,23 +1438,33 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # cosine subject key is case/order-robust and tau-gated, so windows that address nothing self-
         # reject (unknown subjects max-cos ~0.5 < deliver_tau 0.7). Bound the word budget so a huge agent
         # prompt can't explode the candidate count.
-        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'.\-]*", text)[:160]
         _STOP = {"a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was",
                  "were", "be", "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
                  "does", "do", "did", "that", "this", "these", "those", "it", "its", "his", "her", "their",
                  "your", "my", "you", "he", "she", "they", "we", "as", "by", "with", "from", "about",
                  "tell", "me", "please", "can", "could", "would", "will", "s"}
-        n = len(words)
-        for i in range(n):
-            for L in range(2, 7):                             # 2..6-word windows (1-word covered by (a))
-                if i + L > n:
-                    break
-                span = words[i:i + L]
-                if span[0].lower() in _STOP or span[-1].lower() in _STOP:
-                    continue                                  # trim stopword boundaries -> "capital of Zorbia"
-                if all(w.lower() in _STOP for w in span):
-                    continue
-                cands.add(" ".join(span))
+        # Split on sentence/clause punctuation FIRST so a window can't cross a boundary and swallow the
+        # next clause's words (ngram-window-slop: "What is the capital of Zorbia? Just the name." must not
+        # yield "capital of Zorbia Just" — the stray word dilutes the cosine key). Windows are generated
+        # WITHIN each clause; the 160-word budget is shared across clauses so a huge prompt still can't
+        # explode the candidate count.
+        budget = 160
+        for clause in re.split(r"[.?!,;:\n]+", text):
+            if budget <= 0:
+                break
+            words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'.\-]*", clause)[:budget]
+            budget -= len(words)
+            n = len(words)
+            for i in range(n):
+                for L in range(2, 7):                         # 2..6-word windows (1-word covered by (a))
+                    if i + L > n:
+                        break
+                    span = words[i:i + L]
+                    if span[0].lower() in _STOP or span[-1].lower() in _STOP:
+                        continue                              # trim stopword boundaries -> "capital of Zorbia"
+                    if all(w.lower() in _STOP for w in span):
+                        continue
+                    cands.add(" ".join(span))
         ordered = sorted(cands, key=len, reverse=True)        # prefer longer (fuller) spans first
         cids_list = [list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
                      for c in ordered]
