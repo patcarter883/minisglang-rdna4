@@ -55,10 +55,11 @@ RXF_REGDIRECT = _os.environ.get("MINISGL_RXF_REGDIRECT", "1") != "0"
 
 # MXFP4 (OCP E2M1) MoE register-direct b128 — routes the e2m1 experts through the register-direct
 # W4A16 kernel (mmq_regdirect_w4a16_moe, weight_is_e2m1=True): fp16 acts DIRECT (no act-quant, unlike
-# the old w4a8_moe e2m1 path which fp8-quantized acts) + b128 weight loads. Both faster AND higher
-# quality (fp16 acts, matching vLLM/MLX MXFP4). ON by default; =0 reverts to the LDS-staged
-# w4a8_moe(weight_is_e2m1=True). Weights repacked to _w_rep/_scales_rd in post_load.
-MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "1") != "0"
+# the w4a8_moe e2m1 path which fp8-quantizes acts) + b128 weight loads. Aims to be faster AND higher
+# quality (fp16 acts, matching vLLM/MLX MXFP4) — but it is NOT yet validated on the MXFP4 target, so
+# it is OPT-IN (=1). Default OFF -> the validated LDS-staged W4A8 path w4a8_moe(weight_is_e2m1=True)
+# (fp8 acts). Weights repacked to _w_rep/_scales_rd in post_load only when this is on.
+MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "0") != "0"
 
 # Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
 # to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks
@@ -228,6 +229,34 @@ def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     return bm
 
 
+def _softmax_topk_route(
+    gating_output: torch.Tensor, top_k: int, renormalize: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused softmax + top-k (+ optional renormalize) route from raw router logits.
+
+    Returns (topk_weights f32 (M, top_k), topk_ids i32 (M, top_k)) — what a model that does NOT
+    precompute its route (Qwen3.5-MoE: router_logits only, no noaux_tc) hands the grouped-MoE kernel.
+    The lean (vllm-free) image has no fused kernel, so this is the pure-torch chain matching the
+    vLLM _moe_C.topk_softmax op; when vLLM IS present (the legacy combined image) prefer its fused
+    kernel — a single launch vs the torch chain. Shared by w4a8_moe and w4a16_moe."""
+    M = gating_output.shape[0]
+    dev = gating_output.device
+    try:
+        from vllm import _custom_ops as vllm_ops
+    except ImportError:
+        probs = torch.softmax(gating_output.float(), dim=-1)
+        tw, ti = torch.topk(probs, top_k, dim=-1)
+        if renormalize:
+            tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
+        return tw.contiguous(), ti.to(torch.int32).contiguous()
+
+    tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
+    ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
+    tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
+    vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
+    return tw, ti
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
@@ -270,30 +299,12 @@ def w4a8_moe(
     gemm1_kernel = "gemv" if M <= 2 else kernel
     gemm2_kernel = kernel
 
-    # softmax + top-k (+ renormalize) route. The lean (vllm-free) image has no fused kernel, so this
-    # is pure torch (softmax -> topk -> optional renorm -> int32 ids), matching what the vLLM
-    # _moe_C.topk_softmax fused op computed. When vLLM IS present (the legacy combined image), prefer
-    # its fused kernel — a single launch vs the torch chain.
-    def _route():
-        try:
-            from vllm import _custom_ops as vllm_ops
-        except ImportError:
-            probs = torch.softmax(gating_output.float(), dim=-1)
-            tw, ti = torch.topk(probs, top_k, dim=-1)
-            if renormalize:
-                tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
-            return tw.contiguous(), ti.to(torch.int32).contiguous()
-
-        tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
-        ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-        tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
-        vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
-        return tw, ti
-
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise fall back to fused softmax+topk here.
     if topk_ids is None:
-        topk_weights, topk_ids = _moe_time("route", _route)
+        topk_weights, topk_ids = _moe_time(
+            "route", lambda: _softmax_topk_route(gating_output, top_k, renormalize)
+        )
     else:
         assert topk_weights is not None, "topk_weights required when topk_ids is given"
         topk_weights = topk_weights.to(torch.float32).contiguous()
@@ -415,17 +426,21 @@ def w4a16_moe(
     inter: int,
     group_size: int,
     *,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,  # (M, top_k) f32 precomputed route (GLM noaux_tc); None -> route here
+    topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 precomputed ids; None -> softmax+topk from router_logits
+    router_logits: torch.Tensor | None = None,  # (M, E) raw gate logits — used ONLY when topk_ids is None
+    top_k: int = 0,  # experts/token — required when routing here (topk_ids is None)
+    renormalize: bool = False,  # renormalize the top-k weights (Qwen3.5-MoE: always True)
     weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1)
 ) -> torch.Tensor:
     """Grouped W4A16 MoE: fp16 activations DIRECT (no act-quant) via the register-direct
     mmq_regdirect_w4a16_moe kernel. This is the fix for the fp8-activation decode degradation on
     activation-sensitive models (GLM-4.7-Flash): int4 weights, fp16 acts, matching vLLM's W4A16.
     Weights are pre-repacked to w_rep_wide in post_load. block_m is fixed 16; `wide` from group_size.
-    Route is always precomputed (GLM noaux_tc). `weight_is_e2m1=True` decodes the weights as MXFP4
-    (OCP E2M1) — the register-direct MXFP4 path (fp16 acts, e2m1 weight decode, symmetric so no
-    zeros). Returns (M, K)."""
+    Route is precomputed for noaux_tc models (GLM) and the EP path; for a model that hands raw router
+    logits (Qwen3.5-MoE MXFP4) pass `router_logits`+`top_k` and the fused softmax+topk runs here (same
+    fallback as w4a8_moe). `weight_is_e2m1=True` decodes the weights as MXFP4 (OCP E2M1) — the
+    register-direct MXFP4 path (fp16 acts, e2m1 weight decode, symmetric so no zeros). Returns (M, K)."""
     import moe_hip
     import w4a8_fp8_wmma
 
@@ -434,6 +449,15 @@ def w4a16_moe(
     dev = x.device
     block_m = 16
     wide = _w4a16_wide(group_size)
+    # Precomputed route (GLM/DeepSeek noaux_tc, or the EP path). Otherwise softmax+topk here — Qwen3.5-MoE
+    # hands us raw router_logits with no model-side route, same fallback the w4a8_moe LDS path has.
+    if topk_ids is None:
+        assert router_logits is not None and top_k > 0, (
+            "w4a16_moe needs a precomputed route (topk_ids/topk_weights) or router_logits + top_k"
+        )
+        topk_weights, topk_ids = _moe_time(
+            "route", lambda: _softmax_topk_route(router_logits, top_k, renormalize)
+        )
     top_k = topk_ids.shape[1]
     tw = topk_weights.to(torch.float32).contiguous()
     ti = topk_ids.to(torch.int32).contiguous()
