@@ -415,8 +415,15 @@ class CAMMemory:
     memory. `import minisgl.cam.memory` never touches a checkpoint.
     """
 
-    def __init__(self, checkpoint_dir: Optional[str], base_embed, lm_head_weight: torch.Tensor):
+    def __init__(self, checkpoint_dir: Optional[str], base_embed, lm_head_weight: torch.Tensor,
+                 pointer_only: bool = False):
         self.enabled = False
+        # POINTER/RETRIEVE-ONLY mode (set when the served model lacks the tap seam, e.g. MoE 35B): the
+        # trained tap/adapter/router are dimensioned to the CHECKPOINT's base and would matmul-mismatch a
+        # different served hidden width, so their CALL sites (_write value-store, read/apply_tap, router)
+        # are skipped. Exact-object delivery + ambient retrieve run from the cosine subject index, which
+        # uses only the served model's own (full-vocab) embedding and is dimension-independent.
+        self.pointer_only = pointer_only
         self.banks: Optional[List[torch.Tensor]] = None
         self._facts: dict = {}                               # tuple(subject_ids) -> {"object_ids", ...}
         self._pending_object: Optional[List[int]] = None
@@ -467,6 +474,16 @@ class CAMMemory:
         # --- build the tap (shapes inferred from tap.pt where possible) ---
         base_hidden = int(tap_sd["to_q.weight"].shape[0])
         mem_dim = int(tap_sd["to_k.weight"].shape[1])
+        # Robust pointer_only gate: even when the tap SEAM is present, the loaded tap/adapter/router are
+        # dimensioned to the CHECKPOINT's base_hidden. If the SERVED model's hidden differs (e.g. a 4B
+        # checkpoint on the 35B-A3B: 2560 vs 2048) every tap/adapter/router matmul mismatches, so fall
+        # back to pointer/retrieve-only (dimension-independent) instead of crashing in _write/read.
+        served_hidden = int(embed_weight.shape[1])
+        if base_hidden != served_hidden and not self.pointer_only:
+            logger.warning("CAMMemory: checkpoint base_hidden=%d != served hidden=%d — tap/adapter/router "
+                           "DISABLED, pointer/retrieve-only (train a checkpoint on this base for the tap).",
+                           base_hidden, served_hidden)
+            self.pointer_only = True
         tap_heads = int(tap_sd["null_key"].shape[1]) if "null_key" in tap_sd else int(meta.get("tap_heads", 8))
         n_rel = int(tap_sd["conf_ema"].shape[0]) if "conf_ema" in tap_sd else int(meta.get("n_rel", 1))
         self.tap = _GatedMemoryTap(
@@ -566,23 +583,25 @@ class CAMMemory:
 
     @torch.no_grad()
     def _write(self, subject_ids: List[int], object_ids: List[int]) -> None:
-        dev = self.adapter.device
-        tids = torch.tensor([list(subject_ids)], dtype=torch.long, device=dev)
-        subj_emb = self.adapter._e(tids)                     # [1,S,mem]
-        key = self.adapter._pool_subject(subj_emb, keepdim=True) if self._pooled_subj_key \
-            else subj_emb[:, -1:]                             # [1,1,mem] or [1,H,mem]
-        if self.obj_latent and len(object_ids) > 1:
-            oi = torch.tensor([list(object_ids)], dtype=torch.long, device=dev)
-            val = self.adapter._e(oi).mean(1, keepdim=True)  # [1,1,mem] object phrase latent
-        else:
-            val = self.adapter._e(torch.tensor([[int(object_ids[0])]], dtype=torch.long, device=dev))
-        if self.value_suppress > 0 and len(object_ids) > 1:
-            # (kept for parity with CAM_VALUE_SUPPRESS; no true-object id available at serve time -> off)
-            pass
-        if key.shape[1] > 1:                                 # multi-vector keys: same value to H slots
-            val = val.expand(-1, key.shape[1], -1)
-        b = _subject_bank(list(subject_ids), self.n_banks)
-        self.banks[b] = self.adapter.persistent_write(self.banks[b], key, val)
+        # Value-store / product-key write (feeds the tap+router fallback). Skipped in pointer-only mode:
+        # the adapter is sized to the CHECKPOINT's base hidden, so `_e`/`persistent_write` would matmul-
+        # mismatch a different served base (e.g. a 4B checkpoint on a 35B serve). The pointer index below
+        # is dimension-independent and is all the exact-object delivery path needs.
+        if not self.pointer_only:
+            dev = self.adapter.device
+            tids = torch.tensor([list(subject_ids)], dtype=torch.long, device=dev)
+            subj_emb = self.adapter._e(tids)                     # [1,S,mem]
+            key = self.adapter._pool_subject(subj_emb, keepdim=True) if self._pooled_subj_key \
+                else subj_emb[:, -1:]                             # [1,1,mem] or [1,H,mem]
+            if self.obj_latent and len(object_ids) > 1:
+                oi = torch.tensor([list(object_ids)], dtype=torch.long, device=dev)
+                val = self.adapter._e(oi).mean(1, keepdim=True)  # [1,1,mem] object phrase latent
+            else:
+                val = self.adapter._e(torch.tensor([[int(object_ids[0])]], dtype=torch.long, device=dev))
+            if key.shape[1] > 1:                                 # multi-vector keys: same value to H slots
+                val = val.expand(-1, key.shape[1], -1)
+            b = _subject_bank(list(subject_ids), self.n_banks)
+            self.banks[b] = self.adapter.persistent_write(self.banks[b], key, val)
         # POINTER delivery index: store the subject's cosine key + its EXACT object token sequence, so
         # /cam/ask delivers the whole multi-token object losslessly and paraphrase-robustly (the value
         # bank above only carries the first-token seed for the router/tap fallback). Update-in-place on
@@ -600,7 +619,7 @@ class CAMMemory:
     def _subj_key(self, subject_ids: List[int]) -> torch.Tensor:
         """Paraphrase-robust subject key: L2-normalised MEAN of the base input embeddings over the subject
         tokens (order-invariant, title/case robust under cosine). [base_hidden]."""
-        ids = torch.tensor([list(subject_ids)], dtype=torch.long, device=self.device)
+        ids = torch.tensor([list(subject_ids)], dtype=torch.long, device=self._embed_w.device)
         e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
         return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
 
