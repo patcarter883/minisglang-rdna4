@@ -81,7 +81,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("minisgl.cam_api")
@@ -168,26 +168,35 @@ def _encode_sp(tok, text: str) -> List[int]:
     return list(tok(" " + text, add_special_tokens=False).input_ids)
 
 
-def _remember(memory, subject_ids, object_ids, prompt_last_logits) -> bool:
-    """Call the WRITE GATE, adapting to whichever object-passing form WS-A picked.
-
-    Contract left the object-passing convention to WS-A ("set_pending_object or a param"); this
-    supports both so it interlocks regardless.
-    """
+def _remember(memory, subject_ids, object_ids, prompt_last_logits, ns=None) -> bool:
+    """Call the WRITE GATE, adapting to whichever object-passing form WS-A picked. `ns` scopes the write
+    to a namespace (#6)."""
     if hasattr(memory, "set_pending_object"):
         memory.set_pending_object(object_ids)
-        return bool(memory.remember(subject_ids, prompt_last_logits))
-    return bool(memory.remember(subject_ids, object_ids, prompt_last_logits))
+        return bool(memory.remember(subject_ids, prompt_last_logits, ns=ns))
+    return bool(memory.remember(subject_ids, object_ids, prompt_last_logits, ns=ns))
 
 
 # --------------------------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------------------------- #
-cam_router = APIRouter(prefix="/cam", tags=["cam"])
+def _require_cam_auth(authorization: str = Header(None)) -> None:
+    """#8 auth: when MINISGL_CAM_API_TOKEN is set, require `Authorization: Bearer <token>` on EVERY /cam/*
+    route (the edit-plane mutates shared memory). Unset -> open (localhost/dev default). Applied as a
+    router-level dependency so read and write routes are covered uniformly."""
+    import os
+    token = os.environ.get("MINISGL_CAM_API_TOKEN")
+    if not token:
+        return
+    if authorization != f"Bearer {token}":
+        raise HTTPException(status_code=401, detail="invalid or missing CAM API token")
+
+
+cam_router = APIRouter(prefix="/cam", tags=["cam"], dependencies=[Depends(_require_cam_auth)])
 
 
 @cam_router.post("/remember", response_model=RememberResponse)
-async def remember(req: RememberRequest) -> RememberResponse:
+async def remember(req: RememberRequest, x_cam_namespace: str = Header(None)) -> RememberResponse:
     """Base-uncertainty WRITE GATE: store subject->object iff the base can't already recall it.
 
     base_p = softmax(base last logits over the prompt)[object first token]. The store writes only
@@ -202,7 +211,7 @@ async def remember(req: RememberRequest) -> RememberResponse:
     if getattr(runtime, "is_frontend_share", False):
         if not _encode_sp(runtime.tokenizer, req.subject):
             raise HTTPException(status_code=422, detail="subject tokenized to empty")
-        stored = await runtime.remember(req.subject, req.object, req.prompt)
+        stored = await runtime.remember(req.subject, req.object, req.prompt, namespace=x_cam_namespace)
         return RememberResponse(stored=stored, base_p=0.0)
     tok = runtime.tokenizer
     memory = runtime.memory
@@ -220,13 +229,13 @@ async def remember(req: RememberRequest) -> RememberResponse:
         prompt_last_logits = runtime.base_logits(prompt_ids).float()
         val_tid = object_ids[0]
         base_p = float(torch.softmax(prompt_last_logits, dim=-1)[val_tid])
-        stored = _remember(memory, subject_ids, object_ids, prompt_last_logits)
+        stored = _remember(memory, subject_ids, object_ids, prompt_last_logits, ns=x_cam_namespace)
 
     return RememberResponse(stored=stored, base_p=base_p)
 
 
 @cam_router.post("/ask", response_model=AskResponse)
-async def ask(req: AskRequest) -> AskResponse:
+async def ask(req: AskRequest, x_cam_namespace: str = Header(None)) -> AskResponse:
     """Router-gated seed-once generation (the eval_serve ``serve_gen`` loop).
 
     read(subject) -> bank; each step take the base last logits and add CAMMemory.router_delta;
@@ -240,7 +249,8 @@ async def ask(req: AskRequest) -> AskResponse:
     # MULTI-PROCESS model-share: deliver via the backend engine.cam — a normal generate carrying
     # mem_subject; the scheduler forces the exact stored object tokens (pointer), then the base continues.
     if getattr(runtime, "is_frontend_share", False):
-        text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)))
+        text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)),
+                                 namespace=x_cam_namespace)
         return AskResponse(text=text.replace("\n", " ").strip())
     tok = runtime.tokenizer
     memory = runtime.memory
@@ -268,7 +278,7 @@ async def ask(req: AskRequest) -> AskResponse:
     # sentence. Validated 4/4 span-exact offline. Falls back to the router-gated seed-once path when the
     # subject addresses no stored object (nothing to deliver).
     deliver = getattr(memory, "deliver_object_ids", None)
-    obj_ids = deliver(subject_ids) if deliver is not None else []
+    obj_ids = deliver(subject_ids, x_cam_namespace) if deliver is not None else []
 
     with torch.no_grad():
         if obj_ids:
@@ -283,7 +293,7 @@ async def ask(req: AskRequest) -> AskResponse:
                 cur = cur + [nxt]
         else:
             # --- fallback: router-gated seed-once decode (unstored subject / no pointer) ---
-            bank, conf = memory.read(subject_ids)
+            bank, conf = memory.read(subject_ids, ns=x_cam_namespace)
             seed_fn = getattr(memory, "seed_token", None)
             seed_tok = None
             placed = False
@@ -308,7 +318,7 @@ async def ask(req: AskRequest) -> AskResponse:
 
 
 @cam_router.get("/facts", response_model=List[FactItem])
-async def list_facts() -> List[FactItem]:
+async def list_facts(x_cam_namespace: str = Header(None)) -> List[FactItem]:
     """List stored edits from the CAMMemory side index (the bank tensor cannot be enumerated).
 
     CAMMemory keeps the side index as raw token-ids (it is deliberately tokenizer-free), so we
@@ -319,7 +329,7 @@ async def list_facts() -> List[FactItem]:
     runtime = _get_runtime()
     if getattr(runtime, "is_frontend_share", False):     # multi-process: facts come from the backend engine.cam
         return [FactItem(subject=f.get("subject", ""), object=f.get("object", ""))
-                for f in await runtime.facts()]
+                for f in await runtime.facts(x_cam_namespace)]
     memory = runtime.memory
     tok = runtime.tokenizer
     lister = getattr(memory, "list_facts", None)
@@ -333,34 +343,112 @@ async def list_facts() -> List[FactItem]:
         return tok.decode(list(ids)).strip() if ids else ""
 
     return [FactItem(subject=_text(f, "subject", "subject_ids"),
-                     object=_text(f, "object", "object_ids")) for f in lister()]
+                     object=_text(f, "object", "object_ids")) for f in lister(x_cam_namespace)]
 
 
 @cam_router.get("/stats")
-async def stats() -> dict:
+async def stats(x_cam_namespace: str = Header(None)) -> dict:
     """Per-bank occupancy + crowding health for the product-key VALUE banks (the router/tap fallback
     path). NOTE: the PRIMARY /cam/ask delivery is the cosine-NN subject index (exact retrieval, no bank
     collision), so crowding no longer degrades pointer delivery — this monitors only the value-bank
     fallback. Served from the side index."""
     runtime = _get_runtime()
     if getattr(runtime, "is_frontend_share", False):     # multi-process: stats from the backend engine.cam
-        return await runtime.stats()
+        return await runtime.stats(x_cam_namespace)
     statter = getattr(runtime.memory, "stats", None)
     if statter is None:
         raise HTTPException(status_code=503, detail="CAM stats unavailable")
-    return statter()
+    return statter(x_cam_namespace)
+
+
+@cam_router.post("/freeze")
+async def freeze(frozen: bool = True, x_cam_namespace: str = Header(None)) -> dict:
+    """Freeze (or with ?frozen=false, unfreeze) the namespace's store: while frozen, ambient transparent
+    auto-write is refused so a curated/ingested store is not overwritten by conversation — explicit
+    /cam/remember still curates. The natural switch after ingesting a knowledge base: POST /cam/freeze."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):        # multi-process: toggle the backend engine.cam
+        return {"frozen": (await runtime.freeze(x_cam_namespace)) if frozen
+                else (await runtime.unfreeze(x_cam_namespace))}
+    mem = runtime.memory
+    fn = getattr(mem, "freeze" if frozen else "unfreeze", None)
+    if fn is None:
+        raise HTTPException(status_code=503, detail="CAM freeze unavailable")
+    return {"frozen": bool(fn(x_cam_namespace))}
+
+
+@cam_router.post("/save")
+async def save() -> dict:
+    """#7 persistence: force a snapshot to MINISGL_CAM_STORE_PATH now (all namespaces). Returns #edits
+    saved, or -1 when no store path is configured. (Autosave also runs debounced after writes.)"""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.save()
+    saver = getattr(runtime.memory, "save", None)
+    if saver is None:
+        raise HTTPException(status_code=503, detail="CAM persistence unavailable")
+    return {"saved": saver()}
+
+
+@cam_router.post("/reload")
+async def reload_store() -> dict:
+    """#11 DP-scale: re-read the store from MINISGL_CAM_STORE_PATH to pick up writes made by another
+    replica sharing the backing file (eventual consistency). See docs/zaya-port/CAM_DP_SCALE.md."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.reload()
+    reloader = getattr(runtime.memory, "reload", None)
+    if reloader is None:
+        raise HTTPException(status_code=503, detail="CAM reload unavailable")
+    return {"edits": reloader()}
+
+
+@cam_router.post("/undo")
+async def undo(x_cam_namespace: str = Header(None)) -> dict:
+    """#12: undo the most-recent write in a namespace (forget that subject). Returns the undone fact or {}."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.undo(x_cam_namespace)
+    u = runtime.memory.undo(x_cam_namespace)
+    tok = runtime.tokenizer
+    return {"subject": tok.decode(list(u["subject_ids"])).strip(),
+            "object": tok.decode(list(u["object_ids"])).strip()} if u else {}
+
+
+@cam_router.post("/rebuild")
+async def rebuild(x_cam_namespace: str = Header(None)) -> dict:
+    """#12 TRUE ERASE / compaction: re-init a namespace's banks and replay only the surviving facts,
+    discarding delta residue from forgotten/overwritten edits."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.rebuild(x_cam_namespace)
+    return {"rebuilt": runtime.memory.rebuild(x_cam_namespace)}
+
+
+@cam_router.get("/audit")
+async def audit(x_cam_namespace: str = Header(None)) -> List[dict]:
+    """#12: recent write/forget/evict events for a namespace (most-recent last)."""
+    runtime = _get_runtime()
+    if getattr(runtime, "is_frontend_share", False):
+        return await runtime.audit(x_cam_namespace)
+    tok = runtime.tokenizer
+    out = []
+    for r in runtime.memory.audit_log(x_cam_namespace):
+        out.append({"op": r["op"], "ts": r["ts"],
+                    "subject": tok.decode(list(r["subject_ids"])).strip(),
+                    "object": tok.decode(list(r["object_ids"])).strip() if r["object_ids"] else ""})
+    return out
 
 
 @cam_router.delete("/facts/{subject}", response_model=DeleteResponse)
-async def delete_fact(subject: str) -> DeleteResponse:
-    """Tombstone-forget a subject: it stops being delivered from the serve path (bank residue
-    stays; the serve path never reads a tombstoned subject). Exact erase (rebuild) is a full-surface
-    item, not MVP."""
+async def delete_fact(subject: str, x_cam_namespace: str = Header(None)) -> DeleteResponse:
+    """Tombstone-forget a subject in a namespace: it stops being delivered from the serve path. Exact
+    erase (rebuild) is a full-surface item, not MVP."""
     runtime = _get_runtime()
     if getattr(runtime, "is_frontend_share", False):     # multi-process: forget in the backend engine.cam
         if not _encode_sp(runtime.tokenizer, subject):
             raise HTTPException(status_code=422, detail="subject tokenized to empty")
-        return DeleteResponse(deleted=await runtime.forget(subject))
+        return DeleteResponse(deleted=await runtime.forget(subject, namespace=x_cam_namespace))
     tok = runtime.tokenizer
     memory = runtime.memory
 
@@ -371,5 +459,5 @@ async def delete_fact(subject: str) -> DeleteResponse:
     deleter = getattr(memory, "delete", None) or getattr(memory, "forget", None)
     if deleter is None:
         raise HTTPException(status_code=503, detail="CAM delete unavailable")
-    deleted = bool(deleter(subject_ids))
+    deleted = bool(deleter(subject_ids, ns=x_cam_namespace))
     return DeleteResponse(deleted=deleted)

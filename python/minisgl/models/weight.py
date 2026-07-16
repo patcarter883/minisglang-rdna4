@@ -7,6 +7,7 @@ from typing import Dict, Iterator, Tuple
 import safetensors
 import torch
 from minisgl.distributed import get_dp_info, get_ep_rank, get_ep_size, get_tp_info, is_ep_enabled
+from minisgl.quant import nvfp4
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -397,6 +398,10 @@ def _load_qwen3_5_weight(
     concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN/dense in_proj concat (qwen3_5_remap)
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}   # MoE gate/up -> gate_up
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # MoE per-expert -> stacked over E
+    # NVFP4: pair each proj's e4m3 block scale + per-tensor global to fold them into one fp16 per-group
+    # scale at the LEAF (before remap/concat/merge/stack) — see below.
+    _is_nvfp4 = config.quant is not None and config.quant.is_nvfp4
+    nvfp4_fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     # EP: this replica keeps only its expert shard; skip the rest and stack at local ids. Off => full.
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
 
@@ -440,12 +445,32 @@ def _load_qwen3_5_weight(
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
+                # NVFP4: fold the e4m3 block scale / per-tensor global into ONE fp16 per-group scale at
+                # the LEAF — before remap / GDN in_proj concat / gate-up merge / expert stack. That makes
+                # NVFP4 MXFP4-shaped (E2M1 weights + fp16 per-group scale), so every downstream fusion
+                # (each combining differently-scaled matrices) composes exactly as it does for MXFP4, and
+                # no per-tensor scalar ever reaches a merge. weight_packed passes through unchanged (4-bit);
+                # input_global_scale (FP4 act calib) is dropped — the e2m1 kernel quantizes acts to fp8.
+                override = None
+                if _is_nvfp4:
+                    if name.endswith(".input_global_scale"):
+                        continue
+                    if name.endswith((".weight_scale", ".weight_global_scale")):
+                        base, field = name.rsplit(".", 1)
+                        buf = nvfp4_fold_buf.setdefault(base, {})
+                        buf[field] = f.get_tensor(name)
+                        if len(buf) < 2:
+                            continue
+                        del nvfp4_fold_buf[base]
+                        name = base + ".weight_scale"
+                        override = nvfp4.fold_nvfp4_scale(buf["weight_scale"], buf["weight_global_scale"])
                 plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
                 if plan is None:
                     continue
                 # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
                 # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
-                raw = _shard_qwen3_5(name, f.get_tensor(name), tp_info.rank, tp_info.size, config)
+                tens = override if override is not None else f.get_tensor(name)
+                raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config)
                 if plan[0] == "direct":
                     yield from emit(plan[1], raw)
                     continue
@@ -459,6 +484,10 @@ def _load_qwen3_5_weight(
     assert not concat_buf, f"incomplete concat groups in checkpoint: {list(concat_buf.keys())}"
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    assert not nvfp4_fold_buf, (
+        f"incomplete NVFP4 scale/global pairs (a proj missing its weight_scale or weight_global_scale): "
+        f"{list(nvfp4_fold_buf.keys())}"
+    )
 
 
 # ---- ZAYA1-8B CCA-hybrid weight-name remap (Step 3) ----

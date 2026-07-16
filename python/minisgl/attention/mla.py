@@ -66,6 +66,10 @@ class MLABackend(BaseAttnBackend):
         # pool as float8_e4m3fn). Store is a plain bf16->e4m3 cast (scale 1.0), so decode dequant uses
         # descale 1.0, matching the HIP MHA fp8 path. The prefill rebuild dequants in the model layer.
         self.kv_is_fp8 = self.kvcache.dtype == torch.float8_e4m3fn
+        # canonical mla fp8 ops now take k/v_descale as DEVICE tensors (read [0]). MLA's descale is a
+        # static 1.0 (scale-1.0 store cast), so one persistent 1-elem tensor suffices — stable address,
+        # graph-safe (a fresh torch.tensor() per forward would break cuda-graph replay).
+        self._fp8_descale = torch.ones(1, dtype=torch.float32, device=self.kvcache.device)
 
     # ---- cache + kernels (called by the model's MLA layer) ----
     def store_latent(self, latent: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
@@ -80,7 +84,8 @@ class MLABackend(BaseAttnBackend):
         if self.kv_is_fp8:
             # e4m3 latent cache: k_descale=v_descale=1.0 (store was a scale-1.0 cast).
             engaged("mla_hip.mla_decode_fp8")
-            return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale, 1.0, 1.0, 0, 0)
+            return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale,
+                                       self._fp8_descale, self._fp8_descale, 0, 0)
         engaged("mla_hip.mla_decode")
         return self._decode_op(q, latent_cache, block_table, ctx_lens, self.scale, 0, 0)
 
@@ -99,7 +104,8 @@ class MLABackend(BaseAttnBackend):
         if self.kv_is_fp8:
             engaged("mla_hip.mla_verify_fp8")
             return self._verify_fp8_op(
-                q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 1.0, 1.0, 0, 0
+                q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale,
+                self._fp8_descale, self._fp8_descale, 0, 0
             )
         engaged("mla_hip.mla_verify")
         return self._verify_op(q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 0, 0)

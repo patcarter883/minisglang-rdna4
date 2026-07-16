@@ -314,12 +314,8 @@ def create_linear_method(
     if quant is None or not quantized:
         return UnquantizedLinearMethod()
     if quant.is_nvfp4:
-        raise NotImplementedError(
-            "NVFP4 (compressed-tensors 'nvfp4-pack-quantized') is not supported on this backend: it is "
-            "a W4A4 scheme (E2M1 weights + FP4 activations, per-16-group FP8-E4M3 block scale + per-tensor "
-            "FP32 global scale) and gfx1201 has no FP4 WMMA / FP4-activation kernel. Use an MXFP4 "
-            "('mxfp4-pack-quantized'), AWQ/GPTQ int4, or fp8 W8A8 checkpoint instead."
-        )
+        # gfx1201 has no FP4 hardware -> upconvert NVFP4 to the fp8 W8A8 path at load (see NvFp4LinearMethod).
+        return NvFp4LinearMethod(quant)
     if quant.is_rxf:
         return RXFLinearMethod(quant)
     # MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the W4A8 kernel with the e2m1
@@ -334,6 +330,55 @@ def create_linear_method(
     if quant.is_fp8_w8a8:
         return Fp8W8A8LinearMethod(quant)
     return W4A8LinearMethod(quant)
+
+
+class NvFp4LinearMethod:
+    """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') dense linear, served through the SAME e2m1
+    W4A8 kernel as MXFP4 — weights stay 4-bit; the E2M1 codes decode to fp8 e4m3 in-register at the
+    WMMA (no VRAM upconvert). NVFP4 differs from MXFP4 only in the scale, which the WEIGHT LOADER folds
+    to one fp16 per-group scale at the leaf (`nvfp4.fold_nvfp4_scale`: e4m3 block / per-tensor global),
+    dropping the global tensors. So by the time this method loads, the checkpoint is MXFP4-shaped:
+    weight_packed uint8 (N,K//2) 2 E2M1 nibbles/byte + weight_scale fp16 (N,K//16). `process_weights_
+    after_load` packs the nibbles to (N,K//8) int32 codes (verbatim) and passes the fp16 scale through;
+    `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4."""
+
+    def __init__(self, quant: QuantConfig) -> None:
+        self.quant = quant
+
+    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
+        # POST-FOLD checkpoint layout (the loader already folded the scale to fp16 and dropped the
+        # per-tensor globals): weight_packed uint8, weight_scale fp16 at group_size 16.
+        N, K = out_features, in_features
+        g = self.quant.group_size  # 16 (NVFP4 block)
+        assert K % 2 == 0 and K % g == 0 and N % 8 == 0, (
+            f"NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
+        )
+        layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
+        layer.weight_scale = torch.empty((N, K // g), dtype=torch.float16)
+
+    def process_weights_after_load(self, layer: "BaseOP") -> None:
+        from . import nvfp4
+
+        conv = nvfp4.convert_nvfp4_weight(layer.weight_packed, layer.weight_scale)  # type: ignore[attr-defined]
+        layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32 E2M1 codes
+        layer._scales_op = conv["scales"]  # (N, K//16) fp16 per-group
+        del layer.weight_packed, layer.weight_scale
+
+    def apply(
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        out = kernels.w4a8_linear(
+            x,
+            layer._w_packed_op,  # type: ignore[attr-defined]
+            layer._scales_op,  # type: ignore[attr-defined]
+            None,  # symmetric — no zero-points
+            self.quant.group_size,
+            weight_is_e2m1=True,
+        )
+        out = out.to(x.dtype)
+        if bias is not None:
+            out = out + bias
+        return out
 
 
 class Fp8W8A8LinearMethod:

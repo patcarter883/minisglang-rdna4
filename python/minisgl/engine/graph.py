@@ -193,7 +193,10 @@ class GraphRunner:
         # CAM editable-memory decode tap: thread a static per-row bank buffer through the graph so the
         # L24 tap runs inside the captured decode (Phase 2). None when CAM is off or graphs are disabled.
         self.cam_capture = None
-        if cam is not None and getattr(cam, "enabled", False) and self.max_graph_bs > 0:
+        if (cam is not None and getattr(cam, "enabled", False) and self.max_graph_bs > 0
+                and not getattr(cam, "pointer_only", False)):
+            # pointer-only CAM has no residual tap in the captured graph — delivery is a post-sample token
+            # override (_process_last_data), so there is nothing to thread through the decode graph.
             from minisgl.cam.graph_capture import CAMGraphCapture
 
             inner = getattr(model, "model", model)
