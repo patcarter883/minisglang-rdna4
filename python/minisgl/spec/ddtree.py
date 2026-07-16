@@ -175,8 +175,14 @@ def fill_static_template(
         depth=list(t.depth),
         children=[{} for _ in range(n)],
     )
+    # ROBUST to a shorter marginal than the template expects: the drafter may emit FEWER positions than
+    # the template's max depth (DFlash's k_i is variable; TiDAR block_predict is fixed) or fewer than K
+    # top-K at a position. A template node with no matching marginal gets root_token — a placeholder the
+    # target never matches, so it's simply not accepted (correct degradation, like a shallower tree).
+    L = len(topk_ids)
     for j in range(1, n):
-        tok = int(topk_ids[t.depth[j] - 1][t.rank[j]])
+        d, r = t.depth[j] - 1, t.rank[j]
+        tok = int(topk_ids[d][r]) if (d < L and r < len(topk_ids[d])) else root_token
         tree.token[j] = tok
         tree.children[t.parent[j]].setdefault(tok, j)
     return tree

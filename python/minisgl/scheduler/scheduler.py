@@ -2206,8 +2206,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for req in reqs:
             root = int(req.input_ids[req.cached_len])
             entry = topk_map.get(id(req))
-            if entry is None:  # no aux yet / budget-0 req -> root-only tree (commit degrades to plain decode)
-                trees[id(req)] = build_draft_tree([], [], 0, root)  # static mask is topology-only; pad rows discarded
+            if entry is None:  # no aux yet / budget-0 req -> degrade to plain decode
+                if tmpl is not None:
+                    # SEG/STATIC stage the FULL template topology (rep/node_rows reference all n_nodes),
+                    # so a root-only tree (n_nodes=1) would index out of range. Fill the template with a
+                    # dummy (all-root) marginal -> full topology, tokens all = root so the walk accepts
+                    # nothing (same plain-decode degradation as the root-only tree).
+                    L = getattr(self, "_ddtree_block_len", spec.num_draft)
+                    trees[id(req)] = fill_static_template(tmpl, [[root] * K for _ in range(L)], root)
+                else:
+                    trees[id(req)] = build_draft_tree([], [], 0, root)
             else:
                 ids, logp = entry
                 trees[id(req)] = (fill_static_template(tmpl, ids, root) if tmpl is not None
