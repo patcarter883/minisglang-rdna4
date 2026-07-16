@@ -60,6 +60,13 @@ class MHAKVCache(BaseKVCachePool):
         self.kv_is_fp8 = dtype == torch.float8_e4m3fn
         self.k_scale = [1.0] * num_layers
         self.v_scale = [1.0] * num_layers
+        # Persistent per-layer descale TENSORS for the attention kernels. The canonical fp8 attn ops
+        # now take k/v_descale as DEVICE tensors (read [0]) — vllm needs that for its dynamic per-forward
+        # descale under cuda-graph; minisgl's descale is static, but must still pass a tensor. These
+        # persist for the pool's lifetime (stable address = graph-safe) and are kept == k_scale/v_scale
+        # (default 1.0; refreshed in finalize_kv_calibration). Indexing [layer_id] yields a 0-dim view.
+        self.k_descale = torch.ones(num_layers, dtype=torch.float32, device=device)
+        self.v_descale = torch.ones(num_layers, dtype=torch.float32, device=device)
         # Calibration (A5): accumulate pre-cast |k|/|v| amax per layer, then finalize to a static
         # per-tensor scale = amax / FP8_MAX. OFF by default (MINISGL_KV_FP8_CALIBRATE=1 to enable) so
         # the default fp8-KV path is byte-identical to before (scale 1.0). A correct static scale
@@ -125,6 +132,9 @@ class MHAKVCache(BaseKVCachePool):
         # amax 0 (a layer never stored) -> keep scale 1.0.
         self.k_scale = [max(m / _FP8_MAX, 1e-4) if m > 0 else 1.0 for m in kmax]
         self.v_scale = [max(m / _FP8_MAX, 1e-4) if m > 0 else 1.0 for m in vmax]
+        # keep the persistent attention descale tensors in sync (in-place → address stays stable).
+        self.k_descale.copy_(torch.tensor(self.k_scale, dtype=torch.float32, device=self.k_descale.device))
+        self.v_descale.copy_(torch.tensor(self.v_scale, dtype=torch.float32, device=self.v_descale.device))
         self._calibrating = False
         del self._k_amax, self._v_amax
 
