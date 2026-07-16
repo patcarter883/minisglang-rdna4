@@ -119,6 +119,11 @@ def tokenize_worker(
                         kv_tokens_used=sm.kv_tokens_used,
                         gdn_slots_total=sm.gdn_slots_total,
                         gdn_slots_used=sm.gdn_slots_used,
+                        cam_facts=sm.cam_facts,
+                        cam_namespaces=sm.cam_namespaces,
+                        cam_evicted=sm.cam_evicted,
+                        cam_max_bank_load=sm.cam_max_bank_load,
+                        cam_crowded_banks=sm.cam_crowded_banks,
                     )
                 )
             assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + len(stats_msg) == len(
