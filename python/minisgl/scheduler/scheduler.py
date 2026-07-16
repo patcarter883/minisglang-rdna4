@@ -1307,7 +1307,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if obj:
                 req._mem_deliver, req._mem_deliver_pos = list(obj), 0
                 req.mem_bank = None                          # pointer forces exact tokens; no tap needed
-            else:
+            elif not getattr(cam, "pointer_only", False):
+                # Residual-tap fallback (tap+router path only). Skipped in pointer-only mode: cam.read
+                # runs the checkpoint-dimensioned adapter, which mismatches a different served base.
                 bank, conf = cam.read(subj_ids)
                 req.mem_bank, req.mem_conf = bank, conf
                 req._mem_seed = int(cam.seed_token(bank, conf)) if bank is not None else None
@@ -1365,6 +1367,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         go zero. Graph-decode replay ignores these Python tensors (it reads the captured static buffer);
         this path drives eager prefill + eager decode. (Overlap loop: the placed flag lags one step.)"""
         cam, inner = self.engine.cam, self.engine.model.model
+        if getattr(cam, "pointer_only", False) or not hasattr(inner, "stage_cam_rows"):
+            return                                   # no tap seam / pointer-only: bank staging is a no-op
         reqs = batch.padded_reqs if batch.padded_reqs is not None else batch.reqs
         active = [(getattr(r, "mem_bank", None) is not None and not getattr(r, "_mem_placed", False))
                   for r in reqs]
