@@ -936,6 +936,7 @@ class CAMMemory:
             return False
         del self._ns_states[ns]
         self._dirty = True
+        self.autosave(force=True)   # durable: persist the drop so a restart can't resurrect the namespace
         return True
 
     @torch.no_grad()
@@ -1034,6 +1035,10 @@ class CAMMemory:
                 self._write(list(subj), rec["object_ids"], ns=ns)   # rebuild value bank; index in-place
         self._audit_add("forget", ns, key, [])                # #12 audit
         self._dirty = True                                    # #7 persistence
+        self.autosave(force=True)                             # DURABLE DELETE (spine delete-resurrect): the
+        # debounced autosave can miss a delete before a restart -> the fact resurrects from the last
+        # snapshot on load-on-boot. Force an immediate persist so the deletion survives a restart with no
+        # explicit /cam/save. No-op when persistence is off (store_path unset).
         return True
 
     @torch.no_grad()
