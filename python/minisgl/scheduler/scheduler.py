@@ -141,6 +141,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        # runaway-generation-kv-guard: a single degenerate no-EOS generation can grow its context to
+        # ~100% of the KV pool and then crawl (every decode step attends over the whole pool) while
+        # starving every other request. This second, POOL-RELATIVE cap force-finishes any one request
+        # whose KV footprint (device_len tokens ~= its allocated pages) reaches a fraction of the whole
+        # pool, independent of its max_tokens. OFF by default (frac 0 -> budget 0 -> the decode-loop
+        # check below is a no-op), so it never touches a serve that hasn't opted in; when set it never
+        # fires below the fraction, so legitimate long contexts up to the budget are unaffected.
+        _kv_frac = float(os.environ.get("MINISGL_CAM_REQ_KV_FRAC", "0") or 0)
+        self._req_kv_budget_tokens = (
+            int(_kv_frac * self.cache_manager.num_pages * config.page_size)
+            if 0.0 < _kv_frac <= 1.0
+            else 0
+        )
+        if self._req_kv_budget_tokens:
+            logger.info_rank0(
+                f"runaway-generation-kv-guard active: per-request KV budget "
+                f"{self._req_kv_budget_tokens} tokens ({_kv_frac:.2f} of pool)."
+            )
         # GDN recurrent-state slot lifecycle — active ONLY for GDN-hybrid models (engine
         # constructs the state cache in 3d). None (inert) for every dense model today, so
         # the dense scheduling path below is unchanged.
@@ -760,6 +778,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token in self.eos_token_ids
+                # runaway-generation-kv-guard (env MINISGL_CAM_REQ_KV_FRAC): force-finish a single
+                # request whose KV footprint has grown past the pool-fraction budget, so one runaway
+                # can't monopolize the pool. Budget 0 (default) -> disabled. device_len is prompt +
+                # committed tokens ~= this req's KV token count (pages*page_size for MLA differs by
+                # <page_size, immaterial at a 70%-of-pool cap).
+                if not finished and self._req_kv_budget_tokens \
+                        and req.device_len >= self._req_kv_budget_tokens:
+                    logger.warning_rank0(
+                        f"runaway-generation-kv-guard: request {req.uid} reached "
+                        f"{req.device_len} KV tokens (>= budget {self._req_kv_budget_tokens}); "
+                        f"force-finishing to protect the KV pool."
+                    )
+                    finished = True
                 # Structured output: advance this req's grammar matcher with the committed token so the
                 # next step's bitmask reflects the new state. Skip on finish (req is done). A terminated
                 # grammar (complete JSON) is allowed to emit EOS, which the matcher won't accept — guard.
