@@ -313,6 +313,13 @@ def create_linear_method(
     stays unquantized even when the model is quantized."""
     if quant is None or not quantized:
         return UnquantizedLinearMethod()
+    if quant.is_nvfp4:
+        raise NotImplementedError(
+            "NVFP4 (compressed-tensors 'nvfp4-pack-quantized') is not supported on this backend: it is "
+            "a W4A4 scheme (E2M1 weights + FP4 activations, per-16-group FP8-E4M3 block scale + per-tensor "
+            "FP32 global scale) and gfx1201 has no FP4 WMMA / FP4-activation kernel. Use an MXFP4 "
+            "('mxfp4-pack-quantized'), AWQ/GPTQ int4, or fp8 W8A8 checkpoint instead."
+        )
     if quant.is_rxf:
         return RXFLinearMethod(quant)
     # MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the W4A8 kernel with the e2m1
