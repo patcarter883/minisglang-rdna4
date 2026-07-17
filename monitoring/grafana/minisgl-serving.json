@@ -137,7 +137,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(minisgl_running_requests{model_name=~\"$model\"})"
+          "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])"
         }
       ]
     },
@@ -966,7 +966,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(minisgl_running_requests{model_name=~\"$model\"})",
+          "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])",
           "legendFormat": "running"
         },
         {
