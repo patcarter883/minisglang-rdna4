@@ -187,6 +187,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
+        # whitened-GTE subject key (MINISGL_CAM_GTE_KEY=1): wire the served tokenizer as the ids->text
+        # decoder the key needs, then reindex any store loaded at CAM build (which fell back to base-embed
+        # keys because no decoder was wired yet) into the GTE key space. No-op unless GTE mode is active.
+        _cam = getattr(self.engine, "cam", None)
+        if _cam is not None and getattr(_cam, "_gte", None) is not None:
+            _cam._decode = lambda ids: self.tokenizer.decode(list(ids)).strip()
+            _cam.reindex()
         # FULL end-of-generation set: generation_config `eos_token_id` (often a LIST) ∪ tokenizer ∪
         # config. Multi-EOS models (GLM-4.x: [154820,154827,154829]) end turns on a token other than
         # the tokenizer's single EOS, so honouring only that one leaves them generating forever.
