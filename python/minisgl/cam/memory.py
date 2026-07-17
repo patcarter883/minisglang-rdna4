@@ -620,6 +620,14 @@ class CAMMemory:
                                                self._subj_objs, self._subj_tuple, self._facts)}
         # #9 capacity: per-namespace fact cap (0 = unlimited); LRU eviction on overflow.
         self.max_facts = int(os.environ.get("MINISGL_CAM_MAX_FACTS", "0"))
+        # Write-side semantic dedup: on a NON-exact-id re-remember whose subject key is a near-duplicate
+        # of a stored one (cosine >= write_dedup_tau), MERGE onto that entry (latest phrasing+object wins)
+        # instead of appending a paraphrase duplicate. Default 1.0 = OFF (base-embed key space is not
+        # calibrated for it); _load_gte_key drops it to a measured 0.82 when the semantic GTE key is active
+        # (0.82 sits above the distinct-subject cosine ceiling ~0.79 — e.g. "Mozart" vs "Leopold Mozart" —
+        # so genuinely-different subjects never silently merge). Explicit env override always wins.
+        _dedup = os.environ.get("MINISGL_CAM_WRITE_DEDUP_TAU", "").strip()
+        self.write_dedup_tau = float(_dedup) if _dedup else 1.0
         # #12 audit: append-only ring buffer of write/forget/evict events (subject/object/source/ns/ts).
         self._audit: list = []
         self._audit_max = int(os.environ.get("MINISGL_CAM_AUDIT_MAX", "2000"))
@@ -714,15 +722,36 @@ class CAMMemory:
         key_vec = self._subj_key(subject_ids)
         st.seq += 1
         if k in st.subj_tuple:
-            i = st.subj_tuple.index(k)
+            i = st.subj_tuple.index(k)                            # exact re-remember: update object + key
             st.subj_keys[i], st.subj_objs[i] = key_vec, obj
+            fact_key = k
         else:
-            st.subj_tuple.append(k); st.subj_keys.append(key_vec); st.subj_objs.append(obj)
-        st.facts[k] = {"object_ids": obj, "base_p": float(base_p), "used": st.seq}  # #6 index + #9 LRU clock
-        st.last_key = k                                          # #12 undo target
-        self._audit_add("write", ns, k, obj)                    # #12 audit
+            i = self._dedup_match(st, key_vec)                    # paraphrase near-duplicate of a stored subject?
+            if i is not None:                                     # MERGE: newest OBJECT wins, but keep the
+                fact_key = st.subj_tuple[i]                       # FIRST-SEEN subject key ANCHORED — updating it
+                st.subj_objs[i] = obj                             # to each new phrasing would drift the anchor and
+                self._audit_add("merge", ns, fact_key, obj)       # cascade-merge a later distinct subject (data loss)
+            else:                                                 # genuinely new subject: append
+                st.subj_tuple.append(k); st.subj_keys.append(key_vec); st.subj_objs.append(obj)
+                fact_key = k
+        st.facts[fact_key] = {"object_ids": obj, "base_p": float(base_p), "used": st.seq}  # #6 index + #9 LRU clock
+        st.last_key = fact_key                                   # #12 undo target
+        self._audit_add("write", ns, fact_key, obj)             # #12 audit
         self._maybe_evict(st, ns)                               # #9 capacity
         self._dirty = True                                      # #7 persistence
+
+    @torch.no_grad()
+    def _dedup_match(self, st, key_vec: torch.Tensor) -> Optional[int]:
+        """Index of a stored subject whose key is a near-duplicate of key_vec (cosine >= write_dedup_tau),
+        else None. Collapses paraphrase re-remembers ("Mozart" vs "the composer Mozart") onto one entry
+        instead of appending a duplicate. tau is set ABOVE the measured distinct-subject cosine ceiling
+        (~0.79) so genuinely-different-but-related subjects (e.g. Mozart vs Leopold Mozart) never merge —
+        a missed merge is a recoverable duplicate; a wrong merge is silent data loss."""
+        if self.write_dedup_tau >= 1.0 or not st.subj_keys:
+            return None
+        sims = torch.stack(st.subj_keys).to(key_vec.device) @ key_vec
+        j = int(sims.argmax())
+        return j if float(sims[j]) >= self.write_dedup_tau else None
 
     # ---- #9 capacity / eviction --------------------------------------------------------------------
     @torch.no_grad()
@@ -794,6 +823,10 @@ class CAMMemory:
             if "MINISGL_CAM_DELIVER_TAU" not in os.environ:
                 self.deliver_tau = float(os.environ.get("MINISGL_CAM_GTE_DELIVER_TAU", "0.55"))
                 self.protect_tau = self.deliver_tau if "MINISGL_CAM_PROTECT_TAU" not in os.environ else self.protect_tau
+            # Semantic key is now live, so paraphrase re-remembers collide — enable write-side dedup at a
+            # measured, silent-data-loss-safe threshold (above the ~0.79 distinct-subject ceiling).
+            if not os.environ.get("MINISGL_CAM_WRITE_DEDUP_TAU", "").strip():
+                self.write_dedup_tau = float(os.environ.get("MINISGL_CAM_GTE_WRITE_DEDUP_TAU", "0.82"))
             print(f"CAM: whitened-GTE subject key ACTIVE (model={model}, dim={int(W.shape[0])}, tau={self.deliver_tau}, "
                   f"whiten-fit n={art.get('n_fit')}, nn {art.get('nn_raw')}->{art.get('nn_whitened')})", flush=True)
         except Exception as e:  # noqa: BLE001 — degrade to base-embed key, don't crash
