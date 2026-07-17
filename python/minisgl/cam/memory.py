@@ -639,7 +639,9 @@ class CAMMemory:
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
-        if self.store_path and os.path.isfile(self.store_path):   # #7 load-on-boot
+        # #7 load-on-boot: attempt restore if the store OR its .bak exists (a crash mid-save can leave
+        # only the .bak). restore() picks whichever is readable.
+        if self.store_path and (os.path.isfile(self.store_path) or os.path.isfile(f"{self.store_path}.bak")):
             try:
                 n = self.restore(self.store_path)
                 logger.info("CAMMemory: restored %d edits across %d namespace(s) from %s",
@@ -1088,17 +1090,57 @@ class CAMMemory:
         # force-save-on-delete + debounced autosave cheap (store.pt -> KB). restore() re-inits empty banks.
         ns_blob = {ns: {"banks": (None if self.pointer_only else [b.detach().cpu() for b in st.banks]),
                         "facts": st.facts, "frozen": st.frozen} for ns, st in self._ns_states.items()}
-        torch.save({"ns_states": ns_blob,
-                    "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
-                             "base_model": self.meta.get("base_model"),
-                             "pointer_only": self.pointer_only}}, path)
+        payload = {"ns_states": ns_blob,
+                   "meta": {"n_banks": self.n_banks, "k_slots": self.k_slots, "mem_dim": self.mem_dim,
+                            "base_model": self.meta.get("base_model"),
+                            "pointer_only": self.pointer_only}}
+        # ATOMIC durable write: torch.save straight to `path` would leave a TORN store if the process is
+        # killed mid-write (OOM/SIGKILL/power) — and boot-restore then throws and starts EMPTY, silently
+        # losing every fact. Instead write a temp, fsync it, retain the current file as `.bak` (last-good
+        # for logical-corruption recovery), then os.replace(tmp -> path) which is atomic on POSIX: `path`
+        # is always either the old good file or the new one, never half-written. restore() falls back to
+        # `.bak` if `path` is missing/corrupt.
+        tmp = f"{path}.tmp"
+        torch.save(payload, tmp)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())                              # flush the data before we publish it
+        if os.path.exists(path):
+            try:
+                os.replace(path, f"{path}.bak")              # keep the previous good snapshot
+            except OSError:
+                pass
+        os.replace(tmp, path)                                # atomic publish
+        try:                                                  # fsync the dir so the rename itself is durable
+            dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
         return sum(len(st.facts) for st in self._ns_states.values())
 
     @torch.no_grad()
     def restore(self, path: str) -> int:
         """Load a snapshot (all namespaces). Hard-fails on a bank-count mismatch. Rebuilds each namespace's
         cosine-NN delivery index from its facts. Returns total #edits."""
-        d = torch.load(path, map_location="cpu", weights_only=False)
+        # Load `path`; on a missing/torn/corrupt file fall back to the `.bak` last-good snapshot (written
+        # atomically by snapshot()), so a crash during a save can't wipe the store — at worst it rewinds
+        # to the previous save. Only if BOTH are unreadable does this raise (caller then starts empty).
+        d, src = None, None
+        for cand in (path, f"{path}.bak"):
+            if not os.path.isfile(cand):
+                continue
+            try:
+                d = torch.load(cand, map_location="cpu", weights_only=False)
+                src = cand
+                break
+            except Exception as e:  # noqa: BLE001 — try the backup before giving up
+                logger.warning("CAMMemory: snapshot %s unreadable (%s); trying fallback.", cand, e)
+        if d is None:
+            raise FileNotFoundError(f"no readable CAM snapshot at {path} or {path}.bak")
+        if src != path:
+            logger.warning("CAMMemory: primary store %s was bad — recovered from %s.", path, src)
         m = d.get("meta", {})
         if int(m.get("n_banks", self.n_banks)) != self.n_banks:
             raise ValueError(f"snapshot n_banks={m.get('n_banks')} != store n_banks={self.n_banks}")
