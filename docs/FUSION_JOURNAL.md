@@ -113,3 +113,17 @@ Do NOT attempt the full megakernel first — stage it.
   _norm_weight_fp32(), eps) and SKIP `_output_projection`'s separate `rmsnorm_gated` (still out_proj on the
   normed result); whole-layer parity via gdn_layer_parity.py + a short serve coherence smoke; commit engine
   change if clean. Then Stage C (fuse causal_conv1d_update prologue → 1 launch/GDN-layer total).
+- 2026-07-18 (iter 4 — Stage B ENGINE WIRING done + validated + committed; STAGE B COMPLETE):
+  `forward_decode` now calls `gdn_decode_gated` behind `_GDN_FUSED_NORM` (env MINISGL_GDN_FUSED_NORM, default
+  1) + `hasattr(gdn,"gdn_decode_gated")` guard → old .so falls back to the 2-kernel path safely. z_flat =
+  z.reshape(-1,V).contiguous() (== what _output_projection fed rmsnorm_gated). **VALIDATED end-to-end**
+  (tools/car_gdn_fused_smoke.sh): Qwen3.5-4B GDN-dense TP=1 serve under graph capture — 5/5 keyword canaries
+  COHERENT (paris/au/oxygen/jupiter/4), `has gdn_decode_gated: True`, and log `[hip-engage]
+  gdn_hip.gdn_decode_gated` CONFIRMS the fused kernel is executed (not the fallback). **COMMITTED ef618f0.**
+  Stage B (gated-norm fusion) DONE: gdn_decode+rmsnorm_gated -> 1 kernel, bit-exact, 1.16x op, serve-clean.
+  NEXT iter: **Stage C** — fuse `causal_conv1d_update` (conv-state roll + SiLU) into `gdn_decode_gated`'s
+  PROLOGUE → 1 launch/GDN-layer total (was 3). HIGHER RISK: two persistent states (conv_state + ssm_state)
+  resident in one kernel + the conv depthwise reads conv_state[slot] — mind the 64KB LDS budget (see memory
+  gdn-wmma-lds-budget). Read `causal_conv1d_update` kernel (gdn_kernels.hip:772) + its state layout; scope
+  whether it fits the (bi,hv) block structure (conv is per conv-channel, not per v-head — may NOT map cleanly;
+  if it doesn't, Stage C may be lower-ROI than expected — evaluate before implementing).
