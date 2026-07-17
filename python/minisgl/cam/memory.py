@@ -636,6 +636,7 @@ class CAMMemory:
         self._save_interval = float(os.environ.get("MINISGL_CAM_SAVE_INTERVAL", "5"))
         self._dirty = False
         self._last_save = 0.0
+        self._recovered_from_bak = False   # set by restore() when the primary was bad -> ops ALERT signal
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
@@ -1039,6 +1040,7 @@ class CAMMemory:
         total = sum(loads)
         mx = max(loads) if loads else 0
         mean = (total / self.n_banks) if self.n_banks else 0.0
+        idx_nn_mean, idx_nn_max = self._index_crowding(st)
         return {
             "B": self.n_banks, "total_edits": total, "max_bank_load": mx,
             "imbalance": (mx / mean) if mean else 0.0,
@@ -1047,8 +1049,34 @@ class CAMMemory:
             "frozen": st.frozen, "write_policy": self.write_policy,
             "namespace": ns or "default", "namespaces": len(self._ns_states),
             "max_facts": self.max_facts, "evicted": st.evicted,            # #9 capacity
-            "persistent": bool(self.store_path), "dirty": self._dirty,     # #7 persistence
+            # ---- primary-path (cosine-NN index) crowding: the interference-wall gauge. nn_cos = how close
+            # the NEAREST OTHER stored subject key is, averaged (mean) and worst-case (max) over a sample.
+            # Rising toward deliver_tau means the delivery space is filling and false-fire risk climbs.
+            "index_size": len(st.subj_keys),
+            "index_nn_cos_mean": idx_nn_mean, "index_nn_cos_max": idx_nn_max,
+            "deliver_tau": round(float(self.deliver_tau), 3),
+            # ---- #7 persistence health: is the store durable, are there unsaved writes, did we boot from a
+            # backup (== the primary was corrupt/lost — an ops ALERT)?
+            "persistent": bool(self.store_path), "dirty": self._dirty,
+            "last_save_age_s": (round(time.time() - self._last_save, 1) if self._last_save else None),
+            "recovered_from_backup": bool(self._recovered_from_bak),
         }
+
+    @torch.no_grad()
+    def _index_crowding(self, st, sample: int = 256):
+        """Mean/max nearest-OTHER cosine over the namespace's subject-key index — the primary delivery
+        path's crowding gauge (higher => keys packing together => false-fire risk climbs toward deliver_tau).
+        Sampled to `sample` query rows (against all keys) so a big store's /cam/stats stays cheap; (None,
+        None) when fewer than 2 keys exist."""
+        n = len(st.subj_keys)
+        if n < 2:
+            return None, None
+        K = torch.stack(st.subj_keys).float()                 # [N,d] unit-norm keys
+        rows = torch.arange(n) if n <= sample else torch.linspace(0, n - 1, sample).long()
+        sims = K[rows] @ K.t()                                # [S,N]
+        sims[torch.arange(len(rows)), rows] = -1.0            # mask each query's self-match
+        nn = sims.max(dim=1).values                          # nearest OTHER per sampled key
+        return round(float(nn.mean()), 3), round(float(nn.max()), 3)
 
     def list_namespaces(self) -> list:
         """Enumerate every live namespace store with its fact count + freeze state (ops / test hygiene;
@@ -1139,7 +1167,8 @@ class CAMMemory:
                 logger.warning("CAMMemory: snapshot %s unreadable (%s); trying fallback.", cand, e)
         if d is None:
             raise FileNotFoundError(f"no readable CAM snapshot at {path} or {path}.bak")
-        if src != path:
+        self._recovered_from_bak = (src != path)
+        if self._recovered_from_bak:
             logger.warning("CAMMemory: primary store %s was bad — recovered from %s.", path, src)
         m = d.get("meta", {})
         if int(m.get("n_banks", self.n_banks)) != self.n_banks:
