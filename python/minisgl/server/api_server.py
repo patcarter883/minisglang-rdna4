@@ -857,6 +857,9 @@ class FrontendManager:
                         cam_evicted=msg.cam_evicted,
                         cam_max_bank_load=msg.cam_max_bank_load,
                         cam_crowded_banks=msg.cam_crowded_banks,
+                        cam_recovered_from_backup=msg.cam_recovered_from_backup,
+                        cam_index_nn_cos_max=msg.cam_index_nn_cos_max,
+                        cam_last_save_age_s=msg.cam_last_save_age_s,
                     )
                 )
                 continue

@@ -730,6 +730,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 cam_evicted=int(_cam_s.get("evicted", 0)),
                 cam_max_bank_load=int(_cam_s.get("max_bank_load", 0)),
                 cam_crowded_banks=int(_cam_s.get("crowded_banks", 0)),
+                cam_recovered_from_backup=int(_cam_s.get("recovered_from_backup", 0)),
+                cam_index_nn_cos_max=float(_cam_s.get("index_nn_cos_max", 0.0)),
+                cam_last_save_age_s=float(_cam_s.get("last_save_age_s", 0.0)),
             )
         )
 
