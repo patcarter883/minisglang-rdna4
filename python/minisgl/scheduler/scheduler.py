@@ -659,7 +659,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
-    def _flush_stats(self) -> None:
+    def _flush_stats(self, force: bool = False) -> None:
         """Wall-clock-throttled scheduler metrics snapshot -> StatsMsg on the detokenizer link.
 
         Called from the I/O receive path (every loop variant funnels through receive_msg), so it fires
@@ -687,7 +687,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if not self._metrics_enabled:
             return
         now = time.time()
-        if now - self._metrics_last_flush < self._metrics_interval:
+        if not force and now - self._metrics_last_flush < self._metrics_interval:
             return
         self._metrics_last_flush = now
 

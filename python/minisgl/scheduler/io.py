@@ -84,9 +84,10 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
-    def _flush_stats(self) -> None:
+    def _flush_stats(self, force: bool = False) -> None:
         """Metrics snapshot hook. Overridden with the real sampler on the Scheduler; a bare mixin (or
-        a scheduler built before metrics wiring) no-ops."""
+        a scheduler built before metrics wiring) no-ops. `force` bypasses the wall-clock throttle so
+        the return-to-idle transition (running->0) is always published (see the blocking receive)."""
         return
 
     def _emit_stats(self, msg: StatsMsg) -> None:
@@ -100,6 +101,11 @@ class SchedulerIOMixin:
         self._flush_stats()
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
+            # About to park until the next request. The throttled flush above may have skipped the
+            # active->idle transition (running->0) if the last request finished within the metrics
+            # interval, so force one final snapshot; otherwise the stale running=1 gauge persists on
+            # the dashboard for the whole idle period.
+            self._flush_stats(force=True)
             self.run_when_idle()
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
@@ -116,6 +122,10 @@ class SchedulerIOMixin:
         self._flush_stats()
         raw_msgs: List[bytes] = []
         if blocking:
+            # Force a final snapshot before parking so the active->idle transition (running->0) is
+            # always published — the throttled flush above skips it for sub-interval requests, which
+            # otherwise strands a stale running=1 on the dashboard. tp-primary only; rank1 no-ops.
+            self._flush_stats(force=True)
             self.run_when_idle()
             raw_msgs.append(self._recv_from_tokenizer.get_raw())
         while not self._recv_from_tokenizer.empty():
