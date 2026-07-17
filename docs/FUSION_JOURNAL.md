@@ -146,3 +146,21 @@ Do NOT attempt the full megakernel first — stage it.
   epilogue, fall back to #3 dense-bf16 SwiGLU (shared expert, lower risk) or shelve. Files: quant/kernels.py
   :325-342 (gemm1+silu), moe_hip/ or the mmq_fp8_moe_gemm kernel. Next iter: read gemm1 kernel + gemm2 epilogue
   precedent; assess feasibility/safety before writing.
+- 2026-07-18 (iter 6 — MoE gemm1+silu FEASIBILITY assessed; FEASIBLE but HIGH-risk quant; CPU only):
+  Read w4a8_fp8_wmma/w4a8_fp8_wmma_rocm/moe_kernel.hip. Decode gemm1 = `moe_gemv_decode_kernel` (:572),
+  output [P, N=2*inter] (gate|up), tiled BY COLUMN (col=blockIdx.x*BN+threadIdx.x) → gate col j and up col
+  j+inter are in DIFFERENT blocks, so a plain epilogue CANNOT pair them. Separate `tail_hip.silu_and_mul`
+  follows (quant/kernels.py:338) = extra launch + [P,2*inter] HBM round-trip. A FUSED reference already
+  exists for the WMMA/large-M path: `moe_gemm1_silu_alds_kernel` (:255) / `_ashuffle_` (:404) decode BOTH
+  dg+du per output j and fuse silu — but "wmma-only, unusable at decode gemv" (the M<=2 path is the plain
+  gemv). **FEASIBLE:** add `moe_gemv_decode_silu` — model on moe_gemv_decode but each thread gemvs gate row
+  j AND up row j+inter (pairing, as the WMMA fused does), silu(gate)*up in fp32, write [P, inter]. Removes
+  the silu launch + gate_up round-trip EVERY MoE layer (highest remaining ROI). **RISK HIGH** (fp8 act ×
+  W4/e2m1, per-row scales/zeros for gate vs up, e2m1-vs-int4 decode) — a subtle scale/zero/shape bug is
+  exactly the silent-corruption the guardrail forbids. **MANDATORY VALIDATION before commit:** op parity vs
+  (moe_gemv_decode + tail_hip.silu_and_mul) across the FULL matrix — M∈{1,2} × int4 AND e2m1 × zeros/no-zeros
+  × a few inter/E/group sizes; likely NOT bit-exact (silu fp32 order differs from tail_hip) so tight rtol
+  (justify); cross-check vs the WMMA moe_gemm1_silu too; THEN a serve smoke on a MoE model. If the quant
+  details can't be validated confidently in ≤3 tries → SHELVE as ATTENDED-RECOMMENDED (do not gamble a quant
+  kernel unattended). Next iter: read moe_gemv_decode_kernel + moe_gemm1_silu_alds_kernel in FULL (scale/zero/
+  group/e2m1 handling) before writing a line.
