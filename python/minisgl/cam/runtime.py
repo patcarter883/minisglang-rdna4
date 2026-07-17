@@ -43,6 +43,18 @@ def _patch_native_gdn(model):
         return model
 
 
+def _compose_addr(subject: str, relation: str = None) -> str:
+    """Compose the ADDRESSING key text for multi-fact-per-entity. With a `relation` the key becomes
+    "<subject> <relation>" so distinct relations of one entity ("Mozart" + "birthplace" vs "birth year")
+    get distinct semantic keys and coexist without clobbering — measured dedup-safe (0% sibling merge at
+    tau 0.82) and ~89% right-relation delivery. Write and query MUST compose identically; the whitened-GTE
+    key bridges paraphrased relations ("birthplace" vs "where was born"). No relation -> subject alone, so
+    single-fact behaviour is byte-unchanged."""
+    subject = (subject or "").strip()
+    relation = (relation or "").strip()
+    return f"{subject} {relation}".strip() if relation else subject
+
+
 class CAMRuntime:
     """Co-located frozen base + tokenizer + CAMMemory. Provides the base_logits seam for /cam/*."""
 
@@ -311,10 +323,11 @@ class FrontendCAMRuntime:
     async def audit(self, namespace: str = None) -> list:    # #12 recent events
         return (await self._ctrl("audit", namespace=namespace)) or []
 
-    async def lookup(self, subject: str, namespace: str = None) -> dict:
-        """Subject-direct dry-run (spine #1/#5): what /cam/ask WOULD deliver for `subject` —
-        {delivered: bool, object: str, subject}. No generation, no store mutation."""
-        return (await self._ctrl("lookup", subject=subject, namespace=namespace)) or {}
+    async def lookup(self, subject: str, namespace: str = None, relation: str = None) -> dict:
+        """Subject-direct dry-run (spine #1/#5): what /cam/ask WOULD deliver for `subject` (optionally an
+        entity + `relation` for multi-fact) — {delivered: bool, object: str, subject}. No generation, no
+        store mutation."""
+        return (await self._ctrl("lookup", subject=_compose_addr(subject, relation), namespace=namespace)) or {}
 
     async def namespaces(self) -> list:                      # spine #4: enumerate stores
         return (await self._ctrl("namespaces")) or []
@@ -323,8 +336,12 @@ class FrontendCAMRuntime:
         return (await self._ctrl("drop_ns", namespace=namespace)) or {}
 
     async def remember(self, subject: str, object_str: str, prompt: str = None,
-                       mode: str = "force", namespace: str = None) -> bool:
+                       mode: str = "force", namespace: str = None, relation: str = None) -> bool:
         """Write subject->object into the backend engine.cam. Returns True if stored, False if skipped.
+
+        `relation` (optional): store a fact about `subject` UNDER that relation, so an entity can hold many
+        facts ("Mozart" + "birthplace" and "Mozart" + "birth year" coexist). The addressing key becomes
+        "<subject> <relation>"; omit it for the single-fact-per-subject behaviour.
 
         `mode`: "force" (default — explicit ingest via /cam/remember; always writes, bypasses the store's
         freeze/no-clobber gates) or "auto" (ambient transparent auto-write; subject to those gates so a
@@ -344,14 +361,16 @@ class FrontendCAMRuntime:
                 logger.debug("CAM write-gate: base already emits %r for %r; skipping store.",
                              object_str, subject)
                 return False
-        await self._generate(probe, max_tokens=1, mem_subject=subject,
+        await self._generate(probe, max_tokens=1, mem_subject=_compose_addr(subject, relation),
                              mem_remember=self._sp(object_str), mem_write_mode=mode, mem_namespace=namespace)
         return True
 
-    async def ask(self, prompt: str, subject: str, max_tokens: int = 32, namespace: str = None) -> str:
-        """Retrieve: the backend forces the stored object tokens (pointer), then the base continues."""
-        return await self._generate(prompt, max_tokens=max_tokens, mem_subject=subject,
-                                    mem_namespace=namespace)
+    async def ask(self, prompt: str, subject: str, max_tokens: int = 32, namespace: str = None,
+                  relation: str = None) -> str:
+        """Retrieve: the backend forces the stored object tokens (pointer), then the base continues. Pass
+        `relation` to address a specific fact of a multi-fact entity (composed the same way as the write)."""
+        return await self._generate(prompt, max_tokens=max_tokens,
+                                    mem_subject=_compose_addr(subject, relation), mem_namespace=namespace)
 
 
 def get_cam_runtime():

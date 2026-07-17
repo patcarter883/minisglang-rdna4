@@ -80,7 +80,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List
+from typing import List, Optional
+
+from ..cam.runtime import _compose_addr
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -98,6 +100,8 @@ class RememberRequest(BaseModel):
     subject: str
     prompt: str
     object: str
+    relation: Optional[str] = None   # multi-fact: store this fact of `subject` under a relation
+                                     # ("Mozart" + "birthplace"); omit for one-fact-per-subject
 
 
 class RememberResponse(BaseModel):
@@ -115,6 +119,8 @@ class RememberResponse(BaseModel):
 class AskRequest(BaseModel):
     prompt: str
     subject: str
+    relation: Optional[str] = None   # multi-fact: address a specific fact of `subject` (same relation
+                                     # you stored it under, or a paraphrase — the GTE key bridges them)
     # Optional decode cap; router injection stops once the object's first token lands (seed-once),
     # the base then continues fluently up to this many tokens (or EOS).
     max_tokens: int = _DEFAULT_ASK_MAX_TOKENS
@@ -227,7 +233,8 @@ async def remember(req: RememberRequest, x_cam_namespace: str = Header(None)) ->
     if getattr(runtime, "is_frontend_share", False):
         if not _encode_sp(runtime.tokenizer, req.subject):
             raise HTTPException(status_code=422, detail="subject tokenized to empty")
-        stored = await runtime.remember(req.subject, req.object, req.prompt, namespace=x_cam_namespace)
+        stored = await runtime.remember(req.subject, req.object, req.prompt, namespace=x_cam_namespace,
+                                        relation=req.relation)
         # base_p is 0.0 in frontend mode (no logit seam), so report the real gate verdict instead (#3).
         gated = os.environ.get("MINISGL_CAM_WRITE_GATE") == "1"
         gate_reason = ("novel" if stored else "base-known") if gated else "forced"
@@ -235,7 +242,7 @@ async def remember(req: RememberRequest, x_cam_namespace: str = Header(None)) ->
     tok = runtime.tokenizer
     memory = runtime.memory
 
-    subject_ids = _encode_sp(tok, req.subject)
+    subject_ids = _encode_sp(tok, _compose_addr(req.subject, req.relation))
     object_ids = _encode_sp(tok, req.object)
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
@@ -270,9 +277,9 @@ async def ask(req: AskRequest, x_cam_namespace: str = Header(None)) -> AskRespon
     if getattr(runtime, "is_frontend_share", False):
         # Dry-run the subject first so we can echo the EXACT delivered object (#1) — the base confabulates
         # past it in `text`, so substring-matching is lossy; `object` gives the client an exact readback.
-        lk = await runtime.lookup(req.subject, namespace=x_cam_namespace)
+        lk = await runtime.lookup(req.subject, namespace=x_cam_namespace, relation=req.relation)
         text = await runtime.ask(req.prompt, req.subject, max(1, int(req.max_tokens)),
-                                 namespace=x_cam_namespace)
+                                 namespace=x_cam_namespace, relation=req.relation)
         return AskResponse(text=text.replace("\n", " ").strip(),
                            delivered=bool(lk.get("delivered")), object=lk.get("object", ""),
                            mode_served="pointer")
@@ -284,10 +291,10 @@ async def ask(req: AskRequest, x_cam_namespace: str = Header(None)) -> AskRespon
     # decode loop, so it falls through to the logit-only router path below.
     ask_tap = getattr(runtime, "ask_tap", None)
     if ask_tap is not None:
-        text = ask_tap(req.prompt, req.subject, max(1, int(req.max_tokens)))
+        text = ask_tap(req.prompt, _compose_addr(req.subject, req.relation), max(1, int(req.max_tokens)))
         return AskResponse(text=text.replace("\n", " ").strip())
 
-    subject_ids = _encode_sp(tok, req.subject)
+    subject_ids = _encode_sp(tok, _compose_addr(req.subject, req.relation))
     if not subject_ids:
         raise HTTPException(status_code=422, detail="subject tokenized to empty")
 
@@ -488,19 +495,21 @@ async def delete_fact(subject: str, x_cam_namespace: str = Header(None)) -> Dele
 
 
 @cam_router.get("/lookup")
-async def lookup(subject: str = None, text: str = None, x_cam_namespace: str = Header(None)):
-    """DRY-RUN what a query would match (spine #5). `?subject=` -> the exact object /cam/ask WOULD deliver
-    ({delivered, object}); `?text=` -> the transparent-read span matches ([{subject, object}]). Neither
-    mutates the store; lets a client debug why a match did/didn't happen."""
+async def lookup(subject: str = None, text: str = None, relation: str = None,
+                 x_cam_namespace: str = Header(None)):
+    """DRY-RUN what a query would match (spine #5). `?subject=` (optionally `&relation=` for a multi-fact
+    entity) -> the exact object /cam/ask WOULD deliver ({delivered, object}); `?text=` -> the transparent-
+    read span matches ([{subject, object}]). Neither mutates the store; lets a client debug a match."""
     runtime = _get_runtime()
     if subject:
         if hasattr(runtime, "lookup"):
-            return await runtime.lookup(subject, namespace=x_cam_namespace)
+            return await runtime.lookup(subject, namespace=x_cam_namespace, relation=relation)
         memory, tok = getattr(runtime, "memory", None), getattr(runtime, "tokenizer", None)
         if memory is None or tok is None:
             raise HTTPException(status_code=503, detail="CAM lookup unavailable")
-        oids = memory.deliver_object_ids(_encode_sp(tok, subject), x_cam_namespace)
-        return {"delivered": bool(oids), "subject": subject,
+        addr = _compose_addr(subject, relation)
+        oids = memory.deliver_object_ids(_encode_sp(tok, addr), x_cam_namespace)
+        return {"delivered": bool(oids), "subject": addr,
                 "object": tok.decode(oids).strip() if oids else ""}
     if text:
         if hasattr(runtime, "retrieve"):
