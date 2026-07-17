@@ -53,7 +53,8 @@ def run():
     n = cam.snapshot(path)                                   # save #1
     check("snapshot returns fact count", n == 2)
     check("primary written", os.path.isfile(path))
-    check("temp cleaned up (atomic)", not os.path.exists(path + ".tmp"))
+    import glob as _glob
+    check("temp cleaned up (atomic)", not _glob.glob(path + ".*.tmp") and not os.path.exists(path + ".tmp"))
     check("no .bak on first save", not os.path.exists(path + ".bak"))
 
     cam.snapshot(path)                                       # save #2 -> retains #1 as .bak
