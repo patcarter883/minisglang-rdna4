@@ -109,6 +109,9 @@ class BackendSnapshot:
     cam_evicted: int = 0
     cam_max_bank_load: int = 0
     cam_crowded_banks: int = 0
+    cam_recovered_from_backup: int = 0
+    cam_index_nn_cos_max: float = 0.0
+    cam_last_save_age_s: float = 0.0
 
 
 class FrontendMetrics:
@@ -189,6 +192,10 @@ class FrontendMetrics:
             total.cam_evicted += s.cam_evicted
             total.cam_crowded_banks += s.cam_crowded_banks
             total.cam_max_bank_load = max(total.cam_max_bank_load, s.cam_max_bank_load)
+            # health signals: worst-case across replicas (any recovery, worst crowding, stalest save)
+            total.cam_recovered_from_backup = max(total.cam_recovered_from_backup, s.cam_recovered_from_backup)
+            total.cam_index_nn_cos_max = max(total.cam_index_nn_cos_max, s.cam_index_nn_cos_max)
+            total.cam_last_save_age_s = max(total.cam_last_save_age_s, s.cam_last_save_age_s)
         return total
 
     def render(self) -> str:
@@ -279,6 +286,22 @@ class FrontendMetrics:
               b.cam_max_bank_load)
         gauge("minisgl_cam_crowded_banks",
               "Product-key banks past the crowding knee (>9 edits).", b.cam_crowded_banks)
+        # ---- store-health / robustness signals (pageable) ----------------------------------------
+        # Best-effort under TP>1: both ranks share the store file, so the FIRST to restore recovers from
+        # .bak (flag=1) and its autosave repairs the primary before the other rank restores — that rank
+        # (which may be the metrics emitter) then loads the healthy primary and reports 0. So 1 always
+        # means a real recovery happened; 0 does NOT guarantee none occurred. Data recovery itself is
+        # reliable regardless. A rank0-authoritative-store change would make this signal exact.
+        gauge("minisgl_cam_recovered_from_backup",
+              "1 if boot restored the store from .bak (primary corrupt/lost) — ALERT. Best-effort under "
+              "TP>1: 1 => real recovery; 0 does not guarantee none (recovery may land on a non-emitting rank).",
+              b.cam_recovered_from_backup)
+        gauge("minisgl_cam_index_nn_cos_max",
+              "Worst nearest-neighbour cosine in the delivery index; nearing deliver_tau => keys "
+              "crowding, false-fire risk climbs (interference wall).", b.cam_index_nn_cos_max)
+        gauge("minisgl_cam_last_save_age_seconds",
+              "Seconds since the store last persisted; high => writes at risk / autosave stalled.",
+              b.cam_last_save_age_s)
 
         return "\n".join(lines) + "\n"
 

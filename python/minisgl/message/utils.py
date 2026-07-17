@@ -43,6 +43,9 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "cam_evicted",
         "cam_max_bank_load",
         "cam_crowded_banks",
+        "cam_recovered_from_backup",
+        "cam_index_nn_cos_max",
+        "cam_last_save_age_s",
     ),
     "StatsFrontendMsg": (
         "dp_rank",
@@ -61,6 +64,9 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "cam_evicted",
         "cam_max_bank_load",
         "cam_crowded_banks",
+        "cam_recovered_from_backup",
+        "cam_index_nn_cos_max",
+        "cam_last_save_age_s",
     ),
 }
 
