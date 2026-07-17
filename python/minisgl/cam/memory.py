@@ -817,11 +817,17 @@ class CAMMemory:
             mu = torch.tensor(np.asarray(art["mu"], dtype=np.float32))
             W = torch.tensor(np.asarray(art["W"], dtype=np.float32))
             self._gte = (enc, mu, W)
-            # GTE cosine scale differs from base-embed's: paraphrases land ~0.7-0.9, unrelated ~0.2, so
-            # the base-embed-calibrated 0.7 default is a touch high. Drop to a GTE default unless the
-            # operator set MINISGL_CAM_DELIVER_TAU explicitly.
+            # Delivery threshold in whitened-GTE cosine space, set from a measured precision/recall curve
+            # (tools/cam_gte_deliver_tau_measure): a query paraphrasing a STORED subject should deliver
+            # (recall), a DIFFERENT subject should not (precision). At scale (store 1000 real subjects,
+            # query 1000 held-out distinct ones) the nearest-stored cosine reaches into the paraphrase
+            # band, so a low tau false-fires: 0.55 -> 16% of unrelated queries wrongly deliver AND a
+            # related entity ("Leopold Mozart" vs stored "Mozart", cos ~0.68) fires. 0.70 cuts false-fire
+            # to ~2% and zeros the related-entity fires while still delivering ~88% of paraphrases — a
+            # wrong delivery (assert a false fact) is worse than a miss (graceful base fallback), so bias
+            # to precision. Operator override via MINISGL_CAM_DELIVER_TAU always wins.
             if "MINISGL_CAM_DELIVER_TAU" not in os.environ:
-                self.deliver_tau = float(os.environ.get("MINISGL_CAM_GTE_DELIVER_TAU", "0.55"))
+                self.deliver_tau = float(os.environ.get("MINISGL_CAM_GTE_DELIVER_TAU", "0.70"))
                 self.protect_tau = self.deliver_tau if "MINISGL_CAM_PROTECT_TAU" not in os.environ else self.protect_tau
             # Semantic key is now live, so paraphrase re-remembers collide — enable write-side dedup at a
             # measured, silent-data-loss-safe threshold (above the ~0.79 distinct-subject ceiling).
