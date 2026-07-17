@@ -353,6 +353,7 @@ services:
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
       - ${MINISGL_CAM_CHECKPOINT_HOST:-/home/pat/code/memory-organ-softsteer/cam_ckpt}:/cam_ckpt:ro
       - ${MINISGL_CAM_STORE_HOST:-./.cam_store}:/cam_store
+      - ${MINISGL_CAM_GTE_HOST:-/home/pat/code/minisgl-rdna4/.cam_gte}:/cam_gte:ro   # whitened-GTE key artifact (opt-in)
     environment:
       <<: *lean-env
       MINISGL_CAM: "1"
@@ -364,6 +365,8 @@ services:
       MINISGL_CAM_STORE_PATH: /cam_store/store.pt              # #7 load-on-boot + debounced autosave
       MINISGL_CAM_MAX_FACTS: "${MINISGL_CAM_MAX_FACTS:-0}"     # 0 = no LRU eviction cap
       MINISGL_CAM_REQ_KV_FRAC: "${MINISGL_CAM_REQ_KV_FRAC:-0.70}"  # runaway-generation-kv-guard: force-finish a single req at 70% of the KV pool
+      MINISGL_CAM_GTE_KEY: "${MINISGL_CAM_GTE_KEY:-0}"          # 1 = whitened-GTE semantic subject key (paraphrase-robust addressing 0.06->0.43)
+      MINISGL_CAM_GTE_WHITEN: /cam_gte/gte_whiten.pkl
       MINISGL_MOE_SCATTER: "0"
     entrypoint: ["bash", "-lc"]
     command:
