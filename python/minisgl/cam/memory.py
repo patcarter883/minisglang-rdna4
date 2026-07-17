@@ -450,7 +450,7 @@ class CAMMemory:
     """
 
     def __init__(self, checkpoint_dir: Optional[str], base_embed, lm_head_weight: torch.Tensor,
-                 pointer_only: bool = False):
+                 pointer_only: bool = False, decode=None):
         self.enabled = False
         # POINTER/RETRIEVE-ONLY mode (set when the served model lacks the tap seam, e.g. MoE 35B): the
         # trained tap/adapter/router are dimensioned to the CHECKPOINT's base and would matmul-mismatch a
@@ -584,6 +584,18 @@ class CAMMemory:
         self._subj_tuple: List[tuple] = []                   # parallel tuple(subject_ids) (update/forget)
         self.deliver_tau = float(os.environ.get("MINISGL_CAM_DELIVER_TAU", "0.7"))
         self.enabled = True
+        # ---- whitened-GTE semantic subject key (opt-in: MINISGL_CAM_GTE_KEY=1) --------------------------
+        # The base-embed key above is LEXICAL: it addresses a paraphrased subject poorly (bake-off
+        # addr_para 0.06). A whitened GTE-ModernColBERT key lifts paraphrase addressing to ~0.43 — semantic
+        # similarity plus soft-ZCA whitening (which kills the anisotropy that otherwise makes semantic keys
+        # collide: NN-cos 0.99 -> 0.58). `_decode` (subject_ids -> text) lets _subj_key encode from text with
+        # no threading through every call site; store keys rebuilt from facts on load become GTE keys too.
+        # Loads lazily on CPU (short subjects encode in ms; keeps GPU for the base) and falls back to the
+        # base-embed key if the encoder or artifact is missing, so a misconfig degrades, never crashes.
+        self._gte = None            # (encoder, mu, W) when active; None -> base-embed key
+        self._decode = decode       # callable(subject_ids)->str, set by the caller (scheduler tokenizer)
+        if os.environ.get("MINISGL_CAM_GTE_KEY") == "1":
+            self._load_gte_key()
         # ---- write gating (protect a curated/ingested store from ambient auto-write) -------------------
         # frozen: read-only — refuse AMBIENT auto-write (explicit force ingest still writes). Flip at
         #   runtime via freeze()/unfreeze() (POST /cam/freeze) or start frozen with MINISGL_CAM_FROZEN=1.
@@ -761,12 +773,57 @@ class CAMMemory:
             return False
 
     @torch.no_grad()
+    def _load_gte_key(self) -> None:
+        """Load the whitened-GTE key: a GTE-ModernColBERT encoder (CPU) + the soft-ZCA (mu, W) artifact
+        (MINISGL_CAM_GTE_WHITEN). On ANY failure (no pylate / model / artifact) leave self._gte = None so
+        _subj_key falls back to the base-embed key — the feature degrades, it never breaks the serve."""
+        import pickle
+        try:
+            import numpy as np
+            from .gte_encoder import GTEEncoder
+            path = os.environ.get("MINISGL_CAM_GTE_WHITEN", "/cam_gte/gte_whiten.pkl")
+            art = pickle.load(open(path, "rb"))
+            model = os.environ.get("MINISGL_CAM_GTE_MODEL", art.get("model", "lightonai/GTE-ModernColBERT-v1"))
+            enc = GTEEncoder(model)
+            mu = torch.tensor(np.asarray(art["mu"], dtype=np.float32))
+            W = torch.tensor(np.asarray(art["W"], dtype=np.float32))
+            self._gte = (enc, mu, W)
+            # GTE cosine scale differs from base-embed's: paraphrases land ~0.7-0.9, unrelated ~0.2, so
+            # the base-embed-calibrated 0.7 default is a touch high. Drop to a GTE default unless the
+            # operator set MINISGL_CAM_DELIVER_TAU explicitly.
+            if "MINISGL_CAM_DELIVER_TAU" not in os.environ:
+                self.deliver_tau = float(os.environ.get("MINISGL_CAM_GTE_DELIVER_TAU", "0.55"))
+                self.protect_tau = self.deliver_tau if "MINISGL_CAM_PROTECT_TAU" not in os.environ else self.protect_tau
+            print(f"CAM: whitened-GTE subject key ACTIVE (model={model}, dim={int(W.shape[0])}, tau={self.deliver_tau}, "
+                  f"whiten-fit n={art.get('n_fit')}, nn {art.get('nn_raw')}->{art.get('nn_whitened')})", flush=True)
+        except Exception as e:  # noqa: BLE001 — degrade to base-embed key, don't crash
+            self._gte = None
+            print(f"CAM: whitened-GTE key requested but unavailable ({e}); using the base-embed key", flush=True)
+
+    @torch.no_grad()
+    def _gte_key(self, text: str) -> torch.Tensor:
+        """Whitened-GTE subject key from TEXT: masked-mean-pooled GTE key -> (g-mu)@W -> L2-norm."""
+        enc, mu, W = self._gte
+        g = enc.encode([text or ""])[0]                      # [dim]
+        return F.normalize((g - mu) @ W, dim=-1)
+
     def _subj_key(self, subject_ids: List[int]) -> torch.Tensor:
-        """Paraphrase-robust subject key: L2-normalised MEAN of the base input embeddings over the subject
-        tokens (order-invariant, title/case robust under cosine). [base_hidden]."""
+        """Subject key for the cosine index. Default: L2-normalised MEAN of the base input embeddings over
+        the subject tokens (lexical, order/title/case robust). With MINISGL_CAM_GTE_KEY=1 (and a decoder
+        wired): a whitened-GTE semantic key instead — decode the ids back to text and encode, so both stored
+        keys and query keys live in the same whitened-GTE space and paraphrased subjects address correctly."""
+        if self._gte is not None and self._decode is not None:
+            return self._gte_key(self._decode(subject_ids))
         ids = torch.tensor([list(subject_ids)], dtype=torch.long, device=self._embed_w.device)
         e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
         return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
+
+    def reindex(self) -> None:
+        """Rebuild every namespace's cosine subject keys from its stored facts under the CURRENT _subj_key.
+        Used after the GTE decoder is wired so a store loaded with base-embed keys migrates into the GTE
+        key space (the object/fact tables are untouched — only the derived keys are recomputed)."""
+        for st in self._ns_states.values():
+            st.subj_keys[:] = [self._subj_key(list(t)) for t in st.subj_tuple]
 
     # ---- write gating (freeze / no-clobber) ------------------------------------------------------
     @torch.no_grad()
