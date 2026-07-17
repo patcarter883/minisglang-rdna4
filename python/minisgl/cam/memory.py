@@ -1128,7 +1128,11 @@ class CAMMemory:
         # for logical-corruption recovery), then os.replace(tmp -> path) which is atomic on POSIX: `path`
         # is always either the old good file or the new one, never half-written. restore() falls back to
         # `.bak` if `path` is missing/corrupt.
-        tmp = f"{path}.tmp"
+        # The temp name is PID-unique because under TP>1 both rank processes share the store mount and
+        # autosave the (identical) store concurrently — a shared temp name collides (one rank's replace
+        # consumes the other's temp -> ENOENT). Each process publishes its own temp; the renames are
+        # atomic so last-writer-wins with no corruption.
+        tmp = f"{path}.{os.getpid()}.tmp"
         torch.save(payload, tmp)
         with open(tmp, "rb") as f:
             os.fsync(f.fileno())                              # flush the data before we publish it
