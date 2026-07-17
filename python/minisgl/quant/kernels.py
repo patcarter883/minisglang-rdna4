@@ -76,6 +76,15 @@ _MOE_ALIGN_HIP = _os.environ.get("MINISGL_MOE_ALIGN", "1") != "0"
 # stack). silu_and_mul is dtype-generic (fp16 MoE intermediates / bf16 / fp32).
 _TAIL_HIP = _os.environ.get("MINISGL_TAIL_HIP", "1") != "0"
 _SILU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Fused gemm1 + silu_and_mul decode path (mmq_fp8_moe_gemm1_silu, kernel="gemv" -> moe_gemv_decode_silu):
+# one warp per FUSED output col computes gate (weight col j) AND up (col j+inter) sharing the gathered fp8
+# activation, then writes silu(gate)*up to (P, inter) directly -- dropping the separate silu launch AND the
+# (P, 2*inter) out1 HBM round-trip. Reuses the WMMA fused path's exact epilogue (moe_silu_and_mul_h), so it
+# is bit-identical to that already-validated fused kernel; vs the tail_hip.silu_and_mul reference it can
+# differ only in silu's last-bit fp32 rounding. fp16/bf16 only. MINISGL_MOE_FUSED_SILU=0 reverts to
+# gemm1 + tail_hip.silu_and_mul.
+_MOE_FUSED_SILU = _os.environ.get("MINISGL_MOE_FUSED_SILU", "1") != "0"
+_FUSED_SILU_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def _moe_time(bucket: str, fn):
@@ -322,29 +331,40 @@ def w4a8_moe(
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their
     # NATIVE dtype — a bf16 model no longer round-trips bf16->fp16->bf16 here (out1 follows x's dtype).
     x16 = _moe_time("cast", lambda: x.contiguous())
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
-    out1 = _moe_time(
-        "gemm1",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-            x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
-            kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
-        ),
-    )  # (P, 2*inter) in x's dtype
-    d = out1.shape[1] // 2
-    # Gated SiLU-mul: the fp16 MoE intermediates (out1 is fp16) now route through the dtype-generic
-    # native HIP tail_hip.silu_and_mul (one launch, fp32-internal, no temps) — replacing the multi-op
-    # torch chain (silu+mul+float+cast+contiguous). MINISGL_TAIL_HIP=0 reverts to the torch ref.
-    # (The gemm1-epilogue fused silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
-    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
-        import tail_hip  # canonical package: silu_and_mul is a module-level callable
-
-        engaged("tail_hip.silu_and_mul")
-        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
-    else:
+    # Gated gemm1 + SiLU-mul. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
+    # dropping the separate silu launch and the (P, 2*inter) out1 round-trip. The gemm1-epilogue fusion
+    # is now available at DECODE too via the moe_gemv_decode_silu kernel (kernel="gemv"), not just the
+    # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
+    # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
+    if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
+        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
         buf2 = _moe_time(
-            "silu",
-            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(out1.dtype).contiguous(),
-        )
+            "gemm1silu",
+            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
+                x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, inter) in x's dtype
+    else:
+        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
+        out1 = _moe_time(
+            "gemm1",
+            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+                x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, 2*inter) in x's dtype
+        d = out1.shape[1] // 2
+        if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+            import tail_hip  # canonical package: silu_and_mul is a module-level callable
+
+            engaged("tail_hip.silu_and_mul")
+            buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
+        else:
+            buf2 = _moe_time(
+                "silu",
+                lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(out1.dtype).contiguous(),
+            )
 
     tw_flat = topk_weights.reshape(-1).float().contiguous()
     # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE kernel (mmq_fp8_moe_gemm_scatter):
