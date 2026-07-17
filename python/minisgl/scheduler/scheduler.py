@@ -1520,11 +1520,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # cosine subject key is case/order-robust and tau-gated, so windows that address nothing self-
         # reject (unknown subjects max-cos ~0.5 < deliver_tau 0.7). Bound the word budget so a huge agent
         # prompt can't explode the candidate count.
+        # Interrogatives (what/where/when/...) carry the RELATION signal for multi-fact retrieval: "WHERE
+        # was Mozart born" addresses the birthplace fact, "WHEN was Mozart born" the birth-year fact.
+        # They stay in _STOP for the TRAILING trim and the all-stop check, but are allowed at the LEADING
+        # boundary (_LEAD_STOP) so "Where was Mozart born" survives as a candidate while "Mozart born where"
+        # still trims to "Mozart born". Without this the disambiguator is stripped and both collapse to the
+        # ambiguous "Mozart born" (measured: fixes the one transparent multi-fact miss, 6/7 -> 7/7).
+        _INTERROG = {"what", "which", "who", "whom", "whose", "where", "when", "why", "how"}
         _STOP = {"a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was",
-                 "were", "be", "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
-                 "does", "do", "did", "that", "this", "these", "those", "it", "its", "his", "her", "their",
-                 "your", "my", "you", "he", "she", "they", "we", "as", "by", "with", "from", "about",
-                 "tell", "me", "please", "can", "could", "would", "will", "s"}
+                 "were", "be", "does", "do", "did", "that", "this", "these", "those", "it", "its", "his",
+                 "her", "their", "your", "my", "you", "he", "she", "they", "we", "as", "by", "with",
+                 "from", "about", "tell", "me", "please", "can", "could", "would", "will", "s"} | _INTERROG
+        _LEAD_STOP = _STOP - _INTERROG
         # Split on sentence/clause punctuation FIRST so a window can't cross a boundary and swallow the
         # next clause's words (ngram-window-slop: "What is the capital of Zorbia? Just the name." must not
         # yield "capital of Zorbia Just" — the stray word dilutes the cosine key). Windows are generated
@@ -1542,8 +1549,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     if i + L > n:
                         break
                     span = words[i:i + L]
-                    if span[0].lower() in _STOP or span[-1].lower() in _STOP:
-                        continue                              # trim stopword boundaries -> "capital of Zorbia"
+                    if span[0].lower() in _LEAD_STOP or span[-1].lower() in _STOP:
+                        continue                              # trim stopword boundaries (leading interrogatives kept)
                     if all(w.lower() in _STOP for w in span):
                         continue
                     cands.add(" ".join(span))
