@@ -1,5 +1,11 @@
 # Kernel-fusion overnight loop — charter + journal
 
+> **STATUS: COMPLETE (2026-07-18 ~00:55).** Safely-unattended high-ROI shortlist exhausted. Shipped 1
+> validated fusion (GDN gated-norm, bit-exact + serve-clean). Highest remaining target (MoE gemm1+silu)
+> SHELVED as attended-recommended — a major quantized-gemv restructure with tol-only (not bit-exact)
+> validation; warrants human review, not unattended commit. See the final LOG entry + backlog below.
+
+
 Autonomous, unattended. Goal: reduce **bs=1 decode latency** on gfx1201 by fusing per-layer op chains.
 Proven this session by elimination: bs=1 decode (~40 tok/s = 25ms/tok) is **~90% overhead** (kernel
 dispatch + tiny memory-bound gemvs + GDN/MoE glue), NOT bandwidth (mem-OC flat) nor comms (fp8/gather
@@ -164,3 +170,32 @@ Do NOT attempt the full megakernel first — stage it.
   details can't be validated confidently in ≤3 tries → SHELVE as ATTENDED-RECOMMENDED (do not gamble a quant
   kernel unattended). Next iter: read moe_gemv_decode_kernel + moe_gemm1_silu_alds_kernel in FULL (scale/zero/
   group/e2m1 handling) before writing a line.
+- 2026-07-18 (iter 7 — MoE gemm1+silu SHELVED (attended-recommended); loop COMPLETE; CPU only):
+  Finished reading moe_gemv_decode (output: `out[row*N+col]=(AT)(acc*a_scale)`, :207/scatter :205) + the
+  WMMA fused silu (`moe_gemm1_silu_alds`: separate accg/accu, gate scale `ws_e[abs_n]` vs up scale
+  `ws_e[inter+abs_n]`, run_g/run_u then silu*mul). VERDICT: the decode-gemv silu fusion is a MAJOR
+  RESTRUCTURE of moe_gemv_decode (per-warp COLS cols → for each out col j<inter compute gate row j AND up
+  row j+inter: dual acc_gate/acc_up, 2x weight+scale+zp loads, e2m1 AND int4 paths, the gather) and CANNOT
+  be bit-exact (out1 fp8/bf16 store + silu-order differ from tail_hip.silu_and_mul) → TOL-ONLY parity.
+  Major quant restructure + tol-only validation = the exact silent-corruption profile the guardrail says
+  NOT to commit unattended. **SHELVED — ATTENDED-RECOMMENDED** (do it with human review of the quant kernel).
+  Remaining shortlist has no clean bit-exact high-ROI target: #3 SwiGLU = same gemv-restructure class
+  (tol-only); #4 qkv-merge = bit-exact-able (reuse LinearColParallelMerged) but quant-weight-concat + only
+  1/4 (full-attn) layers. Safely-unattended shortlist EXHAUSTED after GDN Stage B. **LOOP COMPLETE.**
+
+## OVERNIGHT RESULT (for morning review)
+- **SHIPPED (validated, on branch feat/kernel-fusion):** GDN gated-norm fusion `gdn_decode_gated` —
+  gdn_decode + rmsnorm_gated → 1 kernel (−1 launch + core HBM round-trip), on 75% of 35B layers + all dense
+  4B GDN layers. BIT-EXACT (output+ssm_state, max|Δ|=0), 1.16x op-level, 4B TP=1 serve smoke COHERENT with
+  [hip-engage] confirming the fused kernel runs. Commits: kernels `fa83125`, engine `ef618f0` (defensive:
+  MINISGL_GDN_FUSED_NORM default-1 + hasattr fallback). Harness: tools/gdn_decode_gated_{parity,bench}.py,
+  tools/car_gdn_fused_smoke.sh.
+- **CORRECTLY AVOIDED (negative results, read not trial):** Stage-A GDN `.contiguous()` copies (no-op at
+  bs=1); Stage-C conv-prologue fusion (per-channel/GQA state-race); confirms GDN optimally fused at 3→2.
+- **BACKLOG (attended-recommended, scoped):** (1) MoE gemm1+silu → `moe_gemv_decode_silu` (restructure
+  moe_gemv_decode to pair gate row j + up row j+inter, silu(gate)*up, write [P,inter]; model on the WMMA
+  `moe_gemm1_silu_alds`; parity vs moe_gemv_decode+tail_hip.silu_and_mul across M{1,2}×int4/e2m1×zeros×sizes,
+  TOL-based; then serve smoke; HIGHEST remaining ROI, every MoE layer). (2) qkv-merge for full-attn layers
+  (bit-exact, reuse merged-linear; lower ROI). (3) dense/shared SwiGLU (same restructure as #1).
+- Next attended session: pick up the MoE fusion (#1) with human review of the quant kernel — it's the real
+  remaining win but needs the careful validation a quant restructure warrants.
