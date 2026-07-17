@@ -1099,14 +1099,22 @@ class CAMMemory:
         the per-namespace fact dicts). facts/evicted/crowded are summed; max_bank_load is the max."""
         facts = evicted = crowded = 0
         max_load = 0
+        nn_max = 0.0
         for ns in list(self._ns_states):
             s = self.stats(ns)
             facts += s["total_edits"]
             evicted += int(s.get("evicted", 0))
             crowded += len(s.get("crowded_banks", []))
             max_load = max(max_load, int(s["max_bank_load"]))
+            nn = s.get("index_nn_cos_max")            # worst cosine-index crowding across namespaces
+            if nn is not None:
+                nn_max = max(nn_max, float(nn))
+        age = (time.time() - self._last_save) if (self.store_path and self._last_save) else 0.0
         return {"facts": facts, "namespaces": len(self._ns_states), "evicted": evicted,
-                "max_bank_load": max_load, "crowded_banks": crowded}
+                "max_bank_load": max_load, "crowded_banks": crowded,
+                "recovered_from_backup": int(bool(self._recovered_from_bak)),  # ops ALERT (primary was lost)
+                "index_nn_cos_max": round(nn_max, 3),      # interference-wall gauge (vs deliver_tau)
+                "last_save_age_s": round(age, 1)}          # durability risk (unpersisted writes)
 
     @torch.no_grad()
     def snapshot(self, path: str) -> int:
