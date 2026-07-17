@@ -374,6 +374,7 @@ services:
       MINISGL_CAM_REQ_KV_FRAC: "${MINISGL_CAM_REQ_KV_FRAC:-0.70}"  # runaway-generation-kv-guard: force-finish a single req at 70% of the KV pool
       MINISGL_CAM_GTE_KEY: "${MINISGL_CAM_GTE_KEY:-0}"          # 1 = whitened-GTE semantic subject key (paraphrase-robust addressing 0.06->0.43)
       MINISGL_CAM_GTE_WHITEN: /cam_gte/gte_whiten.pkl
+      MINISGL_CAM_WRITE_DEDUP_TAU: "${MINISGL_CAM_WRITE_DEDUP_TAU:-}"  # write-side paraphrase dedup cosine; blank => 0.82 under GTE (measured safe), 1.0 (off) on base-embed
       MINISGL_MOE_SCATTER: "0"
     entrypoint: ["bash", "-lc"]
     command:

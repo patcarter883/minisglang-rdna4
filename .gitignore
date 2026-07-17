@@ -68,3 +68,4 @@ tools/ddtree_cap.*.log
 tools/ll.*.json
 tools/kperf_results/
 tools/tp2_results/
+.cam_gte/
