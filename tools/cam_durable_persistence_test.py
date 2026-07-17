@@ -65,11 +65,15 @@ def run():
     check("round-trip facts intact", set(r._ns_states["default"].facts) == {(1, 2), (3,)})
     check("index rebuilt", len(r._ns_states["default"].subj_keys) == 2)
 
+    check("clean restore -> recovered flag False", getattr(r, "_recovered_from_bak", None) is False)
+
     # TORN primary (simulate a kill mid-write leaving garbage) -> must recover from .bak
     with open(path, "wb") as f:
         f.write(b"\x00torn half-written garbage")
     r2 = make_cam(); r2._ns_states = {}
     check("torn primary -> recovers from .bak", r2.restore(path) == 2)
+    # the flag metrics_summary reads as int(bool(...)) -> feeds minisgl_cam_recovered_from_backup
+    check("torn recovery -> recovered flag True (== gauge 1)", r2._recovered_from_bak is True)
 
     # MISSING primary (crash between the two renames) -> must recover from .bak
     os.remove(path)

@@ -59,3 +59,6 @@ class StatsFrontendMsg(BaseFrontendMsg):
     cam_evicted: int = 0
     cam_max_bank_load: int = 0
     cam_crowded_banks: int = 0
+    cam_recovered_from_backup: int = 0    # 1 if boot restored from .bak (primary store was lost)
+    cam_index_nn_cos_max: float = 0.0     # worst cosine-index crowding (vs deliver_tau = interference wall)
+    cam_last_save_age_s: float = 0.0      # seconds since last successful store save (durability risk)

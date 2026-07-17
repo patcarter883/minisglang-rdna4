@@ -124,6 +124,9 @@ def tokenize_worker(
                         cam_evicted=sm.cam_evicted,
                         cam_max_bank_load=sm.cam_max_bank_load,
                         cam_crowded_banks=sm.cam_crowded_banks,
+                        cam_recovered_from_backup=sm.cam_recovered_from_backup,
+                        cam_index_nn_cos_max=sm.cam_index_nn_cos_max,
+                        cam_last_save_age_s=sm.cam_last_save_age_s,
                     )
                 )
             assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + len(stats_msg) == len(
