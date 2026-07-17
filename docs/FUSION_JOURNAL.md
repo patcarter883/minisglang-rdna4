@@ -199,3 +199,25 @@ Do NOT attempt the full megakernel first — stage it.
   (bit-exact, reuse merged-linear; lower ROI). (3) dense/shared SwiGLU (same restructure as #1).
 - Next attended session: pick up the MoE fusion (#1) with human review of the quant kernel — it's the real
   remaining win but needs the careful validation a quant restructure warrants.
+
+## ATTENDED FOLLOW-UP — backlog #1 (MoE gemm1+silu) SHIPPED (2026-07-18, user-directed)
+User directed "start MoE gemm1→silu fusion" (attended, so the quant-kernel review the shelving required is
+now in the loop). Built `moe_gemv_decode_silu_kernel` exactly as scoped: each warp owns one FUSED output col
+j<inter, computes gate (weight col j) + up (col j+inter) sharing the gathered fp8 activation, writes
+silu(gate)*up → (P,inter). Wired via mmq_fp8_moe_gemm1_silu(kernel="gemv") (run_moe_gemm1_silu Gemv branch +
+relaxed wmma-only asserts); engine routes w4a8_moe's decode gemm1+silu through it (MINISGL_MOE_FUSED_SILU,
+default on).
+- **KEY SURPRISE vs the shelving verdict:** reusing the WMMA path's exact epilogue helper `moe_silu_and_mul_h`
+  (gate/up rounded through AT, silu fp32→AT, AT*AT) makes the fused output **BIT-EXACT** to unfused-gemv +
+  that same canonical silu — NOT tol-only as predicted. Parity max=0.000e+00 across int4 sym/asym + e2m1,
+  fp16/bf16, T∈{1,2}, up to the 35B gemm1 shape. The gemv accumulation is byte-identical to the unfused gemv
+  (same code path), and the only epilogue difference vs the OLD tail_hip.silu_and_mul is a 1–2 ULP silu-order
+  choice — but the fused matches the WMMA fused path (already bit-exact to torch _C.silu_and_mul) exactly.
+  So the silent-corruption risk that made this attended-only is GONE (bit-exact, not tolerance-gated).
+- **Perf:** op-level 1.24x (35B T=1, 50.9→41.0us, −9.8us/MoE-layer/token) .. 1.47x (E=64 inter=512); +at T=2.
+- **Serve:** Qwen3.6-35B-A3B-AWQ TP=2 under GRAPH CAPTURE — COHERENT (5/5 greedy), and both
+  `[hip-engage] mmq_fp8_moe_gemm1_silu(gemv)` (decode) AND `(wmma)` (prefill) fire DURING capture.
+- Commits: kernels `ff5a611`, engine `68e1c74`. Harness: tools/moe_gemm1_silu_gemv_{parity,bench}.py,
+  moe_gemm1_silu_parity_run.sh, moe_fused_silu_smoke.sh.
+- **Remaining backlog:** (2) qkv-merge full-attn (bit-exact-able, 1/4 layers); (3) dense/shared SwiGLU
+  (same restructure class as #1, now proven bit-exact-able via moe_silu_and_mul_h — de-risked).
