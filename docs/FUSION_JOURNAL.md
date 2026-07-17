@@ -127,3 +127,22 @@ Do NOT attempt the full megakernel first — stage it.
   gdn-wmma-lds-budget). Read `causal_conv1d_update` kernel (gdn_kernels.hip:772) + its state layout; scope
   whether it fits the (bi,hv) block structure (conv is per conv-channel, not per v-head — may NOT map cleanly;
   if it doesn't, Stage C may be lower-ROI than expected — evaluate before implementing).
+- 2026-07-18 (iter 5 — Stage C SHELVED (infeasible) + next target selected; no code changed, CPU only):
+  **Stage C infeasible, confirmed by reading the kernels.** `causal_conv1d_update_kernel` (gdn_kernels.hip:845):
+  grid=(B), ONE block/batch iterating ALL C=conv_dim channels, each channel rolls its own `conv_state[slot,c]`.
+  `gdn_decode_gated`: grid=(B*HV), per-(batch,v-head). Fusing conv into those blocks → multiple v-head blocks
+  re-conv the SHARED q/k channels (GQA: HV v-heads share H k-heads) AND race on the same conv_state roll-update
+  → redundant compute + STATE CORRUPTION. Would need a 2-phase grid-sync megakernel (out of scope, risky). GDN
+  chain optimally fused at 3→2 launches (Stage B done). NOT redoing.
+  **NEXT TARGET = #2 MoE gemm1 → silu_and_mul** (highest remaining ROI: every 35B layer). Dense GatedMLP + MoE
+  both do gemv→`tail_hip.silu_and_mul`→gemv; silu_and_mul (activation.py:25, python/minisgl/quant/kernels.py:338)
+  is a SEPARATE elementwise kernel with a full gate_up HBM round-trip. Fuse silu(gate)*up into the gemm1 gemv
+  epilogue (write [M,d] directly). PRECEDENT: gemm2 already fuses scatter+reduce epilogue (kernels.py:350-379),
+  so the moe-gemm family supports epilogue fusion. **RISK: HIGH** — quantized (fp8 act × W4) grouped gemv; the
+  survey noted the existing fused-silu epilogue is "wmma-only, unusable at decode gemv" (kernels.py:337), so this
+  ADDS a silu epilogue to the DECODE gemv path. PROTOCOL (extra rigor for a quant kernel, per no-silent-corruption
+  guardrail): op parity vs (gemm1 + tail_hip.silu_and_mul) across MULTIPLE shapes (M=1,2; several inter/expert
+  dims) + scales, bit-exact-or-tight-tol, THEN serve smoke; if the gemv can't cleanly pair gate[j]/up[j] in the
+  epilogue, fall back to #3 dense-bf16 SwiGLU (shared expert, lower risk) or shelve. Files: quant/kernels.py
+  :325-342 (gemm1+silu), moe_hip/ or the mmq_fp8_moe_gemm kernel. Next iter: read gemm1 kernel + gemm2 epilogue
+  precedent; assess feasibility/safety before writing.
