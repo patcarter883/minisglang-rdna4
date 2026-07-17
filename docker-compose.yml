@@ -87,6 +87,12 @@ x-lean-common: &lean-common
 
 services:
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
+  # GRAPH-CAPTURED decode (cuda-graph-max-bs 8, max-running 8): eager MoE decode leaves ~45% of device
+  # time in host-launched gather/scatter/topk glue that serializes with the custom_ar all-reduce spins,
+  # so eager conc-4 pulls only ~70 tok/s / ~120W while the graph-captured path hits ~100 tok/s / ~250-284W
+  # at 100% util (measured 2026-07-16, 35B AWQ TP=2). max-running==cuda-graph-max-bs so EVERY admissible
+  # decode batch (buckets [1,2,4,8]) is captured — none falls back to eager — and 8 covers the real-trace
+  # concurrency peak (~7). Was cuda-graph-max-bs=0 (uniformly eager) — that was the latent 120W config.
   serve:
     <<: *lean-common
     profiles: ["serve"]
@@ -105,7 +111,8 @@ services:
           --page-size 16 \
           --tp "${MINISGL_TP:-2}" \
           --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-0}" \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
           ${MINISGL_EXTRA_ARGS:-}
 
