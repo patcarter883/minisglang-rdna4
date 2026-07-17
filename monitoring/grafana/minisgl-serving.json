@@ -1,1815 +1,2714 @@
 {
-  "annotations": {
-    "list": [
-      {
-        "builtIn": 1,
-        "datasource": {
-          "type": "grafana",
-          "uid": "-- Grafana --"
-        },
-        "enable": true,
-        "hide": true,
-        "iconColor": "rgba(0, 211, 255, 1)",
-        "name": "Annotations & Alerts",
-        "type": "dashboard"
-      }
-    ]
-  },
-  "editable": true,
-  "fiscalYearStartMonth": 0,
-  "graphTooltip": 1,
-  "links": [],
-  "refresh": "1s",
-  "schemaVersion": 39,
-  "tags": [
-    "minisgl",
-    "serving",
-    "spec-decode",
-    "dflash"
-  ],
-  "templating": {
-    "list": [
-      {
-        "name": "model",
-        "label": "Model",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "vllm-prometheus"
-        },
-        "definition": "label_values(minisgl_running_requests, model_name)",
-        "query": {
-          "qryType": 1,
-          "query": "label_values(minisgl_running_requests, model_name)",
-          "refId": "A"
-        },
-        "current": {
-          "text": "All",
-          "value": "$__all"
-        },
-        "includeAll": true,
-        "allValue": ".*",
-        "multi": true,
-        "refresh": 2,
-        "sort": 1
-      }
-    ]
-  },
-  "time": {
-    "from": "now-1h",
-    "to": "now"
-  },
-  "timepicker": {"refresh_intervals": ["1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]},
-  "timezone": "",
-  "title": "minisgl Serving + Spec Decode",
-  "uid": "minisgl-serving",
-  "version": 1,
-  "weekStart": "",
-  "panels": [
-    {
-      "id": 1,
-      "type": "row",
-      "title": "Overview",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "panels": []
+ "annotations": {
+  "list": [
+   {
+    "builtIn": 1,
+    "datasource": {
+     "type": "grafana",
+     "uid": "-- Grafana --"
     },
-    {
-      "id": 2,
-      "type": "stat",
-      "title": "Requests running",
-      "description": "minisgl_running_requests gauge \u2014 in-flight decode batch.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 16
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])"
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Requests waiting (queue)",
-      "description": "minisgl_waiting_requests gauge \u2014 queued, not yet scheduled.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Decode speed (tok/s)",
-      "description": "Live per-stream decode rate = generation tok/s divided by concurrent running requests. Updates every scrape during in-flight generation (unlike the TPOT histogram, which only records on request completion). For batch this is the mean per-stream speed; see \"Token throughput\" for aggregate idle-inclusive throughput and the TPOT latency panel for per-completed-request tail latency.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(minisgl_running_requests{model_name=~\"$model\"}), 1)"
-        }
-      ]
-    },
-    {
-      "id": 5,
-      "type": "stat",
-      "title": "Prompt tok/s",
-      "description": "rate(minisgl_prompt_tokens_total) \u2014 prefill throughput.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
-        }
-      ]
-    },
-    {
-      "id": 6,
-      "type": "stat",
-      "title": "KV-pool utilization",
-      "description": "used/total KV-cache token slots.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 75
-              },
-              {
-                "color": "red",
-                "value": 90
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(minisgl_kv_pool_used_tokens{model_name=~\"$model\"}) / sum(minisgl_kv_pool_total_tokens{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "stat",
-      "title": "GDN-state utilization",
-      "description": "used/total GDN recurrent-state slots (hybrid models).",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 1
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 75
-              },
-              {
-                "color": "red",
-                "value": 90
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(minisgl_gdn_state_used_slots{model_name=~\"$model\"}) / sum(minisgl_gdn_state_total_slots{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 8,
-      "type": "row",
-      "title": "Spec Decode (DFlash / DDTree) \u2014 headline",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 5
-      },
-      "panels": []
-    },
-    {
-      "id": 9,
-      "type": "stat",
-      "title": "Mean accept-len (tok/step)",
-      "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term \u2014 matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.5
-              },
-              {
-                "color": "green",
-                "value": 1.5
-              }
-            ]
-          },
-          "decimals": 3
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_steps_total{model_name=~\"$model\"}[$__rate_interval]))"
-        }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "stat",
-      "title": "Draft acceptance rate",
-      "description": "accepted/drafted = minisgl_spec_accepted_tokens_total / minisgl_spec_draft_tokens_total.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 40
-              },
-              {
-                "color": "green",
-                "value": 60
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
-        }
-      ]
-    },
-    {
-      "id": 11,
-      "type": "stat",
-      "title": "Drafted tok/s",
-      "description": "rate(minisgl_spec_draft_tokens_total) \u2014 draft tokens proposed.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "stat",
-      "title": "Accepted tok/s",
-      "description": "rate(minisgl_spec_accepted_tokens_total) \u2014 draft tokens verified & kept.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 6
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "type": "timeseries",
-      "title": "Mean accept-len over time",
-      "description": "accepted/steps over time \u2014 watch DFlash/DDTree tuning move this.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 10
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_steps_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "accept-len"
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Draft acceptance rate over time",
-      "description": "accepted/drafted fraction over time.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 10
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0,
-          "max": 1
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "0.01 * (100 * sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "acceptance rate"
-        }
-      ]
-    },
-    {
-      "id": 15,
-      "type": "row",
-      "title": "Throughput & Load",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 18
-      },
-      "panels": []
-    },
-    {
-      "id": 16,
-      "type": "timeseries",
-      "title": "Token throughput",
-      "description": "Idle-INCLUSIVE throughput: rate() over the window averages in the gaps between requests, so a bursty workload reads well below the decode speed. See \"Decode speed\" for model tok/s.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 19
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "generation"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "prompt"
-        }
-      ]
-    },
-    {
-      "id": 17,
-      "type": "timeseries",
-      "title": "Requests running / waiting",
-      "description": "batch occupancy vs queue depth.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 19
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])",
-          "legendFormat": "running"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})",
-          "legendFormat": "waiting"
-        }
-      ]
-    },
-    {
-      "id": 18,
-      "type": "timeseries",
-      "title": "Request rate",
-      "description": "req/s: total arrived, succeeded, aborted (minisgl_requests_total / _success_total / _aborted_total).",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 27
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_requests_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "arrived"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_requests_success_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "success"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "aborted"
-        }
-      ]
-    },
-    {
-      "id": 19,
-      "type": "timeseries",
-      "title": "Error rate",
-      "description": "aborted / (success + aborted), clamp_min guards divide-by-zero.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 27
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(minisgl_requests_success_total{model_name=~\"$model\"}[$__rate_interval])) + sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval])), 1)",
-          "legendFormat": "aborted %"
-        }
-      ]
-    },
-    {
-      "id": 20,
-      "type": "row",
-      "title": "Latency (from histograms)",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 35
-      },
-      "panels": []
-    },
-    {
-      "id": 21,
-      "type": "timeseries",
-      "title": "Time to first token (TTFT)",
-      "description": "minisgl_ttft_seconds histogram.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 36
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p50"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p95"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        }
-      ]
-    },
-    {
-      "id": 22,
-      "type": "timeseries",
-      "title": "Time per output token (TPOT)",
-      "description": "minisgl_tpot_seconds histogram (inter-token latency).",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 36
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p50"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p95"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        }
-      ]
-    },
-    {
-      "id": 23,
-      "type": "timeseries",
-      "title": "End-to-end request latency",
-      "description": "minisgl_request_latency_seconds histogram.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 36
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p50"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p95"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
-          "legendFormat": "p99"
-        }
-      ]
-    },
-    {
-      "id": 24,
-      "type": "row",
-      "title": "KV & GDN State",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 44
-      },
-      "panels": []
-    },
-    {
-      "id": 25,
-      "type": "timeseries",
-      "title": "KV-pool utilization %",
-      "description": "used/total KV token slots over time.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 45
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0,
-          "max": 100
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(minisgl_kv_pool_used_tokens{model_name=~\"$model\"}) / sum(minisgl_kv_pool_total_tokens{model_name=~\"$model\"})",
-          "legendFormat": "kv util %"
-        }
-      ]
-    },
-    {
-      "id": 26,
-      "type": "timeseries",
-      "title": "GDN-state slot utilization %",
-      "description": "used/total GDN recurrent-state slots over time.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 45
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "linear",
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineWidth": 2,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "min": 0,
-          "max": 100
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "100 * sum(minisgl_gdn_state_used_slots{model_name=~\"$model\"}) / sum(minisgl_gdn_state_total_slots{model_name=~\"$model\"})",
-          "legendFormat": "gdn util %"
-        }
-      ]
-    },
-    {
-      "id": 27,
-      "type": "row",
-      "title": "CAM editable memory",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 54
-      }
-    },
-    {
-      "id": 28,
-      "type": "stat",
-      "title": "Stored facts",
-      "description": "minisgl_cam_facts \u2014 subject\u2192object edits across all namespaces.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 55
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_cam_facts{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 29,
-      "type": "stat",
-      "title": "Namespaces",
-      "description": "minisgl_cam_namespaces \u2014 per-tenant/session isolated stores.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 55
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_cam_namespaces{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 30,
-      "type": "stat",
-      "title": "Facts evicted",
-      "description": "minisgl_cam_evicted \u2014 LRU-evicted under capacity pressure (0 = uncapped).",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 55
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_cam_evicted{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 31,
-      "type": "stat",
-      "title": "Max bank load",
-      "description": "minisgl_cam_max_bank_load \u2014 product-key crowding; delivery-fallback degrades past ~9/bank.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 55
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 9
-              },
-              {
-                "color": "red",
-                "value": 12
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "max(minisgl_cam_max_bank_load{model_name=~\"$model\"})"
-        }
-      ]
-    },
-    {
-      "id": 32,
-      "type": "stat",
-      "title": "Crowded banks",
-      "description": "minisgl_cam_crowded_banks \u2014 banks past the crowding knee (>9 edits).",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "vllm-prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 55
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "value",
-        "graphMode": "area",
-        "textMode": "auto",
-        "orientation": "auto"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "vllm-prometheus"
-          },
-          "expr": "sum(minisgl_cam_crowded_banks{model_name=~\"$model\"})"
-        }
-      ]
-    }
+    "enable": true,
+    "hide": true,
+    "iconColor": "rgba(0, 211, 255, 1)",
+    "name": "Annotations & Alerts",
+    "type": "dashboard"
+   }
   ]
+ },
+ "editable": true,
+ "fiscalYearStartMonth": 0,
+ "graphTooltip": 1,
+ "links": [],
+ "refresh": "1s",
+ "schemaVersion": 39,
+ "tags": [
+  "minisgl",
+  "serving",
+  "spec-decode",
+  "dflash"
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "model",
+    "label": "Model",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "vllm-prometheus"
+    },
+    "definition": "label_values(minisgl_running_requests, model_name)",
+    "query": {
+     "qryType": 1,
+     "query": "label_values(minisgl_running_requests, model_name)",
+     "refId": "A"
+    },
+    "current": {
+     "text": "All",
+     "value": "$__all"
+    },
+    "includeAll": true,
+    "allValue": ".*",
+    "multi": true,
+    "refresh": 2,
+    "sort": 1
+   }
+  ]
+ },
+ "time": {
+  "from": "now-1h",
+  "to": "now"
+ },
+ "timepicker": {
+  "refresh_intervals": [
+   "1s",
+   "2s",
+   "5s",
+   "10s",
+   "30s",
+   "1m",
+   "5m",
+   "15m",
+   "30m",
+   "1h",
+   "2h",
+   "1d"
+  ]
+ },
+ "timezone": "",
+ "title": "minisgl Serving + Spec Decode",
+ "uid": "minisgl-serving",
+ "version": 3,
+ "weekStart": "",
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Overview",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Requests running",
+   "description": "minisgl_running_requests gauge \u2014 in-flight decode batch.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 16
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Requests waiting (queue)",
+   "description": "minisgl_waiting_requests gauge \u2014 queued, not yet scheduled.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "orange",
+        "value": 1
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Decode speed (tok/s)",
+   "description": "Live per-stream decode rate = generation tok/s divided by concurrent running requests. Updates every scrape during in-flight generation (unlike the TPOT histogram, which only records on request completion). For batch this is the mean per-stream speed; see \"Token throughput\" for aggregate idle-inclusive throughput and the TPOT latency panel for per-completed-request tail latency.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(minisgl_running_requests{model_name=~\"$model\"}), 1)"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Prompt tok/s",
+   "description": "rate(minisgl_prompt_tokens_total) \u2014 prefill throughput.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "KV-pool utilization",
+   "description": "used/total KV-cache token slots.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 75
+       },
+       {
+        "color": "red",
+        "value": 90
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(minisgl_kv_pool_used_tokens{model_name=~\"$model\"}) / sum(minisgl_kv_pool_total_tokens{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "GDN-state utilization",
+   "description": "used/total GDN recurrent-state slots (hybrid models).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 75
+       },
+       {
+        "color": "red",
+        "value": 90
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(minisgl_gdn_state_used_slots{model_name=~\"$model\"}) / sum(minisgl_gdn_state_total_slots{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type": "row",
+   "title": "Spec Decode (DFlash / DDTree) \u2014 headline",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 5
+   },
+   "panels": []
+  },
+  {
+   "id": 9,
+   "type": "stat",
+   "title": "Mean accept-len (tok/step)",
+   "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term \u2014 matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 6
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 0.5
+       },
+       {
+        "color": "green",
+        "value": 1.5
+       }
+      ]
+     },
+     "decimals": 3
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_steps_total{model_name=~\"$model\"}[$__rate_interval]))"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "stat",
+   "title": "Draft acceptance rate",
+   "description": "accepted/drafted = minisgl_spec_accepted_tokens_total / minisgl_spec_draft_tokens_total.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 6
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 40
+       },
+       {
+        "color": "green",
+        "value": 60
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "stat",
+   "title": "Drafted tok/s",
+   "description": "rate(minisgl_spec_draft_tokens_total) \u2014 draft tokens proposed.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 6
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "stat",
+   "title": "Accepted tok/s",
+   "description": "rate(minisgl_spec_accepted_tokens_total) \u2014 draft tokens verified & kept.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 6
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Mean accept-len over time",
+   "description": "accepted/steps over time \u2014 watch DFlash/DDTree tuning move this.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 10
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_steps_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "accept-len"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Draft acceptance rate over time",
+   "description": "accepted/drafted fraction over time.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 10
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0,
+     "max": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "0.01 * (100 * sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "acceptance rate"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "row",
+   "title": "Throughput & Load",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 18
+   },
+   "panels": []
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "Token throughput (incl. prefix cache)",
+   "description": "Idle-INCLUSIVE throughput: rate() over the window averages in the gaps between requests, so a bursty workload reads well below the decode speed. See \"Decode speed\" for model tok/s.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 19
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "generation"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "prompt"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "\u2514 prefill cached (saved)",
+     "refId": "C"
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "Requests running / waiting",
+   "description": "batch occupancy vs queue depth.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 19
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "max_over_time(sum(minisgl_running_requests{model_name=~\"$model\"})[$__rate_interval:])",
+     "legendFormat": "running"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})",
+     "legendFormat": "waiting"
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "type": "timeseries",
+   "title": "Request rate",
+   "description": "req/s: total arrived, succeeded, aborted (minisgl_requests_total / _success_total / _aborted_total).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 27
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_requests_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "arrived"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_requests_success_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "success"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "aborted"
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "Error rate",
+   "description": "aborted / (success + aborted), clamp_min guards divide-by-zero.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 27
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(rate(minisgl_requests_success_total{model_name=~\"$model\"}[$__rate_interval])) + sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval])), 1)",
+     "legendFormat": "aborted %"
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "type": "row",
+   "title": "Latency (from histograms)",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 35
+   },
+   "panels": []
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Time to first token (TTFT)",
+   "description": "minisgl_ttft_seconds histogram.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 36
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p50"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p95"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p99"
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Time per output token (TPOT)",
+   "description": "minisgl_tpot_seconds histogram (inter-token latency).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 36
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p50"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p95"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p99"
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "End-to-end request latency",
+   "description": "minisgl_request_latency_seconds histogram.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 36
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p50"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p95"
+    },
+    {
+     "refId": "C",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+     "legendFormat": "p99"
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "type": "row",
+   "title": "KV & GDN State",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 44
+   },
+   "panels": []
+  },
+  {
+   "id": 25,
+   "type": "timeseries",
+   "title": "KV-pool utilization %",
+   "description": "used/total KV token slots over time.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 45
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0,
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(minisgl_kv_pool_used_tokens{model_name=~\"$model\"}) / sum(minisgl_kv_pool_total_tokens{model_name=~\"$model\"})",
+     "legendFormat": "kv util %"
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "type": "timeseries",
+   "title": "GDN-state slot utilization %",
+   "description": "used/total GDN recurrent-state slots over time.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 45
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "lineWidth": 2,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0,
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(minisgl_gdn_state_used_slots{model_name=~\"$model\"}) / sum(minisgl_gdn_state_total_slots{model_name=~\"$model\"})",
+     "legendFormat": "gdn util %"
+    }
+   ]
+  },
+  {
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 53
+   },
+   "id": 30,
+   "panels": [],
+   "title": "Prefix Cache (recurrent-radix / radix)",
+   "type": "row"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "Windowed: cached / total prompt tokens = fraction of prefill skipped. ~0 when caching is off (naive).",
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "decimals": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 20
+       },
+       {
+        "color": "green",
+        "value": 50
+       }
+      ]
+     },
+     "unit": "percent"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 0,
+    "y": 54
+   },
+   "id": 31,
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "orientation": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_prefix_cache_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "refId": "A"
+    }
+   ],
+   "title": "Hit ratio (windowed)",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "Prompt tokens/s served from the prefix cache (not re-prefilled).",
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "decimals": 1,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 6,
+    "y": 54
+   },
+   "id": 32,
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "orientation": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "refId": "A"
+    }
+   ],
+   "title": "Cached tok/s (saved)",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "Prompt tokens/s actually run through prefill (cache misses).",
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "decimals": 1,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 12,
+    "y": 54
+   },
+   "id": 33,
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "orientation": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval])) - sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "refId": "A"
+    }
+   ],
+   "title": "Prefill computed tok/s",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "TRUE prefill throughput: computed prefill tokens / wall-seconds of prefill compute. Unlike 'Prompt tok/s' (prompt-token ARRIVAL rate), this measures the prefill kernel itself \u2014 the apples-to-apples analog of vLLM request_prompt_tokens_sum / request_prefill_time_seconds_sum.",
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "decimals": 0,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 54
+   },
+   "id": 37,
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "orientation": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "( sum(rate(minisgl_prefix_cache_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval])) - sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval])) ) / sum(rate(minisgl_prefill_seconds_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "refId": "A"
+    }
+   ],
+   "title": "Prefill throughput (compute) tok/s",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "Lifetime cached/total prompt tokens (minisgl_prefix_cache_hit_ratio).",
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "decimals": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 20
+       },
+       {
+        "color": "green",
+        "value": 50
+       }
+      ]
+     },
+     "unit": "percent"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 6,
+    "x": 18,
+    "y": 54
+   },
+   "id": 34,
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "orientation": "auto",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "textMode": "auto"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "100 * minisgl_prefix_cache_hit_ratio{model_name=~\"$model\"}",
+     "refId": "A"
+    }
+   ],
+   "title": "Hit ratio (cumulative)",
+   "type": "stat"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "cached / total prompt tokens, windowed.",
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "lineInterpolation": "linear",
+      "lineWidth": 2,
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      }
+     },
+     "max": 1,
+     "min": 0,
+     "unit": "percentunit"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 58
+   },
+   "id": 35,
+   "options": {
+    "legend": {
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_prefix_cache_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "hit ratio",
+     "refId": "A"
+    }
+   ],
+   "title": "Prefix cache hit ratio over time",
+   "type": "timeseries"
+  },
+  {
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "description": "Stacked prompt-token throughput: cache-saved vs actually computed. Total height = prompt tok/s.",
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "lineInterpolation": "linear",
+      "lineWidth": 2,
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "normal"
+      }
+     },
+     "min": 0,
+     "unit": "short"
+    },
+    "overrides": []
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 58
+   },
+   "id": 36,
+   "options": {
+    "legend": {
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ],
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "cached (saved)",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(rate(minisgl_prefix_cache_prompt_tokens_total{model_name=~\"$model\"}[$__rate_interval])) - sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+     "legendFormat": "computed",
+     "refId": "B"
+    }
+   ],
+   "title": "Prefill tokens: cached vs computed",
+   "type": "timeseries"
+  },
+  {
+   "id": 38,
+   "type": "row",
+   "title": "GPU \u2014 hardware telemetry (amd-smi)",
+   "collapsed": false,
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 66
+   },
+   "panels": []
+  },
+  {
+   "id": 39,
+   "type": "timeseries",
+   "title": "GPU power (W)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 67
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "watt",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_power_watts{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}}"
+    }
+   ]
+  },
+  {
+   "id": 40,
+   "type": "timeseries",
+   "title": "GPU load \u2014 gfx activity (%)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 67
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     },
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_gfx_activity_percent{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}}"
+    }
+   ]
+  },
+  {
+   "id": 41,
+   "type": "timeseries",
+   "title": "GPU temperature (\u00b0C)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 75
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "celsius",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_temperature_celsius{gpu=~\"0|1\",sensor=~\"hotspot|mem\"}",
+     "legendFormat": "GPU {{gpu}} {{sensor}}"
+    }
+   ]
+  },
+  {
+   "id": 42,
+   "type": "timeseries",
+   "title": "GPU VRAM used (%)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 75
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     },
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_vram_used_percent{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}}"
+    }
+   ]
+  },
+  {
+   "id": 43,
+   "type": "timeseries",
+   "title": "GPU clocks (MHz)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 83
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MHz",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_gfx_clock_mhz{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}} core"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_mem_clock_mhz{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}} mem"
+    }
+   ]
+  },
+  {
+   "id": 44,
+   "type": "timeseries",
+   "title": "GPU memory bandwidth (GB/s, effective)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 91
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "Bps",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": ".*peak.*"
+      },
+      "properties": [
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          10,
+          10
+         ]
+        }
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 0
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_umc_activity_percent{gpu=~\"0|1\"} / 100 * amdgpu_mem_clock_mhz{gpu=~\"0|1\"} * 0.512e9",
+     "legendFormat": "GPU {{gpu}} effective"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_mem_clock_mhz{gpu=~\"0|1\"} * 0.512e9",
+     "legendFormat": "GPU {{gpu}} peak"
+    }
+   ],
+   "description": "Effective GDDR6 bandwidth = UMC (memory-controller) activity x peak. Peak = mem_clock_MHz x 0.512e9 B/s (256-bit bus, GDDR6 16n prefetch: 640 GB/s @ ~1250 MHz, auto-tracks the memory OC). Dashed line = peak at the current clock."
+  },
+  {
+   "id": 45,
+   "type": "timeseries",
+   "title": "GPU memory-controller activity (UMC %)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 91
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "min": 0,
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": true,
+      "axisPlacement": "auto"
+     },
+     "max": 100
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "bottom",
+     "calcs": [
+      "last",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "amdgpu_umc_activity_percent{gpu=~\"0|1\"}",
+     "legendFormat": "GPU {{gpu}}"
+    }
+   ],
+   "description": "amdgpu_umc_activity_percent \u2014 measured fraction of time the memory controller is busy (the directly-reported BW-utilization signal the GB/s panel is derived from)."
+  },
+  {
+   "id": 46,
+   "type": "row",
+   "title": "CAM editable memory",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 99
+   }
+  },
+  {
+   "id": 47,
+   "type": "stat",
+   "title": "Stored facts",
+   "description": "minisgl_cam_facts \u2014 subject\u2192object edits across all namespaces.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 100
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_cam_facts{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 48,
+   "type": "stat",
+   "title": "Namespaces",
+   "description": "minisgl_cam_namespaces \u2014 per-tenant/session isolated stores.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 100
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_cam_namespaces{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 49,
+   "type": "stat",
+   "title": "Facts evicted",
+   "description": "minisgl_cam_evicted \u2014 LRU-evicted under capacity pressure (0 = uncapped).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 100
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 1
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_cam_evicted{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 50,
+   "type": "stat",
+   "title": "Max bank load",
+   "description": "minisgl_cam_max_bank_load \u2014 product-key crowding; delivery-fallback degrades past ~9/bank.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 100
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 9
+       },
+       {
+        "color": "red",
+        "value": 12
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "max(minisgl_cam_max_bank_load{model_name=~\"$model\"})"
+    }
+   ]
+  },
+  {
+   "id": 51,
+   "type": "stat",
+   "title": "Crowded banks",
+   "description": "minisgl_cam_crowded_banks \u2014 banks past the crowding knee (>9 edits).",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vllm-prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 100
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     },
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "textMode": "auto",
+    "orientation": "auto"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vllm-prometheus"
+     },
+     "expr": "sum(minisgl_cam_crowded_banks{model_name=~\"$model\"})"
+    }
+   ]
+  }
+ ]
 }
