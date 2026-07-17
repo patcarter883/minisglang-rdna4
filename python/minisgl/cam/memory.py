@@ -594,6 +594,14 @@ class CAMMemory:
         # base-embed key if the encoder or artifact is missing, so a misconfig degrades, never crashes.
         self._gte = None            # (encoder, mu, W) when active; None -> base-embed key
         self._decode = decode       # callable(subject_ids)->str, set by the caller (scheduler tokenizer)
+        # Write-side semantic dedup: on a NON-exact-id re-remember whose subject key is a near-duplicate
+        # of a stored one (cosine >= write_dedup_tau), MERGE onto that entry (newest object wins) instead of
+        # appending a paraphrase duplicate. Default 1.0 = OFF (base-embed key space is not calibrated for it).
+        # MUST be set BEFORE _load_gte_key so the GTE path can override it to a measured 0.82 (0.82 sits above
+        # the distinct-subject cosine ceiling ~0.79 — e.g. "Mozart" vs "Leopold Mozart" — so genuinely-
+        # different subjects never silently merge). Explicit env override always wins.
+        _dedup = os.environ.get("MINISGL_CAM_WRITE_DEDUP_TAU", "").strip()
+        self.write_dedup_tau = float(_dedup) if _dedup else 1.0
         if os.environ.get("MINISGL_CAM_GTE_KEY") == "1":
             self._load_gte_key()
         # ---- write gating (protect a curated/ingested store from ambient auto-write) -------------------
@@ -620,14 +628,6 @@ class CAMMemory:
                                                self._subj_objs, self._subj_tuple, self._facts)}
         # #9 capacity: per-namespace fact cap (0 = unlimited); LRU eviction on overflow.
         self.max_facts = int(os.environ.get("MINISGL_CAM_MAX_FACTS", "0"))
-        # Write-side semantic dedup: on a NON-exact-id re-remember whose subject key is a near-duplicate
-        # of a stored one (cosine >= write_dedup_tau), MERGE onto that entry (latest phrasing+object wins)
-        # instead of appending a paraphrase duplicate. Default 1.0 = OFF (base-embed key space is not
-        # calibrated for it); _load_gte_key drops it to a measured 0.82 when the semantic GTE key is active
-        # (0.82 sits above the distinct-subject cosine ceiling ~0.79 — e.g. "Mozart" vs "Leopold Mozart" —
-        # so genuinely-different subjects never silently merge). Explicit env override always wins.
-        _dedup = os.environ.get("MINISGL_CAM_WRITE_DEDUP_TAU", "").strip()
-        self.write_dedup_tau = float(_dedup) if _dedup else 1.0
         # #12 audit: append-only ring buffer of write/forget/evict events (subject/object/source/ns/ts).
         self._audit: list = []
         self._audit_max = int(os.environ.get("MINISGL_CAM_AUDIT_MAX", "2000"))
@@ -828,7 +828,8 @@ class CAMMemory:
             if not os.environ.get("MINISGL_CAM_WRITE_DEDUP_TAU", "").strip():
                 self.write_dedup_tau = float(os.environ.get("MINISGL_CAM_GTE_WRITE_DEDUP_TAU", "0.82"))
             print(f"CAM: whitened-GTE subject key ACTIVE (model={model}, dim={int(W.shape[0])}, tau={self.deliver_tau}, "
-                  f"whiten-fit n={art.get('n_fit')}, nn {art.get('nn_raw')}->{art.get('nn_whitened')})", flush=True)
+                  f"write_dedup_tau={self.write_dedup_tau}, whiten-fit n={art.get('n_fit')}, "
+                  f"nn {art.get('nn_raw')}->{art.get('nn_whitened')})", flush=True)
         except Exception as e:  # noqa: BLE001 — degrade to base-embed key, don't crash
             self._gte = None
             print(f"CAM: whitened-GTE key requested but unavailable ({e}); using the base-embed key", flush=True)
