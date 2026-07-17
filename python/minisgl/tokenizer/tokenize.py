@@ -7,9 +7,51 @@ from minisgl.message import TokenizeMsg
 from transformers import PreTrainedTokenizerBase
 
 
+import logging
+
+_logger = logging.getLogger("minisgl.tokenize")
+
+
 class TokenizeManager:
     def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
+
+    def _render_chat(self, msg) -> str:
+        """Render a chat-messages list through the model's template. A malformed message list (e.g. a
+        second `system` turn a strict template rejects — "System message must be at the beginning") must
+        NEVER crash the tokenizer worker and take the whole serve down. So: try the template; on failure
+        retry with every system turn coalesced into one leading turn (fixes the common cause); and if it
+        still fails, fall back to a plain role-tagged render so the request degrades instead of the serve."""
+        kwargs = dict(
+            tools=getattr(msg, "tools", None), tokenize=False, add_generation_prompt=True,
+            **(getattr(msg, "chat_template_kwargs", None) or {}),
+        )
+        try:
+            out = self.tokenizer.apply_chat_template(msg.text, **kwargs)
+            assert isinstance(out, str)
+            return out
+        except Exception as e:  # noqa: BLE001 — a bad request must not kill the worker
+            try:
+                out = self.tokenizer.apply_chat_template(self._coalesce_system(msg.text), **kwargs)
+                assert isinstance(out, str)
+                _logger.warning("chat template rejected raw messages (%s); recovered by coalescing system turns", e)
+                return out
+            except Exception:  # noqa: BLE001
+                _logger.warning("chat template failed (%s); using plain fallback render", e)
+                return self._plain_render(msg.text)
+
+    @staticmethod
+    def _coalesce_system(messages):
+        """Merge every system message into one leading system turn (templates want at most one, first)."""
+        sys = [str(m.get("content") or "") for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+        rest = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
+        head = [{"role": "system", "content": "\n\n".join(sys)}] if sys else []
+        return [*head, *rest]
+
+    @staticmethod
+    def _plain_render(messages):
+        lines = [f"{m.get('role', 'user')}: {m.get('content') or ''}" for m in messages if isinstance(m, dict)]
+        return "\n".join(lines) + "\nassistant:"
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
         # Chat-template RENDERING stays per-msg (tools / chat_template_kwargs differ per request),
@@ -26,14 +68,7 @@ class TokenizeManager:
                 # `chat_template_kwargs` (e.g. {"enable_thinking": False}) is forwarded verbatim so
                 # a request can control reasoning-model thinking mode. None -> template defaults
                 # (Qwen3 opens `<think>` in the generation prompt, i.e. thinking ON).
-                prompt = self.tokenizer.apply_chat_template(
-                    msg.text,
-                    tools=getattr(msg, "tools", None),
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    **(getattr(msg, "chat_template_kwargs", None) or {}),
-                )
-                assert isinstance(prompt, str)
+                prompt = self._render_chat(msg)
                 templated.append(True)
             else:
                 prompt = msg.text

@@ -481,6 +481,13 @@ async def _cam_auto_augment(prompt, ns=None):
         f"- {f.get('subject')}: {f.get('object')}" for f in facts)
     logger.debug("CAM auto-RAG: injected %d fact(s)", len(facts))
     if isinstance(prompt, list):
+        # Merge the note into the request's OWN leading system message when it has one. Prepending a
+        # SECOND system message produces two system turns, which templates that require the system turn
+        # first reject (Qwen: "System message must be at the beginning") — and that used to crash the
+        # tokenizer worker. Otherwise prepend a fresh system message.
+        if prompt and isinstance(prompt[0], dict) and prompt[0].get("role") == "system":
+            merged = note + "\n\n" + str(prompt[0].get("content") or "")
+            return [{**prompt[0], "content": merged}, *prompt[1:]]
         return [{"role": "system", "content": note}, *prompt]
     return note + "\n\n" + str(prompt)
 
