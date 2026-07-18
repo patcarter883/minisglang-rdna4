@@ -39,7 +39,15 @@ cost (offset by W4A8's ~6% gain on the shared path + the dedup buys once-for-bot
 `if constexpr(WLoad::is_fp8)` specialization so the W8A8 instantiation compiles to its lean form (drop the
 W4A8 group-fold/zeros/AT machinery on that path). Quick follow-up, not a blocker. Agent's one attempt
 (scalar group-fold) held max|Δ|=0 but didn't move perf → the shift is the reshape, needs the if-constexpr split.
-STEP 2 (me, packaging): **FOLD w4a8_fp8_wmma + w8a8_fp8_wmma → one package `fp8_wmma`** (name locked). One
+STEP 2 (DONE — kernels branch `fp8-wmma-merge` @ `d176d72`, engine `feat/kernel-fusion` @ `7f05b45`, on
+REVIEW branches not yet main/rdna4): ONE package `fp8_wmma` (one physical shared core, 3 coexisting TUs; 7
+duplicate `__global__` kernels made static; repack_w_rep_wide int4/fp8 rank-dispatcher; torch.ops.fp8_wmma_C).
+Engine rewired 67 sites (kernels.py+method.py+moe.py). BYTE-IDENTICAL max|Δ|=0 int4+e2m1+fp8+dense; 35B AWQ
+TP2 graph-capture serve smoke COHERENT with ops firing from fp8_wmma. DEPLOY DEPENDENCY: engine imports
+fp8_wmma → CANNOT land to rdna4 until fp8_wmma is built into /opt/kernels (baked image still has old pkgs).
+LANDING = build fp8_wmma into the kernel deploy → merge both branches → remove old w4a8/w8a8 dirs → restart serves.
+Original packaging spec below (all implemented):
+**FOLD w4a8_fp8_wmma + w8a8_fp8_wmma → one package `fp8_wmma`** (name locked). One
 build.toml + all .hip + the SINGLE physical `moe_gemm_tiled.h` (no copy/sync). Merge torch-ext
 (torch_binding.cpp/.h both op sets: mmq_fp8_* + mmq_w8a8_*), __init__.py (both wrapper sets), one _ops.py
 namespace (torch.ops.fp8_wmma_C.*). Rewire engine imports `w4a8_fp8_wmma`/`w8a8_fp8_wmma` → `fp8_wmma`
