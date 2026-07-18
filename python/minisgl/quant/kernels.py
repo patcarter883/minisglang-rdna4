@@ -89,6 +89,11 @@ _FUSED_SILU_DTYPES = (torch.float16, torch.bfloat16)
 # w4a8 E128/tk8/inter768: 1.9-3.5x over WMMA at M=4-32; WMMA reclaims M=64) — far past the old M<=2 gate.
 # w8a8 gemm1 shares the same gemv structure so uses the same crossover (inferred from the w4a8 measurement).
 _MOE_GEMM1_GEMV_MAX = 32
+# Register-tiled "flag" grouped MoE GEMM (moe_gemm_flag) for PREFILL gemm2 (down-proj, non-scatter): a
+# 64x64/64x32 register-macro-tile port of the flagship dense kernel -> ~1.1-1.5x over the tiled wmma at
+# block_m==128 (bit-exact). Gated block_m==128 (the macro-tile needs it) + group_size==128 for w4 (E's
+# validated config; MXFP4 group=32 + decode/small-M stay on tiled/gemv). MINISGL_MOE_FLAG=0 reverts.
+_MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
 
 
 def _moe_time(bucket: str, fn):
@@ -405,14 +410,28 @@ def w4a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
-    out2 = _moe_time(
-        "gemm2",
-        lambda: fp8_wmma.mmq_fp8_moe_gemm(
-            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
-            kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
-        ),
-    )  # (P, K)
+    # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
+    # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
+    _flag2 = _MOE_FLAG and block_m == 128 and \
+        (w2.shape[-1] * 8) // w2_scales.shape[-1] in (32, 64, 128)  # flag supports group 32/64/128
+    if _flag2:
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm_flag(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+                w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, K)
+    else:
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+                kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, K)
     engaged("fp8_wmma.mmq_fp8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
@@ -675,13 +694,24 @@ def w8a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
-    out2 = _moe_time(
-        "gemm2",
-        lambda: fp8_wmma.mmq_w8a8_moe_gemm(
-            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
-        ),
-    )  # (P, K)
+    # PREFILL gemm2: register-tiled flag kernel at block_m==128 (fp8, per-channel scale — no group gate);
+    # bit-exact, ~1.18-1.30x over tiled wmma. else the tiled wmma.
+    if _MOE_FLAG and block_m == 128:
+        engaged("fp8_wmma.mmq_w8a8_moe_gemm_flag")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm_flag(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+            ),
+        )  # (P, K)
+    else:
+        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
+            ),
+        )  # (P, K)
     engaged("fp8_wmma.mmq_w8a8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
