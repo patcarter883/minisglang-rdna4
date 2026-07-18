@@ -637,6 +637,11 @@ class CAMMemory:
         self._dirty = False
         self._last_save = 0.0
         self._recovered_from_bak = False   # set by restore() when the primary was bad -> ops ALERT signal
+        # rank0-authoritative persistence: under TP>1 the scheduler sets this False on non-primary ranks so
+        # exactly ONE rank writes the store to disk (no save race), and that writer == the metrics emitter,
+        # so its recovered_from_backup flag is authoritative. Default True: single-process / library use and
+        # the tp-primary all persist. RESTORE stays ungated (every rank loads the store it serves from).
+        self._persist_owner = True
         logger.info("CAMMemory loaded: tap_layer=%d n_banks=%d mem_dim=%d K=%d tap_heads=%d read_heads=%d "
                     "router n_out=%d tau=%.3f", self.tap_layer, self.n_banks, a_mem, k_slots, tap_heads,
                     read_heads, n_out, self.remember_tau)
@@ -790,6 +795,8 @@ class CAMMemory:
     def autosave(self, force: bool = False) -> bool:
         """Snapshot to store_path if dirty and the debounce interval elapsed (or force). Returns whether it
         saved. Cheap no-op when no store_path / not dirty."""
+        if not self._persist_owner:            # non-primary TP rank: never writes the shared store to disk
+            return False
         if not self.store_path or (not self._dirty and not force):
             return False
         now = time.time()
@@ -1205,8 +1212,9 @@ class CAMMemory:
 
     def save(self) -> int:
         """Force a persistence snapshot now (explicit flush, e.g. POST /cam/save). Returns #edits, or -1
-        when no store_path is configured."""
-        if not self.store_path:
+        when no store_path is configured / this rank isn't the persist owner (the tp-primary's save is the
+        one that counts and is reported to the client)."""
+        if not self._persist_owner or not self.store_path:
             return -1
         n = self.snapshot(self.store_path)
         self._dirty = False; self._last_save = time.time()
