@@ -66,12 +66,12 @@ class _GroupedGPTQExperts(BaseOP):
         if kernels.MOE_W4A16 != "0":
             # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
             # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
-            import w4a8_fp8_wmma
+            import fp8_wmma
 
             N, K8 = self._w_op.shape[1], self._w_op.shape[2]
             wide = kernels._w4a16_wide(self._quant.group_size)
-            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
-            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            w_rep = fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
             del self._w_op
         del self.qweight, self.scales, self.qzeros
 
@@ -114,12 +114,12 @@ class _GroupedAWQExperts(BaseOP):
         if kernels.MOE_W4A16 != "0":
             # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
             # fp8 op-layout (frees the memory; scales/zeros are shared). See kernels.w4a16_moe.
-            import w4a8_fp8_wmma
+            import fp8_wmma
 
             N, K8 = self._w_op.shape[1], self._w_op.shape[2]
             wide = kernels._w4a16_wide(self._quant.group_size)
-            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
-            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            w_rep = fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N, K8 * 8)
+            self._w_rep = fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
             del self._w_op
         del self.qweight, self.scales, self.qzeros
 
@@ -212,12 +212,12 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         if kernels.MOE_W4A16 != "0":
             # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the
             # fp8 op-layout (same as _GroupedAWQExperts). g=32 -> wide 2 (b64, kernel 13fba94).
-            import w4a8_fp8_wmma
+            import fp8_wmma
 
             N2, K8 = self._w_op.shape[1], self._w_op.shape[2]
             wide = kernels._w4a16_wide(self._quant.group_size)
-            w_rep = w4a8_fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N2, K8 * 8)
-            self._w_rep = w4a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
+            w_rep = fp8_wmma.repack_int4_to_w_rep_moe(self._w_op, N2, K8 * 8)
+            self._w_rep = fp8_wmma.repack_w_rep_wide_moe(w_rep, wide)
             del self._w_op
 
 
@@ -256,10 +256,10 @@ class _GroupedMxFp4Experts(BaseOP):
             # scales, consumed by kernels.w4a16_moe(weight_is_e2m1=True). fp16 acts DIRECT (no
             # act-quant) — faster AND higher quality than the LDS w4a8_moe e2m1 path. group=32 -> wide
             # 2 (b64). Symmetric MXFP4 -> no zero-points.
-            import w4a8_fp8_wmma
+            import fp8_wmma
 
             wide = kernels._w4a16_wide(self._quant.group_size)  # g=32 -> 2
-            self._w_rep, self._scales_rd = w4a8_fp8_wmma.mxfp4_to_w_rep_moe(
+            self._w_rep, self._scales_rd = fp8_wmma.mxfp4_to_w_rep_moe(
                 self.weight_packed, self.weight_scale, N, K, wide
             )
             del self.weight_packed, self.weight_scale
@@ -369,11 +369,11 @@ class _GroupedFP8Experts(BaseOP):
         _oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
         _w8a16 = os.environ.get("MINISGL_ZAYA_W8A16", "0") == "1"
         if kernels.MOE_W8A8_REGDIRECT and not _oldmoe and not _w8a16:
-            import w8a8_fp8_wmma
+            import fp8_wmma
 
             E, N, K = self._w_op.shape
-            w_rep = w8a8_fp8_wmma.repack_fp8_to_w_rep_moe(self._w_op, N, K)
-            self._w_rep = w8a8_fp8_wmma.repack_w_rep_wide_moe(w_rep, 2)  # b128
+            w_rep = fp8_wmma.repack_fp8_to_w_rep_moe(self._w_op, N, K)
+            self._w_rep = fp8_wmma.repack_w_rep_wide_moe(w_rep, 2)  # b128
             del self._w_op
         # A/B toggle: MINISGL_ZAYA_OLDMOE=1 keeps the checkpoint fp8 weights for the legacy
         # dequant->Triton path (forward branch). Default drops them (native W8A8 kernel only).

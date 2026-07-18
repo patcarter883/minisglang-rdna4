@@ -85,6 +85,15 @@ _SILU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # gemm1 + tail_hip.silu_and_mul.
 _MOE_FUSED_SILU = _os.environ.get("MINISGL_MOE_FUSED_SILU", "1") != "0"
 _FUSED_SILU_DTYPES = (torch.float16, torch.bfloat16)
+# MoE gemm1 (wide 2*inter output) decode crossover: the scalar GEMV wins gemm1 through M~32 (measured
+# w4a8 E128/tk8/inter768: 1.9-3.5x over WMMA at M=4-32; WMMA reclaims M=64) — far past the old M<=2 gate.
+# w8a8 gemm1 shares the same gemv structure so uses the same crossover (inferred from the w4a8 measurement).
+_MOE_GEMM1_GEMV_MAX = 32
+# Register-tiled "flag" grouped MoE GEMM (moe_gemm_flag) for PREFILL gemm2 (down-proj, non-scatter): a
+# 64x64/64x32 register-macro-tile port of the flagship dense kernel -> ~1.1-1.5x over the tiled wmma at
+# block_m==128 (bit-exact). Gated block_m==128 (the macro-tile needs it) + group_size==128 for w4 (E's
+# validated config; MXFP4 group=32 + decode/small-M stay on tiled/gemv). MINISGL_MOE_FLAG=0 reverts.
+_MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
 
 
 def _moe_time(bucket: str, fn):
@@ -292,7 +301,7 @@ def w4a8_moe(
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13.shape[0]
@@ -305,7 +314,7 @@ def w4a8_moe(
     # gather, top_k==1): WMMA is ~6.8x faster than GEMV (50us vs 339us) — the GEMV path
     # underperforms for that shape. So pick gemv for gemm1, keep WMMA for gemm2. Together ~85us vs
     # ~356us with the old all-WMMA default. Prefill (M>2) keeps the passed/default kernel for both.
-    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
     gemm2_kernel = kernel
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
@@ -337,19 +346,19 @@ def w4a8_moe(
     # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
     # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
     if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
-        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
         buf2 = _moe_time(
             "gemm1silu",
-            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
+            lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
                 x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                 kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
         )  # (P, inter) in x's dtype
     else:
-        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
         out1 = _moe_time(
             "gemm1",
-            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+            lambda: fp8_wmma.mmq_fp8_moe_gemm(
                 x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                 kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
@@ -389,10 +398,10 @@ def w4a8_moe(
                 ),
             )  # writes acc in place (atomic scatter over experts AND split_k K-slices)
         else:
-            engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
             _moe_time(
                 "gemm2scat",
-                lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
+                lambda: fp8_wmma.mmq_fp8_moe_gemm_scatter(
                     buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
                     kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
                 ),
@@ -401,18 +410,32 @@ def w4a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
-    out2 = _moe_time(
-        "gemm2",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
-            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
-            kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
-        ),
-    )  # (P, K)
-    engaged("w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce")
+    # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
+    # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
+    _flag2 = _MOE_FLAG and block_m == 128 and \
+        (w2.shape[-1] * 8) // w2_scales.shape[-1] in (32, 64, 128)  # flag supports group 32/64/128
+    if _flag2:
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm_flag(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+                w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, K)
+    else:
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+                kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (P, K)
+    engaged("fp8_wmma.mmq_fp8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_fp8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -462,7 +485,7 @@ def w4a16_moe(
     fallback as w4a8_moe). `weight_is_e2m1=True` decodes the weights as MXFP4 (OCP E2M1) — the
     register-direct MXFP4 path (fp16 acts, e2m1 weight decode, symmetric so no zeros). Returns (M, K)."""
     import moe_hip
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     M = x.shape[0]
     E = w13_rep.shape[0]
@@ -489,10 +512,10 @@ def w4a16_moe(
     P = sorted_ids.shape[0]
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
 
-    engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
+    engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
     out1 = _moe_time(
         "gemm1",
-        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe(
             x16, w13_rep, w13_scales, w13_zeros if w13_zeros is not None else _empty,
             sorted_ids, expert_ids, ntp, 2 * inter, top_k, block_m, wide,
             weight_is_e2m1=weight_is_e2m1,
@@ -515,10 +538,10 @@ def w4a16_moe(
     # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
     if M <= 2 and _MOE_SCATTER:
         output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
-        engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter{_e2m1}")
+        engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe_scatter{_e2m1}")
         _moe_time(
             "gemm2scat",
-            lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
+            lambda: fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
                 buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, output,
                 hidden, top_k, block_m, wide, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
@@ -527,18 +550,18 @@ def w4a16_moe(
         return output.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
+    engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
     out2 = _moe_time(
         "gemm2",
-        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe(
             buf2.contiguous(), w2_rep, w2_scales, w2_zeros if w2_zeros is not None else _empty,
             ident, expert_ids, ntp, hidden, 1, block_m, wide, weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, hidden) fp16
-    engaged("w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_fp8_moe_gather_reduce")
     output = _moe_time(
         "gather",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_fp8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, hidden) fp32
@@ -556,13 +579,13 @@ def w4a16_linear(
 ) -> torch.Tensor:
     """Dense W4A16 GEMM (fp16 acts direct) via mmq_regdirect_w4a16_wide — the fp16-act twin of
     w4a8_linear, for the GLM shared expert / dense layers when MINISGL_MOE_W4A16 is on."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     wide = _w4a16_wide(group_size)
     x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
     z = w_zeros if w_zeros is not None else torch.empty(0, dtype=torch.int32, device=x.device)
-    engaged("w4a8_fp8_wmma.mmq_regdirect_w4a16_wide")
-    return w4a8_fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
+    engaged("fp8_wmma.mmq_regdirect_w4a16_wide")
+    return fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
 
 
 def w8a8_moe(
@@ -585,7 +608,7 @@ def w8a8_moe(
     (no zeros, no per-K-group scale: fp8 weights carry a per-output-channel f32 scale folded
     once in the epilogue). Returns (M, K)."""
     import torch.nn.functional as F
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13.shape[0]
@@ -595,7 +618,7 @@ def w8a8_moe(
     # Per-GEMM kernel pick (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a few
     # real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles; gemm2's
     # K output favours WMMA. Prefill (M>2) keeps the passed/default kernel for both.
-    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
     gemm2_kernel = kernel
 
     def _route():
@@ -631,10 +654,10 @@ def w8a8_moe(
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
     out1 = _moe_time(
         "gemm1",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+        lambda: fp8_wmma.mmq_w8a8_moe_gemm(
             x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, gemm1_kernel,
         ),
     )  # (P, 2*inter)
@@ -659,10 +682,10 @@ def w8a8_moe(
     # keeps the unfused gemm2 + contention-free gather_reduce (graph-safe).
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm_scatter({gemm2_kernel})")
+        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm_scatter({gemm2_kernel})")
         _moe_time(
             "gemm2scat",
-            lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm_scatter(
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm_scatter(
                 buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
                 gemm2_kernel,
             ),
@@ -671,17 +694,28 @@ def w8a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
-    out2 = _moe_time(
-        "gemm2",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
-            buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
-        ),
-    )  # (P, K)
-    engaged("w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce")
+    # PREFILL gemm2: register-tiled flag kernel at block_m==128 (fp8, per-channel scale — no group gate);
+    # bit-exact, ~1.18-1.30x over tiled wmma. else the tiled wmma.
+    if _MOE_FLAG and block_m == 128:
+        engaged("fp8_wmma.mmq_w8a8_moe_gemm_flag")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm_flag(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
+            ),
+        )  # (P, K)
+    else:
+        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
+        out2 = _moe_time(
+            "gemm2",
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm(
+                buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
+            ),
+        )  # (P, K)
+    engaged("fp8_wmma.mmq_w8a8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_w8a8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -709,7 +743,7 @@ def w8a8_moe_regdirect(
     WMMA-B lane order). Route is always precomputed (ZAYA). Returns (M, K)."""
     import torch.nn.functional as F
     import moe_hip
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13_rep.shape[0]
@@ -723,10 +757,10 @@ def w8a8_moe_regdirect(
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
-    engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe")
+    engaged("fp8_wmma.mmq_regdirect_w8a8_moe")
     out1 = _moe_time(
         "gemm1",
-        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+        lambda: fp8_wmma.mmq_regdirect_w8a8_moe(
             x16, w13_rep, w13_scales, sorted_ids, expert_ids, ntp, N13, top_k, block_m, wide,
         ),
     )  # (P, 2*inter) fp16
@@ -747,10 +781,10 @@ def w8a8_moe_regdirect(
     # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe_scatter")
+        engaged("fp8_wmma.mmq_regdirect_w8a8_moe_scatter")
         _moe_time(
             "gemm2scat",
-            lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe_scatter(
+            lambda: fp8_wmma.mmq_regdirect_w8a8_moe_scatter(
                 buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc,
                 K, top_k, block_m, wide,
             ),
@@ -759,17 +793,17 @@ def w8a8_moe_regdirect(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe")
+    engaged("fp8_wmma.mmq_regdirect_w8a8_moe")
     out2 = _moe_time(
         "gemm2",
-        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+        lambda: fp8_wmma.mmq_regdirect_w8a8_moe(
             buf2, w2_rep, w2_scales, ident, expert_ids, ntp, K, 1, block_m, wide,
         ),
     )  # (P, K)
-    engaged("w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_w8a8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_w8a8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -978,38 +1012,26 @@ def rxf_moe_regdirect(
 
 
 def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 128) -> str:
-    """Per-M dense-linear kernel selection, at the MEASURED gemv<->wmma crossover.
+    """Per-M dense-linear kernel selection, at the MEASURED crossovers (gfx1201).
 
-    The old two-way split (decode_gemv for M<=2, else prefill_wmma) fell off a cliff across the
-    DECODE-BATCH band: prefill_wmma uses BM=256, so at M=4-8 it runs 256 WMMA rows for a few real
-    (~32-64x wasted throughput) — a non-monotonic decode regression (27B W4A8 dense: 41 tok/s @M=2
-    -> 34 @M=4). decode_gemv (the M<=2 fast path) actually serves M<=16 in-kernel: a streaming GEMV
-    that reads each weight once and dots it against all M rows (amortizing the weight read) and
-    writes straight to `out` — no extra buffer. But the GEMV is scalar-compute, so past a crossover
-    M its per-row compute loses to the WMMA tile. The crossover DIFFERS by decode path (measured,
-    27B/35B TP=2, gfx1201):
-      * int4  (uniform W4A8): gemv wins M<=8 (27B M=4 34->56, M=8 62->66); WMMA reclaims M=16
-        (61 gemv vs 100 wmma — the BM=256 tile finally amortizes) -> gemv only up to 8.
-      * e2m1  (MXFP4): gemv wins through M=16 (35B M=4 102->147, M=8 193->255, M=16 343->401) and
-        is the ONLY e2m1-capable small-M kernel anyway -> gemv up to 16 (decode_gemv's in-kernel cap).
-    Above the crossover -> prefill_wmma (the real prefill regime). NOTE the WMMA small-M variants
-    (nsplit_smallm/splitk_smallm/regdirect_shuffle) are DELIBERATELY not used: they accumulate into
-    an `at::zeros((M,N),f32)` allocated inside the op, which under CUDA-graph capture reserves a
-    persistent fp32 buffer per captured decode size x every linear — that VRAM blowup OOM'd the 27B
-    M=16 prefill transient. Reachable via MINISGL_W4A8_DENSE_SMALLM=<name> for A/B on models with
-    headroom; =off restores the old decode_gemv(M<=2)/prefill_wmma split. (The full vllm_adapter also
-    has a Triton W4A16 large-group fallback — PERF_NOTES.)
+    - m <= gemv_max -> decode_gemv: a streaming GEMV that reads each weight once and dots it against
+      all M rows (amortizing the weight read), writing straight to `out`. Serves the decode/decode-
+      batch band; measured crossover int4 M<=8, e2m1 M<=16 (also the only e2m1-capable small-M kernel;
+      decode_gemv's in-kernel cap is 16).
+    - m >= _W4A8_PREFILL_TILED_MIN -> wmma_tiled_tuned: the tuned tiled WMMA GEMM. Dominates the prefill
+      regime ~2-4x over prefill_wmma (re-bench), for BOTH int4 AND e2m1 now that the tiled kernel is
+      e2m1-bit-exact and carries the packed-store. Bit-exact + graph-capture-safe (writes to `out`,
+      no in-op at::zeros). One dtype-generic rule — no int4-vs-e2m1 branch.
+    - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> prefill_wmma: its conservative config still
+      wins the small-M/wide-N corner (re-bench: tiled loses only at N>=6144, M<=32).
+
+    The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
+    in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
     """
-    override = _os.environ.get("MINISGL_W4A8_DENSE_SMALLM")
-    if override == "off":
-        return "decode_gemv" if m <= 2 else "prefill_wmma"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
-    if m > gemv_max:
-        return "prefill_wmma"
-    if override and m > 2:
-        # e2m1 has no WMMA small-M kernel; never misroute it to one even under an override.
-        return override if not weight_is_e2m1 else "decode_gemv"
-    return "decode_gemv"
+    if m <= gemv_max:
+        return "decode_gemv"
+    return "wmma_tiled_tuned" if m >= _W4A8_PREFILL_TILED_MIN else "prefill_wmma"
 
 
 # gemv<->wmma crossover per decode path (measured). decode_gemv asserts M<=16 in-kernel, so E2M1 caps
@@ -1017,6 +1039,10 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
 # decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
 _W4A8_GEMV_MAX_INT4 = 8
 _W4A8_GEMV_MAX_E2M1 = 16
+# Prefill regime: wmma_tiled_tuned dominates from here up (~2-4x prefill_wmma, bit-exact, graph-safe,
+# both dtypes). Below it (small-M/wide-N mid-band) prefill_wmma's conservative config still wins
+# (re-bench: tiled loses only at N>=6144, M<=32). True prefill/chunked-prefill M is always >> 64.
+_W4A8_PREFILL_TILED_MIN = 64
 
 
 def w4a8_linear(
@@ -1033,13 +1059,13 @@ def w4a8_linear(
     out.to(x.dtype) is then a no-op). `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight
     decode instead of uniform int4 (scales are the E8M0 group exponents folded to fp16; w_zeros MUST
     be None — the op asserts symmetric)."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
         kernel = _pick_dense_kernel(x2d.shape[0], weight_is_e2m1, group_size)
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
-    return w4a8_fp8_wmma.mmq_fp8_gemm(
+    engaged(f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
+    return fp8_wmma.mmq_fp8_gemm(
         x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
     )
 
@@ -1055,10 +1081,10 @@ def w4a8_linear_silu(
     """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
     ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%32==0);
     BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_gemm_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
-    return w4a8_fp8_wmma.mmq_fp8_gemm_silu(
+    engaged(f"fp8_wmma.mmq_fp8_gemm_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
+    return fp8_wmma.mmq_fp8_gemm_silu(
         x, w_packed, scales, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
     )
 
@@ -1077,7 +1103,7 @@ def w8a8_dense_linear(
     path [[_pick_dense_kernel]]: the streaming GEMV amortizes the weight read across the decode band,
     while the BM=big WMMA tile wastes throughput on a few decode rows (the measured batching cliff),
     so route M<=SMALLM -> gemv, prefill -> wmma."""
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     N = w_fp8.shape[0]
@@ -1097,8 +1123,8 @@ def w8a8_dense_linear(
     expert_ids = torch.zeros(P // block_m, dtype=torch.int32, device=dev)
     ntp = torch.full((1,), P, dtype=torch.int32, device=dev)
     x16 = x.to(torch.float16).contiguous()
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
-    out = w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
+    out = fp8_wmma.mmq_w8a8_moe_gemm(
         x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
     )  # (P, N) fp16
     return out[:M].to(x.dtype)
