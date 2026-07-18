@@ -31,6 +31,7 @@ def make_cam(dedup_tau):
     self._subj_key = lambda ids: self._keymap[tuple(int(x) for x in ids)]
     self._write = CAMMemory._write.__get__(self)
     self._dedup_match = CAMMemory._dedup_match.__get__(self)
+    self._key_matrix = CAMMemory._key_matrix.__get__(self)
     self._maybe_evict = CAMMemory._maybe_evict.__get__(self)
     self._audit_add = CAMMemory._audit_add.__get__(self)
     return self, st
