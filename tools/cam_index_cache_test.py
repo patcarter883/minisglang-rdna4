@@ -25,6 +25,7 @@ def make(max_facts=0, dedup_tau=1.0):
     self.max_facts = max_facts
     self._audit = []; self._audit_max = 100; self._dirty = False
     self._keymap = {}
+    self._index_dtype = torch.float16
     st = _NsState([])
     self._state = lambda ns=None: st
     self._subj_key = lambda ids: self._keymap[tuple(int(x) for x in ids)]
@@ -49,7 +50,7 @@ def run():
         m = self._key_matrix(st); f = fresh(st)
         if m is None and f is None:
             return True
-        return m is not None and f is not None and torch.equal(m, f)
+        return m is not None and f is not None and torch.equal(m, f.to(m.dtype))  # cache may be fp16
 
     # --- appends: cache tracks growth -----------------------------------------------------------------
     cam, st = make()
@@ -76,7 +77,7 @@ def run():
     # the newest subject (5) must be deliverable via the cache; the evicted one (0) must not win its own query
     simK = cam2._key_matrix(st2)
     q5 = cam2._keymap[(5,)]
-    j = int((simK @ q5).argmax())
+    j = int((simK @ q5.to(simK.dtype)).argmax())
     check("newest subject addressable via cache", st2.subj_tuple[j] == (5,))
     check("evicted subject gone from index", (0,) not in st2.subj_tuple)
 

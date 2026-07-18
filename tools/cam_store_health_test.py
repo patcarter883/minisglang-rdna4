@@ -23,6 +23,7 @@ def make(keys, *, recovered=False, last_save=0.0):
     self.n_banks = 4
     self.write_policy = "no-clobber"
     self.deliver_tau = 0.70
+    self._index_dtype = torch.float16
     self.max_facts = 0
     self.store_path = "/tmp/store.pt"
     self._dirty = True

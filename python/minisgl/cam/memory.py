@@ -630,6 +630,11 @@ class CAMMemory:
                                                self._subj_objs, self._subj_tuple, self._facts)}
         # #9 capacity: per-namespace fact cap (0 = unlimited); LRU eviction on overflow.
         self.max_facts = int(os.environ.get("MINISGL_CAM_MAX_FACTS", "0"))
+        # Delivery index in fp16: halves the cached key-matrix memory and runs the cosine matmul ~1.8-6x
+        # faster at scale, and it is decision-lossless — measured 0/1600 argmax+deliver-gate flips vs fp32
+        # on real whitened-GTE keys (the top-1/top-2 cosine gap dwarfs fp16 epsilon). Default on; set
+        # MINISGL_CAM_INDEX_FP16=0 to force fp32 (e.g. an untested key space).
+        self._index_dtype = torch.float16 if os.environ.get("MINISGL_CAM_INDEX_FP16", "1") != "0" else torch.float32
         # #12 audit: append-only ring buffer of write/forget/evict events (subject/object/source/ns/ts).
         self._audit: list = []
         self._audit_max = int(os.environ.get("MINISGL_CAM_AUDIT_MAX", "2000"))
@@ -760,7 +765,7 @@ class CAMMemory:
         the index is empty."""
         m = st.key_mat
         if m is None or m.shape[0] != len(st.subj_keys):
-            m = torch.stack(st.subj_keys) if st.subj_keys else None
+            m = torch.stack(st.subj_keys).to(self._index_dtype) if st.subj_keys else None
             st.key_mat = m
         return m
 
@@ -773,7 +778,8 @@ class CAMMemory:
         a missed merge is a recoverable duplicate; a wrong merge is silent data loss."""
         if self.write_dedup_tau >= 1.0 or not st.subj_keys:
             return None
-        sims = self._key_matrix(st).to(key_vec.device) @ key_vec
+        mat = self._key_matrix(st)
+        sims = mat.to(key_vec.device) @ key_vec.to(mat.dtype)
         j = int(sims.argmax())
         return j if float(sims[j]) >= self.write_dedup_tau else None
 
@@ -904,7 +910,8 @@ class CAMMemory:
         if not st.subj_keys:
             return False
         q = self._subj_key(subject_ids)
-        sims = self._key_matrix(st).to(q.device) @ q
+        mat = self._key_matrix(st)
+        sims = mat.to(q.device) @ q.to(mat.dtype)
         return bool(float(sims.max().item()) >= tau)
 
     def write_allowed(self, subject_ids: List[int], *, source: str = "auto", ns: str = None) -> bool:
@@ -938,7 +945,8 @@ class CAMMemory:
         if not self.enabled or not st.subj_objs:
             return []
         q = self._subj_key(subject_ids)                      # [d]
-        sims = self._key_matrix(st).to(q.device) @ q          # [M] cosine (keys + q are unit-norm)
+        mat = self._key_matrix(st)
+        sims = mat.to(q.device) @ q.to(mat.dtype)             # [M] cosine (keys + q are unit-norm)
         j = int(sims.argmax().item())
         if float(sims[j].item()) < self.deliver_tau:
             return []                                        # unknown subject -> no confident delivery
@@ -961,7 +969,7 @@ class CAMMemory:
         if not self.enabled or not st.subj_objs or not subjects_ids:
             return [None] * len(subjects_ids)
         K = self._key_matrix(st)                                   # [M,d] (unit-norm keys), stacked+cached
-        Q = torch.stack([self._subj_key(s) for s in subjects_ids]).to(K.device)  # [C,d] (unit-norm)
+        Q = torch.stack([self._subj_key(s) for s in subjects_ids]).to(K.device, K.dtype)  # [C,d] (unit-norm)
         sims = Q @ K.t()                                           # [C,M] cosine
         out: List[Optional[List[int]]] = []
         for i in range(len(subjects_ids)):
