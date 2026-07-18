@@ -1123,17 +1123,8 @@ def w8a8_dense_linear(
     expert_ids = torch.zeros(P // block_m, dtype=torch.int32, device=dev)
     ntp = torch.full((1,), P, dtype=torch.int32, device=dev)
     x16 = x.to(torch.float16).contiguous()
-    # PREFILL (block_m==128): the flagship register-tiled kernel (mmq_w8a8_moe_gemm_flag) over the
-    # single expert IS the dense flagship path — bit-identical to the tiled 'wmma' (max|Δ|=0), 1.4-1.6x
-    # faster (measured ~144 vs ~90 TF/s). Decode/small-M (block_m<128) stay on the gemv/tiled kernel.
-    if _MOE_FLAG and block_m == 128:
-        engaged("fp8_wmma.mmq_w8a8_moe_gemm_flag(dense)")
-        out = fp8_wmma.mmq_w8a8_moe_gemm_flag(
-            x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m
-        )  # (P, N) fp16
-    else:
-        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
-        out = fp8_wmma.mmq_w8a8_moe_gemm(
-            x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
-        )  # (P, N) fp16
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
+    out = fp8_wmma.mmq_w8a8_moe_gemm(
+        x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
+    )  # (P, N) fp16
     return out[:M].to(x.dtype)
