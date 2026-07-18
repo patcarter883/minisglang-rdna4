@@ -17,18 +17,25 @@ scheduled to be attended to **after** that cycle lands (validated + merged).
    and testing-only `MINISGL_*` toggles (`MINV_PIPE_*`, `MOE_PROF`, per-kernel tuners).
 5. Rebuild → exhaustive parity → serve smoke (int4 + MXFP4, TP=2 graph capture) → merge.
 
-## DEFERRED BACKLOG — structural: weight-loader policy (dedup W4A8/W8A8/RXF core)
-**Do this BEFORE the register-blocking rewrites** (so those, and every future opt, land ONCE). The
-tiled cores are COPY-PASTED: two physical `moe_gemm_tiled.h` (w4a8 int4-decode vs w8a8 fp8-direct),
-differing only in the ~10-line weight-staging block — entire tiling/LDS/double-buffer/WMMA/occupancy
-core duplicated. That's why C's packed-store (w4a8 copy) and B/D's occupancy clamp (w8a8 launcher) did
-NOT transfer. FIX: the kernel is already templated on an `MMA` policy — add a `WLoad` (weight-loader)
-policy the same way: `template<AT, MMA, WLoad, …>` with `WLoad::stage_b(...)` the only per-format code.
-Loaders: `Int4Fp8Loader` (nibble unpack + decode_w4_to_e4m3 + C's packed 2-store), `Fp8DirectLoader`
-(4-byte copy), `E2M1Loader`, later `Int8`/RXF W4-NL. ONE `moe_gemm_tiled.h` + ONE dense `gemm_tiled.h`,
-format-generic. Payoff: every core opt written once for all formats; **w8a8 gets a real DENSE tiled
-kernel** (Fp8DirectLoader) retiring the grouped-over-E=1 hack in `w8a8_dense_linear`; launchers +
-`make_moe_tile_config` + GTILE clamp unify too. Validate byte-identical per format (max|Δ|=0 vs current).
+## ACTIVE — structural: weight-loader policy dedup → merge into ONE `fp8_wmma` package
+**In progress** (agent on branch `core-unify`), then the package merge (me), BEFORE the register-blocking
+rewrites (so those + every future opt land ONCE). Problem: the tiled cores are COPY-PASTED — two physical
+`moe_gemm_tiled.h` (w4a8 int4-decode vs w8a8 fp8-direct) differ only in the ~10-line weight-staging; entire
+tiling/LDS/double-buffer/WMMA/occupancy core duplicated (that's why C's packed-store and B/D's occupancy
+clamp did NOT transfer across).
+STEP 1 (agent, parity-gated): `WLoad` weight-loader policy the same way the kernel is already `MMA`-templated —
+`template<AT, MMA, WLoad, …>`, `WLoad::stage_b(...)` the only per-format code. Loaders: `Int4Fp8Loader`
+(nibble unpack + decode_w4_to_e4m3 + C's packed 2-store), `Fp8DirectLoader` (4-byte copy), `E2M1Loader`,
+later `Int8`/RXF W4-NL. Gate: max|Δ|=0 int4+e2m1 AND fp8 vs current, + perf-neutral (±2-3%).
+STEP 2 (me, packaging): **FOLD w4a8_fp8_wmma + w8a8_fp8_wmma → one package `fp8_wmma`** (name locked). One
+build.toml + all .hip + the SINGLE physical `moe_gemm_tiled.h` (no copy/sync). Merge torch-ext
+(torch_binding.cpp/.h both op sets: mmq_fp8_* + mmq_w8a8_*), __init__.py (both wrapper sets), one _ops.py
+namespace (torch.ops.fp8_wmma_C.*). Rewire engine imports `w4a8_fp8_wmma`/`w8a8_fp8_wmma` → `fp8_wmma`
+(~30 call sites in kernels.py + method.py). Update /opt/kernels bake, lean image, KERNELS.md, _kernels
+symlink. Validate int4+fp8 resolve from the one package + serve smoke both.
+Payoff: every core opt written once for all formats; **w8a8 gets a real DENSE tiled kernel** (Fp8DirectLoader)
+retiring the grouped-over-E=1 hack in `w8a8_dense_linear`; launchers + `make_moe_tile_config` + GTILE clamp
+unify; RXF W4-NL folds in as a third loader; the flagship fp8 GEMM slots in as the Fp8DirectLoader core.
 
 ## DEFERRED BACKLOG — flagship fp8 GEMM: INTEGRATE (don't chase the vendor)
 Round 1+2 established (worktree `rdna4-hip-kernels-fp8gemm`, branch `fp8-gemm-flagship`, `b23dfae`+`242156a`):
