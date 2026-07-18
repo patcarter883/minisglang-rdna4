@@ -115,6 +115,7 @@ CAP="$MAXRUN"; [ "${GRAPH:-0}" -gt 0 ] && [ "$GRAPH" -lt "$CAP" ] && CAP="$GRAPH
 echo "[bench] concurrency ceiling = min(MAXRUN=$MAXRUN, GRAPH=$GRAPH) = $CAP"
 python /engine/tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" \
   --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M" \
+  --prefill-words "${PREFILL_WORDS:-480}" \
   --max-concurrency "$CAP"
 stop
 echo "[done] logs in $RESULTS/"
