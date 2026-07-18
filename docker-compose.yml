@@ -379,6 +379,7 @@ services:
       MINISGL_CAM_GTE_WHITEN: /cam_gte/gte_whiten.pkl
       MINISGL_CAM_WRITE_DEDUP_TAU: "${MINISGL_CAM_WRITE_DEDUP_TAU:-}"  # write-side paraphrase dedup cosine; blank => 0.82 under GTE (measured safe), 1.0 (off) on base-embed
       MINISGL_MOE_SCATTER: "0"
+      MINISGL_MOE_FUSED_SILU: "${MINISGL_MOE_FUSED_SILU:-1}"   # operator toggle; set 0 if boot fails with "fused gemm1+silu needs the 'wmma' kernel"
     entrypoint: ["bash", "-lc"]
     command:
       - |
