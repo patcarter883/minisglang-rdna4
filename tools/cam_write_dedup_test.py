@@ -26,6 +26,7 @@ def make_cam(dedup_tau):
     self._audit_max = 2000
     self._dirty = False
     self._keymap = {}                                    # id-tuple -> unit key vector (test-controlled)
+    self._index_dtype = torch.float16
     st = _NsState([])
     self._state = lambda ns=None: st
     self._subj_key = lambda ids: self._keymap[tuple(int(x) for x in ids)]
