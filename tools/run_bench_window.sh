@@ -18,6 +18,7 @@ docker run --rm \
   -e MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" -e TP="${TP:-2}" \
   -e MEMRATIO="${MEMRATIO:-0.82}" -e MAXRUN="${MAXRUN:-24}" \
   -e GRAPH="${GRAPH:-16}" -e MOE_SCATTER="${MOE_SCATTER:-0}" -e BENCH_M="${BENCH_M:-1,2,4,8,16}" \
+  -e PREFILL_WORDS="${PREFILL_WORDS:-480}" \
   -e ATTN="${ATTN:-hip}" \
   -e SPEC="${SPEC:-}" -e SPEC_K="${SPEC_K:-}" -e DFLASH_MODEL="${DFLASH_MODEL:-}" -e EP="${EP:-}" -e MINISGL_EP_DBG="${MINISGL_EP_DBG:-}" \
   -e MINISGL_SPEC_DEBUG="${MINISGL_SPEC_DEBUG:-}" -e MINISGL_SPEC_FORCE_N0="${MINISGL_SPEC_FORCE_N0:-}" \
