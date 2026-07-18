@@ -205,7 +205,8 @@ class GLMSharedExpert(BaseOP):
         self.down_proj = LinearReplicated(inter, config.hidden_size, has_bias=False, quant_method=qm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        # fused gate_up + silu at decode (bit-exact); falls back to silu_and_mul(forward) otherwise.
+        return self.down_proj.forward(self.gate_up_proj.forward_swiglu(x))
 
 
 class GLMSparseBlock(BaseOP):

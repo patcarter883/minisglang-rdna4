@@ -42,7 +42,7 @@ class Qwen2MoeSharedExpert(BaseOP):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        return self.down_proj.forward(self.gate_up_proj.forward_swiglu(x))
 
 
 class Qwen2MoeSparseBlock(BaseOP):

@@ -40,6 +40,20 @@ class _LinearTPImpl(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._method.apply(self, x, self.bias)
 
+    def forward_swiglu(self, x: torch.Tensor) -> torch.Tensor:
+        """SwiGLU for a MERGED gate_up projection: this linear outputs [.., 2*inter] = [gate | up];
+        return silu(gate) * up = [.., inter]. Prefers the quant method's FUSED gemm+silu kernel
+        (one launch, no [.., 2*inter] HBM round-trip) at decode; falls back to the BIT-IDENTICAL
+        silu_and_mul(self.forward(x)) for prefill / unquantized / unsupported shapes / biased layers."""
+        fn = getattr(self._method, "apply_swiglu", None)
+        if fn is not None and self.bias is None:
+            out = fn(self, x)
+            if out is not None:
+                return out
+        from .activation import silu_and_mul
+
+        return silu_and_mul(self.forward(x))
+
     def post_load(self) -> None:
         proc = getattr(self._method, "process_weights_after_load", None)
         if proc is not None:

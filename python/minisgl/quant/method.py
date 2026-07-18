@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
@@ -10,6 +11,21 @@ from .config import QuantConfig
 
 if TYPE_CHECKING:
     from minisgl.layers.base import BaseOP
+
+# Fused dense gate_up + silu_and_mul (mmq_fp8_gemm_silu) for a MERGED gate_up projection at decode:
+# one kernel writes silu(gate)*up, dropping the separate silu launch + the [.., 2*inter] HBM round-trip.
+# Bit-exact to w4a8_linear(gate_up) + silu_and_mul. Only the decode-gemv path is fused (M<=16, K%512==0,
+# group_size%32==0); otherwise apply_swiglu returns None and Linear.forward_swiglu falls back unfused.
+# MINISGL_DENSE_FUSED_SILU=0 reverts.
+_DENSE_FUSED_SILU = os.environ.get("MINISGL_DENSE_FUSED_SILU", "1") != "0"
+
+
+def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -> bool:
+    """Shape gate for the fused dense gemm+silu decode kernel (see mmq_fp8_gemm_silu constraints)."""
+    if not _DENSE_FUSED_SILU:
+        return False
+    N = w_packed.shape[0]
+    return x.shape[0] <= 16 and x.shape[1] % 512 == 0 and group_size % 32 == 0 and N % 2 == 0
 
 
 def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
@@ -212,6 +228,19 @@ class W4A8LinearMethod:
             out = out + bias
         return out
 
+    def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
+        """FUSED gate_up + silu_and_mul at decode (this linear is a merged gate_up). Returns None ->
+        caller falls back to the unfused silu_and_mul(apply(...)) when the fused kernel doesn't apply:
+        the wide-W4A16 path, prefill (M>16), or an unsupported shape. Bit-exact when it fires."""
+        if getattr(layer, "_w_rep_wide", None) is not None:
+            return None
+        w = layer._w_packed_op  # type: ignore[attr-defined]
+        if not _fused_swiglu_ok(x, w, self.quant.group_size):
+            return None
+        return kernels.w4a8_linear_silu(
+            x, w, layer._scales_op, layer._zeros_op, self.quant.group_size  # type: ignore[attr-defined]
+        ).to(x.dtype)
+
 
 class MxFp4LinearMethod:
     """MXFP4 (OCP E2M1 weights + E8M0 per-32-block scale) dense linear, served through the SAME
@@ -269,6 +298,15 @@ class MxFp4LinearMethod:
         if bias is not None:
             out = out + bias
         return out
+
+    def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
+        """FUSED gate_up + silu (MXFP4 / E2M1, symmetric) at decode; None -> caller falls back."""
+        w = layer._w_packed_op  # type: ignore[attr-defined]
+        if not _fused_swiglu_ok(x, w, self.quant.group_size):
+            return None
+        return kernels.w4a8_linear_silu(
+            x, w, layer._scales_op, None, self.quant.group_size, weight_is_e2m1=True  # type: ignore[attr-defined]
+        ).to(x.dtype)
 
 
 class RXFLinearMethod:
