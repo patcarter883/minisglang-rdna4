@@ -11,11 +11,18 @@ A zero-dependency Python client is at [`minisgl.cam.client.CAMClient`](../python
 
 | Header | When | Meaning |
 |---|---|---|
-| `Authorization: Bearer <token>` | if the serve sets `MINISGL_CAM_API_TOKEN` | else all `/cam/*` return 401 |
+| `Authorization: Bearer <token>` | if any token is configured | else all `/cam/*` return 401 |
 | `X-CAM-Namespace: <name>` | optional | per-tenant/session store; omitted → `default` |
 
-> Note: a single global token authorizes every namespace — the header selects the store but does not
-> yet enforce per-tenant isolation. See `docs/…` (multi-tenant auth is a planned Usability item).
+**Token config (choose one or both):**
+- `MINISGL_CAM_API_TOKEN=<token>` — a single **admin** token, authorized for every namespace.
+- `MINISGL_CAM_TOKENS='{"<tokA>":"acme","<tokB>":["b1","b2"],"<admin>":"*"}'` — **per-tenant** tokens.
+  A token scoped to a namespace (or list) may ONLY touch those; `"*"` = admin. Neither set → open (dev).
+
+**Enforcement:** a request's token must be authorized for the requested namespace, else **403**. Cross-
+tenant access via `X-CAM-Namespace` is blocked, `GET /cam/namespaces` is filtered to the token's
+namespaces, and `DELETE /cam/namespaces/{ns}` re-checks the path namespace. `MINISGL_CAM_MAX_NAMESPACES`
+caps the number of tenant namespaces (`default` excluded) — creating one past the cap returns **429**.
 
 ## Endpoints
 
