@@ -191,7 +191,7 @@ def _moe_bf16_available() -> bool:
     global _MOE_BF16_OK
     if _MOE_BF16_OK is None:
         try:
-            import moe_bf16_wmma  # noqa: F401  (loads .so + registers torch.ops.moe_bf16.*)
+            import fp8_wmma  # moe_bf16 folded into fp8_wmma
 
             _MOE_BF16_OK = True
         except Exception:
@@ -233,7 +233,7 @@ def _fused_experts_bf16_hip(
     weight 1). The moe_bf16 GEMMs do full-K reduction / no split-K -> M-invariant (no Triton autotune)."""
     from minisgl.layers import gelu_and_mul, silu_and_mul
 
-    from moe_bf16_wmma import moe_bf16_gemm_out, moe_bf16_gemm_scatter_out
+    from fp8_wmma import moe_bf16_gemm_out, moe_bf16_gemm_scatter_out
 
     M, K = hidden_states.shape
     E, twoN, _ = w1.shape

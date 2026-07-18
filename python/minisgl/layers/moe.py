@@ -152,12 +152,12 @@ class _GroupedRXFExperts(BaseOP):
         # as-is buffers for the LDS rxf_moe.
         if not kernels.RXF_REGDIRECT:
             return
-        import rxf_hip
+        import fp8_wmma  # rxf folded into fp8_wmma
 
         E, N, Kp = self.weight_packed.shape
         ktiles = (Kp * 2) // 16
         wide = 4 if ktiles % 4 == 0 else 2  # b128 when K%64==0 (ZAYA), else b64
-        self._w_rep = rxf_hip.repack_rxf_w_rep_moe(self.weight_packed.contiguous(), wide)
+        self._w_rep = fp8_wmma.rxf_repack_w_rep_moe(self.weight_packed.contiguous(), wide)
         self._wide = wide
         del self.weight_packed
 
@@ -627,7 +627,7 @@ class _FP8MoEMethod(MoEQuantMethod):
         self._w8a16_fn = None
         if not self._oldmoe and os.environ.get("MINISGL_ZAYA_W8A16", "0") == "1":
             try:  # fail-safe: an env without the built extension falls back to native W8A8
-                from moe_w8a16_wmma import fused_moe_w8a16
+                from fp8_wmma import fused_moe_w8a16
 
                 self._w8a16_fn = fused_moe_w8a16
             except ImportError:
