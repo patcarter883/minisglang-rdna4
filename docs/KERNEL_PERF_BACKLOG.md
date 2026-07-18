@@ -23,10 +23,22 @@ rewrites (so those + every future opt land ONCE). Problem: the tiled cores are C
 `moe_gemm_tiled.h` (w4a8 int4-decode vs w8a8 fp8-direct) differ only in the ~10-line weight-staging; entire
 tiling/LDS/double-buffer/WMMA/occupancy core duplicated (that's why C's packed-store and B/D's occupancy
 clamp did NOT transfer across).
-STEP 1 (agent, parity-gated): `WLoad` weight-loader policy the same way the kernel is already `MMA`-templated —
-`template<AT, MMA, WLoad, …>`, `WLoad::stage_b(...)` the only per-format code. Loaders: `Int4Fp8Loader`
-(nibble unpack + decode_w4_to_e4m3 + C's packed 2-store), `Fp8DirectLoader` (4-byte copy), `E2M1Loader`,
-later `Int8`/RXF W4-NL. Gate: max|Δ|=0 int4+e2m1 AND fp8 vs current, + perf-neutral (±2-3%).
+STEP 1 (DONE — branch `core-unify` @ `ee844c1`, worktree /home/pat/code/rdna4-hip-kernels-unify): `WLoad`
+policy owns ALL per-format seams (staging + scale/pointer types + per-group fold + epilogue scale — the split
+was deeper than staging alone). Both `moe_gemm_tiled_kernel` + `_ashuffle_kernel` now `template<AT, MMA, WLoad,
+…>`. BYTE-IDENTICAL: W4A8 int4 sym+asym+e2m1 20/20 max|Δ|=0, W8A8 fp8 16/16 max|Δ|=0. W4A8 got ~6-7.6% FASTER
+(byte-identical, better codegen); loaders self-contained in moe_gemm_tiled.h (easy merge lift). CORRECTION:
+C's packed-2-store is in the DENSE prefill kernel, NOT the MoE tiled core — the MoE int4 loader still uses the
+byte-loop → packed-storing it is now a once-for-both future opt.
+
+### RETURN-TO — claw back W8A8 MoE tiled +3.5–3.9% (accepted regression, 2026-07-18)
+Unifying the leaner hand-written W8A8 kernel onto the (W4A8-shaped) unified template costs W8A8 MoE gemm
++3.5–3.9% (marginally over ±3%; ≈1% end-to-end on ZAYA, the main W8A8 user). NOT a spill cliff — same VGPR
+range/worst case, just higher register pressure at WARPS_N=4 from the broad reshape. ACCEPTED as a one-time
+cost (offset by W4A8's ~6% gain on the shared path + the dedup buys once-for-both future opts). FIX to try:
+`if constexpr(WLoad::is_fp8)` specialization so the W8A8 instantiation compiles to its lean form (drop the
+W4A8 group-fold/zeros/AT machinery on that path). Quick follow-up, not a blocker. Agent's one attempt
+(scalar group-fold) held max|Δ|=0 but didn't move perf → the shift is the reshape, needs the if-constexpr split.
 STEP 2 (me, packaging): **FOLD w4a8_fp8_wmma + w8a8_fp8_wmma → one package `fp8_wmma`** (name locked). One
 build.toml + all .hip + the SINGLE physical `moe_gemm_tiled.h` (no copy/sync). Merge torch-ext
 (torch_binding.cpp/.h both op sets: mmq_fp8_* + mmq_w8a8_*), __init__.py (both wrapper sets), one _ops.py
