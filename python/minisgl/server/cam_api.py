@@ -84,7 +84,7 @@ from typing import List, Optional
 
 from ..cam.runtime import _compose_addr
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("minisgl.cam_api")
@@ -202,19 +202,84 @@ def _remember(memory, subject_ids, object_ids, prompt_last_logits, ns=None) -> b
 # --------------------------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------------------------- #
-def _require_cam_auth(authorization: str = Header(None)) -> None:
-    """#8 auth: when MINISGL_CAM_API_TOKEN is set, require `Authorization: Bearer <token>` on EVERY /cam/*
-    route (the edit-plane mutates shared memory). Unset -> open (localhost/dev default). Applied as a
-    router-level dependency so read and write routes are covered uniformly."""
+_ADMIN = "*"   # a token mapped to "*" (or the legacy single token) may touch ANY namespace
+
+
+def _token_registry() -> dict:
+    """token -> allowed namespaces (a frozenset) OR _ADMIN. Empty dict => auth disabled (dev/localhost).
+
+    Config (multi-tenant): MINISGL_CAM_TOKENS is JSON {token: "<ns>" | ["<ns>", ...] | "*"}. The legacy
+    MINISGL_CAM_API_TOKEN (single token) is still honoured and mapped to _ADMIN (any namespace), so
+    existing single-token deployments are unchanged. Both may be set (admin + scoped tenants)."""
+    import json
     import os
-    token = os.environ.get("MINISGL_CAM_API_TOKEN")
-    if not token:
+    reg: dict = {}
+    single = os.environ.get("MINISGL_CAM_API_TOKEN")
+    if single:
+        reg[single] = _ADMIN
+    raw = os.environ.get("MINISGL_CAM_TOKENS")
+    if raw:
+        for tok, allowed in json.loads(raw).items():
+            reg[tok] = _ADMIN if allowed == _ADMIN else frozenset(
+                allowed if isinstance(allowed, list) else [allowed])
+    return reg
+
+
+def _cam_principal(authorization: str = Header(None)):
+    """Resolve the Bearer token to its principal: _ADMIN, or the frozenset of namespaces it may touch.
+    401 on a missing/unknown token. Returns _ADMIN when no tokens are configured (open dev default)."""
+    reg = _token_registry()
+    if not reg:
+        return _ADMIN
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing CAM API token")
+    principal = reg.get(authorization[len("Bearer "):])
+    if principal is None:
+        raise HTTPException(status_code=401, detail="invalid CAM API token")
+    return principal
+
+
+def _authorized(principal, namespace: str) -> bool:
+    """Whether `principal` may touch `namespace` (None -> 'default'). Admin -> any."""
+    return principal == _ADMIN or (namespace or "default") in principal
+
+
+def _require_ns(principal, namespace: str) -> None:
+    if not _authorized(principal, namespace):
+        raise HTTPException(status_code=403, detail=f"token not authorized for namespace {namespace or 'default'!r}")
+
+
+def _require_cam_auth(request: Request, principal=Depends(_cam_principal),
+                      x_cam_namespace: str = Header(None)) -> None:
+    """Router-level guard on EVERY /cam/* route: valid token (401) AND the requested namespace is one the
+    token may touch (403). Closes cross-tenant access via the X-CAM-Namespace header. The aggregate
+    `GET /cam/namespaces` route is exempt from the header check — it self-filters to the token's namespaces
+    (a scoped token that lacks 'default' must still be able to list its own). drop_namespace carries the
+    target in the PATH and re-checks `principal` explicitly."""
+    if request.url.path.rstrip("/").endswith("/cam/namespaces"):
         return
-    if authorization != f"Bearer {token}":
-        raise HTTPException(status_code=401, detail="invalid or missing CAM API token")
+    _require_ns(principal, x_cam_namespace)
 
 
 cam_router = APIRouter(prefix="/cam", tags=["cam"], dependencies=[Depends(_require_cam_auth)])
+
+
+async def _enforce_ns_quota(runtime, ns: str) -> None:
+    """Namespace-count DoS guard (opt-in: MINISGL_CAM_MAX_NAMESPACES>0). Refuses creating a NEW namespace
+    once the cap is reached — 429. Checked at the frontend before the write (a backend exception would be
+    fragile in the multi-process arch); soft under concurrency, which is fine for a quota. 'default' and
+    already-existing namespaces are always allowed. Complements the per-namespace fact cap (MAX_FACTS)."""
+    cap = int(os.environ.get("MINISGL_CAM_MAX_NAMESPACES", "0"))
+    if not cap or not ns or ns == "default":
+        return
+    if hasattr(runtime, "namespaces"):
+        existing = {n.get("namespace") for n in (await runtime.namespaces())}
+    else:
+        mem = getattr(runtime, "memory", None)
+        existing = set(mem.namespaces()) if (mem and hasattr(mem, "namespaces")) else set()
+    tenant = existing - {"default"}                        # 'default' always exists; cap TENANT namespaces
+    if ns not in existing and len(tenant) >= cap:
+        raise HTTPException(status_code=429, detail=f"namespace cap reached ({cap})")
 
 
 @cam_router.post("/remember", response_model=RememberResponse)
@@ -228,6 +293,7 @@ async def remember(req: RememberRequest, x_cam_namespace: str = Header(None)) ->
     import torch
 
     runtime = _get_runtime()
+    await _enforce_ns_quota(runtime, x_cam_namespace)      # DoS: cap the number of namespaces (opt-in)
     # MULTI-PROCESS model-share: the store lives in the backend engine.cam; route the write through it
     # (rides a generate with mem_remember). No local model/store on the frontend.
     if getattr(runtime, "is_frontend_share", False):
@@ -519,18 +585,25 @@ async def lookup(subject: str = None, text: str = None, relation: str = None,
 
 
 @cam_router.get("/namespaces")
-async def list_namespaces() -> list:
-    """Enumerate live namespaces + fact counts + freeze state (spine #4)."""
+async def list_namespaces(principal=Depends(_cam_principal)) -> list:
+    """Enumerate live namespaces + fact counts + freeze state (spine #4). A scoped token sees ONLY the
+    namespaces it may touch — it must not learn other tenants' namespace names."""
     runtime = _get_runtime()
     if hasattr(runtime, "namespaces"):
-        return await runtime.namespaces()
-    memory = getattr(runtime, "memory", None)
-    return memory.list_namespaces() if (memory and hasattr(memory, "list_namespaces")) else []
+        rows = await runtime.namespaces()
+    else:
+        memory = getattr(runtime, "memory", None)
+        rows = memory.list_namespaces() if (memory and hasattr(memory, "list_namespaces")) else []
+    if principal == _ADMIN:
+        return rows
+    return [r for r in rows if _authorized(principal, r.get("namespace"))]
 
 
 @cam_router.delete("/namespaces/{ns}")
-async def drop_namespace(ns: str) -> dict:
-    """Delete a namespace's store (spine #4; refuses 'default'). {dropped: bool}."""
+async def drop_namespace(ns: str, principal=Depends(_cam_principal)) -> dict:
+    """Delete a namespace's store (spine #4; refuses 'default'). {dropped: bool}. The target is the PATH
+    `ns`, so re-check it against the principal (the router guard only saw the X-CAM-Namespace header)."""
+    _require_ns(principal, ns)
     runtime = _get_runtime()
     if hasattr(runtime, "drop_namespace"):
         return await runtime.drop_namespace(ns)

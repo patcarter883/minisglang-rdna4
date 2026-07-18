@@ -370,7 +370,10 @@ services:
       MINISGL_CAM_AUTO_WRITE: "${MINISGL_CAM_AUTO_WRITE:-1}"   # gated ambient write on /v1/* (per-req cam_write wins)
       MINISGL_CAM_WRITE_GATE: "${MINISGL_CAM_WRITE_GATE:-1}"   # base-uncertainty gate (opt-in in frontend mode)
       MINISGL_CAM_STORE_PATH: /cam_store/store.pt              # #7 load-on-boot + debounced autosave
-      MINISGL_CAM_MAX_FACTS: "${MINISGL_CAM_MAX_FACTS:-0}"     # 0 = no LRU eviction cap
+      MINISGL_CAM_MAX_FACTS: "${MINISGL_CAM_MAX_FACTS:-0}"     # 0 = no LRU eviction cap (per-namespace)
+      MINISGL_CAM_MAX_NAMESPACES: "${MINISGL_CAM_MAX_NAMESPACES:-0}"  # 0 = unlimited; else cap tenant namespaces (DoS)
+      MINISGL_CAM_API_TOKEN: "${MINISGL_CAM_API_TOKEN:-}"      # single admin token (any namespace); blank = open
+      MINISGL_CAM_TOKENS: "${MINISGL_CAM_TOKENS:-}"            # multi-tenant: JSON {token: "<ns>"|["<ns>",..]|"*"}
       MINISGL_CAM_REQ_KV_FRAC: "${MINISGL_CAM_REQ_KV_FRAC:-0.70}"  # runaway-generation-kv-guard: force-finish a single req at 70% of the KV pool
       MINISGL_CAM_GTE_KEY: "${MINISGL_CAM_GTE_KEY:-0}"          # 1 = whitened-GTE semantic subject key (paraphrase-robust addressing 0.06->0.43)
       MINISGL_CAM_GTE_WHITEN: /cam_gte/gte_whiten.pkl
