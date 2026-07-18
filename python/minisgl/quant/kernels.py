@@ -830,19 +830,19 @@ def w8a8_moe_regdirect(
 # Distinct from the fp8 W4A8 above: weights are an NL (non-uniform) int4 codebook, activations are
 # int8 (not fp8), and a fixed block-diagonal Hadamard rotation is applied to the activation at
 # runtime (and was applied to the weights offline) so it cancels in the dot while spreading
-# activation outliers. Native HIP via the vendored rxf_hip package (rxf_hip.*).
+# activation outliers. Native HIP via fp8_wmma (rxf_* ops; folded from the old rxf_hip package).
 
 _RXF_NL: dict = {}
 
 
 def _rxf_nl(dev: torch.device) -> torch.Tensor:
-    """Cached int8[16] NL codebook on `dev` (rxf_hip.NL_DEFAULT == the Triton _NL_DEFAULT)."""
+    """Cached int8[16] NL codebook on `dev` (fp8_wmma.RXF_NL_DEFAULT == the Triton _NL_DEFAULT)."""
     key = str(dev)
     t = _RXF_NL.get(key)
     if t is None:
-        import rxf_hip
+        import fp8_wmma  # rxf folded into fp8_wmma
 
-        t = torch.tensor(rxf_hip.NL_DEFAULT, dtype=torch.int8, device=dev)
+        t = torch.tensor(fp8_wmma.RXF_NL_DEFAULT, dtype=torch.int8, device=dev)
         _RXF_NL[key] = t
     return t
 
@@ -856,12 +856,12 @@ def rxf_linear(
 ) -> torch.Tensor:
     """Dense RXF W4A8: rotate+int8-quant the activation, then int8 . NL-int4 GEMM -> bf16 (M,N).
     The rotate_quant fuses FWHT-span + per-token int8 quant; linear picks WMMA (M>2) / GEMV (M<=2)."""
-    import rxf_hip  # noqa: F401  registers rxf_hip.*
+    import fp8_wmma  # rxf folded into fp8_wmma
 
-    engaged("rxf_hip.rotate_quant_int8")
-    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    engaged("rxf_hip.linear")
-    return rxf_hip.linear(q, a_scale, w_packed, w_scale, _rxf_nl(x.device), bias)
+    engaged("fp8_wmma.rxf_rotate_quant_int8")
+    q, a_scale = fp8_wmma.rxf_rotate_quant_int8(x.contiguous(), span)
+    engaged("fp8_wmma.rxf_linear")
+    return fp8_wmma.rxf_linear(q, a_scale, w_packed, w_scale, _rxf_nl(x.device), bias)
 
 
 def rxf_moe(
@@ -888,7 +888,7 @@ def rxf_moe(
     + scaling are already folded in, so pass them through unchanged; renormalize is ignored)."""
     import torch.nn.functional as F
     import moe_hip
-    import rxf_hip  # noqa: F401
+    import fp8_wmma  # rxf folded into fp8_wmma
 
     M, K = x.shape
     E = w13.shape[0]
@@ -917,10 +917,10 @@ def rxf_moe(
     # gemm1: rotate+quant the activation (gathered by sorted_ids inside the GEMM), grouped over w13.
     # Per-GEMM kernel selection (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a
     # few real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles.
-    engaged("rxf_hip.rotate_quant_int8")
-    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    gemm1 = rxf_hip.moe_gemv if M <= 2 else rxf_hip.moe_gemm
-    engaged(f"rxf_hip.{'moe_gemv' if M <= 2 else 'moe_gemm'}")
+    engaged("fp8_wmma.rxf_rotate_quant_int8")
+    q, a_scale = fp8_wmma.rxf_rotate_quant_int8(x.contiguous(), span)
+    gemm1 = fp8_wmma.rxf_moe_gemv if M <= 2 else fp8_wmma.rxf_moe_gemm
+    engaged(f"fp8_wmma.rxf_{'moe_gemv' if M <= 2 else 'moe_gemm'}")
     out1 = gemm1(
         q, a_scale, w13, w13_scales, nl, sorted_ids, expert_ids, ntp, top_k, block_m, M * top_k
     )  # (P, 2*inter) bf16
@@ -934,7 +934,7 @@ def rxf_moe(
         buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
 
     # gemm2: rotate+quant the intermediate (w2 was rotated offline too).
-    q2, a_scale2 = rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    q2, a_scale2 = fp8_wmma.rxf_rotate_quant_int8(buf2.contiguous(), span)
     tw_flat = tw.reshape(-1).float().contiguous()
 
     # DECODE fast path (mirrors w4a8_moe): fuse gemm2 + topk-weight + reduce into ONE kernel via the
@@ -942,8 +942,8 @@ def rxf_moe(
     # NOT HIP-graph-capture-safe -> gated to eager decode (M<=2) and MINISGL_MOE_SCATTER.
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        engaged("rxf_hip.moe_gemm_scatter")
-        rxf_hip.moe_gemm_scatter(
+        engaged("fp8_wmma.rxf_moe_gemm_scatter")
+        fp8_wmma.rxf_moe_gemm_scatter(
             q2, a_scale2, w2, w2_scales, nl, sorted_ids, expert_ids, ntp, tw_flat, acc,
             top_k, block_m, M * top_k
         )  # writes acc in place
@@ -951,12 +951,12 @@ def rxf_moe(
 
     # PREFILL: unfused gemm2 (identity gather) + contention-free gather-reduce (graph-safe).
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged("rxf_hip.moe_gemm")
-    out2 = rxf_hip.moe_gemm(
+    engaged("fp8_wmma.rxf_moe_gemm")
+    out2 = fp8_wmma.rxf_moe_gemm(
         q2, a_scale2, w2, w2_scales, nl, ident, expert_ids, ntp, 1, block_m, P
     )  # (P, K) bf16
-    engaged("rxf_hip.moe_gather_reduce")
-    acc = rxf_hip.moe_gather_reduce(
+    engaged("fp8_wmma.rxf_moe_gather_reduce")
+    acc = fp8_wmma.rxf_moe_gather_reduce(
         out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k
     )  # (M, K) fp32
     return acc.to(x.dtype)
@@ -984,7 +984,7 @@ def rxf_moe_regdirect(
     rxf_moe. Route is always precomputed. Returns (M, K)."""
     import torch.nn.functional as F
     import moe_hip
-    import rxf_hip  # noqa: F401
+    import fp8_wmma  # rxf folded into fp8_wmma
 
     M, K = x.shape
     E = w13_rep.shape[0]
@@ -997,10 +997,10 @@ def rxf_moe_regdirect(
     sorted_ids, expert_ids, ntp = moe_hip.moe_align(ti, E, block_m)
     P = sorted_ids.shape[0]
 
-    engaged("rxf_hip.rotate_quant_int8")
-    q, a_scale = rxf_hip.rotate_quant_int8(x.contiguous(), span)
-    engaged("rxf_hip.moe_gemm_regdirect")
-    out1 = rxf_hip.moe_gemm_regdirect(
+    engaged("fp8_wmma.rxf_rotate_quant_int8")
+    q, a_scale = fp8_wmma.rxf_rotate_quant_int8(x.contiguous(), span)
+    engaged("fp8_wmma.rxf_moe_gemm_regdirect")
+    out1 = fp8_wmma.rxf_moe_gemm_regdirect(
         q, a_scale, w13_rep, w13_scales, nl, sorted_ids, expert_ids, ntp,
         top_k, block_m, M * top_k, wide,
     )  # (P, 2*inter) bf16
@@ -1013,16 +1013,16 @@ def rxf_moe_regdirect(
     else:
         buf2 = (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.bfloat16).contiguous()
 
-    q2, a_scale2 = rxf_hip.rotate_quant_int8(buf2.contiguous(), span)
+    q2, a_scale2 = fp8_wmma.rxf_rotate_quant_int8(buf2.contiguous(), span)
     tw_flat = tw.reshape(-1).float().contiguous()
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged("rxf_hip.moe_gemm_regdirect")
-    out2 = rxf_hip.moe_gemm_regdirect(
+    engaged("fp8_wmma.rxf_moe_gemm_regdirect")
+    out2 = fp8_wmma.rxf_moe_gemm_regdirect(
         q2, a_scale2, w2_rep, w2_scales, nl, ident, expert_ids, ntp,
         1, block_m, P, wide,
     )  # (P, K) bf16
-    engaged("rxf_hip.moe_gather_reduce")
-    acc = rxf_hip.moe_gather_reduce(out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k)  # (M, K) f32
+    engaged("fp8_wmma.rxf_moe_gather_reduce")
+    acc = fp8_wmma.rxf_moe_gather_reduce(out2, sorted_ids, tw_flat, ntp, M, top_k, M * top_k)  # (M, K) f32
     return acc.to(x.dtype)
 
 
