@@ -1095,36 +1095,13 @@ def w8a8_dense_linear(
     scales: torch.Tensor,  # (N,) f32 per-output-channel weight scale
     kernel: str | None = None,
 ) -> torch.Tensor:
-    """Dense W8A8-fp8 linear: (M, K) @ (N, K)^T -> (M, N). fp8 (e4m3) weights carrying a per-output-
-    channel f32 scale, with dynamic per-token fp8 activations quantized INSIDE the kernel (the
-    RedHatAI *-FP8-dynamic scheme). The w8a8_fp8_wmma package ships only a grouped-MoE GEMM — but a
-    grouped GEMM over a SINGLE expert (E=1, top_k=1, identity routing) IS a dense GEMM, so this reuses
-    the validated W8A8 WMMA core with no new kernel. Same small-M dispatch lesson as the W4A8 dense
-    path [[_pick_dense_kernel]]: the streaming GEMV amortizes the weight read across the decode band,
-    while the BM=big WMMA tile wastes throughput on a few decode rows (the measured batching cliff),
-    so route M<=SMALLM -> gemv, prefill -> wmma."""
+    """Dense W8A8-fp8 linear: (M, K) @ (N, K)^T -> (M, N). e4m3 weights carrying a per-output-channel
+    f32 scale, with dynamic per-token fp8 activations quantized INSIDE the kernel (RedHatAI
+    *-FP8-dynamic scheme). Runs the GENUINE dense kernel `mmq_w8a8_gemm` — flagship register-tiled
+    prefill + dense fp8 gemv decode, activation-dtype-generic (bf16 goes straight in, NO fp16 cast).
+    This is a real dense GEMM: NO single-expert / sorted_token_ids / expert grouping, NO *_moe_* kernel.
+    `kernel=None` auto-dispatches (M<=8 -> decode_gemv, else prefill_tiled)."""
     import fp8_wmma
 
-    M, K = x.shape
-    N = w_fp8.shape[0]
-    dev = x.device
-    block_m = _moe_block_m(M, 1, 1)
-    if kernel is None:
-        # Mirror the int4 dense crossover (measured 8): streaming GEMV amortizes the weight read for
-        # the decode band, the WMMA tile reclaims larger M. w8a8's grouped "gemv"/"wmma" are the
-        # analogues of decode_gemv/prefill_wmma.
-        kernel = "gemv" if M <= _W4A8_GEMV_MAX_INT4 else "wmma"
-    # Single-expert identity routing built directly (no moe_align): token t -> sorted row t; the
-    # padding rows (id == M == num_valid) are skipped by the kernel, so out[:M] is the dense result
-    # already in token order. All-device tensor construction is CUDA-graph-capture safe (no host sync).
-    P = ((M + block_m - 1) // block_m) * block_m
-    sorted_ids = torch.full((P,), M, dtype=torch.int32, device=dev)
-    sorted_ids[:M] = torch.arange(M, dtype=torch.int32, device=dev)
-    expert_ids = torch.zeros(P // block_m, dtype=torch.int32, device=dev)
-    ntp = torch.full((1,), P, dtype=torch.int32, device=dev)
-    x16 = x.to(torch.float16).contiguous()
-    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
-    out = fp8_wmma.mmq_w8a8_moe_gemm(
-        x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
-    )  # (P, N) fp16
-    return out[:M].to(x.dtype)
+    engaged(f"fp8_wmma.mmq_w8a8_gemm({kernel or 'auto'})")
+    return fp8_wmma.mmq_w8a8_gemm(x, w_fp8, scales, kernel)
