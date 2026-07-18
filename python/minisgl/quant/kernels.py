@@ -85,6 +85,10 @@ _SILU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # gemm1 + tail_hip.silu_and_mul.
 _MOE_FUSED_SILU = _os.environ.get("MINISGL_MOE_FUSED_SILU", "1") != "0"
 _FUSED_SILU_DTYPES = (torch.float16, torch.bfloat16)
+# MoE gemm1 (wide 2*inter output) decode crossover: the scalar GEMV wins gemm1 through M~32 (measured
+# w4a8 E128/tk8/inter768: 1.9-3.5x over WMMA at M=4-32; WMMA reclaims M=64) — far past the old M<=2 gate.
+# w8a8 gemm1 shares the same gemv structure so uses the same crossover (inferred from the w4a8 measurement).
+_MOE_GEMM1_GEMV_MAX = 32
 
 
 def _moe_time(bucket: str, fn):
@@ -305,7 +309,7 @@ def w4a8_moe(
     # gather, top_k==1): WMMA is ~6.8x faster than GEMV (50us vs 339us) — the GEMV path
     # underperforms for that shape. So pick gemv for gemm1, keep WMMA for gemm2. Together ~85us vs
     # ~356us with the old all-WMMA default. Prefill (M>2) keeps the passed/default kernel for both.
-    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
     gemm2_kernel = kernel
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
@@ -595,7 +599,7 @@ def w8a8_moe(
     # Per-GEMM kernel pick (== w4a8_moe): at decode (M<=2) gemm1's wide 2*inter output over a few
     # real tokens is far faster as a per-token GEMV than WMMA over mostly-padding tiles; gemm2's
     # K output favours WMMA. Prefill (M>2) keeps the passed/default kernel for both.
-    gemm1_kernel = "gemv" if M <= 2 else kernel
+    gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
     gemm2_kernel = kernel
 
     def _route():
@@ -978,38 +982,26 @@ def rxf_moe_regdirect(
 
 
 def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 128) -> str:
-    """Per-M dense-linear kernel selection, at the MEASURED gemv<->wmma crossover.
+    """Per-M dense-linear kernel selection, at the MEASURED crossovers (gfx1201).
 
-    The old two-way split (decode_gemv for M<=2, else prefill_wmma) fell off a cliff across the
-    DECODE-BATCH band: prefill_wmma uses BM=256, so at M=4-8 it runs 256 WMMA rows for a few real
-    (~32-64x wasted throughput) — a non-monotonic decode regression (27B W4A8 dense: 41 tok/s @M=2
-    -> 34 @M=4). decode_gemv (the M<=2 fast path) actually serves M<=16 in-kernel: a streaming GEMV
-    that reads each weight once and dots it against all M rows (amortizing the weight read) and
-    writes straight to `out` — no extra buffer. But the GEMV is scalar-compute, so past a crossover
-    M its per-row compute loses to the WMMA tile. The crossover DIFFERS by decode path (measured,
-    27B/35B TP=2, gfx1201):
-      * int4  (uniform W4A8): gemv wins M<=8 (27B M=4 34->56, M=8 62->66); WMMA reclaims M=16
-        (61 gemv vs 100 wmma — the BM=256 tile finally amortizes) -> gemv only up to 8.
-      * e2m1  (MXFP4): gemv wins through M=16 (35B M=4 102->147, M=8 193->255, M=16 343->401) and
-        is the ONLY e2m1-capable small-M kernel anyway -> gemv up to 16 (decode_gemv's in-kernel cap).
-    Above the crossover -> prefill_wmma (the real prefill regime). NOTE the WMMA small-M variants
-    (nsplit_smallm/splitk_smallm/regdirect_shuffle) are DELIBERATELY not used: they accumulate into
-    an `at::zeros((M,N),f32)` allocated inside the op, which under CUDA-graph capture reserves a
-    persistent fp32 buffer per captured decode size x every linear — that VRAM blowup OOM'd the 27B
-    M=16 prefill transient. Reachable via MINISGL_W4A8_DENSE_SMALLM=<name> for A/B on models with
-    headroom; =off restores the old decode_gemv(M<=2)/prefill_wmma split. (The full vllm_adapter also
-    has a Triton W4A16 large-group fallback — PERF_NOTES.)
+    - m <= gemv_max -> decode_gemv: a streaming GEMV that reads each weight once and dots it against
+      all M rows (amortizing the weight read), writing straight to `out`. Serves the decode/decode-
+      batch band; measured crossover int4 M<=8, e2m1 M<=16 (also the only e2m1-capable small-M kernel;
+      decode_gemv's in-kernel cap is 16).
+    - m >= _W4A8_PREFILL_TILED_MIN -> wmma_tiled_tuned: the tuned tiled WMMA GEMM. Dominates the prefill
+      regime ~2-4x over prefill_wmma (re-bench), for BOTH int4 AND e2m1 now that the tiled kernel is
+      e2m1-bit-exact and carries the packed-store. Bit-exact + graph-capture-safe (writes to `out`,
+      no in-op at::zeros). One dtype-generic rule — no int4-vs-e2m1 branch.
+    - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> prefill_wmma: its conservative config still
+      wins the small-M/wide-N corner (re-bench: tiled loses only at N>=6144, M<=32).
+
+    The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
+    in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
     """
-    override = _os.environ.get("MINISGL_W4A8_DENSE_SMALLM")
-    if override == "off":
-        return "decode_gemv" if m <= 2 else "prefill_wmma"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
-    if m > gemv_max:
-        return "prefill_wmma"
-    if override and m > 2:
-        # e2m1 has no WMMA small-M kernel; never misroute it to one even under an override.
-        return override if not weight_is_e2m1 else "decode_gemv"
-    return "decode_gemv"
+    if m <= gemv_max:
+        return "decode_gemv"
+    return "wmma_tiled_tuned" if m >= _W4A8_PREFILL_TILED_MIN else "prefill_wmma"
 
 
 # gemv<->wmma crossover per decode path (measured). decode_gemv asserts M<=16 in-kernel, so E2M1 caps
@@ -1017,6 +1009,10 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
 # decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
 _W4A8_GEMV_MAX_INT4 = 8
 _W4A8_GEMV_MAX_E2M1 = 16
+# Prefill regime: wmma_tiled_tuned dominates from here up (~2-4x prefill_wmma, bit-exact, graph-safe,
+# both dtypes). Below it (small-M/wide-N mid-band) prefill_wmma's conservative config still wins
+# (re-bench: tiled loses only at N>=6144, M<=32). True prefill/chunked-prefill M is always >> 64.
+_W4A8_PREFILL_TILED_MIN = 64
 
 
 def w4a8_linear(
