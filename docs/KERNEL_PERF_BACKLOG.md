@@ -4,8 +4,15 @@
 **Re-run BOTH performance matrices** to capture the cumulative gains in one clean pass on the final state:
 - Serving matrix: `tools/kernel_perf_matrix.sh` (per-model tok/s, all served models, TP=1/2, graph capture)
   — now on the merged `fp8_wmma` package with reroutes + clamps + the register-tiled MoE prefill kernel.
+  **MUST ADD a LONG-CONTEXT / LARGE-M PREFILL workload** (prompt >= ~4096 tok and/or batched prefill so the
+  MoE hits block_m==128) — that's the ONLY regime the flag MoE kernel + the dense-tiled reroute activate in;
+  the existing prefill=480-tok / decode workloads never reach it, so they'd miss the flag entirely. Report
+  prefill throughput (prompt tok/s) at the large-M regime, not just decode tok/s.
 - Op-level TFLOPS/roofline matrix: `tools/kernel_op_matrix.py` (per-kernel achieved TF/s / GB/s + % roofline
-  + vs rocBLAS/hipBLASLt) — reflects w4a8 88 TF/s, the MoE-flag 1.2–1.5x, etc.
+  + vs rocBLAS/hipBLASLt) — reflects w4a8 88 TF/s, the MoE-flag 1.2–1.5x, etc. **MUST ADD a large-M MoE
+  PREFILL dimension** (block_m=128, E/inter/group of the served models incl group=32, gemm1+gemm2 shapes)
+  alongside the decode shapes — the flag kernel only shows up at block_m=128, so a decode-only op matrix
+  hides it. Cover the flag vs tiled at those shapes.
 This gives the final numbers for the HF kernel-repo per-kernel performance answer (supersedes the pre-
 optimization matrix). Rebuild kernel attribution table (which model exercises which kernel) too.
 
