@@ -346,14 +346,29 @@ def w4a8_moe(
     # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
     # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
     if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
-        engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
-        buf2 = _moe_time(
-            "gemm1silu",
-            lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
-                x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
-                kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
-            ),
-        )  # (P, inter) in x's dtype
+        # PREFILL (block_m in {64,128}): the silu-fused flagship register-tiled gemm1 flag — bit-exact
+        # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
+        # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
+        _flag1 = _MOE_FLAG and block_m in (64, 128) and \
+            (w13.shape[-1] * 8) // w13_scales.shape[-1] in (32, 64, 128)
+        if _flag1:
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}")
+            buf2 = _moe_time(
+                "gemm1silu",
+                lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu_flag(
+                    x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                    w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+                ),
+            )  # (P, inter) in x's dtype
+        else:
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
+            buf2 = _moe_time(
+                "gemm1silu",
+                lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
+                    x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                    kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+                ),
+            )  # (P, inter) in x's dtype
     else:
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
         out1 = _moe_time(
