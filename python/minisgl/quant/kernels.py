@@ -292,7 +292,7 @@ def w4a8_moe(
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13.shape[0]
@@ -337,19 +337,19 @@ def w4a8_moe(
     # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
     # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
     if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
-        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
         buf2 = _moe_time(
             "gemm1silu",
-            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm1_silu(
+            lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
                 x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                 kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
         )  # (P, inter) in x's dtype
     else:
-        engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
         out1 = _moe_time(
             "gemm1",
-            lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+            lambda: fp8_wmma.mmq_fp8_moe_gemm(
                 x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                 kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
@@ -389,10 +389,10 @@ def w4a8_moe(
                 ),
             )  # writes acc in place (atomic scatter over experts AND split_k K-slices)
         else:
-            engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
             _moe_time(
                 "gemm2scat",
-                lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm_scatter(
+                lambda: fp8_wmma.mmq_fp8_moe_gemm_scatter(
                     buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
                     kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
                 ),
@@ -401,18 +401,18 @@ def w4a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
+    engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm2_kernel}{_e2m1})")
     out2 = _moe_time(
         "gemm2",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gemm(
+        lambda: fp8_wmma.mmq_fp8_moe_gemm(
             buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m,
             kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, K)
-    engaged("w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_fp8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_fp8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -462,7 +462,7 @@ def w4a16_moe(
     fallback as w4a8_moe). `weight_is_e2m1=True` decodes the weights as MXFP4 (OCP E2M1) — the
     register-direct MXFP4 path (fp16 acts, e2m1 weight decode, symmetric so no zeros). Returns (M, K)."""
     import moe_hip
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     M = x.shape[0]
     E = w13_rep.shape[0]
@@ -489,10 +489,10 @@ def w4a16_moe(
     P = sorted_ids.shape[0]
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
 
-    engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
+    engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
     out1 = _moe_time(
         "gemm1",
-        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe(
             x16, w13_rep, w13_scales, w13_zeros if w13_zeros is not None else _empty,
             sorted_ids, expert_ids, ntp, 2 * inter, top_k, block_m, wide,
             weight_is_e2m1=weight_is_e2m1,
@@ -515,10 +515,10 @@ def w4a16_moe(
     # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
     if M <= 2 and _MOE_SCATTER:
         output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
-        engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter{_e2m1}")
+        engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe_scatter{_e2m1}")
         _moe_time(
             "gemm2scat",
-            lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
+            lambda: fp8_wmma.mmq_regdirect_w4a16_moe_scatter(
                 buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, output,
                 hidden, top_k, block_m, wide, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
             ),
@@ -527,18 +527,18 @@ def w4a16_moe(
         return output.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w4a8_fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
+    engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe{_e2m1}")
     out2 = _moe_time(
         "gemm2",
-        lambda: w4a8_fp8_wmma.mmq_regdirect_w4a16_moe(
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe(
             buf2.contiguous(), w2_rep, w2_scales, w2_zeros if w2_zeros is not None else _empty,
             ident, expert_ids, ntp, hidden, 1, block_m, wide, weight_is_e2m1=weight_is_e2m1,
         ),
     )  # (P, hidden) fp16
-    engaged("w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_fp8_moe_gather_reduce")
     output = _moe_time(
         "gather",
-        lambda: w4a8_fp8_wmma.mmq_fp8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_fp8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, hidden) fp32
@@ -556,13 +556,13 @@ def w4a16_linear(
 ) -> torch.Tensor:
     """Dense W4A16 GEMM (fp16 acts direct) via mmq_regdirect_w4a16_wide — the fp16-act twin of
     w4a8_linear, for the GLM shared expert / dense layers when MINISGL_MOE_W4A16 is on."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     wide = _w4a16_wide(group_size)
     x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
     z = w_zeros if w_zeros is not None else torch.empty(0, dtype=torch.int32, device=x.device)
-    engaged("w4a8_fp8_wmma.mmq_regdirect_w4a16_wide")
-    return w4a8_fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
+    engaged("fp8_wmma.mmq_regdirect_w4a16_wide")
+    return fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
 
 
 def w8a8_moe(
@@ -585,7 +585,7 @@ def w8a8_moe(
     (no zeros, no per-K-group scale: fp8 weights carry a per-output-channel f32 scale folded
     once in the epilogue). Returns (M, K)."""
     import torch.nn.functional as F
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13.shape[0]
@@ -631,10 +631,10 @@ def w8a8_moe(
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
     out1 = _moe_time(
         "gemm1",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+        lambda: fp8_wmma.mmq_w8a8_moe_gemm(
             x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, gemm1_kernel,
         ),
     )  # (P, 2*inter)
@@ -659,10 +659,10 @@ def w8a8_moe(
     # keeps the unfused gemm2 + contention-free gather_reduce (graph-safe).
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm_scatter({gemm2_kernel})")
+        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm_scatter({gemm2_kernel})")
         _moe_time(
             "gemm2scat",
-            lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm_scatter(
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm_scatter(
                 buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
                 gemm2_kernel,
             ),
@@ -671,17 +671,17 @@ def w8a8_moe(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm2_kernel})")
     out2 = _moe_time(
         "gemm2",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+        lambda: fp8_wmma.mmq_w8a8_moe_gemm(
             buf2, w2, w2_scales, ident, expert_ids, ntp, 1, block_m, gemm2_kernel,
         ),
     )  # (P, K)
-    engaged("w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_w8a8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_w8a8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -709,7 +709,7 @@ def w8a8_moe_regdirect(
     WMMA-B lane order). Route is always precomputed (ZAYA). Returns (M, K)."""
     import torch.nn.functional as F
     import moe_hip
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     E = w13_rep.shape[0]
@@ -723,10 +723,10 @@ def w8a8_moe_regdirect(
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
-    engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe")
+    engaged("fp8_wmma.mmq_regdirect_w8a8_moe")
     out1 = _moe_time(
         "gemm1",
-        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+        lambda: fp8_wmma.mmq_regdirect_w8a8_moe(
             x16, w13_rep, w13_scales, sorted_ids, expert_ids, ntp, N13, top_k, block_m, wide,
         ),
     )  # (P, 2*inter) fp16
@@ -747,10 +747,10 @@ def w8a8_moe_regdirect(
     # eager M<=2 + MINISGL_MOE_SCATTER). Otherwise the graph-safe unfused gemm2 + gather_reduce.
     if M <= 2 and _MOE_SCATTER:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe_scatter")
+        engaged("fp8_wmma.mmq_regdirect_w8a8_moe_scatter")
         _moe_time(
             "gemm2scat",
-            lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe_scatter(
+            lambda: fp8_wmma.mmq_regdirect_w8a8_moe_scatter(
                 buf2.contiguous(), w2_rep, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc,
                 K, top_k, block_m, wide,
             ),
@@ -759,17 +759,17 @@ def w8a8_moe_regdirect(
         return acc.to(x.dtype)
 
     ident = torch.arange(P, dtype=torch.int32, device=dev)
-    engaged("w8a8_fp8_wmma.mmq_regdirect_w8a8_moe")
+    engaged("fp8_wmma.mmq_regdirect_w8a8_moe")
     out2 = _moe_time(
         "gemm2",
-        lambda: w8a8_fp8_wmma.mmq_regdirect_w8a8_moe(
+        lambda: fp8_wmma.mmq_regdirect_w8a8_moe(
             buf2, w2_rep, w2_scales, ident, expert_ids, ntp, K, 1, block_m, wide,
         ),
     )  # (P, K)
-    engaged("w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce")
+    engaged("fp8_wmma.mmq_w8a8_moe_gather_reduce")
     acc = _moe_time(
         "gather",
-        lambda: w8a8_fp8_wmma.mmq_w8a8_moe_gather_reduce(
+        lambda: fp8_wmma.mmq_w8a8_moe_gather_reduce(
             out2.contiguous(), sorted_ids, tw_flat, ntp, top_k
         ),
     )  # (M, K) fp32
@@ -1033,13 +1033,13 @@ def w4a8_linear(
     out.to(x.dtype) is then a no-op). `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight
     decode instead of uniform int4 (scales are the E8M0 group exponents folded to fp16; w_zeros MUST
     be None — the op asserts symmetric)."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
         kernel = _pick_dense_kernel(x2d.shape[0], weight_is_e2m1, group_size)
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
-    return w4a8_fp8_wmma.mmq_fp8_gemm(
+    engaged(f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
+    return fp8_wmma.mmq_fp8_gemm(
         x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
     )
 
@@ -1055,10 +1055,10 @@ def w4a8_linear_silu(
     """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
     ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%32==0);
     BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
-    import w4a8_fp8_wmma
+    import fp8_wmma
 
-    engaged(f"w4a8_fp8_wmma.mmq_fp8_gemm_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
-    return w4a8_fp8_wmma.mmq_fp8_gemm_silu(
+    engaged(f"fp8_wmma.mmq_fp8_gemm_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
+    return fp8_wmma.mmq_fp8_gemm_silu(
         x, w_packed, scales, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
     )
 
@@ -1077,7 +1077,7 @@ def w8a8_dense_linear(
     path [[_pick_dense_kernel]]: the streaming GEMV amortizes the weight read across the decode band,
     while the BM=big WMMA tile wastes throughput on a few decode rows (the measured batching cliff),
     so route M<=SMALLM -> gemv, prefill -> wmma."""
-    import w8a8_fp8_wmma
+    import fp8_wmma
 
     M, K = x.shape
     N = w_fp8.shape[0]
@@ -1097,8 +1097,8 @@ def w8a8_dense_linear(
     expert_ids = torch.zeros(P // block_m, dtype=torch.int32, device=dev)
     ntp = torch.full((1,), P, dtype=torch.int32, device=dev)
     x16 = x.to(torch.float16).contiguous()
-    engaged(f"w8a8_fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
-    out = w8a8_fp8_wmma.mmq_w8a8_moe_gemm(
+    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({kernel})")
+    out = fp8_wmma.mmq_w8a8_moe_gemm(
         x16, w_fp8.unsqueeze(0), scales.unsqueeze(0), sorted_ids, expert_ids, ntp, 1, block_m, kernel
     )  # (P, N) fp16
     return out[:M].to(x.dtype)
