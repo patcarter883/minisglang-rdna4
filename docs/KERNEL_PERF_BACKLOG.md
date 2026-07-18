@@ -1,5 +1,16 @@
 # Kernel-perf campaign — backlog
 
+## FINAL STEP (after the flagship integration completes + coordinated deploy)
+**Re-run BOTH performance matrices** to capture the cumulative gains in one clean pass on the final state:
+- Serving matrix: `tools/kernel_perf_matrix.sh` (per-model tok/s, all served models, TP=1/2, graph capture)
+  — now on the merged `fp8_wmma` package with reroutes + clamps + the register-tiled MoE prefill kernel.
+- Op-level TFLOPS/roofline matrix: `tools/kernel_op_matrix.py` (per-kernel achieved TF/s / GB/s + % roofline
+  + vs rocBLAS/hipBLASLt) — reflects w4a8 88 TF/s, the MoE-flag 1.2–1.5x, etc.
+This gives the final numbers for the HF kernel-repo per-kernel performance answer (supersedes the pre-
+optimization matrix). Rebuild kernel attribution table (which model exercises which kernel) too.
+
+
+
 Tracks the gfx1201 (RDNA4) HIP-kernel perf work. The **current cycle** (in progress) is the
 routing consolidation + dead-kernel/env cleanup; the **deferred backlog** below is explicitly
 scheduled to be attended to **after** that cycle lands (validated + merged).
