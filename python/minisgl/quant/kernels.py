@@ -1044,6 +1044,25 @@ def w4a8_linear(
     )
 
 
+def w4a8_linear_silu(
+    x: torch.Tensor,
+    w_packed: torch.Tensor,  # (2*inter, K/8) int32 [gate|up], op layout
+    scales: torch.Tensor,  # (2*inter, K/group) fp16
+    w_zeros: torch.Tensor | None,  # ((2*inter)/8, K/group) int32 (AWQ) or None (sym)
+    group_size: int,
+    weight_is_e2m1: bool = False,
+) -> torch.Tensor:
+    """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
+    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%32==0);
+    BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
+    import w4a8_fp8_wmma
+
+    engaged(f"w4a8_fp8_wmma.mmq_fp8_gemm_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
+    return w4a8_fp8_wmma.mmq_fp8_gemm_silu(
+        x, w_packed, scales, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
+    )
+
+
 def w8a8_dense_linear(
     x: torch.Tensor,  # (M, K) fp16/bf16 activations
     w_fp8: torch.Tensor,  # (N, K) uint8 (e4m3 bits), op layout (natural row-major)
