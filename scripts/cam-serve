@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# cam-serve — one-command lifecycle for the CAM (Canonical Associative Memory) serve.
+#
+# Wraps the leased docker-compose 'cam' profile so an operator doesn't need the tribal knowledge
+# (gpu-lease, compose project naming, GTE env, health polling). Everything is env-overridable.
+#
+#   scripts/cam-serve up        # lease 2 cards, boot the 35B CAM serve, wait until healthy, print the URL
+#   scripts/cam-serve status    # cards + serve health + store stats
+#   scripts/cam-serve logs       # follow serve logs
+#   scripts/cam-serve down       # stop + release the lease
+#   scripts/cam-serve restart    # down then up
+#
+# Config (env, with defaults):
+#   MINISGL_HOST_PORT=1919          host port
+#   MINISGL_CAM_GTE_KEY=1           whitened-GTE semantic key on (paraphrase-robust recall)
+#   MINISGL_CAM_TOKENS / _API_TOKEN auth (see docs/CAM_API.md); unset = open (dev)
+#   MINISGL_CAM_MAX_FACTS / _MAX_NAMESPACES  quotas
+#   CAM_SERVE_NAME=cam              lease/compose instance name (run several with distinct names)
+#   MINISGL_MOE_FUSED_SILU          set 0 if boot fails with "fused gemm1+silu needs the 'wmma' kernel"
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="${MINISGL_HOST_PORT:-1919}"
+NAME="${CAM_SERVE_NAME:-cam}"
+LEASE="minisgl-${NAME}"
+PROJECT="lease-${LEASE}"
+CONTAINER="${PROJECT}-cam"
+URL="http://127.0.0.1:${PORT}"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "cam-serve: '$1' not found on PATH" >&2; exit 127; }; }
+
+up() {
+  need gpu-lease; need docker; need curl
+  export MINISGL_CAM_GTE_KEY="${MINISGL_CAM_GTE_KEY:-1}" MINISGL_HOST_PORT="$PORT"
+  echo "cam-serve: leasing 2 cards + booting (project ${PROJECT}, port ${PORT})…"
+  ( cd "$REPO" && gpu-lease -n 2 --detach --name "$LEASE" -- docker compose --profile cam up -d )
+  local i
+  for i in $(seq 1 60); do
+    if curl -sf -m3 "${URL}/health" >/dev/null 2>&1; then
+      echo "cam-serve: READY at ${URL}  (~$((i*3))s)"; return 0
+    fi
+    if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+      echo "cam-serve: container exited during boot — last logs:" >&2
+      docker logs --tail 25 "$CONTAINER" 2>&1 | tail -25 >&2
+      return 1
+    fi
+    sleep 3
+  done
+  echo "cam-serve: timed out after 180s waiting for health; check 'cam-serve logs'" >&2; return 1
+}
+
+down() { ( cd "$REPO" && docker compose -p "$PROJECT" down ); }
+
+status() {
+  command -v gpu-status >/dev/null 2>&1 && gpu-status 2>/dev/null | head -4 || true
+  if curl -sf -m3 "${URL}/health" >/dev/null 2>&1; then
+    echo "cam-serve: UP at ${URL}"
+    curl -s -m5 "${URL}/cam/stats" 2>/dev/null | sed 's/^/  stats: /' || true; echo
+  else
+    echo "cam-serve: DOWN (no health at ${URL})"
+  fi
+}
+
+logs() { ( cd "$REPO" && docker compose -p "$PROJECT" logs -f ); }
+
+case "${1:-help}" in
+  up)      up ;;
+  down)    down ;;
+  restart) down || true; up ;;
+  status)  status ;;
+  logs)    logs ;;
+  *) grep '^#' "${BASH_SOURCE[0]}" | grep -v '^#!' | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
