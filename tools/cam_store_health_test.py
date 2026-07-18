@@ -37,6 +37,7 @@ def make(keys, *, recovered=False, last_save=0.0):
     self._state = lambda ns=None: st
     self.stats = CAMMemory.stats.__get__(self)
     self._index_crowding = CAMMemory._index_crowding.__get__(self)
+    self._key_matrix = CAMMemory._key_matrix.__get__(self)
     return self, st
 
 
