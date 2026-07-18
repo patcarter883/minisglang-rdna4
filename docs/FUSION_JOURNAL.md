@@ -221,3 +221,25 @@ default on).
   moe_gemm1_silu_parity_run.sh, moe_fused_silu_smoke.sh.
 - **Remaining backlog:** (2) qkv-merge full-attn (bit-exact-able, 1/4 layers); (3) dense/shared SwiGLU
   (same restructure class as #1, now proven bit-exact-able via moe_silu_and_mul_h — de-risked).
+
+## ATTENDED FOLLOW-UP — backlog #3 (dense/shared SwiGLU) SHIPPED (2026-07-18, user-directed)
+"Continue clearing backlog." Built the DENSE analog of #1: `mmq_fp8_gemv_decode_silu_kernel` — same K-tiled
+decode GEMV as mmq_fp8_gemv_decode, each warp owns one FUSED col j<inter computing gate (weight col j) + up
+(col j+inter) sharing the staged fp8 activation, writes silu(gate)*up → (M,inter). New op
+`mmq_fp8_gemm_silu` (launch_mmq_fp8_gemm_silu_gfx1201: act-quant + gemv-silu dispatch). Reused
+moe_silu_and_mul_h verbatim (replicated as w4a8_silu_and_mul_h) → **BIT-EXACT** to (mmq_fp8_gemm gate|up) +
+silu (parity max=0.000e+00: int4 sym/asym + e2m1, fp16/bf16, M∈{1,2,4}, incl K=1536/group=32).
+- **Plumbing (safe-fallback design):** Linear.forward_swiglu prefers the method's apply_swiglu (fused decode)
+  and falls back to the BIT-IDENTICAL silu_and_mul(forward(x)) → swapping a call site is always safe.
+  apply_swiglu added to W4A8LinearMethod + MxFp4LinearMethod; kernels.w4a8_linear_silu; env
+  MINISGL_DENSE_FUSED_SILU (default on). Call sites swapped: GLM-4.7-Flash shared expert (the validated
+  target — quantized merged gate_up, K=1536, every layer) + Qwen2-MoE shared expert.
+- **Perf:** op-level 1.19x-1.30x decode (2.5-7.5us/MLP/token).
+- **Serve:** GLM-4.7-Flash-AWQ TP=2 under GRAPH CAPTURE — COHERENT 5/5 (thinking off), `[hip-engage]
+  mmq_fp8_gemm_silu(int4)` fires DURING capture. (First pass showed thinking-mode CoT preambles at 40 tok →
+  probe artifact, NOT a fusion bug; confirmed by disabling thinking.)
+- Commits: kernels `be85bfe`, engine `f6a8bb4`. Harness: tools/w4a8_gemm_silu_{parity,bench}.py,
+  glm_fused_silu_smoke.sh.
+- **Remaining backlog:** (2) qkv-merge for full-attn layers — bit-exact-by-construction (weight concat, 3
+  gemms→1), pure plumbing (reuse LinearQKVMerged + a 3-way weight-loader merge), but conditional ROI (full-
+  attn layers only; GDN-hybrid models are ~1/4 attn) and the qwen3_5 q_proj gate-interleave adds fiddliness.
