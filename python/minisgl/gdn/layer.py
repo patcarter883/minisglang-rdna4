@@ -35,6 +35,12 @@ from torch import nn
 
 from minisgl._hip_engage import engaged
 
+# Fuse the gated RMSNorm into gdn_decode's epilogue (gdn_hip.gdn_decode_gated) — one kernel instead of
+# gdn_decode + rmsnorm_gated (−1 launch + core HBM round-trip). Bit-exact vs the two-kernel path. Default
+# on; falls back automatically if the loaded gdn_hip .so predates the op. Set MINISGL_GDN_FUSED_NORM=0 to
+# force the unfused path.
+_GDN_FUSED_NORM = os.environ.get("MINISGL_GDN_FUSED_NORM", "1") == "1"
+
 if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod
 
@@ -449,6 +455,18 @@ class QwenGatedDeltaNet(nn.Module):
         )
         # One-step gated-delta-rule (l2norm + g/beta folded in); ssm_state updated in place per slot.
         q, k, v = self._split_conv_qkv(conv_out, n)
+        if _GDN_FUSED_NORM and hasattr(gdn, "gdn_decode_gated"):
+            # FUSED: gdn_decode + the gated-RMSNorm output projection in ONE kernel (skips the separate
+            # rmsnorm_gated launch + the core HBM round-trip). Bit-exact vs the two-kernel path;
+            # z_flat/norm_weight/eps are exactly what _output_projection feeds the standalone rmsnorm_gated.
+            z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+            engaged("gdn_hip.gdn_decode_gated")
+            normed = gdn.gdn_decode_gated(
+                q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+                ssm_state, state_idx, z_flat, self._norm_weight_fp32(), self.norm.eps,
+                self.head_k_dim ** -0.5, 1,
+            )  # [B, num_v_heads, head_v_dim], already gated-RMS-normed
+            return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
         engaged("gdn_hip.gdn_decode")
         core = gdn.gdn_decode(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
