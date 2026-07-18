@@ -130,3 +130,17 @@ kernel as vllm-gfx1201) via hand-rolled `docker run`. The canonical recipe is in
 When in doubt, read the canonical vllm-gfx1201 CLAUDE.md — it is the source of truth for the GPU,
 profiling, and cache protocols; the sections above mirror the rules that bind GPU work done from
 *this* repo and note where this repo's container path differs.
+
+## Kernel core policy — ONE core per shape; weight/act formats are WLoad POLICIES (MANDATORY)
+
+Before writing or "optimizing" ANY GEMM / GEMV / MoE kernel in `rdna4-hip-kernels`, read
+[`/home/pat/code/rdna4-hip-kernels/KERNEL_CORE_POLICY.md`](/home/pat/code/rdna4-hip-kernels/KERNEL_CORE_POLICY.md).
+The rule: **a new weight format (int4/e2m1/fp8/NL-codebook/W8A16/bf16) or activation dtype is a loader
+policy on the EXISTING shared core — never a new kernel, never a new package.** Two kernels that compute
+the same shape and differ only in weight-unpack/dequant/scale MUST be one `template<class WLoad, …>`
+body. Copy-pasting a `*_gemv`/`*_gemm`/`*_moe` kernel and editing the decode lines is the exact debt this
+forbids — occupancy/coalescing/tiling wins live in the core, so a copy silently strands every future win
+(a real, measured example: the fp8 decode GEMV reached 81% of HBM while the copy-pasted int4 GEMV sat at
+38% on the same card — the served path's dominant bandwidth, lost to a fork). Only a genuinely different
+*algorithm or tiling* justifies a new kernel. The doc carries the live consolidation backlog (decode
+GEMV ×5, `rxf`, `moe_bf16`/`moe_w8a16`, `dense_gemm` dead variants) — extend the shared core, do not fork.
