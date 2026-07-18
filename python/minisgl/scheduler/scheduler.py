@@ -194,6 +194,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if _cam is not None and getattr(_cam, "_gte", None) is not None:
             _cam._decode = lambda ids: self.tokenizer.decode(list(ids)).strip()
             _cam.reindex()
+        # rank0-authoritative store persistence: only the tp-primary (== the metrics emitter) writes the
+        # store to disk. One writer => no TP save race; the writer reads the true primary at boot before
+        # its own repair-save, so its recovered_from_backup flag/gauge is exact. Restore stays on every
+        # rank (they each serve deliveries from their in-memory store).
+        if _cam is not None:
+            _cam._persist_owner = config.tp_info.is_primary()
         # FULL end-of-generation set: generation_config `eos_token_id` (often a LIST) ∪ tokenizer ∪
         # config. Multi-EOS models (GLM-4.x: [154820,154827,154829]) end turns on a token other than
         # the tokenizer's single EOS, so honouring only that one leaves them generating forever.

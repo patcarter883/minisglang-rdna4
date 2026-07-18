@@ -287,14 +287,11 @@ class FrontendMetrics:
         gauge("minisgl_cam_crowded_banks",
               "Product-key banks past the crowding knee (>9 edits).", b.cam_crowded_banks)
         # ---- store-health / robustness signals (pageable) ----------------------------------------
-        # Best-effort under TP>1: both ranks share the store file, so the FIRST to restore recovers from
-        # .bak (flag=1) and its autosave repairs the primary before the other rank restores — that rank
-        # (which may be the metrics emitter) then loads the healthy primary and reports 0. So 1 always
-        # means a real recovery happened; 0 does NOT guarantee none occurred. Data recovery itself is
-        # reliable regardless. A rank0-authoritative-store change would make this signal exact.
+        # Exact under TP>1: rank0-authoritative persistence makes the tp-primary the sole store writer AND
+        # the metrics emitter, so it reads the true primary at boot before any repair — its flag reflects
+        # the real recovery. (Other ranks restore too but never write, so nothing masks the primary state.)
         gauge("minisgl_cam_recovered_from_backup",
-              "1 if boot restored the store from .bak (primary corrupt/lost) — ALERT. Best-effort under "
-              "TP>1: 1 => real recovery; 0 does not guarantee none (recovery may land on a non-emitting rank).",
+              "1 if boot restored the store from .bak because the primary was corrupt/lost (ALERT).",
               b.cam_recovered_from_backup)
         gauge("minisgl_cam_index_nn_cos_max",
               "Worst nearest-neighbour cosine in the delivery index; nearing deliver_tau => keys "
