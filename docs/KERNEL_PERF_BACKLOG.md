@@ -17,6 +17,30 @@ scheduled to be attended to **after** that cycle lands (validated + merged).
    and testing-only `MINISGL_*` toggles (`MINV_PIPE_*`, `MOE_PROF`, per-kernel tuners).
 5. Rebuild → exhaustive parity → serve smoke (int4 + MXFP4, TP=2 graph capture) → merge.
 
+## DEFERRED BACKLOG — structural: weight-loader policy (dedup W4A8/W8A8/RXF core)
+**Do this BEFORE the register-blocking rewrites** (so those, and every future opt, land ONCE). The
+tiled cores are COPY-PASTED: two physical `moe_gemm_tiled.h` (w4a8 int4-decode vs w8a8 fp8-direct),
+differing only in the ~10-line weight-staging block — entire tiling/LDS/double-buffer/WMMA/occupancy
+core duplicated. That's why C's packed-store (w4a8 copy) and B/D's occupancy clamp (w8a8 launcher) did
+NOT transfer. FIX: the kernel is already templated on an `MMA` policy — add a `WLoad` (weight-loader)
+policy the same way: `template<AT, MMA, WLoad, …>` with `WLoad::stage_b(...)` the only per-format code.
+Loaders: `Int4Fp8Loader` (nibble unpack + decode_w4_to_e4m3 + C's packed 2-store), `Fp8DirectLoader`
+(4-byte copy), `E2M1Loader`, later `Int8`/RXF W4-NL. ONE `moe_gemm_tiled.h` + ONE dense `gemm_tiled.h`,
+format-generic. Payoff: every core opt written once for all formats; **w8a8 gets a real DENSE tiled
+kernel** (Fp8DirectLoader) retiring the grouped-over-E=1 hack in `w8a8_dense_linear`; launchers +
+`make_moe_tile_config` + GTILE clamp unify too. Validate byte-identical per format (max|Δ|=0 vs current).
+
+## DEFERRED BACKLOG — flagship fp8 GEMM: INTEGRATE (don't chase the vendor)
+Round 1+2 established (worktree `rdna4-hip-kernels-fp8gemm`, branch `fp8-gemm-flagship`, `b23dfae`+`242156a`):
+fp8 WMMA theoretical peak ≈ 389 TF/s but **UNREACHABLE** — gfx1201 lacks the global→LDS DMA
+(`vmem-to-lds-load-insts`), so ~40 VGPR mandatory global staging caps the spill-free macro-tile at 64×64;
+any wider tile spills → collapse. So we CANNOT exceed hipBLASLt via tile size; only hand-scheduled ISA
+(Round 3) could close the last 7–19%, and only to ~match on the compute-dense shape. **Kernel achieves
+90–93% of hipBLASLt (vs the old serving path's 104 TF/s = 46%), exact parity.** ACTION: **integrate the
+flagship into the w8a8 dense + MoE fp8-compute paths** (they cap ~104 → ~180, ≈1.75x) — pairs naturally
+with the weight-loader templating (the flagship IS the Fp8DirectLoader core done right). Round 3 (ISA
+scheduling) = diminishing returns, DEFER/skip unless a fp8-dense-heavy model needs it.
+
 ## DEFERRED BACKLOG — register-blocking rewrites (attend to AFTER the current cycle)
 These are the second-tier occupancy items from D's audit: kernels capped by **register pressure /
 scratch spills**, NOT by the LDS-clamp pattern (so no one-line bit-exact fix — they need a
