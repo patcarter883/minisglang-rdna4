@@ -31,7 +31,14 @@ was deeper than staging alone). Both `moe_gemm_tiled_kernel` + `_ashuffle_kernel
 C's packed-2-store is in the DENSE prefill kernel, NOT the MoE tiled core — the MoE int4 loader still uses the
 byte-loop → packed-storing it is now a once-for-both future opt.
 
-### RETURN-TO — claw back W8A8 MoE tiled +3.5–3.9% (accepted regression, 2026-07-18)
+### RETURN-TO — W8A8 MoE tiled +3.5–3.9%: IRREDUCIBLE via if-constexpr (INVESTIGATED, 2026-07-18)
+The `if constexpr(WLoad::is_fp8)` split (commit `091668d` on fp8-wmma-merge) is byte-identical (W8A8+W4A8
+max|Δ|=0) but recovers **0%** — hipcc had ALREADY constant-folded the `*1.0f` group-scale identity + DCE'd
+the zeros out of the fp8 instantiation at 953fad7 (VGPR/occ identical across all 48 fp8 tiled instantiations,
+already occ 16 / zero spill). The +3.7% is a loop/STAGING RESHAPE cost in the shared body, NOT register
+pressure — NOT recoverable by specialization. Kept the split anyway as a compiler-independent leanness guard.
+**The real W8A8 win is the flagship integration (180 vs ~104 TF/s), which subsumes the +3.7% entirely.**
+Historical context (superseded by the above):
 Unifying the leaner hand-written W8A8 kernel onto the (W4A8-shaped) unified template costs W8A8 MoE gemm
 +3.5–3.9% (marginally over ±3%; ≈1% end-to-end on ZAYA, the main W8A8 user). NOT a spill cliff — same VGPR
 range/worst case, just higher register pressure at WARPS_N=4 from the broad reshape. ACCEPTED as a one-time
@@ -57,6 +64,20 @@ Payoff: every core opt written once for all formats; **w8a8 gets a real DENSE ti
 retiring the grouped-over-E=1 hack in `w8a8_dense_linear`; launchers + `make_moe_tile_config` + GTILE clamp
 unify; RXF W4-NL folds in as a third loader; the flagship fp8 GEMM slots in as the Fp8DirectLoader core.
 
+## STEP 3 DONE + VALIDATED (2026-07-18)
+Cleanup (953fad7) + reroutes (engine f258a12: dense→wmma_tiled_tuned dtype-generic M>=64, MoE gemm1
+gemv->32) + claw-back guard (091668d). Combined serve smoke: 35B-A3B-AWQ TP=2 --graph 8 COHERENT 4/4,
+`[hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv)` + `mmq_fp8_moe_gemm(wmma)` fire during capture. Whole
+arc byte-identical + serve-coherent on the merged/cleaned/rerouted fp8_wmma. Deployable milestone.
+
+## IN PROGRESS — flagship fp8 GEMM → grouped MoE kernel (Phase 1)
+Agent E resumed, branch `fp8-moe-flagship` off fp8-wmma-merge. Porting the flagship's register-tiled
+(256×128/64×64/double-buffered/16B-padded-LDS, spill-free-64×64) design to the GROUPED MoE PREFILL path
+(large M per expert; decode stays on gemv). WLoad-templated (Fp8DirectLoader first, Int4Fp8Loader next) so
+it serves both w8a8 (~77→~180 target, 1.75x) and w4a8. Phase 1 = the kernel + parity + perf + resource; Phase
+2 = engine integration + int4 loader + serve smoke. Flagship ceiling recap: 389 theoretical, but no global→LDS
+DMA on gfx1201 caps spill-free tile at 64×64 → dense hit 90-93% of hipBLASLt (181-188 vs old 104).
+
 ## DEFERRED BACKLOG — flagship fp8 GEMM: INTEGRATE (don't chase the vendor)
 Round 1+2 established (worktree `rdna4-hip-kernels-fp8gemm`, branch `fp8-gemm-flagship`, `b23dfae`+`242156a`):
 fp8 WMMA theoretical peak ≈ 389 TF/s but **UNREACHABLE** — gfx1201 lacks the global→LDS DMA
@@ -76,15 +97,15 @@ where the C++ compiler spills a large in-register tile, manual VGPR budgeting / 
 
 Priority order (impact × tractability):
 
-1. **`attn_prefill_paged` (flash prefill paged)** — 25.4 KB static LDS, occ 2, **spilling 22 VGPR /
-   scratch 80**. The spill is the direct throughput cap. Register-blocking rewrite of the prefill
-   attention inner loop. HIGH — prefill attention is on every request; see
-   [[cca-prefill-attention-kernel-bound]], [[hip-kernel-occupancy-audit]].
-2. **`attn_hip` prefill** — 251 VGPR / occ 2, register-limited (no spill yet, but 1 wave from it).
-   Reduce live state to lift to occ 3. HIGH — same prefill-attention hot path.
-3. **`mla_hip` decode/verify** — occ **1** (VGPR 225 + 28.4 KB static `s_o[NWARPS][LATENT]` fp32).
-   Shrink the fp32 output-accumulator (math-touch, not a clamp). MED — GLM/DeepSeek MLA, but bs=1
-   decode is bandwidth-bound so upside is situational; measure before investing.
+1. **`attn_prefill_paged` — INVESTIGATED, NOT WORTH IT (2026-07-18, branch attn-regblock fe69e2f harness,
+   reverted b1902b7).** The 22-VGPR spill is isolated to 1/12 instantiations (fp8 act=bf16 D256), only 3
+   VGPR over the non-spilling siblings. Closing it (move Q to LDS) is bit-exact but pushes LDS 19.6→28 KB →
+   occupancy 2→1 (D256 occ is LDS-bound, not VGPR-bound) → **measured ~30% SLOWER** on common D256 shapes.
+   The register-resident design is already the better operating point; the spill is the correct tradeoff.
+2. **`attn_hip` prefill (251 VGPR, occ 2, NO spill) + `mla_hip` (occ-1, BW-bound) — DEPRIORITIZED.** The
+   attn_prefill_paged result generalizes: these attention kernels are occupancy-limited by LDS, not
+   registers, so VGPR reduction won't lift occupancy. Skip unless a specific LDS-reduction (not register)
+   lever appears. mla is additionally bs=1 bandwidth-bound (situational).
 4. **flagship fp8 GEMM — spill-free 64×128 macro-tile** (register budgeting / inline-asm) — the SAME
    register-blocking class; the compiler spills the 128-wide fp32 accumulator to scratch → collapse.
    This is the lever to push the flagship kernel past hipBLASLt (>244 → toward the 355–389 TF/s
