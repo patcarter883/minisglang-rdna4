@@ -40,6 +40,11 @@ from minisgl._hip_engage import engaged
 # on; falls back automatically if the loaded gdn_hip .so predates the op. Set MINISGL_GDN_FUSED_NORM=0 to
 # force the unfused path.
 _GDN_FUSED_NORM = os.environ.get("MINISGL_GDN_FUSED_NORM", "1") == "1"
+# Fuse the whole DECODE chain — causal_conv1d_update + gdn_decode + gated RMSNorm — into ONE kernel
+# (gdn_hip.gdn_decode_conv_gated): reads mixed_qkv directly (no python q/k/v split, no conv_out HBM
+# round-trip), 2 launches -> 1. Bit-exact vs the two-kernel path; falls back automatically if the loaded
+# gdn_hip .so predates the op. Set MINISGL_GDN_FUSED_CONV=0 to force the separate path.
+_GDN_FUSED_CONV = os.environ.get("MINISGL_GDN_FUSED_CONV", "1") == "1"
 
 if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod
@@ -442,6 +447,20 @@ class QwenGatedDeltaNet(nn.Module):
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()  # int32->int64 once, reused by both kernels below
+
+        if _GDN_FUSED_CONV and hasattr(gdn, "gdn_decode_conv_gated"):
+            # FUSED: conv_update + gdn_decode + gated-RMSNorm in ONE kernel (was 2 launches:
+            # causal_conv1d_update + gdn_decode_gated). Reads mixed_qkv directly — no python q/k/v split,
+            # no conv_out HBM round-trip. Bit-exact vs the two-kernel path (max|Δ|=0); ~1.3x per-token.
+            z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+            engaged("gdn_hip.gdn_decode_conv_gated")
+            normed = gdn.gdn_decode_conv_gated(
+                mixed_qkv.contiguous(), self._conv_weights_fp32(), None, conv_state,
+                a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+                ssm_state, state_idx, z_flat, self._norm_weight_fp32(), self.norm.eps,
+                1, self.head_k_dim ** -0.5, 1,
+            )  # [B, num_v_heads, head_v_dim], conv+recurrence+gated-RMS-norm in one
+            return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
 
         # One-step depthwise causal conv update (state roll) + SiLU; conv_state (fp32) in place.
         engaged("gdn_hip.causal_conv1d_update")
