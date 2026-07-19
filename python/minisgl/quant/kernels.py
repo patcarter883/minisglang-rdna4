@@ -94,6 +94,12 @@ _MOE_GEMM1_GEMV_MAX = 32
 # block_m==128 (bit-exact). Gated block_m==128 (the macro-tile needs it) + group_size==128 for w4 (E's
 # validated config; MXFP4 group=32 + decode/small-M stay on tiled/gemv). MINISGL_MOE_FLAG=0 reverts.
 _MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
+# DECODE gemm2 (down-proj) + gather-reduce fused into ONE graph-safe kernel (mmq_fp8_moe_gemm2_gather_
+# reduce): drops the (P,N) out2 HBM round-trip + the gather_reduce launch, and skips the alignment-
+# padding rows the WMMA gemm2 computes. Uses gemv-math down-proj -> ~1e-4 vs the WMMA path (fp32
+# accumulation order, ~1000x below the fp8 quant-noise floor; user-accepted, NOT max|Δ|=0).
+# MINISGL_MOE_G2FUSE=0 reverts to the bit-exact WMMA gemm2 + gather_reduce.
+_MOE_G2FUSE = _os.environ.get("MINISGL_MOE_G2FUSE", "1") != "0"
 
 
 def _moe_time(bucket: str, fn):
@@ -421,6 +427,24 @@ def w4a8_moe(
                     kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
                 ),
             )  # writes acc in place
+        _moe_report()
+        return acc.to(x.dtype)
+
+    # DECODE (small M): fuse gemm2 (down-proj) + gather-reduce into ONE launch. Reads the pre-sorted buf2
+    # directly + does the per-token top_k reduce in-kernel, dropping the (P,N) out2 HBM round-trip + the
+    # gather_reduce launch AND skipping the alignment-padding rows the WMMA gemm2 computes. gemv-math
+    # down-proj -> ~1e-4 vs the WMMA path (accumulation order; user-accepted). Prefill (M>threshold) keeps
+    # the flag/WMMA gemm2 + gather_reduce below.
+    if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 \
+            and hasattr(fp8_wmma, "mmq_fp8_moe_gemm2_gather_reduce"):
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce{_e2m1}")
+        acc = _moe_time(
+            "gemm2gather",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce(
+                buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, top_k, block_m,
+                w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+            ),
+        )  # (M, K) fp32 — down-proj + top_k reduce in one
         _moe_report()
         return acc.to(x.dtype)
 
