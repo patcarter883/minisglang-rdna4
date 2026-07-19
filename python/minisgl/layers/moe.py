@@ -471,6 +471,20 @@ class _W4A8MoEMethod(MoEQuantMethod):
         assert activation == "silu" and not apply_router_weight_on_input, (
             "MoE W4A8 path is silu-only without router-weight-on-input"
         )
+        if getattr(w13, "_w_rep", None) is not None:
+            # W4A16 (fp16-act) path: int4 weights repacked to register-direct _w_rep in post_load;
+            # scales/zeros stay op-layout (w4a16_moe consumes _scales_op/_zeros_op directly, see its
+            # (E,2*inter,K//g) / (E,(2*inter)//8,K//g) signature). AWQ/GPTQ int4 is asymmetric -> pass
+            # zeros; weight_is_e2m1=False (true int4, not MXFP4). Same route fallback as w4a8_moe.
+            inter = w13._scales_op.shape[1] // 2
+            return kernels.w4a16_moe(
+                hidden_states, w13._w_rep, w13._scales_op, w13._zeros_op,
+                w2._w_rep, w2._scales_op, w2._zeros_op,
+                hidden_states.shape[1], inter, self._quant.group_size,
+                topk_weights=topk_weights, topk_ids=topk_ids,
+                router_logits=router_logits, top_k=top_k, renormalize=renormalize,
+                weight_is_e2m1=False,
+            )
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
@@ -478,6 +492,15 @@ class _W4A8MoEMethod(MoEQuantMethod):
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+        if getattr(w13, "_w_rep", None) is not None:
+            inter = w13._scales_op.shape[1] // 2
+            return kernels.w4a16_moe(
+                g_hidden, w13._w_rep, w13._scales_op, w13._zeros_op,
+                w2._w_rep, w2._scales_op, w2._zeros_op,
+                g_hidden.shape[1], inter, self._quant.group_size,
+                topk_weights=local_weights, topk_ids=local_ids,
+                top_k=top_k, renormalize=renormalize, weight_is_e2m1=False,
+            )
         return kernels.w4a8_moe(
             g_hidden, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
