@@ -395,6 +395,10 @@ services:
       <<: *lean-env
       MINISGL_CAM: "1"
       MINISGL_CAM_CHECKPOINT: /cam_ckpt
+      # Sampled (rejection) spec-verify ON by default: lets MTP engage for NON-greedy UNCONSTRAINED
+      # requests instead of falling back to plain decode. NOTE: does NOT help grammar-constrained
+      # requests (the JSON-schema spine turns) — those still fall back until spec+grammar is wired.
+      MINISGL_SPEC_SAMPLED: "${MINISGL_SPEC_SAMPLED:-1}"
       MINISGL_CAM_FRONTEND: "1"                                # route /cam/* to the backend engine.cam
       MINISGL_CAM_AUTO: "${MINISGL_CAM_AUTO:-1}"               # transparent read on /v1/*
       MINISGL_CAM_AUTO_WRITE: "${MINISGL_CAM_AUTO_WRITE:-1}"   # gated ambient write on /v1/* (per-req cam_write wins)
