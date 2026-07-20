@@ -565,6 +565,37 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 
+    @torch.inference_mode()
+    def seed_kv_masked(
+        self,
+        x: torch.Tensor,          # [S, hidden] — post input_layernorm prompt-prefix rows
+        positions: torch.Tensor,  # [S] absolute RoPE position per row
+        k_buf: torch.Tensor,      # [max_slots, max_ctx, nkv, hd] GLOBAL persistent draft K
+        v_buf: torch.Tensor,      # [max_slots, max_ctx, nkv, hd] GLOBAL persistent draft V
+        slot: int,                # global slot (= req.table_idx) to seed
+        start_col: int,           # first column to write (0 for a fresh prompt seed)
+    ) -> None:
+        """Seed the GLOBAL draft-KV buffer from the prompt prefix, WITHOUT attention — the buffered
+        twin of GLMMTPAttention.seed_kv. Computes q/k/v + q_norm/k_norm + rotary EXACTLY as
+        forward_draft_masked does (keep in sync); only the attention read is dropped (we just persist
+        k/v). Writes S rows into k_buf[slot, start_col:start_col+S] / v_buf[...], so the first decode
+        propose (which appends the bonus token at column start_col+S and attends over the whole window)
+        sees full prompt context — byte-identical to what a per-step forward_draft_masked chain over the
+        prompt would have produced (softmax(-inf)=0 masking is the only thing dropped, and it's a no-op
+        for k/v storage)."""
+        S = x.shape[0]
+        hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
+        qg = self.q_proj.forward(x).view(S, nq, 2 * hd)
+        q = qg[..., :hd].reshape(S, nq * hd)   # gate half unused (only k/v are stored)
+        k = self.k_proj.forward(x)
+        v = self.v_proj.forward(x).view(S, nkv, hd)
+        self.q_norm.forward_inplace(q.view(S, nq, hd))
+        self.k_norm.forward_inplace(k.view(S, nkv, hd))
+        q, k = self.attn.rotary.forward(positions, q, k)
+        k = k.view(S, nkv, hd)
+        k_buf[slot, start_col : start_col + S] = k
+        v_buf[slot, start_col : start_col + S] = v
+
 
 class Qwen3_5MTPHead(BaseOP):
     """Qwen3.5 MTP (next-token-prediction) self-speculation head — a single STANDARD full-attention
@@ -638,6 +669,23 @@ class Qwen3_5MTPHead(BaseOP):
         normed = self.norm.forward(hidden, None)[0]
         logits = self._lm_head.logits_all_rows(normed)
         return logits, hidden
+
+    @torch.inference_mode()
+    def seed_buffered(
+        self, tokens: torch.Tensor, prev_hidden: torch.Tensor, positions: torch.Tensor,
+        k_buf: torch.Tensor, v_buf: torch.Tensor, slot: int, start_col: int = 0,
+    ) -> None:
+        """Seed the GLOBAL draft-KV buffer (the BUFFERED propose path) from the prompt prefill: for
+        each prompt position build the same fused layer input ``step_masked`` would, then persist its
+        k/v into k_buf/v_buf[slot] at columns start_col.. (no attention). Mirrors ``step_masked``'s
+        fuse + input_layernorm before the attention's seed_kv_masked — the buffered analogue of
+        GLMMTPHead.seed_kv (which returns a per-uid list; here we write the fixed-shape global buffer).
+
+        tokens: [S] (token_p at each seeded position p); prev_hidden: [S, hidden] (the target hidden
+        h_{p-1} that produced it — the MTP ``previous_hidden_states``); positions: [S] RoPE positions."""
+        fused = self.fuse(self.embed(tokens), prev_hidden)
+        x = self.input_layernorm.forward(fused, None)[0]
+        self.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)
 
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
