@@ -297,6 +297,26 @@ class MTPProposer(Proposer):
         tokens = req.input_ids[1:P].to(device=device, dtype=torch.int64)  # token_p, p=1..P-1
         prev_hidden = last_hidden[0 : P - 1].to(self._engine.dtype)  # h_{p-1}
         positions = torch.arange(1, P, dtype=torch.int32, device=device)
+        if self._buffered:
+            # BUFFERED path (default: head has forward_draft_masked): seed the GLOBAL draft-KV buffer
+            # directly instead of the per-uid list (which _propose_buffered never reads). Slot/cursor
+            # convention mirrors _propose_buffered EXACTLY so a seeded prefix is byte-identical to the
+            # eager list path: slot = req.table_idx; columns 0..S-1 hold RoPE positions 1..P-1 (S=P-1);
+            # `_cur[slot] = S` so the first decode propose writes the bonus token at column S and its
+            # mask exposes the whole seeded prefix. Register `_slot_uid[slot]` so that first propose
+            # does NOT treat the slot as cold and reset the cursor to 0.
+            S = P - 1
+            if S > self._max_ctx:
+                # Prompt longer than the draft-KV window: fall back to the cold cache (still lossless,
+                # just no early-token lift). Seeding the tail would misalign the column<->position map
+                # the decode chain assumes (write_col = cur+j at RoPE position base+j).
+                return
+            slot = int(req.table_idx)
+            self._head.seed_buffered(
+                tokens, prev_hidden, positions, self._k_buf, self._v_buf, slot, 0)
+            self._slot_uid[slot] = req.uid
+            self._cur[slot] = S
+            return
         entries = self._head.seed_kv(tokens, prev_hidden, positions)
         self._cache[req.uid] = entries
         self._committed[req.uid] = len(entries)
