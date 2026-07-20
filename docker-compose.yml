@@ -89,6 +89,37 @@ x-lean-common: &lean-common
     MINISGL_PROFILE_STEPS: "${MINISGL_PROFILE_STEPS:-50}"
 
 services:
+  # ═══════════════════════════════════════════════════════════════════════════════════════════════
+  # GENERIC RUNNER — the ONE correct way to run ANY test / benchmark / compile / probe / hello-world
+  # in a WORKING container: correct image (minisgl-rdna4:lean), correct kernels (/opt/kernels — baked,
+  # always consistent with source), ROCm device passthrough, HF cache, and the lease-injected card set.
+  # DO NOT hand-roll `docker run` for these — every hand-rolled run has gotten the kernel path wrong
+  # (stale live /kernels -> gdn_decode_gated missing, fp8_wmma symlink, etc.). Use THIS.
+  #
+  #   Self-test (proves image+HIP+kernels all load — run this first when anything looks broken):
+  #     gpu-lease -n 1 -- docker compose --profile run run --rm run
+  #   Run anything (env MINISGL_CMD is the command; single-quote it):
+  #     MINISGL_CMD='python /engine/tools/serve_matrix_bench.py --help' \
+  #       gpu-lease -n 1 -- docker compose --profile run run --rm run
+  #   Compile a kernel into the canonical repo (CPU only, no lease needed — /kernels is mounted RW):
+  #     MINISGL_CMD='cd /kernels/gdn && GPU_ARCHS=gfx1201 bash local/build_local.sh' \
+  #       docker compose --profile run run --rm run
+  #   TP=2 job: gpu-lease -n 2 -- ...   (the arbiter injects both cards via LEASE_*_DEVICES).
+  #
+  # Kernels default to the baked /opt/kernels (PYTHONPATH from *lean-env). The canonical repo is ALSO
+  # mounted at /kernels for COMPILING or testing local kernel edits — after you build there, set
+  # MINISGL_CMD to prepend PYTHONPATH=/kernels/_kernels for that one run.
+  run:
+    <<: *lean-common
+    profiles: ["run"]
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
+    entrypoint: ["bash", "-lc"]
+    command:
+      - ${MINISGL_CMD:-python /engine/tools/container_selftest.py}
+
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
   # GRAPH-CAPTURED decode (cuda-graph-max-bs 8, max-running 8): eager MoE decode leaves ~45% of device
   # time in host-launched gather/scatter/topk glue that serializes with the custom_ar all-reduce spins,
@@ -319,7 +350,7 @@ services:
           SPEC_ARGS="--spec-algorithm dflash --spec-draft-model-path /draft --spec-num-draft ${MINISGL_SPEC_K:-4}"
         fi
         exec python -m minisgl \
-          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-fp8}" \
+          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-MXFP4}" \
           --host 0.0.0.0 --port 1919 \
           --cache-type radix \
           --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
@@ -393,4 +424,5 @@ services:
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
           --max-running-requests "${MINISGL_MAX_RUNNING:-6}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
+          --spec-algorithm "${MINISGL_CAM_SPEC:-mtp}" --spec-num-draft "${MINISGL_SPEC_K:-4}" \
           ${MINISGL_EXTRA_ARGS:-}
