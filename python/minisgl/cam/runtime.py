@@ -246,6 +246,25 @@ class FrontendCAMRuntime:
         failure. Deliberately conservative so chit-chat doesn't pollute the store."""
         import json
         import re
+        # DETERMINISTIC-FIRST (perf): the regex catches the common explicit assertion — "the <attr> of
+        # SUBJECT is OBJECT" / "SUBJECT's <attr> is OBJECT" / "SUBJECT is OBJECT" (SUBJECT+OBJECT proper-
+        # noun-shaped, filtering "X is nice"). When it fires we SKIP the 256-token extraction generation
+        # entirely (that gen is the ~2s/request bs=1 write penalty). Only prose facts the regex misses
+        # fall through to the LLM extractor below.
+        pat = re.compile(r"(?:the\s+[\w ]+?\s+of\s+)?"
+                         r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+)*)(?:'s\s+[\w ]+?)?"
+                         r"\s+(?:is|was|are|were)\s+([A-Z][A-Za-z.'-]+)")
+        seen, facts = set(), []
+        for mm in pat.finditer(text):
+            s = mm.group(1).strip().strip(".,;:!?'\"")
+            o = mm.group(2).strip().strip(".,;:!?'\"")
+            if s and o and (s, o) not in seen:
+                seen.add((s, o)); facts.append((s, o))
+        if facts:
+            return facts                                       # regex hit -> no generation
+        # LLM fallback for prose facts the regex misses (opt out with MINISGL_CAM_EXTRACT_LLM=0).
+        if os.environ.get("MINISGL_CAM_EXTRACT_LLM", "1") != "1":
+            return []
         instr = ('Extract only DURABLE factual statements the text asserts, as a JSON array of '
                  '{"subject","object"} objects (e.g. a person\'s language, a place\'s country). Ignore '
                  'questions, opinions, and chit-chat. Return [] if none. Return ONLY the JSON array, no '
@@ -256,7 +275,6 @@ class FrontendCAMRuntime:
         out = await self._generate(prompt, max_tokens=max_tokens)
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL)
         m = re.search(r"\[.*\]", out, re.DOTALL)
-        facts = []
         if m:
             try:
                 arr = json.loads(m.group(0))
@@ -264,20 +282,6 @@ class FrontendCAMRuntime:
                          if isinstance(f, dict) and f.get("subject") and f.get("object")]
             except (json.JSONDecodeError, ValueError):
                 facts = []
-        if facts:
-            return facts
-        # Deterministic fallback (small thinking models extract JSON unreliably): explicit fact statements
-        # "the <attr> of SUBJECT is OBJECT" / "SUBJECT's <attr> is OBJECT" / "SUBJECT is OBJECT", where both
-        # SUBJECT and OBJECT are capitalised (proper-noun-shaped) — filters out "X is nice" style non-facts.
-        pat = re.compile(r"(?:the\s+[\w ]+?\s+of\s+)?"
-                         r"([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+)*)(?:'s\s+[\w ]+?)?"
-                         r"\s+(?:is|was|are|were)\s+([A-Z][A-Za-z.'-]+)")
-        seen = set()
-        for mm in pat.finditer(text):
-            s = mm.group(1).strip().strip(".,;:!?'\"")
-            o = mm.group(2).strip().strip(".,;:!?'\"")
-            if s and o and (s, o) not in seen:
-                seen.add((s, o)); facts.append((s, o))
         return facts
 
     async def retrieve(self, prompt: str, max_tokens: int = 512, namespace: str = None) -> list:

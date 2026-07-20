@@ -596,6 +596,12 @@ class CAMMemory:
         # base-embed key if the encoder or artifact is missing, so a misconfig degrades, never crashes.
         self._gte = None            # (encoder, mu, W) when active; None -> base-embed key
         self._decode = decode       # callable(subject_ids)->str, set by the caller (scheduler tokenizer)
+        # Batched-encode LRU cache {subject_text -> unit-norm key vec} for the transparent-read fast path
+        # (deliver_object_ids_batch): repeated candidate spans across requests skip re-encoding. Bounded;
+        # keyed on text so it works for GTE (expensive encode) and base-embed alike. Disable with cap=0.
+        from collections import OrderedDict as _OD
+        self._key_cache = _OD()
+        self._key_cache_cap = int(os.environ.get("MINISGL_CAM_KEYCACHE", "20000") or 0)
         # Write-side semantic dedup: on a NON-exact-id re-remember whose subject key is a near-duplicate
         # of a stored one (cosine >= write_dedup_tau), MERGE onto that entry (newest object wins) instead of
         # appending a paraphrase duplicate. Default 1.0 = OFF (base-embed key space is not calibrated for it).
@@ -890,6 +896,52 @@ class CAMMemory:
         e = F.embedding(ids, self._embed_w).float()          # [1,S,base_hidden] raw base input embeds
         return F.normalize(e.mean(1), dim=-1)[0]             # [base_hidden]
 
+    def _subj_keys_batch(self, subjects_ids: List[List[int]], texts: List[str] = None) -> torch.Tensor:
+        """Batched [C,d] unit-norm subject keys — the vectorised replacement for a per-candidate _subj_key
+        loop (which was C GPU embedding launches, or C CPU GTE encodes, on the scheduler thread). Same
+        math as _subj_key per row. Uses the {text->key} LRU cache; only cache-MISSES are (batch-)encoded.
+        GTE: ONE enc.encode over the miss texts. Base-embed: ONE padded F.embedding + masked mean."""
+        C = len(subjects_ids)
+        if C == 0:
+            d = self._gte[2].shape[1] if self._gte is not None else self._embed_w.shape[1]
+            return torch.empty(0, d, device=self._embed_w.device)
+        use_gte = self._gte is not None and self._decode is not None
+        if texts is None:
+            texts = [self._decode(s) for s in subjects_ids] if use_gte else [None] * C
+        cache, cap = self._key_cache, self._key_cache_cap
+        # cache lookup (only when we have a stable text key)
+        keys: List[Optional[torch.Tensor]] = [None] * C
+        miss = []
+        for i in range(C):
+            t = texts[i]
+            if cap and t is not None and t in cache:
+                keys[i] = cache[t]
+            else:
+                miss.append(i)
+        if miss:
+            if use_gte:
+                enc, mu, W = self._gte
+                g = enc.encode([texts[i] for i in miss])                 # [m,dim] ONE batched forward
+                mk = F.normalize((g.to(mu.device) - mu) @ W, dim=-1)     # [m,d]
+            else:
+                dev = self._embed_w.device
+                sub = [subjects_ids[i] for i in miss]
+                Lmax = max(len(s) for s in sub)
+                pad = [list(s) + [0] * (Lmax - len(s)) for s in sub]
+                m = [[1.0] * len(s) + [0.0] * (Lmax - len(s)) for s in sub]
+                ids = torch.tensor(pad, dtype=torch.long, device=dev)
+                msk = torch.tensor(m, dtype=torch.float32, device=dev).unsqueeze(-1)
+                e = F.embedding(ids, self._embed_w).float()              # [m,Lmax,H]
+                mk = F.normalize((e * msk).sum(1) / msk.sum(1).clamp(min=1), dim=-1)  # [m,H]
+            for k, i in enumerate(miss):
+                keys[i] = mk[k]
+                if cap and texts[i] is not None:
+                    cache[texts[i]] = mk[k].detach()
+            if cap:
+                while len(cache) > cap:
+                    cache.popitem(last=False)
+        return torch.stack(keys)
+
     def reindex(self) -> None:
         """Rebuild every namespace's cosine subject keys from its stored facts under the CURRENT _subj_key.
         Used after the GTE decoder is wired so a store loaded with base-embed keys migrates into the GTE
@@ -957,26 +1009,44 @@ class CAMMemory:
 
     @torch.no_grad()
     def deliver_object_ids_batch(self, subjects_ids: List[List[int]],
-                                 ns: str = None) -> List[Optional[List[int]]]:
+                                 ns: str = None, texts: List[str] = None) -> List[Optional[List[int]]]:
         """Batched deliver_object_ids for the transparent-read path (which queries MANY n-gram-span
         candidates per prompt). SEMANTICALLY IDENTICAL to calling deliver_object_ids on each candidate
-        in the given order — same per-row argmax, same deliver_tau gate, same LRU bump order — but stacks
-        the stored [M,d] key matrix ONCE and does a single [C,d]@[d,M] matmul instead of rebuilding the
-        stack + matmul per candidate (the O(candidates×facts) cost that made big-prompt retrieves heavy
-        under concurrency). Returns a list aligned to `subjects_ids`: object ids on a confident match
-        (>= deliver_tau), else None."""
+        in the given order — same per-row argmax, same deliver_tau gate, same LRU bump order. Fully
+        vectorised: ONE batched key build (_subj_keys_batch, cache-aware), ONE [C,d]@[d,M] matmul, and a
+        SINGLE GPU max + two host transfers — replacing the old per-candidate _subj_key launches and the
+        2*C `.item()` GPU syncs that made transparent-read cost O(candidates) on the scheduler thread.
+        `texts` (candidate strings, when the caller has them) enables the {text->key} cache for the
+        base-embed path too and skips the ids->text decode for GTE. Returns object ids on a confident
+        match (>= deliver_tau) else None, aligned to `subjects_ids`."""
         st = self._state(ns)
         if not self.enabled or not st.subj_objs or not subjects_ids:
             return [None] * len(subjects_ids)
         K = self._key_matrix(st)                                   # [M,d] (unit-norm keys), stacked+cached
-        Q = torch.stack([self._subj_key(s) for s in subjects_ids]).to(K.device, K.dtype)  # [C,d] (unit-norm)
+        if os.environ.get("MINISGL_CAM_DELIVER_LEGACY") == "1":    # A/B: original per-candidate path
+            Q = torch.stack([self._subj_key(s) for s in subjects_ids]).to(K.device, K.dtype)
+            sims = Q @ K.t()
+            out0: List[Optional[List[int]]] = []
+            for i in range(len(subjects_ids)):
+                j = int(sims[i].argmax().item())
+                if float(sims[i, j].item()) < self.deliver_tau:
+                    out0.append(None); continue
+                rec = st.facts.get(st.subj_tuple[j])
+                if rec is not None:
+                    st.seq += 1; rec["used"] = st.seq
+                out0.append(list(st.subj_objs[j]))
+            return out0
+        Q = self._subj_keys_batch(subjects_ids, texts).to(K.device, K.dtype)  # [C,d] (unit-norm)
         sims = Q @ K.t()                                           # [C,M] cosine
+        vals, idx = sims.max(dim=1)                                # GPU argmax + max-cos, ONE kernel
+        ok = (vals >= self.deliver_tau).tolist()                   # 2 host transfers (not 2*C syncs)
+        idx = idx.tolist()
         out: List[Optional[List[int]]] = []
         for i in range(len(subjects_ids)):
-            j = int(sims[i].argmax().item())
-            if float(sims[i, j].item()) < self.deliver_tau:
+            if not ok[i]:
                 out.append(None)                                   # unknown subject -> no confident match
                 continue
+            j = idx[i]
             rec = st.facts.get(st.subj_tuple[j])                   # #9 LRU: mark recently used (same as singular)
             if rec is not None:
                 st.seq += 1; rec["used"] = st.seq

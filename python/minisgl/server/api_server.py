@@ -68,6 +68,10 @@ class GenerateRequest(BaseModel):
     # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
     # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
     cam_write: bool | None = None
+    # Symmetric per-request override for the TRANSPARENT auto-READ (retrieve+augment): True/False forces
+    # it on/off for THIS call, overriding MINISGL_CAM_AUTO (None = server default). Lets a caller (or an
+    # A/B harness) suppress the retrieve round-trip on a given turn.
+    cam_read: bool | None = None
 
 
 class Message(BaseModel):
@@ -116,6 +120,9 @@ class OpenAICompletionRequest(BaseModel):
     # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
     # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
     cam_write: bool | None = None
+    # Symmetric per-request override for the TRANSPARENT auto-READ (retrieve+augment): True/False forces
+    # it on/off for THIS call, overriding MINISGL_CAM_AUTO (None = server default).
+    cam_read: bool | None = None
 
     top_k: int = -1
     top_p: float = 1.0
@@ -448,13 +455,15 @@ def _reasoning_parser():
     return _REASONING_PARSER
 
 
-async def _cam_auto_augment(prompt, ns=None):
+async def _cam_auto_augment(prompt, ns=None, override=None):
     """TRANSPARENT CAM read (MINISGL_CAM_AUTO=1): fold relevant remembered facts into the request context
     so /v1/chat and /generate use CAM with NO special params. `prompt` is a chat-messages list or a raw
     string. Retrieves cosine-matched facts for the query text and prepends them as a system note (chat) or
     a short preface (raw). No-op when auto is off, no CAM runtime, or nothing confidently matches (the
-    store's tau threshold keeps it quiet on unrelated prompts). Costs one extra retrieve round-trip."""
-    if os.environ.get("MINISGL_CAM_AUTO") != "1":
+    store's tau threshold keeps it quiet on unrelated prompts). Costs one extra retrieve round-trip.
+    `override` (per-request cam_read) forces on/off, else the MINISGL_CAM_AUTO env default."""
+    enabled = override if override is not None else (os.environ.get("MINISGL_CAM_AUTO") == "1")
+    if not enabled:
         return prompt
     try:
         from minisgl.cam import get_cam_runtime
@@ -471,7 +480,11 @@ async def _cam_auto_augment(prompt, ns=None):
     if not query.strip():
         return prompt
     try:
+        _t0 = time.perf_counter()
         facts = await rt.retrieve(query, namespace=ns)
+        if os.environ.get("MINISGL_CAM_RETRIEVE_PROF") == "1":
+            logger.info_rank0("[cam-prof] augment retrieve_wall=%.1fms facts=%d qlen=%d",
+                              (time.perf_counter() - _t0) * 1e3, len(facts), len(query))
     except Exception as e:  # noqa: BLE001
         logger.debug("CAM auto-retrieve failed: %s", e)
         return prompt
@@ -513,6 +526,24 @@ def _auto_write_enabled(override: bool | None) -> bool:
     if override is not None:
         return bool(override)
     return os.environ.get("MINISGL_CAM_AUTO_WRITE") == "1"
+
+
+_CAM_WRITE_TASKS: set = set()   # strong refs so fire-and-forget write tasks aren't GC'd mid-flight
+
+
+def _schedule_cam_auto_write(text: str, override: bool | None = None, ns: str = None) -> None:
+    """Run the ambient CAM write OFF the request's critical path (default). The write may cost a
+    fact-extraction generation (~2s), and the user's response must not wait on learning — so unless
+    MINISGL_CAM_WRITE_SYNC=1, schedule it as a background task (self-contained: no request handle, so
+    the disconnect-abort fire-and-forget hazard doesn't apply). Errors are swallowed (best-effort)."""
+    if not _auto_write_enabled(override) or not (text and text.strip()):
+        return
+    try:
+        task = asyncio.ensure_future(_cam_auto_write(text, override=override, ns=ns))
+    except RuntimeError:      # no running loop (shouldn't happen in a handler) -> skip silently
+        return
+    _CAM_WRITE_TASKS.add(task)
+    task.add_done_callback(_CAM_WRITE_TASKS.discard)
 
 
 async def _cam_auto_write(text: str, override: bool | None = None, ns: str = None) -> None:
@@ -1077,8 +1108,11 @@ async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     _cam_ns = request.headers.get("x-cam-namespace")   # #6 per-tenant/session store (None -> default)
-    await _cam_auto_write(req.prompt, override=req.cam_write, ns=_cam_ns)   # ambient write (gated)
-    prompt = await _cam_auto_augment(req.prompt, ns=_cam_ns)   # TRANSPARENT CAM read (no-op unless enabled)
+    if os.environ.get("MINISGL_CAM_WRITE_SYNC") == "1":
+        await _cam_auto_write(req.prompt, override=req.cam_write, ns=_cam_ns)   # ambient write (gated)
+    else:
+        _schedule_cam_auto_write(req.prompt, override=req.cam_write, ns=_cam_ns)  # off critical path
+    prompt = await _cam_auto_augment(req.prompt, ns=_cam_ns, override=req.cam_read)   # TRANSPARENT CAM read
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -1235,8 +1269,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     else:
         _last_user = prompt
     _cam_ns = request.headers.get("x-cam-namespace")   # #6 per-tenant/session store (None -> default)
-    await _cam_auto_write(_last_user or "", override=req.cam_write, ns=_cam_ns)   # gated ambient write
-    prompt = await _cam_auto_augment(prompt, ns=_cam_ns)     # TRANSPARENT CAM read (no-op unless enabled)
+    if os.environ.get("MINISGL_CAM_WRITE_SYNC") == "1":
+        await _cam_auto_write(_last_user or "", override=req.cam_write, ns=_cam_ns)   # gated ambient write
+    else:
+        _schedule_cam_auto_write(_last_user or "", override=req.cam_write, ns=_cam_ns)  # off critical path
+    prompt = await _cam_auto_augment(prompt, ns=_cam_ns, override=req.cam_read)     # TRANSPARENT CAM read
 
     uid = state.new_user()
     # Constrained decoding: response_format wins; else a FORCED tool call (tool_choice required /

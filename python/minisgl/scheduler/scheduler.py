@@ -1516,6 +1516,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         nothing confidently matches — the tau threshold keeps it quiet on unrelated prompts."""
         import json
         import re
+        import time
+        _prof = os.environ.get("MINISGL_CAM_RETRIEVE_PROF") == "1"
+        _t0 = time.perf_counter()
         deliver = getattr(cam, "deliver_object_ids", None)
         if deliver is None:
             return json.dumps([])
@@ -1564,21 +1567,44 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                         continue
                     cands.add(" ".join(span))
         ordered = sorted(cands, key=len, reverse=True)        # prefer longer (fuller) spans first
-        cids_list = [list(self.tokenizer(" " + _canon_subject(c), add_special_tokens=False).input_ids)
-                     for c in ordered]
+        # Safety cap on candidate count for pathological (huge agent) prompts. Loose by default — the
+        # per-candidate cost is now O(1)-batched (one tokenize call + one key build + one matmul), so this
+        # only bounds the truly-degenerate case; normal prompts fall well under it (no recall change).
+        _cap = int(os.environ.get("MINISGL_CAM_MAX_SPANS", "256") or 0)
+        if _cap and len(ordered) > _cap:
+            ordered = ordered[:_cap]
+        _t_cand = time.perf_counter()
+        # ONE batched tokenization over ALL candidates (was a Python loop of C tokenizer invocations).
+        canon = [" " + _canon_subject(c) for c in ordered]
+        cids_list = ([list(x) for x in self.tokenizer(canon, add_special_tokens=False).input_ids]
+                     if canon else [])
+        _t_tok = time.perf_counter()
         # Batched cosine: one [C,d]@[d,M] over all candidate keys instead of a per-candidate stack+matmul
         # (deliver_object_ids in a Python loop) — same per-row argmax/tau/LRU + same order, so byte-identical
         # results, but O(candidates×facts) collapses to one matmul (fixes the big-prompt retrieve wedge).
         # Falls back to the singular deliver if a batched method isn't present (older store build).
         batch = getattr(cam, "deliver_object_ids_batch", None)
-        oids_list = (batch(cids_list, ns) if batch is not None
+        oids_list = (batch(cids_list, ns, texts=ordered) if batch is not None
                      else [deliver(cids, ns) for cids in cids_list])
+        _t_match = time.perf_counter()
         seen_obj, out = set(), []
         for c, oids in zip(ordered, oids_list):
             if oids:
                 obj = self.tokenizer.decode(oids).strip()
                 if obj and obj not in seen_obj:               # dedupe by delivered fact (longest span wins)
                     seen_obj.add(obj); out.append({"subject": c, "object": obj})
+        if _prof:
+            line = ("[cam-prof] retrieve cands=%d cand_gen=%.1fms tokenize=%.1fms match=%.1fms "
+                    "total=%.1fms hits=%d" % (
+                        len(ordered), (_t_cand - _t0) * 1e3, (_t_tok - _t_cand) * 1e3,
+                        (_t_match - _t_tok) * 1e3, (time.perf_counter() - _t0) * 1e3, len(out)))
+            print(line, flush=True)                    # plain stdout — captured by docker logs (boot lines prove it)
+            try:  # file sink — robust to per-process docker-log capture
+                with open(os.environ.get("MINISGL_CAM_RETRIEVE_PROF_FILE", "/cam_store/retrieve_prof.log"),
+                          "a") as _f:
+                    _f.write(line + "\n")
+            except Exception:  # noqa: BLE001
+                pass
         return json.dumps(out)
 
     def _cam_direct_control(self, msg: "UserMsg") -> None:
