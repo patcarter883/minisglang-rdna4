@@ -73,6 +73,9 @@ x-lean-common: &lean-common
     # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
     # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
     MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
+    # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
+    # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
+    MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"
     # TiDAR logit-mixing "Trust-Diffusion" verify (fused-TiDAR path only): verify each draft position
     # against argmax(beta*p_ar + (1-beta)*R_i[0]). 1.0 (default) = the lossless-vs-AR-greedy path
     # (bit-identical); beta<1.0 leans on the diffusion self-draft for higher acceptance but is NOT
@@ -275,11 +278,6 @@ services:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
       - ${MODELS_DIR:-/home/pat/models}:/models
-      # Canonical HIP kernels LIVE (not the image's baked /opt/kernels) so this serve picks up the
-      # latest builds — the register-resident attn_prefill_paged, MXFP4 branch-free decode, and the
-      # GDN prefill critical-path fixes — without rebuilding the image. PYTHONPATH below points at the
-      # _kernels aggregation dir (relative symlinks to every package's torch-ext).
-      - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
       # Re-distilled on-policy DFlash-CCA drafter (captured on THIS dense_gemm serve, num_spec=4).
       # Default = the epoch-4 on-policy checkpoint; point at a later/final checkpoint via the env.
       - ${MINISGL_DFLASH_DRAFT_HOST:-/home/pat/code/_models/ZAYA1-8B-DFlash-CCA-5L-minv-ep4}:/draft:ro
@@ -305,9 +303,10 @@ services:
       # scheduler dumps the drafter's own trajectory per verify step as opdbuf_*.pt for retraining
       # (dflash-drafter). Write under /engine (the `.:/engine` mount) to reach the host. Inert unset.
       MINISGL_ZAYA_OPD_CAPTURE_DIR: "${MINISGL_ZAYA_OPD_CAPTURE_DIR:-}"
-      # Override the image's /opt/kernels: canonical /kernels/_kernels FIRST so `import gdn_hip` etc.
-      # resolve to the mounted latest builds; /engine keeps the 3 not-yet-canonical fallbacks.
-      PYTHONPATH: /kernels/_kernels:/engine/python:/engine
+      # Kernels come from the image's baked /opt/kernels (inherited PYTHONPATH from *lean-env,
+      # /opt/kernels FIRST) — same as every other profile. No live /kernels override: the canonical
+      # kernels are now baked at image-build time, so a rebuild carries every latest build (including
+      # the split-K + GQA head-grouping attn_decode) with no stale-symlink hazard.
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     entrypoint: ["bash", "-lc"]
