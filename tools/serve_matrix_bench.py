@@ -126,6 +126,22 @@ def _prompt_tokens(url: str, prompt: str) -> int:
     return max(1, len(prompt.split()))
 
 
+def _completion_tokens(url: str, prompt: str, max_tokens: int, ignore_eos: bool) -> int:
+    """Server-reported usage.completion_tokens for one non-stream decode — the GROUND-TRUTH real
+    output-token count, used to confirm `ignore_eos` yields exactly max_tokens (so the streaming
+    real-tok/s = max_tokens*streams/wall is exact and independent of SSE-chunk batching)."""
+    payload = json.dumps({"model": "", "messages": _messages(prompt), "max_tokens": max_tokens,
+                          "temperature": 0.0, "ignore_eos": ignore_eos, "stream": False}).encode()
+    req = urllib.request.Request(url + "/v1/chat/completions", data=payload,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            d = json.loads(r.read())
+        return int((d.get("usage") or {}).get("completion_tokens") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
@@ -190,22 +206,37 @@ def main():
     for wl in wls:
         prompt, maxtok, ieos = spec[wl]
         print(f"\n--- {wl} ---")
-        print(f"{'M':>3} {'TTFT ms':>9} {'TPOT ms':>9} {'tok/s':>12} {'fails':>6}")
+        if wl != "prefill":
+            _ct = _completion_tokens(args.url, prompt, maxtok, ieos)
+            print(f"    [ground-truth usage.completion_tokens for 1 stream = {_ct} "
+                  f"(max_tokens={maxtok}; real tok/s uses this count)")
+        # tok/s   = REAL output tokens / wall. Under ignore_eos every stream emits EXACTLY `maxtok`
+        #           tokens, so real output = maxtok * streams — INDEPENDENT of how many SSE chunks
+        #           the server batches them into. chunk/s = SSE-chunk count / wall (= STEPS/s under
+        #           spec-decode, since one step batches accept-len+1 tokens into one chunk). For base
+        #           decode the two coincide; for MTP/spec they diverge by the emitted-per-step factor
+        #           — the old harness reported chunk/s and thus UNDERCOUNTED spec throughput.
+        print(f"{'M':>3} {'TTFT ms':>9} {'TPOT ms':>9} {'tok/s':>12} {'chunk/s':>10} {'tok/chunk':>10} {'fails':>6}")
         for M in Ms:
             ok, wall, bad = _run(args.url, M, prompt, maxtok, ieos)
             if not ok:
-                print(f"{M:>3} {'--':>9} {'--':>9} {'--':>12} {len(bad):>6}  ALL FAILED")
+                print(f"{M:>3} {'--':>9} {'--':>9} {'--':>12} {'--':>10} {'--':>10} {len(bad):>6}  ALL FAILED")
                 continue
             ttft = sum(r["ttft"] for r in ok) / len(ok) * 1000
             tpot = _agg_tpot(ok)
-            # prefill: total PROMPT tokens processed / wall (real prefill throughput). decode/mixed:
-            # output tokens / wall. wall is the concurrent wall-clock for all M streams.
+            chunks = sum(r["n"] for r in ok)
             if wl == "prefill":
-                tps = prefill_ptoks * len(ok) / wall
+                tps = prefill_ptoks * len(ok) / wall  # prompt tokens processed / wall
+                chunk_s = chunks / wall
+                tok_per_chunk = float("nan")
             else:
-                tps = sum(r["n"] for r in ok) / wall
+                real_out = maxtok * len(ok)  # ignore_eos -> exactly maxtok tokens/stream
+                tps = real_out / wall
+                chunk_s = chunks / wall
+                tok_per_chunk = real_out / chunks if chunks else float("nan")
             tpot_s = f"{tpot:9.2f}" if tpot == tpot else f"{'n/a':>9}"
-            print(f"{M:>3} {ttft:9.2f} {tpot_s} {tps:12.1f} {len(bad):>6}")
+            tpc_s = f"{tok_per_chunk:10.2f}" if tok_per_chunk == tok_per_chunk else f"{'n/a':>10}"
+            print(f"{M:>3} {ttft:9.2f} {tpot_s} {tps:12.1f} {chunk_s:10.1f} {tpc_s} {len(bad):>6}")
 
 
 if __name__ == "__main__":
