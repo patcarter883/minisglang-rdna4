@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
@@ -9,6 +10,52 @@ from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
+
+# LM-head logits path. The vocab GEMV [M,K] x [vocab_tp,K] is a pure memory-bound streaming shape; the
+# WMMA-tiled `minv` GEMM (built for large M) stalls at M=1 (~124 GB/s on the 35B LM head). The shared
+# gemv_decode_core<Bf16GemvLoader> streams the weight fully coalesced at ~HBM (~673 GB/s measured) AND
+# is M-invariant BY CONSTRUCTION (per-(row,col) independent fp32 dot in a fixed K-order → logits for a
+# position are bit-identical regardless of batch M). That is exactly minv's guarantee, so it replaces
+# minv on the LM head for EVERY case — decode (M=1) AND spec-verify (M>1) — with no losslessness gate.
+# Only M beyond the core's MMAX cap (16) or non-bf16/fp16 weights fall back to minv.
+_LMHEAD_GEMV_ON = os.environ.get("MINISGL_LMHEAD_GEMV", "1") != "0"
+_LMHEAD_GEMV_MMAX = 16  # gemv_decode_core MMAX cap; LM-head verify M (spec K+1) sits well under this
+_lmhead_gemv_fn = None
+_lmhead_gemv_probed = False
+
+
+def _get_lmhead_gemv():
+    """Lazily resolve fp8_wmma.dense_bf16_gemv (None if the kernel package is unavailable)."""
+    global _lmhead_gemv_fn, _lmhead_gemv_probed
+    if not _lmhead_gemv_probed:
+        _lmhead_gemv_probed = True
+        if _LMHEAD_GEMV_ON:
+            try:
+                from fp8_wmma import dense_bf16_gemv
+
+                _lmhead_gemv_fn = dense_bf16_gemv
+            except Exception:
+                _lmhead_gemv_fn = None
+    return _lmhead_gemv_fn
+
+
+def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
+                    bias: torch.Tensor | None) -> torch.Tensor:
+    """Full-vocab logits x @ weight^T (+bias). Uses the M-invariant bf16 decode GEMV when it applies
+    (bf16/fp16 weight, rows <= MMAX), else the minv GEMM. Both are M-invariant, so the choice never
+    breaks spec-verify == decode bit-identity."""
+    from minisgl.layers.minv import minv_linear
+
+    gemv = _get_lmhead_gemv()
+    if (gemv is not None
+            and weight.dtype in (torch.bfloat16, torch.float16)
+            and x.dtype == weight.dtype
+            and x.dim() == 2 and x.shape[0] <= _LMHEAD_GEMV_MMAX):
+        out = gemv(x.contiguous(), weight)
+        if bias is not None:
+            out = out + bias
+        return out
+    return minv_linear(x, weight, bias)
 
 
 class VocabParallelEmbedding(BaseOP):
@@ -95,9 +142,8 @@ class ParallelLMHead(VocabParallelEmbedding):
         would diverge and desync the verify batch (collective deadlock). Mirrors the all_gather in
         ``forward`` but keeps every row."""
         module = self.tied_embedding or self
-        from minisgl.layers.minv import minv_linear  # M-invariant so verify logits match decode
-
-        logits = minv_linear(x, module.weight, self.bias)  # [rows, vocab//tp]
+        # M-invariant so verify logits match decode: the bf16 decode GEMV when it applies, else minv.
+        logits = _lm_head_linear(x, module.weight, self.bias)  # [rows, vocab//tp]
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
@@ -118,9 +164,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        from minisgl.layers.minv import minv_linear  # M-invariant: verify(M=K+1) logits == decode(M=1)
-
-        logits = minv_linear(x, module.weight, self.bias)
+        # M-invariant: verify(M=K+1) logits == decode(M=1). bf16 decode GEMV when it applies, else minv.
+        logits = _lm_head_linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
