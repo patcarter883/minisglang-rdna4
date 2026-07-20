@@ -38,11 +38,21 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
 
 def launch_server(run_shell: bool = False) -> None:
+    import os
+    import signal
+    import threading
+    import time
+
     from .api_server import run_api_server
     from .args import parse_args
 
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
     logger = init_logger(__name__, "initializer")
+
+    # Worker processes are watched by a crash-watchdog (see below). If any dies unexpectedly (OOM,
+    # segfault, CUDA error) the parent frontend would otherwise survive as a zombie and HOLD THE GPU
+    # LEASE until the caller's timeout — a wedged bench then blocks the whole lease queue for ~40 min.
+    _procs: list = []
 
     def start_subprocess() -> None:
         import multiprocessing as mp
@@ -70,19 +80,21 @@ def launch_server(run_shell: bool = False) -> None:
                     tp_info=DistributedInfo(tp_rank, tp_size),
                     dp_info=DpInfo(dp_rank, dp_size),
                 )
-                mp.Process(
+                _p = mp.Process(
                     target=_run_scheduler,
                     args=(new_args, ack_queue),
                     daemon=False,
                     name=f"minisgl-DP{dp_rank}-TP{tp_rank}-scheduler",
-                ).start()
+                )
+                _p.start()
+                _procs.append(_p)
 
         num_tokenizers = server_args.num_tokenizer
         # Per-replica ingress addresses — the tokenizer/detokenizer round-robins UserMsg across these
         # (one per DP replica's rank-0). dp_size=1 -> a single-element list == the historical behaviour.
         backend_addrs = [server_args.backend_addr_for(dp) for dp in range(dp_size)]
         # DeTokenizer, only 1
-        mp.Process(
+        _dp = mp.Process(
             target=tokenize_worker,
             kwargs={
                 "tokenizer_path": server_args.model_path,
@@ -96,9 +108,11 @@ def launch_server(run_shell: bool = False) -> None:
             },
             daemon=False,
             name="minisgl-detokenizer-0",
-        ).start()
+        )
+        _dp.start()
+        _procs.append(_dp)
         for i in range(num_tokenizers):
-            mp.Process(
+            _tp = mp.Process(
                 target=tokenize_worker,
                 kwargs={
                     "tokenizer_path": server_args.model_path,
@@ -112,7 +126,9 @@ def launch_server(run_shell: bool = False) -> None:
                 },
                 daemon=False,
                 name=f"minisgl-tokenizer-{i}",
-            ).start()
+            )
+            _tp.start()
+            _procs.append(_tp)
 
         # Wait for acknowledgments from all worker processes:
         # - dp_size scheduler replicas (each replica's tp-PRIMARY sends one ack)
@@ -121,6 +137,32 @@ def launch_server(run_shell: bool = False) -> None:
         # Total acks expected: dp_size + num_tokenizers + 1
         for _ in range(dp_size + num_tokenizers + 1):
             logger.info(ack_queue.get())
+
+        # Crash-watchdog: if any worker dies UNEXPECTEDLY (OOM, CUDA error, segfault), tear the whole
+        # server down NOW so the container exits and the GPU lease frees immediately. Without this the
+        # parent frontend survives as a zombie and holds the lease until the caller's timeout (~40 min),
+        # blocking the whole lease queue. A clean SIGTERM/SIGINT (intentional `docker stop` / Ctrl-C) is
+        # NOT a crash — those exit codes are whitelisted so normal shutdown never trips the watchdog.
+        _clean_exit = {0, -signal.SIGTERM, -signal.SIGINT}
+
+        def _crash_watchdog() -> None:
+            while True:
+                for p in _procs:
+                    ec = p.exitcode
+                    if ec is not None and ec not in _clean_exit:
+                        logger.error(
+                            "worker '%s' died unexpectedly (exitcode=%s) — shutting the server down "
+                            "immediately to release the GPU lease.", p.name, ec)
+                        for q in _procs:
+                            if q.is_alive():
+                                try:
+                                    q.terminate()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                        os._exit(1)
+                time.sleep(2)
+
+        threading.Thread(target=_crash_watchdog, name="minisgl-crash-watchdog", daemon=True).start()
 
     run_api_server(server_args, start_subprocess, run_shell=run_shell)
 
