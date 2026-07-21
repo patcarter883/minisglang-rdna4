@@ -2950,6 +2950,58 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             off += L
         return out
 
+    def _bcast_accept_tp(
+        self, reqs: List[Req], results: List[Tuple[int, List[int], bool]]
+    ) -> List[Tuple[int, List[int], bool]]:
+        """TP>1 lockstep: force every rank to COMMIT rank0's accept outcome.
+
+        The verify forward's per-position target logits are NOT bit-identical across TP ranks — the
+        vocab-parallel lm-head all_gather and the MoE reductions accumulate with atomics, so `p` (and
+        thus an argmax near-tie or a sampled rejection draw at min(1, p/q)) can flip on rank1 vs rank0.
+        The accept path used to rely on "p is identical post-all_gather" and skip an outcome broadcast;
+        that assumption is false, so the ranks could commit DIFFERENT tokens for a req -> it reaches
+        EOS/length at different steps -> the ranks' decode req SETS drift -> `spec_ok` (the spec-vs-plain
+        branch in `_spec_loop`) evaluates differently per rank -> one rank enters the gloo draft
+        broadcast while the other enters a plain-decode all_gather -> the collectives desync and NCCL
+        times out (60s) -> SIGABRT. Broadcasting rank0's (num_accepted, keep, eos) makes every rank
+        commit the identical tokens, so reqs finish in lockstep and the branch never splits.
+
+        LOSSLESS: only rank0 streams replies to the frontend (see run path), and no collective depends
+        on the per-rank grammar matcher (its bitmask is applied host-side), so a non-primary rank's
+        matcher drifting to rank0's tokens is invisible — its local verify decision is simply overwritten
+        by rank0's. The committed sequence is always rank0's grammar-valid, greedy-correct output."""
+        if self._tp_size <= 1:
+            return results
+        g = self.tp_cpu_group
+        n = len(reqs)
+        # header = [num_accepted*n | eos(0/1)*n | keep_len*n]; then the flat keep tokens.
+        if self._tp_is_primary:
+            na = [int(r[0]) for r in results]
+            eos = [1 if r[2] else 0 for r in results]
+            klen = [len(r[1]) for r in results]
+            flat_keep = [int(t) for r in results for t in r[1]]
+        else:
+            na = [0] * n; eos = [0] * n; klen = [0] * n; flat_keep = []
+        header = torch.tensor(na + eos + klen, dtype=torch.int64)
+        g.broadcast(header, root=0).wait()
+        h = [int(x) for x in header.tolist()]
+        na, eos, klen = h[:n], h[n:2 * n], h[2 * n:3 * n]
+        total = sum(klen)
+        flat = (
+            torch.tensor(flat_keep, dtype=torch.int64)
+            if self._tp_is_primary else torch.zeros(total, dtype=torch.int64)
+        )
+        if total > 0:
+            g.broadcast(flat, root=0).wait()
+        fl = [int(x) for x in flat.tolist()]
+        out: List[Tuple[int, List[int], bool]] = []
+        off = 0
+        for i in range(n):
+            L = klen[i]
+            out.append((na[i], fl[off:off + L], bool(eos[i])))
+            off += L
+        return out
+
     def _spec_decode_step(self, reqs: List[Req], ddtree_drafts: bool = False) -> None:
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
@@ -3189,6 +3241,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Fresh per-uid target hidden seeds for the NEXT step's propose (draft-head proposers only).
         new_last_hidden: dict[int, torch.Tensor] = {}
         new_aux_hidden: dict[int, torch.Tensor] = {}
+        # PASS 1: compute the accept OUTCOME (num_accepted, keep, eos) per req. This is the ONLY step
+        # whose result can differ across TP ranks (the verify logits are not bit-identical), so it is
+        # computed first for ALL reqs, then made rank0-authoritative below — before any commit.
+        accept_results: List[Tuple[int, List[int], bool]] = []
         for i, (req, d, sd) in enumerate(zip(reqs, drafts, staged_drafts)):
             q_len = len(d) + 1            # REAL rows: drives accept (target slice + verify_greedy)
             staged_q_len = len(sd) + 1    # rows the forward actually laid out (== q_len unless padded)
@@ -3252,7 +3308,23 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     if (not req.sampling_params.ignore_eos) and tok in self.eos_token_ids:
                         eos = True
                         break
+            accept_results.append((num_accepted_i, list(keep), eos))
 
+        # TP LOCKSTEP: commit rank0's accept outcome on EVERY rank so the ranks never drift on committed
+        # tokens -> req finishes -> the spec-vs-plain branch in _spec_loop -> the collective sequence.
+        # (No-op at TP=1.) See _bcast_accept_tp for why the per-rank verify can otherwise disagree.
+        accept_results = self._bcast_accept_tp(reqs, accept_results)
+
+        # PASS 2: commit + rollback per req using the rank0-authoritative outcome. Everything here is a
+        # deterministic function of (num_accepted, keep, eos) + the already-synced drafts/reqs, so all
+        # ranks perform identical KV/state mutations and finish the same reqs on the same step.
+        offset = 0
+        for i, (req, d, sd) in enumerate(zip(reqs, drafts, staged_drafts)):
+            q_len = len(d) + 1
+            staged_q_len = len(sd) + 1
+            block_start = offset
+            offset += staged_q_len
+            num_accepted_i, keep, eos = accept_results[i]
             accepted_counts.append(num_accepted_i)
             c0 = req.cached_len
 
@@ -3269,6 +3341,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if ax is not None and 0 <= c0 < req.input_ids.shape[0]:
                     Kd = len(d)
                     seed = (ax[:, -1] if ax.dim() == 3 else ax).reshape(1, -1).half().cpu()
+                    # Recompute the masked-argmax target for the reject-correct label (pass 1 no longer
+                    # keeps `target` in scope). Guarded to not-use_ondevice above, so `preds` is set.
+                    target = preds[block_start : block_start + q_len].tolist()
                     rc = int(target[num_accepted_i]) if num_accepted_i < Kd else -1
                     rec = {
                         "seed_in": seed,                                              # [1, n_aux*H]
