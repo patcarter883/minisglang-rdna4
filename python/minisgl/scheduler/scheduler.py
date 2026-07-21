@@ -1063,6 +1063,34 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return None
         return torch.tensor(flags, dtype=torch.bool, device=self.device)
 
+    def _gate_mask_spec_logits(
+        self, reqs: List[Req], staged_drafts: List[List[int]], logits: torch.Tensor
+    ) -> bool:
+        """Reasoning gate on the SPEC verify path — the analogue of _build_eos_suppress/_build_grammar_bitmask
+        for the propose→verify step (which has its own accept and never touches those). For each req still
+        inside its <think> span, mask its per-position verify logits IN PLACE so the accepted chain can't
+        emit EOS mid-reasoning (under budget) or is forced to </think> (over budget). The accept below then
+        naturally avoids EOS; the gate is COUNTED/OPENED from the committed (rank0-authoritative) tokens in
+        pass 2, so all TP ranks advance it identically. Returns True if any req was gated. No-op otherwise."""
+        if not self._grammar_think_gate_enabled or not self._grammar_think_gate:
+            return False
+        eos_ids = self.engine.sampler.eos_token_ids
+        any_gated = False
+        offset = 0
+        for req, sd in zip(reqs, staged_drafts):
+            q_len = len(sd) + 1
+            gate_tid = self._grammar_think_gate.get(getattr(req, "uid", None))
+            if gate_tid is not None:
+                any_gated = True
+                block = logits[offset:offset + q_len]
+                if self._think_gate_over_budget(req.uid):
+                    block.fill_(float("-inf"))       # force </think> (drafts won't match → num_accepted=0)
+                    block[:, gate_tid] = 0.0
+                elif eos_ids is not None:
+                    block[:, eos_ids] = float("-inf")  # reasoning phase: forbid EOS until </think>/budget
+            offset += q_len
+        return any_gated
+
     def _resolve_think_close_id(self, delim: str) -> int | None:
         """Token id of the reasoning-close delimiter (e.g. "</think>"), cached per string. These tags
         are registered as single special/added tokens on every target family (qwen3/deepseek/glm), so
@@ -2935,17 +2963,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         """Whether a req may run through the spec step. Greedy reqs always can (lossless greedy verify).
         A non-greedy req can when sampled spec is enabled — unconstrained via verify_sampled, constrained
         via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md.
-
-        A THINKING request (reasoning gate active) is excluded — it must take the PLAIN decode path. The
-        spec verify loop does NOT run the reasoning gate (no EOS suppression, no budget backstop, no
-        </think> open-detect), so a thinking model on the spec path stops mid-reasoning or truncates →
-        blank answer. Gating on the STATIC think_close_delim flag (set once at admission, identical on
-        every TP rank) keeps the spec-vs-plain branch rank-consistent — no collective divergence. The
-        answer phase runs plain too (small perf cost; per-phase spec is a follow-up). Opt out with
-        MINISGL_GRAMMAR_THINK_GATE=0."""
+        Thinking (reasoning-gate) requests DO speculate — the gate is enforced on the verify logits
+        (EOS-suppression + budget force-</think>) in _spec_decode_step, see _apply_think_gate_spec."""
         sp = req.sampling_params
-        if self._grammar_think_gate_enabled and getattr(sp, "think_close_delim", None):
-            return False
         return sp.is_greedy or self._spec_sampled
 
     def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
@@ -3191,6 +3211,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         else:
             logits = self.engine.forward_verify(batch)
 
+        # Reasoning gate on the spec path: mask the verify logits IN PLACE for any req still inside <think>
+        # (EOS-suppress under budget / force-</think> over budget) BEFORE the argmax/accept below, so a
+        # thinking model speculates correctly instead of stopping mid-reasoning or truncating. The gate is
+        # advanced from the committed rank0 tokens in pass 2. any_gated → those reqs take the host accept.
+        any_gated = self._gate_mask_spec_logits(reqs, staged_drafts, logits)
+
         # Greedy acceptance + EOS truncation: either the on-device vectorized chain (one batched sync
         # of small per-req results — the concurrency lever) or the legacy per-position argmax .cpu() +
         # per-req Python verify_greedy/keep loop. The on-device path is byte-lossless (validated in
@@ -3218,6 +3244,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self._spec_ondevice and not any_constrained and not ddtree_drafts and not force_n0
             and not pad_active  # padded layout: accept keys on real per-req len, not the staged q_lens
             and not any_sampled  # sampled reqs take the host rejection path (verify_sampled)
+            and not any_gated    # reasoning-gate reqs need the host accept (</think> truncation + count)
             and len(self.eos_token_ids) <= 1
         )
         preds = None
@@ -3285,6 +3312,33 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             staged_q_len = len(sd) + 1    # rows the forward actually laid out (== q_len unless padded)
             block_start = offset  # this req's first query row in the verify output ([sum staged q_len])
             offset += staged_q_len
+            gate_tid = (
+                self._grammar_think_gate.get(req.uid)
+                if self._grammar_think_gate_enabled else None
+            )
+            if gate_tid is not None:
+                # Reasoning phase: the verify logits for this req were already EOS-masked (under budget) or
+                # </think>-forced (over budget) by _gate_mask_spec_logits. Accept UNCONSTRAINED (the schema
+                # is gated off during reasoning, mirroring the plain path's all-ones bitmask) and TRUNCATE
+                # at </think> so the answer regenerates next step, schema-constrained. The gate itself is
+                # counted/opened from the committed rank0 tokens in pass 2.
+                sp = req.sampling_params
+                if gen is not None and not sp.is_greedy:
+                    lblock = logits[block_start : block_start + q_len]
+                    result = verify_sampled(
+                        d, probs_from_logits(lblock, sp.temperature, sp.top_k, sp.top_p), gen
+                    )
+                else:
+                    result = verify_greedy(d, preds[block_start : block_start + q_len].tolist())
+                num_accepted_i = result.num_accepted
+                keep = list(result.emitted)
+                if gate_tid in keep:                 # </think> committed → reasoning ends here
+                    j = keep.index(gate_tid)
+                    keep = keep[: j + 1]
+                    num_accepted_i = min(num_accepted_i, j)
+                eos = False                          # EOS was masked out during the reasoning phase
+                accept_results.append((num_accepted_i, list(keep), eos))
+                continue
             if use_ondevice:
                 # On-device chain already produced num_accepted + the EOS-truncated keep list for this
                 # req (batch is unconstrained by the use_ondevice gate, so no matcher path). Byte-
@@ -3361,6 +3415,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             offset += staged_q_len
             num_accepted_i, keep, eos = accept_results[i]
             accepted_counts.append(num_accepted_i)
+            # Reasoning gate advance (spec path): drive the budget count + </think> open-detect from the
+            # COMMITTED rank0 tokens so every TP rank moves the gate identically (mirrors the plain path,
+            # _process_last_data). keep was truncated at </think> in pass 1, so it is either all reasoning
+            # (count all) or ends at </think> (count the prefix, then open the gate → schema/answer next step).
+            if self._grammar_think_gate_enabled and req.uid in self._grammar_think_gate:
+                _gtid = self._grammar_think_gate[req.uid]
+                for _tok in keep:
+                    if _tok == _gtid:
+                        self._clear_think_gate(req.uid)
+                        break
+                    self._grammar_think_count[req.uid] = (
+                        self._grammar_think_count.get(req.uid, 0) + 1
+                    )
             c0 = req.cached_len
 
             # On-policy Draft-OPD capture (guarded; DFlash linear block only). One opdbuf record per
