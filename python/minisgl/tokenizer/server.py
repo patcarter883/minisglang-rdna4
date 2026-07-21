@@ -142,6 +142,15 @@ def tokenize_worker(
                     # abort it (broadcast; idempotent on replicas that don't own the uid).
                     if res.stop_hit and not msg.finished:
                         stop_abort_uids.append(msg.uid)
+                    # finish_reason: a stop-STRING match is always "stop"; otherwise carry the engine's
+                    # reason ("length" for max_tokens/KV-budget, "stop" for EOS), defaulting to "stop"
+                    # for finishes the scheduler didn't tag (e.g. CAM result-string, older paths).
+                    if not finished:
+                        finish_reason = None
+                    elif res.stop_hit:
+                        finish_reason = "stop"
+                    else:
+                        finish_reason = msg.finish_reason or "stop"
                     replies.append(
                         UserReply(
                             uid=msg.uid,
@@ -149,7 +158,7 @@ def tokenize_worker(
                             finished=finished,
                             completion_tokens=res.completion_tokens,
                             prompt_tokens=prompt_tokens_map.get(msg.uid, 0),
-                            finish_reason="stop" if finished else None,
+                            finish_reason=finish_reason,
                         )
                     )
                     if finished:

@@ -791,9 +791,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                         and next_token == req._mem_seed \
                         and os.environ.get("MINISGL_CAM_ALWAYS_INJECT") != "1":
                     req._mem_placed = True
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token in self.eos_token_ids
+                eos_hit = (not req.sampling_params.ignore_eos) \
+                    and (next_token in self.eos_token_ids)
+                finished = eos_hit or (not req.can_decode)
                 # runaway-generation-kv-guard (env MINISGL_CAM_REQ_KV_FRAC): force-finish a single
                 # request whose KV footprint has grown past the pool-fraction budget, so one runaway
                 # can't monopolize the pool. Budget 0 (default) -> disabled. device_len is prompt +
@@ -827,7 +827,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                             )
                     elif m is not None and not m.is_terminated():
                         m.accept_token(next_token)
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+                fr = ("stop" if eos_hit else "length") if finished else None
+                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token,
+                                           finished=finished, finish_reason=fr))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -2780,8 +2782,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 install_batch_idx.append(i)
                 install_t_index.append(len(keep) - 1)
             if keep:
+                fr = ("stop" if eos else "length") if finished else None
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=keep[0], finished=finished,
-                                           extra_tokens=keep[1:]))
+                                           extra_tokens=keep[1:], finish_reason=fr))
             # free the speculative query KV cols beyond the committed prefix (rejected drafts + replicas)
             free_start = div_ceil(req.cached_len, ps) * ps
             free_end = div_ceil(c0 + n_query, ps) * ps
@@ -3344,12 +3347,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # One message carries all of this step's committed tokens (the detokenizer keys
             # streaming state by uid and assumes one message per uid per batch).
             if keep:
+                fr = ("stop" if eos else "length") if finished else None
                 reply.append(
                     DetokenizeMsg(
                         uid=req.uid,
                         next_token=keep[0],
                         finished=finished,
                         extra_tokens=keep[1:],
+                        finish_reason=fr,
                     )
                 )
 

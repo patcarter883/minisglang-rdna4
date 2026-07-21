@@ -16,10 +16,20 @@ tag. Crucially, several of these templates put the *opening* ``<think>`` in the 
 Without splitting, all of that reasoning prose lands in ``content``. This module splits on the
 closing delimiter: everything before -> ``reasoning_content``, everything after -> ``content``.
 
-Design: SPLIT ONLY WHEN THE CLOSING TAG IS PRESENT. A non-reasoning model (or a thinking-disabled
-request, whose prompt already carries a *closed* ``<think></think>``) never emits ``</think>`` in
-its output, so the parser is a safe no-op there — no model-name branch, no risk of misclassifying a
-plain answer as reasoning. Delimiter sets are configurable so other families work generically.
+Design: SPLIT ON THE CLOSING TAG WHEN PRESENT. When it is ABSENT, the disposition depends on
+whether thinking was ON for the request (``thinking_open``):
+
+* **Thinking OFF / non-reasoning model** (``thinking_open=False``): the prompt carries no open
+  ``<think>`` (or a *closed* ``<think></think>``), so the output is a plain answer that never
+  contains ``</think>``. Return it unchanged as ``content`` — a safe no-op, no misclassification.
+* **Thinking ON** (``thinking_open=True``): the template injected the *opening* ``<think>`` into the
+  prompt, so the model is INSIDE the reasoning span from token 0. If generation ends before it emits
+  ``</think>`` — truncated at ``max_tokens``, or a model that just never closes — the ENTIRE output
+  is scratch reasoning, NOT a user answer. Route it all to ``reasoning_content`` (content ``""``)
+  rather than leaking a half-finished chain-of-thought into the visible answer.
+
+No model-name branch; ``thinking_open`` comes from the request's thinking state. Delimiter sets are
+configurable so other families work generically.
 """
 
 from typing import Optional, Tuple
@@ -43,16 +53,32 @@ class ReasoningParser:
         self.start_token = start_token
         self.end_token = end_token
 
-    def parse(self, text: str) -> Tuple[Optional[str], str]:
+    def parse(self, text: str, thinking_open: bool = False) -> Tuple[Optional[str], str]:
         """Split ``text`` into ``(reasoning_content, content)``.
 
         When the closing tag is present: reasoning is everything before it (a leading opening tag,
-        if the model echoed one, is stripped), content is everything after. When the closing tag is
-        absent the text is returned unchanged as ``content`` with ``reasoning_content=None`` — safe
-        for non-reasoning models and thinking-disabled requests.
+        if the model echoed one, is stripped), content is everything after.
+
+        When the closing tag is ABSENT the disposition depends on ``thinking_open`` (whether the
+        request had thinking enabled, i.e. the prompt injected an unclosed opening ``<think>``):
+
+        * ``thinking_open=False`` (default, thinking off / non-reasoning): returned unchanged as
+          ``content`` with ``reasoning_content=None`` — a safe no-op.
+        * ``thinking_open=True``: the model was inside the reasoning span from token 0 and generation
+          ended before it emitted the closing tag (truncated at ``max_tokens``, or a model that never
+          closes), so the WHOLE output is reasoning — returned as ``reasoning_content`` with
+          ``content=""``, never leaking a half-finished chain-of-thought into the answer.
         """
-        if not text or self.end_token not in text:
+        if not text:
             return None, text
+        if self.end_token not in text:
+            if not thinking_open:
+                return None, text
+            # Thinking was on and the model never closed </think> -> it's all reasoning.
+            pre = text
+            if self.start_token and self.start_token in pre:
+                pre = pre.split(self.start_token, 1)[-1]
+            return (pre.strip() or None), ""
         # Split on the LAST close tag, not the first: a model (esp. after a β-forced </think> in RSA)
         # may RE-OPEN <think>…</think> before its final answer. rpartition keeps ALL reasoning — the
         # original span plus any re-opened blocks — in reasoning_content and leaves only the final

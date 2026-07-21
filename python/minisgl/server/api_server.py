@@ -1194,7 +1194,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         body = result.final_text
         parser = _reasoning_parser()
         if parser is not None and _thinking_active(req):
-            reasoning_content, body = parser.parse(result.final_text)
+            # thinking_open=True: reached only when thinking is active, so an un-closed </think> means
+            # a truncated chain-of-thought -> route it to reasoning_content, not the visible answer.
+            reasoning_content, body = parser.parse(result.final_text, thinking_open=True)
         message: dict = {"role": "assistant", "content": body}
         if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
@@ -1342,12 +1344,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     # Reasoning: split a thinking model's `<think>…</think>` scratch out of the answer into a
     # separate reasoning_content field (the opening tag is in the prompt, so the completion carries
-    # only the closing </think> + answer). No-op when disabled / no closing tag / thinking off.
+    # only the closing </think> + answer). No-op when disabled / thinking off. thinking_open=True:
+    # thinking is active here, so an output with NO closing </think> is a truncated chain-of-thought
+    # -> route it entirely to reasoning_content, not the visible answer.
     reasoning_content: str | None = None
     body = full_content
     parser = _reasoning_parser()
     if parser is not None and _thinking_active(req):
-        reasoning_content, body = parser.parse(full_content)
+        reasoning_content, body = parser.parse(full_content, thinking_open=True)
 
     # Tool calling: if tools were offered, parse any <tool_call> blocks the model emitted (AFTER the
     # reasoning split) into OpenAI-shaped tool_calls and flip finish_reason. No tools -> untouched.
