@@ -34,6 +34,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # streaming offsets by uid and assumes one message per uid per batch — stays correct. Empty for
     # the normal one-token-per-step path. See DetokenizeManager.detokenize and SPEC_DECODE.md.
     extra_tokens: List[int] = field(default_factory=list)
+    # Why the engine finished this req: "length" (hit max_tokens / KV budget) or "stop" (EOS token).
+    # None while unfinished OR when the scheduler didn't tag a reason (detokenizer defaults such a
+    # finish to "stop"). A stop-STRING match is decided in the detokenizer, which overrides this.
+    finish_reason: str | None = None
 
 
 @dataclass
