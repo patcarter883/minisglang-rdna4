@@ -20,6 +20,11 @@ class BatchSamplingArgs:
     # Structured output: packed xgrammar token bitmask [bs, ceil(vocab/32)] (constrained rows carry
     # the grammar's allowed set; unconstrained rows are all-ones). Applied to logits before sampling.
     grammar_bitmask: torch.Tensor | None = None
+    # Reasoning gate: bool [bs] marking rows still inside a `<think>…</think>` span. Their end-of-turn
+    # (EOS) logits are set to -inf before sampling so a thinking model cannot terminate the turn
+    # mid-reasoning (→ blank/truncated answer). Bounded by the reasoning-budget backstop, which
+    # force-emits </think> and clears the gate, after which EOS is allowed again. None = no suppression.
+    eos_suppress: torch.Tensor | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -73,6 +78,9 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
+    # End-of-generation token ids ([E] int on device), set once by the scheduler after it resolves the
+    # model's full EOS set. Used to suppress EOS for reasoning-phase rows (see BatchSamplingArgs.eos_suppress).
+    eos_token_ids: torch.Tensor | None = None
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
@@ -98,6 +106,14 @@ class Sampler:
                 from .grammar import apply_token_bitmask
 
                 logits = apply_token_bitmask(logits.float(), args.grammar_bitmask)
+            if args.eos_suppress is not None and self.eos_token_ids is not None:
+                # Reasoning phase: forbid end-of-turn tokens for rows still inside <think> so the model
+                # can't stop mid-reasoning. apply_token_bitmask above already returned a fresh fp32
+                # tensor; otherwise copy so we never mutate the forward's (possibly captured) buffer.
+                rows = args.eos_suppress.nonzero(as_tuple=True)[0]
+                if rows.numel():
+                    logits = logits.float() if args.grammar_bitmask is not None else logits.float().clone()
+                    logits[rows.unsqueeze(1), self.eos_token_ids.to(logits.device).unsqueeze(0)] = float("-inf")
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)

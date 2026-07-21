@@ -204,6 +204,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # config. Multi-EOS models (GLM-4.x: [154820,154827,154829]) end turns on a token other than
         # the tokenizer's single EOS, so honouring only that one leaves them generating forever.
         self.eos_token_ids = set(resolve_stop_token_ids(config.model_path, self.tokenizer))
+        # Hand the resolved EOS set to the sampler so it can suppress end-of-turn tokens for rows still
+        # inside a <think> span (the reasoning gate — see _build_eos_suppress / BatchSamplingArgs).
+        if self.eos_token_ids:
+            self.engine.sampler.eos_token_ids = torch.tensor(
+                sorted(self.eos_token_ids), dtype=torch.int64, device=self.device
+            )
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -1031,12 +1037,31 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # the batch). The sampler masks disallowed tokens before argmax/sampling. Built over
         # padded_reqs so the row order matches logits[:batch.size]. No-op for a plain serve.
         sample_args.grammar_bitmask = self._build_grammar_bitmask(batch)
+        # Reasoning gate: suppress EOS for rows still inside <think> so a thinking model can't stop
+        # mid-reasoning and return a blank answer (bounded by the budget backstop, which forces </think>).
+        sample_args.eos_suppress = self._build_eos_suppress(batch)
         return ForwardInput(
             batch=batch,
             sample_args=sample_args,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _build_eos_suppress(self, batch: Batch) -> torch.Tensor | None:
+        """Bool [batch.size] marking rows whose req is still inside its reasoning span (gate armed, not
+        yet over budget). Their EOS logits are masked to -inf so the model can't end the turn before it
+        closes </think> — the budget backstop then force-emits </think> and clears the gate. None when no
+        row is gated (the common case) so the sampler skips the mask entirely."""
+        if not self._grammar_think_gate_enabled or not self._grammar_think_gate:
+            return None
+        gate = self._grammar_think_gate
+        flags = [
+            (getattr(r, "uid", None) in gate) and not self._think_gate_over_budget(r.uid)
+            for r in batch.reqs
+        ]
+        if not any(flags):
+            return None
+        return torch.tensor(flags, dtype=torch.bool, device=self.device)
 
     def _resolve_think_close_id(self, delim: str) -> int | None:
         """Token id of the reasoning-close delimiter (e.g. "</think>"), cached per string. These tags
@@ -2909,8 +2934,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
     def _req_spec_ok(self, req: Req) -> bool:
         """Whether a req may run through the spec step. Greedy reqs always can (lossless greedy verify).
         A non-greedy req can when sampled spec is enabled — unconstrained via verify_sampled, constrained
-        via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md."""
+        via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md.
+
+        A THINKING request (reasoning gate active) is excluded — it must take the PLAIN decode path. The
+        spec verify loop does NOT run the reasoning gate (no EOS suppression, no budget backstop, no
+        </think> open-detect), so a thinking model on the spec path stops mid-reasoning or truncates →
+        blank answer. Gating on the STATIC think_close_delim flag (set once at admission, identical on
+        every TP rank) keeps the spec-vs-plain branch rank-consistent — no collective divergence. The
+        answer phase runs plain too (small perf cost; per-phase spec is a follow-up). Opt out with
+        MINISGL_GRAMMAR_THINK_GATE=0."""
         sp = req.sampling_params
+        if self._grammar_think_gate_enabled and getattr(sp, "think_close_delim", None):
+            return False
         return sp.is_greedy or self._spec_sampled
 
     def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
