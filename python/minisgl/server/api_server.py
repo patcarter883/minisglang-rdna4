@@ -128,6 +128,10 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
+    # OpenAI stream_options, e.g. {"include_usage": true}. When include_usage is set, a spec-compliant
+    # streaming response emits a FINAL chunk with an empty `choices` array carrying the `usage` totals
+    # (before [DONE]) — the shape strict clients (langchain usage_metadata, budget guards) parse.
+    stream_options: dict | None = None
     stop: List[str] | str = []
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -965,7 +969,9 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int, reasoning_stream=None, tool_stream=None):
+    async def stream_chat_completions(
+        self, uid: int, reasoning_stream=None, tool_stream=None, include_usage: bool = False
+    ):
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
@@ -1029,17 +1035,31 @@ class FrontendManager:
                 yield _chunk({"tool_calls": [td]})
             if tool_stream.emitted and finish_reason != "length":
                 finish_reason = "tool_calls"
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
         end_chunk = {
             "id": f"cmpl-{uid}",
             "object": "chat.completion.chunk",
             "choices": [{"delta": final_delta, "index": 0, "finish_reason": finish_reason}],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            # OpenAI spec: in include_usage mode `usage` is null on every content chunk (incl. this
+            # finish chunk) and the totals ride a dedicated trailing chunk (below). Otherwise keep the
+            # totals here (back-compat for clients that read usage off the finish chunk).
+            "usage": None if include_usage else usage,
         }
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
+        if include_usage:
+            # Spec-compliant final usage chunk: choices is an empty array, usage carries the totals.
+            # This is the chunk langchain usage_metadata / budget guards look for.
+            usage_chunk = {
+                "id": f"cmpl-{uid}",
+                "object": "chat.completion.chunk",
+                "choices": [],
+                "usage": usage,
+            }
+            yield f"data: {json.dumps(usage_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
@@ -1319,9 +1339,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         # non-streaming path's `if req.tools`). `tool_choice:"none"` withholds the tools from the
         # template, so no blocks are emitted and this stays a no-op even when constructed.
         tool_stream = ToolCallStreamState(uid) if req.tools and req.tool_choice != "none" else None
+        include_usage = bool((req.stream_options or {}).get("include_usage"))
         return StreamingResponse(
             state.stream_with_cancellation(
-                state.stream_chat_completions(uid, reasoning_stream, tool_stream), request, uid
+                state.stream_chat_completions(uid, reasoning_stream, tool_stream, include_usage),
+                request, uid,
             ),
             media_type="text/event-stream",
         )
