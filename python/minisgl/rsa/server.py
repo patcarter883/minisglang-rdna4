@@ -260,14 +260,23 @@ async def _stream_rsa(app: FastAPI, body: dict, params: RSAParams, model: str):
     text = result.final_text
     for i in range(0, len(text), STREAM_CHUNK_CHARS):
         yield chunk({"content": text[i : i + STREAM_CHUNK_CHARS]})
-    usage = None
-    if (body.get("stream_options") or {}).get("include_usage"):
-        usage = {
-            "prompt_tokens": result.usage.prompt_tokens,
-            "completion_tokens": result.usage.completion_tokens,
-            "total_tokens": result.usage.total_tokens,
-        }
-    yield chunk({}, finish_reason="stop", usage=usage)
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+    yield chunk({}, finish_reason="stop")
+    if include_usage:
+        # OpenAI-spec final usage chunk: `choices` is an empty array, `usage` carries the totals — the
+        # shape strict clients (langchain usage_metadata / budget guards) parse (see api_server.py).
+        yield _sse({
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": result.usage.prompt_tokens,
+                "completion_tokens": result.usage.completion_tokens,
+                "total_tokens": result.usage.total_tokens,
+            },
+        })
     yield b"data: [DONE]\n\n"
 
 
