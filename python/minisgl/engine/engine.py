@@ -523,7 +523,15 @@ class Engine:
             # cap the IPC slot at 8 MB (long eager prefills exceed it and self-fall-back to RCCL on BOTH
             # replicas, staying lockstep). The IPC handshake rides dp_cpu_group (the 2 DP replicas). Only
             # tp_size==1 DP+EP is wired here (ep.dp_size gate); enable_custom_ar_ep no-ops for dp_size!=2.
-            if os.environ.get("MINISGL_CUSTOM_AR_EP", "0") == "1" \
+            # MINISGL_CUSTOM_AG_EP (DEFAULT ON) additionally moves the fused EP dispatch all_gather onto
+            # the custom one-shot P2P all_gather (all_gather_p2p) — moving the residual EP RCCL off the
+            # decode graph. It is DECOUPLED from AR: the IPC infra is set up if EITHER is requested, and
+            # each collective uses custom vs RCCL per its own flag. Default-on is a safe no-op on non-EP
+            # serves (dp_size!=2 or ctx.ep is None) and falls back to RCCL if the baked custom_ar lacks
+            # all_gather_p2p or P2P is unavailable. AR (MINISGL_CUSTOM_AR_EP) stays opt-in/default-off.
+            want_ar = os.environ.get("MINISGL_CUSTOM_AR_EP", "0") == "1"
+            want_ag = os.environ.get("MINISGL_CUSTOM_AG_EP", "1") != "0"
+            if (want_ar or want_ag) \
                     and config.tp_info.size == 1 and self.ctx.ep is not None \
                     and self.dp_cpu_group is not None:
                 car_max_bytes = min(
@@ -531,7 +539,10 @@ class Engine:
                     * self.dtype.itemsize,
                     8 * 1024 * 1024,
                 )
-                enable_custom_ar_ep(self.ctx.ep, self.dp_cpu_group, car_max_bytes)
+                enable_custom_ar_ep(
+                    self.ctx.ep, self.dp_cpu_group, car_max_bytes,
+                    enable_ar=want_ar, enable_ag=want_ag, ag_max_bytes=car_max_bytes,
+                )
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:

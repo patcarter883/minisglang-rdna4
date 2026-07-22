@@ -122,13 +122,46 @@ class EPCommunicator:
         ``[r*N : (r+1)*N]`` (every replica replays the SAME agreed bs N under graph capture)."""
         shape = list(x.shape)
         shape[0] = shape[0] * self.dp_size
+        car = self._car
+        if car is not None and car.ag_data is not None:
+            # Custom one-shot P2P all_gather (dp_size==2). It is PURE data movement (out[i]=x[i], no
+            # arithmetic), so ANY contiguous tensor is bit-cast to the kernel's f32/bf16 wire type purely
+            # by its BYTE COUNT — this covers the EP-gather-fuse's byte-packed uint8 buffer
+            # (hs|weights|ids -> (N, H*2+top_k*8) uint8) as well as a raw bf16/f32/i32 gather. The bit
+            # pattern is preserved through the reinterpret + copy, so the split-out g_hidden/weights/ids
+            # are byte-identical to RCCL. Both replicas run the IDENTICAL model in lockstep at the SAME
+            # agreed bs -> same shape/dtype/contiguity here every call -> both take the SAME branch (a
+            # mismatch would deadlock on the peer flag). Ineligible (non-contiguous / odd byte count /
+            # oversized / eager int64 self-coord counts) falls back to RCCL on BOTH ranks together.
+            nbytes = x.numel() * x.element_size()
+            if nbytes % 4 == 0:
+                wire, wn = torch.float32, nbytes // 4
+            elif nbytes % 2 == 0:
+                wire, wn = torch.bfloat16, nbytes // 2
+            else:
+                wire, wn = None, 0
+            if wire is not None and x.is_contiguous() and wn > 0 and nbytes <= car.ag_slot_bytes:
+                slot = car.ag_ctr & 1
+                car.ag_ctr += 1
+                xv = x.reshape(-1).view(torch.uint8).view(wire)      # bit-reinterpret to the wire type
+                out_w = torch.empty(self.dp_size * wn, dtype=wire, device=x.device)
+                publish = car.ag_data[slot].view(wire)[:wn]          # our shard published to the IPC buffer
+                car.ops.all_gather_p2p(
+                    xv, out_w, publish, car.ag_peer_data_ptr[slot],
+                    car.ag_flags, car.ag_peer_flags_ptr, self.dp_rank,
+                )
+                out = out_w.view(torch.uint8).view(x.dtype)          # back to x's dtype, rank-major
+                return out.view(shape)                               # matches all_gather_into_tensor
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x.contiguous(), group=self.group)
         return out
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         car = self._car
-        if car is not None:
+        # The custom AR path is gated on its OWN flag (MINISGL_CUSTOM_AR_EP), NOT merely on _car being
+        # present: _car is now also installed when only the all_gather is enabled (MINISGL_CUSTOM_AG_EP,
+        # default on). If AR was not requested, all_reduce STAYS on RCCL even though the IPC infra exists.
+        if car is not None and car.enable_ar:
             n = x.numel()
             # Custom one-shot P2P path (dp_size==2). Both replicas run the IDENTICAL model in lockstep
             # (the scheduler's per-step all_reduce(MAX) agreed the common bs/graph), so `partial` has the
@@ -159,22 +192,51 @@ class _EPCustomAR:
     slot_bytes: int
     ops: "object"
     ctr: int = 0
+    # Whether the custom one-shot all_REDUCE is engaged (MINISGL_CUSTOM_AR_EP). Decoupled from install:
+    # the IPC infra is also set up for the all_GATHER alone, in which case this stays False and
+    # all_reduce keeps using RCCL. None of the all_reduce slots above are used when this is False.
+    enable_ar: bool = False
+    # Optional custom one-shot P2P all_gather state (populated by enable_custom_ar_ep when the
+    # MINISGL_CUSTOM_AG_EP flag is on). Its OWN double-buffered IPC publish buffer + flags — the
+    # all_gather kernel publishes THIS rank's shard and P2P-reads the peer's, so it cannot share the
+    # all_reduce slots (those carry reduce operands). None -> all_gather stays on RCCL.
+    ag_data: "torch.Tensor | None" = None      # [2, ag_slot_bytes] uint8 fine-grained IPC
+    ag_flags: "torch.Tensor | None" = None     # [>=BLOCKS] int32 fine-grained IPC
+    ag_peer_data_ptr: "list[int] | None" = None
+    ag_peer_flags_ptr: int = 0
+    ag_slot_bytes: int = 0
+    ag_ctr: int = 0
 
 
 def enable_custom_ar_ep(
-    ep: "EPCommunicator", dp_cpu_group: "torch.distributed.ProcessGroup", max_bytes: int
+    ep: "EPCommunicator", dp_cpu_group: "torch.distributed.ProcessGroup", max_bytes: int,
+    enable_ar: bool = True, enable_ag: bool = False, ag_max_bytes: int = 0,
 ) -> None:
-    """Install the custom_ar one-shot all-reduce on the EP (DP+EP) MoE all_reduce, if usable: exactly
-    two DP replicas + working GPU-to-GPU P2P. Plumbing mirrors enable_custom_ar_distributed (the TP=2
-    path) — that path is ALSO cross-process (each TP rank is its own process/card), so the only diffs
-    are the CPU group carrying the IPC handshake (dp_cpu_group, the 2 DP replicas) and the peer index
-    (ep.dp_rank). Falls back silently (keeps RCCL) otherwise. Called AFTER ctx.ep is built."""
+    """Install the custom_ar one-shot all-reduce and/or one-shot all_gather on the EP (DP+EP) MoE
+    collectives, if usable: exactly two DP replicas + working GPU-to-GPU P2P. Plumbing mirrors
+    enable_custom_ar_distributed (the TP=2 path) — that path is ALSO cross-process (each TP rank is its
+    own process/card), so the only diffs are the CPU group carrying the IPC handshake (dp_cpu_group, the
+    2 DP replicas) and the peer index (ep.dp_rank). Falls back silently (keeps RCCL) otherwise. Called
+    AFTER ctx.ep is built.
+
+    ``enable_ar`` (MINISGL_CUSTOM_AR_EP) engages the custom one-shot all_REDUCE. ``enable_ag``
+    (MINISGL_CUSTOM_AG_EP, default on) additionally allocates a DEDICATED double-buffered IPC publish
+    buffer for the custom all_GATHER that replaces the fused EP dispatch gather (the fat RCCL slice left
+    after the all_reduce went custom). The two are DECOUPLED: the IPC infra is set up if EITHER is
+    requested, and each collective independently uses custom vs RCCL per its own flag. ``ag_max_bytes``
+    sizes one rank's published shard (the largest is g_hidden = max_forward*hidden*dtype)."""
     if ep.dp_size != 2:
+        return  # not the 2-replica EP topology (e.g. TP=2-no-EP, single card) -> no-op, RCCL
+    if not enable_ar and not enable_ag:
         return
     try:
         import custom_ar as car
     except Exception:
         return
+    if enable_ag and not hasattr(car, "all_gather_p2p"):
+        enable_ag = False  # image ships the pre-all_gather custom_ar -> gather stays RCCL
+    if not enable_ar and not enable_ag:
+        return  # nothing left to install (AG requested but kernel absent, AR not requested)
     dev = torch.cuda.current_device()
     peer_dev = 1 - dev
     if peer_dev < 0 or peer_dev >= torch.cuda.device_count() \
@@ -196,18 +258,38 @@ def enable_custom_ar_ep(
         peer_data_base = _exchange(self_data)
         peer_flags_ptr = _exchange(self_flags)
         peer_data_ptr = [peer_data_base, peer_data_base + slot_bytes]
+
+        ag_data = ag_flags = ag_peer_data_ptr = None
+        ag_peer_flags_ptr = 0
+        ag_slot_bytes = 0
+        if enable_ag:
+            ag_slot_bytes = ((ag_max_bytes + 255) // 256) * 256
+            ag_data = car.alloc_shared(2 * ag_slot_bytes, 0).view(2, ag_slot_bytes)  # uint8[2,slot]
+            ag_flags = car.alloc_shared(BLOCKS_SLACK * 4, 3)                          # int32 [64]
+            ag_peer_base = _exchange(ag_data)
+            ag_peer_flags_ptr = _exchange(ag_flags)
+            ag_peer_data_ptr = [ag_peer_base, ag_peer_base + ag_slot_bytes]
+
         dist.barrier(group=dp_cpu_group)
     except Exception as e:  # noqa: BLE001
         from minisgl.utils import init_logger
-        init_logger(__name__).info_rank0(f"custom_ar EP all-reduce unavailable ({e!r}) — using RCCL")
+        init_logger(__name__).info_rank0(f"custom_ar EP unavailable ({e!r}) — using RCCL")
         return
 
     ep._car = _EPCustomAR(
         self_data=self_data, self_flags=self_flags, peer_data_ptr=peer_data_ptr,
-        peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, ops=car,
+        peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, ops=car, enable_ar=enable_ar,
+        ag_data=ag_data, ag_flags=ag_flags, ag_peer_data_ptr=ag_peer_data_ptr,
+        ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes,
     )
     from minisgl.utils import init_logger
-    init_logger(__name__).info_rank0("custom_ar EP one-shot all-reduce ENABLED (graph-safe, ~1.3x vs RCCL)")
+    parts = []
+    if enable_ar:
+        parts.append("all-reduce")
+    if ag_data is not None:
+        parts.append("all-gather")
+    init_logger(__name__).info_rank0(
+        f"custom_ar EP one-shot {'+'.join(parts)} ENABLED (graph-safe, P2P, ~1.3x vs RCCL)")
 
 
 @dataclass
