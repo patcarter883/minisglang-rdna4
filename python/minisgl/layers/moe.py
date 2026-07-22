@@ -895,9 +895,19 @@ class MoELayer(BaseOP):
             ep_w = torch.cat([ep_w, ep_w.new_zeros(pad, ep_w.shape[1])], dim=0)
             ep_i = torch.cat([ep_i, ep_i.new_zeros(pad, ep_i.shape[1])], dim=0)
         N = hs.shape[0]  # common token count, identical on every rank
-        g_hidden = ep.all_gather(hs)  # (dp*N, H)
-        g_weights = ep.all_gather(ep_w)  # (dp*N, top_k)
-        g_ids = ep.all_gather(ep_i)  # (dp*N, top_k)
+        # FUSED EP all-gather: hs(bf16)/weights(f32)/ids(i32) are TINY latency-bound decode collectives
+        # (~27us each, tensor-size-independent). Byte-pack all three into ONE all_gather, then split —
+        # halves the per-MoE-layer collective count (3 gathers -> 1). Bit-identical (pure reinterpret +
+        # a device-local unpack copy). Shapes are static under graph capture, so it captures cleanly.
+        H = hs.shape[1]
+        hs_b = hs.contiguous().view(torch.uint8)        # (N, H*2)
+        w_b = ep_w.contiguous().view(torch.uint8)       # (N, top_k*4)
+        i_b = ep_i.contiguous().view(torch.uint8)        # (N, top_k*4)
+        g = ep.all_gather(torch.cat([hs_b, w_b, i_b], dim=1))  # (dp*N, H*2 + top_k*8)
+        o1, o2 = H * 2, H * 2 + ep_w.shape[1] * 4
+        g_hidden = g[:, :o1].contiguous().view(hs.dtype)       # (dp*N, H)
+        g_weights = g[:, o1:o2].contiguous().view(ep_w.dtype)  # (dp*N, top_k)
+        g_ids = g[:, o2:].contiguous().view(ep_i.dtype)        # (dp*N, top_k)
         lo, hi = self.local_expert_offset, self.local_expert_offset + self.local_num_experts
         is_local = (g_ids >= lo) & (g_ids < hi)
         local_ids = torch.where(is_local, g_ids - lo, torch.zeros_like(g_ids))
