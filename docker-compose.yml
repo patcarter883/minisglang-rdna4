@@ -94,6 +94,11 @@ x-lean-common: &lean-common
     MINISGL_PROFILE: "${MINISGL_PROFILE:-}"
     MINISGL_PROFILE_SKIP: "${MINISGL_PROFILE_SKIP:-40}"
     MINISGL_PROFILE_STEPS: "${MINISGL_PROFILE_STEPS:-50}"
+    # Phase-1 comms/compute overlap: split the fused MoE shared+routed TP all_reduce into 2 disjoint
+    # row-chunks and hide chunk-0's collective (side stream, RCCL) behind chunk-1's expert GEMM. Eager
+    # prefill only, bit-exact (disjoint rows) — measured +4.3% prefill TTFT @M1. Default ON; =0 to disable.
+    MINISGL_MOE_ASYNC_AR: "${MINISGL_MOE_ASYNC_AR:-1}"
+    MINISGL_MOE_ASYNC_AR_MIN_TOKENS: "${MINISGL_MOE_ASYNC_AR_MIN_TOKENS:-512}"
 
 services:
   # ═══════════════════════════════════════════════════════════════════════════════════════════════
