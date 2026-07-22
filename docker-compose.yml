@@ -54,6 +54,9 @@ x-lean-common: &lean-common
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+    # PROTOTYPE (perf/custom-ar-ep): route the in-graph EP MoE all_reduce through the custom_ar one-shot
+    # P2P all-reduce instead of RCCL (dp_size==2 + P2P only). Default 0 (RCCL) so this is an opt-in A/B.
+    MINISGL_CUSTOM_AR_EP: "${MINISGL_CUSTOM_AR_EP:-0}"
     # Reasoning + structured output: gate the JSON grammar until </think> (default on). Set 0 to
     # apply the schema from token 0 even with thinking on (the pre-fix behavior / A-B toggle).
     MINISGL_GRAMMAR_THINK_GATE: "${MINISGL_GRAMMAR_THINK_GATE:-1}"
