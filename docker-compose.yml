@@ -57,6 +57,10 @@ x-lean-common: &lean-common
     # PROTOTYPE (perf/custom-ar-ep): route the in-graph EP MoE all_reduce through the custom_ar one-shot
     # P2P all-reduce instead of RCCL (dp_size==2 + P2P only). Default 0 (RCCL) so this is an opt-in A/B.
     MINISGL_CUSTOM_AR_EP: "${MINISGL_CUSTOM_AR_EP:-0}"
+    # Custom one-shot P2P EP all_GATHER (all_gather_p2p, baked into the lean custom_ar). DEFAULT ON —
+    # moves the fused EP dispatch gather off RCCL; decoupled from AR, no-ops on non-EP serves, and falls
+    # back to RCCL if the baked custom_ar lacks the kernel or P2P is unavailable. Set 0 to force RCCL.
+    MINISGL_CUSTOM_AG_EP: "${MINISGL_CUSTOM_AG_EP:-1}"
     # Reasoning + structured output: gate the JSON grammar until </think> (default on). Set 0 to
     # apply the schema from token 0 even with thinking on (the pre-fix behavior / A-B toggle).
     MINISGL_GRAMMAR_THINK_GATE: "${MINISGL_GRAMMAR_THINK_GATE:-1}"
