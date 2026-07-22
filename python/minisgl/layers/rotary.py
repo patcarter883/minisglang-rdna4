@@ -19,10 +19,15 @@ class RotaryEmbedding(StateLessOP):
         base: float,
         post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
         interleave: bool = False,
+        attention_scaling: float = 1.0,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
+        # YaRN attention temperature (mscale): the reference scales cos/sin by this factor so the
+        # roped q/k magnitude compensates for the frequency interpolation (transformers
+        # `cos = emb.cos() * attention_scaling`). 1.0 for every non-yarn rope (a no-op).
+        self._attention_scaling = attention_scaling
         # Interleaved RoPE (GLM-4.x `rope_interleave=True`): the rotary dims are laid out as adjacent
         # pairs (x0,x1),(x2,x3),... each rotated by ONE frequency, vs the NeoX/Llama "rotate-half"
         # split ([:d] | [d:]). Same rotation formula, DIFFERENT input pairing — applying NeoX to an
@@ -38,8 +43,8 @@ class RotaryEmbedding(StateLessOP):
             inv_freq = post_process(inv_freq)
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
+        cos = freqs.cos() * self._attention_scaling
+        sin = freqs.sin() * self._attention_scaling
         # buffer, so don't load/save
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
@@ -168,7 +173,15 @@ def _get_rope(
                 )
                 return (inv_freq / factor) * ramp + inv_freq * (1 - ramp)
 
-            return RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
+            # YaRN attention temperature (mscale): explicit `attention_factor` if the checkpoint
+            # ships one (Laguna: 1.3465), else the standard 0.1*ln(factor)+1.0. Scales cos/sin.
+            attn_scaling = rope_scaling.get("attention_factor")
+            if attn_scaling is None:
+                attn_scaling = 0.1 * math.log(factor) + 1.0
+            return RotaryEmbedding(
+                head_dim, rotary_dim, max_position, base, post_process,
+                attention_scaling=float(attn_scaling),
+            )
 
     raise ValueError(f"Unsupported {rope_scaling = }")
 

@@ -682,6 +682,146 @@ def _load_zaya_weight(
     assert not expert_buf, f"incomplete Zaya expert stacks: {list(expert_buf.keys())}"
 
 
+# ---- poolside/Laguna-XS-2.1 (SWA-hybrid gated-attention NVFP4 MoE) weight loader ----
+# Standard `model.layers.N.*` naming, so the remap is nearly identity. Two families need a touch:
+#   1. the router balancing bias ships as `mlp.experts.e_score_correction_bias` (co-located with the
+#      experts in the checkpoint) but the model holds it on the router -> rename to `mlp.gate.*`;
+#   2. fp8-KV `self_attn.{k,v}_scale` are dropped for the bf16-KV v1 serve.
+# gate/up merge (dense L0 + shared expert + routed experts) and per-expert stacking are the generic
+# `_gate_up_merge` / `_get_expert_stack_info`; the NVFP4 two-level scale is folded to one fp16 per-group
+# scale at the leaf (before any merge) exactly as in `_load_qwen3_5_weight`. Plain TP=2 (no EP):
+# attention q/k/v/g/o, dense L0, embed/lm_head AND the routed experts are TP-sharded (the experts split
+# their moe_intermediate FFN across ranks — gate/up on output dim 0, down on input dim 1 — so each card
+# holds ~half the 31B of expert weight); the router gate, correction bias and the always-on shared
+# expert stay whole. NVFP4 packed/scale tensors split like a bf16 weight (not `_AWQ_SUFFIXES`).
+
+
+def _laguna_remap(name: str) -> tuple[str] | None:
+    """Map a Laguna checkpoint key to its native key (or None to skip). Returns a 1-tuple `(native,)`
+    (the outer loop reads plan[1]) so the shape mirrors the qwen3_5 `("direct", native)` usage."""
+    # bf16-KV v1: drop the checkpoint's fp8-KV per-tensor scales (attention runs bf16 KV).
+    if name.endswith((".self_attn.k_scale", ".self_attn.v_scale")):
+        return None
+    # Router balancing bias lives on the experts in the checkpoint; the model holds it on the router.
+    if name.endswith(".mlp.experts.e_score_correction_bias"):
+        return (name.replace(".mlp.experts.e_score_correction_bias", ".mlp.gate.e_score_correction_bias"),)
+    return (name,)
+
+
+def _shard_laguna(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Rank-r plain-TP shard of a Laguna checkpoint tensor (applied BEFORE gate/up merge + expert
+    stack). Mirrors the dense `_shard_tensor` rules AND intermediate-splits the routed experts, exactly
+    as GLM/qwen do at TP=2 (no EP): each rank holds ~half the 31B of expert weight.
+
+      * Column-parallel (output dim 0): attention q/k/v/g; dense-L0 gate/up; ROUTED-EXPERT gate/up.
+        For a routed-expert NVFP4 pair this splits N=moe_intermediate across ranks (weight_packed
+        (N,K//2) & weight_scale (N,K//16) both split dim 0), giving each rank moe_intermediate/n rows.
+      * Row-parallel (input dim 1): attention o_proj; dense-L0 down; ROUTED-EXPERT down (splits
+        K=moe_intermediate: weight_packed (N,K//2) & weight_scale (N,K//16) both split dim 1).
+      * Vocab-parallel (dim 0): embed / untied lm_head.
+      * REPLICATED (whole): router gate + `e_score_correction_bias`; the always-on shared expert
+        (its down K=shared_inter must stay whole for the e2m1 kernel); every norm.
+    n==1 is the identity. NVFP4 packed/scale tensors are NOT `_AWQ_SUFFIXES`, so — like a bf16 weight —
+    output-parallel splits dim 0 and input-parallel splits dim 1 (no AWQ axis flip)."""
+    if n == 1:
+        return t
+    # Replicated / whole (no TP split): shared expert, router gate + bias, all norms.
+    if (
+        ".shared_expert." in name
+        or name.endswith(".mlp.gate.weight")
+        or name.endswith(".e_score_correction_bias")
+        or name.endswith("_norm.weight")
+        or name.endswith("layernorm.weight")
+        or name == "model.norm.weight"
+    ):
+        return t
+    # Column-parallel (output dim 0): attention q/k/v/g; dense-L0 + routed-expert gate/up.
+    if name.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".g_proj.weight")) or (
+        ".gate_proj." in name or ".up_proj." in name
+    ):
+        return t.chunk(n, dim=0)[r].clone()
+    # Row-parallel (input dim 1): attention o_proj; dense-L0 + routed-expert down.
+    if name.endswith(".o_proj.weight") or ".down_proj." in name:
+        return t.chunk(n, dim=1)[r].clone()
+    # Vocab-parallel: embed / untied lm_head.
+    if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
+        num_emb = t.shape[0]
+        per = div_ceil(num_emb, n)
+        return t[r * per : min((r + 1) * per, num_emb), :].clone()
+    return t  # anything else (unreached) replicated
+
+
+def _load_laguna_weight(
+    model_folder: str, device: torch.device, config
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for poolside/Laguna-XS-2.1-NVFP4 (see the family note above)."""
+    tp_info = get_tp_info()
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # gate/up -> gate_up
+    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # per-expert -> stacked over E
+    _is_nvfp4 = config.quant is not None and config.quant.is_nvfp4
+    nvfp4_fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
+
+    def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        if (mm := _gate_up_merge(native_key)) is not None:
+            merged_key, slot = mm
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if len(merge_buf[merged_key]) != 2:
+                return
+            parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+            del merge_buf[merged_key]
+            cat_dim = 1 if merged_key.endswith((".qweight", ".qzeros", ".scales")) else 0
+            native_key, tensor = merged_key, torch.cat(parts, dim=cat_dim)
+        if config.is_moe and (einfo := _get_expert_stack_info(native_key)) is not None:
+            packed_key, idx = einfo
+            if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
+                return  # not this replica's expert
+            local_idx = idx - _ep_offset
+            slots = expert_buf.setdefault(packed_key, {})
+            slots[local_idx] = tensor
+            if len(slots) != _ep_local:
+                return
+            experts = [slots[i] for i in range(_ep_local)]
+            del expert_buf[packed_key]
+            yield packed_key, torch.stack(experts, dim=0)
+        else:
+            yield native_key, tensor
+
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for name in f.keys():
+                # NVFP4: fold e4m3 block scale / per-tensor global -> one fp16 per-group scale at the
+                # LEAF (before rename / gate-up merge / expert stack). weight_packed passes through 4-bit;
+                # input_global_scale (FP4 act calib) is dropped (the e2m1 kernel quantizes acts to fp8).
+                override = None
+                if _is_nvfp4:
+                    if name.endswith(".input_global_scale"):
+                        continue
+                    if name.endswith((".weight_scale", ".weight_global_scale")):
+                        base, field = name.rsplit(".", 1)
+                        buf = nvfp4_fold_buf.setdefault(base, {})
+                        buf[field] = f.get_tensor(name)
+                        if len(buf) < 2:
+                            continue
+                        del nvfp4_fold_buf[base]
+                        name = base + ".weight_scale"
+                        override = nvfp4.fold_nvfp4_scale(buf["weight_scale"], buf["weight_global_scale"])
+                plan = _laguna_remap(name)
+                if plan is None:
+                    continue
+                native = plan[0]
+                tens = override if override is not None else f.get_tensor(name)
+                raw = _shard_laguna(native, tens, tp_info.rank, tp_info.size, config)
+                yield from emit(native, raw)
+    assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    assert not nvfp4_fold_buf, (
+        f"incomplete NVFP4 scale/global pairs: {list(nvfp4_fold_buf.keys())}"
+    )
+
+
 def load_weight(
     model_path: str, device: torch.device, spec_algorithm: str = "mtp"
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -701,6 +841,9 @@ def load_weight(
         return
     if config.is_cca_hybrid:
         yield from _load_zaya_weight(model_folder, device, config)
+        return
+    if config.is_swa_hybrid:
+        yield from _load_laguna_weight(model_folder, device, config)
         return
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files

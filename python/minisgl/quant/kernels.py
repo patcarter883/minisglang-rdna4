@@ -320,7 +320,13 @@ def w4a8_moe(
     # gather, top_k==1): WMMA is ~6.8x faster than GEMV (50us vs 339us) — the GEMV path
     # underperforms for that shape. So pick gemv for gemm1, keep WMMA for gemm2. Together ~85us vs
     # ~356us with the old all-WMMA default. Prefill (M>2) keeps the passed/default kernel for both.
-    gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
+    # NVFP4 experts are group-16; the decode GEMV kernels (gemm1+silu / gemm / scatter) all require
+    # group_size%32==0, while the WMMA/tiled path accepts group_size%16. Route a sub-32 group size to
+    # WMMA at EVERY M so group-16 e2m1 MoE runs at all (group-32 int4/MXFP4 keep the fast decode GEMV).
+    # Runtime group_size = K / n_groups, K = w13.shape[-1]*8 (int32 packs 8 e2m1 nibbles). Capability-
+    # aware and model-agnostic — no kernel fork, benefits any group-16 e2m1 MoE.
+    _gemv_ok = ((w13.shape[-1] * 8) // w13_scales.shape[-1]) % 32 == 0
+    gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
@@ -435,8 +441,10 @@ def w4a8_moe(
     # gather_reduce launch AND skipping the alignment-padding rows the WMMA gemm2 computes. gemv-math
     # down-proj -> ~1e-4 vs the WMMA path (accumulation order; user-accepted). Prefill (M>threshold) keeps
     # the flag/WMMA gemm2 + gather_reduce below.
-    if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 \
+    if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
             and hasattr(fp8_wmma, "mmq_fp8_moe_gemm2_gather_reduce"):
+        # _gemv_ok: the decode gemm2 gather-reduce is gemv-math (group_size%32); group-16 NVFP4 falls
+        # through to the WMMA gemm2 + gather_reduce below (group_size%16 OK).
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce{_e2m1}")
         acc = _moe_time(
             "gemm2gather",
@@ -1067,6 +1075,12 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
     The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
     in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
     """
+    # NVFP4 (group-16) e2m1: only wmma_tiled_tuned carries a runtime-group_size (BKT=0) generic
+    # instance; decode_gemv + prefill_wmma/ashuffle hard-require group_size%32 (they'd TORCH_CHECK).
+    # Route group-16 e2m1 to the tiled kernel at EVERY M (group-32 MXFP4/int4 keep the measured per-M
+    # crossover). Capability-aware, model-agnostic — no kernel fork.
+    if weight_is_e2m1 and group_size % 32 != 0:
+        return "wmma_tiled_tuned"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
     if m <= gemv_max:
         return "decode_gemv"
