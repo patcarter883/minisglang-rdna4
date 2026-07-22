@@ -526,10 +526,10 @@ class Engine:
             # MINISGL_CUSTOM_AG_EP (DEFAULT ON) additionally moves the fused EP dispatch all_gather onto
             # the custom one-shot P2P all_gather (all_gather_p2p) — moving the residual EP RCCL off the
             # decode graph. It is DECOUPLED from AR: the IPC infra is set up if EITHER is requested, and
-            # each collective uses custom vs RCCL per its own flag. Default-on is a safe no-op on non-EP
-            # serves (dp_size!=2 or ctx.ep is None) and falls back to RCCL if the baked custom_ar lacks
-            # all_gather_p2p or P2P is unavailable. AR (MINISGL_CUSTOM_AR_EP) stays opt-in/default-off.
-            want_ar = os.environ.get("MINISGL_CUSTOM_AR_EP", "0") == "1"
+            # each collective uses custom vs RCCL per its own flag. Both DEFAULT ON: a safe no-op on non-EP
+            # serves (dp_size!=2 or ctx.ep is None) and falls back to RCCL if the baked custom_ar lacks the
+            # op or P2P is unavailable. With both on, the EP decode graph carries ZERO ncclDevKernel.
+            want_ar = os.environ.get("MINISGL_CUSTOM_AR_EP", "1") != "0"
             want_ag = os.environ.get("MINISGL_CUSTOM_AG_EP", "1") != "0"
             if (want_ar or want_ag) \
                     and config.tp_info.size == 1 and self.ctx.ep is not None \
