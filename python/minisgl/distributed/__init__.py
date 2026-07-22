@@ -4,6 +4,7 @@ from .impl import (
     destroy_distributed,
     enable_pynccl_distributed,
     enable_custom_ar_distributed,
+    enable_custom_ar_ep,
 )
 from .info import (
     DistributedInfo,
@@ -26,6 +27,7 @@ __all__ = [
     "set_tp_info",
     "enable_pynccl_distributed",
     "enable_custom_ar_distributed",
+    "enable_custom_ar_ep",
     "DistributedCommunicator",
     "EPCommunicator",
     "try_get_tp_info",

@@ -12,6 +12,7 @@ from minisgl.distributed import (
     destroy_distributed,
     enable_pynccl_distributed,
     enable_custom_ar_distributed,
+    enable_custom_ar_ep,
     set_dp_info,
     set_tp_info,
 )
@@ -77,9 +78,15 @@ def _maybe_profile() -> None:
     elif st["p"] is not None and st["n"] == skip + active:
         torch.cuda.synchronize()
         st["p"].__exit__(None, None, None)
-        st["p"].export_chrome_trace(spec)
+        # Under DP (tp_size=1) EVERY replica is its own TP-primary, so an unqualified path would have
+        # both replicas write the SAME file concurrently -> corrupt gzip. Qualify by dp_rank.
+        from minisgl.distributed import try_get_dp_info
+        dp = try_get_dp_info()
+        out = spec if (dp is None or dp.dp_size == 1) else spec.replace(
+            ".pt.trace", f".dp{dp.dp_rank}.pt.trace")
+        st["p"].export_chrome_trace(out)
         st["p"] = None
-        logger.info_rank0(f"[profile] wrote {active}-step trace to {spec}")
+        logger.info_rank0(f"[profile] wrote {active}-step trace to {out}")
 
 # Token count for the one-time GDN conv autotune warmup (3c-3). A single representative
 # prefill length settles the per-process in-place batch_ptr autotune.
@@ -510,6 +517,21 @@ class Engine:
                         dp_size=dp_size,
                         num_experts=config.model_config.num_experts,
                     )
+            # Replace the in-graph EP MoE all_reduce (RCCL, ~23.7% of ZAYA decode GPU time) with the
+            # custom_ar one-shot P2P all-reduce when there are exactly 2 DP replicas with working P2P.
+            # The decode all_reduce tensor is (dp_size*bs, hidden) at a captured bs (<= cuda_graph_max_bs);
+            # cap the IPC slot at 8 MB (long eager prefills exceed it and self-fall-back to RCCL on BOTH
+            # replicas, staying lockstep). The IPC handshake rides dp_cpu_group (the 2 DP replicas). Only
+            # tp_size==1 DP+EP is wired here (ep.dp_size gate); enable_custom_ar_ep no-ops for dp_size!=2.
+            if os.environ.get("MINISGL_CUSTOM_AR_EP", "0") == "1" \
+                    and config.tp_info.size == 1 and self.ctx.ep is not None \
+                    and self.dp_cpu_group is not None:
+                car_max_bytes = min(
+                    dp_size * config.max_forward_len * config.model_config.hidden_size
+                    * self.dtype.itemsize,
+                    8 * 1024 * 1024,
+                )
+                enable_custom_ar_ep(self.ctx.ep, self.dp_cpu_group, car_max_bytes)
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
