@@ -120,9 +120,12 @@ class ModelConfig:
 
     @property
     def is_moe(self) -> bool:
-        # model_type=="zaya" carries no "moe" substring, but Zaya IS a (CCA-hybrid) MoE model and the
-        # engine must build the moe_backend for its unquantized/precomputed-route experts.
-        return "moe" in self.model_type or self.is_cca_hybrid
+        # A model with routed experts IS a MoE model (num_experts>0) — the principled signal, not a
+        # model-name substring: Laguna (model_type=="laguna") and Zaya (=="zaya") carry no "moe" in
+        # their type yet both route experts and need the engine's moe_backend + the loader's expert
+        # stacking. The legacy substring/CCA checks are kept as a belt-and-suspenders for any family
+        # that sets num_experts oddly.
+        return self.num_experts > 0 or "moe" in self.model_type or self.is_cca_hybrid
 
     @property
     def is_mla(self) -> bool:
@@ -309,6 +312,23 @@ class ModelConfig:
             or 1.0
         )
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0) or 0
+        # Laguna has no `first_k_dense_replace`; it declares dense layer-0 via `mlp_layer_types`
+        # ([ "dense", "sparse", ... ]) / `mlp_only_layers` ([0]). Derive the count of LEADING dense
+        # layers so the decoder's `layer_id < first_k_dense_replace` dense/MoE dispatch is correct.
+        if not first_k_dense_replace:
+            _mlp_types = getattr(config, "mlp_layer_types", None)
+            if _mlp_types is not None:
+                fk = 0
+                for _t in _mlp_types:
+                    if _t == "dense":
+                        fk += 1
+                    else:
+                        break
+                first_k_dense_replace = fk
+            else:
+                _mol = getattr(config, "mlp_only_layers", None) or []
+                if list(_mol) == list(range(len(_mol))):
+                    first_k_dense_replace = len(_mol)
         n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
         num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
         mtp_num_hidden_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0

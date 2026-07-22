@@ -303,6 +303,72 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
           ${MINISGL_EXTRA_ARGS:-}
 
+  # poolside/Laguna-XS-2.1-NVFP4 — SWA-hybrid gated-attention MoE. FIRST end-to-end NVFP4 quant-path
+  # serve: NVFP4 folds LOSSLESSLY into the e2m1 W4A8-WMMA kernel (fp16 per-group scale =
+  # weight_scale_e4m3 / weight_global_scale at group-16; identical E2M1 codes to MXFP4, no FP4 hw, no
+  # upconvert). Routed + shared experts are NVFP4; backbone / gated SWA attention / dense-L0 / untied
+  # lm_head stay bf16. Plain TP=2 (NO EP): the loader intermediate-splits every routed expert's FFN
+  # across the two ranks (exactly as GLM/qwen at TP=2), so each 16GB card holds ~half the 31B of expert
+  # weight (~7.7GB) plus the bf16 backbone. (EP-over-TP does NOT engage from --enable-ep alone without a
+  # DP launcher, so it is intentionally omitted — --enable-ep here would starve one card and OOM.) SWA
+  # (10 full + 30 sliding, window 512) needs the hip attention backend (window-bounded ring KV pool).
+  # Spec OFF for the coherence bring-up; use the laguna-dflash profile for spec.
+  #   gpu-lease -n 2 --detach --name laguna -- docker compose --profile laguna up -d
+  laguna:
+    <<: *lean-common
+    profiles: ["laguna"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-laguna
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type naive \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
+  # Laguna-XS-2.1-NVFP4 target + its matching DFlash block-diffusion drafter
+  # (poolside/Laguna-XS-2.1-DFlash-NVFP4: 5 sliding layers, block_size 16, aux target layers
+  # [1,13,25,33,39]). DFlash is uniform-K wider-verify; K defaults to the drafter's block size (16).
+  # Same TP=2+EP memory layout as the laguna profile. Measure the spec speedup honestly (prior DFlash
+  # recipes were net-negative on some targets).
+  #   gpu-lease -n 2 --detach --name laguna-dflash -- docker compose --profile laguna-dflash up -d
+  laguna-dflash:
+    <<: *lean-common
+    profiles: ["laguna-dflash"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-laguna-dflash
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type naive \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --spec-algorithm dflash \
+          --spec-draft-model-path "${MINISGL_DFLASH_MODEL:-poolside/Laguna-XS-2.1-DFlash-NVFP4}" \
+          --spec-num-draft "${MINISGL_SPEC_K:-16}" \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-4}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
   # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8, DP=2 + expert-parallel. Runs as DP=2
   # replicas (one per gfx1201 card) with --enable-ep sharding the 128 experts across the pair so the
   # ~9 GB fp8 weights fit 16 GB/card. Default checkpoint is /models/ZAYA1-8B-fp8. Needs BOTH cards
