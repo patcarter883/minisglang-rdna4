@@ -190,8 +190,11 @@ services:
 
   # GLM-4.7-Flash-AWQ (W4A8 AWQ MoE + MLA) at TP=2 with MTP spec-decode UNDER CUDA graph capture
   # (num_nextn_predict_layers=1). Same graph-capture requirement as `qwen`. Draft length
-  # MINISGL_SPEC_K defaults to the sweep-optimal K=1 (graph-captured sweep: baseline 37.6 -> 52.4
-  # tok/s at K=1, +39%; GLM's MTP head only lands ~1 token so K>=2 is a NET LOSS). Needs TP=2.
+  # MINISGL_SPEC_K defaults to the sweep-optimal K=2 (:lean sweep 2026-07-22, TP=2 M=1 decode: no-spec
+  # 48.5 -> K=1 64.9 -> K=2 70.9 -> K=3 64.8 tok/s; peak K=2 = +46%, accept-len ~1.9). Old "GLM MTP is
+  # a net loss / K=1 best" is FALSIFIED on the optimized image; K=2 now beats K=1. (EAGLE3 is unusable
+  # here — the cached thoughtworks/GLM-4.7-Flash-Eagle3 draft is 2048-hidden vs this ckpt's 6144.)
+  # Needs TP=2.
   #   gpu-lease -n 2 --detach --name glm -- docker compose --profile glm up -d
   glm:
     <<: *lean-common
@@ -211,7 +214,7 @@ services:
           --page-size 16 \
           --tp "${MINISGL_TP:-2}" \
           --disable-pynccl \
-          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-1}" \
+          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-2}" \
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
           --max-running-requests "${MINISGL_MAX_RUNNING:-32}" \
           --memory-ratio "${MINISGL_MEM_RATIO:-0.82}" \
@@ -219,8 +222,11 @@ services:
 
   # Qwen3.6-35B-A3B-MXFP4 (GDN-hybrid + 128-expert MoE; MXFP4 weights, bf16-native, MTP head left
   # UNQUANTIZED) at TP=2 with MTP spec-decode UNDER CUDA graph capture. This is the prod spec config —
-  # MTP K=4 gives the best real-text tok/s on this GDN+MoE target (memory spec-decode-breakeven-gdn-moe;
-  # DFlash K=15 is a wider-verify tax — use the qwen35b-dflash profile for that). MTP is uniform-K so it
+  # MTP K=2 gives the best single-stream tok/s on this GDN+MoE target (:lean sweep 2026-07-22, TP=2 M=1
+  # decode: no-spec 53.2 -> K=1 68.0 -> K=2 76.6 -> K=4 71.8 tok/s; peak K=2 = +44%, accept-len ~2.4).
+  # Supersedes the older "K=4" note — the optimized image's peak moved down to K=2 (K=4's higher
+  # accept-len is outweighed by the qlen=5 verify cost). DFlash K=15 is a wider-verify tax — use the
+  # qwen35b-dflash profile for that. MTP is uniform-K so it
   # replays the RESERVED verify graph and tolerates the GRAPH_BS=8/MEM=0.85 config (the validated stable
   # point for this model+spec). Needs BOTH cards (TP=2): lease -n 2.
   #   gpu-lease -n 2 --detach --name qwen35b-mtp -- docker compose --profile qwen35b-mtp up -d
@@ -242,7 +248,7 @@ services:
           --page-size 16 \
           --tp "${MINISGL_TP:-2}" \
           --disable-pynccl \
-          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-4}" \
+          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-2}" \
           --reasoning-parser auto \
           --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
           --max-running-requests "${MINISGL_MAX_RUNNING:-6}" \
