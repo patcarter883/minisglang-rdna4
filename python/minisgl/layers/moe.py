@@ -23,6 +23,47 @@ if TYPE_CHECKING:
     from minisgl.quant.config import QuantConfig
 
 
+# ---------------------------------------------------------------------------------------------------
+# Phase-1 comms/compute overlap for the MoE TP all-reduce (MINISGL_MOE_ASYNC_AR, default ON; =0 to disable).
+#
+# The fused shared+routed MoE output all_reduce (25 MB bf16 at 6.6k prefill tokens, TP=2) runs on the
+# compute stream today -> the GPU idles during it (27.7% of prefill wall, 100% exposed). Splitting the
+# output into 2 DISJOINT row chunks and running chunk-0's all_reduce on a SIDE STREAM (RCCL) concurrent
+# with chunk-1's expert GEMM on the main stream hides chunk-0's collective behind compute. Disjoint
+# token rows => BIT-EXACT: each row's all_reduce is an independent 2-rank elementwise SUM (2 addends,
+# no reduction reordering), so a row-split yields byte-identical results.
+#
+# EAGER PREFILL ONLY — never under graph capture (async side-stream collectives are graph-unsafe), and
+# gated above a token threshold where the overlap outweighs the doubled kernel-launch + the exposed
+# 2nd-chunk-AR drain. See ASYNC_AR_INVESTIGATION.md / ASYNC_AR_PHASE1.md.
+# ---------------------------------------------------------------------------------------------------
+_MOE_ASYNC_AR = os.environ.get("MINISGL_MOE_ASYNC_AR", "1") != "0"
+_MOE_ASYNC_AR_MIN_TOKENS = int(os.environ.get("MINISGL_MOE_ASYNC_AR_MIN_TOKENS", "512"))
+_moe_ar_side_stream: "torch.cuda.Stream | None" = None
+
+
+def moe_async_ar_enabled() -> bool:
+    """Whether Phase-1 chunked async MoE all-reduce is engaged (MINISGL_MOE_ASYNC_AR, default ON)."""
+    return _MOE_ASYNC_AR
+
+
+def moe_async_ar_min_tokens() -> int:
+    """Minimum token count to take the async path (MINISGL_MOE_ASYNC_AR_MIN_TOKENS, default 512).
+    Below this the doubled launch + exposed drain outweigh the hidden collective; prefill only."""
+    return _MOE_ASYNC_AR_MIN_TOKENS
+
+
+def get_moe_ar_side_stream() -> "torch.cuda.Stream":
+    """Lazily-created, process-wide side CUDA stream carrying the overlapped MoE all_reduce. One shared
+    stream is correct: the collectives are ordered by submission on the communicator (both TP ranks
+    submit chunk-0 then chunk-1 all_reduce in program order -> RCCL matches them), and per-chunk events
+    serialize each AR against its producer/consumer on the main stream."""
+    global _moe_ar_side_stream
+    if _moe_ar_side_stream is None:
+        _moe_ar_side_stream = torch.cuda.Stream()
+    return _moe_ar_side_stream
+
+
 class _GroupedGPTQExperts(BaseOP):
     """Per-expert grouped GPTQ buffers for one of the two MoE GEMMs (w13 or w2).
 
