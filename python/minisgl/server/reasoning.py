@@ -43,6 +43,13 @@ _REASONING_DELIMITERS = {
     "deepseek-r1": ("<think>", "</think>"),
     "glm": ("<think>", "</think>"),
     "qwen": ("<think>", "</think>"),
+    # Poolside/Laguna: the turn is wrapped `<assistant><think>REASONING</think>ANSWER</assistant>`;
+    # the generation prompt injects `<assistant><think>` so the OUTPUT is `REASONING</think>ANSWER`
+    # (the `<assistant>` opener is prompt-side; `</assistant>` is the eos, trimmed). So the reasoning
+    # split is the same `<think>/</think>` pair — register the model's declared parser name so the
+    # server selects it explicitly (and treats the format as supported → thinking stays on).
+    "poolside_v1": ("<think>", "</think>"),
+    "poolside": ("<think>", "</think>"),
 }
 
 
