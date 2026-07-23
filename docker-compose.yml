@@ -369,6 +369,44 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
           ${MINISGL_EXTRA_ARGS:-}
 
+  # poolside/Laguna-XS-2.1-NVFP4 — full production serve bundling this session's validated wins,
+  # GRAPH-CAPTURED (never eager):
+  #   * group-16 NVFP4 decode GEMV — automatic (MINISGL_NVFP4_GEMV default-on, baked into :lean):
+  #     2.24x decode (21.7 -> 48.6 tok/s bs=1) vs the old mis-applied prefill-WMMA kernel.
+  #   * SWA prefix caching (--cache-type radix + MINISGL_SWA_RADIX=1): snapshot/restore the sliding-
+  #     window ring across the boundary; ~11-25x TTFT on a reused prefix, byte-identical to cold.
+  #   * fp8 KV (MINISGL_KV_FP8 default 1) works through the SWA extend path (descale-on-gather).
+  #   * CUDA-graph capture ON (SWA decode capture is byte-identical to eager, mirrors GDNGraphCapture).
+  # For spec use laguna-dflash (SWA-radix x DFlash coexistence is validated lossless; mind mr<=0.90).
+  #   gpu-lease -n 2 --detach --name laguna-radix -- docker compose --profile laguna-radix up -d
+  laguna-radix:
+    <<: *lean-common
+    profiles: ["laguna-radix"]
+    container_name: ${LEASE_NAME:-minisgl-lean}-laguna-radix
+    restart: unless-stopped
+    ports:
+      - "${MINISGL_HOST_PORT:-1919}:1919"
+    environment:
+      <<: *lean-env
+      # SWA prefix caching on: snapshot/restore the sliding-window ring so a reused prefix skips
+      # re-prefill. Needs --cache-type radix (below). Default-off in code; enabled here.
+      MINISGL_SWA_RADIX: "${MINISGL_SWA_RADIX:-1}"
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        exec python -m minisgl \
+          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
+          --host 0.0.0.0 --port 1919 \
+          --cache-type radix \
+          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
+          --page-size 16 \
+          --tp "${MINISGL_TP:-2}" \
+          --disable-pynccl \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
+          ${MINISGL_EXTRA_ARGS:-}
+
   # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8, DP=2 + expert-parallel. Runs as DP=2
   # replicas (one per gfx1201 card) with --enable-ep sharding the 128 experts across the pair so the
   # ~9 GB fp8 weights fit 16 GB/card. Default checkpoint is /models/ZAYA1-8B-fp8. Needs BOTH cards
