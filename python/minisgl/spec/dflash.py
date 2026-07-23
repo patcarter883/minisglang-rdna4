@@ -88,6 +88,15 @@ class DFlashProposer(Proposer):
             self._build_cca(engine, hf, cfg, dfc, folder, hidden, num_layers)
             return
         self._is_cca = False
+        # Laguna DFlash drafter (poolside/Laguna-XS-2.1-DFlash): a Laguna-XS gated GQA trunk (fused
+        # qkv, per-head softplus g_proj gate, per-aux hidden norms, causal + sliding-window block
+        # attention). Same fc->KV-prefix mechanism as the z-lab Qwen path, different decoder layer.
+        model_type = str(getattr(hf, "model_type", "") or "").lower()
+        self._is_laguna = model_type == "laguna" or any("Laguna" in a for a in architectures)
+        if self._is_laguna:
+            self._build_laguna(engine, hf, cfg, dfc, folder, hidden, num_layers)
+            return
+        self._is_laguna = False
         num_heads = int(cfg("num_attention_heads"))
         num_kv_heads = int(cfg("num_key_value_heads"))
         head_dim = int(cfg("head_dim", default=hidden // num_heads))
@@ -274,6 +283,135 @@ class DFlashProposer(Proposer):
             put(layer, "conv_qk_weight", p + "conv_qk.weight")
             put(layer, "conv_qk_bias", p + "conv_qk.bias")
             put(layer, "temp", p + "temp")
+
+    def _build_laguna(self, engine, hf, cfg, dfc, folder, hidden, num_layers) -> None:
+        """Build + load the Laguna-XS DFlash drafter (poolside/Laguna-XS-2.1-DFlash). Same fc->per-layer
+        KV-prefix block-diffusion as the z-lab Qwen path, but the trunk is a Laguna-XS gated GQA layer
+        (fused qkv_proj, per-head softplus g_proj gate, per-aux hidden norms) with CAUSAL + sliding-
+        window block attention. Full draft vocab == target vocab and NO own embed/head in the ckpt, so
+        it borrows the target embed_tokens + lm_head (no d2t remap). Replicated on every TP rank."""
+        from minisgl.models.dflash import DFlashDraftModel
+
+        num_heads = int(cfg("num_attention_heads"))
+        num_kv_heads = int(cfg("num_key_value_heads"))
+        head_dim = int(cfg("head_dim", default=hidden // num_heads))
+        inter = int(cfg("intermediate_size"))
+        eps = float(cfg("rms_norm_eps", default=1e-6))
+        rope_theta = float(cfg("rope_theta", default=500000.0))
+        max_pos = int(cfg("max_position_embeddings", default=262144))
+        sliding_window = int(getattr(hf, "sliding_window", 0) or 0)
+        causal = bool(dfc.get("causal", True))
+
+        self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 16)
+        block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
+        if block_cap:
+            self._block_size = min(self._block_size, block_cap)
+        assert self._block_size >= 2, f"DFlash block_size must be >= 2, got {self._block_size}"
+        self._mask_token_id = int(dfc.get("mask_token_id", 12))
+
+        ids = dfc.get("target_layer_ids") or getattr(hf, "aux_hidden_state_layer_ids", None)
+        if (env_ids := os.environ.get("MINISGL_DFLASH_CAPTURE_LAYERS")):
+            ids = [int(x) for x in env_ids.split(",") if x.strip() != ""]
+        assert ids, "Laguna DFlash ckpt has no target_layer_ids"
+        self.capture_layer_ids = [int(x) for x in ids]
+        num_aux = len(self.capture_layer_ids)
+
+        # Full-vocab drafter with no own head -> tied to the target (borrow embed_tokens + lm_head).
+        self._compressed = False
+        self._d2t = None
+        target_hidden = engine.model.model.embed_tokens.weight.shape[1]
+        assert hidden == target_hidden, (
+            f"Laguna DFlash draft hidden {hidden} != target hidden {target_hidden}"
+        )
+
+        with torch.device(self._device):
+            self._draft = DFlashDraftModel(
+                hidden_size=hidden,
+                intermediate_size=inter,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                num_aux_layers=num_aux,
+                rms_norm_eps=eps,
+                rope_theta=rope_theta,
+                max_position=max_pos,
+                draft_vocab_size=None,
+                own_embed=False,
+                decoder_layer_type="laguna_xs",
+                sliding_window=sliding_window,
+                causal=causal,
+                per_aux_norm=True,
+            )
+        self._load_laguna_weights(folder)
+        self._draft.bind_embed(engine.model.model.embed_tokens)
+        self._draft.bind_lm_head(engine.model.lm_head)
+
+        self._dbg = os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3")
+        self._pos_off = int(os.environ.get("MINISGL_DFLASH_POS_OFF", "0"))
+        self._ctx_pos_env = os.environ.get("MINISGL_DFLASH_CTX_POS")
+        self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
+        self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
+        self._kv: dict[int, list] = {}
+        self._kv_plen: dict[int, int] = {}
+        logger.info_rank0(
+            f"DFlash Laguna drafter: {num_layers}L h={hidden} heads={num_heads}/{num_kv_heads} "
+            f"block={self._block_size} mask_id={self._mask_token_id} window={sliding_window} "
+            f"causal={causal} aux_layers={self.capture_layer_ids} (bf16, borrow target embed/head)"
+        )
+
+    def _load_laguna_weights(self, folder: str) -> None:
+        """Load the Laguna DFlash checkpoint (bf16, ~0.92 GB). fc / hidden_norm / aux_hidden_norms.i /
+        norm + per-layer {input_layernorm, post_attention_layernorm, self_attn.qkv_proj (fused ->
+        split q|k|v), self_attn.o_proj, self_attn.g_proj, self_attn.q_norm, self_attn.k_norm,
+        mlp.{gate,up,down}_proj}. Replicated on every TP rank."""
+        import safetensors.torch as st
+
+        path = next((os.path.join(folder, f) for f in sorted(os.listdir(folder))
+                     if f.endswith(".safetensors")), None)
+        assert path is not None, f"no .safetensors in Laguna DFlash folder {folder}"
+        sd = st.load_file(path, device=str(self._device))
+        d = self._draft
+
+        def put(mod, leaf, key):
+            assert key in sd, f"Laguna DFlash ckpt missing {key}"
+            t = sd[key].to(self._dtype).contiguous()
+            cur = getattr(mod, leaf)
+            assert cur.shape == t.shape, (
+                f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
+            )
+            setattr(mod, leaf, t.to(self._device))
+
+        put(d.fc, "weight", "fc.weight")
+        put(d.hidden_norm, "weight", "hidden_norm.weight")
+        put(d.norm, "weight", "norm.weight")
+        assert d.aux_hidden_norms is not None
+        for i, an in enumerate(d.aux_hidden_norms):
+            put(an, "weight", f"aux_hidden_norms.{i}.weight")
+
+        q_dim = d.layers[0].q_dim
+        kv_dim = d.layers[0].kv_dim
+        for i, layer in enumerate(d.layers):
+            p = f"layers.{i}."
+            put(layer.input_layernorm, "weight", p + "input_layernorm.weight")
+            put(layer.post_attention_layernorm, "weight", p + "post_attention_layernorm.weight")
+            # Fused qkv_proj [q_dim+2*kv_dim, hidden] -> split into q/k/v _PlainLinear weights.
+            qkv_key = p + "self_attn.qkv_proj.weight"
+            assert qkv_key in sd, f"Laguna DFlash ckpt missing {qkv_key}"
+            qkv = sd[qkv_key].to(self._dtype)
+            assert qkv.shape[0] == q_dim + 2 * kv_dim, (
+                f"qkv rows {qkv.shape[0]} != q{q_dim}+2*kv{kv_dim}"
+            )
+            layer.q_proj.weight = qkv[:q_dim].contiguous().to(self._device)
+            layer.k_proj.weight = qkv[q_dim:q_dim + kv_dim].contiguous().to(self._device)
+            layer.v_proj.weight = qkv[q_dim + kv_dim:].contiguous().to(self._device)
+            put(layer.o_proj, "weight", p + "self_attn.o_proj.weight")
+            put(layer.g_proj, "weight", p + "self_attn.g_proj.weight")
+            put(layer.q_norm, "weight", p + "self_attn.q_norm.weight")
+            put(layer.k_norm, "weight", p + "self_attn.k_norm.weight")
+            put(layer.gate_proj, "weight", p + "mlp.gate_proj.weight")
+            put(layer.up_proj, "weight", p + "mlp.up_proj.weight")
+            put(layer.down_proj, "weight", p + "mlp.down_proj.weight")
 
     def _load_draft_weights(self, folder: str) -> None:
         """Load the DFlash checkpoint directly. fc/hidden_norm/norm + per-layer Qwen3 decoder tensors

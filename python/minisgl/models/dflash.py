@@ -98,6 +98,9 @@ class _DFlashLayer(BaseOP):
         head_dim: int,
         rms_norm_eps: float,
         rotary,
+        *,
+        gated: bool = False,
+        sliding_window: int = 0,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -107,6 +110,12 @@ class _DFlashLayer(BaseOP):
         self.kv_dim = num_kv_heads * head_dim
         self.scale = head_dim ** -0.5
         self._rotary = rotary
+        # Laguna gated attention: a per-head SOFTPLUS output gate (self_attn.g_proj [num_heads, hidden])
+        # applied to the attention output before o_proj — matches the base LagunaAttention. Qwen3 z-lab
+        # drafters have no gate (gated=False) and this path is byte-identical to before.
+        self.gated = gated
+        self.sliding_window = sliding_window
+        self.g_proj = _PlainLinear(hidden_size, num_heads) if gated else None
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -114,8 +123,8 @@ class _DFlashLayer(BaseOP):
         self.k_proj = _PlainLinear(hidden_size, self.kv_dim)
         self.v_proj = _PlainLinear(hidden_size, self.kv_dim)
         self.o_proj = _PlainLinear(self.q_dim, hidden_size)
-        # Qwen3 per-head RMSNorm over head_dim (plain-weight; the draft is model_type=qwen3, NOT the
-        # target's (1+weight) Qwen3.5 convention).
+        # Per-head RMSNorm over head_dim (plain-weight; both the Qwen3 z-lab draft and the Laguna
+        # draft use the plain-weight convention, NOT the (1+weight) Qwen3.5 one).
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.gate_proj = _PlainLinear(hidden_size, intermediate_size)
@@ -153,10 +162,12 @@ class _DFlashLayer(BaseOP):
         block_pos: torch.Tensor,  # [B]  RoPE positions for the noise block
         k_ctx: torch.Tensor,      # [P, Hkv, hd]  post-rotary prefix K (cached or freshly projected)
         v_ctx: torch.Tensor,      # [P, Hkv, hd]  prefix V
+        attn_mask: Optional[torch.Tensor] = None,  # [B, P+B] additive mask (0/-inf); None => bidirectional
     ) -> torch.Tensor:
-        """The block half of the layer forward: project the noise queries/KV, then attend
-        bidirectionally over [prefix K/V | noise K/V]. `k_ctx`/`v_ctx` is the (possibly persistent)
-        target-context prefix from `project_ctx`."""
+        """The block half of the layer forward: project the noise queries/KV, then attend over
+        [prefix K/V | noise K/V]. `attn_mask` None => bidirectional (z-lab Qwen); a [B, P+B] additive
+        causal+sliding-window mask => Laguna (causal=true, window=512). `k_ctx`/`v_ctx` is the (possibly
+        persistent) target-context prefix from `project_ctx`."""
         B = hidden.shape[0]
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
 
@@ -176,16 +187,22 @@ class _DFlashLayer(BaseOP):
         q = q_flat.view(B, H, hd)
         k_noise = kn_flat.view(B, Hkv, hd)
 
-        # K/V = [ctx prefix | noise]  along the key sequence; bidirectional (no causal mask).
+        # K/V = [ctx prefix | noise]  along the key sequence.
         K = torch.cat([k_ctx, k_noise], dim=0)  # [P+B, Hkv, hd]
         V = torch.cat([v_ctx, v_noise], dim=0)  # [P+B, Hkv, hd]
         group = H // Hkv
         K = K.repeat_interleave(group, dim=1)  # [P+B, H, hd]
         V = V.repeat_interleave(group, dim=1)
-        # scores[b,h,s] = q[b,h] . K[s,h]; full (bidirectional) attention over the P+B keys.
+        # scores[b,h,s] = q[b,h] . K[s,h]; attention over the P+B keys (masked for Laguna causal+SWA).
         scores = torch.einsum("bhd,shd->bhs", q, K) * self.scale  # [B, H, P+B]
+        if attn_mask is not None:
+            scores = scores + attn_mask.unsqueeze(1)  # [B, 1, P+B] broadcast over heads
         probs = scores.softmax(dim=-1).to(V.dtype)
         attn = torch.einsum("bhs,shd->bhd", probs, V)  # [B, H, hd]
+        if self.gated:
+            # Per-head softplus output gate (fp32, matches base LagunaAttention) before o_proj.
+            gate = torch.nn.functional.softplus(self.g_proj.forward(x).float()).to(attn.dtype)  # [B,H]
+            attn = attn * gate.unsqueeze(-1)
         attn_out = self.o_proj.forward(attn.reshape(B, H * hd))  # [B, hidden]
 
         hidden = residual + attn_out
@@ -199,11 +216,12 @@ class _DFlashLayer(BaseOP):
         target_hidden: torch.Tensor,  # [P, hidden]  fc+hidden_norm'd captured context (shared)
         block_pos: torch.Tensor,      # [B]  RoPE positions for the noise block
         ctx_pos: torch.Tensor,        # [P]  RoPE positions for the target prefix
+        attn_mask: Optional[torch.Tensor] = None,  # [B, P+B] additive mask (0/-inf); None => bidirectional
     ) -> torch.Tensor:
         # Recompute-every-step path (no persistent KV): project the whole prefix, then attend. Kept
         # byte-identical for the legacy/window fallback; the fast path caches project_ctx across steps.
         k_ctx, v_ctx = self.project_ctx(target_hidden, ctx_pos)
-        return self.attend_block(hidden, block_pos, k_ctx, v_ctx)
+        return self.attend_block(hidden, block_pos, k_ctx, v_ctx, attn_mask)
 
 
 class DFlashDraftModel(BaseOP):
@@ -231,14 +249,30 @@ class DFlashDraftModel(BaseOP):
         *,
         draft_vocab_size: Optional[int] = None,
         own_embed: bool = False,
+        decoder_layer_type: str = "qwen3",
+        sliding_window: int = 0,
+        causal: bool = False,
+        per_aux_norm: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_aux_layers = num_aux_layers
         self.num_layers = num_layers
+        # Laguna (decoder_layer_type='laguna_xs'): gated attention, causal block mask + sliding window,
+        # and a per-captured-layer RMSNorm on each aux BEFORE fc (aux_hidden_norms). z-lab Qwen3
+        # (default): ungated, bidirectional, single hidden_norm after fc.
+        gated = decoder_layer_type == "laguna_xs"
+        self.causal = causal
+        self.sliding_window = sliding_window
 
         # fc fuses the N captured target aux layers (N*hidden) -> hidden; hidden_norm norms it.
         self.fc = _PlainLinear(num_aux_layers * hidden_size, hidden_size)
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Per-aux-layer RMSNorm applied to each captured target hidden before concat+fc (Laguna).
+        self.aux_hidden_norms = (
+            [RMSNorm(hidden_size, eps=rms_norm_eps) for _ in range(num_aux_layers)]
+            if per_aux_norm
+            else None
+        )
 
         rotary = get_rope(
             head_dim=head_dim,
@@ -256,6 +290,8 @@ class DFlashDraftModel(BaseOP):
                 head_dim=head_dim,
                 rms_norm_eps=rms_norm_eps,
                 rotary=rotary,
+                gated=gated,
+                sliding_window=sliding_window,
             )
             for _ in range(num_layers)
         ]
@@ -303,9 +339,35 @@ class DFlashDraftModel(BaseOP):
         return self._lm_head.logits_all_rows(hidden)
 
     def fuse_aux(self, aux: torch.Tensor) -> torch.Tensor:
-        """fc + hidden_norm of the captured concat. aux: [P, N_aux, hidden] -> [P, hidden]."""
-        flat = aux.reshape(aux.shape[0], -1)  # [P, N_aux*hidden]
+        """fc + hidden_norm of the captured concat. aux: [P, N_aux, hidden] -> [P, hidden].
+        Laguna additionally RMS-norms each captured aux (aux_hidden_norms[i]) before concat."""
+        if self.aux_hidden_norms is not None:
+            parts = [
+                self.aux_hidden_norms[i].forward(aux[:, i, :])
+                for i in range(self.num_aux_layers)
+            ]
+            flat = torch.cat(parts, dim=-1)  # [P, N_aux*hidden]
+        else:
+            flat = aux.reshape(aux.shape[0], -1)  # [P, N_aux*hidden]
         return self.hidden_norm.forward(self.fc.forward(flat))
+
+    def _block_mask(self, P: int, B: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Additive [B, P+B] mask (0 keep / -inf drop) for the Laguna causal + sliding-window block.
+        The keys are the P prefix positions followed by the B block positions, all contiguous in
+        absolute position (prefix at [base-P .. base-1], block at [base .. base+B-1]); so a query at
+        block index i sits at concatenated position i+P and, causally + FlashAttention moving-query
+        SWA, attends to keys j with (i+P-window) < j <= (i+P). Returns None when not causal (z-lab
+        bidirectional path -> byte-identical to before)."""
+        if not self.causal:
+            return None
+        qpos = torch.arange(B, device=device).view(B, 1) + P  # [B,1] concat position of each query
+        kpos = torch.arange(P + B, device=device).view(1, P + B)  # [1,P+B]
+        keep = kpos <= qpos
+        if self.sliding_window > 0:
+            keep = keep & ((qpos - kpos) < self.sliding_window)
+        return torch.where(
+            keep, torch.zeros((), device=device), torch.full((), float("-inf"), device=device)
+        ).float()
 
     @torch.inference_mode()
     def denoise(
@@ -315,10 +377,12 @@ class DFlashDraftModel(BaseOP):
         block_pos: torch.Tensor,      # [B]
         ctx_pos: torch.Tensor,        # [P]
     ) -> torch.Tensor:
-        """One bidirectional denoising forward -> [B, hidden] (pre-head-normed block hidden)."""
+        """One denoising forward -> [B, hidden] (pre-head-normed block hidden). Bidirectional (z-lab)
+        or causal+SWA-masked (Laguna) per self.causal."""
         hidden = noise_embed
+        mask = self._block_mask(target_hidden.shape[0], noise_embed.shape[0], noise_embed.device)
         for layer in self.layers:
-            hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos)
+            hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos, mask)
         return self.norm.forward(hidden)
 
     @torch.inference_mode()
@@ -345,8 +409,10 @@ class DFlashDraftModel(BaseOP):
         Byte-identical to `denoise` for the same effective prefix, but the prefix projection is reused
         across decode steps instead of recomputed."""
         hidden = noise_embed
+        P = prefix_kv[0][0].shape[0]
+        mask = self._block_mask(P, noise_embed.shape[0], noise_embed.device)
         for layer, (k_ctx, v_ctx) in zip(self.layers, prefix_kv):
-            hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx)
+            hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask)
         return self.norm.forward(hidden)
 
 
