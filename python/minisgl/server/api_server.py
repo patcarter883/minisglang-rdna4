@@ -438,52 +438,24 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
-_MODEL_THINK_DEFAULT: bool | None = None
-
-
-def _model_thinking_default() -> bool:
-    """The default `enable_thinking` for the served model. True normally, but FALSE when the model
-    declares a reasoning format minisgl cannot parse (gen_config `reasoning_parser` is not one of the
-    supported `<think>/</think>` families — e.g. Laguna's `poolside_v1`). Forcing thinking ON for such
-    a model is harmful: it emits a full pre-answer inside a reasoning span we can't cleanly split, so
-    the useful answer lands in `reasoning_content` and the visible `content` is a truncated repeat (or
-    a leaked `</think>`). Default it OFF so the model answers directly. Per-request `enable_thinking`
-    still overrides. Principled (keys on reasoning-format support), not a model-name branch."""
-    global _MODEL_THINK_DEFAULT
-    if _MODEL_THINK_DEFAULT is None:
-        from .reasoning import _REASONING_DELIMITERS
-        try:
-            rp = load_generation_config(get_global_state().config.model_path).get("reasoning_parser")
-            _MODEL_THINK_DEFAULT = not (rp and rp not in _REASONING_DELIMITERS)
-        except Exception:
-            _MODEL_THINK_DEFAULT = True
-    return _MODEL_THINK_DEFAULT
-
-
 def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None:
     """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
-    the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3)."""
+    the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3 /
+    Poolside, whose reasoning format is now parsed — see _reasoning_parser + _REASONING_DELIMITERS)."""
     kwargs = dict(req.chat_template_kwargs or {})
     if req.enable_thinking is not None and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = req.enable_thinking
-    # Unparseable-reasoning models (e.g. Laguna/poolside_v1): default thinking OFF so the answer isn't
-    # buried in an un-splittable reasoning span. Explicit request kwargs above still win.
-    if "enable_thinking" not in kwargs and not _model_thinking_default():
-        kwargs["enable_thinking"] = False
     return kwargs or None
 
 
 def _thinking_active(req: "OpenAICompletionRequest") -> bool:
     """Whether reasoning is expected in the output (thinking mode engaged). Governs streaming reasoning
-    routing. Default follows the model (`_model_thinking_default`: True for a supported <think> family,
-    False when the reasoning format is one minisgl can't parse); explicit enable_thinking=False
-    (top-level or in chat_template_kwargs) turns it off."""
+    routing. Default True (reasoning models open `<think>` in the generation prompt); explicit
+    enable_thinking=False (top-level or in chat_template_kwargs) turns it off."""
     if req.enable_thinking is False:
         return False
     if (req.chat_template_kwargs or {}).get("enable_thinking") is False:
         return False
-    if req.enable_thinking is None and (req.chat_template_kwargs or {}).get("enable_thinking") is None:
-        return _model_thinking_default()
     return True
 
 
@@ -492,11 +464,22 @@ _REASONING_PARSER_SET = False
 
 
 def _reasoning_parser():
-    """Cached ReasoningParser built from the server's --reasoning-parser (None when disabled)."""
+    """Cached ReasoningParser. Built from the server's --reasoning-parser; on the default "auto" it
+    honors the MODEL author's declared reasoning format (generation_config.json `reasoning_parser`,
+    e.g. Laguna's `poolside_v1`) so the correct delimiters are selected, falling back to the generic
+    <think>/</think> when the model declares none or an unknown name."""
     global _REASONING_PARSER, _REASONING_PARSER_SET
     if not _REASONING_PARSER_SET:
         cfg = get_global_state().config
-        _REASONING_PARSER = get_reasoning_parser(getattr(cfg, "reasoning_parser", "auto"))
+        name = getattr(cfg, "reasoning_parser", "auto")
+        if name == "auto":
+            try:
+                model_rp = load_generation_config(cfg.model_path).get("reasoning_parser")
+                if model_rp and get_reasoning_parser(model_rp) is not None:
+                    name = model_rp
+            except Exception:
+                pass
+        _REASONING_PARSER = get_reasoning_parser(name)
         _REASONING_PARSER_SET = True
     return _REASONING_PARSER
 
