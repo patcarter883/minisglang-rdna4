@@ -41,6 +41,23 @@ class RDNA4Metadata(BaseAttnMetadata):
     swa_out_loc: torch.Tensor | None = None
     swa_page_table: torch.Tensor | None = None
     swa_cache_seqlens: torch.Tensor | None = None
+    # SWA CAPTURED spec-verify (paged-from-ring): the K+1 verify shape is made cudagraph-capturable by
+    # attending the ring pool through the SAME paged-extend kernel as the full layers (not the eager
+    # dense _gather+_swa_prefill_extend, whose per-seq .clone()/torch.cat allocate fresh + host-sync the
+    # window length -> not capture-safe). These two fields carry the STATIC per-seq ring block table and
+    # context length the captured verify reads; both are populated ONLY by the verify capture/replay
+    # prep (HIPAttnBackend._fill_swa_verify_static). None on every eager path (which keeps swa_table_idx
+    # + the dense extend, byte-unchanged):
+    #   swa_verify_page_table   [bs, W+qlen]  cache-index j -> ring slot; indices [0,Wp)=window (ascending
+    #                                         absolute pos), [Wp,Wp+qlen)=the K+1 new-token slots.
+    #   swa_verify_cache_seqlens[bs]          context_len = Wp+qlen (bounds the kernel's key reads; the
+    #                                         padded tail past it is ignored, same trick as page_table).
+    # The kernel's window test (qpos-kpos)>=W uses cache index j as kpos and prefix_len+r as qpos; the
+    # constant (cached_len-Wp) offset cancels in the difference, so the paged read reproduces the EXACT
+    # sliding-window mask of the dense extend (proven greedy-identical). swa_out_loc (above) carries the
+    # K+1 new-token store slots.
+    swa_verify_page_table: torch.Tensor | None = None
+    swa_verify_cache_seqlens: torch.Tensor | None = None
     # SWA EXTEND (chunked-continuation OR cross-request radix reuse): per-seq (batch order) table_idx
     # of the sliding-window ring block, so the extend can gather each seq's window [cached_len-W,
     # cached_len) directly from ITS ring (a prior chunk wrote it; a cross-request reuse is seeded by
@@ -353,6 +370,15 @@ class RDNA4Backend(BaseAttnBackend):
         if metadata.cold_prefill:
             self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
             return self._swa_prefill_cold(q, k, v, metadata, sliding_window)
+        # SWA CAPTURED spec-verify (paged-from-ring). When the verify capture prep populated the static
+        # ring block table, store the K+1 new tokens into the ring (disjoint speculative slots — ring
+        # stride = W+K+1) then attend [window | new] straight from the ring through the SAME paged-extend
+        # kernel the full layers use. Fully static-buffer / capture-safe (no per-seq clone/cat/host-sync);
+        # greedy-identical to the eager dense extend below (the paged sliding-window mask is exact — see
+        # RDNA4Metadata.swa_verify_page_table). None on every eager path, which keeps the dense extend.
+        if metadata.swa_verify_page_table is not None:
+            self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
+            return self._swa_prefill_paged(q, layer_id, metadata, sliding_window)
         # SWA EXTEND — a chunked-continuation OR a cross-request radix reuse. Each seq's boundary window
         # [cached_len-W, cached_len) is already in ITS OWN ring block: a prior prefill chunk wrote it, or
         # (cross-request reuse) the scheduler's _restore_swa_states seeded it from a page-aligned
@@ -437,6 +463,38 @@ class RDNA4Backend(BaseAttnBackend):
             out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, self.scale, 1, window)
             out[s:e] = out_ext[front:]
         return out
+
+    def _swa_prefill_paged(
+        self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata, window: int
+    ) -> torch.Tensor:
+        """CAPTURED spec-verify SWA attention: attend each seq's K+1 new tokens over its ring window +
+        those new tokens, read straight from the ring pool via the paged-extend kernel (attn_prefill_paged)
+        with causal=1 + sliding_window=W. The ring block table (metadata.swa_verify_page_table) lays out
+        cache index j -> ring slot as [window(Wp) | new(qlen)]; context_len (swa_verify_cache_seqlens) =
+        Wp+qlen bounds the read. This is the capture-safe analogue of _swa_prefill_extend: no per-seq
+        clone/cat and no host-sync of the window length — the same STATIC-buffer paged path the full
+        layers' verify uses (_hip_prefill_paged), just on the ring pool and with the window mask. The new
+        tokens were persisted to the ring by store_kv (disjoint speculative slots) before this call, so the
+        paged read sees them. bf16 ring reads inline; an fp8 ring folds the per-tensor descale (#40)."""
+        k_cache = self.swa_kv.k_cache(layer_id)  # [num_swa_slots, 1, kv_heads, head_dim] (page_size=1)
+        v_cache = self.swa_kv.v_cache(layer_id)
+        block_table = metadata.swa_verify_page_table.to(torch.int32)  # int32 static buf -> no-op cast
+        cu_q = metadata.cu_seqlens_q.to(torch.int32)
+        ctx_lens = metadata.swa_verify_cache_seqlens.to(torch.int32)
+        q = q.contiguous()
+        from minisgl._hip_engage import engaged
+        if self.swa_kv.dtype == torch.float8_e4m3fn:
+            ks, vs = self.swa_kv.k_descale[layer_id], self.swa_kv.v_descale[layer_id]  # persistent device tensors (graph-safe)
+            engaged("attn_prefill_paged.flash_prefill_paged_fp8(swa-verify)")
+            return self._hip_prefill_paged_fp8_op(
+                q, k_cache, v_cache, block_table, cu_q, ctx_lens,
+                self.scale, ks, vs, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+            )
+        engaged("attn_prefill_paged.flash_prefill_paged(swa-verify)")
+        return self._hip_prefill_paged_op(
+            q, k_cache, v_cache, block_table, cu_q, ctx_lens,
+            self.scale, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+        )
 
     def _swa_decode(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
