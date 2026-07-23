@@ -25,6 +25,10 @@ class SamplingParams:
     # Stop strings: generation finishes (and the output is truncated) at the first occurrence of any
     # of these in the decoded text. Matched on the detokenized string, scheduler-agnostic.
     stop: List[str] = field(default_factory=list)
+    # INCLUSIVE stop strings: generation finishes at the first occurrence, but the matched string is
+    # KEPT in the output (unlike `stop`, which trims it). For tool-call closers (`</tool_call>`) on
+    # models that don't emit EOS after a call: stop the over-generation yet leave the block parseable.
+    stop_keep: List[str] = field(default_factory=list)
     # Structured-output spec: None (free), "json" (any valid JSON object), or a JSON-schema string.
     # A constrained request is masked per-token by a grammar matcher (drafts propose unconstrained and
     # the grammar is enforced at the spec verify argmax).
