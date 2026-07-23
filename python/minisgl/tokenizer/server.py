@@ -87,6 +87,7 @@ def tokenize_worker(
     # tokenized and read/cleared when its replies stream back (same process owns both directions).
     prompt_tokens_map: Dict[int, int] = {}
     stop_map: Dict[int, List[str]] = {}
+    keep_map: Dict[int, List[str]] = {}  # INCLUSIVE stops (matched-string kept), e.g. tool closers
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")
@@ -133,7 +134,7 @@ def tokenize_worker(
                 pending_msg
             )
             if len(detokenize_msg) > 0:
-                results = detokenize_manager.detokenize(detokenize_msg, stop_map)
+                results = detokenize_manager.detokenize(detokenize_msg, stop_map, keep_map)
                 replies: List[UserReply] = []
                 stop_abort_uids: List[int] = []
                 for msg, res in zip(detokenize_msg, results, strict=True):
@@ -164,6 +165,7 @@ def tokenize_worker(
                     if finished:
                         prompt_tokens_map.pop(msg.uid, None)
                         stop_map.pop(msg.uid, None)
+                        keep_map.pop(msg.uid, None)
                 batch_output: BaseFrontendMsg = (
                     replies[0] if len(replies) == 1 else BatchFrontendMsg(data=list(replies))
                 )
@@ -185,6 +187,8 @@ def tokenize_worker(
                     prompt_tokens_map[msg.uid] = int(t.numel())
                     if msg.sampling_params.stop:
                         stop_map[msg.uid] = list(msg.sampling_params.stop)
+                    if msg.sampling_params.stop_keep:
+                        keep_map[msg.uid] = list(msg.sampling_params.stop_keep)
                 user_msgs = [
                     UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
                     for msg, t in zip(tokenize_msg, tensors, strict=True)

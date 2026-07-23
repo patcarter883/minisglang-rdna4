@@ -387,6 +387,19 @@ def _norm_stop(stop: list | str | None) -> List[str]:
     return [stop] if isinstance(stop, str) else list(stop)
 
 
+def _tool_stop_keep(req) -> List[str]:
+    """Tool-call closers to stop on but KEEP in the output (an INCLUSIVE stop — unlike a normal stop
+    string, which the detokenizer trims). Laguna (and other tool-trained models that don't emit EOS
+    after a call) over-generate: after the first `</tool_call>` they keep going, repeating the call +
+    emitting garbage until max_tokens. Stopping at the closer yields one clean call
+    (finish_reason=tool_calls); keeping the closer leaves the `<tool_call>…</tool_call>` block
+    parseable. Empty unless tools are offered (then the closer only appears if the model calls a
+    tool)."""
+    if getattr(req, "tools", None) and getattr(req, "tool_choice", None) != "none":
+        return ["</tool_call>", "</zyphra_tool_call>"]
+    return []
+
+
 def _resolve_sampling(req: "OpenAICompletionRequest", model_path: str) -> tuple:
     """Effective (temperature, top_p, top_k): the request value when the client set it, else the
     model author's `generation_config.json` default, else the neutral default. Lets a bare request
@@ -1343,6 +1356,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 max_tokens=req.max_tokens,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
+                stop_keep=_tool_stop_keep(req),
                 grammar=_pl_rf_grammar or _pl_forced_tool_grammar or _pl_auto_tool_grammar,
                 # UNCONDITIONAL close delim (was grammar-only): β-bounds reasoning on the PLAIN lane
                 # too, so a thinking request without response_format can't run reasoning to max_tokens

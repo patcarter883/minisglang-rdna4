@@ -84,7 +84,8 @@ class DetokenizeManager:
         )
 
     def detokenize(
-        self, msgs: List[DetokenizeMsg], stop_map: Optional[Dict[int, List[str]]] = None
+        self, msgs: List[DetokenizeMsg], stop_map: Optional[Dict[int, List[str]]] = None,
+        keep_map: Optional[Dict[int, List[str]]] = None,
     ) -> List[DetokResult]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
@@ -131,17 +132,27 @@ class DetokenizeManager:
             # the whole output_str so a stop string spanning token boundaries is still caught.
             stop_hit = False
             stops = stop_map.get(msg.uid) if stop_map else None
-            if stops:
-                cut = -1
-                for ss in stops:
+            keeps = keep_map.get(msg.uid) if keep_map else None
+            if stops or keeps:
+                # Earliest match by START position wins; an exclusive `stop` cuts BEFORE it (trimmed),
+                # an inclusive `stop_keep` cuts AFTER it (the matched string — e.g. a `</tool_call>`
+                # closer — is kept so the block still parses). Both end generation.
+                best_start, best_cut = -1, -1
+                for ss in stops or ():
                     if not ss:
                         continue
                     idx = output_str.find(ss)
-                    if idx != -1 and (cut == -1 or idx < cut):
-                        cut = idx
-                if cut != -1:
+                    if idx != -1 and (best_start == -1 or idx < best_start):
+                        best_start, best_cut = idx, idx
+                for ss in keeps or ():
+                    if not ss:
+                        continue
+                    idx = output_str.find(ss)
+                    if idx != -1 and (best_start == -1 or idx < best_start):
+                        best_start, best_cut = idx, idx + len(ss)
+                if best_start != -1:
                     stop_hit = True
-                    output_str = output_str[:cut]
+                    output_str = output_str[:best_cut]
 
             incremental_output = output_str[s.sent_offset :] if len(output_str) > s.sent_offset else ""
             s.sent_offset = max(s.sent_offset, len(output_str))
