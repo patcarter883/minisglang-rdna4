@@ -155,9 +155,23 @@ class HIPAttnBackend(RDNA4Backend):
             self._cap_max_bs, self._cap_max_pages, dtype=torch.int32, device=dev
         )
         self._cap_cu_q = torch.arange(self._cap_max_bs + 1, dtype=torch.int32, device=dev)
+        # ---- SWA (Laguna sliding layers) ring-pool decode metadata (persistent, refreshed in place) --
+        # A SWA-hybrid model's 30 sliding layers route decode through _swa_forward -> _swa_decode, which
+        # reads swa_out_loc (ring slot the new token WROTE), swa_page_table (the <=W-slot read window),
+        # and swa_cache_seqlens (min(len,W)) via the shared RDNA4Metadata. Those change every step (the
+        # ring slot = table_idx*R + pos%R advances, the window slides), so — exactly like GDN's
+        # state_indices — they live in PERSISTENT buffers whose CONTENTS _fill_swa_decode_static refreshes
+        # before each g.replay(); the captured store_kv/decode kernels read them through fixed pointers.
+        # Width is the window W (the read window is capped at W; the decode kernel bounds reads by
+        # swa_cache_seqlens, so stale columns past each row's cnt are ignored — same trick as page_table).
+        if self.swa_kv is not None and self.swa_window > 0:
+            W = self.swa_window
+            self._cap_swa_out_loc = torch.zeros(self._cap_max_bs, dtype=torch.int32, device=dev)
+            self._cap_swa_page_table = torch.zeros(self._cap_max_bs, W, dtype=torch.int32, device=dev)
+            self._cap_swa_cache_seqlens = torch.ones(self._cap_max_bs, dtype=torch.int32, device=dev)
 
     def _decode_metadata_static(self, bs: int) -> RDNA4Metadata:
-        return RDNA4Metadata(
+        md = RDNA4Metadata(
             cache_seqlens=self._cap_cache_seqlens[:bs],
             cu_seqlens_q=self._cap_cu_q[: bs + 1],
             max_seqlen_q=1,
@@ -165,6 +179,31 @@ class HIPAttnBackend(RDNA4Backend):
             page_table=self._cap_page_table[:bs],
             cold_prefill=False,
         )
+        # SWA-hybrid: attach the persistent ring-pool decode metadata the sliding layers read.
+        if self.swa_kv is not None and self.swa_window > 0:
+            md.swa_out_loc = self._cap_swa_out_loc[:bs]
+            md.swa_page_table = self._cap_swa_page_table[:bs]
+            md.swa_cache_seqlens = self._cap_swa_cache_seqlens[:bs]
+        return md
+
+    def _fill_swa_decode_static(self, batch: "Batch") -> None:
+        """Refresh the persistent SWA ring-pool decode buffers from `batch.padded_reqs` (eager, OUTSIDE
+        the graph). Reuses the eager `_build_swa_metadata` (byte-identical values to the non-captured
+        path) at decode qlen=1, then copies its (out_loc, page_table, cache_seqlens) INTO the static
+        buffers the captured kernels read. The narrower-than-W page-table columns beyond each row's cnt
+        stay stale but are never attended (the decode kernel bounds reads by swa_cache_seqlens)."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        seqlens_q = [r.extend_len for r in reqs]  # decode: 1 per seq
+        cached_lens = [r.cached_len for r in reqs]
+        out_loc, page_table, cache_seqlens = self._build_swa_metadata(
+            reqs, seqlens_q, cached_lens, dev
+        )
+        self._cap_swa_out_loc[:bs].copy_(out_loc)
+        self._cap_swa_cache_seqlens[:bs].copy_(cache_seqlens)
+        w = page_table.shape[1]
+        self._cap_swa_page_table[:bs, :w].copy_(page_table)
 
     def _fill_decode_static(self, batch: "Batch") -> None:
         """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding).
@@ -190,10 +229,14 @@ class HIPAttnBackend(RDNA4Backend):
 
     def prepare_for_capture(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._fill_swa_decode_static(batch)
         batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
 
     def prepare_for_replay(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._fill_swa_decode_static(batch)
         batch.attn_metadata = self._decode_metadata_static(batch.padded_size)
 
     # ---- spec-verify cudagraph capture (v2 S1: STANDARD K+1 causal verify, no custom mask) --------
