@@ -101,6 +101,14 @@ _MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
 # MINISGL_MOE_G2FUSE=0 reverts to the bit-exact WMMA gemm2 + gather_reduce.
 _MOE_G2FUSE = _os.environ.get("MINISGL_MOE_G2FUSE", "1") != "0"
 
+# NVFP4 (group-16 e2m1) decode-GEMV lever. DEFAULT ON: group-16 rides the unified decode-GEMV core
+# (per-16-K-half scale fold). The earlier serve crash was the MoE fused kernel's own guards still
+# asserting group_size%32==0 (moe_kernel.hip gemm1_silu/gemm2/scatter) while the shared accum already
+# handled group-16 — fixed to allow group_size==16. Validated on Laguna-XS-2.1-NVFP4 (fe2e 2026-07-23):
+# no crash, coherent greedy output, 21.71 -> 48.6 tok/s (2.24x, WMMA baseline was a mis-applied prefill
+# kernel at M=1). MINISGL_NVFP4_GEMV=0 forces the old WMMA path (A/B + rollback).
+_NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "1") != "0"
+
 
 def _moe_time(bucket: str, fn):
     if not _MOE_EVERY:
@@ -320,12 +328,12 @@ def w4a8_moe(
     # gather, top_k==1): WMMA is ~6.8x faster than GEMV (50us vs 339us) — the GEMV path
     # underperforms for that shape. So pick gemv for gemm1, keep WMMA for gemm2. Together ~85us vs
     # ~356us with the old all-WMMA default. Prefill (M>2) keeps the passed/default kernel for both.
-    # NVFP4 experts are group-16; the decode GEMV kernels (gemm1+silu / gemm / scatter) all require
-    # group_size%32==0, while the WMMA/tiled path accepts group_size%16. Route a sub-32 group size to
-    # WMMA at EVERY M so group-16 e2m1 MoE runs at all (group-32 int4/MXFP4 keep the fast decode GEMV).
-    # Runtime group_size = K / n_groups, K = w13.shape[-1]*8 (int32 packs 8 e2m1 nibbles). Capability-
-    # aware and model-agnostic — no kernel fork, benefits any group-16 e2m1 MoE.
-    _gemv_ok = ((w13.shape[-1] * 8) // w13_scales.shape[-1]) % 32 == 0
+    # NVFP4 experts are group-16 and now ride the decode GEMV: the unified Int4Fp8GemvLoader folds a
+    # per-16-K-half scale (group<32 branch), so the MoE gemm1+silu / gemm / scatter / gather-reduce GEMV
+    # kernels serve group_size 16 exactly like group-32 MXFP4/int4 — one shared core, no fork. Runtime
+    # group_size = K / n_groups, K = w13.shape[-1]*8 (int32 packs 8 e2m1 nibbles); %16 covers 16/32/128.
+    _grp = (w13.shape[-1] * 8) // w13_scales.shape[-1]
+    _gemv_ok = (_grp % 32 == 0) or (_grp % 16 == 0 and _NVFP4_GEMV)
     gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
 
@@ -443,8 +451,8 @@ def w4a8_moe(
     # the flag/WMMA gemm2 + gather_reduce below.
     if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
             and hasattr(fp8_wmma, "mmq_fp8_moe_gemm2_gather_reduce"):
-        # _gemv_ok: the decode gemm2 gather-reduce is gemv-math (group_size%32); group-16 NVFP4 falls
-        # through to the WMMA gemm2 + gather_reduce below (group_size%16 OK).
+        # _gemv_ok: the decode gemm2 gather-reduce is gemv-math (now group_size%16, incl. NVFP4 group-16
+        # via the unified loader's per-16-K-half scale fold).
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce{_e2m1}")
         acc = _moe_time(
             "gemm2gather",
@@ -1075,15 +1083,18 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
     The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
     in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
     """
-    # NVFP4 (group-16) e2m1: only wmma_tiled_tuned carries a runtime-group_size (BKT=0) generic
-    # instance; decode_gemv + prefill_wmma/ashuffle hard-require group_size%32 (they'd TORCH_CHECK).
-    # Route group-16 e2m1 to the tiled kernel at EVERY M (group-32 MXFP4/int4 keep the measured per-M
-    # crossover). Capability-aware, model-agnostic — no kernel fork.
-    if weight_is_e2m1 and group_size % 32 != 0:
+    # NVFP4 (group-16) e2m1 now rides decode_gemv in the decode band: the unified Int4Fp8GemvLoader
+    # folds a per-16-K-half scale (group<32 branch), so the streaming GEMV serves group-16 at M<=gemv_max
+    # just like group-32 MXFP4/int4. Above the band, prefill_wmma/ashuffle STILL hard-require
+    # group_size%32, so group-16 must use wmma_tiled_tuned (the only runtime-group_size WMMA, BKT=0).
+    # A/B + rollback: force group-16 e2m1 back onto WMMA when the lever is off.
+    if weight_is_e2m1 and group_size % 32 != 0 and not _NVFP4_GEMV:
         return "wmma_tiled_tuned"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
     if m <= gemv_max:
         return "decode_gemv"
+    if weight_is_e2m1 and group_size % 32 != 0:
+        return "wmma_tiled_tuned"
     return "wmma_tiled_tuned" if m >= _W4A8_PREFILL_TILED_MIN else "prefill_wmma"
 
 
@@ -1132,7 +1143,7 @@ def w4a8_linear_silu(
     weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
-    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%32==0);
+    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%16==0);
     BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
     import fp8_wmma
 
