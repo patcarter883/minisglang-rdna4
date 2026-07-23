@@ -364,9 +364,9 @@ services:
           --spec-algorithm dflash \
           --spec-draft-model-path "${MINISGL_DFLASH_MODEL:-poolside/Laguna-XS-2.1-DFlash-NVFP4}" \
           --spec-num-draft "${MINISGL_SPEC_K:-16}" \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-4}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
+          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-2}" \
+          --max-running-requests "${MINISGL_MAX_RUNNING:-2}" \
+          --memory-ratio "${MINISGL_MEM_RATIO:-0.90}" \
           ${MINISGL_EXTRA_ARGS:-}
 
   # poolside/Laguna-XS-2.1-NVFP4 — full production serve bundling this session's validated wins,
