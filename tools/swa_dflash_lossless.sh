@@ -14,7 +14,7 @@
 # SPEC == FORCE_N0 (byte-identical) is the HARD gate for the verify/ring logic. SPEC == PLAIN is the
 # end-to-end lossless-greedy confirmation.
 set -uo pipefail
-source /app/.venv/bin/activate 2>/dev/null || true
+source /app/.venv/bin/activate 2>/dev/null || source /opt/venv/bin/activate 2>/dev/null || true
 export PYTHONPATH=/opt/kernels:/engine/python:/engine
 export HF_HUB_OFFLINE=1
 # bf16 SWA ring: the extend/verify primitive (_swa_prefill_extend) cats the ring window with the inline
@@ -39,7 +39,7 @@ boot(){ # $1 = extra env assignments (may be empty), $2... = extra minisgl args
     --model "$MODEL" --host 127.0.0.1 --port $PORT \
     --tensor-parallel-size "$TP" --disable-pynccl \
     --cache-type naive --attention-backend hip --page-size 16 \
-    --cuda-graph-max-bs 0 --max-running-requests "${MAXRUN:-2}" --memory-ratio "${MEMR:-0.90}" \
+    --cuda-graph-max-bs "${GRAPHBS:-0}" --max-running-requests "${MAXRUN:-2}" --memory-ratio "${MEMR:-0.90}" \
     "$@" > "$LOG" 2>&1 &
   SRV=$!
   for _ in $(seq 1 300); do

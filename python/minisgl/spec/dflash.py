@@ -324,25 +324,39 @@ class DFlashProposer(Proposer):
             f"Laguna DFlash draft hidden {hidden} != target hidden {target_hidden}"
         )
 
-        with torch.device(self._device):
-            self._draft = DFlashDraftModel(
-                hidden_size=hidden,
-                intermediate_size=inter,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                num_aux_layers=num_aux,
-                rms_norm_eps=eps,
-                rope_theta=rope_theta,
-                max_position=max_pos,
-                draft_vocab_size=None,
-                own_embed=False,
-                decoder_layer_type="laguna_xs",
-                sliding_window=sliding_window,
-                causal=causal,
-                per_aux_norm=True,
-            )
+        # Build the empty drafter in the COMPUTE DTYPE (bf16), not torch's fp32 default. _PlainLinear /
+        # RMSNorm allocate `torch.empty(...)` with no explicit dtype, so under the default they land as
+        # fp32 — 2x the resident bytes of the bf16 checkpoint they're about to be filled with. On a 16 GB
+        # TP=2 pair that fp32 scaffold (~2 GiB) is then freed when _load_laguna_weights replaces each
+        # weight with its bf16 tensor, but expandable_segments keeps ~0.9 GiB of it RESERVED — dead
+        # headroom that (with the on-card staging, now fixed) was the spec-decode boot OOM. Constructing
+        # bf16 up front halves the scaffold so the freed blocks are reused by the incoming bf16 weights.
+        # get_rope keeps its cos/sin cache fp32 (explicit dtype) and every norm weight is overwritten by
+        # the bf16 checkpoint, so this only right-sizes the linear scaffolds — no numerics change.
+        _prev_default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(self._dtype)
+        try:
+            with torch.device(self._device):
+                self._draft = DFlashDraftModel(
+                    hidden_size=hidden,
+                    intermediate_size=inter,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    num_aux_layers=num_aux,
+                    rms_norm_eps=eps,
+                    rope_theta=rope_theta,
+                    max_position=max_pos,
+                    draft_vocab_size=None,
+                    own_embed=False,
+                    decoder_layer_type="laguna_xs",
+                    sliding_window=sliding_window,
+                    causal=causal,
+                    per_aux_norm=True,
+                )
+        finally:
+            torch.set_default_dtype(_prev_default_dtype)
         self._load_laguna_weights(folder)
         self._draft.bind_embed(engine.model.model.embed_tokens)
         self._draft.bind_lm_head(engine.model.lm_head)
@@ -370,7 +384,18 @@ class DFlashProposer(Proposer):
         path = next((os.path.join(folder, f) for f in sorted(os.listdir(folder))
                      if f.endswith(".safetensors")), None)
         assert path is not None, f"no .safetensors in Laguna DFlash folder {folder}"
-        sd = st.load_file(path, device=str(self._device))
+        # Load the checkpoint to HOST RAM, not GPU: the checkpoint staging + the model's initial
+        # on-device empty weights (built under `with torch.device(device)`) must not coexist on the card.
+        # Under expandable_segments the freed staging stays RESERVED (never returned), so loading the whole
+        # checkpoint straight to the card (the old device=cuda path) left ~1.8 GiB of idle-but-reserved
+        # memory for a ~1 GiB drafter — a big part of the spec-decode boot OOM (only 0.19 GiB free after
+        # capture -> any runtime alloc OOMs). Stage in HOST RAM and move each final tensor to the card one
+        # at a time; a trailing empty_cache (below) returns the transient.
+        # NOTE: the reassignment below (setattr, not copy_) is load-bearing — the model was
+        # built with fp32 `torch.empty` weights (_PlainLinear), so we must REPLACE them with the bf16
+        # checkpoint tensors, not copy_ into the fp32 buffers (which would leave the drafter fp32 and trip
+        # `dense_gemm_rd: only bf16/fp16 activations` on the first propose).
+        sd = st.load_file(path, device="cpu")
         d = self._draft
 
         def put(mod, leaf, key):
@@ -380,7 +405,7 @@ class DFlashProposer(Proposer):
             assert cur.shape == t.shape, (
                 f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
             )
-            setattr(mod, leaf, t.to(self._device))
+            setattr(mod, leaf, t.to(self._device))  # bf16 host tensor -> card (replaces the fp32 empty)
 
         put(d.fc, "weight", "fc.weight")
         put(d.hidden_norm, "weight", "hidden_norm.weight")
@@ -412,6 +437,11 @@ class DFlashProposer(Proposer):
             put(layer.gate_proj, "weight", p + "mlp.gate_proj.weight")
             put(layer.up_proj, "weight", p + "mlp.up_proj.weight")
             put(layer.down_proj, "weight", p + "mlp.down_proj.weight")
+        # Release the host staging dict + return the GPU segments freed when the fp32 empty weights were
+        # replaced above. Without this, expandable_segments keeps that ~1 GiB reserved-but-idle on the
+        # card — dead runtime headroom the spec-verify path then OOMs against.
+        del sd
+        torch.cuda.empty_cache()
 
     def _load_draft_weights(self, folder: str) -> None:
         """Load the DFlash checkpoint directly. fc/hidden_norm/norm + per-layer Qwen3 decoder tensors
