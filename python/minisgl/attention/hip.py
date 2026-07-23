@@ -22,6 +22,7 @@ Constraints (v0 — eager, validated on dense head_dim 64/128):
 """
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -169,6 +170,11 @@ class HIPAttnBackend(RDNA4Backend):
             self._cap_swa_out_loc = torch.zeros(self._cap_max_bs, dtype=torch.int32, device=dev)
             self._cap_swa_page_table = torch.zeros(self._cap_max_bs, W, dtype=torch.int32, device=dev)
             self._cap_swa_cache_seqlens = torch.ones(self._cap_max_bs, dtype=torch.int32, device=dev)
+            # Cached device column index [0..W) for the VECTORIZED ring page-table build (avoids a
+            # per-step arange). Default-on; MINISGL_SWA_METADATA_VEC=0 falls back to the eager
+            # _build_swa_metadata python path (kept for the A/B timing that proved the win).
+            self._swa_cols = torch.arange(W, dtype=torch.int64, device=dev)
+            self._swa_vec = os.environ.get("MINISGL_SWA_METADATA_VEC", "1") != "0"
 
     def _decode_metadata_static(self, bs: int) -> RDNA4Metadata:
         md = RDNA4Metadata(
@@ -188,22 +194,50 @@ class HIPAttnBackend(RDNA4Backend):
 
     def _fill_swa_decode_static(self, batch: "Batch") -> None:
         """Refresh the persistent SWA ring-pool decode buffers from `batch.padded_reqs` (eager, OUTSIDE
-        the graph). Reuses the eager `_build_swa_metadata` (byte-identical values to the non-captured
-        path) at decode qlen=1, then copies its (out_loc, page_table, cache_seqlens) INTO the static
-        buffers the captured kernels read. The narrower-than-W page-table columns beyond each row's cnt
-        stay stale but are never attended (the decode kernel bounds reads by swa_cache_seqlens)."""
+        the graph). VECTORIZED by default (MINISGL_SWA_METADATA_VEC=1): the ring math is a closed form,
+        so build it with O(bs) host reads + on-device arithmetic instead of a per-step O(bs*W) python
+        loop. For decode (qlen=1) the new token sits at absolute position c0=device_len-1:
+            out_loc      = table_idx*R + c0 % R                          (ring slot it writes)
+            cache_seqlen = min(device_len, W)                            (= cnt, the live window)
+            page_table[:, j] = table_idx*R + ( (R==W) ? j : (S-cnt+j) % R )
+        Byte-identical to the eager `_build_swa_metadata`: for every column j < cnt the slot matches
+        (R==W: base+j == the first-cnt read; R>W: base+(S-cnt+j)%R == the last-cnt position read); the
+        columns j>=cnt differ (formula vs 0-pad) but are NEVER attended — the decode kernel bounds reads
+        by cache_seqlens=cnt. MINISGL_SWA_METADATA_VEC=0 restores the eager python path (kept for the
+        A/B host-cost comparison). All device tensors here are built OUTSIDE the captured graph; only the
+        copy_ into the persistent buffers matters for pointer stability."""
         reqs = batch.padded_reqs
         bs = len(reqs)
         dev = self.kvcache.device
-        seqlens_q = [r.extend_len for r in reqs]  # decode: 1 per seq
-        cached_lens = [r.cached_len for r in reqs]
-        out_loc, page_table, cache_seqlens = self._build_swa_metadata(
-            reqs, seqlens_q, cached_lens, dev
-        )
-        self._cap_swa_out_loc[:bs].copy_(out_loc)
-        self._cap_swa_cache_seqlens[:bs].copy_(cache_seqlens)
-        w = page_table.shape[1]
-        self._cap_swa_page_table[:bs, :w].copy_(page_table)
+        if not self._swa_vec:
+            # Eager reference path (per-step python list-build + H2D) — the pre-vectorization behaviour.
+            seqlens_q = [r.extend_len for r in reqs]
+            cached_lens = [r.cached_len for r in reqs]
+            out_loc, page_table, cache_seqlens = self._build_swa_metadata(
+                reqs, seqlens_q, cached_lens, dev
+            )
+            self._cap_swa_out_loc[:bs].copy_(out_loc)
+            self._cap_swa_cache_seqlens[:bs].copy_(cache_seqlens)
+            self._cap_swa_page_table[:bs, : page_table.shape[1]].copy_(page_table)
+            return
+        W = self.swa_window
+        R = self.swa_ring_stride
+        # O(bs) host reads -> one pinned H2D each (bs is tiny: <= max_graph_bs).
+        tbl = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64, pin_memory=True).to(
+            dev, non_blocking=True)
+        S = torch.tensor([r.device_len for r in reqs], dtype=torch.int64, pin_memory=True).to(
+            dev, non_blocking=True)
+        base = tbl * R                                   # [bs] ring block start
+        c0 = S - 1                                       # [bs] new-token absolute position (qlen=1)
+        cnt = torch.clamp(S, max=W)                      # [bs] live-window length = min(S, W)
+        cols = self._swa_cols                            # [W] cached device arange
+        if R == W:
+            slots = base[:, None] + cols[None, :]                                    # [bs, W]
+        else:
+            slots = base[:, None] + torch.remainder((S - cnt)[:, None] + cols[None, :], R)
+        self._cap_swa_out_loc[:bs].copy_((base + torch.remainder(c0, R)).to(torch.int32))
+        self._cap_swa_cache_seqlens[:bs].copy_(cnt.to(torch.int32))
+        self._cap_swa_page_table[:bs, :W].copy_(slots.to(torch.int32))
 
     def _fill_decode_static(self, batch: "Batch") -> None:
         """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding).
