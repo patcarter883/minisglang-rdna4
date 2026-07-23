@@ -602,6 +602,11 @@ _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", r
 # in `_parse_tool_calls` before the block scan.
 _INLINE_FN_RE = re.compile(r"<function\s*=\s*([A-Za-z_][\w.]*)\s*\((.*?)\)\s*/?>", re.DOTALL)
 _SQUARE_WRAP_RE = re.compile(r"\[(/?(?:" + "|".join(_TOOL_WRAPPERS) + r"))\]")
+# (D) Laguna native tool args: `<arg_key>NAME</arg_key><arg_value>VALUE</arg_value>` pairs (NOT the
+# Qwen3 `<parameter=…>` form). The call is `<tool_call>fname<arg_key>…</arg_key><arg_value>…` — a bare
+# function-name head (no `<function=>` wrapper) followed by these pairs. Parse both so the call lands
+# as a real tool_call instead of leaking `<arg_value>` markup into content.
+_ARG_KV_RE = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>", re.DOTALL)
 # Orphan wrapper open/close tags left in content after a call is parsed (e.g. the model emitted an opener
 # but no closer around an inline function) — strip them so `content` isn't polluted with dangling markup.
 _ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>")
@@ -664,6 +669,15 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     inl = _INLINE_FN_RE.search(inner)  # (C) ZAYA deviation: inline <function=NAME(a='x', b=1)>
     if inl:
         return inl.group(1).strip(), _parse_pycall_args(inl.group(2))
+    # (D) Laguna native: `fname<arg_key>k</arg_key><arg_value>v</arg_value>…` — a bare function-name
+    # head then arg_key/arg_value pairs (no `<function=>` wrapper). The head is the text before the
+    # first tag; args from the pairs (empty for a no-arg call). Guarded to not shadow A/B/C (which
+    # start with `{` or `<`), so this only fires on the bare-name form.
+    if inner and not inner.startswith(("{", "<")):
+        name = inner.split("<", 1)[0].strip()
+        if name:
+            args = {k.strip(): _coerce(v.strip()) for k, v in _ARG_KV_RE.findall(inner)}
+            return name, args
     return None
 
 
@@ -991,23 +1005,25 @@ class FrontendManager:
                 first_chunk = False
             tool_deltas: List[dict] = []
             if ack.incremental_output:
-                # Reasoning models: route the pre-</think> scratch to `reasoning_content` and the
-                # answer to `content`, in the streaming delta (buffers a partial closing tag).
-                if reasoning_stream is not None:
-                    r_delta, c_delta = reasoning_stream.push(ack.incremental_output)
-                    if r_delta:
-                        delta["reasoning_content"] = r_delta
+                # Tool calls are their OWN channel — detect them on the RAW stream FIRST (before the
+                # reasoning split), so a <tool_call> the model emits (Laguna emits them WITHOUT ever
+                # closing </think>, so the reasoning splitter would otherwise trap the whole block in
+                # reasoning_content) is pulled out as delta.tool_calls. The non-tool remainder then
+                # goes through the reasoning split (pre-</think> scratch -> reasoning_content, answer
+                # -> content). Buffers a partial opener across chunks.
+                if tool_stream is not None:
+                    nontool, tool_deltas = tool_stream.push(ack.incremental_output)
                 else:
-                    c_delta = ack.incremental_output
-                # Tool calling: split completed <tool_call>/<function=> blocks out of `content` and
-                # re-emit them as OpenAI streaming `delta.tool_calls` (buffers a partial opener).
-                if c_delta:
-                    if tool_stream is not None:
-                        content_out, tool_deltas = tool_stream.push(c_delta)
-                        if content_out:
-                            delta["content"] = content_out
+                    nontool = ack.incremental_output
+                if nontool:
+                    if reasoning_stream is not None:
+                        r_delta, c_delta = reasoning_stream.push(nontool)
+                        if r_delta:
+                            delta["reasoning_content"] = r_delta
+                        if c_delta:
+                            delta["content"] = c_delta
                     else:
-                        delta["content"] = c_delta
+                        delta["content"] = nontool
             completion_tokens = max(completion_tokens, ack.completion_tokens)
             prompt_tokens = ack.prompt_tokens or prompt_tokens
             if ack.finish_reason:
@@ -1025,16 +1041,26 @@ class FrontendManager:
         # final chunk: flush any buffered reasoning tail (model never closed </think>) and any tool
         # tail, then finish_reason + usage (OpenAI carries usage on the terminal chunk).
         final_delta: dict = {}
-        if reasoning_stream is not None and (tail := reasoning_stream.flush()):
-            final_delta["reasoning_content"] = tail
+        # Tool tail FIRST (it fed off the RAW stream): emit any final tool fragment, then a buffered
+        # partial-opener that turned out to be literal text still flows through the reasoning split.
+        nontool_tail = None
         if tool_stream is not None:
-            c_tail, t_tail = tool_stream.flush()
-            if c_tail:
-                final_delta["content"] = final_delta.get("content", "") + c_tail
+            nontool_tail, t_tail = tool_stream.flush()
             for td in t_tail:
                 yield _chunk({"tool_calls": [td]})
             if tool_stream.emitted and finish_reason != "length":
                 finish_reason = "tool_calls"
+        if reasoning_stream is not None:
+            if nontool_tail:
+                r2, c2 = reasoning_stream.push(nontool_tail)
+                if r2:
+                    final_delta["reasoning_content"] = r2
+                if c2:
+                    final_delta["content"] = c2
+            if tail := reasoning_stream.flush():
+                final_delta["reasoning_content"] = final_delta.get("reasoning_content", "") + tail
+        elif nontool_tail:
+            final_delta["content"] = nontool_tail
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
