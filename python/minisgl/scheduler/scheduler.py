@@ -134,6 +134,33 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     + why
                 )
                 cache_type = "naive"
+        # SWA-radix prefix caching (Laguna / any sliding-window-attention hybrid). Its FULL-attention
+        # layers are already radix-cacheable; its SLIDING layers keep a window-bounded ring whose
+        # boundary is transient — so, exactly like GDN/CCA recurrent state, we SNAPSHOT the window at
+        # the page-aligned prefix boundary and RESTORE it on a hit (rdna4.py::_swa_prefill_extend runs
+        # the cross-boundary extend; PROVEN bit-identical to cold with a BC front-pad). We reuse the
+        # snapshot-capable radix ('recurrent_radix': match-cap to a snapshotted boundary + attach), and
+        # gate off spec-decode (a second snapshot system) like recurrent radix. Feature-flagged
+        # (MINISGL_SWA_RADIX, default off) so the naive SWA path is byte-unchanged until proven.
+        mc0 = config.model_config
+        self._swa_radix = False
+        self._swa_snap = None
+        _swa_on = os.environ.get("MINISGL_SWA_RADIX", "0") != "0"
+        if getattr(mc0, "is_swa_hybrid", False) and cache_type != "naive":
+            if _swa_on and self.engine.spec_config is None:
+                self._swa_radix = True
+                cache_type = "recurrent_radix"
+                logger.warning_rank0(
+                    "SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window "
+                    "snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable)"
+                )
+            else:
+                why = ("SWA-radix disabled (MINISGL_SWA_RADIX=0)" if not _swa_on
+                       else "SWA-radix is not supported with spec-decode")
+                logger.warning_rank0(
+                    f"SWA-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); " + why
+                )
+                cache_type = "naive"
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
@@ -183,6 +210,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self._rec_cache, self._rec_slots = self.engine.cca_state, self.cca_slots
         else:
             self._rec_cache, self._rec_slots = None, None
+        # SWA-radix window snapshotter (parallel to _rec_cache; a model is SWA xor GDN/CCA). It clones
+        # the sliding-window ring at a page-aligned boundary and restores it on a prefix hit. The
+        # snapshot is stored on the radix node's rec_state field (opaque) and stashed via the shared
+        # _pending_rec_snap dict — reused verbatim since a SWA model never also has recurrent state.
+        if self._swa_radix and self.engine.swa_kv_cache is not None:
+            from minisgl.kvcache.swa_window import SWAWindowSnapshotter
+
+            self._swa_snap = SWAWindowSnapshotter(
+                self.engine.swa_kv_cache, config.model_config.sliding_window
+            )
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -661,8 +698,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # live slot. That clone must be ordered AFTER the sequence's own forward and BEFORE any next
         # forward that could advance the slot — which the synchronous normal loop guarantees (schedule
         # -> forward -> process/commit, no forward launched ahead) but the overlap loop does not. So
-        # run the non-overlap loop when recurrent radix is enabled.
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix:
+        # run the non-overlap loop when recurrent radix is enabled. SWA-radix has the identical
+        # ordering requirement — its window snapshot is cloned from the live ring at a commit point and
+        # RESTORED (ring seed + metadata.swa_prefix) in _finish_prepare right before the forward, which
+        # only the synchronous loop guarantees — so it forces the non-overlap loop too.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -766,6 +806,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     # (tail/finish commit). No cache_req here → no page/handle mutation on the chunk.
                     if self._rec_cache is not None:
                         self._stash_rec_state(req)
+                    elif self._swa_radix:
+                        self._stash_swa_state(req)
                     continue
                 next_token = next_tokens_cpu[i]
                 # #100 POINTER delivery: for the first len(obj) steps, OVERRIDE the sampled token with the
@@ -848,6 +890,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     # a future request sharing it can restore instead of re-prefilling.
                     if self._rec_cache is not None:
                         self._maybe_capture_rec_state(req, inserted)
+                    elif self._swa_radix:
+                        self._maybe_capture_swa_state(req, inserted)
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
@@ -902,6 +946,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # this full sequence + new tokens) restores it instead of re-prefilling the whole history.
         if self._rec_cache is not None:
             self._maybe_capture_rec_state(req, inserted)
+        elif self._swa_radix:
+            self._maybe_capture_swa_state(req, inserted)
         # Release the GDN state slot (idempotent — overlap scheduling can free a req twice).
         # This single site covers both normal finish (via _process_last_data) and abort.
         if self.gdn_slots is not None:
@@ -985,6 +1031,57 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return
         self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
 
+    # ---- SWA-radix window snapshot/restore (parallel to the recurrent path above) ------------------
+    # Same three-stage lifecycle as recurrent radix, but the snapshot is the sliding-window ring's last
+    # min(L,W) tokens (all sliding layers) instead of GDN/CCA state. Stored on the radix node's opaque
+    # rec_state field and stashed via the shared _pending_rec_snap dict (a model is SWA xor recurrent).
+    def _stash_swa_state(self, req: Req) -> None:
+        """Checkpoint the sliding-window at a page-aligned chunk boundary (mirror _stash_rec_state).
+        The ring holds the last W tokens at device_len==cached_len here, so clone(table_idx, cached_len)
+        captures the window exactly. Attached to the align_down radix node at the tail/finish commit."""
+        cached_len = req.cached_len
+        if cached_len == 0 or (cached_len % self.cache_manager.page_size) != 0:
+            return
+        self._pending_rec_snap[req.uid] = (
+            cached_len, self._swa_snap.clone(req.table_idx, cached_len)
+        )
+
+    def _maybe_capture_swa_state(self, req: Req, handle) -> None:
+        """Attach a page-aligned window snapshot to the freshly-inserted radix node (mirror
+        _maybe_capture_rec_state): a chunk stash at that boundary, else the live ring if the committed
+        length IS the boundary (single-shot prefill — the common 'warm a prefix' path)."""
+        if self._swa_snap is None or handle is None:
+            return
+        boundary = handle.cached_len
+        if boundary == 0:
+            return
+        stash = self._pending_rec_snap.get(req.uid)
+        if stash is not None and stash[0] == boundary:
+            self.cache_manager.attach_rec_state(handle, stash[1])
+            self._pending_rec_snap.pop(req.uid, None)
+            return
+        if req.cached_len != boundary or (boundary % self.cache_manager.page_size) != 0:
+            return
+        self.cache_manager.attach_rec_state(handle, self._swa_snap.clone(req.table_idx, boundary))
+
+    def _restore_swa_states(self, batch: Batch) -> None:
+        """CROSS-REQUEST reuse only: seed the reusing request's ring block from the page-aligned window
+        snapshot attached to the matched radix node, BEFORE the forward. The sliding-layer extend
+        (_gather_swa_windows) then reads the window straight from the ring — identical to a chunked
+        continuation, whose window its own prior chunk already wrote. Only the initial prefix-hit pass
+        restores (cached_len == matched boundary); a chunked continuation carries the same handle at a
+        larger cached_len and is skipped (its ring already holds the window)."""
+        for req in batch.reqs:
+            handle = getattr(req, "cache_handle", None)
+            snap = getattr(handle, "rec_state", None)
+            if snap is None or req.cached_len == 0 or req.cached_len != handle.cached_len:
+                continue
+            self._swa_snap.restore_ring(req.table_idx, snap)
+            logger.info_rank0(
+                f"SWA-radix HIT: uid={req.uid} seeded ring window at cached_len={req.cached_len} "
+                f"(sliding layers extend across the boundary; skips re-prefill of the shared prefix)"
+            )
+
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         return self._finish_prepare(batch)
@@ -1027,6 +1124,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # continue from it — byte-identical to prefilling the shared prefix from zero (recurrent kernel).
         if self._rec_cache is not None and batch.is_prefill and not batch.spec_verify:
             self._restore_rec_states(batch)
+        # SWA-radix RESTORE: for any prefill req that hit a page-aligned window snapshot, seed its ring
+        # block AND build batch.attn_metadata.swa_prefix so the sliding-layer extend attends across the
+        # window boundary (rdna4.py::_swa_prefill_extend). Runs AFTER prepare_metadata (which built the
+        # RDNA4Metadata); swa_prefix is a post-hoc field.
+        elif self._swa_radix and batch.is_prefill and not batch.spec_verify:
+            self._restore_swa_states(batch)
         # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
         # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
         # inside a graph — read here, reuse across decode). Inert when CAM is not built.
