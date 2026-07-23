@@ -223,6 +223,9 @@ class GraphRunner:
         self._verify = None
         self._verify_max_seq_len = max_seq_len
         self._verify_vocab = vocab_size
+        import os as _os
+        self._timing = ({"n": 0, "copy": 0.0, "prep": 0.0, "replay": 0.0}
+                        if _os.environ.get("MINISGL_GRAPH_TIMING") == "1" else None)
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
@@ -288,6 +291,38 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        # Env-gated per-step host-cost timing (MINISGL_GRAPH_TIMING=1). Diagnostics only: splits the
+        # host wall of a captured decode step into copy_from (I/O staging), prepare_for_replay (attn +
+        # recurrent metadata rebuild — the eager work NOT in the graph), and the g.replay() launch.
+        # Prints running averages every 100 replays on rank0. Inert (no branches taken) when unset.
+        if self._timing is not None:
+            import time as _t
+            t0 = _t.perf_counter()
+            self.buffer.copy_from(batch)
+            t1 = _t.perf_counter()
+            g = self.graph_map[batch.padded_size]
+            self.attn_backend.prepare_for_replay(batch)
+            if self.gdn_capture is not None:
+                self.gdn_capture.prepare_for_replay(batch)
+            if self.cca_capture is not None:
+                self.cca_capture.prepare_for_replay(batch)
+            if self.cam_capture is not None:
+                self.cam_capture.prepare_for_replay(batch)
+            t2 = _t.perf_counter()
+            g.replay()
+            t3 = _t.perf_counter()
+            tm = self._timing
+            tm["n"] += 1
+            tm["copy"] += t1 - t0
+            tm["prep"] += t2 - t1
+            tm["replay"] += t3 - t2
+            if tm["n"] % 100 == 0:
+                n = tm["n"]
+                logger.info_rank0(
+                    f"[graph-timing] n={n} host/step: copy_from={tm['copy']/n*1e3:.3f}ms "
+                    f"prepare_for_replay={tm['prep']/n*1e3:.3f}ms replay_launch={tm['replay']/n*1e3:.3f}ms"
+                )
+            return self.buffer.logits[: batch.size]
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
