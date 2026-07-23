@@ -318,7 +318,10 @@ services:
     <<: *lean-common
     profiles: ["laguna"]
     container_name: ${LEASE_NAME:-minisgl-lean}-laguna
-    restart: unless-stopped
+    # restart "no" (NOT unless-stopped): under a gpu-lease --detach, a crash+auto-restart orphans the
+    # container (lease-watcher releases on the stop, restart brings it back with no lease -> holds the
+    # cards for everyone). A leased serve must DIE on crash so the lease frees. Re-up manually.
+    restart: "no"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     entrypoint: ["bash", "-lc"]
@@ -347,7 +350,7 @@ services:
     <<: *lean-common
     profiles: ["laguna-dflash"]
     container_name: ${LEASE_NAME:-minisgl-lean}-laguna-dflash
-    restart: unless-stopped
+    restart: "no"  # lease-safe: die on crash so the gpu-lease frees, never orphan-restart
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     entrypoint: ["bash", "-lc"]
@@ -383,7 +386,7 @@ services:
     <<: *lean-common
     profiles: ["laguna-radix"]
     container_name: ${LEASE_NAME:-minisgl-lean}-laguna-radix
-    restart: unless-stopped
+    restart: "no"  # lease-safe: die on crash so the gpu-lease frees, never orphan-restart
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     environment:
