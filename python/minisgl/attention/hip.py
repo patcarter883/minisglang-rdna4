@@ -295,9 +295,27 @@ class HIPAttnBackend(RDNA4Backend):
         self._vcap_cu_q = (
             torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
         )
+        # ---- SWA-hybrid (Laguna): STATIC ring-pool VERIFY metadata (persistent, refreshed in place) ----
+        # The 30 sliding layers verify the K+1 tokens through the ring pool. Made capturable by the
+        # paged-from-ring path (rdna4._swa_prefill_paged) — mirrors the decode SWA static buffers (Track
+        # D) at the verify shape. Widths are FIXED: swa_out_loc holds bs*qlen new-token store slots; the
+        # ring block table is [bs, W+qlen] (window Wp<=W ++ the qlen new slots); cache_seqlens = Wp+qlen
+        # bounds the read (padded tail ignored). Contents are rebuilt by _fill_swa_verify_static before
+        # capture and every replay; the captured store_kv/paged-extend read them through fixed pointers.
+        if self.swa_kv is not None and self.swa_window > 0:
+            W = self.swa_window
+            self._vcap_swa_out_loc = torch.zeros(
+                self._vcap_max_bs * self._vcap_qlen, dtype=torch.int32, device=dev
+            )
+            self._vcap_swa_page_table = torch.zeros(
+                self._vcap_max_bs, W + self._vcap_qlen, dtype=torch.int32, device=dev
+            )
+            self._vcap_swa_cache_seqlens = torch.ones(
+                self._vcap_max_bs, dtype=torch.int32, device=dev
+            )
 
     def _verify_metadata_static(self, bs: int) -> RDNA4Metadata:
-        return RDNA4Metadata(
+        md = RDNA4Metadata(
             cache_seqlens=self._vcap_cache_seqlens[:bs],
             cu_seqlens_q=self._vcap_cu_q[: bs + 1],
             max_seqlen_q=self._vcap_qlen,
@@ -305,6 +323,14 @@ class HIPAttnBackend(RDNA4Backend):
             page_table=self._vcap_page_table[:bs],
             cold_prefill=False,
         )
+        # SWA-hybrid: attach the persistent ring-pool VERIFY metadata the sliding layers read (paged
+        # verify). swa_out_loc = bs*qlen new-token store slots (store_kv), swa_verify_page_table /
+        # swa_verify_cache_seqlens = the [window|new] ring block table + context length.
+        if self.swa_kv is not None and self.swa_window > 0:
+            md.swa_out_loc = self._vcap_swa_out_loc[: bs * self._vcap_qlen]
+            md.swa_verify_page_table = self._vcap_swa_page_table[:bs]
+            md.swa_verify_cache_seqlens = self._vcap_swa_cache_seqlens[:bs]
+        return md
 
     def _fill_verify_static(self, batch: "Batch") -> None:
         """Refresh the static verify buffers from `batch.padded_reqs` (eager, OUTSIDE the graph).
@@ -328,12 +354,61 @@ class HIPAttnBackend(RDNA4Backend):
         ncols = rows.shape[1]
         self._vcap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
 
+    def _fill_swa_verify_static(self, batch: "Batch") -> None:
+        """Refresh the persistent SWA ring-pool VERIFY buffers from `batch.padded_reqs` (eager, OUTSIDE
+        the graph). For each seq (device_len S, qlen K+1 new tokens): cached_len c0 = S - qlen, window
+        Wp = min(c0, W). Builds, per seq:
+            out_loc (bs*qlen)   ring slot per NEW token = table_idx*R + (c0+j) % R
+            page_table[i]       [ window slots  base+(p%R) for p in [c0-Wp, c0)  |  the qlen new slots ]
+                                (ascending absolute position; tail past Wp+qlen padded with 0)
+            cache_seqlens[i]    Wp + qlen         (bounds the paged read; padded tail ignored)
+        These are the SAME ring slots the eager _build_swa_metadata / _gather_swa_windows would address
+        (store slots identical; window read = the last Wp positions at their ring slots p%R), so the
+        captured paged verify is greedy-identical to the eager dense extend. bs is tiny (<= max verify
+        bs) and qlen small, so the O(bs*(W+qlen)) build is negligible; one pinned H2D per buffer."""
+        reqs = batch.padded_reqs
+        bs = len(reqs)
+        dev = self.kvcache.device
+        W = self.swa_window
+        R = self.swa_ring_stride
+        qlen = self._vcap_qlen
+        out_slots: list[int] = []
+        pt_rows: list[list[int]] = []
+        ctx: list[int] = []
+        row_w = W + qlen
+        for req in reqs:
+            base = req.table_idx * R
+            S = req.device_len
+            c0 = S - qlen  # cached prefix before the K+1 new tokens
+            Wp = min(c0, W) if c0 > 0 else 0
+            new_slots = [base + ((c0 + j) % R) for j in range(qlen)]
+            out_slots.extend(new_slots)
+            win_slots = [base + (p % R) for p in range(c0 - Wp, c0)]  # ascending absolute pos
+            row = win_slots + new_slots
+            row += [0] * (row_w - len(row))  # pad tail (never read; ctx bounds it)
+            pt_rows.append(row)
+            ctx.append(Wp + qlen)
+        CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        self._vcap_swa_out_loc[: bs * qlen].copy_(
+            torch.tensor(out_slots, **CPU).to(dev, non_blocking=True)
+        )
+        self._vcap_swa_page_table[:bs].copy_(
+            torch.tensor(pt_rows, **CPU).to(dev, non_blocking=True)
+        )
+        self._vcap_swa_cache_seqlens[:bs].copy_(
+            torch.tensor(ctx, **CPU).to(dev, non_blocking=True)
+        )
+
     def prepare_verify_for_capture(self, batch: "Batch") -> None:
         self._fill_verify_static(batch)
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._fill_swa_verify_static(batch)
         batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
 
     def prepare_verify_for_replay(self, batch: "Batch") -> None:
         self._fill_verify_static(batch)
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._fill_swa_verify_static(batch)
         batch.attn_metadata = self._verify_metadata_static(batch.padded_size)
 
     # ---- FUSED spec-verify cudagraph capture (v2 S4: the custom-mask single-forward) --------------
