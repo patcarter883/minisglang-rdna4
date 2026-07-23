@@ -175,7 +175,13 @@ class LagunaTopKRouter(BaseOP):
         self.e_score_correction_bias = torch.empty(num_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(x, self.weight)  # [T, E] logits
+        # M-invariant GEMM (layers/minv.py) not raw F.linear: the router logits drive top-k expert
+        # SELECTION, so a ~1-ULP M-dependence (a chunked/prefix-reused forward runs at a different M
+        # than a cold one) could flip a near-tie selection -> different experts -> divergent output.
+        # Routing through the fixed-tile WMMA GEMM makes a reused-prefix forward bit-identical to cold.
+        from minisgl.layers.minv import minv_linear
+
+        return minv_linear(x, self.weight)  # [T, E] logits
 
 
 class LagunaSharedExpert(BaseOP):

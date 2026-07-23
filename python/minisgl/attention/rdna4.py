@@ -13,6 +13,11 @@ from ._triton_unified import KVQuantMode, unified_attention
 if TYPE_CHECKING:
     from minisgl.models import ModelConfig
 
+# Flash BC tile for head_dim 64/128 (attn_kernels_hip.hip kBC): the online-softmax reduces in BC-wide
+# blocks. Front-padding the SWA extend buffer by (cached_len - Wp) % BC lands the first new-token row
+# at the same residue mod BC as a cold prefill => identical block grouping => bit-identical.
+_SWA_BC_ALIGN = 32
+
 
 @dataclass
 class RDNA4Metadata(BaseAttnMetadata):
@@ -36,6 +41,12 @@ class RDNA4Metadata(BaseAttnMetadata):
     swa_out_loc: torch.Tensor | None = None
     swa_page_table: torch.Tensor | None = None
     swa_cache_seqlens: torch.Tensor | None = None
+    # SWA EXTEND (chunked-continuation OR cross-request radix reuse): per-seq (batch order) table_idx
+    # of the sliding-window ring block, so the extend can gather each seq's window [cached_len-W,
+    # cached_len) directly from ITS ring (a prior chunk wrote it; a cross-request reuse is seeded by
+    # the scheduler's _restore_swa_states before the forward). None => no SWA extend supported for this
+    # forward (naive single-shot cold only). See rdna4.py::_swa_prefill_extend.
+    swa_table_idx: List[int] | None = None
     # Lazy per-forward host-sync caches. A metadata object is built ONCE per forward and shared
     # across every attention layer, so the cold-prefill kernels' `.tolist()` slicing would re-sync
     # the same tensor ~40 times (once per layer). Memoize the first sync here; all later layers of
@@ -331,17 +342,88 @@ class RDNA4Backend(BaseAttnBackend):
             "The Triton unified path does not wire the SWA ring pool."
         )
         assert metadata.swa_out_loc is not None, "SWA metadata missing (is_swa_hybrid not wired?)"
-        # Persist the new tokens' K/V into the ring pool at the ring slots (table_idx*W + pos%W).
-        self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
         if metadata.max_seqlen_q == 1:
+            self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
             return self._swa_decode(q, layer_id, metadata)
         if metadata.cold_prefill:
+            self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
             return self._swa_prefill_cold(q, k, v, metadata, sliding_window)
-        raise NotImplementedError(
-            "SWA extend/chunked prefill is not supported: a SWA-hybrid model must run the naive "
-            "prefix cache (whole-prompt cold prefill). Radix reuse across the window boundary is "
-            "unsound, and the ring pool holds only the last `window` tokens."
-        )
+        # SWA EXTEND — a chunked-continuation OR a cross-request radix reuse. Each seq's boundary window
+        # [cached_len-W, cached_len) is already in ITS OWN ring block: a prior prefill chunk wrote it, or
+        # (cross-request reuse) the scheduler's _restore_swa_states seeded it from a page-aligned
+        # snapshot before this forward. GATHER that window from the ring FIRST (before store_kv overwrites
+        # it with the new chunk), then attend [pad | window | new] under the SAME causal+SWA kernel as a
+        # cold prefill — PROVEN bit-identical with a BC front-pad (tools/swa_prefix_extend_validate.py).
+        if metadata.swa_table_idx is None:
+            raise NotImplementedError(
+                "SWA extend/chunked prefill reached without ring metadata (swa_table_idx is None). "
+                "A SWA-hybrid model needs the SWA extend metadata wired (is_swa_hybrid path)."
+            )
+        windows = self._gather_swa_windows(layer_id, metadata, sliding_window)
+        self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)  # persist new tokens for later decode
+        return self._swa_prefill_extend(q, k, v, metadata, sliding_window, windows)
+
+    def _gather_swa_windows(self, layer_id: int, metadata: RDNA4Metadata, window: int):
+        """Per-seq boundary window (batch order), gathered from THIS layer's ring BEFORE store_kv. Entry
+        is None for a cold seq (cached_len==0) or (pad, k_win, v_win) with k/v_win [Wp, Hk, D] in
+        ascending absolute position (Wp=min(cached_len,W)). Reads the ring at slots table_idx*W + p%W."""
+        W = window
+        cu = metadata.cu_seqlens_q_list()
+        dev_lens = metadata.cache_seqlens_list()  # device_len per seq
+        tidx = metadata.swa_table_idx
+        k_ring = self.swa_kv.k_cache(layer_id).view(-1, *self.swa_kv.k_cache(layer_id).shape[2:])  # [slots,Hk,D]
+        v_ring = self.swa_kv.v_cache(layer_id).view(-1, *self.swa_kv.v_cache(layer_id).shape[2:])
+        dev = k_ring.device
+        out = []
+        for i in range(len(cu) - 1):
+            qlen = cu[i + 1] - cu[i]
+            cached_len = dev_lens[i] - qlen
+            if qlen <= 0 or cached_len <= 0:
+                out.append(None)
+                continue
+            Wp = min(cached_len, W)
+            pos = torch.arange(cached_len - Wp, cached_len, device=dev, dtype=torch.long)
+            slots = tidx[i] * W + (pos % W)
+            pad = (cached_len - Wp) % _SWA_BC_ALIGN  # BC front-pad -> flash block grouping == cold
+            out.append((pad, k_ring[slots].clone(), v_ring[slots].clone()))
+        return out
+
+    def _swa_prefill_extend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        metadata: RDNA4Metadata, window: int, windows: list,
+    ) -> torch.Tensor:
+        """Attend each seq's new chunk over [pad zeros | ring window | new chunk] with the kernel's
+        causal+sliding_window mask, dropping the front (pad+Wp) rows. Contiguous ascending absolute
+        position => same non-masked key SET+values as a cold prefill; the `pad` zero rows (all window-
+        masked, value-irrelevant) align the flash block grouping to cold => BIT-IDENTICAL. `windows`
+        (from _gather_swa_windows) is per-seq None|(pad, k_win, v_win); k/v are the inline new bf16 K/V."""
+        D = self.config.head_dim
+        k = k.view(-1, k.shape[-1] // D, D)
+        v = v.view(-1, v.shape[-1] // D, D)
+        cu = metadata.cu_seqlens_q_list()
+        out = self._get_out_buf(q)
+        for i in range(len(cu) - 1):
+            s, e = cu[i], cu[i + 1]
+            if e - s <= 0:
+                continue
+            win = windows[i]
+            if win is None:  # cold seq in a mixed batch: plain windowed prefill over its own tokens
+                out[s:e] = self._hip_prefill_op(
+                    q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
+                    self.scale, 1, window,
+                )
+                continue
+            pad, k_win, v_win = win  # [Wp, Hk, D]
+            Wp, Hk = k_win.shape[0], k_win.shape[1]
+            front = pad + Wp
+            parts_k = ([k_win.new_zeros((pad, Hk, D))] if pad else []) + [k_win, k[s:e]]
+            parts_v = ([v_win.new_zeros((pad, Hk, D))] if pad else []) + [v_win, v[s:e]]
+            k_ext = torch.cat(parts_k, dim=0).contiguous()
+            v_ext = torch.cat(parts_v, dim=0).contiguous()
+            q_ext = torch.cat([q.new_zeros((front, q.shape[1], D)), q[s:e]], dim=0).contiguous()
+            out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, self.scale, 1, window)
+            out[s:e] = out_ext[front:]
+        return out
 
     def _swa_decode(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
@@ -418,11 +500,12 @@ class RDNA4Backend(BaseAttnBackend):
         if self.page_size > 1:
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
-        swa_out_loc = swa_page_table = swa_cache_seqlens = None
+        swa_out_loc = swa_page_table = swa_cache_seqlens = swa_table_idx = None
         if self.swa_kv is not None and self.swa_window > 0:
             swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
                 reqs, seqlens_q, cached_lens, device
             )
+            swa_table_idx = [req.table_idx for req in reqs]  # ring block per seq (SWA extend gather)
 
         batch.attn_metadata = RDNA4Metadata(
             cache_seqlens=cache_seqlens,
@@ -434,6 +517,7 @@ class RDNA4Backend(BaseAttnBackend):
             swa_out_loc=swa_out_loc,
             swa_page_table=swa_page_table,
             swa_cache_seqlens=swa_cache_seqlens,
+            swa_table_idx=swa_table_idx,
         )
 
     def _build_swa_metadata(self, reqs, seqlens_q, cached_lens, device):
