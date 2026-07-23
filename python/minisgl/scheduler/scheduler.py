@@ -146,19 +146,29 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._swa_radix = False
         self._swa_snap = None
         _swa_on = os.environ.get("MINISGL_SWA_RADIX", "0") != "0"
+        # SWA-radix COMPOSES with spec-decode (unlike recurrent radix). The window snapshot/restore is
+        # made ring-STRIDE-aware (SWAWindowSnapshotter takes swa_ring_stride = window + num_draft + 1
+        # under spec): a snapshot reads/writes the committed window at slots table_idx*R + pos%R, exactly
+        # the addressing rdna4.py's store/gather/decode use, so the reusing request's spec decode/verify
+        # gathers the right window. The speculative block lives in the ring's disjoint tail slots and is
+        # never in the committed window [boundary-Wp, boundary), so it never corrupts a snapshot. The
+        # prefix-HIT restore runs at the reusing request's PREFILL (a non-spec_verify batch, see
+        # _restore_swa_states / the _finish_prepare gate), before any spec propose/verify — no ordering
+        # conflict with the widened-ring verify path Track B added.
         if getattr(mc0, "is_swa_hybrid", False) and cache_type != "naive":
-            if _swa_on and self.engine.spec_config is None:
+            if _swa_on:
                 self._swa_radix = True
                 cache_type = "recurrent_radix"
                 logger.warning_rank0(
                     "SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window "
                     "snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable)"
+                    + ("; spec-decode active — snapshot/restore stride = window + num_draft + 1"
+                       if self.engine.spec_config is not None else "")
                 )
             else:
-                why = ("SWA-radix disabled (MINISGL_SWA_RADIX=0)" if not _swa_on
-                       else "SWA-radix is not supported with spec-decode")
                 logger.warning_rank0(
-                    f"SWA-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); " + why
+                    f"SWA-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
+                    "SWA-radix disabled (MINISGL_SWA_RADIX=0)"
                 )
                 cache_type = "naive"
         self.cache_manager = CacheManager(
@@ -217,8 +227,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if self._swa_radix and self.engine.swa_kv_cache is not None:
             from minisgl.kvcache.swa_window import SWAWindowSnapshotter
 
+            # Stride-aware: pass the engine's ring stride (swa_ring_stride = window + num_draft + 1 under
+            # spec, else window) so the snapshot addresses the ring like store/gather/decode do. Without
+            # spec this is just the window, so Track A stays byte-identical.
             self._swa_snap = SWAWindowSnapshotter(
-                self.engine.swa_kv_cache, config.model_config.sliding_window
+                self.engine.swa_kv_cache,
+                config.model_config.sliding_window,
+                ring_stride=getattr(self.engine.ctx, "swa_ring_stride", None),
             )
 
         # some alias for easy access
