@@ -4,6 +4,11 @@
 # Phase 2: naive (SWA off) -> same B COLD -> record sha + TTFT.
 # GATE: reuse sha == cold sha for both cases. bf16 KV (MINISGL_KV_FP8=0) required for byte-identity.
 set -u
+# /opt/kernels first so `python -m minisgl` loads THIS worktree's source, not the image's baked
+# /opt/minisgl stub (Track B footgun — this harness previously lacked it and hit the stub).
+source /app/.venv/bin/activate 2>/dev/null || true
+export PYTHONPATH=/opt/kernels:/engine/python:/engine
+export HF_HUB_OFFLINE=1
 MODEL="${SWA_MODEL:-poolside/Laguna-XS-2.1-NVFP4}"
 RES=/engine/_swa_results.txt
 : > "$RES"

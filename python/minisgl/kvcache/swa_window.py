@@ -28,16 +28,24 @@ BC_ALIGN = 32
 class SWAWindowSnapshotter:
     """Clone/restore the sliding-window ring KV for SWA-radix prefix caching."""
 
-    def __init__(self, swa_kv, window: int) -> None:
+    def __init__(self, swa_kv, window: int, ring_stride: int | None = None) -> None:
         self.swa_kv = swa_kv          # MHAKVCache ring pool ([num_slots, 1, kv_heads, head_dim]/layer)
-        self.W = int(window)
+        self.W = int(window)          # window SIZE — how many recent positions the snapshot holds
+        # Per-seq ring STRIDE. == W without spec (Track A ring); == window + num_draft + 1 under spec
+        # (engine.py widens the ring so a K+1 verify's speculative block gets disjoint slots). The ring
+        # is addressed EVERYWHERE (store/gather/decode-read in rdna4.py) as slot = table_idx*R + pos%R,
+        # so the snapshot MUST use R for both the per-seq base offset AND the modulo — using W would read
+        # the wrong block base (table_idx*W) and alias positions the widened ring keeps disjoint,
+        # corrupting the restore. Defaults to W (spec-off) so Track A is byte-unchanged.
+        self.R = int(ring_stride) if ring_stride else self.W
         self.num_layers = swa_kv.num_layers
 
     def _window_slots(self, table_idx: int, boundary: int, Wp: int) -> torch.Tensor:
-        """Ring slots for absolute positions [boundary-Wp, boundary), in ascending position order."""
-        base = table_idx * self.W
+        """Ring slots for absolute positions [boundary-Wp, boundary), in ascending position order.
+        Strided by R (the ring stride), matching rdna4.py's store/gather/decode addressing exactly."""
+        base = table_idx * self.R
         pos = torch.arange(boundary - Wp, boundary, device=self.swa_kv.device, dtype=torch.long)
-        return base + (pos % self.W)
+        return base + (pos % self.R)
 
     def clone(self, table_idx: int, boundary: int):
         """Snapshot the window at a page-aligned prefix boundary. Precondition: the ring currently
