@@ -421,6 +421,12 @@ class RDNA4Backend(BaseAttnBackend):
                 )
                 continue
             pad, k_win, v_win = win  # [Wp, Hk, D]
+            if k_win.dtype != k.dtype:
+                # fp8 (e4m3) ring window: descale-on-gather to the bf16 compute dtype so the
+                # cat below (+ zero-pad, + inline bf16 new K/V) is uniform for the bf16 flash_prefill.
+                # Per-tensor descale is 1.0 (direct e4m3 cast on store), so the cast IS the dequant.
+                k_win = k_win.to(k.dtype)
+                v_win = v_win.to(v.dtype)
             Wp, Hk = k_win.shape[0], k_win.shape[1]
             front = pad + Wp
             parts_k = ([k_win.new_zeros((pad, Hk, D))] if pad else []) + [k_win, k[s:e]]
