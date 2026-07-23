@@ -182,7 +182,18 @@ class Engine:
         if mc0.is_swa_hybrid:
             from minisgl.kvcache.mha_pool import MHAKVCache
 
-            swa_slots = (config.max_running_req + 2) * mc0.sliding_window  # +1 NULL, +1 dummy
+            # Ring STRIDE per sequence = window + spec block. A plain window-sized ring (stride == W)
+            # is correct for single-query decode/extend, but a K+1 spec-VERIFY stores its whole block
+            # (anchor + drafts) into the ring BEFORE attention; the rejected drafts then land in slots
+            # that COLLIDE with the live window (position p and p+W share slot p%W once len >= W), so
+            # the next step's window gather reads stale speculative keys. Widening the stride to
+            # window + num_draft + 1 gives the speculative block its own disjoint slots, so a rejected
+            # draft never overwrites a valid-window slot (position q and any window position p differ by
+            # < stride => distinct mod stride). No spec -> stride == window (byte-identical to Track A).
+            spec_block = (self.spec_config.num_draft + 1) if self.spec_config is not None else 0
+            swa_stride = mc0.sliding_window + spec_block
+            self.ctx.swa_ring_stride = swa_stride
+            swa_slots = (config.max_running_req + 2) * swa_stride  # +1 NULL, +1 dummy
             self.ctx.swa_kv_cache = self.swa_kv_cache = MHAKVCache(
                 num_kv_heads=mc0.num_kv_heads,
                 num_layers=mc0.num_swa_layers,
@@ -194,7 +205,7 @@ class Engine:
             )
             logger.info_rank0(
                 f"SWA ring KV: {mc0.num_swa_layers} layers x {swa_slots} slots "
-                f"(window={mc0.sliding_window}, {config.max_running_req} seqs)"
+                f"(window={mc0.sliding_window}, stride={swa_stride}, {config.max_running_req} seqs)"
             )
         else:
             self.swa_kv_cache = None  # type: ignore[assignment]
@@ -623,10 +634,13 @@ class Engine:
             total += conv + prev
         if getattr(mc, "is_swa_hybrid", False):
             # SWA ring KV pool (allocated AFTER the main pool): 2 (K+V) * num_swa_layers * num_slots *
-            # sliding_window * local_kv_heads * head_dim * kv_dtype.itemsize. num_slots as above.
+            # STRIDE * local_kv_heads * head_dim * kv_dtype.itemsize. num_slots as above. Stride is the
+            # per-seq ring stride = window + spec block (must match the pool sizing above); no spec => W.
             local_kv = div_even(mc.num_kv_heads, tp, allow_replicate=True)
+            spec_block = (config.spec_config.num_draft + 1) if config.spec_config is not None else 0
+            swa_stride = mc.sliding_window + spec_block
             total += (
-                2 * mc.num_swa_layers * num_slots * mc.sliding_window
+                2 * mc.num_swa_layers * num_slots * swa_stride
                 * local_kv * mc.head_dim * self.kv_dtype.itemsize
             )
         return total

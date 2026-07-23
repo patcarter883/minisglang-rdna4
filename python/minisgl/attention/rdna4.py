@@ -96,6 +96,11 @@ class RDNA4Backend(BaseAttnBackend):
         # swa id. None for every non-SWA model (the full-context main pool serves every layer).
         self.swa_kv = getattr(ctx, "swa_kv_cache", None)
         self.swa_window = config.sliding_window or 0
+        # Per-seq ring STRIDE (>= window). = window + spec block when spec is enabled on a SWA model,
+        # so a K+1 spec-verify's speculative block occupies slots disjoint from the live window (see
+        # engine.py). Without spec it equals the window (Track A's ring, byte-identical). The window
+        # SIZE stays self.swa_window; only slot addressing (store/gather/decode-read) strides by this.
+        self.swa_ring_stride = getattr(ctx, "swa_ring_stride", self.swa_window)
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
         # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. Per-tensor
@@ -366,8 +371,10 @@ class RDNA4Backend(BaseAttnBackend):
     def _gather_swa_windows(self, layer_id: int, metadata: RDNA4Metadata, window: int):
         """Per-seq boundary window (batch order), gathered from THIS layer's ring BEFORE store_kv. Entry
         is None for a cold seq (cached_len==0) or (pad, k_win, v_win) with k/v_win [Wp, Hk, D] in
-        ascending absolute position (Wp=min(cached_len,W)). Reads the ring at slots table_idx*W + p%W."""
+        ascending absolute position (Wp=min(cached_len,W)). Reads the ring at slots table_idx*R + p%R
+        (R = ring stride >= W; disjoint from a prior verify's speculative block so the gather is clean)."""
         W = window
+        R = self.swa_ring_stride  # per-seq ring stride (== W without spec; W + spec block under spec)
         cu = metadata.cu_seqlens_q_list()
         dev_lens = metadata.cache_seqlens_list()  # device_len per seq
         tidx = metadata.swa_table_idx
@@ -383,7 +390,7 @@ class RDNA4Backend(BaseAttnBackend):
                 continue
             Wp = min(cached_len, W)
             pos = torch.arange(cached_len - Wp, cached_len, device=dev, dtype=torch.long)
-            slots = tidx[i] * W + (pos % W)
+            slots = tidx[i] * R + (pos % R)
             pad = (cached_len - Wp) % _SWA_BC_ALIGN  # BC front-pad -> flash block grouping == cold
             out.append((pad, k_ring[slots].clone(), v_ring[slots].clone()))
         return out
@@ -522,26 +529,34 @@ class RDNA4Backend(BaseAttnBackend):
 
     def _build_swa_metadata(self, reqs, seqlens_q, cached_lens, device):
         """Ring-pool metadata for the sliding layers (SWA-hybrid only). Each request owns a fixed
-        `window`-slot block [table_idx*W, table_idx*W + W); token at absolute position p writes slot
-        table_idx*W + (p % W) (the ring). The read block for a request of length S is the first
-        min(S, W) slots (when S >= W every slot holds one of the last W positions; when S < W slots
-        0..S-1 hold positions 0..S-1) with cache_seqlen = min(S, W). Order within the block is
-        irrelevant — each stored key already carries its RoPE at absolute position, and a decode
-        query's softmax over keys is permutation-invariant."""
+        `stride`-slot block [table_idx*R, table_idx*R + R) (R = ring stride >= window W); token at
+        absolute position p writes slot table_idx*R + (p % R) (the ring). The read block for a request
+        of length S is the last min(S, W) positions [S-cnt, S), addressed POSITION-BASED (slot p%R) so a
+        widened ring (R>W, spec) reads only the live window and never a stale speculative-block slot;
+        cache_seqlen = min(S, W). Order within the block is irrelevant — each stored key already carries
+        its RoPE at absolute position, and a decode query's softmax over keys is permutation-invariant.
+        When R==W (no spec) the position-based read is the SAME slot SET as the old first-cnt read."""
         W = self.swa_window
+        R = self.swa_ring_stride
         out_slots: list[int] = []
         table_rows: list[list[int]] = []
         seqlens_win: list[int] = []
         max_win = 0
         for req, qlen, c0 in zip(reqs, seqlens_q, cached_lens):
             t = req.table_idx
-            base = t * W
+            base = t * R
             # new tokens this batch: absolute positions [c0, c0+qlen) -> ring slots
-            out_slots.extend(base + (p % W) for p in range(c0, c0 + qlen))
+            out_slots.extend(base + (p % R) for p in range(c0, c0 + qlen))
             S = c0 + qlen  # device_len
             cnt = min(S, W)
             seqlens_win.append(cnt)
-            table_rows.append([base + s for s in range(cnt)])
+            if R == W:
+                # Track A ring (no spec): first cnt slots — byte-identical to the validated path.
+                table_rows.append([base + s for s in range(cnt)])
+            else:
+                # Widened ring (spec): the last cnt positions [S-cnt, S) at their ring slots p%R, so
+                # rejected speculative tokens (in disjoint slots) are never read.
+                table_rows.append([base + (p % R) for p in range(S - cnt, S)])
             max_win = max(max_win, cnt)
         CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
         swa_out_loc = torch.tensor(out_slots, **CPU).to(device, non_blocking=True)
