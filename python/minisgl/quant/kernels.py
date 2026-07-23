@@ -101,12 +101,13 @@ _MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
 # MINISGL_MOE_G2FUSE=0 reverts to the bit-exact WMMA gemm2 + gather_reduce.
 _MOE_G2FUSE = _os.environ.get("MINISGL_MOE_G2FUSE", "1") != "0"
 
-# NVFP4 (group-16 e2m1) decode-GEMV lever. DEFAULT OFF: the group-16 decode GEMV passes isolated
-# op-parity (cos=1.0 vs WMMA) but CRASHES the full serve at decode (fe2e A/B 2026-07-23: WMMA arm
-# clean 21.71 tok/s; GEMV arm container died on the first decode request). Opt in with
-# MINISGL_NVFP4_GEMV=1 only for debugging; the shipped NVFP4 path stays on WMMA until the serve
-# crash is root-caused (isolated M=1/4/16 parity did not reproduce it — a serve-shape/integration bug).
-_NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "0") != "0"
+# NVFP4 (group-16 e2m1) decode-GEMV lever. DEFAULT ON: group-16 rides the unified decode-GEMV core
+# (per-16-K-half scale fold). The earlier serve crash was the MoE fused kernel's own guards still
+# asserting group_size%32==0 (moe_kernel.hip gemm1_silu/gemm2/scatter) while the shared accum already
+# handled group-16 — fixed to allow group_size==16. Validated on Laguna-XS-2.1-NVFP4 (fe2e 2026-07-23):
+# no crash, coherent greedy output, 21.71 -> 48.6 tok/s (2.24x, WMMA baseline was a mis-applied prefill
+# kernel at M=1). MINISGL_NVFP4_GEMV=0 forces the old WMMA path (A/B + rollback).
+_NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "1") != "0"
 
 
 def _moe_time(bucket: str, fn):
