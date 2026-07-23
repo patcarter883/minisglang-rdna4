@@ -101,10 +101,12 @@ _MOE_FLAG = _os.environ.get("MINISGL_MOE_FLAG", "1") != "0"
 # MINISGL_MOE_G2FUSE=0 reverts to the bit-exact WMMA gemm2 + gather_reduce.
 _MOE_G2FUSE = _os.environ.get("MINISGL_MOE_G2FUSE", "1") != "0"
 
-# NVFP4 (group-16 e2m1) decode-GEMV lever. Default on: group-16 rides the unified decode-GEMV core
-# (per-16-K-half scale fold). Set MINISGL_NVFP4_GEMV=0 to force the pre-change WMMA path for group-16
-# e2m1 (dense wmma_tiled_tuned + MoE WMMA gemm) — an A/B baseline + rollback knob, model-agnostic.
-_NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "1") != "0"
+# NVFP4 (group-16 e2m1) decode-GEMV lever. DEFAULT OFF: the group-16 decode GEMV passes isolated
+# op-parity (cos=1.0 vs WMMA) but CRASHES the full serve at decode (fe2e A/B 2026-07-23: WMMA arm
+# clean 21.71 tok/s; GEMV arm container died on the first decode request). Opt in with
+# MINISGL_NVFP4_GEMV=1 only for debugging; the shipped NVFP4 path stays on WMMA until the serve
+# crash is root-caused (isolated M=1/4/16 parity did not reproduce it — a serve-shape/integration bug).
+_NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "0") != "0"
 
 
 def _moe_time(bucket: str, fn):
