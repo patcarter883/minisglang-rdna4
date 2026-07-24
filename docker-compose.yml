@@ -363,6 +363,12 @@ services:
       # (e.g. a shared system prompt) skips re-prefill. Requires --cache-type radix (below). Validated
       # to coexist with DFlash spec (Track C). MINISGL_SWA_RADIX=0 to disable.
       MINISGL_SWA_RADIX: "${MINISGL_SWA_RADIX:-1}"
+      # page_size=16 under spec (lifts the legacy per-token rollback override). NOT a cold-prefill perf
+      # lever (A/B ~neutral), but REQUIRED for SWA-radix to reliably HIT: page-16-aligned snapshot
+      # boundaries make prefix reuse fire where page_size=1 silently misses (measured: same 1216-token
+      # prefix — ps=16 hits, ps=1 0 hits). GPU-validated coherent + lossless. Forced on for THIS serve
+      # only (not the global default — other MHA-spec models aren't validated at ps=16).
+      MINISGL_SPEC_MHA_PAGED: "${MINISGL_SPEC_MHA_PAGED:-1}"
     entrypoint: ["bash", "-lc"]
     command:
       - |
