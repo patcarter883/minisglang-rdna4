@@ -406,6 +406,85 @@ class GLMMTPAttention(GLMMLAAttention):
         k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(S, H, rope)], dim=-1)  # [S,H,qk]
         return [(k_full[s : s + 1], v[s : s + 1]) for s in range(S)]
 
+    def draft_buffer_dims(self) -> "tuple[int, int, int, int]":
+        """(n_k_heads, k_dim, n_v_heads, v_dim) for the GLOBAL persistent draft-KV buffer the buffered
+        MTP propose allocates (spec/mtp.py). MLA materializes per-head K/V for the tiny draft chain, so
+        it is full multi-head (H q == H k, no GQA) with an ASYMMETRIC k-dim (qk = nope+rope) vs v-dim."""
+        return self.num_heads, self.qk_head_dim, self.num_heads, self.v_head_dim
+
+    def forward_draft_masked(
+        self,
+        x: torch.Tensor,           # [B, hidden] — ONE draft token per row (post input_layernorm)
+        positions: torch.Tensor,   # [B] absolute RoPE position per row
+        k_buf: torch.Tensor,       # [max_slots, max_ctx, H, qk] GLOBAL persistent draft K (materialized)
+        v_buf: torch.Tensor,       # [max_slots, max_ctx, H, vhd] GLOBAL persistent draft V
+        slot_rows: torch.Tensor,   # [B] slot (= req.table_idx) per row
+        write_col: torch.Tensor,   # [B] column this token's K/V is written at, per row
+        mask_bias: torch.Tensor,   # [B, max_ctx] additive: 0 for cols <= write_col, -inf beyond
+    ) -> torch.Tensor:
+        """CUDA-graph-capturable twin of forward_draft: fixed-shape masked attention over a GLOBAL
+        persistent draft-KV buffer (keyed by slot, like page_table / GDN-state) instead of a torch.stack
+        over a growing Python list. The q/k/v + RoPE + per-head materialization is IDENTICAL to
+        forward_draft (keep in sync); only the KV store + attention read change (write to k_buf/v_buf at
+        write_col, attend over the whole max_ctx with the additive -inf mask). softmax(-inf)=0, so this is
+        byte-exact vs the sliced stack. No list mutation, no dynamic shapes → capturable."""
+        B = x.shape[0]
+        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        q = q.view(B, H, self.qk_head_dim)
+        q_nope, q_rope = q[..., :nope], q[..., nope:]
+        kv = self.kv_a_proj_with_mqa.forward(x)
+        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
+        k_rope = kv[:, self.kv_lora_rank :]
+        q_rope, k_rope = self.rotary.forward(
+            positions, q_rope.reshape(B, H * rope).contiguous(), k_rope.contiguous()
+        )
+        q_rope = q_rope.view(B, H, rope)
+        kvb = self.kv_b_proj.forward(c_kv).view(B, H, nope + vhd)
+        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [B,H,nope], [B,H,vhd]
+        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(B, H, rope)], dim=-1)  # [B,H,qk]
+        q_full = torch.cat([q_nope, q_rope], dim=-1)  # [B,H,qk]
+        # Persist this token's per-head K/V into its slot at write_col (dynamic index — capturable).
+        k_buf[slot_rows, write_col] = k_full
+        v_buf[slot_rows, write_col] = v
+        # Full multi-head (1:1 q<->k, no GQA) masked attention over the whole window.
+        Ks = k_buf[slot_rows]  # [B, max_ctx, H, qk] (gather, read-only)
+        Vs = v_buf[slot_rows]  # [B, max_ctx, H, vhd]
+        scores = torch.einsum("bhd,bshd->bhs", q_full, Ks) * self.scale_attn  # [B,H,max_ctx]
+        scores = scores + mask_bias.view(B, 1, -1)  # broadcast the -inf mask over heads
+        probs = scores.softmax(dim=-1).to(Vs.dtype)
+        o = torch.einsum("bhs,bshd->bhd", probs, Vs)  # [B,H,vhd]
+        return self.o_proj.forward(o.reshape(B, H * vhd))
+
+    def seed_kv_masked(
+        self,
+        x: torch.Tensor,          # [S, hidden] — post input_layernorm prompt-prefix rows
+        positions: torch.Tensor,  # [S] absolute RoPE position per row
+        k_buf: torch.Tensor,      # [max_slots, max_ctx, H, qk] GLOBAL persistent draft K
+        v_buf: torch.Tensor,      # [max_slots, max_ctx, H, vhd] GLOBAL persistent draft V
+        slot: int,                # slot (= req.table_idx) to seed
+        start_col: int,           # first column to write (0 for a fresh prompt seed)
+    ) -> None:
+        """Seed the GLOBAL draft-KV buffer from the prompt prefix WITHOUT attention — the buffered twin
+        of seed_kv. q/k/v + RoPE + materialization mirror forward_draft_masked EXACTLY (keep in sync);
+        only the attention read is dropped. Writes S rows into k_buf/v_buf[slot, start_col:start_col+S]."""
+        S = x.shape[0]
+        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        q = q.view(S, H, self.qk_head_dim)
+        q_rope = q[..., nope:]
+        kv = self.kv_a_proj_with_mqa.forward(x)
+        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
+        k_rope = kv[:, self.kv_lora_rank :]
+        _, k_rope = self.rotary.forward(
+            positions, q_rope.reshape(S, H * rope).contiguous(), k_rope.contiguous()
+        )
+        kvb = self.kv_b_proj.forward(c_kv).view(S, H, nope + vhd)
+        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [S,H,nope], [S,H,vhd]
+        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(S, H, rope)], dim=-1)  # [S,H,qk]
+        k_buf[slot, start_col : start_col + S] = k_full
+        v_buf[slot, start_col : start_col + S] = v
+
     def post_load(self) -> None:
         super().post_load()
         self.scale_attn = float(self.qk_head_dim) ** -0.5
@@ -437,6 +516,7 @@ class GLMMTPHead(BaseOP):
         )
         self.shared_head = GLMMTPSharedHead(config)
         self._layer_id = layer_id
+        self.hidden_size = config.hidden_size  # for the buffered-propose seed buffer alloc (spec/mtp.py)
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens.forward(tokens)
@@ -476,6 +556,46 @@ class GLMMTPHead(BaseOP):
         fused = self.fuse(self.embed(tokens), prev_hidden)
         x = self.input_layernorm.forward(fused, None)[0]
         return self.self_attn.seed_kv(x, positions)
+
+    def step_masked(
+        self,
+        fused: torch.Tensor,
+        positions: torch.Tensor,
+        k_buf: torch.Tensor,
+        v_buf: torch.Tensor,
+        slot_rows: torch.Tensor,
+        write_col: torch.Tensor,
+        mask_bias: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CUDA-graph-capturable twin of step(): identical input_layernorm / MLP(MoE) / norm / lm-head,
+        but self-attention uses forward_draft_masked (fixed-shape masked attention over the GLOBAL
+        persistent draft-KV buffer) instead of the growing-list stack. Byte-exact vs step() — only the
+        attention core differs. Drives the batched K-step chain in MTPProposer._chain."""
+        x, residual = self.input_layernorm.forward(fused, None)
+        x = self.self_attn.forward_draft_masked(
+            x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        x = self.mlp.forward(x)
+        hidden = x + residual
+        logits = self.shared_head.forward(hidden)
+        return logits, hidden
+
+    @torch.inference_mode()
+    def seed_buffered(
+        self,
+        tokens: torch.Tensor,
+        prev_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        k_buf: torch.Tensor,
+        v_buf: torch.Tensor,
+        slot: int,
+        start_col: int,
+    ) -> None:
+        """Buffered twin of seed_kv: seed the GLOBAL draft-KV buffer from the prompt prefix (no attention).
+        Mirrors seed_kv's fuse + input_layernorm, then writes into k_buf/v_buf[slot, start_col:]."""
+        fused = self.fuse(self.embed(tokens), prev_hidden)
+        x = self.input_layernorm.forward(fused, None)[0]
+        self.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)
 
 
 class GLMMTPSharedHead(BaseOP):
