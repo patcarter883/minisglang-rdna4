@@ -449,7 +449,14 @@ class Engine:
                 timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            # LONG timeout (not the default 30-min gloo timeout, and NOT distributed_timeout which is a
+            # short active-work hang detector): this group carries the per-step control-message sync
+            # (scheduler/io.py), where rank1's `broadcast(count, root=0).wait()` LEGITIMATELY blocks
+            # indefinitely while the serve is IDLE (rank0 blocks on the ZMQ tokenizer recv and only
+            # broadcasts when a request arrives). With the default 30-min timeout a parked serve dies
+            # after 30 min of no traffic. A crashed rank0 is caught by the parent's worker-death watch,
+            # not this timeout, so a long value is safe.
+            tp_cpu_group = torch.distributed.new_group(backend="gloo", timeout=timedelta(days=7))
             assert tp_cpu_group is not None
             if self._ep_over_tp:
                 # EP-over-TP: the expert-sharding group IS the TP group (all ranks, since dp=1). Build the
