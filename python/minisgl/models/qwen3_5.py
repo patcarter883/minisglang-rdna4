@@ -515,6 +515,11 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 
+    def draft_buffer_dims(self) -> "tuple[int, int, int, int]":
+        """(n_k_heads, k_dim, n_v_heads, v_dim) for the buffered MTP propose draft-KV buffer
+        (spec/mtp.py). Qwen packs GQA with nkv heads and a symmetric head_dim for both K and V."""
+        return self._num_kv_heads, self._head_dim, self._num_kv_heads, self._head_dim
+
     def forward_draft_masked(
         self,
         x: torch.Tensor,           # [B, hidden] — ONE draft token per batch row
