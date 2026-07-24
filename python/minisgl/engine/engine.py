@@ -1045,14 +1045,33 @@ def _adjust_config(config: EngineConfig):
     #     (MHA/GDN) verify stays eager (page_size-1 / recurrent-state paths) — graph disabled there.
     if config.spec_config is not None:
         if not config.model_config.is_mla:
-            if config.page_size != 1:
+            # MHA/SWA spec historically forced page_size=1 for per-token KV rollback. That rollback is
+            # now the SHARED page-aware form used by MLA spec at page_size=16: every free site rounds
+            # via div_ceil(len, ps)*ps, releasing only WHOLE pages beyond the kept run and retaining the
+            # partial page straddling cached_len (its rejected-draft tail is overwritten as the seq
+            # regrows). Allocation (cache.allocate_paged) is likewise page-granular, the HIP verify
+            # kernel reads the global page_size=1 table STRIDED by page_size (hip.py: gpt[..., ::ps]),
+            # and the 30 SWA layers use an independent page_size=1 ring — so the whole MHA/SWA spec path
+            # is page_size-parametrized. page_size>1 gives the 10 full-attn layers 16-token-contiguous KV
+            # (better decode/prefill gather coalescing). GATED default-off pending GPU validation:
+            # MINISGL_SPEC_MHA_PAGED=1 keeps the configured page_size (already snapped to a %16 multiple
+            # by the HIP backend rule above); unset restores the shipped byte-identical page_size=1.
+            _mha_paged = os.environ.get("MINISGL_SPEC_MHA_PAGED", "0") != "0"
+            if _mha_paged and config.page_size > 1:
+                logger.warning_rank0(
+                    f"spec-decode (MHA): keeping page_size={config.page_size} (page-aware rollback; "
+                    "MINISGL_SPEC_MHA_PAGED opt-in — validate before making this the default)"
+                )
+            elif config.page_size != 1:
                 override("page_size", 1)
                 logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
             # All non-MLA backbones now cudagraph-capture the spec-VERIFY forward: the HIP attn
             # verify-capture (S1) is model-agnostic (pure MHA works by itself), and the recurrent
             # backbones thread their per-token state through static scratch buffers — CCA via
             # CCAVerifyGraphCapture, GDN via GDNVerifyGraphCapture. So keep graphs ON for MHA, GDN,
-            # and CCA alike. (page_size stays 1 above for per-token rollback.) The FUSED TiDAR
+            # and CCA alike. (page_size is 1 above unless MINISGL_SPEC_MHA_PAGED opts into paged
+            # rollback; the verify capture reads the global table strided by page_size either way.)
+            # The FUSED TiDAR
             # forward's non-K+1 qlen auto-falls-back to eager via can_use_verify_graph until S4.
             pass
         else:
