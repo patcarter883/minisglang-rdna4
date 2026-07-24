@@ -353,13 +353,19 @@ services:
     restart: "no"  # lease-safe: die on crash so the gpu-lease frees, never orphan-restart
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
+    environment:
+      <<: *lean-env
+      # SWA prefix caching (Track A/C): snapshot/restore the sliding-window ring so a reused prefix
+      # (e.g. a shared system prompt) skips re-prefill. Requires --cache-type radix (below). Validated
+      # to coexist with DFlash spec (Track C). MINISGL_SWA_RADIX=0 to disable.
+      MINISGL_SWA_RADIX: "${MINISGL_SWA_RADIX:-1}"
     entrypoint: ["bash", "-lc"]
     command:
       - |
         exec python -m minisgl \
           --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
           --host 0.0.0.0 --port 1919 \
-          --cache-type naive \
+          --cache-type "${MINISGL_CACHE_TYPE:-radix}" \
           --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
           --page-size 16 \
           --tp "${MINISGL_TP:-2}" \
