@@ -72,6 +72,10 @@ class MTPProposer(Proposer):
         _want = os.environ.get("MINISGL_SPEC_PROPOSE_GRAPH", "1") != "0"
         attn = self._head.self_attn
         self._buffered = _want and hasattr(attn, "forward_draft_masked")
+        # Long-context spec gate (see the buffered block for the rationale). Default: no gate for the
+        # eager path (unchanged behavior); the buffered block lowers it to the draft window. Either way
+        # MINISGL_SPEC_MAX_CONTEXT overrides. Set here so BOTH propose paths can read self._ctx_gate.
+        self._ctx_gate = int(os.environ.get("MINISGL_SPEC_MAX_CONTEXT") or 10**9)
         if _want and not self._buffered:
             from minisgl.utils import init_logger
             init_logger(__name__).info_rank0(
@@ -97,11 +101,21 @@ class MTPProposer(Proposer):
             # the cold seed (lossless — just no early-token lift). MINISGL_MTP_MAX_CTX caps it further.
             from minisgl.engine.graph import get_free_memory  # engine-side free-VRAM probe (bytes)
             per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize  # buffer bytes/column
+            # Peak = the persistent buffer PLUS the per-step gather k_buf[slot_rows]/v_buf[slot_rows],
+            # which is B (<= max_running ~ slots) columns wide — i.e. up to a SECOND buffer-sized
+            # transient at full batch. Budget for both (per_col*2) or a batch-4 burst OOMs the way it
+            # did at bs>=4. Floor 512 cols so propose always has a usable window.
             _budget = int(get_free_memory(dev) * float(os.environ.get("MINISGL_MTP_KV_FRAC", "0.33")))
-            _mem_cap = max(512, _budget // max(per_col, 1))   # >= 512 cols so propose always has a window
+            _mem_cap = max(512, _budget // max(per_col * 2, 1))
             self._max_ctx = min(int(engine.max_seq_len),
                                 int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"),
                                 int(_mem_cap))
+            # Long-context spec gate: above this committed length a request skips propose entirely and
+            # decodes plain. Rationale: once cached_len exceeds the draft window the seed fell back to
+            # cold, so the drafts are context-BLIND (near-zero accept) yet still pay the full propose +
+            # verify(K+1) overhead — net-negative, which is what tanks GLM at 32k. Default = the window
+            # (the natural "propose is blind past here" boundary); MINISGL_SPEC_MAX_CONTEXT tunes it.
+            self._ctx_gate = int(os.environ.get("MINISGL_SPEC_MAX_CONTEXT") or self._max_ctx)
             self._k_buf = torch.zeros(self._max_slots, self._max_ctx, _nkh, _kdim, device=dev, dtype=dt)
             self._v_buf = torch.zeros(self._max_slots, self._max_ctx, _nvh, _vdim, device=dev, dtype=dt)
             self._cur = torch.zeros(self._max_slots, dtype=torch.int64, device=dev)   # committed len/slot
@@ -150,7 +164,8 @@ class MTPProposer(Proposer):
         for i, req in enumerate(reqs):
             k_i = max(0, min(num_draft, req.remain_len - 1))
             seed = ctx.last_hidden.get(req.uid)
-            if k_i <= 0 or seed is None:
+            # Long-context gate: skip propose (plain decode) past the threshold — see __init__.
+            if k_i <= 0 or seed is None or req.cached_len > self._ctx_gate:
                 continue
             # Drop the previous step's rejected-draft tail (keep only confirmed context).
             cache = self._cache.setdefault(req.uid, [])
@@ -213,7 +228,8 @@ class MTPProposer(Proposer):
         for i, req in enumerate(reqs):
             k_i = max(0, min(K, req.remain_len - 1))
             seed = ctx.last_hidden.get(req.uid) if ctx.last_hidden else None
-            if k_i <= 0 or seed is None:
+            # Long-context gate: skip propose (plain decode) past the draft window — see __init__.
+            if k_i <= 0 or seed is None or req.cached_len > self._ctx_gate:
                 continue
             s = int(req.table_idx)
             if self._slot_uid.get(s) != req.uid:   # fresh req on this slot → cold cache
