@@ -80,6 +80,10 @@ x-lean-common: &lean-common
     # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
     # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
     MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
+    # MHA/SWA spec page-aware rollback: =1 keeps page_size=16 under spec (validated coherent +
+    # lossless, but A/B showed NO prefill win, so default 0 = shipped page_size->1). CPU proof:
+    # tools/spec_page_rollback_check.py.
+    MINISGL_SPEC_MHA_PAGED: "${MINISGL_SPEC_MHA_PAGED:-0}"
     # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
     # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
     MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"
