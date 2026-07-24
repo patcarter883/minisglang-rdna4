@@ -926,6 +926,8 @@ class FrontendManager:
                         kv_tokens_used=msg.kv_tokens_used,
                         gdn_slots_total=msg.gdn_slots_total,
                         gdn_slots_used=msg.gdn_slots_used,
+                        prefix_cache_hit_tokens=msg.prefix_cache_hit_tokens,
+                        prefix_cache_prompt_tokens=msg.prefix_cache_prompt_tokens,
                         cam_facts=msg.cam_facts,
                         cam_namespaces=msg.cam_namespaces,
                         cam_evicted=msg.cam_evicted,

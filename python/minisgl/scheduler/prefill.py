@@ -130,6 +130,11 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    # Prefix-cache accounting: hit_tokens = prefix tokens reused from the radix cache,
+    # prompt_tokens = total prompt tokens seen. Counted ONCE per request, at first
+    # admission (not per chunk), so hit_ratio = hit/prompt is a true prefix reuse rate.
+    prefix_hit_tokens: int = 0
+    prefix_prompt_tokens: int = 0
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -148,7 +153,12 @@ class PrefillManager:
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
         for pending_req in self.pending_list:
+            # "new" == not resuming an in-flight chunk: count prefix reuse exactly once.
+            is_new_req = pending_req.chunked_req is None
             if req := adder.try_add_one(pending_req):
+                if is_new_req:
+                    self.prefix_hit_tokens += req.cached_len
+                    self.prefix_prompt_tokens += pending_req.input_len
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
                     pending_req.chunked_req = req

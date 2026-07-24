@@ -120,6 +120,8 @@ def tokenize_worker(
                         kv_tokens_used=sm.kv_tokens_used,
                         gdn_slots_total=sm.gdn_slots_total,
                         gdn_slots_used=sm.gdn_slots_used,
+                        prefix_cache_hit_tokens=sm.prefix_cache_hit_tokens,
+                        prefix_cache_prompt_tokens=sm.prefix_cache_prompt_tokens,
                         cam_facts=sm.cam_facts,
                         cam_namespaces=sm.cam_namespaces,
                         cam_evicted=sm.cam_evicted,

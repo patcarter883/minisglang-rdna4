@@ -104,6 +104,8 @@ class BackendSnapshot:
     kv_tokens_used: int = 0
     gdn_slots_total: int = 0
     gdn_slots_used: int = 0
+    prefix_cache_hit_tokens: int = 0
+    prefix_cache_prompt_tokens: int = 0
     cam_facts: int = 0
     cam_namespaces: int = 0
     cam_evicted: int = 0
@@ -186,6 +188,8 @@ class FrontendMetrics:
             total.kv_tokens_used += s.kv_tokens_used
             total.gdn_slots_total += s.gdn_slots_total
             total.gdn_slots_used += s.gdn_slots_used
+            total.prefix_cache_hit_tokens += s.prefix_cache_hit_tokens
+            total.prefix_cache_prompt_tokens += s.prefix_cache_prompt_tokens
             # CAM stores are per-replica (DP-pinned): sum counts (idle replicas report 0), max the load.
             total.cam_facts += s.cam_facts
             total.cam_namespaces += s.cam_namespaces
@@ -247,12 +251,17 @@ class FrontendMetrics:
                 "Tokens emitted by spec steps (accepted + bonus).", b.spec_emitted_tokens)
         counter("minisgl_spec_steps_total",
                 "Speculative verify steps executed.", b.spec_steps)
-        # Derived gauges. mean_accept_len = tokens committed per verify step (accepted + 1 bonus);
-        # >= 1 always, == 1 means nothing is being accepted. accept_rate = accepted / proposed.
-        if b.spec_steps > 0:
+        # Derived gauges. mean_accept_len = tokens committed PER REQUEST per verify (accepted + 1
+        # bonus); >= 1 always, == 1 means nothing is being accepted. accept_rate = accepted / proposed.
+        # NOTE: spec_steps counts verify *batches* (one per _spec_decode_step call), while the token
+        # counters sum *per-request* over the batch — so accepted/steps would inflate by the mean
+        # batch size. The exact per-request count is (emitted - accepted): every request emits exactly
+        # one bonus token, so emitted - accepted == the number of (request, verify) instances.
+        _spec_reqs = b.spec_emitted_tokens - b.spec_accepted_tokens
+        if _spec_reqs > 0:
             gauge("minisgl_spec_mean_accept_len",
-                  "Mean tokens committed per verify step (accepted drafts + 1 bonus).",
-                  1.0 + b.spec_accepted_tokens / b.spec_steps)
+                  "Mean tokens committed per request per verify (accepted drafts + 1 bonus).",
+                  b.spec_emitted_tokens / _spec_reqs)
         if b.spec_draft_tokens > 0:
             gauge("minisgl_spec_accept_rate",
                   "Fraction of proposed draft tokens accepted.",
@@ -273,6 +282,19 @@ class FrontendMetrics:
               "GDN/CCA recurrent-state slot capacity.", b.gdn_slots_total)
         gauge("minisgl_gdn_state_used_slots",
               "GDN/CCA recurrent-state slots in use.", b.gdn_slots_used)
+
+        # ---- prefix cache (radix reuse) ---------------------------------------------------------
+        # hit = prefix tokens served from the radix cache; prompt = total prompt tokens seen; both
+        # cumulative counters so a dashboard can rate() them. hit_ratio is the instantaneous overall
+        # reuse fraction (0 when nothing prompted yet). All 0 with --cache-type naive.
+        counter("minisgl_prefix_cache_hit_tokens_total",
+                "Prompt tokens served from the prefix (radix) cache.", b.prefix_cache_hit_tokens)
+        counter("minisgl_prefix_cache_prompt_tokens_total",
+                "Total prompt tokens seen (prefix-cache denominator).", b.prefix_cache_prompt_tokens)
+        _hit_ratio = (b.prefix_cache_hit_tokens / b.prefix_cache_prompt_tokens
+                      if b.prefix_cache_prompt_tokens > 0 else 0.0)
+        gauge("minisgl_prefix_cache_hit_ratio",
+              "Cumulative prefix-cache hit ratio (hit_tokens / prompt_tokens).", _hit_ratio)
 
         # ---- CAM editable-memory store (backend; all 0 when CAM is off) --------------------------
         gauge("minisgl_cam_facts",

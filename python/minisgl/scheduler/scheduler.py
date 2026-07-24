@@ -788,6 +788,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 spec_steps=self._m_spec_steps,
                 running_requests=len(self.decode_manager.running_reqs),
                 waiting_requests=len(self.prefill_manager.pending_list),
+                prefix_cache_hit_tokens=self.prefill_manager.prefix_hit_tokens,
+                prefix_cache_prompt_tokens=self.prefill_manager.prefix_prompt_tokens,
                 kv_tokens_total=int(kv_total),
                 kv_tokens_used=int(kv_used),
                 gdn_slots_total=int(gdn_total),
