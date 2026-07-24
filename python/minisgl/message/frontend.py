@@ -53,6 +53,8 @@ class StatsFrontendMsg(BaseFrontendMsg):
     kv_tokens_used: int
     gdn_slots_total: int
     gdn_slots_used: int
+    prefix_cache_hit_tokens: int = 0
+    prefix_cache_prompt_tokens: int = 0
     # CAM editable-memory store stats (0 when CAM is off), aggregated across namespaces.
     cam_facts: int = 0
     cam_namespaces: int = 0
