@@ -85,13 +85,23 @@ class MTPProposer(Proposer):
             # page_table is [max_running_req + 1, aligned_max_seq_len]; its row count is exactly the
             # slot space of req.table_idx (0..max_running_req), so key the draft-KV buffer off it.
             self._max_slots = int(engine.page_table.shape[0])
-            # Cap the draft-KV window to bound VRAM (buffer = slots * max_ctx * nkv * hd * 2kv * dt).
-            # TODO: sequences whose MTP context exceeds max_ctx are not yet handled (would overflow the
-            # cursor); the write_col is clamped as a backstop. Raise MINISGL_MTP_MAX_CTX for long ctx.
-            self._max_ctx = min(int(engine.max_seq_len),
-                                int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"))
             dt = engine.dtype
             dev = self._device
+            # Cap the draft-KV window to bound VRAM. The buffer is slots*max_ctx*(nkh*kdim+nvh*vdim)*dt,
+            # AND every propose step gathers k_buf[slot_rows]/v_buf[slot_rows] over the WHOLE window as a
+            # transient of comparable size — so a naive 8192 window OOMs on a heavy head (GLM MLA: 96
+            # materialized heads => a ~1.4 GB buffer + ~0.3 GB/step transient, which OOM'd the ~1 GiB
+            # free after graph capture). Size max_ctx to the memory actually free at proposer-build time:
+            # budget the buffer at ~1/3 of free (leaving room for the per-step transient + KV growth), so
+            # it auto-shrinks for heavy heads / tight cards. A prompt longer than max_ctx falls back to
+            # the cold seed (lossless — just no early-token lift). MINISGL_MTP_MAX_CTX caps it further.
+            from minisgl.engine.graph import get_free_memory  # engine-side free-VRAM probe (bytes)
+            per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize  # buffer bytes/column
+            _budget = int(get_free_memory(dev) * float(os.environ.get("MINISGL_MTP_KV_FRAC", "0.33")))
+            _mem_cap = max(512, _budget // max(per_col, 1))   # >= 512 cols so propose always has a window
+            self._max_ctx = min(int(engine.max_seq_len),
+                                int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"),
+                                int(_mem_cap))
             self._k_buf = torch.zeros(self._max_slots, self._max_ctx, _nkh, _kdim, device=dev, dtype=dt)
             self._v_buf = torch.zeros(self._max_slots, self._max_ctx, _nvh, _vdim, device=dev, dtype=dt)
             self._cur = torch.zeros(self._max_slots, dtype=torch.int64, device=dev)   # committed len/slot
