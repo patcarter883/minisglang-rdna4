@@ -1418,42 +1418,47 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             break
     full_content = "".join(content_chunks)
 
-    # Reasoning: split a thinking model's `<think>…</think>` scratch out of the answer into a
-    # separate reasoning_content field (the opening tag is in the prompt, so the completion carries
-    # only the closing </think> + answer). No-op when disabled / thinking off. thinking_open=True:
-    # thinking is active here, so an output with NO closing </think> is a truncated chain-of-thought
-    # -> route it entirely to reasoning_content, not the visible answer.
-    reasoning_content: str | None = None
-    body = full_content
-    parser = _reasoning_parser()
-    if parser is not None and _thinking_active(req):
-        reasoning_content, body = parser.parse(full_content, thinking_open=True)
-
-    # Tool calling: if tools were offered, parse any <tool_call> blocks the model emitted (AFTER the
-    # reasoning split) into OpenAI-shaped tool_calls and flip finish_reason. No tools -> untouched.
-    message: dict = {"role": "assistant", "content": body}
-    if reasoning_content is not None:
-        message["reasoning_content"] = reasoning_content
+    # Tool calls are extracted from the RAW output FIRST, BEFORE the reasoning split. A reasoning
+    # model (Laguna/poolside) emits its <tool_call> block WITHOUT ever closing </think>, so splitting
+    # reasoning first (thinking_open=True) traps the ENTIRE block — markup and all — inside
+    # reasoning_content, leaving `body` empty: tool_calls come back null and the caller sees raw
+    # `<arg_value>…</arg_value></tool_call>` leak into the payload (the spine acceptance battery's
+    # signature). Mirror the streaming path (ToolCallStreamState runs pre-reasoning-split): pull the
+    # calls out of the raw text, THEN reasoning-split only the non-tool remainder.
+    tool_calls: List[dict] | None = None
+    remainder = full_content
     if _pl_forced_tool_grammar is not None:
         # Forced tool call: zaya_xml -> native XML (wrapper parser); else JSON {"name","arguments"}.
         if '"__ebnf__"' in _pl_forced_tool_grammar:
-            content, tool_calls = _parse_tool_calls(body, uid)
-            if tool_calls:
-                message["content"] = content
-                message["tool_calls"] = tool_calls
-                finish_reason = "tool_calls"
+            _c, _tc = _parse_tool_calls(full_content, uid)
+            if _tc:
+                tool_calls, remainder = _tc, (_c or "")
         else:
-            tc = _parse_json_tool_call(body, uid)
+            tc = _parse_json_tool_call(full_content, uid)
             if tc is not None:
-                message["content"] = None
-                message["tool_calls"] = [tc]
-                finish_reason = "tool_calls"
+                tool_calls, remainder = [tc], ""
     elif req.tools and finish_reason != "length":
-        content, tool_calls = _parse_tool_calls(body, uid)
-        if tool_calls:
-            message["content"] = content
-            message["tool_calls"] = tool_calls
-            finish_reason = "tool_calls"
+        _c, _tc = _parse_tool_calls(full_content, uid)
+        if _tc:
+            tool_calls, remainder = _tc, (_c or "")
+
+    # Reasoning: split a thinking model's `<think>…</think>` scratch out of the (tool-stripped)
+    # remainder into a separate reasoning_content field (the opening tag is in the prompt, so the
+    # completion carries only the closing </think> + answer). No-op when disabled / thinking off.
+    # thinking_open=True: thinking is active here, so an output with NO closing </think> is a truncated
+    # chain-of-thought -> route it entirely to reasoning_content, not the visible answer.
+    reasoning_content: str | None = None
+    body = remainder
+    parser = _reasoning_parser()
+    if parser is not None and _thinking_active(req):
+        reasoning_content, body = parser.parse(remainder, thinking_open=True)
+
+    message: dict = {"role": "assistant", "content": (body or None) if tool_calls else body}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish_reason = "tool_calls"
 
     return {
         "id": f"chatcmpl-{uid}",
