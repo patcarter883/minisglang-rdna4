@@ -78,7 +78,10 @@ class MTPProposer(Proposer):
                 "spec-decode: buffered/captured MTP propose unavailable (head has no masked draft "
                 "attention) — using the eager list path")
         if self._buffered:
-            nkv, hd = attn._num_kv_heads, attn._head_dim
+            # Draft-KV buffer geometry is head-specific: Qwen packs GQA (nkv heads, symmetric hd for
+            # K and V); GLM MLA materializes full multi-head with an ASYMMETRIC k-dim (qk) vs v-dim.
+            # Each MTP attention declares its own (n_k_heads, k_dim, n_v_heads, v_dim).
+            _nkh, _kdim, _nvh, _vdim = attn.draft_buffer_dims()
             # page_table is [max_running_req + 1, aligned_max_seq_len]; its row count is exactly the
             # slot space of req.table_idx (0..max_running_req), so key the draft-KV buffer off it.
             self._max_slots = int(engine.page_table.shape[0])
@@ -89,8 +92,8 @@ class MTPProposer(Proposer):
                                 int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"))
             dt = engine.dtype
             dev = self._device
-            self._k_buf = torch.zeros(self._max_slots, self._max_ctx, nkv, hd, device=dev, dtype=dt)
-            self._v_buf = torch.zeros(self._max_slots, self._max_ctx, nkv, hd, device=dev, dtype=dt)
+            self._k_buf = torch.zeros(self._max_slots, self._max_ctx, _nkh, _kdim, device=dev, dtype=dt)
+            self._v_buf = torch.zeros(self._max_slots, self._max_ctx, _nvh, _vdim, device=dev, dtype=dt)
             self._cur = torch.zeros(self._max_slots, dtype=torch.int64, device=dev)   # committed len/slot
             self._col_idx = torch.arange(self._max_ctx, device=dev)                    # [max_ctx]
             self._slot_uid: Dict[int, int] = {}   # which uid currently owns each slot (reset cursor on reuse)
@@ -98,7 +101,8 @@ class MTPProposer(Proposer):
             # Static I/O buffers for the CAPTURED K-step chain (one graph per exact batch size, captured
             # on demand). The chain reads _g_seed/_g_tok/_g_slots/_g_base/_g_curb[:B] and writes drafts to
             # _g_out[:B]; k_buf/v_buf are persistent externals the graph writes in place.
-            hidden = int(self._head.pre_fc_norm_hidden.weight.shape[-1])
+            hidden = int(getattr(self._head, "hidden_size", 0)) \
+                or int(self._head.pre_fc_norm_hidden.weight.shape[-1])
             G = self._max_slots
             self._g_seed = torch.zeros(G, hidden, device=dev, dtype=dt)
             self._g_tok = torch.zeros(G, dtype=torch.int64, device=dev)
