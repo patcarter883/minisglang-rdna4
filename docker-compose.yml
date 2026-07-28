@@ -42,7 +42,7 @@ x-lean-common: &lean-common
     # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
     # moe_bf16 / rxf, still vendored here until ported upstream).
     PYTHONPATH: /opt/kernels:/engine/python:/engine
-    HF_HUB_OFFLINE: "1"
+    HF_HUB_OFFLINE: "0"
     TORCH_BLAS_PREFER_HIPBLASLT: "0"
     # Fragmentation guard: on the 16 GB cards a full-model + graph-capture footprint (e.g. the 35B
     # MXFP4 GDN-hybrid) can leave enough free memory but too little CONTIGUOUS free after capture —
@@ -80,6 +80,8 @@ x-lean-common: &lean-common
     # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
     # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
     MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
+    # MoE quant mode: 0 = W4A8 (int4 wt + int8/fp8 act via FP8-WMMA); 1 = W4A16 (weight-only, fp16 act).
+    MINISGL_MOE_W4A16: "${MINISGL_MOE_W4A16:-0}"
     # MHA/SWA spec page-aware rollback: =1 keeps page_size=16 under spec (validated coherent +
     # lossless, but A/B showed NO prefill win, so default 0 = shipped page_size->1). CPU proof:
     # tools/spec_page_rollback_check.py.
@@ -135,6 +137,335 @@ services:
     entrypoint: ["bash", "-lc"]
     command:
       - ${MINISGL_CMD:-python /engine/tools/container_selftest.py}
+
+  # vllm 0.24 + full HIP kernels — the PERFORMANT Qwen3.6-35B serve (measured 82.3 tok/s bs=1 decode
+  # vs minisglang ~47, no-spec; stock-Triton ceiling 92). Runs the BEST current gdn_hip state by
+  # DEFAULT: stride-aware gdn_hip_C.so (indexes the paged mamba cache in place, no fp32 full-cache
+  # copy) + paged/cast-free glue + bf16 SSM state (halves recurrent-state HBM). Progression that got
+  # here: 24 (baked fp32 full-cache copy) -> 72 (slot-copy) -> 79.6 (stride paged) -> 81.6 (cast-free)
+  # -> 81.8 (bf16 ssm) -> 82.3 (fused conv+decode). Remaining 81.8->92 is decode launch/gap structure (~1478 dispatches/token).
+  # Run (lease-bound so the janitor never reaps it):
+  #     gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
+  #     docker compose -p lease-vhip logs -f          # watch boot (~2.5 min, no 30-min GDN autotune)
+  #     curl localhost:8000/v1/chat/completions ...    # served model name: "x"
+  #     docker compose -p lease-vhip down              # stop + release lease
+  # Rebuild the stride-aware .so after editing rdna4-hip-kernels/gdn:  bash gdn/local/build_local.sh
+  # (inside the image toolchain). To A/B a HIP kernel: set VLLM_PLUGINS (whitelist) /
+  # VLLM_ATTENTION_BACKEND (ROCM_HIP_ATTN|TRITON_ATTN); to fall back to the baked (slow fp32-copy) glue
+  # set VHIP_GLUE_DST=/tmp/x VHIP_SO_DST=/tmp/y.  Port 8000; probe: tools/msgl_probe.py <pre> <gen> 8000.
+  vhip:
+    <<: *lean-common
+    image: vllm24-hip:combined
+    profiles: ["vhip"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      # DEFAULT ON: paged-aware gdn_hip glue over the baked (slow, fp32-full-cache-copy) one.
+      - ${VHIP_GLUE_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/vllm_oot_slotfix.py}:${VHIP_GLUE_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/vllm_oot.py}:ro
+      # DEFAULT ON: rebuilt stride-aware gdn_hip_C.so over the baked contiguous-only one.
+      - ${VHIP_SO_SRC:-/home/pat/code/rdna4-hip-kernels/gdn/torch-ext/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:${VHIP_SO_DST:-/opt/kernels/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:ro
+      # DEFAULT ON: bf16 SSM state (conv stays fp32) — halves recurrent-state traffic vs the forced-fp32 baked register.
+      - ${VHIP_REG_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/register_bf16ssm.py}:${VHIP_REG_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/register.py}:ro
+      # DEFAULT ON: mla_vllm — the vLLM glue for the baked /opt/kernels/mla_hip kernels. The image
+      # ships the kernels AND exports VLLM_MLA_HIP=1 but has no glue, so vLLM picks the CK FMHA for
+      # MLA prefill and SEGFAULTS on gfx1201 at GLM-4.7-Flash's 256/256 dims. The dist-info is what
+      # makes `mla_hip` resolvable in VLLM_PLUGINS (entry-point group vllm.general_plugins).
+      - ${VHIP_MLAGLUE_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/mla_vllm}:/usr/local/lib/python3.12/dist-packages/mla_vllm:ro
+      - ${VHIP_MLAMETA_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/mla_vllm-0.1.0.dist-info}:/usr/local/lib/python3.12/dist-packages/mla_vllm-0.1.0.dist-info:ro
+      # ...and the rebuilt mla_hip that adds mla_prefill_lse (the baked one has prefill WITHOUT the
+      # log-sum-exp output, so it cannot serve vLLM's chunked-context prefill merge).
+      - ${VHIP_MLASO_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/mla/torch-ext/mla_hip/mla_hip_C.cpython-312-x86_64-linux-gnu.so}:/opt/kernels/mla_hip/mla_hip_C.cpython-312-x86_64-linux-gnu.so:ro
+      - ${VHIP_MLAINIT_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/mla/torch-ext/mla_hip/__init__.py}:/opt/kernels/mla_hip/__init__.py:ro
+      # DEFAULT ON: route auto_awq DENSE linears to our W4A8 FP8-WMMA kernel. vLLM only consults
+      # _POSSIBLE_KERNELS (where w4a8_vllm installs it) for AWQ on CUDA/CPU — on ROCm it goes
+      # straight to the pure-Triton awq_gemm_triton, so our kernel was dead weight for every AWQ
+      # model here. (That Triton kernel is also bf16-broken: it accumulates in the output dtype.)
+      - ${VHIP_AWQDENSE_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/awqdense_vllm}:/usr/local/lib/python3.12/dist-packages/awqdense_vllm:ro
+      - ${VHIP_AWQMETA_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/awqdense_vllm-0.1.0.dist-info}:/usr/local/lib/python3.12/dist-packages/awqdense_vllm-0.1.0.dist-info:ro
+      # PERSISTENT TRITON CACHE — not optional here. vLLM's FLA GDN chunk kernels
+      # (chunk_scaled_dot_kkt_fwd et al) are Triton-AUTOTUNED per shape, and spec decode at
+      # concurrency introduces shapes that warmup never covered. A cold autotune of those takes
+      # longer than the executor's RPC timeout, so BOTH ranks sit in do_bench/make_amdgcn and vLLM
+      # declares the workers dead ("RPC call to execute_model timed out") — it reads exactly like a
+      # TP deadlock but is just an unbounded first-run compile. Persisting the cache pays it once.
+      # NOTE its own dir, not vllm-gfx1201/.triton-cache-combined: that one belongs to the vllm22
+      # image and this is vllm24 with a different Triton/torch (per vllm-gfx1201 CLAUDE.md §2-3,
+      # a changed toolchain wants a fresh cache).
+      - ${VHIP_TRITON_CACHE:-/home/pat/code/vllm-gfx1201/.triton-cache-vllm24hip}:/root/.triton
+      # ALWAYS-ON startup attention autotune (tcclaviger's, vllm/v1/attention/ops/attn_autotune.py):
+      # profiles ~12 configs x every cudagraph capture size x every attention group on EVERY boot and
+      # has NO load path upstream — it only dumps. With the GDN path on native HIP (no Triton compile)
+      # this is the dominant boot cost. The patched module adds a persistent cache keyed by a hash of
+      # upstream's own cache_key, so a hit is byte-identical tuning with none of the wait.
+      #   VLLM_ATTN_AUTOTUNE=0 additionally skips it entirely -> built-in defaults (fast, UNTUNED).
+      - ${VHIP_ATTNTUNE_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/attn_autotune.py}:/app/vllm/vllm/v1/attention/ops/attn_autotune.py:ro
+      - ${VHIP_ATTNTUNE_CACHE:-/home/pat/code/vllm-gfx1201/.attn-autotune-cache-vllm24hip}:/root/.attn_tune
+      # Rebuilt fp8_wmma_C.so — adds the BYLANE (N-on-lanes) tiling to the shared gemv_decode core
+      # plus the Int4Fp16GemvLoader policy that folds the former standalone W4A16 MoE GEMV onto it.
+      # The image's own package was built with the same local shim (namespace fp8_wmma_C, same .so
+      # basename), so this drops straight in. Both package names are the SAME .so in the image —
+      # mount both so they can never skew. Rebuild: MINISGL_IMAGE=vllm24-hip:combined
+      # MINISGL_CMD='cd /kernels/fp8_wmma && GPU_ARCHS=gfx1201 bash local/build_local.sh'
+      # gpu-lease -n 1 -- docker compose --profile run run --rm run
+      - ${VHIP_FP8SO_SRC:-/home/pat/code/rdna4-hip-kernels/fp8_wmma/torch-ext/fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so}:/opt/kernels/w4a8_fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so:ro
+      - ${VHIP_FP8SO_SRC:-/home/pat/code/rdna4-hip-kernels/fp8_wmma/torch-ext/fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so}:/opt/kernels/fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so:ro
+      # ...and the matching package __init__.py (strict superset of the image's: adds only the
+      # mmq_regdirect_w4a16_moe_gemv_silu wrapper for the new fused-SiLU op).
+      - ${VHIP_FP8INIT_SRC:-/home/pat/code/rdna4-hip-kernels/fp8_wmma/torch-ext/fp8_wmma/__init__.py}:/opt/kernels/w4a8_fp8_wmma/__init__.py:ro
+      # W4A16 grouped MoE. MEASURED (tools/profiling, cudagraph decode trace): the stock Triton
+      # `fused_moe_kernel_gptq_awq` is the #1 decode kernel at 26% of GPU time — our fp8-activation
+      # grouped kernel never engaged there, because the crossover cache's decode window is empty.
+      # This patched hook routes M<=96 to `mmq_regdirect_w4a16_moe_gemv`, which reads the SAME
+      # standard (E,N,K/8) weights (no repack, no extra VRAM) and skips activation quantisation
+      # entirely: rel error vs an fp16 dequant reference 0.0006 vs the fp8 path's 0.045
+      # (tools/vhip_patches/test_w4a16_moe.py, 4/4 on the real Qwen expert shape).
+      - ${VHIP_MOEEXP_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/moe_experts.py}:/usr/local/lib/python3.12/dist-packages/w4a8_vllm/moe_experts.py:ro
+      # rdna4_vllm: the consolidated native-HIP wiring plugin (LM head today; see
+      # docs/RDNA4_VLLM_WIRING_SPEC.md). Registered as a real vllm.general_plugins entry point.
+      - ${VHIP_RDNA4_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/rdna4_vllm}:/usr/local/lib/python3.12/dist-packages/rdna4_vllm:ro
+      - ${VHIP_RDNA4META_SRC:-/home/pat/code/minisgl-rdna4/tools/vhip_patches/rdna4_vllm-0.1.0.dist-info}:/usr/local/lib/python3.12/dist-packages/rdna4_vllm-0.1.0.dist-info:ro
+      # dense_gemm is NOT in the base image; the LM-head M>16 branch needs it (no-fallback policy
+      # means that path must be a real kernel, not a raise). Built via dense_gemm/local/build_local.sh.
+      - ${VHIP_DENSEGEMM_SRC:-/home/pat/code/rdna4-hip-kernels/dense_gemm/torch-ext/dense_gemm}:/opt/kernels/dense_gemm:ro
+      # torch.compile / inductor AOT cache. vLLM writes it to /root/.cache/vllm and logs "saved AOT
+      # compiled function to ..." — but with the dir unmounted that is thrown away on container exit,
+      # so every boot recompiles the backbone (~28 s) + eagle head (~6 s). Persisting it is the second
+      # biggest boot win after the attention-autotune cache. Keyed by model+config hash, so each
+      # distinct matrix row compiles once and is free thereafter.
+      - ${VHIP_VLLM_CACHE:-/home/pat/code/vllm-gfx1201/.vllm-compile-cache-vllm24hip}:/root/.cache/vllm
+    # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
+    # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
+    # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
+    # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
+    #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
+    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
+    #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
+    #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
+    #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        # Escape hatch: run an arbitrary command with THIS service's mounts+env instead of the
+        # server. A profile has to see the same glue/.so/plugin overlays the serve sees, and the
+        # `run` profile above carries none of them — duplicating this mount list into a second
+        # service is exactly how the two would drift apart. One-shot use (foreground):
+        #   VHIP_CMD='export VLLM_TORCH_PROFILER_DIR=/engine/tools/profiling/prof_out PROF_MODEL=x;
+        #             python3 /engine/tools/profiling/offline_profile.py' \
+        #   gpu-lease -n 2 --name vhipprof -- docker compose --profile vhip run --rm vhip
+        if [ -n "$${VHIP_CMD:-}" ]; then echo "[vhip] VHIP_CMD override"; eval "$${VHIP_CMD}"; exit $$?; fi
+        args=("$${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+          --host 0.0.0.0 --port 8000 --tensor-parallel-size "$${VHIP_TP:-2}"
+          --max-model-len "$${VHIP_MAXLEN:-60000}"
+          --kv-cache-dtype "$${VHIP_KV:-fp8}" --dtype "$${VHIP_DTYPE:-float16}"
+          --max-num-batched-tokens "$${VHIP_MBT:-2048}" --max-num-seqs "$${VHIP_MNS:-8}"
+          --gpu-memory-utilization "$${VHIP_MEM:-0.92}"
+          --language-model-only
+          --served-model-name x --trust-remote-code)
+        if [ -n "$${VHIP_SPEC:-}" ]; then args+=(--speculative-config "$${VHIP_SPEC}"); fi
+        # free-form escape hatch, word-split on purpose (e.g. VHIP_EXTRA='--enforce-eager --seed 0')
+        if [ -n "$${VHIP_EXTRA:-}" ]; then args+=($${VHIP_EXTRA}); fi
+        # Prefix caching: default ON (VHIP_PREFIX_CACHE=1) — a serve that re-prefills every turn is
+        # mostly useless. vLLM auto-disables it for a HYBRID GDN model, so we force it on, which puts
+        # the mamba cache in experimental 'align' mode (attn block padded up to the GDN page + a full
+        # conv+ssm GDN state snapshot reserved PER KV block). MoE 35B fits at VHIP_MNS<=4. On a DENSE-GDN
+        # model (Qwen 27B) that per-block state ~doubles the footprint and can overcommit the 16GB card
+        # ("No available memory for the cache blocks") — trim VHIP_MNS / VHIP_MAXLEN, or VHIP_PREFIX_CACHE=0.
+        pc="$${VHIP_PREFIX_CACHE}"; [ "$$pc" = 1 ] && args+=(--enable-prefix-caching)
+        # reasoning parser (<think> -> reasoning_content), tool-call parser + auto tool-choice, and the
+        # checkpoint's preserve_thinking chat-template kwarg. Defaults live in the environment block below
+        # (a bash ${VAR:-default} silently drops here). Set any of these env vars to "off" to skip.
+        rp="$${VHIP_REASONING_PARSER}"; [ "$$rp" != off ] && [ -n "$$rp" ] && args+=(--reasoning-parser "$$rp")
+        tp="$${VHIP_TOOL_PARSER}"
+        if [ "$$tp" != off ] && [ -n "$$tp" ]; then
+          args+=(--tool-call-parser "$$tp")
+          [ "$${VHIP_TOOL_CHOICE}" = 1 ] && args+=(--enable-auto-tool-choice)
+        fi
+        ctk="$${VHIP_CHAT_TEMPLATE_KWARGS}"; [ "$$ctk" != off ] && [ -n "$$ctk" ] && args+=(--default-chat-template-kwargs "$$ctk")
+        echo "[vhip] spec=$${VHIP_SPEC:-none} reasoning=$${rp:-off} tools=$${tp:-off} auto-tool-choice=$${VHIP_TOOL_CHOICE} ctk=$${ctk:-off}"
+        exec /app/tools/image_entrypoint.sh "$${args[@]}"
+    environment:
+      <<: *lean-env
+      PYTHONPATH: /opt/kernels
+      NCCL_P2P_DISABLE: "1"
+      NCCL_PROTO: Simple
+      # `awq_dense_hip` MUST be here, not just in the glm/laguna presets. w4a8_fp8_wmma_register
+      # installs our W4A8 kernel at _POSSIBLE_KERNELS[ROCM][0], but for an AWQ checkpoint that
+      # registry is NEVER consulted on ROCm (AutoAWQConfig.get_quant_method routes to the
+      # choose_mp_linear_kernel path only on CUDA/CPU; on ROCm it returns AutoAWQLinearMethod ->
+      # vLLM's pure-Triton awq_gemm). Without awq_dense_hip our dense kernel is dead weight and every
+      # AWQ dense linear runs stock Triton — which is what Qwen3.6-35B-A3B-AWQ was silently doing.
+      # NOTE the `-` not `:-`: an EXPLICIT empty VLLM_PLUGINS must mean "load no plugins" (the
+      # all-stock A/B row). With `:-` compose substitutes the default on empty as well as unset, so
+      # `VLLM_PLUGINS=""` silently booted the full HIP stack and an all-stock row measured identical
+      # to the HIP baseline — a fake null result. Only UNSET now falls back to the default.
+      VLLM_PLUGINS: "${VLLM_PLUGINS-gdn_hip,tail_hip_register,w4a8_fp8_wmma_register,awq_dense_hip,rdna4_hip}"
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      # W4A8 dispatch gates. FORCE=on keeps MoE experts on our grouped FP8-WMMA kernel for every
+      # batch; "auto" (default) consults the tuned crossover cache and falls back to stock Triton
+      # fused_moe outside the proven-winning M window. AWQ_DENSE=0 disables the dense routing plugin.
+      VLLM_ROCM_W4A8_FORCE: "${VLLM_ROCM_W4A8_FORCE:-auto}"
+      VLLM_ROCM_W4A8_AWQ_DENSE: "${VLLM_ROCM_W4A8_AWQ_DENSE:-1}"
+      # W4A16 decode MoE (see the moe_experts.py mount above): auto|on|off. DEFAULT AUTO —
+      # MEASURED 90.7 vs 83.0 tok/s bs=1 decode (+9.3%) AND ~70x more accurate than the fp8-act path
+      # (rel err 0.0006 vs 0.045). Needed BOTH the BYLANE tiling for gemm2 (K=256 starved the
+      # K-on-lanes wave) and fused SiLU/scatter epilogues; either alone measures as a regression or
+      # a wash. "auto" engages only on an fp16 serve (the GEMV takes at::Half pointers, so bf16 —
+      # GLM, Laguna — would need a per-step cast, exactly the hidden hot-path copy this forbids);
+      # "on" engages regardless and raises on bf16. The decision is printed once at the first
+      # expert batch either way, so it can never go inert unnoticed.
+      VLLM_ROCM_W4A16_MOE: "${VLLM_ROCM_W4A16_MOE:-auto}"
+      VLLM_ROCM_W4A16_MOE_MAX_M: "${VLLM_ROCM_W4A16_MOE_MAX_M:-96}"
+      # First-batch MoE crossover autotune. It runs a synchronous A/B on the FIRST batch that hits
+      # an untuned expert shape — on TP>1 that is a long one-rank stall mid-step, which desyncs the
+      # ranks and kills the engine with "RPC call to sample_tokens timed out". Off by default here.
+      VLLM_ROCM_W4A8_AUTOTUNE: "${VLLM_ROCM_W4A8_AUTOTUNE:-off}"
+      # GDN spec-decode path selection (see tools/profiling/vllm_oot_slotfix.py).
+      VLLM_GDN_HIP_SPEC: "${VLLM_GDN_HIP_SPEC:-0}"
+      VLLM_GDN_HIP_SPEC_DEBUG: "${VLLM_GDN_HIP_SPEC_DEBUG:-0}"
+      VLLM_GDN_HIP_SPEC_NO_SCATTER: "${VLLM_GDN_HIP_SPEC_NO_SCATTER:-0}"
+      VLLM_GDN_HIP_SPEC_AB: "${VLLM_GDN_HIP_SPEC_AB:-0}"
+      VLLM_GDN_HIP_SPEC_GATHER: "${VLLM_GDN_HIP_SPEC_GATHER:-0}"
+      VLLM_GDN_HIP_SPEC_FUSED: "${VLLM_GDN_HIP_SPEC_FUSED:-1}"
+      # Startup attention-autotune control (see the mounts above).
+      VLLM_ATTN_AUTOTUNE_CACHE_DIR: "${VLLM_ATTN_AUTOTUNE_CACHE_DIR:-/root/.attn_tune}"
+      VLLM_ATTN_AUTOTUNE: "${VLLM_ATTN_AUTOTUNE:-1}"
+      # Give a COLD Triton autotune room to finish. vLLM's default (300 s) is shorter than a
+      # first-time GDN chunk-kernel tune on a fresh shape, and blowing it kills the engine outright
+      # rather than just being slow. With the Triton cache mounted above this only bites on the
+      # first run after an image/kernel change.
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-1800}"
+      # MLA models (GLM-4.7-Flash) — vLLM's ROCm MLA *prefill* selector only offers CK-based
+      # FlashAttention (ROCM_AITER_FA -> FLASH_ATTN, both `flash_attn.mha_varlen_fwd`), and that CK
+      # FMHA kernel SEGFAULTS on gfx1201 at qk=256/v=256. Two ways out, in preference order:
+      #   MLA_HIP=1                            -> our native mla_hip prefill backend (see mla_vllm glue)
+      #   FLASH_ATTENTION_TRITON_AMD_ENABLE    -> flash_attn's Triton-AMD path instead of CK.
+      # NOTE the value must be the literal string "TRUE" — flash_attn does `== "TRUE"`, so "1" is a
+      # SILENT no-op (the `vllm` service below had exactly that bug).
+      FLASH_ATTENTION_TRITON_AMD_ENABLE: "${FLASH_ATTENTION_TRITON_AMD_ENABLE:-FALSE}"
+      # spec-decode + serve tunables (empty -> in-container defaults above). Set VHIP_SPEC to a
+      # --speculative-config JSON (see presets above) to enable MTP / DFlash / draft-model spec.
+      MINISGL_MODEL: "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      # non-empty -> run this instead of the server (see the command block above); used to
+      # profile with the serve's exact mounts/env.
+      VHIP_CMD: "${VHIP_CMD:-}"
+      VHIP_SPEC: "${VHIP_SPEC:-}"
+      VHIP_MAXLEN: "${VHIP_MAXLEN:-}"
+      VHIP_MNS: "${VHIP_MNS:-}"
+      VHIP_MEM: "${VHIP_MEM:-}"
+      # per-model knobs (empty -> the in-container defaults in the command block above).
+      # VHIP_KV=auto is REQUIRED for MLA models (GLM-4.7-Flash): the triton_mla backend rejects fp8 KV.
+      VHIP_TP: "${VHIP_TP:-}"
+      VHIP_KV: "${VHIP_KV:-}"
+      VHIP_DTYPE: "${VHIP_DTYPE:-}"
+      VHIP_MBT: "${VHIP_MBT:-}"
+      VHIP_EXTRA: "${VHIP_EXTRA:-}"
+      # prefix caching default ON (a serve without it re-prefills every turn). For a hybrid GDN model
+      # this uses experimental mamba 'align' mode; if it overcommits (dense GDN, long ctx), lower
+      # VHIP_MNS / VHIP_MAXLEN, or set VHIP_PREFIX_CACHE=0 to disable.
+      VHIP_PREFIX_CACHE: "${VHIP_PREFIX_CACHE:-1}"
+      # reasoning/tool parsing — Qwen3.6 defaults; set to "off" to skip either,
+      # VHIP_TOOL_CHOICE=0 to drop --enable-auto-tool-choice.
+      VHIP_REASONING_PARSER: "${VHIP_REASONING_PARSER:-qwen3}"
+      VHIP_TOOL_PARSER: "${VHIP_TOOL_PARSER:-qwen3_coder}"
+      VHIP_TOOL_CHOICE: "${VHIP_TOOL_CHOICE:-1}"
+      # server-wide chat-template kwargs (JSON) — preserve_thinking keeps prior-turn <think> blocks in
+      # the rendered context (the checkpoint template's kwarg). Set "off" to omit.
+      VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
+
+  vllm:
+    <<: *lean-common
+    image: tcclaviger/vllm:latest
+    profiles: ["vllm"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+    # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
+    # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
+    # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
+    # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
+    #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
+    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
+    #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
+    #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
+    #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vllm -- docker compose --profile vllm up -d
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        args=("$${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+          --host 0.0.0.0 --port 8000 --tensor-parallel-size "$${VHIP_TP:-2}"
+          --max-model-len "$${VHIP_MAXLEN:-60000}"
+          --kv-cache-dtype "$${VHIP_KV:-fp8}" --dtype "$${VHIP_DTYPE:-float16}"
+          --max-num-batched-tokens "$${VHIP_MBT:-2048}" --max-num-seqs "$${VHIP_MNS:-8}"
+          --gpu-memory-utilization "$${VHIP_MEM:-0.92}"
+          --language-model-only
+          --served-model-name x --trust-remote-code)
+        if [ -n "$${VHIP_SPEC:-}" ]; then args+=(--speculative-config "$${VHIP_SPEC}"); fi
+        # free-form escape hatch, word-split on purpose (e.g. VHIP_EXTRA='--enforce-eager --seed 0')
+        if [ -n "$${VHIP_EXTRA:-}" ]; then args+=($${VHIP_EXTRA}); fi
+        # Prefix caching: default ON (VHIP_PREFIX_CACHE=1) — a serve that re-prefills every turn is
+        # mostly useless. vLLM auto-disables it for a HYBRID GDN model, so we force it on, which puts
+        # the mamba cache in experimental 'align' mode (attn block padded up to the GDN page + a full
+        # conv+ssm GDN state snapshot reserved PER KV block). MoE 35B fits at VHIP_MNS<=4. On a DENSE-GDN
+        # model (Qwen 27B) that per-block state ~doubles the footprint and can overcommit the 16GB card
+        # ("No available memory for the cache blocks") — trim VHIP_MNS / VHIP_MAXLEN, or VHIP_PREFIX_CACHE=0.
+        pc="$${VHIP_PREFIX_CACHE}"; [ "$$pc" = 1 ] && args+=(--enable-prefix-caching)
+        # reasoning parser (<think> -> reasoning_content), tool-call parser + auto tool-choice, and the
+        # checkpoint's preserve_thinking chat-template kwarg. Defaults live in the environment block below
+        # (a bash ${VAR:-default} silently drops here). Set any of these env vars to "off" to skip.
+        rp="$${VHIP_REASONING_PARSER}"; [ "$$rp" != off ] && [ -n "$$rp" ] && args+=(--reasoning-parser "$$rp")
+        tp="$${VHIP_TOOL_PARSER}"
+        if [ "$$tp" != off ] && [ -n "$$tp" ]; then
+          args+=(--tool-call-parser "$$tp")
+          [ "$${VHIP_TOOL_CHOICE}" = 1 ] && args+=(--enable-auto-tool-choice)
+        fi
+        ctk="$${VHIP_CHAT_TEMPLATE_KWARGS}"; [ "$$ctk" != off ] && [ -n "$$ctk" ] && args+=(--default-chat-template-kwargs "$$ctk")
+        echo "[vhip] spec=$${VHIP_SPEC:-none} reasoning=$${rp:-off} tools=$${tp:-off} auto-tool-choice=$${VHIP_TOOL_CHOICE} ctk=$${ctk:-off}"
+        exec /app/tools/image_entrypoint.sh "$${args[@]}"
+    environment:
+      <<: *lean-env
+      PYTHONPATH: /opt/kernels
+      NCCL_P2P_DISABLE: "1"
+      NCCL_PROTO: Simple
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      # flash_attn compares this to the literal string "TRUE" (`== "TRUE"`), so the old "1" here was a
+      # SILENT no-op — it never switched CK for the Triton-AMD path.
+      FLASH_ATTENTION_TRITON_AMD_ENABLE: "${FLASH_ATTENTION_TRITON_AMD_ENABLE:-TRUE}"
+      # spec-decode + serve tunables (empty -> in-container defaults above). Set VHIP_SPEC to a
+      # --speculative-config JSON (see presets above) to enable MTP / DFlash / draft-model spec.
+      MINISGL_MODEL: "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      VHIP_SPEC: "${VHIP_SPEC:-}"
+      VHIP_MAXLEN: "${VHIP_MAXLEN:-}"
+      VHIP_MNS: "${VHIP_MNS:-}"
+      VHIP_MEM: "${VHIP_MEM:-}"
+      # per-model knobs (empty -> the in-container defaults in the command block above).
+      # VHIP_KV=auto is REQUIRED for MLA models (GLM-4.7-Flash): the triton_mla backend rejects fp8 KV.
+      VHIP_TP: "${VHIP_TP:-}"
+      VHIP_KV: "${VHIP_KV:-}"
+      VHIP_DTYPE: "${VHIP_DTYPE:-}"
+      VHIP_MBT: "${VHIP_MBT:-}"
+      VHIP_EXTRA: "${VHIP_EXTRA:-}"
+      # prefix caching default ON (a serve without it re-prefills every turn). For a hybrid GDN model
+      # this uses experimental mamba 'align' mode; if it overcommits (dense GDN, long ctx), lower
+      # VHIP_MNS / VHIP_MAXLEN, or set VHIP_PREFIX_CACHE=0 to disable.
+      VHIP_PREFIX_CACHE: "${VHIP_PREFIX_CACHE:-1}"
+      # reasoning/tool parsing — Qwen3.6 defaults; set to "off" to skip either,
+      # VHIP_TOOL_CHOICE=0 to drop --enable-auto-tool-choice.
+      VHIP_REASONING_PARSER: "${VHIP_REASONING_PARSER:-qwen3}"
+      VHIP_TOOL_PARSER: "${VHIP_TOOL_PARSER:-qwen3_coder}"
+      VHIP_TOOL_CHOICE: "${VHIP_TOOL_CHOICE:-1}"
+      # server-wide chat-template kwargs (JSON) — preserve_thinking keeps prior-turn <think> blocks in
+      # the rendered context (the checkpoint template's kwarg). Set "off" to omit.
+      VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
 
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
   # GRAPH-CAPTURED decode (cuda-graph-max-bs 8, max-running 8): eager MoE decode leaves ~45% of device

@@ -1,0 +1,4 @@
+row	plugins	extra	decode_tok_s	e2e_tok_s	boot_s
+A-stock-awq-dense	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register	none	83.4	82.1	111
+B-w4a8-awq-dense	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register,awq_dense_hip	none	83.3	81.9	131
+C-w4a8-dense+moe	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register,awq_dense_hip	VLLM_ROCM_W4A8_FORCE=on	83.4	82.0	116
