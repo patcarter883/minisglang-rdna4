@@ -126,11 +126,51 @@ def run(M: int):
         print(f"{kind:>9} {int(ntp.item()):>7} {lumpiness:>14.2f} {us:>8.1f}  {rel:>10}")
 
 
+def sweep_block_m(M: int):
+    """Does a LARGER block_m recover the skew tax?
+
+    The tax is duplicate weight reads: an expert with c routed rows occupies ceil(c/block_m)
+    blocks, and EACH of those re-streams that expert's weight slice. block_m is therefore the
+    duplicate-read divisor -- raising it should shrink the tax directly, with no kernel change.
+    Against that: MMAX (the compile-time real-rows cap) tracks block_m, and acc[COLS][MMAX] is
+    registers, so a bigger block_m costs occupancy. This measures which way that trade lands.
+    Kernel constraint: block_m % 8 == 0 and <= 64.
+    """
+    global BLOCK_M
+    w2, s2, z2 = build_w(HIDDEN, INTER, E)
+    n_active = min(E, max(TOP_K, M * TOP_K // 8))
+    print(f"\n=== block_m sweep, M={M}, {n_active} active experts, SKEWED routing")
+    print(f"{'block_m':>8} {'ntp':>7} {'blocks':>7} {'us':>8}  {'vs block_m=8':>13}")
+    base = None
+    saved = BLOCK_M
+    for bm in (8, 16, 32, 64):
+        BLOCK_M = bm
+        ids = routing("skewed", M, n_active)
+        sorted_ids, expert_ids, ntp = moe_align_block_size(
+            ids, bm, E, None, pad_sorted_ids=True, ignore_invalid_experts=True)
+        P = sorted_ids.size(0)
+        x = torch.randn((P, INTER), device=DEV, dtype=torch.float16)
+
+        def call():
+            return w4a8_fp8_wmma.mmq_regdirect_w4a16_moe_gemv(
+                x, w2, s2, sorted_ids, expert_ids, ntp, HIDDEN, 1, bm, w_zeros=z2)
+
+        us = time_call(call)
+        n = int(ntp.item())
+        rel = "" if base is None else f"{us / base:+.2f}x"
+        if base is None:
+            base = us
+        print(f"{bm:>8} {n:>7} {n // bm:>7} {us:>8.1f}  {rel:>13}")
+    BLOCK_M = saved
+
+
 def main():
     print("MoE expert-skew tax — how much a persistent tile scheduler could recover")
     print("(balanced = the ceiling a perfect scheduler reaches; gap to skewed = the prize)")
     for M in (1, 8, 16, 32, 64, 96):   # the M range the GEMV actually serves (gemv_max_m=96)
         run(M)
+    for M in (8, 32, 96):
+        sweep_block_m(M)
     print("""
 MEASURED VERDICT (2026-07-28, Qwen3.6-35B-A3B TP=2 gemm2 shape): DO NOT build the work queue.
   The time increase tracks `ntp` (+48% rows balanced->skewed) and NOT lumpiness (11-14x max/mean).
@@ -141,8 +181,20 @@ MEASURED VERDICT (2026-07-28, Qwen3.6-35B-A3B TP=2 gemm2 shape): DO NOT build th
   blocks are near-equal cost however lumpy the routing, and there is little variance to balance.
   Skew does not make blocks UNEVEN, it makes MORE of them: an expert whose rows overflow block_m
   spans extra blocks, and EACH of those re-reads that expert's weights.
-  THE REAL LEVER is therefore duplicate weight reads, not scheduling -- give hot experts a larger
-  block_m (or one block per expert) so their weight row is read once, not once per block.""")
+  Duplicate weight reads DO cost: at fixed block_m=8, skew takes blocks 96->142 and time +36%.
+
+FALSIFIED FOLLOW-UP -- "raise block_m for hot experts" does NOT work (block_m sweep below).
+  M=96 skewed: block_m 8->64 cuts blocks 142->97 (-32%, i.e. fewer duplicate reads) and is
+  5.16x SLOWER (125.4 -> 647.3 us). MMAX tracks block_m and acc[COLS][MMAX] is registers, so
+  MMAX=64 costs 64 VGPRs of accumulator on top of wf[32] and collapses occupancy far harder
+  than the saved weight traffic helps. Same story at M=32 (+4.72x).
+  CONSEQUENCE: the duplicate-read fix must keep MMAX SMALL while covering many rows -- i.e.
+  stage the block's weight slice in LDS once and loop row-chunks against it. But that trades
+  HBM traffic for LDS capacity and occupancy, and this core's own history says the opposite
+  trade won: the six-GEMV consolidation REMOVED LDS staging and called it occupancy-positive.
+  So the direction is not obviously a win on gfx1201, and its ceiling is the skew tax itself:
+  +1% at M=8 and +10% at M=16 -- the range this serve actually runs (VHIP_MNS=8) -- rising to
+  +31/36% only at M=64/96, which the 16 GB cards do not reach. Do not build it on spec.""")
 
 
 if __name__ == "__main__":
