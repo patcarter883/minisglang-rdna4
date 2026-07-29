@@ -24,7 +24,7 @@ SCOPE ("as close to M-invariant as realistically possible")
     (with a one-time warning) for: fp32/other dtypes, IN not a multiple of 16, or under cudagraph
     capture (static shapes are already self-consistent, and the arange/route tensors would allocate
     mid-capture). Integer (int8) matmuls are already exact/M-invariant; quantized-expert and attention
-    kernels are already fixed-tile HIP. Global off-switch: MINISGL_MINV_GEMM=0.
+    kernels are already fixed-tile HIP.
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ import os
 
 import torch
 
-_MINV_ON = os.environ.get("MINISGL_MINV_GEMM", "1") != "0"
 _BLOCK_M = int(os.environ.get("MINISGL_MINV_BLOCK_M", "64"))  # WMMA M-tile (mult of 16, <=128)
 _BN = int(os.environ.get("MINISGL_MINV_BN", "64"))            # WMMA N-tile (divides most OUT dims)
 # Large-M path: the deep-pipelined dense_gemm_pipe kernel runs at rocBLAS parity at large M (gate_up
@@ -57,28 +56,16 @@ def _warn_once(key: str, msg: str) -> None:
             pass
 
 
-# DIAGNOSTIC (perf/bf16-gemv-dispatch): route tiny-OUT linears to F.linear to SIZE the prize.
-# shared_expert_gate is a 2048->1 linear run 40x/step. OUT=1 means OUT % BN != 0, so minv falls to the
-# ragged `dense_gemm` LDS kernel: grid (1,1) = ONE workgroup running a full 64x64 tile with LDS
-# staging + a barrier per 16-wide K step — 128 staged iterations to produce a single dot product. The
-# native decode profile measures 26.8 us/call = 1.07 ms/step = 6.5% of a 16.5 ms bs=1 step, to read
-# 4 KB of weight.
-# Measured for IN=2048/OUT=1: F.linear, x@w.t() and (x*w).sum are ALL M-invariant on this shape
-# (max|d|=0 across m in {1,2,8,64,200} vs M=512) — but that is an empirical property of one rocBLAS
-# version on one degenerate shape, i.e. precisely the drift this module exists to prevent. So this is
-# a MEASUREMENT KNOB, not a shipping path; the real fix is a small-OUT kernel we own.
-_SMALL_OUT_FLINEAR = int(os.environ.get("MINISGL_MINV_SMALL_OUT_FLINEAR", "0"))
-
 # Decode fast path through the shared bf16/fp16 GEMV — see the note in minv_linear.
 #
-# DEFAULT ON, MAXM=16 (was off/2). Both sides of the threshold are individually M-invariant (the
-# GEMV per-(row,col) in a fixed K-order; dense_gemm with a fixed full-K reduction), so the only
-# hazard is the CROSSING between them. MAXM=16 is the M ceiling the GEMV accepts, so ordinary
-# decode and spec-decode VERIFY (M=K+1) now land on the SAME kernel instead of opposite sides of
-# the threshold — that is what keeps verify bit-matching sequential decode.
-# Set MINISGL_MINV_DECODE_GEMV=0 to route every M back through dense_gemm.
-_DECODE_GEMV = os.environ.get("MINISGL_MINV_DECODE_GEMV", "1") == "1"
-_DECODE_GEMV_MAXM = int(os.environ.get("MINISGL_MINV_DECODE_GEMV_MAXM", "16"))
+# UNCONDITIONAL — no env gate. Both sides of the threshold are individually M-invariant (the GEMV
+# per-(row,col) in a fixed K-order; dense_gemm with a fixed full-K reduction), so the only hazard is
+# the CROSSING between them. MAXM=16 is the M ceiling the GEMV accepts, so ordinary decode and
+# spec-decode VERIFY (M=K+1) land on the SAME kernel rather than opposite sides of the threshold —
+# that is what keeps verify bit-matching sequential decode.
+# Measured vs the old threshold of 2: +19.8% at conc=4, +7.9% at conc=8, neutral at bs=1
+# (tools/_maxm_ab.sh).
+_DECODE_GEMV_MAXM = 16
 _decode_gemv_fn = None
 _decode_gemv_probed = False
 
@@ -99,10 +86,6 @@ def _get_decode_gemv():
 
 def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """True iff `minv_linear` will run the M-invariant kernel (else it falls back to F.linear)."""
-    if not _MINV_ON:
-        return False
-    if _SMALL_OUT_FLINEAR and weight.shape[0] <= _SMALL_OUT_FLINEAR:
-        return False
     if weight.dtype not in (torch.bfloat16, torch.float16):
         return False
     if weight.shape[-1] % 16 != 0:  # IN must be WMMA-friendly (full-K reduction in 16-wide steps)
@@ -125,7 +108,7 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     import torch.nn.functional as F
 
     if not minv_supported(x, weight):
-        if _MINV_ON and weight.dtype in (torch.bfloat16, torch.float16) and weight.shape[-1] % 16 != 0:
+        if weight.dtype in (torch.bfloat16, torch.float16) and weight.shape[-1] % 16 != 0:
             _warn_once(f"K{weight.shape[-1]}",
                        f"minv_linear: IN={weight.shape[-1]} not a multiple of 16 -> F.linear fallback "
                        f"(this GEMM is NOT M-invariant; see layers/minv.py)")
@@ -140,9 +123,9 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     # gdn/layer.py::_GemvLinear.
     #
     # M-invariant (row i is a per-(row,col) fp32 dot in a fixed K-order, bit-identical at any M —
-    # measured max|d|=0.0 across M=1/2/8/16), but NOT bit-identical to the dense_gemm family, so a
-    # threshold introduces a decode-vs-prefill crossing. DEFAULT OFF; MINISGL_MINV_DECODE_GEMV=1.
-    if (_DECODE_GEMV and x.dim() == 2 and x.shape[0] <= _DECODE_GEMV_MAXM and bias is None
+    # measured max|d|=0.0 across M=1/2/8/16). It is NOT bit-identical to the dense_gemm family, so
+    # the threshold is a crossing; MAXM=16 puts decode AND spec-verify on this side of it.
+    if (x.dim() == 2 and x.shape[0] <= _DECODE_GEMV_MAXM and bias is None
             and x.dtype == weight.dtype):          # minv_supported() gated weight.dtype, not x's
         gemv = _get_decode_gemv()
         if gemv is not None and weight.shape[-1] % 8 == 0:
