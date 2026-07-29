@@ -394,6 +394,81 @@ services:
       # the rendered context (the checkpoint template's kwarg). Set "off" to omit.
       VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
 
+  # STOCK BASELINE — the collaborator's unmodified vLLM 0.24 image (`tcclaviger/vllm:latest`,
+  # vllm 0.24.0), which is exactly the base `vllm24-hip:combined` is built FROM. Deliberately
+  # carries NONE of the vhip overlays: no gdn_hip glue, no mla_hip, no rocm_hip_attn, no W4A8/W4A16
+  # MoE, no rdna4_vllm LM head, no patched attn_autotune. This is the reference the wiring table's
+  # "stock vLLM" row must come from — same serve flags as `vhip` so the only variable is the stack.
+  #
+  #   VSTOCK_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+  #     gpu-lease -n 2 --detach --name vstock -- docker compose --profile vstock up -d
+  #
+  # Boot is LONG the first time: stock GDN runs vLLM's vendored fla Triton kernels, whose cold
+  # compile is tens of minutes, plus tcclaviger's always-on startup attention autotune (unpatched
+  # here, so no persistent cache — it re-profiles every boot). The Triton cache mount makes the
+  # GDN half one-time. Do not mistake either for a hang.
+  vstock:
+    <<: *lean-common
+    image: ${VSTOCK_IMAGE:-tcclaviger/vllm:latest}
+    profiles: ["vstock"]
+    # lean-common's /engine working dir does not exist in the stock image (nothing is mounted there).
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      # Same Triton cache dir as vhip — same image lineage/toolchain, so entries are valid here.
+      - ${VHIP_TRITON_CACHE:-/home/pat/code/vllm-gfx1201/.triton-cache-vllm24hip}:/root/.triton
+      # torch.compile / inductor AOT cache (keyed by model+config hash, so stock gets its own rows).
+      - ${VSTOCK_VLLM_CACHE:-/home/pat/code/vllm-gfx1201/.vllm-compile-cache-vstock}:/root/.cache/vllm
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        args=("$${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+          --host 0.0.0.0 --port 8000 --tensor-parallel-size 2
+          --max-model-len "$${VHIP_MAXLEN:-32768}" --kv-cache-dtype fp8 --dtype float16
+          --max-num-batched-tokens "$${VSTOCK_MBT:-2048}" --max-num-seqs "$${VHIP_MNS:-8}"
+          --gpu-memory-utilization "$${VHIP_MEM:-0.92}"
+          --language-model-only
+          --served-model-name x --trust-remote-code)
+        if [ -n "$${VSTOCK_SPEC:-}" ]; then args+=(--speculative-config "$${VSTOCK_SPEC}"); fi
+        pc="$${VHIP_PREFIX_CACHE}"; [ "$$pc" = 1 ] && args+=(--enable-prefix-caching)
+        rp="$${VHIP_REASONING_PARSER}"; [ "$$rp" != off ] && [ -n "$$rp" ] && args+=(--reasoning-parser "$$rp")
+        tp="$${VHIP_TOOL_PARSER}"
+        if [ "$$tp" != off ] && [ -n "$$tp" ]; then
+          args+=(--tool-call-parser "$$tp")
+          [ "$${VHIP_TOOL_CHOICE}" = 1 ] && args+=(--enable-auto-tool-choice)
+        fi
+        ctk="$${VHIP_CHAT_TEMPLATE_KWARGS}"; [ "$$ctk" != off ] && [ -n "$$ctk" ] && args+=(--default-chat-template-kwargs "$$ctk")
+        echo "[vstock] STOCK vllm24 — spec=$${VSTOCK_SPEC:-none} plugins=<none>"
+        exec /app/tools/image_entrypoint.sh "$${args[@]}"
+    environment:
+      <<: *lean-env
+      # NOT /opt/kernels — the stock image has no canonical-kernel tree, and pointing PYTHONPATH at
+      # a non-existent dir is the kind of thing that silently half-loads something later.
+      PYTHONPATH: ""
+      # Belt-and-braces: even if some plugin dist-info leaked in, load none of it.
+      VLLM_PLUGINS: ""
+      NCCL_P2P_DISABLE: "1"
+      NCCL_PROTO: Simple
+      FLASH_ATTENTION_TRITON_AMD_ENABLE: "1"
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      MINISGL_MODEL: "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      VSTOCK_SPEC: "${VSTOCK_SPEC:-}"
+      # Prefill chunk. MEASURED: at 2048 the profiling run's activation peak through stock Triton's
+      # 256-expert `fused_moe_kernel_gptq_awq` leaves NEGATIVE KV headroom on a 16 GiB card once the
+      # 11.35 GiB of TP=2 weights are down — max-num-seqs and max-model-len barely move it, this does.
+      # Irrelevant to a bs=1 decode measurement (it only chunks long prefills).
+      VSTOCK_MBT: "${VSTOCK_MBT:-2048}"
+      VHIP_MAXLEN: "${VHIP_MAXLEN:-}"
+      VHIP_MNS: "${VHIP_MNS:-}"
+      VHIP_MEM: "${VHIP_MEM:-}"
+      VHIP_PREFIX_CACHE: "${VHIP_PREFIX_CACHE:-1}"
+      VHIP_REASONING_PARSER: "${VHIP_REASONING_PARSER:-qwen3}"
+      VHIP_TOOL_PARSER: "${VHIP_TOOL_PARSER:-qwen3_coder}"
+      VHIP_TOOL_CHOICE: "${VHIP_TOOL_CHOICE:-1}"
+      VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
+
   vllm:
     <<: *lean-common
     image: tcclaviger/vllm:latest
