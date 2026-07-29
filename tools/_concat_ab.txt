@@ -1,0 +1,11 @@
+=== unfused (MINISGL_FUSE_COL_PROJ=0) ===
+  ready after 50s
+  [driver] chunks=255 decode_wall=3.021s tok/s=84.07
+  --- first 200 chars of output (coherence) ---
+  <think></think>Matrix multiplication is the fundamental kernel of Deep Learning and High-Performance Computing (HPC). A modern GPU (e.g., NVIDIA Ampere, Hopper, or Ada Lovelace architecture) executes 
+=== fused (MINISGL_FUSE_COL_PROJ=1) ===
+  ready after 60s
+  [driver] chunks=255 decode_wall=3.022s tok/s=84.04
+  --- first 200 chars of output (coherence) ---
+  <think></think>Matrix multiplication is the fundamental kernel of Deep Learning and High-Performance Computing (HPC). A modern GPU (e.g., NVIDIA Ampere, Hopper, or Ada Lovelace architecture) executes 
+=== done ===

@@ -1,0 +1,9 @@
+=== torch_chain (ROUTER_FUSED=0) ===
+  60s gpu_use=3%
+  ready after 70s
+  [driver] chunks=255 decode_wall=3.410s tok/s=74.48
+=== fused (ROUTER_FUSED=1) ===
+  60s gpu_use=3%
+  ready after 70s
+  [driver] chunks=255 decode_wall=3.253s tok/s=78.07
+=== done ===

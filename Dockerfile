@@ -109,6 +109,14 @@ ENV PYTHONPATH=/opt/kernels:/opt/minisgl/python \
     HF_HUB_OFFLINE=1 \
     TORCH_BLAS_PREFER_HIPBLASLT=0
 
+# Fused MoE gemm2+gather_reduce BYLANE tiling. This one CANNOT have a Python default — it is read by
+# getenv() INSIDE the kernel — so the turnkey image must set it or the win is only reachable by hand.
+# Measured on the served shape (K = moe_intermediate/TP = 256, top_k=8, N=2048): 1.15x at M=1 and
+# 2.22x at M=8, i.e. a win at every M we serve; ~6% e2e at bs=1.
+# Opt-in upstream only because it forfeits bit-equality with the unfused 2-kernel path; it REMAINS
+# M-invariant, which is the property prefix-caching / chunked-prefill / spec-verify depend on.
+ENV VLLM_W4A8_MOE_G2FUSE_BYLANE=1
+
 EXPOSE 1919
 WORKDIR /opt/minisgl
 CMD ["python", "-m", "minisgl", "--help"]

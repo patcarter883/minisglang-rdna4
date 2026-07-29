@@ -1,0 +1,5 @@
+=== MAXM=2 ===
+  60s gpu_use=98%
+  ready after 80s
+  container MAXM=2
+  bs=1  [driver] chunks=255 decode_wall=3.159s tok/s=80.40

@@ -1,0 +1,5 @@
+=== torch_chain (MINISGL_ROUTER_FUSED=0) ===
+  bs=1 [driver] chunks=255 decode_wall=3.408s tok/s=74.52
+=== fused (MINISGL_ROUTER_FUSED=1) ===
+  BOOT FAILED — container left up:
+=== done ===

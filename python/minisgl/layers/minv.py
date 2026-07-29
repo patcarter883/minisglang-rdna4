@@ -70,8 +70,15 @@ def _warn_once(key: str, msg: str) -> None:
 _SMALL_OUT_FLINEAR = int(os.environ.get("MINISGL_MINV_SMALL_OUT_FLINEAR", "0"))
 
 # Decode fast path through the shared bf16/fp16 GEMV — see the note in minv_linear.
-_DECODE_GEMV = os.environ.get("MINISGL_MINV_DECODE_GEMV", "0") == "1"
-_DECODE_GEMV_MAXM = int(os.environ.get("MINISGL_MINV_DECODE_GEMV_MAXM", "2"))
+#
+# DEFAULT ON, MAXM=16 (was off/2). Both sides of the threshold are individually M-invariant (the
+# GEMV per-(row,col) in a fixed K-order; dense_gemm with a fixed full-K reduction), so the only
+# hazard is the CROSSING between them. MAXM=16 is the M ceiling the GEMV accepts, so ordinary
+# decode and spec-decode VERIFY (M=K+1) now land on the SAME kernel instead of opposite sides of
+# the threshold — that is what keeps verify bit-matching sequential decode.
+# Set MINISGL_MINV_DECODE_GEMV=0 to route every M back through dense_gemm.
+_DECODE_GEMV = os.environ.get("MINISGL_MINV_DECODE_GEMV", "1") == "1"
+_DECODE_GEMV_MAXM = int(os.environ.get("MINISGL_MINV_DECODE_GEMV_MAXM", "16"))
 _decode_gemv_fn = None
 _decode_gemv_probed = False
 
