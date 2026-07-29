@@ -1,26 +1,21 @@
-# Dev override: hot-mounted engine source + shadow-mounted kernel packages, and the perf knobs the
-# base compose does not forward.
+# Dev override: hot-mounted engine source + shadow-mounted kernel packages.
 #
-# The env block lives HERE rather than in docker-compose.yml on purpose. These are pass-throughs
-# with defaults that match the code / image defaults, so they change nothing unless an A/B script
-# sets them — but without them an `A=1 docker compose up` silently does NOTHING, because compose
-# only forwards variables it names. That failure is invisible: the serve comes up healthy and just
-# measures the default config, which is how a MAXM A/B ended up comparing a config against itself.
+# There is deliberately NO environment block here. The decode-GEMV routing, the fused MoE
+# router and the fused-gemm2 BYLANE tiling are all UNCONDITIONAL in code/kernel now — they
+# used to need env knobs, and compose only forwards variables it names, so a knob that the
+# base compose did not list silently did nothing (an A/B once compared a config to itself
+# with no symptom). Nothing to forward means nothing to get wrong.
 services:
   serve:
-    environment:
-      # decode-GEMV routing (code defaults: on / MAXM 16 — see layers/minv.py and gdn/layer.py)
-      MINISGL_GDN_PROJ_GEMV: "${MINISGL_GDN_PROJ_GEMV:-1}"
-      MINISGL_GDN_PROJ_GEMV_MAXM: "${MINISGL_GDN_PROJ_GEMV_MAXM:-16}"
-      MINISGL_MINV_DECODE_GEMV: "${MINISGL_MINV_DECODE_GEMV:-1}"
-      MINISGL_MINV_DECODE_GEMV_MAXM: "${MINISGL_MINV_DECODE_GEMV_MAXM:-16}"
-      MINISGL_MINV_GEMM: "${MINISGL_MINV_GEMM:-1}"
-      MINISGL_ROUTER_FUSED: "${MINISGL_ROUTER_FUSED:-1}"
-      # kernel-side, no Python default possible (getenv inside the kernel); baked in the Dockerfile
-      VLLM_W4A8_MOE_G2FUSE_BYLANE: "${VLLM_W4A8_MOE_G2FUSE_BYLANE:-1}"
-      MINISGL_HOSTPROF: "${MINISGL_HOSTPROF:-0}"
     volumes:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-      - ${FP8_WMMA_PKG:-/home/pat/code/rdna4-hip-kernels-mmax/fp8_wmma/torch-ext/fp8_wmma}:/opt/kernels/fp8_wmma:ro
-      - ${MOE_HIP_PKG:-/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip}:/opt/kernels/moe_hip:ro
+      # Kernel shadow-mounts for A/B-ing an unbuilt kernel change against the baked image. These
+      # default to the CANONICAL repo, not a task worktree: the old defaults pointed at
+      # rdna4-hip-kernels-mmax, which predates the bylane/tiling-table work, so a plain
+      # `docker compose up` silently DOWNGRADED the image's kernels with no symptom.
+      # The mounted package must be BUILT, and built INSIDE this serve image (a .so from another
+      # image fails with "libc10.so: cannot open shared object file", which presents as a serve
+      # that never reaches the GPU). tools/_maxm_ab.sh has the preflight that catches both.
+      - ${FP8_WMMA_PKG:-/home/pat/code/rdna4-hip-kernels/fp8_wmma/torch-ext/fp8_wmma}:/opt/kernels/fp8_wmma:ro
+      - ${MOE_HIP_PKG:-/home/pat/code/rdna4-hip-kernels/moe/torch-ext/moe_hip}:/opt/kernels/moe_hip:ro

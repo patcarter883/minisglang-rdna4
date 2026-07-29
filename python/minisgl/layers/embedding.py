@@ -18,7 +18,6 @@ from .base import BaseOP
 # position are bit-identical regardless of batch M). That is exactly minv's guarantee, so it replaces
 # minv on the LM head for EVERY case — decode (M=1) AND spec-verify (M>1) — with no losslessness gate.
 # Only M beyond the core's MMAX cap (16) or non-bf16/fp16 weights fall back to minv.
-_LMHEAD_GEMV_ON = os.environ.get("MINISGL_LMHEAD_GEMV", "1") != "0"
 _LMHEAD_GEMV_MMAX = 16  # gemv_decode_core MMAX cap; LM-head verify M (spec K+1) sits well under this
 _lmhead_gemv_fn = None
 _lmhead_gemv_probed = False
@@ -29,13 +28,12 @@ def _get_lmhead_gemv():
     global _lmhead_gemv_fn, _lmhead_gemv_probed
     if not _lmhead_gemv_probed:
         _lmhead_gemv_probed = True
-        if _LMHEAD_GEMV_ON:
-            try:
-                from fp8_wmma import dense_bf16_gemv
+        try:
+            from fp8_wmma import dense_bf16_gemv
 
-                _lmhead_gemv_fn = dense_bf16_gemv
-            except Exception:
-                _lmhead_gemv_fn = None
+            _lmhead_gemv_fn = dense_bf16_gemv
+        except Exception:
+            _lmhead_gemv_fn = None
     return _lmhead_gemv_fn
 
 

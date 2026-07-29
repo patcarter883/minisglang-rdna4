@@ -3,3 +3,12 @@
   ready after 80s
   container MAXM=2
   bs=1  [driver] chunks=255 decode_wall=3.159s tok/s=80.40
+  [conc=4] streams=4 tokens=508 wall=2.616s agg_tok/s=194.2
+  [conc=8] streams=8 tokens=1016 wall=3.009s agg_tok/s=337.7
+=== MAXM=16 ===
+  ready after 40s
+  container MAXM=16
+  bs=1  [driver] chunks=255 decode_wall=3.165s tok/s=80.24
+  [conc=4] streams=4 tokens=508 wall=2.183s agg_tok/s=232.7
+  [conc=8] streams=8 tokens=1016 wall=2.788s agg_tok/s=364.4
+=== done ===
