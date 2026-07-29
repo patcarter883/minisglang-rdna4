@@ -1,21 +1,41 @@
-# Dev override: hot-mounted engine source + shadow-mounted kernel packages.
+# Dev override: hot-mounted engine source. Auto-loaded by `docker compose` — so anything here
+# applies to EVERY dev run whether the operator wanted it or not.
 #
-# There is deliberately NO environment block here. The decode-GEMV routing, the fused MoE
-# router and the fused-gemm2 BYLANE tiling are all UNCONDITIONAL in code/kernel now — they
-# used to need env knobs, and compose only forwards variables it names, so a knob that the
-# base compose did not list silently did nothing (an A/B once compared a config to itself
-# with no symptom). Nothing to forward means nothing to get wrong.
+# There is deliberately NO environment block here. The decode-GEMV routing, the fused MoE router
+# and the fused-gemm2 BYLANE tiling are all UNCONDITIONAL in code/kernel now — they used to need
+# env knobs, and compose only forwards variables it NAMES, so a knob the base compose did not list
+# silently did nothing (an A/B once compared a config against itself, with no symptom). Nothing to
+# forward means nothing to get wrong.
+#
+# And there are deliberately NO KERNEL SHADOW-MOUNTS here either. They used to live in this file,
+# defaulted, and that is a trap in three separate ways — all three of which actually fired:
+#
+#   1. the default pointed at a task worktree (rdna4-hip-kernels-mmax) that predated the current
+#      kernels, so a plain `docker compose up` silently DOWNGRADED the image's kernels;
+#   2. repointing the default at the CANONICAL repo was no better — that tree carries untracked
+#      stale build residue (a .so from an older image), and mounting it over the baked package
+#      fails with "Could not load this library", which presents as a serve that never reaches the
+#      GPU (gpu_use 0% until the readiness timeout), NOT as an error;
+#   3. because the mount was defaulted, a harness whose FP8_WMMA_PKG assignment failed to reach
+#      compose still came up — on the default — so the A/B silently measured the wrong kernels.
+#
+# The baked image is the source of truth. To A/B an unbuilt kernel change, pass an EXTRA compose
+# file explicitly, so the mount is visible at the call site and its absence is loud:
+#
+#   cat > /tmp/kmount.yml <<'YAML'
+#   services:
+#     serve:
+#       volumes:
+#         - /path/to/kernels-worktree/fp8_wmma/torch-ext/fp8_wmma:/opt/kernels/fp8_wmma:ro
+#   YAML
+#   docker compose -f docker-compose.yml -f docker-compose.override.yml -f /tmp/kmount.yml \
+#     --profile serve up -d
+#
+# The package MUST be built INSIDE the serve image; a .so from another image fails to load with
+# "libc10.so: cannot open shared object file". Preflight it (`import torch, <pkg>` in that image)
+# and assert the mount landed (`docker inspect ... .Mounts`) — see tools/_maxm_ab.sh.
 services:
   serve:
     volumes:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-      # Kernel shadow-mounts for A/B-ing an unbuilt kernel change against the baked image. These
-      # default to the CANONICAL repo, not a task worktree: the old defaults pointed at
-      # rdna4-hip-kernels-mmax, which predates the bylane/tiling-table work, so a plain
-      # `docker compose up` silently DOWNGRADED the image's kernels with no symptom.
-      # The mounted package must be BUILT, and built INSIDE this serve image (a .so from another
-      # image fails with "libc10.so: cannot open shared object file", which presents as a serve
-      # that never reaches the GPU). tools/_maxm_ab.sh has the preflight that catches both.
-      - ${FP8_WMMA_PKG:-/home/pat/code/rdna4-hip-kernels/fp8_wmma/torch-ext/fp8_wmma}:/opt/kernels/fp8_wmma:ro
-      - ${MOE_HIP_PKG:-/home/pat/code/rdna4-hip-kernels/moe/torch-ext/moe_hip}:/opt/kernels/moe_hip:ro
