@@ -65,6 +65,15 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
     ignore_eos: bool = False
+    # Sampling. Unset (None) inherits the checkpoint's generation_config.json via _resolve_sampling,
+    # exactly as the OpenAI endpoints already do. /generate previously built a bare SamplingParams()
+    # and so served GREEDY (SamplingParams defaults temperature=0.0 / top_k=-1 / top_p=1.0) even
+    # though this checkpoint asks for do_sample=true, temperature 1.0, top_k 20, top_p 0.95 — a
+    # silent divergence from /v1/chat/completions, and it meant every /generate benchmark measured
+    # the argmax path instead of the top-k/top-p sampler the real serve runs.
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
     # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
     # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
     cam_write: bool | None = None
@@ -400,7 +409,7 @@ def _tool_stop_keep(req) -> List[str]:
     return []
 
 
-def _resolve_sampling(req: "OpenAICompletionRequest", model_path: str) -> tuple:
+def _resolve_sampling(req: "OpenAICompletionRequest | GenerateRequest", model_path: str) -> tuple:
     """Effective (temperature, top_p, top_k): the request value when the client set it, else the
     model author's `generation_config.json` default, else the neutral default. Lets a bare request
     inherit the model's recommended sampling (e.g. GLM-4.x top_p 0.95 / top_k 50) instead of the
@@ -1194,6 +1203,10 @@ async def generate(req: GenerateRequest, request: Request):
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 max_tokens=req.max_tokens,
+                # unset -> the checkpoint's generation_config default (same resolution the OpenAI
+                # endpoints use), NOT the greedy SamplingParams default.
+                **dict(zip(("temperature", "top_p", "top_k"),
+                           _resolve_sampling(req, state.config.model_path))),
             ),
         )
     )

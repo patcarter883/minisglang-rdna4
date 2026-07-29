@@ -266,6 +266,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
 
+        # --- env-gated per-stage HOST-overhead profiler (diagnostics only) -----------------------
+        # MINISGL_HOSTPROF=<N> accumulates wall time by named loop stage and logs the breakdown every
+        # N decode steps (rank0). Zero cost when unset (self._hp stays None). NEVER alters tokens.
+        self._hp_every = int(os.environ.get("MINISGL_HOSTPROF", "0") or "0")
+        self._hp: Dict[str, float] | None = {} if self._hp_every > 0 else None
+        self._hp_n = 0
+
         # Speculative-decode proposer (n-gram / MTP / draft-model). None unless spec is enabled.
         self._proposer = (
             make_proposer(self.engine.spec_config, self.engine)
@@ -648,17 +655,65 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._process_last_data(last_data)
         return ongoing_data
 
+    def _hp_add(self, key: str, dt: float) -> None:
+        d = self._hp
+        if d is not None:
+            d[key] = d.get(key, 0.0) + dt
+
+    def _hp_tick(self) -> None:
+        """Log + reset the accumulated per-stage host breakdown every _hp_every decode steps."""
+        self._hp_n += 1
+        if self._hp_n % self._hp_every:
+            return
+        d = self._hp
+        assert d is not None
+        n = self._hp_every
+        tot = sum(d.values()) or 1e-9
+        parts = " ".join(
+            f"{k}={1000 * v / n:.3f}ms({100 * v / tot:.0f}%)"
+            for k, v in sorted(d.items(), key=lambda x: -x[1])
+        )
+        logger.info_rank0(
+            f"[hostprof] {n}-step avg: total={1000 * tot / n:.3f}ms/step "
+            f"({n / tot:.1f} step/s) {parts}"
+        )
+        for k in d:
+            d[k] = 0.0
+
     def normal_loop(self) -> None:
+        if self._hp is None:
+            blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
+            for msg in self.receive_msg(blocking=blocking):
+                self._process_one_msg(msg)
+
+            forward_input = self._schedule_next_batch()
+            ongoing_data = None
+            if forward_input is not None:
+                ongoing_data = (forward_input, self._forward(forward_input))
+
+            self._process_last_data(ongoing_data)
+            return
+
+        # Instrumented path: identical logic, wall-time split by stage. gpu_wait/commit are recorded
+        # inside _process_last_data (the copy_done.synchronize is the exposed GPU-active time).
+        t0 = time.perf_counter()
         blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
-
+        t1 = time.perf_counter()
+        self._hp_add("recv", t1 - t0)
         forward_input = self._schedule_next_batch()
+        t2 = time.perf_counter()
+        self._hp_add("sched", t2 - t1)
         ongoing_data = None
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
-
+        t3 = time.perf_counter()
+        self._hp_add("fwd_launch", t3 - t2)
         self._process_last_data(ongoing_data)
+        # Tick per decode step only (prefill/idle steps have very different shape).
+        if forward_input is not None and not forward_input.batch.is_prefill:
+            self._hp_tick()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -809,8 +864,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if last_data is None:
             return
 
+        hp = self._hp
+        _t0 = time.perf_counter() if hp is not None else 0.0
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        if hp is not None:
+            _t0 = self._hp_add("gpu_wait", time.perf_counter() - _t0) or time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -912,6 +971,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
+        if hp is not None:
+            self._hp_add("commit", time.perf_counter() - _t0)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
