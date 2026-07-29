@@ -124,11 +124,30 @@ Priority order (impact × tractability):
    attn_prefill_paged result generalizes: these attention kernels are occupancy-limited by LDS, not
    registers, so VGPR reduction won't lift occupancy. Skip unless a specific LDS-reduction (not register)
    lever appears. mla is additionally bs=1 bandwidth-bound (situational).
-4. **flagship fp8 GEMM — spill-free 64×128 macro-tile** (register budgeting / inline-asm) — the SAME
-   register-blocking class; the compiler spills the 128-wide fp32 accumulator to scratch → collapse.
-   This is the lever to push the flagship kernel past hipBLASLt (>244 → toward the 355–389 TF/s
-   ceiling). Then **integrate the flagship into the w8a8 dense + MoE fp8 paths** (currently they cap
-   ~104 TF/s; the flagship hit 181–188 = 92% of hipBLASLt in round 1). HIGH — biggest raw win.
+4. **flagship fp8 GEMM — spill-free 64×128 macro-tile — ❌ CLOSED, STRUCTURALLY BLOCKED (measured
+   2026-07-29).** Was "HIGH — biggest raw win"; the premise (a smarter register budget / inline-asm
+   schedule can fit the 128-wide fp32 accumulator) is **falsified**. Force-instantiated
+   `moe_gemm_flag_kernel` at several warp macro-tiles with identical headers/flags, varying only the
+   compiler, and read the emitted `NumVgprs`/`ScratchSize`/`Occupancy`:
+
+   | BM×BN, warp WM×WN | ROCm 7.2.1 (clang 22) | ROCm 7.14 (clang 23) |
+   |---|---|---|
+   | 128×256, warp **64×64** (shipped) | occ4 vgpr244 **scratch 0** | occ4 vgpr234 **scratch 0** |
+   | 64×128,  warp **64×64** (shipped) | occ2 vgpr256 scratch 132  | occ2 vgpr243 **scratch 0** |
+   | 128×256, warp **64×128** | occ2 vgpr256 **scratch 1500** | occ2 vgpr256 **scratch 1332** |
+   | 64×256,  warp **64×128** | occ1 vgpr256 scratch 1604 | occ1 vgpr256 scratch 1592 |
+   | 256×128, warp **128×64** | occ2 vgpr256 scratch 1424 | occ2 vgpr256 scratch 1356 |
+
+   Any warp tile above 64×64 pins VGPRs at the 256 ceiling and spills ~1.3–1.6 KB — in BOTH
+   directions (128×64 spills too, so it is not an N-axis artifact), and **a full LLVM major bump
+   barely moves it**. This is the no-global→LDS-DMA ceiling (~40 VGPR of mandatory global staging,
+   see the DEFERRED note above), i.e. silicon, not a compiler deficiency waiting to be fixed.
+   Do not spend budget here. *(Method caveat: `-D__HIP_NO_HALF_CONVERSIONS__` had to be dropped for
+   the probe to compile, so absolute numbers may differ slightly from the production build; both
+   legs used identical flags, so the comparison holds.)*
+   The **integration** half is still live and unaffected: fold the flagship (181–188 TF/s = 92% of
+   hipBLASLt) into the w8a8 dense + MoE fp8 paths, which still cap ~104 TF/s. That is where the raw
+   win actually is — at the shipped 64×64 warp tile.
 5. **`rxf_hip` linear gemv/gemm** (236 VGPR) and **`moe_splitk`** (224 VGPR, decode-only) — mild
    register pressure; LOW priority, register reduction only.
 6. **`dense_gemm` bf16 wide-tile occupancy** — 36–46 KB LDS → 1 block/WGP, but the tile is
@@ -142,3 +161,13 @@ elementwise (tail/swiglu/sampler) at HBM peak — fine.
 CAVEAT (D): the packed-store 2x is a compiler codegen/occupancy effect — re-verify VGPR/occupancy
 (`--save-temps` / rocprof) if the ROCm/hipcc toolchain in the image changes; the same source can land
 on either side of the spill cliff.
+
+TOOLCHAIN (2026-07-29): that caveat is now load-bearing. ROCm **7.13/7.14 ship AMD clang 23** vs the
+image's 7.2.1 = clang 22, and clang 23 raises occupancy on **112–124 of 513** kernels in
+`fp8_wmma/moe_kernel.hip` **spill-free, with zero regressions** (`moe_gemm_tiled_ashuffle`
+245→169 VGPR, occ 9→16; `gdn_prefill_wmma` 10→12; `attn_prefill_paged` unchanged, consistent with
+being LDS-bound). 7.13 ≈ 7.14 (identical on 501/513) but carries far better torch coverage, so
+**7.13 is the migration target**. Bumping 7.2.1→7.2.4 buys nothing — same LLVM commit (`f58b06d`).
+Occupancy is a PREDICTOR: prove any of this with `tools/kernel_op_matrix.py` before acting on it.
+AMD's gfx1201 wheels are on TheRock index `https://rocm.nightlies.amd.com/v2/gfx120X-all/`, not
+download.pytorch.org. Details: memory `rocm714-clang23-occupancy-win`.
