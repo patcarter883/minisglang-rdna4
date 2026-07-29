@@ -36,6 +36,25 @@ _moe_calls = 0
 # Set MINISGL_MOE_SCATTER=1 to force the fused scatter for an eager (non-graph) deployment.
 _MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "0") != "0"
 
+# Fused router (moe_hip.moe_topk_softmax): softmax+top-k+renormalize in one launch. Default ON;
+# MINISGL_ROUTER_FUSED=0 restores the torch chain.
+_ROUTER_FUSED = _os.environ.get("MINISGL_ROUTER_FUSED", "1") != "0"
+_fused_router_fn = None
+_fused_router_probed = False
+
+
+def _get_fused_router():
+    global _fused_router_fn, _fused_router_probed
+    if not _fused_router_probed:
+        _fused_router_probed = True
+        try:
+            import moe_hip
+
+            _fused_router_fn = getattr(moe_hip, "moe_topk_softmax", None)
+        except Exception:
+            _fused_router_fn = None
+    return _fused_router_fn
+
 # W4A16 MoE (fp16 activations, no act-quant) for the routed experts — the fix for the fp8-act decode
 # degradation on activation-sensitive models (GLM-4.7-Flash). "1" = all M; "decode" = M<=2 only
 # (mirrors vLLM's low-M W4A16 crossover). Off by default. Requires group_size>=64 (g=128 -> wide 8).
@@ -273,6 +292,19 @@ def _softmax_topk_route(
     kernel — a single launch vs the torch chain. Shared by w4a8_moe and w4a16_moe."""
     M = gating_output.shape[0]
     dev = gating_output.device
+    # FUSED (native HIP, vllm-free): softmax + top-k + renormalize in ONE launch. The torch chain
+    # below is 4 kernels + an elementwise tail PER MoE LAYER — profiled at 0.077 (softmax) + 0.269
+    # (warpMergeSortTopK) + 0.100 (bitonicSort) + 0.086 (reduce) ms/step over 40 layers, ~160
+    # launches to route ONE token over 256 experts, on a step that carries ~1.9 ms of inter-kernel
+    # gap across ~1539 launches. Measured 2.64x at the served shape (M=1, E=256, K=8, renormalize),
+    # saving 0.813 ms/step; top-k INDICES are bit-identical to torch.topk and the weights agree to
+    # 1.2e-7. Falls through if the op is unavailable (older moe_hip).
+    if _ROUTER_FUSED:
+        fn = _get_fused_router()
+        if fn is not None:
+            g = gating_output.float()
+            return fn(g.contiguous() if not g.is_contiguous() else g, top_k, renormalize)
+
     try:
         from vllm import _custom_ops as vllm_ops
     except ImportError:

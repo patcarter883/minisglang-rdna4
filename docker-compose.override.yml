@@ -1,0 +1,7 @@
+services:
+  serve:
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${FP8_WMMA_PKG:-/home/pat/code/rdna4-hip-kernels-mmax/fp8_wmma/torch-ext/fp8_wmma}:/opt/kernels/fp8_wmma:ro
+      - ${MOE_HIP_PKG:-/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip}:/opt/kernels/moe_hip:ro

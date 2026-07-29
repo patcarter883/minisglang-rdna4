@@ -57,9 +57,44 @@ def _warn_once(key: str, msg: str) -> None:
             pass
 
 
+# DIAGNOSTIC (perf/bf16-gemv-dispatch): route tiny-OUT linears to F.linear to SIZE the prize.
+# shared_expert_gate is a 2048->1 linear run 40x/step. OUT=1 means OUT % BN != 0, so minv falls to the
+# ragged `dense_gemm` LDS kernel: grid (1,1) = ONE workgroup running a full 64x64 tile with LDS
+# staging + a barrier per 16-wide K step — 128 staged iterations to produce a single dot product. The
+# native decode profile measures 26.8 us/call = 1.07 ms/step = 6.5% of a 16.5 ms bs=1 step, to read
+# 4 KB of weight.
+# Measured for IN=2048/OUT=1: F.linear, x@w.t() and (x*w).sum are ALL M-invariant on this shape
+# (max|d|=0 across m in {1,2,8,64,200} vs M=512) — but that is an empirical property of one rocBLAS
+# version on one degenerate shape, i.e. precisely the drift this module exists to prevent. So this is
+# a MEASUREMENT KNOB, not a shipping path; the real fix is a small-OUT kernel we own.
+_SMALL_OUT_FLINEAR = int(os.environ.get("MINISGL_MINV_SMALL_OUT_FLINEAR", "0"))
+
+# Decode fast path through the shared bf16/fp16 GEMV — see the note in minv_linear.
+_DECODE_GEMV = os.environ.get("MINISGL_MINV_DECODE_GEMV", "0") == "1"
+_DECODE_GEMV_MAXM = int(os.environ.get("MINISGL_MINV_DECODE_GEMV_MAXM", "2"))
+_decode_gemv_fn = None
+_decode_gemv_probed = False
+
+
+def _get_decode_gemv():
+    """Lazily resolve fp8_wmma.dense_bf16_gemv (None if the kernel package is unavailable)."""
+    global _decode_gemv_fn, _decode_gemv_probed
+    if not _decode_gemv_probed:
+        _decode_gemv_probed = True
+        try:
+            from fp8_wmma import dense_bf16_gemv
+
+            _decode_gemv_fn = dense_bf16_gemv
+        except Exception:
+            _decode_gemv_fn = None
+    return _decode_gemv_fn
+
+
 def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """True iff `minv_linear` will run the M-invariant kernel (else it falls back to F.linear)."""
     if not _MINV_ON:
+        return False
+    if _SMALL_OUT_FLINEAR and weight.shape[0] <= _SMALL_OUT_FLINEAR:
         return False
     if weight.dtype not in (torch.bfloat16, torch.float16):
         return False
@@ -88,6 +123,23 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
                        f"minv_linear: IN={weight.shape[-1]} not a multiple of 16 -> F.linear fallback "
                        f"(this GEMM is NOT M-invariant; see layers/minv.py)")
         return F.linear(x, weight, bias)
+
+    # DECODE fast path: the WMMA-tiled dense_gemm is built for large M and stalls at M=1 — it pads M
+    # up to block_m (63/64 of the tile is padding) and the decode profile puts this chokepoint at
+    # 2.58 ms/step (dense_gemm_rd, 160 calls) + 1.03 ms/step (the ragged dense_gemm on OUT=1
+    # shared_expert_gate, 40 calls) = 3.6 ms of a 13.19 ms kernel step. The shared decode GEMV
+    # (gemv_decode_core<Bf16GemvLoader>, packed v_dot2_f32_bf16) runs the same shapes at 1.5-3x —
+    # it is the same trade the LM head already took (embedding.py) and the GDN projections took in
+    # gdn/layer.py::_GemvLinear.
+    #
+    # M-invariant (row i is a per-(row,col) fp32 dot in a fixed K-order, bit-identical at any M —
+    # measured max|d|=0.0 across M=1/2/8/16), but NOT bit-identical to the dense_gemm family, so a
+    # threshold introduces a decode-vs-prefill crossing. DEFAULT OFF; MINISGL_MINV_DECODE_GEMV=1.
+    if (_DECODE_GEMV and x.dim() == 2 and x.shape[0] <= _DECODE_GEMV_MAXM and bias is None
+            and x.dtype == weight.dtype):          # minv_supported() gated weight.dtype, not x's
+        gemv = _get_decode_gemv()
+        if gemv is not None and weight.shape[-1] % 8 == 0:
+            return gemv(x.contiguous(), weight)
 
     import dense_gemm as _dg
 

@@ -46,6 +46,29 @@ _GDN_FUSED_NORM = os.environ.get("MINISGL_GDN_FUSED_NORM", "1") == "1"
 # gdn_hip .so predates the op. Set MINISGL_GDN_FUSED_CONV=0 to force the separate path.
 _GDN_FUSED_CONV = os.environ.get("MINISGL_GDN_FUSED_CONV", "1") == "1"
 
+# Route the UNQUANTIZED GDN projections (in_proj_qkvz / in_proj_ba / out_proj) through the shared
+# decode GEMV at small M instead of nn.Linear -> F.linear -> rocBLAS.
+#
+# WHY: these are the largest kernel group in bs=1 decode. Profiled on the 35B AWQ (TP=2, 30 GDN
+# layers): rocBLAS MT128x128x32 3.185 ms/step (60 calls, 53.1 us) + MT16x16x32 0.422 ms/step
+# (30 calls) = 3.61 ms/step = 24% of the whole 14.75 ms kernel step. Measured per-shape at M=1:
+#     in_proj_qkvz 2048x6144   F.linear 70.6us/356 GB/s  ->  gemv 44.8us/561 GB/s (83% of peak)
+#     out_proj     2048x2048   F.linear 36.0us/233       ->  gemv 17.3us/484
+#     x30 layers               F.linear 3.542 ms/step    ->  gemv 2.013 ms/step   (1.76x)
+#
+# THRESHOLD, and why it is small: the GEMV is M=1-shaped. At M=8 it LOSES to rocBLAS (4.42 vs
+# 3.23 ms/step) and it cannot run at all above the core's MMAX cap of 16. Cutting its VALU 4x via
+# packed dot2 did not move M=8, so M>=4 is not VALU-bound there — above the crossover the work
+# belongs on WMMA, which rocBLAS already does well (403 GB/s at M=8).
+#
+# CORRECTNESS: the GEMV is M-invariant (row 0 at M=1 vs M=2/8/16 is bit-identical, max|d|=0.0), but
+# it is NOT bit-identical to F.linear (rel 1.7e-5..8.2e-4 on these shapes). F.linear itself measured
+# M-invariant here, so a threshold INTRODUCES a crossing that does not exist today: a token computed
+# at M<=MAXM and the same token computed at M>MAXM would differ. That is the hazard layers/minv.py
+# exists to prevent (ZAYA GSM8K 45->25), which is why this is DEFAULT OFF and opt-in.
+_GDN_PROJ_GEMV = os.environ.get("MINISGL_GDN_PROJ_GEMV", "0") == "1"
+_GDN_PROJ_GEMV_MAXM = int(os.environ.get("MINISGL_GDN_PROJ_GEMV_MAXM", "2"))
+
 if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod
 
@@ -97,8 +120,49 @@ def _make_proj(
     from minisgl.quant.method import UnquantizedLinearMethod
 
     if method is None or isinstance(method, UnquantizedLinearMethod):
-        return nn.Linear(in_features, out_features, bias=False, dtype=dtype, device=device)
+        cls = _GemvLinear if _GDN_PROJ_GEMV else nn.Linear
+        return cls(in_features, out_features, bias=False, dtype=dtype, device=device)
     return _MethodLinear(in_features, out_features, method, device=device)
+
+
+class _GemvLinear(nn.Linear):
+    """nn.Linear that routes SMALL-M forwards through the shared decode GEMV
+    (fp8_wmma.dense_bf16_gemv = gemv_decode_core<Bf16GemvLoader>) and everything else through the
+    normal nn.Linear path. Opt-in via MINISGL_GDN_PROJ_GEMV — see the note on _GDN_PROJ_GEMV for the
+    measured crossover and the M-invariance caveat.
+
+    SUBCLASSES nn.Linear rather than wrapping one: a wrapper renames the parameter to
+    `<proj>.lin.weight` and the checkpoint loader (models/qwen3_5.py:248 pops by the module's own
+    state_dict names) then dies with KeyError on `...in_proj_qkvz.lin.weight`. Subclassing keeps
+    `weight` a direct Parameter, so the state_dict key, the TP sharding, and the differentiable
+    F.linear the CAM-training path needs are all unchanged.
+    """
+
+    _gemv = None
+    _probed = False
+
+    @classmethod
+    def _fn(cls):
+        if not cls._probed:
+            cls._probed = True
+            try:
+                from fp8_wmma import dense_bf16_gemv
+
+                cls._gemv = dense_bf16_gemv
+            except Exception:
+                cls._gemv = None
+        return cls._gemv
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight
+        if (x.dim() == 2 and x.shape[0] <= _GDN_PROJ_GEMV_MAXM and self.bias is None
+                and w.dtype in (torch.bfloat16, torch.float16) and x.dtype == w.dtype
+                and w.shape[-1] % 8 == 0):
+            fn = self._fn()
+            if fn is not None:
+                engaged("fp8_wmma.dense_bf16_gemv[gdn_proj]")
+                return fn(x.contiguous(), w)
+        return super().forward(x)   # F.linear -> rocBLAS (also the >MAXM / prefill path)
 
 
 class GatedRMSNormWeight(nn.Module):
