@@ -240,8 +240,21 @@ services:
     # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
     # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
     #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
-    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
-    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #          — Loads and serves coherently, but MEASURED NET-NEGATIVE AT EVERY K under REAL
+    #            SAMPLING (2026-07-29; checkpoint generation_config temp 1.0/top_k 20/top_p 0.95;
+    #            20000 ctx, MNS=8, 5 trials; tools/vhip_patches/bench_spec_decode.py):
+    #              no-spec 87.2 | K=2 68.2 (-21.8%) | K=4 70.5 (-19.1%) | K=6 62.8 (-28.0%)
+    #            DO NOT quote greedy (temp=0) spec numbers: the SAME sweep greedy says K=4 is 98.3
+    #            = "+8.7% WIN". temp=0 makes verify an exact argmax match against a drafter that IS
+    #            the target checkpoint, and the inflation is worst at the LATE draft positions
+    #            (K=4 pos3 42.1% -> 23.3%), so a greedy sweep over-recommends K.
+    #            Break-even at K=4 needs step cost <=2.673x = 30.6 ms vs the measured 37.91 ms, and
+    #            our ENTIRE deficit vs stock vllm24 is ~3.4 ms/step — so even a perfect
+    #            propose+verify still loses. Binding constraint is drafter acceptance (41.8%), NOT
+    #            our kernels: do not fund "close the spec kernel gap" on this model.
+    #            (The old note here said "~28 tok/s vs 82 plain, propose ~5x, accept ~1.9". It was
+    #             superseded twice — stride-aware state, then fused in-kernel publish 53.8 -> 74.1
+    #             e2e — and it misled a later session into a wrong "3.3x off upstream" claim.)
     #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
     #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
     #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
@@ -483,8 +496,21 @@ services:
     # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
     # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
     #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
-    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
-    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #          — Loads and serves coherently, but MEASURED NET-NEGATIVE AT EVERY K under REAL
+    #            SAMPLING (2026-07-29; checkpoint generation_config temp 1.0/top_k 20/top_p 0.95;
+    #            20000 ctx, MNS=8, 5 trials; tools/vhip_patches/bench_spec_decode.py):
+    #              no-spec 87.2 | K=2 68.2 (-21.8%) | K=4 70.5 (-19.1%) | K=6 62.8 (-28.0%)
+    #            DO NOT quote greedy (temp=0) spec numbers: the SAME sweep greedy says K=4 is 98.3
+    #            = "+8.7% WIN". temp=0 makes verify an exact argmax match against a drafter that IS
+    #            the target checkpoint, and the inflation is worst at the LATE draft positions
+    #            (K=4 pos3 42.1% -> 23.3%), so a greedy sweep over-recommends K.
+    #            Break-even at K=4 needs step cost <=2.673x = 30.6 ms vs the measured 37.91 ms, and
+    #            our ENTIRE deficit vs stock vllm24 is ~3.4 ms/step — so even a perfect
+    #            propose+verify still loses. Binding constraint is drafter acceptance (41.8%), NOT
+    #            our kernels: do not fund "close the spec kernel gap" on this model.
+    #            (The old note here said "~28 tok/s vs 82 plain, propose ~5x, accept ~1.9". It was
+    #             superseded twice — stride-aware state, then fused in-kernel publish 53.8 -> 74.1
+    #             e2e — and it misled a later session into a wrong "3.3x off upstream" claim.)
     #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
     #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
     #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
