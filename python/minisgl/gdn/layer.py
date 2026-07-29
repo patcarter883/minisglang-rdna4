@@ -65,9 +65,18 @@ _GDN_FUSED_CONV = os.environ.get("MINISGL_GDN_FUSED_CONV", "1") == "1"
 # it is NOT bit-identical to F.linear (rel 1.7e-5..8.2e-4 on these shapes). F.linear itself measured
 # M-invariant here, so a threshold INTRODUCES a crossing that does not exist today: a token computed
 # at M<=MAXM and the same token computed at M>MAXM would differ. That is the hazard layers/minv.py
-# exists to prevent (ZAYA GSM8K 45->25), which is why this is DEFAULT OFF and opt-in.
-_GDN_PROJ_GEMV = os.environ.get("MINISGL_GDN_PROJ_GEMV", "0") == "1"
-_GDN_PROJ_GEMV_MAXM = int(os.environ.get("MINISGL_GDN_PROJ_GEMV_MAXM", "2"))
+# exists to prevent (ZAYA GSM8K 45->25).
+#
+# DEFAULT ON, MAXM=16 (was off/2). The hazard above is a THRESHOLD hazard, not a kernel hazard: it
+# appears only where two different kernels serve the same shape at different M. MAXM=16 is the M
+# ceiling this GEMV accepts (torch_binding checks M<=16), so raising the threshold to the ceiling
+# puts BOTH ordinary decode (M=1..max_running) and spec-decode VERIFY (M=K+1) on the SAME kernel —
+# which is what makes verify match sequential decode. At MAXM=2 they landed on opposite sides and
+# spec losslessness was silently broken. Above 16 the fallback is F.linear, which is not M-invariant
+# at all, so raising MAXM strictly widens the M-invariant region rather than narrowing it.
+# Set MINISGL_GDN_PROJ_GEMV=0 to restore the old F.linear/rocBLAS path.
+_GDN_PROJ_GEMV = os.environ.get("MINISGL_GDN_PROJ_GEMV", "1") == "1"
+_GDN_PROJ_GEMV_MAXM = int(os.environ.get("MINISGL_GDN_PROJ_GEMV_MAXM", "16"))
 
 if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod

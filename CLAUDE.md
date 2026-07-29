@@ -90,11 +90,29 @@ mandatory.
 
 ## Container-run conventions for *this* repo (MANDATORY)
 
-GPU runs here do **not** use this repo's `Dockerfile` (that's the inherited CUDA/NVIDIA upstream
-artifact, kept for the future native image — it is NOT the run path). Instead we mount this repo's
-source into the **shared ROCm image `vllm22-w4a8:combined`** (same image, toolchain, and W4A8
-kernel as vllm-gfx1201) via hand-rolled `docker run`. The canonical recipe is in
-[`README.md`](README.md) ("Running"); the conventions every run must keep:
+**This repo's `Dockerfile` IS the serve image** — `rocm/dev-ubuntu-24.04:7.2.1-complete`, which
+builds the canonical HIP kernels into `/opt/kernels` and bakes `python/` to `/opt/minisgl/python`.
+It is built through the compose `build` service, which injects the kernels as a named additional
+build context. `Dockerfile.lean` is **RETIRED** — do not look for it, and note that copies survive
+in stale non-git directories like `minisgl-rdna4-leanimg/`, which is a trap.
+
+    docker build -t minisgl-rdna4:<tag> \
+      --build-context kernels=<CLEAN kernels worktree> \
+      --build-arg KERNELS_REF=<kernels sha> .
+
+Both contexts must be **clean worktrees**: the Dockerfile does `COPY --from=kernels .` and
+`COPY python`, i.e. it copies whatever is ON DISK, so building from a shared tree silently bakes
+another agent's mid-edit files (this is the source-isolation rule above, applied to image builds).
+`KERNELS_REF` is only a cache-buster label — the real source is the copied tree — so it must be
+bumped or the kernel layer is served from cache and you ship stale kernels believing otherwise.
+
+A `.so` built in one image will NOT load in another (`libc10.so: cannot open shared object file`)
+and the symptom is a serve that never reaches the GPU — `gpu_use=0%` until the readiness timeout,
+not a build error. Build kernel packages inside the image that will run them.
+
+The older hand-rolled path (mounting source into the shared `vllm22-w4a8:combined` image via
+`docker run`) is still used for **standalone kernel benches/parity**, where no engine is involved.
+The canonical recipe is in [`README.md`](README.md) ("Running"); its conventions:
 
 - **ROCm device passthrough is mandatory or `is_rocm()` → False** (torch sees no HIP GPU, Triton
   disables, boot crashes). Always pass the full set:
