@@ -19,10 +19,17 @@ def _env(k, d): return os.environ.get(k, d)
 
 
 def main():
+    import json as _json
+
     from vllm import LLM, SamplingParams
     prof_dir = os.environ.get("VLLM_TORCH_PROFILER_DIR")
     assert prof_dir, "VLLM_TORCH_PROFILER_DIR must be set"
     model = os.environ["PROF_MODEL"]
+    # PROF_SPEC = a --speculative-config JSON, so a spec-decode step can be profiled with the same
+    # harness as plain decode. A spec step is propose(K) + one verify forward, and only a trace can
+    # say which of the two owns the extra time — the serve-side tok/s cannot.
+    #   PROF_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    spec_cfg = _json.loads(_env("PROF_SPEC", "") or "null")
     # vLLM 0.24 replaced the VLLM_TORCH_PROFILER_DIR env trigger with a structured profiler_config
     # (dict accepted by offline LLM). start_profile()/stop_profile() propagate to ALL TP workers.
     llm = LLM(
@@ -46,6 +53,7 @@ def main():
         gpu_memory_utilization=float(_env("PROF_MEM", "0.92")),
         enforce_eager=_env("PROF_EAGER", "0") == "1",
         trust_remote_code=True,
+        **({"speculative_config": spec_cfg} if spec_cfg else {}),
     )
     pre = int(_env("PROF_PREFILL", "300"))
     dec = int(_env("PROF_DECODE", "30"))

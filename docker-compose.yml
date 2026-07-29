@@ -291,8 +291,25 @@ services:
     environment:
       <<: *lean-env
       PYTHONPATH: /opt/kernels
-      NCCL_P2P_DISABLE: "1"
-      NCCL_PROTO: Simple
+      # MEASURED 2026-07-29 (spec decode trace, tools/profiling/prof_spec): RCCL all-reduce is 33%
+      # of spec-decode GPU time — 93 calls/step (2 per layer x 48 layers) at 92.8 us for a ~12 KB
+      # message. The no-spec profile has the same call count at 42 us for 1/3 the bytes, i.e. cost
+      # scales with SIZE on a message far too small to be bandwidth-bound — the signature of a
+      # host-staged path. With P2P off, RCCL cannot use the PCIe peer link between the two cards.
+      # Spec pays this 3x harder than plain decode (verify carries qlen=3), so it is a prime suspect
+      # for the spec gap vs stock.
+      # DO NOT set NCCL_P2P_DISABLE=0: MEASURED 2026-07-29, RCCL cannot bring up its P2P transport
+      # between these two RDNA4 cards — ncclCommInitRank dies on BOTH ranks with
+      # "NCCL error: unhandled cuda error" / "[FATAL ERROR]: HIP failure: 'invalid argument'".
+      # The =1 here is load-bearing, not a copied default. (HIP IPC peer access itself DOES work on
+      # this box — minisgl's custom_ar one-shot allreduce uses it — so the fix is a custom AR, not
+      # RCCL P2P. vLLM skips its _can_p2p probe on ROCm, so custom AR is gated by arch, not peer.)
+      NCCL_P2P_DISABLE: "${NCCL_P2P_DISABLE:-1}"
+      # Simple protocol + Ring algorithm: with P2P off every collective stages through host memory,
+      # where Ring's contiguous chunked transfers beat Tree's latency-optimised pattern, and Simple
+      # avoids LL/LL128's protocol overhead on a path that is already copy-bound.
+      NCCL_PROTO: "${NCCL_PROTO:-Simple}"
+      NCCL_ALGO: "${NCCL_ALGO:-Ring}"
       # `awq_dense_hip` MUST be here, not just in the glm/laguna presets. w4a8_fp8_wmma_register
       # installs our W4A8 kernel at _POSSIBLE_KERNELS[ROCM][0], but for an AWQ checkpoint that
       # registry is NEVER consulted on ROCm (AutoAWQConfig.get_quant_method routes to the

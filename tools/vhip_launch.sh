@@ -109,5 +109,19 @@ fi
 
 echo "[launch] preset=$PRESET model=$MINISGL_MODEL spec=${VHIP_SPEC:-none}"
 cd "$REPO"
+
+# VHIP_CMD set => run that ONE command in the foreground with this preset's exact mounts+env
+# instead of starting the server. Profiling MUST go through here: the mount list above is what
+# redirects every overlay at THIS worktree, and the compose defaults point at the shared tree (a
+# hand-rolled `docker compose run` either fails on a missing path or, worse, silently profiles the
+# BAKED glue — which is the slow fp32-full-cache-copy one, so the trace looks catastrophic for
+# reasons that have nothing to do with the current code).
+#   VHIP_CMD='...' tools/vhip_launch.sh qwen-mtp
+if [ -n "${VHIP_CMD:-}" ]; then
+  export VHIP_CMD
+  exec gpu-lease -n 2 --name "vhip-$PRESET-cmd" -- \
+    docker compose --profile vhip run --rm vhip
+fi
+
 exec gpu-lease -n 2 --detach --name "vhip-$PRESET" -- \
   docker compose --profile vhip up -d --force-recreate

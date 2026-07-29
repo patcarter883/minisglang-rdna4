@@ -98,7 +98,18 @@ Cannot be wired — no call site exists (clean negative, do not re-derive):
 
 ## Landing order (cost-ranked, each measured independently)
 
-1. `custom_ops=+rms_norm,+rms_norm_add,+silu_and_mul` — zero code, turns on wiring already written.
+1. ~~`custom_ops=+rms_norm,+rms_norm_add,+silu_and_mul` — zero code, turns on wiring already
+   written.~~ **MEASURED 2026-07-29: WORTH EXACTLY ZERO. Do not re-run.** Qwen3.6-35B TP=2, 20000
+   ctx, sampled (temp 1.0 / top_k 20 / top_p 0.95), 5 trials: **87.3 tok/s with vs 87.2 without**,
+   inside a 1.0 tok/s spread. Config confirmed applied in the boot log
+   (`'custom_ops': ['none','+rms_norm','+rms_norm_add','+silu_and_mul']`).
+   *Why it is a wash:* under `VLLM_COMPILE` the default `custom_ops: ['none']` lets **inductor fuse**
+   those pointwise ops into `triton_poi_fused_*`; forcing our custom kernels wins on the kernel but
+   loses the fusion, and the two cancel. A standalone microbench win (1.16–1.47x, memory
+   `kernel-fusion-gdn-gated-norm`) does NOT survive contact with inductor.
+   Syntax note: `-O.custom_ops=...` is NOT parsed by 0.24 (`-O` swallows it, pydantic then rejects
+   the enum); use `--compilation-config '{"custom_ops":[...]}'` with `none` FIRST so the `+` entries
+   are additive.
 2. `store_kv` — only per-layer decode op still genuinely Triton; we own the override point.
 3. W4A16 MoE — no repack for decode; directly attacks the fp8-act degradation.
 4. `gdn_decode_conv_gated` + remove the spec-path casts/copies.
