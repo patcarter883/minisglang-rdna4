@@ -110,12 +110,11 @@ RUN set -eux; \
 #   accordo -> snapshot-based correctness validation with configurable atol/rtol, i.e. the job our
 #              hand-rolled parity_*.py recorders do.
 #   metrix  -> the counter tool. Kept for when counters are fixed; refuses today (see profile_kernel.sh).
-#   uprof_mcp -> INERT here. It is only an MCP WRAPPER: AMD uProf itself is a SEPARATE manual download
-#              from AMD's developer site (EULA-gated, not in apt, not in pip) and is installed NOWHERE
-#              on this box. The wrapper imports fine and then fails at runtime wanting
-#              $INTELLIKIT_UPROF_CLI, so do not read "uprof_mcp installed" as "CPU profiling works".
-#              There is currently NO CPU profiler here at all (no uProf, no perf, no py-spy), which is
-#              a real gap given how often this stack turns out to be host-bound rather than GPU-bound.
+#   uprof_mcp -> an MCP WRAPPER only; it needs AMD uProf itself, which is EULA-gated and in neither apt
+#              nor pip. It is installed by the uProf stage further down (build-context supplied), and
+#              $INTELLIKIT_UPROF_CLI points the wrapper at it. Without that stage the wrapper imports
+#              fine and then fails at runtime, so never read "uprof_mcp installed" as "CPU profiling
+#              works" -- check WHAT=caps, which reports the CLI itself.
 #
 # apt deps are from IntelliKit's own docker/Dockerfile. libdw/libelf are ALSO symlinked out of
 # torch/lib: rocprofiler-sdk injects a tool library that needs them, they exist nowhere else in this
@@ -145,6 +144,33 @@ PYEOF
     for d in libdw.so.1 libelf.so.1; do ln -sf "$TL/$d" "/opt/rocprof-deps/$d"; done
 ENV KERNCAP_DEPS=/opt/rocprof-deps \
     ATT_DECODER_DIR=/opt/rocprof-decoder
+
+# ---- AMD uProf 5.3.521: the CPU profiler -------------------------------------------------------
+# WHY: this stack keeps turning out to be HOST-bound rather than GPU-bound (35B MoE decode is
+# overhead-bound; the metrix supervisor slept in poll() while its child burned 199% CPU), and until
+# now there was NO CPU profiler here at all — no uProf, no perf, no py-spy. uprof_mcp from IntelliKit
+# is only an MCP wrapper and is inert without this.
+#
+# NOT FETCHABLE AT BUILD TIME. AMD serves it only behind a EULA click-through: the direct URL
+# (download.amd.com/developer/eula/uprof/uprof-5-3/amduprof_5.3-521_amd64.deb) answers 302 back to the
+# landing page for any request that has not been through the form. So the .deb is supplied as a BUILD
+# CONTEXT rather than downloaded, which also keeps the build reproducible and offline.
+#   docker build --build-context uprof=/home/pat/pkgs ...     # dir containing amduprof_5.3-521_amd64.deb
+# The stage is skipped cleanly if that context has no .deb, so the image still builds without it.
+COPY --from=uprof . /tmp/uprof-pkg/
+RUN set -eux; \
+    if ls /tmp/uprof-pkg/amduprof_*.deb >/dev/null 2>&1; then \
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        /tmp/uprof-pkg/amduprof_*.deb; \
+      rm -rf /var/lib/apt/lists/*; \
+      ls -d /opt/AMDuProf_*/bin/AMDuProfCLI; \
+    else \
+      echo "NOTE: no amduprof_*.deb in the uprof build context — CPU profiling will be unavailable"; \
+    fi; \
+    rm -rf /tmp/uprof-pkg
+# uprof_mcp resolves the CLI from this; without it the wrapper imports and then fails at runtime.
+ENV INTELLIKIT_UPROF_CLI=/opt/AMDuProf_5.3-521/bin/AMDuProfCLI
 
 ARG KERNELS_REF=2fa1c38
 # Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
