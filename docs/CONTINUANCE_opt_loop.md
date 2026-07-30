@@ -5,6 +5,60 @@ established by measurement in the previous session; the "do not repeat" list cos
 
 ---
 
+## STATUS UPDATE — 2026-07-30, second session (READ BEFORE THE REST)
+
+The two loops below are **LAUNCHED and running**. Several claims further down are now **falsified by
+measurement** — the sections are kept for their reasoning, but trust this block over them.
+
+**Measured serve baseline is 81.05 tok/s, not 69.1.** Qwen3.6-35B-A3B-AWQ-4bit, TP=2, `--graph 16`,
+M=1 decode, **sampled**. The 69.1 figure was stale (old image). Prereqs are all cleared: the image
+was rebuilt (`minisgl-rdna4:lean`, kernels @202dd65 — the handover build had NOT finished; old image
+preserved as `minisgl-rdna4:base0723`), and `serve_ab.sh` has now booted real serves on both
+`qwen35b_decode` and `zaya_decode`.
+
+| item | verdict |
+|---|---|
+| §3a scatter under graph capture | **TRUE and LANDED.** Captures fine; +3.2% e2e (81.05 → 83.60, non-overlap). Default flipped ON (`4bb4a083`). |
+| §3a's "1.75× waiting behind a flag" | **FALSE as stated.** The 1.75× was an isolated microbench; e2e is **+3.2%**. |
+| moe_splitk (`3f8cb2c`+`25cc782`, "biggest single open win") | **DEAD CODE on the served model.** It hard-asserts `at::kHalf` at both entry points and Qwen3.6-35B is **bf16** → raises on the first decode step. The blocker was never graph capture. |
+| §4 blocker 1 (rocprofv3 flock) | **FIXED** — box-wide mutex in `profile_kernel.sh` (`d1018f0`). |
+| §4 blocker 2 (card pinning) | **FIXED** — timing legs now lease `-n 2` for exclusivity; the workflow told agents `-n 1`, which is what made parallel loops unsafe. |
+| §4 blocker 3 (contamination) | **ENFORCED** by the above — the arbiter now serializes the two loops' timing legs for you. |
+| `serve_ab.sh` zaya config | **WAS BROKEN** — pointed at `/models/ZAYA1-8B`, which does not exist and never did. Real trees: `ZAYA1-8B-fp8` (served) / `ZAYA1-8B-MXFP4`. The CCA loop would have died on its first gate. |
+| `WORKLOADS` plumbing | **WAS BROKEN** — never forwarded, so all 3 workloads ran and any "M=1 row" parse silently read `mixed` while reporting `decode`. |
+
+**Serving noise band = ~0.7%** (ZAYA1-8B-fp8 TP=1 CONTROL run: 58.8–59.2 tok/s over 4 legs, ratio
+1.0034×, non-overlap correctly NO). So the non-overlap gate can resolve a genuine ~1% win — CCA's
+"~1.05× in situ" IS measurable e2e. Run the control first; it is the only proof the gate has the
+right polarity.
+
+**Loops running:**
+- CCA **serving** loop — `mode:'serving', serveConfig:'zaya_decode'`, run `wf_a5ae97c7-c5a`.
+- `attn_prefill_paged` **kernel** loop — run `wf_fac3e4de-742`. Chosen because it does NOT collide
+  with the in-flight `fp8_wmma` split-K fold, and because a real profile put it at ~70% of CCA
+  prefill at ~2% of peak.
+
+**In flight, NOT finished** (worktree `rdna4-hip-kernels-splitkfold`, branch `perf/splitk-into-core`):
+folding split-K into `fp8_wmma`'s shared MoE core as a **runtime `split_k` arg** (not a template
+param — it only moves the K-loop bounds, so templating would DCE nothing while multiplying
+instantiations, and instantiation count drives the spills that actually cost time). The whole delta
+is ~10 lines: carve the `g` loop by `blockIdx.z`, set `grid.z`, and let the EXISTING atomic scatter
+epilogue do the cross-slice reduction (`asc`/`wscale_epi` are per-row/per-channel constants, so they
+distribute exactly). Core axis is in; launcher + binding + engine rewire + parity + delete the
+package remain. Gate: `split_k=1` must be **bit-exact** (that is the control); `split_k>=2` is
+tolerance-only because atomics reorder.
+
+**Standing rule learned the hard way:** nothing may assert on dtype. Every pathway is dtype-agnostic
+and runs in the model's **native** dtype with minimal casts. A `TORCH_CHECK(scalar_type()==kHalf)` is
+a bug to fix by templating, not a contract to design around — that assert is exactly why a measured
+1.767× could never run in production.
+
+**Do NOT re-derive:** minisgl 83.6 is **sampled**; the ~90 figure people remember is stock vLLM 0.24
+at **92.9 greedy** (obs #5310) — a different engine AND a different sampling mode. Not a valid gap;
+get the sampled vLLM24 number before claiming one.
+
+---
+
 ## 0. READ THIS FIRST — how to pick a target
 
 **Do NOT pick targets from `rdna4-hip-kernels/KERNELS.md`.** It was wrong on every target decision
