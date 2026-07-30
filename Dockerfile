@@ -153,14 +153,28 @@ ENV KERNCAP_DEPS=/opt/rocprof-deps \
 # CONTEXT rather than downloaded, which also keeps the build reproducible and offline.
 #   docker build --build-context uprof=/home/pat/pkgs ...     # dir containing amduprof_5.3-521_amd64.deb
 # The stage is skipped cleanly if that context has no .deb, so the image still builds without it.
+#
+# THE POSTINST FAILURE IS EXPECTED AND TOLERATED (|| true), because it fails for two reasons that are
+# both artefacts of building in a container and neither of which affects CPU sampling:
+#   * "Linux headers is required for installing AMD Power Profiler driver" — it wants to build a KERNEL
+#     MODULE against the HOST kernel (7.0.10-1-cachyos-custom). Those headers cannot exist in a Debian
+#     image, and the module is for POWER/energy profiling, not CPU hotspots.
+#   * "debugfs or tracefs is not mounted" — not mounted during a build; it is a runtime concern.
+# The binaries unpack correctly either way, so the real gate is whether the CLI RUNS, which is what is
+# checked below. Letting apt's exit 100 fail the build would reject a perfectly usable profiler.
+# NOTE: energy/power counters and some OS tracing will therefore be unavailable; plain CPU sampling is
+# what we installed this for and is unaffected.
 COPY --from=uprof . /tmp/uprof-pkg/
 RUN set -eux; \
     if ls /tmp/uprof-pkg/amduprof_*.deb >/dev/null 2>&1; then \
       DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        /tmp/uprof-pkg/amduprof_*.deb; \
+        /tmp/uprof-pkg/amduprof_*.deb || true; \
       rm -rf /var/lib/apt/lists/*; \
-      ls -d /opt/AMDuProf_*/bin/AMDuProfCLI; \
+      /opt/AMDuProf_5.3-521/bin/AMDuProfCLI info --list-cpu-topology >/dev/null 2>&1 \
+        || /opt/AMDuProf_5.3-521/bin/AMDuProfCLI --version >/dev/null 2>&1 \
+        || { echo "uProf CLI does not run"; exit 1; }; \
+      echo "uProf CLI OK: $(ls -d /opt/AMDuProf_*/bin/AMDuProfCLI)"; \
     else \
       echo "NOTE: no amduprof_*.deb in the uprof build context — CPU profiling will be unavailable"; \
     fi; \
