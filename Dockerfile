@@ -66,8 +66,13 @@ RUN pip install \
 # import name of each module already matches what the engine imports (gdn_hip, mla_hip, tail_hip, …);
 # only cca is exposed as `zaya_cca` (the engine is repointed to that name in the same change).
 ARG KERNELS_REF=2fa1c38
+# Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
+# 16 cores, and on this SHARED box that perturbs whatever a concurrent opt_loop is timing (host-side
+# contention shows up in kernel launch latency). Raise it for a solo build; leave it modest when the
+# loops are running.
+ARG MAX_JOBS=6
 COPY --from=kernels . /opt/rdna4-hip-kernels
-RUN set -eux; mkdir -p /opt/kernels; \
+RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; mkdir -p /opt/kernels; \
     for pkg in \
         gdn:gdn_hip \
         cca:zaya_cca \
