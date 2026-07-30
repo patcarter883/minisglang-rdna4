@@ -25,8 +25,7 @@ boot(){ # $1=persist ; sets $LOG
   LOG="$OUTDIR/spec_dflash_longprompt.p${persist}.log"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
   echo "[boot dflash persist=$persist] -> $LOG"
-  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine \
-    MINISGL_MOE_SCATTER=0 MINISGL_KV_FP8=1 MINISGL_SPEC_DEBUG=1 MINISGL_DFLASH_PERSIST_KV=$persist \
+  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine \ MINISGL_KV_FP8=1 MINISGL_SPEC_DEBUG=1 MINISGL_DFLASH_PERSIST_KV=$persist \
     python -m minisgl --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph 16 $pynccl \
     --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" --attention-backend hip \
     --spec-algorithm dflash --spec-num-draft $NUM_DRAFT --spec-draft-model-path $DRAFT > "$LOG" 2>&1 &

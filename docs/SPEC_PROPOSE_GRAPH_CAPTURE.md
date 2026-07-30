@@ -86,7 +86,7 @@ keeps verify eager under EP (`scheduler.py:2074-2081`).
 
 ## MoE safety — already OK
 
-Under `MINISGL_MOE_SCATTER=0` (default) the head's MoE runs unfused gemm2 + `scatter_add_` gather_reduce
+HISTORICAL (the flag no longer exists): the head's MoE ran unfused gemm2 + `scatter_add_` gather_reduce
 (graph-safe; the fused scatter's `atomicAdd` is not — `quant/kernels.py:31-35`, `moe/fused.py:142-144`).
 `MoELayer.forward` non-EP is self-contained (`layers/moe.py:735`). Nothing to change; just don't capture
 under EP.

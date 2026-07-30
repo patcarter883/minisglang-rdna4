@@ -55,7 +55,7 @@ run_phase() {
     --entrypoint bash ${IMAGE} -lc "
       source /app/.venv/bin/activate
       pip install -q msgpack pyzmq prompt_toolkit accelerate 2>/dev/null
-      PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 \\
+      PYTHONPATH=/engine/python:/engine \\
         python /engine/tools/dp_validate_client.py \\
           --dp \$dp --model ${MODEL} --conc ${CONC} --max-tokens ${MAXTOK} \\
           --max-running ${MAX_RUNNING} \\

@@ -33,7 +33,7 @@ timeout --signal=KILL ${PHASE_TO} docker run --rm \\
   --entrypoint bash ${IMAGE} -lc "
     source /app/.venv/bin/activate
     pip install -q msgpack pyzmq prompt_toolkit accelerate 2>/dev/null
-    PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 \\
+    PYTHONPATH=/engine/python:/engine \\
       python /engine/tools/dp_validate_client.py \\
         --dp 2 --model ${MODEL} --conc ${CONC} --max-tokens ${MAXTOK} \\
         --port 1919 --graph ${GRAPH} --boot-timeout ${BOOT_TO} --req-timeout ${REQ_TO} \\

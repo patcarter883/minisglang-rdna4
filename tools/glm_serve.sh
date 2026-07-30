@@ -25,7 +25,7 @@ docker run --rm --name glm_serve_eagle3 \
     mkdir -p /root/.triton && cp -a /triton-ro/. /root/.triton/ 2>/dev/null || true
     source /app/.venv/bin/activate
     pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil 2>&1 | tail -1
-    exec env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_KV_FP8=1 \
+    exec env PYTHONPATH=/engine/python:/engine MINISGL_KV_FP8=1 \
       MINISGL_SPEC_PREFILL_SEED=1 python -m minisgl \
       --model QuantTrio/GLM-4.7-Flash-AWQ --tensor-parallel-size 2 \
       --host 0.0.0.0 --port 1919 --disable-pynccl \

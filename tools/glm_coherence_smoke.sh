@@ -13,7 +13,6 @@ PORT="${PORT:-21919}"
 MEMRATIO="${MEMRATIO:-0.85}"
 MAXRUN="${MAXRUN:-8}"
 GRAPH="${GRAPH:-0}"                 # cuda_graph_max_bs; 0 = eager, >0 = capture decode graphs
-MMS="${MOE_SCATTER:-0}"            # MINISGL_MOE_SCATTER: 0 = graph-safe gather_reduce MoE decode
 KV_FP8="${KV_FP8:-0}"             # 1 -> MINISGL_KV_FP8 (e4m3 latent KV cache, ~2x tokens)
 MAXSEQ="${MAXSEQ:-}"              # --max-seq-len-override (max context per request)
 LOG=/engine/tools/glm_smoke.server.log
@@ -40,8 +39,7 @@ mode="eager"; [ "$GRAPH" -gt 0 ] && mode="graph(max_bs=$GRAPH, moe_scatter=$MMS)
 kvf=""; [ "$KV_FP8" = "1" ] && kvf="MINISGL_KV_FP8=1"
 echo "[launch] $MODEL TP=$TP $mode (mla) kv_fp8=$KV_FP8 maxseq=${MAXSEQ:-default} memratio=$MEMRATIO -> $LOG"
 # NO --attention-backend (is_mla forces 'mla'). --graph 0 = eager; >0 captures the decode graph
-# (MoE-decode uses the graph-safe gather_reduce path via MINISGL_MOE_SCATTER).
-setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER="$MMS" $kvf python -m minisgl \
+setsid env PYTHONPATH=/engine/python:/engine $kvf python -m minisgl \
   --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" \
   $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" $maxseq_flag \
   > "$LOG" 2>&1 &

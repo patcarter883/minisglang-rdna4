@@ -21,7 +21,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 boot(){ # $1 = --graph value
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_SPEC_DEBUG=1 \
+  setsid env PYTHONPATH=/engine/python:/engine MINISGL_SPEC_DEBUG=1 \
     MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PREFILL_SEED=1 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size 2 --port $PORT --graph "$1" --disable-pynccl \
     --memory-ratio 0.80 --max-running-requests 4 \

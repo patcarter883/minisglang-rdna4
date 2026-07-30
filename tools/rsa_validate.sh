@@ -25,7 +25,7 @@ timeout --signal=KILL ${PHASE_TO} docker run --rm \\
   --entrypoint bash ${IMAGE} -lc "
     source /app/.venv/bin/activate
     pip install -q msgpack pyzmq prompt_toolkit accelerate 2>/dev/null
-    PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 \\
+    PYTHONPATH=/engine/python:/engine \\
       python /engine/tools/rsa_validate_client.py --model ${MODEL} --port 1919 --graph 16 \\
         --rsa-n 4 --rsa-k 2 --rsa-t 2 --rsa-max-tokens 192 --rsa-tail-tokens 256"
 echo "[rsa-harness] docker rc=\$?"

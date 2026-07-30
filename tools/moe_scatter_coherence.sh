@@ -10,7 +10,7 @@
 # So the scatter path must be judged by reading the generated text, at the SAME --graph setting the
 # benchmark used (capture is exactly what was claimed impossible here).
 #
-#   MMS=1 GRAPH=16 bash tools/moe_scatter_coherence.sh
+#   GRAPH=16 bash tools/moe_scatter_coherence.sh
 set -uo pipefail
 source /opt/venv/bin/activate 2>/dev/null || source /app/.venv/bin/activate
 
@@ -18,10 +18,6 @@ MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
 TP="${TP:-2}"
 PORT="${PORT:-21962}"
 GRAPH="${GRAPH:-16}"
-# Same names run_bench_window.sh already forwards, so a coherence run and a bench run are configured
-# identically (INNER=/engine/tools/moe_scatter_coherence.sh is the only difference).
-MMS="${MOE_SCATTER:-1}"                  # MINISGL_MOE_SCATTER
-SPLITK="${MINISGL_MOE_SPLITK:-}"         # >=2 routes the M==1 scatter to moe_splitk_hip
 LOG=/engine/tools/moe_scatter_coherence.server.log
 
 SRV=""
@@ -31,9 +27,9 @@ stop() { [ -n "$SRV" ] || return 0
   kill -KILL -- "-$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
 trap stop EXIT
 
-echo "[boot] scatter=$MMS splitk=${SPLITK:-0} graph=$GRAPH tp=$TP"
+echo "[boot] graph=$GRAPH tp=$TP (decode scatter + split-K are unconditional at M<=2)"
 local_pynccl=""; [ "$TP" -gt 1 ] && local_pynccl="--disable-pynccl"
-setsid env MINISGL_MOE_SCATTER="$MMS" MINISGL_MOE_SPLITK="$SPLITK" python -m minisgl \
+setsid python -m minisgl \
   --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --graph "$GRAPH" $local_pynccl \
   --memory-ratio 0.82 --max-running-requests 4 --attention-backend hip > "$LOG" 2>&1 &
 SRV=$!

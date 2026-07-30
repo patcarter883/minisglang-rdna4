@@ -11,7 +11,7 @@ Decode TPOT is isolated as t(max_tokens=1+STEPS) - t(max_tokens=1) over STEPS, a
 (the shared prefill cancels). prefill_ms ~= t(max_tokens=1) (prefill of B*L + 1 decode).
 
 Run INSIDE vllm22-w4a8:combined via the gpu-lease wrapper (graph capture on, scatter off for capture):
-    PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 python /engine/tools/zaya_serving_matrix.py
+    PYTHONPATH=/engine/python:/engine python /engine/tools/zaya_serving_matrix.py
 """
 from __future__ import annotations
 

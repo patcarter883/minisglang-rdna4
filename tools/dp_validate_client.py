@@ -126,7 +126,6 @@ def main() -> int:
     base = f"http://127.0.0.1:{args.port}"
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", "/engine/python:/engine")
-    env.setdefault("MINISGL_MOE_SCATTER", "0")  # graph-capture-friendly (prod config)
     # MINISGL_ATTN_HIP / MINISGL_TAIL_HIP are inherited from the parent env so the harness can flip
     # the native-HIP attention/tail kernels off for crash isolation without touching this file.
 

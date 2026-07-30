@@ -30,20 +30,21 @@ _MOE_EVERY = int(_os.environ["MINISGL_MOE_PROF"]) if _os.environ.get("MINISGL_MO
 _moe_buckets: dict = _dd(float)
 _moe_calls = 0
 
-# Decode-path gemm2+gather fusion via mmq_fp8_moe_gemm_scatter (atomic scatter). ON by default.
+# Decode-path gemm2+gather fusion via mmq_fp8_moe_gemm_scatter (atomic scatter). UNCONDITIONAL at
+# M<=2 -- there is no flag. M<=2 is a WORKLOAD condition (decode vs prefill), not a toggle.
 #
-# This used to default OFF, on the claim that "the scatter's atomicAdd is NOT graph-capture-safe".
+# This was once gated OFF on the claim that "the scatter's atomicAdd is NOT graph-capture-safe".
 # THAT CLAIM WAS FALSE and it cost the served path a free win for as long as it stood. An atomicAdd
 # is an ordinary instruction; nothing about it resists capture. What a captured region does require
 # is that the accumulator be re-zeroed on every REPLAY, and it is: the `torch.zeros((M, K))` below is
 # recorded INSIDE the captured region, so its fill kernel is part of the graph and runs on each
 # replay. Measured 2026-07-30, Qwen3.6-35B-A3B-AWQ-4bit TP=2 --graph 16, M=1 decode, interleaved
 # paired legs in one lease: all 6 decode graphs capture with the scatter engaged, and
-#   MOE_SCATTER=0 -> 81.0, 81.1 tok/s    MOE_SCATTER=1 -> 83.7, 83.5 tok/s   (1.0315x, non-overlap)
+#   gather_reduce -> 81.0, 81.1 tok/s    scatter -> 83.7, 83.5 tok/s   (1.0315x, non-overlap)
 # Note the size of that win, because the isolated microbench for the same op said 1.75x
 # (21.93us scatter vs 38.42us gather_reduce). e2e it is +3.2%. Trust the serve number.
-# MINISGL_MOE_SCATTER=0 reverts to the unfused gemm2 + gather_reduce.
-_MOE_SCATTER = _os.environ.get("MINISGL_MOE_SCATTER", "1") != "0"
+#
+# NOT bit-exact vs gather_reduce (the atomic reduction order varies), so it is tolerance-gated.
 
 # Fused router (moe_hip.moe_topk_softmax): softmax+top-k+renormalize in one launch. Unconditional —
 # measured +4.8% bs=1, outputs bit-identical to the torch chain.
@@ -88,11 +89,20 @@ RXF_REGDIRECT = _os.environ.get("MINISGL_RXF_REGDIRECT", "1") != "0"
 # (fp8 acts). Weights repacked to _w_rep/_scales_rd in post_load only when this is on.
 MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "0") != "0"
 
-# Decode gemm2 split-K (Task A #17): MINISGL_MOE_SPLITK=<S> (S>=2) routes the decode scatter gemm2
-# to the minisgl-local moe_splitk_hip kernel, carving the K=inter contraction across S grid.z blocks
-# to lift occupancy (gemm2 is ~15% of peak BW at M=1). 0/unset = the vendored w4a8_fp8_wmma scatter.
-# Like the base scatter, the atomicAdd is NOT cuda-graph-capture-safe (eager decode only).
-_MOE_SPLITK = int(_os.environ["MINISGL_MOE_SPLITK"]) if _os.environ.get("MINISGL_MOE_SPLITK", "").isdigit() else 0
+# Decode gemm2 split-K, DERIVED FROM THE SHAPE (no flag), the same way _moe_block_m is. The scatter
+# GEMM at M==1 is occupancy-starved -- grid is only (N/BN, P/block_m), a handful of blocks -- so the
+# K=inter contraction is carved across grid.z and the scatter's atomicAdd (already the reduction)
+# combines the slices for free. M>=2 has enough blocks and takes no slicing.
+# This used to be MINISGL_MOE_SPLITK pointing at a whole separate moe_splitk_hip package. That
+# package hardcoded fp16 activations, so on a bf16 model it raised on the first decode step -- its
+# "1.767x" could never run in production. Split-K is now an axis on the shared fp8_wmma core, which
+# is activation-dtype generic, so it works for fp16 AND bf16.
+_MOE_SPLITK_DECODE = 4          # k-slices at M==1; clamped to K/group_size inside the launcher
+
+
+def _moe_split_k(M: int) -> int:
+    """K-slices for the decode scatter gemm2. Workload-derived: 1 = no slicing."""
+    return _MOE_SPLITK_DECODE if M == 1 else 1
 
 # Native HIP moe_align (moe_hip) replacing the vLLM moe_align_block_size host op. On by default;
 # MINISGL_MOE_ALIGN=0 reverts to the vLLM reference.
@@ -453,35 +463,26 @@ def w4a8_moe(
     # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE kernel (mmq_fp8_moe_gemm_scatter):
     # it computes gemm2 (identity-gather over buf2) and atomic-scatters topk_weights[r]*(buf2[r]@W) into
     # a pre-zeroed fp32 (M,K), removing BOTH the (P,K) out2 materialization AND the separate
-    # gather_reduce launch. It IS graph-capturable (see _MOE_SCATTER; the old "atomicAdd cannot be
+    # gather_reduce launch. It IS graph-capturable (the old "atomicAdd cannot be
     # captured" claim was false) and is ON by default -- the `torch.zeros` below is captured too, so
     # the accumulator is re-zeroed on every replay. Prefill (M>2) keeps the unfused gemm2 +
     # contention-free gather_reduce (the (P,K) out2 reuse amortizes better at larger M).
     # NOT bit-exact vs gather_reduce: the atomic reduction order varies, so this is a tolerance-gated
     # path, never a bit-exact one.
-    if M <= 2 and _MOE_SCATTER:
+    if M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
-        if _MOE_SPLITK >= 2 and M == 1:  # split-K only helps the M==1 grid (M>=2 has enough blocks)
-            assert not weight_is_e2m1, "moe_splitk scatter has no MXFP4 (e2m1) decode path"
-            import moe_splitk_hip  # canonical package: op is a module-level callable
-
-            engaged("moe_splitk_hip.moe_gemm_splitk_scatter")
-            _moe_time(
-                "gemm2scat",
-                lambda: moe_splitk_hip.moe_gemm_splitk_scatter(
-                    buf2, w2, w2_scales, w2_zeros, sorted_ids, expert_ids, ntp, tw_flat, acc,
-                    top_k, block_m, _MOE_SPLITK,
-                ),
-            )  # writes acc in place (atomic scatter over experts AND split_k K-slices)
-        else:
-            engaged(f"fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
-            _moe_time(
-                "gemm2scat",
-                lambda: fp8_wmma.mmq_fp8_moe_gemm_scatter(
-                    buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
-                    kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
-                ),
-            )  # writes acc in place
+        # split_k is an AXIS on the shared scatter core (workload-derived), not a second kernel and
+        # not a second package: same op, same weights, same epilogue, one extra grid dimension.
+        split_k = _moe_split_k(M)
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm_scatter{_e2m1}")
+        _moe_time(
+            "gemm2scat",
+            lambda: fp8_wmma.mmq_fp8_moe_gemm_scatter(
+                buf2, w2, w2_scales, sorted_ids, expert_ids, ntp, tw_flat, acc, top_k, block_m,
+                kernel=gemm2_kernel, w_zeros=w2_zeros, weight_is_e2m1=weight_is_e2m1,
+                split_k=split_k,
+            ),
+        )  # writes acc in place (atomic scatter over experts AND the split_k K-slices)
         _moe_report()
         return acc.to(x.dtype)
 
@@ -631,8 +632,8 @@ def w4a16_moe(
 
     tw_flat = tw.reshape(-1).contiguous()
     # DECODE fast path: fused gemm2 + topk-weight + atomic scatter (graph-capturable, ON by default --
-    # see _MOE_SCATTER; gated to M<=2). Otherwise the unfused gemm2 + gather_reduce.
-    if M <= 2 and _MOE_SCATTER:
+    # gated to M<=2 by workload, not by a flag). Otherwise the unfused gemm2 + gather_reduce.
+    if M <= 2:
         output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
         engaged(f"fp8_wmma.mmq_regdirect_w4a16_moe_scatter{_e2m1}")
         _moe_time(
@@ -774,9 +775,9 @@ def w8a8_moe(
 
     tw_flat = topk_weights.reshape(-1).float().contiguous()
     # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE atomic-scatter kernel
-    # (graph-capturable, ON by default -- see _MOE_SCATTER; gated to M<=2). Prefill (M>2) keeps the
+    # (graph-capturable, unconditional at M<=2). Prefill (M>2) keeps the
     # unfused gemm2 + contention-free gather_reduce.
-    if M <= 2 and _MOE_SCATTER:
+    if M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         engaged(f"fp8_wmma.mmq_w8a8_moe_gemm_scatter({gemm2_kernel})")
         _moe_time(
@@ -874,8 +875,8 @@ def w8a8_moe_regdirect(
 
     tw_flat = tw.reshape(-1).contiguous()
     # DECODE fast path: fused gemm2 + topk-weight + atomic scatter (graph-capturable, ON by default --
-    # see _MOE_SCATTER; gated to M<=2). Otherwise the unfused gemm2 + gather_reduce.
-    if M <= 2 and _MOE_SCATTER:
+    # gated to M<=2 by workload, not by a flag). Otherwise the unfused gemm2 + gather_reduce.
+    if M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         engaged("fp8_wmma.mmq_regdirect_w8a8_moe_scatter")
         _moe_time(
@@ -1020,8 +1021,8 @@ def rxf_moe(
 
     # DECODE fast path (mirrors w4a8_moe): fuse gemm2 + topk-weight + reduce into ONE kernel via the
     # atomic scatter, removing the (P,K) out2 materialization + the separate gather. Graph-capturable,
-    # ON by default (see _MOE_SCATTER); gated to M<=2.
-    if M <= 2 and _MOE_SCATTER:
+    # gated to M<=2 by workload, not by a flag.
+    if M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         engaged("fp8_wmma.rxf_moe_gemm_scatter")
         fp8_wmma.rxf_moe_gemm_scatter(

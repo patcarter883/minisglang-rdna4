@@ -21,7 +21,7 @@ docker run --rm \
     source /app/.venv/bin/activate
     pip install -q msgpack pyzmq prompt_toolkit accelerate fastapi uvicorn pydantic starlette psutil 2>&1 | tail -1
     LOG=/engine/tools/glm_kv_probe.server.log
-    setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_KV_FP8=1 \
+    setsid env PYTHONPATH=/engine/python:/engine MINISGL_KV_FP8=1 \
       MINISGL_SPEC_PREFILL_SEED=1 python -m minisgl \
       --model QuantTrio/GLM-4.7-Flash-AWQ --tensor-parallel-size 2 --port 21972 --disable-pynccl \
       --graph 8 --memory-ratio 0.80 --max-seq-len-override 40000 --max-running-requests 4 \

@@ -29,7 +29,7 @@ trap stop EXIT
 boot(){ # $1=algo(none|dflash) $2=ddtree(0|1) ; sets $LOG
   local algo="$1" ddtree="$2"
   LOG="$OUTDIR/ddtree_cap.${algo}.dd${ddtree}.log"
-  local spec="" env_extra="MINISGL_MOE_SCATTER=0 MINISGL_KV_FP8=1"
+  local spec="" env_extra=" MINISGL_KV_FP8=1"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
   if [ "$algo" != "none" ]; then
     spec="--spec-algorithm $algo --spec-num-draft $NUM_DRAFT --spec-draft-model-path $DRAFT"

@@ -14,7 +14,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
   kill -KILL -- "-$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
 trap stop EXIT
 boot(){ local log="$1"; shift
-  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_SPEC_DEBUG=1 \
+  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine MINISGL_SPEC_DEBUG=1 \
     MINISGL_DFLASH_FULLCTX=1 "$@" \
     python -m minisgl --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph "$GRAPH" --attn hip \
     --spec-algorithm dflash --spec-draft-model-path "$DRAFT" --spec-num-draft "$K" \

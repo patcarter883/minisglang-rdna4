@@ -26,7 +26,7 @@ boot(){ # $1 = extra env assignment
   # GDN_HIP_WMMA_PREFILL=${WMMA:-1}: only affects the PROMPT prefill kernel. The spec VERIFY now
   # uses the dedicated per-token-state recurrent kernel (gdn_prefill_verify) regardless of this flag,
   # so spec==n0 is bit-exact even at WMMA=1 (the old re-advance path needed WMMA=0 to be bit-stable).
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" $1 python -m minisgl \
+  setsid env PYTHONPATH=/engine/python:/engine GDN_HIP_WMMA_PREFILL="${WMMA:-1}" $1 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size 1 --port $PORT --graph 0 --attn hip \
     --memory-ratio 0.85 --max-running-requests 4 \
     --spec-algorithm ngram --spec-num-draft 5 --spec-ngram-max 3 > "$LOG" 2>&1 &

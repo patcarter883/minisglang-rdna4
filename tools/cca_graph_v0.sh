@@ -21,7 +21,7 @@ trap stop EXIT
 
 boot(){ local label="$1"; local g="$2"
   echo "[launch:$label] --graph $g -> $LOG"
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 \
+  setsid env PYTHONPATH=/engine/python:/engine MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 \
     MINISGL_ZAYA_W8A16=1 MINISGL_HIP_ENGAGE_LOG=1 MINISGL_DISABLE_OVERLAP_SCHEDULING=1 \
     python -m minisgl --model "$ORIG" --tensor-parallel-size 1 --port "$PORT" --graph "$g" --attn hip \
     --memory-ratio "$MEMRATIO" --max-running-requests 4 > "$LOG" 2>&1 &

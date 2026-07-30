@@ -90,7 +90,7 @@ serve under graph capture, not just eager. Concretely:
   for DP-only; just confirm replicas capture and replay.
 - **EP**: the all_gather + masked-local-expert w8a8_moe + all_reduce all live INSIDE the captured decode
   graph at fixed (agreed-bs) shapes; the per-step common-bs `all_reduce(MAX)` is the only host sync and
-  is outside the graph. Use the gather_reduce MoE epilogue (capture-safe), keep `MINISGL_MOE_SCATTER=0`.
+  is outside the graph. (The MoE scatter epilogue is itself capture-safe and is now unconditional.)
 - A non-capturable EP (variable all_to_all, in-graph host handshake, or `.item()`/data-dependent shapes
   inside the forward) is a FAIL. Validation must run WITH graph capture on and confirm coherence +
   greedy-parity UNDER capture (eager is necessary but not sufficient).

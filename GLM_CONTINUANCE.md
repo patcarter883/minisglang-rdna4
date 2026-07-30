@@ -46,7 +46,7 @@
   `page_table`; latent store + decode run inside the graph; cu_seqlens are a placeholder arange).
   MLA is simpler than GDN — no recurrent state to thread. Validated: `GRAPH=8 MOE_SCATTER=0`
   captures bs [1,2,4,8] cleanly and the replayed graphs produce identical coherent output
-  ("...Paris."). MoE-decode MUST use the graph-safe gather_reduce path (`MINISGL_MOE_SCATTER=0`).
+  ("...Paris."). MoE-decode uses the fused atomic-scatter MoE decode path (unconditional at M<=2; it IS graph-capturable — the old "atomicAdd cannot be captured" claim was FALSE, disproved 2026-07-30, +3.2% e2e).
   `tools/glm_coherence_smoke.sh` now takes `GRAPH`/`MOE_SCATTER` envs.
 
 - **MLA cudagraph capture committed** at `c5035bb`.
@@ -142,7 +142,7 @@ are AWQ-quantized — **MLA attention, router gate, and shared expert stay bf16*
   that threads the MLA latent-cache slots through static buffers, mirroring `GDNGraphCapture`). This
   is the big one — **graph capture was ~20% faster TPOT than eager** on the 35B this session
   (`production-serve-config-and-bench`), so eager GLM is leaving ~20% on the floor. Once captured,
-  production GLM = `--graph N` + `MINISGL_MOE_SCATTER=0` (the MoE-decode scatter atomicAdd is not
+  production GLM = `--graph N` (the MoE-decode scatter is unconditional and capturable; the old claim that its atomicAdd is not
   graph-capturable — use the graph-safe gather_reduce path under capture).
 - **TP=2 MLA sharding:** remove the `tp_size==1` assert; shard the MLA projections (head-parallel
   q/o; the latent kv cache is shared/replicated) + the latent pool. The 35B serves TP=2 today; GLM

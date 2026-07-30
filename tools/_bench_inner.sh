@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Runs INSIDE the minisgl-rdna4:lean container (launched by run_bench_window.sh under the lease).
 # PRODUCTION serving benchmark: CUDA-graph decode capture ON (--graph), fused atomic-scatter MoE
-# decode (MINISGL_MOE_SCATTER=1), HIP attention. Runs the prefill/decode/mixed x M matrix once.
-# The scatter defaulted to 0 here for as long as the engine wrongly believed its atomicAdd could not
-# be graph-captured. It captures fine and is worth +3.2% e2e (81.05 -> 83.60 tok/s, Qwen35B TP=2
-# M=1, 2026-07-30), so this bench now measures the production path with the scatter ON.
+# decode, HIP attention. Runs the prefill/decode/mixed x M matrix once.
+# There is NO scatter knob to set here any more: the decode scatter is unconditional at M<=2 in the
+# engine, so this bench measures the production path by construction rather than by agreeing with it.
 set -uo pipefail
 # Activate the serving venv: lean image (/opt/venv, the infra serving all day) or legacy (/app/.venv).
 source /opt/venv/bin/activate 2>/dev/null || source /app/.venv/bin/activate
@@ -17,11 +16,6 @@ MAXRUN="${MAXRUN:-24}"
 GRAPH="${GRAPH:-24}"            # cuda_graph_max_bs; base rows default 24 so the sweep can reach M=24
                                # STILL graph-captured (M>GRAPH would fall back to eager). Spec rows
                                # override to their memory-safe value (MTP 8, DFlash 4).
-# MINISGL_MOE_SCATTER. EMPTY (the default) means "do not override" -- the ENGINE's own default is
-# authoritative, so this bench measures whatever production actually runs. Do NOT re-pin a value
-# here: this line used to hardcode 0 and kept saying so in the header long after the engine default
-# flipped to 1, which is how a bench silently starts measuring a path nobody ships.
-MMS="${MOE_SCATTER:-}"
 # Attention backend. 'hip' = native HIP flash (the only capture-capable GQA/MHA backend, for
 # dense/Qwen). MLA models (GLM-4.7-Flash) MUST use 'auto' — the engine force-selects the capture-
 # capable 'mla' backend (page_size 16) and a 'hip' override would just be re-overridden. The 'mla'
@@ -60,11 +54,8 @@ python -c "import gdn_hip, moe_hip, tail_hip, mla_hip; print('[setup] hip pkgs i
 SRV=""
 launch() {  # $1 = log tag
   local tag="$1" log="$RESULTS/bench_$1.server.log"
-  echo "[launch] attn=$ATTN graph_max_bs=$GRAPH moe_scatter=${MMS:-<engine default>} tag=$tag -> $log"
+  echo "[launch] attn=$ATTN graph_max_bs=$GRAPH tag=$tag -> $log"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
-  # Only export MINISGL_MOE_SCATTER when the caller actually asked for a value; an unset env var is
-  # what lets the engine default stand (an empty one would read as "not 0", i.e. silently ON).
-  local -a scat_env=(); [ -n "$MMS" ] && scat_env=(MINISGL_MOE_SCATTER="$MMS")
   # setsid => own process group, so stop() can kill the WHOLE engine tree (scheduler/worker subprocs);
   # a bare kill leaves them holding GPU+port and the next boot hangs.
   # --attn hip: the HIP attention backend (attn_hip prefill + attn_decode paged) is the ONLY
@@ -73,7 +64,7 @@ launch() {  # $1 = log tag
   # --host 0.0.0.0: bind all interfaces so the published -p 1919 port is reachable from the host and
   # from Prometheus (host.docker.internal:1919). The default 127.0.0.1 binds container-loopback only,
   # so the serve is invisible to the monitored path (metrics never scraped).
-  setsid env "${scat_env[@]}" python -m minisgl \
+  setsid python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --host 0.0.0.0 --graph "$GRAPH" \
     --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
     $SPEC_ARGS ${EP:+--enable-ep} \

@@ -22,7 +22,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 boot(){ local log="$1"; shift
-  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_SPEC_DEBUG=1 "$@" \
+  setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine MINISGL_SPEC_DEBUG=1 "$@" \
     python -m minisgl --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph "$GRAPH" --attn hip \
     --spec-algorithm dflash --spec-draft-model-path "$DRAFT" --spec-num-draft "$K" \
     --memory-ratio "$MEM" --max-running-requests "$MAXREQ" > "$log" 2>&1 &

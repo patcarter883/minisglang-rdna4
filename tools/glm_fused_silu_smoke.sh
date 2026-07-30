@@ -17,7 +17,7 @@ docker run -d --name "$name" \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
-  -e HF_HUB_OFFLINE=1 -e MINISGL_DENSE_FUSED_SILU=1 -e MINISGL_MOE_SCATTER=0 -e MINISGL_KV_FP8=1 \
+  -e HF_HUB_OFFLINE=1 -e MINISGL_DENSE_FUSED_SILU=1 -e MINISGL_KV_FP8=1 \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 \
   -v "$W4A8FIX":/opt/w4a8fix -v "$WT":/engine \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -p "${PORT}:1919" \

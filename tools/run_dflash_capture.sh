@@ -43,7 +43,7 @@ docker run --rm --name "$CNAME" \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 \
   -e MINISGL_ZAYA_CAPTURE_DIR=/capture \
-  -e MINISGL_KV_FP8="${KV_FP8:-1}" -e MINISGL_MOE_SCATTER=0 \
+  -e MINISGL_KV_FP8="${KV_FP8:-1}" \
   -e GENTOK="$GENTOK" -e WORKERS="$WORKERS" -e MODEL="$MODEL" \
   -e MAXRUN="${MAXRUN:-64}" -e MEMRATIO="${MEMRATIO:-0.9}" \
   -v "$PWD":/engine \
@@ -59,8 +59,7 @@ docker run --rm --name "$CNAME" \
     export PYTHONPATH=/kernels/_kernels:/engine/python:/engine
     LOG=/engine/tools/dflash_capture.server.log
     # Boot ZAYA TP=1 with prefix cache OFF (teacher-force must be a full prefill).
-    setsid env MINISGL_ZAYA_CAPTURE_DIR=/capture MINISGL_KV_FP8="'"${KV_FP8:-1}"'" \
-      MINISGL_MOE_SCATTER=0 MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 \
+    setsid env MINISGL_ZAYA_CAPTURE_DIR=/capture MINISGL_KV_FP8="'"${KV_FP8:-1}"'" \ MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 \
       python -m minisgl --model "$MODEL" --host 127.0.0.1 --port 1919 \
         --cache-type naive --attention-backend hip --page-size 16 --tp 1 --disable-pynccl \
         --max-running-requests "'"${MAXRUN:-64}"'" \

@@ -1,7 +1,7 @@
 # ZAYA1-8B-fp8 serving matrix (concurrency × context) — for RSA serving limits
 
 Measured on one gfx1201 (RX 9070 XT, 16 GB), native Triton-free path: `--attn hip` + W8A8-fp8 MoE
-kernel + CUDA graphs (bs 1–16), `MINISGL_MOE_SCATTER=0`, chunked prefill (`max_extend_tokens=2048`),
+kernel + CUDA graphs (bs 1–16), chunked prefill (`max_extend_tokens=2048`),
 `memory_ratio=0.90`. Tool: `tools/zaya_serving_matrix.py`. Decode TPOT isolated as
 t(1+STEPS)−t(1) over STEPS=16. **KV pool = 65,615 tokens (5.0 GiB).** No Triton compiled (verified).
 

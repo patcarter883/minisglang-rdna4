@@ -59,7 +59,6 @@ services:
       MINISGL_ZAYA_W8A16: "${MINISGL_ZAYA_W8A16:-1}"
       MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-1}"
       MINISGL_TAIL_HIP: "${MINISGL_TAIL_HIP:-1}"
-      MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
       MINISGL_ZAYA_OLDMOE: "${MINISGL_ZAYA_OLDMOE:-0}"
       # TiDAR spec-decode: NON-FUSED (serving-viable) + segmented. FUSED=0 is the whole point.
       MINISGL_TIDAR_FUSED: "${MINISGL_TIDAR_FUSED:-0}"

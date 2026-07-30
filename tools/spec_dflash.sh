@@ -35,7 +35,7 @@ trap stop EXIT
 boot(){ # $1=label  $2=memratio  $3...=extra env+args verbatim
   local label="$1"; local memratio="$2"; shift 2
   echo "[launch:$label] (memratio=$memratio) $* -> $LOG"
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
+  setsid env PYTHONPATH=/engine/python:/engine GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
     --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph 0 --attn hip \
     --memory-ratio "$memratio" --max-running-requests 4 > "$LOG" 2>&1 &
   SRV=$!

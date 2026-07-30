@@ -15,7 +15,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 echo "[boot] starting $MODEL TP=${TP:-2} attn=${ATTN:-hip} graph=${GRAPH:-0}"
-setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine MINISGL_MOE_SCATTER=0 \
+setsid env PYTHONPATH=/opt/kernels:/engine/python:/engine \
   python -m minisgl --model "$MODEL" --tensor-parallel-size "${TP:-2}" --port "$PORT" \
   --graph "${GRAPH:-0}" --attn "${ATTN:-hip}" --dtype "${DTYPE:-bfloat16}" \
   --memory-ratio "${MEMRATIO:-0.82}" \

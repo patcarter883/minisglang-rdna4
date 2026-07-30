@@ -24,7 +24,7 @@ forward = the ~4× crown jewel.**
 - **v0 GREEN**: cudagraph on the CCA AR decode = **1.59×** (23→37 tok/s); all 5 custom HIP kernels
   verified engaged + survive capture (`_hip_engage.py`, `MINISGL_HIP_ENGAGE_LOG`). `tools/run_cca_graph_v0.sh`.
 - **Graph capture is the serve DEFAULT** now: `docker-compose.yml serve` = `--cuda-graph-max-bs 16` +
-  `MINISGL_MOE_SCATTER=0` (graph-safe). ⚠ SMOKE-TEST the 35B GDN serve under `--graph 16` (v0 proved
+  the fused atomic-scatter MoE decode (capturable, no flag). ⚠ SMOKE-TEST the 35B GDN serve under `--graph 16` (v0 proved
   CCA, GLM proves MLA-MoE, GDN capture is implemented — but the 35B specifically wasn't booted under it).
 - **v2 S1–S3 DONE + validated byte-identical**: graph-capture the CCA spec-VERIFY forward.
   - S1 `HIPAttnBackend` verify-capture (hip.py: `init_verify_capture`/`_fill_verify_static`/

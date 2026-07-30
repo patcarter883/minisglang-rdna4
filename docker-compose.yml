@@ -42,7 +42,7 @@ x-lean-common: &lean-common
     # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
     # moe_bf16 / rxf, still vendored here until ported upstream).
     PYTHONPATH: /opt/kernels:/engine/python:/engine
-    HF_HUB_OFFLINE: "1"
+    HF_HUB_OFFLINE: "0"
     TORCH_BLAS_PREFER_HIPBLASLT: "0"
     # Fragmentation guard: on the 16 GB cards a full-model + graph-capture footprint (e.g. the 35B
     # MXFP4 GDN-hybrid) can leave enough free memory but too little CONTIGUOUS free after capture —
@@ -80,6 +80,8 @@ x-lean-common: &lean-common
     # argmax .cpu() + per-req Python verify/keep loop with the vectorized GPU chain (one batched
     # sync). Byte-lossless; falls back to the host path for constrained/ddtree batches. Default 0.
     MINISGL_SPEC_ONDEVICE: "${MINISGL_SPEC_ONDEVICE:-0}"
+    # MoE quant mode: 0 = W4A8 (int4 wt + int8/fp8 act via FP8-WMMA); 1 = W4A16 (weight-only, fp16 act).
+    MINISGL_MOE_W4A16: "${MINISGL_MOE_W4A16:-0}"
     # MHA/SWA spec page-aware rollback: =1 keeps page_size=16 under spec (validated coherent +
     # lossless, but A/B showed NO prefill win, so default 0 = shipped page_size->1). CPU proof:
     # tools/spec_page_rollback_check.py.
@@ -135,6 +137,183 @@ services:
     entrypoint: ["bash", "-lc"]
     command:
       - ${MINISGL_CMD:-python /engine/tools/container_selftest.py}
+
+  # vllm 0.24 + full HIP kernels — the PERFORMANT Qwen3.6-35B serve (measured 82.3 tok/s bs=1 decode
+  # vs minisglang ~47, no-spec; stock-Triton ceiling 92). Runs the BEST current gdn_hip state by
+  # DEFAULT: stride-aware gdn_hip_C.so (indexes the paged mamba cache in place, no fp32 full-cache
+  # copy) + paged/cast-free glue + bf16 SSM state (halves recurrent-state HBM). Progression that got
+  # here: 24 (baked fp32 full-cache copy) -> 72 (slot-copy) -> 79.6 (stride paged) -> 81.6 (cast-free)
+  # -> 81.8 (bf16 ssm) -> 82.3 (fused conv+decode). Remaining 81.8->92 is decode launch/gap structure (~1478 dispatches/token).
+  # Run (lease-bound so the janitor never reaps it):
+  #     gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
+  #     docker compose -p lease-vhip logs -f          # watch boot (~2.5 min, no 30-min GDN autotune)
+  #     curl localhost:8000/v1/chat/completions ...    # served model name: "x"
+  #     docker compose -p lease-vhip down              # stop + release lease
+  # Rebuild the stride-aware .so after editing rdna4-hip-kernels/gdn:  bash gdn/local/build_local.sh
+  # (inside the image toolchain). To A/B a HIP kernel: set VLLM_PLUGINS (whitelist) /
+  # VLLM_ATTENTION_BACKEND (ROCM_HIP_ATTN|TRITON_ATTN); to fall back to the baked (slow fp32-copy) glue
+  # set VHIP_GLUE_DST=/tmp/x VHIP_SO_DST=/tmp/y.  Port 8000; probe: tools/msgl_probe.py <pre> <gen> 8000.
+  vhip:
+    <<: *lean-common
+    image: vllm24-hip:combined
+    profiles: ["vhip"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      # DEFAULT ON: paged-aware gdn_hip glue over the baked (slow, fp32-full-cache-copy) one.
+      - ${VHIP_GLUE_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/vllm_oot_slotfix.py}:${VHIP_GLUE_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/vllm_oot.py}:ro
+      # DEFAULT ON: rebuilt stride-aware gdn_hip_C.so over the baked contiguous-only one.
+      - ${VHIP_SO_SRC:-/home/pat/code/rdna4-hip-kernels/gdn/torch-ext/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:${VHIP_SO_DST:-/opt/kernels/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:ro
+      # DEFAULT ON: bf16 SSM state (conv stays fp32) — halves recurrent-state traffic vs the forced-fp32 baked register.
+      - ${VHIP_REG_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/register_bf16ssm.py}:${VHIP_REG_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/register.py}:ro
+    # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
+    # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
+    # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
+    # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
+    #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
+    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
+    #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
+    #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
+    #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        args=("$${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+          --host 0.0.0.0 --port 8000 --tensor-parallel-size 2
+          --max-model-len "$${VHIP_MAXLEN:-60000}" --kv-cache-dtype fp8 --dtype float16
+          --max-num-batched-tokens 2048 --max-num-seqs "$${VHIP_MNS:-8}"
+          --gpu-memory-utilization "$${VHIP_MEM:-0.92}"
+          --language-model-only
+          --served-model-name x --trust-remote-code)
+        if [ -n "$${VHIP_SPEC:-}" ]; then args+=(--speculative-config "$${VHIP_SPEC}"); fi
+        # Prefix caching: default ON (VHIP_PREFIX_CACHE=1) — a serve that re-prefills every turn is
+        # mostly useless. vLLM auto-disables it for a HYBRID GDN model, so we force it on, which puts
+        # the mamba cache in experimental 'align' mode (attn block padded up to the GDN page + a full
+        # conv+ssm GDN state snapshot reserved PER KV block). MoE 35B fits at VHIP_MNS<=4. On a DENSE-GDN
+        # model (Qwen 27B) that per-block state ~doubles the footprint and can overcommit the 16GB card
+        # ("No available memory for the cache blocks") — trim VHIP_MNS / VHIP_MAXLEN, or VHIP_PREFIX_CACHE=0.
+        pc="$${VHIP_PREFIX_CACHE}"; [ "$$pc" = 1 ] && args+=(--enable-prefix-caching)
+        # reasoning parser (<think> -> reasoning_content), tool-call parser + auto tool-choice, and the
+        # checkpoint's preserve_thinking chat-template kwarg. Defaults live in the environment block below
+        # (a bash ${VAR:-default} silently drops here). Set any of these env vars to "off" to skip.
+        rp="$${VHIP_REASONING_PARSER}"; [ "$$rp" != off ] && [ -n "$$rp" ] && args+=(--reasoning-parser "$$rp")
+        tp="$${VHIP_TOOL_PARSER}"
+        if [ "$$tp" != off ] && [ -n "$$tp" ]; then
+          args+=(--tool-call-parser "$$tp")
+          [ "$${VHIP_TOOL_CHOICE}" = 1 ] && args+=(--enable-auto-tool-choice)
+        fi
+        ctk="$${VHIP_CHAT_TEMPLATE_KWARGS}"; [ "$$ctk" != off ] && [ -n "$$ctk" ] && args+=(--default-chat-template-kwargs "$$ctk")
+        echo "[vhip] spec=$${VHIP_SPEC:-none} reasoning=$${rp:-off} tools=$${tp:-off} auto-tool-choice=$${VHIP_TOOL_CHOICE} ctk=$${ctk:-off}"
+        exec /app/tools/image_entrypoint.sh "$${args[@]}"
+    environment:
+      <<: *lean-env
+      PYTHONPATH: /opt/kernels
+      NCCL_P2P_DISABLE: "1"
+      NCCL_PROTO: Simple
+      VLLM_PLUGINS: "${VLLM_PLUGINS:-gdn_hip,tail_hip_register,w4a8_fp8_wmma_register}"
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      # spec-decode + serve tunables (empty -> in-container defaults above). Set VHIP_SPEC to a
+      # --speculative-config JSON (see presets above) to enable MTP / DFlash / draft-model spec.
+      MINISGL_MODEL: "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      VHIP_SPEC: "${VHIP_SPEC:-}"
+      VHIP_MAXLEN: "${VHIP_MAXLEN:-}"
+      VHIP_MNS: "${VHIP_MNS:-}"
+      VHIP_MEM: "${VHIP_MEM:-}"
+      # prefix caching default ON (a serve without it re-prefills every turn). For a hybrid GDN model
+      # this uses experimental mamba 'align' mode; if it overcommits (dense GDN, long ctx), lower
+      # VHIP_MNS / VHIP_MAXLEN, or set VHIP_PREFIX_CACHE=0 to disable.
+      VHIP_PREFIX_CACHE: "${VHIP_PREFIX_CACHE:-1}"
+      # reasoning/tool parsing — Qwen3.6 defaults; set to "off" to skip either,
+      # VHIP_TOOL_CHOICE=0 to drop --enable-auto-tool-choice.
+      VHIP_REASONING_PARSER: "${VHIP_REASONING_PARSER:-qwen3}"
+      VHIP_TOOL_PARSER: "${VHIP_TOOL_PARSER:-qwen3_coder}"
+      VHIP_TOOL_CHOICE: "${VHIP_TOOL_CHOICE:-1}"
+      # server-wide chat-template kwargs (JSON) — preserve_thinking keeps prior-turn <think> blocks in
+      # the rendered context (the checkpoint template's kwarg). Set "off" to omit.
+      VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
+
+  vllm:
+    <<: *lean-common
+    image: tcclaviger/vllm:latest
+    profiles: ["vllm"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/engine
+      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+    # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
+    # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
+    # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
+    # --max-model-len / --gpu-memory-utilization if it OOMs on KV):
+    #   MTP    (native, Qwen3.6 MTP head):  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+    #          — VALIDATED loads+serves, but MEASURED NET-NEGATIVE at bs=1 (~28 tok/s vs 82 plain:
+    #            propose ~5x, accept ~1.9). May pay off at higher concurrency / a better drafter.
+    #   DFlash (drafter must be vLLM/EAGLE3-loadable; the ZAYA/minisgl DFlash drafters are NOT — they
+    #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
+    #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
+    #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vllm -- docker compose --profile vllm up -d
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        args=("$${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+          --host 0.0.0.0 --port 8000 --tensor-parallel-size 2
+          --max-model-len "$${VHIP_MAXLEN:-60000}" --kv-cache-dtype fp8 --dtype float16
+          --max-num-batched-tokens 2048 --max-num-seqs "$${VHIP_MNS:-8}"
+          --gpu-memory-utilization "$${VHIP_MEM:-0.92}"
+          --language-model-only
+          --served-model-name x --trust-remote-code)
+        if [ -n "$${VHIP_SPEC:-}" ]; then args+=(--speculative-config "$${VHIP_SPEC}"); fi
+        # Prefix caching: default ON (VHIP_PREFIX_CACHE=1) — a serve that re-prefills every turn is
+        # mostly useless. vLLM auto-disables it for a HYBRID GDN model, so we force it on, which puts
+        # the mamba cache in experimental 'align' mode (attn block padded up to the GDN page + a full
+        # conv+ssm GDN state snapshot reserved PER KV block). MoE 35B fits at VHIP_MNS<=4. On a DENSE-GDN
+        # model (Qwen 27B) that per-block state ~doubles the footprint and can overcommit the 16GB card
+        # ("No available memory for the cache blocks") — trim VHIP_MNS / VHIP_MAXLEN, or VHIP_PREFIX_CACHE=0.
+        pc="$${VHIP_PREFIX_CACHE}"; [ "$$pc" = 1 ] && args+=(--enable-prefix-caching)
+        # reasoning parser (<think> -> reasoning_content), tool-call parser + auto tool-choice, and the
+        # checkpoint's preserve_thinking chat-template kwarg. Defaults live in the environment block below
+        # (a bash ${VAR:-default} silently drops here). Set any of these env vars to "off" to skip.
+        rp="$${VHIP_REASONING_PARSER}"; [ "$$rp" != off ] && [ -n "$$rp" ] && args+=(--reasoning-parser "$$rp")
+        tp="$${VHIP_TOOL_PARSER}"
+        if [ "$$tp" != off ] && [ -n "$$tp" ]; then
+          args+=(--tool-call-parser "$$tp")
+          [ "$${VHIP_TOOL_CHOICE}" = 1 ] && args+=(--enable-auto-tool-choice)
+        fi
+        ctk="$${VHIP_CHAT_TEMPLATE_KWARGS}"; [ "$$ctk" != off ] && [ -n "$$ctk" ] && args+=(--default-chat-template-kwargs "$$ctk")
+        echo "[vhip] spec=$${VHIP_SPEC:-none} reasoning=$${rp:-off} tools=$${tp:-off} auto-tool-choice=$${VHIP_TOOL_CHOICE} ctk=$${ctk:-off}"
+        exec /app/tools/image_entrypoint.sh "$${args[@]}"
+    environment:
+      <<: *lean-env
+      PYTHONPATH: /opt/kernels
+      NCCL_P2P_DISABLE: "1"
+      NCCL_PROTO: Simple
+      FLASH_ATTENTION_TRITON_AMD_ENABLE: "1"
+      VLLM_ATTENTION_BACKEND: "${VLLM_ATTENTION_BACKEND:-}"
+      # spec-decode + serve tunables (empty -> in-container defaults above). Set VHIP_SPEC to a
+      # --speculative-config JSON (see presets above) to enable MTP / DFlash / draft-model spec.
+      MINISGL_MODEL: "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}"
+      VHIP_SPEC: "${VHIP_SPEC:-}"
+      VHIP_MAXLEN: "${VHIP_MAXLEN:-}"
+      VHIP_MNS: "${VHIP_MNS:-}"
+      VHIP_MEM: "${VHIP_MEM:-}"
+      # prefix caching default ON (a serve without it re-prefills every turn). For a hybrid GDN model
+      # this uses experimental mamba 'align' mode; if it overcommits (dense GDN, long ctx), lower
+      # VHIP_MNS / VHIP_MAXLEN, or set VHIP_PREFIX_CACHE=0 to disable.
+      VHIP_PREFIX_CACHE: "${VHIP_PREFIX_CACHE:-1}"
+      # reasoning/tool parsing — Qwen3.6 defaults; set to "off" to skip either,
+      # VHIP_TOOL_CHOICE=0 to drop --enable-auto-tool-choice.
+      VHIP_REASONING_PARSER: "${VHIP_REASONING_PARSER:-qwen3}"
+      VHIP_TOOL_PARSER: "${VHIP_TOOL_PARSER:-qwen3_coder}"
+      VHIP_TOOL_CHOICE: "${VHIP_TOOL_CHOICE:-1}"
+      # server-wide chat-template kwargs (JSON) — preserve_thinking keeps prior-turn <think> blocks in
+      # the rendered context (the checkpoint template's kwarg). Set "off" to omit.
+      VHIP_CHAT_TEMPLATE_KWARGS: '${VHIP_CHAT_TEMPLATE_KWARGS:-{"preserve_thinking": true}}'
 
   # Default: Qwen3.6-35B-A3B-AWQ (W4A8 MoE) on the native-HIP Triton-free path, radix prefix cache.
   # GRAPH-CAPTURED decode (cuda-graph-max-bs 8, max-running 8): eager MoE decode leaves ~45% of device
@@ -455,7 +634,6 @@ services:
       - ${MINISGL_DFLASH_DRAFT_HOST:-/home/pat/code/_models/ZAYA1-8B-DFlash-CCA-5L-minv-ep4}:/draft:ro
     environment:
       <<: *lean-env
-      MINISGL_MOE_SCATTER: "${MINISGL_MOE_SCATTER:-0}"
       # Forced tool calls emit ZAYA's NATIVE <zyphra_tool_call><function=NAME><parameter=P>…</parameter>
       # XML (via a custom EBNF grammar) instead of JSON — respects ZAYA's RL training and is guaranteed
       # parseable. Auto tool calls additionally now trigger on <zyphra_tool_call> (was never firing).
@@ -553,7 +731,6 @@ services:
       MINISGL_CAM_GTE_KEY: "${MINISGL_CAM_GTE_KEY:-0}"          # 1 = whitened-GTE semantic subject key (paraphrase-robust addressing 0.06->0.43)
       MINISGL_CAM_GTE_WHITEN: /cam_gte/gte_whiten.pkl
       MINISGL_CAM_WRITE_DEDUP_TAU: "${MINISGL_CAM_WRITE_DEDUP_TAU:-}"  # write-side paraphrase dedup cosine; blank => 0.82 under GTE (measured safe), 1.0 (off) on base-embed
-      MINISGL_MOE_SCATTER: "0"
       MINISGL_MOE_FUSED_SILU: "${MINISGL_MOE_FUSED_SILU:-1}"   # operator toggle; set 0 if boot fails with "fused gemm1+silu needs the 'wmma' kernel"
     entrypoint: ["bash", "-lc"]
     command:

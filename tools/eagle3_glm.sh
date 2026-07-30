@@ -23,7 +23,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 boot(){ # $1 = extra env assignment
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 $1 python -m minisgl \
+  setsid env PYTHONPATH=/engine/python:/engine $1 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size 2 --port $PORT --graph 0 --disable-pynccl \
     --memory-ratio 0.85 --max-running-requests 4 \
     --spec-algorithm eagle3 --spec-draft-model-path "$DRAFT" \

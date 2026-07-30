@@ -68,7 +68,7 @@ kernel ids: 6=wmma (prefill/gemm2), 7=gemv (decode gemm1). fp16 I/O is the stagi
    top_k, renormalize, *, topk_weights=None, topk_ids=None, kernel="wmma", block_m=16)` mirroring
    `w4a8_moe` body verbatim (kernels.py:170-311): per-GEMM kernel pick (gemm1 gemv if M<=2 else wmma;
    gemm2 wmma), precomputed-route branch, `moe_align`, gemm1→`tail_hip.silu_and_mul`→ decode scatter
-   (M<=2, MINISGL_MOE_SCATTER) OR prefill gather_reduce. Drop zeros/group args. Reuse all env gates.
+   (M<=2) OR prefill gather_reduce. Drop zeros/group args. Do NOT add env gates.
 2. `python/minisgl/layers/moe.py`:
    - Add `_GroupedFP8Experts.post_load(self)`: build `self._w_op` (E,N,K e4m3 contiguous — op layout is
      the natural layout, likely just `.contiguous()`; if kernel needs a transpose, mirror per-expert+stack),

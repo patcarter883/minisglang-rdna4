@@ -20,7 +20,7 @@ launch() {  # $1 = tag, $2 = extra env assignments (space sep), $3 = spec_args
   local tag="$1" envs="$2" specargs="$3" log="$RESULTS/seed_$1.server.log"
   echo "[launch:$tag] envs='$envs' spec='$specargs' -> $log"
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
-  setsid env MINISGL_MOE_SCATTER=0 MINISGL_SPEC_DEBUG=1 MINISGL_SPEC_TIMING=1 $envs python -m minisgl \
+  setsid env MINISGL_SPEC_DEBUG=1 MINISGL_SPEC_TIMING=1 $envs python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port "$PORT" --host 0.0.0.0 --graph "$GRAPH" \
     --attention-backend "$ATTN" $pynccl --memory-ratio "$MEMRATIO" --max-running-requests "$MAXRUN" \
     $specargs \

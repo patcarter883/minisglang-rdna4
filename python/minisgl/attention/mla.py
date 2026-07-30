@@ -44,7 +44,7 @@ class MLABackend(BaseAttnBackend):
 
     The generic ``forward(q,k,v,...)`` is unused (the MLA layer calls the methods above directly).
     DECODE cudagraph capture is supported (static cache_seqlens + page_table buffers, see below);
-    MoE-decode must run the graph-safe gather_reduce path (MINISGL_MOE_SCATTER=0). Prefill is eager.
+    MoE-decode runs the fused atomic-scatter path (graph-capturable; unconditional at M<=2).
     """
 
     def __init__(self, config: "ModelConfig"):
@@ -201,7 +201,7 @@ class MLABackend(BaseAttnBackend):
     # its reads by cache_seqlens, so a fixed max-width page table is fine (stale tail ignored). The
     # latent pool is a fixed tensor (captured by reference). cu_seqlens_* are unused by decode (q-len
     # is always 1) — a static arange placeholder. Mirrors HIPAttnBackend's capture. (MoE-decode must
-    # use the graph-safe gather_reduce path, MINISGL_MOE_SCATTER=0 — the scatter atomicAdd is not
+    # use the fused atomic-scatter decode path — it IS graph-capturable (the old claim that
     # graph-capturable; see [[splitk-gemm2-modest-win]] / production-serve-config-and-bench.)
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         dev = self.kvcache.device

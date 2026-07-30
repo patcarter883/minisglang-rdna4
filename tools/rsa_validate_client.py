@@ -62,7 +62,6 @@ def main() -> int:
     base = f"http://127.0.0.1:{args.port}"
     env = dict(os.environ)
     env.setdefault("PYTHONPATH", "/engine/python:/engine")
-    env.setdefault("MINISGL_MOE_SCATTER", "0")
     cmd = [
         sys.executable, "-m", "minisgl",
         "--model", args.model, "--attn", "hip", "--graph", str(args.graph),

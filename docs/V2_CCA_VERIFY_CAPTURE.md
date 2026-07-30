@@ -63,7 +63,7 @@ the ~4× ITL. This is the crown jewel; S1–S3 de-risk the state/threading befor
 - **Losslessness gate every step** — capture must be token-identical to the eager fused path (the
   existing `tools/run_tidar_window.sh` prefix-exact diff). A graph that drifts is a fail.
 - **page_size stays 1** for CCA spec (per-token rollback); only the graph disable is lifted.
-- **MoE decode must be graph-safe** (`MINISGL_MOE_SCATTER=0`, already the serve default now).
+- **MoE decode is graph-safe** — the fused atomic-scatter path captures fine and is unconditional at M<=2 (no flag).
 - Fixed capture shapes: one graph per (bs) at fixed `n_query`; partial-K/finished steps fall back to
   eager (like `can_use_verify_graph` / `pad_verify`).
 

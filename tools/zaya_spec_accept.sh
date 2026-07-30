@@ -50,7 +50,7 @@ trap stop EXIT
 boot(){ # $1=label  $2...=extra env+args verbatim
   local label="$1"; shift
   echo "[launch:$label] $* -> $LOG"
-  setsid env PYTHONPATH="$PYTHONPATH" MINISGL_MOE_SCATTER="$MOE_SCATTER" MINISGL_KV_FP8="$KV_FP8" \
+  setsid env PYTHONPATH="$PYTHONPATH" MINISGL_KV_FP8="$KV_FP8" \
     MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 "$@" \
     --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph "$GRAPH" \
     --attention-backend hip --page-size 16 --cache-type "$CACHE" --disable-pynccl \

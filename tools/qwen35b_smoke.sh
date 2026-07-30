@@ -17,7 +17,7 @@ trap stop EXIT
 
 boot(){ # $1 = extra spec args
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 $2 python -m minisgl \
+  setsid env PYTHONPATH=/engine/python:/engine $2 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size "$TP" --port $PORT --graph "${GRAPH:-0}" $pynccl \
     --memory-ratio 0.82 --max-running-requests 4 --attention-backend hip $1 > "$LOG" 2>&1 &
   SRV=$!

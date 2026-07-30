@@ -28,7 +28,7 @@ trap stop EXIT
 
 boot(){ local label="$1"; shift
   echo "[launch:$label] $* -> $LOG"
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
+  setsid env PYTHONPATH=/engine/python:/engine GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
     --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph 0 --attn hip \
     --memory-ratio "$MEM" --max-running-requests 4 > "$LOG" 2>&1 &
   SRV=$!

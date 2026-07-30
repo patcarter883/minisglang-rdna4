@@ -29,7 +29,7 @@ trap stop EXIT
 boot(){ # $1=algo $2=k $3=seed ; log path echoed via $LOG
   local algo="$1" k="$2" seed="$3"
   LOG="/engine/tools/spec_sweep.${TAG}.${algo}.${k}.${seed}.log"
-  local spec="" graph="--graph 16" env_extra="MINISGL_MOE_SCATTER=0"
+  local spec="" graph="--graph 16" env_extra=""
   local pynccl=""; [ "$TP" -gt 1 ] && pynccl="--disable-pynccl"
   if [ "$algo" != "none" ]; then
     # GRAPH_SPEC>0 enables MLA spec-decode verify CUDA-graph capture (eager-only otherwise).

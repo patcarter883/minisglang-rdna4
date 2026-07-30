@@ -3,8 +3,8 @@ graph capture ENABLED) and emits a short greedy completion, validating that the 
 decode kernel (torch.ops.zaya_cca.cca_decode_qk, which rolls conv_states in place) and
 the MoE path are graph-capturable and stay coherent.
 
-Run INSIDE vllm22-w4a8:combined via the gpu-lease wrapper, with MINISGL_MOE_SCATTER=0:
-    PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 \
+Run INSIDE vllm22-w4a8:combined via the gpu-lease wrapper, with:
+    PYTHONPATH=/engine/python:/engine \
       python /engine/tools/zaya_graph_smoke.py
 """
 

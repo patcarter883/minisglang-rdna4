@@ -16,7 +16,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
   kill -KILL -- "-$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""; }
 trap stop EXIT
 boot(){ local label="$1"; shift
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
+  setsid env PYTHONPATH=/engine/python:/engine GDN_HIP_WMMA_PREFILL="${WMMA:-1}" "$@" \
     --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph 0 --attn hip \
     --memory-ratio "$MEM" --max-running-requests 4 > "$LOG" 2>&1 &
   SRV=$!

@@ -5,7 +5,7 @@ single-request greedy decode, warms up, then times a fixed decode length and rep
 latency (TPOT, ms). Eager (cuda_graph_max_bs=0) so we measure the kernel, not graph replay.
 
 Run INSIDE vllm22-w4a8:combined via the gpu-lease wrapper:
-    PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 MINISGL_ZAYA_OLDMOE=<0|1> \
+    PYTHONPATH=/engine/python:/engine MINISGL_ZAYA_OLDMOE=<0|1> \
       python /engine/tools/zaya_tpot_ab.py
 """
 

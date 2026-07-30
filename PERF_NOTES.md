@@ -36,7 +36,7 @@ wired. Wrapping both capture forwards in `torch.inference_mode()` fixes it: Qwen
 now captures all decode sizes and generates coherently (France→Paris, primes 2 3 5 7 11). The stale
 "GDN/CCA cudagraph out of scope / eager only" notes are lifted; the only remaining eager paths are
 legitimate — dynamic-shape prefill and the opt-in atomicAdd MoE scatter (gated to the capturable
-`gather_reduce` under graphs, `MINISGL_MOE_SCATTER=0`).
+the fused atomic-scatter under graphs — capturable, no flag).
 
 ## Detail
 

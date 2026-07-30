@@ -21,7 +21,7 @@ SRV=""; stop(){ [ -n "$SRV" ]||return 0; kill -TERM -- "-$SRV" 2>/dev/null
 trap stop EXIT
 
 boot(){ # $1 = extra env assignment
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 GDN_HIP_WMMA_PREFILL="${WMMA:-1}" $1 python -m minisgl \
+  setsid env PYTHONPATH=/engine/python:/engine GDN_HIP_WMMA_PREFILL="${WMMA:-1}" $1 python -m minisgl \
     --model "$MODEL" --tensor-parallel-size 1 --port $PORT --graph 0 --attn hip \
     --memory-ratio 0.85 --max-running-requests 4 \
     --spec-algorithm mtp --spec-num-draft "${KDRAFT:-4}" > "$LOG" 2>&1 &

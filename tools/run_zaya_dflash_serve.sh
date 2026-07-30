@@ -15,7 +15,7 @@ docker run --rm --name "$CNAME" \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
   --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" -e ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-0}" \
-  -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 -e MINISGL_KV_FP8=1 -e MINISGL_MOE_SCATTER=0 \
+  -e TORCH_BLAS_PREFER_HIPBLASLT=0 -e HF_HUB_OFFLINE=1 -e MINISGL_KV_FP8=1 \
   -e MINISGL_ATTN_HIP=1 -e MINISGL_TAIL_HIP=1 \
   -p "$HOSTPORT":1919 \
   -v "$PWD":/engine \

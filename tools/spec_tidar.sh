@@ -37,7 +37,7 @@ trap stop EXIT
 boot(){ # $1=label  $2...=extra env+args verbatim
   local label="$1"; shift
   echo "[launch:$label] $* -> $LOG"
-  setsid env PYTHONPATH=/engine/python:/engine MINISGL_MOE_SCATTER=0 \
+  setsid env PYTHONPATH=/engine/python:/engine \
     MINISGL_ATTN_HIP=1 MINISGL_TAIL_HIP=1 "$@" \
     --model "$MODEL" --tensor-parallel-size 1 --port "$PORT" --graph "${GRAPH:-0}" --attn hip \
     --memory-ratio "$MEMRATIO" --max-running-requests 4 > "$LOG" 2>&1 &
