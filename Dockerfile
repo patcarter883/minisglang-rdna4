@@ -65,6 +65,33 @@ RUN pip install \
 # importable python module (torch-ext/<pyname>) under /opt/kernels, which goes on PYTHONPATH. The
 # import name of each module already matches what the engine imports (gdn_hip, mla_hip, tail_hip, …);
 # only cca is exposed as `zaya_cca` (the engine is repointed to that name in the same change).
+# ---- rpd_tracer (rocmProfileData): low-overhead STREAMING tracer -------------------------------
+# rocprofv3 pays twice on a long serving run: it timestamps every dispatch (overhead scales with
+# KERNEL COUNT, ~1.33x on a ~3M-dispatch run) and then serializes the buffered trace at exit on
+# essentially one thread, which on a huge trace takes longer than the run. rpd streams straight to
+# SQLite during execution, so there is no end-of-run serialization -- it is the right tool for a
+# whole-serve trace. Selected via `WHAT=stream bash opt_loop/bin/gpuprof.sh ...`.
+#
+# Build deps discovered by building it (not guessed): libsqlite3-dev, libfmt-dev, and xxd (the
+# Makefile generates tableSchema.h with `xxd -i`; without it the build dies at Error 127).
+# GOTCHA: the repo ROOT contains a Django app directory named `rocpd/` which SHADOWS the real
+# `rocpd_python/rocpd` package whenever python runs with the repo as CWD -- the import then fails with
+# "No module named rocpd.schema" and looks like a packaging bug. Install, then leave the directory.
+ARG RPD_REF=main
+RUN set -eux; \
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libsqlite3-dev libfmt-dev xxd; \
+    rm -rf /var/lib/apt/lists/*; \
+    git clone --depth 1 --branch "${RPD_REF}" https://github.com/ROCm/rocmProfileData /opt/rocmProfileData; \
+    cd /opt/rocmProfileData; \
+    make -C rocpd_python install; \
+    make -C rpd_tracer; \
+    make -C rpd_tracer install; \
+    cd /; \
+    python -c "import rocpd.schema, rpdTracerControl; print('rpd import OK')"; \
+    test -f /usr/local/lib/librpd_tracer.so
+
 ARG KERNELS_REF=2fa1c38
 # Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
 # 16 cores, and on this SHARED box that perturbs whatever a concurrent opt_loop is timing (host-side
