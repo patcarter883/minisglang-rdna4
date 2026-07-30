@@ -18,7 +18,8 @@ docker run --rm \
   -e MODEL="${MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" -e TP="${TP:-2}" \
   -e MEMRATIO="${MEMRATIO:-0.82}" -e MAXRUN="${MAXRUN:-24}" \
   -e GRAPH="${GRAPH:-16}" -e MOE_SCATTER="${MOE_SCATTER:-0}" -e BENCH_M="${BENCH_M:-1,2,4,8,16}" \
-  -e PREFILL_WORDS="${PREFILL_WORDS:-480}" \
+  -e MINISGL_MOE_SPLITK="${MINISGL_MOE_SPLITK:-}" \
+  -e PREFILL_WORDS="${PREFILL_WORDS:-480}" -e WORKLOADS="${WORKLOADS:-prefill,decode,mixed}" \
   -e ATTN="${ATTN:-hip}" \
   -e SPEC="${SPEC:-}" -e SPEC_K="${SPEC_K:-}" -e DFLASH_MODEL="${DFLASH_MODEL:-}" -e EP="${EP:-}" -e MINISGL_EP_DBG="${MINISGL_EP_DBG:-}" \
   -e MINISGL_DFLASH_DDTREE="${MINISGL_DFLASH_DDTREE:-}" -e MINISGL_DDTREE_BUDGET="${MINISGL_DDTREE_BUDGET:-}" -e MINISGL_DDTREE_TOPK="${MINISGL_DDTREE_TOPK:-}" \
@@ -34,5 +35,5 @@ docker run --rm \
   -v /home/pat/models:/models \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
   -e PYTHONPATH="${KERNEL_PYPATH:-/opt/kernels}:/engine/python:/engine" \
-  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" /engine/tools/_bench_inner.sh
+  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" "${INNER:-/engine/tools/_bench_inner.sh}"
 echo "[run_bench_window] exited rc=$?"

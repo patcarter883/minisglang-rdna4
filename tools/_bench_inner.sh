@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs INSIDE the vllm22-w4a8:combined container (launched by run_bench_window.sh under the lease).
-# PRODUCTION serving benchmark: CUDA-graph decode capture ON (--graph), graph-safe MoE decode
-# (MINISGL_MOE_SCATTER=0 — the scatter/split-K atomicAdd is NOT graph-capturable), HIP attention.
-# Runs the prefill/decode/mixed x M matrix once. (Split-K is irrelevant under graphs — same atomic
-# constraint — so it is NOT benchmarked here.)
+# Runs INSIDE the minisgl-rdna4:lean container (launched by run_bench_window.sh under the lease).
+# PRODUCTION serving benchmark: CUDA-graph decode capture ON (--graph), fused atomic-scatter MoE
+# decode (MINISGL_MOE_SCATTER=1), HIP attention. Runs the prefill/decode/mixed x M matrix once.
+# The scatter defaulted to 0 here for as long as the engine wrongly believed its atomicAdd could not
+# be graph-captured. It captures fine and is worth +3.2% e2e (81.05 -> 83.60 tok/s, Qwen35B TP=2
+# M=1, 2026-07-30), so this bench now measures the production path with the scatter ON.
 set -uo pipefail
 # Activate the serving venv: lean image (/opt/venv, the infra serving all day) or legacy (/app/.venv).
 source /opt/venv/bin/activate 2>/dev/null || source /app/.venv/bin/activate
@@ -113,9 +114,14 @@ grep -iE 'captur|cuda.?graph' "$RESULTS/bench_graph.server.log" | head -4 || tru
 # production path). Cap at the smaller so every point is BOTH concurrent AND graph-captured.
 CAP="$MAXRUN"; [ "${GRAPH:-0}" -gt 0 ] && [ "$GRAPH" -lt "$CAP" ] && CAP="$GRAPH"
 echo "[bench] concurrency ceiling = min(MAXRUN=$MAXRUN, GRAPH=$GRAPH) = $CAP"
+# WORKLOADS selects which rows run. The full matrix (prefill,decode,mixed) is the default; an A/B
+# targeting one kernel sets WORKLOADS=decode so the run is minutes not tens of minutes AND so a
+# single-section table can be parsed unambiguously (serve_ab.sh takes the tok/s of the row it asked
+# for -- with three sections printed, "the M=1 row" is three different rows).
 python /engine/tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" \
   --label "$(basename "$MODEL") spec=${SPEC:-none} graph_max_bs=$GRAPH" --m "$BENCH_M" \
   --prefill-words "${PREFILL_WORDS:-480}" \
+  --workloads "${WORKLOADS:-prefill,decode,mixed}" \
   --max-concurrency "$CAP"
 stop
 echo "[done] logs in $RESULTS/"
