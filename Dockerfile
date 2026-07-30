@@ -77,7 +77,10 @@ RUN pip install \
 # GOTCHA: the repo ROOT contains a Django app directory named `rocpd/` which SHADOWS the real
 # `rocpd_python/rocpd` package whenever python runs with the repo as CWD -- the import then fails with
 # "No module named rocpd.schema" and looks like a packaging bug. Install, then leave the directory.
-ARG RPD_REF=main
+# rocmProfileData's default branch is **master**, not main — pinning --branch main fails the clone
+# with "Remote branch main not found" (exit 128). The original working command simply cloned the
+# default; adding a branch pin without checking it is what broke the build.
+ARG RPD_REF=master
 RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
