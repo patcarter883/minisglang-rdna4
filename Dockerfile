@@ -129,19 +129,12 @@ RUN set -eux; \
     git clone --depth 1 --branch "${INTELLIKIT_REF}" https://github.com/AMDResearch/intellikit /opt/intellikit; \
     bash /opt/intellikit/install/tools/install.sh --pip-cmd "pip --no-cache-dir"; \
     python -c "import accordo, kerncap, linex, metrix, nexus; print('intellikit import OK')"; \
-    mkdir -p /opt/rocprof-decoder; \
-    python - <<'PYEOF'; \
-import inspect, pathlib, re, urllib.request
-from linex.api import Linex
-src = inspect.getsource(Linex)
-url = re.search(r'DEFAULT_DECODER_URL\s*=\s*"([^"]+)"', src).group(1)
-dst = pathlib.Path("/opt/rocprof-decoder/librocprof-trace-decoder.so")
-urllib.request.urlretrieve(url, dst)
-print("trace decoder:", dst, dst.stat().st_size, "bytes")
-PYEOF
     TL=/opt/venv/lib/python3.12/site-packages/torch/lib; \
     mkdir -p /opt/rocprof-deps; \
     for d in libdw.so.1 libelf.so.1; do ln -sf "$TL/$d" "/opt/rocprof-deps/$d"; done
+COPY tools/fetch_att_decoder.py /opt/fetch_att_decoder.py
+RUN . /opt/venv/bin/activate && python /opt/fetch_att_decoder.py /opt/rocprof-decoder/librocprof-trace-decoder.so
+
 ENV KERNCAP_DEPS=/opt/rocprof-deps \
     ATT_DECODER_DIR=/opt/rocprof-decoder
 
