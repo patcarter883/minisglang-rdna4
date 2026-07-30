@@ -92,29 +92,53 @@ RUN set -eux; \
     python -c "import rocpd.schema, rpdTracerControl; print('rpd import OK')"; \
     test -f /usr/local/lib/librpd_tracer.so
 
-# ---- kerncap (AMDResearch/intellikit): kernel EXTRACTION, the fast iteration loop ---------------
-# Captures a real kernel dispatch (kernarg buffer + device memory regions + HSACO) at the ACTUAL
-# served shapes and emits a standalone reproducer you can edit, rebuild and validate. Verified on
-# gfx1201 2026-07-30: extracted cca_decode_fused_kernel<128,2,2,2,4> (grid 1536x1x1, block 128x1x1,
-# isa amdgcn-amd-amdhsa--gfx1201), replay PASS at 72.0 us, and the reproducer traces in ~1s.
+# ---- IntelliKit (AMDResearch): kerncap + linex + accordo + metrix + nexus + MCP servers ---------
+# Installed as a SUITE via the project's own installer, because two of these change what profiling is
+# possible on this box:
 #
-# WHY IT MATTERS HERE: hardware counters are unusable on this box (--pmc hangs on the first real
-# dispatch), and profiling a torch serve is the slow path. A captured reproducer removes torch from
-# the iteration loop entirely and pins the shapes to the ones production actually runs -- which is
-# otherwise a human transcribing numbers out of a trace and getting them subtly wrong.
-# It uses rocprofiler-sdk HSA INTERCEPTION (the half of the stack that works), not counters.
+#   linex   -> maps latency_cycles / stall_cycles to SOURCE LINES via `rocprofv3 --att` (SQTT thread
+#              trace). CRITICAL: --att is a DIFFERENT mechanism from --pmc. Hardware counters (--pmc)
+#              HANG on gfx1201 here (>90s on 4 dispatches; see opt_loop/bin/counter_cost_check.sh),
+#              but --att completes in ~1s and emits real per-wave traces. It had been failing only
+#              because librocprof-trace-decoder.so was absent -- linex knows the URL and fetches it,
+#              so this stage pre-downloads it to a system path. Verified on gfx1201 2026-07-30:
+#              rc=0 in 1s, producing *_gfx1201_code_object_id_*.out, *.att, results.db and per-wave
+#              JSON. Instruction-level stalls beat the aggregate occupancy/VALU numbers we lost.
+#   kerncap -> captures a live dispatch (kernarg + device memory + HSACO) at the REAL served shapes
+#              and emits a standalone reproducer. Verified: cca_decode_fused_kernel<128,2,2,2,4>,
+#              grid 1536x1x1, isa amdgcn-amd-amdhsa--gfx1201, replay PASS 72.0us, traces in ~1s.
+#   accordo -> snapshot-based correctness validation with configurable atol/rtol, i.e. the job our
+#              hand-rolled parity_*.py recorders do.
+#   metrix  -> the counter tool. Kept for when counters are fixed; refuses today (see profile_kernel.sh).
 #
-# GOTCHA: capture injects a tool library that needs libdw/libelf, which in this image exist ONLY
-# inside torch/lib -- without them the target dies with "libdw.so.1: cannot open shared object file"
-# and kerncap reports only "Capture did not produce output". Same shim as profile_kernel.sh.
+# apt deps are from IntelliKit's own docker/Dockerfile. libdw/libelf are ALSO symlinked out of
+# torch/lib: rocprofiler-sdk injects a tool library that needs them, they exist nowhere else in this
+# image, and without them a capture dies at exec while the tool reports only "no output produced".
+ARG INTELLIKIT_REF=main
 RUN set -eux; \
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git wget ninja-build cmake python3-dev build-essential libdwarf-dev libzstd-dev; \
+    rm -rf /var/lib/apt/lists/*; \
     . /opt/venv/bin/activate; \
-    pip install --no-cache-dir "git+https://github.com/AMDResearch/intellikit@main#subdirectory=kerncap"; \
-    kerncap --version; \
+    git clone --depth 1 --branch "${INTELLIKIT_REF}" https://github.com/AMDResearch/intellikit /opt/intellikit; \
+    bash /opt/intellikit/install/tools/install.sh --pip-cmd "pip --no-cache-dir"; \
+    python -c "import accordo, kerncap, linex, metrix, nexus; print('intellikit import OK')"; \
+    mkdir -p /opt/rocprof-decoder; \
+    python - <<'PYEOF'; \
+import inspect, pathlib, re, urllib.request
+from linex.api import Linex
+src = inspect.getsource(Linex)
+url = re.search(r'DEFAULT_DECODER_URL\s*=\s*"([^"]+)"', src).group(1)
+dst = pathlib.Path("/opt/rocprof-decoder/librocprof-trace-decoder.so")
+urllib.request.urlretrieve(url, dst)
+print("trace decoder:", dst, dst.stat().st_size, "bytes")
+PYEOF
     TL=/opt/venv/lib/python3.12/site-packages/torch/lib; \
     mkdir -p /opt/rocprof-deps; \
     for d in libdw.so.1 libelf.so.1; do ln -sf "$TL/$d" "/opt/rocprof-deps/$d"; done
-ENV KERNCAP_DEPS=/opt/rocprof-deps
+ENV KERNCAP_DEPS=/opt/rocprof-deps \
+    ATT_DECODER_DIR=/opt/rocprof-decoder
 
 ARG KERNELS_REF=2fa1c38
 # Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
