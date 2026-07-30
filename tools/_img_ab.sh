@@ -14,5 +14,5 @@ run(){ local img="$1" label="$2"
   docker compose -p lease-imgab --profile serve down >/dev/null 2>&1; sleep 5; }
 : > "$OUT"
 run minisgl-rdna4:lean      stale_jul23
-run minisgl-rdna4:lean-cur  current_kernels
+run minisgl-rdna4:lean  current_kernels
 echo "=== done ===" | tee -a "$OUT"

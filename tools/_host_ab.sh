@@ -12,7 +12,7 @@ cleanup(){ docker compose -p lease-hab --profile serve down >/dev/null 2>&1 || t
 trap cleanup EXIT INT TERM
 run(){ local args="$1" label="$2"
   echo "=== $label (extra args: '$args') ===" | tee -a "$OUT"
-  LEASE_NAME=hab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 FP8_WMMA_PKG="$PKG" \
+  LEASE_NAME=hab MINISGL_IMAGE=minisgl-rdna4:lean FP8_WMMA_PKG="$PKG" \
     MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 MINISGL_EXTRA_ARGS="$args" \
     gpu-lease -n 2 --detach --name hab -- docker compose -p lease-hab --profile serve up -d >/dev/null 2>&1
   if ! wait_ready; then echo "  BOOT FAILED" | tee -a "$OUT"

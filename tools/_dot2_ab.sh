@@ -20,7 +20,7 @@ trap cleanup EXIT INT TERM
 
 run(){ local label="$1"
   echo "=== $label ===" | tee -a "$OUT"
-  LEASE_NAME=d2ab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 FP8_WMMA_PKG="$DOT2_PKG" \
+  LEASE_NAME=d2ab MINISGL_IMAGE=minisgl-rdna4:lean FP8_WMMA_PKG="$DOT2_PKG" \
     gpu-lease -n 2 --detach --name d2ab -- docker compose -p lease-d2ab --profile serve up -d >/dev/null 2>&1
   if ! wait_ready; then echo "  BOOT FAILED:" | tee -a "$OUT"
     docker compose -p lease-d2ab --profile serve logs --tail 15 2>&1 | sed 's/^/    /' | tee -a "$OUT"

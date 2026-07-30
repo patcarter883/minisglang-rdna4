@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.." || exit 1
 REPO="$PWD"; OUT="$REPO/tools/_maxm_ab.txt"
 FP8=/home/pat/code/rdna4-hip-kernels-bfgemv/fp8_wmma/torch-ext/fp8_wmma
 MOE=/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip
-IMG="${MINISGL_IMAGE:-minisgl-rdna4:lean-b000dd0}"
+IMG="${MINISGL_IMAGE:-minisgl-rdna4:lean}"
 for p in "$FP8" "$MOE"; do
   [ -f "$p/_ops.py" ] || { echo "FATAL: $p not built"; exit 1; }
   pkg=$(basename "$p")

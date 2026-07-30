@@ -48,7 +48,7 @@ lock = threading.Lock(); acc = {"n": 0, "err": 0, "out": 0}
 
 def _post(req, model, stream):
     body = json.dumps({"model": model, "messages": req["messages"],
-                       "max_tokens": min(req.get("max_tokens", 512), 1024),
+                       "max_tokens": min(req.get("max_tokens", 512), 4096),  # real per-request cap
                        "temperature": 0.7, "stream": stream}).encode()
     r = urllib.request.Request(f"http://localhost:{PORT}/v1/chat/completions", data=body,
                                headers={"Content-Type": "application/json"})

@@ -1,1 +1,1 @@
-=== BAKED minisgl-rdna4:lean-perf, NO shadow mounts ===
+=== BAKED minisgl-rdna4:lean, NO shadow mounts ===

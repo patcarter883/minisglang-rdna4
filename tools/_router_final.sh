@@ -7,7 +7,7 @@ PKG=/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip
 : > "$OUT"
 run(){ local v="$1" label="$2"
   echo "=== $label (ROUTER_FUSED=$v) ===" | tee -a "$OUT"
-  LEASE_NAME=rfin MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 MOE_HIP_PKG="$PKG" \
+  LEASE_NAME=rfin MINISGL_IMAGE=minisgl-rdna4:lean MOE_HIP_PKG="$PKG" \
     MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 VLLM_W4A8_MOE_G2FUSE_BYLANE=1 \
     MINISGL_ROUTER_FUSED="$v" MINISGL_EXTRA_ARGS="--no-gdn-radix" \
     gpu-lease -n 2 --detach --name rfin -- docker compose -p lease-rfin --profile serve up -d >/dev/null 2>&1

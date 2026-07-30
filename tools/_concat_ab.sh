@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.." || exit 1
 REPO="$PWD"; OUT="$REPO/tools/_concat_ab.txt"
 FP8=/home/pat/code/rdna4-hip-kernels-bfgemv/fp8_wmma/torch-ext/fp8_wmma
 MOE=/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip
-IMG="${MINISGL_IMAGE:-minisgl-rdna4:lean-b000dd0}"
+IMG="${MINISGL_IMAGE:-minisgl-rdna4:lean}"
 # PREFLIGHT. Checking for _ops.py is NOT enough: a package built in a different image links against
 # that image's libtorch and dies at load with "libc10.so: cannot open shared object file" — which
 # presents as a serve that never reaches the GPU (gpu_use 0% until the 600s timeout), not as an
@@ -25,7 +25,7 @@ echo "preflight: both packages import in $IMG"
 
 run(){ local v="$1" label="$2"
   echo "=== $label (MINISGL_FUSE_COL_PROJ=$v) ===" | tee -a "$OUT"
-  LEASE_NAME=cab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 \
+  LEASE_NAME=cab MINISGL_IMAGE=minisgl-rdna4:lean \
     FP8_WMMA_PKG="$FP8" MOE_HIP_PKG="$MOE" \
     MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 VLLM_W4A8_MOE_G2FUSE_BYLANE=1 \
     MINISGL_ROUTER_FUSED=1 MINISGL_FUSE_COL_PROJ="$v" MINISGL_EXTRA_ARGS="--no-gdn-radix" \

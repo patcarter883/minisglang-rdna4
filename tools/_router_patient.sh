@@ -4,7 +4,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 REPO="$PWD"; PKG=/home/pat/code/rdna4-hip-kernels-build/moe/torch-ext/moe_hip
-LEASE_NAME=rpat MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 MOE_HIP_PKG="$PKG" \
+LEASE_NAME=rpat MINISGL_IMAGE=minisgl-rdna4:lean MOE_HIP_PKG="$PKG" \
   MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 VLLM_W4A8_MOE_G2FUSE_BYLANE=1 \
   MINISGL_ROUTER_FUSED=1 MINISGL_EXTRA_ARGS="--no-gdn-radix" \
   gpu-lease -n 2 --detach --name rpat -- docker compose -p lease-rpat --profile serve up -d >/dev/null 2>&1

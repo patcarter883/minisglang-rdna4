@@ -34,5 +34,5 @@ docker run --rm \
   -v /home/pat/models:/models \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
   -e PYTHONPATH="${KERNEL_PYPATH:-/opt/kernels}:/engine/python:/engine" \
-  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean-zaya}" /engine/tools/_bench_inner.sh
+  --entrypoint bash "${MINISGL_IMAGE:-minisgl-rdna4:lean}" /engine/tools/_bench_inner.sh
 echo "[run_bench_window] exited rc=$?"

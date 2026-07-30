@@ -12,7 +12,7 @@ cleanup(){ docker compose -p lease-sab --profile serve down >/dev/null 2>&1 || t
 trap cleanup EXIT INT TERM
 run(){ local gd="$1" mv="$2" label="$3"
   echo "=== $label (GDN_PROJ=$gd MINV_DECODE=$mv) ===" | tee -a "$OUT"
-  LEASE_NAME=sab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 FP8_WMMA_PKG="$PKG" \
+  LEASE_NAME=sab MINISGL_IMAGE=minisgl-rdna4:lean FP8_WMMA_PKG="$PKG" \
     MINISGL_GDN_PROJ_GEMV="$gd" MINISGL_MINV_DECODE_GEMV="$mv" \
     gpu-lease -n 2 --detach --name sab -- docker compose -p lease-sab --profile serve up -d >/dev/null 2>&1
   if ! wait_ready; then echo "  BOOT FAILED" | tee -a "$OUT"; cleanup; sleep 5; return 1; fi

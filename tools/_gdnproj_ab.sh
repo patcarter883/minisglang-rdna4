@@ -30,7 +30,7 @@ PY
 }
 run(){ local v="$1" label="$2"
   echo "=== $label (MINISGL_MINV_DECODE_GEMV=$v, GDN_PROJ_GEMV=1) ===" | tee -a "$OUT"
-  LEASE_NAME=gpab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 FP8_WMMA_PKG="$PKG" MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV="$v" \
+  LEASE_NAME=gpab MINISGL_IMAGE=minisgl-rdna4:lean FP8_WMMA_PKG="$PKG" MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV="$v" \
     gpu-lease -n 2 --detach --name gpab -- docker compose -p lease-gpab --profile serve up -d >/dev/null 2>&1
   if ! wait_ready; then echo "  BOOT FAILED:" | tee -a "$OUT"
     docker compose -p lease-gpab --profile serve logs --tail 15 2>&1 | sed 's/^/    /' | tee -a "$OUT"; cleanup; sleep 5; return 1; fi

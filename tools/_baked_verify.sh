@@ -25,8 +25,8 @@ print(f"  conc={n}: {sum(c for c,_ in res)/w:.1f} tok/s")
 PY
 }
 : > "$OUT"
-echo "=== BAKED minisgl-rdna4:lean-perf, NO shadow mounts ===" | tee -a "$OUT"
-LEASE_NAME=bk MINISGL_IMAGE=minisgl-rdna4:lean-perf \
+echo "=== BAKED minisgl-rdna4:lean, NO shadow mounts ===" | tee -a "$OUT"
+LEASE_NAME=bk MINISGL_IMAGE=minisgl-rdna4:lean \
   MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 VLLM_W4A8_MOE_G2FUSE_BYLANE=1 \
   MINISGL_EXTRA_ARGS="--no-gdn-radix" \
   gpu-lease -n 2 --detach --name bk -- docker compose -p lease-bk --profile serve up -d >/dev/null 2>&1

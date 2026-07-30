@@ -25,7 +25,7 @@ PY
 }
 run(){ local v="$1" label="$2"
   echo "=== $label (VLLM_W4A8_MOE_G2FUSE_BYLANE='$v') ===" | tee -a "$OUT"
-  LEASE_NAME=g2ab MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 VLLM_W4A8_MOE_G2FUSE_BYLANE="$v" \
+  LEASE_NAME=g2ab MINISGL_IMAGE=minisgl-rdna4:lean VLLM_W4A8_MOE_G2FUSE_BYLANE="$v" \
     gpu-lease -n 2 --detach --name g2ab -- docker compose -p lease-g2ab --profile serve up -d >/dev/null 2>&1
   if ! wait_ready; then echo "  BOOT FAILED" | tee -a "$OUT"
     docker compose -p lease-g2ab --profile serve logs --tail 20 2>&1 | sed 's/^/    /' | tee -a "$OUT"

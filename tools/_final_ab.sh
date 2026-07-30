@@ -30,7 +30,7 @@ PY
 }
 run(){ local args="$1" bl="$2" label="$3"
   echo "=== $label ===" | tee -a "$OUT"
-  LEASE_NAME=fin MINISGL_IMAGE=minisgl-rdna4:lean-b000dd0 FP8_WMMA_PKG="$PKG" \
+  LEASE_NAME=fin MINISGL_IMAGE=minisgl-rdna4:lean FP8_WMMA_PKG="$PKG" \
     MINISGL_GDN_PROJ_GEMV=1 MINISGL_MINV_DECODE_GEMV=1 VLLM_W4A8_MOE_G2FUSE_BYLANE="$bl" \
     MINISGL_EXTRA_ARGS="$args" \
     gpu-lease -n 2 --detach --name fin -- docker compose -p lease-fin --profile serve up -d >/dev/null 2>&1
