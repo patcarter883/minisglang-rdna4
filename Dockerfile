@@ -172,6 +172,13 @@ RUN set -eux; \
 # uprof_mcp resolves the CLI from this; without it the wrapper imports and then fails at runtime.
 ENV INTELLIKIT_UPROF_CLI=/opt/AMDuProf_5.3-521/bin/AMDuProfCLI
 
+# py-spy: sampling profiler for the PYTHON layer. uProf is the AMD-native CPU tool, but most of this
+# engine's host overhead is Python -- scheduler loop, per-step batch assembly, the spec/EP orchestration
+# -- and py-spy attributes that directly, on a RUNNING process, with no instrumentation and no restart
+# (`py-spy dump --pid <serve>` / `py-spy record`). That matters here because the serve is the thing we
+# cannot easily rebuild mid-experiment. Complements uProf rather than replacing it.
+RUN . /opt/venv/bin/activate && pip install --no-cache-dir py-spy && py-spy --version
+
 ARG KERNELS_REF=2fa1c38
 # Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
 # 16 cores, and on this SHARED box that perturbs whatever a concurrent opt_loop is timing (host-side
