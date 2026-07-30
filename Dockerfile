@@ -110,6 +110,12 @@ RUN set -eux; \
 #   accordo -> snapshot-based correctness validation with configurable atol/rtol, i.e. the job our
 #              hand-rolled parity_*.py recorders do.
 #   metrix  -> the counter tool. Kept for when counters are fixed; refuses today (see profile_kernel.sh).
+#   uprof_mcp -> INERT here. It is only an MCP WRAPPER: AMD uProf itself is a SEPARATE manual download
+#              from AMD's developer site (EULA-gated, not in apt, not in pip) and is installed NOWHERE
+#              on this box. The wrapper imports fine and then fails at runtime wanting
+#              $INTELLIKIT_UPROF_CLI, so do not read "uprof_mcp installed" as "CPU profiling works".
+#              There is currently NO CPU profiler here at all (no uProf, no perf, no py-spy), which is
+#              a real gap given how often this stack turns out to be host-bound rather than GPU-bound.
 #
 # apt deps are from IntelliKit's own docker/Dockerfile. libdw/libelf are ALSO symlinked out of
 # torch/lib: rocprofiler-sdk injects a tool library that needs them, they exist nowhere else in this
