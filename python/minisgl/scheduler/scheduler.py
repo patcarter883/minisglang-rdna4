@@ -484,6 +484,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # feed (for A/B). MINISGL_DFLASH_CTX_WINDOW>0 caps P to the last W positions (perf/memory).
         self._dflash_fullctx = os.environ.get("MINISGL_DFLASH_FULLCTX", "1") not in ("0", "false", "no")
         self._dflash_ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
+        # Proposer-derived cap on the accumulated aux buffer (0 = unbounded). A windowed drafter can
+        # only ever read its newest `window` prefix rows, so it publishes window + block_size here and
+        # the scheduler stops growing the buffer past that. Read the same way `prefill_aux_tail` is.
+        self._spec_aux_ctx_cap = int(getattr(self._proposer, "aux_ctx_cap", 0) or 0)
 
         # MINISGL_SPEC_ONDEVICE=1: compute greedy acceptance + EOS truncation with the on-device
         # vectorized chain (spec/accept_gpu.py) instead of the per-position argmax .cpu() + per-req
@@ -3747,7 +3751,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                             if (prev is not None and prev.dim() == 3)
                             else new_slice
                         )
-                        w = self._dflash_ctx_window
+                        # Cap the accumulated aux. The default comes from the PROPOSER
+                        # (`aux_ctx_cap` = drafter window + block size for a windowed DFlash drafter;
+                        # 0 = unbounded), not from an env knob: the drafter masks every key older than
+                        # its window to -inf, so rows past that cap can never reach a logit — while
+                        # keeping them made this torch.cat reallocate and copy an O(P)
+                        # [num_aux, P, hidden] buffer every step of every request (614 MB resident per
+                        # uid at a 30k context, on a card that already needs MEM_RATIO 0.93 to boot
+                        # Laguna+DFlash). MINISGL_DFLASH_CTX_WINDOW still overrides it — that one may
+                        # be SMALLER than the window and is then a real (diagnostic) numerics change.
+                        w = self._dflash_ctx_window or self._spec_aux_ctx_cap
                         if w and buf.shape[1] > w:
                             buf = buf[:, -w:].contiguous()
                         new_aux_hidden[req.uid] = buf

@@ -1,0 +1,43 @@
+=== base [timing] ===
+  mounted spec/dflash.py md5: b10e6216f155eacc0c07778c5216da1a
+  mounted models/dflash.py md5: 4c3958beaaa9eeae20e46f3b4a26d099
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_DEBUG= 
+TOKENS 3072
+WALL 34.258
+TPS 89.674
+MD5 b3bdf253a35a8e6ce712119643bf1009
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  [spec-timing] lines:
+[spec-timing] step=50 propose=18.8ms stage=0.3ms forward=47.3ms accept=0.5ms total=66.9ms
+[spec-timing] step=100 propose=12.5ms stage=0.3ms forward=48.4ms accept=0.5ms total=61.6ms
+[spec-timing] step=150 propose=10.4ms stage=0.3ms forward=49.0ms accept=0.5ms total=60.2ms
+[spec-timing] step=200 propose=9.4ms stage=0.3ms forward=49.5ms accept=0.5ms total=59.6ms
+[spec-timing] step=250 propose=8.9ms stage=0.3ms forward=49.8ms accept=0.5ms total=59.5ms
+[spec-timing] step=300 propose=8.6ms stage=0.3ms forward=50.2ms accept=0.5ms total=59.6ms
+[spec-timing] step=350 propose=8.4ms stage=0.3ms forward=50.6ms accept=0.5ms total=59.8ms
+[spec-timing] step=400 propose=8.3ms stage=0.3ms forward=50.9ms accept=0.5ms total=60.0ms
+[spec-timing] step=450 propose=8.4ms stage=0.3ms forward=51.1ms accept=0.5ms total=60.3ms
+[spec-timing] step=500 propose=8.4ms stage=0.3ms forward=51.2ms accept=0.5ms total=60.5ms
+[spec-timing] step=550 propose=8.5ms stage=0.3ms forward=51.4ms accept=0.6ms total=60.7ms
+
+=== new [timing] ===
+  mounted spec/dflash.py md5: ca619e4ed10b6687d280534ecdd14566
+  mounted models/dflash.py md5: 6fb007f263d95152002c683599d30d55
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_DEBUG= 
+TOKENS 3072
+WALL 33.423
+TPS 91.911
+MD5 2bab70b16fb32d4ea94329b9f49b0ce6
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all the required f
+  [spec-timing] lines:
+[spec-timing] step=50 propose=23.2ms stage=0.3ms forward=47.3ms accept=0.4ms total=71.2ms
+[spec-timing] step=100 propose=14.6ms stage=0.3ms forward=48.4ms accept=0.5ms total=63.7ms
+[spec-timing] step=150 propose=11.8ms stage=0.3ms forward=49.0ms accept=0.5ms total=61.6ms
+[spec-timing] step=200 propose=10.3ms stage=0.3ms forward=49.5ms accept=0.5ms total=60.6ms
+[spec-timing] step=250 propose=9.5ms stage=0.3ms forward=49.9ms accept=0.5ms total=60.1ms
+[spec-timing] step=300 propose=8.9ms stage=0.3ms forward=50.3ms accept=0.5ms total=60.0ms
+[spec-timing] step=350 propose=8.5ms stage=0.3ms forward=50.7ms accept=0.5ms total=60.0ms
+[spec-timing] step=400 propose=8.2ms stage=0.3ms forward=50.9ms accept=0.5ms total=59.9ms
+[spec-timing] step=450 propose=8.0ms stage=0.3ms forward=51.1ms accept=0.5ms total=59.9ms
+[spec-timing] step=500 propose=7.8ms stage=0.3ms forward=51.3ms accept=0.5ms total=59.9ms
+

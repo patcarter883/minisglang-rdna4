@@ -114,6 +114,23 @@ class RotaryEmbedding(StateLessOP):
         sin = torch.cat((sin_half, sin_half), dim=-1)
         return self._apply(query, cos, sin), self._apply(key, cos, sin)
 
+    def forward_one(self, positions: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """RoPE a SINGLE tensor. Bit-identical to `forward(positions, x, x)[1]`, but one kernel launch
+        and one staging copy instead of two — for callers (the DFlash drafter's prefix projection) that
+        only need a key rotated and were passing the same tensor in twice to get it."""
+        if self.interleave:
+            cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
+            return self._apply_interleave(x, cos_half, sin_half)
+        if _tail_hip.active(x):
+            return _tail_hip.rope(
+                x.contiguous(), positions.to(torch.int32), self._cos_sin_cache,
+                self.head_size, self.rotary_dim,
+            )
+        cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
+        cos = torch.cat((cos_half, cos_half), dim=-1)
+        sin = torch.cat((sin_half, sin_half), dim=-1)
+        return self._apply(x, cos, sin)
+
 
 def _get_rope(
     head_dim: int,

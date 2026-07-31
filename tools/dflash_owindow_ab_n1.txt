@@ -1,0 +1,31 @@
+=== base [identity] ===
+  mounted spec/dflash.py md5: b10e6216f155eacc0c07778c5216da1a
+  mounted models/dflash.py md5: 4c3958beaaa9eeae20e46f3b4a26d099
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_DEBUG=2 
+TOKENS 640
+WALL 8.166
+TPS 78.378
+MD5 186bcbe5c4bf869e43ce52894e40c221
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all the required f
+  drafted chains captured: 254
+
+=== new [identity] ===
+  mounted spec/dflash.py md5: 1b6998f3a0db88f8bb09bfe2c36e701a
+  mounted models/dflash.py md5: 6fb007f263d95152002c683599d30d55
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_DEBUG=2 
+TOKENS 640
+WALL 8.211
+TPS 77.947
+MD5 186bcbe5c4bf869e43ce52894e40c221
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all the required f
+  drafted chains captured: 254
+
+=== DRAFT-CHAIN IDENTITY ===
+  DIFFER: 2 of 254 lines
+233,234c233,234
+< draft=[350, 1290, 6395, 77144, 1117, 1117, 341, 341, 5993, 5993, 341, 2078, 2078, 2078, 2078]
+< draft=[350, 1290, 6395, 77144, 1117, 1117, 341, 341, 5993, 5993, 341, 2078, 2078, 2078, 2078]
+---
+> draft=[350, 1290, 6395, 77144, 1117, 1117, 341, 341, 3627, 5993, 341, 2078, 2078, 2078, 2078]
+> draft=[350, 1290, 6395, 77144, 1117, 1117, 341, 341, 3627, 5993, 341, 2078, 2078, 2078, 2078]
+

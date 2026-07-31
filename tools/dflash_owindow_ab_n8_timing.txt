@@ -1,0 +1,30 @@
+=== base [timing] ===
+  mounted spec/dflash.py md5: b10e6216f155eacc0c07778c5216da1a
+  mounted models/dflash.py md5: 4c3958beaaa9eeae20e46f3b4a26d099
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_DEBUG= 
+TOKENS 8192
+WALL 59.238
+TPS 138.290
+MD5 c9071e53be89f0654d892dd5112d855d
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  [spec-timing] lines:
+[spec-timing] step=50 propose=56.6ms stage=1.3ms forward=179.6ms accept=0.9ms total=238.4ms
+[spec-timing] step=100 propose=51.1ms stage=1.3ms forward=199.9ms accept=0.9ms total=253.2ms
+[spec-timing] step=150 propose=49.8ms stage=1.3ms forward=207.1ms accept=1.0ms total=259.3ms
+[spec-timing] step=200 propose=49.5ms stage=1.4ms forward=209.9ms accept=1.0ms total=261.9ms
+
+=== new [timing] ===
+  mounted spec/dflash.py md5: ca619e4ed10b6687d280534ecdd14566
+  mounted models/dflash.py md5: 6fb007f263d95152002c683599d30d55
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_DEBUG= 
+TOKENS 8192
+WALL 58.043
+TPS 141.137
+MD5 c29061c01066189692e423d14ea839e6
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  [spec-timing] lines:
+[spec-timing] step=50 propose=55.2ms stage=1.3ms forward=181.9ms accept=0.9ms total=239.3ms
+[spec-timing] step=100 propose=49.5ms stage=1.3ms forward=200.4ms accept=1.0ms total=252.2ms
+[spec-timing] step=150 propose=48.0ms stage=1.3ms forward=207.7ms accept=1.0ms total=258.0ms
+[spec-timing] step=200 propose=47.3ms stage=1.3ms forward=211.5ms accept=1.1ms total=261.2ms
+

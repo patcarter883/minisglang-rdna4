@@ -151,9 +151,11 @@ class _DFlashLayer(BaseOP):
         k_ctx = self.k_proj.forward(target_hidden).view(m, Hkv, hd)
         v_ctx = self.v_proj.forward(target_hidden).view(m, Hkv, hd)
         self.k_norm.forward_inplace(k_ctx)
-        _, kc_flat = self._rotary.forward(
-            ctx_pos, k_ctx.reshape(m, Hkv * hd).contiguous(), k_ctx.reshape(m, Hkv * hd).contiguous()
-        )
+        # ONE rope launch + ONE [m, Hkv*hd] staging copy. The old call handed the SAME k tensor in as
+        # both `query` and `key` and threw the query result away, i.e. it paid two identical
+        # `tail_hip.rope` launches and two `.contiguous()` copies per layer per step for one result.
+        # Bit-identical: same kernel, same input, same positions.
+        kc_flat = self._rotary.forward_one(ctx_pos, k_ctx.reshape(m, Hkv * hd).contiguous())
         return kc_flat.view(m, Hkv, hd), v_ctx
 
     def attend_block(
@@ -188,15 +190,27 @@ class _DFlashLayer(BaseOP):
         k_noise = kn_flat.view(B, Hkv, hd)
 
         # K/V = [ctx prefix | noise]  along the key sequence.
-        K = torch.cat([k_ctx, k_noise], dim=0)  # [P+B, Hkv, hd]
-        V = torch.cat([v_ctx, v_noise], dim=0)  # [P+B, Hkv, hd]
+        K = torch.cat([k_ctx, k_noise], dim=0)  # [S, Hkv, hd], S = P + B
+        V = torch.cat([v_ctx, v_noise], dim=0)  # [S, Hkv, hd]
         group = H // Hkv
-        K = K.repeat_interleave(group, dim=1)  # [P+B, H, hd]
+        # The group-expanded K/V stays. NOT an oversight — MEASURED, min-of-7, in
+        # tools/dflash_gqa_formulation_probe.py: the "carry a group axis in the einsum" rewrite (`bkgd,skd->bkgs` / `bkgs,skd->bkgd`)
+        # changes the underlying bmm from (batch=H, M=B, K=hd) to (batch=Hkv, M=B*group, K=hd) and the
+        # AV product from (batch=H, K=S) to (batch=Hkv, K=S). rocBLAS partitions those differently, so
+        # it is NOT bit-identical (dmax 2e-6..5e-4 on the attention output, ~1 bf16 ULP), and in
+        # tools/dflash_window_parity.py that was enough to FLIP a drafted token's argmax at P=512.
+        # A stride-0 broadcast `matmul` formulation IS bit-identical (dmax exactly 0 at every S) but
+        # torch materialises the broadcast anyway and it runs SLOWER than this (0.235 vs 0.160 ms at
+        # S=528). And the expansion is no longer the cost it was: once the window slice above caps
+        # S at sliding_window + block, these two copies are ~8.6 MB each per layer, not the ~492 MB
+        # they were at a 30k prefix — the grouped einsum's whole remaining edge at S=528 is 3.8% of
+        # the attention core (0.154 vs 0.160 ms), which does not buy a drafted-token flip.
+        K = K.repeat_interleave(group, dim=1)  # [S, H, hd]
         V = V.repeat_interleave(group, dim=1)
-        # scores[b,h,s] = q[b,h] . K[s,h]; attention over the P+B keys (masked for Laguna causal+SWA).
-        scores = torch.einsum("bhd,shd->bhs", q, K) * self.scale  # [B, H, P+B]
+        # scores[b,h,s] = q[b,h] . K[s,h]; attention over the S keys (masked for Laguna causal+SWA).
+        scores = torch.einsum("bhd,shd->bhs", q, K) * self.scale  # [B, H, S]
         if attn_mask is not None:
-            scores = scores + attn_mask.unsqueeze(1)  # [B, 1, P+B] broadcast over heads
+            scores = scores + attn_mask.unsqueeze(1)  # [B, 1, S] broadcast over heads
         probs = scores.softmax(dim=-1).to(V.dtype)
         attn = torch.einsum("bhs,shd->bhd", probs, V)  # [B, H, hd]
         if self.gated:
@@ -369,6 +383,31 @@ class DFlashDraftModel(BaseOP):
             keep, torch.zeros((), device=device), torch.full((), float("-inf"), device=device)
         ).float()
 
+    def window_prefix(self, P: int) -> int:
+        """How many TRAILING prefix rows the block can actually attend to. 0-cost, host-only.
+
+        Under the Laguna causal + sliding-window mask (`_block_mask`) the FIRST block query sits at
+        concatenated position P and keeps only keys j with P - j < W, so every row j <= P - W is
+        `-inf` for EVERY query in the block. Those rows contribute exp(-inf - max) == 0.0 exactly and
+        0.0 * V == 0.0, so materialising and reading them is pure traffic — at a 30k prefix, ~4.9 GB
+        of transient alloc and ~13 GB of HBM traffic per propose, to compute something that depends
+        on 512 keys.
+
+        NO position-base shift is needed after slicing, and this is the one place it is easy to get
+        wrong. `_block_mask` indexes the CONCATENATION, not absolute positions. Dropping the oldest
+        D = P - W keys maps key j -> j - D and query i from concat position i + P to i + W:
+          * distance  (i + P) - j  ==  (i + W) - (j - D)         -> the SWA test is preserved;
+          * causality  j <= i + P  <=>  j - D <= i + W           -> the causal test is preserved.
+        So `_block_mask(min(P, W), B)` IS the sliced mask, unshifted. RoPE is unaffected regardless:
+        every prefix row was rotated at its own TRUE absolute position when it was projected
+        (`project_ctx`), so a row carries its phase with it and slicing moves no phase.
+
+        (Row P - W itself is also always masked — for query i, qpos - kpos = i + W >= W — so W - 1
+        rows would suffice; W is kept as the conservative, easier-to-reason-about bound.)"""
+        if not self.causal or self.sliding_window <= 0:
+            return P  # z-lab bidirectional drafter: NO mask at all, every key is live. Never slice.
+        return min(P, self.sliding_window)
+
     @torch.inference_mode()
     def denoise(
         self,
@@ -380,7 +419,12 @@ class DFlashDraftModel(BaseOP):
         """One denoising forward -> [B, hidden] (pre-head-normed block hidden). Bidirectional (z-lab)
         or causal+SWA-masked (Laguna) per self.causal."""
         hidden = noise_embed
-        mask = self._block_mask(target_hidden.shape[0], noise_embed.shape[0], noise_embed.device)
+        P_full = target_hidden.shape[0]
+        P = self.window_prefix(P_full)
+        if P < P_full:  # windowed: drop the prefix rows the mask discards BEFORE projecting them
+            target_hidden = target_hidden[P_full - P :]
+            ctx_pos = ctx_pos[P_full - P :]
+        mask = self._block_mask(P, noise_embed.shape[0], noise_embed.device)
         for layer in self.layers:
             hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos, mask)
         return self.norm.forward(hidden)
@@ -409,7 +453,13 @@ class DFlashDraftModel(BaseOP):
         Byte-identical to `denoise` for the same effective prefix, but the prefix projection is reused
         across decode steps instead of recomputed."""
         hidden = noise_embed
-        P = prefix_kv[0][0].shape[0]
+        P_full = prefix_kv[0][0].shape[0]
+        P = self.window_prefix(P_full)
+        if P < P_full:
+            # SLICE BEFORE THE CAT: a contiguous view of the newest W rows, so `attend_block`'s
+            # torch.cat + einsums see [W + B] keys instead of [P + B]. Constant-shaped once P >= W.
+            d = P_full - P
+            prefix_kv = [(k[d:], v[d:]) for (k, v) in prefix_kv]
         mask = self._block_mask(P, noise_embed.shape[0], noise_embed.device)
         for layer, (k_ctx, v_ctx) in zip(self.layers, prefix_kv):
             hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask)

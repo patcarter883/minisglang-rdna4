@@ -77,6 +77,15 @@ class Proposer(ABC):
     # drafter regardless, so truncating to the tail is numerically inert — it only bounds the cost.
     prefill_aux_tail: int = 0
 
+    # Cap, in positions, on the aux buffer the scheduler ACCUMULATES for this proposer. 0 = unbounded.
+    #
+    # The steady-state twin of `prefill_aux_tail`. A sliding-window drafter masks out every key older
+    # than its window, so accumulating aux past (window + one draft block) is numerically inert —
+    # while the scheduler's append is a `torch.cat`, i.e. an O(P) realloc+copy of a
+    # [num_aux, P, hidden] buffer on every step of every request. Publishing the cap here keeps the
+    # bound derived from the drafter's own geometry instead of an env knob.
+    aux_ctx_cap: int = 0
+
     @abstractmethod
     def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
         """Return up to ``num_draft`` draft token ids per req (empty list ⇒ plain decode step)."""
