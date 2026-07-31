@@ -41,20 +41,30 @@ PORT="${PORT:-1919}"
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
+# Each arm matches the ALIAS *or* the checkpoint id/path, because the two ways of choosing a model
+# produce different strings: typing `MODEL=laguna` gives the alias, while the control panel's model
+# dropdown is populated from the HF cache and hands over the full id. Matching only the alias meant
+# picking a model from the dropdown silently fell through to the catch-all and lost its draft
+# checkpoint, attention backend and tuned defaults.
 case "$MODEL" in
-  qwen35b-awq)    model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4
+  qwen35b-awq|cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit)
+                  model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash" ;;
-  qwen35b-mxfp4)  model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
+  qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
+                  model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15 ;;
   # GLM's MTP head is a measured NET LOSS on this box, so its default is EAGLE3 (K=6 from the
   # spec-len sweep). MTP remains selectable — it is just not the default.
-  glm)            model_id="QuantTrio/GLM-4.7-Flash-AWQ";              spec_default="eagle3"; k_mtp=2
+  glm|QuantTrio/GLM-4.7-Flash-AWQ)
+                  model_id="QuantTrio/GLM-4.7-Flash-AWQ";              spec_default="eagle3"; k_mtp=2
                   eagle3_draft="thoughtworks/GLM-4.7-Flash-Eagle3"; k_eagle3=6 ;;
-  laguna)         model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
+  laguna|poolside/Laguna-XS-2.1-NVFP4)
+                  model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
                   dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85" ;;
-  zaya)           model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
+  zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
+                  model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
-  *)              model_id="$MODEL" ;;     # any HF id or local path, straight through
+  *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
 
@@ -79,6 +89,8 @@ esac
 if [[ -n "$need_draft" && -z "$resolved_draft" ]]; then
   echo "serve.sh: SPEC=$SPEC needs a draft checkpoint and MODEL=$MODEL has no default for it." >&2
   echo "serve.sh: set DRAFT=<hf-id or /drafts/... path>, or pick a different SPEC." >&2
+  echo "serve.sh: models with a built-in draft: qwen35b-awq qwen35b-mxfp4 (dflash),"  >&2
+  echo "serve.sh:                               glm (eagle3), laguna zaya (dflash)."  >&2
   exit 2
 fi
 case "$SPEC" in
