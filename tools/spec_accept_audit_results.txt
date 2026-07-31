@@ -1,0 +1,483 @@
+# Phase 1a — Laguna DFlash acceptance audit (2026-07-31). Raw cell summaries.
+# Harnesses: tools/spec_truth.sh (matrix), tools/spec_sweep.sh (knobs), tools/spec_dflash_divergence.sh
+# All legs: gpu-lease -n 2, one at a time, run compose profile, hand-written argv, 127.0.0.1:21955 in-container.
+# TRUE tok/s = usage.completion_tokens on non-streaming requests. See docs/CONTINUANCE_laguna_spec_and_decode_perf.md §11.
+
+################################################################ leg_A_cur_ps1
+===== CELL  leg=A_cur_ps1  prompt=A_repetitive_e6ddb502_verbatim =====
+  req: prompt_tok=70 completion_tok=720 wall=5.99s tok/s=120.24 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.30s tok/s=135.88 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.60s tok/s=156.37 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.71s tok/s=194.30 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=146.96  per-req=['120.24', '135.88', '156.37', '194.30']
+  spec steps=303  emitted=2876  accepted=2573  drafted=4448
+  accept-len [emitted/steps]            = 9.492   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.492   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.492   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.492   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.67
+===== CELL  leg=A_cur_ps1  prompt=A2_prose =====
+  req: prompt_tok=83 completion_tok=512 wall=11.40s tok/s=44.92 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=10.33s tok/s=49.55 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=47.12  per-req=['44.92', '49.55']
+  spec steps=351  emitted=1022  accepted=671  drafted=5196
+  accept-len [emitted/steps]            = 2.912   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.912   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.912   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.912   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 61.91
+===== CELL  leg=A_cur_ps1  prompt=B_real_code =====
+  req: prompt_tok=95 completion_tok=720 wall=8.59s tok/s=83.82 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=11.96s tok/s=60.22 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=70.09  per-req=['83.82', '60.22']
+  spec steps=319  emitted=1438  accepted=1119  drafted=4719
+  accept-len [emitted/steps]            = 4.508   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.508   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.508   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.508   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.40
+
+################################################################ leg_B_swaverify
+===== CELL  leg=B_swaverify  prompt=A_repetitive_e6ddb502_verbatim =====
+  req: prompt_tok=70 completion_tok=720 wall=7.54s tok/s=95.54 finish=length
+  req: prompt_tok=68 completion_tok=663 wall=6.72s tok/s=98.62 finish=stop
+  req: prompt_tok=67 completion_tok=720 wall=6.82s tok/s=105.52 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=5.78s tok/s=124.64 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=105.11  per-req=['95.54', '98.62', '105.52', '124.64']
+  spec steps=307  emitted=2820  accepted=2513  drafted=4500
+  accept-len [emitted/steps]            = 9.186   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.186   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.186   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.186   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 87.49
+===== CELL  leg=B_swaverify  prompt=A2_prose =====
+  req: prompt_tok=83 completion_tok=512 wall=11.19s tok/s=45.77 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=16.30s tok/s=31.41 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=37.25  per-req=['45.77', '31.41']
+  spec steps=307  emitted=1022  accepted=715  drafted=4506
+  accept-len [emitted/steps]            = 3.329   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 3.329   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 3.329   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 2.329   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 89.53
+===== CELL  leg=B_swaverify  prompt=B_real_code =====
+  req: prompt_tok=95 completion_tok=720 wall=13.51s tok/s=53.29 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=13.67s tok/s=52.68 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=52.98  per-req=['53.29', '52.68']
+  spec steps=303  emitted=1438  accepted=1135  drafted=4491
+  accept-len [emitted/steps]            = 4.746   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.746   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.746   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.746   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 89.70
+
+################################################################ leg_C_cur_ps16
+===== CELL  leg=C_cur_ps16  prompt=A_repetitive_e6ddb502_verbatim =====
+  req: prompt_tok=70 completion_tok=720 wall=6.09s tok/s=118.16 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.41s tok/s=133.19 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.85s tok/s=148.39 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.77s tok/s=190.87 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=143.12  per-req=['118.16', '133.19', '148.39', '190.87']
+  spec steps=306  emitted=2876  accepted=2570  drafted=4490
+  accept-len [emitted/steps]            = 9.399   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.399   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.399   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.399   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 65.76
+===== CELL  leg=C_cur_ps16  prompt=A2_prose =====
+  req: prompt_tok=83 completion_tok=512 wall=11.79s tok/s=43.43 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=10.52s tok/s=48.67 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=45.90  per-req=['43.43', '48.67']
+  spec steps=355  emitted=1022  accepted=667  drafted=5256
+  accept-len [emitted/steps]            = 2.879   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.879   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.879   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.879   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 62.84
+===== CELL  leg=C_cur_ps16  prompt=B_real_code =====
+  req: prompt_tok=95 completion_tok=720 wall=9.65s tok/s=74.63 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=12.10s tok/s=59.52 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=66.22  per-req=['74.63', '59.52']
+  spec steps=333  emitted=1438  accepted=1105  drafted=4928
+  accept-len [emitted/steps]            = 4.318   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.318   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.318   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.318   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 65.30
+
+################################################################ sweep_S1_graph8
+===== CELL  leg=S1_graph8  prompt=A_repetitive_e6ddb502_verbatim  temperature=0.0 =====
+  req: prompt_tok=70 completion_tok=720 wall=5.34s tok/s=134.85 finish=length
+  req: prompt_tok=68 completion_tok=663 wall=4.23s tok/s=156.64 finish=stop
+  req: prompt_tok=67 completion_tok=720 wall=4.25s tok/s=169.33 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.27s tok/s=220.33 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=165.17  per-req=['134.85', '156.64', '169.33', '220.33']
+  spec steps=302  emitted=2820  accepted=2518  drafted=4437
+  accept-len [emitted/steps]            = 9.338   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.338   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.338   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.338   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 56.60
+===== CELL  leg=S1_graph8  prompt=A2_prose  temperature=0.0 =====
+  req: prompt_tok=83 completion_tok=512 wall=10.17s tok/s=50.35 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=10.80s tok/s=47.42 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=48.84  per-req=['50.35', '47.42']
+  spec steps=378  emitted=1022  accepted=644  drafted=5604
+  accept-len [emitted/steps]            = 2.704   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.704   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.704   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.704   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 55.47
+===== CELL  leg=S1_graph8  prompt=B_real_code  temperature=0.0 =====
+  req: prompt_tok=95 completion_tok=720 wall=7.76s tok/s=92.81 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=9.49s tok/s=75.88 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=83.50  per-req=['92.81', '75.88']
+  spec steps=308  emitted=1438  accepted=1130  drafted=4546
+  accept-len [emitted/steps]            = 4.669   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.669   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.669   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.669   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 55.99
+
+################################################################ sweep_S2_seed
+===== CELL  leg=S2_seed  prompt=A_repetitive_e6ddb502_verbatim  temperature=0.0 =====
+  req: prompt_tok=70 completion_tok=720 wall=5.89s tok/s=122.30 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.33s tok/s=135.00 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.75s tok/s=151.68 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.73s tok/s=192.92 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=146.20  per-req=['122.30', '135.00', '151.68', '192.92']
+  spec steps=303  emitted=2876  accepted=2573  drafted=4450
+  accept-len [emitted/steps]            = 9.492   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.492   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.492   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.492   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 65.01
+===== CELL  leg=S2_seed  prompt=A2_prose  temperature=0.0 =====
+  req: prompt_tok=83 completion_tok=512 wall=8.06s tok/s=63.50 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=12.37s tok/s=41.39 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=50.11  per-req=['63.50', '41.39']
+  spec steps=327  emitted=1022  accepted=695  drafted=4829
+  accept-len [emitted/steps]            = 3.125   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 3.125   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 3.125   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 2.125   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 62.49
+===== CELL  leg=S2_seed  prompt=B_real_code  temperature=0.0 =====
+  req: prompt_tok=95 completion_tok=720 wall=9.51s tok/s=75.69 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=10.44s tok/s=68.96 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=72.17  per-req=['75.69', '68.96']
+  spec steps=311  emitted=1438  accepted=1127  drafted=4576
+  accept-len [emitted/steps]            = 4.624   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.624   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.624   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.624   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.16
+
+################################################################ sweep_S3_sampled1
+===== CELL  leg=S3_sampled1  prompt=A_repetitive_e6ddb502_verbatim  temperature=0.0 =====
+  req: prompt_tok=70 completion_tok=720 wall=6.00s tok/s=119.96 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.32s tok/s=135.45 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.87s tok/s=147.78 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.75s tok/s=192.20 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=144.46  per-req=['119.96', '135.45', '147.78', '192.20']
+  spec steps=307  emitted=2876  accepted=2569  drafted=4510
+  accept-len [emitted/steps]            = 9.368   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.368   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.368   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.368   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.94
+===== CELL  leg=S3_sampled1  prompt=A2_prose  temperature=0.0 =====
+  req: prompt_tok=83 completion_tok=512 wall=11.67s tok/s=43.88 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=12.74s tok/s=40.19 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=41.95  per-req=['43.88', '40.19']
+  spec steps=390  emitted=1022  accepted=632  drafted=5779
+  accept-len [emitted/steps]            = 2.621   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.621   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.621   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.621   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 62.59
+===== CELL  leg=S3_sampled1  prompt=B_real_code  temperature=0.0 =====
+  req: prompt_tok=95 completion_tok=720 wall=9.48s tok/s=75.91 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=11.93s tok/s=60.35 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=67.24  per-req=['75.91', '60.35']
+  spec steps=333  emitted=1438  accepted=1105  drafted=4928
+  accept-len [emitted/steps]            = 4.318   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.318   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.318   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.318   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.31
+===== CELL  leg=S3_sampled1  prompt=S_repetitive_temp0.7  temperature=0.7 =====
+  req: prompt_tok=70 completion_tok=720 wall=6.25s tok/s=115.12 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.05s tok/s=142.68 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=5.23s tok/s=137.76 finish=length
+  req: prompt_tok=64 completion_tok=603 wall=5.85s tok/s=103.04 finish=stop
+  TRUE tok/s (usage.completion_tokens): aggregate=123.46  per-req=['115.12', '142.68', '137.76', '103.04']
+  spec steps=341  emitted=2760  accepted=2420  drafted=5024
+  accept-len [emitted/steps]            = 8.094   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 8.118   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 8.097   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 7.097   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 0.9971   OK (bs=1)
+  ms/step = 65.63
+===== CELL  leg=S3_sampled1  prompt=S_real_code_temp0.7  temperature=0.7 =====
+  req: prompt_tok=95 completion_tok=720 wall=10.22s tok/s=70.48 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=9.13s tok/s=78.82 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=74.42  per-req=['70.48', '78.82']
+  spec steps=300  emitted=1438  accepted=1138  drafted=4442
+  accept-len [emitted/steps]            = 4.793   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.793   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.793   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.793   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.50
+
+################################################################ sweep_S4_sampled0
+===== CELL  leg=S4_sampled0  prompt=A_repetitive_e6ddb502_verbatim  temperature=0.0 =====
+  req: prompt_tok=70 completion_tok=720 wall=5.93s tok/s=121.49 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=5.34s tok/s=134.77 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.67s tok/s=154.17 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.72s tok/s=193.54 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=146.50  per-req=['121.49', '134.77', '154.17', '193.54']
+  spec steps=302  emitted=2876  accepted=2574  drafted=4433
+  accept-len [emitted/steps]            = 9.523   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.523   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.523   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.523   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 65.10
+===== CELL  leg=S4_sampled0  prompt=A2_prose  temperature=0.0 =====
+  req: prompt_tok=83 completion_tok=512 wall=11.50s tok/s=44.52 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=10.40s tok/s=49.24 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=46.76  per-req=['44.52', '49.24']
+  spec steps=351  emitted=1022  accepted=671  drafted=5196
+  accept-len [emitted/steps]            = 2.912   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.912   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.912   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.912   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 62.39
+===== CELL  leg=S4_sampled0  prompt=B_real_code  temperature=0.0 =====
+  req: prompt_tok=95 completion_tok=720 wall=9.00s tok/s=80.00 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=10.47s tok/s=68.79 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=73.97  per-req=['80.00', '68.79']
+  spec steps=303  emitted=1438  accepted=1135  drafted=4462
+  accept-len [emitted/steps]            = 4.746   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.746   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.746   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.746   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 64.25
+===== CELL  leg=S4_sampled0  prompt=S_repetitive_temp0.7  temperature=0.7 =====
+  req: prompt_tok=70 completion_tok=720 wall=11.94s tok/s=60.31 finish=length
+  req: prompt_tok=68 completion_tok=607 wall=9.83s tok/s=61.72 finish=stop
+  req: prompt_tok=67 completion_tok=720 wall=11.87s tok/s=60.68 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=11.63s tok/s=61.93 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=61.13  per-req=['60.31', '61.72', '60.68', '61.93']
+  spec steps=0  emitted=0  accepted=0  drafted=0
+  spec steps=0 (no spec ran!)
+===== CELL  leg=S4_sampled0  prompt=S_real_code_temp0.7  temperature=0.7 =====
+  req: prompt_tok=95 completion_tok=720 wall=12.10s tok/s=59.49 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=11.56s tok/s=62.30 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=60.87  per-req=['59.49', '62.30']
+  spec steps=0  emitted=0  accepted=0  drafted=0
+  spec steps=0 (no spec ran!)
+
+################################################################ sweep_S5_graph8_sampled1
+===== CELL  leg=S5_graph8_sampled1  prompt=A_repetitive_e6ddb502_verbatim  temperature=0.0 =====
+  req: prompt_tok=70 completion_tok=720 wall=5.34s tok/s=134.78 finish=length
+  req: prompt_tok=68 completion_tok=663 wall=4.20s tok/s=157.90 finish=stop
+  req: prompt_tok=67 completion_tok=720 wall=4.30s tok/s=167.29 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.28s tok/s=219.40 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=164.83  per-req=['134.78', '157.90', '167.29', '219.40']
+  spec steps=302  emitted=2820  accepted=2518  drafted=4442
+  accept-len [emitted/steps]            = 9.338   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.338   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.338   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.338   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 56.71
+===== CELL  leg=S5_graph8_sampled1  prompt=A2_prose  temperature=0.0 =====
+  req: prompt_tok=83 completion_tok=512 wall=10.38s tok/s=49.34 finish=length
+  req: prompt_tok=65 completion_tok=512 wall=10.82s tok/s=47.33 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=48.31  per-req=['49.34', '47.33']
+  spec steps=381  emitted=1022  accepted=641  drafted=5651
+  accept-len [emitted/steps]            = 2.682   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 2.682   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 2.682   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 1.682   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 55.63
+===== CELL  leg=S5_graph8_sampled1  prompt=B_real_code  temperature=0.0 =====
+  req: prompt_tok=95 completion_tok=720 wall=7.57s tok/s=95.12 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=9.91s tok/s=72.66 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=82.39  per-req=['95.12', '72.66']
+  spec steps=311  emitted=1438  accepted=1127  drafted=4595
+  accept-len [emitted/steps]            = 4.624   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 4.624   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 4.624   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 3.624   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 56.20
+===== CELL  leg=S5_graph8_sampled1  prompt=S_repetitive_temp0.7  temperature=0.7 =====
+  req: prompt_tok=70 completion_tok=720 wall=4.96s tok/s=145.16 finish=length
+  req: prompt_tok=68 completion_tok=720 wall=4.59s tok/s=156.79 finish=length
+  req: prompt_tok=67 completion_tok=720 wall=4.35s tok/s=165.68 finish=length
+  req: prompt_tok=64 completion_tok=720 wall=3.62s tok/s=198.91 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=164.41  per-req=['145.16', '156.79', '165.68', '198.91']
+  spec steps=302  emitted=2876  accepted=2574  drafted=4433
+  accept-len [emitted/steps]            = 9.523   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 9.523   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 9.523   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 8.523   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 58.01
+===== CELL  leg=S5_graph8_sampled1  prompt=S_real_code_temp0.7  temperature=0.7 =====
+  req: prompt_tok=95 completion_tok=720 wall=8.14s tok/s=88.49 finish=length
+  req: prompt_tok=99 completion_tok=720 wall=12.42s tok/s=57.99 finish=length
+  TRUE tok/s (usage.completion_tokens): aggregate=70.06  per-req=['88.49', '57.99']
+  spec steps=364  emitted=1438  accepted=1074  drafted=5393
+  accept-len [emitted/steps]            = 3.951   <-- the '8.1' and '2.58' basis
+  accept-len [emitted/(emitted-accept)] = 3.951   <-- current-build gauge form
+  accept-len [1 + accepted/steps]       = 3.951   <-- swaverify gauge form
+  accepted-drafts/step [accepted/steps] = 2.951   <-- '[spec] mean accept-len' basis
+  reqs/step = (emitted-accepted)/steps  = 1.0000   OK (bs=1)
+  ms/step = 56.47
+
+################################################################ div_L1 (default) / div_L2 (MINISGL_DFLASH_CTX_WINDOW=8)
+############ DIVERGENCE ANALYSIS  leg=L1 ctxw=0 ############
+
+=== uid=0  steps=20  c0_min(prompt_len)=44  gen_span=30  emitted=31 accepted=11 drafted=186
+    accept-len emitted/steps = 1.550   accepted/step = 0.550   accept RATE accepted/drafted = 0.059
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:13(65%)  n=1:4(20%)  n=2:2(10%)  n=3:1(5%)
+    P(n=0 immediate divergence) = 0.650   P(full accept n=k) = 0.000
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=  20  emitted/step=1.550  accepted/step=0.550  rate=0.059
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[1187, 453, 874, 83, 83, 83, 1304, 268, 268, 268, 268, 558, 458, 778, 778]
+      P=3    k=15 n=0 emitted=1 draft=[453, 704, 453, 83, 290, 83, 290, 290, 350, 350, 395, 395, 86, 290, 81]
+      P=4    k=15 n=1 emitted=2 draft=[14169, 554, 554, 83, 83, 83, 350, 290, 268, 268, 573, 99, 99, 290, 532]
+      P=6    k=15 n=2 emitted=3 draft=[6053, 100, 290, 85, 350, 83, 96, 350, 162, 479, 532, 2453, 5432, 1143, 5432]
+      P=9    k=15 n=0 emitted=1 draft=[24, 24, 5518, 99, 24, 24, 99, 532, 532, 1143, 5432, 1170, 1143, 5518, 1143]
+
+=== uid=1  steps=260  c0_min(prompt_len)=95  gen_span=1592  emitted=1599 accepted=1339 drafted=3873
+    accept-len emitted/steps = 6.150   accepted/step = 5.150   accept RATE accepted/drafted = 0.346
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:30(12%)  n=1:30(12%)  n=2:31(12%)  n=3:30(12%)  n=4:24(9%)  n=5:19(7%)  n=6:14(5%)  n=7:15(6%)  n=8:12(5%)  n=9:10(4%)  n=10:7(3%)  n=11:7(3%)  n=12:3(1%)  n=13:3(1%)  n=14:6(2%)  n=15:19(7%)
+    P(n=0 immediate divergence) = 0.115   P(full accept n=k) = 0.077
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=   9  emitted/step=3.556  accepted/step=2.556  rate=0.192
+      P in [   32,   64): steps=  11  emitted/step=3.545  accepted/step=2.545  rate=0.170
+      P in [   64,  128): steps=  16  emitted/step=4.062  accepted/step=3.062  rate=0.204
+      P in [  128,  256): steps=  34  emitted/step=3.529  accepted/step=2.529  rate=0.169
+      P in [  256,  512): steps=  42  emitted/step=6.143  accepted/step=5.143  rate=0.343
+      P in [  512, 1024): steps=  71  emitted/step=7.366  accepted/step=6.366  rate=0.424
+      P in [ 1024,  inf): steps=  77  emitted/step=7.299  accepted/step=6.299  rate=0.424
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[268, 464, 458, 11447, 99, 99, 85, 83, 2258, 268, 268, 2258, 268, 83, 268]
+      P=3    k=15 n=1 emitted=2 draft=[458, 1290, 99, 268, 2258, 458, 458, 3127, 99, 268, 2258, 458, 21876, 2258, 21876]
+      P=5    k=15 n=4 emitted=5 draft=[99, 268, 2258, 458, 16516, 99, 268, 268, 2258, 458, 2891, 99, 268, 21435, 458]
+      P=10   k=15 n=4 emitted=5 draft=[99, 268, 2258, 458, 18147, 99, 268, 2258, 458, 18147, 18147, 21435, 18147, 18147, 18147]
+      P=15   k=15 n=5 emitted=6 draft=[13952, 99, 268, 2258, 458, 2891, 99, 268, 2258, 458, 2891, 21435, 268, 2258, 458]
+
+=== uid=2  steps=180  c0_min(prompt_len)=70  gen_span=1486  emitted=1491 accepted=1312 drafted=2685
+    accept-len emitted/steps = 8.283   accepted/step = 7.289   accept RATE accepted/drafted = 0.489
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:2(1%)  n=1:1(1%)  n=2:6(3%)  n=3:11(6%)  n=4:11(6%)  n=5:15(8%)  n=6:14(8%)  n=7:59(33%)  n=8:19(11%)  n=9:5(3%)  n=10:5(3%)  n=11:17(9%)  n=12:1(1%)  n=13:1(1%)  n=14:4(2%)  n=15:9(5%)
+    P(n=0 immediate divergence) = 0.011   P(full accept n=k) = 0.050
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=   6  emitted/step=5.833  accepted/step=4.833  rate=0.387
+      P in [   32,   64): steps=   4  emitted/step=7.250  accepted/step=6.250  rate=0.417
+      P in [   64,  128): steps=  10  emitted/step=6.600  accepted/step=5.600  rate=0.373
+      P in [  128,  256): steps=  18  emitted/step=7.333  accepted/step=6.333  rate=0.422
+      P in [  256,  512): steps=  31  emitted/step=8.258  accepted/step=7.258  rate=0.484
+      P in [  512, 1024): steps=  53  emitted/step=9.660  accepted/step=8.660  rate=0.577
+      P in [ 1024,  inf): steps=  58  emitted/step=7.948  accepted/step=6.966  rate=0.464
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[87, 83, 268, 88, 88, 88, 88, 88, 88, 88, 88, 88, 88, 88, 350]
+      P=3    k=15 n=6 emitted=7 draft=[88, 268, 89, 268, 90, 268, 90, 91, 85, 90, 88, 88, 268, 268, 268]
+      P=10   k=15 n=4 emitted=5 draft=[268, 92, 268, 93, 85, 86, 93, 268, 93, 93, 86, 86, 86, 86, 93]
+      P=15   k=15 n=9 emitted=10 draft=[94, 268, 86, 85, 268, 86, 86, 268, 86, 86, 268, 268, 268, 268, 86]
+      P=25   k=15 n=9 emitted=10 draft=[268, 86, 88, 268, 86, 89, 268, 86, 90, 90, 90, 86, 86, 86, 86]
+[done] leg=L1
+
+############ DIVERGENCE ANALYSIS  leg=L2 ctxw=8 ############
+
+=== uid=0  steps=21  c0_min(prompt_len)=44  gen_span=30  emitted=31 accepted=10 drafted=201
+    accept-len emitted/steps = 1.476   accepted/step = 0.476   accept RATE accepted/drafted = 0.050
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:14(67%)  n=1:4(19%)  n=2:3(14%)
+    P(n=0 immediate divergence) = 0.667   P(full accept n=k) = 0.000
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=  21  emitted/step=1.476  accepted/step=0.476  rate=0.050
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[1187, 453, 874, 83, 83, 83, 1304, 268, 268, 268, 268, 558, 458, 778, 778]
+      P=3    k=15 n=0 emitted=1 draft=[453, 704, 453, 83, 290, 83, 290, 290, 350, 350, 395, 395, 86, 290, 81]
+      P=4    k=15 n=1 emitted=2 draft=[14169, 554, 554, 83, 83, 83, 350, 290, 268, 268, 573, 99, 99, 290, 532]
+      P=6    k=15 n=2 emitted=3 draft=[6053, 100, 290, 85, 350, 83, 96, 350, 162, 479, 532, 2453, 5432, 1143, 5432]
+      P=9    k=15 n=0 emitted=1 draft=[24, 24, 99, 26, 24, 24, 99, 532, 532, 1143, 5432, 1170, 1143, 5518, 1143]
+
+=== uid=1  steps=436  c0_min(prompt_len)=95  gen_span=1596  emitted=1599 accepted=1163 drafted=6493
+    accept-len emitted/steps = 3.667   accepted/step = 2.667   accept RATE accepted/drafted = 0.179
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:32(7%)  n=1:100(23%)  n=2:113(26%)  n=3:72(17%)  n=4:51(12%)  n=5:34(8%)  n=6:15(3%)  n=7:9(2%)  n=8:4(1%)  n=9:3(1%)  n=10:2(0%)  n=15:1(0%)
+    P(n=0 immediate divergence) = 0.073   P(full accept n=k) = 0.005
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=   9  emitted/step=3.556  accepted/step=2.556  rate=0.192
+      P in [   32,   64): steps=  14  emitted/step=2.429  accepted/step=1.429  rate=0.095
+      P in [   64,  128): steps=  20  emitted/step=3.200  accepted/step=2.200  rate=0.147
+      P in [  128,  256): steps=  44  emitted/step=2.977  accepted/step=1.977  rate=0.132
+      P in [  256,  512): steps=  68  emitted/step=3.706  accepted/step=2.706  rate=0.180
+      P in [  512, 1024): steps= 140  emitted/step=3.664  accepted/step=2.664  rate=0.178
+      P in [ 1024,  inf): steps= 141  emitted/step=4.064  accepted/step=3.064  rate=0.207
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[268, 464, 458, 11447, 99, 268, 2258, 458, 2258, 268, 268, 2258, 268, 83, 268]
+      P=3    k=15 n=1 emitted=2 draft=[458, 1290, 99, 268, 2258, 458, 55540, 3127, 99, 268, 2258, 458, 21876, 2258, 21876]
+      P=5    k=15 n=4 emitted=5 draft=[99, 268, 2258, 458, 16516, 99, 268, 268, 2258, 458, 2891, 99, 268, 2891, 458]
+      P=10   k=15 n=4 emitted=5 draft=[99, 268, 2258, 458, 18147, 99, 268, 2258, 458, 16516, 18147, 18147, 18147, 18147, 458]
+      P=15   k=15 n=5 emitted=6 draft=[13952, 99, 268, 2258, 458, 2891, 99, 268, 6452, 458, 2891, 2891, 458, 268, 458]
+
+=== uid=2  steps=207  c0_min(prompt_len)=70  gen_span=1488  emitted=1491 accepted=1284 drafted=3090
+    accept-len emitted/steps = 7.203   accepted/step = 6.203   accept RATE accepted/drafted = 0.416
+    divergence-position histogram  n=#accepted drafts before first mismatch:
+      n=0:2(1%)  n=1:1(0%)  n=2:8(4%)  n=3:28(14%)  n=4:14(7%)  n=5:17(8%)  n=6:13(6%)  n=7:89(43%)  n=8:12(6%)  n=10:8(4%)  n=11:15(7%)
+    P(n=0 immediate divergence) = 0.010   P(full accept n=k) = 0.000
+    accept-len vs P (# generated tokens already in the drafter aux prefix):
+      P in [    0,   32): steps=   7  emitted/step=5.286  accepted/step=4.286  rate=0.333
+      P in [   32,   64): steps=   4  emitted/step=6.750  accepted/step=5.750  rate=0.383
+      P in [   64,  128): steps=  10  emitted/step=6.900  accepted/step=5.900  rate=0.393
+      P in [  128,  256): steps=  18  emitted/step=7.167  accepted/step=6.167  rate=0.411
+      P in [  256,  512): steps=  35  emitted/step=7.314  accepted/step=6.314  rate=0.421
+      P in [  512, 1024): steps=  69  emitted/step=7.362  accepted/step=6.362  rate=0.424
+      P in [ 1024,  inf): steps=  64  emitted/step=7.266  accepted/step=6.266  rate=0.418
+    first 6 steps (drafts vs accepted count):
+      P=0    k=0 n=0 emitted=1 draft=None
+      P=1    k=15 n=1 emitted=2 draft=[87, 83, 268, 88, 88, 88, 88, 88, 88, 88, 88, 88, 88, 88, 350]
+      P=3    k=15 n=6 emitted=7 draft=[88, 268, 89, 268, 90, 268, 90, 91, 85, 90, 88, 88, 268, 268, 268]
+      P=10   k=15 n=4 emitted=5 draft=[268, 92, 268, 93, 85, 86, 93, 93, 93, 93, 86, 86, 86, 86, 92]
+      P=15   k=15 n=7 emitted=8 draft=[94, 268, 86, 85, 268, 86, 86, 86, 86, 86, 268, 268, 86, 86, 86]
+      P=23   k=15 n=7 emitted=8 draft=[86, 87, 268, 86, 88, 268, 86, 88, 268, 86, 90, 90, 90, 90, 90]
+[done] leg=L2

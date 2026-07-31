@@ -20,6 +20,10 @@ All `poolside/Laguna-XS-2.1-NVFP4`, TP=2, graph-captured, greedy, 384-token gene
 | spec DFlash K=16 (**shipped default**) | 39.68 | 2.582 | 66.27 ms |
 
 **Spec is net-negative at every K.** Plain decode wins.
+**SCOPED 2026-07-31 by §11: this whole table is a PROSE benchmark** (a 384-token B-tree essay). The
+accept-lens are correct for that prompt and wrong as a property of the model — the same build, same
+K, same day gives accept-len 4.5 on real code and 9.5 on repetitive output. Re-read §7 and §11
+before quoting any row here.
 
 GPU-side, from `MINISGL_PROFILE` traces (`tools/spec_profile_split.sh`):
 
@@ -48,6 +52,11 @@ undercounts tok/s by the accept-len (I read 14.9 tok/s when the truth was 49.8).
    (39.68 -> 47.50) at identical accept-len**. `SPEC_K=16` is the single worst possible value.
 2. **Accept-len is flat at ~2.55-2.68 for K=7..16.** Drafting 16 tokens buys nothing over 7. Acceptance
    is NOT the problem and a better drafter is NOT the lever.
+   **WRONG AS STATED — see §11.** The flatness is an artifact of sweeping K on a single prose prompt.
+   Measured across prompt classes on one build, accept-len spans 2.6-9.5 (and 7.4 on real code once
+   the drafter's 512-token window is full). Acceptance IS the lever; the drafter is never conditioned
+   on the prompt (§11.5). Note also `spec/dflash.py:523` caps drafts at `block_size-1 = 15`, so
+   K=16 cannot draft more than K=15 regardless.
 3. **Expert divergence is why verify doesn't amortize.** 256 experts, top-8: K tokens route
    independently and pull up to 8*K distinct experts. Measured at M=17, dense projections cost 2.3x
    for 17x rows (amortizing correctly) while MoE costs **14x** (32.8 ms of the 64.5 ms step).
@@ -90,7 +99,7 @@ undercounts tok/s by the accept-len (I read 14.9 tok/s when the truth was 49.8).
 | Accept/commit path cost | **NO** | `MINISGL_SPEC_FORCE_N0=1`: accept-len 3.34 -> 2.04, step **identical** (67.1 vs 67.2 ms) |
 | MoE gemm2 routed to the wrong kernel | **NO** | `MINISGL_MOE_G2FUSE=0` (forces WMMA grouped gemm2) identical: 54.14 vs 54.33 ms |
 | NVFP4 upconverts weights to fp8 | **NO** | VRAM math: measured 10.40 GiB/card matches 4-bit+scales (21.3 GiB); fp8 would be 31.4 GB of experts alone |
-| Low acceptance / need a better drafter | **NO** | accept-len flat across all K; cost is per-verify-row |
+| ~~Low acceptance / need a better drafter~~ | **RETRACTED by §11** | the "flat across all K" evidence was one prose prompt; accept-len is 2.6-9.5 by prompt class and rises to 7.4 on code as the drafter's window fills |
 | NVFP4 scale traffic is worth halving (e4m3 uint8) | **NO** | 34.5 MB of a 2258 MB step; step is at 23.7% of HBM peak -> 0.30% bs=1 / 0.14% NREQ=8 (§10) |
 
 `_gate_mask_spec_logits` (`scheduler.py:1271`) showed as **63% of py-spy samples** — that is
@@ -141,6 +150,9 @@ is the first blocking op after the verify forward. Don't chase it.
    The one real payoff is **0.918 GiB/card of VRAM**; revisit only if the KV pool is binding.
 5. **Spec defaults:** ship `SPEC_K=7` (+72% over the shipped 16) or default Laguna to no spec until
    verify amortizes. Never ship `SPEC_K=16` — it is exactly one row past the cliff.
+   **REVISED by §11: do NOT default Laguna to no spec.** Ship **K=15** graph-captured with
+   `MINISGL_SPEC_SAMPLED=1` (2.70x repetitive / 1.35x real code vs plain eager bs=1; loss only on
+   free-form prose). `SPEC_K=16` stays banned. K=7 was never re-measured off the prose prompt.
 6. **Land the accept-path hygiene** (multi-EOS + gated on-device). It will NOT move tok/s — say so in
    the commit message — but it is the only thing that makes the fast path reachable for a multi-EOS
    reasoning model, which every production Laguna request is. **Drop the gloo->device lockstep idea**;
@@ -218,41 +230,54 @@ at row 16. So MoE verify cost grows as `distinct(qlen)`, sublinearly but steeply
 overlap saves it. The doc's "14x at M=17" was `6.94x` of inherent divergence times the `M<=16` cliff
 (finding 1) putting that batch on the WMMA prefill family — the two effects compose.
 
-### CAVEAT ADDED 2026-07-31 (later the same day): this section is CONDITIONAL on accept-len 2.55
+### REVISED 2026-07-31 (§11): the conditional resolved — accept-len is 2.6-9.5, NOT flat at 2.55
 
-Everything below divides by the accept-len measured in §1. That number is now DISPUTED: commit
-`e6ddb502` ("multi-query SWA verify path — DFlash spec works on Laguna (lossless, accept ~8)",
-merged Jul 23) recorded **mean accept-length ~8.1** at K=16, bs=1, TP=2, eager, explicitly noting
-`reqs/step=1.0, not batch-inflated`. A reference implementation of the same model + drafter reports
-~81% acceptance at short context, i.e. accept-len ~5.1-5.3 — which sits with 8.1, not with 2.58.
+The caveat that gated this section is settled by the Phase 1a audit (**§11**). The short version:
 
-Run the arithmetic the other way and the verdict flips: at qlen 16 the MoE cost per emitted token is
-`distinct(16)/(8 * accept_len)` = `6.94/2.58 = 2.69x WORSE` at today's acceptance, but
-`6.94/8.1 = 0.86x`, i.e. **spec WINS on the MoE stack**, at 8.1.
+* **Accept-len is the same quantity in both builds** (`emitted/steps`; all three definitions agree
+  to three decimals at `reqs/step=1.0`, verified in all 28 cells). No accounting artifact, and
+  **no regression** — `e6ddb502`'s number reproduces on the current build.
+* **Accept-len is NOT flat.** It is dominated by the prompt class and by generation length:
+  measured **within one boot of one build**, K=15, bs=1, eager, greedy — repetitive **9.492**,
+  real code **4.508** (720 tok) / **6.150** (1600 tok), prose **2.912**. §1's `2.58` is the
+  *prose-at-384-tokens* cell; it is correct, it is just not the model's acceptance.
+* Cause: the DFlash drafter is never conditioned on the prompt, so its 512-token window fills only
+  with its own output; accept-len rises with `P` and saturates at the window (**7.366** for real
+  code at `P>=512`). See §11.5.
 
-So the heading below is wrong as written. It is true of the CURRENT BUILD's acceptance; it is NOT a
-property of the model or of expert divergence. **The divergence measurement stands; the conclusion
-drawn from it does not, until the acceptance question is settled.** That audit is the gating task.
-Note also the two candidate accept-len figures may not be the same QUANTITY — see
-`server/metrics.py:254-262`, and this repo has a recorded history of a batch-inflated accept-len
-gauge (true 3.16 reported as 4.65). Establish the definition before calling 8.1 -> 2.58 a regression.
+**Recomputed MoE cost per emitted token,** `distinct(qlen) / (8 * accept_len)`, at K=15 (qlen 16,
+`distinct(16)/8 = 6.94x`), using measured accept-lens instead of the assumed 2.55:
 
-### At accept-len 2.55, spec loses at EVERY K, not just K=16
+| workload / regime | accept-len | MoE cost per emitted token |
+|---|---|---|
+| prose, 384-512 tok (§1's cell) | 2.58-2.91 | **2.4-2.7x worse** |
+| real code, 720 tok | 4.32-4.75 | **1.46-1.61x worse** |
+| real code, 1600 tok | 6.150 | **1.13x worse** |
+| real code, drafter window full (`P>=512`) | 7.366 | **0.94x — spec WINS** |
+| repetitive/counting, 720 tok | 9.34-9.52 | **0.73x — spec WINS** |
 
-MoE cost per *emitted* token, relative to plain decode, is `distinct(qlen) / (8 * accept_len)`, and
-accept-len is flat at ~2.55 (finding 2):
+So the old heading ("spec loses at EVERY K") was a statement about **one prompt class**, not about
+the model or about expert divergence. **The divergence measurement stands unchanged** — routing is
+still 6.94x at qlen 16, `blocks/distinct = 1.00`, no kernel bug. What changes is the denominator:
+spec crosses over on the MoE stack at accept-len ~6.94, which real code reaches once the drafter's
+window is full and repetitive workloads reach immediately.
 
-| K | qlen | distinct/8 | accept-len | MoE cost per emitted token |
-|---|---|---|---|---|
-| 15 | 16 | 6.94x | 2.58 | **2.69x worse** |
-| 7 | 8 | 4.58x | 2.55 | **1.80x worse** |
-| 3 | 4 | 2.76x | <=2.55 | **>=1.08x worse** |
-| 2 | 3 | 2.26x | <=2.4 (bounded by K+1) | ~0.94x — break-even at best |
+End-to-end this matches: best measured config (graph-captured, `SPEC_SAMPLED=1`, K=15, bs=1) is
+**164.83 tok/s repetitive / 82.39 tok/s real code / 48.31 tok/s prose**, against a plain **eager**
+bs=1 baseline of **61.0 tok/s** — i.e. **2.70x / 1.35x / 0.79x**. (§1's `74.02` plain was
+graph-captured at CONC=2, so the code comparison is indicative, not matched; the matched plain leg
+is the first item of §11.6's next measurement.)
 
-Spec only stops losing on the MoE stack alone at K≈2, where acceptance is bounded below the cost —
-**and that ignores the ~9 ms/step drafter (finding 4), which is by itself 66% of a 13.51 ms plain
-step.** There is no K at which DFlash spec wins on this model on this box. §5 item 5 should read
-"default Laguna to no spec", not "ship K=7".
+`K=7` (qlen 8, `distinct/8 = 4.58x`) was **not** re-measured under the corrected prompt set — the
+old K-sweep's flat `~2.55` is now known to be a prose-only artifact, so no K recommendation should
+be inherited from it. `SPEC_K=16` remains the one value never to ship (§2 finding 1: qlen 17 falls
+off the decode-kernel cliff, and `spec/dflash.py:523` caps drafts at `B-1 = 15` anyway, so K=16
+buys zero extra drafts).
+
+**Revised guidance for §5 item 5:** do **not** "default Laguna to no spec". Ship K=15 with graph
+capture and `MINISGL_SPEC_SAMPLED=1`; it is a large win on repetitive/structured output, a modest
+win on real code, and a loss only on free-form prose. The real lever is the drafter-conditioning
+hole in §11.5, not K.
 
 ### What it says about lucebox's 296 tok/s
 
@@ -615,3 +640,233 @@ g16->g32 delta as up to 1.21x; min-of-5 collapsed it to 1.08x — small-kernel A
 min-of-N. (2) The obvious g16-vs-g32 A/B is confounded by a *branch*, not just bytes, and it
 over-reports the lever by ~3x. When a knob changes two things, find the pair of settings that changes
 only one — here g32/g64/g128, where the instruction stream is provably identical.
+
+---
+
+## 11. Phase 1a — the acceptance audit (MEASURED)
+
+Gating task from §7's caveat: is the "accept-len 8.1 (`e6ddb502`, Jul 23) -> 2.58 (§1, Jul 31)"
+collapse real? **Answer: there is no regression to bisect.** The two numbers are the same quantity
+and both reproduce today, on the current build, within noise. They were measured on **different
+prompt classes**, and accept-len on this drafter spans **2.6 -> 9.5 with the build held constant**.
+
+### 11.1 Definition verdict — COMMENSURABLE (one basis correction to `e6ddb502`)
+
+The `/metrics` gauge formula *did* change between the two builds, and it does **not** matter:
+
+| build | `minisgl_spec_mean_accept_len` |
+|---|---|
+| `44dfb97f` (`e6ddb502`'s descendant) | `metrics.py:253-255` — `1.0 + accepted/steps` |
+| `4a031cc3` (current) | `metrics.py:262-264` — `emitted/(emitted-accepted)` (changed by `63aac736`, Jul 24) |
+
+**Neither headline number came from that gauge.** `2.58` is `spec_k_sweep.sh:47-48`,
+`accept-len = em/st` on raw counter deltas. `8.1` is the `[spec]` debug line, archived verbatim at
+`minisgl-rdna4-swaverify/tools/swa_dflash.spec.log:52-53`:
+
+```
+[spec] mean accept-len=8.09 over 300 reqs
+[spec] step=300 accept_rate=0.55 draft_accepted=2427/4403 emitted/step=9.09 (reqs/step=1.0)
+```
+
+`2427/300 = 8.09` exactly, so **`8.1` is the accepted-drafts-only basis** and its `emitted/steps`
+counterpart *in the same log line* is **9.09**. The counter-increment code
+(`scheduler.py:3792-3796` current == `:3729-3733` swaverify) is byte-identical in both trees.
+
+At `reqs/step == 1.0` all three definitions collapse to the same value
+(`emitted = accepted + steps`). The harness prints all three per cell and **they agree to three
+decimals in every one of the 28 cells measured**; `reqs/step` printed `1.0000` everywhere (single
+exception 0.9971, EOS truncation). No cell is batch-inflated. **The accounting-artifact hypothesis
+is dead** — but so is the premise it was protecting: the honest like-for-like statement was always
+`9.09 -> 2.58`, and 9.09 is reproducible today.
+
+### 11.2 The matrix — 3 builds/configs x 3 prompt classes, one harness
+
+Conditions, identical in every cell: K=15, bs=1 (`--max-running-requests 1`), TP=2, **eager**
+(`--cuda-graph-max-bs 0`), greedy `temperature 0.0`, `--cache-type naive`, bf16 KV
+(`MINISGL_KV_FP8=0`), `--memory-ratio 0.90`, short context (64-99 prompt tokens), non-streaming.
+Prompt A = `e6ddb502`'s own four counting/repetition strings **verbatim**
+(`tools/swa_dflash_lossless.sh:56-63`, 720 tok). Prompt A2 = prose (includes `spec_k_sweep.sh`'s
+B-tree essay, 512 tok). Prompt B = real code (write a templated C++ B-tree, 720 tok).
+
+| leg | build | page_size | prompt | accept-len (all 3 defs) | TRUE tok/s | steps | emitted | accepted | drafted | ms/step |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | `4a031cc3` current | 1 | A repetitive | **9.492** | 146.96 | 303 | 2876 | 2573 | 4448 | 64.67 |
+| A | current | 1 | A2 prose | **2.912** | 47.12 | 351 | 1022 | 671 | 5196 | 61.91 |
+| A | current | 1 | B real code | **4.508** | 70.09 | 319 | 1438 | 1119 | 4719 | 64.40 |
+| B | `44dfb97f` swaverify | 1 (forced) | A repetitive | 9.186 | 105.11 | 307 | 2820 | 2513 | 4500 | 87.49 |
+| B | swaverify | 1 (forced) | A2 prose | 3.329 | 37.25 | 307 | 1022 | 715 | 4506 | 89.53 |
+| B | swaverify | 1 (forced) | B real code | 4.746 | 52.98 | 303 | 1438 | 1135 | 4491 | 89.70 |
+| C | current, `MINISGL_SPEC_MHA_PAGED=1` | 16 | A repetitive | 9.399 | 143.12 | 306 | 2876 | 2570 | 4490 | 65.76 |
+| C | current, paged | 16 | A2 prose | 2.879 | 45.90 | 355 | 1022 | 667 | 5256 | 62.84 |
+| C | current, paged | 16 | B real code | 4.318 | 66.22 | 333 | 1438 | 1105 | 4928 | 65.30 |
+
+Read it two ways:
+
+* **Build vs build (A vs B, page_size matched at 1): +3.3% / -12.5% / -5.0%.** All inside the
+  same-build boot-to-boot band measured below (§11.3). **No build effect is detectable**; any build
+  effect is bounded near +/-15%, two orders of magnitude below the claimed 3x.
+* **Prompt class, inside ONE boot of ONE build (leg A, minutes apart, same process, same config):
+  9.492 -> 4.508 -> 2.912.** A **3.26x spread from the prompt alone.** That is the whole of the
+  claimed "8.1 -> 2.58" collapse, reproduced with the code held constant.
+* `e6ddb502`'s 9.09 emitted/steps (8.09 accepted-only) is **exceeded on the current build**: 9.492
+  (8.492 accepted-only), reproduced 4/4 across independent boots with `emitted = 2876` every time.
+* §1's `2.58` is reproduced as a **prose-at-384-tokens** number (prose cells 2.621-3.125).
+
+**Provenance, asserted from inside each container per leg** (this is not new-vs-itself):
+distinct `/engine/python` digests `b5368ebc...` (current) vs `3febf440...` (swaverify); distinct
+`scheduler.py` md5 `c1c99c9b` vs `c9b4bb8d`; `git rev-parse HEAD` = `4a031cc3` vs `44dfb97f` with
+`git status --porcelain` showing no source edits; build discriminator
+`grep -c MINISGL_SPEC_MHA_PAGED engine.py` = **4 vs 0**; the gauge source line printed per leg.
+Image is a **proven constant** across all legs (`/opt/minisgl` `7a465c14`, `/opt/kernels`
+`886f4202`, torch 2.14.0.dev+rocm7.2). The real argv from `/proc/<pid>/cmdline` is
+**character-identical** across legs A and B, cross-checked against each engine's own parsed
+`ServerArgs` echo. Both A and B logged `spec-decode (MHA): overriding page_size -> 1`; C logged
+`keeping page_size=16 (page-aware rollback)`.
+
+**Neutralisation was mandatory and is why this is comparable at all:** swaverify has *no*
+`tools/serve.sh` and its `laguna-dflash` compose service uses a different knob namespace
+(`MINISGL_SPEC_K`, `MINISGL_CUDA_GRAPH_MAX_BS`, ...), so passing `SPEC_K=15` there would have
+silently served K=16. `tools/spec_truth.sh` hand-writes the argv and runs under the `run` compose
+profile, binding `127.0.0.1:21955` **inside** the container — port 1919 is never touched, so two
+legs cannot collide.
+
+### 11.3 Knob sweep (current build, five more serve legs)
+
+Same cell as leg A (repetitive/counting is the only class tight enough to adjudicate a knob).
+
+| knob | verdict | evidence |
+|---|---|---|
+| `MINISGL_SPEC_PREFILL_SEED=1` | **INERT BY CONSTRUCTION — 0.00%** | `spec/base.py:65 supports_prefill_seed = False`; only `spec/draft_model.py:56` and `spec/mtp.py:44` override it; `scheduler.py:347` ANDs on it, so `_spec_prefill_seeded` never runs for DFlash. Runtime: flag present in the engine's own environ, `"prompt-prefill draft-KV seed ENABLED"` logged **zero** times, and the counting cell reproduced leg A **exactly** (steps 303, emitted 2876, accepted 2573). |
+| `MINISGL_SPEC_MHA_PAGED` (ps 16 vs 1) | **acceptance-neutral, slightly negative** | 9.399 vs 9.492, 2.879 vs 2.912, 4.318 vs 4.508 — 1-4%, consistently negative, never a collapse. Exonerated as the suspect; safe as a default on acceptance grounds. |
+| `MINISGL_SPEC_SAMPLED` @ temp 0 | **inert** | `_req_spec_ok` (`scheduler.py:3143-3150`) lets greedy reqs speculate either way; `any_sampled` (`:3413-3415`) needs a non-greedy req. Measured 9.368 (=1) vs 9.523 (=0), both inside the eager band. |
+| `MINISGL_SPEC_SAMPLED` @ temp 0.7 | **it is the on/off switch for spec existing at all** | With `=0`: `spec steps = 0, emitted = 0, drafted = 0` — every non-greedy request falls through to plain decode (61.13 / 60.87 tok/s). With `=1`: counting 9.523 @ 164.41, real code 3.951 @ 70.06. Must stay default-ON (`4c504316`). |
+| `--cuda-graph-max-bs 8` | **large throughput win** | counting 56.6-56.7 vs 64.7-65.1 ms/step (-13%), 164.8-165.2 vs 144.5-147.0 tok/s (+12.5%); real code 82.4-83.5 vs 70.1-74.0 tok/s (+14%). Accept-len 9.338 vs eager 9.469 mean (-1.4%). |
+
+**Noise floor, measured not assumed.** Legs S2/S3/S4 toggle knobs that are *provably inert* on the
+greedy cells, so their spread against leg A **is** the four-boot run-to-run band:
+
+```
+counting  9.492 / 9.492 / 9.523 / 9.368   (range 1.7%;  emitted = 2876 in all four)
+prose     2.912 / 3.125 / 2.912 / 2.621   (range 19%)
+code      4.508 / 4.624 / 4.746 / 4.318   (range 9.9%)
+```
+
+Nothing smaller than ~10-20% is resolvable on prose or code at this sample size.
+
+**Best measured config:** `--cuda-graph-max-bs 8` + `MINISGL_SPEC_SAMPLED=1` + `PREFILL_SEED` unset
++ `MINISGL_SPEC_MHA_PAGED=0`, K=15, bs=1, TP=2 — counting 9.338 @ **164.83 tok/s**, real code 4.624
+@ **82.39 tok/s**, prose 2.682 @ 48.31 tok/s. Against the plain **eager bs=1** baseline of
+**61.0 tok/s** (a free by-product of the `SAMPLED=0` temp-0.7 cells, and the like-for-like plain
+number §1 never had): **2.70x repetitive, 1.35x real code, 0.79x prose.**
+
+### 11.4 Is verify-graph capture lossless for acceptance? — YES on acceptance; output determinism differs
+
+* **Acceptance: within noise.** Graph 9.338 (two independent boots, raw counters *bit-identical*)
+  vs an eager minimum of 9.368 — a 0.3% margin the 1.7% eager band cannot adjudicate. Graph buys
+  +12-14% true tok/s. **Do not turn graph capture off on acceptance grounds.**
+* **Output: reproducibly different on one knife-edge prompt.** `e6ddb502` prompt #2
+  (multiplication table for 7) emits 663 tokens / `finish=stop` under graph (2/2 legs) vs 720 /
+  `finish=length` under eager (4/4 legs), at temperature 0.
+* **But this is NOT a spec-verify defect.** The swaverify build produced the *same* 663/stop while
+  running **eager**. It is a knife-edge logit tie flipped by any change of numeric path (static
+  buffers, tile/kernel selection under capture), which the two builds already resolve differently
+  from each other. Reported as a "spec correctness bug" it would send the next agent to the wrong
+  file. Not isolated further; the next step if anyone cares is a logits-level eager-vs-replay diff
+  on one verify step, not another e2e leg.
+
+### 11.5 What actually drives the 3.26x prompt spread: the drafter never sees the prompt
+
+One extra instrumented leg (`tools/spec_dflash_divergence.sh`, 1600-token real-code generation,
+current build, eager, K=15, bs=1, `MINISGL_SPEC_DEBUG=2`):
+
+* **Divergence position is a smooth decay, not a spike.** `n` = drafts accepted before the first
+  mismatch, over 260 verify steps: `n=0` **11.5%**, `n=15` (full accept) **7.7%**, monotone decay
+  between. That rules out a conditioning-*wiring* fault (would pin `n=0` near 100%) and a
+  position/mask off-by-one (would spike at a fixed `n`). It is genuine per-token disagreement at a
+  per-position conditional acceptance of ~0.86.
+* **Accept-len is a monotone function of `P` = target hidden states already in the drafter's aux
+  prefix, and it saturates exactly at the drafter's 512 sliding window:**
+
+  | `P` bucket | real code | repetitive |
+  |---|---|---|
+  | <32 | 3.556 | 5.833 |
+  | 32-64 | 3.545 | 7.250 |
+  | 64-128 | 4.062 | 6.600 |
+  | 128-256 | 3.529 | 7.333 |
+  | 256-512 | 6.143 | 8.258 |
+  | **512-1024** | **7.366** | **9.660** |
+  | >1024 | 7.299 | 7.948 |
+
+* **Causal control:** capping the drafter prefix at 8 positions (`MINISGL_DFLASH_CTX_WINDOW=8`)
+  collapses real code **6.150 -> 3.667** accept-len and **92.1 -> 55.2 tok/s**, and flattens the
+  `P`-dependence to 2.4-4.1 across every bucket. The `P<32` bucket is identical in both legs
+  (3.556) — a clean internal control, since below `P=8` the two configurations are the same thing.
+* **Mechanism, read-only and confirmed:** `_spec_aux_hidden` is built append-only from **accepted
+  generated positions** (`scheduler.py:3682-3701`) and consumed at `spec/dflash.py:535-564`
+  (`P = aux.shape[1]`, `ctx_start = req.cached_len - P`). The only site that could seed it from the
+  prompt (`scheduler.py:2270-2276`) is dead code for DFlash (see the `PREFILL_SEED` row above).
+  So the drafter's context at generated position `P` is exactly `min(P, 512)` tokens **of its own
+  output** — every request starts blind and stays starved for ~512 tokens. High acceptance on
+  prompts that carry no information (counting), poor acceptance where the prompt carries everything
+  (code).
+* **Basis reconciliation with the reference:** their "81% acceptance" is a per-position conditional
+  rate -> accept-len 5.08 at K=15. Our windowed 7.366 implies ~0.865; our whole-720-token-request
+  4.5 implies ~0.78. The gap was never 3x — it is ~3 points of conditional acceptance, entirely
+  explained by window occupancy.
+
+**The fix is code, not env:** implement `seed_prefill` on `DFlashProposer` with
+`supports_prefill_seed = True` (the receiving code at `scheduler.py:2270-2276` already writes the
+whole prompt aux), and relax the `req.cached_len == 0` filter at `scheduler.py:2247` so
+prefix-cache hits are still seeded. Payoff scales with prompt length: negligible for a 95-token
+prompt, decisive for the 1-4k-token prompts of real agentic-coding traffic, where the drafter would
+start at ~7.4 instead of ~3.5.
+
+### 11.6 Bottom line (post adversarial audit)
+
+**NOT A REGRESSION. NOT A METRIC ARTIFACT. It is a comparison artifact**: two measurements of the
+same quantity taken on different workloads under different serve configs — `e6ddb502`'s counting
+prompts at 720 tok / K=16 / naive / eager / bf16 KV, versus §1's prose essay at 384 tok / graph /
+radix / fp8 KV / `mem 0.96`. Both reproduce today on the current build. **Do not open a commit
+bisect** — the spec accept/verify path in `scheduler.py` is byte-identical between the two builds
+(the whole `44dfb97f -> ea2669f7` scheduler diff is host-profiler + prefix-cache counters).
+
+Claims deliberately **downgraded** by the audit, so nobody inherits them as facts:
+
+* "Current build is +3.3%/-12.5%/-5.0% vs swaverify" -> **not resolvable**; state it as a
+  +/-15% bound.
+* "Verify-graph capture is a fidelity bug" -> **overstated**; see §11.4.
+* "Real code 6.150 is past the 5.1 target" -> **ill-posed as stated.** Accept-len on this drafter
+  is a function of *generation length* (code: 4.3-4.7 at 720 tok, 6.150 at 1600 tok). **No bare
+  accept-len number in this document is interpretable without its `max_tokens`.**
+
+**What is genuinely UNDETERMINED — the shipped configuration was never measured for acceptance.**
+Every acceptance number here and in §1's spec rows was taken at `MINISGL_KV_FP8=0`,
+`--cache-type naive`, `--max-running-requests 1`, page_size=1 (except leg C). Production compose
+defaults are `MINISGL_KV_FP8=1` (`docker-compose.yml:56`), radix, `MINISGL_SPEC_MHA_PAGED=1`,
+`CONC=4`, graph-captured. fp8-quantised target K/V shifts both the target's argmax and the captured
+aux the drafter is conditioned on. bf16 KV was *mandatory* to keep the cross-build comparison valid
+(swaverify has no fp8 SWA descale), so this axis was correctly held constant — and consequently
+**served acceptance is unknown and could be below every number above.**
+
+**The one next measurement** (settles the coverage hole and tests the root cause's one falsifiable
+prediction in the same leg): current build, production config (`MINISGL_KV_FP8=1`, radix,
+`MINISGL_SPEC_MHA_PAGED=1`, `--cuda-graph-max-bs 8`, K=15, bs=1, TP=2, greedy), a **2-4k-token real
+code prompt** at `max_tokens=1600`, run twice in one boot (the second exercises the radix
+prefix-cache-hit path), plus the identical prompt with `--spec-algorithm none` for the matched plain
+baseline. Report accept-len bucketed by `P` exactly as `spec_dflash_divergence.sh` already does.
+*Prediction:* if the drafter is genuinely blind to the prompt, the `P<64` bucket stays ~3.5 despite
+a 4k-token prompt; if it jumps, the starvation diagnosis is dead.
+
+### 11.7 Artifacts
+
+- `tools/spec_truth.sh` — the 3-leg matrix harness (hand-written argv, three accept-len definitions
+  per cell, `reqs/step` batch-inflation guard with an explicit `*** VOID ***` branch, provenance
+  block printed from inside the container).
+- `tools/spec_sweep.sh` — the knob sweep (adds `PREFILL_SEED` / `SAMPLED` / `GRAPHBS` legs and
+  temperature-0.7 cells).
+- `tools/spec_dflash_divergence.sh` — divergence-position histogram + accept-len bucketed by `P`.
+- `tools/spec_accept_audit_results.txt` — every cell's raw counters, as printed by the harnesses.
+- All three `.sh` must be run **inside** the image under `gpu-lease -n 2` via the `run` compose
+  profile; they bind `127.0.0.1:21955` in-container and deliberately do not lease themselves.
+- The isolation worktree `/home/pat/code/minisgl-rdna4-spectruth` (branch `task/spec-laguna-truth`
+  @ `4a031cc3`) is left in place; remove with `git worktree remove` when the follow-up lands.
