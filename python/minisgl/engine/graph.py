@@ -384,6 +384,16 @@ class GraphRunner:
             return logger.info_rank0("spec-verify CUDA graph: unsupported backend / disabled")
         widths = sorted({int(w) for w in (widths or [num_draft])})
         assert widths and widths[-1] <= num_draft, (widths, num_draft)
+        if len(widths) > 1 and not hasattr(self.attn_backend, "set_verify_width"):
+            # A backend that supports verify capture but cannot repoint its per-width statics would
+            # replay a narrow graph against the WIDEST width's cu_seqlens/kbound/seq_idx — silently
+            # wrong output, not an error. Capture the single widest instead. (hip + mla, the only two
+            # backends with init_verify_capture, both implement it.)
+            logger.warning_rank0(
+                f"{type(self.attn_backend).__name__} has no set_verify_width; capturing ONE verify "
+                f"width ({widths[-1]}) instead of {widths} — adaptive verify width is OFF."
+            )
+            widths = widths[-1:]
         qlen = widths[-1] + 1  # widest; the shared buffers/scratch are sized here
         dev = self.device
         max_bs = max(bs_list)

@@ -70,8 +70,14 @@ def verify_width_ladder(num_draft: int) -> List[int]:
     """The captured verify widths for a run with ``--spec-num-draft num_draft``.
 
     Ascending, always contains the (clamped) max so a fully-accepting step never has to give up
-    rows it would have used. Halving ladder: K=15 -> [3, 7, 15]; K=6 -> [3, 6]; K=4 -> [2, 4];
+    rows it would have used. Halving ladder: K=15 -> [3, 7, 15]; K=8 -> [2, 4, 8];
     K<=2 -> [K] (a single width, i.e. the pre-adaptive behaviour).
+
+    At small K halving runs out of room before the ladder is full (K=4 -> [2, 4]), and a two-rung
+    ladder that coarse is not usefully adaptive: MTP's measured acceptance is ~2.2, `mean+1` wants 3,
+    and 3 rounds up to 4 — so the controller would report 100% at the max and never narrow. When
+    there is a spare rung AND a gap of at least 2 to fill, put a rung in the middle: K=4 -> [2, 3, 4],
+    K=6 -> [3, 4, 6]. Resolution near the operating point is the whole point of the ladder.
     """
     w_max = min(int(num_draft), MAX_VERIFY_ROWS - 1)
     if w_max < 1:
@@ -81,6 +87,14 @@ def verify_width_ladder(num_draft: int) -> List[int]:
     while len(ladder) < _LADDER_LEN and w // 2 >= _LADDER_MIN:
         w //= 2
         ladder.append(w)
+    ladder.sort()
+    while len(ladder) < _LADDER_LEN:
+        # widen the largest gap by one rung; stop when no gap is big enough to split
+        gaps = [(ladder[i + 1] - ladder[i], i) for i in range(len(ladder) - 1)]
+        if not gaps or max(gaps)[0] < 2:
+            break
+        _, i = max(gaps)
+        ladder.insert(i + 1, (ladder[i] + ladder[i + 1]) // 2)
     return sorted(set(ladder))
 
 

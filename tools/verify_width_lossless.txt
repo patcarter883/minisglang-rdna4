@@ -1,0 +1,63 @@
+=== plain (SPEC=none) ===
+  scheduler.py md5: 699d567651899850a17a30fdbe5e0571
+  MT=  32 n=  32 finish=length    md5=f2ced4ae9dbfa25515088d952d2f080c
+        head: ' ListNode:\n    def __init'
+  MT=  64 n=  64 finish=length    md5=4075a7087a0ea5af9afd2d5fcdfde3b6
+        head: '        self.next = next\n\ndef reverse_linked_list(head):\n    """'
+  MT= 128 n= 128 finish=length    md5=b528bfb4882e3eab5926e4a2c0051764
+        head: '  \n    Returns:\n        The new head of the reversed linked list\n    """\n    prev = None\n '
+  MT= 256 n= 256 finish=length    md5=ef5584b847a2367fc29a21f2c7b114dd
+        head: ' Explanation:\n\n1. **Initialization**:\n   - `prev` starts as `None` (will become the new ta'
+
+=== base (SPEC=dflash) ===
+  scheduler.py md5: 569de819d77a31bee85231974b41ba4a
+  MT=  32 n=  32 finish=length    md5=508de94e877f686395102ee26f6730c5
+        head: 'class Node:\n    def'
+  MT=  64 n=  64 finish=length    md5=5564f9f9ddcb3b61090099564e4951d5
+        head: 'def reverse_linked_list(head):\n    """\n   '
+  MT= 128 n= 128 finish=length    md5=fe8965b0ebea24d8578b218dc12f4c87
+        head: 'To reverse a singly linked list in place, we use an iterative approach with three pointers'
+  MT= 256 n= 256 finish=length    md5=313c0d02339769b84450825a904207b3
+        head: '### Explanation of How It Works\n\nThe function reverses the linked list by iteratively chan'
+[1m[2026-07-31|19:54:51|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.94 over 100 reqs
+
+=== fixed (SPEC=dflash) ===
+  scheduler.py md5: 70ba1b05cd44d342e3798cb510927de0
+  MT=  32 n=  32 finish=length    md5=2105d268b6547575402198d96332acbf
+        head: '```python\nclass ListNode:\n'
+  MT=  64 n=  64 finish=length    md5=5564f9f9ddcb3b61090099564e4951d5
+        head: 'def reverse_linked_list(head):\n    """\n   '
+  MT= 128 n= 128 finish=length    md5=fe8965b0ebea24d8578b218dc12f4c87
+        head: 'To reverse a singly linked list in place, we use an iterative approach with three pointers'
+  MT= 256 n= 256 finish=length    md5=b5ee0e5e2fd91e5eb9c103db5561fe13
+        head: "Here's a Python function that reverses a singly linked list in place, along with a detaile"
+[1m[2026-07-31|19:55:48|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|19:55:54|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.19 over 100 reqs verify-width[0:1(1%) 3:0(0%) 7:0(0%) 15:99(99%)] verify-graph replay=99 eager=1
+
+=== adapt (SPEC=dflash) ===
+  scheduler.py md5: 699d567651899850a17a30fdbe5e0571
+  MT=  32 n=  32 finish=length    md5=508de94e877f686395102ee26f6730c5
+        head: 'class Node:\n    def'
+  MT=  64 n=  64 finish=length    md5=9e564218f5a6667a11144312583b90c4
+        head: 'To reverse a singly linked list in place'
+  MT= 128 n= 128 finish=length    md5=fe8965b0ebea24d8578b218dc12f4c87
+        head: 'To reverse a singly linked list in place, we use an iterative approach with three pointers'
+  MT= 256 n= 256 finish=length    md5=ca5758da420567507d7316e037ff2985
+        head: 'To reverse a singly linked list in place, we can use an iterative approach that modifies t'
+[1m[2026-07-31|19:57:12|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|19:57:18|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.73 over 100 reqs verify-width[0:1(1%) 3:27(27%) 7:68(68%) 15:4(4%)] verify-graph replay=99 eager=1
+
+=== adapt2 (SPEC=dflash) ===
+  scheduler.py md5: 699d567651899850a17a30fdbe5e0571
+  MT=  32 n=  32 finish=length    md5=508de94e877f686395102ee26f6730c5
+        head: 'class Node:\n    def'
+  MT=  64 n=  64 finish=length    md5=9e564218f5a6667a11144312583b90c4
+        head: 'To reverse a singly linked list in place'
+  MT= 128 n= 128 finish=length    md5=fe8965b0ebea24d8578b218dc12f4c87
+        head: 'To reverse a singly linked list in place, we use an iterative approach with three pointers'
+  MT= 256 n= 256 finish=length    md5=ca5758da420567507d7316e037ff2985
+        head: 'To reverse a singly linked list in place, we can use an iterative approach that modifies t'
+[1m[2026-07-31|19:58:03|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|19:58:07|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.73 over 100 reqs verify-width[0:1(1%) 3:27(27%) 7:68(68%) 15:4(4%)] verify-graph replay=99 eager=1
+
+== LOSSLESS GATE COMPLETE ==
