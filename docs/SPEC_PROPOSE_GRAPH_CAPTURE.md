@@ -131,7 +131,85 @@ override that is deleted before merge**).
   unquoted redirect is evaluated by the HOST shell and reads the host's pid 1), and the boot log must
   show either `PROPOSE graphs CAPTURED buckets=[...]` or `propose capture disabled by A/B override`.
 
-Measured results are in `tools/propose_capture_ab_*.txt`.
+### 3.1 Results
+
+**Engagement.** Every captured leg logs `replay=N eager=0` for the whole run, at every batch size,
+for all three proposers. No leg silently fell back.
+
+**Bit-identity, replay vs eager (same body, same inputs):**
+
+| proposer / model | verdict |
+|---|---|
+| DFlash / Laguna, NREQ=1 | **PASS** — 178/178 drafted chains identical verbatim, same completion md5 |
+| DFlash / Laguna, NREQ=8 | **PASS** — 1342/1342 chains identical as a multiset (60 lines differ in log ORDER only; see below) |
+| EAGLE3 / GLM-4.7-Flash, NREQ=1 | **PASS** — 354/354 chains identical verbatim |
+| MTP / Qwen3.6-35B-AWQ, NREQ=1 | **NOT RUNNABLE** — see §3.2 |
+
+The NREQ=8 comparison is a multiset, deliberately: each leg is an independent boot, so admission
+order and per-step batch composition permute the interleaving of per-request debug lines without
+changing a single chain. Calling that a failure would be an artefact of the instrument.
+
+**A CONTROL run establishes the noise floor** — two boots of the *identical captured* configuration
+(`CTL=1`), which is what makes the passes above mean anything:
+
+* DFlash / Laguna: **144/144 identical.** Noise floor is ZERO. The DFlash and EAGLE3 passes are real.
+* MTP / Qwen3.6-35B-AWQ: **208 of 280 chains differ.** See §3.2.
+
+**Timing** (cuda-synchronized `[spec-timing]`, per-50-step running means differenced to steady state;
+first window discarded as warmup):
+
+| config | propose ms/step | tok/s |
+|---|---|---|
+| DFlash NREQ=1, captured vs eager-same-body | 5.7 vs 6.1 | 78.3 vs 75.4 |
+| DFlash NREQ=1, **vs the parent commit** | **5.7 vs 6.0** | **79.6 vs 74.6** |
+| DFlash NREQ=8, captured vs eager-same-body | 13.7 vs 13.8 | 154.2 vs 152.2 |
+| DFlash NREQ=8, **vs the parent commit** | **13.7 vs 44.4 (3.2x)** | **154.2 vs 135.9 (+13.5%)** |
+| MTP NREQ=1, captured vs eager-same-body | 5.4 vs 5.7 | (confounded, §3.2) |
+| EAGLE3 NREQ=1, captured vs eager-same-body | 6.6 vs 6.7 | 58.4 vs 56.2 |
+
+**Read this honestly: the graph replay itself is the small half.** At NREQ=1 it buys 1–8% of propose.
+The large win — 3.2x at NREQ=8 — comes from the *batched, fixed-shape rewrite that capture required*,
+because the old per-request loop issued ~150 launches PER REQUEST and the new body issues ~180 for
+the whole batch. Capture and that rewrite are not separable as a deliverable (the old body could not
+be captured), but they are separable as a measurement, and the A/B legs above measure only the
+replay. At NREQ=8 replay-alone is ~1%, exactly as expected once the launch count is amortised over
+8x the work.
+
+**And the propose floor is NOT launch-bound**, which contradicts what the O(window) work inferred
+from a floor that did not move. At bs=1 the captured DFlash propose is 5.7 ms against a ~1.6 ms
+weight-bandwidth roofline (drafter trunk ~875 MB + LM head ~205 MB/rank at 700 GB/s). Removing every
+launch moved it 0.4 ms. The remaining 3.5x is small-M GEMM efficiency: the drafter's `_PlainLinear`
+calls `F.linear` (rocBLAS) at M=16, bypassing the tuned `dense_bf16_gemv` that
+`layers/minv.py` already dispatches below M=16 and that measured 5.4x over rocBLAS on the LM head.
+Routing the drafter's linears through the shared primitive is the next lever, and it is a
+"share the compute primitive" fix, not a new kernel.
+
+Raw logs: `tools/propose_capture_ab_*.txt`, `tools/propose_capture_vs_base_*.txt`.
+
+### 3.2 MTP: the gate is not runnable on this model, and that is a finding
+
+MTP propose on Qwen3.6-35B-A3B-AWQ is **not bit-reproducible against itself**. The control — two
+boots of the identical captured configuration, same prompt, same seed, greedy — differs in 208 of 280
+drafted chains. The replay-vs-eager difference (80 of 276) is *smaller than that noise floor*, so it
+cannot be attributed to capture, and no bit-identity claim about capture can be made on this model
+either way.
+
+The obvious suspect is named by the kernel itself — `quant/kernels.py` on the fused MoE gemm2 taken
+below M=2, which is exactly what an MTP draft head hits at bs=1:
+
+> "NOT bit-exact vs gather_reduce: the atomic reduction order varies, so this is a tolerance-gated
+> path, never a bit-exact one."
+
+But that is **not the whole cause**: re-running the control with `MINISGL_MOE_G2FUSE=0` (the
+documented bit-exact gemm2) still gives 74 of 264 chains differing. Something else in this model's
+decode is non-reproducible too. Laguna+DFlash reproduces exactly under the same harness, so it is
+specific to this stack (GDN-hybrid + AWQ MoE), it is upstream of propose, and it predates this work.
+**Not chased — recorded.** A greedy serve that does not reproduce itself is worth its own
+investigation.
+
+What IS established for MTP: capture engages 100% (`replay=N eager=0`), propose drops 5.7 → 5.4
+ms/step, and losslessness is structural — verify gates every emitted token regardless of what the
+drafter proposes.
 
 ---
 
