@@ -342,13 +342,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if self._dflash_ddtree:
                     logger.info_rank0("spec-decode: DFlash DDTree draft-tree path ENABLED")
                     self._ddtree_budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "32")
-            self._spec_seed_enabled = (
-                os.environ.get("MINISGL_SPEC_PREFILL_SEED") == "1"
-                and bool(self._proposer.supports_prefill_seed)
-                and (self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids))
+            # ON whenever the proposer wants it. It used to ALSO require MINISGL_SPEC_PREFILL_SEED=1,
+            # which nothing ever set — not tools/serve.sh, not docker-compose.yml — so a measured win
+            # (+8.5% on EAGLE3) shipped switched off; and for DFlash the flag was doubly dead, because
+            # supports_prefill_seed was False too.
+            self._spec_seed_enabled = bool(self._proposer.supports_prefill_seed) and (
+                self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
             )
             if self._spec_seed_enabled:
-                logger.info_rank0("spec-decode: prompt-prefill draft-KV seed ENABLED")
+                _tail = int(getattr(self._proposer, "prefill_aux_tail", 0) or 0)
+                logger.info_rank0(
+                    "spec-decode: prompt-prefill draft seed ENABLED "
+                    f"(aux tail={_tail or 'whole prompt'})"
+                )
             # Capture the verify CUDA graphs NOW — after the aux-capture layers are programmed above, so
             # the captured forward stashes the hidden/aux the draft head consumes. Supported for every
             # backbone now: MLA, pure MHA (generic attn verify-capture), and the recurrent hybrids CCA
@@ -2232,9 +2238,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         proposer's persistent draft KV from it (the prompt-prefill draft-KV seed lever). Mirrors the
         normal prefill (`_forward` + `_process_last_data`) but runs the one forward with
         `return_hidden=True`, so the bonus token and the prompt hidden come from a SINGLE pass. Only
-        reqs whose WHOLE prompt is in this forward (cached_len==0, not chunked) are seeded — a chunked
-        or prefix-cache-hit prompt's earlier hidden isn't available here, so it falls back to the cold
-        cache (still lossless, just no early-token lift)."""
+        reqs that are not chunked are seeded, INCLUDING prefix-cache hits: this forward computes the
+        hidden for positions [cached_len, cached_len+ext), and the consumer takes the buffer's origin
+        as `cached_len - P`, so seeding the suffix is exact. The cached prefix's hidden was never
+        computed and cannot be recovered without re-running it, so a cache hit seeds less — never
+        wrong, just less lift. Seeding is lossless either way: it changes only what the DRAFTER
+        conditions on, and every draft is still verified against the target."""
         forward_input = self._prepare_batch(batch)
         # Plan the seed-eligible reqs + their hidden-row slices BEFORE the forward advances cached_len
         # (forward_batch calls complete_one). Prefill rows follow padded_reqs order, which equals
@@ -2244,17 +2253,46 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         offset = 0
         for req in batch.padded_reqs:
             ext = req.extend_len
-            if (not isinstance(req, ChunkedReq)) and req.cached_len == 0 and id(req) in real:
+            # `cached_len == 0` used to be required here, which silently excluded every RADIX PREFIX-
+            # CACHE HIT — i.e. exactly the repeat/multi-turn traffic where seeding matters most. The
+            # rows this forward produces cover absolute positions [cached_len, cached_len+ext), and the
+            # consumer derives its origin as `ctx_start = req.cached_len - P` (spec/dflash.py), so a
+            # partial prompt seeds correctly as long as it is the SUFFIX ending at the prompt's end —
+            # which is what a prefix-cache hit leaves us. The cached prefix's hidden states were never
+            # computed and cannot be recovered without re-running them, so seeding the suffix is the
+            # most that is available, and it is strictly better than seeding nothing.
+            # ChunkedReq stays excluded: it is seeded once per chunk and the last chunk would clobber
+            # the earlier ones with a tail that does not start where the consumer assumes.
+            if (not isinstance(req, ChunkedReq)) and id(req) in real:
                 plan.append((req, offset, ext))
             offset += ext
 
         fi_batch, sample_args, input_mapping, output_mapping = forward_input
         fi_batch.input_ids = self.token_pool[input_mapping]
+        # This function is a SECOND implementation of `_forward`'s prologue, so anything added there
+        # has to be mirrored here or it is silently skipped on every prefill. Both of the following
+        # were missing while this path was unreachable (it required an env var nothing set); they
+        # matter now that seeding is the default.
+        #   * CAM staging — the CAM serve profile runs MTP, and MTP sets supports_prefill_seed, so
+        #     without this a CAM+spec serve would lose its memory injection on prefill entirely.
+        #   * DFlash training-data capture — we already have `aux_hidden`, so dump it rather than
+        #     making MINISGL_DFLASH_CAPTURE_DIR quietly produce nothing whenever spec is on.
+        if self.engine.cam is not None:
+            self._stage_cam(fi_batch)
+        cap_spans = None
+        if self._capture_dir and any(r.extend_len > 1 for r in fi_batch.reqs):
+            # Snapshot BEFORE the forward: forward_batch -> complete_one() collapses extend_len to 1.
+            cap_spans, _off = [], 0
+            for r in fi_batch.padded_reqs:
+                cap_spans.append((getattr(r, "uid", -1), _off, r.extend_len, r.cached_len))
+                _off += r.extend_len
         out, last_hidden, aux_hidden = self.engine.forward_batch(
             fi_batch, sample_args, return_hidden=True
         )
         self.token_pool[output_mapping] = out.next_tokens_gpu
         self.decode_manager.filter_reqs(fi_batch.reqs)
+        if cap_spans is not None and aux_hidden is not None:
+            self._dump_capture(fi_batch, aux_hidden, cap_spans)
 
         # Seed each eligible req's draft KV over its prompt slice, and carry the first-step seed hidden
         # (the prompt's LAST position produced the bonus token, so its hidden seeds the first propose —
@@ -2268,12 +2306,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if self._spec_needs_last_hidden and lh is not None:
                 self._spec_last_hidden[req.uid] = lh[plen - 1].clone()
             if self._spec_capture_layer_ids and ax is not None:
-                # Full-context: seed the buffer with the WHOLE prompt aux [num_aux, plen, hidden] so the
-                # first block's drafter attends over the entire prompt (matches z-lab's prefill prefix).
+                # Full-context: seed the buffer with the prompt aux [num_aux, S, hidden] so the first
+                # block's drafter attends over the prompt instead of starting blind.
                 # Legacy: just the last prompt position [num_aux, hidden].
-                self._spec_aux_hidden[req.uid] = (
-                    ax[:, :plen].clone() if self._dflash_fullctx else ax[:, plen - 1].clone()
-                )
+                #
+                # S is the TAIL the proposer asked for (`prefill_aux_tail`), not necessarily the whole
+                # prompt. A sliding-window drafter masks out every key older than its window, so a
+                # longer seed changes no logit — it would only make each later propose re-read a
+                # bigger prefix. Taking the tail keeps `ctx_start = cached_len - P` exact, because the
+                # seeded slice still ENDS at the prompt's final position.
+                if self._dflash_fullctx:
+                    tail = int(getattr(self._proposer, "prefill_aux_tail", 0) or 0)
+                    start = max(0, plen - tail) if tail > 0 else 0
+                    self._spec_aux_hidden[req.uid] = ax[:, start:plen].clone()
+                else:
+                    self._spec_aux_hidden[req.uid] = ax[:, plen - 1].clone()
 
         self._process_last_data((forward_input, out))
 
@@ -3686,8 +3733,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 if aux_hidden is not None:
                     if self._dflash_fullctx:
                         # Append THIS step's accepted positions' aux [num_aux, len(keep), hidden] to the
-                        # running buffer. We only ever append ACCEPTED positions, so the buffer length
-                        # stays == cached_len (committed) — no rollback needed on rejection.
+                        # running buffer. We only ever append ACCEPTED positions, so the buffer is
+                        # always a contiguous suffix ENDING at the last committed position — no
+                        # rollback needed on rejection. Its length is NOT cached_len in general: the
+                        # prompt seed contributes only min(prompt, prefill_aux_tail) positions, and a
+                        # prefix-cache hit contributes only the extended suffix. The consumer derives
+                        # the origin as `ctx_start = cached_len - P` (spec/dflash.py), so a shorter
+                        # buffer is correct as long as it ends where the committed text ends.
                         new_slice = aux_hidden[:, block_start : block_start + len(keep)].clone()
                         prev = self._spec_aux_hidden.get(req.uid)
                         buf = (

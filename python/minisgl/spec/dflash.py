@@ -368,10 +368,29 @@ class DFlashProposer(Proposer):
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
         self._kv: dict[int, list] = {}
         self._kv_plen: dict[int, int] = {}
+
+        # PROMPT-PREFILL SEED (full-context path only). Without it the drafter's aux prefix is built
+        # append-only from ACCEPTED GENERATED positions (scheduler.py:_spec_aux_hidden), so its context
+        # at generated position P is min(P, window) tokens OF ITS OWN OUTPUT and it never sees the
+        # prompt at all. Measured consequence (docs/CONTINUANCE §11.5): accept-len is a monotone
+        # function of P that saturates exactly at this window — real code 3.5 at P<32 rising to 7.4 at
+        # P=512-1024 — so every request starts starved and stays starved for ~512 tokens. Capping the
+        # drafter prefix at 8 positions collapses real code 6.150 -> 3.667, which is the causal control.
+        #
+        # Seeding is the fix, and it is bounded by the window rather than the prompt: the drafter's
+        # own mask drops every key older than `sliding_window`, so seeding more than window+block is
+        # numerically inert AND would charge O(prompt) on every later propose (attend_block re-reads
+        # the whole prefix each step). window+block covers the oldest key the last block query can
+        # still see. CCA does NOT get this: its seed is a single fused position by construction, so it
+        # has no prefix to seed (see _build_cca).
+        self.supports_prefill_seed = True
+        self.prefill_aux_tail = (sliding_window + self._block_size) if sliding_window > 0 else 0
+
         logger.info_rank0(
             f"DFlash Laguna drafter: {num_layers}L h={hidden} heads={num_heads}/{num_kv_heads} "
             f"block={self._block_size} mask_id={self._mask_token_id} window={sliding_window} "
-            f"causal={causal} aux_layers={self.capture_layer_ids} (bf16, borrow target embed/head)"
+            f"causal={causal} aux_layers={self.capture_layer_ids} "
+            f"prefill_seed=on(tail={self.prefill_aux_tail or 'all'}) (bf16, borrow target embed/head)"
         )
 
     def _load_laguna_weights(self, folder: str) -> None:

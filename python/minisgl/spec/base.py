@@ -57,12 +57,25 @@ class Proposer(ABC):
     needs_last_hidden: bool = False
     # Target decoder-layer ids whose hidden states must be captured (DFlash/EAGLE3); None = no aux.
     capture_layer_ids: Optional[List[int]] = None
-    # Whether this proposer can seed its persistent draft KV from the prompt prefill (MTP / EAGLE3).
-    # When True AND MINISGL_SPEC_PREFILL_SEED=1, the scheduler runs a hidden-capturing prefill and
-    # hands the per-req prompt hidden to `seed_prefill` so the FIRST draft already sees full prompt
-    # context (lifts early-token acceptance). n-gram (no draft KV) and DFlash (no persistent KV)
-    # leave this False, so the extra prefill capture is skipped for them.
+    # Whether this proposer wants the prompt prefill's hidden states (MTP / EAGLE3 / DFlash).
+    # When True the scheduler runs a hidden-capturing prefill, hands the per-req prompt hidden to
+    # `seed_prefill`, and seeds the aux buffer, so the FIRST draft already sees prompt context
+    # instead of starting blind. n-gram (no draft state at all) leaves this False, so the extra
+    # prefill capture is skipped for it.
+    #
+    # NOT env-gated. It used to require MINISGL_SPEC_PREFILL_SEED=1 and therefore never ran: for
+    # DFlash it was doubly dead (see DFlashProposer), and even for EAGLE3, where it measured +8.5%,
+    # nothing set the variable in serve.sh or docker-compose.yml. A measured win behind an unset
+    # flag is just a slower default.
     supports_prefill_seed: bool = False
+
+    # How many of the prompt's TRAILING aux positions to seed. 0 = all of them.
+    #
+    # This exists because seeding is not free downstream: a sliding-window drafter re-reads its whole
+    # aux prefix on EVERY propose, so seeding a 4k-token prompt would buy nothing past the window and
+    # then charge O(prompt) per step forever. Keys older than the window are masked out inside the
+    # drafter regardless, so truncating to the tail is numerically inert — it only bounds the cost.
+    prefill_aux_tail: int = 0
 
     @abstractmethod
     def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
