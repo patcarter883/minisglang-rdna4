@@ -36,7 +36,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
     silu_and_mul,
 )
-from minisgl.quant import create_linear_method
+from minisgl.quant import create_linear_method, kernels
 from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
@@ -227,14 +227,24 @@ class LagunaSparseBlock(BaseOP):
         self.routed_scaling_factor = config.routed_scaling_factor
 
     def _route(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = logits.float().sigmoid()  # routing weights = UN-biased sigmoid scores
-        choice = scores + self.gate.e_score_correction_bias.float()  # bias steers SELECTION only
-        topk_ids = choice.topk(self.top_k, dim=-1).indices  # [T, top_k]
-        topk_weights = scores.gather(1, topk_ids)  # [T, top_k]
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights.float().contiguous(), topk_ids.int().contiguous()
+        # ONE launch instead of twelve (sigmoid, +bias, topk, gather, sum, div, *sf, casts). Both
+        # tensors go in at their NATIVE dtype — the kernel widens in-register, losslessly, so a
+        # `.float()` here would be a no-op that costs a dispatch.
+        #
+        # THE BIAS DTYPE IS bf16 ON PURPOSE, and this is bit-identical to the torch chain it
+        # replaces. The checkpoints ship `e_score_correction_bias` as F32, but engine.py:575-608 has
+        # no case for it (ZAYA's `.balancing_biases` is special-cased to fp32 at :598-607; this one
+        # was not), so it falls through :608 to the model dtype = bf16 — and the model-side buffer
+        # is bf16 too. The old `.float()` therefore widened an ALREADY-TRUNCATED value. Feeding the
+        # kernel the F32 checkpoint value would change expert SELECTION on near-ties — arguably
+        # better, definitely different, and completely invisible to a tok/s A/B. Separate commit.
+        return kernels.moe_route_sigmoid_bias(
+            logits,
+            self.gate.e_score_correction_bias,
+            self.top_k,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
 
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

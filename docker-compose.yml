@@ -93,6 +93,14 @@ x-lean-common: &lean-common
     # 0 forces the K-on-lanes sweep, which is what every group-16 (NVFP4) shape got before
     # Int4Fp8GemvLoader declared bylane_min_group_v=16 — i.e. the matched A/B baseline, same binary.
     VLLM_W4A8_MOE_G2FUSE_BYLANE: "${VLLM_W4A8_MOE_G2FUSE_BYLANE:-}"
+    # A/B BASELINE ONLY for the fused sigmoid+bias MoE route (quant/kernels.py:moe_route_sigmoid_bias,
+    # used by Laguna `_route` and GLM-4.7-Flash `_noaux_tc` at n_group=1). The fused op is
+    # UNCONDITIONALLY ON; =1 reconstructs the pre-change TWELVE-op torch chain on the SAME BINARY, so
+    # a measurement leg does not need a second image (which would reintroduce the provenance question
+    # the A/B exists to settle). Present-but-EMPTY — which is exactly what this `${VAR:-}` form yields
+    # when the variable is unset — must NOT read as an override; kernels.py's _env_flag() requires a
+    # non-empty value that parses to a non-zero int.
+    MINISGL_MOE_ROUTE_TORCH_BASELINE: "${MINISGL_MOE_ROUTE_TORCH_BASELINE:-}"
     # MoE quant mode: 0 = W4A8 (int4 wt + int8/fp8 act via FP8-WMMA); 1 = W4A16 (weight-only, fp16 act).
     MINISGL_MOE_W4A16: "${MINISGL_MOE_W4A16:-0}"
     # MHA/SWA spec page-aware rollback: =1 keeps page_size=16 under spec (validated coherent +
