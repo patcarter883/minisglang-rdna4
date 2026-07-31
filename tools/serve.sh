@@ -13,7 +13,8 @@
 #
 # THE CHOICES (all optional; every one has a default)
 #   MODEL   alias below, or any HF id / local path      (default qwen35b-awq)
-#   SPEC    none | mtp | dflash | eagle3 | ngram        (default: the model's own default)
+#   SPEC    none|mtp|dflash|eagle3|ngram|tidar          (default: the model's own default)
+#   DRAFT   draft checkpoint for dflash/eagle3          (default: per model; required if none)
 #   SPEC_K  draft length                                (default: per model+algorithm, tuned)
 #   TP      tensor-parallel size, 1 or 2                (default 2)
 #   DP      data-parallel size, 1 or 2                  (default 1)
@@ -38,16 +39,21 @@ PORT="${PORT:-1919}"
 # Per model: the checkpoint, the attention backend it wants, its default spec algorithm + draft
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
-draft=""; attn="hip"; spec_default="none"; k_mtp=4; k_dflash=15; mem_default="0.80"
+dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"
+k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 case "$MODEL" in
-  qwen35b-awq)    model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4  ;;
+  qwen35b-awq)    model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4
+                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash" ;;
   qwen35b-mxfp4)  model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
-                  draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15 ;;
-  glm)            model_id="QuantTrio/GLM-4.7-Flash-AWQ";              spec_default="mtp"; k_mtp=2  ;;
+                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15 ;;
+  # GLM's MTP head is a measured NET LOSS on this box, so its default is EAGLE3 (K=6 from the
+  # spec-len sweep). MTP remains selectable — it is just not the default.
+  glm)            model_id="QuantTrio/GLM-4.7-Flash-AWQ";              spec_default="eagle3"; k_mtp=2
+                  eagle3_draft="thoughtworks/GLM-4.7-Flash-Eagle3"; k_eagle3=6 ;;
   laguna)         model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
-                  draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85" ;;
+                  dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85" ;;
   zaya)           model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
-                  draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
+                  dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
   *)              model_id="$MODEL" ;;     # any HF id or local path, straight through
 esac
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
@@ -62,16 +68,29 @@ CACHE_TYPE="${CACHE_TYPE:-radix}"
 
 # --- spec decode ---------------------------------------------------------------------------------
 spec_args=()
+# A draft checkpoint is REQUIRED by dflash and eagle3, and meaningless for the others: mtp reads the
+# MTP head out of the target checkpoint, tidar reads tidar_config.json from the target, and ngram has
+# no model at all. DRAFT= overrides whatever the table resolved.
+need_draft=""; resolved_draft=""
+case "$SPEC" in
+  dflash) need_draft=1; resolved_draft="${DRAFT:-$dflash_draft}" ;;
+  eagle3) need_draft=1; resolved_draft="${DRAFT:-$eagle3_draft}" ;;
+esac
+if [[ -n "$need_draft" && -z "$resolved_draft" ]]; then
+  echo "serve.sh: SPEC=$SPEC needs a draft checkpoint and MODEL=$MODEL has no default for it." >&2
+  echo "serve.sh: set DRAFT=<hf-id or /drafts/... path>, or pick a different SPEC." >&2
+  exit 2
+fi
 case "$SPEC" in
   none|"") : ;;
   mtp)     spec_args=(--spec-algorithm mtp    --spec-num-draft "${SPEC_K:-$k_mtp}") ;;
-  eagle3)  spec_args=(--spec-algorithm eagle3 --spec-num-draft "${SPEC_K:-4}") ;;
   ngram)   spec_args=(--spec-algorithm ngram  --spec-num-draft "${SPEC_K:-4}") ;;
-  dflash)
-    [[ -n "$draft" ]] || { echo "serve.sh: MODEL=$MODEL has no DFlash draft checkpoint; set DRAFT=<path>" >&2; exit 2; }
-    spec_args=(--spec-algorithm dflash --spec-draft-model-path "${DRAFT:-$draft}"
-               --spec-num-draft "${SPEC_K:-$k_dflash}") ;;
-  *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|eagle3|ngram)" >&2; exit 2 ;;
+  tidar)   spec_args=(--spec-algorithm tidar  --spec-num-draft "${SPEC_K:-$k_tidar}") ;;
+  eagle3)  spec_args=(--spec-algorithm eagle3 --spec-draft-model-path "$resolved_draft"
+                      --spec-num-draft "${SPEC_K:-$k_eagle3}") ;;
+  dflash)  spec_args=(--spec-algorithm dflash --spec-draft-model-path "$resolved_draft"
+                      --spec-num-draft "${SPEC_K:-$k_dflash}") ;;
+  *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|eagle3|ngram|tidar)" >&2; exit 2 ;;
 esac
 
 # --- parallelism ---------------------------------------------------------------------------------
