@@ -1,0 +1,144 @@
+I'll start by carefully reading both files to understand the existing code structure and patterns.
+
+Looking at the code:
+
+1. **rotary.py**: Contains `RotaryEmbedding` class with NeoX-style rotary embedding, supports partial rotary, interleaved mode, and YaRN scaling via `rope_scaling` parameter. The YaRN implementation is in `_get_rope` function.
+
+2. **norm.py**: Contains `RMSNorm` and `RMSNormFused` classes. The fused version handles residual addition.
+
+Now I'll implement the requested additions:
+
+```python
+# rotary.py - Add this class after the existing RotaryEmbedding class
+
+class YaRNScalingRotaryEmbedding(StateLessOP):
+    """YaRN (NTK-by-parts) long-context scaling for rotary embeddings.
+    
+    Extends standard rotary embeddings with per-frequency interpolation between
+    low_freq_factor and high_freq_factor wavelengths, plus attention-temperature
+    correction (mscale) folded into the cached cos/sin tables.
+    
+    This allows extrapolation to longer sequences while maintaining the relative position
+    information for shorter context lengths.
+   
+    The interpolation ramp smoothly transitions between high-frequency (short wavelength) and
+    low-frequency (long wavelength) components based on the ratio of original_max_position
+    to the current position.
+    """
+    
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        low_freq_factor: float = 1.0,
+        high_freq_factor: float = 32.0,
+        original_max_position_embeddings: int = 128,
+        attention_scaling: float = 1.0,
+        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self._attention_scaling = attention_scaling
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.original_max_position = original_max_position_embeddings
+    
+        # Compute base inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        if post_process is not None:
+            inv_freq = post_process(inv_freq)
+        
+        # Compute wavelength for each frequency component
+        # wavelength = 2 * pi / frequency = 2 * pi * inv_freq
+        wavelengths = 2 * math.pi / inv_freq
+        
+        # Compute interpolation factors for each frequency
+        # For frequencies with wavelength < original_max_position / high_freq_factor: use full freq
+        # For frequencies with wavelength > original_max_position / low_freq_factor: use scaled freq
+        # Otherwise: interpolate between them
+        low_threshold = original_max_position_embeddings / self.low_freq_factor
+        high_threshold = original_max_position_embeddings / self.high_freq_factor
+        
+        # Compute the interpolation ramp
+        # ramp = (wavelength - low_threshold) / (high_threshold - low_threshold)
+        # clamped to [0, 1]
+        ramp = (wavelengths - low_threshold) / max(high_threshold - low_threshold, 1.0)
+        ramp = torch.clamp(ramp, 0.0, 1.0)
+        
+        # Apply YaRN scaling: scaled_inv_freq = inv_freq * (ramp / factor + (1 - ramp))
+        # where factor is the scaling factor (typically > 1 for extrapolation)
+        # For simplicity, we use a default factor of 1.0 here, but it can be parameterized
+        factor = 1.0
+        scaled_inv_freq = inv_freq * (ramp / factor + (1.0 - ramp))
+        
+        # Compute position frequencies
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, scaled_inv_freq)
+        
+        # Apply attention scaling (mscale)
+        cos = freqs.cos() * self._attention_scaling
+        sin = freqs.sin() * self._attention_scaling
+        
+        # Cache cos/sin values
+        self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
+        assert self.head_size in [64, 128, 256, 512]
+    
+    def _apply(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply rotary embedding to input tensor (NeoX-style).
+<<<CONTENT>>>
+        n = x.shape[0]
+        orig_dtype = x.dtype
+        x = x.view(n, -1, self.head_size).float()
+        rd = self.rotary_dim
+        d = rd // 2
+        x_rot = x[..., :rd]
+        x1, x2 = x_rot[..., :d], x_rot[..., d:]
+        rot = torch.cat((-x2, x1), dim=-1)
+        out_rot = x_rot * cos.view(n, 1, rd) + rot * sin.view(n, 1, rd)
+        out = torch.cat((out_rot, x[..., rd:]), dim=-1) if rd < self.head_size else out_rot
+        return out.view(n, -1).to(orig_dtype)
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply YaRN-scaled rotary embeddings to query and key tensors.
+        
+        Args:
+            positions: Position indices for each token
+            query: Query tensor of shape [seq_len, num_heads * head_size]
+            key: Key tensor of shape [seq_len, num_heads * head_size]
+            
+        Returns:
+            Tuple of (rotated_query, rotated_key) with same shapes as inputs
+        """
+        if _tail_hip.active(query, key):
+            # Use HIP fused path for efficiency
+            pos = positions.to(torch.int32)
+            q = _tail_hip.rope(
+                query.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
+            )
+            k = _tail_hip.rope(
+                key.contiguous(), pos, self._cos_sin_cache, self.head_size, self.rotary_dim
+            )
+            return q, k
+        
+        # Fallback to PyTorch implementation
+        cos_half, sin_half = self._cos_sin_cache[positions].chunk(2, dim=-1)
+        cos = torch.cat((cos_half, cos_half), dim=-1)
+        sin = torch.cat((sin_half, sin_half), dim=-1)
+        return self._apply(query, cos, sin), self._apply(key, cos, sin)
+
+
+# norm.py - Add this class after the existing RMSNormFused class
+
+class FusedAddRMSNorm(BaseOP):
+    """Fused RMS normalization with residual addition.
+    
+    Combines residual addition and RMS normalization in a single operation,
+    which is more efficient than doing them separately

@@ -136,6 +136,76 @@ _MOE_G2FUSE = _os.environ.get("MINISGL_MOE_G2FUSE", "1") != "0"
 _NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "1") != "0"
 
 
+# ---- Expert-divergence probe (diagnostic; OFF unless MINISGL_MOE_ROUTE_STATS names a JSON path).
+#
+# Answers ONE question that the spec-decode cost analysis rests on: when a verify batch of qlen=K+1
+# draft rows hits a 256-expert top-8 MoE, do those rows route to DISJOINT expert sets (so the grouped
+# GEMM genuinely has to stream ~8*qlen expert slabs and the verify cost is inherent), or do they
+# overlap heavily (in which case the cost is a kernel/alignment bug)?
+#
+# The kernel-side truth is `ntp` (num_tokens_post_padded) from moe_align: the grouped GEMM grinds
+# ntp/block_m tiles, one expert slab per tile. So blocks/D tells you whether alignment amortizes the
+# overlap that IS there. Recorded per MoE call; rows are dumped when the sample cap is hit.
+_ROUTE_STATS_PATH = _os.environ.get("MINISGL_MOE_ROUTE_STATS", "")
+_ROUTE_STATS_MAX = int(_os.environ.get("MINISGL_MOE_ROUTE_STATS_N") or 4000)
+_ROUTE_STATS_MAXTOK = int(_os.environ.get("MINISGL_MOE_ROUTE_STATS_MAXTOK") or 64)
+_route_stats_rows: list = []
+_route_stats_done = False
+
+
+def _route_stats(topk_ids: torch.Tensor, num_experts: int, block_m: int, ntp: torch.Tensor) -> None:
+    """Record one MoE call's routing shape. Syncs (unique + .tolist()) — probe only."""
+    global _route_stats_done
+    if _route_stats_done:
+        return
+    if torch.cuda.is_current_stream_capturing():  # .item() is illegal mid-capture
+        return
+    M = topk_ids.shape[0]
+    if M > _ROUTE_STATS_MAXTOK:  # prefill batch, not a decode/verify step
+        return
+    ids = topk_ids.tolist()  # [M, top_k]
+    per_expert: dict = {}
+    union_curve = []
+    seen: set = set()
+    for row in ids:
+        seen.update(row)
+        union_curve.append(len(seen))
+        for e in row:
+            per_expert[e] = per_expert.get(e, 0) + 1
+    D = len(seen)
+    pairs = M * len(ids[0]) if ids else 0
+    ideal_blocks = sum(-(-c // block_m) for c in per_expert.values())
+    _route_stats_rows.append(
+        {
+            "M": M,
+            "top_k": len(ids[0]) if ids else 0,
+            "E": num_experts,
+            "block_m": block_m,
+            "pairs": pairs,
+            "distinct": D,
+            "ntp": int(ntp.item()),
+            "blocks": int(ntp.item()) // block_m,
+            "ideal_blocks": ideal_blocks,
+            "max_rows_per_expert": max(per_expert.values()) if per_expert else 0,
+            "union_curve": union_curve,
+        }
+    )
+    if len(_route_stats_rows) >= _ROUTE_STATS_MAX:
+        import json
+
+        _route_stats_done = True
+        try:
+            import torch.distributed as dist
+
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            path = f"{_ROUTE_STATS_PATH}.rank{rank}.json"
+            with open(path, "w") as f:
+                json.dump(_route_stats_rows, f)
+            print(f"[route-stats] wrote {len(_route_stats_rows)} rows -> {path}", flush=True)
+        except Exception as exc:  # a probe must never take the serve down
+            print(f"[route-stats] dump failed: {exc}", flush=True)
+
+
 def _moe_time(bucket: str, fn):
     if not _MOE_EVERY:
         return fn()
@@ -314,6 +384,40 @@ def _route_align(
     return moe_hip.moe_route_align(g, top_k, renormalize, num_experts, block_size)
 
 
+def moe_route_sigmoid_bias(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The sigmoid + correction-bias route in ONE launch (Laguna, GLM-4.7-Flash n_group=1).
+
+    Replaces a TWELVE-kernel torch chain per sparse layer over a single [T, E] row — `logits.float()`,
+    `bias.float()`, `sigmoid`, `add`, `warpMergeSortTopK`, `bitonicSortKVInPlace`, `gather`, `sum`,
+    `+1e-20`, `div`, `*sf`, `.int().contiguous()`. Laguna-XS-2.1 pays that 39x per step (468
+    dispatches, 21.9% of ALL decode dispatches, ~1.9 us each of pure launch latency); GLM-4.7-Flash
+    pays it 46x (552). Same kernel body as `moe_topk_softmax` under a different SCORING POLICY
+    (KERNEL_CORE_POLICY) — not a second router, and not a per-model kernel: E comes from the tensor
+    and top_k / renormalize / routed_scaling_factor are runtime arguments.
+
+    SCOPE IS THE ROUTE ONLY. `moe_align` deliberately stays a separate call: folding it in needs
+    `w4a8_moe`'s signature re-plumbed and would re-open the fused kernel's `extern __shared__`
+    carve-up. So this is ~1020 route dispatches/step -> ~85, with ~85 aligns still standing.
+
+    Pass the gate logits and the bias at their NATIVE dtype. Do NOT .float() either: the core widens
+    bf16/fp16 in-register (lossless), and the engine's bias buffer is ALREADY at the model dtype
+    (bf16 for Laguna-XS-2.1-NVFP4, fp16 for QuantTrio/GLM-4.7-Flash-AWQ), so widening it here would
+    be a no-op that costs a dispatch. See the bias-dtype note at the call sites.
+    """
+    import moe_hip
+
+    engaged("moe_hip.moe_topk_sigmoid_bias")
+    g = gating_output if gating_output.is_contiguous() else gating_output.contiguous()
+    b = correction_bias if correction_bias.is_contiguous() else correction_bias.contiguous()
+    return moe_hip.moe_topk_sigmoid_bias(g, b, top_k, renormalize, routed_scaling_factor)
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
@@ -384,6 +488,8 @@ def w4a8_moe(
             "align", lambda: moe_hip.moe_align(topk_ids, E, block_m)
         )
     P = sorted_ids.shape[0]
+    if _ROUTE_STATS_PATH:
+        _route_stats(topk_ids, E, block_m, ntp)
 
     _e2m1 = "+e2m1" if weight_is_e2m1 else ""
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their

@@ -1,0 +1,58 @@
+```cpp
+#include <vector>
+#include <algorithm>
+#include <stdexcept>
+#include <iostream>
+#include <iterator>
+#include <functional>
+
+template <typename Key, typename Value, int Order>
+class BTree {
+private:
+    struct Node {
+        bool isLeaf;
+        int numKeys;
+        std::vector<Key> keys;
+        std::vector<Value> values;
+        std::vector<Node*> children;
+
+        Node(bool leaf = true) : isLeaf(leaf), numKeys(0) {
+            keys.reserve(2 * Order - 1);
+            values.reserve(2 * Order - 1);
+            if (!leaf) {
+                children.reserve(2 * Order);
+            }
+        }
+
+        ~Node() {
+            for (Node* child : children) {
+                delete child;
+            }
+        }
+    };
+
+    Node* root;
+
+    bool isFull(Node* node) const {
+        return node->numKeys == 2 * Order - 1;
+    }
+
+    bool isUnderflow(Node* node) const {
+        return node->numKeys < Order - 1;
+    }
+
+    void splitChild(Node* parent, int index) {
+        Node* fullChild = parent->children[index];
+        Node* newNode
+<<<CONTENT>>>
+ new Node(fullChild->isLeaf);
+
+        int mid = Order - 1;
+
+        newNode->numKeys = Order - 1;
+        for (int i = 0; i < Order - 1; ++i) {
+            newNode->keys[i] = fullChild->keys[i + mid + 1];
+            newNode->values[i] = fullChild->values[i + mid + 1];
+        }
+
+        if

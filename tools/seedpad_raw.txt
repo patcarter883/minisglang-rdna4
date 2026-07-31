@@ -1,0 +1,85 @@
+=============================== PADLEG TAIL=0  2026-07-31T23:21:37+10:00 ===============================
+ Network lease-gpu0-1_default Creating 
+ Network lease-gpu0-1_default Created 
+ Container lease-gpu0-1-run-run-b056d8ed97a8 Creating 
+ Container lease-gpu0-1-run-run-b056d8ed97a8 Created 
+################ PADLEN LEG=pt0 SPEC=dflash TAIL=0 GENTOK=384 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+45:[1m[2026-07-31|13:22:40|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=all) (bf16, borrow target embed/head)
+  seed-ENABLED line count = 0
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+REQ warm: prompt_tok=44 completion_tok=22 wall=1.42s TRUE_tok/s=15.51 finish=stop md5=64859ed8
+REQ PAD3400: prompt_tok=3495 completion_tok=384 wall=5.87s TRUE_tok/s=65.47 finish=length md5=c8baedde
+REQ PAD2048: prompt_tok=2143 completion_tok=384 wall=5.66s TRUE_tok/s=67.88 finish=length md5=b192d7db
+REQ PAD1024: prompt_tok=1119 completion_tok=384 wall=5.56s TRUE_tok/s=69.03 finish=length md5=31097fb1
+REQ PAD512: prompt_tok=607 completion_tok=384 wall=5.21s TRUE_tok/s=73.74 finish=length md5=df7985f4
+REQ PAD256: prompt_tok=351 completion_tok=384 wall=5.25s TRUE_tok/s=73.15 finish=length md5=7e0a2ce4
+REQ PAD128: prompt_tok=223 completion_tok=384 wall=5.53s TRUE_tok/s=69.43 finish=length md5=dea2e4c9
+REQ PAD0: prompt_tok=95 completion_tok=384 wall=4.70s TRUE_tok/s=81.62 finish=length md5=5dcd3e23
+############ ACCEPT-LEN PER REQUEST  leg=pt0 ############
+  uid=0 prompt_len=   44 steps=  12 ALL=1.833 P<128=1.833 P<64=1.833 rate=0.067
+  uid=1 prompt_len= 3495 steps=  85 ALL=4.506 P<128=3.611 P<64=3.368 rate=0.238
+  uid=2 prompt_len= 2143 steps=  90 ALL=4.256 P<128=3.853 P<64=3.200 rate=0.221
+  uid=3 prompt_len= 1119 steps=  92 ALL=4.163 P<128=4.029 P<64=3.765 rate=0.214
+  uid=4 prompt_len=  607 steps=  90 ALL=4.256 P<128=3.308 P<64=3.200 rate=0.221
+  uid=5 prompt_len=  351 steps=  93 ALL=4.118 P<128=3.583 P<64=2.909 rate=0.212
+  uid=6 prompt_len=  223 steps= 101 ALL=3.792 P<128=3.200 P<64=2.909 rate=0.191
+  uid=7 prompt_len=   95 steps=  88 ALL=4.352 P<128=3.538 P<64=3.227 rate=0.228
+[done] leg=pt0
+[driver] padleg TAIL=0 exit=0
+=============================== PADLEG TAIL=64  2026-07-31T23:23:33+10:00 ===============================
+ Container lease-gpu0-1-run-run-f0d67091c48d Creating 
+ Container lease-gpu0-1-run-run-f0d67091c48d Created 
+################ PADLEN LEG=pt64 SPEC=dflash TAIL=64 GENTOK=384 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+45:[1m[2026-07-31|13:24:24|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=64) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:24:24|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=64)
+  seed-ENABLED line count = 1
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+REQ warm: prompt_tok=44 completion_tok=384 wall=9.90s TRUE_tok/s=38.79 finish=length md5=69f24e6d
+REQ PAD3400: prompt_tok=3495 completion_tok=384 wall=6.05s TRUE_tok/s=63.42 finish=length md5=2f63dd13
+REQ PAD2048: prompt_tok=2143 completion_tok=384 wall=5.74s TRUE_tok/s=66.85 finish=length md5=a0153f29
+REQ PAD1024: prompt_tok=1119 completion_tok=384 wall=5.63s TRUE_tok/s=68.17 finish=length md5=d4f1945d
+REQ PAD512: prompt_tok=607 completion_tok=384 wall=6.11s TRUE_tok/s=62.89 finish=length md5=b91f8950
+REQ PAD256: prompt_tok=351 completion_tok=384 wall=4.87s TRUE_tok/s=78.89 finish=length md5=fcb3283a
+REQ PAD128: prompt_tok=223 completion_tok=384 wall=4.87s TRUE_tok/s=78.91 finish=length md5=e4ae09fe
+REQ PAD0: prompt_tok=95 completion_tok=384 wall=3.87s TRUE_tok/s=99.30 finish=length md5=0f67a499
+############ ACCEPT-LEN PER REQUEST  leg=pt64 ############
+  uid=0 prompt_len=   44 steps= 173 ALL=2.214 P<128=1.753 P<64=1.778 rate=0.081
+  uid=1 prompt_len= 3495 steps=  88 ALL=4.352 P<128=3.714 P<64=3.421 rate=0.224
+  uid=2 prompt_len= 2143 steps=  91 ALL=4.209 P<128=4.029 P<64=3.556 rate=0.220
+  uid=3 prompt_len= 1119 steps=  92 ALL=4.163 P<128=3.459 P<64=3.200 rate=0.212
+  uid=4 prompt_len=  607 steps= 105 ALL=3.648 P<128=3.368 P<64=3.200 rate=0.178
+  uid=5 prompt_len=  351 steps=  84 ALL=4.560 P<128=4.031 P<64=3.556 rate=0.239
+  uid=6 prompt_len=  223 steps=  87 ALL=4.402 P<128=3.368 P<64=3.200 rate=0.229
+  uid=7 prompt_len=   95 steps=  71 ALL=5.394 P<128=4.267 P<64=4.176 rate=0.294
+[done] leg=pt64
+[driver] padleg TAIL=64 exit=0
+=============================== PADLEG TAIL=none  2026-07-31T23:25:25+10:00 ===============================
+ Container lease-gpu0-1-run-run-5bc6250b2a5a Creating 
+ Container lease-gpu0-1-run-run-5bc6250b2a5a Created 
+################ PADLEN LEG=pplain SPEC=none TAIL=<unset> GENTOK=384 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+  seed-ENABLED line count = 0
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+REQ warm: prompt_tok=44 completion_tok=384 wall=5.62s TRUE_tok/s=68.34 finish=length md5=50611272
+REQ PAD3400: prompt_tok=3495 completion_tok=384 wall=6.65s TRUE_tok/s=57.78 finish=length md5=bc62da3f
+REQ PAD2048: prompt_tok=2143 completion_tok=384 wall=5.90s TRUE_tok/s=65.10 finish=length md5=360cbd95
+REQ PAD1024: prompt_tok=1119 completion_tok=384 wall=5.53s TRUE_tok/s=69.38 finish=length md5=da3e7df1
+REQ PAD512: prompt_tok=607 completion_tok=384 wall=5.29s TRUE_tok/s=72.57 finish=length md5=c8cae1da
+REQ PAD256: prompt_tok=351 completion_tok=384 wall=5.23s TRUE_tok/s=73.46 finish=length md5=61685965
+REQ PAD128: prompt_tok=223 completion_tok=384 wall=5.08s TRUE_tok/s=75.53 finish=length md5=92cf244a
+REQ PAD0: prompt_tok=95 completion_tok=384 wall=4.90s TRUE_tok/s=78.29 finish=length md5=5db399aa
+############ ACCEPT-LEN PER REQUEST  leg=pplain ############
+[done] leg=pplain
+[driver] padleg TAIL=none exit=0
+[driver] PADLEN ALL DONE 2026-07-31T23:27:26+10:00

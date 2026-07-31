@@ -1,0 +1,497 @@
+=============================== LEG TAIL=0  2026-07-31T22:56:52+10:00 ===============================
+ Network lease-gpu0-1_default Creating 
+ Network lease-gpu0-1_default Created 
+ Container lease-gpu0-1-run-run-3337e8fd78f3 Creating 
+ Container lease-gpu0-1-run-run-3337e8fd78f3 Created 
+################ LEG=t0  SPEC=dflash  TAIL=0  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 0
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|12:57:57|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=all) (bf16, borrow target embed/head)
+  seed-ENABLED line count = 0
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.29s TRUE_tok/s=12.45 finish=length out_chars=68 md5=282b24cb
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=24.74s TRUE_tok/s=64.67 finish=length out_chars=6507 md5=95ac11d7
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=19.99s TRUE_tok/s=80.05 finish=length out_chars=6420 md5=dd470205
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=4.40s TRUE_tok/s=87.26 finish=length out_chars=1397 md5=89e2cd47
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=4.58s TRUE_tok/s=83.79 finish=length out_chars=1359 md5=72db0a9f
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t0 ############
+
+=== uid=0  steps=10  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.500   accepted/step = 0.500   rate accepted/drafted = 0.089
+    P(n=0)=0.600  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=  10  emitted/step=1.500  rate=0.089
+
+=== uid=1  steps=408  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.919   accepted/step = 2.919   rate accepted/drafted = 0.196
+    P(n=0)=0.203  P(full n=k)=0.002
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.462  rate=0.106
+      P in [   32,   64): steps=  15  emitted/step=2.333  rate=0.089
+      P in [   64,  128): steps=  16  emitted/step=4.250  rate=0.217
+      P in [  128,  256): steps=  40  emitted/step=3.075  rate=0.138
+      P in [  256,  512): steps=  54  emitted/step=4.704  rate=0.247
+      P in [  512, 1024): steps= 127  emitted/step=4.055  rate=0.204
+      P in [ 1024,  inf): steps= 143  emitted/step=4.000  rate=0.203
+
+=== uid=2  steps=344  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 4.648   accepted/step = 3.648   rate accepted/drafted = 0.245
+    P(n=0)=0.172  P(full n=k)=0.035
+    accept-len vs P:
+      P in [    0,   32): steps=  14  emitted/step=2.286  rate=0.092
+      P in [   32,   64): steps=  15  emitted/step=2.333  rate=0.089
+      P in [   64,  128): steps=  19  emitted/step=3.368  rate=0.158
+      P in [  128,  256): steps=  41  emitted/step=3.171  rate=0.145
+      P in [  256,  512): steps=  45  emitted/step=5.844  rate=0.323
+      P in [  512, 1024): steps= 109  emitted/step=4.596  rate=0.240
+      P in [ 1024,  inf): steps= 101  emitted/step=5.683  rate=0.315
+
+=== uid=3  steps=82  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 4.671   accepted/step = 3.671   rate accepted/drafted = 0.255
+    P(n=0)=0.183  P(full n=k)=0.049
+    accept-len vs P:
+      P in [    0,   32): steps=  10  emitted/step=3.400  rate=0.178
+      P in [   32,   64): steps=  12  emitted/step=2.667  rate=0.111
+      P in [   64,  128): steps=  15  emitted/step=4.733  rate=0.249
+      P in [  128,  256): steps=  24  emitted/step=5.333  rate=0.289
+      P in [  256,  512): steps=  21  emitted/step=5.619  rate=0.345
+
+=== uid=4  steps=88  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 4.352   accepted/step = 3.352   rate accepted/drafted = 0.228
+    P(n=0)=0.216  P(full n=k)=0.034
+    accept-len vs P:
+      P in [    0,   32): steps=  10  emitted/step=3.200  rate=0.163
+      P in [   32,   64): steps=  12  emitted/step=3.250  rate=0.150
+      P in [   64,  128): steps=  17  emitted/step=3.941  rate=0.196
+      P in [  128,  256): steps=  29  emitted/step=4.069  rate=0.205
+      P in [  256,  512): steps=  20  emitted/step=6.350  rate=0.369
+[done] leg=t0
+[driver] leg TAIL=0 exit=0
+=============================== LEG TAIL=none  2026-07-31T22:59:04+10:00 ===============================
+ Container lease-gpu0-1-run-run-4a89feac7c08 Creating 
+ Container lease-gpu0-1-run-run-4a89feac7c08 Created 
+################ LEG=plain  SPEC=none  TAIL=<unset/none>  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : <unset>
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+  seed-ENABLED line count = 0
+REQ warm: prompt_tok=44 completion_tok=16 wall=0.71s TRUE_tok/s=22.69 finish=length out_chars=62 md5=adb5d5d0
+REQ CODE1: prompt_tok=3571 completion_tok=1548 wall=24.13s TRUE_tok/s=64.16 finish=stop out_chars=6625 md5=dfa2f530
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=23.86s TRUE_tok/s=67.05 finish=length out_chars=6216 md5=226990a1
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=4.91s TRUE_tok/s=78.27 finish=length out_chars=1347 md5=58b5306e
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=4.78s TRUE_tok/s=80.34 finish=length out_chars=1291 md5=ee797e7c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=plain ############
+  (no [spec-dbg] lines — DBG!=2 or spec off)
+[done] leg=plain
+[driver] leg TAIL=none exit=0
+=============================== LEG TAIL=32  2026-07-31T23:00:49+10:00 ===============================
+ Container lease-gpu0-1-run-run-04ced6c6e61e Creating 
+ Container lease-gpu0-1-run-run-04ced6c6e61e Created 
+################ LEG=t32  SPEC=dflash  TAIL=32  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 32
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|13:01:46|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=32) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:01:46|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=32)
+  seed-ENABLED line count = 1
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.22s TRUE_tok/s=13.17 finish=length out_chars=72 md5=4b7727b1
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=23.01s TRUE_tok/s=69.52 finish=length out_chars=6128 md5=cec1185e
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=21.98s TRUE_tok/s=72.80 finish=length out_chars=6128 md5=cec1185e
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=3.86s TRUE_tok/s=99.54 finish=length out_chars=1396 md5=f6a4727c
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=3.73s TRUE_tok/s=103.08 finish=length out_chars=1396 md5=f6a4727c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t32 ############
+
+=== uid=0  steps=8  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.875   accepted/step = 0.875   rate accepted/drafted = 0.115
+    P(n=0)=0.375  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=   8  emitted/step=1.875  rate=0.115
+
+=== uid=1  steps=378  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 4.230   accepted/step = 3.230   rate accepted/drafted = 0.216
+    P(n=0)=0.161  P(full n=k)=0.019
+    accept-len vs P:
+      P in [    0,   32): steps=  14  emitted/step=2.357  rate=0.090
+      P in [   32,   64): steps=  18  emitted/step=1.778  rate=0.052
+      P in [   64,  128): steps=  22  emitted/step=3.000  rate=0.133
+      P in [  128,  256): steps=  40  emitted/step=3.250  rate=0.150
+      P in [  256,  512): steps=  60  emitted/step=4.250  rate=0.217
+      P in [  512, 1024): steps= 107  emitted/step=4.785  rate=0.252
+      P in [ 1024,  inf): steps= 117  emitted/step=4.880  rate=0.262
+
+=== uid=2  steps=378  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 4.230   accepted/step = 3.230   rate accepted/drafted = 0.216
+    P(n=0)=0.161  P(full n=k)=0.019
+    accept-len vs P:
+      P in [    0,   32): steps=  14  emitted/step=2.357  rate=0.090
+      P in [   32,   64): steps=  18  emitted/step=1.778  rate=0.052
+      P in [   64,  128): steps=  22  emitted/step=3.000  rate=0.133
+      P in [  128,  256): steps=  40  emitted/step=3.250  rate=0.150
+      P in [  256,  512): steps=  60  emitted/step=4.250  rate=0.217
+      P in [  512, 1024): steps= 107  emitted/step=4.785  rate=0.252
+      P in [ 1024,  inf): steps= 117  emitted/step=4.880  rate=0.262
+
+=== uid=3  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+
+=== uid=4  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+[done] leg=t32
+[driver] leg TAIL=32 exit=0
+=============================== LEG TAIL=64  2026-07-31T23:02:50+10:00 ===============================
+ Container lease-gpu0-1-run-run-ca23f84f220e Creating 
+ Container lease-gpu0-1-run-run-ca23f84f220e Created 
+################ LEG=t64  SPEC=dflash  TAIL=64  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 64
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|13:03:56|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=64) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:03:56|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=64)
+  seed-ENABLED line count = 1
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.86s TRUE_tok/s=8.61 finish=length out_chars=72 md5=4b7727b1
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=22.85s TRUE_tok/s=70.02 finish=length out_chars=6454 md5=57413d18
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=21.82s TRUE_tok/s=73.33 finish=length out_chars=6454 md5=57413d18
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=3.86s TRUE_tok/s=99.38 finish=length out_chars=1396 md5=f6a4727c
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=3.73s TRUE_tok/s=102.99 finish=length out_chars=1396 md5=f6a4727c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t64 ############
+
+=== uid=0  steps=8  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.875   accepted/step = 0.875   rate accepted/drafted = 0.115
+    P(n=0)=0.375  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=   8  emitted/step=1.875  rate=0.115
+
+=== uid=1  steps=375  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 4.264   accepted/step = 3.264   rate accepted/drafted = 0.218
+    P(n=0)=0.181  P(full n=k)=0.016
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.615  rate=0.108
+      P in [   32,   64): steps=  16  emitted/step=2.125  rate=0.075
+      P in [   64,  128): steps=  25  emitted/step=2.440  rate=0.096
+      P in [  128,  256): steps=  35  emitted/step=3.686  rate=0.179
+      P in [  256,  512): steps=  56  emitted/step=4.625  rate=0.242
+      P in [  512, 1024): steps=  95  emitted/step=5.347  rate=0.290
+      P in [ 1024,  inf): steps= 135  emitted/step=4.252  rate=0.219
+
+=== uid=2  steps=375  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 4.264   accepted/step = 3.264   rate accepted/drafted = 0.218
+    P(n=0)=0.181  P(full n=k)=0.016
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.615  rate=0.108
+      P in [   32,   64): steps=  16  emitted/step=2.125  rate=0.075
+      P in [   64,  128): steps=  25  emitted/step=2.440  rate=0.096
+      P in [  128,  256): steps=  35  emitted/step=3.686  rate=0.179
+      P in [  256,  512): steps=  56  emitted/step=4.625  rate=0.242
+      P in [  512, 1024): steps=  95  emitted/step=5.347  rate=0.290
+      P in [ 1024,  inf): steps= 135  emitted/step=4.252  rate=0.219
+
+=== uid=3  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+
+=== uid=4  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+[done] leg=t64
+[driver] leg TAIL=64 exit=0
+=============================== LEG TAIL=128  2026-07-31T23:05:01+10:00 ===============================
+ Container lease-gpu0-1-run-run-172f69d882c1 Creating 
+ Container lease-gpu0-1-run-run-172f69d882c1 Created 
+################ LEG=t128  SPEC=dflash  TAIL=128  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 128
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|13:05:32|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=128) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:05:32|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=128)
+  seed-ENABLED line count = 1
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.19s TRUE_tok/s=13.42 finish=length out_chars=72 md5=4b7727b1
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=25.64s TRUE_tok/s=62.41 finish=length out_chars=6362 md5=238346dc
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=24.59s TRUE_tok/s=65.06 finish=length out_chars=6362 md5=238346dc
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=3.86s TRUE_tok/s=99.46 finish=length out_chars=1396 md5=f6a4727c
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=3.72s TRUE_tok/s=103.09 finish=length out_chars=1396 md5=f6a4727c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t128 ############
+
+=== uid=0  steps=8  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.875   accepted/step = 0.875   rate accepted/drafted = 0.115
+    P(n=0)=0.375  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=   8  emitted/step=1.875  rate=0.115
+
+=== uid=1  steps=423  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.780   accepted/step = 2.780   rate accepted/drafted = 0.186
+    P(n=0)=0.054  P(full n=k)=0.005
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.538  rate=0.103
+      P in [   32,   64): steps=  16  emitted/step=2.000  rate=0.067
+      P in [   64,  128): steps=  20  emitted/step=3.200  rate=0.147
+      P in [  128,  256): steps=  33  emitted/step=3.879  rate=0.192
+      P in [  256,  512): steps=  75  emitted/step=3.427  rate=0.162
+      P in [  512, 1024): steps= 108  emitted/step=4.741  rate=0.249
+      P in [ 1024,  inf): steps= 158  emitted/step=3.627  rate=0.178
+
+=== uid=2  steps=423  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.780   accepted/step = 2.780   rate accepted/drafted = 0.186
+    P(n=0)=0.054  P(full n=k)=0.005
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.538  rate=0.103
+      P in [   32,   64): steps=  16  emitted/step=2.000  rate=0.067
+      P in [   64,  128): steps=  20  emitted/step=3.200  rate=0.147
+      P in [  128,  256): steps=  33  emitted/step=3.879  rate=0.192
+      P in [  256,  512): steps=  75  emitted/step=3.427  rate=0.162
+      P in [  512, 1024): steps= 108  emitted/step=4.741  rate=0.249
+      P in [ 1024,  inf): steps= 158  emitted/step=3.627  rate=0.178
+
+=== uid=3  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+
+=== uid=4  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+[done] leg=t128
+[driver] leg TAIL=128 exit=0
+=============================== LEG TAIL=256  2026-07-31T23:06:43+10:00 ===============================
+ Container lease-gpu0-1-run-run-01c0cdb6c031 Creating 
+ Container lease-gpu0-1-run-run-01c0cdb6c031 Created 
+################ LEG=t256  SPEC=dflash  TAIL=256  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 256
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|13:07:46|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=256) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:07:46|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=256)
+  seed-ENABLED line count = 1
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.19s TRUE_tok/s=13.45 finish=length out_chars=72 md5=4b7727b1
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=24.99s TRUE_tok/s=64.02 finish=length out_chars=6096 md5=0de817c5
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=23.94s TRUE_tok/s=66.84 finish=length out_chars=6096 md5=0de817c5
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=3.86s TRUE_tok/s=99.38 finish=length out_chars=1396 md5=f6a4727c
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=3.72s TRUE_tok/s=103.10 finish=length out_chars=1396 md5=f6a4727c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t256 ############
+
+=== uid=0  steps=8  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.875   accepted/step = 0.875   rate accepted/drafted = 0.115
+    P(n=0)=0.375  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=   8  emitted/step=1.875  rate=0.115
+
+=== uid=1  steps=412  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.881   accepted/step = 2.881   rate accepted/drafted = 0.193
+    P(n=0)=0.068  P(full n=k)=0.005
+    accept-len vs P:
+      P in [    0,   32): steps=  15  emitted/step=2.200  rate=0.080
+      P in [   32,   64): steps=  14  emitted/step=2.357  rate=0.090
+      P in [   64,  128): steps=  22  emitted/step=2.818  rate=0.121
+      P in [  128,  256): steps=  26  emitted/step=5.077  rate=0.272
+      P in [  256,  512): steps=  80  emitted/step=3.150  rate=0.143
+      P in [  512, 1024): steps= 102  emitted/step=5.029  rate=0.269
+      P in [ 1024,  inf): steps= 153  emitted/step=3.752  rate=0.185
+
+=== uid=2  steps=412  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.881   accepted/step = 2.881   rate accepted/drafted = 0.193
+    P(n=0)=0.068  P(full n=k)=0.005
+    accept-len vs P:
+      P in [    0,   32): steps=  15  emitted/step=2.200  rate=0.080
+      P in [   32,   64): steps=  14  emitted/step=2.357  rate=0.090
+      P in [   64,  128): steps=  22  emitted/step=2.818  rate=0.121
+      P in [  128,  256): steps=  26  emitted/step=5.077  rate=0.272
+      P in [  256,  512): steps=  80  emitted/step=3.150  rate=0.143
+      P in [  512, 1024): steps= 102  emitted/step=5.029  rate=0.269
+      P in [ 1024,  inf): steps= 153  emitted/step=3.752  rate=0.185
+
+=== uid=3  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+
+=== uid=4  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+[done] leg=t256
+[driver] leg TAIL=256 exit=0
+=============================== LEG TAIL=528  2026-07-31T23:08:55+10:00 ===============================
+ Container lease-gpu0-1-run-run-96ca36ee8c97 Creating 
+ Container lease-gpu0-1-run-run-96ca36ee8c97 Created 
+################ LEG=t528  SPEC=dflash  TAIL=528  DBG=2  K=15 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedsweep
+
+  /engine/python digest      : 14363606dfc6fbeca34ca4bda2d85630  -
+  dflash.py md5              : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+  MINISGL_DFLASH_SEED_TAIL   : 528
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE (the cell is VOID if this does not show the intended tail) --
+45:[1m[2026-07-31|13:09:45|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=528) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:09:45|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=528)
+  seed-ENABLED line count = 1
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.52s TRUE_tok/s=10.53 finish=length out_chars=72 md5=4b7727b1
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=24.96s TRUE_tok/s=64.12 finish=length out_chars=6452 md5=75ed8975
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=23.90s TRUE_tok/s=66.95 finish=length out_chars=6452 md5=75ed8975
+REQ SHORT1: prompt_tok=95 completion_tok=384 wall=3.86s TRUE_tok/s=99.47 finish=length out_chars=1396 md5=f6a4727c
+REQ SHORT2: prompt_tok=95 completion_tok=384 wall=3.73s TRUE_tok/s=102.95 finish=length out_chars=1396 md5=f6a4727c
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=t528 ############
+
+=== uid=0  steps=8  prompt_len=44  emitted=15
+    ACCEPT-LEN emitted/steps = 1.875   accepted/step = 0.875   rate accepted/drafted = 0.115
+    P(n=0)=0.375  P(full n=k)=0.000
+    accept-len vs P:
+      P in [    0,   32): steps=   8  emitted/step=1.875  rate=0.115
+
+=== uid=1  steps=411  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.891   accepted/step = 2.891   rate accepted/drafted = 0.193
+    P(n=0)=0.131  P(full n=k)=0.010
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.462  rate=0.097
+      P in [   32,   64): steps=  14  emitted/step=2.500  rate=0.100
+      P in [   64,  128): steps=  19  emitted/step=3.211  rate=0.147
+      P in [  128,  256): steps=  29  emitted/step=4.448  rate=0.230
+      P in [  256,  512): steps=  62  emitted/step=4.161  rate=0.211
+      P in [  512, 1024): steps= 120  emitted/step=4.308  rate=0.221
+      P in [ 1024,  inf): steps= 154  emitted/step=3.682  rate=0.180
+
+=== uid=2  steps=411  prompt_len=3571  emitted=1599
+    ACCEPT-LEN emitted/steps = 3.891   accepted/step = 2.891   rate accepted/drafted = 0.193
+    P(n=0)=0.131  P(full n=k)=0.010
+    accept-len vs P:
+      P in [    0,   32): steps=  13  emitted/step=2.462  rate=0.097
+      P in [   32,   64): steps=  14  emitted/step=2.500  rate=0.100
+      P in [   64,  128): steps=  19  emitted/step=3.211  rate=0.147
+      P in [  128,  256): steps=  29  emitted/step=4.448  rate=0.230
+      P in [  256,  512): steps=  62  emitted/step=4.161  rate=0.211
+      P in [  512, 1024): steps= 120  emitted/step=4.308  rate=0.221
+      P in [ 1024,  inf): steps= 154  emitted/step=3.682  rate=0.180
+
+=== uid=3  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+
+=== uid=4  steps=71  prompt_len=95  emitted=383
+    ACCEPT-LEN emitted/steps = 5.394   accepted/step = 4.394   rate accepted/drafted = 0.294
+    P(n=0)=0.225  P(full n=k)=0.028
+    accept-len vs P:
+      P in [    0,   32): steps=   7  emitted/step=4.571  rate=0.238
+      P in [   32,   64): steps=  10  emitted/step=3.900  rate=0.193
+      P in [   64,  128): steps=  13  emitted/step=4.385  rate=0.226
+      P in [  128,  256): steps=  27  emitted/step=4.963  rate=0.264
+      P in [  256,  512): steps=  14  emitted/step=8.643  rate=0.514
+[done] leg=t528
+[driver] leg TAIL=528 exit=0
+[driver] ALL DONE 2026-07-31T23:10:54+10:00

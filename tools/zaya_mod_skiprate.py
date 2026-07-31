@@ -1,8 +1,12 @@
 """Measure ZAYA1 MoD 'skip' expert routing rate at DECODE (go/no-go for the skip optimization).
 
 Loads ZAYA1-8B-fp8 offline (single card, eager) and monkeypatches ZayaMoEBlock.forward to count,
-per routing decision, how often top-1 lands on the MOD skip slot (expert_idx == num_experts),
-split by prefill vs decode phase. Reports overall + per-layer decode skip rate.
+per routing decision, how often top-1 lands on the MOD skip slot, split by prefill vs decode phase.
+Reports overall + per-layer decode skip rate.
+
+The skip signal is the router's `keep` mask (0 == the raw top-1 was the skip slot), NOT the expert
+id: the fused route clamps the id to a real expert inside the kernel, so `expert_ids == num_experts`
+is unreachable by construction.
 
 Run INSIDE the lean image via gpu-lease:
     PYTHONPATH=/opt/kernels:/engine/python:/engine python /engine/tools/zaya_mod_skiprate.py
@@ -43,27 +47,33 @@ def _instrument() -> None:
         if _ov is not None:
             with torch.no_grad():
                 self.router.balancing_biases[self._num_experts] = float(_ov)
-        route_prob, expert_idx, rsn = self.router.forward(hidden_states, prev_router_states)
-        ne = self._num_experts
+        # ROUTER CONTRACT (fused route, models/zaya.py:299): FOUR values, and the ids are ALREADY
+        # CLAMPED to [0, ne-1] by the kernel epilogue. The raw winner `ne` never reaches python any
+        # more, so the old `expert_idx == ne` skip test can no longer fire — the skip signal is
+        # `keep == 0`, which the router emits (in the model dtype) exactly when the RAW winner was
+        # the MOD slot. This tool read the pre-fusion 3-tuple and that dead metric; both are fixed.
+        route_prob, expert_ids, keep, rsn = self.router.forward(hidden_states, prev_router_states)
         try:
             phase = "decode" if get_global_ctx().batch.is_decode else "prefill"
         except Exception:
             phase = "unknown"
-        n_skip = int((expert_idx == ne).sum().item())
-        n_total = int(expert_idx.numel())
+        assert keep is not None, (
+            "skip-rate is a MoD metric and the router only emits `keep` with MOD on "
+            "(config.zaya_use_mod); this checkpoint has it off, so there is no skip slot to count."
+        )
+        n_skip = int((keep == 0).sum().item())
+        n_total = int(keep.numel())
         s = STATS[(phase, lid)]
         s[0] += n_skip
         s[1] += n_total
-        # replicate the real forward using the route we already computed (avoid double router call)
-        clamped_idx = torch.clamp(expert_idx, 0, ne - 1).to(torch.int32)
-        if self._use_mod:
-            experts_out = self.experts.forward(hidden_states, topk_weights=route_prob, topk_ids=clamped_idx)
-            prob = route_prob.to(hidden_states.dtype)
-            mod_out = hidden_states * prob
-            mask = (expert_idx != ne).to(hidden_states.dtype)
-            out = mask * experts_out + (1.0 - mask) * mod_out
-        else:
-            out = self.experts.forward(hidden_states, topk_weights=route_prob, topk_ids=clamped_idx)
+        # Replicate the real forward from the route we already have (avoid a second router call).
+        # This is ZayaMoEBlock.forward verbatim, minus the router call.
+        experts_out = self.experts.forward(
+            hidden_states, topk_weights=route_prob, topk_ids=expert_ids
+        )
+        prob = route_prob.to(hidden_states.dtype)
+        mod_out = hidden_states * prob
+        out = keep * experts_out + (1.0 - keep) * mod_out
         return out, rsn
 
     Block.forward = wrapped

@@ -45,7 +45,7 @@ from minisgl.layers import (
     get_rope,
     silu_and_mul,
 )
-from minisgl.quant import create_linear_method
+from minisgl.quant import create_linear_method, kernels
 from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
@@ -239,6 +239,29 @@ class GLMSparseBlock(BaseOP):
 
     def _noaux_tc(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # logits [T, E]. Returns (topk_weights [T,top_k] f32, topk_ids [T,top_k] i32).
+        if self.n_group <= 1:
+            # Every checkpoint we serve (zai-org/GLM-4.7-Flash and QuantTrio/GLM-4.7-Flash-AWQ both
+            # ship n_group=1) takes this path: the group-topk block below is DEAD on them, and the
+            # remaining chain is byte-for-byte Laguna's. ONE launch instead of twelve.
+            #
+            # Both tensors go in at their NATIVE dtype, and THE ALREADY-TRUNCATED BIAS IS DELIBERATE
+            # — this is bit-identical to the torch chain below. The checkpoint ships
+            # e_score_correction_bias as F32, but engine.py:608 downcasts it to the MODEL dtype
+            # because there is no special case for it (QuantTrio/GLM-4.7-Flash-AWQ is fp16), and the
+            # model-side buffer is at the model dtype too — so the `.float()` below widens a value
+            # that was already truncated. Feeding the F32 checkpoint value would change expert
+            # SELECTION on near-ties: different, arguably better, and invisible to a tok/s A/B.
+            # Raise it as its own commit if at all.
+            return kernels.moe_route_sigmoid_bias(
+                logits,
+                self.gate.e_score_correction_bias,
+                self.top_k,
+                self.norm_topk_prob,
+                self.routed_scaling_factor,
+            )
+        # n_group > 1: DeepSeek-style group-limited routing. The kernel has no group-topk policy, so
+        # this stays a LIVE torch fallback — not an assert. A future checkpoint gets a slow-but-
+        # correct serve instead of a crash, and never a silently wrong router.
         scores = logits.float().sigmoid()  # routing weights come from the UN-biased scores
         choice = scores + self.gate.e_score_correction_bias.float()  # bias only steers selection
         if self.n_group > 1:

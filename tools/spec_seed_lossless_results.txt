@@ -1,0 +1,18 @@
+=== per-request md5 (reasoning_content + content) ===
+TAG    BASELINE                           CANDIDATE                          PLAIN                              VERDICT
+warm   282b24cb9bafaae62f49b73c9ee89cf5   4b7727b1c3bc8d046fa27d0d9f1e4b2e   282b24cb9bafaae62f49b73c9ee89cf5   base!=cand  base==plain  cand!=plain
+CODE1  0191b4f3170af4bb6049c96ebadad38b   76e7613373e745113e7a4b54f1e8b960   219b2448db971903ad2ee6a9b34bf202   base!=cand  base!=plain  cand!=plain
+CODE2  0191b4f3170af4bb6049c96ebadad38b   76e7613373e745113e7a4b54f1e8b960   99922ba79e36a2f0cbdb7ed018d8659b   base!=cand  base!=plain  cand!=plain
+SHORT  481c9ac1a8826a6d3085d507e1ea7086   f6a4727ce00757bbde440f72ea35db6f   c6769b598d41032c194c394c0491c2ba   base!=cand  base!=plain  cand!=plain
+
+=== CONTROL 2: is the engine byte-deterministic with spec OFF? ===
+  plain CODE1 (219b2448db971903ad2ee6a9b34bf202) != plain CODE2 (99922ba79e36a2f0cbdb7ed018d8659b)
+  -> the SAME prompt, SAME boot, temperature 0, spec OFF already produces different text.
+     Byte-identity is NOT a property of this config (fp8 KV + SWA-radix prefix-cache hit),
+     so a base-vs-cand text difference is NOT evidence that seeding corrupts the verify path.
+
+=== divergence offsets (base vs cand) ===
+  warm   differ: byte 40, line 1
+  CODE1  differ: byte 71, line 1
+  CODE2  differ: byte 71, line 1
+  SHORT  differ: byte 98, line 6

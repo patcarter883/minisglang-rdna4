@@ -261,15 +261,23 @@ class ZayaRouter(nn.Module):
 
     Checkpoint prefix: `zaya_block.router.*`."""
 
-    def __init__(self, config: ModelConfig, *, use_eda: bool, dtype: torch.dtype,
+    def __init__(self, config: ModelConfig, *, use_eda: bool, use_mod: bool, dtype: torch.dtype,
                  device: torch.device):
         super().__init__()
         hidden = config.hidden_size
         r = config.zaya_mlp_expansion  # 256
         ne = config.num_experts  # 16
         self._use_eda = use_eda
+        self._use_mod = use_mod
         self._num_experts = ne
         self._eps = config.rms_norm_eps
+        # A/B ESCAPE HATCH ONLY (the fused route is the default and is not gated). Polarity is
+        # deliberate: compose writes `VAR: "${VAR:-}"`, i.e. an EMPTY STRING, for any unset var, and
+        # an empty string must never read as an override. Unset/empty/0 -> the FUSED path.
+        self._torch_route = (
+            os.environ.get("MINISGL_ZAYA_TORCH_ROUTE", "").strip().lower()
+            not in ("", "0", "false", "no")
+        )
 
         f = dict(dtype=dtype, device=device)
         self.down_proj_weight = nn.Parameter(torch.empty(r, hidden, **f))
@@ -290,14 +298,17 @@ class ZayaRouter(nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, prev_router_states: torch.Tensor | None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Top-1 EDA/MOD route (mirror reference ZayaRouter.forward, zaya.py:384-447).
 
-        Returns (route_prob[N,1] fp32, expert_idx[N,1] int64, router_states_next[N,r]).
-        `expert_idx` may equal `num_experts` (the MOD skip slot); the caller clamps it for the
-        expert kernel and masks the skip rows. `balancing_biases` steer the CHOICE only — the
-        returned probability is the UN-biased softmax prob at the chosen expert. route_prob is fp32
-        (the fused-MoE topk-weight convention; the kernel casts to compute dtype internally)."""
+        Returns (route_prob[N,1] fp32, expert_ids[N,1] int32 CLAMPED to a real expert,
+        keep[N,1] model-dtype or None, router_states_next[N,r]).
+
+        `balancing_biases` steer the CHOICE only — the returned probability is the UN-biased softmax
+        prob at the chosen expert, WHICH MAY BE THE SKIP SLOT `num_experts`. `expert_ids` is already
+        clamped to [0, ne-1] because the skip slot has no expert weights, and `keep` (MOD only) is
+        1.0 exactly on the rows whose RAW winner was a real expert. route_prob is fp32 (the fused-MoE
+        topk-weight convention; the kernel casts to compute dtype internally)."""
         import torch.nn.functional as F
 
         from minisgl.layers.minv import minv_linear  # M-invariant: a router ULP flip reroutes experts
@@ -315,6 +326,34 @@ class ZayaRouter(nn.Module):
         x = F.gelu(x)
         logits = minv_linear(x, self.router_mlp_4_weight)  # [N, ne+1] (no bias)
 
+        ne = self._num_experts
+        if not self._torch_route:
+            # ONE launch for what the chain below spends SEVEN dispatches on (bf16->fp32 copy,
+            # softmax, +bias, topk, gather, clamp, int64->int32) plus the two the MOD blend spends
+            # on `(idx != ne).to(dtype)`. This is a SCORING POLICY on the shared router core, not a
+            # new kernel: `moe_topk_softmax_bias` ranks on `softmax_prob(e) + bias[e]` and emits the
+            # UN-BIASED prob, which is exactly ZAYA's "biases steer the CHOICE only" contract. The
+            # core reads the bf16 logits natively (the widening is lossless, so the `.float()` this
+            # deletes moved no bits) and applies the skip-slot clamp + mask in the epilogue, from the
+            # one thread that already owns the winner.
+            #
+            # The router glue is 468 of the decode step's dispatches at ~2.6 us of pure launch each;
+            # you cannot tile a dispatch floor away, only stop paying it.
+            import moe_hip
+
+            from minisgl._hip_engage import engaged
+
+            engaged("moe_hip.moe_topk_softmax_bias")
+            g = logits if logits.is_contiguous() else logits.contiguous()
+            route_prob, expert_ids, keep = moe_hip.moe_topk_softmax_bias(
+                g, self.balancing_biases, 1, False, ne - 1, self._use_mod
+            )  # [N,1] fp32 un-biased prob, [N,1] int32 clamped id, [N,1] model-dtype mask
+            return route_prob, expert_ids, (keep if self._use_mod else None), router_states_next
+
+        # ---- reference chain, kept as the A/B baseline (MINISGL_ZAYA_TORCH_ROUTE=1) -------------
+        from minisgl._hip_engage import engaged
+
+        engaged("zaya.torch_route (BASELINE: MINISGL_ZAYA_TORCH_ROUTE)")
         # zaya_high_prec -> fp32 softmax (selection-stable); biases affect CHOICE only.
         probs = torch.softmax(logits, dim=-1, dtype=torch.float32)  # [N, ne+1]
         # biases steer the CHOICE only; detach so they never feed gradients (reference zaya.py:427:
@@ -322,7 +361,10 @@ class ZayaRouter(nn.Module):
         biased = probs.detach() + self.balancing_biases  # [N, ne+1] fp32
         expert_idx = torch.topk(biased, 1, dim=-1).indices  # [N, 1] int64 (may select skip == ne)
         route_prob = torch.gather(probs, 1, expert_idx).contiguous()  # [N, 1] fp32 un-biased prob
-        return route_prob, expert_idx, router_states_next
+        # The skip slot has no expert weights: clamp for the kernel and hand the caller the mask.
+        expert_ids = torch.clamp(expert_idx, 0, ne - 1).to(torch.int32)
+        keep = (expert_idx != ne).to(hidden_states.dtype) if self._use_mod else None
+        return route_prob, expert_ids, keep, router_states_next
 
 
 # =====================================================================================
@@ -565,7 +607,7 @@ class ZayaMoEBlock(BaseOP):
         self._use_mod = config.zaya_use_mod
         self._num_experts = config.num_experts  # skip slot (MOD) == this index
         self.router = ZayaRouter(
-            config, use_eda=use_eda, dtype=torch.get_default_dtype(),
+            config, use_eda=use_eda, use_mod=self._use_mod, dtype=torch.get_default_dtype(),
             device=torch.device("meta"),
         )
         # Experts stay fp8 (F8_E4M3 + per-channel F32 scale, ~8 GB): dequant-to-bf16 at load is
@@ -599,31 +641,26 @@ class ZayaMoEBlock(BaseOP):
         The route is computed model-side; experts run via the precomputed-topk path. MOD: the
         "skip" expert (index num_experts) outputs `input * route_prob` instead of an expert MLP.
         Returns (mixer_output[N,H], router_states_next[N,r] threaded to the next MoE layer)."""
-        route_prob, expert_idx, router_states_next = self.router.forward(
+        # The router already clamps the id and (with MOD) emits the keep mask: the skip slot at
+        # index `num_experts` has no expert weights, so an unclamped `ne` would index past the last
+        # expert in the grouped kernel's gather (OOB / device assert). That clamp is MANDATORY with
+        # MOD off too — the router emits ne+1 logits either way and top-1 can still land on `ne`.
+        route_prob, expert_ids, keep, router_states_next = self.router.forward(
             hidden_states, prev_router_states
-        )  # [N,1] fp32, [N,1] int64, [N,r]
+        )  # [N,1] fp32, [N,1] int32 clamped, [N,1] model-dtype mask or None, [N,r]
 
-        ne = self._num_experts
-        if self._use_mod:
-            # Skip slot (== ne) has no real expert weights -> clamp to a valid id for the kernel,
-            # then mask its rows back out and replace with the scaled-input MOD output.
-            clamped_idx = torch.clamp(expert_idx, 0, ne - 1).to(torch.int32)
-            experts_out = self.experts.forward(
-                hidden_states, topk_weights=route_prob, topk_ids=clamped_idx
-            )  # [N,H] model-dtype
-            prob = route_prob.to(hidden_states.dtype)  # [N,1] gate, in compute dtype
-            mod_out = hidden_states * prob  # [N,H] skip-expert output (gated residual)
-            mask = (expert_idx != ne).to(hidden_states.dtype)  # [N,1] 1.0 where a real expert ran
-            out = mask * experts_out + (1.0 - mask) * mod_out
-        else:
-            # The router always emits ne+1 logits (the MOD skip slot at index ne exists even when
-            # MOD is disabled), so top-1 can still land on `ne`. Without MOD there is no skip output
-            # to substitute, but the id MUST be clamped to a real expert before the kernel gathers
-            # weights — an unclamped `ne` indexes past the last expert (OOB gather / device assert).
-            clamped_idx = torch.clamp(expert_idx, 0, ne - 1).to(torch.int32)
-            out = self.experts.forward(
-                hidden_states, topk_weights=route_prob, topk_ids=clamped_idx
-            )
+        experts_out = self.experts.forward(
+            hidden_states, topk_weights=route_prob, topk_ids=expert_ids
+        )  # [N,H] model-dtype
+        if not self._use_mod:
+            return experts_out, router_states_next
+
+        # MOD: the skip rows ran a clamped real expert whose output is discarded here and replaced
+        # by the scaled-input (gated residual) branch. `keep` is 1.0 exactly where the RAW winner
+        # was a real expert.
+        prob = route_prob.to(hidden_states.dtype)  # [N,1] gate, in compute dtype
+        mod_out = hidden_states * prob  # [N,H] skip-expert output (gated residual)
+        out = keep * experts_out + (1.0 - keep) * mod_out
         return out, router_states_next
 
     # ---- state bridge: router params live in nn._parameters; experts is a BaseOP ----

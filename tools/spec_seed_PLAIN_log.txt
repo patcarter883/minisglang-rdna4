@@ -1,0 +1,36 @@
+ Network lease-gpu0-1_default Creating 
+ Network lease-gpu0-1_default Created 
+ Container lease-gpu0-1-run-run-b27b1d8ff279 Creating 
+ Container lease-gpu0-1-run-run-b27b1d8ff279 Created 
+################ LEG=PLAIN  SPEC=none  DBG=0  K=15  KV_FP8=1  graphbs=8 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-specod
+
+  /engine/python digest      : dd0b9ebbb5ae426489a940f9a54684d1  -
+  dflash.py md5              : ed01188dceb865fd1790c05ad658453a  /engine/python/minisgl/spec/dflash.py
+  scheduler.py md5           : 835fdd053be52cf30a0b16b56d6ca419  /engine/python/minisgl/scheduler/scheduler.py
+  spec/base.py md5           : 3b3116016c05adcb4d7e29e7fcde7e33  /engine/python/minisgl/spec/base.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  SEED discriminator (grep)  : 1
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+[boot] launching...
+[boot] ready.
+-- ENGINE ARGV --
+  pid 32 : python -m minisgl --model poolside/Laguna-XS-2.1-NVFP4 --host 127.0.0.1 --port 21957 --tensor-parallel-size 2 --disable-pynccl --cache-type radix --attention-backend hip --page-size 16 --cuda-graph-max-bs 8 --max-running-requests 1 --memory-ratio 0.93 --spec-algorithm none 
+-- SEED / drafter boot lines (present ONLY on the candidate) --
+  seed-line count = 0
+REQ warm: prompt_tok=44 completion_tok=16 wall=0.73s TRUE_tok/s=22.04 finish=length out_chars=68 md5=282b24cb9bafaae62f49b73c9ee89cf5
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=24.98s TRUE_tok/s=64.06 finish=length out_chars=6312 md5=219b2448db971903ad2ee6a9b34bf202
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=23.94s TRUE_tok/s=66.84 finish=length out_chars=5910 md5=99922ba79e36a2f0cbdb7ed018d8659b
+REQ SHORT: prompt_tok=95 completion_tok=384 wall=4.93s TRUE_tok/s=77.97 finish=length out_chars=1353 md5=c6769b598d41032c194c394c0491c2ba
+-- spec counters --
+-- prefix-cache / radix lines --
+[1m[2026-07-31|12:20:36|core|rank=0][0m [33mWARNING [0m SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable)
+[1m[2026-07-31|12:20:38|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=1 seeded ring window at cached_len=32 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+[1m[2026-07-31|12:21:03|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=2 seeded ring window at cached_len=3568 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+[1m[2026-07-31|12:21:27|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=3 seeded ring window at cached_len=32 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=PLAIN ############
+  (no [spec-dbg] lines — DBG!=2 or spec off)
+[done] leg=PLAIN

@@ -18,6 +18,25 @@ if TYPE_CHECKING:
 __all__ = ["DFlashProposer"]
 
 
+# Prompt-prefill seed length, in trailing aux positions. MEASURED, not provisional: the {0,32,64,128,
+# 256,528} x {3571-tok code @1600, 95-tok instruction @384} sweep, two full replicates, is in
+# CONTINUANCE §11.8 / tools/spec_seed_tail_sweep_results.txt. 64 is the ONLY seeded tail whose four
+# long-prompt legs all beat their own boot's matched plain leg, and it is joint-best on the combined
+# score (86.2 tok/s geo-mean vs 79.7 seeding-off, 72.1 plain).
+#
+# But the number itself barely matters, and saying so is the point of this comment: on a 95-token
+# prompt tails 32..528 are BIT-IDENTICAL (same completion md5, same 5.394 accept-len, same first
+# draft chain), and on a 3.5k-token prompt the seed produces NO lift in the P<64 region where it is
+# physically able to act (2.46/2.39 seeding-off vs 2.03-2.83 seeded, unordered) — the long-prompt
+# tail-vs-tail spread is the greedy content lottery, which is 19% wide at a FIXED tail. What the seed
+# is really a function of is PROMPT LENGTH: +23.9% accept-len at 95 tokens, +16.1% at 223, +10.7% at
+# 351, then 0 to -3% from 607 out to 3495 — crossing zero at the drafter's own 512-key window. So
+# 341c4df0's eviction story is falsified (a 32-token seed cannot evict 512 keys yet behaves like the
+# 528 one), and the real follow-up is to gate seeding on prompt_len <= sliding_window, not to retune
+# this constant. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
+_SEED_TAIL_DEFAULT = 64
+
+
 class DFlashProposer(Proposer):
     """DFlash block-diffusion draft proposer.
 
@@ -368,10 +387,47 @@ class DFlashProposer(Proposer):
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
         self._kv: dict[int, list] = {}
         self._kv_plen: dict[int, int] = {}
+
+        # PROMPT-PREFILL SEED (full-context path only). Without it the drafter's aux prefix is built
+        # append-only from ACCEPTED GENERATED positions (scheduler.py:_spec_aux_hidden), so its context
+        # at generated position P is min(P, window) tokens OF ITS OWN OUTPUT and it never sees the
+        # prompt at all. Measured consequence (docs/CONTINUANCE §11.5): accept-len is a monotone
+        # function of P that saturates exactly at this window — real code 3.5 at P<32 rising to 7.4 at
+        # P=512-1024 — so every request starts starved and stays starved for ~512 tokens. Capping the
+        # drafter prefix at 8 positions collapses real code 6.150 -> 3.667, which is the causal control.
+        #
+        # Seeding is the fix, and it is bounded by the window rather than the prompt: the drafter's
+        # own mask drops every key older than `sliding_window`, so seeding more than window+block is
+        # numerically inert AND would charge O(prompt) on every later propose (attend_block re-reads
+        # the whole prefix each step). window+block covers the oldest key the last block query can
+        # still see. CCA does NOT get this: its seed is a single fused position by construction, so it
+        # has no prefix to seed (see _build_cca).
+        # HOW MUCH prompt to seed is a real trade-off, and the obvious answer is WRONG. Seeding
+        # `sliding_window + block_size` (528) was measured NET-NEGATIVE on long prompts: accept-len
+        # 4.635 -> 3.910 (-15.6%) on a 3.5k-token code prompt, giving back essentially the whole spec
+        # win — while being +22.5% on a 95-token prompt. The window is a FIXED 512 keys, so a
+        # window-sized prompt seed EVICTS the model's own recent output for ~500 generated tokens,
+        # and that recent output is what actually predicts the next token. So `P` in §11.5's table
+        # never indexed "window occupancy"; it indexed "how much of the window is my own output" —
+        # which is why the starvation reading of that table did not survive contact with the fix.
+        # The default below is therefore a small context anchor, not a window-full.
+        # MINISGL_DFLASH_SEED_TAIL overrides it (0 disables seeding entirely), mirroring how
+        # `_moe_block_m` exposes MINISGL_MOE_BLOCK_M for autotuning around a derived default.
+        self.supports_prefill_seed = True
+        _tail_env = os.environ.get("MINISGL_DFLASH_SEED_TAIL")
+        if _tail_env not in (None, ""):
+            self.prefill_aux_tail = max(0, int(_tail_env))
+            self.supports_prefill_seed = self.prefill_aux_tail > 0
+        elif sliding_window > 0:
+            self.prefill_aux_tail = min(_SEED_TAIL_DEFAULT, sliding_window + self._block_size)
+        else:
+            self.prefill_aux_tail = _SEED_TAIL_DEFAULT
+
         logger.info_rank0(
             f"DFlash Laguna drafter: {num_layers}L h={hidden} heads={num_heads}/{num_kv_heads} "
             f"block={self._block_size} mask_id={self._mask_token_id} window={sliding_window} "
-            f"causal={causal} aux_layers={self.capture_layer_ids} (bf16, borrow target embed/head)"
+            f"causal={causal} aux_layers={self.capture_layer_ids} "
+            f"prefill_seed=on(tail={self.prefill_aux_tail or 'all'}) (bf16, borrow target embed/head)"
         )
 
     def _load_laguna_weights(self, folder: str) -> None:

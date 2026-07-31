@@ -1,0 +1,162 @@
+I'll start by carefully reading both files to understand the existing implementation patterns, then implement the requested classes.
+
+Let me analyze the code structure:
+
+1. **rotary.py**: Contains `RotaryEmbedding` class with YaRN support already partially implemented in `_get_rope` function. The YaRN implementation uses a post_process function and attention_scaling.
+
+2. **norm.py**: Contains `RMSNorm` and `RMSNormFused` classes. The `RMSNormFused` already has the fused residual add logic.
+
+Now I'll implement the requested classes:
+
+```python
+# rotary.py - Add this class after the existing RotaryEmbedding class
+
+class YaRNScalingRotaryEmbedding(RotaryEmbedding):
+    """YaRN (NTK-by-parts) long-context scaling for rotary embeddings.
+    
+    Extends base rotary embedding with per-frequency interpolation between
+    low and high frequency wavelengths, plus attention-temperature (mscale)
+    correction folded into cached cos/sin tables.
+    
+    The interpolation ramp smoothly transitions between original frequencies
+    (for short context) and interpolated frequencies (for long context),
+    preventing performance degradation on sequences longer than training.
+    """
+    
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        rope_scaling: Dict[str, Any],
+        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        interleave: bool = False,
+        attention_scaling: float = 1.0,
+    ) -> None:
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base,
+            post_process=post_process, interleave=interleave,
+            attention_scaling=attention_scaling
+        )
+        self.rope_scaling = rope_scaling
+        
+    def _compute_yarn_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute YaRN-adjusted cos/sin cache with frequency interpolation.
+        
+        Returns:
+            Tuple of (cos_cache, sin_cache) with YaRN interpolation applied.
+        """
+        rotary_dim = self.rotary_dim
+        base = self.base
+        max_pos = self.max_position_embeddings
+        
+        # Get original inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        
+        # Apply YaRN post-processing if provided
+        if self._post_process is not None:
+            inv_freq = self._post_process(inv_freq)
+        
+        # Compute position indices
+        t = torch.arange(max_pos, dtype=torch.float)
+        
+        # Compute base frequencies
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        
+        # Apply YaRN interpolation ramp
+        factor = self.rope_scaling.get("factor", 1.0)
+        beta_fast = self.rope_scaling.get("beta_fast", 32.0)
+        beta_slow = self.rope_scaling.get("beta_slow", 1.0)
+        orig_max_pos = self.rope_scaling.get("original_max_position_embeddings", max_pos)
+        
+        def _find_correction_dim(num_rotations: float) -> float:
+            return rotary_dim * math.log(orig_max_pos / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+        
+        low = max(math.floor(_find_correction_dim(beta_fast)), 0)
+        high = min(math.ceil(_find_correction_dim(beta_slow)), rotary_dim // 2 - 1)
+        
+        # Create interpolation ramp
+        ramp = torch.clamp(
+            (torch.arange(rotary_dim // 2, dtype=torch.float32) - low) / max(high - low, 1),
+            0, 1,
+        )
+        
+        # Apply interpolation to frequencies
+        freqs = (freqs / factor) * ramp + freqs * (1 - ramp)
+        
+        # Apply attention scaling (mscale)
+        attn_scaling = self.rope_scaling.get("attention_factor")
+        if attn_scaling is None:
+            attn_scaling = 0.1 * math.log(factor) + 1.0
+        
+        cos = freqs.cos() * attn_scaling
+        sin = freqs.sin() * attn_scaling
+        
+        return cos, sin
+    
+    def forward(
+        self,
+        positions: torch.Tensor
+<<<CONTENT>>>
+I need to complete the implementation. Let me write the full code:
+
+```python
+# rotary.py - Add this class after the existing RotaryEmbedding class
+
+class YaRNScalingRotaryEmbedding(RotaryEmbedding):
+    """YaRN (NTK-by-parts) long-context scaling for rotary embeddings.
+    
+    Extends base rotary embedding with per-frequency interpolation between
+    low and high frequency wavelengths, plus attention-temperature (mscale)
+    correction folded into cached cos/sin tables.
+    
+    The interpolation ramp smoothly transitions between original frequencies
+    (for short context) and interpolated frequencies (for long context),
+    preventing performance degradation on sequences longer than training.
+    """
+    
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        rope_scaling: Dict[str, Any],
+        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        interleave: bool = False,
+        attention_scaling: float = 1.0,
+    ) -> None:
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base,
+            post_process=post_process, interleave=interleave,
+            attention_scaling=attention_scaling
+        )
+        self.rope_scaling = rope_scaling
+        
+    def _compute_yarn_cache(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute YaRN-adjusted cos/sin cache with frequency interpolation.
+        
+        Returns:
+            Tuple of (cos_cache, sin_cache) with YaRN interpolation applied.
+        """
+        rotary_dim = self.rotary_dim
+        base = self.base
+        max_pos = self.max_position_embeddings
+        
+        # Get original inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        
+        # Apply YaRN post-processing if provided
+        if self._post_process is not None:
+            inv_freq = self._post_process(inv_freq)
+        
+        # Compute position indices
+        t = torch.arange(max_pos, dtype=torch.float)
+        
+        # Compute base frequencies
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        
+        # Apply YaRN interpolation ramp
+        factor = self.rope_scaling.get("factor", 1.0)
+        beta_fast = self.rope_scaling.get("beta_fast",

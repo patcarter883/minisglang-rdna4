@@ -1,0 +1,46 @@
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+ Network lease-gpu0-1_default Creating 
+ Network lease-gpu0-1_default Created 
+ Container lease-gpu0-1-run-run-b642c16805d7 Creating 
+ Container lease-gpu0-1-run-run-b642c16805d7 Created 
+################ LEG=BASE_clean  SPEC=dflash  DBG=1  K=15  KV_FP8=1  graphbs=8 ################
+-- PROVENANCE (from inside the container) --
+  git rev-parse HEAD         : (no git)
+  git status --porcelain py/ : fatal: not a git repository: /home/pat/code/minisgl-rdna4/.git/worktrees/minisgl-rdna4-seedbase
+
+  /engine/python digest      : 745fd209de6c3ec3908c3961ef64634e  -
+  dflash.py md5              : 4f06871964d555d6fc91281d07fa95f4  /engine/python/minisgl/spec/dflash.py
+  scheduler.py md5           : c1c99c9babfb8324f7fc49a913083a7d  /engine/python/minisgl/scheduler/scheduler.py
+  spec/base.py md5           : 8e8f8cf8915925b096ada9381425ef6d  /engine/python/minisgl/spec/base.py
+  prompt file md5            : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+  SEED discriminator (grep)  : 0
+  /opt/minisgl/python digest : d41cf7facdf8e929fe3579526dea95c1  -
+  /opt/kernels        digest : 886f4202f9e4fea2af611f1642f84a08  -
+[boot] launching...
+[boot] ready.
+-- ENGINE ARGV --
+  pid 32 : python -m minisgl --model poolside/Laguna-XS-2.1-NVFP4 --host 127.0.0.1 --port 21957 --tensor-parallel-size 2 --disable-pynccl --cache-type radix --attention-backend hip --page-size 16 --cuda-graph-max-bs 8 --max-running-requests 1 --memory-ratio 0.93 --spec-algorithm dflash --spec-draft-model-path poolside/Laguna-XS-2.1-DFlash-NVFP4 --spec-num-draft 15 
+-- SEED / drafter boot lines (present ONLY on the candidate) --
+6:[1m[2026-07-31|12:22:08|core|rank=0][0m [33mWARNING [0m spec-decode (MHA): keeping page_size=16 (page-aware rollback; MINISGL_SPEC_MHA_PAGED opt-in — validate before making this the default)
+42:[1m[2026-07-31|12:22:38|core|rank=0][0m [33mWARNING [0m SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable); spec-decode active — snapshot/restore stride = window + num_draft + 1
+45:[1m[2026-07-31|12:22:40|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] (bf16, borrow target embed/head)
+  seed-line count = 0
+REQ warm: prompt_tok=44 completion_tok=16 wall=1.34s TRUE_tok/s=11.97 finish=length out_chars=68 md5=282b24cb9bafaae62f49b73c9ee89cf5
+REQ CODE1: prompt_tok=3571 completion_tok=1600 wall=21.51s TRUE_tok/s=74.38 finish=length out_chars=6572 md5=1e9f7b946883392ce4bfac8b81cc01dc
+REQ CODE2: prompt_tok=3571 completion_tok=1600 wall=21.81s TRUE_tok/s=73.37 finish=length out_chars=6382 md5=46e7643319918217516833e81e1eb39f
+REQ SHORT: prompt_tok=95 completion_tok=384 wall=4.41s TRUE_tok/s=87.03 finish=length out_chars=1397 md5=89e2cd47c66202c54e82851cb9248ff2
+-- spec counters --
+[1m[2026-07-31|12:23:01|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.04 over 300 reqs
+[1m[2026-07-31|12:23:07|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.25 over 400 reqs
+[1m[2026-07-31|12:23:12|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.16 over 500 reqs
+[1m[2026-07-31|12:23:18|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.31 over 600 reqs
+[1m[2026-07-31|12:23:24|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.24 over 700 reqs
+[1m[2026-07-31|12:23:30|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.37 over 800 reqs
+-- prefix-cache / radix lines --
+[1m[2026-07-31|12:22:38|core|rank=0][0m [33mWARNING [0m SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable); spec-decode active — snapshot/restore stride = window + num_draft + 1
+[1m[2026-07-31|12:22:43|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=1 seeded ring window at cached_len=32 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+[1m[2026-07-31|12:23:04|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=2 seeded ring window at cached_len=3568 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+[1m[2026-07-31|12:23:26|core|rank=0][0m [32mINFO    [0m SWA-radix HIT: uid=3 seeded ring window at cached_len=32 (sliding layers extend across the boundary; skips re-prefill of the shared prefix)
+############ P-BUCKET / DIVERGENCE ANALYSIS  leg=BASE_clean ############
+  (no [spec-dbg] lines — DBG!=2 or spec off)
+[done] leg=BASE_clean

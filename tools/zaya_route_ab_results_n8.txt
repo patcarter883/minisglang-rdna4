@@ -1,0 +1,27 @@
+# source: `git archive 4de24ce9 | tar -x` of minisgl-rdna4-specod (this line added by
+#   hand: the run predates the WT_SHA fallback the harness now carries; the tree path
+#   below is that extracted snapshot, which is why it reports as 'not a git tree').
+# tree:   /tmp/claude-1000/-home-pat-code-minisgl-rdna4/e743af7b-adeb-4a4d-aece-15768b42104b/scratchpad/snap2
+# sha:    (not a git tree — archive snapshot)  (tracked-file edits: 0)
+# image:  minisgl-rdna4:zroute-merged
+## ZAYA1-8B-fp8 TP=1, SPEC=none, graph-captured — fused route vs the torch chain
+=== BASELINE: torch route chain (MINISGL_ZAYA_TORCH_ROUTE=1) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: MINISGL_ZAYA_TORCH_ROUTE=1
+  engage witness: hip-engage] zaya.torch_route
+  moe .so md5: 98ea638a168324f3413f9388917b45be  /opt/kernels/moe_hip/moe_hip_C.cpython-312-x86_64-linux-gnu.so
+  AGGREGATE tok/s (NREQ=8): min=338.52 median=343.69 max=344.02
+  tokens=9213 wall=26.93s
+  timed-wave sha256 (NOT leg-comparable at NREQ>1): 252f0024090f8cf0aaa034e2ceb9537b
+  COHERENCE sha256 (one greedy request, 384 tokens): ede9091d7352c9d8ae514a05e46d5baf
+  sample: . The node is split into two nodes with roughly half the keys, and the middle key is moved up. But the order might depend on the B-tree type (like AVL, red-black, but B-trees are different). Each spli
+
+=== CANDIDATE: fused moe_topk_softmax_bias (default, no env) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: (absent -> fused)
+  engage witness: hip-engage] moe_hip.moe_topk_softmax_bias
+  moe .so md5: 98ea638a168324f3413f9388917b45be  /opt/kernels/moe_hip/moe_hip_C.cpython-312-x86_64-linux-gnu.so
+  AGGREGATE tok/s (NREQ=8): min=352.28 median=358.67 max=358.85
+  tokens=9213 wall=25.84s
+  timed-wave sha256 (NOT leg-comparable at NREQ>1): 252f0024090f8cf0aaa034e2ceb9537b
+  COHERENCE sha256 (one greedy request, 384 tokens): ede9091d7352c9d8ae514a05e46d5baf
+  sample: . The node is split into two nodes with roughly half the keys, and the middle key is moved up. But the order might depend on the B-tree type (like AVL, red-black, but B-trees are different). Each spli
+

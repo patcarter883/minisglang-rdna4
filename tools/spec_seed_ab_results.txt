@@ -1,0 +1,151 @@
+PROMPT-PREFILL DRAFT SEED — A/B MEASUREMENT (2026-07-31)
+=========================================================
+Tests CONTINUANCE §11.6's falsifiable prediction and closes its "served acceptance was never
+measured" coverage hole in the same legs.
+
+WHAT WAS COMPARED — two WORKTREES mounted at /engine, not an env flag
+  BASELINE  /home/pat/code/minisgl-rdna4-seedbase @ 35382357 (parent, no seed)
+  CANDIDATE /home/pat/code/minisgl-rdna4-specod   @ 67bbdfb2 (seed on; branch has since advanced
+            with two unrelated ZAYA commits — the three seed files are byte-identical to 67bbdfb2)
+
+PROVENANCE, asserted from INSIDE the container on every leg
+  image (constant, all legs) minisgl-rdna4:zroute-merged
+                             /opt/minisgl/python d41cf7fa   /opt/kernels 886f4202
+  /engine/python digest      cand dd0b9ebb   base 745fd209   (stable across that tree's own legs)
+  spec/dflash.py     md5     cand ed01188d   base 4f068719
+  scheduler/scheduler.py md5 cand 835fdd05   base c1c99c9b
+  spec/base.py       md5     cand 3b311601   base 8e8f8cf8
+  "prefill_aux_tail" grep    cand 1          base 0
+  boot lines                 cand: "DFlash Laguna drafter: ... prefill_seed=on(tail=528)"
+                                   "spec-decode: prompt-prefill draft seed ENABLED (aux tail=528)"
+                             base: seed-line count = 0   (line absent, as required)
+  python files differing between the two mounted trees: exactly 5 —
+    spec/dflash.py, scheduler/scheduler.py, spec/base.py   (the seed commit)
+    models/config.py     (another agent's ZAYA HF-detector fix; every hunk is inside `is_cca`,
+                          inert for Laguna)
+    spec/accept_gpu.py   (another agent's uncommitted new function; reached only under
+                          MINISGL_SPEC_ONDEVICE=1, which is 0 — never imported on these legs)
+
+CONFIG — PRODUCTION, not Phase 1a's
+  MINISGL_KV_FP8=1, --cache-type radix + MINISGL_SWA_RADIX=1 (Laguna is SWA-hybrid: without it the
+  engine silently downgrades radix -> naive), MINISGL_SPEC_MHA_PAGED=1 (page_size stays 16),
+  --cuda-graph-max-bs 8, --max-running-requests 1, K=15, TP=2, temperature 0, Laguna-XS-2.1-NVFP4
+  + Laguna-XS-2.1-DFlash-NVFP4, --memory-ratio 0.93.
+  Prompt CODE = tools/spec_seed_prompt.txt (md5 486e61f3, identical in both trees) — two real repo
+  source files (layers/rotary.py + layers/norm.py) plus a substantial implementation task.
+  Tokenises to 3571 prompt tokens; max_tokens=1600.  SHORT control = 95 prompt tokens / 384 tokens.
+  Non-streaming; every tok/s below is usage.completion_tokens / wall.
+
+  ! --memory-ratio 0.85 (tools/serve.sh's laguna default, and NOT raised for spec) CANNOT BOOT this
+    combination: engine.py:817 "Not enough memory for KV cache after reserving recurrent state /
+    draft model / CUDA-graph buffers". 0.93 -> KV pool 101856 tokens. `serve.sh MODEL=laguna
+    ALGORITHM=dflash` with graph capture would fail to boot today.
+
+RESULT 1 — LONG REAL-CODE PROMPT (3571 tok prompt, 1600 generated). THE HEADLINE.
+  leg               accept-len   steps  emitted  TRUE tok/s CODE1  CODE2   ms/step
+  BASELINE (dbg=2)    4.635       345    1599       75.90     79.72   61.1
+  CANDIDATE(dbg=2)    3.910       409    1599       64.17     66.96   60.9
+  BASELINE (clean)      -           -       -       74.38     73.37     -
+  CANDIDATE(clean)      -           -       -       66.63     69.61     -
+  PLAIN --spec-algorithm none                       64.06     66.84     -
+
+  Seeding costs -15.6% accept-len and -11 to -12% tok/s, reproduced on two independent boots per
+  leg. ms/step is UNCHANGED (61.1 vs 60.9), so the loss is not propose cost — it is purely worse
+  drafts. The candidate lands on top of the no-spec baseline: seeding ERASES the entire spec-decode
+  win on a long code prompt (66.6 vs plain 64.1; baseline spec 74.4).
+
+RESULT 2 — SECOND REQUEST, SAME BOOT, SAME PROMPT (radix prefix-cache hit)
+  Both legs log "SWA-radix HIT: uid=2 seeded ring window at cached_len=3568" and both produce a
+  request that is CHARACTER-IDENTICAL to the first — same md5, same step count, same per-step
+  divergence histogram, same drafts. The prefix-cache-hit seeding path the change also enables is
+  therefore measurably a NO-OP here, in both legs. (Wall time improves ~3-5% from the cheaper
+  prefill, in both legs equally.)
+
+RESULT 3 — SHORT PROMPT CONTROL (95 tok prompt, 384 generated). NOT INERT — the seed WINS here.
+  leg                accept-len   steps  emitted  TRUE tok/s   ms/step
+  BASELINE (dbg=2)     4.402        87     383      82.08       53.8
+  CANDIDATE(dbg=2)     5.394        71     383      98.88       54.6
+  BASELINE (clean)       -           -       -      87.03         -
+  CANDIDATE(clean)       -           -       -      98.72         -
+  PLAIN (no spec)      1.0           -       -      77.97         -
+  +22.5% accept-len, +13 to +20% tok/s. The sign is OPPOSITE to the long prompt, and the effect is
+  LARGER at the short prompt — the exact reverse of "payoff scales with prompt length".
+
+THE §11.6 PREDICTION — accept-len bucketed by P (= generated tokens already emitted)
+  LONG CODE PROMPT (3571 tok)                 SHORT PROMPT (95 tok)
+  P bucket   BASE    CAND    delta            P bucket   BASE    CAND    delta
+  <32        2.357   2.538   +7.7%            <32        3.400   4.571   +34%
+  32-64      1.824   2.214   +21%             32-64      2.667   3.900   +46%
+  64-128     3.300   2.750   -17%             64-128     4.733   4.385   -7%
+  128-256    2.529   5.609   +122%            128-256    3.903   4.963   +27%
+  256-512    4.722   3.134   -34%             256-512    6.579   8.643   +31%
+  512-1024   5.920   5.131   -13%
+  >1024      5.588   3.734   -33%
+  ALL        4.635   3.910   -15.6%           ALL        4.402   5.394   +22.5%
+
+  P<64 combined: code 2.065 -> 2.370 (+14.8%);  short 3.000 -> 4.176 (+39%).
+
+  The seed IS reaching the drafter, and the cleanest proof is not the bucket table but the FIRST
+  DECODE STEP: baseline logs `P=0 k=0 n=0 emitted=1 draft=None` — it cannot draft at all, its aux
+  is empty — while the candidate logs `P=0 k=15` with a real 15-token chain. Immediate-divergence
+  probability P(n=0) on the code prompt drops 0.162 -> 0.051.
+
+  But the low-P buckets move by +8 to +21%, NOT from ~3.5 to ~7.4. The starvation reading of §11.5
+  is therefore FALSIFIED as a causal account: filling the drafter's window with prompt hidden states
+  does not buy the acceptance that the same window filled with the model's own generated tokens
+  buys. P does not index "window occupancy"; it indexes "how much of the window is the model's own
+  recent output". A 528-position prompt seed EVICTS that output from a 512-wide window for the first
+  ~500 generated tokens, which is why the long-prompt legs get WORSE overall while the 95-token
+  prompt (which cannot evict anything — the whole seed fits well inside the window alongside the
+  generated tail) gets better.
+
+  Indexing was checked and is NOT the bug: the seed is the tail ENDING at the prompt's last
+  position and the consumer derives ctx_start = cached_len - P, so absolute RoPE positions line up
+  (scheduler.py:2318-2322, spec/dflash.py:552-554).
+
+LOSSLESSNESS — the byte-identity gate CANNOT BE RUN on this config, for reasons that predate the seed
+  tag    BASELINE   CANDIDATE  PLAIN      verdict
+  warm   282b24cb   4b7727b1   282b24cb   base==plain, cand differs
+  CODE1  0191b4f3   76e76133   219b2448   all three differ
+  CODE2  0191b4f3   76e76133   99922ba7   all three differ
+  SHORT  481c9ac1   f6a4727c   c6769b59   all three differ
+
+  CONTROL 1: BASELINE spec already differs from PLAIN on CODE1, CODE2 and SHORT. Spec-vs-plain byte
+             identity is NOT a property of this build/config, so a base-vs-cand difference is not
+             evidence that seeding corrupts the verify path.
+  CONTROL 2: PLAIN CODE1 (219b2448) != PLAIN CODE2 (99922ba7) — the SAME prompt, SAME boot,
+             temperature 0, spec ENTIRELY OFF, and the text still differs across the radix
+             prefix-cache hit. And BASELINE CODE1 differs between its own two boots (0191b4f3 vs
+             1e9f7b94). The engine is not byte-deterministic here at all.
+  Cause is the production config, not spec: fp8 KV quantisation (MINISGL_KV_FP8=1) makes the KV a
+  function of how many positions are written per step, and the SWA-radix ring reuse changes it
+  again on a hit. §11's exact reproductions were all at MINISGL_KV_FP8=0.
+  VERDICT: no losslessness violation can be attributed to the seed, and none is demonstrable in
+  either direction on this config. Anyone wanting a real byte-identity gate must run it at
+  MINISGL_KV_FP8=0 with the prefix cache cold.
+  COHERENCE: read on every leg. All legs produce coherent, on-task, correctly-referencing code
+  (they cite the actual RotaryEmbedding / RMSNorm classes from the pasted files). No degradation.
+
+BOTTOM LINE
+  Seeding did NOT lift acceptance where the diagnosis said it would. On the workload the change was
+  built for — a 3.5k-token real code prompt — it costs 15.6% accept-len and 12% tok/s and gives back
+  the whole spec-decode win. It helps, by +22% accept-len / +13-20% tok/s, only on a SHORT prompt,
+  where the seed fits inside the drafter's window without evicting generated context.
+  DO NOT SHIP AS AN UNCONDITIONAL DEFAULT.
+  The one obvious follow-up, cheap and directly implied by the sign flip: sweep
+  `prefill_aux_tail` DOWN (528 -> 128 -> 64 -> 32). The measured pattern predicts the long-prompt
+  regression shrinks and probably turns positive as the seed stops evicting the generated tail —
+  i.e. the right amount of prompt context is a small one, not a window-full.
+
+REPRODUCE
+  tools/spec_seed_ab.sh        (in each worktree; LEG/SPEC/DBG/MAXTOK env)
+  tools/spec_seed_prompt.txt   (the 3571-token real-code prompt, identical in both trees)
+  tools/spec_seed_lossless.sh  (host-side byte gate + both controls)
+  Per-leg raw output: tools/spec_seed.<LEG>.out and .server.log; per-request text dumps
+  tools/spec_seed.<LEG>.<tag>.txt.
+  Run:  MINISGL_IMAGE=minisgl-rdna4:zroute-merged \
+        MINISGL_CMD='LEG=X SPEC=dflash DBG=2 bash /engine/tools/spec_seed_ab.sh' \
+        gpu-lease -n 2 -- docker compose --profile run run --rm run
+  NOTE the image: minisgl-rdna4:lean is STALE for these commits — 28d460df wired
+  moe_hip.moe_topk_sigmoid_bias into Laguna and lean's /opt/kernels does not export it
+  (AttributeError at the first forward). zroute-merged does.

@@ -259,10 +259,28 @@ class ModelConfig:
         is_cca = (model_type == "zaya") or bool(getattr(config, "cca", False))
         # HF-format ZAYA fuses attn+MoE into ONE decoder layer (num_hidden_layers = #blocks); minisgl
         # models them as TWO alternating layers (even=CCA-attn, odd=MoE), so double the count. The
-        # Megatron-export config already ships the split (80) count. Detector: the HF-only `layer_types`
-        # key (Megatron config lacks it). See docs/zaya-port/HF_FORMAT_LOADER.md.
+        # Megatron-export config already ships the split (80) count. See docs/zaya-port/HF_FORMAT_LOADER.md.
+        #
+        # DETECT ON A MEGATRON KEY, NEVER ON AN HF ONE. The old detector was `layer_types is not
+        # None` ("the Megatron config lacks it"). That premise died: transformers >=5.13 SYNTHESIZES
+        # `layer_types` (80x'hybrid') for any config carrying `sliding_window`, which the Megatron
+        # export does — so the detector fired on the Megatron export, doubled 80 -> 160, and the
+        # loader died with KeyError: 'model.layers.80.input_norm.weight' before any forward ran.
+        # Every HF-side name is equally unusable for the same reason: measured under transformers
+        # 5.13.0, the Megatron export's LOADED config also reports `num_experts_per_tok`=1,
+        # `moe_intermediate_size`=2048, `router_hidden_size`=256 and `rms_norm_eps` purely from
+        # ZayaConfig class defaults, though its config.json has none of them. Only the reverse
+        # direction is safe: these Megatron-export spellings have NO class default, so getattr sees
+        # them iff the file shipped them (measured absent on the HF-format ZAYA1-8B-MXFP4 config).
+        # Tie it to `is_cca` so a non-ZAYA config that happens to carry one of these names (e.g.
+        # `norm_epsilon`) cannot be dragged into this branch.
+        _MEGATRON_ZAYA_KEYS = ("moe_router_topk", "ffn_hidden_size", "zaya_mlp_expansion",
+                               "num_query_groups", "norm_epsilon")
+        _megatron_zaya = is_cca and any(
+            getattr(config, k, None) is not None for k in _MEGATRON_ZAYA_KEYS
+        )
         num_layers = config.num_hidden_layers
-        _hf_zaya = is_cca and getattr(config, "layer_types", None) is not None
+        _hf_zaya = is_cca and not _megatron_zaya
         if _hf_zaya:
             num_layers = num_layers * 2
         # Zaya names kv heads `num_query_groups` (Megatron) / `num_key_value_heads` (HF); top-k

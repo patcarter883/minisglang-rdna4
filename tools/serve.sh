@@ -61,6 +61,7 @@ case "$MODEL" in
   laguna|poolside/Laguna-XS-2.1-NVFP4)
                   model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
                   dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85"
+                  mem_default_spec="0.93"
                   swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
@@ -71,6 +72,13 @@ esac
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
 
 ATTN="${ATTN:-$attn}"
+# Laguna's 0.85 default leaves too little KV pool once a DFlash drafter AND the verify graphs are
+# also resident: `MODEL=laguna SPEC=dflash` at TP=2 with graph capture dies in engine.py's
+# `num_pages <= 1` check before serving a single token. Measured: 0.85 fails, 0.93 boots. The
+# per-model default is sized for PLAIN decode, so raise it when a draft model has to fit beside it.
+if [[ -n "${mem_default_spec:-}" && "$SPEC" != "none" && -n "$SPEC" ]]; then
+  mem_default="$mem_default_spec"
+fi
 MEM_RATIO="${MEM_RATIO:-$mem_default}"
 # Graph capture must cover the concurrency you serve, or requests above the captured batch size fall
 # back to eager and the served config is not the measured one. Default to CONC, floor of 8.

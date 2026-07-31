@@ -1,0 +1,133 @@
+I'll start by carefully reading both files to understand the existing code structure and patterns.
+
+Looking at the code, I need to:
+1. Add `YaRNScalingRotaryEmbedding` to rotary.py - this should extend the existing rotary embedding with YaRN long-context scaling
+2. Add `FusedAddRMSNorm` to norm.py - this should fuse residual add into normalization
+
+Let me implement both classes:
+
+```python
+# FILE: python/minisgl/layers/rotary.py (modified)
+from __future__ import annotations
+
+import functools
+import math
+from typing import Any, Callable, Dict, Tuple
+
+import torch
+
+from . import _tail_hip
+from .base import StateLessOP
+
+
+class RotaryEmbedding(StateLessOP):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        interleave: bool = False,
+        attention_scaling: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        # YaRN attention temperature (mscale): the reference scales cos/sin by this factor so the
+        # roped q/k magnitude compensates for the frequency interpolation (transformers
+        # `cos = emb.cos() * attention_scaling`). 1.0 for every non-yarn rope (a no-op).
+        self._attention_scaling = attention_scaling
+        # Interleaved RoPE (GLM-4.x `rope_interleave=True`): the rotary dims are laid out as adjacent
+        # pairs (x0,x1),(x2,x3),... each rotated by ONE frequency, vs the NeoX/Llama "rotate-half"
+        # split ([:d] | [d:]). Same rotation formula, DIFFERENT input pairing — applying NeoX to an
+        # interleaved-weight model mis-assigns every frequency and scrambles relative position
+        # (grammatical output that loses precise reasoning). The tail_hip.rope kernel is NeoX-only, so
+        # the interleaved path stays in torch.
+        self.interleave = interleave
+        # Partial rotary (Qwen3.5: rotary_dim < head_size): rotate the first rotary_dim dims of
+        # each head, pass the rest through. rotary_dim == head_size is the full-rotary default.
+        assert rotary_dim <= head_size and rotary_dim % 2 == 0
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        if post_process is not None:
+            inv_freq = post_process(inv_freq)
+        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos() * self._attention_scaling
+        sin = freqs.sin() * self._attention_scaling
+        # buffer, so don't load/save
+        self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
+        assert self.head_size in [64, 128, 256, 512]
+
+    def _apply(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: [n, num_heads * head_size] -> NeoX rotate-half RoPE, fp32 internal, in-dtype out.
+        # cos/sin are rotary_dim wide; only the first rotary_dim dims of each head are rotated
+        # (partial rotary), the remaining [rotary_dim:head_size] pass through unchanged.
+        n = x.shape[0]
+        orig_dtype = x.dtype
+        x = x.view(n, -1, self.head_size).float()
+        rd = self.rotary_dim
+        d = rd // 2
+        x_rot = x[..., :rd]
+        x1, x2 = x_rot[..., :d], x_rot[..., d:]
+        rot = torch.cat((-x2, x1), dim=-1)
+        out_rot = x_rot * cos.view(n, 1, rd) + rot * sin.view(n, 1, rd)
+        out = torch.cat((out_rot, x[..., rd:]), dim=-1) if rd < self.head_size else out_rot
+        return out.view(n, -1).to(orig_dtype)
+
+    def _apply_interleave(
+        self, x: torch.Tensor, cos_half: torch.Tensor, sin_half: torch.Tensor
+    ) -> torch.Tensor:
+        # Interleaved RoPE
+<<<CONTENT>>>
+I'll start by carefully reading both files to understand the existing code structure and patterns.
+
+Looking at the code, I need to:
+1. Add `YaRNScalingRotaryEmbedding` to rotary.py - extending rotary embedding with YaRN long-context scaling
+2. Add `FusedAddRMSNorm` to norm.py - fusing residual add into normalization
+
+Let me implement both classes:
+
+```python
+# FILE: python/minisgl/layers/rotary.py (modified)
+from __future__ import annotations
+
+import functools
+import math
+from typing import Any, Callable, Dict, Tuple
+
+import torch
+
+from . import _tail_hip
+from .base import StateLessOP
+
+
+class RotaryEmbedding(StateLessOP):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        post_process: None | Callable[[torch.Tensor], torch.Tensor] = None,
+        interleave: bool = False,
+        attention_scaling: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        # YaRN attention temperature (mscale): the reference scales cos/sin by this factor so the
+        # roped q/k magnitude compensates for the frequency interpolation (transformers
+        # `cos = emb.cos() * attention_scaling`). 1.0 for every non-yarn rope (a no-op).
+        self._attention_scaling = attention_scaling
+        # Interleaved RoPE (GLM-4.x `rope_interleave=True`): the rotary dims are laid out as adjacent
+        # pairs (x0,x1),(x2,x3),... each rotated by ONE frequency, vs the NeoX/Llama "rotate-half"
+        # split ([:d] | [d:]). Same rotation formula, DIFFERENT input pairing — applying NeoX to an
+        # interleaved-weight model mis-assigns every frequency and scrambles relative position
+        # (grammatical output that loses precise reasoning). The tail_hip.rope kernel is NeoX-only, so
+        # the interleaved path stays in torch.
+        self.interleave = interleave
+        # Partial rotary (Qwen3.5: rotary_dim < head_size): rotate the first rotary_dim dims of
+        # each head, pass the rest through. rotary_dim == head_size is the full-rotary default.
+        assert rotary_dim <= head_size and rotary_dim % 2 == 0
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float)

@@ -1,0 +1,34 @@
+## Laguna-XS-2.1-NVFP4 — E=256, top_k=8, sf=2.5, 39 sparse layers
+=== laguna TORCH BASELINE (12 kernels/layer) ===
+  PID1 baseline env: MINISGL_MOE_ROUTE_TORCH_BASELINE=1
+  image carries the op: 3
+  [hip-engage] moe_topk_sigmoid_bias: absent -> torch chain
+  TRUE tok/s (NREQ=1): min=74.08 median=74.21 max=74.28
+  tokens=1920 wall=25.88s
+  sample: 3. **Handle root split**: If splitting the root, create a new root with the promoted key, increasing tree height by 1 Example with order 4 (max 3 keys per node): ``` Before split: 
+
+=== laguna FUSED (1 launch/layer) ===
+  PID1 baseline env: MINISGL_MOE_ROUTE_TORCH_BASELINE=
+  image carries the op: 3
+  [hip-engage] moe_topk_sigmoid_bias: PRESENT -> FUSED route fired
+  TRUE tok/s (NREQ=1): min=80.99 median=81.37 max=81.47
+  tokens=1920 wall=23.61s
+  sample: Example For a B-tree of order 4 (max 3 keys per node): ``` Insert keys: 10, 20, 5, 15, 25, 30 ``` After inserting 10, 20, 5: Node contains [5, 10, 20] Insert 15: Node overflows, sp
+
+## GLM-4.7-Flash-AWQ — E=64, top_k=4, sf=1.8, 46 sparse layers, n_group=1
+=== glm TORCH BASELINE (12 kernels/layer) ===
+  PID1 baseline env: MINISGL_MOE_ROUTE_TORCH_BASELINE=1
+  image carries the op: 3
+  [hip-engage] moe_topk_sigmoid_bias: absent -> torch chain
+  TRUE tok/s (NREQ=1): min=55.55 median=55.63 max=55.67
+  tokens=1915 wall=34.43s
+  sample: Critical Mechanism):** * Trigger condition (node full). * The split algorithm (median key, left/right children). * Propagation up the tree (recursive nature). * **Range Scans:** Ex
+
+=== glm FUSED (1 launch/layer) ===
+  PID1 baseline env: MINISGL_MOE_ROUTE_TORCH_BASELINE=
+  image carries the op: 3
+  [hip-engage] moe_topk_sigmoid_bias: PRESENT -> FUSED route fired
+  TRUE tok/s (NREQ=1): min=60.29 median=60.47 max=60.64
+  tokens=1915 wall=31.66s
+  sample: , no random disk I/O). * **Summary/Conclusion:** Why it's used (SQL indexes, filesystems). 4. **Drafting Content - Section by Section:** * **Introduction:** * B-tree stands for "Ba
+
