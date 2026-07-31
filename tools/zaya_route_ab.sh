@@ -35,7 +35,8 @@
 # It also made the committed results irreproducible, because they were in fact produced from an
 # isolated snapshot rather than from the path the script named. Pass a snapshot you own:
 #     cd /home/pat/code/minisgl-rdna4 && git worktree add /home/pat/code/minisgl-rdna4-<task> <sha>
-#   or, for a read-only measurement of a committed state:
+#   or, for a read-only measurement of a committed state (then pass WT_SHA=<sha>, since an
+#   extracted archive is not a repo and cannot report its own commit):
 #     mkdir /tmp/snap && git archive <sha> | tar -x -C /tmp/snap
 # The tree path, its git sha, its dirty/clean state, the image tag and the in-container moe .so md5
 # are all written into the results file, so a banked number always names the thing that produced it.
@@ -57,7 +58,8 @@ NAME=zaya-route-ab
 # Provenance of the SOURCE side, recorded before anything is served. `git -C` on a plain `git
 # archive` snapshot has no repo — that is fine and is reported as such, since the snapshot is by
 # construction a committed state; a WORKTREE that is dirty is the case worth shouting about.
-_wt_sha=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "(not a git tree — archive snapshot)")
+_wt_sha=$(git -C "$WT" rev-parse HEAD 2>/dev/null \
+          || echo "${WT_SHA:-(not a git tree — archive snapshot; pass WT_SHA to name the commit)}")
 _wt_dirty=$(git -C "$WT" status --porcelain -uno 2>/dev/null | wc -l)
 {
   echo "# tree:   $WT"
@@ -96,7 +98,7 @@ serve_up() {   # serve_up <extra -e args...>
 
 bench() {
   NREQ="$NREQ" PORT="$PORT" python3 - <<'PY'
-import json, os, time, urllib.request
+import hashlib, json, os, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 BASE=f"http://localhost:{os.environ['PORT']}"
 # Ask the server what it is serving rather than reconstructing serve.sh's model table here — the
@@ -105,10 +107,10 @@ MODEL=json.loads(urllib.request.urlopen(f"{BASE}/v1/models", timeout=10).read())
 NREQ=int(os.environ["NREQ"])
 PROMPT=("Write a detailed technical explanation of how a B-tree index works, including "
         "insertion, node splitting, and range scans.")
-def run(i=0, mt=384):
+def run(i=0, mt=384, txt=None):
     # A distinct suffix per stream keeps the requests from sharing a radix-cache prefix, so all NREQ
     # really do decode concurrently instead of collapsing onto one cached sequence.
-    txt = PROMPT if NREQ == 1 else f"{PROMPT} (variant {i})"
+    txt = txt if txt is not None else (PROMPT if NREQ == 1 else f"{PROMPT} (variant {i})")
     b={"model":MODEL,"messages":[{"role":"user","content":txt}],"max_tokens":mt,
        "temperature":0.0,"stream":False}          # NON-streaming: usage.completion_tokens is truth
     r=urllib.request.Request(f"{BASE}/v1/chat/completions",data=json.dumps(b).encode(),
@@ -119,14 +121,29 @@ def wave(mt=384):
     t=time.perf_counter()
     with ThreadPoolExecutor(NREQ) as ex:
         res=list(ex.map(lambda i: run(i, mt), range(NREQ)))
-    return time.perf_counter()-t, sum(n for n,_ in res), res[0][1]
+    return time.perf_counter()-t, sum(n for n,_ in res), [c for _,c in res]
 wave(64)                                             # warm (capture + radix)
 w=[wave() for _ in range(3 if NREQ > 1 else 5)]
 tps=sorted(n/t for t,n,_ in w)
 label="AGGREGATE tok/s" if NREQ > 1 else "TRUE tok/s"
 print(f"  {label} (NREQ={NREQ}): min={tps[0]:.2f} median={tps[len(tps)//2]:.2f} max={tps[-1]:.2f}")
 print(f"  tokens={sum(n for _,n,_ in w):.0f} wall={sum(t for t,_,_ in w):.2f}s")
-print("  sample:", " ".join(w[0][2].split())[:200])
+# COHERENCE, banked as a comparable value rather than eyeballed. Greedy decoding + top-1 routing
+# means there is no second expert to average a routing error away: ONE rerouted token changes the
+# whole continuation, so a digest catches what a 200-char sample cannot.
+#
+# IT IS A SEPARATE, SINGLE-STREAM REQUEST ON PURPOSE. The digest over the TIMED waves is NOT
+# comparable between legs at NREQ>1 — continuous batching composes batches differently run to run,
+# which changes the fused-MoE M and with it the reduction order, so the text legitimately diverges
+# for reasons that have nothing to do with the router (measured on this harness: 9214 vs 9213
+# tokens over 24 requests, both legs coherent). A lone greedy request has no such freedom, so THIS
+# is the digest that must match across legs; the timed one is printed only as a batching witness.
+print("  timed-wave sha256 (NOT leg-comparable at NREQ>1):",
+      hashlib.sha256("\u0000".join(c for _,_,cs in w for c in cs).encode()).hexdigest()[:32])
+_n, _txt = run(0, 384, txt=PROMPT)
+print(f"  COHERENCE sha256 (one greedy request, {_n} tokens):",
+      hashlib.sha256(_txt.encode()).hexdigest()[:32])
+print("  sample:", " ".join(_txt.split())[:200])
 PY
 }
 
