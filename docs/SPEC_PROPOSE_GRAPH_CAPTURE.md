@@ -65,7 +65,11 @@ around warmup AND capture · side-stream warmup ×2 then shared-pool capture · 
 | **DFlash (z-lab / CCA)** | same entry point, different drafter | **EAGER by construction** — see §4. |
 | **EAGLE3** | K-step chain over the draft layer | **CAPTURED**, default ON. Required new `step_masked`/`seed_buffered`/`draft_buffer_dims` on the draft model. |
 | **TiDAR** | `_tidar_block_predict` = the K+1 verify graph | Already captured before this work. Unchanged. |
-| **DDTree** | has no `propose` — it is a scheduler MODE | See §5. Its three forwards are all captured; its tree ASSEMBLY cannot be. |
+| **DDTree** | has no `propose` — it is a scheduler MODE | See §5. Its tree ASSEMBLY cannot be captured. Its F1 propose is DFlash's, and that is now **observed** engaged (`propose-graph replay=148 eager=0`) rather than asserted — DDTree could not boot on Laguna at all until the fix in §4/§5. |
+
+The `propose-graph` field of the `[spec-timing]` line is the readout for this table, and it now
+distinguishes `captured` from `ALWAYS-EAGER(never: …)` from `ALWAYS-EAGER(failed: …)`. A row that is
+eager by construction no longer prints as `eager=0`.
 
 ### 2.1 MTP
 Slot = `req.table_idx`; `_cur[slot]` = committed draft-KV length; the KV lives in one global
@@ -207,6 +211,19 @@ specific to this stack (GDN-hybrid + AWQ MoE), it is upstream of propose, and it
 **Not chased — recorded.** A greedy serve that does not reproduce itself is worth its own
 investigation.
 
+**Independently confirmed at the SERVED-TEXT level** (review follow-up, `tools/fixgate_neutral.txt`),
+which matters because a later review reported that fp8 KV alone explained it. It does not. With
+**both** `MINISGL_KV_FP8=0` **and** `MINISGL_MOE_G2FUSE=0`, one greedy prompt at fixed seed, issued
+twice inside a single boot:
+
+* `753f08d2` returned **two different completions** at max_tokens 128;
+* the fixed tree returned **the same two, in the opposite order**, and two more at 256.
+
+So Qwen3.6-35B-A3B-AWQ is nondeterministic at the emitted-text level from ~128 tokens, on **both**
+trees, with every known nondeterminism source disabled. Laguna + DFlash under the identical harness
+is `repeat=SAME` at all four lengths. It is intermittent (some boots reproduce cleanly at all
+lengths), which is why a single clean run must not be read as "the floor is zero" on this model.
+
 What IS established for MTP: capture engages 100% (`replay=N eager=0`), propose drops 5.7 → 5.4
 ms/step, and losslessness is structural — verify gates every emitted token regardless of what the
 drafter proposes.
@@ -229,6 +246,26 @@ This is a property of those checkpoints, not a switch.
 
 `DFlashProposer.propose` dispatches on the drafter, and `propose_capturable` is set by
 `_build_laguna` only when `causal and sliding_window > 0`.
+
+### These configurations used to CRASH the engagement readout, and used to READ GREEN
+
+Two defects found in review, both fixed, both re-gated by `tools/fixgate_capture_crash.sh`:
+
+1. **`propose_capture_stats` assumed the capture state existed.** Inheriting `CapturableProposer`
+   declares a proposer *can* be captured; whether it *is* depends on the checkpoint. DFlash skips
+   `init_propose_capture` for every drafter above (and for `MINISGL_DFLASH_PERSIST_KV=0`), so
+   `self._pc_replays` did not exist — and the scheduler's timing line dereferenced it every 50
+   steps. With `MINISGL_SPEC_TIMING=1` (both compose-forwarded) the worker died mid-serve:
+   `AttributeError: 'DFlashProposer' object has no attribute '_pc_replays'`. It killed exactly the
+   configurations the capture work claimed to have "verified at runtime", under exactly the
+   diagnostic added to prove those claims. Now read through `getattr`, as the base stub always was.
+2. **100% eager rendered as `eager=0`.** Any proposer with no captured propose (n-gram, TiDAR, the
+   drafters above, DP+EP) fell through to the base stub's `(0, 0, [])`, so the line read
+   `propose-graph replay=0 eager=0` — the exact "green number over a silent eager fallback" this
+   whole exercise exists to prevent. `propose_capture_stats` now returns a `ProposeCaptureStats`
+   carrying a **mode** (`captured` / `never` / `failed`) plus a reason, and the line renders
+   `propose-graph ALWAYS-EAGER(never: <why>)` instead. `never` is by construction; `failed` is a
+   degradation (graphs off, capture OOM'd) and is named as one.
 
 ---
 
@@ -287,7 +324,51 @@ data (`tree.parent`) is already on the host. `ddtree.ancestor_block_host` now as
 `[tree_qlen, tree_qlen]` block in Python for ONE H2D copy. **Byte-identical content — no proposed or
 accepted token changes.**
 
+### DDTree could not BOOT on the one model where it mattered — now it can
+
+Review finding, and it invalidated the sentence "its F1 propose is DFlash's, so it is captured by
+this work": `MINISGL_DFLASH_DDTREE=1` on **Laguna** — the only model whose DFlash drafter has a
+capturable propose — died at boot with
+
+```
+AssertionError: SWA metadata missing (is_swa_hybrid not wired?)      attention/rdna4.py
+  <- GraphRunner.capture_ddtree_verify_graphs                        engine/graph.py
+```
+
+because `RDNA4Backend._ddtree_verify_metadata_static` (`attention/hip.py`) populates **no** `swa_*`
+fields, while the K+1 verify capture allocates a per-qlen ring block table and `out_loc`. So the
+first sliding layer of the capture *warmup* asserted, and no DDTree serve could ever exercise the
+captured propose. The crash is **pre-existing**: reproduced here on `753f08d2`, and the review
+reports the identical assert on the phase parent `d276137c` with `git diff` showing this phase never
+touched that metadata function. "Pre-existing" does not make "unverifiable" acceptable, though, and
+it was not disclosed.
+
+**Fix:** `capture_ddtree_verify_graphs` now **declines** on an SWA-hybrid model with a warning
+instead of asserting. The tree-verify runs eager there — the scheduler's own `prepare_metadata` does
+build the SWA fields, so the eager path is complete — which is slower but **runnable, and therefore
+gateable**. Wiring a sliding-window ring at `tree_qlen` is the real fix and is a separate change
+(and is of doubtful value while `tree_qlen = 33` sits past the M≤16 boundary anyway).
+
+Gate: `tools/fixgate_ddtree.sh` — pre-fix must crash, fixed must serve, must show DFlash PROPOSE
+capture engaged *under DDTree*, and must be reproducible boot-to-boot. **Result**
+(`tools/fixgate_ddtree.txt`, Laguna TP=2, `MINISGL_KV_FP8=0`):
+
+* pre-fix `753f08d2`: `NEVER BECAME READY`, `AssertionError: SWA metadata missing` out of
+  `Capturing ddtree-verify graphs` — and note it dies *after* `DFlash PROPOSE graphs CAPTURED
+  buckets=[1]`, which is precisely why the capture claim looked fine and was untestable.
+* fixed: `ddtree-verify CUDA graph: SKIPPED on an SWA-hybrid model … runs EAGER`, then coherent text,
+  and — the point of the exercise — **`propose-graph replay=148 eager=0 buckets=[1]`**. The DFlash
+  captured propose is now *observed* engaged under DDTree instead of asserted.
+* reproducibility: two independent boots agree byte-for-byte at 64 and 128 tokens, and **disagree at
+  256 — including between the two requests of the SAME boot**. That is the fused MoE gemm2's
+  documented run-to-run atomic reduction order (Laguna-XS.2 is a 256-expert MoE), not anything in
+  this phase; it is why the determinism gates elsewhere force `MINISGL_MOE_G2FUSE=0`. DDTree's noise
+  floor on this stack is therefore **not zero past ~128 tokens**, and no DDTree text comparison
+  should be run without pinning that kernel.
+
 ### Remaining DDTree gaps (recorded, not fixed here)
+* The tree ASSEMBLY remains uncapturable for the reason quoted above (a host heap over host floats).
+  That verdict is unchanged; what changed is that it can now be run and measured.
 * `docker-compose.yml` forwards only `MINISGL_DFLASH_DDTREE`, `MINISGL_DDTREE_TOPK` and
   `MINISGL_DDTREE_BUDGET`. `MINISGL_DDTREE_STATIC`/`_SEG`/`_FUSE`/`_MAXCTX`/`_MAXBS` and
   `MINISGL_TIDAR_DDTREE` are not forwarded, so a compose serve cannot reach the baked-mask path at

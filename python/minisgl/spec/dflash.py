@@ -239,6 +239,9 @@ class DFlashProposer(CapturableProposer):
         self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
         self._init_prefix_kv(0)  # z-lab drafter is bidirectional/unwindowed -> unbounded append
+        self.propose_uncapturable_reason = (
+            "the z-lab DFlash drafter is non-causal and unwindowed — it attends its ENTIRE prefix "
+            "bidirectionally, so there is no fixed-capacity shape to capture")
 
     # ---- persistent prefix K/V (ring) ------------------------------------------------------------
     def _init_prefix_kv(self, window: int) -> None:
@@ -613,6 +616,9 @@ class DFlashProposer(CapturableProposer):
         self._persist = False
         self._ctx_window = 0
         self._init_prefix_kv(0)
+        self.propose_uncapturable_reason = (
+            "the CCA-recurrent drafter fuses its context into a single position — it owns no prefix "
+            "KV, so there is no fixed-shape propose body to capture")
 
     def _load_cca_weights(self, folder: str) -> None:
         """Load the CCA drafter checkpoint (keys: fc, norm, layers.i.{linear_q,linear_k,val_proj,o_proj,
@@ -743,6 +749,14 @@ class DFlashProposer(CapturableProposer):
             # here REPLACES the per-uid compacting buffers for this drafter (nothing reads them on
             # the captured path); the unwindowed z-lab drafter keeps them.
             self.init_propose_capture(engine)
+        else:
+            # Record WHY, so the engagement readout says ALWAYS-EAGER(never: <reason>) instead of a
+            # `replay=0 eager=0` that reads like "no fallbacks". `propose_capturable` stays False, so
+            # `propose` keeps the eager per-uid path and nothing here touches the capture state.
+            self.propose_uncapturable_reason = (
+                f"this drafter has no bounded prefix (causal={causal}, "
+                f"sliding_window={sliding_window})" if self._kv_window <= 0 else
+                "MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off")
 
         # PROMPT-PREFILL SEED (full-context path only). Without it the drafter's aux prefix is built
         # append-only from ACCEPTED GENERATED positions (scheduler.py:_spec_aux_hidden), so its context

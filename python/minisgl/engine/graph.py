@@ -706,6 +706,22 @@ class GraphRunner:
         built (it knows budget → tree_qlen)."""
         if not bs_list or not hasattr(self.attn_backend, "init_ddtree_verify_capture"):
             return logger.info_rank0("ddtree-verify CUDA graph: unsupported backend / disabled")
+        # SWA-HYBRID (Laguna): NOT WIRED, and it must decline rather than crash. The static DDTree
+        # metadata (`_ddtree_verify_metadata_static`) populates no swa_* fields — unlike the K+1
+        # verify capture, which allocates a per-qlen ring block table + out_loc — so the first
+        # sliding layer of the capture WARMUP trips `_swa_forward`'s "SWA metadata missing" assert
+        # and takes the boot down. That made DDTree unbootable on the ONLY model whose DFlash
+        # drafter has a capturable propose, i.e. DDTree could not be exercised at all. Declining
+        # here leaves the tree-verify EAGER (the scheduler's own `prepare_metadata` DOES build the
+        # SWA fields, so the eager path is complete and lossless — DDTree's verify is a plain
+        # ancestor-masked forward), which is slower but runnable and testable.
+        if getattr(self.attn_backend, "swa_kv", None) is not None and \
+                getattr(self.attn_backend, "swa_window", 0) > 0:
+            return logger.warning_rank0(
+                "ddtree-verify CUDA graph: SKIPPED on an SWA-hybrid model — the DDTree static "
+                "metadata has no sliding-window ring fields (attention/hip.py "
+                "_ddtree_verify_metadata_static vs init_verify_capture). The tree-verify runs EAGER."
+            )
         dev = self.device
         max_bs = max(bs_list)
         self.attn_backend.init_ddtree_verify_capture(

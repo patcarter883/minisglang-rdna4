@@ -1,0 +1,43 @@
+=== PARENT K=4  (SPEC_K=4) ===
+  PROVENANCE spec/width.py present? ABSENT
+  PROVENANCE env KV_FP8/SPEC_K: SPEC_K=4 MINISGL_KV_FP8=0 
+  MT=  32  md5=aba5d08053083aaa0cd4f77ec51839d8  repeat=SAME
+  MT=  64  md5=e36f88190e1a828c77977ba4bb8d1a7f  repeat=SAME
+  MT= 128  md5=8b07b0d7eccdd294e749aa9c2bbdc251  repeat=SAME
+  MT= 256  md5=508690479af7c81d8c56c2d142d52c0b  repeat=SAME
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=1, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=8, page_size=16, memory_ratio=0.8, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=None, spec_algorithm='mtp', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=True, _unique_suffix='.pid=1', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-07-31|22:52:51|core|rank=0][0m [32mINFO    [0m spec-verify graphs captured; free 2.90 GiB
+
+=== PARENT K=3  (SPEC_K=3) ===
+  PROVENANCE spec/width.py present? ABSENT
+  PROVENANCE env KV_FP8/SPEC_K: SPEC_K=3 MINISGL_KV_FP8=0 
+  MT=  32  md5=6e13b1f1987893822e1090af2dd239c4  repeat=SAME
+  MT=  64  md5=3a1f7e9a7c998e71a70f0d2ef3de7bb5  repeat=SAME
+  MT= 128  md5=056da2d7ba72f43305f7cc432a54bb32  repeat=SAME
+  MT= 256  md5=d28be93db017c9b518cbd4c82a090350  repeat=aeada3919aef43c4bf0a532d6623dfc3
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=1, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=8, page_size=16, memory_ratio=0.8, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=None, spec_algorithm='mtp', spec_num_draft=3, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=True, _unique_suffix='.pid=1', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-07-31|22:54:24|core|rank=0][0m [32mINFO    [0m spec-verify graphs captured; free 2.90 GiB
+
+=== PARENT K=2  (SPEC_K=2) ===
+  PROVENANCE spec/width.py present? ABSENT
+  PROVENANCE env KV_FP8/SPEC_K: SPEC_K=2 MINISGL_KV_FP8=0 
+  MT=  32  md5=0f8c8d5f423d2152518c0e03a86e4ecb  repeat=SAME
+  MT=  64  md5=e8f7bc349ed1fa6a80762293f3adaa06  repeat=SAME
+  MT= 128  md5=b1ab67bc8c4a0743258a3d1ab78e667d  repeat=SAME
+  MT= 256  md5=c4f212bb96aa0b62ba070d17eb0266e0  repeat=SAME
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=1, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=8, page_size=16, memory_ratio=0.8, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=None, spec_algorithm='mtp', spec_num_draft=2, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=True, _unique_suffix='.pid=1', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-07-31|22:55:56|core|rank=0][0m [32mINFO    [0m spec-verify graphs captured; free 2.88 GiB
+
+=== NEW default  (SPEC_K=default) ===
+  PROVENANCE spec/width.py present? 1cdbeac2b11745f2f53c68b780701303
+  PROVENANCE env KV_FP8/SPEC_K: SPEC_K= MINISGL_KV_FP8=0 
+  MT=  32  md5=aba5d08053083aaa0cd4f77ec51839d8  repeat=SAME
+  MT=  64  md5=e36f88190e1a828c77977ba4bb8d1a7f  repeat=3a1f7e9a7c998e71a70f0d2ef3de7bb5
+  MT= 128  md5=bd68f4b649491b0a6577d561fa15e648  repeat=SAME
+  MT= 256  md5=cf0598fa120a6a1abbea0ff60cb4b771  repeat=SAME
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=1, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=8, page_size=16, memory_ratio=0.8, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=None, spec_algorithm='mtp', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=True, _unique_suffix='.pid=1', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-07-31|22:56:57|core|rank=0][0m [32mINFO    [0m spec-verify graphs captured; free 2.88 GiB
+[1m[2026-07-31|22:56:57|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[2, 3, 4] (K=4, capped at 7 for the M<=8 decode-kernel cliff)
+[1m[2026-07-31|22:56:58|core|rank=0][0m [32mINFO    [0m spec-decode: MTP PROPOSE graphs CAPTURED buckets=[1]; free 2.60 GiB (was 2.88 GiB)
+
+== FIX GATE 3 COMPLETE ==

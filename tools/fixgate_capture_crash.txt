@@ -1,0 +1,31 @@
+=== PRE-FIX  persist_kv=0  (/home/pat/code/minisgl-rdna4-prefix753) ===
+  PROVENANCE spec/capture.py md5: 642efe2325c16061bc4b9a433a5fc655
+  PROVENANCE env MINISGL_DFLASH_PERSIST_KV / SPEC_TIMING: MINISGL_SPEC_TIMING=1 MINISGL_DFLASH_PERSIST_KV=0 
+  REQUEST FAILED: RemoteDisconnected: Remote end closed connection without response
+  --- scheduler outcome ---
+Traceback (most recent call last):
+Traceback (most recent call last):
+AttributeError: 'DFlashProposer' object has no attribute '_pc_replays'
+AttributeError: 'DFlashProposer' object has no attribute '_pc_replays'
+[1m[2026-07-31|22:31:37|initializer][0m [31mERROR   [0m worker 'minisgl-DP0-TP0-scheduler' died unexpectedly (exitcode=1) — shutting the server down immediately to release the GPU lease.
+
+=== FIXED    persist_kv=0  (/home/pat/code/minisgl-rdna4-propose) ===
+  PROVENANCE spec/capture.py md5: c8745c58bb7946272b3013501470975e
+  PROVENANCE env MINISGL_DFLASH_PERSIST_KV / SPEC_TIMING: MINISGL_SPEC_TIMING=1 MINISGL_DFLASH_PERSIST_KV=0 
+  REQUEST OK  tokens=600 head='To reverse a singly linked list in place, we can use an iter'
+  --- scheduler outcome ---
+[1m[2026-07-31|22:32:29|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=20.4ms stage=0.3ms forward=22.1ms accept=0.4ms total=43.2ms propose-graph ALWAYS-EAGER(never: MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off) verify-graph replay=50 eager=0 verify-width[3:27(54%) 7:22(44%) 15:1(2%)]
+[1m[2026-07-31|22:32:31|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=13.1ms stage=0.3ms forward=22.4ms accept=0.4ms total=36.2ms propose-graph ALWAYS-EAGER(never: MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off) verify-graph replay=100 eager=0 verify-width[3:53(53%) 7:46(46%) 15:1(1%)]
+[1m[2026-07-31|22:32:32|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=10.8ms stage=0.3ms forward=22.9ms accept=0.4ms total=34.4ms propose-graph ALWAYS-EAGER(never: MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off) verify-graph replay=150 eager=0 verify-width[3:81(54%) 7:68(45%) 15:1(1%)]
+
+=== FIXED    default  (/home/pat/code/minisgl-rdna4-propose) ===
+  PROVENANCE spec/capture.py md5: c8745c58bb7946272b3013501470975e
+  PROVENANCE env MINISGL_DFLASH_PERSIST_KV / SPEC_TIMING: MINISGL_SPEC_TIMING=1 MINISGL_DFLASH_PERSIST_KV= 
+  REQUEST OK  tokens=600 head='To reverse a singly linked list in place, we can use an iter'
+  --- scheduler outcome ---
+[1m[2026-07-31|22:33:48|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+[1m[2026-07-31|22:33:52|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=5.8ms stage=0.3ms forward=22.0ms accept=0.4ms total=28.4ms propose-graph replay=50 eager=0 buckets=[1] verify-graph replay=50 eager=0 verify-width[3:27(54%) 7:22(44%) 15:1(2%)]
+[1m[2026-07-31|22:33:54|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=5.7ms stage=0.3ms forward=22.4ms accept=0.4ms total=28.8ms propose-graph replay=100 eager=0 buckets=[1] verify-graph replay=100 eager=0 verify-width[3:53(53%) 7:46(46%) 15:1(1%)]
+[1m[2026-07-31|22:33:55|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=5.7ms stage=0.3ms forward=22.8ms accept=0.4ms total=29.2ms propose-graph replay=150 eager=0 buckets=[1] verify-graph replay=150 eager=0 verify-width[3:83(55%) 7:66(44%) 15:1(1%)]
+
+== FIX GATE 1 COMPLETE ==

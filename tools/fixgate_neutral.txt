@@ -1,0 +1,37 @@
+=== 753f08d2 laguna  model=laguna spec=dflash ===
+  PROVENANCE width.py/scheduler.py md5: f5fcab10c9a90472ca032b08d6bb69d1 699d567651899850a17a30fdbe5e0571 
+  MT=  32  md5=d4b300ca72461e3ebbf3e04a739f18d4  repeat=SAME
+  MT=  64  md5=3825668e88c5cd1c802a819189ec2933  repeat=SAME
+  MT= 128  md5=1aa75f4b0b11dbad19f31345ed59a0bb  repeat=SAME
+  MT= 256  md5=d625fe78bd63bab44a13d6d4782c66ff  repeat=SAME
+[1m[2026-07-31|22:46:39|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|22:46:40|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+
+=== FIXED    laguna  model=laguna spec=dflash ===
+  PROVENANCE width.py/scheduler.py md5: 1cdbeac2b11745f2f53c68b780701303 6efa2215c1bc8e6ec865fa35f0b67856 
+  MT=  32  md5=d4b300ca72461e3ebbf3e04a739f18d4  repeat=SAME
+  MT=  64  md5=3825668e88c5cd1c802a819189ec2933  repeat=SAME
+  MT= 128  md5=1aa75f4b0b11dbad19f31345ed59a0bb  repeat=SAME
+  MT= 256  md5=d625fe78bd63bab44a13d6d4782c66ff  repeat=SAME
+[1m[2026-07-31|22:48:03|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 decode-kernel cliff)
+[1m[2026-07-31|22:48:04|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+
+=== 753f08d2 qwen35b  model=qwen35b-awq spec=mtp ===
+  PROVENANCE width.py/scheduler.py md5: f5fcab10c9a90472ca032b08d6bb69d1 699d567651899850a17a30fdbe5e0571 
+  MT=  32  md5=aba5d08053083aaa0cd4f77ec51839d8  repeat=SAME
+  MT=  64  md5=e36f88190e1a828c77977ba4bb8d1a7f  repeat=SAME
+  MT= 128  md5=729464391b21db6fa6657a29ee054b47  repeat=bd68f4b649491b0a6577d561fa15e648
+  MT= 256  md5=c51e18fbb95f7d44acb1c93a2696a028  repeat=SAME
+[1m[2026-07-31|22:49:38|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[2, 3, 4] (K=4, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|22:49:39|core|rank=0][0m [32mINFO    [0m spec-decode: MTP PROPOSE graphs CAPTURED buckets=[1]; free 2.60 GiB (was 2.88 GiB)
+
+=== FIXED    qwen35b  model=qwen35b-awq spec=mtp ===
+  PROVENANCE width.py/scheduler.py md5: 1cdbeac2b11745f2f53c68b780701303 6efa2215c1bc8e6ec865fa35f0b67856 
+  MT=  32  md5=aba5d08053083aaa0cd4f77ec51839d8  repeat=SAME
+  MT=  64  md5=e36f88190e1a828c77977ba4bb8d1a7f  repeat=SAME
+  MT= 128  md5=bd68f4b649491b0a6577d561fa15e648  repeat=729464391b21db6fa6657a29ee054b47
+  MT= 256  md5=cf0598fa120a6a1abbea0ff60cb4b771  repeat=f2ab13c9a2421553c2f6e599d150e880
+[1m[2026-07-31|22:51:15|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[2, 3, 4] (K=4, capped at 7 for the M<=8 decode-kernel cliff)
+[1m[2026-07-31|22:51:16|core|rank=0][0m [32mINFO    [0m spec-decode: MTP PROPOSE graphs CAPTURED buckets=[1]; free 2.60 GiB (was 2.88 GiB)
+
+== FIX GATE 4 COMPLETE ==

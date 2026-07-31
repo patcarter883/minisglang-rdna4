@@ -370,15 +370,25 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                          if b <= config.max_running_req]
             # ADAPTIVE VERIFY WIDTH. Capture a small LADDER of widths instead of the single
             # `num_draft` (spec/width.py `verify_width_ladder`), so the step can size the verify block
-            # from recent acceptance and still land on a captured graph. The ladder's max is clamped to
-            # MAX_VERIFY_ROWS-1 = 15 for the M<=16 decode-kernel cliff — see spec/width.py for the four
-            # file:line thresholds and why the clamp is a bs=1 statement.
+            # from recent acceptance and still land on a captured graph. The ladder's max is clamped
+            # for the decode-kernel M cliff — 15 normally, 7 on an int4 W4A8 checkpoint (its dense
+            # GEMV/WMMA switch is at 8, and crossing it MEASURES worse per row). The thresholds are
+            # imported from the kernel modules, not restated; see spec/width.py.
             from minisgl.spec.width import (
-                MAX_VERIFY_ROWS, AdaptiveVerifyWidth, verify_width_ladder,
+                AdaptiveVerifyWidth, live_m_thresholds, max_verify_rows, verify_width_ladder,
             )
 
             _K = self.engine.spec_config.num_draft
-            width_ladder = verify_width_ladder(_K)
+            _quant = getattr(config.model_config, "quant", None)
+            _mrows = max_verify_rows(_quant)
+            _, _drift = live_m_thresholds()
+            if _drift:
+                # The kernels moved a threshold spec/width.py documents. Say so — a stale cap is a
+                # silent throughput loss (too narrow) or a silent cliff (too wide).
+                logger.warning_rank0(
+                    f"spec-decode: decode-kernel M thresholds have DRIFTED from spec/width.py's "
+                    f"documented values: {'; '.join(_drift)}. The LIVE values are in force.")
+            width_ladder = verify_width_ladder(_K, _quant)
             self.engine.capture_spec_verify_graphs(
                 needs_hidden, num_aux, verify_bs, widths=width_ladder
             )
@@ -392,8 +402,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 logger.info_rank0(
                     "spec-decode: ADAPTIVE verify width "
                     f"{'ON' if self._verify_width.adaptive else 'OFF (single captured width)'} "
-                    f"widths={captured_widths} (K={_K}, capped at {MAX_VERIFY_ROWS - 1} "
-                    "for the M<=16 kernel cliff)"
+                    f"widths={captured_widths} (K={_K}, capped at {_mrows - 1} "
+                    f"for the M<={_mrows} decode-kernel cliff)"
                 )
             # ...and the PROPOSE graphs, on the same bucket grid. Propose was the last eager forward
             # in the spec step — ~150 kernel launches per request per step for a draft trunk, in a
@@ -3422,18 +3432,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # causally correct (its query position's input is the last REAL draft; the filler only ever
         # feeds strictly-later, discarded positions).
         #
-        # THE TARGET IS THE SMALLEST CAPTURED WIDTH >= max draft length, NOT `spec.num_draft`. Padding
-        # back up to num_draft would silently UNDO the adaptive narrowing above on every single step —
-        # the step would pay full width while the controller reported a narrow one. Deriving it from the
-        # already-BROADCAST drafts also makes it a function of replicated data, so every TP rank pads to
-        # the same width without another collective (rank0's drafts won the broadcast; a rank whose own
-        # controller chose differently still stages rank0's layout).
-        # Note the common case now needs NO padding at all: when the proposer emits a full block and the
-        # chosen width matches it, `lens` is already uniform-and-captured, which also keeps the fast
-        # on-device accept path enabled (it is skipped when pad_active).
+        # The width choice, the truncation and the padding are ONE decision, so they live in ONE pure
+        # function (`spec/width.pad_to_captured_width`) that is unit-testable without a GPU — the
+        # invariant it enforces (staged rows >= real drafts, or accept reads across requests) is
+        # otherwise only reachable in a DP+EP serve. It also derives the target from the ALREADY-
+        # BROADCAST drafts, so every TP rank pads identically without another collective.
+        # Note the common case needs NO padding at all: when the proposer emits a full block and the
+        # chosen width matches it, the lengths are already uniform-and-captured, which also keeps the
+        # fast on-device accept path enabled (it is skipped when pad_active).
         staged_drafts = drafts
         pad_active = False
         if not ddtree_drafts:
+            from minisgl.spec.width import pad_to_captured_width
+
             vbs = self.engine.graph_runner.verify_bs_list
             cw = self.engine.graph_runner.verify_widths
             lens = [len(d) for d in drafts]
@@ -3441,16 +3452,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # (no captured widths / batch past the captured bs → eager verify at the ragged width).
             self._cur_verify_width = max(lens, default=0)
             if vbs and cw and len(reqs) <= vbs[-1] and any(L >= 1 for L in lens):
-                # Under DP+EP the width must be a CONSTANT, not a per-step function of local drafts:
-                # the replicas hold different reqs, so `max(lens)` can differ and the in-graph MoE
-                # all_gather would see mismatched shapes. Fixed max width there (which is also what
-                # this code did before the adaptive width existed).
-                w_pad = cw[-1] if not self._adaptive_width_ok() else next(
-                    (w for w in cw if w >= max(lens)), cw[-1]
+                drafts, staged_drafts, w_pad, pad_active = pad_to_captured_width(
+                    drafts, cw, self._adaptive_width_ok()
                 )
-                if not all(L == w_pad for L in lens):
-                    staged_drafts = [d[:w_pad] + [0] * (w_pad - min(len(d), w_pad)) for d in drafts]
-                    pad_active = True
                 self._cur_verify_width = w_pad
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
@@ -4006,8 +4010,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 n = ph["n"]
                 # Report propose-graph ENGAGEMENT next to the number it is supposed to explain. A
                 # captured path that quietly degrades to eager is the failure mode, so the
-                # replay/eager split is not left to be inferred from a speedup.
-                _rep, _eag, _bk = self._proposer.propose_capture_stats()
+                # replay/eager split is not left to be inferred from a speedup — and a proposer with
+                # NO captured propose says ALWAYS-EAGER rather than rendering as `eager=0`
+                # (ProposeCaptureStats.line()).
+                _pc = self._proposer.propose_capture_stats()
                 _vg = getattr(self, "_m_vgraph", [0, 0])
                 _wd = (self._verify_width.hist_str() if self._verify_width is not None else "-")
                 logger.info_rank0(
@@ -4015,7 +4021,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"stage={ph['stage']/n*1e3:.1f}ms forward={ph['forward']/n*1e3:.1f}ms "
                     f"accept={ph['accept']/n*1e3:.1f}ms "
                     f"total={(ph['propose']+ph['stage']+ph['forward']+ph['accept'])/n*1e3:.1f}ms "
-                    f"propose-graph replay={_rep} eager={_eag} buckets={_bk} "
+                    f"{_pc.line()} "
                     f"verify-graph replay={_vg[0]} eager={_vg[1]} verify-width[{_wd}]"
                 )
         self._spec_debug(reqs, drafts, total_emitted)

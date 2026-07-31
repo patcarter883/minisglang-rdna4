@@ -1,0 +1,46 @@
+gpu-lease: leased card(s) [0] as 'gpu0'  (HIP=0, port=8000, project=lease-gpu0)
+ Network lease-gpu0_default Creating 
+ Network lease-gpu0_default Created 
+ Container lease-gpu0-run-run-e825d74aa1f0 Creating 
+ Container lease-gpu0-run-run-e825d74aa1f0 Created 
+torch 2.14.0.dev20260703+rocm7.2  dev AMD Radeon RX 9070 XT
+
+=== int4 W4A8 dense  N=4096 K=4096 group=128  (us, min of 5x50) ===
+   M  decode_gemv  prefill_wmma  gemv/wmma  us/row gemv  us/row wmma
+   1         26.2         104.2       0.25         26.2        104.2
+   4         39.0         103.2       0.38          9.8         25.8
+   8         53.1         104.9       0.51          6.6         13.1
+   9         55.4         117.9       0.47          6.2         13.1
+  12         66.0         118.3       0.56          5.5          9.9
+  16         83.2         120.5       0.69          5.2          7.5
+  dispatcher: M=8 60.0us  M=16 121.9us  -> M=16 costs 2.03x M=8 (CLIFF: cap at 8)
+
+=== int4 W4A8 dense  N=11008 K=4096 group=128  (us, min of 5x50) ===
+   M  decode_gemv  prefill_wmma  gemv/wmma  us/row gemv  us/row wmma
+   1         40.2         157.6       0.25         40.2        157.6
+   4         78.1         157.7       0.50         19.5         39.4
+   8        118.9         163.3       0.73         14.9         20.4
+   9        124.8         178.4       0.70         13.9         19.8
+  12        155.8         178.3       0.87         13.0         14.9
+  16        197.7         183.9       1.07         12.4         11.5
+  dispatcher: M=8 118.7us  M=16 183.6us  -> M=16 costs 1.55x M=8 (NO CLIFF at 8: crossover only)
+
+=== int4 W4A8 dense  N=6144 K=2048 group=128  (us, min of 5x50) ===
+   M  decode_gemv  prefill_wmma  gemv/wmma  us/row gemv  us/row wmma
+   1         19.0          57.4       0.33         19.0         57.4
+   4         32.4          58.8       0.55          8.1         14.7
+   8         44.4          59.1       0.75          5.5          7.4
+   9         45.6          64.9       0.70          5.1          7.2
+  12         55.3          65.4       0.84          4.6          5.5
+  16         67.3          67.2       1.00          4.2          4.2
+  dispatcher: M=8 44.5us  M=16 66.9us  -> M=16 costs 1.50x M=8 (NO CLIFF at 8: crossover only)
+
+=== int4 W4A8 dense  N=2048 K=6144 group=128  (us, min of 5x50) ===
+   M  decode_gemv  prefill_wmma  gemv/wmma  us/row gemv  us/row wmma
+   1         22.9         142.8       0.16         22.9        142.8
+   4         35.4         142.4       0.25          8.8         35.6
+   8         44.7         143.2       0.31          5.6         17.9
+   9         46.7         164.0       0.28          5.2         18.2
+  12         55.6         163.4       0.34          4.6         13.6
+  16         67.6         165.3       0.41          4.2         10.3
+  dispatcher: M=8 45.0us  M=16 165.6us  -> M=16 costs 3.68x M=8 (CLIFF: cap at 8)

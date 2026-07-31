@@ -17,9 +17,13 @@ genuinely drafter-specific, as four hooks:
   ``propose_body(bs)``               THE CAPTURED BODY. static buffers in, static buffers out.
   ``read_drafts(reqs, staged)``      ONE device->host sync per STEP, after replay
 
-``propose()`` itself is FINAL on this class: stage -> replay-or-eager -> read. The body is the same
-callable in both cases, which is what makes "replay == eager" a testable claim rather than an
-assertion (tools/propose_capture_ab.sh runs exactly that comparison, per proposer).
+``propose()`` on this class is the WHOLE captured step: stage -> replay-or-eager -> read. The body is
+the same callable in both cases, which is what makes "replay == eager" a testable claim rather than
+an assertion (tools/propose_capture_ab.sh runs exactly that comparison, per proposer). One subclass
+overrides it — ``DFlashProposer.propose`` — and only to DISPATCH ON THE DRAFTER: a causal+windowed
+checkpoint delegates straight back here via ``super().propose``, an unwindowed/CCA one takes its own
+eager path (there is no fixed-capacity shape to capture). Nothing overrides the stage/replay/read
+sequence itself.
 
 THE RULES THE BODY MUST OBEY (each one is a real failure this repo has hit)
 --------------------------------------------------------------------------
@@ -47,7 +51,7 @@ import torch
 
 from minisgl.utils import init_logger
 
-from .base import Proposer
+from .base import Proposer, ProposeCaptureStats
 
 if TYPE_CHECKING:
     from minisgl.core import Req
@@ -225,10 +229,32 @@ class CapturableProposer(Proposer):
         self._pc_graphs[bucket].replay()
         self._pc_replays += 1
 
-    def propose_capture_stats(self) -> "tuple[int, int, list[int]]":
-        """(replays, eager steps, captured buckets) — the engagement evidence. Read by the scheduler's
-        spec timing line; a captured path that silently degrades to eager is the failure mode."""
-        return self._pc_replays, self._pc_eager, list(self._pc_bs_list)
+    def propose_capture_stats(self) -> "ProposeCaptureStats":
+        """The engagement evidence, read by the scheduler's spec-timing line every 50 steps.
+
+        MUST NOT ASSUME `init_propose_capture_state` RAN. Inheriting this class declares that the
+        proposer CAN be captured; whether it IS depends on the checkpoint (DFlash only allocates its
+        capture state for a causal+windowed drafter — a z-lab / CCA drafter, or
+        MINISGL_DFLASH_PERSIST_KV=0, keeps the eager per-uid path and never calls the init hook).
+        Dereferencing `self._pc_replays` unconditionally therefore took the scheduler worker down
+        mid-serve with an AttributeError on exactly those configurations, under exactly the
+        diagnostic (MINISGL_SPEC_TIMING=1) that exists to prove capture is engaged. So: read through
+        `getattr`, and report the honest mode rather than a 0/0 that looks like "no eager fallbacks"."""
+        if not getattr(self, "propose_capturable", False) or not hasattr(self, "_pc_replays"):
+            return ProposeCaptureStats(
+                0, 0, [], "never",
+                getattr(self, "propose_uncapturable_reason",
+                        "capture state was never initialised for this checkpoint/config"))
+        if not self._pc_allowed:
+            return ProposeCaptureStats(
+                0, self._pc_eager, [], "never",
+                "DP+EP — an in-graph MoE all_gather cannot match an idle replica's self-agreed N")
+        if not self._pc_bs_list:
+            return ProposeCaptureStats(
+                self._pc_replays, self._pc_eager, [], "failed",
+                "declared capturable but NO propose graphs exist (graphs disabled, or capture OOM'd)")
+        return ProposeCaptureStats(
+            self._pc_replays, self._pc_eager, list(self._pc_bs_list), "captured")
 
     def destroy_propose_graphs(self) -> None:
         """Release the captured graphs. Must run BEFORE NCCL teardown or shutdown can hang — the
