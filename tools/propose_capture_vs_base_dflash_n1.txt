@@ -1,0 +1,25 @@
+=== base  MODEL=laguna SPEC=dflash NREQ=1 ===
+  mounted spec/dflash.py md5: 70a5e83a8087bb920ff2e212c09d0f70
+  mounted spec/capture.py:   tree sha: aa9bb06d
+TOKENS 1024
+WALL 13.730
+TPS 74.583
+MD5 a4e2483f1bd8dde7eb966539ab4f0736
+[spec-timing] step=50 propose=18.9ms stage=0.3ms forward=47.3ms accept=0.5ms total=67.0ms
+[spec-timing] step=100 propose=12.4ms stage=0.3ms forward=48.4ms accept=0.5ms total=61.6ms
+[spec-timing] step=150 propose=10.3ms stage=0.3ms forward=49.0ms accept=0.5ms total=60.1ms
+[spec-timing] step=200 propose=9.2ms stage=0.3ms forward=49.4ms accept=0.5ms total=59.5ms
+
+=== new  MODEL=laguna SPEC=dflash NREQ=1 ===
+  mounted spec/dflash.py md5: bbd9aed128b6bd015fb0f5bb2b1a60a3
+  mounted spec/capture.py: 162b44961af957b739be25746b3ac1be
+  tree sha: aa9bb06d
+TOKENS 1024
+WALL 12.861
+TPS 79.622
+MD5 a4e2483f1bd8dde7eb966539ab4f0736
+[spec-timing] step=50 propose=5.7ms stage=0.3ms forward=47.2ms accept=0.5ms total=53.7ms propose-graph replay=50 eager=0 buckets=[1]
+[spec-timing] step=100 propose=5.7ms stage=0.3ms forward=48.3ms accept=0.5ms total=54.8ms propose-graph replay=100 eager=0 buckets=[1]
+[spec-timing] step=150 propose=5.7ms stage=0.3ms forward=49.0ms accept=0.5ms total=55.5ms propose-graph replay=150 eager=0 buckets=[1]
+[spec-timing] step=200 propose=5.6ms stage=0.3ms forward=49.5ms accept=0.5ms total=55.9ms propose-graph replay=200 eager=0 buckets=[1]
+

@@ -1,0 +1,47 @@
+=== cap [identity] MODEL=laguna SPEC=dflash NREQ=8 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    PROPOSE graphs CAPTURED buckets=[1, 2, 4, 8]
+    propose ring (slots=9+NULL of 9, C=640, block=16, window=512, prefix-KV 131 MB, logits buf 60 MB)
+TOKENS 3072
+WALL 19.038
+TPS 161.360
+MD5 5b0e87c0514133026d6f04003f7e94f9
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  drafted chains captured: 1342
+
+=== eager [identity] MODEL=laguna SPEC=dflash NREQ=8 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose capture disabled by A/B override
+    propose ring (slots=9+NULL of 9, C=640, block=16, window=512, prefix-KV 131 MB, logits buf 60 MB)
+TOKENS 3072
+WALL 19.409
+TPS 158.276
+MD5 5b0e87c0514133026d6f04003f7e94f9
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  drafted chains captured: 1342
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (dflash_n8) ===
+  DIFFER: 60 of 1342 lines
+7d6
+< draft=[604, 330, 2460, 377, 330, 3201, 367, 330, 83, 367, 367, 340, 81, 330, 81]
+9a9
+> draft=[604, 330, 2460, 377, 330, 3201, 367, 330, 83, 367, 367, 340, 81, 330, 81]
+54a55
+> draft=[354, 3201, 377, 3201, 3201, 3201, 350, 350, 350, 350, 268, 268, 82, 447, 268]
+57d57
+< draft=[354, 3201, 377, 3201, 3201, 3201, 350, 350, 350, 350, 268, 268, 82, 447, 268]
+72d71
+< draft=[3201, 377, 330, 3201, 3201, 3201, 3201, 83, 350, 350, 117, 104, 3131, 372, 350]
+73a73
+> draft=[3201, 377, 330, 3201, 3201, 3201, 3201, 83, 350, 350, 117, 104, 3131, 372, 350]
+152d151
+< draft=[2825, 268, 846, 268, 268, 410, 268, 1117, 846, 3627, 268, 268, 350, 268, 268]
+154a154
+> draft=[2825, 268, 846, 268, 268, 410, 268, 1117, 846, 3627, 268, 268, 350, 268, 268]
+168d167
+< draft=[10504, 1334, 25627, 81, 1290, 10504, 268, 341, 268, 341, 410, 19348, 5895, 5895, 5895]
+169a169
+> draft=[10504, 1334, 25627, 81, 1290, 10504, 268, 341, 268, 341, 410, 19348, 5895, 5895, 5895]
+

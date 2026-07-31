@@ -86,6 +86,27 @@ class Proposer(ABC):
     # bound derived from the drafter's own geometry instead of an env knob.
     aux_ctx_cap: int = 0
 
+    # Whether this proposer's propose forward is CUDA-graph CAPTURED (spec/capture.py). Verify has
+    # been captured for a long time; propose was the remaining eager launch storm — ~150 kernel
+    # launches per request per step for a draft trunk, which is what pins the propose floor at a
+    # value invariant to a 5x change in attention traffic. A proposer sets this by inheriting
+    # `CapturableProposer`, which supplies capture/replay once for all of them. n-gram (no model at
+    # all) leaves it False and the three no-ops below make the scheduler's call sites unconditional.
+    propose_capturable: bool = False
+
+    def capture_propose_graphs(self, bs_list: List[int]) -> None:
+        """Capture this proposer's propose graphs (one per batch-size bucket). No-op unless
+        `propose_capturable`. Called at BOOT from the scheduler, on the engine stream, right after
+        the verify graphs — the proposer's weights and buffers already exist by then."""
+
+    def destroy_propose_graphs(self) -> None:
+        """Release captured propose graphs before NCCL teardown (a live graph there hangs shutdown)."""
+
+    def propose_capture_stats(self) -> "tuple[int, int, list[int]]":
+        """(replays, eager steps, captured buckets). The engagement evidence — a captured path that
+        silently falls back to eager is the failure mode, so this is reported, not assumed."""
+        return 0, 0, []
+
     @abstractmethod
     def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
         """Return up to ``num_draft`` draft token ids per req (empty list ⇒ plain decode step)."""

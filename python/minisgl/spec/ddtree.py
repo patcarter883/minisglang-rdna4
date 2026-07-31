@@ -30,6 +30,7 @@ NEG_INF = float("-inf")
 __all__ = [
     "Tree", "build_draft_tree", "ddtree_paged_layout", "ddtree_walk", "ddtree_walk_sampled",
     "StaticTemplate", "build_static_template", "fill_static_template", "template_ancestor_block",
+    "ancestor_block_host",
     "ddtree_paged_layout_segmented", "template_rank0_path", "ddtree_fused_paged_layout_segmented",
 ]
 
@@ -201,6 +202,35 @@ def template_ancestor_block(t: StaticTemplate, device=None, dtype=torch.float32)
             m[j, a] = 0.0
             a = t.parent[a]
     return m
+
+
+def ancestor_block_host(parent: List[int], n: int, qlen: int) -> torch.Tensor:
+    """The DYNAMIC-topology twin of ``template_ancestor_block``: a `[qlen, qlen]` additive 0/-inf
+    tree-local ancestor mask built entirely on the HOST, as ONE tensor, for ONE H2D copy.
+
+    Why this exists. The heap-built tree's topology genuinely varies per step, so unlike the STATIC
+    template this block cannot be baked once — but it was being materialised the worst possible way:
+    the scheduler wrote each node's deny row and then EVERY ancestor cell as an individual store into
+    a DEVICE tensor, i.e. ``n + n*avg_depth`` single-element GPU writes per request per step (~33 +
+    ~130 at the default budget of 32). That is pure launch overhead and it is avoidable for free:
+    ``tree.parent`` is already a host list, so the whole block can be assembled in Python and shipped
+    in one copy. The CONTENT is byte-identical — this changes no proposed token, only how the same
+    bytes reach the card.
+
+    Rows ``[n, qlen)`` are pad rows and stay all-ALLOWED, matching the caller's zeros base: their
+    logits are discarded, and an all -inf row would make the softmax produce NaN."""
+    data = [NEG_INF] * (qlen * qlen)
+    for j in range(n):
+        base = j * qlen
+        a = j
+        while a != -1:          # own column + the ancestor chain to the root
+            data[base + a] = 0.0
+            a = parent[a]
+    for j in range(n, qlen):    # pad rows: all-allowed (never read, must not be all -inf)
+        base = j * qlen
+        for c in range(qlen):
+            data[base + c] = 0.0
+    return torch.tensor(data, dtype=torch.float32).view(qlen, qlen)
 
 
 def ddtree_paged_layout(

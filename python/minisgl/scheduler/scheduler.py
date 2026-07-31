@@ -366,6 +366,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
                          if b <= config.max_running_req]
             self.engine.capture_spec_verify_graphs(needs_hidden, num_aux, verify_bs)
+            # ...and the PROPOSE graphs, on the same bucket grid. Propose was the last eager forward
+            # in the spec step — ~150 kernel launches per request per step for a draft trunk, in a
+            # per-request Python loop — which is why its floor was invariant to a 5x reduction in
+            # attention traffic. Same place as verify because the same preconditions hold here: the
+            # proposer exists, its weights are loaded and its buffers are allocated. Capturing at
+            # BOOT (not lazily on first sight of a batch size) keeps the graph count bounded and
+            # keeps a multi-hundred-ms capture off the serving path.
+            if getattr(self._proposer, "propose_capturable", False):
+                self.engine.capture_spec_propose_graphs(self._proposer, verify_bs)
             # v2 S4: ALSO capture the FUSED-TiDAR custom-mask verify graphs when the fused path is on.
             # fused_qlen is fixed per (block_size B, layout) — flat 1+B+B², segmented 1+B+B·(tp+B) — so
             # compute it once here (c0-independent) via the same layout helpers the fused step uses, and
@@ -2493,10 +2502,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         The ancestor mask is fed through the captured graph's static mask buffer (see
         GraphRunner.capture_ddtree_verify_graphs); state neutrality is preserved by the snapshot/restore
         below (eager, around the replay) — the tree-verify never installs recurrent state."""
+        from minisgl.spec.ddtree import ancestor_block_host as ddtree_ancestor_block_host
         from minisgl.spec.ddtree import ddtree_walk
         device = self.device
         page_table = self.engine.page_table
-        NEG_INF = float("-inf")
         # Fixed padded query length = budget+1 (matches the captured graph). Fall back to the max real
         # tree size when no budget is configured (DDTree disabled path — should not happen here).
         budget = getattr(self, "_ddtree_budget", 0)
@@ -2582,12 +2591,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             elif tmpl_block is not None:
                 block[:tree_qlen, c0 : c0 + tree_qlen] = tmpl_block  # baked deny/allow ancestor mask
             else:
-                for j in range(n):  # real rows only; pad rows [n, tree_qlen) stay all-allowed
-                    block[j, c0 : c0 + tree_qlen] = NEG_INF  # deny the whole tree-local block first
-                    a = j
-                    while a != -1:  # then re-allow own column + the ancestor chain to the root
-                        block[j, c0 + a] = 0.0
-                        a = tree.parent[a]
+                # DYNAMIC heap topology: build the whole [tree_qlen, tree_qlen] ancestor block on the
+                # HOST and issue ONE copy. The previous form wrote each node's deny row plus every
+                # ancestor cell as an INDIVIDUAL device store — n + n*avg_depth single-element GPU
+                # writes per request per step (~163 at the default budget 32), the dominant host cost
+                # of this path and pure launch overhead, since `tree.parent` is already host data.
+                # Byte-identical content: no proposed or accepted token changes.
+                block[:, c0 : c0 + tree_qlen] = ddtree_ancestor_block_host(
+                    tree.parent, n, tree_qlen).to(device, non_blocking=True)
             off += tree_qlen
         batch.attn_metadata.custom_mask = custom_mask
         # recurrent metadata with per-token verify-state capture (capture_verify_state=True routes the
@@ -3879,11 +3890,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             ph["n"] += 1
             if ph["n"] % 50 == 0:
                 n = ph["n"]
+                # Report propose-graph ENGAGEMENT next to the number it is supposed to explain. A
+                # captured path that quietly degrades to eager is the failure mode, so the
+                # replay/eager split is not left to be inferred from a speedup.
+                _rep, _eag, _bk = self._proposer.propose_capture_stats()
                 logger.info_rank0(
                     f"[spec-timing] step={n} propose={ph['propose']/n*1e3:.1f}ms "
                     f"stage={ph['stage']/n*1e3:.1f}ms forward={ph['forward']/n*1e3:.1f}ms "
                     f"accept={ph['accept']/n*1e3:.1f}ms "
-                    f"total={(ph['propose']+ph['stage']+ph['forward']+ph['accept'])/n*1e3:.1f}ms"
+                    f"total={(ph['propose']+ph['stage']+ph['forward']+ph['accept'])/n*1e3:.1f}ms "
+                    f"propose-graph replay={_rep} eager={_eag} buckets={_bk}"
                 )
         self._spec_debug(reqs, drafts, total_emitted)
 

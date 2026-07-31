@@ -958,6 +958,28 @@ class Engine:
                 dtype=self.dtype,
             )
 
+    def capture_spec_propose_graphs(self, proposer, bs_list: "list[int]") -> None:
+        """Capture the proposer's PROPOSE graphs (spec/capture.py). Called by the scheduler right
+        after the verify graphs, on the ENGINE stream — the scheduler may have switched the current
+        stream in its __init__, and the warmup forward plus the graph context must share one stream.
+
+        Capture failure is logged and survivable, NOT fatal: the proposer keeps the same body and
+        runs it eagerly, its eager counter climbs, and the [spec-timing] line reports the split. A
+        boot crash on a memory-tight card is a worse trade than a slower-but-correct serve — but
+        "slower" has to be VISIBLE, which is what the counters are for."""
+        if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
+            return
+        self._spec_proposer = proposer
+        try:
+            with torch.cuda.stream(self.stream):
+                proposer.capture_propose_graphs(bs_list)
+        except torch.cuda.OutOfMemoryError as e:
+            proposer.destroy_propose_graphs()
+            torch.cuda.empty_cache()
+            logger.error(
+                f"spec-decode: PROPOSE graph capture ran out of memory ({e}); propose will run "
+                "EAGER. Lower --mem-fraction-static or --graph to recover the headroom.")
+
     def capture_spec_fused_verify_graphs(self, fused_qlen: int, bs_list: "list[int]") -> None:
         """Capture the FUSED-TiDAR custom-mask verify graphs (v2 S4). Called by the scheduler when the
         TiDAR FUSED path is enabled, after the proposer is built (it knows B → fused_qlen). No-op if
@@ -983,6 +1005,11 @@ class Engine:
             )
 
     def shutdown(self) -> None:
+        # Propose graphs FIRST, for the same reason destroy_cuda_graphs exists at all: a live CUDA
+        # graph held past NCCL teardown hangs the process. They were invisible here while capture
+        # lived privately inside MTPProposer.
+        if getattr(self, "_spec_proposer", None) is not None:
+            self._spec_proposer.destroy_propose_graphs()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

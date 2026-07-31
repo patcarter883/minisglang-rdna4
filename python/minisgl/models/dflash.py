@@ -224,6 +224,69 @@ class _DFlashLayer(BaseOP):
         normed = self.post_attention_layernorm.forward(hidden)
         return residual + self._mlp(normed)
 
+    def attend_block_batched(
+        self,
+        hidden: torch.Tensor,     # [N, Q, hidden]  noise block hidden, N requests x Q block rows
+        block_pos: torch.Tensor,  # [N, Q] int32 RoPE positions for the noise block
+        k_ctx: torch.Tensor,      # [N, C, Hkv, hd]  post-rotary prefix K (a ring slice of the pool)
+        v_ctx: torch.Tensor,      # [N, C, Hkv, hd]
+        attn_mask: torch.Tensor,  # [N, Q, C+Q] additive 0/-inf
+    ) -> torch.Tensor:
+        """BATCHED, CUDA-graph-capturable twin of `attend_block`.
+
+        Three differences from the per-request form, each forced by capture (see spec/capture.py):
+          * N requests in ONE forward — the per-request Python loop is host control flow, which a
+            graph cannot contain, and it was also serialising every request's ~150 launches.
+          * the prefix is a FIXED [N, C, ...] ring slice with an additive mask, not a variable [P,...]
+            slice: a data-dependent contraction dim cannot be captured.
+          * GROUPED-query contraction instead of `repeat_interleave(group)`. The expansion would
+            materialise [N, C+Q, H, hd] — 8x larger — INSIDE the graph, where every allocation is
+            charged to the graph's private pool permanently (this is the same allocation that OOM'd
+            the MTP propose pool before it was grouped). At the O(window) shape it is 8.6 MB/layer
+            expanded, so the trade that kept `repeat_interleave` in the eager path (bit-identity at
+            a 3.8% cost) does not survive multiplication by the batch and the pool.
+
+        NOT bit-identical to `attend_block` — the reduction regroups (different bmm shapes, longer
+        masked-out key axis). It IS bit-identical to ITSELF eager vs replayed, which is the property
+        capture has to have; losslessness of the emitted tokens comes from verify, as always."""
+        N, Q = hidden.shape[0], hidden.shape[1]
+        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        group = H // Hkv
+        T = N * Q
+
+        flat = hidden.reshape(T, -1)
+        residual = flat
+        x = self.input_layernorm.forward(flat)
+
+        q = self.q_proj.forward(x).view(T, H, hd)
+        k_noise = self.k_proj.forward(x).view(T, Hkv, hd)
+        v_noise = self.v_proj.forward(x).view(T, Hkv, hd)
+        self.q_norm.forward_inplace(q)
+        self.k_norm.forward_inplace(k_noise)
+        q_flat, kn_flat = self._rotary.forward(
+            block_pos.reshape(T), q.reshape(T, H * hd).contiguous(),
+            k_noise.reshape(T, Hkv * hd).contiguous()
+        )
+        # [N, Q, Hkv, group, hd] — the regrouping that matches repeat_interleave's head mapping
+        # (expanded head h reads kv head h // group, so q head h = kv*group + r).
+        qg = q_flat.view(N, Q, Hkv, group, hd)
+        k_noise = kn_flat.view(N, Q, Hkv, hd)
+        v_noise = v_noise.view(N, Q, Hkv, hd)
+
+        K = torch.cat([k_ctx, k_noise], dim=1)   # [N, S, Hkv, hd], S = C + Q
+        V = torch.cat([v_ctx, v_noise], dim=1)
+        scores = torch.einsum("nqgrd,nsgd->nqgrs", qg, K) * self.scale       # [N,Q,Hkv,group,S]
+        scores = scores + attn_mask.view(N, Q, 1, 1, -1)
+        probs = scores.softmax(dim=-1).to(V.dtype)
+        attn = torch.einsum("nqgrs,nsgd->nqgrd", probs, V).reshape(T, H, hd)
+        if self.gated:
+            gate = torch.nn.functional.softplus(self.g_proj.forward(x).float()).to(attn.dtype)
+            attn = attn * gate.unsqueeze(-1)
+        attn_out = self.o_proj.forward(attn.reshape(T, H * hd))
+
+        h = residual + attn_out
+        return (h + self._mlp(self.post_attention_layernorm.forward(h))).view(N, Q, -1)
+
     def forward(
         self,
         hidden: torch.Tensor,         # [B, hidden]  noise block hidden
@@ -464,6 +527,53 @@ class DFlashDraftModel(BaseOP):
         for layer, (k_ctx, v_ctx) in zip(self.layers, prefix_kv):
             hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask)
         return self.norm.forward(hidden)
+
+    # ---- CUDA-graph-capturable batched propose (see spec/capture.py, spec/dflash.py) -------------
+    def project_prefix_into(
+        self,
+        aux: torch.Tensor,          # [m, num_aux, hidden]  captured target aux, m rows
+        rope_pos: torch.Tensor,     # [m] int32 absolute RoPE position of each row
+        k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd] persistent ring
+        v_pool: List[torch.Tensor],
+        wslot: torch.Tensor,        # [m] destination slot per row (NULL slot = discard)
+        wcol: torch.Tensor,         # [m] destination ring column per row
+    ) -> None:
+        """fc+hidden_norm the captured aux of m committed positions and SCATTER each layer's prefix
+        K/V straight into the persistent ring. Fixed-shape and sync-free, so it runs INSIDE the
+        captured body — which is what makes the whole propose captured rather than "captured except
+        for the part that keeps the drafter's context up to date".
+
+        Rows whose ``wslot`` is the NULL slot are computed and thrown away. That is deliberate: how
+        MANY positions were newly committed varies per request per step (1..block), and a variable
+        row count is exactly what a graph cannot express. Projecting a FIXED block-sized tail every
+        step and discarding the overhang is idempotent — the scheduler only ever APPENDS accepted
+        positions to the aux buffer, so re-projecting an already-projected position reproduces the
+        identical K/V, bit for bit."""
+        target_hidden = self.fuse_aux(aux)  # [m, hidden]
+        for l, layer in enumerate(self.layers):
+            k, v = layer.project_ctx(target_hidden, rope_pos)
+            k_pool[l][wslot, wcol] = k
+            v_pool[l][wslot, wcol] = v
+
+    def denoise_batched(
+        self,
+        noise_embed: torch.Tensor,   # [N, Q, hidden]
+        block_pos: torch.Tensor,     # [N, Q] int32
+        k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd]
+        v_pool: List[torch.Tensor],
+        slots: torch.Tensor,         # [N] which ring slot each request reads
+        mask: torch.Tensor,          # [N, Q, C+Q] additive 0/-inf
+    ) -> torch.Tensor:
+        """One BATCHED denoising forward over the persistent ring -> [N, Q, hidden].
+
+        The per-layer gather ``k_pool[l][slots]`` is issued INSIDE the layer loop, not hoisted: the
+        caching allocator then reuses one layer's [N, C, Hkv, hd] transient for the next, so the
+        graph's private pool holds one layer's worth rather than all of them."""
+        hidden = noise_embed
+        for l, layer in enumerate(self.layers):
+            hidden = layer.attend_block_batched(
+                hidden, block_pos, k_pool[l][slots], v_pool[l][slots], mask)
+        return self.norm.forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
 
 
 __all__ = ["DFlashDraftModel"]
