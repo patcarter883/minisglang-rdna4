@@ -19,17 +19,22 @@ from .base import BaseOP
 # minv on the LM head for EVERY case — decode (M=1) AND spec-verify (M>1) — with no losslessness gate.
 # Only M beyond the core's MMAX cap (16) or non-bf16/fp16 weights fall back to minv.
 _LMHEAD_GEMV_MMAX = 16  # gemv_decode_core MMAX cap; LM-head verify M (spec K+1) sits well under this
+_lmhead_gemv_fn = None
+_lmhead_gemv_probed = False
 
 
 def _get_lmhead_gemv():
-    """The shared small-M decode GEMV (``layers.minv.decode_gemv``). It runs W8A16 (fp8 weight /
-    native activation) by DEFAULT and falls back in code to the unquantized bf16 twin for shapes the
-    fp8 lane slot cannot take. The LM head is the single biggest weight on this path (N=124160,
-    K=2048 per TP rank = 509 MB in bf16, 738 us/step measured), so halving its stream is the largest
-    single byte cut in the decode step. Returns None when it does not apply to this call."""
-    from minisgl.layers.minv import decode_gemv
+    """Lazily resolve fp8_wmma.dense_bf16_gemv (None if the kernel package is unavailable)."""
+    global _lmhead_gemv_fn, _lmhead_gemv_probed
+    if not _lmhead_gemv_probed:
+        _lmhead_gemv_probed = True
+        try:
+            from fp8_wmma import dense_bf16_gemv
 
-    return decode_gemv
+            _lmhead_gemv_fn = dense_bf16_gemv
+        except Exception:
+            _lmhead_gemv_fn = None
+    return _lmhead_gemv_fn
 
 
 def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
@@ -44,11 +49,10 @@ def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
             and weight.dtype in (torch.bfloat16, torch.float16)
             and x.dtype == weight.dtype
             and x.dim() == 2 and x.shape[0] <= _LMHEAD_GEMV_MMAX):
-        out = gemv(x, weight)
-        if out is not None:                      # None = no decode GEMV applies to this shape
-            if bias is not None:
-                out = out + bias
-            return out
+        out = gemv(x.contiguous(), weight)
+        if bias is not None:
+            out = out + bias
+        return out
     return minv_linear(x, weight, bias)
 
 
@@ -98,19 +102,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.bias = torch.empty(self.num_embeddings_tp) if bias else None
         self.tied_embedding = tied_embedding
         assert (tied_embedding is not None) == tie_word_embeddings
-
-    def post_load(self) -> None:
-        # RULE 3 (KERNEL_CORE_POLICY.md): the LM head produces every token's logits, so error here
-        # lands directly on sampling — the checkpoints we serve leave it unquantized on purpose.
-        # Mark the TENSOR so the W8A16 decode GEMV can never pick it up; the exclusion is a property
-        # of the weight, not of this call site (layers/minv.py::keep_wide), which is why nothing in
-        # _lm_head_linear below has to know about it.
-        # Marked in post_load, not __init__: load_state_dict REBINDS self.weight (BaseOP setattr),
-        # so the __init__-time meta placeholder's pointer is not the one the GEMV will see.
-        super().post_load()
-        from minisgl.layers.minv import keep_wide
-
-        keep_wide((self.tied_embedding or self).weight)
 
     def load_state_dict(
         self,
