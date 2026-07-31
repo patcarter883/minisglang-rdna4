@@ -293,6 +293,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # corrects every draft, so the seed can only change acceptance, never output). Only engages for
         # a proposer that owns a seedable per-req draft KV (MTP / EAGLE3 -> supports_prefill_seed).
         self._spec_seed_enabled = False
+        # Adaptive spec-decode VERIFY width (spec/width.py). Built after verify-graph capture, from
+        # the widths that were ACTUALLY captured; stays None when capture is off (fixed width, eager).
+        self._verify_width = None
         # Under EP, an MTP draft HEAD that is a full EP-sharded MoE layer issues a data-dependent
         # number of collectives in propose, which an idle replica can't match with a fixed count. The
         # fix is to build that draft MoE REPLICATED (all experts local, no EP shard) so propose issues
@@ -365,7 +368,33 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             num_aux = len(self._spec_capture_layer_ids) if self._spec_capture_layer_ids else 0
             verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
                          if b <= config.max_running_req]
-            self.engine.capture_spec_verify_graphs(needs_hidden, num_aux, verify_bs)
+            # ADAPTIVE VERIFY WIDTH. Capture a small LADDER of widths instead of the single
+            # `num_draft` (spec/width.py `verify_width_ladder`), so the step can size the verify block
+            # from recent acceptance and still land on a captured graph. The ladder's max is clamped to
+            # MAX_VERIFY_ROWS-1 = 15 for the M<=16 decode-kernel cliff — see spec/width.py for the four
+            # file:line thresholds and why the clamp is a bs=1 statement.
+            from minisgl.spec.width import (
+                MAX_VERIFY_ROWS, AdaptiveVerifyWidth, verify_width_ladder,
+            )
+
+            _K = self.engine.spec_config.num_draft
+            width_ladder = verify_width_ladder(_K)
+            self.engine.capture_spec_verify_graphs(
+                needs_hidden, num_aux, verify_bs, widths=width_ladder
+            )
+            # Only ever choose from what was ACTUALLY captured (empty when --graph 0 / an unsupported
+            # backend skipped capture — then the width is fixed and the step is eager as before).
+            captured_widths = self.engine.graph_runner.verify_widths
+            self._verify_width = (
+                AdaptiveVerifyWidth(captured_widths) if captured_widths else None
+            )
+            if self._verify_width is not None:
+                logger.info_rank0(
+                    "spec-decode: ADAPTIVE verify width "
+                    f"{'ON' if self._verify_width.adaptive else 'OFF (single captured width)'} "
+                    f"widths={captured_widths} (K={_K}, capped at {MAX_VERIFY_ROWS - 1} "
+                    "for the M<=16 kernel cliff)"
+                )
             # ...and the PROPOSE graphs, on the same bucket grid. Propose was the last eager forward
             # in the spec step — ~150 kernel launches per request per step for a draft trunk, in a
             # per-request Python loop — which is why its floor was invariant to a 5x reduction in
@@ -1055,6 +1084,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
+        # Drop this uid's acceptance EMA (adaptive verify width); uids are never reused, so leaving it
+        # would leak one float per completed request for the process lifetime.
+        if self._verify_width is not None:
+            self._verify_width.free(req.uid)
         # Release the structured-output grammar matcher + reasoning gate/budget (idempotent).
         self._grammar_matchers.pop(req.uid, None)
         self._clear_think_gate(req.uid)
@@ -2216,6 +2249,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             k = max(1, engine.spec_config.num_draft)
             if proposer is not None and hasattr(proposer, "block_size"):
                 k = max(1, min(engine.spec_config.num_draft, proposer.block_size))
+            # ...and clamp to the widest CAPTURED verify width, because that is what the busy replica
+            # stages (the M<=16 ladder cap in spec/width.py can make it narrower than num_draft — e.g.
+            # K=16 -> 15). Under DP+EP the width is pinned to this max (`_adaptive_width_ok` is False
+            # there), so the two replicas still agree on one constant qlen.
+            _cw = self.engine.graph_runner.verify_widths
+            if _cw:
+                k = max(1, min(k, _cw[-1]))
             mask_id = int(getattr(proposer, "mask_token_id", 0))
             for _ in range(n_ep):
                 # Captured @ ep_cap_bs when set (matches the busy replica's block_predict+verify graph),
@@ -3300,6 +3340,21 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             off += L
         return out
 
+    def _adaptive_width_ok(self) -> bool:
+        """True when this step may pick its own verify width.
+
+        Requires (a) a controller — i.e. verify graphs were actually captured, otherwise there is no
+        captured ladder to land on; (b) more than one captured width; and (c) NOT DP+EP. Under DP+EP
+        the data-parallel replicas hold different requests, so a per-replica width would give the
+        in-graph MoE all_gather a different fixed N on each replica and wedge the collective — the
+        same reason `use_vgraph` gates on `_ep_common_bs` below. EP-over-TP is fine: the TP ranks run
+        the identical padded batch in lockstep (rank0's drafts win `_bcast_drafts_tp`)."""
+        if self._verify_width is None or not self._verify_width.adaptive:
+            return False
+        from minisgl.distributed import is_ep_over_tp
+
+        return not (self.engine.enable_ep and not is_ep_over_tp())
+
     def _spec_decode_step(self, reqs: List[Req], ddtree_drafts: bool = False) -> None:
         spec = self.engine.spec_config
         assert spec is not None and self._proposer is not None
@@ -3332,31 +3387,71 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             drafts = [list(getattr(r, "_tidar_drafts", []) or []) for r in reqs]
         else:
             drafts = self._proposer.propose(reqs, spec.num_draft, ctx)
+            # ADAPTIVE VERIFY WIDTH (spec/width.py). Size THIS step's verify block from recent
+            # per-request acceptance and truncate the drafts to it, so we stop staging + verifying
+            # rows that measurement says are not being accepted.
+            #   * LOSSLESS. Dropping trailing DRAFTS only removes speculative rows; every emitted
+            #     token is still the target's own output at its own query row, and the accept loop
+            #     already slices the logits by each req's REAL draft length.
+            #   * The width is always a CAPTURED one (the controller is constructed from
+            #     graph_runner.verify_widths), so a narrower step still replays a graph. Falling off
+            #     the graph would cost far more than the rows saved.
+            #   * PROPOSE stays at full K: the captured propose graph bakes K as a shape (spec/mtp.py
+            #     unrolls `range(num_draft)`, DFlash's block is fixed at B), so varying the propose
+            #     width would need a propose graph per (bs, K). Truncating only the VERIFY side keeps
+            #     propose single-shaped and is where the M-scaled cost actually is.
+            # Deterministic across TP ranks: the EMA is keyed by uid and fed the RANK0-AUTHORITATIVE
+            # accepted counts (post _bcast_accept_tp) from the same `reqs`, so every rank chooses the
+            # same width without another collective. Under DP+EP the replicas do NOT share reqs, so a
+            # per-replica width would desync the fixed-N MoE all_gather — stay at max width there.
+            if self._adaptive_width_ok():
+                _w = self._verify_width.choose(r.uid for r in reqs)
+                drafts = [d[:_w] for d in drafts]
         # TP>1 lockstep: every rank verifies rank0's drafts so the eager lm-head all_gather sees an
         # identical row count on all ranks (else the verify batch desyncs → illegal-address fault).
         drafts = self._bcast_drafts_tp(reqs, drafts)
 
-        # Partial-K → uniform padding for the verify GRAPH. `can_use_verify_graph` needs every req to
-        # have exactly num_draft drafts (uniform qlen); a partial-K step (a req clamped near max_tokens
-        # / a cold first block) otherwise falls to the EAGER verify — slower, and (under TP) the eager
-        # lm-head all_gather is the desync surface the broadcast above guards. Padding each req's drafts
-        # up to num_draft (filler 0 at the tail) makes the step uniform so it hits the captured GDN/CCA/
-        # MLA verify graph instead. LOSSLESS: `drafts` (REAL) still drives accept — the target is sliced
-        # to the real length per req, so the padded tail rows are verified-then-freed (their KV is
-        # released by the normal rollback), and the bonus at the real length is causally correct (its
-        # query position's input is the last REAL draft; the filler only ever feeds strictly-later,
-        # discarded positions). Only when it actually helps: graphs captured, padded bs fits, real spec
-        # work exists, and the step isn't already uniform. Skipped for the on-device accept path (it keys
-        # accept on q_lens; padding would need a separate real-length arg) and for ddtree.
+        # Ragged → uniform padding for the verify GRAPH. `can_use_verify_graph` needs every req to have
+        # the SAME number of drafts, and that count to be a CAPTURED width; a ragged step (a req clamped
+        # near max_tokens / a cold first block) otherwise falls to the EAGER verify — slower, and (under
+        # TP) the eager lm-head all_gather is the desync surface the broadcast above guards. Padding each
+        # req's drafts up to the target width (filler 0 at the tail) makes the step uniform so it hits
+        # the captured GDN/CCA/MLA verify graph instead. LOSSLESS: `drafts` (REAL) still drives accept —
+        # the target is sliced to the real length per req, so the padded tail rows are verified-then-
+        # freed (their KV is released by the normal rollback), and the bonus at the real length is
+        # causally correct (its query position's input is the last REAL draft; the filler only ever
+        # feeds strictly-later, discarded positions).
+        #
+        # THE TARGET IS THE SMALLEST CAPTURED WIDTH >= max draft length, NOT `spec.num_draft`. Padding
+        # back up to num_draft would silently UNDO the adaptive narrowing above on every single step —
+        # the step would pay full width while the controller reported a narrow one. Deriving it from the
+        # already-BROADCAST drafts also makes it a function of replicated data, so every TP rank pads to
+        # the same width without another collective (rank0's drafts won the broadcast; a rank whose own
+        # controller chose differently still stages rank0's layout).
+        # Note the common case now needs NO padding at all: when the proposer emits a full block and the
+        # chosen width matches it, `lens` is already uniform-and-captured, which also keeps the fast
+        # on-device accept path enabled (it is skipped when pad_active).
         staged_drafts = drafts
         pad_active = False
         if not ddtree_drafts:
             vbs = self.engine.graph_runner.verify_bs_list
+            cw = self.engine.graph_runner.verify_widths
             lens = [len(d) for d in drafts]
-            if (vbs and len(reqs) <= vbs[-1] and any(L >= 1 for L in lens)
-                    and not all(L == spec.num_draft for L in lens)):
-                staged_drafts = [d + [0] * (spec.num_draft - len(d)) for d in drafts]
-                pad_active = True
+            # What the histogram attributes this step to, even if none of the padding below applies
+            # (no captured widths / batch past the captured bs → eager verify at the ragged width).
+            self._cur_verify_width = max(lens, default=0)
+            if vbs and cw and len(reqs) <= vbs[-1] and any(L >= 1 for L in lens):
+                # Under DP+EP the width must be a CONSTANT, not a per-step function of local drafts:
+                # the replicas hold different reqs, so `max(lens)` can differ and the in-graph MoE
+                # all_gather would see mismatched shapes. Fixed max width there (which is also what
+                # this code did before the adaptive width existed).
+                w_pad = cw[-1] if not self._adaptive_width_ok() else next(
+                    (w for w in cw if w >= max(lens)), cw[-1]
+                )
+                if not all(L == w_pad for L in lens):
+                    staged_drafts = [d[:w_pad] + [0] * (w_pad - min(len(d), w_pad)) for d in drafts]
+                    pad_active = True
+                self._cur_verify_width = w_pad
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
 
@@ -3401,6 +3496,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         use_vgraph = self.engine.graph_runner.can_use_verify_graph(batch) and (
             not self.engine.enable_ep or is_ep_over_tp() or ep_bs is not None
         )
+        # Verify-graph ENGAGEMENT counters. An adaptive width that quietly stops landing on a captured
+        # graph is the failure mode this whole deliverable has to rule out, and it is invisible in a
+        # throughput number (it just gets slower). Counted here, next to the decision, and reported on
+        # the [spec] / [spec-timing] lines with the width histogram.
+        self._m_vgraph = getattr(self, "_m_vgraph", [0, 0])
+        self._m_vgraph[0 if use_vgraph else 1] += 1
         if use_vgraph:
             self.engine.graph_runner.pad_verify(batch, ep_bs)
         else:
@@ -3860,9 +3961,22 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             for na in accepted_counts:
                 ast["acc"] += na; ast["n"] += 1
             self._spec_accept_stat = ast
+            # Feed the adaptive-width controller. `accepted_counts` is the RANK0-AUTHORITATIVE outcome
+            # (post _bcast_accept_tp), so every rank's EMA — and therefore every rank's next chosen
+            # width — moves identically. Recorded even when the width is currently pinned (DP+EP), so
+            # the histogram always reports what was actually run.
+            if self._verify_width is not None:
+                self._verify_width.record(
+                    [r.uid for r in reqs], accepted_counts,
+                    getattr(self, "_cur_verify_width", self._verify_width.max_width),
+                )
             if ast["n"] % 100 == 0:
+                _wd = (f" verify-width[{self._verify_width.hist_str()}]"
+                       if self._verify_width is not None else "")
+                _vg = getattr(self, "_m_vgraph", [0, 0])
                 logger.info_rank0(
-                    f"[spec] mean accept-len={ast['acc']/ast['n']:.2f} over {ast['n']} reqs")
+                    f"[spec] mean accept-len={ast['acc']/ast['n']:.2f} over {ast['n']} reqs{_wd} "
+                    f"verify-graph replay={_vg[0]} eager={_vg[1]}")
         # Metrics: one verify step for the batch; per-req draft/accepted/emitted totals (see
         # server/metrics.py -> minisgl_spec_*). Cheap int adds off the per-token path.
         if self._metrics_enabled:
@@ -3894,12 +4008,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 # captured path that quietly degrades to eager is the failure mode, so the
                 # replay/eager split is not left to be inferred from a speedup.
                 _rep, _eag, _bk = self._proposer.propose_capture_stats()
+                _vg = getattr(self, "_m_vgraph", [0, 0])
+                _wd = (self._verify_width.hist_str() if self._verify_width is not None else "-")
                 logger.info_rank0(
                     f"[spec-timing] step={n} propose={ph['propose']/n*1e3:.1f}ms "
                     f"stage={ph['stage']/n*1e3:.1f}ms forward={ph['forward']/n*1e3:.1f}ms "
                     f"accept={ph['accept']/n*1e3:.1f}ms "
                     f"total={(ph['propose']+ph['stage']+ph['forward']+ph['accept'])/n*1e3:.1f}ms "
-                    f"propose-graph replay={_rep} eager={_eag} buckets={_bk}"
+                    f"propose-graph replay={_rep} eager={_eag} buckets={_bk} "
+                    f"verify-graph replay={_vg[0]} eager={_vg[1]} verify-width[{_wd}]"
                 )
         self._spec_debug(reqs, drafts, total_emitted)
 

@@ -737,6 +737,12 @@ class Engine:
         # reserves harmlessly). These are the big buffers for spec (T = verify_bs*(K+1) rows of vocab).
         sc = config.spec_config
         if sc is not None:
+            # ADAPTIVE VERIFY WIDTH (spec/width.py): several widths are captured, but they SHARE one
+            # VerifyCaptureBuffer sized at the widest (VerifyCaptureBuffer.view), and the widest is
+            # `min(num_draft, 15)` <= num_draft. So this single-width reservation still bounds the
+            # static I/O buffers, and now over-reserves slightly rather than under-reserving. The
+            # per-width graphs share one pool captured widest-first, so the pool high-water mark is
+            # also the widest graph's — which the _GRAPH_ACT_MULT term below already approximates.
             qlen = sc.num_draft + 1
             vbs = max((b for b in bs_list if b <= config.max_running_req), default=max_bs)
             T = vbs * qlen
@@ -937,11 +943,15 @@ class Engine:
             return self.model.forward(return_hidden=return_hidden)
 
     def capture_spec_verify_graphs(
-        self, needs_hidden: bool, num_aux: int, bs_list: "list[int]"
+        self, needs_hidden: bool, num_aux: int, bs_list: "list[int]",
+        widths: "list[int] | None" = None,
     ) -> None:
         """Capture the MLA spec-decode verify graphs. Called by the scheduler AFTER the proposer is
         built and the target's aux-capture layers are programmed (so the captured forward stashes the
-        hidden states the draft head consumes). No-op if graphs are disabled / non-MLA backend."""
+        hidden states the draft head consumes). No-op if graphs are disabled / non-MLA backend.
+
+        `widths` is the adaptive-verify-width ladder (spec/width.py); None captures the single fixed
+        width `num_draft`."""
         if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
             return
         hidden_size = self.model.model.embed_tokens.weight.shape[1]
@@ -956,6 +966,7 @@ class Engine:
                 num_aux=num_aux,
                 hidden_size=hidden_size,
                 dtype=self.dtype,
+                widths=widths,
             )
 
     def capture_spec_propose_graphs(self, proposer, bs_list: "list[int]") -> None:

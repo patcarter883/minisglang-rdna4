@@ -255,24 +255,42 @@ class MLABackend(BaseAttnBackend):
     # live in static buffers the captured kernel reads; `prepare_verify_for_replay` refreshes them
     # (+ cache_seqlens + page_table) in place before g.replay(). cu_seqlens_q is unused on this path
     # (verify reads the precomputed indices), kept as an arange*(K+1) placeholder.
-    def init_verify_capture(self, max_seq_len: int, bs_list: List[int], num_draft: int) -> None:
+    def init_verify_capture(
+        self, max_seq_len: int, bs_list: List[int], num_draft: "int | List[int]"
+    ) -> None:
+        # `num_draft` may be a LIST of widths (adaptive verify width, spec/width.py). kbound and the
+        # seq-index pattern are qlen-SHAPED, and `seq_idx = arange(T) // qlen` is NOT a prefix slice of
+        # the max-width pattern (the row->seq mapping changes with qlen), so both are built per width;
+        # `set_verify_width` repoints them before each capture/replay. cache_seqlens/page_table are
+        # qlen-independent and shared.
         dev = self.kvcache.device
+        widths = [num_draft] if isinstance(num_draft, int) else sorted(set(int(w) for w in num_draft))
         self._vcap_max_bs = max(bs_list)
-        self._vcap_qlen = num_draft + 1
         self._vcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
-        T = self._vcap_max_bs * self._vcap_qlen
         self._vcap_cache_seqlens = torch.ones(self._vcap_max_bs, dtype=torch.int32, device=dev)
         self._vcap_page_table = torch.zeros(
             self._vcap_max_bs, self._vcap_max_pages, dtype=torch.int32, device=dev
         )
-        self._vcap_cu_q = (
-            torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
-        )
-        self._vcap_kbound = torch.zeros(T, dtype=torch.int32, device=dev)
-        # static seq-index pattern: row r belongs to seq r // (K+1).
-        self._vcap_seq_idx = (
-            torch.arange(T, dtype=torch.int32, device=dev) // self._vcap_qlen
-        )
+        self._vcap_by_qlen: "dict[int, dict]" = {}
+        for w in widths:
+            ql = w + 1
+            T = self._vcap_max_bs * ql
+            self._vcap_by_qlen[ql] = {
+                "cu_q": torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * ql,
+                "kbound": torch.zeros(T, dtype=torch.int32, device=dev),
+                # static seq-index pattern: row r belongs to seq r // qlen.
+                "seq_idx": torch.arange(T, dtype=torch.int32, device=dev) // ql,
+            }
+        self.set_verify_width(max(widths) + 1)
+
+    def set_verify_width(self, qlen: int) -> None:
+        """Point the live verify statics at the buffers captured for `qlen` query rows/seq (see
+        RDNA4Backend.set_verify_width)."""
+        ent = self._vcap_by_qlen[qlen]
+        self._vcap_qlen = qlen
+        self._vcap_cu_q = ent["cu_q"]
+        self._vcap_kbound = ent["kbound"]
+        self._vcap_seq_idx = ent["seq_idx"]
 
     def _verify_metadata_static(self, bs: int) -> MLAMetadata:
         ql = self._vcap_qlen
