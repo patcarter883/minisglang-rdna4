@@ -19,7 +19,7 @@ genuinely drafter-specific, as four hooks:
 
 ``propose()`` itself is FINAL on this class: stage -> replay-or-eager -> read. The body is the same
 callable in both cases, which is what makes "replay == eager" a testable claim rather than an
-assertion (tools/propose_capture_parity.py runs exactly that comparison).
+assertion (tools/propose_capture_ab.sh runs exactly that comparison, per proposer).
 
 THE RULES THE BODY MUST OBEY (each one is a real failure this repo has hit)
 --------------------------------------------------------------------------
@@ -41,7 +41,6 @@ THE RULES THE BODY MUST OBEY (each one is a real failure this repo has hit)
 """
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
@@ -137,12 +136,6 @@ class CapturableProposer(Proposer):
         # in-graph MoE all_gather pins a fixed N while an idle replica self-agrees its own N eagerly.
         # EP-over-TP is fine (the draft head is built replicated, so propose issues no EP collective).
         self._pc_allowed = (not bool(getattr(engine, "enable_ep", False))) or is_ep_over_tp()
-        # TEMPORARY, A/B ONLY — DELETE BEFORE MERGE. Runs the SAME body eagerly so the captured leg
-        # can be compared against a body-identical baseline (the only way to attribute a delta to
-        # capture rather than to the batched rewrite underneath it).
-        if os.environ.get("MINISGL_SPEC_PROPOSE_NOCAPTURE") == "1":
-            self._pc_allowed = False
-            logger.info_rank0(f"spec-decode: {tag} propose capture disabled by A/B override")
         if not self._pc_allowed:
             logger.info_rank0(
                 f"spec-decode: {tag} propose capture DISABLED under DP+EP (the in-graph MoE "
@@ -198,9 +191,6 @@ class CapturableProposer(Proposer):
     def reset_propose_state(self) -> None:
         """Drop any per-request state the warmup/capture dummy batch dirtied. Default: nothing."""
 
-    def can_replay_propose(self, bs: int) -> bool:
-        return bool(self._pc_graphs) and bs <= self._pc_bs_list[-1]
-
     def _propose_bucket(self, bs: int) -> Optional[int]:
         for b in self._pc_bs_list:
             if b >= bs:
@@ -237,7 +227,7 @@ class CapturableProposer(Proposer):
 
     def propose_capture_stats(self) -> "tuple[int, int, list[int]]":
         """(replays, eager steps, captured buckets) — the engagement evidence. Read by the scheduler's
-        spec timing line and by tools/propose_capture_parity.py."""
+        spec timing line; a captured path that silently degrades to eager is the failure mode."""
         return self._pc_replays, self._pc_eager, list(self._pc_bs_list)
 
     def destroy_propose_graphs(self) -> None:

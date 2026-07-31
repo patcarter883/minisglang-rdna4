@@ -7,8 +7,17 @@
 # makes "replay == eager" a testable claim instead of an assertion.
 #
 #   leg cap    : default. Boot log must say "PROPOSE graphs CAPTURED buckets=[...]".
-#   leg eager  : MINISGL_SPEC_PROPOSE_NOCAPTURE=1 — the TEMPORARY A/B override in spec/capture.py.
-#                Boot log must say "propose capture disabled by A/B override".
+#   leg eager  : MINISGL_SPEC_PROPOSE_NOCAPTURE=1.
+#
+# !! THE `eager` LEG NO LONGER RUNS AS-IS. !!
+# MINISGL_SPEC_PROPOSE_NOCAPTURE was a MEASUREMENT-ONLY override and was DELETED at merge, because
+# capture ships ON and the repo does not gate merged behaviour on env. This script is kept as the
+# executable record of HOW the gate was run and as the harness to re-run it: to reproduce the eager
+# leg, temporarily reinstate the two lines in `CapturableProposer.init_propose_capture_state`
+#     if os.environ.get("MINISGL_SPEC_PROPOSE_NOCAPTURE") == "1": self._pc_allowed = False
+# plus the compose passthrough, run, and remove them again. The `cap` legs and CTL=1 (below) work
+# unmodified. For a captured-vs-PARENT-COMMIT comparison that needs no override at all, use
+# tools/propose_capture_vs_base.sh.
 #
 # WHAT IS MEASURED
 #   identity : MINISGL_SPEC_DEBUG=2 prints every drafted chain. Greedy, fixed prompt, fixed seed,
@@ -93,7 +102,11 @@ leg() {
   down
   local envs=()
   [ "$mode" = identity ] && envs+=(MINISGL_SPEC_DEBUG=2) || envs+=(MINISGL_SPEC_TIMING=1)
-  [ "$tag" = eager ] && envs+=(MINISGL_SPEC_PROPOSE_NOCAPTURE=1)
+  # CTL=1 makes the second leg ANOTHER captured boot instead of the eager one — the control that
+  # establishes the NOISE FLOOR. Without it, "the two legs differ" cannot distinguish "capture is
+  # not bit-identical" from "this model's propose is not bit-reproducible run-to-run at all"
+  # (the fused MoE gemm2 below M=2 reduces with atomics, and its own comment says so).
+  [ "$tag" = eager ] && [ "${CTL:-0}" != 1 ] && envs+=(MINISGL_SPEC_PROPOSE_NOCAPTURE=1)
   ( cd "$WT" && env MINISGL_IMAGE="$IMAGE" "${envs[@]}" \
       docker compose --profile serve up -d >/dev/null 2>&1 )
   if ! wait_ready; then

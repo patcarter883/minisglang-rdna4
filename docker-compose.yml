@@ -107,10 +107,12 @@ x-lean-common: &lean-common
     # scheduler but never forwarded, so it could not be reached through compose — which is the only
     # way this repo serves. Diagnostic; costs 4 syncs/step when on.
     MINISGL_SPEC_TIMING: "${MINISGL_SPEC_TIMING:-}"
-    # A/B ONLY (spec/capture.py) — DELETE WITH THE FLAG. Runs the proposer's captured propose body
-    # EAGERLY so the captured leg has a body-identical baseline. Not a feature switch: unset (the
-    # default) means propose capture is ON for every proposer that supports it.
-    MINISGL_SPEC_PROPOSE_NOCAPTURE: "${MINISGL_SPEC_PROPOSE_NOCAPTURE:-}"
+    # =0 reverts the fused MoE gemm2 to the bit-exact WMMA gemm2 + gather_reduce. Forwarded because
+    # the fused path's atomic reduction order VARIES RUN TO RUN (quant/kernels.py says so in place),
+    # which makes an MTP draft head — a MoE at M=1 — non-bit-reproducible against ITSELF. Any
+    # bit-identity gate over a MoE drafter has to be able to turn that off, and through compose is
+    # the only way this repo serves. Diagnostic; production keeps the fused default.
+    MINISGL_MOE_G2FUSE: "${MINISGL_MOE_G2FUSE:-}"
     # DFlash drafter knobs the proposer reads. PERSIST_KV=0 falls back to re-projecting the whole
     # prefix each step (diagnostic). CTX_WINDOW is a scheduler-side cap on the accumulated aux; the
     # DEFAULT cap now comes from the drafter's own attention window (Proposer.aux_ctx_cap), so this

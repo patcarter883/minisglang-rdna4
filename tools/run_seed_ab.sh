@@ -19,7 +19,7 @@ docker run --rm \
   -e MEMRATIO="${MEMRATIO:-0.80}" -e MAXRUN="${MAXRUN:-4}" -e GRAPH="${GRAPH:-4}" \
   -e ATTN="${ATTN:-hip}" -e SPEC_K="${SPEC_K:-4}" -e CONC="${CONC:-4}" \
   -e DECODE_TOKENS="${DECODE_TOKENS:-256}" -e MODE="${MODE:-all}" \
-  -e MINISGL_SPEC_PROPOSE_GRAPH="${MINISGL_SPEC_PROPOSE_GRAPH:-}" -e MINISGL_MTP_MAX_CTX="${MINISGL_MTP_MAX_CTX:-}" \
+  -e MINISGL_MTP_MAX_CTX="${MINISGL_MTP_MAX_CTX:-}" \
   -e SKIP_TRITON_COPY=1 \
   -v "$REPO":/engine \
   -v /home/pat/models:/models \
