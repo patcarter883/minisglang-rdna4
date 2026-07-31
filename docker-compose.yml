@@ -329,6 +329,22 @@ services:
   # at 100% util (measured 2026-07-16, 35B AWQ TP=2). max-running==cuda-graph-max-bs so EVERY admissible
   # decode batch (buckets [1,2,4,8]) is captured — none falls back to eager — and 8 covers the real-trace
   # concurrency peak (~7). Was cuda-graph-max-bs=0 (uniformly eager) — that was the latent 120W config.
+  # THE minisgl serve service. Pick a model, a spec mode, a parallelism, a context length and a
+  # concurrency — tools/serve.sh maps those onto the engine's flags and owns the per-model table
+  # (checkpoint, attention backend, DFlash draft path, tuned draft length).
+  #
+  #   MODEL=qwen35b-awq|qwen35b-mxfp4|glm|laguna|zaya|<any HF id or /models path>
+  #   SPEC=none|mtp|dflash|eagle3|ngram    SPEC_K=<n>
+  #   TP=2  DP=1  EP=0                     CTX=<tokens>   CONC=<n>
+  #
+  # Overrides for everything else: ATTN MEM_RATIO GRAPH_BS PAGE_SIZE CACHE_TYPE DRAFT EXTRA_ARGS.
+  # `DRY_RUN=1 tools/serve.sh` prints the composed launch line without running it.
+  #
+  # This REPLACED nine near-identical services (serve, qwen, glm, qwen35b-mtp, qwen35b-dflash,
+  # laguna, laguna-dflash, laguna-radix, zaya) that ran the SAME command and differed only by the
+  # values above — so every new model or spec mode meant another copy-pasted 40-line block, and the
+  # combinations nobody had pre-baked (laguna+mtp, glm+DP+EP, anything with DP or EP at all) simply
+  # did not exist. The variation is a table, and the table lives in tools/serve.sh.
   serve:
     <<: *lean-common
     profiles: ["serve"]
@@ -336,365 +352,31 @@ services:
     restart: unless-stopped
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.8}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # Qwen3.6-35B-A3B-AWQ (W4A16 compressed-tensors MoE, GDN-hybrid) at TP=2 with MTP spec-decode UNDER
-  # CUDA graph capture. Graph capture is REQUIRED — spec run eager is not the served config and its
-  # numbers are not a result (graph-capture-required rule); that is why cuda-graph-max-bs defaults to
-  # 16 here, not 0. The MTP head is itself MoE. Draft length MINISGL_SPEC_K defaults to the sweep-
-  # optimal K=4 (graph-captured sweep: baseline 47.7 -> 64.7 tok/s at K=4, +36%; falls off past 5).
-  # Needs BOTH cards (TP=2): lease -n 2.
-  #   gpu-lease -n 2 --detach --name qwen -- docker compose --profile qwen up -d
-  qwen:
-    <<: *lean-common
-    profiles: ["qwen"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-qwen
-    restart: unless-stopped
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-4}" \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-32}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.82}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # GLM-4.7-Flash-AWQ (W4A8 AWQ MoE + MLA) at TP=2 with MTP spec-decode UNDER CUDA graph capture
-  # (num_nextn_predict_layers=1). Same graph-capture requirement as `qwen`. Draft length
-  # MINISGL_SPEC_K defaults to the sweep-optimal K=2 (:lean sweep 2026-07-22, TP=2 M=1 decode: no-spec
-  # 48.5 -> K=1 64.9 -> K=2 70.9 -> K=3 64.8 tok/s; peak K=2 = +46%, accept-len ~1.9). Old "GLM MTP is
-  # a net loss / K=1 best" is FALSIFIED on the optimized image; K=2 now beats K=1. (EAGLE3 is unusable
-  # here — the cached thoughtworks/GLM-4.7-Flash-Eagle3 draft is 2048-hidden vs this ckpt's 6144.)
-  # Needs TP=2.
-  #   gpu-lease -n 2 --detach --name glm -- docker compose --profile glm up -d
-  glm:
-    <<: *lean-common
-    profiles: ["glm"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-glm
-    restart: unless-stopped
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-QuantTrio/GLM-4.7-Flash-AWQ}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-auto}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-2}" \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-32}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.82}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # Qwen3.6-35B-A3B-MXFP4 (GDN-hybrid + 128-expert MoE; MXFP4 weights, bf16-native, MTP head left
-  # UNQUANTIZED) at TP=2 with MTP spec-decode UNDER CUDA graph capture. This is the prod spec config —
-  # MTP K=2 gives the best single-stream tok/s on this GDN+MoE target (:lean sweep 2026-07-22, TP=2 M=1
-  # decode: no-spec 53.2 -> K=1 68.0 -> K=2 76.6 -> K=4 71.8 tok/s; peak K=2 = +44%, accept-len ~2.4).
-  # Supersedes the older "K=4" note — the optimized image's peak moved down to K=2 (K=4's higher
-  # accept-len is outweighed by the qlen=5 verify cost). DFlash K=15 is a wider-verify tax — use the
-  # qwen35b-dflash profile for that. MTP is uniform-K so it
-  # replays the RESERVED verify graph and tolerates the GRAPH_BS=8/MEM=0.85 config (the validated stable
-  # point for this model+spec). Needs BOTH cards (TP=2): lease -n 2.
-  #   gpu-lease -n 2 --detach --name qwen35b-mtp -- docker compose --profile qwen35b-mtp up -d
-  qwen35b-mtp:
-    <<: *lean-common
-    profiles: ["qwen35b-mtp"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-qwen35b-mtp
-    restart: unless-stopped
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --spec-algorithm mtp --spec-num-draft "${MINISGL_SPEC_K:-2}" \
-          --reasoning-parser auto \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-6}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # PRIMARY spec serve. Qwen3.6-35B-A3B-MXFP4 target + DFlash block-diffusion spec-decode with a
-  # SEPARATE trained drafter (z-lab/Qwen3.6-35B-A3B-DFlash). K=15 = the drafter's block size (memory
-  # dflash-fullctx-fix). DFlash's accept-len (~4.67) beats MTP's (~2) on this GDN+MoE target, so this
-  # is the throughput-preferred spec config when it fits.
-  # CONCURRENCY IS UNBLOCKED (2026-07-14): the TP>1 verify desync that GPU-faulted at bs>1 is FIXED —
-  # 65915b6 broadcasts rank0's drafts so every TP rank verifies the identical batch, and 98ea775 pads
-  # partial-K steps to uniform num_draft so they replay the GDN verify GRAPH instead of the eager path.
-  # DFlash-on-MoE at concurrency c~3-4 is the literature's winning spec regime (expert saturation makes
-  # the wide verify ~free); MAX_RUNNING defaults to 8 (c<=4 is graph-captured at GRAPH_BS=4, 5-8 eager
-  # but now crash-safe). GPU-VALIDATION of the concurrency fix is still pending; the throughput knee and
-  # the VRAM ceiling on 2x16GB want a measurement window before pushing MAX_RUNNING/GRAPH_BS higher.
-  # MEMORY-RAZOR-THIN at TP=2/16GB: GRAPH_BS=4 MEM=0.80 boots; MEM>=0.82 or GRAPH_BS=8 runtime-OOMs the
-  # GDN verify (continuance Gotcha). MINISGL_DFLASH_QUANT=fp8|int8 weight-only-quantizes the replicated
-  # drafter to ~half if a bigger pair is needed; MINISGL_DFLASH_DDTREE=1 routes it through the draft-TREE
-  # step. Needs BOTH cards (TP=2): lease -n 2.
-  #   gpu-lease -n 2 --detach --name qwen35b-dflash -- docker compose --profile qwen35b-dflash up -d
-  qwen35b-dflash:
-    <<: *lean-common
-    profiles: ["qwen35b-dflash"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-qwen35b-dflash
-    restart: unless-stopped
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --spec-algorithm dflash \
-          --spec-draft-model-path "${MINISGL_DFLASH_MODEL:-z-lab/Qwen3.6-35B-A3B-DFlash}" \
-          --spec-num-draft "${MINISGL_SPEC_K:-15}" \
-          --reasoning-parser auto \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-4}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # poolside/Laguna-XS-2.1-NVFP4 — SWA-hybrid gated-attention MoE. FIRST end-to-end NVFP4 quant-path
-  # serve: NVFP4 folds LOSSLESSLY into the e2m1 W4A8-WMMA kernel (fp16 per-group scale =
-  # weight_scale_e4m3 / weight_global_scale at group-16; identical E2M1 codes to MXFP4, no FP4 hw, no
-  # upconvert). Routed + shared experts are NVFP4; backbone / gated SWA attention / dense-L0 / untied
-  # lm_head stay bf16. Plain TP=2 (NO EP): the loader intermediate-splits every routed expert's FFN
-  # across the two ranks (exactly as GLM/qwen at TP=2), so each 16GB card holds ~half the 31B of expert
-  # weight (~7.7GB) plus the bf16 backbone. (EP-over-TP does NOT engage from --enable-ep alone without a
-  # DP launcher, so it is intentionally omitted — --enable-ep here would starve one card and OOM.) SWA
-  # (10 full + 30 sliding, window 512) needs the hip attention backend (window-bounded ring KV pool).
-  # Spec OFF for the coherence bring-up; use the laguna-dflash profile for spec.
-  #   gpu-lease -n 2 --detach --name laguna -- docker compose --profile laguna up -d
-  laguna:
-    <<: *lean-common
-    profiles: ["laguna"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-laguna
-    # restart "no" (NOT unless-stopped): under a gpu-lease --detach, a crash+auto-restart orphans the
-    # container (lease-watcher releases on the stop, restart brings it back with no lease -> holds the
-    # cards for everyone). A leased serve must DIE on crash so the lease frees. Re-up manually.
-    restart: "no"
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type naive \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # Laguna-XS-2.1-NVFP4 target + its matching DFlash block-diffusion drafter
-  # (poolside/Laguna-XS-2.1-DFlash-NVFP4: 5 sliding layers, block_size 16, aux target layers
-  # [1,13,25,33,39]). DFlash is uniform-K wider-verify; K defaults to the drafter's block size (16).
-  # Same TP=2+EP memory layout as the laguna profile. Measure the spec speedup honestly (prior DFlash
-  # recipes were net-negative on some targets).
-  #   gpu-lease -n 2 --detach --name laguna-dflash -- docker compose --profile laguna-dflash up -d
-  laguna-dflash:
-    <<: *lean-common
-    profiles: ["laguna-dflash"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-laguna-dflash
-    restart: "no"  # lease-safe: die on crash so the gpu-lease frees, never orphan-restart
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    environment:
-      <<: *lean-env
-      # SWA prefix caching (Track A/C): snapshot/restore the sliding-window ring so a reused prefix
-      # (e.g. a shared system prompt) skips re-prefill. Requires --cache-type radix (below). Validated
-      # to coexist with DFlash spec (Track C). MINISGL_SWA_RADIX=0 to disable.
-      MINISGL_SWA_RADIX: "${MINISGL_SWA_RADIX:-1}"
-      # page_size=16 under spec (lifts the legacy per-token rollback override). NOT a cold-prefill perf
-      # lever (A/B ~neutral), but REQUIRED for SWA-radix to reliably HIT: page-16-aligned snapshot
-      # boundaries make prefix reuse fire where page_size=1 silently misses (measured: same 1216-token
-      # prefix — ps=16 hits, ps=1 0 hits). GPU-validated coherent + lossless. Forced on for THIS serve
-      # only (not the global default — other MHA-spec models aren't validated at ps=16).
-      MINISGL_SPEC_MHA_PAGED: "${MINISGL_SPEC_MHA_PAGED:-1}"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type "${MINISGL_CACHE_TYPE:-radix}" \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --spec-algorithm dflash \
-          --spec-draft-model-path "${MINISGL_DFLASH_MODEL:-poolside/Laguna-XS-2.1-DFlash-NVFP4}" \
-          --spec-num-draft "${MINISGL_SPEC_K:-16}" \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-4}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-4}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.90}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # poolside/Laguna-XS-2.1-NVFP4 — full production serve bundling this session's validated wins,
-  # GRAPH-CAPTURED (never eager):
-  #   * group-16 NVFP4 decode GEMV — automatic (MINISGL_NVFP4_GEMV default-on, baked into :lean):
-  #     2.24x decode (21.7 -> 48.6 tok/s bs=1) vs the old mis-applied prefill-WMMA kernel.
-  #   * SWA prefix caching (--cache-type radix + MINISGL_SWA_RADIX=1): snapshot/restore the sliding-
-  #     window ring across the boundary; ~11-25x TTFT on a reused prefix, byte-identical to cold.
-  #   * fp8 KV (MINISGL_KV_FP8 default 1) works through the SWA extend path (descale-on-gather).
-  #   * CUDA-graph capture ON (SWA decode capture is byte-identical to eager, mirrors GDNGraphCapture).
-  # For spec use laguna-dflash (SWA-radix x DFlash coexistence is validated lossless; mind mr<=0.90).
-  #   gpu-lease -n 2 --detach --name laguna-radix -- docker compose --profile laguna-radix up -d
-  laguna-radix:
-    <<: *lean-common
-    profiles: ["laguna-radix"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-laguna-radix
-    restart: "no"  # lease-safe: die on crash so the gpu-lease frees, never orphan-restart
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
-    environment:
-      <<: *lean-env
-      # SWA prefix caching on: snapshot/restore the sliding-window ring so a reused prefix skips
-      # re-prefill. Needs --cache-type radix (below). Default-off in code; enabled here.
-      MINISGL_SWA_RADIX: "${MINISGL_SWA_RADIX:-1}"
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-poolside/Laguna-XS-2.1-NVFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --tp "${MINISGL_TP:-2}" \
-          --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-8}" \
-          --max-running-requests "${MINISGL_MAX_RUNNING:-8}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.85}" \
-          ${MINISGL_EXTRA_ARGS:-}
-
-  # ZAYA1-8B base (Zyphra CCA MoE), compressed-tensors W8A8-fp8, DP=2 + expert-parallel. Runs as DP=2
-  # replicas (one per gfx1201 card) with --enable-ep sharding the 128 experts across the pair so the
-  # ~9 GB fp8 weights fit 16 GB/card. Default checkpoint is /models/ZAYA1-8B-fp8. Needs BOTH cards
-  # (DP=2): lease -n 2. The CCA fusions are default-on.
-  # WHY fp8 (not the RXF 4-bit quant): the RXF-h32 build regressed constrained decode — its noisier
-  # 4-bit logits flip grammar-masked argmaxes to "..." placeholders after a β-force-close (spine
-  # specify/classification "..." fills), and its rxf_hip linear_gemv is uncoalesced (~39 vs ~52 tok/s
-  # single-stream). fp8's 8-bit logits are clean under the same grammar/RSA path. Serve RXF instead
-  # with MINISGL_MODEL=/root/.cache/huggingface/ZAYA1-8B-RXF-h32 MINISGL_EXTRA_ARGS= (RXF has no EP
-  # path — its weights replicate). (TiDAR variant in 2c58e2e.)
-  #   gpu-lease -n 2 --detach --name minisgl-zaya -- docker compose --profile zaya up -d
-  zaya:
-    <<: *lean-common
-    # No image override: ZAYA uses the SAME lean image as every other serve. Its kernels (zaya_cca /
-    # w8a8 / moe_w8a16 / attn_prefill_paged etc.) come from the canonical /kernels/_kernels mount
-    # below, so there is no ZAYA-specific baked-kernel image anymore (the old `lean-zaya` tag). The
-    # lean image also carries xgrammar, so structured output / json_schema / tools work on this lane.
-    profiles: ["zaya"]
-    container_name: ${LEASE_NAME:-minisgl-lean}-zaya
-    restart: unless-stopped
     volumes:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      # Local checkpoints (ZAYA, Laguna) and DFlash drafts, so a model alias can name a path.
       - ${MODELS_DIR:-/home/pat/models}:/models
-      # Re-distilled on-policy DFlash-CCA drafter (captured on THIS dense_gemm serve, num_spec=4).
-      # Default = the epoch-4 on-policy checkpoint; point at a later/final checkpoint via the env.
-      - ${MINISGL_DFLASH_DRAFT_HOST:-/home/pat/code/_models/ZAYA1-8B-DFlash-CCA-5L-minv-ep4}:/draft:ro
+      - ${DRAFT_DIR:-/home/pat/code/_models}:/drafts:ro
     environment:
       <<: *lean-env
-      # Forced tool calls emit ZAYA's NATIVE <zyphra_tool_call><function=NAME><parameter=P>…</parameter>
-      # XML (via a custom EBNF grammar) instead of JSON — respects ZAYA's RL training and is guaranteed
-      # parseable. Auto tool calls additionally now trigger on <zyphra_tool_call> (was never firing).
-      MINISGL_TOOL_FORMAT: "${MINISGL_TOOL_FORMAT:-zaya_xml}"
-      # Spec-decode is OPT-IN and OFF by default: on the served numbers DFlash spec makes ZAYA ~4x
-      # SLOWER (43 -> 11 tok/s). ZAYA is compute-cheap (~1.3B active/token, ~23ms/step decode) so the
-      # per-step spec cost (drafter forward + K-wide verify + DDTree) dwarfs the accept gain: the -ep4
-      # drafter delivers only ~1.11 emitted/step / ddtree accept-len ~0.11 on the DP=2 graph serve.
-      # Set MINISGL_ZAYA_SPEC=1 to turn the DFlash+DDTree lane back on (drafter mount + envs below are
-      # inert when it's off). Break-even needs emitted/step well above ~2 AND a cheaper per-step path.
-      MINISGL_ZAYA_SPEC: "${MINISGL_ZAYA_SPEC:-}"
-      # DFlash draft-TREE verify (DDTree): per-position top-K marginals -> best-first tree -> more
-      # accepted tokens/step than the linear block. Only consulted when MINISGL_ZAYA_SPEC=1.
-      MINISGL_DFLASH_DDTREE: "${MINISGL_DFLASH_DDTREE:-1}"
-      MINISGL_DDTREE_BUDGET: "${MINISGL_DDTREE_BUDGET:-32}"
-      # On-policy Draft-OPD capture: when set (+ MINISGL_ZAYA_SPEC=1, MINISGL_DFLASH_DDTREE=0), the
-      # scheduler dumps the drafter's own trajectory per verify step as opdbuf_*.pt for retraining
-      # (dflash-drafter). Write under /engine (the `.:/engine` mount) to reach the host. Inert unset.
-      MINISGL_ZAYA_OPD_CAPTURE_DIR: "${MINISGL_ZAYA_OPD_CAPTURE_DIR:-}"
-      # Kernels come from the image's baked /opt/kernels (inherited PYTHONPATH from *lean-env,
-      # /opt/kernels FIRST) — same as every other profile. No live /kernels override: the canonical
-      # kernels are now baked at image-build time, so a rebuild carries every latest build (including
-      # the split-K + GQA head-grouping attn_decode) with no stale-symlink hazard.
-    ports:
-      - "${MINISGL_HOST_PORT:-1919}:1919"
+      MODEL: "${MODEL:-qwen35b-awq}"
+      SPEC: "${SPEC:-}"
+      SPEC_K: "${SPEC_K:-}"
+      TP: "${TP:-2}"
+      DP: "${DP:-1}"
+      EP: "${EP:-0}"
+      CTX: "${CTX:-}"
+      CONC: "${CONC:-4}"
+      ATTN: "${ATTN:-}"
+      MEM_RATIO: "${MEM_RATIO:-}"
+      GRAPH_BS: "${GRAPH_BS:-}"
+      PAGE_SIZE: "${PAGE_SIZE:-}"
+      CACHE_TYPE: "${CACHE_TYPE:-}"
+      DRAFT: "${DRAFT:-}"
+      EXTRA_ARGS: "${EXTRA_ARGS:-}"
     entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        # Spec-decode is opt-in (net-negative on ZAYA — see MINISGL_ZAYA_SPEC note above). Only append
-        # the DFlash+DDTree args when explicitly enabled; the default serve is plain DP=2 (~43 tok/s).
-        SPEC_ARGS=""
-        if [ -n "${MINISGL_ZAYA_SPEC:-}" ]; then
-          SPEC_ARGS="--spec-algorithm dflash --spec-draft-model-path /draft --spec-num-draft ${MINISGL_SPEC_K:-4}"
-        fi
-        exec python -m minisgl \
-          --model "${MINISGL_MODEL:-/models/ZAYA1-8B-MXFP4}" \
-          --host 0.0.0.0 --port 1919 \
-          --cache-type radix \
-          --attention-backend "${MINISGL_ATTN_BACKEND:-hip}" \
-          --page-size 16 \
-          --data-parallel-size 2 \
-          --disable-pynccl \
-          --cuda-graph-max-bs "${MINISGL_CUDA_GRAPH_MAX_BS:-16}" \
-          --memory-ratio "${MINISGL_MEM_RATIO:-0.9}" \
-          --rsa-n "${MINISGL_RSA_N:-4}" \
-          --rsa-t "${MINISGL_RSA_T:-1}" \
-          --rsa-think-budget "${MINISGL_RSA_THINK_BUDGET:-512}" \
-          --rsa-max-tokens "${MINISGL_RSA_MAX_TOKENS:-1024}" \
-          --rsa-agg-max-tokens "${MINISGL_RSA_AGG_MAX_TOKENS:-640}" \
-          --rsa-tail-tokens "${MINISGL_RSA_TAIL_TOKENS:-2048}" \
-          --rsa-top-p "${MINISGL_RSA_TOP_P:-0.95}" \
-          $SPEC_ARGS \
-          ${MINISGL_EXTRA_ARGS:---enable-ep}
-
+    command: ["exec /engine/tools/serve.sh"]
   # CAM editable-memory serve: Qwen3.6-35B-A3B-AWQ + the CAM #100 pointer/retrieve memory plane
   # (namespaces #6, persistence #7, write-gate, freeze/no-clobber, audit/undo). Recall-only on this
   # base: the 4B-trained checkpoint's hidden (2560) != served (2048), so CAM auto-falls-back to
