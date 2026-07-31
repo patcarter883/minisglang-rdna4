@@ -384,47 +384,6 @@ def _route_align(
     return moe_hip.moe_route_align(g, top_k, renormalize, num_experts, block_size)
 
 
-# A/B BASELINE ONLY — this is NOT a feature flag on the fused route.
-#
-# The fused route is UNCONDITIONALLY ON (repo rule: if it merges it's ON; the worktree is the
-# isolation, not a flag). This variable exists so the pre-change TWELVE-op torch chain can be
-# reconstructed on the SAME BINARY for a measurement leg — building a second image to get the
-# baseline would reintroduce exactly the provenance question the A/B is supposed to settle.
-#
-# UNSET **AND PRESENT-BUT-EMPTY** BOTH MEAN "fused" (docker-compose's `VAR: "${VAR:-}"` sets the
-# variable to the EMPTY STRING, and treating that as a value is how a leg silently benchmarks the
-# wrong thing). Only a non-empty value that parses to a non-zero int selects the torch baseline.
-def _env_flag(name: str) -> bool:
-    v = _os.environ.get(name, "").strip()
-    if not v:
-        return False
-    try:
-        return int(v) != 0
-    except ValueError:
-        return False
-
-
-_MOE_ROUTE_TORCH_BASELINE = _env_flag("MINISGL_MOE_ROUTE_TORCH_BASELINE")
-
-
-def _moe_route_sigmoid_bias_torch(
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    top_k: int,
-    renormalize: bool,
-    routed_scaling_factor: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The TWELVE-kernel torch chain the fused op replaces, verbatim. A/B baseline leg only."""
-    scores = gating_output.float().sigmoid()
-    choice = scores + correction_bias.float()
-    topk_ids = choice.topk(top_k, dim=-1).indices
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-    topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights.float().contiguous(), topk_ids.int().contiguous()
-
-
 def moe_route_sigmoid_bias(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -451,10 +410,6 @@ def moe_route_sigmoid_bias(
     (bf16 for Laguna-XS-2.1-NVFP4, fp16 for QuantTrio/GLM-4.7-Flash-AWQ), so widening it here would
     be a no-op that costs a dispatch. See the bias-dtype note at the call sites.
     """
-    if _MOE_ROUTE_TORCH_BASELINE:
-        return _moe_route_sigmoid_bias_torch(
-            gating_output, correction_bias, top_k, renormalize, routed_scaling_factor
-        )
     import moe_hip
 
     engaged("moe_hip.moe_topk_sigmoid_bias")
