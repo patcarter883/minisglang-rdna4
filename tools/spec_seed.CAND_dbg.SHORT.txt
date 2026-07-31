@@ -1,0 +1,57 @@
+```cpp
+#include <vector>
+#include <algorithm>
+#include <stdexcept>
+#include <iostream>
+#include <memory>
+
+template <typename Key, typename Value, int Order>
+class BTree {
+private:
+    struct Node {
+        bool isLeaf;
+        int numKeys;
+        std::vector<Key> keys;
+        std::vector<Value> values;
+        std::vector<std::shared_ptr<Node>> children;
+
+        Node(bool leaf = true) : isLeaf(leaf), numKeys(0) {
+            keys.reserve(2 * Order - 1);
+            values.reserve(2 * Order - 1);
+            if (!leaf) {
+                children.reserve(2 * Order);
+            }
+        }
+    };
+
+    std::shared_ptr<Node> root;
+
+    bool isInternalNode(const std::shared_ptr<Node>& node) const {
+        return !node->isLeaf;
+    }
+
+    int findMinIndex(const std::shared_ptr<Node>& node, const Key& key) const {
+        int low = 0;
+        int high = node->numKeys - 1;
+        while (low <= high) {
+            int mid = (low + high) / 2;
+            if (node->keys[mid] == key) {
+                return mid;
+            } else
+<<<CONTENT>>>
+```cpp
+#include <vector>
+#include <algorithm>
+#include <stdexcept>
+#include <iostream>
+#include <memory>
+
+template <typename Key, typename Value, int Order>
+class BTree {
+private:
+    struct Node {
+        bool isLeaf;
+        int numKeys;
+        std::vector<Key> keys;
+        std::vector<Value> values;
+        std::vector<std::shared_ptr
