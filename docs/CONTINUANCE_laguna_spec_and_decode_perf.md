@@ -198,14 +198,46 @@ rows on one expert, so the grouped GEMM streams the *minimum possible* number of
 already amortizing 100% of the overlap that exists. Nothing to fix, and the "if overlap is high there
 IS a kernel bug" branch of finding 3 is closed.
 
-**(b) Finding 3's PREMISE was wrong, but its verdict survives.** Routing is *not* disjoint: at qlen 16
+**(b) Finding 3's PREMISE was wrong, but its verdict survives.**
+
+The analytic bound in `docs/PERF_PUSH_CONTINUANCE.md:112-117`, `E[distinct] = E*(1-(1-top_k/E)^M)`,
+assumes INDEPENDENT UNIFORM routing and **overestimates real divergence by ~1.9x**:
+
+| qlen | binomial model | MEASURED |
+|---|---:|---:|
+| 8 | 57.4 | **36.6** |
+| 16 | 102.0 | **55.5** |
+
+Consecutive draft tokens are semantically correlated and route far more coherently than the model
+assumes. Any cap on useful K derived from that formula is therefore too tight.
+
+Routing is *not* disjoint: at qlen 16
 the 128 (token,expert) pairs land on 55.5 distinct experts, 43% of the disjoint worst case. Even so,
 the last draft row still brings **1.86 new experts** — 23% of `top_k` — and the curve is still rising
 at row 16. So MoE verify cost grows as `distinct(qlen)`, sublinearly but steeply, and no amount of
 overlap saves it. The doc's "14x at M=17" was `6.94x` of inherent divergence times the `M<=16` cliff
 (finding 1) putting that batch on the WMMA prefill family — the two effects compose.
 
-### This kills spec decode on Laguna at EVERY K, not just K=16
+### CAVEAT ADDED 2026-07-31 (later the same day): this section is CONDITIONAL on accept-len 2.55
+
+Everything below divides by the accept-len measured in §1. That number is now DISPUTED: commit
+`e6ddb502` ("multi-query SWA verify path — DFlash spec works on Laguna (lossless, accept ~8)",
+merged Jul 23) recorded **mean accept-length ~8.1** at K=16, bs=1, TP=2, eager, explicitly noting
+`reqs/step=1.0, not batch-inflated`. A reference implementation of the same model + drafter reports
+~81% acceptance at short context, i.e. accept-len ~5.1-5.3 — which sits with 8.1, not with 2.58.
+
+Run the arithmetic the other way and the verdict flips: at qlen 16 the MoE cost per emitted token is
+`distinct(16)/(8 * accept_len)` = `6.94/2.58 = 2.69x WORSE` at today's acceptance, but
+`6.94/8.1 = 0.86x`, i.e. **spec WINS on the MoE stack**, at 8.1.
+
+So the heading below is wrong as written. It is true of the CURRENT BUILD's acceptance; it is NOT a
+property of the model or of expert divergence. **The divergence measurement stands; the conclusion
+drawn from it does not, until the acceptance question is settled.** That audit is the gating task.
+Note also the two candidate accept-len figures may not be the same QUANTITY — see
+`server/metrics.py:254-262`, and this repo has a recorded history of a batch-inflated accept-len
+gauge (true 3.16 reported as 4.65). Establish the definition before calling 8.1 -> 2.58 a regression.
+
+### At accept-len 2.55, spec loses at EVERY K, not just K=16
 
 MoE cost per *emitted* token, relative to plain decode, is `distinct(qlen) / (8 * accept_len)`, and
 accept-len is flat at ~2.55 (finding 2):
@@ -400,6 +432,33 @@ Two harness bugs caught by the provenance checks, both worth keeping in mind:
 the outer shell) — use `docker exec <c> sh -c "... < /proc/1/environ"`. And the better witness is
 kernel-side: `select_gemv_tiling` warns once per process when it takes K-on-lanes at an under-filled
 K, so the `K=256` warning present/absent proves which tiling actually ran.
+
+### SPEC-RELEVANT SIDE EFFECT: verify-side gemm2 is now 3.02x cheaper at qlen 16
+
+The M-scaling above is not just a concurrency story — **M is also the spec verify batch height**, so
+this change directly cuts verify cost:
+
+| | M=1 | M=8 | M=16 | M=16 / M=1 |
+|---|---:|---:|---:|---:|
+| K-on-lanes (before) | 59.0 us | 207.7 | 363.7 | **6.16x** |
+| BYLANE (now) | 69.1 us | 95.1 | 120.5 | **1.74x** |
+
+Any spec step-cost number measured before this landed is stale. Re-baseline on this build.
+
+**This is also the correct scoping of §7's `blocks/distinct = 1.00`.** That result is about the
+ALIGNED grouped GEMM (gemm1, tiled gemm2), where `moe_align` dedups perfectly. The FUSED
+`moe_gemm2_gather_reduce_core` does NOT go through that dedup: its grid is `(N/pb, M)` with an outer
+`top_k` loop, so it issues `M * top_k` expert-slab loads — **128 at qlen 16 against only 55.5 distinct
+experts, i.e. 2.31x of cross-token dedup left on the floor** (1.75x at qlen 8). Both statements are
+true of different kernels. Raising the `M<=2` gate at `quant/kernels.py:452` so verify also takes the
+aligned tiled-WMMA scatter path is the change that would claim that 2.31x; BYLANE has already taken a
+3.02x from the orthogonal direction (lane occupancy), so measure the residual before assuming it adds.
+
+**Related correction.** The "MoE gemm2 costs 17.76x (24.32 -> 431.83 us)" figure quoted elsewhere is
+measured at **M=17**, i.e. OVER the `M<=16` cliff, so it is the fall onto `wmma_tiled_tuned`
+(`bm=256`, 93% padding at 17 rows), NOT `gather_reduce`'s M-scaling. Under the cliff at M=16,
+`gather_reduce` was 6.16x M=1 and is now 1.74x. Attributing that jump to expert fanout double-counts
+the cliff.
 
 ### Verdict
 
