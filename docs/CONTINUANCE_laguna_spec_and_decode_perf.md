@@ -91,6 +91,7 @@ undercounts tok/s by the accept-len (I read 14.9 tok/s when the truth was 49.8).
 | MoE gemm2 routed to the wrong kernel | **NO** | `MINISGL_MOE_G2FUSE=0` (forces WMMA grouped gemm2) identical: 54.14 vs 54.33 ms |
 | NVFP4 upconverts weights to fp8 | **NO** | VRAM math: measured 10.40 GiB/card matches 4-bit+scales (21.3 GiB); fp8 would be 31.4 GB of experts alone |
 | Low acceptance / need a better drafter | **NO** | accept-len flat across all K; cost is per-verify-row |
+| NVFP4 scale traffic is worth halving (e4m3 uint8) | **NO** | 34.5 MB of a 2258 MB step; step is at 23.7% of HBM peak -> 0.30% bs=1 / 0.14% NREQ=8 (§10) |
 
 `_gate_mask_spec_logits` (`scheduler.py:1271`) showed as **63% of py-spy samples** — that is
 **sync absorption**, not work. Every leaf frame was in `libhsa-runtime64.so`; the list-index H2D there
@@ -134,6 +135,10 @@ is the first blocking op after the verify forward. Don't chase it.
    dispatch count, not a host launch count (1920 of it replays from ONE captured graph), and the
    biggest group is none of the three guessed here: it is 468 router/top-k glue dispatches/step.**
 4. **e4m3 uint8 scales instead of folded fp16** (finding 6) — halves NVFP4 scale traffic.
+   **NO-GO — see §10.** The byte arithmetic is right (34.5 MB/step, 1.53% of step traffic) but the
+   step runs at 23.7% of the HBM ceiling, so removing those bytes is worth **0.30% at bs=1 / 0.14% at
+   NREQ=8** — a ceiling, measured with the fold-vs-byte confound isolated. Do not re-open for tok/s.
+   The one real payoff is **0.918 GiB/card of VRAM**; revisit only if the KV pool is binding.
 5. **Spec defaults:** ship `SPEC_K=7` (+72% over the shipped 16) or default Laguna to no spec until
    verify amortizes. Never ship `SPEC_K=16` — it is exactly one row past the cliff.
 6. **Land the accept-path hygiene** (multi-EOS + gated on-device). It will NOT move tok/s — say so in
