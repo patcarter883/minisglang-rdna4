@@ -7,12 +7,15 @@
 # simply marked down. host.docker.internal resolves to the docker host (extra_hosts:
 # host-gateway in docker-compose.yml).
 #
-# 5s gives ample resolution for production insight (vLLM updates its loggers ~every
-# iteration / ~10s) while keeping the TSDB small over an all-day run. Retention is set on
-# the prometheus command line (--storage.tsdb.retention.time), data persists in the named
-# volume vllm-prom-data — so a serve run's behavior is analyzable AFTER the container is gone.
+# 1s scrape for near-real-time dashboards (matches the minisgl scheduler's 0.5s metrics
+# emit, so the gauges are at most ~1s stale, and discrete signals like the GPU mem clock
+# render as clean steps rather than downsample-averaged ramps). This is ~5x the TSDB write
+# rate of the old 5s — fine for interactive sessions; bump back toward 5s for multi-day
+# unattended runs if the volume grows. Retention is set on the prometheus command line
+# (--storage.tsdb.retention.time), data persists in the named volume vllm-prom-data — so a
+# serve run's behavior is analyzable AFTER the container is gone.
 global:
-  scrape_interval: 5s
+  scrape_interval: 1s
   evaluation_interval: 30s
 
 scrape_configs:
@@ -44,3 +47,13 @@ scrape_configs:
         regex: 'host.docker.internal:(\d+)'
         target_label: serve_port
         replacement: '${1}'
+
+  # amdgpu hardware telemetry (per-card load/power/temp/vram/clocks). The gpu-exporter service
+  # runs in the vllm-gfx1201 compose project, so Prometheus reaches it by service name on the
+  # shared default network — no host.docker.internal / published-port dependency. Metrics are
+  # amdgpu_* (host-wide, labelled by physical `gpu` id, NOT per-serve). Feeds the GPU row on the
+  # minisgl-serving Grafana dashboard (power/clocks/temp/vram/bandwidth).
+  - job_name: gpu
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['gpu-exporter:9400']

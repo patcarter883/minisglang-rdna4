@@ -134,6 +134,13 @@ services:
       - .:/engine
       - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
       - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
+      # Magpie/metrix site-packages at the path profile_kernel.sh expects (MX_SITE_PACKAGES=/mx).
+      # Without this the runner cannot host a profiling run, which forced agents back to hand-rolled
+      # `docker run` for exactly the workload where getting the mounts right matters most.
+      - ${MAGPIE_SITE_PACKAGES:-/home/pat/code/Magpie/.venv/lib/python3.12/site-packages}:/mx:ro
+      # The box-wide rocprofv3 mutex must be the SAME file inside the container as outside, or two
+      # profiling runs in different containers will not see each other and will SIGABRT.
+      - /home/pat/code/vllm-gfx1201/.gpu-locks:/home/pat/code/vllm-gfx1201/.gpu-locks
     entrypoint: ["bash", "-lc"]
     command:
       - ${MINISGL_CMD:-python /engine/tools/container_selftest.py}
