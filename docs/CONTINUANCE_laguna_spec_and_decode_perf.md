@@ -857,8 +857,117 @@ baseline. Report accept-len bucketed by `P` exactly as `spec_dflash_divergence.s
 *Prediction:* if the drafter is genuinely blind to the prompt, the `P<64` bucket stays ~3.5 despite
 a 4k-token prompt; if it jumps, the starvation diagnosis is dead.
 
+### 11.8 MEASURED: the prompt-prefill seed TAIL SWEEP — the tail is not the lever, the PROMPT LENGTH is
+
+Closes the sweep `341c4df0` deferred (`_SEED_TAIL_DEFAULT = 64` was provisional). `tail ∈ {0, 32, 64,
+128, 256, 528}` x {LONG 3571-token code prompt @ 1600 tok, SHORT 95-token instruction @ 384 tok},
+plus a matched `--spec-algorithm none` PLAIN leg, **two full independent replicates** (14 boots).
+`MINISGL_DFLASH_SEED_TAIL=0` disables seeding on the same binary, so unlike `5bd8d5a7` this is one
+tree and one image; verified equivalent to the pre-change build (warm md5 `282b24cb` byte-identical
+to that bank's baseline, LONG accept-len 4.675 vs its 4.635). Config, image and prompt file are
+identical to `5bd8d5a7`. Full numbers, provenance and the void leg:
+`tools/spec_seed_tail_sweep_results.txt`.
+
+**The table** (tok/s = `usage.completion_tokens`/wall, non-streaming; 4 samples per cell):
+
+| tail | LONG accept-len | LONG tok/s | LONG vs PLAIN | SHORT accept-len | SHORT tok/s | SHORT vs PLAIN | combined |
+|---|---|---|---|---|---|---|---|
+| PLAIN | 1.000 | 65.59 | +0.0% | 1.000 | 79.32 | +0.0% | 72.13 |
+| **0 (off)** | 4.479 | **75.39** | **+14.9%** | 4.442 | 84.32 | +6.3% | 79.73 |
+| 32 | 4.019 | 67.50 | +2.9% | 5.394 | 101.07 | +27.4% | 82.60 |
+| **64** | 4.384 | 73.55 | +12.1% | **5.394** | **101.11** | **+27.5%** | **86.23** |
+| 128 | 4.396 | 73.74 | +12.4% | 5.394 | 101.13 | +27.5% | 86.36 |
+| 256 | 4.056 | 68.23 | +4.0% | 5.394 | 101.18 | +27.6% | 83.08 |
+| 528 | 4.101 | 69.00 | +5.2% | 5.394 | 101.16 | +27.5% | 83.54 |
+
+`ms/step` is flat at 60.6-61.6 (LONG) / 52.0-54.6 (SHORT) for **every** tail including 0 — seeding
+costs nothing per step, it only changes draft quality. "combined" = geometric mean of the two regime
+means.
+
+**The tail size is not the lever, and there are two independent proofs.**
+
+1. **SHORT is bit-identical for every tail in {32,…,528}** — same completion md5 `f6a4727c`, same 71
+   steps, same 5.394, same first draft chain, in both replicates. Above 32 trailing positions the
+   knob does nothing on a 95-token prompt. It is *not* an inert code path: at 3571 tokens the first
+   draft chain differs between every tail from draft position 4 onward.
+2. **The LONG differences are the greedy content lottery.** Restrict accept-len to `P<64`, the only
+   region where the seed is still inside the drafter's fixed 512-key window:
+
+   | | LONG `P<64` (rep1 / rep2) | SHORT `P<64` (both reps) |
+   |---|---|---|
+   | tail 0 (off) | 2.462 / 2.393 | 3.000 |
+   | 32 | 2.241 / 2.031 | 4.176 |
+   | 64 | 2.407 / 2.345 | 4.176 |
+   | 128 | 2.615 / 2.241 | 4.176 |
+   | 256 | 2.826 / 2.276 | 4.176 |
+   | 528 | 2.241 / 2.481 | 4.176 |
+
+   On the LONG prompt the seed produces **no lift at all**, in either replicate, in the only place it
+   can act. On the SHORT prompt the same statistic moves **3.000 → 4.176 (+39.2%)**, identically in 4
+   boots x 5 tails. Meanwhile whole-request LONG accept-len spans **3.919-4.675 at tail=0 alone**
+   across 3 independent generations — a 19% band, wider than any tail-vs-tail difference in the
+   table. Everything past `P=512` is the drafter conditioned on its own output, which is where the
+   LONG numbers actually move.
+
+**The crossover is real and it sits at the drafter's window.** Truncating the code prompt to
+intermediate lengths is **VOID** as a length measurement (each truncation asks for a different
+continuation; accept-len swung 3.0-8.0 *within one leg*). `tools/spec_seed_padlen.sh` holds the task
+fixed instead — the same 95-token instruction is always last, preceded by N tokens of filler:
+
+| prompt_tok | PLAIN tok/s | tail 0 acc / tok/s | tail 64 acc / tok/s | seed Δ accept-len |
+|---|---|---|---|---|
+| 95 | 78.29 | 4.352 / 81.62 | 5.394 / 99.30 | **+23.9%** |
+| 223 | 75.53 | 3.792 / 69.43 | 4.402 / 78.91 | +16.1% |
+| 351 | 73.46 | 4.118 / 73.15 | 4.560 / 78.89 | +10.7% |
+| 607 | 72.57 | 4.256 / 73.74 | 3.648 / 62.89 | -14.3% |
+| 1119 | 69.38 | 4.163 / 69.03 | 4.163 / 68.17 | +0.0% |
+| 2143 | 65.10 | 4.256 / 67.88 | 4.209 / 66.85 | -1.1% |
+| 3495 | 57.78 | 4.506 / 65.47 | 4.352 / 63.42 | -3.4% |
+
+The advantage decays monotonically 95 → 223 → 351 and is gone by ~600 tokens; 1119-3495 sit at 0 to
+-3%. **Crossover: between 351 and 607 prompt tokens** — the drafter's own 512-key sliding window, the
+only length scale in the system that could put it there. `n=1` per cell, so the 607 cell's -14.3% is
+scatter around zero, not a dip.
+
+**This falsifies `341c4df0`'s own explanation.** That commit blamed EVICTION ("a window-sized seed
+evicts the model's recent output"). A 32-token seed can evict at most 32 of 512 keys, yet tail=32 is
+*not* better than tail=528 on LONG (4.019 vs 4.101, both under tail=0's 4.479) and is bit-identical
+to it on SHORT. Size is not the mechanism. And `5bd8d5a7`'s headline -15.6% at tail=528 does not
+survive replication as a *seed* effect: re-measured it is -8.4% against a tail=0 that itself moves 19%.
+
+**Chosen default: `_SEED_TAIL_DEFAULT = 64`, unchanged — now measured, no longer provisional.**
+Decision rule: must not regress LONG below plain, then maximise across both.
+
+* Gate — every LONG leg above its **own boot's** matched plain leg, 4/4: passed by tail 0 and tail 64
+  **only**. 32 fails rep1 (62.54 vs 64.19); 128 fails rep2 (62.41 vs 64.16); 256 fails rep2 (64.02 vs
+  64.16); 528 fails rep2 (64.12 vs 64.16).
+* Of the two survivors: LONG 75.39 (off) vs 73.55 (64) — off by 2.5%, **inside** the 19% lottery
+  band. SHORT 84.32 vs 101.11 — 64 by 19.9%, reproducible to <1%. Combined 79.73 vs 86.23.
+* 128 ties 64 on the combined score (86.36) but fails the gate and has 4x the spread (62.41-86.11 vs
+  70.02-77.26).
+
+**No single tail wins both regimes; the trade-off is stated, not hidden.** Choosing 64 over
+seeding-off costs the long-prompt regime ~2.5% tok/s (unresolvable against its own noise) to buy the
+short-prompt regime 19.9% (reproducible). The opposite reading — "seeding off is simply best at long
+prompts, ship it off" — is **not** what the data says: off is 0-3% better there, under the noise
+floor. The correct statement is that **the tail number is irrelevant** and the feature earns its keep
+for prompts up to ~500 tokens and is free-but-pointless above that.
+
+**Next, and it is the measured follow-up, not a guess:** gate the seed on prompt length — seed when
+`prompt_len <= sliding_window` (512), skip above. The crossover table is the whole justification; it
+keeps +24%/+16%/+11% at 95/223/351 and gives back the 0-3% the long regime pays. That is a scheduler
+predicate, not a new tail value, so this sweep cannot pick it — it needs its own A/B.
+
 ### 11.7 Artifacts
 
+- `tools/spec_seed_tail_sweep.sh` / `_driver.sh` — the §11.8 tail sweep (one boot per tail, seed
+  provenance asserted per leg from the scheduler's ENABLED line, warm/CODE1/CODE2/SHORT1/SHORT2).
+- `tools/spec_seed_padlen.sh` / `_driver.sh` — the held-task prompt-length crossover (§11.8).
+- `tools/spec_seed_crossover.sh` — the **VOID** truncation-based length sweep; kept so nobody re-runs
+  it (each truncation changes the requested continuation and the lottery swamps the effect).
+- `tools/seedtail_parse.py` / `tools/seedtail_window_analysis.py` — the tail x regime table and the
+  `P<512`/`P<128`/`P<64` restricted accept-len that separates the seed from the content lottery.
+- `tools/spec_seed_tail_sweep_results.txt` — every raw cell, provenance, and the void leg.
 - `tools/spec_truth.sh` — the 3-leg matrix harness (hand-written argv, three accept-len definitions
   per cell, `reqs/step` batch-inflation guard with an explicit `*** VOID ***` branch, provenance
   block printed from inside the container).

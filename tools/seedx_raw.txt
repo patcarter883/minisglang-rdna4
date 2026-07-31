@@ -1,0 +1,86 @@
+=============================== XLEG TAIL=0  2026-07-31T23:10:54+10:00 ===============================
+ Network lease-gpu0-1_default Creating 
+ Network lease-gpu0-1_default Created 
+ Container lease-gpu0-1-run-run-4a13a5f2c132 Creating 
+ Container lease-gpu0-1-run-run-4a13a5f2c132 Created 
+################ CROSSOVER LEG=xt0 SPEC=dflash TAIL=0 GENTOK=512 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt md5    : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+45:[1m[2026-07-31|13:11:38|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=all) (bf16, borrow target embed/head)
+  seed-ENABLED line count = 0
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+full prompt = 3529 raw tokens
+REQ warm: prompt_tok=44 completion_tok=22 wall=1.43s TRUE_tok/s=15.40 finish=stop
+REQ P3529: prompt_tok=3571 completion_tok=512 wall=9.82s TRUE_tok/s=52.13 finish=length
+REQ P2048: prompt_tok=2090 completion_tok=512 wall=10.42s TRUE_tok/s=49.15 finish=length
+REQ P1024: prompt_tok=1066 completion_tok=512 wall=5.02s TRUE_tok/s=102.08 finish=length
+REQ P512: prompt_tok=554 completion_tok=512 wall=7.18s TRUE_tok/s=71.33 finish=length
+REQ P256: prompt_tok=297 completion_tok=512 wall=3.65s TRUE_tok/s=140.39 finish=length
+REQ P128: prompt_tok=170 completion_tok=512 wall=4.18s TRUE_tok/s=122.56 finish=length
+############ ACCEPT-LEN PER REQUEST  leg=xt0 ############
+  uid=0 prompt_len=   44 steps=  12 emitted=   22 ACCEPT-LEN=1.833 rate=0.067
+  uid=1 prompt_len= 3571 steps= 153 emitted=  511 ACCEPT-LEN=3.340 rate=0.158
+  uid=2 prompt_len= 2090 steps= 170 emitted=  511 ACCEPT-LEN=3.006 rate=0.136
+  uid=3 prompt_len= 1066 steps=  82 emitted=  511 ACCEPT-LEN=6.232 rate=0.353
+  uid=4 prompt_len=  554 steps= 125 emitted=  511 ACCEPT-LEN=4.088 rate=0.209
+  uid=5 prompt_len=  297 steps=  64 emitted=  511 ACCEPT-LEN=7.984 rate=0.481
+  uid=6 prompt_len=  170 steps=  75 emitted=  511 ACCEPT-LEN=6.813 rate=0.399
+[done] leg=xt0
+[driver] xleg TAIL=0 exit=0
+=============================== XLEG TAIL=32  2026-07-31T23:12:35+10:00 ===============================
+ Container lease-gpu0-1-run-run-60d59f18f162 Creating 
+ Container lease-gpu0-1-run-run-60d59f18f162 Created 
+################ CROSSOVER LEG=xt32 SPEC=dflash TAIL=32 GENTOK=512 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt md5    : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+45:[1m[2026-07-31|13:13:32|core|rank=0][0m [32mINFO    [0m DFlash Laguna drafter: 5L h=2048 heads=64/8 block=16 mask_id=12 window=512 causal=True aux_layers=[1, 13, 25, 33, 39] prefill_seed=on(tail=32) (bf16, borrow target embed/head)
+46:[1m[2026-07-31|13:13:32|core|rank=0][0m [32mINFO    [0m spec-decode: prompt-prefill draft seed ENABLED (aux tail=32)
+  seed-ENABLED line count = 1
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+full prompt = 3529 raw tokens
+REQ warm: prompt_tok=44 completion_tok=512 wall=12.42s TRUE_tok/s=41.23 finish=length
+REQ P3529: prompt_tok=3571 completion_tok=512 wall=8.63s TRUE_tok/s=59.34 finish=length
+REQ P2048: prompt_tok=2090 completion_tok=512 wall=9.77s TRUE_tok/s=52.40 finish=length
+REQ P1024: prompt_tok=1066 completion_tok=512 wall=7.67s TRUE_tok/s=66.74 finish=length
+REQ P512: prompt_tok=554 completion_tok=512 wall=5.40s TRUE_tok/s=94.85 finish=length
+REQ P256: prompt_tok=297 completion_tok=512 wall=6.79s TRUE_tok/s=75.39 finish=length
+REQ P128: prompt_tok=170 completion_tok=512 wall=3.85s TRUE_tok/s=133.10 finish=length
+############ ACCEPT-LEN PER REQUEST  leg=xt32 ############
+  uid=0 prompt_len=   44 steps= 221 emitted=  511 ACCEPT-LEN=2.312 rate=0.088
+  uid=1 prompt_len= 3571 steps= 132 emitted=  511 ACCEPT-LEN=3.871 rate=0.192
+  uid=2 prompt_len= 2090 steps= 158 emitted=  511 ACCEPT-LEN=3.234 rate=0.150
+  uid=3 prompt_len= 1066 steps= 128 emitted=  511 ACCEPT-LEN=3.992 rate=0.200
+  uid=4 prompt_len=  554 steps=  92 emitted=  511 ACCEPT-LEN=5.554 rate=0.304
+  uid=5 prompt_len=  297 steps= 121 emitted=  511 ACCEPT-LEN=4.223 rate=0.218
+  uid=6 prompt_len=  170 steps=  68 emitted=  511 ACCEPT-LEN=7.515 rate=0.438
+[done] leg=xt32
+[driver] xleg TAIL=32 exit=0
+=============================== XLEG TAIL=none  2026-07-31T23:14:40+10:00 ===============================
+ Container lease-gpu0-1-run-run-a57246006880 Creating 
+ Container lease-gpu0-1-run-run-a57246006880 Created 
+################ CROSSOVER LEG=xplain SPEC=none TAIL=<unset> GENTOK=512 ################
+  dflash.py md5 : 856a6f15725e392cd844c22086b3a6c4  /engine/python/minisgl/spec/dflash.py
+  prompt md5    : 486e61f3494ad45c5e503ff5910f4794  /engine/tools/spec_seed_prompt.txt
+[boot] launching...
+[boot] ready.
+-- SEED PROVENANCE --
+  seed-ENABLED line count = 0
+[transformers] The tokenizer you are loading from 'poolside/Laguna-XS-2.1-NVFP4' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+full prompt = 3529 raw tokens
+REQ warm: prompt_tok=44 completion_tok=487 wall=7.18s TRUE_tok/s=67.84 finish=stop
+REQ P3529: prompt_tok=3571 completion_tok=512 wall=8.61s TRUE_tok/s=59.50 finish=length
+REQ P2048: prompt_tok=2090 completion_tok=512 wall=7.81s TRUE_tok/s=65.53 finish=length
+REQ P1024: prompt_tok=1066 completion_tok=512 wall=7.22s TRUE_tok/s=70.87 finish=length
+REQ P512: prompt_tok=554 completion_tok=512 wall=6.95s TRUE_tok/s=73.63 finish=length
+REQ P256: prompt_tok=297 completion_tok=512 wall=6.82s TRUE_tok/s=75.05 finish=length
+REQ P128: prompt_tok=170 completion_tok=512 wall=6.67s TRUE_tok/s=76.73 finish=length
+############ ACCEPT-LEN PER REQUEST  leg=xplain ############
+[done] leg=xplain
+[driver] xleg TAIL=none exit=0
+[driver] XOVER ALL DONE 2026-07-31T23:16:49+10:00

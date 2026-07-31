@@ -18,10 +18,22 @@ if TYPE_CHECKING:
 __all__ = ["DFlashProposer"]
 
 
-# Prompt-prefill seed length, in trailing aux positions. PROVISIONAL — pending the tail sweep; the
-# window-sized value this replaced (528) measured -15.6% accept-len on a 3.5k code prompt while
-# measuring +22.5% on a 95-token one, because a window-sized seed evicts the model's own recent
-# output from a fixed 512-key window. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
+# Prompt-prefill seed length, in trailing aux positions. MEASURED, not provisional: the {0,32,64,128,
+# 256,528} x {3571-tok code @1600, 95-tok instruction @384} sweep, two full replicates, is in
+# CONTINUANCE §11.8 / tools/spec_seed_tail_sweep_results.txt. 64 is the ONLY seeded tail whose four
+# long-prompt legs all beat their own boot's matched plain leg, and it is joint-best on the combined
+# score (86.2 tok/s geo-mean vs 79.7 seeding-off, 72.1 plain).
+#
+# But the number itself barely matters, and saying so is the point of this comment: on a 95-token
+# prompt tails 32..528 are BIT-IDENTICAL (same completion md5, same 5.394 accept-len, same first
+# draft chain), and on a 3.5k-token prompt the seed produces NO lift in the P<64 region where it is
+# physically able to act (2.46/2.39 seeding-off vs 2.03-2.83 seeded, unordered) — the long-prompt
+# tail-vs-tail spread is the greedy content lottery, which is 19% wide at a FIXED tail. What the seed
+# is really a function of is PROMPT LENGTH: +23.9% accept-len at 95 tokens, +16.1% at 223, +10.7% at
+# 351, then 0 to -3% from 607 out to 3495 — crossing zero at the drafter's own 512-key window. So
+# 341c4df0's eviction story is falsified (a 32-token seed cannot evict 512 keys yet behaves like the
+# 528 one), and the real follow-up is to gate seeding on prompt_len <= sliding_window, not to retune
+# this constant. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
 _SEED_TAIL_DEFAULT = 64
 
 
