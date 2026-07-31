@@ -411,3 +411,143 @@ cannot be chosen per-M. One choice for all M: the concurrent win dominates.
 **Method note worth carrying forward.** The first A/B ran at CONC=1 and read "flat, 0.0%" — a correct
 measurement of the wrong regime, and it would have discarded a +20% lever. When a kernel's isolated
 speedup is steep in M, the serve A/B has to sweep the concurrency that sets M, not just the default.
+
+---
+
+## 10. MEASURED: NVFP4 e4m3-uint8 scales (§5 item 4) — **NO-GO on performance**, ~0.3% at bs=1
+
+Finding 6's premise ("halve the scale traffic") is arithmetically correct and the byte saving is
+real. It does **not** convert to time, because nothing in the Laguna decode step is bandwidth-bound.
+Establish this before touching any loader or kernel — the change is invasive (blast radius below)
+and the ceiling is a third of a percent.
+
+### The arithmetic, verified against the checkpoint
+
+`poolside/Laguna-XS-2.1-NVFP4` safetensors, summed by tensor class:
+
+| class | on disk | vs weights |
+|---|---:|---:|
+| `weight_packed` (E2M1, 4-bit) | 15.703 GB | — |
+| `weight_scale` (**e4m3 uint8**, group 16) | 1.963 GB | **12.5%** |
+| after `fold_nvfp4_scale` -> **fp16** | 3.926 GB | **25.0%** |
+| dense bf16 (attn proj + layer-0 MLP + norms) | 3.004 GB | — |
+
+So finding 6 is right: fp16 at group 16 is 0.125 B/param = 25% on top of 0.5 B/param of weights, and
+the fold costs ~1.96 GB of extra scale bytes (0.985 GB, **0.918 GiB, per card at TP=2**).
+
+**Per decode step per card at bs=1** (8 of 256 experts x 39 sparse layers, + the shared expert,
++ TP-sharded bf16 backbone, + the replicated bf16 `lm_head`):
+
+| | MB/step |
+|---|---:|
+| routed experts (weights + fp16 scales) | 306.7 (of which **61.3** is scale) |
+| shared expert | 38.3 (7.7 scale) |
+| dense bf16 backbone | 1501.9 |
+| `lm_head` | 411.0 |
+| **total** | **2258.0** |
+
+That is **167 GB/s** against the 706.6 GB/s ceiling (1380 MHz mem OC) = **23.7% of peak**, which is
+the engine-wide "umc <= 27% at every batch size" result reproduced from first principles on this model.
+
+fp16 -> e4m3-uint8 removes **34.5 MB/step**, i.e. **1.53% of step traffic**. Even if those bytes
+were being fetched at the full DRAM ceiling and their removal were pure time, that is **48.8 us of a
+13510 us step = 0.36%**.
+
+### Measured, on the kernels the engine actually dispatches
+
+`group_size 16 vs 32` at identical weight bytes looks like the obvious A/B (g32 has exactly half the
+scale bytes) and it reports 1.02-1.08x. **It is a confounded A/B and must not be used.**
+`gemv_decode.h accum()/accum_bylane()` take a *different branch* below group 32: the 32-k chunk
+straddles two groups, so g16 does TWO `__half2float` loads and splits the dot into `plo`/`phi`.
+e4m3-uint8-at-16 keeps that branch verbatim (same two loads, same split) and *adds* a convert. The
+g16->g32 delta is mostly fold structure, not bytes.
+
+The clean byte-only probe is **g32 vs g64 vs g128 on the GEMV path**: in the `group_size >= 32`
+branch there is exactly ONE `ws[g]` load and ONE fold per 32-k chunk for 32, 64 and 128 alike, and
+the decode GEMV has no `GSc` compile-time specialisation (that exists only in the tiled WMMA
+`moe_gemm`). So the instruction stream is *identical* and only the scale array size changes. Fit
+time vs scale bytes -> us/MB, then price the proposal's 0.0625 B/param.
+Served TP=2 shapes: `w13` N=512 K=2048, `w2` N=2048 K=256, E=256, top_k=8, block_m=16.
+
+| kernel | M | g32 us | g64 us | g128 us | slope us/MB | ceiling us/MB | proposal |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `gemm1_silu(gemv)` w13 | 1 | 23.5 | 22.8 | 23.1 | **1.01** | 1.42 | 0.53 us -> 0.021 ms/step |
+| `gemm_scatter(wmma,splitk4)` w2 | 1 | 26.0 | 25.0 | n/a | 7.18 (INVALID) | 1.42 | <= 0.37 us -> 0.015 ms/step |
+| `gemm1_silu(gemv)` w13 | 8 | 108.9 | 109.0 | 108.8 | **0.00** | 1.42 | ~0 |
+| `gemm2_gather_reduce` w2 | 8 | 94.0 | 93.3 | 93.1 | **0.56** | 1.42 | 1.13 us -> 0.044 ms/step |
+| `gemm1_silu(gemv)` w13 | 16 | 195.2 | 194.1 | 193.6 | **0.30** | 1.42 | 0.080 ms/step |
+| `gemm2_gather_reduce` w2 | 16 | 113.3 | 113.0 | 113.1 | **0.09** | 1.42 | 0.013 ms/step |
+
+The `gemm_scatter` row is **excluded**: 7.18 us/MB is 5x the physical DRAM cost of a MB, so that
+delta is not bytes — the tiled kernel's `k_sub = group_size/16` inner loop is runtime at `GSc=0`, so
+g32/g64 differ in instruction count there too. It is bounded by physics instead (0.262 MB x 1.42).
+Every valid slope is **at or below** the ceiling slope, as it must be.
+
+**Per-step ceiling for the proposal, fold-confound removed:**
+
+| regime | saved ms/step | step | **e2e ceiling** |
+|---|---:|---:|---:|
+| bs=1 (M=1) | 0.021 + <=0.015 + 0.005 (shared) = **0.041** | 13.51 ms | **0.30%** |
+| NREQ=8 (M=8) | **0.044** | ~31.9 ms | **0.14%** |
+| M=16 | 0.093 | ~31.9 ms | 0.29% |
+
+Independent cross-check: the whole-step byte accounting above gives 48.8 us = 0.36% at bs=1. The two
+methods agree.
+
+### Why the NREQ=8 regime does not rescue it (it did for §9)
+
+§9's by-lane lever was neutral at bs=1 and +20.1% at NREQ=8 because its isolated delta was **steep in
+M** (0.85x at M=1, 2.19x at M=8 -> 4.39 ms/step isolated, which converted ~1:1 to the 5.4 ms/step the
+serve actually gained). This lever is the opposite: the byte slope *falls* with M (1.01 -> 0.00 -> 0.30
+us/MB on gemm1), because at larger M each expert slab's scales are amortised over more rows while the
+weights are not. 0.044 ms on a ~31.9 ms step is 0.14%. There is no concurrency at which this pays.
+
+### **GO/NO-GO: NO-GO for throughput.**
+
+0.3% at bs=1 and 0.14% at NREQ=8 are *ceilings* that additionally ignore the e4m3->f32 convert the
+change adds and the unchanged group-16 double-fold. The measured e2e conversion factor for isolated
+MoE-kernel savings at bs=1 in this engine is ~0 (§9: a 0.4 ms/step isolated delta moved tok/s 0.09%).
+Do not spend the blast radius below on it.
+
+### What IS real, and is not a bandwidth argument: **0.918 GiB/card of VRAM**
+
+Not folding to fp16 keeps 1.963 GB of scales as uint8 -> **0.985 GB = 0.918 GiB freed per card at
+TP=2**. On a 16 GiB card serving Laguna at `MEM_RATIO=0.96` with ~10.4 GiB of weights that is roughly
+a fifth of the free pool, ~96k more tokens of full-attention fp8 KV (10 full layers x 4 kv-heads/card
+x 128 x 2 x 1 B = 10240 B/token). If KV pool is ever the binding constraint on Laguna concurrency or
+context length, **that** is the reason to do this — not tok/s. Measure the pool first.
+
+### Numerics of the current fold (checked, and it is fine)
+
+52.4M folded scale elements sampled from 800 matrices: folded |value| spans 1.94e-3 .. 1.38e-1, so
+**zero** subnormals, **zero** flush-to-zero, **zero** overflow in fp16 — the fold is safe.
+It is however **not exact**, contrary to `nvfp4.py`'s docstring: representing `e4m3/global` in fp16
+costs mean **1.63e-4** / max **4.49e-4** relative (fp16 ulp/2 = 4.88e-4). That is ~1000x below the
+E2M1 weight-quantisation noise floor (1-2 mantissa bits), so it is harmless — but the docstring's
+"This fold is exact" should read "exact to fp16 rounding, ~1.6e-4 rel". No quality reason to change.
+
+### Blast radius, if someone revives this for the VRAM
+
+- **Kernels** (`fp8_wmma` only — no other package consumes an fp16 group scale): the decode GEMV core
+  is already `WScaleT`-templated and already has a non-`__half` sibling (`WScaleT = float`, RXF), so
+  a `WScaleT = uint8_t` loader with an `e4m3_to_f32` on read is a genuine WLoad policy there. Every
+  *other* path hardcodes it: ~128 `const __half* w_scales` signature / `data_ptr<at::Half>()` sites
+  across 12 files (`moe_kernel.hip` 11, `w4a8_fp8_wmma_kernel.hip` 35, `w8a8_moe_kernel.hip` 11,
+  `gemm_tiled.h`, `moe_gemm_flag.h`, `moe_gemm1_silu_flag.h`, + the `*_hip` twins). Prefill (M>32)
+  and the dense NVFP4 path all go through those, so a decode-only change would leave two encodings
+  of the same weight resident — i.e. no VRAM saving at all. It is all-or-nothing.
+- **Op schemas**: `scales` dtype is part of every `torch.ops` signature and every `_register_fake`.
+- **Engine**: `nvfp4.py` stops folding and must carry the per-tensor global through the leaf->merge
+  path that `fold_nvfp4_scale` exists to avoid. Checked: in this checkpoint `gate_proj` and
+  `up_proj` share a global per expert but experts differ from each other, so post-stack the global is
+  a per-expert (in general per-output-channel) fp32 vector, not a scalar. That is tractable via the
+  existing `wscale_epi()` per-channel hook at 4 B x N per matrix (2 KB vs 128 KB of scales), but it
+  touches the gate-up merge, the expert stack and the GDN in_proj concat.
+
+### Method note
+
+Two things nearly produced a wrong answer here. (1) A first pass at 200 iters/no min-of-N read the
+g16->g32 delta as up to 1.21x; min-of-5 collapsed it to 1.08x — small-kernel A/Bs on a shared box need
+min-of-N. (2) The obvious g16-vs-g32 A/B is confounded by a *branch*, not just bytes, and it
+over-reports the lever by ~3x. When a knob changes two things, find the pair of settings that changes
+only one — here g32/g64/g128, where the instruction stream is provably identical.
