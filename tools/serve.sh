@@ -39,7 +39,7 @@ PORT="${PORT:-1919}"
 # Per model: the checkpoint, the attention backend it wants, its default spec algorithm + draft
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
-dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"
+dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 # Each arm matches the ALIAS *or* the checkpoint id/path, because the two ways of choosing a model
 # produce different strings: typing `MODEL=laguna` gives the alias, while the control panel's model
@@ -60,7 +60,8 @@ case "$MODEL" in
                   eagle3_draft="thoughtworks/GLM-4.7-Flash-Eagle3"; k_eagle3=6 ;;
   laguna|poolside/Laguna-XS-2.1-NVFP4)
                   model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
-                  dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85" ;;
+                  dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85"
+                  swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
@@ -105,6 +106,20 @@ case "$SPEC" in
   *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|eagle3|ngram|tidar)" >&2; exit 2 ;;
 esac
 
+# --- SWA-hybrid prefix caching ------------------------------------------------------------------
+# A sliding-window model downgrades `--cache-type radix` to `naive` unless MINISGL_SWA_RADIX is on
+# (scheduler.py feature-flags it, default off), which is why an SWA model silently logs
+#   "SWA-hybrid model: forcing prefix cache 'naive' (was 'radix'); SWA-radix disabled"
+# and loses prefix reuse. MINISGL_SPEC_MHA_PAGED=1 is the second half: SWA-radix only HITS on
+# page-16-aligned snapshot boundaries — measured on the TP=2 serve with an identical 1216-token
+# shared prefix, ps=1 gave 0 hits (a SILENT miss) and ps=16 gave 2 hits with warm TTFT dropping.
+# Both were set per-service on the old laguna services; they belong to the MODEL, so they live here.
+# An explicit value from the caller/panel always wins, and both are inert on non-SWA models.
+if [[ -n "$swa_hybrid" ]]; then
+  export MINISGL_SWA_RADIX="${MINISGL_SWA_RADIX:-1}"
+  export MINISGL_SPEC_MHA_PAGED="${MINISGL_SPEC_MHA_PAGED:-1}"
+fi
+
 # --- parallelism ---------------------------------------------------------------------------------
 # TP and DP are counts, not device ids — the GPU lease decides WHICH cards are visible. EP is a flag
 # that only means anything on a MoE model; passing it elsewhere is harmless but pointless.
@@ -139,6 +154,8 @@ cmd=(python -m minisgl
 printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=%s graph_bs=%s\n' \
   "$model_id" "$SPEC" "${SPEC_K:+ k=$SPEC_K}" "$TP" "$DP" "$EP" "${CTX:-checkpoint}" "$CONC" \
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
+[[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
+  "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
 printf '[serve] %s\n' "${cmd[*]}" >&2
 [[ -n "${DRY_RUN:-}" ]] && exit 0
 exec "${cmd[@]}"
