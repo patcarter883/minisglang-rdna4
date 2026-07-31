@@ -1,0 +1,15 @@
+## ZAYA1-8B-fp8 TP=1, SPEC=none, graph-captured — fused route vs the torch chain
+=== BASELINE: torch route chain (MINISGL_ZAYA_TORCH_ROUTE=1) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: MINISGL_ZAYA_TORCH_ROUTE=1
+  engage witness: hip-engage] zaya.torch_route
+  AGGREGATE tok/s (NREQ=8): min=332.84 median=337.89 max=338.54
+  tokens=9213 wall=27.39s
+  sample: A B-tree index is a self-balancing search tree data structure used for storing data records and enabling fast range queries. It is particularly useful in databases and file systems, where fast access 
+
+=== CANDIDATE: fused moe_topk_softmax_bias (default, no env) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: (absent -> fused)
+  engage witness: hip-engage] moe_hip.moe_topk_softmax_bias
+  AGGREGATE tok/s (NREQ=8): min=345.94 median=351.92 max=352.76
+  tokens=9214 wall=26.31s
+  sample: A B-tree index is a self-balancing search tree data structure used for storing data records and enabling fast range queries. It is particularly useful in databases and file systems, where fast access 
+

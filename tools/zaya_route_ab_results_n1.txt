@@ -1,0 +1,15 @@
+## ZAYA1-8B-fp8 TP=1, SPEC=none, graph-captured — fused route vs the torch chain
+=== BASELINE: torch route chain (MINISGL_ZAYA_TORCH_ROUTE=1) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: MINISGL_ZAYA_TORCH_ROUTE=1
+  engage witness: hip-engage] zaya.torch_route
+  TRUE tok/s (NREQ=1): min=65.80 median=65.92 max=65.94
+  tokens=1920 wall=29.14s
+  sample: . The node is split into two nodes with roughly half the keys, and the middle key is moved up. But the order might depend on the B-tree type (like AVL, red-black, but B-trees are different). Each spli
+
+=== CANDIDATE: fused moe_topk_softmax_bias (default, no env) ===
+  PID1 MINISGL_ZAYA_TORCH_ROUTE: (absent -> fused)
+  engage witness: hip-engage] moe_hip.moe_topk_softmax_bias
+  TRUE tok/s (NREQ=1): min=70.18 median=70.41 max=70.45
+  tokens=1920 wall=27.29s
+  sample: . The node is split into two nodes with roughly half the keys, and the middle key is moved up. But the order might depend on the B-tree type (like AVL, red-black, but B-trees are different). Each spli
+
