@@ -58,7 +58,11 @@ class MTPProposer(CapturableProposer):
         )
         self._device = engine.device
         self._pos_shift = int(os.environ.get("MINISGL_MTP_POS_SHIFT", "0"))
-        self._dbg = os.environ.get("MINISGL_MTP_DBG") == "1"
+        # Draft-chain trace, on the SAME switch DFlash and EAGLE3 use. It used to be a private
+        # MINISGL_MTP_DBG that docker-compose does not forward — so MTP's drafted chains were
+        # unreachable through the only way this repo serves, and the replay-vs-eager identity gate
+        # (which diffs exactly these lines) silently had nothing to compare.
+        self._dbg = os.environ.get("MINISGL_SPEC_DEBUG") in ("2", "3")
         self.init_propose_capture(engine)
 
     # ------------------------------------------------------------------ hook: buffer allocation

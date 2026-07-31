@@ -1,0 +1,61 @@
+=== cap [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 4.137
+TPS 92.826
+MD5 9d57e9f541c5bb282b95db11e8865f6a
+SAMPLE # Persistent Red-Black Tree in Python Below is a complete, well-commented implementation of a **persistent red
+  drafted chains captured: 0
+
+=== eager [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    propose capture disabled by A/B override
+TOKENS 384
+WALL 5.490
+TPS 69.952
+MD5 71cce68d7db577f561b1845fd87aeb71
+SAMPLE - Use immutable nodes (or copy-on-write) - Each node stores: key, value, color, left, right, parent (optional,
+  drafted chains captured: 0
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (mtp_n1) ===
+  NO DRAFT CHAINS CAPTURED — the identity gate did not run
+
+=== cap [timing] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG= 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 768
+WALL 8.212
+TPS 93.519
+MD5 ba51e721f096354df45b18b9b48a0bac
+SAMPLE Here is a complete, well-commented Python implementation of a **persistent red-black tree**. ### Key Design Ch
+  [spec-timing] lines:
+[spec-timing] step=50 propose=5.6ms stage=0.3ms forward=20.8ms accept=1.6ms total=28.3ms propose-graph replay=50 eager=0 buckets=[1]
+[spec-timing] step=100 propose=5.5ms stage=0.3ms forward=20.8ms accept=1.5ms total=28.1ms propose-graph replay=100 eager=0 buckets=[1]
+[spec-timing] step=150 propose=5.4ms stage=0.3ms forward=20.9ms accept=1.5ms total=28.2ms propose-graph replay=150 eager=0 buckets=[1]
+[spec-timing] step=200 propose=5.4ms stage=0.3ms forward=21.0ms accept=1.5ms total=28.2ms propose-graph replay=200 eager=0 buckets=[1]
+[spec-timing] step=250 propose=5.4ms stage=0.3ms forward=21.1ms accept=1.5ms total=28.4ms propose-graph replay=250 eager=0 buckets=[1]
+
+=== eager [timing] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG= 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    propose capture disabled by A/B override
+TOKENS 768
+WALL 9.537
+TPS 80.532
+MD5 7c361fdd8b05e616a08adcee1c84a70e
+SAMPLE - **Delete:** Standard BST delete (replace with inorder successor/predecessor if needed), then fix up if the d
+  [spec-timing] lines:
+[spec-timing] step=50 propose=11.2ms stage=0.3ms forward=20.9ms accept=1.6ms total=33.9ms propose-graph replay=0 eager=50 buckets=[]
+[spec-timing] step=100 propose=8.4ms stage=0.3ms forward=20.8ms accept=1.6ms total=31.2ms propose-graph replay=0 eager=100 buckets=[]
+[spec-timing] step=150 propose=7.5ms stage=0.3ms forward=20.9ms accept=1.6ms total=30.4ms propose-graph replay=0 eager=150 buckets=[]
+[spec-timing] step=200 propose=7.1ms stage=0.3ms forward=21.0ms accept=1.6ms total=30.0ms propose-graph replay=0 eager=200 buckets=[]
+[spec-timing] step=250 propose=6.8ms stage=0.3ms forward=21.1ms accept=1.6ms total=29.8ms propose-graph replay=0 eager=250 buckets=[]
+
