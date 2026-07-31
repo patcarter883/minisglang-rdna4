@@ -132,6 +132,14 @@ fi
 if [[ -n "$swa_hybrid" ]]; then
   export MINISGL_SWA_RADIX="${MINISGL_SWA_RADIX:-1}"
   export MINISGL_SPEC_MHA_PAGED="${MINISGL_SPEC_MHA_PAGED:-1}"
+  # Both are REQUIRED here, and a 0 in either fails SILENTLY — the cache is downgraded, or it is
+  # "enabled" and never hits. Say so loudly rather than let the serve look healthy.
+  # NOTE the compose lean-env anchor SETS MINISGL_SPEC_MHA_PAGED, so `${VAR:-1}` above cannot
+  # default it: an inherited value always wins. Its compose default is therefore 1, not 0.
+  [[ "$MINISGL_SWA_RADIX" == "0" ]] && echo \
+    "[serve] WARNING: MINISGL_SWA_RADIX=0 on an SWA-hybrid model — prefix cache falls back to naive." >&2
+  [[ "$MINISGL_SPEC_MHA_PAGED" == "0" ]] && echo \
+    "[serve] WARNING: MINISGL_SPEC_MHA_PAGED=0 on an SWA-hybrid model — SWA-radix will NEVER hit." >&2
 fi
 
 # --- parallelism ---------------------------------------------------------------------------------
