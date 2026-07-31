@@ -67,6 +67,11 @@ class DraftModelProposer(CapturableProposer):
     needs_last_hidden = False
     capture_layer_ids = _GLM47_CAPTURE_LAYER_IDS
     supports_prefill_seed = True
+    # EAGLE3's per-step seed is fc(aux) at the LAST confirmed position — one column, not a history.
+    # The scheduler's aux accumulator is a global (`MINISGL_DFLASH_FULLCTX`, default on) that is NOT
+    # gated on the proposer, so without this cap it grows a [num_aux, P, hidden] buffer with a
+    # torch.cat per step per request for a consumer that reads exactly one column of it.
+    aux_ctx_cap = 1
 
     def __init__(self, engine, num_draft: int, draft_model_path: str) -> None:
         from minisgl.models.glm_eagle3 import GLMEagle3DraftModel
@@ -233,6 +238,14 @@ class DraftModelProposer(CapturableProposer):
             aux = ctx.aux_hidden.get(req.uid)  # [num_aux, hidden] at the last confirmed token
             if k_i <= 0 or aux is None or req.cached_len > self._ctx_gate:
                 continue
+            if aux.dim() == 3:
+                # The scheduler's full-context accumulator hands out [num_aux, P, hidden] for EVERY
+                # proposer (`MINISGL_DFLASH_FULLCTX` is not gated on the proposer being DFlash), but
+                # EAGLE3 conditions on the LAST confirmed position only. The old code fed the whole
+                # 3-D buffer into `fc` via `unsqueeze(0)`, which is a hard shape error — EAGLE3 could
+                # not serve a single token on this build. Take the last column, which is exactly the
+                # legacy 2-D value (`aux_hidden[:, row]`).
+                aux = aux[:, -1]
             tok_idx = max(0, min(req.cached_len + self._tok_off, req.input_ids.shape[0] - 1))
             s = int(req.table_idx)
             if self._slot_uid.get(s) != req.uid:   # fresh req on this slot -> cold cache
