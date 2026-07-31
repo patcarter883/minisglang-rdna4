@@ -39,7 +39,7 @@ PORT="${PORT:-1919}"
 # Per model: the checkpoint, the attention backend it wants, its default spec algorithm + draft
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
-dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""
+dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 # Each arm matches the ALIAS *or* the checkpoint id/path, because the two ways of choosing a model
 # produce different strings: typing `MODEL=laguna` gives the alias, while the control panel's model
@@ -64,6 +64,7 @@ case "$MODEL" in
                   swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
+                  tool_format="zaya_xml"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
@@ -105,6 +106,19 @@ case "$SPEC" in
                       --spec-num-draft "${SPEC_K:-$k_dflash}") ;;
   *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|eagle3|ngram|tidar)" >&2; exit 2 ;;
 esac
+
+# --- sampled speculative verify ------------------------------------------------------------------
+# ON by default whenever spec-decode is active. The engine defaults MINISGL_SPEC_SAMPLED off, and
+# with it off spec-decode only runs for GREEDY requests — every temperature>0 request silently falls
+# back to plain decode. Real traffic is sampled, so leaving this off means the spec machinery is
+# carried but does nothing for the requests that actually arrive. It also makes the served config
+# match how spec is measured: greedy verify inflates acceptance at LATE draft positions and
+# over-recommends K, so a greedy-only serve is both slower and measured wrong.
+if [[ "$SPEC" != "none" && -n "$SPEC" ]]; then
+  export MINISGL_SPEC_SAMPLED="${MINISGL_SPEC_SAMPLED:-1}"
+fi
+# Per-model engine env that used to live in the deleted per-model services.
+[[ -n "$tool_format" ]] && export MINISGL_TOOL_FORMAT="${MINISGL_TOOL_FORMAT:-$tool_format}"
 
 # --- SWA-hybrid prefix caching ------------------------------------------------------------------
 # A sliding-window model downgrades `--cache-type radix` to `naive` unless MINISGL_SWA_RADIX is on
@@ -156,6 +170,7 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
+[[ "$SPEC" != "none" && -n "$SPEC" ]] && printf '[serve] spec sampled=%s\n' "$MINISGL_SPEC_SAMPLED" >&2
 printf '[serve] %s\n' "${cmd[*]}" >&2
 [[ -n "${DRY_RUN:-}" ]] && exit 0
 exec "${cmd[@]}"
