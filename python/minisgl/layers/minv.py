@@ -67,21 +67,205 @@ def _warn_once(key: str, msg: str) -> None:
 # (tools/_maxm_ab.sh).
 _DECODE_GEMV_MAXM = 16
 _decode_gemv_fn = None
+_decode_gemv_w8a16_fn = None
 _decode_gemv_probed = False
 
 
 def _get_decode_gemv():
     """Lazily resolve fp8_wmma.dense_bf16_gemv (None if the kernel package is unavailable)."""
-    global _decode_gemv_fn, _decode_gemv_probed
-    if not _decode_gemv_probed:
-        _decode_gemv_probed = True
-        try:
-            from fp8_wmma import dense_bf16_gemv
-
-            _decode_gemv_fn = dense_bf16_gemv
-        except Exception:
-            _decode_gemv_fn = None
+    _probe_decode_gemv()
     return _decode_gemv_fn
+
+
+def _probe_decode_gemv():
+    """Resolve BOTH decode-GEMV entry points once. The W8A16 op may be absent on an older kernel
+    package, in which case the bf16 twin still resolves and the engine simply streams more bytes."""
+    global _decode_gemv_fn, _decode_gemv_w8a16_fn, _decode_gemv_probed
+    if _decode_gemv_probed:
+        return
+    _decode_gemv_probed = True
+    try:
+        from fp8_wmma import dense_bf16_gemv
+
+        _decode_gemv_fn = dense_bf16_gemv
+    except Exception:
+        _decode_gemv_fn = None
+    try:
+        from fp8_wmma import dense_w8a16_gemv
+
+        _decode_gemv_w8a16_fn = dense_w8a16_gemv
+    except Exception:
+        _decode_gemv_w8a16_fn = None
+
+
+# =====================================================================================
+# W8A16 decode GEMV — fp8 (e4m3) WEIGHTS, unquantized bf16/fp16 activations. THE DEFAULT.
+#
+# WHY. Profiled on the served Qwen3.6-35B-A3B TP=2 decode step, this GEMV is the single largest
+# GPU consumer: 3.81 ms of a 10.99 ms TPOT (46% of all kernel time) across ~291 launches, and it
+# decomposes exactly as `t = 3.93 us/dispatch + bytes / 648.1 GB/s`. The kernel BODY is already at
+# 100% of the measured HBM read ceiling at every grid size — no tiling, spill, LDS or occupancy
+# headroom exists (scratch 0, 13-27 VGPR, 16 B LDS, loads already b128), and three separate
+# launch-count reductions (column-concat, KSPLIT, PREQUANT) each measured 0.0% e2e. The ONLY lever
+# left is fewer BYTES, and every one of the 1.834 GB/step it streams was still unquantized bf16
+# while the MoE experts running beside it were already W4A16.
+#
+# WHAT. One fp8 companion per weight tensor: raw e4m3 bytes + ONE fp32 scale per output channel,
+# folded into the kernel epilogue. Halves the weight stream. Not bit-exact vs bf16 (that is stated,
+# not hidden), but M-INVARIANCE — the property this module exists to defend — is preserved EXACTLY:
+# each output is an independent per-(row, col) fp32 accumulation over K in a fixed lane-strided
+# order, so row r at M=1 is bit-identical to row r at M=16, which is what keeps spec-verify,
+# chunked prefill and radix caching lossless.
+#
+# NO FLAG. This is the default path; the bf16 twin remains as an in-code fallback for shapes the
+# fp8 lane slot cannot take (K % 16 != 0), for weights on the KEEP-WIDE list below, and for the one
+# context where the companion cannot be built (see below). The caller never has to know.
+#
+# SCOPE — NOT every dense weight. See the KEEP-WIDE registry immediately below: `lm_head` and the
+# Qwen3.5/3.6 shared-expert `down_proj` are excluded under KERNEL_CORE_POLICY.md RULE 3 because the
+# checkpoint ships them unquantized on purpose. MEASURED with those two excluded, Qwen3.6-35B-A3B
+# TP=2 decode M=1: 89.50 -> 99.35 tok/s median (+11.0%), 4 interleaved reps, non-overlapping
+# (cand_min 96.7 > base_max 90.5), against a base-vs-base control of 0.9967x.
+#
+# WHEN THE COMPANION IS BUILT. Lazily, on the first decode-shaped call for a given weight — which
+# in a real serve is the EAGER warmup forward that GraphRunner runs immediately before each
+# `torch.cuda.graph(...)` capture, at the same batch size. Allocating mid-capture is illegal, so if
+# a weight somehow first arrives while capturing we fall back to bf16 for that call rather than
+# fault. Building at warmup rather than at load time is deliberate: it leaves the KV-pool sizing
+# (which happens earlier) byte-identical, so an A/B of this change is not confounded by a different
+# pool. The cost is VRAM: +0.5 byte per QUANTIZED dense weight element on top of the retained bf16
+# master. MEASURED on the 35B TP=2 config WITH the RULE-3 exclusions: +0.65 GiB/card (graph-capture
+# free-memory delta 0.25 -> 0.90 GiB), taken from the post-KV slack. Keeping the LM head wide is
+# most of the gap to the un-scoped ~0.92 GiB — its own companion alone is 254 MiB/card.
+_W8A16_E4M3_MAX = 448.0
+# Rows per quantisation chunk: the fp32 cast is materialised, so a whole-tensor cast spikes
+# 4 bytes/elem of transient at warmup, right where the graph-capture reserve is tightest. 8192 rows
+# caps it at ~67 MB at K=2048. With the LM head KEPT WIDE the largest companion left on the served
+# model is the GDN in_proj_qkvz (6144 rows), so this chunks nothing today; it stays because it is
+# what makes the builder safe at any N rather than at the sizes we happen to serve.
+_W8A16_QUANT_ROWS = 8192
+# key: (weight.data_ptr(), N, K) -> (e4m3 bytes uint8 (N,K), fp32 per-channel scale (N,))
+_w8a16_companions: dict = {}
+
+# ---------------------------------------------------------------------------------------------
+# KEEP-WIDE registry — the tensors W8A16 must NEVER touch.
+#
+# WHY (KERNEL_CORE_POLICY.md, RULE 3: "a WLoad policy may EXIST anywhere; APPLYING it to an
+# unquantized tensor is not yours to decide"). A W8A16 loader is a legitimate policy on the shared
+# decode-GEMV core, but pointing it at a tensor the CHECKPOINT deliberately shipped wide is a model-
+# quality decision, not a kernel decision — and a kernel-parity gate cannot clear it, because parity
+# only says "the kernel computes what it claims", never "the model is still as good". The publisher
+# skips exactly the tensors where quantization costs the most, so "it went faster" is not a licence.
+#
+# Marked here, per the policy's table:
+#   * lm_head            — produces every token's logits; error lands directly on sampling.
+#   * shared-expert down_proj (Qwen3.5/3.6 MoE) — small, always-on, and explicitly EXCLUDED from
+#     the routed-expert quant by the checkpoint (Qwen3_5MoeSharedExpert builds it with
+#     create_linear_method(None) while the routed experts carry int4/mxfp4).
+#
+# HOW. The policy lives ON THE TENSOR, not on the call site: a weight is marked once where it is
+# owned (each module's post_load, after load_state_dict has installed the final tensor), and
+# `w8a16_companion` returns None for it so the EXISTING in-code bf16 fallback carries it. There is
+# no per-call-site branch, no module-name match and no shape heuristic — `K == 256` would silently
+# catch an unrelated tensor the day a config changes. No env var either: if it merges, it is on.
+#
+# DO NOT "optimise this away". Deleting a mark here re-quantizes a tensor its publisher chose not
+# to, and nothing in the parity suite will fail when you do.
+_keep_wide: set = set()
+
+
+def _weight_key(w: torch.Tensor):
+    """Identity used by BOTH the keep-wide set and the companion cache: a weight is the storage it
+    points at plus its 2-D shape. Same keying, so a mark can never miss the tensor it named."""
+    return (w.data_ptr(), int(w.shape[0]), int(w.shape[1]))
+
+
+def keep_wide(w: torch.Tensor) -> None:
+    """Mark `w` as NEVER-QUANTIZE on the decode-GEMV path (see the note above). Call once from the
+    owning module's `post_load`, i.e. after `load_state_dict` has installed the final tensor —
+    marking the meta-device placeholder built in `__init__` would key on a stale pointer."""
+    if w is None or w.dim() != 2:
+        return
+    _keep_wide.add(_weight_key(w))
+    _warn_once(f"keep_wide_{w.shape[0]}x{w.shape[1]}",
+               f"minv: KEEP-WIDE ({int(w.shape[0])}, {int(w.shape[1])}) {w.dtype} -- excluded from "
+               f"the W8A16 decode GEMV (KERNEL_CORE_POLICY.md RULE 3: the checkpoint left this "
+               f"tensor unquantized on purpose)")
+
+
+def is_kept_wide(w: torch.Tensor) -> bool:
+    """True iff `w` was marked never-quantize. Public so a probe/test can assert the exclusion took
+    effect rather than inferring it from a kernel name in a log."""
+    return w.dim() == 2 and _weight_key(w) in _keep_wide
+
+
+def w8a16_companion(w: torch.Tensor):
+    """The fp8 companion for weight `w`, building + caching it on first use.
+
+    Returns None when the weight is KEPT WIDE (RULE 3 — the caller then runs the bf16 GEMV), or
+    when the companion cannot be produced *right now* (mid-graph-capture, where a fresh allocation
+    is illegal). Callers fall back to the bf16 GEMV in both cases."""
+    if is_kept_wide(w):
+        return None
+    key = _weight_key(w)
+    ent = _w8a16_companions.get(key)
+    if ent is not None:
+        return ent
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        _warn_once("w8a16_capture",
+                   "minv: W8A16 decode-GEMV companion missing at CUDA-graph capture time -> this "
+                   "weight stays on the bf16 GEMV inside the graph (no fault, just more bytes). "
+                   "Expected only if the pre-capture warmup forward did not touch this linear.")
+        return None
+    N, K = int(w.shape[0]), int(w.shape[1])
+    q = torch.empty((N, K), dtype=torch.float8_e4m3fn, device=w.device)
+    scale = torch.empty((N,), dtype=torch.float32, device=w.device)
+    worst = 0.0
+    for r0 in range(0, N, _W8A16_QUANT_ROWS):
+        r1 = min(r0 + _W8A16_QUANT_ROWS, N)
+        blk = w[r0:r1].to(torch.float32)
+        # Per-OUTPUT-CHANNEL (row) amax -> one fp32 scale per row, applied once in the epilogue.
+        s = blk.abs().amax(dim=1).clamp_min_(1e-12) / _W8A16_E4M3_MAX
+        scale[r0:r1] = s
+        qb = blk.div(s.unsqueeze(1)).clamp_(-_W8A16_E4M3_MAX, _W8A16_E4M3_MAX).to(
+            torch.float8_e4m3fn)
+        q[r0:r1] = qb
+        # Measure the representation error on the REAL weights, elementwise (no GEMM, no BLAS):
+        # this is the whole numerics argument for W8A16 and it should be reported, not assumed.
+        # Synthetic-weight parity on this part turned out to be unreliable at LM-head shapes, so
+        # this is the number that actually characterises the served model.
+        err = (qb.to(torch.float32).mul_(s.unsqueeze(1)) - blk).abs_().amax()
+        worst = max(worst, float(err) / max(1e-30, float(blk.abs().amax())))
+        del blk, qb
+    _warn_once(f"w8a16_shape_{N}x{K}",
+               f"minv W8A16: companion built for ({N}, {K}) -- max relative weight error "
+               f"{worst:.4f} (per-output-channel e4m3), {N * K / 2**20:.0f} MiB added")
+    ent = (q.view(torch.uint8), scale)
+    _w8a16_companions[key] = ent
+    return ent
+
+
+def decode_gemv(x: torch.Tensor, w: torch.Tensor):
+    """The small-M dense decode GEMV every call site shares. W8A16 (fp8 weight / native activation)
+    by DEFAULT; the unquantized bf16 twin for shapes the fp8 lane slot cannot take AND for weights
+    marked KEEP-WIDE (RULE 3 — see the registry above; `w8a16_companion` returns None for those, so
+    the exclusion needs no branch here and no call site knows about it). Returns None if no decode
+    GEMV applies at all, so the caller can keep its own fallback.
+
+    Both paths run the SAME `gemv_decode_core` under different WLoad policies and are individually
+    M-invariant, and the choice between them is a pure function of the weight shape — never of M —
+    so it can never make row r depend on the batch size."""
+    _probe_decode_gemv()
+    if _decode_gemv_fn is None:
+        return None
+    xc = x.contiguous()
+    if _decode_gemv_w8a16_fn is not None and w.shape[-1] % 16 == 0:
+        ent = w8a16_companion(w)
+        if ent is not None:
+            return _decode_gemv_w8a16_fn(xc, ent[0], ent[1])
+    if w.shape[-1] % 8 == 0:
+        return _decode_gemv_fn(xc, w)
+    return None
 
 
 def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -127,9 +311,9 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     # the threshold is a crossing; MAXM=16 puts decode AND spec-verify on this side of it.
     if (x.dim() == 2 and x.shape[0] <= _DECODE_GEMV_MAXM and bias is None
             and x.dtype == weight.dtype):          # minv_supported() gated weight.dtype, not x's
-        gemv = _get_decode_gemv()
-        if gemv is not None and weight.shape[-1] % 8 == 0:
-            return gemv(x.contiguous(), weight)
+        out = decode_gemv(x, weight)
+        if out is not None:
+            return out
 
     import dense_gemm as _dg
 

@@ -54,6 +54,18 @@ class Qwen3_5MoeSharedExpert(BaseOP):
             inter, config.hidden_size, has_bias=False, quant_method=qm
         )
 
+    def post_load(self) -> None:
+        # RULE 3 (KERNEL_CORE_POLICY.md): this shared expert is small (inter=512), always-on, and
+        # the checkpoint EXCLUDES it from the routed-expert quant on purpose — note the
+        # create_linear_method(None) above while `experts` carries int4/mxfp4. Its down_proj is the
+        # narrowest tensor on the decode-GEMV path, so it is also where per-output-channel e4m3 has
+        # the least to work with. Mark the TENSOR (not the call site) so the W8A16 loader skips it;
+        # in post_load because load_state_dict rebinds .weight after __init__.
+        super().post_load()
+        from minisgl.layers.minv import keep_wide
+
+        keep_wide(self.down_proj.weight)
+
     def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         # reduce=False -> return the row-parallel down_proj PARTIAL so the MoE block can fuse it with
         # the routed-expert partial into a single all_reduce.
@@ -87,6 +99,19 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         )
         self.shared_expert = Qwen3_5MoeSharedExpert(config)
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
+
+    def post_load(self) -> None:
+        # RULE 3 (KERNEL_CORE_POLICY.md): the checkpoint's quant ignore-list excludes this gate along
+        # with lm_head and the shared expert, so it stays wide for the same reason they do. It is also
+        # the worst possible shape to quantize: N=1, i.e. the ENTIRE tensor shares a single
+        # per-output-channel scale, so e4m3 has nothing to adapt to — and its output is a sigmoid that
+        # multiplies the whole shared-expert contribution, so error here is not local. Excluding it is
+        # free: the companion it would have built is 8 KB.
+        # Mark the TENSOR, not the call site; in post_load because load_state_dict rebinds .weight.
+        super().post_load()
+        from minisgl.layers.minv import keep_wide
+
+        keep_wide(self.shared_expert_gate.weight)
 
     def _fused_partial(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Fused shared+routed row-parallel PARTIAL (no all_reduce) over `hidden_states` rows. Both

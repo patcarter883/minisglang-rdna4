@@ -46,23 +46,12 @@ _moe_calls = 0
 #
 # NOT bit-exact vs gather_reduce (the atomic reduction order varies), so it is tolerance-gated.
 
-# Fused router (moe_hip.moe_topk_softmax): softmax+top-k+renormalize in one launch. Unconditional —
-# measured +4.8% bs=1, outputs bit-identical to the torch chain.
-_fused_router_fn = None
-_fused_router_probed = False
-
-
-def _get_fused_router():
-    global _fused_router_fn, _fused_router_probed
-    if not _fused_router_probed:
-        _fused_router_probed = True
-        try:
-            import moe_hip
-
-            _fused_router_fn = getattr(moe_hip, "moe_topk_softmax", None)
-        except Exception:
-            _fused_router_fn = None
-    return _fused_router_fn
+# The route is produced by moe_hip.moe_route_align (see _route_align below) — softmax + top-k +
+# renormalize + moe_align_block_size in ONE op, unconditionally. The old `_get_fused_router()`
+# capability probe and the pure-torch / vLLM fallback chain it guarded are DELETED, not left
+# dormant: the lean image has no vLLM, tools/_bench_inner.sh already hard-fails a leg whose moe_hip
+# does not import, and a silent try/except fallback is exactly how a slower leg becomes an
+# accidental "baseline" (COMMANDMENT §1, routing-reality check).
 
 # W4A16 MoE (fp16 activations, no act-quant) for the routed experts — the fix for the fp8-act decode
 # degradation on activation-sensitive models (GLM-4.7-Flash). "1" = all M; "decode" = M<=2 only
@@ -298,44 +287,31 @@ def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     return bm
 
 
-def _softmax_topk_route(
-    gating_output: torch.Tensor, top_k: int, renormalize: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused softmax + top-k (+ optional renormalize) route from raw router logits.
+def _route_align(
+    gating_output: torch.Tensor, top_k: int, renormalize: bool, num_experts: int, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """THE WHOLE ROUTE IN ONE OP: softmax + top-k + renormalize + moe_align_block_size.
 
-    Returns (topk_weights f32 (M, top_k), topk_ids i32 (M, top_k)) — what a model that does NOT
-    precompute its route (Qwen3.5-MoE: router_logits only, no noaux_tc) hands the grouped-MoE kernel.
-    The lean (vllm-free) image has no fused kernel, so this is the pure-torch chain matching the
-    vLLM _moe_C.topk_softmax op; when vLLM IS present (the legacy combined image) prefer its fused
-    kernel — a single launch vs the torch chain. Shared by w4a8_moe and w4a16_moe."""
-    M = gating_output.shape[0]
-    dev = gating_output.device
-    # FUSED (native HIP, vllm-free): softmax + top-k + renormalize in ONE launch. The torch chain
-    # below is 4 kernels + an elementwise tail PER MoE LAYER — profiled at 0.077 (softmax) + 0.269
-    # (warpMergeSortTopK) + 0.100 (bitonicSort) + 0.086 (reduce) ms/step over 40 layers, ~160
-    # launches to route ONE token over 256 experts, on a step that carries ~1.9 ms of inter-kernel
-    # gap across ~1539 launches. Measured 2.64x at the served shape (M=1, E=256, K=8, renormalize),
-    # saving 0.813 ms/step; top-k INDICES are bit-identical to torch.topk and the weights agree to
-    # 1.2e-7. Falls through if the op is unavailable (older moe_hip).
-    fn = _get_fused_router()
-    if fn is not None:
-        g = gating_output.float()
-        return fn(g.contiguous() if not g.is_contiguous() else g, top_k, renormalize)
+    Returns (topk_weights f32, topk_ids i32, sorted_ids, expert_ids, num_tokens_post_pad) — every
+    tensor the grouped-MoE GEMM needs to start.
 
-    try:
-        from vllm import _custom_ops as vllm_ops
-    except ImportError:
-        probs = torch.softmax(gating_output.float(), dim=-1)
-        tw, ti = torch.topk(probs, top_k, dim=-1)
-        if renormalize:
-            tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
-        return tw.contiguous(), ti.to(torch.int32).contiguous()
+    WHY THIS EXISTS. Producing the route used to cost THREE dispatches per MoE layer:
+    `gating_output.float()`, `moe_hip.moe_topk_softmax`, `moe_hip.moe_align`. At the served decode
+    point (Qwen3.6-35B-A3B: M=1, E=256, top_k=8, 40 MoE layers, TP=2) every one of them is
+    dominated by its own launch — measured amortized on GPU0: the router is 6.311 us of which the
+    work-free floor is 3.955 us, and the smallest possible torch dispatch (a 1-element `add_`)
+    under the same harness is 3.098 us. You cannot tile or de-barrier a dispatch floor away. The
+    kernel package now exposes the whole pipeline as ONE op, and the launcher falls back to the
+    two-kernel form IN CODE at large M (a single block cannot parallelise a 2048-token prefill
+    route). There is no flag and no opt-in: the caller always calls this.
 
-    tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
-    ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
-    vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
-    return tw, ti
+    The `.float()` is deleted rather than moved: the router core reads bf16/fp16 natively and the
+    widening is lossless, so it is bit-identical (gated in the package's parity_route_align.py)."""
+    import moe_hip
+
+    engaged("moe_hip.moe_route_align")
+    g = gating_output if gating_output.is_contiguous() else gating_output.contiguous()
+    return moe_hip.moe_route_align(g, top_k, renormalize, num_experts, block_size)
 
 
 def w4a8_moe(
@@ -387,22 +363,26 @@ def w4a8_moe(
     gemm2_kernel = kernel
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
-    # normalize + scale, done in the model). Otherwise fall back to fused softmax+topk here.
+    # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:
+    # the cast+router+sort trio was three dispatches per MoE layer and each one is ~3.1 us of pure
+    # launch at the served M=1.
+    import moe_hip
+
     if topk_ids is None:
-        topk_weights, topk_ids = _moe_time(
-            "route", lambda: _softmax_topk_route(gating_output, top_k, renormalize)
+        topk_weights, topk_ids, sorted_ids, expert_ids, ntp = _moe_time(
+            "route_align",
+            lambda: _route_align(gating_output, top_k, renormalize, E, block_m),
         )
     else:
         assert topk_weights is not None, "topk_weights required when topk_ids is given"
         topk_weights = topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_ids.to(torch.int32).contiguous()
-
-    # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone — the
-    # lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that host op.
-    import moe_hip
-
-    engaged("moe_hip.moe_align")
-    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
+        # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone —
+        # the lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that op.
+        engaged("moe_hip.moe_align")
+        sorted_ids, expert_ids, ntp = _moe_time(
+            "align", lambda: moe_hip.moe_align(topk_ids, E, block_m)
+        )
     P = sorted_ids.shape[0]
 
     _e2m1 = "+e2m1" if weight_is_e2m1 else ""
@@ -591,12 +571,15 @@ def w4a16_moe(
     wide = _w4a16_wide(group_size)
     # Precomputed route (GLM/DeepSeek noaux_tc, or the EP path). Otherwise softmax+topk here — Qwen3.5-MoE
     # hands us raw router_logits with no model-side route, same fallback the w4a8_moe LDS path has.
+    sorted_ids = None
     if topk_ids is None:
         assert router_logits is not None and top_k > 0, (
             "w4a16_moe needs a precomputed route (topk_ids/topk_weights) or router_logits + top_k"
         )
-        topk_weights, topk_ids = _moe_time(
-            "route", lambda: _softmax_topk_route(router_logits, top_k, renormalize)
+        # ONE op for cast+route+sort (see _route_align).
+        topk_weights, topk_ids, sorted_ids, expert_ids, ntp = _moe_time(
+            "route_align",
+            lambda: _route_align(router_logits, top_k, renormalize, E, block_m),
         )
     top_k = topk_ids.shape[1]
     tw = topk_weights.to(torch.float32).contiguous()
@@ -604,8 +587,9 @@ def w4a16_moe(
     _empty = torch.empty(0, dtype=torch.int32, device=dev)
 
     _e2m1 = "+e2m1" if weight_is_e2m1 else ""
-    engaged("moe_hip.moe_align")
-    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
+    if sorted_ids is None:
+        engaged("moe_hip.moe_align")
+        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
     P = sorted_ids.shape[0]
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
 
@@ -718,36 +702,26 @@ def w8a8_moe(
     gemm1_kernel = "gemv" if M <= _MOE_GEMM1_GEMV_MAX else kernel
     gemm2_kernel = kernel
 
-    def _route():
-        try:
-            from vllm import _custom_ops as vllm_ops
-        except ImportError:
-            probs = torch.softmax(gating_output.float(), dim=-1)
-            tw, ti = torch.topk(probs, top_k, dim=-1)
-            if renormalize:
-                tw = tw / (tw.sum(dim=-1, keepdim=True) + 1e-20)
-            return tw.contiguous(), ti.to(torch.int32).contiguous()
+    # Precomputed route (ZAYA top-1 + MOD), else route AND align in ONE op (see _route_align).
+    # This site used to skip the native HIP router entirely and fall through to vLLM/torch — dead
+    # code in the lean image, and 4+ launches where there is now one.
+    import moe_hip
 
-        tw = torch.empty(M, top_k, dtype=torch.float32, device=dev)
-        ti = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-        tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)  # token_expert_indices scratch
-        vllm_ops.topk_softmax(tw, ti, tei, gating_output.float(), renormalize)
-        return tw, ti
-
-    # Precomputed route (ZAYA top-1 + MOD) or fused softmax+topk fallback.
     if topk_ids is None:
-        topk_weights, topk_ids = _moe_time("route", _route)
+        topk_weights, topk_ids, sorted_ids, expert_ids, ntp = _moe_time(
+            "route_align",
+            lambda: _route_align(gating_output, top_k, renormalize, E, block_m),
+        )
     else:
         assert topk_weights is not None, "topk_weights required when topk_ids is given"
         topk_weights = topk_weights.to(torch.float32).contiguous()
         topk_ids = topk_ids.to(torch.int32).contiguous()
-
-    # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone — the
-    # lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that host op.
-    import moe_hip
-
-    engaged("moe_hip.moe_align")
-    sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(topk_ids, E, block_m))
+        # moe_align: native HIP (moe_hip). The former MINISGL_MOE_ALIGN=0 vLLM reference is gone —
+        # the lean image has no vllm, and moe_hip.moe_align is the validated drop-in for that op.
+        engaged("moe_hip.moe_align")
+        sorted_ids, expert_ids, ntp = _moe_time(
+            "align", lambda: moe_hip.moe_align(topk_ids, E, block_m)
+        )
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())

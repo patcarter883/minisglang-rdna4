@@ -144,30 +144,25 @@ class _GemvLinear(nn.Linear):
     F.linear the CAM-training path needs are all unchanged.
     """
 
-    _gemv = None
-    _probed = False
+    @staticmethod
+    def _fn():
+        """The shared small-M decode GEMV (``layers.minv.decode_gemv``): W8A16 (fp8 weight / native
+        activation) by DEFAULT, with the unquantized bf16 twin as the in-code fallback for shapes
+        the fp8 lane slot cannot take. The GDN projections are 90 of the ~291 decode-GEMV launches
+        per step and 2.0 ms of its 3.81 ms, so they are the bulk of the byte cut."""
+        from minisgl.layers.minv import decode_gemv
 
-    @classmethod
-    def _fn(cls):
-        if not cls._probed:
-            cls._probed = True
-            try:
-                from fp8_wmma import dense_bf16_gemv
-
-                cls._gemv = dense_bf16_gemv
-            except Exception:
-                cls._gemv = None
-        return cls._gemv
+        return decode_gemv
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.weight
         if (x.dim() == 2 and x.shape[0] <= _GDN_PROJ_GEMV_MAXM and self.bias is None
                 and w.dtype in (torch.bfloat16, torch.float16) and x.dtype == w.dtype
                 and w.shape[-1] % 8 == 0):
-            fn = self._fn()
-            if fn is not None:
-                engaged("fp8_wmma.dense_bf16_gemv[gdn_proj]")
-                return fn(x.contiguous(), w)
+            out = self._fn()(x, w)
+            if out is not None:
+                engaged("fp8_wmma.dense_gemv[gdn_proj]")
+                return out
         return super().forward(x)   # F.linear -> rocBLAS (also the >MAXM / prefill path)
 
 
