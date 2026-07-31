@@ -18,6 +18,13 @@ if TYPE_CHECKING:
 __all__ = ["DFlashProposer"]
 
 
+# Prompt-prefill seed length, in trailing aux positions. PROVISIONAL — pending the tail sweep; the
+# window-sized value this replaced (528) measured -15.6% accept-len on a 3.5k code prompt while
+# measuring +22.5% on a 95-token one, because a window-sized seed evicts the model's own recent
+# output from a fixed 512-key window. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
+_SEED_TAIL_DEFAULT = 64
+
+
 class DFlashProposer(Proposer):
     """DFlash block-diffusion draft proposer.
 
@@ -383,8 +390,26 @@ class DFlashProposer(Proposer):
         # the whole prefix each step). window+block covers the oldest key the last block query can
         # still see. CCA does NOT get this: its seed is a single fused position by construction, so it
         # has no prefix to seed (see _build_cca).
+        # HOW MUCH prompt to seed is a real trade-off, and the obvious answer is WRONG. Seeding
+        # `sliding_window + block_size` (528) was measured NET-NEGATIVE on long prompts: accept-len
+        # 4.635 -> 3.910 (-15.6%) on a 3.5k-token code prompt, giving back essentially the whole spec
+        # win — while being +22.5% on a 95-token prompt. The window is a FIXED 512 keys, so a
+        # window-sized prompt seed EVICTS the model's own recent output for ~500 generated tokens,
+        # and that recent output is what actually predicts the next token. So `P` in §11.5's table
+        # never indexed "window occupancy"; it indexed "how much of the window is my own output" —
+        # which is why the starvation reading of that table did not survive contact with the fix.
+        # The default below is therefore a small context anchor, not a window-full.
+        # MINISGL_DFLASH_SEED_TAIL overrides it (0 disables seeding entirely), mirroring how
+        # `_moe_block_m` exposes MINISGL_MOE_BLOCK_M for autotuning around a derived default.
         self.supports_prefill_seed = True
-        self.prefill_aux_tail = (sliding_window + self._block_size) if sliding_window > 0 else 0
+        _tail_env = os.environ.get("MINISGL_DFLASH_SEED_TAIL")
+        if _tail_env not in (None, ""):
+            self.prefill_aux_tail = max(0, int(_tail_env))
+            self.supports_prefill_seed = self.prefill_aux_tail > 0
+        elif sliding_window > 0:
+            self.prefill_aux_tail = min(_SEED_TAIL_DEFAULT, sliding_window + self._block_size)
+        else:
+            self.prefill_aux_tail = _SEED_TAIL_DEFAULT
 
         logger.info_rank0(
             f"DFlash Laguna drafter: {num_layers}L h={hidden} heads={num_heads}/{num_kv_heads} "
