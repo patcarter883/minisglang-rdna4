@@ -39,6 +39,14 @@ remains the source. The essentials:
   Foreground jobs (`run --rm`, a script that blocks) need no flag — the lease frees when they exit,
   including on crash/Ctrl-C (flock auto-releases; no stale "reserved" state, no janitor).
 - See who holds what:  `gpu-status` (bare command, same repo/PATH as `gpu-lease`)
+- **A card can be leased and still be DEAD.** A faulted/spinning kernel pins a card at ~100% "use"
+  while moving no memory at idle power and never returns — the holder stays alive, so the flock and
+  `gpu-status` both look perfectly healthy. Never treat "100% use" as proof a card is working; the
+  giveaway is ~0% memory R/W activity plus roughly idle power. Each lease now watches its own cards
+  and, on confirmation, kills the job and **exits 76** — so `76` means *the GPU wedged, not a bug in
+  your command*: re-run it, and if it wedges again the fault is in the GPU code it launched. Other
+  agents see it as `WEDGED` in `gpu-status`; `lease wedge` scans on demand (details in the gpu-lease
+  README).
 - CPU-only work (builds, static analysis, editing, trace post-processing) needs **no** lease.
 
 ### Profiling — run TraceLens after collecting traces
