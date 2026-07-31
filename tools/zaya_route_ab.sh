@@ -27,18 +27,43 @@
 #    routing has no second expert to average the error away.
 #  * TP=1, which is where the 16.9 ms step-time baseline this lever was sized against was measured.
 #
+# WHICH TREE IS SERVED — `WT` IS REQUIRED, WITH NO DEFAULT. This script used to hardcode
+# WT=/home/pat/code/minisgl-rdna4-specod, i.e. it mounted the SHARED worktree. That is the exact
+# thing CLAUDE.md §"Source isolation" forbids: the container re-reads /engine lazily for the whole
+# run (imports, AOT .so loads), so a concurrent agent's mid-edit file lands in the middle of a
+# measurement — as a crash if you are lucky and as plausible-but-meaningless numbers if you are not.
+# It also made the committed results irreproducible, because they were in fact produced from an
+# isolated snapshot rather than from the path the script named. Pass a snapshot you own:
+#     cd /home/pat/code/minisgl-rdna4 && git worktree add /home/pat/code/minisgl-rdna4-<task> <sha>
+#   or, for a read-only measurement of a committed state:
+#     mkdir /tmp/snap && git archive <sha> | tar -x -C /tmp/snap
+# The tree path, its git sha, its dirty/clean state, the image tag and the in-container moe .so md5
+# are all written into the results file, so a banked number always names the thing that produced it.
+#
 # MUST be invoked UNDER the shared arbiter, which this script does NOT acquire itself:
-#     NREQ=1 gpu-lease -n 1 -- bash tools/zaya_route_ab.sh
-#     NREQ=8 gpu-lease -n 1 -- bash tools/zaya_route_ab.sh
+#     WT=<snapshot> NREQ=1 gpu-lease -n 1 -- bash tools/zaya_route_ab.sh
+#     WT=<snapshot> NREQ=8 gpu-lease -n 1 -- bash tools/zaya_route_ab.sh
 set -uo pipefail
 
-WT=/home/pat/code/minisgl-rdna4-specod
+WT="${WT:?WT is required: absolute path to the SNAPSHOT tree to serve (never the shared worktree)}"
+[ -d "$WT/python/minisgl" ] || { echo "WT=$WT is not a minisgl tree" >&2; exit 2; }
 NREQ="${NREQ:-1}"
 OUT=${OUT:-$WT/tools/zaya_route_ab_results_n$NREQ.txt}
-IMAGE=${MINISGL_IMAGE:-minisgl-rdna4:zroute}
+IMAGE=${MINISGL_IMAGE:-minisgl-rdna4:zroute-merged}
 PORT=${PORT:-1919}
 NAME=zaya-route-ab
 : > "$OUT"
+
+# Provenance of the SOURCE side, recorded before anything is served. `git -C` on a plain `git
+# archive` snapshot has no repo — that is fine and is reported as such, since the snapshot is by
+# construction a committed state; a WORKTREE that is dirty is the case worth shouting about.
+_wt_sha=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "(not a git tree — archive snapshot)")
+_wt_dirty=$(git -C "$WT" status --porcelain -uno 2>/dev/null | wc -l)
+{
+  echo "# tree:   $WT"
+  echo "# sha:    $_wt_sha  (tracked-file edits: $_wt_dirty)"
+  echo "# image:  $IMAGE"
+} | tee -a "$OUT"
 
 down() { docker rm -f "$NAME" >/dev/null 2>&1; }
 trap down EXIT
@@ -132,6 +157,12 @@ leg() {
   echo -n "  engage witness: " | tee -a "$OUT"
   docker logs "$NAME" 2>&1 | grep -oE 'hip-engage\] (moe_hip\.moe_topk_softmax_bias|zaya\.torch_route[^ ]*)' \
     | head -1 | tee -a "$OUT" || echo "(none)" | tee -a "$OUT"
+  #  3. WHICH KERNEL BINARY. Both legs are the same image by construction (the A/B is one env var),
+  #     so this is not a leg-vs-leg discriminator — it is what lets a banked number be traced back
+  #     to a specific build months later, when the tag has been reused.
+  echo -n "  moe .so md5: " | tee -a "$OUT"
+  docker exec "$NAME" sh -c 'md5sum /opt/kernels/moe_hip/*.so 2>/dev/null | head -1' \
+    2>/dev/null | tee -a "$OUT"
 
   bench 2>&1 | tee -a "$OUT"
   echo | tee -a "$OUT"
