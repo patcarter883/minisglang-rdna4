@@ -20,6 +20,28 @@ All `poolside/Laguna-XS-2.1-NVFP4`, TP=2, graph-captured, greedy, 384-token gene
 | spec DFlash K=16 (**shipped default**) | 39.68 | 2.582 | 66.27 ms |
 
 **Spec is net-negative at every K.** Plain decode wins.
+
+> **SUPERSEDED 2026-07-31 — THIS IS NO LONGER TRUE, AND IT IS THE HEADLINE OF THIS DOCUMENT.**
+> On the current build, measured against a `--spec-algorithm none` PLAIN leg **in the same boot, same
+> config** (§11.8, K=15, TP=2, bs=1, graph 8, fp8 KV, radix, two full replicates):
+>
+> | prompt | plain tok/s | DFlash spec tok/s | |
+> |---|---:|---:|---:|
+> | 3571-token real code @1600 | 65.59 | **73.55** | **+12.1%** |
+> | 95-token instruction @384 | 79.32 | **101.11** | **+27.5%** |
+>
+> DFlash spec on Laguna is a WIN, not a loss. Nothing about the drafter changed. What changed is
+> everything this document blamed it for:
+>   * **K=16 -> 15** — the shipped default sat exactly one row past the `M<=16` decode-kernel cliff
+>     (§2 finding 1, +20% for a one-character change), so every number in the table above was
+>     measured on the prefill/WMMA kernel family;
+>   * **verify-side MoE gemm2 is 3.02x cheaper at qlen 16** (§9) — group-16 by-lane;
+>   * the fused sigmoid+bias route (§ router work) lifts BOTH legs, so it is not the source of the
+>     ratio, but it is in the build;
+>   * and the table above is a PROSE benchmark, the worst of the three prompt classes (§11.2).
+>
+> The row that matters for the original lucebox comparison is the SHORT one: **101 tok/s single-stream
+> greedy at 95 tokens**, versus 74.02 for plain in this table.
 **SCOPED 2026-07-31 by §11: this whole table is a PROSE benchmark** (a 384-token B-tree essay). The
 accept-lens are correct for that prompt and wrong as a property of the model — the same build, same
 K, same day gives accept-len 4.5 on real code and 9.5 on repetitive output. Re-read §7 and §11
