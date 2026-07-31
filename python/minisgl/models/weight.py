@@ -565,6 +565,76 @@ def _zaya_remap(ckpt_key: str) -> str | None:
     return ckpt_key
 
 
+# HF-format ZAYA (Zyphra's transformers release): 40 FUSED layers (attn+MoE per layer) with HF names,
+# vs our Megatron layout of 80 ALTERNATING layers. Map HF key -> Megatron-checkpoint-style key (then
+# _zaya_remap finishes the CCA/router rename). L -> 2L (attn) / 2L+1 (MoE). Experts + expert-scales
+# return None (handled by the stacked EP path in _load_zaya_weight). Full derivation + shape checks:
+# docs/zaya-port/HF_FORMAT_LOADER.md.
+_HF_ATTN_QKV = {
+    "q_proj.weight": "linear_q.weight", "k_proj.weight": "linear_k.weight",
+    "v_proj_current.weight": "val_proj1.weight", "v_proj_delayed.weight": "val_proj2.weight",
+    "conv_qk_depthwise.weight": "conv_qk.0.weight", "conv_qk_depthwise.bias": "conv_qk.0.bias",
+    "conv_qk_grouped.weight": "conv_qk.1.weight", "conv_qk_grouped.bias": "conv_qk.1.bias",
+}
+_HF_ROUTER = {
+    "down_proj.weight": "down_proj.weight", "down_proj.bias": "down_proj.bias",
+    "router_mlp.norm.weight": "rmsnorm_eda.weight",
+    "router_mlp.fc1.weight": "router_mlp.0.weight", "router_mlp.fc1.bias": "router_mlp.0.bias",
+    "router_mlp.fc2.weight": "router_mlp.2.weight", "router_mlp.fc2.bias": "router_mlp.2.bias",
+    "router_mlp.out_proj.weight": "router_mlp.4.weight",
+    "router_states_scale": "router_states_scale", "balancing_biases": "balancing_biases",
+}
+
+
+def _zaya_remap_hf(key: str, n_blocks: int) -> str | None:
+    """HF-format ZAYA key -> Megatron-checkpoint-style key (None => skip; experts handled elsewhere)."""
+    if key in ("model.embed_tokens.weight",):
+        return key
+    if key == "model.norm.weight":
+        return "model.final_norm.weight"
+    if key.startswith("model.input_hidden_states_"):  # first attn layer's hidden-only res_scale
+        return f"model.layers.0.res_scale.hidden_states_{key[len('model.input_hidden_states_'):]}"
+    m = re.match(r"^model\.layers\.(\d+)\.(.+)$", key)
+    if m is None:
+        raise AssertionError(f"unmapped HF ZAYA top-level key: {key}")
+    L, sub = int(m.group(1)), m.group(2)
+    attn, moe = 2 * L, 2 * L + 1
+    # residual scales: index by CONSUMING minisgl layer (post_attention -> the MoE layer entered after
+    # attn; post_mlp -> the NEXT block's attn layer, or the top-level final merge for the last block).
+    if sub.startswith("post_attention_residual_scale."):
+        return f"model.layers.{moe}.res_scale.{sub.split('.', 1)[1]}"
+    if sub.startswith("post_mlp_residual_scale."):
+        f = sub.split(".", 1)[1]
+        return f"model.res_scale.{f}" if L == n_blocks - 1 else f"model.layers.{2*L+2}.res_scale.{f}"
+    if sub == "input_layernorm.weight":
+        return f"model.layers.{attn}.input_norm.weight"
+    if sub == "post_attention_layernorm.weight":
+        return f"model.layers.{moe}.input_norm.weight"
+    if sub.startswith("self_attn."):
+        a = sub[len("self_attn."):]
+        if a == "o_proj.weight":
+            return f"model.layers.{attn}.self_attn.o_proj.weight"
+        if a == "qk_norm.temp":
+            return f"model.layers.{attn}.self_attn.qkv.temp"
+        if a.startswith("qkv_proj."):
+            nn = _HF_ATTN_QKV.get(a[len("qkv_proj."):])
+            assert nn is not None, f"unmapped HF attn qkv key: {a} ({key})"
+            return f"model.layers.{attn}.self_attn.qkv.{nn}"
+        raise AssertionError(f"unmapped HF self_attn key: {a} ({key})")
+    if sub.startswith("mlp.gate."):
+        nn = _HF_ROUTER.get(sub[len("mlp.gate."):])
+        assert nn is not None, f"unmapped HF router key: {sub} ({key})"
+        return f"model.layers.{moe}.zaya_block.router.{nn}"
+    if sub.startswith("mlp.experts."):
+        return None  # stacked experts -> EP path in _load_zaya_weight
+    raise AssertionError(f"unmapped HF ZAYA layer key: {sub} ({key})")
+
+
+_HF_EXPERT_RE = re.compile(
+    r"^model\.layers\.(?P<L>\d+)\.mlp\.experts\.(?P<proj>gate_up_proj|down_proj)(?P<scale>\.weight_scale)?$"
+)
+
+
 def _shard_zaya(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
     """Extract rank r's TP head-shard of a ZAYA CCA-hybrid NATIVE (post-`_zaya_remap`) tensor.
 
@@ -665,13 +735,41 @@ def _load_zaya_weight(
             del expert_buf[native_key]
         yield f"{native_key}.{field}", stacked
 
+    # HF-format detection: Zyphra's transformers release fuses attn+MoE per layer with HF names
+    # (input_layernorm / mlp.experts.gate_up_proj); our Megatron export uses input_norm / local_experts.
+    is_hf = False
+    if files:
+        with safetensors.safe_open(files[0], framework="pt", device="cpu") as _f0:
+            is_hf = any(k.endswith("input_layernorm.weight") or ".mlp.experts.gate_up_proj" in k
+                        for k in _f0.keys())
+    n_blocks = config.num_layers // 2  # HF fused-block count (minisgl models each block as 2 layers)
+    # HF names the bare expert tensor `gate_up_proj`/`down_proj`; the model's param is `.weight` (fp8
+    # W8A8) or `.weight_packed` (4-bit mxfp4-pack). Pick by declared quant width (the Megatron path
+    # reads the field straight off the per-expert key, so this is HF-only).
+    _wfield = "weight_packed" if (config.quant is not None
+                                  and getattr(config.quant, "bits", 8) == 4) else "weight"
+
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for ckpt_name in f.keys():
-                if _ZAYA_EXPERT_PATTERN.match(ckpt_name) is not None:
-                    yield from _store_expert(ckpt_name, f.get_tensor(ckpt_name))
-                    continue
-                native = _zaya_remap(ckpt_name)
+                if is_hf:
+                    # HF ships experts ALREADY stacked [E,...] -> native, EP-sliced (no accumulate).
+                    if (em := _HF_EXPERT_RE.match(ckpt_name)) is not None:
+                        field = "weight_scale" if em.group("scale") else _wfield
+                        native = (f"model.layers.{2 * int(em.group('L')) + 1}.zaya_block.experts."
+                                  f"{em.group('proj')}.{field}")
+                        t = f.get_tensor(ckpt_name)
+                        yield native, t[ep_offset:ep_offset + ep_local].contiguous()
+                        continue
+                    mega = _zaya_remap_hf(ckpt_name, n_blocks)
+                    if mega is None:
+                        continue
+                    native = _zaya_remap(mega)
+                else:
+                    if _ZAYA_EXPERT_PATTERN.match(ckpt_name) is not None:
+                        yield from _store_expert(ckpt_name, f.get_tensor(ckpt_name))
+                        continue
+                    native = _zaya_remap(ckpt_name)
                 if native is None:
                     continue
                 # Head-shard the CCA/o_proj/embed tensors for this rank (no-op at TP=1); experts are

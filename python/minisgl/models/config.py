@@ -257,9 +257,19 @@ class ModelConfig:
         # `zaya` checkpoint that omits `cca` (no error, garbage output); OR matches the spec and the
         # shipping checkpoints (which carry both).
         is_cca = (model_type == "zaya") or bool(getattr(config, "cca", False))
-        # Zaya names kv heads `num_query_groups` (not num_key_value_heads) and top-k `moe_router_topk`.
+        # HF-format ZAYA fuses attn+MoE into ONE decoder layer (num_hidden_layers = #blocks); minisgl
+        # models them as TWO alternating layers (even=CCA-attn, odd=MoE), so double the count. The
+        # Megatron-export config already ships the split (80) count. Detector: the HF-only `layer_types`
+        # key (Megatron config lacks it). See docs/zaya-port/HF_FORMAT_LOADER.md.
+        num_layers = config.num_hidden_layers
+        _hf_zaya = is_cca and getattr(config, "layer_types", None) is not None
+        if _hf_zaya:
+            num_layers = num_layers * 2
+        # Zaya names kv heads `num_query_groups` (Megatron) / `num_key_value_heads` (HF); top-k
+        # `moe_router_topk` (Megatron) / `num_experts_per_tok` (HF).
         num_kv_heads = (
-            getattr(config, "num_query_groups", None)
+            (getattr(config, "num_query_groups", None)
+             or getattr(config, "num_key_value_heads", None))
             if is_cca
             else getattr(config, "num_key_value_heads", None)
         ) or config.num_attention_heads
@@ -282,11 +292,14 @@ class ModelConfig:
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         if is_cca:
-            # ZAYA: top-k from moe_router_topk; per-expert FFN width = ffn_hidden_size//2 (the
-            # checkpoint's linear_fc1 is the MERGED gate+up of width ffn_hidden_size).
-            num_experts_per_tok = getattr(config, "moe_router_topk", 1) or 1
+            # ZAYA top-k: moe_router_topk (Megatron) / num_experts_per_tok (HF, read just above).
+            num_experts_per_tok = (getattr(config, "moe_router_topk", None)
+                                   or num_experts_per_tok or 1)
+            # Per-expert FFN width: ffn_hidden_size//2 (Megatron ships the MERGED gate+up width) or,
+            # for HF format (no ffn_hidden_size), the moe_intermediate_size read directly above.
             ffn_hidden_size = getattr(config, "ffn_hidden_size", 0) or 0
-            moe_intermediate_size = ffn_hidden_size // 2
+            if ffn_hidden_size:
+                moe_intermediate_size = ffn_hidden_size // 2
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
@@ -450,7 +463,7 @@ class ModelConfig:
                     )
 
         return cls(
-            num_layers=config.num_hidden_layers,
+            num_layers=num_layers,
             num_qo_heads=config.num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -532,6 +545,6 @@ class ModelConfig:
             # and the EDA state thread -> degenerate). Still overridable by an explicit config key.
             zaya_use_eda=bool(getattr(config, "zaya_use_eda", True)) if is_cca else False,
             zaya_use_mod=bool(getattr(config, "zaya_use_mod", True)) if is_cca else False,
-            scale_residual_merge=bool(getattr(config, "scale_residual_merge", False)),
+            scale_residual_merge=bool(getattr(config, "scale_residual_merge", is_cca)),
             residual_in_fp32=bool(getattr(config, "residual_in_fp32", False)),
         )
