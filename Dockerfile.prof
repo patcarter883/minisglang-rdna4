@@ -1,0 +1,27 @@
+# minisgl-rdna4:lean + a working rocprofv3.
+#
+# rocprofv3 core-dumps in the stock lean image with
+#   "api registration failed with error code 16: Configuration request occurred outside of valid
+#    rocprofiler configuration period"
+# because torch VENDORS its own standalone librocprofiler-sdk.so / librocprofiler-register.so in
+# site-packages/torch/lib. Those shadow /opt/rocm/lib's copies, so when Python imports torch the
+# vendored SDK registers against a registry rocprofv3 has already closed. Pointing both at the
+# system libs makes tool and runtime share ONE registration.
+#
+# Also puts libdw/libelf on the path: rocprofv3 needs libdw.so.1, which the image stages in
+# /opt/rocprof-deps but never adds to the loader path (bare failure: "error while loading shared
+# libraries: libdw.so.1").
+#
+# This image exists so a CAPTURED CUDA GRAPH can be profiled at all: the torch-profiler window
+# (MINISGL_PROFILE) records the graph LAUNCH and none of its kernels, so propose/verify are opaque
+# to it. rocprofv3 sees GPU-side dispatches, graph-internal ones included.
+FROM minisgl-rdna4:lean
+RUN set -eux; \
+    L=/opt/venv/lib/python3.12/site-packages/torch/lib; \
+    for lib in librocprofiler-sdk librocprofiler-register; do \
+      if [ -e "$L/$lib.so" ] && [ ! -L "$L/$lib.so" ]; then mv "$L/$lib.so" "$L/$lib.so.vendored.bak"; fi; \
+    done; \
+    ln -sf /opt/rocm/lib/librocprofiler-sdk.so.1 "$L/librocprofiler-sdk.so"; \
+    ln -sf /opt/rocm/lib/librocprofiler-register.so.0 "$L/librocprofiler-register.so"; \
+    ldconfig
+ENV LD_LIBRARY_PATH=/opt/rocprof-deps:${LD_LIBRARY_PATH}

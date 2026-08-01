@@ -116,6 +116,21 @@ x-lean-common: &lean-common
     # tokens per STEP, but a wider rung costs more time per step, so emitted/step and tok/s can point
     # opposite ways — this is how that gets settled with data. Unset = normal adaptive behaviour.
     MINISGL_SPEC_VERIFY_WIDTH_PIN: "${MINISGL_SPEC_VERIFY_WIDTH_PIN:-}"
+    # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations then return from run_forever, so
+    # the process exits NORMALLY. Diagnostics only; unset = serve forever. Required to profile inside
+    # a captured CUDA graph: rocprofv3 is LD_PRELOADed into this very process (it is not a separate
+    # process to stop) and flushes only on clean interpreter teardown, so no signal can produce a
+    # trace. Set it BELOW the step count the driving request will reach, or the loop blocks idle
+    # waiting for work and never reaches the bound.
+    MINISGL_EXIT_AFTER_STEPS: "${MINISGL_EXIT_AFTER_STEPS:-}"
+    # ROCTx phase markers + a gated collection window (python/minisgl/utils/roctx.py). MINISGL_ROCTX=1
+    # wraps each spec step in propose/stage/verify_forward/accept ranges and calls
+    # roctxProfilerResume/Pause around steps [SKIP, SKIP+STEPS), so `rocprofv3 --marker-trace
+    # --selected-regions` records ONLY those steps and every dispatch is attributable to a phase.
+    # Adds no synchronize (unlike MINISGL_SPEC_TIMING), so the profiled step keeps its real shape.
+    MINISGL_ROCTX: "${MINISGL_ROCTX:-}"
+    MINISGL_ROCTX_SKIP: "${MINISGL_ROCTX_SKIP:-}"
+    MINISGL_ROCTX_STEPS: "${MINISGL_ROCTX_STEPS:-}"
     # Per-phase spec step timing: =1 logs [spec-timing] propose/stage/forward/accept ms every 50 steps
     # (cuda-synchronized, so these are real GPU times, not queue times). Already implemented in the
     # scheduler but never forwarded, so it could not be reached through compose — which is the only

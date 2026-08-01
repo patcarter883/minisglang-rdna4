@@ -91,3 +91,5 @@ tools/tp2_results/
 # propose-capture A/B raw per-step draft-chain dumps (regenerable by tools/propose_capture_ab.sh;
 # the verdicts they support are in the committed tools/propose_capture_ab_*.txt summaries)
 tools/_pcab_*.txt
+rpv3out-*/
+docker-compose.rocprof-*.yml

@@ -27,7 +27,7 @@ NREQS=${NREQS:-"1 8"}
 MAXTOK=${MAXTOK:-384}
 : > "$OUT"
 
-export MODEL=laguna SPEC=dflash SPEC_K=16 TP=2 CONC=8 GRAPH_BS=8 MINISGL_SPEC_DEBUG=1
+export MODEL=laguna SPEC="${SPEC:-dflash}" SPEC_K="${SPEC_K:-16}" TP=2 CONC=8 GRAPH_BS=8 MINISGL_SPEC_DEBUG=1
 
 down() { ( cd "$WT" && MINISGL_IMAGE="$IMAGE" docker compose --profile serve down >/dev/null 2>&1 ); }
 trap down EXIT INT TERM

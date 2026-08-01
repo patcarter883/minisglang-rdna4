@@ -145,10 +145,33 @@ def launch_server(run_shell: bool = False) -> None:
         # NOT a crash — those exit codes are whitelisted so normal shutdown never trips the watchdog.
         _clean_exit = {0, -signal.SIGTERM, -signal.SIGINT}
 
+        # MINISGL_EXIT_AFTER_STEPS bounds the SCHEDULER loop, but the frontend never runs one — so a
+        # bounded run left the parent (and therefore its container, and therefore the GPU lease) up
+        # indefinitely while the workers had already finished and flushed their profiler output.
+        # Under a bounded run a CLEAN worker exit means "the run is done", so take the server down
+        # with it and let the container stop on its own.
+        _bounded_run = int(os.environ.get("MINISGL_EXIT_AFTER_STEPS") or "0") > 0
+
         def _crash_watchdog() -> None:
             while True:
                 for p in _procs:
                     ec = p.exitcode
+                    if _bounded_run and ec is not None and ec in _clean_exit:
+                        logger.info(
+                            "worker '%s' completed its bounded run (exitcode=%s) — shutting the "
+                            "server down so the container exits.", p.name, ec)
+                        # Exit THIS process immediately; do NOT terminate the children first. Under
+                        # a profiler the workers have rocprofv3 LD_PRELOADed and its handler treats
+                        # SIGTERM as an ERROR signal (finalize -> chain -> abort), which hung this
+                        # thread before it reached the exit. Firing here is also correctly ORDERED:
+                        # p.exitcode only becomes non-None once the child has fully exited, i.e.
+                        # after its profiler trace has flushed during interpreter teardown.
+                        # SIGKILL as well as os._exit: os._exit alone was observed NOT to bring the
+                        # container down, so log the pid to see which process this thread is in.
+                        logger.info("bounded-run shutdown from pid=%d (ppid=%d)",
+                                    os.getpid(), os.getppid())
+                        os.kill(os.getpid(), signal.SIGKILL)
+                        os._exit(0)
                     if ec is not None and ec not in _clean_exit:
                         logger.error(
                             "worker '%s' died unexpectedly (exitcode=%s) — shutting the server down "
