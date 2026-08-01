@@ -40,6 +40,44 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
+# Spec decode is a LATENCY win that stops paying once the batch saturates the GPU: verify costs
+# M = bs*(width+1) rows against plain decode's bs. Above the crossover it is a straight LOSS.
+#
+# The crossover is PER-PROPOSER, and by a lot — one global number would be badly wrong for one of
+# them. Measured on Qwen3.6-35B-A3B-AWQ TP=2, temp 0.8 (SAMPLED), TRUE tok/s vs a matched plain leg:
+#
+#   bs      1        2        4        6        8
+#   MTP   +41.3%   +27.6%   +5.5%   -5.9%   -2.8%     -> crossover in (4, 6]  => 4
+#   DFlash +29.5%  -22.1%  -40.4%     -       -       -> crossover in (1, 2]  => 1
+#
+# A separate DRAFT MODEL costs a full extra forward per step, so it needs a much higher accept-len to
+# pay for itself and stops paying almost immediately; MTP's head is far cheaper. EAGLE3 is the same
+# shape as DFlash (separate drafter) and takes its default UNMEASURED — conservative on purpose.
+# ngram/tidar are unmeasured too and keep the MTP-ish default since they add no separate model.
+#
+# 0 disables the gate (always speculate) — required when MEASURING a crossover, or the gate
+# suppresses the very points that set it. MINISGL_SPEC_MAX_BS overrides.
+# CRITICAL: the gate removes spec COMPUTE but never spec MEMORY. The drafter and the verify graphs
+# stay resident whichever path a step takes, so the KV pool is smaller than a true plain serve and
+# the fallback does NOT recover plain throughput. Measured at bs=8 on 35B MTP:
+#     pure plain (no spec loaded) 389.0 | MTP ungated 378.3 | MTP GATED->plain 360.8
+# i.e. the residual-memory penalty is -7.3% while MTP's own overhead at bs=8 is only -2.8%, so
+# GATING MTP IS WORSE THAN LEAVING IT ON. The gate only pays when the spec compute loss exceeds that
+# residual penalty — true for a separate draft model (-22% at bs=2, -40% at bs=4), false for MTP.
+#
+# Hence 0 (gate OFF) for MTP: its concurrency loss is real but smaller than the cost of dodging it.
+# The genuine fix for a high-concurrency deployment is to NOT LOAD the spec machinery at all, which
+# is a serve-level choice (SPEC=none), not something a per-step gate can reach.
+_SPEC_MAX_BS_BY_ALGO = {
+    "mtp": 0,        # measured: gating is NET-NEGATIVE (see above). Leave spec on at every bs.
+    "dflash": 1,     # measured crossover in (1, 2]; losses there dwarf the residual penalty
+    "eagle3": 1,     # UNMEASURED — separate drafter, assumed to behave like dflash
+    "ngram": 0,      # UNMEASURED — no separate model, so assumed MTP-like
+    "tidar": 0,      # UNMEASURED
+}
+_SPEC_MAX_BS_DEFAULT = 4
+
+
 if TYPE_CHECKING:
     from minisgl.engine import BatchSamplingArgs, ForwardOutput
 
@@ -281,6 +319,22 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         #
         # Returning (not os._exit / not sys.exit from a callback) is load-bearing: the trace is
         # written by the tool's destructor during normal interpreter teardown, which os._exit skips.
+        # Spec decode is a LATENCY optimization, and it stops paying once the batch is large enough
+        # that the GPU is already saturated: verify costs M = bs*(width+1) rows while plain decode
+        # costs bs. Measured net-NEGATIVE at concurrency on BOTH models (temp 0.8, TRUE tok/s):
+        #   Qwen3.6-35B MTP K=4 : bs=1 110.3 vs plain 78.6 (+41%), bs=8 346.1 vs 377.9 (-8%)
+        #   Qwen3.6-35B DFlash  : bs=1 101.1 vs plain 78.6 (+29%), bs=4 124.2 vs 233.1 (-47%)
+        #   Laguna DFlash       : bs=1 102.8 vs plain  77.1 (+33%), bs=8 254.0 vs 302.4 (-16%)
+        # The adaptive verify WIDTH already narrows to the cheapest rung as bs grows, but on both
+        # models even the BEST rung loses to plain there — the ladder needs one rung below the
+        # narrowest, which is OFF. Above this batch size the step falls back to plain decode through
+        # the EXISTING spec_ok fallback, so nothing new has to be correct on that path.
+        _algo = getattr(getattr(self.engine, "spec_config", None), "algorithm", None)
+        self._spec_max_bs = int(
+            os.environ.get("MINISGL_SPEC_MAX_BS")
+            or _SPEC_MAX_BS_BY_ALGO.get(_algo, _SPEC_MAX_BS_DEFAULT)
+        )
+        self._spec_bs_declined = 0
         self._exit_after_steps = int(os.environ.get("MINISGL_EXIT_AFTER_STEPS") or "0")
         self._loop_steps_run = 0
         # ROCTx marker-gated profiling window (MINISGL_ROCTX=1). SKIP past model load + graph
@@ -827,6 +881,26 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Tick per decode step only (prefill/idle steps have very different shape).
         if forward_input is not None and not forward_input.batch.is_prefill:
             self._hp_tick()
+
+    def _spec_batch_ok(self, bs: int) -> bool:
+        """Whether a decode batch of `bs` should speculate at all (else plain decode).
+
+        Deterministic in `bs` alone — every TP rank runs the SAME batch, so they agree without a
+        collective. Under DP+EP the replicas do NOT share a batch, so there the decision is folded
+        into the existing cross-replica veto instead of being taken per replica (a per-replica choice
+        would desync the fixed-N MoE collectives).
+        """
+        if self._spec_max_bs <= 0 or bs <= self._spec_max_bs:
+            return True
+        self._spec_bs_declined += 1
+        if self._spec_bs_declined == 1:
+            logger.info_rank0(
+                f"spec-decode: DISABLED for batches > {self._spec_max_bs} (this step bs={bs}) — "
+                "verify costs bs*(width+1) rows against plain decode's bs, and spec measured "
+                "net-negative at concurrency on every model tested. Falling back to plain decode; "
+                "logged once (see _spec_bs_declined for the count)."
+            )
+        return False
 
     def _bounded_exit_reached(self) -> bool:
         """True once MINISGL_EXIT_AFTER_STEPS loop iterations have run (see __init__ for why).
@@ -2164,7 +2238,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # spec is enabled (MINISGL_SPEC_SAMPLED), which lets non-greedy unconstrained reqs spec-decode
         # via rejection sampling. Constrained (structured-output) reqs spec-decode greedily too (grammar
         # enforced at the verify argmax); a constrained-AND-sampled req falls back to plain decode.
-        spec_ok = all(self._req_spec_ok(req) for req in reqs)
+        spec_ok = all(self._req_spec_ok(req) for req in reqs) and self._spec_batch_ok(len(reqs))
         if spec_ok:
             if getattr(self, "_tidar_ddtree", False):
                 self._spec_decode_step_ddtree(
@@ -2236,8 +2310,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # A replica with decode work vetoes spec iff ANY of its reqs can't spec-decode (non-greedy with
         # sampled-spec OFF, or constrained-and-sampled); a replica with NO decode work has nothing to
         # veto. Agreed via MAX over (1 - all_spec_ok): any 1 -> some replica must fall back.
+        # ...and the batch gate votes through the SAME veto: a replica whose batch is too large for
+        # spec to pay asks everyone to fall back, so the decision stays replica-identical.
         local_nongreedy = (
-            1 if (local_reqs and not all(self._req_spec_ok(r) for r in local_reqs)) else 0
+            1 if (local_reqs and (not all(self._req_spec_ok(r) for r in local_reqs)
+                                  or not self._spec_batch_ok(len(local_reqs)))) else 0
         )
         t = torch.tensor(
             [local_prefill_tokens, local_decode_bs, local_nongreedy], dtype=torch.int64
