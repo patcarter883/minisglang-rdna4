@@ -1001,3 +1001,50 @@ predicate, not a new tail value, so this sweep cannot pick it — it needs its o
   profile; they bind `127.0.0.1:21955` in-container and deliberately do not lease themselves.
 - The isolation worktree `/home/pat/code/minisgl-rdna4-spectruth` (branch `task/spec-laguna-truth`
   @ `4a031cc3`) is left in place; remove with `git worktree remove` when the follow-up lands.
+
+---
+
+## 12. MEASURED 2026-08-01: the drafter is NO LONGER the gap — verify is 79% of the step
+
+Post propose-capture (merge `55f08758`), `MINISGL_SPEC_TIMING=1`, Laguna TP=2, bs=1, short prompt,
+adaptive width settling on rung 7 (97% of steps). Stable across step=50 and step=100:
+
+```
+propose=5.7ms  stage=0.3ms  forward=24.7ms  accept=0.5ms  total=31.3ms
+propose-graph replay=100 eager=0    verify-graph replay=100 eager=0
+```
+
+| phase | ours | lucebox (§6) | share of our step |
+|---|---|---|---|
+| propose (drafter) | 5.7 ms | 2.4 ms | 19% |
+| **verify forward** | **24.7 ms** | **13.7 ms** | **79%** |
+| stage + accept | 0.8 ms | — | 3% |
+| total | 31.3 ms | ~16.1 ms | |
+
+**This retires §5 item 4 and finding 4 as a lever.** Those recorded a ~9 ms drafter measured EAGER
+(py-spy showed live per-layer `dflash.py attend_block` frames). The captured propose path cut it to
+5.7 ms, and the capture is confirmed engaged (`propose-graph replay=100 eager=0`). Driving propose to
+**zero** would leave a 24.6 ms step — about **164 tok/s**. lucebox's 296 is therefore NOT reachable
+from the drafter side at all, whatever else is done there.
+
+**The whole remaining gap is the verify forward.** At bs=1 rung 7 that is M = 8 rows, costing 24.7 ms
+against plain decode's 13.51 ms at M=1 (§1) — i.e. 8x the rows for 1.8x the time, which is §7's
+resolved `distinct(qlen)` expert-fanout law, not a kernel bug. To reach 296 the step must come down
+to ~16 ms, so verify must roughly HALVE.
+
+### Why that gap looks like overhead, not bandwidth — the thing to settle first
+
+We run **TP=2**: expert weights are sharded, so aggregate bandwidth is ~1412 GB/s against a single
+3090's 936. On pure streaming we should be AHEAD of lucebox, not 1.8x behind. That points at verify
+being overhead-bound at small M rather than bandwidth-bound, which is consistent with:
+
+* the banked 35B result that MoE decode sits at <=27% memory-controller utilisation at every bs, and
+* §8's dispatch census: the largest group is **468 router/top-k glue dispatches per step**.
+
+**Next action, replacing §5's ordering: settle BW-vs-overhead for the verify forward at M=8**, then
+attack whichever it is. Do it with a trace + ISA rather than hardware counters — `--pmc` hangs on the
+first dispatch on gfx1201.
+
+Numbers above carry the `MINISGL_SPEC_TIMING` per-phase `cuda.synchronize`, so treat the RATIOS as
+load-bearing and the absolute values as an upper bound. Untimed, the same config measures 102.8-107.2
+tok/s end-to-end.
