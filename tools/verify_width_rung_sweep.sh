@@ -105,7 +105,7 @@ for rung in $RUNGS; do
     | sed 's/^/  provenance: /' | tee -a "$OUT"
   for nq in $NREQS; do drive "$nq" | tee -a "$OUT"; done
   # Per-rung acceptance + realized width histogram, straight from the engine.
-  docker logs "$C" 2>&1 | grep -aE "\[spec\] step=|verify-width\[" | tail -2 \
+  docker logs "$C" 2>&1 | grep -aE "\[spec\] step=|verify-width\[|DISABLED for batches" | tail -2 \
     | sed 's/^/  /' | tee -a "$OUT"
 done
 

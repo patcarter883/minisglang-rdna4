@@ -116,6 +116,11 @@ x-lean-common: &lean-common
     # tokens per STEP, but a wider rung costs more time per step, so emitted/step and tok/s can point
     # opposite ways — this is how that gets settled with data. Unset = normal adaptive behaviour.
     MINISGL_SPEC_VERIFY_WIDTH_PIN: "${MINISGL_SPEC_VERIFY_WIDTH_PIN:-}"
+    # Batch-size gate: above this decode batch the step falls back to PLAIN decode, because spec is
+    # measured net-negative there (verify costs bs*(width+1) rows vs plain's bs). Per-proposer
+    # defaults live in scheduler.py::_SPEC_MAX_BS_BY_ALGO (MTP 4, DFlash 1 — both measured). Set 0 to
+    # disable the gate, which is REQUIRED when measuring a crossover or the gate hides the points.
+    MINISGL_SPEC_MAX_BS: "${MINISGL_SPEC_MAX_BS:-}"
     # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations then return from run_forever, so
     # the process exits NORMALLY. Diagnostics only; unset = serve forever. Required to profile inside
     # a captured CUDA graph: rocprofv3 is LD_PRELOADed into this very process (it is not a separate
