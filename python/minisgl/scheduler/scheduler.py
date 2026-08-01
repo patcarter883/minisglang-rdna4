@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 import torch
 import torch.distributed as dist
 import torch.profiler
+from minisgl.utils import roctx as _roctx
 from minisgl.cam.memory import _canon_subject   # #10 optional subject canonicalization (env-gated no-op)
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
@@ -265,6 +266,28 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
+
+        # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations, then RETURN from
+        # run_forever so the process exits NORMALLY. Diagnostics only; 0/unset = serve forever.
+        #
+        # This exists because rocprofv3 flushes its trace only on a clean interpreter shutdown, and
+        # it is NOT a separate process you can stop independently: it sets LD_PRELOAD and execs the
+        # target, so the tool is a library living INSIDE this process (measured 2026-08-01:
+        # `/proc/<pid>/exe -> python3.12` with cmdline `python -m minisgl ...`, and the profiler's
+        # handler firing on that same pid). Signalling "the profiler" therefore signals the ENGINE,
+        # and the injected handler treats SIGINT/SIGTERM as ERROR signals and aborts without
+        # writing — four separate shutdown strategies produced zero output before this was
+        # understood. A bounded return is the only way to get a flush out of a server process.
+        #
+        # Returning (not os._exit / not sys.exit from a callback) is load-bearing: the trace is
+        # written by the tool's destructor during normal interpreter teardown, which os._exit skips.
+        self._exit_after_steps = int(os.environ.get("MINISGL_EXIT_AFTER_STEPS") or "0")
+        self._loop_steps_run = 0
+        # ROCTx marker-gated profiling window (MINISGL_ROCTX=1). SKIP past model load + graph
+        # capture, then annotate STEPS spec steps. See utils/roctx.py.
+        self._rtx_step = 0
+        self._rtx_skip = int(os.environ.get("MINISGL_ROCTX_SKIP") or "20")
+        self._rtx_steps = int(os.environ.get("MINISGL_ROCTX_STEPS") or "20")
 
         # --- env-gated per-stage HOST-overhead profiler (diagnostics only) -----------------------
         # MINISGL_HOSTPROF=<N> accumulates wall time by named loop stage and logs the breakdown every
@@ -805,8 +828,25 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if forward_input is not None and not forward_input.batch.is_prefill:
             self._hp_tick()
 
+    def _bounded_exit_reached(self) -> bool:
+        """True once MINISGL_EXIT_AFTER_STEPS loop iterations have run (see __init__ for why).
+
+        Counts SCHEDULER-LOOP iterations, not tokens: one call per loop body, whichever loop is in
+        force, so a bound means the same thing on the spec, EP, normal and overlap paths.
+        """
+        if self._exit_after_steps <= 0:
+            return False
+        self._loop_steps_run += 1
+        if self._loop_steps_run < self._exit_after_steps:
+            return False
+        logger.info_rank0(
+            f"scheduler: MINISGL_EXIT_AFTER_STEPS={self._exit_after_steps} reached — returning from "
+            "run_forever for a NORMAL interpreter exit (profiler traces flush in teardown)"
+        )
+        return True
+
     @torch.inference_mode()
-    def run_forever(self) -> NoReturn:
+    def run_forever(self) -> None:
         # Establish the rank0->rank{1..} PUB/SUB fan-out before any request flows, so the first
         # message can't be lost to the ZMQ slow-joiner (which deadlocked the first request). No-op
         # for TP=1. See SchedulerIOMixin.establish_inter_rank_link.
@@ -840,11 +880,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self._spec_ep_loop()
+                    if self._bounded_exit_reached():
+                        return
         if self.engine.spec_config is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self._spec_loop()
+                    if self._bounded_exit_reached():
+                        return
         # Expert parallelism runs a dedicated synchronous lockstep loop: every step issues the MoE
         # all_gather/all_reduce over the DP/EP group, so all replicas must agree the per-step
         # phase+size (one gloo all_reduce(MAX), OUTSIDE the graph) or the collectives deadlock. This
@@ -854,6 +898,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self.ep_loop()
+                    if self._bounded_exit_reached():
+                        return
         # Recurrent radix caches a sequence's linear-attention state at commit points by cloning its
         # live slot. That clone must be ordered AFTER the sequence's own forward and BEFORE any next
         # forward that could advance the slot — which the synchronous normal loop guarantees (schedule
@@ -867,11 +913,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self.engine.stream.wait_stream(self.stream)
                 while True:
                     self.normal_loop()
+                    if self._bounded_exit_reached():
+                        return
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
+                if self._bounded_exit_reached():
+                    return
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -3435,6 +3485,20 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             import time as _time
             torch.cuda.synchronize(device); _t0 = _time.perf_counter()
 
+        # ROCTx phase markers (MINISGL_ROCTX=1, else a bool test). Unlike _timing these add NO
+        # synchronize — they only annotate the stream, so the profiled step keeps its real shape.
+        # Collection is gated to [SKIP, SKIP+STEPS) via roctxProfilerResume/Pause so rocprofv3
+        # --selected-regions never records model load or the graph-capture warmup.
+        _rtx = _roctx.enabled()
+        if _rtx:
+            self._rtx_step += 1
+            if self._rtx_step == self._rtx_skip:
+                _roctx.resume()
+            elif self._rtx_step == self._rtx_skip + self._rtx_steps:
+                _roctx.pause()
+            _roctx.push("spec_step")
+            _roctx.push("propose")
+
         # --- 1. propose drafts (proposer-specific: n-gram lookup / MTP head / draft model). The
         # proposer clamps per-req to the remaining budget; an empty list ⇒ plain decode for that req.
         # Draft-head proposers read the target hidden states captured at the PREVIOUS verify (keyed
@@ -3516,6 +3580,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 self._cur_verify_width = w_pad
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
+        if _rtx:
+            _roctx.pop(); _roctx.push("stage")
 
         # --- 2. stage: extend each req to K_i+1 query tokens; write drafts into the token pool --
         # Confirmed token sits at position c0 (= cached_len); drafts go at c0+1 .. c0+K_i.
@@ -3612,6 +3678,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         last_hidden = aux_hidden = None
         if _timing:
             _t_stage = _time.perf_counter()  # CPU-side staging (steps 2-3) done; forward next
+        if _rtx:
+            _roctx.pop(); _roctx.push("verify_forward")
         if capture:
             logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
         else:
@@ -3690,6 +3758,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
         if _timing:
             _t2 = _time.perf_counter()  # forward already synced by the .cpu() above
+        if _rtx:
+            _roctx.pop(); _roctx.push("accept")
 
         # --- 5. accept + commit + rollback per req --------------------------------------------
         offset = 0
@@ -4082,6 +4152,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"{_pc.line()} "
                     f"verify-graph replay={_vg[0]} eager={_vg[1]} verify-width[{_wd}]"
                 )
+        if _rtx:
+            _roctx.pop()  # accept
+            _roctx.pop()  # spec_step
         self._spec_debug(reqs, drafts, total_emitted)
 
     def _spec_debug(self, reqs: List[Req], drafts: List[List[int]], emitted: int) -> None:
