@@ -352,11 +352,37 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             self._spec_seed_enabled = bool(self._proposer.supports_prefill_seed) and (
                 self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
             )
+            # ...but ON-whenever-supported is not the same as ON-UNCONDITIONALLY, and shipping it that
+            # way was an OOM. The seed forward runs with return_hidden=True, so last_hidden AND
+            # aux_hidden stay live across the whole prefill span instead of being freed inside the
+            # forward. On a card holding weights + KV pool + propose graphs that slack is ~0.7 GiB, and
+            # 8 concurrent ~11k-token prompts walked straight through it: OOM inside
+            # mmq_fp8_moe_gather_reduce asking for 64 MiB with 14.46 GiB already allocated, which kills
+            # the scheduler process (measured 2026-08-01; 8x ~3.1k-token prompts pass, 8x ~11k fail).
+            #
+            # A length bound is the right shape rather than a bigger buffer, because the seed is ALSO
+            # already measured NET-NEGATIVE on long prompts: 5bd8d5a7 ("do not ship it on") and
+            # 44960dd4 ("PROMPT LENGTH is the lever, and it crosses at ~500"). So a long prompt was
+            # paying a hidden-capturing prefill to make throughput WORSE, and occasionally to die. The
+            # crossover is the policy; the env vars exist to re-measure it, not to configure it.
+            # Skipping the seed is lossless — verify corrects every draft, so the seed can only move
+            # acceptance, never output.
+            self._spec_seed_max_prompt = int(
+                os.environ.get("MINISGL_SPEC_SEED_MAX_PROMPT") or "512"
+            )
+            # Second, independent bound: even all-short prompts capture hidden for the WHOLE batch, so
+            # peak scales with summed extend_len, not with any one prompt.
+            self._spec_seed_max_batch_tokens = int(
+                os.environ.get("MINISGL_SPEC_SEED_MAX_BATCH_TOKENS") or "4096"
+            )
+            self._spec_seed_declined = 0
             if self._spec_seed_enabled:
                 _tail = int(getattr(self._proposer, "prefill_aux_tail", 0) or 0)
                 logger.info_rank0(
                     "spec-decode: prompt-prefill draft seed ENABLED "
-                    f"(aux tail={_tail or 'whole prompt'})"
+                    f"(aux tail={_tail or 'whole prompt'}; skipped above "
+                    f"{self._spec_seed_max_prompt} prompt tokens or "
+                    f"{self._spec_seed_max_batch_tokens} batch tokens)"
                 )
             # Capture the verify CUDA graphs NOW — after the aux-capture layers are programmed above, so
             # the captured forward stashes the hidden/aux the draft head consumes. Supported for every
@@ -404,6 +430,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                     f"{'ON' if self._verify_width.adaptive else 'OFF (single captured width)'} "
                     f"widths={captured_widths} (K={_K}, capped at {_mrows - 1} "
                     f"for the M<={_mrows} decode-kernel cliff)"
+                    + (
+                        f" -- PINNED to rung {self._verify_width.pinned} "
+                        "(MEASUREMENT INSTRUMENT: controller disabled)"
+                        if self._verify_width.pinned
+                        else ""
+                    )
                 )
             # ...and the PROPOSE graphs, on the same bucket grid. Propose was the last eager forward
             # in the spec step — ~150 kernel launches per request per step for a draft trunk, in a
@@ -2067,7 +2099,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             # (the prefill bonus) is grammar-masked — the hidden-capturing seed forward bypasses the
             # sampler's bitmask. It also isn't a spec req, so seeding its draft KV is pointless.
             constrained = any(r.sampling_params.is_constrained for r in batch.reqs)
-            if self._spec_seed_enabled and not constrained:
+            if self._spec_seed_enabled and not constrained and self._spec_seed_fits(batch):
                 self._spec_prefill_seeded(batch)
             else:
                 forward_input = self._prepare_batch(batch)
@@ -2295,6 +2327,32 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             return None
         bigger = [b for b in vbs if b >= max_decode]
         return min(bigger) if bigger else None
+
+    def _spec_seed_fits(self, batch: Batch) -> bool:
+        """Whether this prefill batch may take the hidden-capturing seed path.
+
+        The decision is per-BATCH, not per-req, because the memory is spent by the forward itself:
+        `return_hidden=True` keeps last_hidden/aux_hidden live over the whole batch span, so excusing
+        one long req while still capturing hidden for the batch would save nothing. A batch that
+        declines simply prefills normally and its reqs draft unseeded — lossless, since verify
+        corrects every draft.
+        """
+        longest = max((r.extend_len for r in batch.reqs), default=0)
+        total = sum(r.extend_len for r in batch.reqs)
+        if longest <= self._spec_seed_max_prompt and total <= self._spec_seed_max_batch_tokens:
+            return True
+        # Log the FIRST decline only: this fires per prefill batch on a long-prompt workload, and a
+        # per-batch log line on the scheduler thread is itself a serving cost.
+        self._spec_seed_declined += 1
+        if self._spec_seed_declined == 1:
+            logger.info_rank0(
+                "spec-decode: prompt-prefill draft seed SKIPPED for this batch "
+                f"(longest={longest} > {self._spec_seed_max_prompt} or "
+                f"total={total} > {self._spec_seed_max_batch_tokens}); "
+                "long prompts draft unseeded — lossless, and the seed is net-negative there anyway. "
+                "Logged once; see _spec_seed_declined for the count."
+            )
+        return False
 
     def _spec_prefill_seeded(self, batch: Batch) -> None:
         """Prefill forward that ALSO captures the per-token target hidden over the prompt and seeds the

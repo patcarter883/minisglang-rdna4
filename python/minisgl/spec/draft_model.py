@@ -148,7 +148,10 @@ class DraftModelProposer(CapturableProposer):
         per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize
         # Budget the persistent buffer AND the per-step k_buf[slot_rows] gather (a second transient
         # of comparable size at full batch) — the same sizing MTP arrived at after a bs>=4 OOM.
-        _budget = int(get_free_memory(dev) * float(os.environ.get("MINISGL_EAGLE3_KV_FRAC", "0.33")))
+        # `or` form, not a dict default — compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY
+        # and float("") raises at boot. See the same note in spec/dflash.py.
+        _budget = int(get_free_memory(dev)
+                      * float(os.environ.get("MINISGL_EAGLE3_KV_FRAC") or "0.33"))
         _mem_cap = max(512, _budget // max(per_col * 2, 1))
         self._max_ctx = min(int(engine.max_seq_len),
                             int(os.environ.get("MINISGL_EAGLE3_MAX_CTX") or "8192"),

@@ -98,7 +98,10 @@ class MTPProposer(CapturableProposer):
         from minisgl.engine.graph import get_free_memory
 
         per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize
-        _budget = int(get_free_memory(dev) * float(os.environ.get("MINISGL_MTP_KV_FRAC", "0.33")))
+        # `or` form, not a dict default — compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY
+        # and float("") raises at boot. See the same note in spec/dflash.py.
+        _budget = int(get_free_memory(dev)
+                      * float(os.environ.get("MINISGL_MTP_KV_FRAC") or "0.33"))
         _mem_cap = max(512, _budget // max(per_col * 2, 1))
         self._max_ctx = min(int(engine.max_seq_len),
                             int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"),

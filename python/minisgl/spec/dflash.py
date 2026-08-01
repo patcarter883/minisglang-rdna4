@@ -370,7 +370,13 @@ class DFlashProposer(CapturableProposer):
 
         per_slot = L * C * Hkv * hd * dt.itemsize * 2
         want = int(engine.page_table.shape[0])
-        budget = int(get_free_memory(dev) * float(os.environ.get("MINISGL_DFLASH_KV_FRAC", "0.30")))
+        # `or "0.30"` not a dict default: docker-compose's `VAR: "${VAR:-}"` sets the variable to the
+        # EMPTY STRING, so the key IS present and `os.environ.get(k, default)` returns "" — which
+        # float() raises on and which kills the serve at boot, not at the call site. Every other env
+        # reader in this file already uses the `or` form; these three KV_FRAC readers did not, so
+        # forwarding any of them through compose (the only way this repo serves) was fatal.
+        budget = int(get_free_memory(dev)
+                     * float(os.environ.get("MINISGL_DFLASH_KV_FRAC") or "0.30"))
         self._pool_slots = max(1, min(want, budget // max(per_slot, 1)))
         self._null_slot = self._pool_slots
         S = self._pool_slots + 1
