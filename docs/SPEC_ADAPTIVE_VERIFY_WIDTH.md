@@ -216,3 +216,99 @@ deterministic greedy completions for the default Laguna config change, once, for
 * **`_W4A8_GEMV_MAX_INT4 = 8` is probably too low for these dense shapes** (§2). Raising it would be
   the better fix and would let an int4 model use the full 15-wide ladder; not done here because it
   changes ordinary int4 decode numerics at M=9..16.
+
+---
+
+## 7. MEASURED 2026-08-01 — §1's objective is wrong: the optimal rung depends on BATCH SIZE
+
+`tools/verify_width_rung_sweep.sh`, Laguna TP=2, K=16 held fixed (so propose cost is identical and
+verify width is the only variable), short ~95-token prompt, TRUE tok/s from `usage.completion_tokens`
+over wall, each leg's rung asserted from the engine's own `PINNED to rung N` log line rather than
+inferred from how it was invoked:
+
+| rung | M at bs=1 | bs=1 tok/s | M at bs=8 | bs=8 tok/s |
+|---|---|---|---|---|
+| 3  | 4  | 93.41  | 32  | **254.31** |
+| 7  | 8  | **103.22** | 64  | 145.94 |
+| 15 | 16 | 90.63  | 128 | 125.92 |
+| free-running controller | — | ~103–109 | — | 202.1 |
+
+**Both optima are INTERIOR, and they are on opposite ends of the ladder.** The mechanism is
+`M = bs * (width + 1)` against the M<=16 decode-kernel boundary this document already documents in
+§2: at bs=1 every rung stays inside the decode-GEMV family, so step cost is nearly flat and more
+accepted tokens per step wins (peak at 7, with 15 falling off at the cliff edge); at bs=8 every rung
+is already past the boundary into WMMA + MoE expert fanout, where cost scales with verify rows, so
+the NARROWEST rung wins by a wide margin.
+
+**Pinning rung 3 at bs=8 beats the live adaptive controller by +26% (254.31 vs 202.31).**
+
+### What this means for §1
+
+* The controller's objective — accepted tokens per STEP — is not the serving objective, which is
+  tokens per MILLISECOND. `choose()` (`width.py:260`) has **no batch-size term**: it averages per-uid
+  acceptance EMAs and reads a rung off the ladder, while the cost of that rung is set by
+  `bs * (width+1)`. At bs=8 it therefore climbs into rungs that cost more time than they return.
+* §1's claim that the `+1` exploratory row lets a narrowed request "climb back" is arithmetically
+  false for any realistic acceptance: escaping rung W requires `mean_ema > W-1`, i.e. >66.7% of
+  offered rows at rung 3, >85.7% at rung 7, >93.3% at rung 15, because `record`
+  (`width.py:285`) stores `accepted` at face value and never uses the `width` argument it is handed
+  at line 277 to detect censoring. Every rung is a stable fixed point.
+* **Do NOT "fix" the censoring alone.** Imputing the next rung up on a saturated observation drives
+  the controller toward rung 15, which the table above shows is the WORST rung at BOTH batch sizes.
+  The censoring bug and the missing cost model happen to cancel at bs=8 and compound at bs=1.
+* `tools/verify_width_unit.py:113-114` cannot catch any of this: `record([1], [min(15, w)], w)` is
+  100% acceptance at every width — the one regime where a fixed `+1` clears `W-1` — and it drives a
+  single uid with no notion of step cost. §1 cites it as proof of a property the code does not have.
+
+### The shape of a correct fix (NOT yet implemented)
+
+Choose the rung that maximizes **expected accepted tokens per millisecond** at the CURRENT batch
+size, not accepted tokens per step. That requires (a) a censoring-corrected acceptance estimate and
+(b) a per-rung step-cost model keyed on `M = bs*(width+1)` — the cheap version being a cap that keeps
+M at or under the same decode-kernel boundary §2 already imports from the kernel modules. Both halves
+are needed: (a) alone overshoots, (b) alone cannot tell a good drafter from a bad one.
+
+## 8. The fix, and what it measures at
+
+`choose()` now has BOTH terms §7 said it needed, and neither alone is sufficient:
+
+* **Censoring-corrected acceptance.** `record` folds each step into per-depth survival counters
+  (`_st`/`_sh`): a step at width W observes "did the run reach j" for j = 1..W and nothing beyond,
+  so `survival(j)` is unbiased for j <= W and extrapolates past the deepest rung ever offered with
+  the deepest measured rate. `expected_run()` = sum of survivals is then a run-length estimate that
+  does NOT collapse to whatever rung the controller happens to be sitting on. Decayed (`_DECAY`,
+  ~200-step memory) so it tracks a drafter whose acceptance shifts mid-request.
+* **A batch-size cost cap.** `width_cap(bs)` returns the widest rung with `bs*(width+1) <= 32`.
+  Deterministic in `bs` alone — deliberately NOT a measured step time, because each TP rank would
+  time a different cost, choose a different width, and desync the verify batch into an illegal
+  address. 32 rows is the unique power-of-two reproducing both measured optima.
+* **Cold start from the MIDDLE rung.** With no observations the survival estimate must assume
+  something; assuming the best opens at the widest rung, which is the most expensive place to be
+  wrong. Measured: opening at the top cost 97.65 tok/s at bs=1 vs 102.77 opening at the middle.
+
+### Measured (Laguna TP=2, K=16, TRUE tok/s, rung asserted from the engine log)
+
+| leg | bs=1 short | bs=8 short | bs=8 long (~3.1k prompt) |
+|---|---|---|---|
+| pinned rung 3  | 93.41  | **254.31** | **125.75** |
+| pinned rung 7  | **103.22** | 145.94 | 88.99 |
+| pinned rung 15 | 90.63  | 125.92 | 75.73 |
+| OLD controller | —      | 202.1  | — |
+| **NEW controller** | **102.77** | **253.97** | **122.09** |
+
+The new controller lands on the optimal rung unaided at every point measured: **99.6%** of the best
+pinned rung at bs=1 short, **99.9%** at bs=8 short (**+25.6% over the old controller**), and **97.1%**
+at bs=8 long.
+
+### Known residual, NOT fixed here
+
+The 2.9% gap at bs=8 long is real. Long context is monotone-decreasing in width (125.8 / 89.0 / 75.7),
+i.e. narrower is better there than the row budget alone implies, because KV traffic per verify row
+grows with sequence length while the budget is a pure row count. As requests drain and `bs` falls,
+the cap admits wider rungs that long context does not actually want. A context-length term in
+`width_cap` would close it; it is deliberately not guessed at here, because the only honest form is
+another sweep (rungs x bs x context), and the residual is ~3%.
+
+`tools/verify_width_unit.py` §5 now gates the regime that broke: partial acceptance at bs=1 and bs=8
+against the SAME drafter, the extrapolation past the offered rung, that a bad drafter still narrows,
+and TP-rank determinism. The pre-existing §4 cases still pass unchanged.

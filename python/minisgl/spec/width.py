@@ -124,6 +124,13 @@ def max_verify_rows(quant: "Optional[object]" = None) -> int:
 # static I/O buffers are shared — see VerifyCaptureBuffer.view — so the cost is graph-pool memory
 # and boot-time capture, not I/O buffers). Three gives a useful dynamic range (e.g. 3/7/15) without
 # tripling the verify graph count.
+# Censored-survival estimator (AdaptiveVerifyWidth). _MIN_TRIALS is how much evidence a depth needs
+# before its rate is trusted rather than inherited from a shallower depth; _DECAY gives the counters
+# a ~200-step memory so the estimate follows a drafter whose acceptance shifts mid-request instead of
+# averaging the whole run. Both are pure arithmetic — no wall-clock — so every TP rank agrees.
+_MIN_TRIALS = 32.0
+_DECAY = 0.995
+
 _LADDER_LEN = 3
 
 # Never capture a width below this: at width 1 a step emits at most 2 tokens and the drafter cost is
@@ -235,7 +242,7 @@ class AdaptiveVerifyWidth:
     into its measured acceptance rather than starting starved.
     """
 
-    __slots__ = ("_widths", "_max", "_ema", "_alpha", "_hist")
+    __slots__ = ("_widths", "_max", "_ema", "_alpha", "_hist", "_pin", "_st", "_sh", "_budget")
 
     def __init__(self, widths: Sequence[int], alpha: float = 0.25) -> None:
         self._widths: List[int] = sorted(int(w) for w in widths)
@@ -244,6 +251,31 @@ class AdaptiveVerifyWidth:
         self._alpha = float(alpha)
         self._ema: Dict[int, float] = {}
         self._hist: Dict[int, int] = {w: 0 for w in self._widths}
+        # MEASUREMENT INSTRUMENT ONLY (MINISGL_SPEC_VERIFY_WIDTH_PIN=<rung>): force every step onto
+        # one captured rung so each rung's TRUE tok/s can be measured at a fixed K. Needed because the
+        # controller maximizes accepted tokens per STEP while serving cares about tokens per
+        # MILLISECOND, and a wider rung costs more per step (bs=8: rung 3 -> M=32, rung 7 -> M=64).
+        # Unset = normal adaptive behaviour. An unparseable or un-captured value is ignored, not
+        # fatal — a typo must not silently pin the ladder to a rung that was never captured.
+        import os
+
+        _p = os.environ.get("MINISGL_SPEC_VERIFY_WIDTH_PIN") or ""
+        try:
+            _pv = int(_p) if _p else 0
+        except ValueError:
+            _pv = 0
+        self._pin: int = _pv if _pv in self._widths else 0
+        # Censored-survival counters, index 1.._max (index 0 unused).
+        self._st: List[float] = [0.0] * (self._max + 1)   # rows OFFERED at depth j
+        self._sh: List[float] = [0.0] * (self._max + 1)   # rows that REACHED depth j
+        # Verify-row budget behind width_cap(). 32 is measured, not guessed — see width_cap's
+        # docstring and docs/SPEC_ADAPTIVE_VERIFY_WIDTH.md §7. Env override is a re-measurement
+        # instrument; `or` form because compose substitutes the EMPTY STRING for an unset var.
+        try:
+            _b = int(os.environ.get("MINISGL_SPEC_VERIFY_ROW_BUDGET") or "32")
+        except ValueError:
+            _b = 32
+        self._budget: int = _b if _b > 0 else 32
 
     @property
     def widths(self) -> List[int]:
@@ -257,22 +289,91 @@ class AdaptiveVerifyWidth:
     def adaptive(self) -> bool:
         return len(self._widths) > 1
 
+    @property
+    def pinned(self) -> int:
+        """The pinned rung, or 0 when the controller is free-running. Logged at boot so a measured
+        leg can ASSERT which rung it actually ran instead of inferring it from how it was invoked."""
+        return self._pin
+
+    def survival(self, j: int) -> float:
+        """P(draft run-length >= j), estimated from CENSORED observations.
+
+        A step at width W offers W rows, so for every j <= W it observes whether the run reached j.
+        That is an UNBIASED sample of P(A >= j) for j <= W and no information at all for j > W —
+        which is exactly why reading `accepted` at face value (the pre-2026-08-01 rule) biases the
+        estimate downward and locks the ladder at whatever rung it starts on. Past the deepest rung
+        ever offered we extrapolate with the deepest measured rate; the drafter measured here is
+        close to all-or-nothing (survival flat at ~0.41 out to j=7), so flat is the right prior.
+        """
+        if j < 1:
+            return 1.0
+        t = self._st[j] if j <= self._max else 0.0
+        if t >= _MIN_TRIALS:
+            return self._sh[j] / t
+        for k in range(min(j, self._max), 0, -1):     # deepest rung with enough evidence
+            if self._st[k] >= _MIN_TRIALS:
+                return self._sh[k] / self._st[k]
+        return 1.0                                    # no evidence yet -> stay wide, keep observing
+
+    def expected_run(self) -> float:
+        """E[A] = sum_{j>=1} P(A >= j), over the whole ladder rather than the current rung."""
+        return sum(self.survival(j) for j in range(1, self._max + 1))
+
+    def width_cap(self, bs: int) -> int:
+        """Largest rung whose verify block stays inside the row budget at this batch size.
+
+        The COST of a step is set by M = bs * (width + 1), not by width, because the verify forward
+        is flat over tokens. Past the M<=16 decode-kernel boundary (§2) the MoE pays expert fanout
+        per row, so at bs=8 a wider rung buys tokens at a worse rate than it costs time. Measured
+        2026-08-01: bs=8 rung 3 = 254.3 tok/s vs rung 7 = 145.9 and rung 15 = 125.9, while bs=1 peaks
+        at rung 7 (103.2 vs 93.4 at rung 3 and 90.6 at rung 15). A budget of 32 rows is the unique
+        power-of-two that reproduces BOTH optima: it caps bs=8 at rung 3 and leaves bs=1 unconstrained
+        so the acceptance term picks 7 there.
+
+        Deterministic in `bs` alone — no wall-clock — because a locally TIMED cost model would have
+        each TP rank measure a different cost, choose a different width, and desync the verify batch.
+        """
+        if bs <= 0:
+            return self._max
+        best = self._widths[0]
+        for w in self._widths:
+            if bs * (w + 1) <= self._budget:
+                best = w
+        return best
+
     def choose(self, uids: Iterable[int]) -> int:
-        """Width for the next verify block, always a member of the captured ladder."""
+        """Width for the next verify block, always a member of the captured ladder.
+
+        Two terms, and BOTH are needed (see docs/SPEC_ADAPTIVE_VERIFY_WIDTH.md §7):
+          * acceptance — how many rows the drafter actually sustains, censoring-corrected. Alone it
+            picks rung 7 at every batch size, which is right at bs=1 and 43% too slow at bs=8.
+          * cost — the row budget at this batch size. Alone it cannot tell a good drafter from a bad
+            one and would sit at the cap regardless of whether the rows are being accepted.
+        """
+        if self._pin:
+            return self._pin
         if len(self._widths) == 1:
             return self._max
-        total = 0.0
         n = 0
-        for uid in uids:
-            total += self._ema.get(uid, float(self._max))
+        for _ in uids:
             n += 1
         if n == 0:
             return self._max
-        want = total / n + 1.0  # one exploratory row past the mean (the censoring argument above)
+        # COLD START: explore from the MIDDLE rung, not the top. With no observations the survival
+        # estimate has to assume something, and assuming the best (p=1 everywhere) opens at the
+        # widest rung — which measurement says is the most expensive place to be wrong: at bs=1 rung
+        # 15 runs 90.6 tok/s vs 103.2 at rung 7, and on a short request the controller is still
+        # converging when the request ends. Opening at the middle cost 97.65 -> (re-measured below)
+        # at bs=1 while leaving bs=8 untouched, because the cost cap governs there regardless.
+        if self._st[1] < _MIN_TRIALS:
+            return min(self._widths[len(self._widths) // 2], self.width_cap(n))
+        want = self.expected_run() + 1.0  # one exploratory row past the CORRECTED mean
+        w_acc = self._max
         for w in self._widths:
             if w >= want:
-                return w
-        return self._max
+                w_acc = w
+                break
+        return min(w_acc, self.width_cap(n))
 
     def record(self, uids: Sequence[int], accepted: Sequence[int], width: int) -> None:
         """Fold this step's outcome into the per-uid EMA and count the width that was actually run.
@@ -283,6 +384,21 @@ class AdaptiveVerifyWidth:
         for uid, n in zip(uids, accepted):
             prev = self._ema.get(uid)
             self._ema[uid] = float(n) if prev is None else (1.0 - a) * prev + a * float(n)
+        # Censored survival counts. `width` is the number of rows OFFERED, so this step observes
+        # "did the run reach j" for j = 1..width and observes NOTHING beyond it. Decayed so the
+        # estimate tracks a drafter whose acceptance changes over a request rather than averaging
+        # the whole run; DECAY**-1 ~ 200 steps. Deterministic across ranks: same inputs, same
+        # arithmetic, no wall-clock.
+        w = min(int(width), self._max)
+        if w >= 1:
+            for j in range(1, self._max + 1):
+                self._st[j] *= _DECAY
+                self._sh[j] *= _DECAY
+            for j in range(1, w + 1):
+                self._st[j] += len(accepted)
+            for n in accepted:
+                for j in range(1, min(int(n), w) + 1):
+                    self._sh[j] += 1.0
         self._hist[width] = self._hist.get(width, 0) + 1
 
     def free(self, uid: int) -> None:

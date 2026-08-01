@@ -116,5 +116,56 @@ check("a narrowed request climbs back to the max", c.choose([1]) == 15, f"({c.ch
 c3 = AdaptiveVerifyWidth([4])
 check("a single-width ladder reports NOT adaptive", not c3.adaptive)
 
+print("\n== 5. the regime that actually broke: partial acceptance + batch-size cost ==")
+# Section 4's two cases are the ONLY regimes where the pre-2026-08-01 rule was correct: acceptance
+# hard-capped at 2, and acceptance at 100% of whatever width is offered. Both are degenerate, which
+# is why this file passed while the shipped controller sat on the wrong rung for ~475 steps. A real
+# drafter accepts a FRACTION of the rows offered, and under the old face-value `record` that made
+# every rung a stable fixed point (escaping rung W needed >(W-1)/W of offered rows: 66.7% at 3,
+# 85.7% at 7, 93.3% at 15, against a measured 0.41). These cases drive the measured regime.
+
+
+def drive(ctrl, bs, run_len, steps=400):
+    """Feed an ALL-OR-NOTHING drafter: each request's true run-length is `run_len`, so a step at
+    width w observes min(run_len, w) — exactly the censoring the estimator has to invert."""
+    uids = list(range(bs))
+    for _ in range(steps):
+        w = ctrl.choose(uids)
+        ctrl.record(uids, [min(run_len, w)] * bs, w)
+    return ctrl.choose(uids)
+
+
+c5 = AdaptiveVerifyWidth([3, 7, 15])
+w5 = drive(c5, bs=1, run_len=3)
+check("bs=1, drafter sustaining 3: does NOT lock at the narrowest rung", w5 > 3, f"(chose {w5})")
+check("bs=1, drafter sustaining 3: picks rung 7 (measured optimum, 103.2 tok/s)", w5 == 7,
+      f"(chose {w5}; rung 3 measured 93.4 and rung 15 measured 90.6 tok/s)")
+
+c6 = AdaptiveVerifyWidth([3, 7, 15])
+w6 = drive(c6, bs=8, run_len=3)
+check("bs=8, SAME drafter: cost cap pulls it to rung 3 (measured optimum, 254.3 tok/s)", w6 == 3,
+      f"(chose {w6}; rung 7 measured 145.9 and rung 15 measured 125.9 tok/s)")
+check("the optimum therefore MOVES with batch size", w5 != w6, f"(bs=1 -> {w5}, bs=8 -> {w6})")
+
+# Censoring is INVERTED, not merely tolerated: a controller sitting at rung 3 must still estimate a
+# run-length it has never been allowed to observe, or it can never justify leaving that rung.
+c7 = AdaptiveVerifyWidth([3, 7, 15])
+for _ in range(400):                              # only ever offers 3 rows, always all accepted
+    c7.record([0], [3], 3)
+check("survival past the offered rung is extrapolated, not read as zero", c7.expected_run() > 3.0,
+      f"(E[A]={c7.expected_run():.2f} from observations censored at 3)")
+
+# The fix must not simply widen everything: a genuinely bad drafter still has to narrow.
+c8 = AdaptiveVerifyWidth([3, 7, 15])
+w8 = drive(c8, bs=1, run_len=0)
+check("a drafter accepting nothing still narrows to rung 3", w8 == 3, f"(chose {w8})")
+
+# Determinism: width must be a pure function of (recorded outcomes, batch size). If it ever depends
+# on wall-clock, TP ranks choose different widths and the verify batch desyncs into an illegal
+# address — which is why the cost term is a function of bs and not of a measured step time.
+ca, cb = AdaptiveVerifyWidth([3, 7, 15]), AdaptiveVerifyWidth([3, 7, 15])
+check("two controllers fed identical outcomes agree exactly (TP-rank determinism)",
+      drive(ca, bs=4, run_len=5) == drive(cb, bs=4, run_len=5))
+
 print("\n" + ("ALL PASS" if not FAILED else f"FAILED: {FAILED}"))
 sys.exit(1 if FAILED else 0)
