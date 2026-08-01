@@ -27,7 +27,12 @@ NREQS=${NREQS:-"1 8"}
 MAXTOK=${MAXTOK:-384}
 : > "$OUT"
 
-export MODEL=laguna SPEC="${SPEC:-dflash}" SPEC_K="${SPEC_K:-16}" TP=2 CONC=8 GRAPH_BS=8 MINISGL_SPEC_DEBUG=1
+export MODEL="${MODEL:-laguna}" SPEC="${SPEC:-dflash}" SPEC_K="${SPEC_K:-16}" TP=2 \
+       CONC="${CONC:-8}" GRAPH_BS="${GRAPH_BS:-8}" MINISGL_SPEC_DEBUG=1
+# TEMP: spec must be measured SAMPLED, not greedy — greedy inflates acceptance at LATE draft
+# positions and over-recommends K (and, here, width). Default 0.0 keeps the banked Laguna sweep
+# comparable; set TEMP=0.8 for the honest serving measurement.
+export DRIVE_TEMP="${TEMP:-0.0}"
 
 down() { ( cd "$WT" && MINISGL_IMAGE="$IMAGE" docker compose --profile serve down >/dev/null 2>&1 ); }
 trap down EXIT INT TERM
@@ -58,7 +63,8 @@ def run(i):
     # Distinct suffix per request: one shared prefix would measure radix hits, not decode.
     txt = BASE_PROMPT if NREQ == 1 else f"{BASE_PROMPT}\n\n(Answer variant {i}: focus on point {i + 1}.)"
     b = {"model": MODEL, "messages": [{"role": "user", "content": txt}], "max_tokens": MT,
-         "temperature": 0.0, "top_p": 1.0, "seed": 1234, "stream": False}
+         "temperature": float(os.environ.get("DRIVE_TEMP") or "0.0"),
+         "top_p": 1.0, "seed": 1234, "stream": False}
     r = urllib.request.Request(f"{BASE}/v1/chat/completions", data=json.dumps(b).encode(),
                                headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(r, timeout=3600).read())["usage"]["completion_tokens"]

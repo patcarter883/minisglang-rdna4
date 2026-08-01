@@ -49,7 +49,21 @@ k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 case "$MODEL" in
   qwen35b-awq|cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit)
                   model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4
-                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash" ;;
+                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
+                  # SPEC=dflash on this pair could not boot AT ALL on 16 GB cards until these.
+                  # 35B weights are ~11.4 GB/card, so a 737 MB bf16 drafter REPLICATED on every rank
+                  # plus the verify graphs do not fit beside a plain-decode-sized KV pool. The two
+                  # failures bracket it: at 0.80 the KV pool starves after reserving drafter+graphs
+                  # ("num_pages > 1" assert), at 0.93 the drafter itself OOMs (13.54 GiB allocated,
+                  # 0 free) — no ratio alone works, the FOOTPRINT has to come down. fp8 weight-only
+                  # quant halves the drafter (lossless: the target verifies every draft), and the
+                  # graph buckets have to shrink with it. Measured booting and serving at
+                  # 0.86 + fp8 + GRAPH_BS<=4. MTP needs none of this (no separate draft model).
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                    mem_default_spec="0.86"
+                    : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
+                    : "${GRAPH_BS:=4}"; export GRAPH_BS
+                  fi ;;
   qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
                   model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15 ;;
