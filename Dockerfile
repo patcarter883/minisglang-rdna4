@@ -16,7 +16,12 @@
 # The canonical kernels are outside this repo's build context, so `docker compose` injects them as a
 # named additional build context (`kernels` -> /home/pat/code/rdna4-hip-kernels). Building standalone:
 #   docker build --build-context kernels=<CLEAN kernels worktree> \
+#       --build-context uprof=/home/pat/pkgs \
 #       --build-arg KERNELS_REF=<kernels sha> -t minisgl-rdna4:<tag> .
+# BOTH contexts are REQUIRED. Omitting `uprof` does not skip the stage — docker tries to resolve the
+# name as a REGISTRY image and fails with "pull access denied ... insufficient_scope", which reads
+# like an auth problem rather than a missing context. (An empty dir is fine; the stage skips when it
+# holds no .deb.)
 #
 # Build from CLEAN worktrees for BOTH contexts: `COPY --from=kernels .` and `COPY python` copy what
 # is ON DISK, so a shared tree bakes another agent's mid-edit files. KERNELS_REF is only a

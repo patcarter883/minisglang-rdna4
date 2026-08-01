@@ -23,6 +23,12 @@ x-lean-common: &lean-common
     additional_contexts:
       # The canonical kernels live outside this repo's build context — inject them by name.
       kernels: ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}
+      # AMD uProf .deb, likewise outside the context (AMD serves it only behind a EULA click-through,
+      # so it cannot be fetched at build time). WITHOUT this entry `docker compose build` FAILS:
+      # the Dockerfile's `COPY --from=uprof .` makes docker try to resolve `uprof` as a REGISTRY
+      # image and it dies with "pull access denied ... insufficient_scope", which reads like an auth
+      # problem rather than a missing context. The stage skips cleanly when the dir holds no .deb.
+      uprof: ${UPROF_PKG_DIR:-/home/pat/pkgs}
   restart: "no"
   working_dir: /engine
   devices:
