@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.layers.moe import _ADAPTIVE_K_TAU, adaptive_k_gate
 from minisgl.layers import (
     AttentionLayer,
     BaseOP,
@@ -55,6 +56,12 @@ class LayerPlan:
     sliding_window: int  # 0 for a full layer
     kv_id: int  # compact index: full layers -> main pool; sliding layers -> SWA ring pool
     rotary_config: "RotaryConfig"
+
+
+# [ADAPTIVE-K] DFlash capture layers, published by the model's set_capture_layers so the MoE blocks
+# can exempt themselves. Module-level because the blocks are constructed before the proposer exists
+# and the scheduler programs the capture layers afterwards.
+_CAPTURE_LAYERS: tuple = ()
 
 
 def laguna_layer_plan(config: "ModelConfig", layer_id: int) -> LayerPlan:
@@ -211,7 +218,8 @@ class LagunaSparseBlock(BaseOP):
     (scaling a linear combination == scaling its weights) — and the shared expert is added, ungated.
     `expert_quant` (NVFP4) is threaded to the experts + shared expert; the router gate stays bf16."""
 
-    def __init__(self, config: "ModelConfig", expert_quant):
+    def __init__(self, config: "ModelConfig", expert_quant, layer_id: int = -1):
+        self.layer_id = layer_id
         self.gate = LagunaTopKRouter(config.hidden_size, config.num_experts)
         self.experts = MoELayer(
             num_experts=config.num_experts,
@@ -251,6 +259,12 @@ class LagunaSparseBlock(BaseOP):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         topk_weights, topk_ids = self._route(self.gate.forward(hidden_states))
+        # [ADAPTIVE-K] shrink the per-row expert set on verify-sized batches. The DFlash CAPTURE
+        # layers are exempt: the drafter is conditioned on their hidden states, so gating them would
+        # change the features it was trained on and cost acceptance — the same carve-out lucebox
+        # makes (DFLASH_ADAPTIVE_K_DENSE defaults to their capture layers).
+        if _ADAPTIVE_K_TAU > 0.0 and self.layer_id not in (_CAPTURE_LAYERS or ()):
+            topk_weights, topk_ids = adaptive_k_gate(topk_weights, topk_ids)
         routed = self.experts.forward(
             hidden_states, topk_weights=topk_weights, topk_ids=topk_ids
         )
@@ -267,7 +281,7 @@ class LagunaDecoderLayer(BaseOP):
         if layer_id < config.first_k_dense_replace:
             self.mlp = GatedMLP(config)  # bf16 (backbone is the unquantized config)
         else:
-            self.mlp = LagunaSparseBlock(config, expert_quant)
+            self.mlp = LagunaSparseBlock(config, expert_quant, layer_id)
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps
@@ -301,6 +315,8 @@ class LagunaModel(BaseOP):
 
     def set_capture_layers(self, ids: list[int] | None) -> None:
         self._capture_layer_ids = list(ids) if ids else None
+        global _CAPTURE_LAYERS
+        _CAPTURE_LAYERS = tuple(ids) if ids else ()
 
     def forward(
         self, input_ids: torch.Tensor, return_hidden: bool = False

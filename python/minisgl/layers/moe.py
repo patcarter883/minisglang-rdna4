@@ -1005,3 +1005,49 @@ class MoELayer(BaseOP):
         if self.tp_size > 1 and not self.enable_ep and reduce:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states
+
+
+# ── [ADAPTIVE-K] per-token expert-count gating for spec-verify-sized batches ─────────────────────
+# Verify cost is superlinear in M because the UNION of top-k experts over the M rows grows fast
+# (measured `distinct(qlen)` = 6.94x at qlen 16), and the MoE block is 19% of our verify time. This
+# keeps each row's leading experts until their cumulative combine weight reaches tau and drops the
+# rest, shrinking that union. Ported from lucebox's [TAG_MMID_ADAPTIVE_K].
+#
+# NOT LOSSLESS. It changes the TARGET's own output, so accepted tokens differ from true greedy
+# target output — unlike the adaptive verify WIDTH, which only truncates drafts. It is therefore a
+# quality/throughput trade and defaults OFF (tau=0), exactly as lucebox ship it. Gate any rollout on
+# output quality, not just tok/s.
+#
+# No kernel change: dropped slots get weight 0 AND are pointed at a slot the row already keeps, so
+# they contribute exactly zero and add no expert to the union. A -1 sentinel would be cleaner (one
+# fewer padded row per drop) but moe_align does `atomicAdd(&cnt[topk_ids[t]], 1)` with no bounds
+# check, so a negative id is an out-of-bounds shared-memory write — that needs a 4-line guard in the
+# canonical kernel first.
+_ADAPTIVE_K_TAU = float(os.environ.get("MINISGL_MOE_ADAPTIVE_K_TAU") or "0")
+
+
+def adaptive_k_gate(
+    topk_weights: torch.Tensor,  # (M, top_k) f32, already normalized
+    topk_ids: torch.Tensor,      # (M, top_k) int
+    tau: float = _ADAPTIVE_K_TAU,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Drop each row's trailing experts once cumulative combine weight reaches `tau`; renormalize.
+
+    Verify-sized batches only (2..16 rows): at M=1 there is no union to shrink, and past ~16 the
+    expert set is already saturated so gating buys nothing and only costs accuracy.
+    """
+    if tau <= 0.0 or tau >= 1.0:
+        return topk_weights, topk_ids
+    M = topk_weights.shape[0]
+    if M < 2 or M > 16:
+        return topk_weights, topk_ids
+    order = topk_weights.argsort(dim=-1, descending=True)
+    w = topk_weights.gather(-1, order)
+    ids = topk_ids.gather(-1, order)
+    # Keep slot i iff the mass BEFORE it has not yet reached tau — so the slot that crosses tau is
+    # kept and slot 0 is always kept (cum-before = 0), i.e. a row can never end up with no expert.
+    keep = (w.cumsum(-1) - w) < tau
+    w = w * keep
+    w = w / w.sum(-1, keepdim=True).clamp_min(1e-9)
+    ids = torch.where(keep, ids, ids[:, :1].expand_as(ids))
+    return w.contiguous(), ids.to(torch.int32).contiguous()
