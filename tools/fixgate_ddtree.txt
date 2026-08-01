@@ -1,0 +1,46 @@
+=== PRE-FIX  ddtree  (/home/pat/code/minisgl-rdna4-prefix753) ===
+  NEVER BECAME READY
+  --- boot/serve evidence ---
+[1m[2026-07-31|22:35:35|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash DDTree draft-tree path ENABLED
+[1m[2026-07-31|22:35:36|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+Capturing ddtree-verify graphs:   0%|          | 0/1 [00:00<?, ?batch/s]Capturing ddtree-verify graphs:   0%|          | 0/1 [00:00<?, ?batch/s]
+assert metadata.swa_out_loc is not None, "SWA metadata missing (is_swa_hybrid not wired?)"
+AssertionError: SWA metadata missing (is_swa_hybrid not wired?)
+assert metadata.swa_out_loc is not None, "SWA metadata missing (is_swa_hybrid not wired?)"
+AssertionError: SWA metadata missing (is_swa_hybrid not wired?)
+
+=== FIXED    ddtree  (/home/pat/code/minisgl-rdna4-propose) ===
+  PROVENANCE engine/graph.py md5: 364d453fe693d85c7ba54dd84fee32da
+  PROVENANCE env DDTREE: MINISGL_DFLASH_DDTREE=1 MINISGL_DDTREE_TOPK= MINISGL_DDTREE_BUDGET= 
+  MT=  64 rep=1 n=  64 md5=f282426691a8a5242cd3476bb7a1bbca  head='To reverse a singly linked list in place, we can use'
+  MT=  64 rep=2 n=  64 md5=f282426691a8a5242cd3476bb7a1bbca  head='To reverse a singly linked list in place, we can use'
+  MT= 128 rep=1 n= 128 md5=736a20439089f0e42d25e2337c267792  head='To reverse a singly linked list in place, we can use an '
+  MT= 128 rep=2 n= 128 md5=736a20439089f0e42d25e2337c267792  head='To reverse a singly linked list in place, we can use an '
+  MT= 256 rep=1 n= 256 md5=61778f8c3a686f8bed68dd38e683191a  head="Here's a Python function to reverse a singly linked list"
+  MT= 256 rep=2 n= 256 md5=9ff21fcdfc4a3ea557f4eb980241da58  head="Here's a Python function to reverse a singly linked list"
+  --- boot/serve evidence ---
+[1m[2026-07-31|22:43:18|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash DDTree draft-tree path ENABLED
+[1m[2026-07-31|22:43:19|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+[1m[2026-07-31|22:43:19|core|rank=0][0m [33mWARNING [0m ddtree-verify CUDA graph: SKIPPED on an SWA-hybrid model — the DDTree static metadata has no sliding-window ring fields (attention/hip.py _ddtree_verify_metadata_static vs init_verify_capture). The tree-verify runs EAGER.
+[1m[2026-07-31|22:43:28|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=0.2ms stage=0.4ms forward=22.6ms accept=1.4ms total=24.6ms propose-graph replay=50 eager=0 buckets=[1] verify-graph replay=16 eager=34 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+[1m[2026-07-31|22:43:35|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=0.2ms stage=0.4ms forward=22.7ms accept=0.9ms total=24.3ms propose-graph replay=98 eager=0 buckets=[1] verify-graph replay=29 eager=71 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+[1m[2026-07-31|22:43:42|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=0.2ms stage=0.4ms forward=23.3ms accept=0.8ms total=24.7ms propose-graph replay=147 eager=0 buckets=[1] verify-graph replay=41 eager=109 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+
+=== FIXED    ddtree#2  (/home/pat/code/minisgl-rdna4-propose) ===
+  PROVENANCE engine/graph.py md5: 364d453fe693d85c7ba54dd84fee32da
+  PROVENANCE env DDTREE: MINISGL_DFLASH_DDTREE=1 MINISGL_DDTREE_TOPK= MINISGL_DDTREE_BUDGET= 
+  MT=  64 rep=1 n=  64 md5=f282426691a8a5242cd3476bb7a1bbca  head='To reverse a singly linked list in place, we can use'
+  MT=  64 rep=2 n=  64 md5=f282426691a8a5242cd3476bb7a1bbca  head='To reverse a singly linked list in place, we can use'
+  MT= 128 rep=1 n= 128 md5=736a20439089f0e42d25e2337c267792  head='To reverse a singly linked list in place, we can use an '
+  MT= 128 rep=2 n= 128 md5=736a20439089f0e42d25e2337c267792  head='To reverse a singly linked list in place, we can use an '
+  MT= 256 rep=1 n= 256 md5=19e7af28a060b694af3ef74121263450  head="Here's a Python function to reverse a singly linked list"
+  MT= 256 rep=2 n= 256 md5=4c6ebd93b9d154cc06d16f7f2621a9de  head="Here's a Python function to reverse a singly linked list"
+  --- boot/serve evidence ---
+[1m[2026-07-31|22:44:59|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash DDTree draft-tree path ENABLED
+[1m[2026-07-31|22:45:00|core|rank=0][0m [32mINFO    [0m spec-decode: DFlash PROPOSE graphs CAPTURED buckets=[1]; free 1.10 GiB (was 1.42 GiB)
+[1m[2026-07-31|22:45:00|core|rank=0][0m [33mWARNING [0m ddtree-verify CUDA graph: SKIPPED on an SWA-hybrid model — the DDTree static metadata has no sliding-window ring fields (attention/hip.py _ddtree_verify_metadata_static vs init_verify_capture). The tree-verify runs EAGER.
+[1m[2026-07-31|22:45:10|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=0.2ms stage=0.4ms forward=23.2ms accept=0.6ms total=24.4ms propose-graph replay=50 eager=0 buckets=[1] verify-graph replay=14 eager=36 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+[1m[2026-07-31|22:45:17|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=0.2ms stage=0.4ms forward=23.0ms accept=0.6ms total=24.2ms propose-graph replay=98 eager=0 buckets=[1] verify-graph replay=30 eager=70 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+[1m[2026-07-31|22:45:24|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=0.2ms stage=0.4ms forward=23.7ms accept=0.5ms total=24.9ms propose-graph replay=148 eager=0 buckets=[1] verify-graph replay=38 eager=112 verify-width[3:0(0%) 7:0(0%) 15:0(0%)]
+
+== FIX GATE 2 COMPLETE ==

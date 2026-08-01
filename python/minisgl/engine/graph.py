@@ -76,6 +76,21 @@ class VerifyCaptureBuffer:
                         if num_aux else None),
         )
 
+    def view(self, qlen: int) -> "VerifyCaptureBuffer":
+        """A narrower-width VIEW sharing the same allocations (adaptive verify width, spec/width.py).
+
+        Every buffer here is FLAT over tokens (`T = padded_bs * qlen` leading rows), so a width whose
+        qlen is smaller than the one this buffer was allocated at simply uses fewer leading rows —
+        there is no per-width stride to get wrong and no reason to allocate a second set. The logits
+        buffer alone is `max_bs*qlen*vocab*4` bytes (51 MB at bs=8, qlen=16, vocab=100352), so sharing
+        it is what keeps a 3-width ladder affordable."""
+        assert qlen <= self.qlen, (qlen, self.qlen)
+        return VerifyCaptureBuffer(
+            qlen=qlen,
+            input_ids=self.input_ids, out_loc=self.out_loc, positions=self.positions,
+            logits=self.logits, last_hidden=self.last_hidden, aux_hidden=self.aux_hidden,
+        )
+
     def total(self, batch: Batch) -> int:
         return batch.padded_size * self.qlen
 
@@ -353,17 +368,36 @@ class GraphRunner:
         num_aux: int,
         hidden_size: int,
         dtype: torch.dtype,
+        widths: "List[int] | None" = None,
     ) -> None:
-        """Capture one verify graph per bs in `bs_list`. Called by the scheduler AFTER the proposer is
+        """Capture one verify graph per (width, bs). Called by the scheduler AFTER the proposer is
         built and aux-capture layers are programmed, so the captured forward stashes the aux/hidden the
-        draft head consumes. Each graph runs model.forward over bs*(num_draft+1) staged tokens; the
-        MLA backend reads precomputed static verify indices (see MLABackend.init_verify_capture)."""
+        draft head consumes. Each graph runs model.forward over bs*(width+1) staged tokens; the
+        MLA backend reads precomputed static verify indices (see MLABackend.init_verify_capture).
+
+        `widths` is the ADAPTIVE VERIFY WIDTH ladder (spec/width.py `verify_width_ladder`): the small
+        set of draft counts the scheduler is allowed to pick from per step. Defaults to `[num_draft]`,
+        i.e. the single fixed width this used to capture. All widths share ONE VerifyCaptureBuffer
+        (see `VerifyCaptureBuffer.view`) and ONE graph pool, so the incremental cost of a width is the
+        graph-pool slice for its (width, bs) graphs, not another set of vocab-sized buffers."""
         if not bs_list or not hasattr(self.attn_backend, "init_verify_capture"):
             return logger.info_rank0("spec-verify CUDA graph: unsupported backend / disabled")
-        qlen = num_draft + 1
+        widths = sorted({int(w) for w in (widths or [num_draft])})
+        assert widths and widths[-1] <= num_draft, (widths, num_draft)
+        if len(widths) > 1 and not hasattr(self.attn_backend, "set_verify_width"):
+            # A backend that supports verify capture but cannot repoint its per-width statics would
+            # replay a narrow graph against the WIDEST width's cu_seqlens/kbound/seq_idx — silently
+            # wrong output, not an error. Capture the single widest instead. (hip + mla, the only two
+            # backends with init_verify_capture, both implement it.)
+            logger.warning_rank0(
+                f"{type(self.attn_backend).__name__} has no set_verify_width; capturing ONE verify "
+                f"width ({widths[-1]}) instead of {widths} — adaptive verify width is OFF."
+            )
+            widths = widths[-1:]
+        qlen = widths[-1] + 1  # widest; the shared buffers/scratch are sized here
         dev = self.device
         max_bs = max(bs_list)
-        self.attn_backend.init_verify_capture(self._verify_max_seq_len, bs_list, num_draft)
+        self.attn_backend.init_verify_capture(self._verify_max_seq_len, bs_list, widths)
         # v2 S3: CCA-hybrid recurrent state through static verify buffers (per-CCA-layer conv/prev
         # scratch that the captured verify forward writes in place; see CCAVerifyGraphCapture).
         self.cca_verify = None
@@ -372,7 +406,7 @@ class GraphRunner:
 
             cs = self._cca_state
             self.cca_verify = CCAVerifyGraphCapture(
-                dev, max_bs, num_draft,
+                dev, max_bs, widths,
                 cca_layer_ids=range(cs.num_cca_layers),
                 conv_dim=cs.conv_states.shape[2], conv_width=cs.conv_states.shape[3],
                 hidden=cs.prev_hs.shape[2],
@@ -388,7 +422,7 @@ class GraphRunner:
             cshape = gs.conv_state.shape
             sshape = gs.ssm_state.shape
             self.gdn_verify = GDNVerifyGraphCapture(
-                dev, max_bs, num_draft,
+                dev, max_bs, widths,
                 gdn_layer_ids=range(gs.num_gdn_layers),
                 conv_dim=cshape[2], conv_width=cshape[3],
                 num_v_heads=sshape[2], head_v_dim=sshape[3], head_k_dim=sshape[4],
@@ -399,43 +433,65 @@ class GraphRunner:
             hidden_size if needs_hidden else None,
             num_aux, dtype, dev,
         )
-        graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
-        # a dedicated dummy req with extend_len = K+1 (cached_len 0, device_len K+1).
-        vdummy = Req(
-            input_ids=torch.zeros(qlen, dtype=torch.int32, device="cpu"),
-            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
-            sampling_params=None, cache_handle=None,  # type: ignore
-        )
         torch.cuda.synchronize(dev)
         free0 = get_free_memory(dev)
         logger.info_rank0(
-            f"Capturing spec-verify CUDA graphs (qlen={qlen}, hidden={needs_hidden}, aux={num_aux}) "
-            f"sizes={sorted(bs_list)}; free {mem_GB(free0)}"
+            f"Capturing spec-verify CUDA graphs (widths={widths} -> qlens={[w + 1 for w in widths]}, "
+            f"hidden={needs_hidden}, aux={num_aux}) sizes={sorted(bs_list)}; free {mem_GB(free0)}"
         )
+        # DESCENDING width, then descending bs: the first (widest, biggest) capture allocates the
+        # shared graph pool at its high-water mark and every narrower graph reuses that memory instead
+        # of extending the pool. Capturing narrow-first would grow the pool once per width.
+        by_qlen: Dict[int, dict] = {}
         pool = None
-        for bs in tqdm(sorted(bs_list, reverse=True), desc="Capturing verify graphs",
-                       unit="batch", disable=not get_tp_info().is_primary()):
+        todo = [(w, bs) for w in sorted(widths, reverse=True)
+                for bs in sorted(bs_list, reverse=True)]
+        for w, bs in tqdm(todo, desc="Capturing verify graphs", unit="graph",
+                          disable=not get_tp_info().is_primary()):
+            ql = w + 1
+            ent = by_qlen.setdefault(ql, {"buf": vbuf.view(ql), "graphs": {}})
             graph = torch.cuda.CUDAGraph()
+            # a dedicated dummy req with extend_len = ql (cached_len 0, device_len ql).
+            vdummy = Req(
+                input_ids=torch.zeros(ql, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+                sampling_params=None, cache_handle=None,  # type: ignore
+            )
             batch = Batch(reqs=[vdummy] * bs, phase="decode")
             batch.spec_verify = True
             batch.padded_reqs = batch.reqs
+            self._set_verify_width(ql)
             self.attn_backend.prepare_verify_for_capture(batch)
             if self.cca_verify is not None:
                 self.cca_verify.prepare_verify_for_capture(batch)
             if self.gdn_verify is not None:
                 self.gdn_verify.prepare_verify_for_capture(batch)
-            vbuf.set_batch(batch)
-            T = vbuf.total(batch)
+            wbuf: VerifyCaptureBuffer = ent["buf"]
+            wbuf.set_batch(batch)
+            T = wbuf.total(batch)
             with get_global_ctx().forward_batch(batch), torch.inference_mode():
-                self._run_verify_into(model, vbuf, T, needs_hidden)  # warmup
+                self._run_verify_into(model, wbuf, T, needs_hidden)  # warmup
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self._run_verify_into(model, vbuf, T, needs_hidden)
+                    self._run_verify_into(model, wbuf, T, needs_hidden)
             if pool is None:
                 pool = graph.pool()
-            graph_map[bs] = graph
-        self._verify = {"buf": vbuf, "graphs": graph_map, "qlen": qlen,
+            ent["graphs"][bs] = graph
+        self._verify = {"buf": vbuf, "widths": by_qlen, "qlens": sorted(by_qlen),
+                        "qlen": qlen, "graphs": by_qlen[qlen]["graphs"],
                         "bs_list": sorted(bs_list), "needs_hidden": needs_hidden, "num_aux": num_aux}
         logger.info_rank0(f"spec-verify graphs captured; free {mem_GB(get_free_memory(dev))}")
+
+    def _set_verify_width(self, qlen: int) -> None:
+        """Repoint every per-width static (attention verify metadata, GDN/CCA recurrent scratch) at the
+        buffers captured for `qlen` query rows per sequence. Must run BEFORE the prepare_* calls, which
+        read those pointers to build the batch metadata."""
+        setter = getattr(self.attn_backend, "set_verify_width", None)
+        if setter is not None:
+            setter(qlen)
+        if self.cca_verify is not None:
+            self.cca_verify.set_width(qlen)
+        if self.gdn_verify is not None:
+            self.gdn_verify.set_width(qlen)
 
     @staticmethod
     def _run_verify_into(model, vbuf: VerifyCaptureBuffer, T: int, needs_hidden: bool) -> None:
@@ -455,14 +511,24 @@ class GraphRunner:
         (only when the padded bs fits a captured size → the step hits the verify graph)."""
         return self._verify["bs_list"] if self._verify is not None else []
 
+    @property
+    def verify_widths(self) -> "list[int]":
+        """Captured spec-verify WIDTHS (drafts/seq), ascending; empty if verify graphs weren't
+        captured. The scheduler's adaptive-width controller may only ever choose from this set —
+        anything else falls off the graph (see can_use_verify_graph)."""
+        return [q - 1 for q in self._verify["qlens"]] if self._verify is not None else []
+
     def can_use_verify_graph(self, batch: Batch) -> bool:
-        # capturable iff: graphs exist, every req has exactly num_draft drafts (uniform qlen), and the
-        # req count fits a captured bs. Partial-K steps (near max_tokens / first cold step) fall back
-        # to eager. spec_verify is set by the scheduler.
+        # capturable iff: graphs exist, every req in the step has the SAME extend_len, that extend_len
+        # is one of the CAPTURED qlens (adaptive verify width — the scheduler picks the width and pads
+        # to it), and the req count fits a captured bs. A ragged step (near max_tokens / first cold
+        # step) falls back to eager. spec_verify is set by the scheduler.
         if self._verify is None or not getattr(batch, "spec_verify", False):
             return False
-        ql = self._verify["qlen"]
-        if batch.size > self._verify["bs_list"][-1]:
+        if batch.size > self._verify["bs_list"][-1] or batch.size == 0:
+            return False
+        ql = batch.reqs[0].extend_len
+        if ql not in self._verify["widths"]:
             return False
         return all(r.extend_len == ql for r in batch.reqs)
 
@@ -477,7 +543,9 @@ class GraphRunner:
         batch.padded_reqs = batch.reqs + [self._verify_dummy(batch)] * (bs - batch.size)
 
     def _verify_dummy(self, batch: Batch) -> Req:
-        ql = self._verify["qlen"]
+        # Dummy rows must carry the SAME extend_len as the real ones (the step's chosen width), or the
+        # padded batch would stage a different token count than the captured graph expects.
+        ql = batch.reqs[0].extend_len if batch.reqs else self._verify["qlen"]
         return Req(
             input_ids=torch.zeros(ql, dtype=torch.int32, device="cpu"),
             table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
@@ -491,15 +559,21 @@ class GraphRunner:
         real-token outputs (the dummy-padded tail rows are discarded)."""
         v = self._verify
         v["replays"] = v.get("replays", 0) + 1
-        vbuf: VerifyCaptureBuffer = v["buf"]
+        # Adaptive verify width: the step's width is carried by the reqs themselves (can_use_verify_graph
+        # already checked it is uniform AND captured), so pick that width's buffer view + graph and
+        # repoint the per-width statics before the prepare_* calls read them.
+        ql = batch.reqs[0].extend_len
+        w = v["widths"][ql]
+        vbuf: VerifyCaptureBuffer = w["buf"]
         vbuf.copy_from(batch)
+        self._set_verify_width(ql)
         self.attn_backend.prepare_verify_for_replay(batch)
         if self.cca_verify is not None:
             self.cca_verify.prepare_verify_for_replay(batch)
         if self.gdn_verify is not None:
             self.gdn_verify.prepare_verify_for_replay(batch)
-        v["graphs"][batch.padded_size].replay()
-        n = batch.size * v["qlen"]
+        w["graphs"][batch.padded_size].replay()
+        n = batch.size * ql
         logits = vbuf.logits[:n]
         if not return_hidden:
             return logits
@@ -632,6 +706,22 @@ class GraphRunner:
         built (it knows budget → tree_qlen)."""
         if not bs_list or not hasattr(self.attn_backend, "init_ddtree_verify_capture"):
             return logger.info_rank0("ddtree-verify CUDA graph: unsupported backend / disabled")
+        # SWA-HYBRID (Laguna): NOT WIRED, and it must decline rather than crash. The static DDTree
+        # metadata (`_ddtree_verify_metadata_static`) populates no swa_* fields — unlike the K+1
+        # verify capture, which allocates a per-qlen ring block table + out_loc — so the first
+        # sliding layer of the capture WARMUP trips `_swa_forward`'s "SWA metadata missing" assert
+        # and takes the boot down. That made DDTree unbootable on the ONLY model whose DFlash
+        # drafter has a capturable propose, i.e. DDTree could not be exercised at all. Declining
+        # here leaves the tree-verify EAGER (the scheduler's own `prepare_metadata` DOES build the
+        # SWA fields, so the eager path is complete and lossless — DDTree's verify is a plain
+        # ancestor-masked forward), which is slower but runnable and testable.
+        if getattr(self.attn_backend, "swa_kv", None) is not None and \
+                getattr(self.attn_backend, "swa_window", 0) > 0:
+            return logger.warning_rank0(
+                "ddtree-verify CUDA graph: SKIPPED on an SWA-hybrid model — the DDTree static "
+                "metadata has no sliding-window ring fields (attention/hip.py "
+                "_ddtree_verify_metadata_static vs init_verify_capture). The tree-verify runs EAGER."
+            )
         dev = self.device
         max_bs = max(bs_list)
         self.attn_backend.init_ddtree_verify_capture(

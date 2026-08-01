@@ -1,0 +1,27 @@
+=== cap [identity] MODEL=laguna SPEC=dflash NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    PROPOSE graphs CAPTURED buckets=[1]
+    propose ring (slots=2+NULL of 2, C=640, block=16, window=512, prefix-KV 39 MB, logits buf 18 MB)
+TOKENS 384
+WALL 4.368
+TPS 87.908
+MD5 e257534c8d062e72ce28f98f238eff65
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  drafted chains captured: 144
+
+=== eager [identity] MODEL=laguna SPEC=dflash NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    PROPOSE graphs CAPTURED buckets=[1]
+    propose ring (slots=2+NULL of 2, C=640, block=16, window=512, prefix-KV 39 MB, logits buf 18 MB)
+TOKENS 384
+WALL 4.456
+TPS 86.169
+MD5 e257534c8d062e72ce28f98f238eff65
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  drafted chains captured: 144
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (dflash_ctl) ===
+  IDENTICAL (verbatim): 144 drafted chains
+

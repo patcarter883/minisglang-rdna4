@@ -1,0 +1,47 @@
+=== cap [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 4.298
+TPS 89.354
+MD5 06becd85b52388dbf0474eac359be8de
+SAMPLE Here is a complete, well-commented Python implementation of a **persistent red-black tree**. I'll explain the 
+  drafted chains captured: 280
+
+=== eager [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 4.204
+TPS 91.342
+MD5 7a5024e3b41aab9b46c3c123fd22b53a
+SAMPLE - Use immutable nodes (or effectively immutable via copying) - Each node stores: key, value, color, left, righ
+  drafted chains captured: 272
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (mtp_ctl) ===
+  DIFFER: 208 of 280 chains
+2a3,8
+> draft=[10288, 80025, 466, 958]
+> draft=[10288, 80025, 466, 958]
+> draft=[10583, 318, 269, 975]
+> draft=[10583, 318, 269, 975]
+> draft=[10583, 513, 660, 279]
+> draft=[10583, 513, 660, 279]
+5,10c11,12
+< draft=[11121, 264, 491, 2357]
+< draft=[11121, 264, 491, 2357]
+< draft=[11121, 264, 491, 49835]
+< draft=[11121, 264, 491, 49835]
+< draft=[11, 1575, 44145, 290]
+< draft=[11, 1575, 44145, 290]
+---
+> draft=[11137, 466, 958, 1752]
+> draft=[11137, 466, 958, 1752]
+12a15,22
+> draft=[11, 1829, 11, 2047]
+> draft=[11, 1829, 11, 2047]
+

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -9,7 +9,37 @@ if TYPE_CHECKING:
 
     from .config import SpecConfig
 
-__all__ = ["Proposer", "ProposeContext"]
+__all__ = ["Proposer", "ProposeContext", "ProposeCaptureStats"]
+
+
+class ProposeCaptureStats(NamedTuple):
+    """Propose-graph ENGAGEMENT, as rendered on the ``[spec-timing]`` line.
+
+    ``mode`` is load-bearing, and is why this is not just ``(replays, eager, buckets)``. A proposer
+    with NO captured propose at all (n-gram, TiDAR, a non-causal/unwindowed DFlash drafter, DP+EP)
+    used to report ``replay=0 eager=0`` — 100% eager rendered as *zero eager*, i.e. exactly the
+    "green number over a silently eager path" this capture work exists to prevent. So the readout
+    now states WHICH of three states it is in:
+
+      ``captured``  graphs exist; ``replays``/``eager`` are the real per-step split.
+      ``never``     this proposer has no capturable propose (``reason`` says why). Every step is
+                    eager BY CONSTRUCTION; a replay/eager split would be meaningless, so it is not
+                    printed at all.
+      ``failed``    it declared itself capturable but capture did not happen (graphs off, OOM at
+                    boot). Every step is eager and that is a DEGRADATION, not a design choice.
+    """
+
+    replays: int
+    eager: int
+    buckets: List[int]
+    mode: str = "captured"
+    reason: str = ""
+
+    def line(self) -> str:
+        """The ``propose-graph ...`` fragment of the spec-timing line."""
+        if self.mode == "captured":
+            return f"propose-graph replay={self.replays} eager={self.eager} buckets={self.buckets}"
+        return f"propose-graph ALWAYS-EAGER({self.mode}: {self.reason or 'no reason recorded'})"
 
 
 class ProposeContext:
@@ -76,6 +106,41 @@ class Proposer(ABC):
     # then charge O(prompt) per step forever. Keys older than the window are masked out inside the
     # drafter regardless, so truncating to the tail is numerically inert — it only bounds the cost.
     prefill_aux_tail: int = 0
+
+    # Cap, in positions, on the aux buffer the scheduler ACCUMULATES for this proposer. 0 = unbounded.
+    #
+    # The steady-state twin of `prefill_aux_tail`. A sliding-window drafter masks out every key older
+    # than its window, so accumulating aux past (window + one draft block) is numerically inert —
+    # while the scheduler's append is a `torch.cat`, i.e. an O(P) realloc+copy of a
+    # [num_aux, P, hidden] buffer on every step of every request. Publishing the cap here keeps the
+    # bound derived from the drafter's own geometry instead of an env knob.
+    aux_ctx_cap: int = 0
+
+    # Whether this proposer's propose forward is CUDA-graph CAPTURED (spec/capture.py). Verify has
+    # been captured for a long time; propose was the remaining eager launch storm — ~150 kernel
+    # launches per request per step for a draft trunk, which is what pins the propose floor at a
+    # value invariant to a 5x change in attention traffic. A proposer sets this by inheriting
+    # `CapturableProposer`, which supplies capture/replay once for all of them. n-gram (no model at
+    # all) leaves it False and the three no-ops below make the scheduler's call sites unconditional.
+    propose_capturable: bool = False
+
+    def capture_propose_graphs(self, bs_list: List[int]) -> None:
+        """Capture this proposer's propose graphs (one per batch-size bucket). No-op unless
+        `propose_capturable`. Called at BOOT from the scheduler, on the engine stream, right after
+        the verify graphs — the proposer's weights and buffers already exist by then."""
+
+    def destroy_propose_graphs(self) -> None:
+        """Release captured propose graphs before NCCL teardown (a live graph there hangs shutdown)."""
+
+    # Why this proposer has no captured propose, for the engagement readout. Subclasses that COULD
+    # be capturable but are not for this checkpoint/config overwrite it with the specific reason.
+    propose_uncapturable_reason: str = "this proposer has no draft forward to capture"
+
+    def propose_capture_stats(self) -> "ProposeCaptureStats":
+        """Engagement evidence. A captured path that silently falls back to eager is the failure
+        mode, so this is reported, not assumed — including the case where there is no captured path
+        AT ALL, which must never render as `eager=0`. See ProposeCaptureStats."""
+        return ProposeCaptureStats(0, 0, [], "never", self.propose_uncapturable_reason)
 
     @abstractmethod
     def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:

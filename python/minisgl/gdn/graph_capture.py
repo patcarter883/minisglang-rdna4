@@ -76,17 +76,35 @@ class GDNVerifyGraphCapture:
                  gdn_layer_ids, conv_dim: int, conv_width: int,
                  num_v_heads: int, head_v_dim: int, head_k_dim: int,
                  ssm_dtype: torch.dtype) -> None:
-        Q = num_draft + 1
-        self._Q = Q
+        # `num_draft` may be a LIST of widths (adaptive verify width, spec/width.py). The per-layer
+        # conv/ssm scratch is the DOMINANT per-width allocation on a GDN hybrid, so it is allocated
+        # ONCE at the widest Q and every narrower width takes the leading `[:Q]` slice — a prefix view
+        # of the outermost dim, exactly like the existing `[:, :bs]` batch slice. Only `query_start_loc`
+        # (arange*Q) is genuinely per-width, and it is [max_bs+1] ints.
+        widths = [num_draft] if isinstance(num_draft, int) else sorted(set(int(w) for w in num_draft))
+        Qmax = max(widths) + 1
+        self._Qmax = Qmax
+        self._Q = Qmax
         self._state_indices = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        self._cu = torch.arange(max_bs + 1, dtype=torch.int32, device=device) * Q
+        self._cu_by_q = {
+            w + 1: torch.arange(max_bs + 1, dtype=torch.int32, device=device) * (w + 1)
+            for w in widths
+        }
+        self._cu = self._cu_by_q[Qmax]
         self._has_init = torch.zeros(max_bs, dtype=torch.bool, device=device)
-        self._conv = {int(lid): torch.zeros(Q, max_bs, conv_dim, conv_width, dtype=torch.float32,
+        self._conv = {int(lid): torch.zeros(Qmax, max_bs, conv_dim, conv_width, dtype=torch.float32,
                                             device=device) for lid in gdn_layer_ids}
-        self._ssm = {int(lid): torch.zeros(Q, max_bs, num_v_heads, head_v_dim, head_k_dim,
+        self._ssm = {int(lid): torch.zeros(Qmax, max_bs, num_v_heads, head_v_dim, head_k_dim,
                                            dtype=ssm_dtype, device=device) for lid in gdn_layer_ids}
 
+    def set_width(self, qlen: int) -> None:
+        """Select the captured width (`qlen` query rows/seq) whose metadata the next capture/replay
+        should use. Called by GraphRunner right before prepare_verify_for_capture / _for_replay."""
+        self._Q = qlen
+        self._cu = self._cu_by_q[qlen]
+
     def _metadata(self, bs: int) -> GDNMetadata:
+        Q = self._Q
         return GDNMetadata(
             is_prefill=True,  # verify is the multi-query varlen path (matches build_gdn_metadata)
             num_seqs=bs,
@@ -94,9 +112,9 @@ class GDNVerifyGraphCapture:
             state_indices=self._state_indices[:bs],
             has_initial_state=self._has_init[:bs],
             capture_verify_state=True,
-            verify_max_qlen=self._Q,
-            conv_scratch={lid: buf[:, :bs] for lid, buf in self._conv.items()},
-            ssm_scratch={lid: buf[:, :bs] for lid, buf in self._ssm.items()},
+            verify_max_qlen=Q,
+            conv_scratch={lid: buf[:Q, :bs] for lid, buf in self._conv.items()},
+            ssm_scratch={lid: buf[:Q, :bs] for lid, buf in self._ssm.items()},
         )
 
     def prepare_verify_for_capture(self, batch: "Batch") -> None:

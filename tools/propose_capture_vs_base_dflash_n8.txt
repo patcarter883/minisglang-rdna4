@@ -1,0 +1,23 @@
+=== base  MODEL=laguna SPEC=dflash NREQ=8 ===
+  mounted spec/dflash.py md5: 70a5e83a8087bb920ff2e212c09d0f70
+  mounted spec/capture.py:   tree sha: aa9bb06d
+TOKENS 6144
+WALL 45.222
+TPS 135.864
+MD5 06c227acc9a9802a308a9a7305583f43
+[spec-timing] step=50 propose=54.9ms stage=1.4ms forward=181.9ms accept=0.9ms total=239.1ms
+[spec-timing] step=100 propose=49.3ms stage=1.3ms forward=200.6ms accept=0.9ms total=252.2ms
+[spec-timing] step=150 propose=47.9ms stage=1.3ms forward=207.3ms accept=1.0ms total=257.5ms
+
+=== new  MODEL=laguna SPEC=dflash NREQ=8 ===
+  mounted spec/dflash.py md5: bbd9aed128b6bd015fb0f5bb2b1a60a3
+  mounted spec/capture.py: 162b44961af957b739be25746b3ac1be
+  tree sha: aa9bb06d
+TOKENS 6144
+WALL 39.846
+TPS 154.195
+MD5 06c227acc9a9802a308a9a7305583f43
+[spec-timing] step=50 propose=14.0ms stage=1.1ms forward=182.5ms accept=0.9ms total=198.6ms propose-graph replay=50 eager=0 buckets=[1, 2, 4, 8]
+[spec-timing] step=100 propose=13.9ms stage=1.2ms forward=200.8ms accept=0.9ms total=216.8ms propose-graph replay=100 eager=0 buckets=[1, 2, 4, 8]
+[spec-timing] step=150 propose=13.8ms stage=1.2ms forward=207.5ms accept=1.0ms total=223.5ms propose-graph replay=150 eager=0 buckets=[1, 2, 4, 8]
+

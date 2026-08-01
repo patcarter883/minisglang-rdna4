@@ -283,36 +283,63 @@ class HIPAttnBackend(RDNA4Backend):
     # max-width page table (stale tail ignored) is fine — same trick as decode/MLA-verify. Mirrors
     # MLABackend.init_verify_capture / _fill_verify_static. NOTE (v2 S4): the FUSED custom-mask forward
     # needs an additional static mask_bias + §7.6 positions buffer — see docs/V2_CCA_VERIFY_CAPTURE.md.
-    def init_verify_capture(self, max_seq_len: int, bs_list: List[int], num_draft: int) -> None:
+    def init_verify_capture(
+        self, max_seq_len: int, bs_list: List[int], num_draft: "int | List[int]"
+    ) -> None:
+        # `num_draft` may be a LIST of widths (adaptive verify width, spec/width.py): every captured
+        # width gets its own qlen-shaped statics, and `set_verify_width` repoints the live ones before
+        # each capture/replay. The qlen-INDEPENDENT buffers (cache_seqlens, page_table, and the SWA
+        # ring cache_seqlens) are allocated ONCE and shared by every width.
         dev = self.kvcache.device
+        widths = [num_draft] if isinstance(num_draft, int) else sorted(set(int(w) for w in num_draft))
         self._vcap_max_bs = max(bs_list)
-        self._vcap_qlen = num_draft + 1
         self._vcap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
         self._vcap_cache_seqlens = torch.ones(self._vcap_max_bs, dtype=torch.int32, device=dev)
         self._vcap_page_table = torch.zeros(
             self._vcap_max_bs, self._vcap_max_pages, dtype=torch.int32, device=dev
         )
-        self._vcap_cu_q = (
-            torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * self._vcap_qlen
-        )
         # ---- SWA-hybrid (Laguna): STATIC ring-pool VERIFY metadata (persistent, refreshed in place) ----
         # The 30 sliding layers verify the K+1 tokens through the ring pool. Made capturable by the
         # paged-from-ring path (rdna4._swa_prefill_paged) — mirrors the decode SWA static buffers (Track
-        # D) at the verify shape. Widths are FIXED: swa_out_loc holds bs*qlen new-token store slots; the
-        # ring block table is [bs, W+qlen] (window Wp<=W ++ the qlen new slots); cache_seqlens = Wp+qlen
-        # bounds the read (padded tail ignored). Contents are rebuilt by _fill_swa_verify_static before
-        # capture and every replay; the captured store_kv/paged-extend read them through fixed pointers.
-        if self.swa_kv is not None and self.swa_window > 0:
-            W = self.swa_window
-            self._vcap_swa_out_loc = torch.zeros(
-                self._vcap_max_bs * self._vcap_qlen, dtype=torch.int32, device=dev
-            )
-            self._vcap_swa_page_table = torch.zeros(
-                self._vcap_max_bs, W + self._vcap_qlen, dtype=torch.int32, device=dev
-            )
+        # D) at the verify shape. Widths are FIXED per captured qlen: swa_out_loc holds bs*qlen new-token
+        # store slots; the ring block table is [bs, W+qlen] (window Wp<=W ++ the qlen new slots);
+        # cache_seqlens = Wp+qlen bounds the read (padded tail ignored). Contents are rebuilt by
+        # _fill_swa_verify_static before capture and every replay; the captured store_kv/paged-extend
+        # read them through fixed pointers. NOTE these are allocated PER WIDTH rather than sliced out of
+        # a max-width buffer: the page table's ROW STRIDE is W+qlen, so a `[:, :W+ql]` view of a wider
+        # allocation would be non-contiguous and the kernel reads it as a dense [bs, W+ql] block. Each
+        # one is a few KB, so the duplication is free.
+        swa = self.swa_kv is not None and self.swa_window > 0
+        if swa:
             self._vcap_swa_cache_seqlens = torch.ones(
                 self._vcap_max_bs, dtype=torch.int32, device=dev
             )
+        self._vcap_by_qlen: "dict[int, dict]" = {}
+        for w in widths:
+            ql = w + 1
+            ent = {
+                "cu_q": torch.arange(self._vcap_max_bs + 1, dtype=torch.int32, device=dev) * ql,
+            }
+            if swa:
+                ent["swa_out_loc"] = torch.zeros(
+                    self._vcap_max_bs * ql, dtype=torch.int32, device=dev
+                )
+                ent["swa_page_table"] = torch.zeros(
+                    self._vcap_max_bs, self.swa_window + ql, dtype=torch.int32, device=dev
+                )
+            self._vcap_by_qlen[ql] = ent
+        self.set_verify_width(max(widths) + 1)
+
+    def set_verify_width(self, qlen: int) -> None:
+        """Point the live verify statics at the buffers captured for `qlen` query rows/seq. Called by
+        GraphRunner immediately before prepare_verify_for_capture / _for_replay, so the fill helpers
+        and the metadata builder below need no width argument."""
+        ent = self._vcap_by_qlen[qlen]
+        self._vcap_qlen = qlen
+        self._vcap_cu_q = ent["cu_q"]
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._vcap_swa_out_loc = ent["swa_out_loc"]
+            self._vcap_swa_page_table = ent["swa_page_table"]
 
     def _verify_metadata_static(self, bs: int) -> RDNA4Metadata:
         md = RDNA4Metadata(

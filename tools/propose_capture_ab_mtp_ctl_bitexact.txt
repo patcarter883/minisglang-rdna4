@@ -1,0 +1,47 @@
+=== cap [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 4.195
+TPS 91.528
+MD5 af92cf70460837ef687638d3787e867d
+SAMPLE I'll implement a persistent red-black tree in Python. The key challenge in persistence is that every modificat
+  drafted chains captured: 264
+
+=== eager [identity] MODEL=qwen35b-awq SPEC=mtp NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 25 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 4.222
+TPS 90.961
+MD5 e4c3bf966698204384cd4c7b6725894c
+SAMPLE Here is a complete, well-commented Python implementation of a **persistent red-black tree**. I'll explain the 
+  drafted chains captured: 266
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (mtp_ctl_bitexact) ===
+  DIFFER: 74 of 264 chains
+7,8c7,8
+< draft=[11227, 310, 1791, 49835]
+< draft=[11227, 310, 1791, 49835]
+---
+> draft=[11, 1575, 44145, 290]
+> draft=[11, 1575, 44145, 290]
+17,18d16
+< draft=[11, 958, 1510, 23814]
+< draft=[11, 958, 1510, 23814]
+25,32c23,26
+< draft=[1246, 7561, 1510, 2282]
+< draft=[1246, 7561, 1510, 2282]
+< draft=[12, 49422, 318, 88098]
+< draft=[12, 49422, 318, 88098]
+< draft=[12654, 1608, 279, 15694]
+< draft=[12654, 1608, 279, 15694]
+< draft=[12654, 64700, 198, 16]
+< draft=[12654, 64700, 198, 16]
+---
+> draft=[12, 49422, 318, 68]
+

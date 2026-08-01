@@ -1,0 +1,69 @@
+=== base  MODEL=laguna SPEC=dflash NREQ=8 MAXTOK=1024 ===
+  mounted spec/width.py:        mounted scheduler.py md5:   569de819d77a31bee85231974b41ba4a
+  tree sha: c172f649
+TOKENS 8192
+WALL 50.664
+TPS 161.692
+MD5 c29061c01066189692e423d14ea839e6
+HEAD Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+[1m[2026-07-31|20:00:10|core|rank=0][0m [32mINFO    [0m Capturing spec-verify CUDA graphs (qlen=17, hidden=True, aux=5) sizes=[1, 2, 4, 8]; free 1.45 GiB
+[1m[2026-07-31|20:00:18|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.15 over 200 reqs
+[1m[2026-07-31|20:00:23|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.03 over 400 reqs
+[1m[2026-07-31|20:00:23|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=13.9ms stage=1.2ms forward=182.0ms accept=0.9ms total=198.1ms propose-graph replay=50 eager=0 buckets=[1, 2, 4, 8]
+[1m[2026-07-31|20:00:29|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.32 over 600 reqs
+[1m[2026-07-31|20:00:35|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.13 over 800 reqs
+[1m[2026-07-31|20:00:35|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=13.9ms stage=1.2ms forward=200.5ms accept=0.9ms total=216.5ms propose-graph replay=100 eager=0 buckets=[1, 2, 4, 8]
+[1m[2026-07-31|20:00:41|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.24 over 1000 reqs
+[1m[2026-07-31|20:00:47|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.38 over 1200 reqs
+[1m[2026-07-31|20:00:47|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=13.8ms stage=1.3ms forward=208.0ms accept=1.0ms total=224.1ms propose-graph replay=150 eager=0 buckets=[1, 2, 4, 8]
+[1m[2026-07-31|20:00:53|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.43 over 1400 reqs
+[1m[2026-07-31|20:00:59|core|rank=0][0m [32mINFO    [0m [spec-timing] step=200 propose=13.8ms stage=1.3ms forward=212.1ms accept=1.0ms total=228.3ms propose-graph replay=200 eager=0 buckets=[1, 2, 4, 8]
+
+=== fixed  MODEL=laguna SPEC=dflash NREQ=8 MAXTOK=1024 ===
+  mounted spec/width.py:      95d1d19f94d9ca36980fa4563d7290cf
+  mounted scheduler.py md5:   70ba1b05cd44d342e3798cb510927de0
+  tree sha: bb3ccea2 +AB-PATCH
+TOKENS 8192
+WALL 48.820
+TPS 167.801
+MD5 c29061c01066189692e423d14ea839e6
+HEAD Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+[1m[2026-07-31|20:02:08|core|rank=0][0m [32mINFO    [0m Capturing spec-verify CUDA graphs (widths=[3, 7, 15] -> qlens=[4, 8, 16], hidden=True, aux=5) sizes=[1, 2, 4, 8]; free 1.45 GiB
+[1m[2026-07-31|20:02:09|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|20:02:17|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.15 over 200 reqs verify-width[3:0(0%) 7:0(0%) 15:25(100%)] verify-graph replay=25 eager=0
+[1m[2026-07-31|20:02:23|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.03 over 400 reqs verify-width[3:0(0%) 7:0(0%) 15:50(100%)] verify-graph replay=50 eager=0
+[1m[2026-07-31|20:02:23|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=13.9ms stage=1.2ms forward=171.0ms accept=0.9ms total=187.0ms propose-graph replay=50 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=50 eager=0 verify-width[3:0(0%) 7:0(0%) 15:50(100%)]
+[1m[2026-07-31|20:02:28|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.32 over 600 reqs verify-width[3:0(0%) 7:0(0%) 15:75(100%)] verify-graph replay=75 eager=0
+[1m[2026-07-31|20:02:34|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.13 over 800 reqs verify-width[3:0(0%) 7:0(0%) 15:100(100%)] verify-graph replay=100 eager=0
+[1m[2026-07-31|20:02:34|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=13.9ms stage=1.2ms forward=190.3ms accept=0.9ms total=206.3ms propose-graph replay=100 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=100 eager=0 verify-width[3:0(0%) 7:0(0%) 15:100(100%)]
+[1m[2026-07-31|20:02:40|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.24 over 1000 reqs verify-width[3:0(0%) 7:0(0%) 15:125(100%)] verify-graph replay=125 eager=0
+[1m[2026-07-31|20:02:46|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.38 over 1200 reqs verify-width[3:0(0%) 7:0(0%) 15:150(100%)] verify-graph replay=150 eager=0
+[1m[2026-07-31|20:02:46|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=13.8ms stage=1.2ms forward=198.1ms accept=1.0ms total=214.1ms propose-graph replay=150 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=150 eager=0 verify-width[3:0(0%) 7:0(0%) 15:150(100%)]
+[1m[2026-07-31|20:02:51|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=3.43 over 1400 reqs verify-width[3:0(0%) 7:0(0%) 15:175(100%)] verify-graph replay=175 eager=0
+[1m[2026-07-31|20:02:57|core|rank=0][0m [32mINFO    [0m [spec-timing] step=200 propose=13.8ms stage=1.2ms forward=202.6ms accept=1.0ms total=218.7ms propose-graph replay=200 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=200 eager=0 verify-width[3:0(0%) 7:0(0%) 15:200(100%)]
+
+=== adapt  MODEL=laguna SPEC=dflash NREQ=8 MAXTOK=1024 ===
+  mounted spec/width.py:      95d1d19f94d9ca36980fa4563d7290cf
+  mounted scheduler.py md5:   699d567651899850a17a30fdbe5e0571
+  tree sha: bb3ccea2
+TOKENS 8192
+WALL 42.305
+TPS 193.639
+MD5 04c163567258d21b172ae13785d6efdb
+HEAD ```python         else:             x.parent.right = y                  y.left = x         x.parent = y       
+[1m[2026-07-31|20:04:00|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[3, 7, 15] (K=16, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|20:04:06|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=1.67 over 200 reqs verify-width[3:22(88%) 7:2(8%) 15:1(4%)] verify-graph replay=25 eager=0
+[1m[2026-07-31|20:04:08|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=1.85 over 400 reqs verify-width[3:43(86%) 7:6(12%) 15:1(2%)] verify-graph replay=50 eager=0
+[1m[2026-07-31|20:04:08|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=13.9ms stage=1.2ms forward=74.7ms accept=0.7ms total=90.5ms propose-graph replay=50 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=50 eager=0 verify-width[3:43(86%) 7:6(12%) 15:1(2%)]
+[1m[2026-07-31|20:04:12|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.60 over 600 reqs verify-width[3:43(57%) 7:31(41%) 15:1(1%)] verify-graph replay=75 eager=0
+[1m[2026-07-31|20:04:17|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.52 over 800 reqs verify-width[3:43(43%) 7:56(56%) 15:1(1%)] verify-graph replay=100 eager=0
+[1m[2026-07-31|20:04:17|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=13.8ms stage=1.2ms forward=120.5ms accept=0.8ms total=136.3ms propose-graph replay=100 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=100 eager=0 verify-width[3:43(43%) 7:56(56%) 15:1(1%)]
+[1m[2026-07-31|20:04:21|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.55 over 1000 reqs verify-width[3:49(39%) 7:75(60%) 15:1(1%)] verify-graph replay=125 eager=0
+[1m[2026-07-31|20:04:26|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.68 over 1200 reqs verify-width[3:49(33%) 7:100(67%) 15:1(1%)] verify-graph replay=150 eager=0
+[1m[2026-07-31|20:04:26|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=13.8ms stage=1.1ms forward=135.4ms accept=0.9ms total=151.2ms propose-graph replay=150 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=150 eager=0 verify-width[3:49(33%) 7:100(67%) 15:1(1%)]
+[1m[2026-07-31|20:04:31|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.81 over 1400 reqs verify-width[3:49(28%) 7:125(71%) 15:1(1%)] verify-graph replay=175 eager=0
+[1m[2026-07-31|20:04:36|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.98 over 1600 reqs verify-width[3:49(24%) 7:150(75%) 15:1(0%)] verify-graph replay=200 eager=0
+[1m[2026-07-31|20:04:36|core|rank=0][0m [32mINFO    [0m [spec-timing] step=200 propose=13.8ms stage=1.2ms forward=146.2ms accept=0.9ms total=162.1ms propose-graph replay=200 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=200 eager=0 verify-width[3:49(24%) 7:150(75%) 15:1(0%)]
+[1m[2026-07-31|20:04:44|core|rank=0][0m [32mINFO    [0m [spec-timing] step=250 propose=13.6ms stage=1.2ms forward=147.7ms accept=1.0ms total=163.5ms propose-graph replay=250 eager=0 buckets=[1, 2, 4, 8] verify-graph replay=250 eager=0 verify-width[3:49(20%) 7:200(80%) 15:1(0%)]
+
+== A/B COMPLETE ==

@@ -1,0 +1,32 @@
+=== cap [timing] MODEL=laguna SPEC=dflash NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG= 
+  capture witness:
+    PROPOSE graphs CAPTURED buckets=[1]
+    propose ring (slots=2+NULL of 2, C=640, block=16, window=512, prefix-KV 39 MB, logits buf 18 MB)
+TOKENS 1024
+WALL 13.079
+TPS 78.295
+MD5 a4e2483f1bd8dde7eb966539ab4f0736
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  [spec-timing] lines:
+[spec-timing] step=50 propose=5.7ms stage=0.3ms forward=47.2ms accept=0.4ms total=53.6ms propose-graph replay=50 eager=0 buckets=[1]
+[spec-timing] step=100 propose=5.7ms stage=0.3ms forward=48.3ms accept=0.4ms total=54.7ms propose-graph replay=100 eager=0 buckets=[1]
+[spec-timing] step=150 propose=5.7ms stage=0.3ms forward=49.0ms accept=0.5ms total=55.4ms propose-graph replay=150 eager=0 buckets=[1]
+[spec-timing] step=200 propose=5.6ms stage=0.3ms forward=49.4ms accept=0.5ms total=55.9ms propose-graph replay=200 eager=0 buckets=[1]
+
+=== eager [timing] MODEL=laguna SPEC=dflash NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG= 
+  capture witness:
+    propose capture disabled by A/B override
+    propose ring (slots=2+NULL of 2, C=640, block=16, window=512, prefix-KV 39 MB, logits buf 18 MB)
+TOKENS 1024
+WALL 13.581
+TPS 75.398
+MD5 a4e2483f1bd8dde7eb966539ab4f0736
+SAMPLE Here's a complete, well-commented Python implementation of a persistent red-black tree with all required featu
+  [spec-timing] lines:
+[spec-timing] step=50 propose=19.3ms stage=0.3ms forward=47.3ms accept=0.5ms total=67.4ms propose-graph replay=0 eager=50 buckets=[]
+[spec-timing] step=100 propose=12.7ms stage=0.3ms forward=48.3ms accept=0.5ms total=61.8ms propose-graph replay=0 eager=100 buckets=[]
+[spec-timing] step=150 propose=10.5ms stage=0.3ms forward=49.0ms accept=0.5ms total=60.3ms propose-graph replay=0 eager=150 buckets=[]
+[spec-timing] step=200 propose=9.4ms stage=0.3ms forward=49.4ms accept=0.5ms total=59.7ms propose-graph replay=0 eager=200 buckets=[]
+

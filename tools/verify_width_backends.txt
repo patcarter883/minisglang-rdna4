@@ -1,0 +1,25 @@
+=== MODEL=qwen35b-awq SPEC=mtp ===
+  TOKENS 700  TPS 110.44
+  TEXT: Here's a complete, production-ready Python implementation of an iterative linked list reversal, followed by a step-by-st
+[1m[2026-07-31|20:13:46|core|rank=0][0m [32mINFO    [0m Capturing spec-verify CUDA graphs (widths=[2, 3, 4] -> qlens=[3, 4, 5], hidden=True, aux=0) sizes=[1, 2, 4]; free 2.79 GiB
+[1m[2026-07-31|20:13:47|core|rank=0][0m [32mINFO    [0m spec-decode: ADAPTIVE verify width ON widths=[2, 3, 4] (K=4, capped at 15 for the M<=16 kernel cliff)
+[1m[2026-07-31|20:13:51|core|rank=0][0m [32mINFO    [0m [spec-timing] step=50 propose=5.4ms stage=0.3ms forward=20.3ms accept=1.6ms total=27.6ms propose-graph replay=50 eager=0 buckets=[1, 2, 4] verify-graph replay=50 eager=0 verify-width[2:1(2%) 3:17(34%) 4:32(64%)]
+[1m[2026-07-31|20:13:52|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.17 over 100 reqs verify-width[2:1(1%) 3:38(38%) 4:61(61%)] verify-graph replay=100 eager=0
+[1m[2026-07-31|20:13:52|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=5.4ms stage=0.3ms forward=20.3ms accept=1.6ms total=27.6ms propose-graph replay=100 eager=0 buckets=[1, 2, 4] verify-graph replay=100 eager=0 verify-width[2:1(1%) 3:38(38%) 4:61(61%)]
+[1m[2026-07-31|20:13:54|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=5.4ms stage=0.3ms forward=20.5ms accept=1.6ms total=27.7ms propose-graph replay=150 eager=0 buckets=[1, 2, 4] verify-graph replay=150 eager=0 verify-width[2:1(1%) 3:49(33%) 4:100(67%)]
+[1m[2026-07-31|20:13:55|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=2.21 over 200 reqs verify-width[2:3(2%) 3:70(35%) 4:127(64%)] verify-graph replay=200 eager=0
+[1m[2026-07-31|20:13:55|core|rank=0][0m [32mINFO    [0m [spec-timing] step=200 propose=5.4ms stage=0.3ms forward=20.5ms accept=1.6ms total=27.8ms propose-graph replay=200 eager=0 buckets=[1, 2, 4] verify-graph replay=200 eager=0 verify-width[2:3(2%) 3:70(35%) 4:127(64%)]
+
+=== MODEL=glm SPEC=eagle3 ===
+  TOKENS 700  TPS 73.47
+  TEXT: ```python  class ListNode:     """Definition for singly-linked list node."""     def __init__(self, val=0, next=None):  
+[1m[2026-07-31|20:15:08|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=1.10 over 100 reqs verify-width[3:91(91%) 4:3(3%) 6:6(6%)] verify-graph replay=100 eager=0
+[1m[2026-07-31|20:15:08|core|rank=0][0m [32mINFO    [0m [spec-timing] step=100 propose=6.7ms stage=0.3ms forward=22.0ms accept=0.5ms total=29.4ms propose-graph replay=100 eager=0 buckets=[1, 2, 4] verify-graph replay=100 eager=0 verify-width[3:91(91%) 4:3(3%) 6:6(6%)]
+[1m[2026-07-31|20:15:10|core|rank=0][0m [32mINFO    [0m [spec-timing] step=150 propose=6.7ms stage=0.3ms forward=22.1ms accept=0.5ms total=29.5ms propose-graph replay=150 eager=0 buckets=[1, 2, 4] verify-graph replay=150 eager=0 verify-width[3:127(85%) 4:17(11%) 6:6(4%)]
+[1m[2026-07-31|20:15:11|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=1.15 over 200 reqs verify-width[3:177(88%) 4:17(8%) 6:6(3%)] verify-graph replay=200 eager=0
+[1m[2026-07-31|20:15:11|core|rank=0][0m [32mINFO    [0m [spec-timing] step=200 propose=6.6ms stage=0.3ms forward=22.1ms accept=0.5ms total=29.4ms propose-graph replay=200 eager=0 buckets=[1, 2, 4] verify-graph replay=200 eager=0 verify-width[3:177(88%) 4:17(8%) 6:6(3%)]
+[1m[2026-07-31|20:15:13|core|rank=0][0m [32mINFO    [0m [spec-timing] step=250 propose=6.6ms stage=0.3ms forward=22.2ms accept=0.5ms total=29.5ms propose-graph replay=250 eager=0 buckets=[1, 2, 4] verify-graph replay=250 eager=0 verify-width[3:220(88%) 4:24(10%) 6:6(2%)]
+[1m[2026-07-31|20:15:14|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=1.28 over 300 reqs verify-width[3:262(87%) 4:31(10%) 6:7(2%)] verify-graph replay=300 eager=0
+[1m[2026-07-31|20:15:14|core|rank=0][0m [32mINFO    [0m [spec-timing] step=300 propose=6.6ms stage=0.3ms forward=22.3ms accept=0.5ms total=29.6ms propose-graph replay=300 eager=0 buckets=[1, 2, 4] verify-graph replay=300 eager=0 verify-width[3:262(87%) 4:31(10%) 6:7(2%)]
+
+== BACKENDS COMPLETE ==

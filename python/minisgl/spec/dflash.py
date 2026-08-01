@@ -7,9 +7,15 @@ import torch
 
 from minisgl.utils import init_logger
 
-from .base import Proposer, ProposeContext
+from .base import ProposeContext
+from .capture import CapturableProposer, StagedPropose
 
 logger = init_logger(__name__)
+
+# Sentinel absolute position for a ring column that holds nothing (or holds a previous owner's key).
+# Any real query position minus this is astronomically larger than any sliding window, so the mask
+# discards it — which is why the ring needs no zeroing of stale K/V, only of this position vector.
+_NO_POS = -(1 << 40)
 
 if TYPE_CHECKING:
     from minisgl.core import Req
@@ -36,8 +42,14 @@ __all__ = ["DFlashProposer"]
 # this constant. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
 _SEED_TAIL_DEFAULT = 64
 
+# Compacting-buffer slack, in rows, on top of the drafter's attention window (see _init_prefix_kv).
+# Amortisation only, never correctness: the newest `window` rows are resident at every step for any
+# slack >= the per-step append (<= block_size). 128 makes the memmove fire roughly every 128/accepted
+# steps (~30 at a 4-token accept) and costs 128 extra rows/layer = ~0.26 MB/uid over the window.
+_KV_SLACK = 128
 
-class DFlashProposer(Proposer):
+
+class DFlashProposer(CapturableProposer):
     """DFlash block-diffusion draft proposer.
 
     Unlike MTP/EAGLE3 (autoregressive K-token chains), DFlash drafts a whole BLOCK in ONE bidirectional
@@ -70,6 +82,13 @@ class DFlashProposer(Proposer):
 
     needs_last_hidden = False
     capture_layer_ids: Optional[List[int]] = None  # set in __init__ from the ckpt config
+    # Set True in _build_laguna when the drafter is CAUSAL + SLIDING-WINDOW. It is a property of the
+    # checkpoint, not a switch: the z-lab DFlash drafters are constructed non-causal with
+    # sliding_window=0, so `_block_mask` returns None and the block attends the ENTIRE prefix
+    # bidirectionally. There is no fixed-capacity ring that can hold an unbounded prefix, so those
+    # drafters keep the eager per-uid path. Same for the CCA-recurrent drafter (a different
+    # architecture with no prefix at all). See `propose` for the dispatch.
+    propose_capturable = False
 
     def __init__(self, engine, num_draft: int, draft_model_path: str) -> None:
         from minisgl.models.dflash import DFlashDraftModel
@@ -211,13 +230,351 @@ class DFlashProposer(Proposer):
         # is cacheable. Instead of re-projecting the whole [num_aux, P, hidden] prefix every propose
         # (O(P) per generated token — the ~47 GFLOP/step re-feed that made DFlash a net LOSS), we keep
         # a per-uid, per-layer prefix K/V and project ONLY the newly-accepted tail each step (O(new)).
-        # _kv[uid] = list over layers of [k_ctx, v_ctx]; _kv_plen[uid] = #positions already projected.
-        # Only active on the full-context (aux.dim()==3) path with no ctx window; disable via
-        # MINISGL_DFLASH_PERSIST_KV=0 to fall back to the recompute path (diagnostic).
+        # _kv[uid] = per-layer [k_buf, v_buf]; _kv_fill[uid] = valid rows; _kv_end[uid] = the ABSOLUTE
+        # position that prefix ends at (see _init_prefix_kv). Only active on the full-context
+        # (aux.dim()==3) path; disable via MINISGL_DFLASH_PERSIST_KV=0 for the recompute path
+        # (diagnostic). MINISGL_DFLASH_CTX_WINDOW no longer disables it — the delta is tracked in
+        # absolute positions, so a capped aux buffer is fine; that knob is now purely a scheduler-side
+        # cap on the accumulated aux (and it used to silently revert this whole fast path).
         self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
-        self._kv: dict[int, list] = {}
-        self._kv_plen: dict[int, int] = {}
+        self._init_prefix_kv(0)  # z-lab drafter is bidirectional/unwindowed -> unbounded append
+        self.propose_uncapturable_reason = (
+            "the z-lab DFlash drafter is non-causal and unwindowed — it attends its ENTIRE prefix "
+            "bidirectionally, so there is no fixed-capacity shape to capture")
+
+    # ---- persistent prefix K/V (ring) ------------------------------------------------------------
+    def _init_prefix_kv(self, window: int) -> None:
+        """Size the per-request persistent prefix K/V from the drafter's own attention window.
+
+        `window == 0` (z-lab: causal=False, sliding_window=0 -> `_block_mask` returns None) means the
+        drafter attends the WHOLE prefix bidirectionally, so nothing may be dropped and the cache
+        stays an unbounded append. Laguna (causal + window 512) can only ever read the newest
+        `window` rows, so the cache is a fixed-capacity COMPACTING buffer:
+
+          * capacity C = window + _KV_SLACK. The per-step append is at most block_size rows, so the
+            newest `window` rows are always resident; the slack is amortisation headroom, not
+            correctness. On overflow the newest `window` rows are memmoved to the front ONCE
+            (~1 MB/layer) every ~C-window/append steps, instead of `torch.cat` reallocating and
+            copying the WHOLE prefix on every step of every request (10 full-prefix copies/req/step,
+            O(P) forever, 614 MB/uid resident at a 30k prefix).
+          * COMPACTING, not modulo. A modulo ring permutes the key order, which reorders the probs·V
+            reduction and would force `_block_mask` onto explicit absolute positions. Keeping the
+            rows contiguous keeps the sliced form numerically equivalent to the unsliced one.
+        """
+        self._kv_window = window
+        self._kv_cap = (window + _KV_SLACK) if window > 0 else 0
+        # How many trailing aux rows the SCHEDULER needs to keep for us (0 = all). The drafter reads
+        # at most `window` prefix rows and we re-project at most one accepted block per step, so
+        # window + block_size is exactly sufficient — everything older is masked to -inf anyway.
+        self.aux_ctx_cap = (window + self._block_size) if window > 0 else 0
+        self._kv: dict[int, list] = {}       # uid -> per-layer [k_buf, v_buf]
+        self._kv_fill: dict[int, int] = {}   # uid -> valid rows in those buffers
+        # uid -> ABSOLUTE end position of the prefix already projected (== req.cached_len at the time
+        # of projection). Deliberately absolute rather than "rows projected": once the scheduler caps
+        # the aux buffer at `aux_ctx_cap`, its length P STOPS GROWING, so a `P > cached_rows` delta
+        # test silently stops projecting anything. cached_len never stops growing.
+        self._kv_end: dict[int, int] = {}
+
+    def _append_prefix_kv(self, uid: int, new_kv: list, rebuild: bool) -> list:
+        """Append the freshly-projected tail rows to uid's persistent prefix K/V; return the live
+        per-layer (k, v) views. `rebuild` forces a cold start (uid reuse / inconsistent delta)."""
+        n = new_kv[0][0].shape[0]
+        C, W = self._kv_cap, self._kv_window
+        cache = None if rebuild else self._kv.get(uid)
+        if cache is None:
+            self._kv.pop(uid, None)
+            if C == 0:  # unbounded (bidirectional drafter): plain append, as before
+                self._kv[uid] = [[k, v] for (k, v) in new_kv]
+                self._kv_fill[uid] = n
+                return self._kv[uid]
+            cache = [
+                [torch.empty((C,) + k.shape[1:], dtype=k.dtype, device=k.device),
+                 torch.empty((C,) + v.shape[1:], dtype=v.dtype, device=v.device)]
+                for (k, v) in new_kv
+            ]
+            self._kv[uid] = cache
+            fill = 0
+        else:
+            fill = self._kv_fill.get(uid, 0)
+
+        if C == 0:
+            for l, (k, v) in enumerate(new_kv):
+                cache[l][0] = torch.cat([cache[l][0], k], dim=0)
+                cache[l][1] = torch.cat([cache[l][1], v], dim=0)
+            self._kv_fill[uid] = fill + n
+            return cache
+
+        if n >= C:  # a single append bigger than the ring: only its newest C rows can ever be read
+            for l, (k, v) in enumerate(new_kv):
+                cache[l][0].copy_(k[-C:])
+                cache[l][1].copy_(v[-C:])
+            self._kv_fill[uid] = C
+            return cache
+        if fill + n > C:
+            # Compact: keep the newest rows the window can still reach, memmoved to the front. The
+            # .clone() is required — copy_ between OVERLAPPING slices of the same tensor is UB.
+            keep = min(fill, W, C - n)
+            for l in range(len(cache)):
+                for t in (0, 1):
+                    buf = cache[l][t]
+                    if keep > 0:
+                        buf[:keep].copy_(buf[fill - keep : fill].clone())
+            fill = keep
+        for l, (k, v) in enumerate(new_kv):
+            cache[l][0][fill : fill + n].copy_(k)
+            cache[l][1][fill : fill + n].copy_(v)
+        self._kv_fill[uid] = fill + n
+        return cache
+
+    # ---- CAPTURED propose: the fixed-shape ring + the four hooks -------------------------------
+    def init_propose_capture(self, engine) -> None:
+        """Allocate the persistent per-slot prefix-K/V RING and the static propose I/O.
+
+        Why a ring pool and not the per-uid compacting buffers this replaces: a captured graph records
+        kernel argument POINTERS, so a dict of freshly allocated per-uid tensors can never be baked
+        into one. The pool is ONE tensor per layer, `[slots, C, Hkv, hd]`, indexed by the same stable
+        `req.table_idx` the page_table and the GDN/CCA recurrent state use, plus ONE extra NULL row
+        that bucket-padding and discarded projections write into.
+
+        MODULO ring, not the compacting buffer. Compaction is a conditional memmove — host control
+        flow, which a graph cannot contain. The cost of going modulo is that the ring's column order
+        is no longer position order, so the mask can no longer be built from concatenation indices:
+        `_ppos[slot, col]` carries each column's ABSOLUTE position and the mask is
+        `pos <= qpos and (qpos - pos) < window`. That is strictly more general, and it incidentally
+        removes the latent bug where a nonzero MINISGL_DFLASH_POS_OFF made RoPE positions
+        non-contiguous while `_block_mask` still assumed they were.
+
+        Capacity C = window + block: a query at the END of the block reaches back `window` positions,
+        and the ring must additionally absorb the block's worth of newly committed positions before
+        the oldest needed key is overwritten."""
+        d = self._draft
+        dev, dt = self._device, self._dtype
+        L = len(d.layers)
+        Hkv, hd = d.layers[0].num_kv_heads, d.layers[0].head_dim
+        C = self._kv_cap                      # window + _KV_SLACK, from _init_prefix_kv
+        A = self._block_size                  # positions committed per step is at most one block
+        self._pc_A = A
+        self._pc_C = C
+        self._window = self._kv_window
+        self._num_aux = len(self.capture_layer_ids or [])
+        self._hidden = int(d.hidden_size)
+        vocab = int(engine.model.model.embed_tokens.num_embeddings)
+
+        # Slot space. `req.table_idx` runs 0..max_running_req, so the pool would like that many rows;
+        # a row costs L*C*Hkv*hd*2 (K and V) bytes, which at a 512-window Laguna drafter is ~10.8 MB.
+        # Cap it against the memory actually free at build time (the KV pool is already allocated by
+        # now) rather than trusting max_running_req: a request whose slot falls outside the pool
+        # simply skips propose and decodes plain, which is lossless.
+        from minisgl.engine.graph import get_free_memory
+
+        per_slot = L * C * Hkv * hd * dt.itemsize * 2
+        want = int(engine.page_table.shape[0])
+        # `or "0.30"` not a dict default: docker-compose's `VAR: "${VAR:-}"` sets the variable to the
+        # EMPTY STRING, so the key IS present and `os.environ.get(k, default)` returns "" — which
+        # float() raises on and which kills the serve at boot, not at the call site. Every other env
+        # reader in this file already uses the `or` form; these three KV_FRAC readers did not, so
+        # forwarding any of them through compose (the only way this repo serves) was fatal.
+        budget = int(get_free_memory(dev)
+                     * float(os.environ.get("MINISGL_DFLASH_KV_FRAC") or "0.30"))
+        self._pool_slots = max(1, min(want, budget // max(per_slot, 1)))
+        self._null_slot = self._pool_slots
+        S = self._pool_slots + 1
+        self._pk = [torch.zeros(S, C, Hkv, hd, device=dev, dtype=dt) for _ in range(L)]
+        self._pv = [torch.zeros(S, C, Hkv, hd, device=dev, dtype=dt) for _ in range(L)]
+        self._ppos = torch.full((S, C), _NO_POS, dtype=torch.int64, device=dev)
+
+        G = S  # static I/O rows: one per pool slot (+NULL), which bounds the captured bucket too
+        Q = self._block_size
+        self._g_slots = torch.zeros(G, dtype=torch.int64, device=dev)
+        # [slot, ring column, absolute position, rope position] for the A projected prefix rows/req
+        self._g_pre = torch.zeros(4, G, A, dtype=torch.int64, device=dev)
+        # [block token ids, block RoPE positions, block ABSOLUTE positions]
+        self._g_blk = torch.zeros(3, G, Q, dtype=torch.int64, device=dev)
+        self._aux_stage = torch.zeros(G, A, self._num_aux, self._hidden, device=dev, dtype=dt)
+        self._g_out = torch.zeros(G, Q - 1, dtype=torch.int64, device=dev)
+        # Block logits live in a static buffer because DDTree reads the per-position top-K marginals
+        # of the SAME forward; a graph's internal tensors are not addressable from Python afterwards.
+        # fp32 so it is lossless whatever kernel family the LM head dispatched to (the bf16 decode
+        # GEMV below M=16, minv above it) — DDTree reads log-probs off this, not off the argmax.
+        self._g_logits = torch.zeros(G * (Q - 1), vocab, device=dev, dtype=torch.float32)
+        # Causal mask WITHIN the block. Position-independent and window-independent (the block is
+        # `block_size` wide and the window is far larger), so it is a constant, not per-step data.
+        tri = torch.arange(Q, device=dev).view(Q, 1) >= torch.arange(Q, device=dev).view(1, Q)
+        self._blk_tri = torch.where(tri, 0.0, float("-inf")).to(torch.float32)
+        # Pinned host staging -> three H2D copies per step for the whole batch.
+        self._h_slots = torch.zeros(G, dtype=torch.int64, pin_memory=True)
+        self._h_pre = torch.zeros(4, G, A, dtype=torch.int64, pin_memory=True)
+        self._h_blk = torch.zeros(3, G, Q, dtype=torch.int64, pin_memory=True)
+        self._ar_A = torch.arange(A, dtype=torch.int64)     # host, for the staging arithmetic
+        self._ar_Q = torch.arange(Q, dtype=torch.int64)
+        self._slot_uid: dict[int, int] = {}   # pool slot -> owning uid (reset the ring on reuse)
+        self._ring_end: dict[int, int] = {}   # pool slot -> ABSOLUTE end position already projected
+        self._rebuilds = 0                    # cold/gap eager rebuilds (evidence, not a knob)
+        self.propose_capturable = True
+        self.init_propose_capture_state(engine, tag="DFlash")
+        logger.info_rank0(
+            f"spec-decode: DFlash propose ring (slots={self._pool_slots}+NULL of {want}, C={C}, "
+            f"block={Q}, window={self._window}, prefix-KV "
+            f"{2 * L * S * C * Hkv * hd * dt.itemsize / 1e6:.0f} MB, "
+            f"logits buf {self._g_logits.numel() * 4 / 1e6:.0f} MB)")
+
+    @torch.inference_mode()
+    def _rebuild_ring(self, slot: int, aux: torch.Tensor, end: int, m: int) -> None:
+        """EAGER cold/gap rebuild of one slot's resident window: project the newest `m` committed aux
+        positions and scatter them into the ring. Runs once per request (its first propose, or after
+        a gap the fixed block-sized tail cannot bridge), never in the steady state — the counter is
+        reported so "captured" can't quietly mean "rebuilding every step"."""
+        dev = self._device
+        P = int(aux.shape[1])
+        rows = aux[:, P - m : P].permute(1, 0, 2).contiguous().to(self._dtype)  # [m, num_aux, hidden]
+        pos = torch.arange(end - m, end, dtype=torch.int64, device=dev)
+        col = pos % self._pc_C
+        ws = torch.full((m,), slot, dtype=torch.int64, device=dev)
+        self._draft.project_prefix_into(rows, pos.to(torch.int32), self._pk, self._pv, ws, col)
+        self._ppos[slot].fill_(_NO_POS)
+        self._ppos[slot, col] = pos
+        self._rebuilds += 1
+
+    def stage_propose(
+        self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, topk: int = 0, **kw
+    ) -> Optional[StagedPropose]:
+        A, C, Q = self._pc_A, self._pc_C, self._block_size
+        rows: List[int] = []
+        budget: List[int] = []
+        hs, hpre, hblk, ar = self._h_slots, self._h_pre, self._h_blk, self._ar_A
+        for i, req in enumerate(reqs):
+            # The block emits up to Q-1 drafts; clamp to the per-step and per-request budgets.
+            k_i = max(0, min(num_draft, Q - 1, req.remain_len - 1))
+            aux = ctx.aux_hidden.get(req.uid)
+            if k_i <= 0 or aux is None or aux.dim() != 3 or aux.shape[1] < 1:
+                continue
+            slot = int(req.table_idx)
+            if slot >= self._pool_slots:
+                self._pc_warn_once(
+                    "slot", f"req slot {slot} is outside the {self._pool_slots}-slot prefix ring "
+                            "(memory-capped) — this request decodes plain")
+                continue
+            end = int(req.cached_len)
+            P = int(aux.shape[1])
+            if self._slot_uid.get(slot) != req.uid:      # slot reused by a new request
+                self._slot_uid[slot] = req.uid
+                self._ring_end.pop(slot, None)
+            covered = self._ring_end.get(slot)
+            if covered is None or end < covered or end - covered > A:
+                self._rebuild_ring(slot, aux, end, min(P, C))
+            self._ring_end[slot] = end
+
+            j = len(rows)
+            m = min(P, A)
+            # Stage the FIXED block-sized aux tail. The leading A-m rows (only before the request has
+            # committed a full block) are zero and are routed to the NULL slot below.
+            self._aux_stage[j, A - m :].copy_(aux[:, P - m : P].permute(1, 0, 2))
+            if m < A:
+                self._aux_stage[j, : A - m].zero_()
+            p = end - A + ar                                # absolute position of each staged row
+            live = ar >= (A - m)
+            hs[j] = slot
+            hpre[0, j] = torch.where(live, torch.full_like(p, slot),
+                                     torch.full_like(p, self._null_slot))
+            hpre[1, j] = torch.where(live, p % C, torch.zeros_like(p))
+            hpre[2, j] = torch.where(live, p, torch.full_like(p, _NO_POS))
+            hpre[3, j] = p.clamp(min=0)                     # RoPE position (never negative)
+            hblk[0, j, 0] = int(req.input_ids[end])         # anchor
+            hblk[0, j, 1:] = self._mask_token_id
+            hblk[1, j] = end + self._pos_off + self._ar_Q   # RoPE positions of the block
+            hblk[2, j] = end + self._ar_Q                   # ABSOLUTE positions (mask)
+            rows.append(i)
+            budget.append(k_i)
+        if not rows:
+            return None
+        B = len(rows)
+        self._g_slots[:B].copy_(hs[:B], non_blocking=True)
+        self._g_pre[:, :B].copy_(hpre[:, :B], non_blocking=True)
+        self._g_blk[:, :B].copy_(hblk[:, :B], non_blocking=True)
+        return StagedPropose(B, rows, budget)
+
+    def pad_propose_rows(self, bs: int, bucket: int) -> None:
+        """Route rows [bs, bucket) entirely at the NULL slot: their projections land in a row nobody
+        reads, their prefix mask is all -inf (every NULL column carries _NO_POS) and only their own
+        block's causal diagonal survives — so the softmax still has a live key and cannot produce a
+        NaN that a later kernel would propagate out of the graph."""
+        self._g_slots[bs:bucket].fill_(self._null_slot)
+        self._g_pre[0, bs:bucket].fill_(self._null_slot)
+        self._g_pre[1, bs:bucket].zero_()
+        self._g_pre[2, bs:bucket].fill_(_NO_POS)
+        self._g_pre[3, bs:bucket].zero_()
+        self._g_blk[:, bs:bucket].zero_()
+        self._aux_stage[bs:bucket].zero_()
+
+    def propose_body(self, bs: int) -> None:
+        """THE CAPTURED BODY: fixed block-sized prefix projection -> absolute-position mask -> one
+        batched denoising forward -> head. Reads only the static buffers' first `bs` rows; writes the
+        ring, `_g_out` and `_g_logits`. No host sync, no data-dependent shape, one fixed trip count."""
+        d = self._draft
+        A, C, Q = self._pc_A, self._pc_C, self._block_size
+        m = bs * A
+        # 1) Re-project the newest A committed positions into the ring. Idempotent for the ones
+        #    already there (the aux of a committed position never changes), so a fixed row count can
+        #    stand in for the step's variable number of newly accepted positions.
+        pre = self._g_pre[:, :bs]
+        ws, wc, wp = pre[0].reshape(m), pre[1].reshape(m), pre[2].reshape(m)
+        d.project_prefix_into(
+            self._aux_stage[:bs].reshape(m, self._num_aux, self._hidden),
+            pre[3].reshape(m).to(torch.int32), self._pk, self._pv, ws, wc)
+        self._ppos[ws, wc] = wp
+        # 2) Additive mask from ABSOLUTE positions (see init_propose_capture for why not concat idx).
+        slots = self._g_slots[:bs]
+        pa = self._ppos[slots].unsqueeze(1)              # [bs, 1, C]
+        qa = self._g_blk[2, :bs].unsqueeze(2)            # [bs, Q, 1]
+        keep = (pa <= qa) & ((qa - pa) < self._window)
+        mask = torch.cat(
+            [torch.where(keep, 0.0, float("-inf")).to(torch.float32),
+             self._blk_tri.expand(bs, Q, Q)], dim=2)     # [bs, Q, C+Q]
+        # 3) One batched denoising forward over [anchor, mask, mask, ...].
+        noise = d.embed(self._g_blk[0, :bs].reshape(-1)).to(self._dtype).view(bs, Q, -1)
+        hidden = d.denoise_batched(
+            noise, self._g_blk[1, :bs].to(torch.int32), self._pk, self._pv, slots, mask)
+        # 4) Head over block rows 1..Q-1 only (row 0 is the known anchor and is never read).
+        n = bs * (Q - 1)
+        logits = d.head(hidden[:, 1:].reshape(n, -1))
+        self._g_logits[:n] = logits
+        ids = logits.argmax(dim=-1)
+        if self._compressed:
+            ids = ids + self._d2t[ids]                   # draft vocab -> target vocab (on device)
+        self._g_out[:bs] = ids.view(bs, Q - 1)
+
+    def read_drafts(
+        self, reqs: List["Req"], staged: StagedPropose, topk: int = 0, **kw
+    ) -> List[List[int]]:
+        out: List[List[int]] = [[] for _ in reqs]
+        Q = self._block_size
+        drafts = self._g_out[: staged.bs].cpu().tolist()      # ONE D2H for the whole step
+        for i, k_i, row in zip(staged.rows, staged.budget, drafts):
+            out[i] = row[:k_i]
+            if self._dbg:
+                print(f"[dflash-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}", flush=True)
+        if topk > 0:
+            # DDTree: per-position top-K marginals of the SAME forward, read off the static logits
+            # buffer. Two batched D2H copies for the step, not two per request.
+            n = staged.bs * (Q - 1)
+            lp = torch.log_softmax(self._g_logits[:n].float(), dim=-1)
+            tv, ti = lp.topk(topk, dim=-1)
+            if self._compressed:
+                ti = ti + self._d2t[ti]
+            ti_all, tv_all = ti.cpu().tolist(), tv.cpu().tolist()
+            for j, (i, k_i) in enumerate(zip(staged.rows, staged.budget)):
+                b = j * (Q - 1)
+                self._ddtree_topk[id(reqs[i])] = (ti_all[b : b + k_i], tv_all[b : b + k_i])
+        return out
+
+    def reset_propose_state(self) -> None:
+        """Undo what the warmup/capture dummy batch wrote. It ran entirely on the NULL slot, so only
+        that row's position vector needs clearing; no live request can have observed anything."""
+        self._ppos[self._null_slot].fill_(_NO_POS)
+        self._slot_uid.clear()
+        self._ring_end.clear()
+        self._rebuilds = 0
 
     def _build_cca(self, engine, hf, cfg, dfc, folder, hidden, num_layers) -> None:
         """Build + load the CCA-recurrent DFlash drafter (ZAYA DFlashCCADraftModel). B = 1 + num_draft
@@ -262,8 +619,12 @@ class DFlashProposer(Proposer):
         self._ctx_pos_env = None
         # rdna4's on_accept/free reference the persistent-KV dicts (Qwen path); the CCA drafter has no
         # persistent KV, so init them empty so free()/on_accept are safe no-ops for CCA reqs.
-        self._kv = {}
-        self._kv_plen = {}
+        self._persist = False
+        self._ctx_window = 0
+        self._init_prefix_kv(0)
+        self.propose_uncapturable_reason = (
+            "the CCA-recurrent drafter fuses its context into a single position — it owns no prefix "
+            "KV, so there is no fixed-shape propose body to capture")
 
     def _load_cca_weights(self, folder: str) -> None:
         """Load the CCA drafter checkpoint (keys: fc, norm, layers.i.{linear_q,linear_k,val_proj,o_proj,
@@ -385,8 +746,23 @@ class DFlashProposer(Proposer):
         self._ctx_pos_env = os.environ.get("MINISGL_DFLASH_CTX_POS")
         self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
-        self._kv: dict[int, list] = {}
-        self._kv_plen: dict[int, int] = {}
+        # O(window), not O(context): gated on the drafter's OWN mask being windowed+causal. Without
+        # both, `_block_mask` returns None and the block attends the full prefix bidirectionally, so
+        # dropping rows would change results rather than skip discarded work.
+        self._init_prefix_kv(sliding_window if (causal and sliding_window > 0) else 0)
+        if self._kv_window > 0 and self._persist:
+            # Bounded prefix => a fixed-capacity ring => a capturable propose. Allocating the ring
+            # here REPLACES the per-uid compacting buffers for this drafter (nothing reads them on
+            # the captured path); the unwindowed z-lab drafter keeps them.
+            self.init_propose_capture(engine)
+        else:
+            # Record WHY, so the engagement readout says ALWAYS-EAGER(never: <reason>) instead of a
+            # `replay=0 eager=0` that reads like "no fallbacks". `propose_capturable` stays False, so
+            # `propose` keeps the eager per-uid path and nothing here touches the capture state.
+            self.propose_uncapturable_reason = (
+                f"this drafter has no bounded prefix (causal={causal}, "
+                f"sliding_window={sliding_window})" if self._kv_window <= 0 else
+                "MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off")
 
         # PROMPT-PREFILL SEED (full-context path only). Without it the drafter's aux prefix is built
         # append-only from ACCEPTED GENERATED positions (scheduler.py:_spec_aux_hidden), so its context
@@ -427,7 +803,9 @@ class DFlashProposer(Proposer):
             f"DFlash Laguna drafter: {num_layers}L h={hidden} heads={num_heads}/{num_kv_heads} "
             f"block={self._block_size} mask_id={self._mask_token_id} window={sliding_window} "
             f"causal={causal} aux_layers={self.capture_layer_ids} "
-            f"prefill_seed=on(tail={self.prefill_aux_tail or 'all'}) (bf16, borrow target embed/head)"
+            f"prefill_seed=on(tail={self.prefill_aux_tail or 'all'}) "
+            f"prefix_kv={'ring cap=' + str(self._kv_cap) if self._kv_cap else 'unbounded'} "
+            f"aux_cap={self.aux_ctx_cap or 'unbounded'} (bf16, borrow target embed/head)"
         )
 
     def _load_laguna_weights(self, folder: str) -> None:
@@ -563,17 +941,39 @@ class DFlashProposer(Proposer):
     def propose(
         self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, topk: int = 0
     ) -> List[List[int]]:
+        """Dispatch on the DRAFTER, not on a flag.
+
+        A causal + sliding-window drafter (Laguna) has a bounded prefix, so it rides the shared
+        captured path (`CapturableProposer.propose` -> stage/body/read). A non-causal, unwindowed
+        z-lab drafter attends its ENTIRE prefix bidirectionally and a CCA-recurrent drafter has no
+        prefix at all; neither has a fixed-capacity shape to capture, so both keep the eager
+        per-request path below. That is a checkpoint property, not an env switch."""
+        self._ddtree_topk: dict[int, tuple] = {}
+        if self.propose_capturable:
+            return super().propose(reqs, num_draft, ctx, topk=topk)
+        return self._propose_eager(reqs, num_draft, ctx, topk)
+
+    @torch.inference_mode()
+    def _propose_eager(
+        self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, topk: int = 0
+    ) -> List[List[int]]:
         out: List[List[int]] = [[] for _ in reqs]
         draft = self._draft
         device = self._device
         mask_id = self._mask_token_id
         B = self._block_size
-        # DDTree (topk>0): stash the per-position top-K MARGINALS (target-vocab ids + log-probs) of the
-        # k_i drafted positions per req, keyed by id(req), for build_draft_tree. Mirrors the scheduler's
-        # _tidar_block_predict topk path. Cleared each call.
-        self._ddtree_topk: dict[int, tuple] = {}
+        # DDTree (topk>0): the per-position top-K MARGINALS (target-vocab ids + log-probs) of the k_i
+        # drafted positions per req are stashed in `self._ddtree_topk`, keyed by id(req), for
+        # build_draft_tree. Mirrors the scheduler's _tidar_block_predict topk path; cleared by
+        # `propose` each call (both dispatch arms fill the same dict).
         if self._is_cca:
             return self._propose_cca(reqs, num_draft, ctx, topk, out)
+        # ONE host sync per STEP, not per request. The drafted ids stay on device through the whole
+        # per-request loop and are read back once at the end; the old `ids.tolist()` inside the loop
+        # stalled the queue N times per step, serialising every request's ~150 kernel launches behind
+        # the previous request's completion.
+        pend: List[tuple] = []      # (out_index, req, anchor_tok, base_pos, k_i, ids[k_i])
+        pend_topk: List[tuple] = []  # (id(req), ti[k_i,topk], tv[k_i,topk])
         for i, req in enumerate(reqs):
             # Block emits up to B-1 drafts; clamp to the per-step draft budget and the req budget.
             k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))
@@ -593,33 +993,46 @@ class DFlashProposer(Proposer):
                 # their TRUE absolute RoPE positions; the block [anchor, mask...] follows at [base_pos..].
                 P = aux.shape[1]
                 ctx_start = req.cached_len - P
-                if self._persist and self._ctx_window == 0:
-                    # FAST PATH: project only the newly-accepted tail [cached .. P-1] and append it to
-                    # the per-uid persistent K/V; reuse the cached prefix for the rest. The scheduler
-                    # only appends accepted positions to `aux`, so aux[:, :cached] is unchanged from the
+                if self._persist:
+                    # FAST PATH: project only the newly-committed tail and append it to the per-uid
+                    # persistent K/V; reuse the cached prefix for the rest. The scheduler only appends
+                    # ACCEPTED positions to `aux`, so everything before the tail is unchanged from the
                     # previous step and needs no re-projection. free(uid) drops the cache on finish.
+                    #
+                    # The delta is measured in ABSOLUTE positions (`req.cached_len`), not in aux rows:
+                    # once the scheduler caps the aux buffer at `aux_ctx_cap` its row count P stops
+                    # growing, and the old `P > rows_already_projected` test would then silently stop
+                    # projecting anything at all.
                     uid = req.uid
-                    cached = self._kv_plen.get(uid, 0)
-                    if P < cached:  # uid reuse without free (defensive): rebuild from scratch
-                        cached = 0
-                        self._kv.pop(uid, None)
-                    if P > cached:
-                        new_aux = aux[:, cached:P].permute(1, 0, 2).contiguous().to(self._dtype)
+                    prev_end = self._kv_end.get(uid, 0)
+                    n = req.cached_len - prev_end
+                    rebuild = uid not in self._kv or not (0 <= n <= P)
+                    if rebuild:
+                        n = P
+                    if n > 0:
+                        new_aux = aux[:, P - n : P].permute(1, 0, 2).contiguous().to(self._dtype)
                         new_pos = torch.arange(
-                            ctx_start + cached, ctx_start + P, dtype=torch.int32, device=device
+                            req.cached_len - n, req.cached_len, dtype=torch.int32, device=device
                         )
                         new_kv = draft.project_prefix(new_aux, new_pos)  # per-layer (k_ctx, v_ctx)
-                        if cached == 0:
-                            self._kv[uid] = [[k, v] for (k, v) in new_kv]
-                        else:
-                            cache = self._kv[uid]
-                            for l, (k, v) in enumerate(new_kv):
-                                cache[l][0] = torch.cat([cache[l][0], k], dim=0)
-                                cache[l][1] = torch.cat([cache[l][1], v], dim=0)
-                        self._kv_plen[uid] = P
-                    prefix_kv = self._kv[uid]
+                        cache = self._append_prefix_kv(uid, new_kv, rebuild)
+                        self._kv_end[uid] = req.cached_len
+                    else:
+                        cache = self._kv.get(uid)
+                    if cache is None:
+                        # No prefix at all (an empty aux buffer on a cold uid). Nothing to condition
+                        # on, so skip this req -> plain decode. Lossless; verify gates every token.
+                        continue
+                    fill = self._kv_fill[uid]
+                    prefix_kv = [(k[:fill], v[:fill]) for (k, v) in cache]
                 else:
-                    # Recompute path (persist disabled or ctx-window active): project the whole prefix.
+                    # Recompute path (MINISGL_DFLASH_PERSIST_KV=0, diagnostic): re-project the prefix
+                    # every step. Window-slice the AUX first, so `fuse_aux` (the 10240->2048 fc, the
+                    # single biggest FLOP here) also runs O(window) instead of O(context).
+                    if 0 < self._kv_window < P:
+                        aux = aux[:, P - self._kv_window :]
+                        P = self._kv_window
+                        ctx_start = req.cached_len - P
                     aux_t = aux.permute(1, 0, 2).contiguous().to(self._dtype)  # [P, num_aux, hidden]
                     target_hidden = draft.fuse_aux(aux_t)  # [P, hidden]
                     ctx_pos = torch.arange(
@@ -643,23 +1056,44 @@ class DFlashProposer(Proposer):
                 hidden = draft.denoise_cached(noise_embed, prefix_kv, block_pos)  # [B, hidden]
             else:
                 hidden = draft.denoise(noise_embed, target_hidden, block_pos, ctx_pos)  # [B, hidden]
-            logits = draft.head(hidden)  # [B, vocab]
-            # Positions 1..B-1 are the speculation (position 0 is the known anchor).
-            block_logits = logits[1 : 1 + k_i]  # [k_i, vocab]
+            # SLICE THE ROWS BEFORE THE HEAD. Positions 1..k_i are the speculation (position 0 is the
+            # known anchor) and rows k_i+1..B-1 were never read, yet the borrowed target head scored
+            # all B of them over the full 100352-wide vocab, TP-all_gathered them, and paid a
+            # .permute().contiguous() copy on the result. Bit-identical, unlike (a)-(c): the head is
+            # M-INVARIANT BY CONSTRUCTION (layers/embedding.py:16-21 — per-(row,col) independent fp32
+            # dot in a fixed K-order), and B=16 -> k_i=15 rows stays inside the same
+            # `dense_bf16_gemv` band (_LMHEAD_GEMV_MMAX = 16), so no kernel-family switch either.
+            block_logits = draft.head(hidden[1 : 1 + k_i])  # [k_i, vocab]
             ids = block_logits.argmax(dim=-1)  # [k_i] draft-vocab ids
             if self._compressed:
                 ids = ids + self._d2t[ids]  # draft id -> target id (delta map)
-            drafts = [int(x) for x in ids.tolist()]
-            out[i] = drafts
+            pend.append((i, req, anchor_tok, base_pos, k_i, ids))
             if topk > 0 and k_i > 0:
                 lp = torch.log_softmax(block_logits.float(), dim=-1)  # [k_i, vocab]
                 tv, ti = lp.topk(topk, dim=-1)  # [k_i, topk], descending
                 if self._compressed:
                     ti = ti + self._d2t[ti]  # draft ids -> target ids (delta map)
-                self._ddtree_topk[id(req)] = (ti.cpu().tolist(), tv.cpu().tolist())
-            if self._dbg:
-                print(f"[dflash-dbg] uid={req.uid} anchor={anchor_tok} base_pos={base_pos} "
-                      f"B={B} k={k_i} draft={drafts}", flush=True)
+                pend_topk.append((id(req), ti, tv))
+
+        # --- the ONE host sync of the step -------------------------------------------------------
+        if pend:
+            flat = torch.cat([p[5] for p in pend]).tolist()  # single D2H for the whole batch
+            off = 0
+            for (i, req, anchor_tok, base_pos, k_i, _ids) in pend:
+                out[i] = flat[off : off + k_i]
+                off += k_i
+                if self._dbg:
+                    print(f"[dflash-dbg] uid={req.uid} anchor={anchor_tok} base_pos={base_pos} "
+                          f"B={B} k={k_i} draft={out[i]}", flush=True)
+        if pend_topk:
+            # DDTree only. Two batched D2H copies for the whole step instead of two PER REQUEST.
+            ti_all = torch.cat([p[1] for p in pend_topk]).cpu().tolist()
+            tv_all = torch.cat([p[2] for p in pend_topk]).cpu().tolist()
+            off = 0
+            for (rid, ti, _tv) in pend_topk:
+                n = ti.shape[0]
+                self._ddtree_topk[rid] = (ti_all[off : off + n], tv_all[off : off + n])
+                off += n
         return out
 
     def _propose_cca(self, reqs, num_draft, ctx, topk, out):
@@ -716,6 +1150,15 @@ class DFlashProposer(Proposer):
         return
 
     def free(self, uid: int) -> None:
-        # Drop the finished/aborted request's persistent draft K/V (and its projected-length counter).
+        # Drop the finished/aborted request's persistent draft K/V (and its cursors).
         self._kv.pop(uid, None)
-        self._kv_plen.pop(uid, None)
+        self._kv_fill.pop(uid, None)
+        self._kv_end.pop(uid, None)
+        if self.propose_capturable:
+            # Release the ring slot. Stale K/V need not be zeroed — clearing the slot's ownership is
+            # enough, because the next owner's first propose rebuilds the ring and resets every
+            # column's ABSOLUTE POSITION to _NO_POS, which is what the mask actually consults.
+            for s, u in list(self._slot_uid.items()):
+                if u == uid:
+                    del self._slot_uid[s]
+                    self._ring_end.pop(s, None)

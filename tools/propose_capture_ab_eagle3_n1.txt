@@ -1,0 +1,65 @@
+=== cap [identity] MODEL=glm SPEC=eagle3 NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 50 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 384
+WALL 6.421
+TPS 59.806
+MD5 7fde84c9b4396b573b01cfa8f7aad54b
+SAMPLE ```python # Persistent Red-Black Tree Implementation # This implementation is fully persistent: each operation
+  drafted chains captured: 354
+
+=== eager [identity] MODEL=glm SPEC=eagle3 NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING= MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG=2 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 50 MB)
+    propose capture disabled by A/B override
+TOKENS 384
+WALL 6.898
+TPS 55.669
+MD5 7fde84c9b4396b573b01cfa8f7aad54b
+SAMPLE ```python # Persistent Red-Black Tree Implementation # This implementation is fully persistent: each operation
+  drafted chains captured: 354
+
+=== REPLAY-vs-EAGER DRAFT IDENTITY (eagle3_n1) ===
+  IDENTICAL (verbatim): 354 drafted chains
+
+=== cap [timing] MODEL=glm SPEC=eagle3 NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE= MINISGL_SPEC_DEBUG= 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 50 MB)
+    PROPOSE graphs CAPTURED buckets=[1]
+TOKENS 768
+WALL 13.158
+TPS 58.369
+MD5 5ac21bf1c343ebe03cde4f957cb7cfe4
+SAMPLE ```python # Persistent Red-Black Tree Implementation # This implementation is fully persistent: each operation
+  [spec-timing] lines:
+[spec-timing] step=50 propose=6.7ms stage=0.3ms forward=26.3ms accept=0.4ms total=33.7ms propose-graph replay=50 eager=0 buckets=[1]
+[spec-timing] step=100 propose=6.6ms stage=0.3ms forward=26.2ms accept=0.4ms total=33.5ms propose-graph replay=100 eager=0 buckets=[1]
+[spec-timing] step=150 propose=6.6ms stage=0.3ms forward=26.3ms accept=0.5ms total=33.6ms propose-graph replay=150 eager=0 buckets=[1]
+[spec-timing] step=200 propose=6.6ms stage=0.3ms forward=26.3ms accept=0.4ms total=33.6ms propose-graph replay=200 eager=0 buckets=[1]
+[spec-timing] step=250 propose=6.6ms stage=0.3ms forward=26.5ms accept=0.4ms total=33.7ms propose-graph replay=250 eager=0 buckets=[1]
+[spec-timing] step=300 propose=6.6ms stage=0.3ms forward=26.6ms accept=0.4ms total=33.9ms propose-graph replay=300 eager=0 buckets=[1]
+[spec-timing] step=350 propose=6.6ms stage=0.3ms forward=26.7ms accept=0.4ms total=34.0ms propose-graph replay=350 eager=0 buckets=[1]
+
+=== eager [timing] MODEL=glm SPEC=eagle3 NREQ=1 ===
+  env witness: MINISGL_SPEC_TIMING=1 MINISGL_SPEC_PROPOSE_NOCAPTURE=1 MINISGL_SPEC_DEBUG= 
+  capture witness:
+    propose buffers (slots=2+NULL, max_ctx=8192, draft-KV 50 MB)
+    propose capture disabled by A/B override
+TOKENS 768
+WALL 13.656
+TPS 56.238
+MD5 5ac21bf1c343ebe03cde4f957cb7cfe4
+SAMPLE ```python # Persistent Red-Black Tree Implementation # This implementation is fully persistent: each operation
+  [spec-timing] lines:
+[spec-timing] step=50 propose=9.9ms stage=0.3ms forward=26.4ms accept=0.4ms total=37.1ms propose-graph replay=0 eager=50 buckets=[]
+[spec-timing] step=100 propose=8.4ms stage=0.3ms forward=26.3ms accept=0.5ms total=35.4ms propose-graph replay=0 eager=100 buckets=[]
+[spec-timing] step=150 propose=7.8ms stage=0.3ms forward=26.3ms accept=0.4ms total=34.9ms propose-graph replay=0 eager=150 buckets=[]
+[spec-timing] step=200 propose=7.6ms stage=0.3ms forward=26.4ms accept=0.4ms total=34.7ms propose-graph replay=0 eager=200 buckets=[]
+[spec-timing] step=250 propose=7.4ms stage=0.3ms forward=26.5ms accept=0.4ms total=34.6ms propose-graph replay=0 eager=250 buckets=[]
+[spec-timing] step=300 propose=7.3ms stage=0.3ms forward=26.6ms accept=0.4ms total=34.6ms propose-graph replay=0 eager=300 buckets=[]
+[spec-timing] step=350 propose=7.2ms stage=0.3ms forward=26.7ms accept=0.5ms total=34.7ms propose-graph replay=0 eager=350 buckets=[]
+

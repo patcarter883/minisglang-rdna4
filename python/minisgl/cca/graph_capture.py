@@ -72,10 +72,19 @@ class CCAVerifyGraphCapture:
 
     def __init__(self, device: torch.device, max_bs: int, num_draft: int,
                  cca_layer_ids, conv_dim: int, conv_width: int, hidden: int) -> None:
-        Q = num_draft + 1
+        # `num_draft` may be a LIST of widths (adaptive verify width, spec/width.py); the per-layer
+        # scratch is allocated at the widest Q and narrower widths take the leading `[:Q]` slice. See
+        # GDNVerifyGraphCapture for the reasoning.
+        widths = [num_draft] if isinstance(num_draft, int) else sorted(set(int(w) for w in num_draft))
+        Q = max(widths) + 1
+        self._Qmax = Q
         self._Q = Q
         self._state_indices = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        self._cu = torch.arange(max_bs + 1, dtype=torch.int32, device=device) * Q
+        self._cu_by_q = {
+            w + 1: torch.arange(max_bs + 1, dtype=torch.int32, device=device) * (w + 1)
+            for w in widths
+        }
+        self._cu = self._cu_by_q[Q]
         # has_initial_state (verify is a multi-query PREFILL-path forward, build_cca_metadata is_prefill
         # =True): True ⟺ cached_len>0 (always so for a verify continuation). Static bool buf refreshed
         # per replay; the captured cca_prefill_qk's `torch.where(has_init, init_conv, 0)` reads it live.
@@ -86,7 +95,14 @@ class CCAVerifyGraphCapture:
         self._prev = {int(lid): torch.zeros(Q, max_bs, hidden, dtype=torch.float32, device=device)
                       for lid in cca_layer_ids}
 
+    def set_width(self, qlen: int) -> None:
+        """Select the captured width (`qlen` query rows/seq) for the next capture/replay."""
+        self._Q = qlen
+        self._cu = self._cu_by_q[qlen]
+        self._seg_full = [qlen] * len(self._seg_full)
+
     def _metadata(self, bs: int) -> CCAMetadata:
+        Q = self._Q
         return CCAMetadata(
             is_prefill=True,  # verify is the multi-query varlen path (matches build_cca_metadata)
             num_seqs=bs,
@@ -94,9 +110,9 @@ class CCAVerifyGraphCapture:
             state_indices=self._state_indices[:bs],
             has_initial_state=self._has_init[:bs],
             capture_verify_state=True,
-            verify_max_qlen=self._Q,
-            conv_scratch={lid: buf[:, :bs] for lid, buf in self._conv.items()},
-            prev_scratch={lid: buf[:, :bs] for lid, buf in self._prev.items()},
+            verify_max_qlen=Q,
+            conv_scratch={lid: buf[:Q, :bs] for lid, buf in self._conv.items()},
+            prev_scratch={lid: buf[:Q, :bs] for lid, buf in self._prev.items()},
             seg_lens=self._seg_full[:bs],
         )
 

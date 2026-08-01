@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from .base import Proposer, ProposeContext
+from minisgl.utils import init_logger
+
+from .base import ProposeContext
+from .capture import CapturableProposer, StagedPropose
 
 if TYPE_CHECKING:
     from minisgl.core import Req
 
 
 __all__ = ["DraftModelProposer"]
+
+logger = init_logger(__name__)
 
 
 # Target GLM-4.7-Flash decoder layers to capture for EAGLE3 aux fusion.
@@ -27,7 +32,7 @@ _GLM47_CAPTURE_LAYER_IDS = [
 ]
 
 
-class DraftModelProposer(Proposer):
+class DraftModelProposer(CapturableProposer):
     """EAGLE3 draft-model speculative proposer.
 
     Owns a SEPARATE small draft checkpoint (thoughtworks/GLM-4.7-Flash-Eagle3) loaded directly from
@@ -45,15 +50,28 @@ class DraftModelProposer(Proposer):
     **Persistent draft KV.** The single draft layer's self-attention needs the full causal context,
     not just the K-token chain — restricting attention to the chain collapses the head to ~2% accept
     (near random). So this proposer keeps a PERSISTENT per-request draft KV (one layer, like the GLM
-    MTP head): every confirmed token is run through the draft layer (growing the context across decode
-    steps), the K drafts append temporary K/V, and `on_accept` truncates back to the accepted prefix;
-    `free(uid)` drops it on finish. It never touches the engine's paged KV. (`MINISGL_EAGLE3_NO_CTX=1`
-    rebuilds the cache empty each step — the diagnostic that exposed this ~2% floor.)
+    MTP head). It lives in ONE GLOBAL fixed-shape buffer `[max_slots, max_ctx, Hkv, hd]` keyed by
+    `req.table_idx` plus a per-slot cursor, NOT a per-uid Python list: a growing list is both a
+    dynamic contraction dim and a host-side mutation, i.e. two capture blockers, and it made propose
+    O(prompt) in interpreted Python per draft step (the prompt seed pushed P-1 one-row tuples into
+    it, and every step re-stacked the lot). Rejected drafts are not truncated — the cursor simply
+    does not advance past them and next step's mask re-hides their columns.
+
+    **This is a WINDOWED buffer over an UNWINDOWED drafter, and that is a real semantic.** Unlike
+    DFlash, the EAGLE3 draft layer attends every cached key with no sliding window, so capping the
+    buffer at `max_ctx` is not a pure traffic reduction: past the window the drafts genuinely differ.
+    It stays end-to-end LOSSLESS because verify gates every emitted token — but an EAGLE3 A/B must be
+    read as accept-len at a stated window, never as byte-equality of drafts.
     """
 
     needs_last_hidden = False
     capture_layer_ids = _GLM47_CAPTURE_LAYER_IDS
     supports_prefill_seed = True
+    # EAGLE3's per-step seed is fc(aux) at the LAST confirmed position — one column, not a history.
+    # The scheduler's aux accumulator is a global (`MINISGL_DFLASH_FULLCTX`, default on) that is NOT
+    # gated on the proposer, so without this cap it grows a [num_aux, P, hidden] buffer with a
+    # torch.cat per step per request for a consumer that reads exactly one column of it.
+    aux_ctx_cap = 1
 
     def __init__(self, engine, num_draft: int, draft_model_path: str) -> None:
         from minisgl.models.glm_eagle3 import GLMEagle3DraftModel
@@ -109,15 +127,57 @@ class DraftModelProposer(Proposer):
         # Diagnostic offsets for the step-0 embedded-token index and RoPE base position (default 0).
         self._tok_off = int(os.environ.get("MINISGL_EAGLE3_TOK_OFF", "0"))
         self._pos_off = int(os.environ.get("MINISGL_EAGLE3_POS_OFF", "0"))
-        # Persistent per-uid draft KV (one draft layer). Like the MTP head, the EAGLE3 draft's
-        # self-attention needs the full causal context, not just the K draft tokens — restricting
-        # attention to the chain collapses the 1-layer head to near-random. Each entry is the KV for
-        # one processed position; the first `_committed[uid]` are confirmed (permanent), any beyond
-        # are this step's draft tail (truncated by on_accept). MINISGL_EAGLE3_NO_CTX=1 disables it
-        # (rebuild-empty each step) for diagnostics.
-        self._cache: Dict[int, list] = {}
-        self._committed: Dict[int, int] = {}
-        self._no_ctx = os.environ.get("MINISGL_EAGLE3_NO_CTX") == "1"
+        self.init_propose_capture(engine)
+
+    # ------------------------------------------------------------------ hook: buffer allocation
+    def init_propose_capture(self, engine) -> None:
+        """Allocate the global draft-KV buffer, the per-slot cursors and the static propose I/O —
+        once, because a captured graph records POINTERS. Mirrors MTPProposer.init_propose_capture;
+        the only EAGLE3 differences are that the chain feeds BOTH an embedding and a hidden into each
+        step, and that the seed comes from `ctx.aux_hidden` (fused by `fc`) rather than last_hidden."""
+        d = self._draft
+        _nkh, _kdim, _nvh, _vdim = d.draft_buffer_dims()
+        # page_table row count == the slot space of req.table_idx; one EXTRA row is the reserved NULL
+        # slot bucket-padding rows write into (a real row no live sequence owns).
+        self._live_slots = int(engine.page_table.shape[0])
+        self._null_slot = self._live_slots
+        self._max_slots = self._live_slots + 1
+        dev, dt = self._device, self._dtype
+        from minisgl.engine.graph import get_free_memory
+
+        per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize
+        # Budget the persistent buffer AND the per-step k_buf[slot_rows] gather (a second transient
+        # of comparable size at full batch) — the same sizing MTP arrived at after a bs>=4 OOM.
+        # `or` form, not a dict default — compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY
+        # and float("") raises at boot. See the same note in spec/dflash.py.
+        _budget = int(get_free_memory(dev)
+                      * float(os.environ.get("MINISGL_EAGLE3_KV_FRAC") or "0.33"))
+        _mem_cap = max(512, _budget // max(per_col * 2, 1))
+        self._max_ctx = min(int(engine.max_seq_len),
+                            int(os.environ.get("MINISGL_EAGLE3_MAX_CTX") or "8192"),
+                            int(_mem_cap))
+        # Past this committed length a request skips propose and decodes plain: above the window the
+        # seed fell back to cold, so drafts are context-blind while still paying propose + verify.
+        self._ctx_gate = int(os.environ.get("MINISGL_SPEC_MAX_CONTEXT") or self._max_ctx)
+        self._k_buf = torch.zeros(self._max_slots, self._max_ctx, _nkh, _kdim, device=dev, dtype=dt)
+        self._v_buf = torch.zeros(self._max_slots, self._max_ctx, _nvh, _vdim, device=dev, dtype=dt)
+        self._cur = torch.zeros(self._max_slots, dtype=torch.int64, device=dev)
+        self._col_idx = torch.arange(self._max_ctx, device=dev)
+        self._slot_uid: Dict[int, int] = {}
+        self._drafted_slots: List[int] = []
+        hidden = int(self._draft.hidden_size)
+        G = self._max_slots
+        self._g_seed = torch.zeros(G, hidden, device=dev, dtype=dt)
+        self._g_curb = torch.zeros(G, dtype=torch.int64, device=dev)
+        self._g_out = torch.zeros(G, self._num_draft, dtype=torch.int64, device=dev)
+        self._h_idx = torch.zeros(3, G, dtype=torch.int64, device="cpu", pin_memory=True)
+        self._g_idx = torch.zeros(3, G, dtype=torch.int64, device=dev)
+        self._g_slots, self._g_base, self._g_tok = self._g_idx[0], self._g_idx[1], self._g_idx[2]
+        self.init_propose_capture_state(engine, tag="EAGLE3")
+        logger.info_rank0(
+            f"spec-decode: EAGLE3 propose buffers (slots={self._live_slots}+NULL, "
+            f"max_ctx={self._max_ctx}, draft-KV "
+            f"{(self._k_buf.numel() + self._v_buf.numel()) * dt.itemsize / 1e6:.0f} MB)")
 
     def _load_draft_weights(self, folder: str) -> None:
         """Load the 15-tensor EAGLE3 checkpoint directly. The checkpoint key layout (midlayer.* /
@@ -165,100 +225,143 @@ class DraftModelProposer(Proposer):
         d.d2t = sd["d2t"].to(torch.int64)
         d.t2d = sd["t2d"].to(torch.bool)
 
-    @torch.inference_mode()
-    def propose(self, reqs: List["Req"], num_draft: int, ctx: ProposeContext) -> List[List[int]]:
-        # Per-req, like the MTP head: the 1-layer draft attention needs the full causal context, so
-        # each request keeps a PERSISTENT KV (one draft layer) that grows across decode steps. Step 0
-        # processes the confirmed token (fused with the captured target aux) and appends its K/V to
-        # the persistent cache; later steps process each draft. The attention therefore sees the full
-        # confirmed prefix, not just the K-token chain. on_accept truncates the cache to the accepted
-        # prefix; free(uid) drops it on finish.
-        out: List[List[int]] = [[] for _ in reqs]
-        draft = self._draft
-        device = self._device
+    # ----------------------------------------------------------------------- hook: HOST staging
+    def stage_propose(
+        self, reqs: List["Req"], num_draft: int, ctx: ProposeContext, **kw
+    ) -> Optional[StagedPropose]:
+        """Pick the rows that will draft and refresh the static inputs in place. The step-0 seed is
+        `fc(aux)` — the fused captured target aux at the last confirmed token — which is where EAGLE3
+        differs from MTP (whose seed is the target's raw last_hidden)."""
+        rows: List[int] = []
+        budget: List[int] = []
+        seeds: List[torch.Tensor] = []
+        h = self._h_idx
         for i, req in enumerate(reqs):
             k_i = max(0, min(num_draft, req.remain_len - 1))
             aux = ctx.aux_hidden.get(req.uid)  # [num_aux, hidden] at the last confirmed token
-            if k_i <= 0 or aux is None:
+            if k_i <= 0 or aux is None or req.cached_len > self._ctx_gate:
                 continue
+            if aux.dim() == 3:
+                # The scheduler's full-context accumulator hands out [num_aux, P, hidden] for EVERY
+                # proposer (`MINISGL_DFLASH_FULLCTX` is not gated on the proposer being DFlash), but
+                # EAGLE3 conditions on the LAST confirmed position only. The old code fed the whole
+                # 3-D buffer into `fc` via `unsqueeze(0)`, which is a hard shape error — EAGLE3 could
+                # not serve a single token on this build. Take the last column, which is exactly the
+                # legacy 2-D value (`aux_hidden[:, row]`).
+                aux = aux[:, -1]
+            tok_idx = max(0, min(req.cached_len + self._tok_off, req.input_ids.shape[0] - 1))
+            s = int(req.table_idx)
+            if self._slot_uid.get(s) != req.uid:   # fresh req on this slot -> cold cache
+                self._slot_uid[s] = req.uid
+                self._cur[s] = 0
+            j = len(rows)
+            h[0, j] = s
+            h[1, j] = int(req.cached_len) + self._pos_off
+            h[2, j] = int(req.input_ids[tok_idx])
+            rows.append(i)
+            budget.append(k_i)
+            seeds.append(aux.reshape(-1))          # [num_aux*hidden], fc'd on device in the body
+        self._drafted_slots = [int(reqs[i].table_idx) for i in rows]
+        if not rows:
+            return None
+        B = len(rows)
+        self._g_idx[:, :B].copy_(h[:, :B], non_blocking=True)
+        self._g_seed[:B].copy_(
+            self._draft.fc.forward(torch.stack(seeds).to(self._dtype)))
+        self._g_curb[:B].copy_(self._cur[self._g_slots[:B]])
+        return StagedPropose(B, rows, budget)
 
-            tok_idx = req.cached_len + self._tok_off
-            tok_idx = max(0, min(tok_idx, req.input_ids.shape[0] - 1))
-            conf_tok = int(req.input_ids[tok_idx])
-            base_pos = req.cached_len + self._pos_off
+    def pad_propose_rows(self, bs: int, bucket: int) -> None:
+        self._g_slots[bs:bucket].fill_(self._null_slot)
+        self._g_base[bs:bucket].zero_()
+        self._g_tok[bs:bucket].zero_()
+        self._g_curb[bs:bucket].zero_()
+        self._g_seed[bs:bucket].zero_()
 
-            # Drop the previous step's rejected-draft tail (keep only confirmed context).
-            if self._no_ctx:
-                cache: list = []
-            else:
-                cache = self._cache.setdefault(req.uid, [])
-                committed = self._committed.get(req.uid, 0)
-                del cache[committed:]
+    # ------------------------------------------------------------------------ hook: the BODY
+    def propose_body(self, bs: int) -> None:
+        """The K-step autoregressive EAGLE3 chain over the STATIC buffers [:bs]. Step 0 processes the
+        confirmed token paired with fc(aux); step j the previous draft paired with the draft layer's
+        OWN output hidden. The d2t (draft->target) remap stays ON DEVICE, so the whole chain runs
+        with no host round-trip — which is both a latency property and a capture requirement."""
+        d = self._draft
+        slots = self._g_slots[:bs]
+        base = self._g_base[:bs]
+        cur = self._g_curb[:bs]
+        cur_tok = self._g_tok[:bs]
+        cur_hidden = self._g_seed[:bs]
+        col = self._col_idx.unsqueeze(0)
+        for j in range(self._num_draft):
+            write_col = (cur + j).clamp(max=self._max_ctx - 1)      # OOB backstop
+            positions = (base + j).to(torch.int32)
+            mask_bias = torch.where(col <= write_col.unsqueeze(1),
+                                    0.0, float("-inf")).to(torch.float32)
+            logits, cur_hidden = d.step_masked(
+                d.embed(cur_tok), cur_hidden, positions,
+                self._k_buf, self._v_buf, slots, write_col, mask_bias)
+            draft_id = logits.argmax(dim=-1)                        # compressed draft vocab
+            target_id = draft_id + self._d2t[draft_id]              # -> target vocab, on device
+            self._g_out[:bs, j] = target_id
+            cur_tok = target_id
 
-            fused = draft.fuse_aux(aux.unsqueeze(0).to(self._dtype))  # [1, hidden] step-0 hidden
-            cur_tok = torch.tensor([conf_tok], dtype=torch.int64, device=device)
-            cur_hidden = fused  # [1, hidden]
-            # On-device draft chain: keep the per-step argmax, the d2t (draft->target) map, and the
-            # next-token id ON DEVICE across the K steps, so the autoregressive chain runs without a
-            # CPU<->GPU round-trip per step. The chain is inherently sequential (step N+1 embeds step
-            # N's argmax), but removing the host syncs lets the GPU chain the steps back-to-back; the
-            # CPU just enqueues and pulls the whole chain to host ONCE at the end. Per-step positions
-            # are sliced from one precomputed tensor (vs a torch.tensor(...) alloc per step).
-            positions_all = torch.arange(
-                base_pos, base_pos + k_i, dtype=torch.int32, device=device
-            )
-            draft_ids: List[torch.Tensor] = []
-            for step in range(k_i):
-                embed_e = draft.embed(cur_tok)  # [1, hidden]
-                logits, cur_hidden = draft.step(
-                    embed_e, cur_hidden, positions_all[step : step + 1], cache
-                )
-                draft_id = logits.argmax(dim=-1)  # [1] COMPRESSED draft vocab (on device)
-                target_id = draft_id + self._d2t[draft_id]  # [1] -> target vocab (on device)
-                draft_ids.append(target_id)
-                cur_tok = target_id  # next step embeds the target-vocab id; no host sync
-            drafts = torch.cat(draft_ids).cpu().tolist() if draft_ids else []
-            out[i] = drafts
+    # ------------------------------------------------------------------- hook: the ONE host sync
+    def read_drafts(self, reqs: List["Req"], staged: StagedPropose, **kw) -> List[List[int]]:
+        out: List[List[int]] = [[] for _ in reqs]
+        drafts = self._g_out[: staged.bs].cpu().tolist()   # ONE D2H for the whole step
+        for i, k_i, dd in zip(staged.rows, staged.budget, drafts):
+            out[i] = dd[:k_i]
             if self._dbg:
-                print(f"[eagle3-dbg] uid={req.uid} conf={conf_tok} base_pos={base_pos} "
-                      f"k={k_i} ctx={len(cache) - k_i} draft={drafts}", flush=True)
+                print(f"[eagle3-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}", flush=True)
         return out
+
+    def reset_propose_state(self) -> None:
+        self._cur[self._null_slot] = 0
+        self._drafted_slots = []
 
     @torch.inference_mode()
     def seed_prefill(self, req: "Req", last_hidden=None, aux_hidden=None) -> None:
-        # Seed the persistent EAGLE3 draft KV from the prompt prefill so the FIRST draft already sees
-        # full prompt context (otherwise the cache starts empty -> cold early tokens, the ~2% floor's
-        # milder cousin). Same convention as the decode-time propose: the pair (embed(token_p),
-        # fc(aux_{p-1})) lives at RoPE position p (aux_{p-1} = the captured target aux that produced
-        # token_p). We run the draft layer's k/v over prompt pairs p=1..P-1 and mark them committed;
-        # the first decode step then appends position P (the bonus). MINISGL_EAGLE3_NO_CTX disables
-        # the persistent cache entirely, so seeding is a no-op there too.
-        if self._no_ctx or aux_hidden is None:
+        """Seed the persistent draft KV from the prompt prefill so the FIRST draft already sees full
+        prompt context (otherwise the cache starts empty -> cold early tokens, the ~2% floor's milder
+        cousin). Same convention as the decode-time chain: the pair (embed(token_p), fc(aux_{p-1}))
+        lives at RoPE position p, so we write the draft layer's k/v for prompt pairs p=1..P-1 into
+        columns 0..S-1 of this req's slot and set the cursor to S; the first decode propose then
+        appends position P (the bonus) at column S."""
+        if aux_hidden is None:
             return
         P = aux_hidden.shape[1]  # aux_hidden: [num_aux, P, hidden]
         if P < 2:
             return
+        S = P - 1
+        if S > self._max_ctx:
+            # Prompt longer than the draft-KV window: fall back to the cold cache (lossless, just no
+            # early-token lift). Seeding the tail would misalign the column<->position map the chain
+            # assumes (write_col = cur+j at RoPE position base+j).
+            return
         device = self._device
         tokens = req.input_ids[1:P].to(device=device, dtype=torch.int64)  # token_p, p=1..P-1
-        # fc(aux_{p-1}): fuse the captured aux at positions 0..P-2. fuse_aux wants [B, num_aux, hidden].
         aux_prev = aux_hidden[:, 0 : P - 1].to(self._dtype).permute(1, 0, 2).contiguous()
         fused = self._draft.fuse_aux(aux_prev)  # [P-1, hidden]
         positions = torch.arange(1, P, dtype=torch.int32, device=device)
-        entries = self._draft.seed_kv(self._draft.embed(tokens), fused, positions)
-        self._cache[req.uid] = entries
-        self._committed[req.uid] = len(entries)
+        slot = int(req.table_idx)
+        self._draft.seed_buffered(
+            self._draft.embed(tokens), fused, positions, self._k_buf, self._v_buf, slot, 0)
+        self._slot_uid[slot] = req.uid
+        self._cur[slot] = S
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         # The confirmed token (always committed) plus the n accepted drafts become permanent draft
-        # context; the K-n rejected drafts' K/V are dropped. The cache layout per step is
-        # [confirmed, d0, d1, ...]; committing 1 + n keeps confirmed + the accepted run.
-        if self._no_ctx:
-            return
+        # context. Columns written per step are [confirmed, d0 .. d_{K-2}] — d_{K-1}'s K/V is never
+        # written — so cap the advance at K, exactly as the eager list path capped `committed` at
+        # len(cache). The K-n rejected drafts need no truncation: the cursor does not reach them and
+        # next step's mask re-hides their columns.
+        drafted = set(self._drafted_slots)
         for req, n in zip(reqs, num_accepted):
-            if req.uid in self._cache:
-                self._committed[req.uid] = self._committed.get(req.uid, 0) + 1 + n
-                del self._cache[req.uid][self._committed[req.uid]:]
+            s = int(req.table_idx)
+            if s in drafted:
+                self._cur[s] = self._cur[s] + min(1 + n, self._num_draft)
 
     def free(self, uid: int) -> None:
-        self._cache.pop(uid, None)
-        self._committed.pop(uid, None)
+        for s, u in list(self._slot_uid.items()):
+            if u == uid:
+                del self._slot_uid[s]
+                self._cur[s] = 0

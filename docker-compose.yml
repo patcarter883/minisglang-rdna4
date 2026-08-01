@@ -102,6 +102,48 @@ x-lean-common: &lean-common
     # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
     # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
     MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"
+    # Bounds on the prompt-prefill draft seed (scheduler.py::_spec_seed_fits). The seed forward keeps
+    # last_hidden/aux_hidden live over the whole prefill span; unbounded, 8 concurrent ~11k-token
+    # prompts OOM'd the scheduler inside the MoE gather-reduce. Defaults ARE the policy (512 = the
+    # ~500-token crossover past which the seed was already measured net-negative, 5bd8d5a7/44960dd4);
+    # these are forwarded to RE-MEASURE that crossover, not to configure a deployment. Set MAX_PROMPT=0
+    # to disable seeding entirely (the control leg). NOTE the reader uses the `or` form, so the empty
+    # string compose substitutes here falls back to the default instead of raising in float()/int().
+    MINISGL_SPEC_SEED_MAX_PROMPT: "${MINISGL_SPEC_SEED_MAX_PROMPT:-}"
+    MINISGL_SPEC_SEED_MAX_BATCH_TOKENS: "${MINISGL_SPEC_SEED_MAX_BATCH_TOKENS:-}"
+    # MEASUREMENT INSTRUMENT ONLY: pin the adaptive verify width to one captured rung (3/7/15 at
+    # K=16) so each rung's TRUE tok/s is measurable at fixed K. The controller optimizes accepted
+    # tokens per STEP, but a wider rung costs more time per step, so emitted/step and tok/s can point
+    # opposite ways — this is how that gets settled with data. Unset = normal adaptive behaviour.
+    MINISGL_SPEC_VERIFY_WIDTH_PIN: "${MINISGL_SPEC_VERIFY_WIDTH_PIN:-}"
+    # Per-phase spec step timing: =1 logs [spec-timing] propose/stage/forward/accept ms every 50 steps
+    # (cuda-synchronized, so these are real GPU times, not queue times). Already implemented in the
+    # scheduler but never forwarded, so it could not be reached through compose — which is the only
+    # way this repo serves. Diagnostic; costs 4 syncs/step when on.
+    MINISGL_SPEC_TIMING: "${MINISGL_SPEC_TIMING:-}"
+    # =0 reverts the fused MoE gemm2 to the bit-exact WMMA gemm2 + gather_reduce. Forwarded because
+    # the fused path's atomic reduction order VARIES RUN TO RUN (quant/kernels.py says so in place),
+    # which makes an MTP draft head — a MoE at M=1 — non-bit-reproducible against ITSELF. Any
+    # bit-identity gate over a MoE drafter has to be able to turn that off, and through compose is
+    # the only way this repo serves. Diagnostic; production keeps the fused default.
+    MINISGL_MOE_G2FUSE: "${MINISGL_MOE_G2FUSE:-}"
+    # DFlash drafter knobs the proposer reads. PERSIST_KV=0 falls back to re-projecting the whole
+    # prefix each step (diagnostic). CTX_WINDOW is a scheduler-side cap on the accumulated aux; the
+    # DEFAULT cap now comes from the drafter's own attention window (Proposer.aux_ctx_cap), so this
+    # is only for forcing a SMALLER (and then not numerically inert) window.
+    MINISGL_DFLASH_PERSIST_KV: "${MINISGL_DFLASH_PERSIST_KV:-}"
+    MINISGL_DFLASH_CTX_WINDOW: "${MINISGL_DFLASH_CTX_WINDOW:-}"
+    # Full-context drafter conditioning (scheduler.py:485, default 1). Forwarded because it is the
+    # ONLY way to construct a working pre-change EAGLE3 reference: at d276137c this flag is not
+    # gated on the proposer being DFlash, so ctx.aux_hidden is 3-D for EAGLE3 too and its first
+    # decode step dies with a shape error. =0 restores the 2-D legacy aux and makes that baseline
+    # servable. Inert on the current tree (the gate is fixed) — production keeps the default.
+    MINISGL_DFLASH_FULLCTX: "${MINISGL_DFLASH_FULLCTX:-}"
+    # Fraction of FREE memory the DFlash propose prefix RING may take (spec/dflash.py:373, default
+    # 0.30). The ring is allocated after the KV pool, so it competes with the (1-memory_ratio) slack
+    # that long prompts at concurrency also need. Forwarded so that competition can be measured
+    # rather than argued about; a slot outside the pool simply skips propose, which is lossless.
+    MINISGL_DFLASH_KV_FRAC: "${MINISGL_DFLASH_KV_FRAC:-}"
     # TiDAR logit-mixing "Trust-Diffusion" verify (fused-TiDAR path only): verify each draft position
     # against argmax(beta*p_ar + (1-beta)*R_i[0]). 1.0 (default) = the lossless-vs-AR-greedy path
     # (bit-identical); beta<1.0 leans on the diffusion self-draft for higher acceptance but is NOT

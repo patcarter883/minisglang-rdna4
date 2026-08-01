@@ -36,6 +36,13 @@ class TiDARProposer(Proposer):
 
     needs_last_hidden = False
     capture_layer_ids: Optional[List[int]] = None
+    # TiDAR's "propose" is the scheduler's block_predict forward on the TARGET, which has its own
+    # capture path (`_fused_verify` / `can_use_verify_graph`) inside the scheduler. There is no
+    # separate drafter forward for spec/capture.py to own, so the propose-graph readout must say so
+    # rather than report a replay/eager split of zero.
+    propose_uncapturable_reason = (
+        "TiDAR self-drafts on the TARGET (scheduler._tidar_block_predict); that forward is captured "
+        "by the scheduler's own verify-graph path, not by spec/capture.py")
 
     def __init__(self, engine, num_draft: int, draft_model_path: Optional[str] = None) -> None:
         self._engine = engine
