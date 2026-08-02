@@ -215,6 +215,60 @@ class RadixPrefixCache(BasePrefixCache):
             self._rec_nodes.append(node)
         self._enforce_rec_cap()
 
+    def attach_rec_state_at(
+        self, handle: RadixCacheHandle, boundary: int, rec_state: Any
+    ) -> bool:
+        """Attach a recurrent-state snapshot at an INTERIOR page-aligned boundary of the prefix the
+        scheduler just inserted, splitting the node there if no node ends exactly at `boundary`.
+
+        Why this exists: `attach_rec_state` only ever marks the node at the sequence's OWN committed
+        end, so the only reusable resume points were whole committed sequences. A second request that
+        shares this prefix but diverges before that end splits the node, and `split_at` leaves the new
+        shallow parent with `rec_state=None` — so `match_prefix` walks up, finds nothing, and returns
+        cached_len 0 (full re-prefill of a prefix whose KV is sitting right there). Marking the chunk
+        boundaries we already checkpointed during prefill turns those into legal resume points, so a
+        divergence recomputes at most one chunk instead of the whole context.
+
+        Returns True if a snapshot was attached. `boundary` must be page-aligned and strictly inside
+        (0, handle.cached_len) — the end boundary is `attach_rec_state`'s job."""
+        if not self.recurrent or handle is None:
+            return False
+        node = handle.node
+        if node is None or node.is_root():
+            return False
+        if boundary <= 0 or boundary >= handle.cached_len:
+            return False
+        if boundary % self.page_size != 0:
+            return False
+        # Root->node chain, so cumulative lengths are boundaries measured from the root.
+        chain: List[RadixTreeNode] = []
+        cur = node
+        while not cur.is_root():
+            chain.append(cur)
+            cur = cur.parent
+        chain.reverse()
+        target: RadixTreeNode | None = None
+        acc = 0
+        for n in chain:
+            if acc + n.length == boundary:
+                target = n
+                break
+            if acc + n.length > boundary:
+                # No node ends here; split so one does. The new shallow parent ends exactly at
+                # `boundary` and inherits ref_count, so locking/eviction accounting is unchanged
+                # (total length across the pair is preserved, as in _tree_walk's split).
+                target = n.split_at(boundary - acc)
+                break
+            acc += n.length
+        if target is None:
+            return False
+        was_none = target.rec_state is None
+        target.rec_state = rec_state
+        if was_none:
+            self._rec_nodes.append(target)
+        self._enforce_rec_cap()
+        return True
+
     def _enforce_rec_cap(self) -> None:
         # Prune dead/cleared entries, then evict the oldest live snapshot(s) until under the cap.
         self._rec_nodes = [n for n in self._rec_nodes if n.rec_state is not None]

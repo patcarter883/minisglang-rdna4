@@ -745,6 +745,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # inserted (tail/finish commit). Decouples "capture the aligned state" from "a node exists to
         # hang it on", and avoids mutating pages on a chunk commit. Popped on attach / free / abort.
         self._pending_rec_snap: dict[int, tuple[int, object]] = {}
+        # INTERIOR resume points. _pending_rec_snap deliberately keeps only the DEEPEST boundary,
+        # because only that one matches the single node the eventual insert creates — which is why the
+        # only reusable resume point was a whole committed sequence, and why any request that shared a
+        # long prefix but diverged before its end re-prefilled the WHOLE thing from zero state. We
+        # already clone the state at every chunk boundary, so retaining the last few costs no extra
+        # compute (only the cloned state, ~17 MB each) and turns them into legal resume points via
+        # attach_rec_state_at. Keep the DEEPEST ones: divergence is overwhelmingly near the end of the
+        # prompt (shared document/system prefix, differing question or turn at the tail).
+        self._rec_snap_ladder: dict[int, list[tuple[int, object]]] = {}
+        self._rec_snap_ladder_depth = max(
+            0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4)
+        )
         # Reasoning + structured output: while a constrained req is still inside its `<think>…</think>`
         # reasoning span, the grammar matcher must NOT advance or mask (else the JSON schema suppresses
         # the reasoning phase → truncated / CoT-leaked answers). uid -> think-close token id, present
@@ -1275,6 +1287,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._clear_think_gate(req.uid)
         # Drop any un-attached recurrent-state checkpoint (idempotent; frees the cloned slot state).
         self._pending_rec_snap.pop(req.uid, None)
+        self._rec_snap_ladder.pop(req.uid, None)  # frees any un-attached interior checkpoints
         # Drop the reasoning-gate "done" marker (idempotent; the gate dicts are cleared via _clear_think_gate).
         self._think_gate_done.discard(req.uid)
 
@@ -1313,7 +1326,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         slot = self._rec_slots.slot_for(req.uid)
         if slot is None:
             return
-        self._pending_rec_snap[req.uid] = (cached_len, self._rec_cache.clone_slot(slot))
+        snap = self._rec_cache.clone_slot(slot)
+        self._pending_rec_snap[req.uid] = (cached_len, snap)
+        # Also retain it as an INTERIOR resume point. Same clone — no extra state capture — so the
+        # only cost is holding the last `_rec_snap_ladder_depth` of them until this sequence inserts.
+        if self._rec_snap_ladder_depth:
+            ladder = self._rec_snap_ladder.setdefault(req.uid, [])
+            if not ladder or ladder[-1][0] != cached_len:
+                ladder.append((cached_len, snap))
+            while len(ladder) > self._rec_snap_ladder_depth:
+                ladder.pop(0)  # drop the shallowest; frees its cloned state
 
     def _maybe_capture_rec_state(self, req: Req, handle) -> None:
         """Attach a page-aligned recurrent-state checkpoint to the freshly-inserted radix node so a
@@ -1330,6 +1352,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         boundary = handle.cached_len
         if boundary == 0:
             return
+        # Mark the interior chunk boundaries FIRST, so a later request that diverges anywhere inside
+        # this prefix has a resume point instead of falling back to a full re-prefill from zero state.
+        self._attach_rec_ladder(req, handle)
         stash = self._pending_rec_snap.get(req.uid)
         if stash is not None and stash[0] == boundary:
             self.cache_manager.attach_rec_state(handle, stash[1])
@@ -1342,6 +1367,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if slot is None:
             return
         self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
+
+    def _attach_rec_ladder(self, req: Req, handle) -> None:
+        """Turn this sequence's retained chunk boundaries into interior resume points on the freshly
+        inserted prefix. Each is state@boundary EXACTLY (same losslessness precondition as the end
+        boundary), so restoring at one is equivalent to having prefilled up to it. Boundaries at or
+        past the node's own end are skipped — that one belongs to _maybe_capture_rec_state."""
+        ladder = self._rec_snap_ladder.pop(req.uid, None)
+        if not ladder:
+            return
+        attached = 0
+        for boundary, snap in ladder:
+            if self.cache_manager.attach_rec_state_at(handle, boundary, snap):
+                attached += 1
+        if attached:
+            logger.debug_rank0(
+                f"recurrent-radix: uid={req.uid} marked {attached} interior resume point(s) "
+                f"within cached_len={handle.cached_len}"
+            )
 
     # ---- SWA-radix window snapshot/restore (parallel to the recurrent path above) ------------------
     # Same three-stage lifecycle as recurrent radix, but the snapshot is the sliding-window ring's last
