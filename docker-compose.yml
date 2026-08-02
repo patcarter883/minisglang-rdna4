@@ -135,6 +135,12 @@ x-lean-common: &lean-common
     # on a repeated-prefix workload is the single largest lever available — prefill is ~70% of the
     # wall on a 14k-token prompt and the original recurrent-radix fix measured 37-40% off a hit.
     MINISGL_REC_RADIX_SPEC: "${MINISGL_REC_RADIX_SPEC:-}"
+    # MTP draft-KV ring window (spec/mtp.py). The buffer is max_slots*W, so W trades drafter context
+    # for VRAM that goes straight back to the KV pool. Unset = the old _max_ctx (8192), which keeps
+    # behaviour and footprint identical to before the ring landed. NOT forwarding this made a W sweep
+    # silently run three identical 8192 legs — the giveaway was the engine logging "draft-KV 50 MB"
+    # for every W.
+    MINISGL_MTP_KV_WINDOW: "${MINISGL_MTP_KV_WINDOW:-}"
     # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations then return from run_forever, so
     # the process exits NORMALLY. Diagnostics only; unset = serve forever. Required to profile inside
     # a captured CUDA graph: rocprofv3 is LD_PRELOADed into this very process (it is not a separate
