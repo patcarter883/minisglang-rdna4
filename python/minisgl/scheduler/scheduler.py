@@ -1387,11 +1387,16 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         The cap defaulted to 64 back when a snapshot was created at most ONCE per committed sequence,
         so the LRU effectively never filled and its cost was invisible. The interior-resume ladder
-        creates up to (depth + 1) per sequence, which makes 64 genuinely reachable — and at ~25 MB a
-        snapshot on the 35B that is 1.6 GiB of unaccounted VRAM. It does not fail at boot: it fails
-        later, as an OOM in a prefill activation, after the pool has already been sized around memory
-        the snapshots then take. Measured: at --memory-ratio 0.85 (2.47 GiB free after init) a
-        branching workload OOM'd in F.linear; at 0.90 (1.69 GiB free) it OOM'd sooner.
+        creates up to (depth + 1) per sequence, which makes 64 genuinely reachable — MEASURED at
+        16.4 MiB a snapshot on the 35B, so 1.05 GiB of otherwise unaccounted VRAM. It does not fail
+        at boot: it fails later, as an OOM in a prefill activation, after the pool has already been
+        sized around memory the snapshots then take.
+
+        Bounding this is necessary but NOT sufficient, and the measurements say so plainly: with the
+        store capped at 0.74 GiB, --memory-ratio 0.85 still OOM'd. The dominant term is the prefill
+        activation working set, which grows with prompt length, and a larger KV pool ADMITS longer
+        prompts (0.80 rejects a 93k-token prompt outright; 0.85 accepts it and then dies in
+        F.linear). Nothing ties admission to activation headroom. 0.80 is the validated setting.
 
         So derive the cap from an explicit budget and LOG it, the way every other VRAM reservation
         here is logged. Sized to cover the live working set — (ladder depth + 1) per concurrent
