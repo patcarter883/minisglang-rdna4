@@ -62,7 +62,13 @@ case "$MODEL" in
                   if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
                     mem_default_spec="0.86"
                     : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
-                    : "${GRAPH_BS:=4}"; export GRAPH_BS
+                    # Cap ADMISSION, not just capture. GRAPH_BS now follows CONC, so capping only the
+                    # graph would admit batches above the captured max and run them FULLY EAGER —
+                    # the exact failure the capture-coverage rule exists to prevent. Cap CONC and let
+                    # GRAPH_BS follow it, so admission and coverage stay equal. A CAP, not a
+                    # default: CONC is already assigned above this case block, so `${CONC:=4}` would
+                    # be a silent no-op.
+                    if [ "$CONC" -gt 4 ]; then CONC=4; fi
                   fi ;;
   qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
                   model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
@@ -94,9 +100,19 @@ if [[ -n "${mem_default_spec:-}" && "$SPEC" != "none" && -n "$SPEC" ]]; then
   mem_default="$mem_default_spec"
 fi
 MEM_RATIO="${MEM_RATIO:-$mem_default}"
-# Graph capture must cover the concurrency you serve, or requests above the captured batch size fall
-# back to eager and the served config is not the measured one. Default to CONC, floor of 8.
-GRAPH_BS="${GRAPH_BS:-$(( CONC > 8 ? CONC : 8 ))}"
+# Graph capture must COVER the concurrency you serve — a request above the captured batch size falls
+# back to eager and the served config is no longer the measured one. But covering it is enough: the
+# decode batch can never exceed --max-running-requests (= CONC), so any captured size ABOVE CONC can
+# never be selected. It is pure waste, and the waste is VRAM at exactly the moment VRAM is tightest
+# (capture runs after the KV pool is sized). The old `floor of 8` captured bs=2/4/8 for a CONC=1
+# serve and bs=8 for CONC=4 — graphs that could not be reached.
+#
+# Spec decode does NOT need the larger sizes either, which is the non-obvious part: the verify
+# capture derives its own list and ALREADY clamps it (scheduler.py: `verify_bs = [b for b in
+# graph_bs_list if b <= config.max_running_req]`), and the propose capture filters the same list
+# against its own row cap. So all three capture families follow CONC; only plain decode was reading
+# the inflated value.
+GRAPH_BS="${GRAPH_BS:-$CONC}"
 PAGE_SIZE="${PAGE_SIZE:-16}"
 CACHE_TYPE="${CACHE_TYPE:-radix}"
 
