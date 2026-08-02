@@ -974,6 +974,12 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # message can't be lost to the ZMQ slow-joiner (which deadlocked the first request). No-op
         # for TP=1. See SchedulerIOMixin.establish_inter_rank_link.
         self.establish_inter_rank_link()
+        # Publish one snapshot BEFORE serving. Stats are otherwise emitted from the request path, so
+        # an idle serve sends nothing at all — and the very first thing a client does is ask how much
+        # context it has. Without this, /v1/models advertises null until traffic arrives, and an agent
+        # auto-detecting at connect time falls back to a guess (Hermes settles on 131072 against a
+        # real 73,872) and then sends prompts that can only be rejected.
+        self._flush_stats(force=True)
         # Speculative decoding runs in a dedicated synchronous loop: acceptance is a
         # data-dependent host-sync that fundamentally conflicts with the zero-sync overlap path
         # (see SPEC_DECODE.md §1). All GPU work runs on the engine stream, like the eager path.
@@ -1104,6 +1110,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 spec_accepted_tokens=self._m_spec_accepted_tokens,
                 spec_emitted_tokens=self._m_spec_emitted_tokens,
                 spec_steps=self._m_spec_steps,
+                max_seq_len=int(self.engine.max_seq_len),
                 prefill_seconds=self.engine.prefill_seconds_total,
                 running_requests=len(self.decode_manager.running_reqs),
                 waiting_requests=len(self.prefill_manager.pending_list),

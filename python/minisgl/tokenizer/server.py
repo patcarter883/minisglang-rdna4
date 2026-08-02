@@ -120,6 +120,7 @@ def tokenize_worker(
                         kv_tokens_used=sm.kv_tokens_used,
                         gdn_slots_total=sm.gdn_slots_total,
                         gdn_slots_used=sm.gdn_slots_used,
+                        max_seq_len=sm.max_seq_len,
                         prefill_seconds=sm.prefill_seconds,
                         prefix_cache_hit_tokens=sm.prefix_cache_hit_tokens,
                         prefix_cache_prompt_tokens=sm.prefix_cache_prompt_tokens,
