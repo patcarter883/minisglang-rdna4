@@ -909,6 +909,14 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "mini-sglang"
     root: str
+    # SERVABLE context, not the checkpoint's. These are min(model max_position, KV pool) — for this
+    # 35B the checkpoint says 262,144 while the pool allows 73,872. Published because a client with
+    # nothing to read must guess, and the guess is wrong in the dangerous direction: Hermes
+    # auto-detect settles on 131,072 and then sends prompts the engine can only reject. Both spellings
+    # are emitted deliberately — `max_model_len` is what vLLM publishes (so vLLM-shaped clients find
+    # it), `context_length` is what Ollama-shaped clients read.
+    max_model_len: int | None = None
+    context_length: int | None = None
 
 
 class ModelList(BaseModel):
@@ -929,6 +937,10 @@ class FrontendManager:
     # Strong refs to fire-and-forget cleanup tasks: a bare asyncio.create_task can be garbage-collected
     # before it runs (the disconnect-abort bug), so keep the task alive until it completes.
     _bg_tasks: set = field(default_factory=set)
+    # Servable context, learned from the scheduler's first stats snapshot (it depends on the KV pool,
+    # which only the scheduler knows). None until then, and /v1/models then omits it rather than
+    # publishing the checkpoint's number — which would be wrong in the direction that hurts.
+    max_seq_len: int | None = None
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -943,6 +955,8 @@ class FrontendManager:
             msg = await self.recv_tokenizer.get()
             # Scheduler metrics snapshot (piggybacked on the detokenizer link) — feed /metrics, no uid.
             if isinstance(msg, StatsFrontendMsg):
+                if msg.max_seq_len:
+                    self.max_seq_len = int(msg.max_seq_len)
                 self.metrics.update_backend(
                     BackendSnapshot(
                         dp_rank=msg.dp_rank,
@@ -1198,6 +1212,16 @@ class FrontendManager:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Start consuming the scheduler link IMMEDIATELY, not on the first outgoing request.
+    # `_create_listener_once` used to fire only from `send_one`, so on an idle serve nothing drained
+    # recv_tokenizer and the scheduler's stats snapshots were never processed: /metrics read 0 and
+    # /v1/models could not advertise the servable context until traffic happened to arrive. A client
+    # asking "how much context do I have?" does so BEFORE sending anything, which is precisely when
+    # the answer was unavailable.
+    try:
+        get_global_state()._create_listener_once()
+    except Exception:  # noqa: BLE001 - never block startup on the metrics link
+        logger.warning("could not start the scheduler listener at startup", exc_info=True)
     yield
     # shutdown code here
     global _GLOBAL_STATE
@@ -1562,7 +1586,9 @@ async def metrics():
 @app.get("/v1/models")
 async def available_models():
     state = get_global_state()
-    return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
+    ctx = state.max_seq_len
+    return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path,
+                                     max_model_len=ctx, context_length=ctx)])
 
 
 async def shell_completion(req: OpenAICompletionRequest):

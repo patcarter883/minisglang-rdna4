@@ -85,6 +85,11 @@ class StatsMsg(BaseTokenizerMsg):
     gdn_slots_used: int
     # Prefix-cache reuse: cumulative prefix tokens served from the radix cache and cumulative
     # prompt tokens seen. hit/prompt = prefix reuse ratio (frontend computes it across replicas).
+    # Servable context = min(model max_position, KV pool tokens). The API advertises this so a
+    # client does not have to GUESS: with nothing published, agents fall back to a default (Hermes
+    # auto-detect lands on 131072) while this serve can only do 73,872 — a guess wrong in the
+    # dangerous direction, since the client then sends prompts the engine must reject.
+    max_seq_len: int = 0
     prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
