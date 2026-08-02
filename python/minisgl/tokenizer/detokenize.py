@@ -102,7 +102,9 @@ class DetokenizeManager:
             # One message may carry several tokens (speculative decoding); append them in order.
             # Drop only a trailing EOS on a finished req so it isn't rendered (matches the prior
             # single-token skip). Spec truncates at EOS, so EOS is always last when present.
-            toks = [msg.next_token, *msg.extra_tokens]
+            # A terminal rejection (msg.error) produced NO tokens — next_token is filler. Decoding it
+            # would emit a stray character on a request the engine refused.
+            toks = [] if msg.error is not None else [msg.next_token, *msg.extra_tokens]
             if msg.finished and toks and toks[-1] in self.eos_token_ids:
                 toks = toks[:-1]
             s.decoded_ids.extend(toks)

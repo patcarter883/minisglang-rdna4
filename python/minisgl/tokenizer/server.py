@@ -120,6 +120,7 @@ def tokenize_worker(
                         kv_tokens_used=sm.kv_tokens_used,
                         gdn_slots_total=sm.gdn_slots_total,
                         gdn_slots_used=sm.gdn_slots_used,
+                        prefill_seconds=sm.prefill_seconds,
                         prefix_cache_hit_tokens=sm.prefix_cache_hit_tokens,
                         prefix_cache_prompt_tokens=sm.prefix_cache_prompt_tokens,
                         cam_facts=sm.cam_facts,
@@ -140,7 +141,8 @@ def tokenize_worker(
                 replies: List[UserReply] = []
                 stop_abort_uids: List[int] = []
                 for msg, res in zip(detokenize_msg, results, strict=True):
-                    finished = msg.finished or res.stop_hit
+                    # A rejection is terminal regardless of what else the message says.
+                    finished = msg.finished or res.stop_hit or msg.error is not None
                     # A stop string finished the request before the engine did -> tell the backend to
                     # abort it (broadcast; idempotent on replicas that don't own the uid).
                     if res.stop_hit and not msg.finished:
@@ -162,6 +164,7 @@ def tokenize_worker(
                             completion_tokens=res.completion_tokens,
                             prompt_tokens=prompt_tokens_map.get(msg.uid, 0),
                             finish_reason=finish_reason,
+                            error=msg.error,
                         )
                     )
                     if finished:

@@ -38,6 +38,13 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # None while unfinished OR when the scheduler didn't tag a reason (detokenizer defaults such a
     # finish to "stop"). A stop-STRING match is decided in the detokenizer, which overrides this.
     finish_reason: str | None = None
+    # TERMINAL REJECTION. Set when the scheduler refuses a request outright (input longer than the
+    # KV pool, no activation headroom). The request produced NO tokens, so next_token is a filler the
+    # detokenizer must NOT decode — it skips token accumulation whenever this is set and finishes the
+    # request immediately. Before this existed the scheduler just logged and returned, the frontend
+    # never saw a `finished` ack, and the caller blocked until its own timeout: a rejected request
+    # was indistinguishable from a hung server.
+    error: str | None = None
 
 
 @dataclass
@@ -78,6 +85,7 @@ class StatsMsg(BaseTokenizerMsg):
     gdn_slots_used: int
     # Prefix-cache reuse: cumulative prefix tokens served from the radix cache and cumulative
     # prompt tokens seen. hit/prompt = prefix reuse ratio (frontend computes it across replicas).
+    prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
     # CAM editable-memory store stats (0 when CAM is off), aggregated across namespaces.

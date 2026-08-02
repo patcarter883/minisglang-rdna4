@@ -104,6 +104,7 @@ class BackendSnapshot:
     kv_tokens_used: int = 0
     gdn_slots_total: int = 0
     gdn_slots_used: int = 0
+    prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
     cam_facts: int = 0
@@ -188,6 +189,7 @@ class FrontendMetrics:
             total.kv_tokens_used += s.kv_tokens_used
             total.gdn_slots_total += s.gdn_slots_total
             total.gdn_slots_used += s.gdn_slots_used
+            total.prefill_seconds += s.prefill_seconds
             total.prefix_cache_hit_tokens += s.prefix_cache_hit_tokens
             total.prefix_cache_prompt_tokens += s.prefix_cache_prompt_tokens
             # CAM stores are per-replica (DP-pinned): sum counts (idle replicas report 0), max the load.
@@ -287,6 +289,10 @@ class FrontendMetrics:
         # hit = prefix tokens served from the radix cache; prompt = total prompt tokens seen; both
         # cumulative counters so a dashboard can rate() them. hit_ratio is the instantaneous overall
         # reuse fraction (0 when nothing prompted yet). All 0 with --cache-type naive.
+        counter("minisgl_prefill_seconds_total",
+                "Cumulative scheduler-side wall time spent on prefill batches (seconds). Denominator "
+                "of prefill throughput; the dashboard referenced this series before it existed, so "
+                "that panel rendered nothing.", b.prefill_seconds)
         counter("minisgl_prefix_cache_hit_tokens_total",
                 "Prompt tokens served from the prefix (radix) cache.", b.prefix_cache_hit_tokens)
         counter("minisgl_prefix_cache_prompt_tokens_total",

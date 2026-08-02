@@ -34,6 +34,9 @@ class UserReply(BaseFrontendMsg):
     completion_tokens: int = 0
     prompt_tokens: int = 0
     finish_reason: str | None = None
+    # Set when the engine REFUSED the request (see DetokenizeMsg.error). The reply is terminal and
+    # carries no text; the HTTP layer turns it into a 4xx instead of ending the stream silently.
+    error: str | None = None
 
 
 @dataclass
@@ -53,6 +56,7 @@ class StatsFrontendMsg(BaseFrontendMsg):
     kv_tokens_used: int
     gdn_slots_total: int
     gdn_slots_used: int
+    prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
     # CAM editable-memory store stats (0 when CAM is off), aggregated across namespaces.
