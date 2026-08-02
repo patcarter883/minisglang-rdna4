@@ -49,6 +49,15 @@ class CacheManager:
         if attach is not None:
             attach(handle, rec_state)
 
+    def attach_rec_state_at(self, handle: BaseCacheHandle, boundary: int, rec_state) -> bool:
+        """Attach a recurrent-state snapshot at an interior boundary of an inserted prefix node,
+        making that boundary a legal resume point for a request that diverges later (recurrent radix
+        only)."""
+        attach = getattr(self.prefix_cache, "attach_rec_state_at", None)
+        if attach is None:
+            return False
+        return bool(attach(handle, boundary, rec_state))
+
     def allocate_paged(self, reqs: List[Req]) -> None:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
