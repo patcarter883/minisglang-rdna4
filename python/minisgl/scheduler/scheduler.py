@@ -4375,8 +4375,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 _wd = (f" verify-width[{self._verify_width.hist_str()}]"
                        if self._verify_width is not None else "")
                 _vg = getattr(self, "_m_vgraph", [0, 0])
+                # `mean accept-len` here counts accepted DRAFTS; minisgl_spec_mean_accept_len counts
+                # tokens COMMITTED (accepted + the bonus token every verify emits). Same name, and
+                # they differ by exactly 1 — so 1.07 in the log beside 2.09 on the dashboard reads
+                # like one of them is broken. It is the committed figure that decides whether spec
+                # pays (tokens per step vs 1.0 for plain decode); mistaking the draft figure for it
+                # makes healthy spec look net-negative. Spell both out.
+                #
+                # The `mean accept-len=X over N reqs` substring is LOAD-BEARING: tools/*.sh grep that
+                # exact shape (dflash_graph_ab, dflash_aux_ab, ddtree_capture_ab, ...). Additive only.
+                _acc = ast["acc"] / ast["n"]
                 logger.info_rank0(
-                    f"[spec] mean accept-len={ast['acc']/ast['n']:.2f} over {ast['n']} reqs{_wd} "
+                    f"[spec] mean accept-len={_acc:.2f} over {ast['n']} reqs "
+                    f"[accepted-drafts/verify; committed/verify={1.0 + _acc:.2f}]{_wd} "
                     f"verify-graph replay={_vg[0]} eager={_vg[1]}")
         # Metrics: one verify step for the batch; per-req draft/accepted/emitted totals (see
         # server/metrics.py -> minisgl_spec_*). Cheap int adds off the per-token path.
