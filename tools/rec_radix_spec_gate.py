@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import subprocess
 import sys
 import time
@@ -44,7 +45,7 @@ def post(base, body, timeout=1800):
         return json.loads(resp.read())
 
 
-def ask(base, model, prompt, max_tokens=256):
+def ask(base, model, prompt, max_tokens=32):
     t0 = time.perf_counter()
     d = post(base, {"model": model, "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": max_tokens, **GREEDY})
@@ -68,20 +69,39 @@ def main() -> int:
     B = a.base
     model = json.loads(urllib.request.urlopen(B + "/v1/models", timeout=30).read())["data"][0]["id"]
 
-    # PRECONDITION: the serve must be bit-reproducible, else cold-vs-warm compares noise.
-    try:
-        env = subprocess.run(["docker", "exec", a.container, "bash", "-lc",
-                              "tr '\0' '\n' < /proc/1/environ | grep -E '^MINISGL_MOE_G2FUSE='"],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception:  # noqa: BLE001
-        env = ""
-    if env != "MINISGL_MOE_G2FUSE=0":
-        print("REFUSING TO RUN: the serve is not bit-reproducible.")
-        print(f"  /proc/1/environ has {env or 'MINISGL_MOE_G2FUSE unset (defaults to 1 = fused)'}")
-        print("  The fused MoE gemm2 accumulates cross-block with atomicAdd, so its reduction order")
-        print("  varies run to run; measured, that changes the answer text by ~256 output tokens even")
-        print("  with the prefix cache OFF. Restart the serve with MINISGL_MOE_G2FUSE=0 and re-run.")
+    # PRECONDITION, MEASURED not assumed: find an output length at which this serve is actually
+    # bit-reproducible, and compare only there.
+    #
+    # MINISGL_MOE_G2FUSE=0 is NOT sufficient. Measured 2026-08-02 with the prefix cache OFF and
+    # G2FUSE=0, an identical greedy request repeated 5x produced:
+    #     max_tokens= 32 -> 1 distinct output   (reproducible)
+    #     max_tokens=128 -> 3 distinct
+    #     max_tokens=256 -> 4 distinct          (essentially non-reproducible)
+    # so a 256-token comparison measures NOISE. The residual source is not only the fused gemm2:
+    # moe_align scatters rows with `atomicAdd` and documents "order within a run is arbitrary", so the
+    # per-expert row order — and therefore the gather-reduce summation order — varies run to run.
+    # This gate therefore probes the floor and refuses if even the shortest length is unstable,
+    # rather than reporting a confident verdict on a comparison that cannot mean anything.
+    probe = "Explain speculative decoding in an inference engine."
+    stable = None
+    for mt in (32, 64, 128):
+        h = {hashlib.sha1((ask(B, model, probe, mt)["reasoning"] + "|"
+                           + ask(B, model, probe, mt)["text"]).encode()).hexdigest() for _ in range(2)}
+        outs = [ask(B, model, probe, mt) for _ in range(3)]
+        sigs = {o["reasoning"] + "|" + o["text"] for o in outs}
+        print(f"  noise probe max_tokens={mt:<4} -> {len(sigs)} distinct of 3"
+              + ("   <= REPRODUCIBLE" if len(sigs) == 1 else ""))
+        if len(sigs) == 1:
+            stable = mt
+        else:
+            break
+    if stable is None:
+        print("REFUSING TO RUN: this serve is not bit-reproducible at ANY tested length, so a")
+        print("  cold-vs-warm output comparison cannot distinguish a lossy cache from run-to-run")
+        print("  noise. Validate the recurrent state directly instead of via model output.")
         return 2
+    print(f"  -> comparing at max_tokens={stable}\n")
+    GATE_MT = stable
 
     prefix = "\n".join(f"Fact {i}: item {i} has value {i * 7 % 97}." for i in range(PREFIX_FACTS))
     q = "\n\nUsing the facts above, explain in detail how you would find the value of item 500, then give it."
@@ -91,11 +111,11 @@ def main() -> int:
     print(f"model {model}\nprefix ~{PREFIX_FACTS} facts\n" + "=" * 74)
 
     # A fresh serve has never seen this prefix -> this run is the COLD MISS that populates the cache.
-    cold = ask(B, model, prompt)
+    cold = ask(B, model, prompt, GATE_MT)
     print(f"cold  MISS  {cold['prompt_tokens']:6d} prompt tok  {cold['tokens']:4d} out  {cold['wall']:6.2f}s")
 
     # Same prompt again: identical prefix AND suffix -> maximal hit.
-    warm = ask(B, model, prompt)
+    warm = ask(B, model, prompt, GATE_MT)
     print(f"warm  HIT?  {warm['prompt_tokens']:6d} prompt tok  {warm['tokens']:4d} out  {warm['wall']:6.2f}s"
           f"   ({100*(1-warm['wall']/cold['wall']):+.0f}% wall)")
 
@@ -112,8 +132,8 @@ def main() -> int:
     # A DIFFERENT suffix on the same prefix — the case a prefix cache actually exists for. It cannot
     # be compared to `cold`, so compare it to itself across a hit boundary.
     q2 = "\n\nUsing the facts above, explain how you would find the value of item 250, then give it."
-    first = ask(B, model, prefix + q2)
-    again = ask(B, model, prefix + q2)
+    first = ask(B, model, prefix + q2, GATE_MT)
+    again = ask(B, model, prefix + q2, GATE_MT)
     if first["text"] != again["text"]:
         fails.append("different-suffix answer not reproducible across a hit")
     print(f"  new-suffix reproducible: {first['text'] == again['text']}"
