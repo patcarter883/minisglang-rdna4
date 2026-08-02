@@ -65,6 +65,10 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
     ignore_eos: bool = False
+    # Mirror the OpenAI lane so /generate is not a second-class citizen (it already mirrors
+    # temperature/top_p/top_k). Neutral 0.0 default = penalty path skipped entirely.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     # Sampling. Unset (None) inherits the checkpoint's generation_config.json via _resolve_sampling,
     # exactly as the OpenAI endpoints already do. /generate previously built a bare SamplingParams()
     # and so served GREEDY (SamplingParams defaults temperature=0.0 / top_k=-1 / top_p=1.0) even
@@ -174,7 +178,28 @@ class OpenAICompletionRequest(BaseModel):
     # ("low"/"medium"/"high") maps to a token budget; a `reasoning_max_tokens` in `chat_template_kwargs`
     # is also honored. Unset -> the server's MINISGL_THINK_BUDGET default.
     reasoning_max_tokens: int | None = None
+    # reasoning_effort ladder: none/off/minimal -> thinking OFF; low/medium/high -> 256/1024/4096;
+    # extra_high (a.k.a. "extra high"/"xhigh") -> 16384; max/maximum/unlimited -> unbounded.
+    # An unrecognised value is a 400 rather than a silent fallback.
     reasoning_effort: str | None = None
+    # OpenRouter-style {"enabled": bool, "effort": str, "exclude": bool}, and a bare `thinking` bool.
+    # Accepted as aliases so a client does not have to know THIS server's preferred spelling.
+    reasoning: dict | None = None
+    thinking: bool | None = None
+    # Accepted and inert (no behavioural meaning for a local single-tenant server). Declared so they
+    # are visibly ignored rather than silently swallowed by the extra-field policy.
+    user: str | None = None
+    store: bool | None = None
+    metadata: dict | None = None
+    service_tier: str | None = None
+    parallel_tool_calls: bool | None = None
+    # Declared ONLY so the request can be REJECTED with a clear reason. The engine has no support for
+    # these; accepting them silently (the old behaviour) means answering a different question than the
+    # one asked. See _reject_unsupported.
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
+    logit_bias: dict | None = None
+    seed: int | None = None
 
     # Per-call Markovian-RSA control (in-engine, same port). Absent / null -> ordinary single
     # completion. `true` -> run RSA with the server's --rsa-* defaults. An object patches those
@@ -395,19 +420,64 @@ def _reasoning_close_delim(req: "OpenAICompletionRequest") -> str | None:
     return parser.end_token if parser is not None else None
 
 
+# reasoning_effort -> token budget for the think-gate backstop.
+#   * OFF rungs disable thinking outright (handled in _resolve_chat_template_kwargs, not here).
+#   * "max" means UNBOUNDED: thinking on, no budget — distinct from omitting the field only in that
+#     it is an explicit choice rather than a default.
+# Spellings are normalised (case, spaces, hyphens -> underscores) because clients disagree:
+# "extra high" / "extra-high" / "xhigh" all mean the same thing.
+_EFFORT_OFF = frozenset({"none", "off", "minimal", "no", "false", "disabled"})
+_EFFORT_BUDGET = {
+    "low": 256,
+    "medium": 1024,
+    "high": 4096,
+    "extra_high": 16384,
+    "xhigh": 16384,
+    "x_high": 16384,
+    "very_high": 16384,
+    "max": None,          # explicit "think as long as you need"
+    "maximum": None,
+    "unlimited": None,
+}
+
+
+def _norm_effort(value: str) -> str:
+    return "_".join(str(value).strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _effort_is_off(req: "OpenAICompletionRequest") -> bool:
+    """True when the client asked for NO reasoning via reasoning_effort or an OpenRouter-style alias."""
+    if req.reasoning_effort and _norm_effort(req.reasoning_effort) in _EFFORT_OFF:
+        return True
+    r = req.reasoning
+    if isinstance(r, dict):
+        if r.get("enabled") is False or r.get("exclude") is True:
+            return True
+        eff = r.get("effort")
+        if eff and _norm_effort(eff) in _EFFORT_OFF:
+            return True
+    return req.thinking is False
+
+
 def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
-    """Per-request reasoning-token budget for the think-gate backstop, or None to use the server's
-    MINISGL_THINK_BUDGET default. Precedence: explicit `reasoning_max_tokens` > the same key inside
-    `chat_template_kwargs` > OpenAI `reasoning_effort` (low/medium/high -> a token budget). Only takes
-    effect for grammar-constrained + thinking requests (the scheduler ignores it otherwise)."""
+    """Per-request reasoning-token budget, or None for unbounded (the server's MINISGL_THINK_BUDGET
+    default still applies when nothing is set). Precedence: explicit `reasoning_max_tokens` > the same
+    key inside `chat_template_kwargs` > `reasoning_effort` > `reasoning.effort`.
+
+    Applies to plain requests too, not just grammar-constrained ones — the scheduler arms the think
+    gate for any thinking request (see _maybe_arm_think_gate). The old docstring claimed otherwise
+    and was stale, which made this knob look inert when it is not."""
     if isinstance(req.reasoning_max_tokens, int) and req.reasoning_max_tokens > 0:
         return req.reasoning_max_tokens
     ck = req.chat_template_kwargs or {}
     ck_budget = ck.get("reasoning_max_tokens")
     if isinstance(ck_budget, int) and ck_budget > 0:
         return ck_budget
-    if req.reasoning_effort:
-        return {"low": 256, "medium": 1024, "high": 4096}.get(req.reasoning_effort.lower())
+    effort = req.reasoning_effort
+    if not effort and isinstance(req.reasoning, dict):
+        effort = req.reasoning.get("effort")
+    if effort:
+        return _EFFORT_BUDGET.get(_norm_effort(effort))
     return None
 
 
@@ -468,6 +538,37 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
+def _reject_unsupported(req: "OpenAICompletionRequest") -> JSONResponse | None:
+    """400 for parameters this engine cannot honour, instead of accepting and ignoring them.
+
+    Silently ignoring is the worse failure: the caller gets a 200 and a confidently wrong answer to a
+    different question. Measured before this existed — presence_penalty 0.0 vs 2.0 produced
+    byte-identical output, n=3 returned 1 choice, and reasoning_effort="none" produced UNBOUNDED
+    reasoning. Every one of those looked like success."""
+    def bad(msg: str, param: str, code: str = "unsupported_parameter") -> JSONResponse:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": msg, "type": "invalid_request_error", "param": param, "code": code}})
+
+    if req.logprobs or req.top_logprobs is not None:
+        return bad("logprobs / top_logprobs are not supported by this server: returning per-token "
+                   "logprobs would require carrying them through the sampler, scheduler and "
+                   "detokenizer on every token. Omit the field.", "logprobs")
+    if req.logit_bias:
+        return bad("logit_bias is not supported by this server.", "logit_bias")
+    if req.n is not None and req.n != 1:
+        return bad(f"n={req.n} is not supported: this server returns a single choice. Issue n "
+                   "separate requests instead.", "n")
+    effort = req.reasoning_effort or (req.reasoning or {}).get("effort")
+    if effort:
+        norm = _norm_effort(effort)
+        if norm not in _EFFORT_OFF and norm not in _EFFORT_BUDGET:
+            return bad(
+                f"reasoning_effort={effort!r} is not recognised. Supported: "
+                "none/off/minimal (no reasoning), low, medium, high, extra_high, max.",
+                "reasoning_effort", "invalid_value")
+    return None
+
+
 def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None:
     """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
     the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3 /
@@ -475,6 +576,12 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None
     kwargs = dict(req.chat_template_kwargs or {})
     if req.enable_thinking is not None and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = req.enable_thinking
+    # reasoning_effort=none/minimal, reasoning={"enabled":false}, thinking=false all mean the same
+    # thing as enable_thinking=false. They were previously accepted and IGNORED — and for
+    # reasoning_effort="none" the effect was the opposite of the request (no budget -> unbounded
+    # thinking), which is how a client asking for less reasoning got the most possible.
+    if "enable_thinking" not in kwargs and _effort_is_off(req):
+        kwargs["enable_thinking"] = False
     return kwargs or None
 
 
@@ -485,6 +592,8 @@ def _thinking_active(req: "OpenAICompletionRequest") -> bool:
     if req.enable_thinking is False:
         return False
     if (req.chat_template_kwargs or {}).get("enable_thinking") is False:
+        return False
+    if _effort_is_off(req):
         return False
     return True
 
@@ -1261,6 +1370,8 @@ async def generate(req: GenerateRequest, request: Request):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
+                presence_penalty=req.presence_penalty,
+                frequency_penalty=req.frequency_penalty,
                 max_tokens=req.max_tokens,
                 # unset -> the checkpoint's generation_config default (same resolution the OpenAI
                 # endpoints use), NOT the greedy SamplingParams default.
@@ -1283,6 +1394,9 @@ async def v1_root():
 
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
+    _bad = _reject_unsupported(req)
+    if _bad is not None:
+        return _bad
     state = get_global_state()
 
     # In-engine Markovian RSA (opt-in per call via the `rsa` field). When enabled, the WHOLE
@@ -1439,6 +1553,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             chat_template_kwargs=_resolve_chat_template_kwargs(req),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
+                presence_penalty=req.presence_penalty,
+                frequency_penalty=req.frequency_penalty,
                 max_tokens=req.max_tokens,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
@@ -1604,6 +1720,8 @@ async def shell_completion(req: OpenAICompletionRequest):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
+                presence_penalty=req.presence_penalty,
+                frequency_penalty=req.frequency_penalty,
                 max_tokens=req.max_tokens,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
             ),

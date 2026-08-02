@@ -24,6 +24,12 @@ class SamplingParams:
     max_tokens: int = 1024
     # Stop strings: generation finishes (and the output is truncated) at the first occurrence of any
     # of these in the decoded text. Matched on the detokenized string, scheduler-agnostic.
+    # OpenAI repetition controls, applied to the tokens THIS REQUEST HAS GENERATED (not the prompt —
+    # penalising the caller's own vocabulary makes long prompts steer the answer away from their own
+    # subject matter). logit -= presence*(count>0) + frequency*count, exactly the OpenAI formula.
+    # 0.0 (both) is the neutral default and skips the whole path, so unpenalised traffic is unchanged.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     stop: List[str] = field(default_factory=list)
     # INCLUSIVE stop strings: generation finishes at the first occurrence, but the matched string is
     # KEPT in the output (unlike `stop`, which trims it). For tool-call closers (`</tool_call>`) on
@@ -109,6 +115,8 @@ class Req:
         # reader sees a byte-identical tensor (same values, dtype, cpu device); only the backing
         # store changed. Appends past the preallocated max (a speculative accept near the end) grow
         # the buffer by doubling — see _append_host_ids.
+        # Prompt boundary, so the penalty path can count GENERATED tokens only.
+        self._prompt_len = n
         self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)
         self._ids_buf[:n] = self.input_ids
         self._ids_len = n
@@ -120,6 +128,16 @@ class Req:
         self.mem_conf: "torch.Tensor | None" = None
         self._mem_seed: "int | None" = None       # the object's first (store-preferred) token
         self._mem_placed: bool = False            # seed-once: True once _mem_seed has been emitted
+
+    @property
+    def has_penalty(self) -> bool:
+        sp = self.sampling_params
+        return sp.presence_penalty != 0.0 or sp.frequency_penalty != 0.0
+
+    @property
+    def generated_ids(self) -> "torch.Tensor":
+        """The tokens this request has produced so far (excludes the prompt)."""
+        return self._ids_buf[self._prompt_len : self._ids_len]
 
     @property
     def remain_len(self) -> int:

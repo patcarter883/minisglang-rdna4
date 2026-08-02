@@ -1326,6 +1326,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Drop any un-attached recurrent-state checkpoint (idempotent; frees the cloned slot state).
         self._pending_rec_snap.pop(req.uid, None)
         self._rec_snap_ladder.pop(req.uid, None)  # frees any un-attached interior checkpoints
+        # Release this request's repetition-penalty count buffer (~1 MB at a 248k vocab; only
+        # allocated for penalised requests, but it would leak for the process lifetime otherwise).
+        self.engine.sampler.free_penalty_state(req.uid)
         # Drop the reasoning-gate "done" marker (idempotent; the gate dicts are cleared via _clear_think_gate).
         self._think_gate_done.discard(req.uid)
 
