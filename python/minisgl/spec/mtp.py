@@ -118,10 +118,20 @@ class MTPProposer(CapturableProposer):
         # < window)). The kernel needs no change: step_masked already takes an arbitrary write_col
         # and an explicit mask_bias, and never assumes column == position.
         #
-        # W defaults to the OLD _max_ctx so behaviour and VRAM are unchanged at <= that length (the
-        # ring cannot wrap there) and only the cliff above it disappears. Lower it to trade drafter
-        # context for VRAM: the buffer is max_slots*W, so W=2048 frees ~75% of it.
-        self._ring = max(64, int(os.environ.get("MINISGL_MTP_KV_WINDOW") or self._max_ctx))
+        # W=512, MEASURED. The buffer is max_slots*W, so this is 3 MB where the old full-context
+        # 8192 was 50 MB. A provenance-asserted sweep (35B-MXFP4 TP=2, MTP K=4) found NO detectable
+        # cost — every difference sits inside the run-to-run noise floor (+-0.06 accept,
+        # +-0.15 emitted/step), accept / emitted-per-step / tok-s:
+        #     W=512   3 MB   0.54/2.81/51.1   0.49/2.76/18.9   0.54/2.58/9.3
+        #     W=2048 13 MB   0.49/2.62/48.5   0.48/2.58/18.5   0.53/2.62/9.3
+        #     W=8192 50 MB   0.53/2.81/50.4   0.49/2.76/18.9   0.54/2.67/9.3
+        #                    (ctx 6955)       (ctx 25651)      (ctx 45548)
+        # i.e. the drafter does not need long context: 512 tokens of recent history match 8192 at
+        # every depth tested. The freed 47 MB is post-KV-pool SLACK, not KV pool — the draft KV is
+        # allocated from what is free AFTER the pool is sized — so it buys OOM headroom for the
+        # capture/transient path, which is exactly where this stack runs out (see _spec_seed_fits).
+        # Raise it if a model's drafter turns out to be more context-sensitive than MTP's.
+        self._ring = max(64, int(os.environ.get("MINISGL_MTP_KV_WINDOW") or 512))
         # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to _max_ctx and was the
         # silent cliff; the ring makes any length drafts-capable, so there is nothing to gate.
         _gate_env = os.environ.get("MINISGL_SPEC_MAX_CONTEXT")
