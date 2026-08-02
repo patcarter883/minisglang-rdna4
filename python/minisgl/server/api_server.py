@@ -190,6 +190,27 @@ class OpenAICompletionRequest(BaseModel):
             self.max_tokens = self.max_completion_tokens if self.max_completion_tokens is not None else 16
         return self
 
+    @model_validator(mode="after")
+    def _reject_malformed(self) -> "OpenAICompletionRequest":
+        """Reject requests that cannot be served, as 4xx, BEFORE they reach the engine.
+
+        `max_tokens <= 0` KILLED THE WHOLE SERVE — measured 2026-08-02: a single
+        `{"max_tokens": -5}` dropped the connection and the container came back reloading the model
+        from scratch. Nothing downstream bounded it (`reasoning_max_tokens` is checked `> 0` a few
+        lines below, but the main field never was), so a negative budget reached the scheduler and
+        took the process with it. That is a remote DoS from an unauthenticated malformed request —
+        any client can end the serve, and every other in-flight request dies with it.
+
+        Empty/absent `messages` with no `prompt` was a 500 for the same reason: the guard existed
+        only on the RSA lane, so the ordinary lane fell through to a raw-prompt branch with nothing
+        to read. A malformed CLIENT request must never surface as a server error.
+        """
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        if not self.messages and not getattr(self, "prompt", None):
+            raise ValueError("either `messages` (chat) or `prompt` (completion) is required")
+        return self
+
 
 def _grammar_from_response_format(rf: dict | None) -> str | None:
     """Map an OpenAI ``response_format`` to a SamplingParams.grammar spec ("json" or a JSON-schema
