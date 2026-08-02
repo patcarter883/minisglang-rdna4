@@ -17,7 +17,7 @@ import torch
 # fallback and composes inside a `Batch*.data` list exactly as before. Field order mirrors each
 # dataclass's declaration so the emitted dict is identical to what the generic walk produced.
 _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
-    "DetokenizeMsg": ("uid", "next_token", "finished", "extra_tokens", "finish_reason"),
+    "DetokenizeMsg": ("uid", "next_token", "finished", "extra_tokens", "finish_reason", "error"),
     "UserReply": (
         "uid",
         "incremental_output",
@@ -25,6 +25,7 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "completion_tokens",
         "prompt_tokens",
         "finish_reason",
+        "error",
     ),
     "StatsMsg": (
         "dp_rank",
@@ -38,6 +39,7 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "kv_tokens_used",
         "gdn_slots_total",
         "gdn_slots_used",
+        "prefill_seconds",
         "prefix_cache_hit_tokens",
         "prefix_cache_prompt_tokens",
         "cam_facts",
@@ -61,6 +63,7 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "kv_tokens_used",
         "gdn_slots_total",
         "gdn_slots_used",
+        "prefill_seconds",
         "prefix_cache_hit_tokens",
         "prefix_cache_prompt_tokens",
         "cam_facts",

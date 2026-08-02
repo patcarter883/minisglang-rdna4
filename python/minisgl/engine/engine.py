@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
@@ -101,6 +102,8 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
+        # Completed-but-unread prefill timing events (see prefill_seconds_total).
+        self._pf_events: deque = deque()
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         # Register this replica's DP coordinates (inert DpInfo(0,1) when dp_size=1). Done before any
@@ -857,12 +860,41 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
+    # Cumulative GPU time spent in prefill forwards; exported as minisgl_prefill_seconds_total.
+    #
+    # Timed with CUDA EVENTS, not host wall-clock. forward_batch returns once the kernels are
+    # LAUNCHED, so host timing measures launch overhead: it read 84,631 tokens / 0.384 s = 220k
+    # tok/s, which is not a prefill rate. Events measure the device interval without forcing a host
+    # sync; pairs are drained opportunistically once complete, so nothing blocks the scheduler.
+    prefill_seconds_total: float = 0.0
+
+    def _drain_prefill_events(self) -> None:
+        """Fold completed prefill event pairs into the counter. Non-blocking: an incomplete pair is
+        left for a later step, so this never syncs the host onto the GPU just to keep a metric."""
+        ev = self._pf_events
+        while ev and ev[0][1].query():
+            start, end = ev.popleft()
+            self.prefill_seconds_total += start.elapsed_time(end) / 1000.0
+
     def forward_batch(
         self, batch: Batch, args: BatchSamplingArgs, return_hidden: bool = False
     ):
         assert torch.cuda.current_stream() == self.stream
         _maybe_profile()
         extra = None
+        # GPU time for minisgl_prefill_seconds_total — the denominator of the "prefill throughput"
+        # panel, which until now divided by a series the engine never exported and so rendered blank.
+        _pf_ev = None
+        if batch.is_prefill:
+            _pf_ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            _pf_ev[0].record(self.stream)
+        _pf_probe = batch.is_prefill and os.environ.get("MINISGL_PREFILL_MEM_PROBE") == "1"
+        if _pf_probe:
+            torch.cuda.reset_peak_memory_stats()
+            _pf_free0 = torch.cuda.mem_get_info()[0]
+            _pf_alloc0 = torch.cuda.memory_allocated()
+            _pf_tok = sum(r.extend_len for r in batch.reqs)
+            _pf_ctx = max(r.device_len for r in batch.reqs)
         with self.ctx.forward_batch(batch):
             if return_hidden:
                 # Draft-head spec-decode PREFILL SEED path: one forward yields the bonus-token logits
@@ -896,6 +928,17 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        if _pf_ev is not None:
+            _pf_ev[1].record(self.stream)
+            self._pf_events.append(_pf_ev)
+        self._drain_prefill_events()
+        if _pf_probe:
+            torch.cuda.synchronize()
+            _peak = torch.cuda.max_memory_allocated() - _pf_alloc0
+            logger.info_rank0(
+                f"[pf-probe] tokens={_pf_tok} ctx={_pf_ctx} bs={batch.size} "
+                f"peak_delta_MiB={_peak/(1<<20):.1f} free_before_MiB={_pf_free0/(1<<20):.1f}"
+            )
         return (out, *extra) if return_hidden else out
 
     def forward_verify(self, batch: Batch, return_hidden: bool = False):

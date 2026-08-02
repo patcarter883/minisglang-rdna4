@@ -956,6 +956,7 @@ class FrontendManager:
                         kv_tokens_used=msg.kv_tokens_used,
                         gdn_slots_total=msg.gdn_slots_total,
                         gdn_slots_used=msg.gdn_slots_used,
+                        prefill_seconds=msg.prefill_seconds,
                         prefix_cache_hit_tokens=msg.prefix_cache_hit_tokens,
                         prefix_cache_prompt_tokens=msg.prefix_cache_prompt_tokens,
                         cam_facts=msg.cam_facts,
@@ -1034,6 +1035,10 @@ class FrontendManager:
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                yield f"data: {json.dumps({'error': ack.error})}\n".encode()
+                yield "data: [DONE]\n".encode()
+                return
             yield f"data: {ack.incremental_output}\n".encode()
             if ack.finished:
                 break
@@ -1056,6 +1061,15 @@ class FrontendManager:
             return f"data: {json.dumps(payload)}\n\n".encode()
 
         async for ack in self.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                # Headers are already sent, so this cannot become a 4xx — emit an explicit error
+                # event so the client sees a REASON instead of an empty stream that just stops.
+                _err = json.dumps({"error": {"message": ack.error,
+                                             "type": "invalid_request_error",
+                                             "code": "context_length_exceeded"}})
+                yield f"data: {_err}\n\n".encode()
+                yield "data: [DONE]\n\n".encode()
+                return
             delta: dict = {}
             if first_chunk:
                 delta["role"] = "assistant"
@@ -1442,7 +1456,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     content_chunks: List[str] = []
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
+    rejected: str | None = None
     async for ack in state.wait_for_ack(uid):
+        if getattr(ack, "error", None):
+            rejected = ack.error
+            break
         content_chunks.append(ack.incremental_output)
         completion_tokens = max(completion_tokens, ack.completion_tokens)
         prompt_tokens = ack.prompt_tokens or prompt_tokens
@@ -1450,6 +1468,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             finish_reason = ack.finish_reason
         if ack.finished:
             break
+    if rejected is not None:
+        # The engine refused this request (e.g. prompt longer than the KV pool). Answer with a real
+        # 4xx: returning an empty 200 would look like the model chose to say nothing, and the old
+        # behaviour — no reply at all — hung the caller until its own timeout.
+        return JSONResponse(status_code=400, content={"error": {
+            "message": rejected, "type": "invalid_request_error", "param": "messages",
+            "code": "context_length_exceeded"}})
     full_content = "".join(content_chunks)
 
     # Tool calls are extracted from the RAW output FIRST, BEFORE the reasoning split. A reasoning

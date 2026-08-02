@@ -319,6 +319,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             )
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        # PREFILL ACTIVATION GUARD — sized from a MEASUREMENT, not a guess.
+        #
+        # MINISGL_PREFILL_MEM_PROBE=1 logs peak allocation per prefill forward. On Qwen3.6-35B TP=2:
+        #     tokens=8192 ctx=8192  -> 465.6 MiB      tokens=8192 ctx=32768 -> 465.6 MiB
+        #     tokens=8192 ctx=16384 -> 465.6 MiB      tokens=8192 ctx=57344 -> 465.6 MiB
+        #     tokens=6352 ctx=6352  -> 347.8 MiB
+        # i.e. the peak tracks the CHUNK (~58-65 KiB/token) and is FLAT in context length. So the
+        # thing to bound is the per-step token budget, not the prompt length — a long prompt is
+        # simply more chunks, each costing the same. (My first cut scaled the budget by how far free
+        # memory had fallen below a reserve; that is unrelated to what the forward actually needs,
+        # and measured, it shrank 8192->7456 while the worker still died.)
+        self._act_bytes_per_token = int(
+            float(os.environ.get("MINISGL_PREFILL_ACT_KIB_PER_TOKEN") or 64) * 1024
+        )
+        self._act_safety_bytes = int(
+            float(os.environ.get("MINISGL_PREFILL_ACT_SAFETY_MIB") or 384) * (1 << 20)
+        )
+        self._act_guard_trips = 0
         # self.config = config
 
         # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations, then RETURN from
@@ -1086,6 +1104,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 spec_accepted_tokens=self._m_spec_accepted_tokens,
                 spec_emitted_tokens=self._m_spec_emitted_tokens,
                 spec_steps=self._m_spec_steps,
+                prefill_seconds=self.engine.prefill_seconds_total,
                 running_requests=len(self.decode_manager.running_reqs),
                 waiting_requests=len(self.prefill_manager.pending_list),
                 prefix_cache_hit_tokens=self.prefill_manager.prefix_hit_tokens,
@@ -1241,10 +1260,19 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
-                return logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
+                # REJECT, and tell the caller. This used to `return` after logging: the frontend
+                # blocks in wait_for_ack until an ack with finished=True, so a rejected request hung
+                # the client until its own timeout and was indistinguishable from a hung server
+                # (observed: dropped at 05:30:54, client abort at 05:34:53). next_token is filler —
+                # `error` makes the detokenizer skip token accumulation entirely.
+                reason = (
+                    f"input sequence length {input_len} exceeds the servable maximum "
+                    f"{max_seq_len} (KV pool); request rejected"
                 )
+                logger.warning_rank0(f"{reason} [uid={msg.uid}]")
+                self.send_result([DetokenizeMsg(uid=msg.uid, next_token=0, finished=True,
+                                                finish_reason="length", error=reason)])
+                return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
@@ -1885,10 +1913,49 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             break  # bonus token (rejected draft, or i == K)
         return AcceptResult(emitted=emitted, num_accepted=n_acc)
 
+    def _prefill_budget_now(self) -> int:
+        """Per-step prefill token budget, capped by what free VRAM can actually hold.
+
+        Peak prefill allocation is ~`_act_bytes_per_token` per token in the STEP and independent of
+        context length (measured; see __init__). So the largest safe step is
+        `(free - safety) / bytes_per_token`. Returns the configured budget whenever it fits, so the
+        common path is untouched; under pressure the step SHRINKS instead of the forward dying."""
+        base = self.prefill_budget
+        if self._act_bytes_per_token <= 0:
+            return base
+        try:
+            free, _total = torch.cuda.mem_get_info()
+            # mem_get_info reports DEVICE-free only. PyTorch's caching allocator holds reserved-but-
+            # unallocated blocks that the next forward reuses WITHOUT a new device mapping, and at
+            # steady state that cache is most of the card — so device-free alone reads near zero on a
+            # perfectly healthy serve. Counting it made the guard trip at --memory-ratio 0.80, where
+            # there is ~2.5 GiB of headroom, and collapse the budget. Available = device-free + the
+            # allocator's own free cache.
+            free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        except Exception:  # noqa: BLE001 - the guard must never break scheduling
+            return base
+        affordable = (free - self._act_safety_bytes) // self._act_bytes_per_token
+        if affordable >= base:
+            return base
+        page = max(1, self.cache_manager.page_size)
+        # Never collapse the budget: a step too small to make progress turns an OOM into a livelock,
+        # which is strictly worse to debug. Below this the honest outcome is to let the forward fail.
+        floor = min(base, max(page, 1024))
+        scaled = max(floor, (int(affordable) // page) * page)
+        self._act_guard_trips += 1
+        if self._act_guard_trips <= 3 or self._act_guard_trips % 100 == 0:
+            logger.warning_rank0(
+                f"prefill activation guard: free {free/(1<<30):.2f} GiB affords {affordable} tokens "
+                f"at {self._act_bytes_per_token/1024:.0f} KiB/token -> prefill budget {base} -> "
+                f"{scaled} this step (trip #{self._act_guard_trips}). Sustained trips mean the card "
+                f"is genuinely tight: lower --memory-ratio rather than raise it."
+            )
+        return scaled
+
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
         batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            self.prefill_manager.schedule_next_batch(self._prefill_budget_now())
             or self.decode_manager.schedule_next_batch()
         )
         return self._prepare_batch(batch) if batch else None
@@ -2332,7 +2399,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         # Prefill takes priority and uses the normal (non-spec) synchronous path — except when the
         # prompt-prefill draft-KV seed is enabled, where it runs a hidden-capturing prefill instead.
-        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        batch = self.prefill_manager.schedule_next_batch(self._prefill_budget_now())
         if batch is not None:
             # A constrained (structured-output) req must take the plain prefill path so its first token
             # (the prefill bonus) is grammar-masked — the hidden-capturing seed forward bypasses the
@@ -2414,7 +2481,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         for msg in self.receive_msg(blocking=False):
             self._process_one_msg(msg)
 
-        prefill_batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        prefill_batch = self.prefill_manager.schedule_next_batch(self._prefill_budget_now())
         local_prefill_tokens = (
             sum(r.extend_len for r in prefill_batch.reqs) if prefill_batch is not None else 0
         )
