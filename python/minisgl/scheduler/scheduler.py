@@ -156,8 +156,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # recurrent state behind it must match a fresh forward bit-for-bit. Gate any rollout on
         # tools/rec_radix_spec_gate.py (cold-MISS output == warm-HIT output, byte-identical, UNDER
         # SPEC) — not on a throughput number.
+        # `or "0"` NOT a dict default: compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY,
+        # and "" != "0" is True — so `get(k, "0") != "0"` turns a default-OFF flag into default-ON
+        # under compose, which is the only way this repo serves. Measured: a control run launched
+        # WITHOUT the variable still came up with the cache enabled, silently making an A/B compare
+        # a config against itself. Same trap as the KV_FRAC readers fixed in e9cdb541.
         _rec_radix_ok = (self.engine.spec_config is None
-                         or os.environ.get("MINISGL_REC_RADIX_SPEC", "0") != "0")
+                         or (os.environ.get("MINISGL_REC_RADIX_SPEC") or "0") != "0")
         # CCA (ZAYA) is EXCLUDED from recurrent radix. This is NOT the recurrent state's fault: the
         # (conv_states, prev_hs) snapshot is captured/restored byte-faithfully AND the reused prefix
         # keys are bit-identical to a fresh forward (both verified: tools/cca_radix_whitebox.py and
