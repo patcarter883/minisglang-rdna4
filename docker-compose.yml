@@ -127,6 +127,14 @@ x-lean-common: &lean-common
     # defaults live in scheduler.py::_SPEC_MAX_BS_BY_ALGO (MTP 4, DFlash 1 — both measured). Set 0 to
     # disable the gate, which is REQUIRED when measuring a crossover or the gate hides the points.
     MINISGL_SPEC_MAX_BS: "${MINISGL_SPEC_MAX_BS:-}"
+    # Lift the spec-decode gate on the RECURRENT (GDN/CCA) radix prefix cache. Off by default because
+    # wrong here is SILENT GARBAGE, not a crash — a hit reports cached_len>0 and the recurrent state
+    # behind it must match a fresh forward bit-for-bit. Gate any rollout on
+    # tools/rec_radix_spec_gate.py (cold-MISS output == warm-HIT output, UNDER SPEC), not on tok/s.
+    # Without it a recurrent hybrid + spec serves with prefix caching DISABLED (forced 'naive'), which
+    # on a repeated-prefix workload is the single largest lever available — prefill is ~70% of the
+    # wall on a 14k-token prompt and the original recurrent-radix fix measured 37-40% off a hit.
+    MINISGL_REC_RADIX_SPEC: "${MINISGL_REC_RADIX_SPEC:-}"
     # MINISGL_EXIT_AFTER_STEPS=<N>: run N scheduler-loop iterations then return from run_forever, so
     # the process exits NORMALLY. Diagnostics only; unset = serve forever. Required to profile inside
     # a captured CUDA graph: rocprofv3 is LD_PRELOADed into this very process (it is not a separate

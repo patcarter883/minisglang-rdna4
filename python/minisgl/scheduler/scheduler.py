@@ -134,7 +134,30 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # batches). Spec-decode is DIFFERENT and stays gated: it runs its OWN decode-time snapshot/
         # restore over the same recurrent state (verify-state install) with prompt-dependent
         # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
-        _rec_radix_ok = self.engine.spec_config is None
+        # MINISGL_REC_RADIX_SPEC=1 lifts the spec-decode gate. The gate's stated premise — "both
+        # snapshot the recurrent state" — does not match what the code does:
+        #   * RECURRENT RADIX touches the slot only during PREFILL: it stashes a clone at page-aligned
+        #     prefill-commit boundaries (_stash_rec_state) and restores on a prefix HIT in
+        #     _finish_prepare (line ~1422). The spec prefill path reaches BOTH — _spec_prefill_seeded
+        #     calls _prepare_batch -> _finish_prepare, so the restore is not skipped on the seeded
+        #     prologue (which HAS silently missed things before).
+        #   * SPEC does NOT snapshot/restore the live slot at all. The verify forward captures the
+        #     conv+ssm state after each of the K+1 tokens into per-layer SCRATCH and then INSTALLS the
+        #     accepted-prefix state into the slot, "bit-exact vs 1-token decode" (see the verify
+        #     comment ~3722). That is a decode-phase WRITE, not a second snapshot system racing the
+        #     first.
+        # So the two are temporally disjoint (prefill vs decode) — the same over-conservatism SWA-radix
+        # was found to have, which now composes with spec via a stride widening. The CCA half of the
+        # old gate is already resolved above (minv_linear made chunked prefill bit-identical), leaving
+        # spec as the sole remaining gate.
+        #
+        # DEFAULT OFF, exactly as SWA-radix shipped ("so the naive path is byte-unchanged until
+        # proven"). Wrong here is SILENT GARBAGE, not a crash: a hit reports cached_len>0 and the
+        # recurrent state behind it must match a fresh forward bit-for-bit. Gate any rollout on
+        # tools/rec_radix_spec_gate.py (cold-MISS output == warm-HIT output, byte-identical, UNDER
+        # SPEC) — not on a throughput number.
+        _rec_radix_ok = (self.engine.spec_config is None
+                         or os.environ.get("MINISGL_REC_RADIX_SPEC", "0") != "0")
         # CCA (ZAYA) is EXCLUDED from recurrent radix. This is NOT the recurrent state's fault: the
         # (conv_states, prev_hs) snapshot is captured/restored byte-faithfully AND the reused prefix
         # keys are bit-identical to a fresh forward (both verified: tools/cca_radix_whitebox.py and
