@@ -222,7 +222,7 @@
       "id": 4,
       "type": "stat",
       "title": "Decode speed (tok/s)",
-      "description": "Live per-stream decode rate = generation tok/s divided by concurrent running requests. Updates every scrape during in-flight generation (unlike the TPOT histogram, which only records on request completion). For batch this is the mean per-stream speed; see \"Token throughput\" for aggregate idle-inclusive throughput and the TPOT latency panel for per-completed-request tail latency.",
+      "description": "Per-stream decode rate = 1 / mean TPOT, where TPOT is measured PREFILL-EXCLUDED as (completion_time - first_token_time) / (tokens - 1) (server/metrics.py). Records on request COMPLETION, so it lags in-flight generation — that lag is the deliberate price of correctness. The previous expression, rate(generation_tokens)/running_requests, divided by WALL time and so counted prefill and idle as decode: at 65k context it read 4.3 tok/s against a true 57.5 (13x understated), because TTFT had grown to 27s inside the rate window. It also divided a window-averaged rate by an instantaneous gauge. See \"Token throughput\" for aggregate idle-inclusive throughput.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -272,7 +272,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval])) / clamp_min(sum(minisgl_running_requests{model_name=~\"$model\"}), 1)"
+          "expr": "1 / (sum(rate(minisgl_tpot_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_tpot_seconds_count{model_name=~\"$model\"}[$__rate_interval])))"
         }
       ]
     },
