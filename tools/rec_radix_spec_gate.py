@@ -1,4 +1,8 @@
-"""Correctness gate for recurrent radix UNDER SPEC DECODE (MINISGL_REC_RADIX_SPEC=1).
+"""Correctness gate for recurrent radix UNDER SPEC DECODE.
+
+The MINISGL_REC_RADIX_SPEC flag this was written for is GONE — recurrent radix now composes with
+spec by default, having been measured lossless. Kept as the REGRESSION gate for that property: run
+it after any change to the recurrent snapshot/restore or the spec verify-state install.
 
 Wrong here is SILENT GARBAGE, not a crash: a prefix HIT reports cached_len>0, and the recurrent
 (GDN/CCA) state behind it must equal what a fresh full forward would have produced. If it does not,
@@ -6,10 +10,9 @@ the serve keeps answering — just differently, and worse. So the gate is OUTPUT
 
     cold MISS output  ==  warm HIT output      byte-identical, greedy, same seed
 
-Run it against a serve started WITH the flag, and again against one started WITHOUT, and compare:
-    MINISGL_REC_RADIX_SPEC=1 ... docker compose --profile serve up -d
+    MINISGL_MOE_G2FUSE=0 ... docker compose --profile serve up -d   # required, see below
     python3 tools/rec_radix_spec_gate.py --expect-hit
-    python3 tools/rec_radix_spec_gate.py            # flag off: no hits expected, still must match
+Compare against a --no-gdn-radix serve for the cache-off control.
 
 A pass here is necessary, not sufficient — it shows the reused state is faithful on THESE prompts.
 The original recurrent-radix fix was validated the same way (cold-MISS == warm-HIT byte-identical)

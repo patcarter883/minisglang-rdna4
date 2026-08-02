@@ -134,35 +134,24 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # batches). Spec-decode is DIFFERENT and stays gated: it runs its OWN decode-time snapshot/
         # restore over the same recurrent state (verify-state install) with prompt-dependent
         # losslessness, so combining two snapshot systems there is unsafe -> force naive under spec.
-        # MINISGL_REC_RADIX_SPEC=1 lifts the spec-decode gate. The gate's stated premise — "both
-        # snapshot the recurrent state" — does not match what the code does:
-        #   * RECURRENT RADIX touches the slot only during PREFILL: it stashes a clone at page-aligned
-        #     prefill-commit boundaries (_stash_rec_state) and restores on a prefix HIT in
-        #     _finish_prepare (line ~1422). The spec prefill path reaches BOTH — _spec_prefill_seeded
-        #     calls _prepare_batch -> _finish_prepare, so the restore is not skipped on the seeded
-        #     prologue (which HAS silently missed things before).
-        #   * SPEC does NOT snapshot/restore the live slot at all. The verify forward captures the
-        #     conv+ssm state after each of the K+1 tokens into per-layer SCRATCH and then INSTALLS the
-        #     accepted-prefix state into the slot, "bit-exact vs 1-token decode" (see the verify
-        #     comment ~3722). That is a decode-phase WRITE, not a second snapshot system racing the
-        #     first.
-        # So the two are temporally disjoint (prefill vs decode) — the same over-conservatism SWA-radix
-        # was found to have, which now composes with spec via a stride widening. The CCA half of the
-        # old gate is already resolved above (minv_linear made chunked prefill bit-identical), leaving
-        # spec as the sole remaining gate.
+        # Recurrent radix COMPOSES WITH SPEC-DECODE. This was gated off for a long time on the
+        # premise that "both snapshot the recurrent state"; that premise does not match the code:
+        #   * RECURRENT RADIX touches the slot only in PREFILL — stash a clone at page-aligned
+        #     prefill-commit boundaries, restore on a hit in _finish_prepare. The spec prefill path
+        #     reaches both (_spec_prefill_seeded -> _prepare_batch -> _finish_prepare).
+        #   * SPEC never snapshots/restores the live slot. Its verify forward captures conv+ssm state
+        #     per token into per-layer SCRATCH and INSTALLS the accepted prefix, bit-exact vs 1-token
+        #     decode. A decode-phase WRITE, not a second snapshot system.
+        # Prefill vs decode: disjoint. Same over-conservatism SWA-radix was found to have.
         #
-        # DEFAULT OFF, exactly as SWA-radix shipped ("so the naive path is byte-unchanged until
-        # proven"). Wrong here is SILENT GARBAGE, not a crash: a hit reports cached_len>0 and the
-        # recurrent state behind it must match a fresh forward bit-for-bit. Gate any rollout on
-        # tools/rec_radix_spec_gate.py (cold-MISS output == warm-HIT output, byte-identical, UNDER
-        # SPEC) — not on a throughput number.
-        # `or "0"` NOT a dict default: compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY,
-        # and "" != "0" is True — so `get(k, "0") != "0"` turns a default-OFF flag into default-ON
-        # under compose, which is the only way this repo serves. Measured: a control run launched
-        # WITHOUT the variable still came up with the cache enabled, silently making an A/B compare
-        # a config against itself. Same trap as the KV_FRAC readers fixed in e9cdb541.
-        _rec_radix_ok = (self.engine.spec_config is None
-                         or (os.environ.get("MINISGL_REC_RADIX_SPEC") or "0") != "0")
+        # MEASURED lossless (2026-08-02, 35B-MXFP4 TP=2, MTP K=4, 15919-token shared prefix, 32
+        # output tokens inside the verified reproducibility floor, spec asserted active on both legs):
+        #     cache OFF  signature 7b91ad4f21 x4   3.47 s
+        #     cache ON   signature 7b91ad4f21 x4   0.40 s     <- byte-identical, -88% wall
+        # Under concurrency outputs diverge WITH OR WITHOUT the cache (batched GEMM M-dependence), and
+        # the cache leg matched MORE often (5/12 vs 3/12) while running 47% faster — so the cache is
+        # not the source of that. Prefill is ~70% of the wall on a 14k prompt, so this is the largest
+        # lever on repeated-prefix traffic.
         # CCA (ZAYA) is EXCLUDED from recurrent radix. This is NOT the recurrent state's fault: the
         # (conv_states, prev_hs) snapshot is captured/restored byte-faithfully AND the reused prefix
         # keys are bit-identical to a fresh forward (both verified: tools/cca_radix_whitebox.py and
@@ -182,10 +171,11 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # int8/fp8 downcast). Routing those dense linears through the engine's fixed-tile WMMA GEMM
         # (layers/minv.py::minv_linear) makes chunked prefill BIT-IDENTICAL to single-pass (verified 0.0
         # across all 40 CCA layers, tools/cca_chunk_bisect.py), so recurrent radix is now lossless for
-        # CCA too. Both GDN and CCA recurrent state are prefix-cacheable; the only remaining gate is
-        # spec-decode (both snapshot the recurrent state). See [[cca-prefix-cache-gemm-m-dependence]].
+        # CCA too. Both GDN and CCA recurrent state are prefix-cacheable, and the spec-decode gate
+        # that used to remain has been REMOVED — measured lossless, see the block above.
+        # See [[cca-prefix-cache-gemm-m-dependence]].
         if has_recurrent_state and cache_type != "naive":
-            if config.gdn_radix and _rec_radix_ok:
+            if config.gdn_radix:
                 self._rec_radix = True
                 cache_type = "recurrent_radix"
                 logger.warning_rank0(
@@ -194,8 +184,6 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 )
             else:
                 why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
-                if config.gdn_radix and not _rec_radix_ok:
-                    why = "recurrent radix is not supported with spec-decode (both snapshot the recurrent state)"
                 logger.warning_rank0(
                     f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
                     + why
