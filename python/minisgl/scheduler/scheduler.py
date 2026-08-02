@@ -757,6 +757,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self._rec_snap_ladder_depth = max(
             0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4)
         )
+        # Must run AFTER the ladder depth is known and the cache manager exists: the snapshot store is
+        # now a real VRAM consumer and has to be bounded and logged, not left at a magic count.
+        self._size_rec_snapshot_budget(config.max_running_req)
         # Reasoning + structured output: while a constrained req is still inside its `<think>…</think>`
         # reasoning span, the grammar matcher must NOT advance or mask (else the JSON schema suppresses
         # the reasoning phase → truncated / CoT-leaked answers). uid -> think-close token id, present
@@ -1367,6 +1370,54 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         if slot is None:
             return
         self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
+
+    def _rec_snapshot_nbytes(self) -> int:
+        """Bytes held by ONE recurrent-state snapshot — i.e. what clone_slot() copies: the [:, s:s+1]
+        slice of each state tensor across all layers (GDN: conv+ssm; CCA: conv+prev_hs)."""
+        c = self._rec_cache
+        total = 0
+        for name in ("conv_state", "ssm_state", "prev_hs"):
+            t = getattr(c, name, None)
+            if t is not None and t.dim() >= 2 and t.shape[1] > 0:
+                total += (t.numel() // t.shape[1]) * t.element_size()
+        return total
+
+    def _size_rec_snapshot_budget(self, max_running: int) -> None:
+        """Bound the radix snapshot LRU by VRAM, not by a magic count.
+
+        The cap defaulted to 64 back when a snapshot was created at most ONCE per committed sequence,
+        so the LRU effectively never filled and its cost was invisible. The interior-resume ladder
+        creates up to (depth + 1) per sequence, which makes 64 genuinely reachable — and at ~25 MB a
+        snapshot on the 35B that is 1.6 GiB of unaccounted VRAM. It does not fail at boot: it fails
+        later, as an OOM in a prefill activation, after the pool has already been sized around memory
+        the snapshots then take. Measured: at --memory-ratio 0.85 (2.47 GiB free after init) a
+        branching workload OOM'd in F.linear; at 0.90 (1.69 GiB free) it OOM'd sooner.
+
+        So derive the cap from an explicit budget and LOG it, the way every other VRAM reservation
+        here is logged. Sized to cover the live working set — (ladder depth + 1) per concurrent
+        request — with headroom, rather than an arbitrary number."""
+        if self._rec_cache is None:
+            return
+        pc = getattr(self.cache_manager, "prefix_cache", None)
+        if not getattr(pc, "recurrent", False):
+            return
+        per = self._rec_snapshot_nbytes()
+        if per <= 0:
+            return
+        budget = int(float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.75) * (1 << 30))
+        # Floor at the LIVE working set — (ladder depth + 1 end) per concurrent request. Below that
+        # the store evicts entries this batch is still going to attach, so the ladder would thrash
+        # against itself and interior resume points would vanish before anyone could use them.
+        floor = (self._rec_snap_ladder_depth + 1) * max(1, max_running)
+        cap = max(4, floor, budget // per)
+        if os.environ.get("MINISGL_GDN_RADIX_MAX_SNAPSHOTS"):
+            cap = min(cap, pc.max_rec_snapshots)  # explicit override still wins downward
+        pc.max_rec_snapshots = int(cap)
+        logger.info_rank0(
+            f"recurrent-radix snapshot store: cap={pc.max_rec_snapshots} x {per/(1<<20):.1f} MiB "
+            f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB (ladder depth "
+            f"{self._rec_snap_ladder_depth}, max_running={max_running})"
+        )
 
     def _attach_rec_ladder(self, req: Req, handle) -> None:
         """Turn this sequence's retained chunk boundaries into interior resume points on the freshly
