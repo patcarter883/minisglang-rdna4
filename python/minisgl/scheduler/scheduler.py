@@ -1447,7 +1447,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         per = self._rec_snapshot_nbytes()
         if per <= 0:
             return
-        budget = int(float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.75) * (1 << 30))
+        # 0.375 GiB covers the LIVE working set with headroom — (ladder depth + 1) per concurrent
+        # request, measured at 20 x 16.4 MiB = 328 MiB here — and little more. This store is reserved
+        # out of the same budget the KV pool is sized from (engine._rec_snapshot_store_bytes), so
+        # every GiB given to it is a GiB of context taken away: at --memory-ratio 0.85 a 0.75 GiB
+        # budget cost ~157k pool tokens, wiping out most of the reason to raise the ratio. Above the
+        # working set the store only buys CROSS-REQUEST prefix reuse — a bonus, not a correctness
+        # requirement. Raise it if branch-heavy traffic wants deeper reuse and you have the VRAM.
+        budget = int(float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.375) * (1 << 30))
         # Floor at the LIVE working set — (ladder depth + 1 end) per concurrent request. Below that
         # the store evicts entries this batch is still going to attach, so the ladder would thrash
         # against itself and interior resume points would vanish before anyone could use them.

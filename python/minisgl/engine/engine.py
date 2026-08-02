@@ -617,6 +617,39 @@ class Engine:
                 )
             }
 
+    def _rec_snapshot_store_bytes(self, config: EngineConfig) -> int:
+        """Bytes the recurrent-radix SNAPSHOT store will consume, reserved up front.
+
+        This store holds cloned recurrent state on radix nodes so a request that branches inside a
+        shared prefix can resume instead of re-prefilling from zero. It is filled DURING serving, long
+        after the KV pool is sized — exactly like the recurrent-state slots, draft model and graph
+        buffers above, all of which are already subtracted here for the same reason.
+
+        It was missing from that list, and the omission is why --memory-ratio 0.85 over-committed: the
+        pool claimed memory the snapshots then took, PyTorch's reserved climbed to 93% of the card,
+        device-free hit 0 during the very first prefill, and any allocation the caching allocator
+        could not serve from a cached block OOM'd. Measured at 0.85: alloc 13.3 GiB / reserved 15.1 GiB
+        / devfree 0 with a 16.3 GiB card. Concurrency did not consume this memory — it only changed
+        the allocation shapes, which is why 4x57k died where a single 123k prompt did not.
+
+        One snapshot is one slot's worth of recurrent state, and the cap is a VRAM budget shared with
+        the scheduler (MINISGL_GDN_RADIX_SNAP_BUDGET_GIB), so both agree on the number. 0 when the
+        model has no recurrent state or the recurrent radix is off."""
+        # gdn_radix is declared on SchedulerConfig, not EngineConfig — the object reaching the engine
+        # may be either, so read it defensively rather than assume the subclass.
+        if not getattr(config, "gdn_radix", True):
+            return 0
+        per_slot = self._recurrent_state_bytes(config) // max(1, config.max_running_req + 2)
+        if per_slot <= 0:
+            return 0
+        budget = int(
+            float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.375) * (1 << 30)
+        )
+        # The scheduler floors the cap at the live working set, so reserve at least that much.
+        floor = (int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4) + 1) * max(
+            1, config.max_running_req)
+        return max(budget, floor * per_slot)
+
     def _recurrent_state_bytes(self, config: EngineConfig) -> int:
         """Bytes the fixed GDN/CCA recurrent-state caches will consume (they are allocated AFTER the
         KV pool). Mirrors GDNStateCache / CCAStateCache buffer shapes so _determine_num_pages can
@@ -794,14 +827,21 @@ class Engine:
             # forced manual mem-ratio tuning. Both are 0 when not applicable (no spec / no capture).
             draft_memory = self._draft_model_bytes(config)
             graph_memory = self._graph_capture_bytes(config, old_free_memory)
+            snap_memory = self._rec_snapshot_store_bytes(config)
             available_memory = (
                 int(config.memory_ratio * old_free_memory)
                 - model_memory
                 - state_memory
                 - draft_memory
                 - graph_memory
+                - snap_memory
             )
             num_pages = available_memory // cache_per_page
+            if snap_memory:
+                logger.info(
+                    f"Reserved {mem_GB(snap_memory)} for the recurrent-radix snapshot store "
+                    f"(filled during serving); KV pool gets the remainder"
+                )
             if state_memory:
                 logger.info(
                     f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
@@ -895,6 +935,10 @@ class Engine:
             _pf_alloc0 = torch.cuda.memory_allocated()
             _pf_tok = sum(r.extend_len for r in batch.reqs)
             _pf_ctx = max(r.device_len for r in batch.reqs)
+            # SUM of context across the batch, not just the max: the single-stream probe showed peak
+            # allocation flat in ctx, but a 4-way concurrent long-context batch still OOM'd, so the
+            # scaling term has to be looked for across the batch, not within one request.
+            _pf_ctxsum = sum(r.device_len for r in batch.reqs)
         with self.ctx.forward_batch(batch):
             if return_hidden:
                 # Draft-head spec-decode PREFILL SEED path: one forward yields the bonus-token logits
@@ -936,8 +980,14 @@ class Engine:
             torch.cuda.synchronize()
             _peak = torch.cuda.max_memory_allocated() - _pf_alloc0
             logger.info_rank0(
-                f"[pf-probe] tokens={_pf_tok} ctx={_pf_ctx} bs={batch.size} "
-                f"peak_delta_MiB={_peak/(1<<20):.1f} free_before_MiB={_pf_free0/(1<<20):.1f}"
+                # ABSOLUTE levels, not just the delta: the delta is flat (465 MiB per 8192-token
+                # step, independent of ctx/bs), yet the card still fills up under concurrency — so
+                # what matters is what the BASELINE climbs to between steps, not what one step adds.
+                f"[pf-probe] tokens={_pf_tok} ctx={_pf_ctx} ctxsum={_pf_ctxsum} bs={batch.size} "
+                f"peak_delta_MiB={_peak/(1<<20):.1f} "
+                f"alloc_MiB={torch.cuda.memory_allocated()/(1<<20):.0f} "
+                f"reserved_MiB={torch.cuda.memory_reserved()/(1<<20):.0f} "
+                f"devfree_MiB={torch.cuda.mem_get_info()[0]/(1<<20):.0f}"
             )
         return (out, *extra) if return_hidden else out
 
