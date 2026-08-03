@@ -120,17 +120,23 @@ class RDNA4Backend(BaseAttnBackend):
         self.swa_ring_stride = getattr(ctx, "swa_ring_stride", self.swa_window)
         self.page_size = ctx.page_size
         self.scale = config.head_dim**-0.5
-        # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. Per-tensor
-        # scale 1.0 (direct e4m3 cast on store; the kernel folds the descale into the
-        # score/accumulator). The store cast lives in MHAKVCache.store_kv (.to(cache.dtype)).
+        # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. The native-HIP ops read
+        # the pool's [num_kv_heads] descale ROW per layer (per-head capable) and fold it into the
+        # score/accumulator. The Triton unified FALLBACK below can only take ONE scalar, so its
+        # descale is resolved per layer in _triton_descale() and it refuses a non-uniform table
+        # rather than silently dequantizing every head with head 0's scale.
+        # This backend is constructed AFTER Engine installs the scales (engine.py orders KV pool ->
+        # scale install -> attention backend), so the table it reads here is already final.
         self.kv_is_fp8 = self.kvcache.dtype == torch.float8_e4m3fn
         if self.kv_is_fp8:
             self._kv_quant_mode = KVQuantMode.FP8_PER_TENSOR
-            ones = torch.ones(1, dtype=torch.float32, device=self.kvcache.device)
-            self._k_descale, self._v_descale = ones, ones
+            kd, vd = self.kvcache.k_descale, self.kvcache.v_descale
+            self._descale_uniform = bool(
+                (kd == kd[:, :1]).all().item() and (vd == vd[:, :1]).all().item()
+            )
         else:
             self._kv_quant_mode = KVQuantMode.NONE
-            self._k_descale = self._v_descale = None
+            self._descale_uniform = True
         # Persistent attention-output buffer, reused across forwards (eager paths only). See
         # _get_out_buf; grown to the largest token count seen so no per-forward torch.empty_like.
         self._out_buf: torch.Tensor | None = None
@@ -238,6 +244,7 @@ class RDNA4Backend(BaseAttnBackend):
         # A/B / debugging), never as a silent fallback from the native-HIP path above.
         from minisgl._hip_engage import engaged
         engaged(f"attn:TRITON_unified_FALLBACK(attn_hip={self._attn_hip},hd={q.shape[-1]})")
+        kdsc, vdsc = self._triton_descale(layer_id)
         out = self._get_out_buf(q)  # A2 persistent buffer
         self._ensure_segm_scratch(q)
         # Always pass the 3D scratch + segments; the kernel's gate routes prefill
@@ -257,8 +264,8 @@ class RDNA4Backend(BaseAttnBackend):
             block_table=metadata.page_table,
             softcap=0.0,
             q_descale=None,
-            k_descale=self._k_descale,
-            v_descale=self._v_descale,
+            k_descale=kdsc,
+            v_descale=vdsc,
             kv_quant_mode=self._kv_quant_mode,
             seq_threshold_3D=self._seq_threshold_3D,
             num_par_softmax_segments=self.NUM_PAR_SOFTMAX_SEGMENTS,
@@ -267,6 +274,25 @@ class RDNA4Backend(BaseAttnBackend):
             softmax_segm_expsum=self._segm_expsum,
         )
         return out
+
+    def _triton_descale(self, layer_id: int):
+        """(k_descale, v_descale) for the Triton unified fallback, or (None, None) on a bf16 cache.
+
+        unified_attention's FP8_PER_TENSOR mode does a single `tl.load(k_scale)`, so it can only take
+        ONE scalar for the whole layer. Hand it element 0 of the layer's row — correct for a
+        per-tensor scale (checkpoint kv_cache_scheme is `strategy: tensor`, so every head shares it)
+        and REFUSE a genuinely per-head table rather than dequantize heads 1..H-1 with head 0's
+        scale. Per-head fp8 is a native-HIP-backend feature; this is the MINISGL_ATTN_HIP=0 path."""
+        if not self.kv_is_fp8:
+            return None, None
+        if not self._descale_uniform:
+            raise NotImplementedError(
+                "PER-HEAD fp8-KV descale on the Triton unified attention fallback. Triton's "
+                "FP8_PER_TENSOR mode takes one scalar per layer, so a per-head table cannot be "
+                "applied there. Serve with the native-HIP attention backend (the default; "
+                "MINISGL_ATTN_HIP=1), or use a per-tensor scale source."
+            )
+        return self.kvcache.k_descale[layer_id][:1], self.kvcache.v_descale[layer_id][:1]
 
     def _hip_decode(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata
@@ -390,11 +416,13 @@ class RDNA4Backend(BaseAttnBackend):
                 "SWA extend/chunked prefill reached without ring metadata (swa_table_idx is None). "
                 "A SWA-hybrid model needs the SWA extend metadata wired (is_swa_hybrid path)."
             )
-        windows = self._gather_swa_windows(layer_id, metadata, sliding_window)
+        windows = self._gather_swa_windows(layer_id, metadata, sliding_window, k.dtype)
         self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)  # persist new tokens for later decode
         return self._swa_prefill_extend(q, k, v, metadata, sliding_window, windows)
 
-    def _gather_swa_windows(self, layer_id: int, metadata: RDNA4Metadata, window: int):
+    def _gather_swa_windows(
+        self, layer_id: int, metadata: RDNA4Metadata, window: int, out_dtype: torch.dtype
+    ):
         """Per-seq boundary window (batch order), gathered from THIS layer's ring BEFORE store_kv. Entry
         is None for a cold seq (cached_len==0) or (pad, k_win, v_win) with k/v_win [Wp, Hk, D] in
         ascending absolute position (Wp=min(cached_len,W)). Reads the ring at slots table_idx*R + p%R
@@ -418,7 +446,20 @@ class RDNA4Backend(BaseAttnBackend):
             pos = torch.arange(cached_len - Wp, cached_len, device=dev, dtype=torch.long)
             slots = tidx[i] * R + (pos % R)
             pad = (cached_len - Wp) % _SWA_BC_ALIGN  # BC front-pad -> flash block grouping == cold
-            out.append((pad, k_ring[slots].clone(), v_ring[slots].clone()))
+            k_win, v_win = k_ring[slots].clone(), v_ring[slots].clone()
+            if k_win.dtype == torch.float8_e4m3fn:
+                # DEQUANTIZE here, where the descale row for THIS layer is in scope. This is the one
+                # fp8 cache read in the engine that is not folded into a kernel's descale argument —
+                # _swa_prefill_extend cats the window with inline bf16 K/V and runs the BF16 flash
+                # prefill over it, so the scale has to be applied in python. It used to be a bare
+                # `.to(bf16)` justified by "the descale is 1.0", which held only while nothing ever
+                # calibrated one; with real scales installed a bare cast yields k/descale (~448x too
+                # large) and the model emits UNK spam. Per-head row [Hkv] broadcasts over [Wp,Hkv,D].
+                kd = self.swa_kv.k_descale[layer_id].view(1, -1, 1)
+                vd = self.swa_kv.v_descale[layer_id].view(1, -1, 1)
+                k_win = (k_win.float() * kd).to(out_dtype)
+                v_win = (v_win.float() * vd).to(out_dtype)
+            out.append((pad, k_win, v_win))
         return out
 
     def _swa_prefill_extend(
@@ -447,12 +488,9 @@ class RDNA4Backend(BaseAttnBackend):
                 )
                 continue
             pad, k_win, v_win = win  # [Wp, Hk, D]
-            if k_win.dtype != k.dtype:
-                # fp8 (e4m3) ring window: descale-on-gather to the bf16 compute dtype so the
-                # cat below (+ zero-pad, + inline bf16 new K/V) is uniform for the bf16 flash_prefill.
-                # Per-tensor descale is 1.0 (direct e4m3 cast on store), so the cast IS the dequant.
-                k_win = k_win.to(k.dtype)
-                v_win = v_win.to(v.dtype)
+            # NOTE: an fp8 ring window is already DEQUANTIZED to the compute dtype by
+            # _gather_swa_windows (it owns layer_id, hence the descale row), so k_win/v_win are
+            # always the same dtype as the inline new K/V by the time they get here.
             Wp, Hk = k_win.shape[0], k_win.shape[1]
             front = pad + Wp
             parts_k = ([k_win.new_zeros((pad, Hk, D))] if pad else []) + [k_win, k[s:e]]
