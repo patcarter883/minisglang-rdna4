@@ -104,6 +104,14 @@ class Req:
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        # Set by Scheduler._free_req_resources the first time this request's resources are released.
+        # Overlap scheduling reaches that function from several independent paths (normal finish, the
+        # spec and tidar decode steps, abort), and the de-dup used to be the one-step-deep
+        # `finished_reqs` set that each path REPLACED rather than accumulated — so a request freed by
+        # the spec path was forgotten by the next step and freed a second time, unlocking its radix
+        # handle twice and driving node.ref_count negative. The flag lives on the REQUEST, so every
+        # path is safe with no cross-step bookkeeping.
+        self._resources_freed = False
         n = len(self.input_ids)
         self.device_len = n
         self.max_device_len = n + self.output_len

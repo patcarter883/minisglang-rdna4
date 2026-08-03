@@ -291,8 +291,13 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 ring_stride=getattr(self.engine.ctx, "swa_ring_stride", None),
             )
 
-        # some alias for easy access
+        # some alias for easy access. NOTE: this set is a one-step-deep view of what the LAST step
+        # finished — it is assigned (not accumulated) at three sites — so it is NOT a safe double-free
+        # ledger. `Req._resources_freed` owns that; see _free_req_resources.
         self.finished_reqs: Set[Req] = set()
+        # How many times the idempotency guard in _free_req_resources caught a second free. Non-zero
+        # means the overlap-scheduling double free is real and this build is surviving it.
+        self._m_double_free_suppressed: int = 0
         self.tokenizer = load_tokenizer(config.model_path)
         # whitened-GTE subject key (MINISGL_CAM_GTE_KEY=1): wire the served tokenizer as the ids->text
         # decoder the key needs, then reindex any store loaded at CAM build (which fell back to base-embed
@@ -1297,6 +1302,28 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             raise NotImplementedError
 
     def _free_req_resources(self, req: Req) -> None:
+        # IDEMPOTENT. Five call sites reach this (normal finish, abort, the spec and tidar decode
+        # steps), and under overlap scheduling more than one can reach it for the SAME request. The
+        # old guard — `req not in self.finished_reqs` at the normal-finish site — was one step deep:
+        # `self.finished_reqs = new_finished_reqs` REPLACES the set at three separate sites, so a
+        # request freed by the spec path was forgotten as soon as the next step assigned (very often
+        # the empty set, because nothing finished) and the deferred _process_last_data freed it again.
+        # cache_req() then unlocked an already-unlocked radix handle, drove node.ref_count negative
+        # and tripped `assert node.ref_count >= 0`, killing BOTH TP scheduler workers at once.
+        # The GDN/CCA slot releases below were already made idempotent for this same reason; the
+        # cache and table releases were not, which is what actually crashed.
+        if req._resources_freed:
+            self._m_double_free_suppressed += 1
+            # Instrumentation, not decoration: this counter is what turns "the traceback is consistent
+            # with a double free" into "a double free demonstrably happens N times per run". Loud on
+            # the first, rate-limited after, so a regression stays visible without spamming.
+            if self._m_double_free_suppressed == 1 or self._m_double_free_suppressed % 100 == 0:
+                logger.info_rank0(
+                    f"scheduler: suppressed a SECOND free of req uid={req.uid} "
+                    f"(count={self._m_double_free_suppressed}) — overlap scheduling reached "
+                    f"_free_req_resources twice; the idempotency guard held")
+            return
+        req._resources_freed = True
         self.table_manager.free(req.table_idx)
         inserted = self.cache_manager.cache_req(req, finished=True)
         # Recurrent radix: snapshot the FINISHED sequence's recurrent state onto its inserted prefix
