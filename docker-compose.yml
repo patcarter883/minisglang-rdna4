@@ -60,6 +60,9 @@ x-lean-common: &lean-common
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
+    # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
+    # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
+    MINISGL_KV_FP8_SCALES: "${MINISGL_KV_FP8_SCALES:-}"
     # PROTOTYPE (perf/custom-ar-ep): route the in-graph EP MoE all_reduce through the custom_ar one-shot
     # P2P all-reduce instead of RCCL (dp_size==2 + P2P only). Default 0 (RCCL) so this is an opt-in A/B.
     MINISGL_CUSTOM_AR_EP: "${MINISGL_CUSTOM_AR_EP:-0}"
