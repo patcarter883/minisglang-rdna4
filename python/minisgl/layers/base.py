@@ -12,6 +12,42 @@ def _concat_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
 
+# Narrow float dtypes a checkpoint may legitimately store a WIDE (real-valued) tensor in, and that
+# a layer may legitimately declare. A tensor whose dtype is in this set carries an ordinary real
+# number, so re-encoding it in another member of the set is a value-preserving-to-rounding cast —
+# the same thing `nn.Module.load_state_dict` does via `param.copy_(input_param)`.
+#
+# Everything NOT in this set is a STORAGE ENCODING, not a number, and must never be cast:
+#   * int32 / uint8 packs (AWQ/GPTQ `qweight`/`qzeros`, compressed-tensors `weight_packed`,
+#     `weight_zero_point`, MXFP4/NVFP4 `weight_packed`) hold several sub-byte quanta per element —
+#     a dtype cast reinterprets the bit pattern as a scalar and destroys the weight.
+#   * uint8 E8M0 block scales (MXFP4 `weight_scale`) are raw exponents, not floats.
+#   * float8_e4m3fn (ZAYA experts) IS floating point, but upcasting it at load re-inflates ~8 GB to
+#     ~16 GB and OOMs a 16 GB card — the storage dtype is a deliberate memory decision (see
+#     engine._cast / _GroupedFP8Experts, which dequant at COMPUTE time). Excluded on purpose.
+_CASTABLE_FLOAT_DTYPES = frozenset(
+    {torch.float32, torch.float64, torch.bfloat16, torch.float16}
+)
+
+
+def _coerce_dtype(key: str, param: torch.Tensor, item: torch.Tensor) -> torch.Tensor:
+    """Adapt a checkpoint tensor whose stored dtype differs from the layer's declared dtype.
+
+    A loader must load any checkpoint of an architecture it supports, so a WIDE tensor stored as
+    fp16 where the layer declares bf16 (or vice versa) is a cast, not a refusal — checkpoints of the
+    same architecture ship both (e.g. `cyankiwi/Agents-A1-AWQ-INT4` is fp16 throughout where
+    `Qwen3.6-35B-A3B-AWQ-4bit` is bf16). QUANTIZED tensors are the exception and still hard-fail:
+    their dtype is a packing/encoding contract, not a numeric precision (see
+    `_CASTABLE_FLOAT_DTYPES`)."""
+    if param.dtype in _CASTABLE_FLOAT_DTYPES and item.dtype in _CASTABLE_FLOAT_DTYPES:
+        return item.to(param.dtype)
+    raise AssertionError(
+        f"weight dtype mismatch for {key!r}: model {param.dtype} vs checkpoint {item.dtype}. "
+        f"At least one is a packed/quantized storage dtype, which cannot be cast — the layer's "
+        f"declared buffer must match the checkpoint's encoding exactly."
+    )
+
+
 class BaseOP:
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -43,10 +79,12 @@ class BaseOP:
                 key = _concat_prefix(prefix, name)
                 item = state_dict.pop(key)
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype, (
-                    f"weight mismatch for {key!r}: model {tuple(param.shape)}/{param.dtype} "
-                    f"vs checkpoint {tuple(item.shape)}/{item.dtype}"
+                assert param.shape == item.shape, (
+                    f"weight shape mismatch for {key!r}: model {tuple(param.shape)} "
+                    f"vs checkpoint {tuple(item.shape)}"
                 )
+                if param.dtype != item.dtype:
+                    item = _coerce_dtype(key, param, item)
                 setattr(self, name, item)
             elif isinstance(param, BaseOP):
                 param.load_state_dict(

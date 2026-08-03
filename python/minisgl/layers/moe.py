@@ -205,18 +205,29 @@ class _GroupedRXFExperts(BaseOP):
 
 class _GroupedCompressedTensorsExperts(BaseOP):
     """compressed-tensors int4 *weight-only* (W4A16) experts for one MoE GEMM (w13 or w2), STACKED
-    over E. The format `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` ships (despite "AWQ" in its name):
-        weight_packed (E, N, K//pf) int32 — 8 SIGNED int4 per int32, packed along INPUT K in natural
-            order (K-index k -> column k//pf, nibble k%pf); symmetric, so NO zero-points.
-        weight_scale  (E, N, K//g)  bf16  — per-(output-row, input-group) scale, group g=32.
-    (N=out, K=in per expert.) This is structurally the op's grouped `_w_op (E,N,K//pf)` /
-    `_scales_op (E,N,K//g)` layout ALREADY (same natural nibble order as gptq_to_op_layout's output),
-    so `post_load` is a cheap whole-tensor fixup rather than a per-expert unpack/transpose:
-      * signed int4 -> the kernel's `w = scale*(q_unsigned - zero)` convention by flipping each
-        nibble's top bit (XOR 0x8) and using a CONSTANT zero-point of 8: for every nibble value
-        `(n ^ 8) - 8 == signed_int4(n)` exactly (n<8 -> n, else n-16). XOR 0x8 per nibble == XOR 0x88
-        per byte, done via a uint8 view (no int32 overflow).
-      * zeros_op is all-8 (every nibble 8 -> every int32 0x88888888), shape (E, N//pf, K//g).
+    over E. The checkpoint ships (N=out, K=in per expert):
+        weight_packed (E, N, K//pf) int32 — 8 int4 per int32, packed along INPUT K in natural order
+            (K-index k -> column k//pf, nibble k%pf).
+        weight_scale  (E, N, K//g)  fp16 or bf16 — per-(output-row, input-group) scale, group g=32.
+            Checkpoints ship EITHER (35B: bf16; Agents-A1: fp16); engine._cast normalizes both to
+            fp16, which is also what the op consumes, so the buffer is declared fp16.
+        weight_zero_point (E, N//pf, K//g) int32 — ASYMMETRIC checkpoints only (config_groups
+            `symmetric: false`, e.g. `cyankiwi/Agents-A1-AWQ-INT4`); int4-packed 8-per-int32 along
+            the OUTPUT N, i.e. already the op's zeros layout. Symmetric checkpoints omit it.
+    This is structurally the op's grouped `_w_op (E,N,K//pf)` / `_scales_op (E,N,K//g)` layout ALREADY
+    (same natural nibble order as gptq_to_op_layout's output), so `post_load` is a cheap whole-tensor
+    fixup rather than a per-expert unpack/transpose. It mirrors the DENSE compressed-tensors linear
+    (`W4A8LinearMethod.process_weights_after_load`) exactly, one E dimension up:
+      * The op wants nibbles as uint4b8 (nibble = q + 8). "pack-quantized" ships int4 in one of TWO
+        packings per producer, so the convention is DETECTED from the nibble distribution rather than
+        assumed: two's-complement (mode at 0) is converted by flipping each nibble's top bit — XOR
+        0x8 per nibble == XOR 0x88 per byte via a uint8 view — since `(q & 0xF) ^ 8 == q + 8` for q in
+        [-8,7]; already-offset uint4b8 (mode at 8) passes through UNCHANGED, because an XOR there
+        re-flips the top bit and yields garbage weights.
+      * zeros_op is the real per-group `weight_zero_point` when the checkpoint is asymmetric (it
+        shares the weight's sign convention — same quantizer — so it gets the SAME transform, putting
+        W_u and Z_u in one unsigned domain where the op's `scale*(W_u - Z_u) == scale*(q - zp)` is
+        exact), else the constant 8 (every nibble 8 -> every int32 0x88888888), shape (E,N//pf,K//g).
     Then `kernels.w4a8_moe` consumes `_w_op/_scales_op/_zeros_op` exactly as for GPTQ/AWQ (the
     activations are quantized to int8 by that kernel — same W4A16-weights-through-W4A8-kernel path the
     AWQ experts already use)."""
@@ -229,7 +240,15 @@ class _GroupedCompressedTensorsExperts(BaseOP):
             f"grouped compressed-tensors needs K%{pf}==0,K%{g}==0,N%{pf}==0; got N={N},K={K}"
         )
         self.weight_packed = torch.empty((num_experts, N, K // pf), dtype=torch.int32)
-        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.bfloat16)
+        # fp16, matching the DENSE compressed-tensors linear (quant/method.py create_weights) and
+        # engine._cast, which normalizes every non-fp32 `.weight_scale` to fp16. Declaring bf16 here
+        # (as this did) both refused every CT-MoE checkpoint at the load-time dtype check AND, once
+        # that check coerces, would round an fp16 scale through bf16 and lose 2 mantissa bits before
+        # post_load casts it straight back to fp16.
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float16)
+        if not quant.sym:
+            # ASYMMETRIC: real per-group zero-points, already the op's packed [N//pf, G] layout.
+            self.weight_zero_point = torch.empty((num_experts, N // pf, K // g), dtype=torch.int32)
         self._quant = quant
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
@@ -237,18 +256,29 @@ class _GroupedCompressedTensorsExperts(BaseOP):
 
     def post_load(self) -> None:
         from minisgl.quant import kernels
+        from minisgl.quant.method import _ct_packed_is_uint4b8
 
         pf = 32 // self._quant.bits
         E, N, Kp = self.weight_packed.shape
         G = self.weight_scale.shape[-1]
-        # signed int4 -> unsigned (q+8) by flipping each nibble's top bit (XOR 0x88 per byte).
-        flipped = (self.weight_packed.contiguous().view(torch.uint8) ^ 0x88).view(torch.int32)
-        self._w_op = flipped.contiguous()
+        wp = self.weight_packed.contiguous()
+        # Detected, not assumed — see the class docstring. XOR only for two's-complement packing.
+        uint4b8 = _ct_packed_is_uint4b8(wp)
+        self._w_op = wp if uint4b8 else (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
         self._scales_op = self.weight_scale.to(torch.float16).contiguous()
-        # symmetric zero-point == 8 for every (output, group): every packed nibble 8 -> 0x88888888.
-        zeros = torch.empty((E, N // pf, G), dtype=torch.int32)
-        zeros.view(torch.uint8).fill_(0x88)
-        self._zeros_op = zeros.to(self.weight_packed.device)
+        zp = getattr(self, "weight_zero_point", None)
+        if zp is None:
+            # SYMMETRIC: zero-point == 8 for every (output, group); every packed nibble 8 -> 0x88888888.
+            zeros = torch.empty((E, N // pf, G), dtype=torch.int32)
+            zeros.view(torch.uint8).fill_(0x88)
+            self._zeros_op = zeros.to(wp.device)
+        else:
+            # ASYMMETRIC: same sign convention as the weight, so the same transform.
+            zp = zp.contiguous()
+            self._zeros_op = (
+                zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+            )
+            del self.weight_zero_point
         del self.weight_packed, self.weight_scale
         if kernels.MOE_W4A16 != "0":
             # W4A16 (fp16-act) path: repack int4 op-layout -> register-direct w_rep_wide and DROP the

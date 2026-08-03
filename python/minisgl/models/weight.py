@@ -315,12 +315,19 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
             return t.chunk(n, dim=0)[r].clone()
         # compressed-tensors W4A16: weight_packed [N, K//pf] / weight_scale [N, K//g] are N-major
         # (output on dim 0). gate/up split the output N (dim 0); down splits the input K (dim 1).
+        # weight_zero_point (ASYMMETRIC CT, [N//pf, K//g]) follows the SAME axes as its weight — it is
+        # int4-packed 8-per-int32 along the OUTPUT N, so a column-parallel gate/up splits its dim 0 in
+        # PACKED units (needs N/n % pf == 0, true for these checkpoints) and a row-parallel down keeps
+        # the whole packed N and splits the input group dim 1. Identical to the dense CT rules below.
+        # Without this the expert zero-points would REPLICATE while their weights shard, and the load
+        # would fail on shape (loudly — never a silent half-sharded dequant).
         if name.endswith(
-            (".gate_proj.weight_packed", ".gate_proj.weight_scale",
-             ".up_proj.weight_packed", ".up_proj.weight_scale")
+            (".gate_proj.weight_packed", ".gate_proj.weight_scale", ".gate_proj.weight_zero_point",
+             ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point")
         ):
             return t.chunk(n, dim=0)[r].clone()
-        if name.endswith((".down_proj.weight_packed", ".down_proj.weight_scale")):
+        if name.endswith((".down_proj.weight_packed", ".down_proj.weight_scale",
+                          ".down_proj.weight_zero_point")):
             return t.chunk(n, dim=1)[r].clone()
 
     # ---- dense MLP (4B) + shared expert (35B): col gate/up (dim 0), row down (dim 1) ----
