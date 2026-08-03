@@ -156,13 +156,34 @@ class DraftModelProposer(CapturableProposer):
         self._max_ctx = min(int(engine.max_seq_len),
                             int(os.environ.get("MINISGL_EAGLE3_MAX_CTX") or "8192"),
                             int(_mem_cap))
-        # Past this committed length a request skips propose and decodes plain: above the window the
-        # seed fell back to cold, so drafts are context-blind while still paying propose + verify.
-        self._ctx_gate = int(os.environ.get("MINISGL_SPEC_MAX_CONTEXT") or self._max_ctx)
-        self._k_buf = torch.zeros(self._max_slots, self._max_ctx, _nkh, _kdim, device=dev, dtype=dt)
-        self._v_buf = torch.zeros(self._max_slots, self._max_ctx, _nvh, _vdim, device=dev, dtype=dt)
+        # RING, not a linear absolute-indexed buffer — the same fix MTP already carries (spec/mtp.py).
+        # Column WAS the absolute position, so the buffer capped context at its allocation and
+        # `_ctx_gate` skipped propose entirely past it: EAGLE3 became a SILENT no-op on long prompts.
+        # Measured on GLM-4.7-Flash under a real agent prompt (~25k tokens of system+tools before the
+        # user says anything): accept-len 0.00 over 300 reqs, verify-width 0 for 100% of steps, every
+        # verify eager because width 0 is not a captured rung — with nothing logged to say why.
+        # A ring stores the most recent W positions at col = pos % W and masks from ABSOLUTE
+        # positions, so context is unbounded at fixed VRAM. The kernel needs no change: step_masked
+        # already takes an arbitrary write_col and an explicit mask_bias and never assumes
+        # column == position. Same design as MTP's ring and DFlash's prefix ring.
+        #
+        # W=512 mirrors MTP's measured default, where a provenance-asserted sweep found W=512 matches
+        # W=8192 at every context depth tested (accept / emitted-per-step / tok-s all inside the noise
+        # floor) for 3 MB instead of 50 MB. EAGLE3's drafter is a different model, so if it turns out
+        # to be more context-sensitive than MTP's, raise MINISGL_EAGLE3_KV_WINDOW.
+        self._ring = max(64, int(os.environ.get("MINISGL_EAGLE3_KV_WINDOW") or 512))
+        # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to _max_ctx and was the
+        # silent cliff; the ring makes any length drafts-capable, so there is nothing to gate.
+        _gate_env = os.environ.get("MINISGL_SPEC_MAX_CONTEXT")
+        self._ctx_gate = int(_gate_env) if _gate_env else (1 << 62)
+        self._k_buf = torch.zeros(self._max_slots, self._ring, _nkh, _kdim, device=dev, dtype=dt)
+        self._v_buf = torch.zeros(self._max_slots, self._ring, _nvh, _vdim, device=dev, dtype=dt)
         self._cur = torch.zeros(self._max_slots, dtype=torch.int64, device=dev)
-        self._col_idx = torch.arange(self._max_ctx, device=dev)
+        # Absolute position resident in each ring column (-1 = empty). The mask reads this, never the
+        # column index, so a wrapped ring still hides the future and anything older than the window.
+        self._pos_buf = torch.full((self._max_slots, self._ring), -1,
+                                   dtype=torch.int64, device=dev)
+        self._col_idx = torch.arange(self._ring, device=dev)
         self._slot_uid: Dict[int, int] = {}
         self._drafted_slots: List[int] = []
         hidden = int(self._draft.hidden_size)
@@ -176,7 +197,7 @@ class DraftModelProposer(CapturableProposer):
         self.init_propose_capture_state(engine, tag="EAGLE3")
         logger.info_rank0(
             f"spec-decode: EAGLE3 propose buffers (slots={self._live_slots}+NULL, "
-            f"max_ctx={self._max_ctx}, draft-KV "
+            f"max_ctx={self._max_ctx}, ring={self._ring} (unbounded context), draft-KV "
             f"{(self._k_buf.numel() + self._v_buf.numel()) * dt.itemsize / 1e6:.0f} MB)")
 
     def _load_draft_weights(self, folder: str) -> None:
@@ -254,6 +275,9 @@ class DraftModelProposer(CapturableProposer):
             if self._slot_uid.get(s) != req.uid:   # fresh req on this slot -> cold cache
                 self._slot_uid[s] = req.uid
                 self._cur[s] = 0
+                # The ring mask keys off ABSOLUTE positions, so a cursor reset alone is not enough:
+                # the previous owner's positions would still satisfy `pa <= qa`. Invalidate the ring.
+                self._pos_buf[s].fill_(-1)
             j = len(rows)
             h[0, j] = s
             h[1, j] = int(req.cached_len) + self._pos_off
@@ -290,12 +314,19 @@ class DraftModelProposer(CapturableProposer):
         cur = self._g_curb[:bs]
         cur_tok = self._g_tok[:bs]
         cur_hidden = self._g_seed[:bs]
-        col = self._col_idx.unsqueeze(0)
         for j in range(self._num_draft):
-            write_col = (cur + j).clamp(max=self._max_ctx - 1)      # OOB backstop
+            q_abs = cur + j                                        # ABSOLUTE position being written
+            write_col = torch.remainder(q_abs, self._ring)         # ring slot
             positions = (base + j).to(torch.int32)
-            mask_bias = torch.where(col <= write_col.unsqueeze(1),
-                                    0.0, float("-inf")).to(torch.float32)
+            # Publish this token's position BEFORE masking so the row it is about to write is visible
+            # to its own attention (the old `col <= write_col` mask included write_col).
+            self._pos_buf[slots, write_col] = q_abs
+            pa = self._pos_buf[slots]                              # [bs, ring] abs pos per column
+            qa = q_abs.unsqueeze(1)
+            # Causal + in-window, keyed on ABSOLUTE positions: hides empty columns (-1), the future,
+            # and anything the ring has already overwritten. Column order is meaningless once wrapped.
+            keep = (pa >= 0) & (pa <= qa) & ((qa - pa) < self._ring)
+            mask_bias = torch.where(keep, 0.0, float("-inf")).to(torch.float32)
             logits, cur_hidden = d.step_masked(
                 d.embed(cur_tok), cur_hidden, positions,
                 self._k_buf, self._v_buf, slots, write_col, mask_bias)
@@ -316,6 +347,7 @@ class DraftModelProposer(CapturableProposer):
 
     def reset_propose_state(self) -> None:
         self._cur[self._null_slot] = 0
+        self._pos_buf[self._null_slot].fill_(-1)
         self._drafted_slots = []
 
     @torch.inference_mode()
@@ -332,19 +364,31 @@ class DraftModelProposer(CapturableProposer):
         if P < 2:
             return
         S = P - 1
-        if S > self._max_ctx:
-            # Prompt longer than the draft-KV window: fall back to the cold cache (lossless, just no
-            # early-token lift). Seeding the tail would misalign the column<->position map the chain
-            # assumes (write_col = cur+j at RoPE position base+j).
-            return
         device = self._device
-        tokens = req.input_ids[1:P].to(device=device, dtype=torch.int64)  # token_p, p=1..P-1
-        aux_prev = aux_hidden[:, 0 : P - 1].to(self._dtype).permute(1, 0, 2).contiguous()
-        fused = self._draft.fuse_aux(aux_prev)  # [P-1, hidden]
-        positions = torch.arange(1, P, dtype=torch.int32, device=device)
         slot = int(req.table_idx)
-        self._draft.seed_buffered(
-            self._draft.embed(tokens), fused, positions, self._k_buf, self._v_buf, slot, 0)
+        # Seed the ring TAIL. The old code REFUSED when S > buffer and left the cache cold, which —
+        # together with the _ctx_gate that has now gone — is what made long prompts draft blind.
+        # With col = pos % ring the tail is always representable; it just may WRAP, so write it as up
+        # to two contiguous runs.
+        p_lo = max(1, P - self._ring)                    # first prompt position kept in the ring
+        tokens = req.input_ids[p_lo:P].to(device=device, dtype=torch.int64)  # token_p, p=p_lo..P-1
+        aux_prev = (aux_hidden[:, p_lo - 1 : P - 1]
+                    .to(self._dtype).permute(1, 0, 2).contiguous())
+        fused = self._draft.fuse_aux(aux_prev)           # [P-p_lo, hidden]
+        positions = torch.arange(p_lo, P, dtype=torch.int32, device=device)
+        n = int(positions.numel())
+        if n > 0:
+            c0 = p_lo % self._ring
+            first = min(n, self._ring - c0)              # contiguous run before the wrap
+            self._draft.seed_buffered(
+                self._draft.embed(tokens[:first]), fused[:first], positions[:first],
+                self._k_buf, self._v_buf, slot, c0)
+            if first < n:
+                self._draft.seed_buffered(
+                    self._draft.embed(tokens[first:]), fused[first:], positions[first:],
+                    self._k_buf, self._v_buf, slot, 0)
+            abs_pos = torch.arange(p_lo, P, dtype=torch.int64, device=device)
+            self._pos_buf[slot, torch.remainder(abs_pos, self._ring)] = abs_pos
         self._slot_uid[slot] = req.uid
         self._cur[slot] = S
 
@@ -365,3 +409,4 @@ class DraftModelProposer(CapturableProposer):
             if u == uid:
                 del self._slot_uid[s]
                 self._cur[s] = 0
+                self._pos_buf[s].fill_(-1)   # stale absolute positions must not survive the slot
