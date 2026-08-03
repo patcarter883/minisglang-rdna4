@@ -64,6 +64,41 @@ class GDNStateCache:
             dtype=self._ssm_dtype,
             device=device,
         )
+        # ---- ReplaySSM ring (one per GDN layer) ----------------------------------------------
+        # The decode kernel does not read-modify-write ssm_state every step; it decodes against the
+        # CHECKPOINT in ssm_state plus a small ring of (k, vr, g) appended since, and folds the ring
+        # back only every L steps (or when the Frobenius bound says so). So `ssm_state` alone is NOT
+        # the state any more — the true state is fold(ssm_state, ring). Two rules follow, and every
+        # method below that touches ssm_state obeys one of them:
+        #   READ  ssm_state from outside the decode kernel  -> `flush_ring` FIRST (materialises it).
+        #   WRITE ssm_state from outside the decode kernel  -> `reset_ring` AFTER (the ring's entries
+        #                                                      and its cached ||S0||_F are now stale).
+        # `reset_ring` marks ||S0||_F unknown (-1), which the decode kernel treats as "re-establish on
+        # the next step" — that is the self-heal path for a freshly prefilled slot, not a separate
+        # invalidation mechanism.
+        # Allocated ONCE, here, alongside the state it shadows: the decode op is graph-captured, so
+        # every buffer it touches needs a stable device address and there is no per-step allocation.
+        # Per-layer `make_replay_ring` rather than one big [layers, ...] tensor so the shapes can
+        # never drift from the kernel's own allocator.
+        self._ring: list | None = None
+        self.ring_len = 0
+        if device.type == "cuda":   # the replay kernels are HIP-only; a CPU cache keeps the old path
+            try:
+                import gdn_hip as _gdn
+                if hasattr(_gdn, "gdn_decode_conv_gated_replay"):
+                    self.ring_len = int(_gdn.REPLAY_RING_LEN)
+                    self._ring = [
+                        _gdn.make_replay_ring(num_slots, num_v_heads, head_v_dim, head_k_dim,
+                                              self.ring_len, dtype=self._ssm_dtype, device=device)
+                        for _ in range(num_gdn_layers)
+                    ]
+            except Exception:
+                # Not ImportError alone: torch.ops.load_library raises OSError when the extension is
+                # built but its runtime is not present. Either way the replay op is unreachable, so
+                # fall back to the materialised decode rather than failing the cache ctor — and any
+                # real breakage in gdn_hip surfaces loudly at the first forward, not here.
+                pass
+
         # LIFO free-list of slot ids. Slot 0 is the reserved NULL block (see class
         # docstring): the range STOPS at 1, so slot 0 is never popped/allocated.
         self.NULL_SLOT = 0
@@ -84,6 +119,48 @@ class GDNStateCache:
         """Zero a fresh sequence's state across all GDN layers (called at prefill)."""
         self.conv_state[:, slots] = 0
         self.ssm_state[:, slots] = 0
+        self.reset_ring(slots)
+
+    # ---- ReplaySSM ring lifecycle ---------------------------------------------------------------
+
+    def ring(self, gdn_layer_id: int):
+        """The ReplaySSM ring for one GDN layer, or None when the kernel package has no replay op."""
+        return None if self._ring is None else self._ring[gdn_layer_id]
+
+    def flush_ring(self, slots: torch.Tensor) -> None:
+        """Fold the ring into the checkpoint for `slots`, in every GDN layer, so `ssm_state` IS the
+        true state afterwards. Call before ANY direct read of ssm_state (snapshot, radix clone, a
+        prefill that continues an existing sequence).
+
+        Cheap when the ring is empty: the kernel's blocks return on their own cursor, so an untouched
+        slot costs the dispatch and nothing else."""
+        if self._ring is None:
+            return
+        import gdn_hip as gdn
+        sl = slots.to(torch.long)
+        for lid in range(self.num_gdn_layers):
+            r = self._ring[lid]
+            gdn.gdn_replay_flush(self.ssm_state[lid], sl, r["k"], r["vr"], r["g"], r["len"],
+                                 r["s0n"])
+
+    def reset_ring(self, slots: torch.Tensor | int | None = None) -> None:
+        """Drop the buffered entries and mark ||S0||_F unknown, for `slots` (or all). Call after ANY
+        direct write to ssm_state — the ring's entries belong to the state that was just overwritten,
+        and the cached ||S0||_F is stale. `-1` (unknown) makes the next decode step re-establish the
+        checkpoint norm itself, so a freshly written slot needs no other invalidation."""
+        if self._ring is None:
+            return
+        if slots is None:
+            for r in self._ring:
+                r["len"].zero_()
+                r["s0n"].fill_(-1.0)
+            return
+        if isinstance(slots, int):
+            slots = torch.tensor([slots], dtype=torch.long, device=self._device)
+        sl = slots.to(torch.long)
+        for r in self._ring:
+            r["len"].index_fill_(0, sl, 0)
+            r["s0n"].index_fill_(0, sl, -1.0)
 
     def snapshot(self, slots: torch.Tensor):
         """Clone conv+ssm state for `slots` (across all GDN layers). Returns an opaque handle for
@@ -93,6 +170,7 @@ class GDNStateCache:
         state directly via the per-token-state verify kernel (`install_verify_state` below), so the
         old snapshot + re-advance is gone. Kept as a general-purpose state-clone API."""
         sl = slots.to(torch.long)
+        self.flush_ring(sl)          # a direct ssm_state READ: materialise the ReplaySSM ring first
         return (sl, self.conv_state[:, sl].clone(), self.ssm_state[:, sl].clone())
 
     def restore(self, snapshot) -> None:
@@ -100,6 +178,7 @@ class GDNStateCache:
         sl, conv, ssm = snapshot
         self.conv_state[:, sl] = conv
         self.ssm_state[:, sl] = ssm
+        self.reset_ring(sl)          # a direct ssm_state WRITE: the ring's entries are now stale
 
     def clone_slot(self, slot: int):
         """Slot-agnostic snapshot of ONE slot's conv+ssm state across all GDN layers, for radix
@@ -108,6 +187,7 @@ class GDNStateCache:
         restores this exact recurrent state instead of re-prefilling the shared prefix. ~17 MB / slot
         for the 35B (all 30 GDN layers, per rank)."""
         s = int(slot)
+        self.flush_ring(torch.tensor([s], dtype=torch.long, device=self._device))
         return (self.conv_state[:, s : s + 1].clone(), self.ssm_state[:, s : s + 1].clone())
 
     def load_slot(self, slot: int, snap) -> None:
@@ -118,6 +198,7 @@ class GDNStateCache:
         conv, ssm = snap
         self.conv_state[:, s : s + 1] = conv
         self.ssm_state[:, s : s + 1] = ssm
+        self.reset_ring(s)           # a direct ssm_state WRITE: the ring's entries are now stale
 
     def install_verify_state(
         self,
@@ -146,6 +227,7 @@ class GDNStateCache:
             ssm_pick = ss[t_index, seq_ar]   # [N, HV, V, K]
             self.conv_state[lid, slots] = conv_pick.to(self.conv_state.dtype)
             self.ssm_state[lid, slots] = ssm_pick.to(self.ssm_state.dtype)
+        self.reset_ring(slots)       # a direct ssm_state WRITE: the ring's entries are now stale
 
     def conv(self, gdn_layer_id: int) -> torch.Tensor:
         """conv_state for one GDN layer: (num_slots, conv_dim, conv_kernel-1)."""

@@ -639,7 +639,11 @@ class Engine:
         # may be either, so read it defensively rather than assume the subclass.
         if not getattr(config, "gdn_radix", True):
             return 0
-        per_slot = self._recurrent_state_bytes(config) // max(1, config.max_running_req + 2)
+        # WITHOUT the ReplaySSM ring: a snapshot is what clone_slot() copies, which is conv+ssm only.
+        # The ring is per LIVE slot, never cloned onto a radix node, so folding it into per_slot would
+        # inflate this reservation by the ring's whole 25% for state that is never stored here.
+        per_slot = (self._recurrent_state_bytes(config, replay_ring=False)
+                    // max(1, config.max_running_req + 2))
         if per_slot <= 0:
             return 0
         budget = int(
@@ -650,7 +654,21 @@ class Engine:
             1, config.max_running_req)
         return max(budget, floor * per_slot)
 
-    def _recurrent_state_bytes(self, config: EngineConfig) -> int:
+    @staticmethod
+    def _replay_ring_bytes(mc, num_slots: int, num_v_heads: int, ssm_itemsize: int) -> int:
+        """Bytes of the ReplaySSM ring GDNStateCache allocates next to ssm_state (0 when the baked
+        kernel package has no replay op, i.e. nothing will be allocated)."""
+        try:
+            import gdn_hip as gdn
+            if not hasattr(gdn, "gdn_decode_conv_gated_replay"):
+                return 0
+            return mc.num_gdn_layers * gdn.replay_ring_bytes(
+                num_slots, num_v_heads, mc.linear_value_head_dim, mc.linear_key_head_dim,
+                gdn.REPLAY_RING_LEN, itemsize=ssm_itemsize)
+        except Exception:   # see GDNStateCache: the extension may fail to load, not just to import
+            return 0
+
+    def _recurrent_state_bytes(self, config: EngineConfig, replay_ring: bool = True) -> int:
         """Bytes the fixed GDN/CCA recurrent-state caches will consume (they are allocated AFTER the
         KV pool). Mirrors GDNStateCache / CCAStateCache buffer shapes so _determine_num_pages can
         reserve them up front. Returns 0 for models with no recurrent state (dense / MHA / MLA)."""
@@ -664,11 +682,19 @@ class Engine:
             conv_dim = div_even(mc.gdn_conv_dim, tp)
             conv = mc.num_gdn_layers * num_slots * conv_dim * (mc.linear_conv_kernel_dim - 1) * 4
             ssm_itemsize = 4 if os.environ.get("MINISGL_SSM_BF16", "1") == "0" else 2
+            num_v_heads = div_even(mc.linear_num_value_heads, tp)
             ssm = (
-                mc.num_gdn_layers * num_slots * div_even(mc.linear_num_value_heads, tp)
+                mc.num_gdn_layers * num_slots * num_v_heads
                 * mc.linear_value_head_dim * mc.linear_key_head_dim * ssm_itemsize
             )
+            # ReplaySSM ring — a per-slot store allocated by GDNStateCache alongside ssm_state, so it
+            # comes out of the same budget. Sized by the kernel package's OWN estimator, which is
+            # derived from the shapes its allocator uses, so this cannot drift from what gets
+            # allocated (the failure mode is silent VRAM over-commit; cf. the recurrent-radix
+            # snapshot store, 71e322bf). L*(K+V)/(V*K) of ssm_state = +25% at the default L=16.
             total += conv + ssm
+            if replay_ring:
+                total += self._replay_ring_bytes(mc, num_slots, num_v_heads, ssm_itemsize)
         if getattr(mc, "is_cca_hybrid", False):
             # conv_states (num_cca_layers, num_slots, conv_dim/tp, conv_kernel) fp32 +
             # prev_hs     (num_cca_layers, num_slots, hidden_size) fp32  (prev_hs stays FULL hidden)
