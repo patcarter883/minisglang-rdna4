@@ -381,6 +381,28 @@ class QwenGatedDeltaNet(nn.Module):
             [self._prefill_train_one_seq(hidden_states[cu[i]:cu[i + 1]]) for i in range(len(cu) - 1)],
             dim=0)
 
+    # ---- ReplaySSM ring: the two rules any non-decode use of ssm_state must obey ----------------
+    # Under ReplaySSM the true state is fold(ssm_state, ring), so every OTHER kernel that touches
+    # ssm_state has to bracket itself: materialise before reading, invalidate after writing. Both
+    # prefill entry points below do exactly that; the cross-layer sites (snapshot / radix clone /
+    # verify-state install / fresh-slot reset) do it through GDNStateCache.
+    @staticmethod
+    def _replay_flush(gdn, ring, ssm_state, state_idx) -> None:
+        """Fold the ring into ssm_state for these slots, so the prefill kernel reads the TRUE initial
+        state. A no-op dispatch when the ring is empty (the kernel returns on its own cursor), which
+        is the common case — a slot only has entries if plain decode ran on it since the last write."""
+        if ring is not None:
+            gdn.gdn_replay_flush(ssm_state, state_idx, ring["k"], ring["vr"], ring["g"], ring["len"],
+                                 ring["s0n"])
+
+    @staticmethod
+    def _replay_invalidate(ring, state_idx) -> None:
+        """The prefill just overwrote ssm_state: drop the buffered entries and mark ||S0||_F unknown.
+        -1 makes the next decode step re-establish the checkpoint norm itself."""
+        if ring is not None:
+            ring["len"].index_fill_(0, state_idx, 0)
+            ring["s0n"].index_fill_(0, state_idx, -1.0)
+
     # ---- prefill: chunk-scan over the full sequence, writes final SSM state ----
     def forward_prefill(
         self,
@@ -391,6 +413,7 @@ class QwenGatedDeltaNet(nn.Module):
         state_indices: torch.Tensor,  # slot id per sequence, int32
         has_initial_state: torch.Tensor,  # bool per sequence
         conv_metadata=None,  # GDN conv metadata (nums_dict/batch_ptr/token_chunk_offset_ptr)
+        ring=None,  # ReplaySSM ring for this GDN layer (GDNStateCache.ring(lid)), or None
     ) -> torch.Tensor:
         # Differentiable native path: when autograd is tracking the input (tap / LM-loss training), the
         # in-place conv/prefill ops below cannot carry a backward (Tensor(a!) state; torch rejects a raw
@@ -408,6 +431,7 @@ class QwenGatedDeltaNet(nn.Module):
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()  # int32->int64 once, reused by conv + prefill kernels
         has_init = has_initial_state.to(torch.uint8)  # bool->uint8 once, reused likewise
+        self._replay_flush(gdn, ring, ssm_state, state_idx)  # READ of ssm_state -> materialise first
 
         # Depthwise causal conv (varlen) + SiLU; conv_state (fp32) updated in place per slot. The HIP
         # kernel takes token-major [T, conv_dim] contiguous (vs the Triton path's transposed view).
@@ -445,6 +469,7 @@ class QwenGatedDeltaNet(nn.Module):
             query_start_loc, state_idx, has_init,
             ssm_state, self.head_k_dim ** -0.5, 1,
         )  # [T, num_v_heads, head_v_dim] at the input (model) dtype
+        self._replay_invalidate(ring, state_idx)  # WRITE of ssm_state -> the ring is now stale
         return self._output_projection(core, z, n)
 
     # ---- verify: varlen recurrent prefill that ALSO captures the per-token recurrent state ----
@@ -457,6 +482,7 @@ class QwenGatedDeltaNet(nn.Module):
         state_indices: torch.Tensor,  # slot id per sequence, int32
         has_initial_state: torch.Tensor,  # bool per sequence
         max_qlen: int,  # = max extend_len (= max K+1) across the batch's verify windows
+        ring=None,  # ReplaySSM ring for this GDN layer (GDNStateCache.ring(lid)), or None
     ):
         """Spec-decode GDN verify forward. Identical recurrence to ``forward_prefill`` (same bit-stable
         recurrent kernels), but captures the conv + ssm state AFTER EACH of the per-seq verify tokens
@@ -475,6 +501,7 @@ class QwenGatedDeltaNet(nn.Module):
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()
         has_init = has_initial_state.to(torch.uint8)
+        self._replay_flush(gdn, ring, ssm_state, state_idx)  # READ of ssm_state -> materialise first
 
         # Conv: bit-identical to forward_prefill's causal_conv1d_fwd, plus per-token window capture.
         engaged("gdn_hip.causal_conv1d_fwd_verify")
@@ -499,6 +526,7 @@ class QwenGatedDeltaNet(nn.Module):
             query_start_loc, state_idx, has_init,
             ssm_state, int(max_qlen), self.head_k_dim ** -0.5, 1,
         )
+        self._replay_invalidate(ring, state_idx)  # WRITE of ssm_state -> the ring is now stale
         return self._output_projection(core, z, n), conv_scratch, ssm_scratch
 
     # ---- decode: single-step recurrent update per sequence, advances state in place ----
@@ -509,6 +537,7 @@ class QwenGatedDeltaNet(nn.Module):
         ssm_state: torch.Tensor,  # (num_slots, num_v_heads, head_v_dim, head_k_dim)
         query_start_loc: torch.Tensor,  # int32 (num_decodes+1,)
         state_indices: torch.Tensor,  # slot id per sequence, int32
+        ring=None,  # ReplaySSM ring for this GDN layer (GDNStateCache.ring(lid)), or None
     ) -> torch.Tensor:
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
@@ -517,6 +546,26 @@ class QwenGatedDeltaNet(nn.Module):
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()  # int32->int64 once, reused by both kernels below
+
+        if ring is not None and hasattr(gdn, "gdn_decode_conv_gated_replay"):
+            # FUSED + REPLAY: the same conv_update + gated-RMSNorm fusion as the rung below, with the
+            # ReplaySSM state step in place of the materialised recurrence. The per-step ssm_state
+            # read-modify-WRITE disappears: the step reads the checkpoint, probes it, and appends
+            # (k, vr, g) to the ring; ssm_state is written only when the ring fills (or its Frobenius
+            # bound trips), on a device-side branch, so this is capture-safe and needs no host
+            # round-trip. Everything that reads ssm_state elsewhere flushes first — see
+            # GDNStateCache's ring lifecycle. Measured 1.13x/2.60x/2.90x/1.50x on the kernel at
+            # B=1/2/4/8 (bf16 state, served head dims).
+            z_flat = z.reshape(-1, z.shape[-1]).contiguous()
+            engaged("gdn_hip.gdn_decode_conv_gated_replay")
+            normed = gdn.gdn_decode_conv_gated_replay(
+                mixed_qkv.contiguous(), self._conv_weights_fp32(), None, conv_state,
+                a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+                ssm_state, state_idx, ring["k"], ring["vr"], ring["g"], ring["vn"], ring["len"],
+                ring["s0n"], z_flat, self._norm_weight_fp32(), self.norm.eps,
+                1, self.head_k_dim ** -0.5, 1,
+            )  # [B, num_v_heads, head_v_dim], conv+replay-recurrence+gated-RMS-norm in one
+            return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
 
         if _GDN_FUSED_CONV and hasattr(gdn, "gdn_decode_conv_gated"):
             # FUSED: conv_update + gdn_decode + gated-RMSNorm in ONE kernel (was 2 launches:

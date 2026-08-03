@@ -200,6 +200,11 @@ class GDNLinearAttn(BaseOP):
         md = ctx.batch.gdn_metadata
         conv = state.conv(self._gdn_layer_id)
         ssm = state.ssm(self._gdn_layer_id)
+        # ReplaySSM ring for this layer (None when the baked kernels have no replay op). It rides
+        # every entry point, not just decode: `ssm` is only the CHECKPOINT once replay is on, so the
+        # varlen paths have to fold the ring in before they read it and invalidate it after they
+        # overwrite it. Passing None everywhere restores the pre-ReplaySSM behaviour exactly.
+        ring = state.ring(self._gdn_layer_id)
         # A spec-decode VERIFY batch (phase "decode", extend_len = K+1 per seq) uses the varlen
         # recurrent path, like a prefill. The GDN state it leaves is "after the last verify token";
         # the scheduler snapshots + re-advances it to the accepted position (see SPEC_DECODE.md).
@@ -210,7 +215,7 @@ class GDNLinearAttn(BaseOP):
             # is stashed per gdn_layer_id on the metadata for the scheduler to read post-forward.
             out, conv_scr, ssm_scr = self._gdn.forward_prefill_verify(
                 x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state,
-                md.verify_max_qlen,
+                md.verify_max_qlen, ring=ring,
             )
             # cudagraph capture: if the verify-graph capturer pre-bound a PERSISTENT scratch buffer for
             # this layer (GDNVerifyGraphCapture), COPY the fresh kernel output into it IN PLACE so the
@@ -226,10 +231,11 @@ class GDNLinearAttn(BaseOP):
                 md.ssm_scratch[self._gdn_layer_id] = ssm_scr
         elif ctx.batch.is_prefill or ctx.batch.spec_verify:
             out = self._gdn.forward_prefill(
-                x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state
+                x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state, ring=ring
             )
         else:
-            out = self._gdn.forward_decode(x, conv, ssm, md.query_start_loc, md.state_indices)
+            out = self._gdn.forward_decode(x, conv, ssm, md.query_start_loc, md.state_indices,
+                                           ring=ring)
         if self._tp_size > 1:
             out = self._comm.all_reduce(out)
         return out
