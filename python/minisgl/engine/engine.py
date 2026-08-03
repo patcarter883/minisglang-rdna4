@@ -213,6 +213,22 @@ class Engine:
         else:
             self.swa_kv_cache = None  # type: ignore[assignment]
 
+        # ======================= fp8-KV scale install (must precede EVERY store) ================
+        # Resolve k_scale/v_scale for an fp8 KV cache and freeze them HERE — after both pools exist,
+        # before the warmup forward, graph capture, or any request. The ordering is a correctness
+        # requirement, not a preference: one descale has to undo every store ever written under it,
+        # so changing it later invalidates the whole cache (a captured graph does pick the new value
+        # up — measured max|Δ|=4.85e-01 on the attention output). Sources, in order: an offline
+        # calibration sidecar (the only per-head one), then the checkpoint's own
+        # quantization_config.kv_cache_scheme + self_attn.{k,v}_scale, then a loud warning + the
+        # defined identity fallback. No-op for a bf16/fp16 cache. See kvcache/fp8_scales.py.
+        if self.kv_dtype == torch.float8_e4m3fn:
+            from minisgl.kvcache.fp8_scales import install_kv_fp8_scales
+
+            install_kv_fp8_scales(
+                config.model_path, config.model_config, self.kv_cache, self.swa_kv_cache
+            )
+
         # ======================= GDN recurrent-state cache (Phase 3c/3d) ========================
         # GDN-hybrid models keep a fixed per-sequence recurrent state (conv + ssm) alongside
         # the paged MHA KV cache. The scheduler wires GDN slot alloc/free + per-batch GDN

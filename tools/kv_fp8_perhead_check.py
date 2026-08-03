@@ -101,24 +101,45 @@ def main():
     ok("quietest head, gaussian: per-head ~= per-tensor", 0.9 < e_pt / e_ph < 1.1,
        f"MAE per-head={e_ph:.3e} per-tensor={e_pt:.3e} ({e_pt / e_ph:.3f}x)")
 
-    # (b) Where per-head DOES pay: SUBNORMAL FLUSH. e4m3's usable dynamic range is only
-    #     448 / 2^-9 ~= 2^18. Give one head a wide-dynamic-range distribution and another a big
-    #     amax, and a per-tensor scale pushes the quiet head's small values under e4m3's smallest
-    #     subnormal, where they are flushed to zero outright. A per-head scale keeps them.
+    # (b) Where per-head DOES pay: SUBNORMAL FLUSH — measured THROUGH THE REAL STORE KERNEL, not
+    #     a torch stand-in, because "per-head writing works" is a claim about the store path.
+    #     e4m3's usable dynamic range is only 448 / 2^-10 ~= 2^19 (values under scale*2^-10 round to
+    #     zero outright). Give one head a wide-dynamic-range distribution and another a loud amax,
+    #     and a per-tensor scale pushes most of the quiet head under that floor. Per-head keeps it.
+    print("\n== 4b. subnormal flush through the REAL store kernel (the per-head justification) ==")
+    torch.manual_seed(23)
     wide = torch.zeros(T, H, D, device=DEV, dtype=torch.bfloat16)
-    wide[:, 0] = (10.0 ** (torch.rand(T, D, device=DEV) * -6.0)).bfloat16()   # 1e-6 .. 1
+    wide[:, 0] = (10.0 ** (torch.rand(T, D, device=DEV) * -6.0)).bfloat16()   # 1e-6 .. 1, span 2^20
     wide[:, 1:] = (torch.randn(T, H - 1, D, device=DEV) * 3000.0).bfloat16()  # a very loud head
-    ph_s = (wide.float().abs().amax(dim=(0, 2)) / 448.0).clamp(min=1e-30)
-    pt_s = wide.float().abs().amax() / 448.0
-    q_ph = (wide.float() / ph_s.view(1, -1, 1)).to(torch.float8_e4m3fn).float() * ph_s.view(1, -1, 1)
-    q_pt2 = (wide.float() / pt_s).to(torch.float8_e4m3fn).float() * pt_s
-    zeroed_pt = (q_pt2[:, 0] == 0).float().mean().item()
-    zeroed_ph = (q_ph[:, 0] == 0).float().mean().item()
-    # The head's own span here is 1e-6..1 == 2^20, WIDER than e4m3's 2^18, so even a perfect
-    # per-head scale must flush the bottom few percent. The claim is the gap, not zero.
-    ok("wide-range head: per-tensor flushes to zero, per-head does not",
-       zeroed_pt > 0.2 and zeroed_ph < 0.5 * zeroed_pt,
-       f"zeroed per-tensor={zeroed_pt:.1%} per-head={zeroed_ph:.1%}")
+    ph_s = (wide.float().abs().amax(dim=(0, 2)) / 448.0).clamp(min=1e-30)     # [H]  per-head
+    pt_s = (wide.float().abs().amax() / 448.0).reshape(1)                     # [1]  per-tensor
+    flat = wide.reshape(T, -1)
+    res = {}
+    for name, row, li in (("per-head", ph_s, 1), ("per-tensor", pt_s, 2)):
+        pool.set_fp8_kv_scales(li, row, row)
+        pool.store_kv(flat, flat, loc, li)
+        cache = pool.k_cache(li).view(P * PS, H, D)[:T]
+        # BIT-EXACT vs the torch reference that applies the SAME reciprocal, per head.
+        inv = pool.k_inv_scale[li].view(1, -1, 1)
+        ref = (wide.float() * inv).to(torch.float8_e4m3fn)
+        d = (cache.float() - ref.float()).abs().max().item()
+        ok(f"{name}: store == torch reference (bit-exact)", d == 0.0, f"max|Δ|={d:.3e}")
+        deq = cache.float() * pool.k_descale[li].view(1, -1, 1)
+        # PER-ELEMENT relative error, not rel-RMSE. rel-RMSE is dominated by the head's few LARGE
+        # values, which both granularities represent fine; the damage is at the bottom of the range,
+        # where a flushed element has relative error 1.0 and contributes almost nothing to an RMS.
+        x0 = wide.float()[:, 0]
+        res[name] = ((cache[:, 0].float() == 0).float().mean().item(),
+                     ((deq[:, 0] - x0).abs() / x0.abs().clamp(min=1e-30)).mean().item())
+    (z_ph, e_ph2), (z_pt, e_pt2) = res["per-head"], res["per-tensor"]
+    # The head's own span (2^20) is WIDER than e4m3's 2^19, so even a perfect per-head scale must
+    # flush the bottom few percent. The claim is the GAP, not zero.
+    ok("wide head: per-tensor flushes >>, per-head does not",
+       z_pt > 0.5 and z_ph < 0.15,
+       f"zeroed per-tensor={z_pt:.1%} per-head={z_ph:.1%}")
+    ok("wide head: per-head per-element error is far lower",
+       e_ph2 < 0.25 * e_pt2,
+       f"mean |Δ|/|x| per-head={e_ph2:.4f} per-tensor={e_pt2:.4f} ({e_pt2 / e_ph2:.1f}x)")
 
     # ---- 5. CAPTURE SAFETY ----
     print("\n== 5. graph capture replays the LIVE descale, not a captured constant ==")
@@ -164,6 +185,135 @@ def main():
     torch.cuda.synchronize()
     ok("restoring the descale restores the output bit-exactly",
        (static_out.float() - before.float()).abs().max().item() == 0.0)
+
+    # ---- 6. THE DEFAULT PATH IS UNPERTURBED ----
+    # fp8-KV is opt-in. A bf16 pool must still round-trip BIT-EXACTLY through the same store kernel
+    # (it passes no scale tensors at all, so the fp8 per-head plumbing must be genuinely inert).
+    print("\n== 6. default bf16 KV store is still bit-exact ==")
+    for dt in (torch.bfloat16, torch.float16):
+        p2 = MHAKVCache(num_kv_heads=H, num_layers=2, head_dim=D, num_pages=P, page_size=PS,
+                        dtype=dt, device=torch.device(DEV))
+        ok(f"{str(dt).split('.')[-1]} pool is not fp8 (no scale plumbing)", not p2.kv_is_fp8)
+        p2.store_kv(k.reshape(T, -1), v.reshape(T, -1), loc, 0)
+        got = p2.k_cache(0).view(P * PS, H, D)[:T]
+        d = (got.float() - k.to(dt).float()).abs().max().item()
+        ok(f"{str(dt).split('.')[-1]} store round-trip max|Δ| == 0", d == 0.0, f"max|Δ|={d:.3e}")
+        del p2
+
+    # ---- 7. THE STORE INSIDE A CAPTURED GRAPH ----
+    # store_kv runs inside the captured decode graph, which is the whole reason the reciprocals are
+    # DEVICE tensors: a host scalar would freeze at capture. Capture store->decode as one graph,
+    # then change the scale in place and check the replay both stores AND reads at the new value.
+    print("\n== 7. fp8 store + decode captured and replayed as one graph ==")
+    st_k = k.reshape(T, -1).clone()
+    st_v = v.reshape(T, -1).clone()
+    st_loc = loc.to(torch.int32)
+    lid = 3
+
+    def store_and_read():
+        pool.store_kv(st_k, st_v, st_loc, lid)
+        return attn_decode.flash_decode_paged_fp8(
+            q, pool.k_cache(lid), pool.v_cache(lid), bt, cl, D ** -0.5,
+            pool.k_descale[lid], pool.v_descale[lid], 0)
+
+    scale_a = (k.float().abs().amax(dim=(0, 2)) / 448.0).clamp(min=1e-8)
+    pool.set_fp8_kv_scales(lid, scale_a, scale_a)
+    for _ in range(3):
+        store_and_read()
+    torch.cuda.synchronize()
+    g2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g2):
+        out2 = store_and_read()
+    g2.replay()
+    torch.cuda.synchronize()
+    eager_a = store_and_read()
+    torch.cuda.synchronize()
+    d = (out2.float() - eager_a.float()).abs().max().item()
+    ok("replayed store+decode == eager store+decode", d == 0.0, f"max|Δ|={d:.3e}")
+    cap_a = out2.clone()
+    # Now move the scale IN PLACE. Both halves of the graph must follow it: the store re-quantizes
+    # at the new reciprocal and the read undoes it, so the OUTPUT should come back close to where
+    # it was (a consistent store/read pair is scale-invariant up to e4m3 rounding), while a graph
+    # that had baked only ONE side would diverge wildly.
+    # NOTE: move the scale UP, never down. scale_a is already amax/448, so shrinking it pushes the
+    # stored value past e4m3fn's max, where it becomes NaN (the format has no inf) — that would test
+    # saturation, not scale liveness.
+    pool.set_fp8_kv_scales(lid, scale_a * 4.0, scale_a * 4.0)
+    g2.replay()
+    torch.cuda.synchronize()
+    cap_b = out2.clone()
+    rel = ((cap_b.float() - cap_a.float()).norm() / cap_a.float().norm()).item()
+    ok("store+read stay CONSISTENT across an in-place scale change", rel < 0.05,
+       f"rel|Δ|={rel:.4f} (store and read both followed the new scale)")
+    # Control: break the pair — move ONLY the read side — and the same replay must diverge. This is
+    # what proves the previous check was not vacuous.
+    pool.k_descale[lid].mul_(4.0)
+    pool.v_descale[lid].mul_(4.0)
+    g2.replay()
+    torch.cuda.synchronize()
+    rel_bad = ((out2.float() - cap_b.float()).norm() / cap_b.float().norm()).item()
+    ok("control: read-only scale change DOES diverge", rel_bad > 0.1, f"rel|Δ|={rel_bad:.4f}")
+
+    # ---- 8. SCALE RESOLUTION: checkpoint -> pool (the thing that was never wired) ----
+    # finalize_kv_calibration() had no caller in the engine, so every served scale was 1.0 and the
+    # granularity was moot. This exercises the boot-time resolver end to end on a synthetic
+    # checkpoint: the compressed-tensors kv_cache_scheme gate, the per-tensor -> per-head broadcast,
+    # and the refusal to believe scales calibrated for a DIFFERENT grid.
+    print("\n== 8. boot-time scale resolution from a checkpoint ==")
+    import json
+    import tempfile
+
+    from safetensors.torch import save_file
+
+    from minisgl.kvcache.fp8_scales import install_kv_fp8_scales, resolve_kv_fp8_scales
+
+    NL = 4
+    with tempfile.TemporaryDirectory() as td:
+        def write_ckpt(scheme):
+            cfg = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
+                   "num_hidden_layers": NL, "num_attention_heads": 16, "num_key_value_heads": H,
+                   "hidden_size": 2048, "head_dim": D, "intermediate_size": 4096,
+                   "vocab_size": 1000, "max_position_embeddings": 4096,
+                   "quantization_config": {"quant_method": "compressed-tensors",
+                                           "kv_cache_scheme": scheme}}
+            json.dump(cfg, open(os.path.join(td, "config.json"), "w"))
+            save_file({f"model.layers.{i}.self_attn.{c}_scale":
+                       torch.tensor([0.01 * (i + 1) * (2.0 if c == "v" else 1.0)])
+                       for i in range(NL) for c in "kv"},
+                      os.path.join(td, "model.safetensors"))
+            from minisgl.utils.hf import _load_hf_config
+            _load_hf_config.cache_clear()   # @functools.cache on the path -> must reset per rewrite
+
+        write_ckpt({"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True})
+        rs = resolve_kv_fp8_scales(td)
+        ok("resolves the checkpoint's kv_cache_scheme scales", rs is not None and len(rs.scales) == NL,
+           "" if rs is None else f"{len(rs.scales)} layers from {rs.source}")
+        ok("checkpoint scales are per-TENSOR (numel 1)", rs is not None and not rs.per_head)
+
+        from minisgl.models import ModelConfig
+        from minisgl.utils import cached_load_hf_config as _clhc
+        mc = ModelConfig.from_hf(_clhc(td))
+        p8 = MHAKVCache(num_kv_heads=H, num_layers=NL, head_dim=D, num_pages=P, page_size=PS,
+                        dtype=torch.float8_e4m3fn, device=torch.device(DEV))
+        install_kv_fp8_scales(td, mc, p8, None)
+        want = torch.tensor([0.01 * (i + 1) for i in range(NL)], device=DEV)
+        ok("k_descale broadcast to every head, per layer",
+           torch.allclose(p8.k_descale, want.view(-1, 1).expand(NL, H), rtol=1e-6),
+           f"layer0={p8.k_descale[0, 0].item():.4g} layer3={p8.k_descale[3, 0].item():.4g}")
+        ok("v_descale is the checkpoint's v_scale (not k's)",
+           torch.allclose(p8.v_descale, (2 * want).view(-1, 1).expand(NL, H), rtol=1e-6))
+        ok("k_inv_scale == 1/k_descale (store and read share the table)",
+           torch.allclose(p8.k_inv_scale, 1.0 / p8.k_descale, rtol=1e-6))
+        del p8
+
+        # An int8 kv_cache_scheme calibrates amax/127, not amax/448 — believing it would store
+        # everything at 28% of range. The resolver must REFUSE, not silently misapply.
+        write_ckpt({"num_bits": 8, "type": "int", "strategy": "tensor", "symmetric": True})
+        ok("REFUSES scales calibrated for a non-e4m3 grid", resolve_kv_fp8_scales(td) is None)
+        # No scheme at all -> nothing, so the engine takes the warned identity fallback.
+        write_ckpt(None)
+        ok("no kv_cache_scheme -> no scales (warned identity fallback)",
+           resolve_kv_fp8_scales(td) is None)
 
     print("\n" + (f"FAILED ({len(FAILS)}): " + ", ".join(FAILS) if FAILS else "ALL GREEN"))
     return 1 if FAILS else 0
