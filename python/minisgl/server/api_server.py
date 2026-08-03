@@ -774,6 +774,12 @@ _ARG_KV_RE = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s
 # Orphan wrapper open/close tags left in content after a call is parsed (e.g. the model emitted an opener
 # but no closer around an inline function) — strip them so `content` isn't polluted with dangling markup.
 _ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>")
+# A wrapper opener with NO matching closer anywhere after it — the truncated-mid-call shape. Group 1 is
+# the block body (opener to end of text) to hand to the same inner parsers.
+_UNCLOSED_WRAP_RE = re.compile(
+    r"<(?:" + "|".join(_TOOL_WRAPPERS) + r")>(?!.*</(?:" + "|".join(_TOOL_WRAPPERS) + r")>)(.*)$",
+    re.DOTALL,
+)
 _KV_FALLBACK_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^,]+))")
 
 
@@ -878,6 +884,24 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
         _add(m.group(0))
     for m in _INLINE_FN_RE.finditer(_BARE_FN_BLOCK_RE.sub("", remainder)):
         _add(m.group(0))
+    # UNCLOSED wrapper recovery. `_TOOL_CALL_BLOCK_RE` hard-requires a matching closer, so a model that
+    # emits `<tool_call>{"name": …` and then runs out of tokens (or drifts into a different tool syntax
+    # mid-call) matched nothing at all and the raw markup leaked into `content` as if it were prose.
+    # Take everything from the dangling opener to end-of-text and try the same inner parsers: when the
+    # JSON/XML is already complete this recovers a real tool call, and when it genuinely is truncated we
+    # say so in the log instead of silently passing markup off as the model's answer.
+    if not tool_calls:
+        unclosed = _UNCLOSED_WRAP_RE.search(text)
+        if unclosed:
+            before = len(tool_calls)
+            _add(unclosed.group(1))
+            if len(tool_calls) > before:
+                return (text[: unclosed.start()].strip() or None), tool_calls
+            logger.warning(
+                "tool-call block opened but never closed and its body did not parse (%d chars) — "
+                "leaving it in content; the model most likely truncated or mixed tool syntaxes mid-call",
+                len(unclosed.group(1)),
+            )
     if not tool_calls:
         return text, []
     content = _INLINE_FN_RE.sub("", _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text)))
@@ -951,11 +975,14 @@ class ToolCallStreamState:
             return _parse_one_tool_call(inner)
         return _parse_one_tool_call(block)  # <function=…></function>, regex finds the fn tag
 
-    def _emit_call(self, block: str) -> List[dict]:
-        parsed = self._parse_block(block)
-        if parsed is None:
-            return []  # malformed block -> drop it (never leak markup into content)
-        name, args = parsed
+    def _parse_unclosed(self, buf: str) -> Tuple[str, dict] | None:
+        """Parse a block the stream ended INSIDE (opener seen, closer never arrived). Same inner
+        formats as ``_parse_block``; the only difference is there is no closer to strip."""
+        if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
+            return _parse_one_tool_call(buf[len(self.opener):])
+        return _parse_one_tool_call(buf)
+
+    def _emit_parsed(self, name: str, args) -> List[dict]:
         args_str = args if isinstance(args, str) else json.dumps(args)
         i = self.next_index
         self.next_index += 1
@@ -965,6 +992,12 @@ class ToolCallStreamState:
              "function": {"name": name, "arguments": ""}},
             {"index": i, "function": {"arguments": args_str}},
         ]
+
+    def _emit_call(self, block: str) -> List[dict]:
+        parsed = self._parse_block(block)
+        if parsed is None:
+            return []  # malformed block -> drop it (never leak markup into content)
+        return self._emit_parsed(*parsed)
 
     def push(self, delta: str) -> Tuple[str | None, List[dict]]:
         content_parts: List[str] = []
@@ -1001,11 +1034,26 @@ class ToolCallStreamState:
         return ("".join(content_parts) or None), tool_deltas
 
     def flush(self) -> Tuple[str | None, List[dict]]:
-        """At stream end: an unclosed block (truncated mid-call) is dropped; a buffered partial opener
-        turned out to be literal ``content`` and is emitted."""
+        """At stream end, drain whatever is still buffered — NEVER silently. A block the stream ended
+        inside (hit the token cap mid-call) used to be discarded outright, which returned
+        ``finish_reason="length"`` with empty content AND zero tool_calls: the caller could not tell a
+        truncated call from a model that chose to say nothing, and multi-KB arguments vanished. Now the
+        partial block is parsed if it is already complete enough to parse (the common case — the cap
+        lands in trailing whitespace or the closer), and otherwise surfaced verbatim as ``content`` so
+        the bytes reach the caller and the truncation is visible. A buffered partial opener turned out
+        to be literal ``content`` and is emitted."""
         if self.in_tool:
+            buf = self.buf
+            parsed = self._parse_unclosed(buf)
             self.buf, self.in_tool, self.opener = "", False, None
-            return None, []
+            if parsed is not None:
+                return None, self._emit_parsed(*parsed)
+            logger.warning(
+                "stream ended inside an unclosed tool-call block (%d chars); surfacing it as content "
+                "rather than dropping it — the call was almost certainly truncated by the token cap",
+                len(buf),
+            )
+            return (buf or None), []
         if self.buf:
             out, self.buf = self.buf, ""
             return out, []
@@ -1626,6 +1674,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     # calls out of the raw text, THEN reasoning-split only the non-tool remainder.
     tool_calls: List[dict] | None = None
     remainder = full_content
+    # Set only when a forced bare-JSON call was recovered from AFTER a think block: the reasoning was
+    # split off here, so it has to be carried across or it would be dropped with the remainder.
+    reasoning_prefix: str | None = None
     if _pl_forced_tool_grammar is not None:
         # Forced tool call: zaya_xml -> native XML (wrapper parser); else JSON {"name","arguments"}.
         if '"__ebnf__"' in _pl_forced_tool_grammar:
@@ -1633,10 +1684,26 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             if _tc:
                 tool_calls, remainder = _tc, (_c or "")
         else:
+            # The forced grammar emits a BARE JSON object, so `_parse_json_tool_call` needs the whole
+            # string to be that object — but on a thinking model the grammar only takes effect after the
+            # `<think>` scratch, so the raw text is `…reasoning…</think>{"name":…}` and `json.loads`
+            # fails, demoting a forced call to plain content with finish_reason="stop". Raw first (the
+            # d71cde22 rationale: a WRAPPED call can sit inside an unclosed think block), then retry on
+            # the reasoning-stripped body for this bare form.
             tc = _parse_json_tool_call(full_content, uid)
+            if tc is None:
+                _p = _reasoning_parser()
+                if _p is not None and _thinking_active(req):
+                    _rc, _body = _p.parse(full_content, thinking_open=True)
+                    tc = _parse_json_tool_call(_body, uid)
+                    if tc is not None:
+                        reasoning_prefix = _rc
             if tc is not None:
                 tool_calls, remainder = [tc], ""
-    elif req.tools and finish_reason != "length":
+    elif req.tools:
+        # Parsed even when finish_reason == "length": skipping truncated output guaranteed that any
+        # markup already emitted leaked into `content` as prose. `_parse_tool_calls` recovers complete
+        # blocks and logs the genuinely-truncated ones, so attempting it is strictly better than not.
         _c, _tc = _parse_tool_calls(full_content, uid)
         if _tc:
             tool_calls, remainder = _tc, (_c or "")
@@ -1651,6 +1718,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     parser = _reasoning_parser()
     if parser is not None and _thinking_active(req):
         reasoning_content, body = parser.parse(remainder, thinking_open=True)
+    if reasoning_prefix is not None:
+        reasoning_content = reasoning_prefix if not reasoning_content else reasoning_prefix + reasoning_content
 
     message: dict = {"role": "assistant", "content": (body or None) if tool_calls else body}
     if reasoning_content is not None:
