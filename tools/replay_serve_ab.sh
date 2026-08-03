@@ -19,6 +19,10 @@ OUT="${OUT:-/tmp/replay_ab}"
 PORT="${PORT:-1919}"
 MODEL_ALIAS="${MODEL_ALIAS:-qwen35b-awq}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-900}"
+CONC="${CONC:-4}"
+M_LIST="${M_LIST:-1,2,4}"
+REPS="${REPS:-1}"
+PROJECT="${PROJECT:-minisgl-rdna4-replayserve}"
 mkdir -p "$OUT"
 
 preflight() {  # an ABI-mismatched .so shows up as a 0%-GPU wedge at readiness timeout, not a build error
@@ -41,9 +45,13 @@ PY' || return 1
 boot() {
   local leg="$1" img="$2"
   echo "== boot leg=$leg image=$img =="
-  MINISGL_IMAGE="$img" MODEL="$MODEL_ALIAS" SPEC=none TP=2 CONC=4 ATTN=hip \
-    MINISGL_HOST_PORT="$PORT" LEASE_NAME="replay-$leg" COMPOSE_PROJECT_NAME="replay-$leg" \
-    docker compose --profile serve up -d >/dev/null 2>&1 || return 1
+  # ONE compose project for both legs, reusing the network this worktree already owns: the box's
+  # docker address pool is fully subnetted by other agents' abandoned compose networks, so creating a
+  # per-leg network fails with "all predefined address pools have been fully subnetted". The legs run
+  # sequentially and are told apart by container_name (LEASE_NAME), so one project is enough.
+  MINISGL_IMAGE="$img" MODEL="$MODEL_ALIAS" SPEC=none TP=2 CONC="$CONC" ATTN=hip \
+    MINISGL_HOST_PORT="$PORT" LEASE_NAME="replay-$leg" COMPOSE_PROJECT_NAME="$PROJECT" \
+    docker compose --profile serve up -d || return 1
   local t0=$SECONDS
   while (( SECONDS - t0 < BOOT_TIMEOUT )); do
     if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -54,10 +62,9 @@ boot() {
   echo "   TIMEOUT after ${BOOT_TIMEOUT}s"; return 1
 }
 
-teardown() {
+teardown() {   # by container, NOT `compose down`: down deletes the shared network we are reusing
   local leg="$1" img="$2"
-  MINISGL_IMAGE="$img" COMPOSE_PROJECT_NAME="replay-$leg" LEASE_NAME="replay-$leg" \
-    docker compose --profile serve down >/dev/null 2>&1
+  docker rm -f "replay-$leg-serve" >/dev/null 2>&1
 }
 
 run_leg() {
@@ -87,8 +94,12 @@ run_leg() {
     }' | tee "$OUT/$leg.coherence.json" | python -c 'import json,sys; d=json.load(sys.stdin); print(d["choices"][0]["message"]["content"])'
 
   echo "-- decode bench ($leg) --"
-  python tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" --label "$leg" \
-      --m 1,2,4 --workloads decode --decode-tokens 256 2>&1 | tee "$OUT/$leg.bench.txt"
+  : > "$OUT/$leg.bench.txt"
+  for rep in $(seq 1 "$REPS"); do
+    echo "[rep $rep]" | tee -a "$OUT/$leg.bench.txt"
+    python tools/serve_matrix_bench.py --url "http://127.0.0.1:$PORT" --label "$leg-r$rep" \
+        --m "$M_LIST" --workloads decode --decode-tokens 256 2>&1 | tee -a "$OUT/$leg.bench.txt"
+  done
   teardown "$leg" "$img"
 }
 
@@ -96,4 +107,7 @@ run_leg control "$CTL_IMAGE" 0 || exit 1
 run_leg replay  "$REPLAY_IMAGE" 1 || exit 1
 echo
 echo "=================== SUMMARY ==================="
-for leg in control replay; do echo "--- $leg ---"; grep -E "decode|tok/s|TPOT" "$OUT/$leg.bench.txt"; done
+for leg in control replay; do
+  echo "--- $leg ---"
+  grep -E "^\s+[0-9]+\s+[0-9]" "$OUT/$leg.bench.txt"
+done

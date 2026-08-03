@@ -639,7 +639,11 @@ class Engine:
         # may be either, so read it defensively rather than assume the subclass.
         if not getattr(config, "gdn_radix", True):
             return 0
-        per_slot = self._recurrent_state_bytes(config) // max(1, config.max_running_req + 2)
+        # WITHOUT the ReplaySSM ring: a snapshot is what clone_slot() copies, which is conv+ssm only.
+        # The ring is per LIVE slot, never cloned onto a radix node, so folding it into per_slot would
+        # inflate this reservation by the ring's whole 25% for state that is never stored here.
+        per_slot = (self._recurrent_state_bytes(config, replay_ring=False)
+                    // max(1, config.max_running_req + 2))
         if per_slot <= 0:
             return 0
         budget = int(
@@ -664,7 +668,7 @@ class Engine:
         except Exception:   # see GDNStateCache: the extension may fail to load, not just to import
             return 0
 
-    def _recurrent_state_bytes(self, config: EngineConfig) -> int:
+    def _recurrent_state_bytes(self, config: EngineConfig, replay_ring: bool = True) -> int:
         """Bytes the fixed GDN/CCA recurrent-state caches will consume (they are allocated AFTER the
         KV pool). Mirrors GDNStateCache / CCAStateCache buffer shapes so _determine_num_pages can
         reserve them up front. Returns 0 for models with no recurrent state (dense / MHA / MLA)."""
@@ -688,7 +692,9 @@ class Engine:
             # derived from the shapes its allocator uses, so this cannot drift from what gets
             # allocated (the failure mode is silent VRAM over-commit; cf. the recurrent-radix
             # snapshot store, 71e322bf). L*(K+V)/(V*K) of ssm_state = +25% at the default L=16.
-            total += conv + ssm + self._replay_ring_bytes(mc, num_slots, num_v_heads, ssm_itemsize)
+            total += conv + ssm
+            if replay_ring:
+                total += self._replay_ring_bytes(mc, num_slots, num_v_heads, ssm_itemsize)
         if getattr(mc, "is_cca_hybrid", False):
             # conv_states (num_cca_layers, num_slots, conv_dim/tp, conv_kernel) fp32 +
             # prev_hs     (num_cca_layers, num_slots, hidden_size) fp32  (prev_hs stays FULL hidden)
