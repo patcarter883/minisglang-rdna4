@@ -967,6 +967,11 @@ class ToolCallStreamState:
         self.opener: str | None = None
         self.next_index = 0
         self.emitted = False     # any tool call emitted -> finish_reason becomes "tool_calls"
+        # Set by flush() when the stream ended inside a tool-call block that could NOT be parsed, so
+        # its raw markup was surfaced as content. The caller MUST NOT report finish_reason="stop"
+        # then: the turn did not complete, and a client told "stop" renders that markup to the user
+        # as the final answer instead of continuing or retrying.
+        self.unparsed_tail = False
 
     def _parse_block(self, block: str) -> Tuple[str, dict] | None:
         if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
@@ -1048,9 +1053,12 @@ class ToolCallStreamState:
             self.buf, self.in_tool, self.opener = "", False, None
             if parsed is not None:
                 return None, self._emit_parsed(*parsed)
+            self.unparsed_tail = bool(buf)
             logger.warning(
-                "stream ended inside an unclosed tool-call block (%d chars); surfacing it as content "
-                "rather than dropping it — the call was almost certainly truncated by the token cap",
+                "stream ended inside an unclosed tool-call block (%d chars) whose body did not parse; "
+                "surfacing it as content rather than dropping it, and reporting finish_reason=length "
+                "so the caller treats the turn as truncated. Cause is either the token cap or the "
+                "model emitting a stop token mid-call — check completion_tokens against max_tokens",
                 len(buf),
             )
             return (buf or None), []
@@ -1292,6 +1300,12 @@ class FrontendManager:
                 yield _chunk({"tool_calls": [td]})
             if tool_stream.emitted and finish_reason != "length":
                 finish_reason = "tool_calls"
+            elif tool_stream.unparsed_tail:
+                # A tool call was cut off mid-emission and its markup is going out as content. Saying
+                # "stop" would assert the model finished normally, so the client renders raw
+                # `<tool_call>{…` to the user and ends the turn. "length" is the truthful signal and
+                # is what makes an agent harness treat this as a partial turn to continue or retry.
+                finish_reason = "length"
         if reasoning_stream is not None:
             if nontool_tail:
                 r2, c2 = reasoning_stream.push(nontool_tail)
