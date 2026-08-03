@@ -661,7 +661,7 @@ class Engine:
             return mc.num_gdn_layers * gdn.replay_ring_bytes(
                 num_slots, num_v_heads, mc.linear_value_head_dim, mc.linear_key_head_dim,
                 gdn.REPLAY_RING_LEN, itemsize=ssm_itemsize)
-        except ImportError:
+        except Exception:   # see GDNStateCache: the extension may fail to load, not just to import
             return 0
 
     def _recurrent_state_bytes(self, config: EngineConfig) -> int:

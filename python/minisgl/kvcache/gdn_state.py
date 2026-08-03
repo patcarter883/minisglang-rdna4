@@ -82,17 +82,22 @@ class GDNStateCache:
         # never drift from the kernel's own allocator.
         self._ring: list | None = None
         self.ring_len = 0
-        try:
-            import gdn_hip as _gdn
-            if hasattr(_gdn, "gdn_decode_conv_gated_replay"):
-                self.ring_len = int(_gdn.REPLAY_RING_LEN)
-                self._ring = [
-                    _gdn.make_replay_ring(num_slots, num_v_heads, head_v_dim, head_k_dim,
-                                          self.ring_len, dtype=self._ssm_dtype, device=device)
-                    for _ in range(num_gdn_layers)
-                ]
-        except ImportError:  # CPU-side unit tests / a build without the HIP extension
-            pass
+        if device.type == "cuda":   # the replay kernels are HIP-only; a CPU cache keeps the old path
+            try:
+                import gdn_hip as _gdn
+                if hasattr(_gdn, "gdn_decode_conv_gated_replay"):
+                    self.ring_len = int(_gdn.REPLAY_RING_LEN)
+                    self._ring = [
+                        _gdn.make_replay_ring(num_slots, num_v_heads, head_v_dim, head_k_dim,
+                                              self.ring_len, dtype=self._ssm_dtype, device=device)
+                        for _ in range(num_gdn_layers)
+                    ]
+            except Exception:
+                # Not ImportError alone: torch.ops.load_library raises OSError when the extension is
+                # built but its runtime is not present. Either way the replay op is unreachable, so
+                # fall back to the materialised decode rather than failing the cache ctor — and any
+                # real breakage in gdn_hip surfaces loudly at the first forward, not here.
+                pass
 
         # LIFO free-list of slot ids. Slot 0 is the reserved NULL block (see class
         # docstring): the range STOPS at 1, so slot 0 is never popped/allocated.
