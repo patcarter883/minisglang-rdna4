@@ -827,6 +827,155 @@ def _load_zaya_weight(
     assert not expert_buf, f"incomplete Zaya expert stacks: {list(expert_buf.keys())}"
 
 
+# ---- Gemma4 / DiffusionGemma (split-head_dim SWA hybrid, parallel dense+MoE FFN) weight loader ----
+# The two checkpoints are the SAME backbone under different namespaces: `model.language_model.*`
+# (gemma4) and `model.decoder.*` (diffusion_gemma). Everything else they ship is vision (a 27-layer
+# tower plus its projector) which this text-only engine skips.
+#
+# Four remaps and one skip carry the whole thing:
+#   1. namespace  -> `model.*`;
+#   2. `router.proj.weight` -> `router.weight` (the model flattens the router's single Linear, as
+#      the Laguna loader does for its gate);
+#   3. `.weight_shape` is DROPPED — compressed-tensors ships an int64 [2] logical-shape tensor beside
+#      every packed weight, and the model declares no buffer for it. It is not a weight;
+#   4. the 128 per-expert gate/up/down merge + stack through the generic `_gate_up_merge` /
+#      `_get_expert_stack_info` into the MoELayer containers.
+#
+# Sharding differs from every other model here in ONE respect that matters: the k/v head count is
+# PER LAYER (8 on the 25 sliding layers, 2 on the 5 full ones), so a single `config.num_kv_heads`
+# cannot drive the k/v split — `_shard_gemma4` recovers the layer type from the key instead.
+_GEMMA4_SKIP_PREFIXES = (
+    "model.vision_tower.",
+    "model.embed_vision.",
+    "model.encoder.",  # diffusion_gemma nests the whole vision encoder here
+)
+_GEMMA4_NAMESPACES = ("model.language_model.", "model.decoder.")
+
+
+def _gemma4_remap(name: str) -> str | None:
+    """Checkpoint key -> model-native key, or None to skip."""
+    if name.endswith(".weight_shape"):
+        return None
+    if name.startswith(_GEMMA4_SKIP_PREFIXES):
+        return None
+    for namespace in _GEMMA4_NAMESPACES:
+        if name.startswith(namespace):
+            name = "model." + name.removeprefix(namespace)
+            break
+    else:
+        # A key in neither namespace and not vision: refuse rather than silently drop it. A dropped
+        # weight leaves the model holding uninitialized meta memory, which reads as garbage output
+        # and not as an error.
+        if not name.startswith("model."):
+            raise ValueError(
+                f"Gemma4 loader: unrecognized checkpoint key {name!r} — it is in neither the "
+                f"`model.language_model.*` (gemma4) nor the `model.decoder.*` (diffusion_gemma) "
+                f"namespace, and is not a vision tensor. Refusing to drop it silently."
+            )
+    if name.endswith(".router.proj.weight"):
+        return name.replace(".router.proj.weight", ".router.weight")
+    return name
+
+
+def _gemma4_layer_is_sliding(name: str, config) -> bool | None:
+    """Which attention schedule slot does this key belong to? None when the key is not layer-scoped."""
+    match = _LAYER_IDX_PATTERN.search(name)
+    if match is None or config.layer_types is None:
+        return None
+    return config.layer_types[int(match.group(1))] == "sliding_attention"
+
+
+def _shard_gemma4(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Rank-r plain-TP shard, applied BEFORE the gate/up merge and the expert stack.
+
+    compressed-tensors packs int4 along the INPUT dim (weight_packed is (out, in//8), weight_scale is
+    (out, in//group)), so — unlike the AWQ suffixes — an output-parallel split is dim 0 and an
+    input-parallel split is dim 1 for the packed tensor exactly as for a plain `.weight`."""
+    if n == 1:
+        return t
+    # Replicated: every norm, the per-layer residual scalar, and all three router tensors (the
+    # router must produce identical logits on every rank or the ranks route to different experts).
+    if (
+        name.endswith("_layernorm.weight")
+        or name.endswith("_norm.weight")
+        or name == "model.norm.weight"
+        or name.endswith(".layer_scalar")
+        or ".router." in name
+    ):
+        return t
+    if name.endswith("embed_tokens.weight"):
+        num_emb = t.shape[0]
+        per = div_ceil(num_emb, n)
+        return t[r * per : min((r + 1) * per, num_emb), :].clone()
+    # q_proj and the dense/expert gate+up are output-parallel; o_proj and the down projections are
+    # input-parallel. Both hold for the packed and the scale tensor.
+    if ".q_proj." in name or ".gate_proj." in name or ".up_proj." in name:
+        return t.chunk(n, dim=0)[r].clone()
+    if ".o_proj." in name or ".down_proj." in name:
+        return t.chunk(n, dim=1)[r].clone()
+    if ".k_proj." in name or ".v_proj." in name:
+        # PER-LAYER kv head count: 8 on a sliding layer, 2 on a full one. AttentionLayer sizes the
+        # layer with div_even(nkv, tp, allow_replicate=True), so when the heads do not divide the TP
+        # size it REPLICATES — and the loader must make the same call or the buffer will not fit.
+        is_sliding = _gemma4_layer_is_sliding(name, config)
+        nkv = (config.swa_num_kv_heads or config.num_kv_heads) if is_sliding else config.num_kv_heads
+        if nkv % n:
+            return t  # replicated, mirroring div_even(..., allow_replicate=True)
+        return t.chunk(n, dim=0)[r].clone()
+    return t
+
+
+def _load_gemma4_weight(
+    model_folder: str, device: torch.device, config
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for the Gemma4 / DiffusionGemma backbone (see the family note above)."""
+    tp_info = get_tp_info()
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
+
+    def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        if (mm := _gate_up_merge(native_key)) is not None:
+            merged_key, slot = mm
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if len(merge_buf[merged_key]) != 2:
+                return
+            parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+            del merge_buf[merged_key]
+            # compressed-tensors packs along the INPUT dim, so gate|up concatenate on the OUTPUT dim
+            # (0) for the packed weight and its scale alike — the AWQ dim-1 flip does not apply.
+            native_key, tensor = merged_key, torch.cat(parts, dim=0)
+        if (einfo := _get_expert_stack_info(native_key)) is not None:
+            packed_key, idx = einfo
+            if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
+                return
+            slots = expert_buf.setdefault(packed_key, {})
+            slots[idx - _ep_offset] = tensor
+            if len(slots) != _ep_local:
+                return
+            experts = [slots[i] for i in range(_ep_local)]
+            del expert_buf[packed_key]
+            yield packed_key, torch.stack(experts, dim=0)
+        else:
+            yield native_key, tensor
+
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for ckpt_name in f.keys():
+                native = _gemma4_remap(ckpt_name)
+                if native is None:
+                    continue
+                raw = _shard_gemma4(
+                    native, f.get_tensor(ckpt_name), tp_info.rank, tp_info.size, config
+                )
+                yield from emit(native, raw)
+
+    assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+
+
 # ---- poolside/Laguna-XS-2.1 (SWA-hybrid gated-attention NVFP4 MoE) weight loader ----
 # Standard `model.layers.N.*` naming, so the remap is nearly identity. Two families need a touch:
 #   1. the router balancing bias ships as `mlp.experts.e_score_correction_bias` (co-located with the
@@ -990,6 +1139,11 @@ def load_weight(
         return
     if config.is_cca_hybrid:
         yield from _load_zaya_weight(model_folder, device, config)
+        return
+    # MUST precede the is_swa_hybrid branch: Gemma4 is also a SWA hybrid, so it would otherwise be
+    # routed into the Laguna loader, whose remap and TP sharding are Laguna-specific.
+    if config.is_gemma4:
+        yield from _load_gemma4_weight(model_folder, device, config)
         return
     if config.is_swa_hybrid:
         yield from _load_laguna_weight(model_folder, device, config)

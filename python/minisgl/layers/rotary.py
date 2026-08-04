@@ -147,6 +147,32 @@ def _get_rope(
         case "default":
             return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
 
+        case "proportional":
+            # Gemma4 full-attention rope. The reference (transformers modeling_rope_utils
+            # `_compute_proportional_rope_parameters`) keeps only the first
+            # `partial_rotary_factor * head_dim / 2` frequencies, computes their exponent over the
+            # FULL head_dim, and zero-pads the rest — then rotates full-width. A zero frequency is
+            # cos=1/sin=0, i.e. an exact identity on those channels, so expressing it this way is
+            # equivalent to the reference AND keeps rotary_dim == head_dim (config.py rebinds it),
+            # which is what lets the NeoX tail_hip kernel serve it unchanged.
+            #
+            # The distinction that matters: this rotates channel pairs (i, i+head_dim/2) for
+            # i < live, NOT the contiguous prefix a normal partial rope would rotate, and the
+            # exponent denominator is head_dim and not the rotary width.
+            partial: float = rope_scaling.get("partial_rotary_factor", 1.0)
+            live = int(partial * head_dim // 2)
+
+            def post_process(inv_freq: torch.Tensor) -> torch.Tensor:
+                del inv_freq  # rebuilt from scratch: the base cache divides by rotary_dim, not head_dim
+                rotated = 1.0 / (
+                    base ** (torch.arange(0, 2 * live, 2, dtype=torch.float) / head_dim)
+                )
+                return torch.cat(
+                    (rotated, torch.zeros(head_dim // 2 - live, dtype=torch.float))
+                )
+
+            return RotaryEmbedding(head_dim, rotary_dim, max_position, base, post_process)
+
         case "llama3":
             scaling_factor: float = rope_scaling["factor"]
             low_freq_factor: float = rope_scaling["low_freq_factor"]

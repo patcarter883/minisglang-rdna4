@@ -3,7 +3,7 @@ from typing import Tuple
 import torch
 
 from . import _tail_hip
-from .base import BaseOP
+from .base import BaseOP, StateLessOP
 
 
 def _rms_norm(
@@ -31,6 +31,25 @@ class RMSNorm(BaseOP):
 
     def forward_inplace(self, x: torch.Tensor) -> None:
         x.copy_(_rms_norm(x, self.weight, self.eps, self.plus_one))
+
+
+class RMSNormNoScale(StateLessOP):
+    """RMSNorm with NO learned gain (transformers' `with_scale=False`).
+
+    Gemma4 uses three of these — `self_attn.v_norm`, `router.norm`, and the vision embedder's
+    pre-projection norm — and because `with_scale=False` creates no parameter, the checkpoint ships
+    NO weight tensor for them. That makes them easy to skip by accident: nothing in the state dict
+    hints they exist, and dropping one leaves the model running with un-normalized V (or un-normalized
+    router input) — plausible output, quietly wrong. Being a StateLessOP keeps it out of the state
+    dict, so the loader's exact-key check stays honest."""
+
+    def __init__(self, eps: float) -> None:
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)).to(dtype)
 
 
 class RMSNormFused(BaseOP):

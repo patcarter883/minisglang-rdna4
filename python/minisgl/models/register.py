@@ -15,6 +15,10 @@ _MODEL_REGISTRY = {
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
     "LagunaForCausalLM": (".laguna", "LagunaForCausalLM"),
+    # Gemma4 and DiffusionGemma share ONE backbone; the block-diffusion head is a separate
+    # execution mode, not a separate decoder stack.
+    "Gemma4ForConditionalGeneration": (".gemma4", "Gemma4ForConditionalGeneration"),
+    "Gemma4ForCausalLM": (".gemma4", "Gemma4ForConditionalGeneration"),
 }
 
 
