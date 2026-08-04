@@ -35,6 +35,9 @@ class SchedulerIOMixin:
         self.tp_cpu_group: Final = tp_cpu_group
         self._tp_size: Final = tp_info.size
         self._tp_is_primary: Final = tp_info.is_primary()
+        # Offline mode has NO ZMQ at all: every rank feeds itself from its own `pending_requests`
+        # (see LLM), so there is no rank0->rank1 fan-out socket to build — or to hand-shake.
+        self._offline_mode: Final = config.offline_mode
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
@@ -175,7 +178,10 @@ class SchedulerIOMixin:
         over the GLOO group) that it has received one, then a final SYNC_END marker; rank1 drains
         in-order through SYNC_END so its SUB buffer is empty before real traffic. ZMQ preserves order
         on a connection, so once a SYNC arrives the link is live and no real message is lost."""
-        if self._tp_size <= 1:
+        if self._tp_size <= 1 or self._offline_mode:
+            # Offline: there is no PUB/SUB link to establish (every rank generates the same request
+            # stream locally), and touching `_send_into_ranks` here would AttributeError — which is
+            # what a multi-rank offline run used to do the moment it entered run_forever.
             return
         if self._tp_is_primary:
             while True:

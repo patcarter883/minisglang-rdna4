@@ -27,9 +27,15 @@ class RequestStatus:
 
 class LLM(Scheduler):
     def __init__(self, model_path: str, dtype: torch.dtype = torch.bfloat16, **kwargs):
+        # TP=1 unless the caller supplies its own `tp_info`. A TP>1 offline run is ONE PROCESS PER
+        # RANK (the caller spawns them, exactly as server/launch.py does), each building its own LLM
+        # with its own rank. Every rank then drives the IDENTICAL request stream from its own
+        # `pending_requests`, so the ranks stay in lockstep without the ZMQ rank0->rank1 fan-out that
+        # the served path uses. That is what lets tools/kv_fp8_calibrate.py calibrate a model whose
+        # weights do not fit on one card.
+        kwargs.setdefault("tp_info", DistributedInfo(0, 1))
         config = SchedulerConfig(
             model_path=model_path,
-            tp_info=DistributedInfo(0, 1),
             dtype=dtype,
             offline_mode=True,
             **kwargs,
