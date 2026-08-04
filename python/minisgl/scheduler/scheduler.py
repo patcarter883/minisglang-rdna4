@@ -34,6 +34,9 @@ from .cache import CacheManager
 from .cca_slots import CCASlotManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from minisgl.diffusion import DiffusionSamplerConfig
+
+from .diffusion import CanvasManager, SchedulerDiffusionMixin
 from .ep import SchedulerEPMixin
 from .gdn_slots import GDNSlotManager
 from .io import SchedulerIOMixin
@@ -98,7 +101,7 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
+class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine, resolve_prefix_cache, snapshot_ladder_depth
 
@@ -281,6 +284,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             CCASlotManager(self.engine.cca_state)
             if self.engine.cca_state is not None
             else None
+        )
+        # Block-diffusion canvas lifecycle — active ONLY for a checkpoint that declares a
+        # `canvas_length` (DiffusionGemma). None for every autoregressive model, which is also what
+        # `run_forever` keys the loop selection on: `config` is not retained past __init__, so the
+        # decision is captured here as an attribute exactly like `_rec_radix` / `gdn_slots`.
+        self._canvas_cfg = (
+            DiffusionSamplerConfig.from_hf(config.model_path, config.model_config)
+            if config.model_config.is_block_diffusion
+            else None
+        )
+        self.canvas_slots = (
+            CanvasManager(self._canvas_cfg, self.device) if self._canvas_cfg is not None else None
         )
         # Recurrent-radix prefix caching binds to the single active recurrent state cache + its slot
         # manager (a model is GDN xor CCA, never both). None unless --gdn-radix enabled it above.
@@ -1060,6 +1075,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # ordering requirement — its window snapshot is cloned from the live ring at a commit point and
         # RESTORED (ring seed + metadata.swa_prefix) in _finish_prepare right before the forward, which
         # only the synchronous loop guarantees — so it forces the non-overlap loop too.
+        # Block diffusion runs its own synchronous loop for the same reason spec decode does: whether
+        # a block stops early is a data-dependent host sync (the stability + confidence criteria read
+        # the entropies back), which the zero-sync overlap path cannot express. It also has a
+        # completely different request lifecycle (ENCODE -> DENOISE xk -> COMMIT), so it sits BESIDE
+        # the autoregressive loop rather than inside it. See scheduler/diffusion.py.
+        if self.canvas_slots is not None:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self._diffusion_loop()
+                    if self._bounded_exit_reached():
+                        return
         if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -1358,6 +1385,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release the CCA conv-state slot (idempotent — overlap scheduling can free a req twice).
         if self.cca_slots is not None:
             self.cca_slots.free(req.uid)
+        # Release any in-flight block-diffusion canvas state (idempotent).
+        if self.canvas_slots is not None:
+            self.canvas_slots.free(req.uid)
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
