@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
-from minisgl.utils import load_generation_config
+from minisgl.utils import load_generation_config, load_tokenizer
 from minisgl.rsa.config import merge_params
 from minisgl.rsa.core import RSAError, run_markovian_rsa
 from minisgl.rsa.inproc import InProcessBackendClient
@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from .args import ServerArgs
-from .reasoning import get_reasoning_parser
+from .reasoning import resolve_reasoning_parser
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -585,17 +585,112 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None
     return kwargs or None
 
 
-def _thinking_active(req: "OpenAICompletionRequest") -> bool:
-    """Whether reasoning is expected in the output (thinking mode engaged). Governs streaming reasoning
-    routing. Default True (reasoning models open `<think>` in the generation prompt); explicit
-    enable_thinking=False (top-level or in chat_template_kwargs) turns it off."""
+def _thinking_opted_out(req: "OpenAICompletionRequest") -> bool:
+    """The request explicitly asked for no reasoning: `enable_thinking=false` (top-level or inside
+    chat_template_kwargs) or an OFF reasoning-effort rung. Checked ahead of the prompt derivation so
+    the opt-out holds even for a template that silently ignores the kwarg."""
     if req.enable_thinking is False:
-        return False
+        return True
     if (req.chat_template_kwargs or {}).get("enable_thinking") is False:
+        return True
+    return _effort_is_off(req)
+
+
+_FRONTEND_TOKENIZER = None
+_FRONTEND_TOKENIZER_SET = False
+
+
+def _frontend_tokenizer():
+    """The served checkpoint's tokenizer, loaded ONCE in the frontend process (None if it can't be).
+
+    The frontend does not tokenize — the tokenizer workers do — but it does need the checkpoint's
+    CHAT TEMPLATE, both to derive the reasoning delimiters and to read whether a request's generation
+    prompt leaves a reasoning span open. Rendering is the only way to get either: the delimiters are
+    produced by template LOGIC (branches on enable_thinking, on the last turn's role), so reading the
+    Jinja source or a config field would be guessing at what it emits instead of observing it.
+    Costs one CPU-side tokenizer load and a handful of cached renders; no GPU state."""
+    global _FRONTEND_TOKENIZER, _FRONTEND_TOKENIZER_SET
+    if not _FRONTEND_TOKENIZER_SET:
+        _FRONTEND_TOKENIZER_SET = True
+        try:
+            _FRONTEND_TOKENIZER = load_tokenizer(get_global_state().config.model_path)
+        except Exception as e:  # noqa: BLE001 — reasoning splitting must never block serving
+            logger.warning("could not load the tokenizer in the frontend (%s); reasoning delimiters "
+                           "fall back to the legacy <think>/</think> pair", e)
+            _FRONTEND_TOKENIZER = None
+    return _FRONTEND_TOKENIZER
+
+
+# Rendered generation prompts, keyed by the resolved chat_template_kwargs. The reasoning delimiters
+# are emitted by the template's `add_generation_prompt` branch, which keys on the THINKING KWARGS,
+# not on message text — so one render per distinct kwargs set answers every request and the whole
+# cache is a handful of entries (unset / thinking-on / thinking-off).
+_PROMPT_PROBE_CACHE: Dict[tuple, str | None] = {}
+
+
+def _probe_generation_prompt(kwargs: dict | None) -> str | None:
+    """Render this checkpoint's generation prompt under `kwargs`, cached. None if it can't render."""
+    key = tuple(sorted((k, repr(v)) for k, v in (kwargs or {}).items()))
+    if key not in _PROMPT_PROBE_CACHE:
+        rendered = None
+        tok = _frontend_tokenizer()
+        if tok is not None:
+            try:
+                rendered = tok.apply_chat_template(
+                    [{"role": "user", "content": "hi"}], tokenize=False,
+                    add_generation_prompt=True, **(kwargs or {}),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("generation-prompt probe render failed for %s: %s", kwargs, e)
+        _PROMPT_PROBE_CACHE[key] = rendered
+    return _PROMPT_PROBE_CACHE[key]
+
+
+def _prompt_thinking_state(req: "OpenAICompletionRequest") -> Tuple[bool, bool]:
+    """`(span_open, reasoning_possible)` for THIS request, read off its rendered generation prompt.
+
+    This replaces a DEFAULT. The old code assumed thinking was on for every request, on the theory
+    that "reasoning models open `<think>` in the generation prompt" — true for Qwen3/GLM, false for
+    everything else, and when it is false the parser routes the WHOLE completion into
+    `reasoning_content` and returns `content=""`. That is a silent, total output loss: generation is
+    perfect, every OpenAI client reading `.content` gets an empty string, and nothing logs an error.
+    Gemma-4 hit it on every request.
+
+    The ground truth is the rendered prompt — a span is open iff the template injected an opener and
+    did not close it. Reading it needs no model-name branch, no allow-list and no new config field.
+    Falls back to the old optimistic default only when nothing renders, i.e. when we truly cannot
+    tell."""
+    parser = _reasoning_parser()
+    if parser is None:
+        return False, False
+    # The raw-completion lane has no template: the request's `prompt` IS the rendered prompt, so read
+    # the delimiters straight out of it (a raw prompt ending in `<think>` really is mid-reasoning).
+    if req.messages is None and isinstance(req.prompt, str):
+        return parser.prompt_state(req.prompt)
+    rendered = _probe_generation_prompt(_resolve_chat_template_kwargs(req))
+    if rendered is None:
+        return True, True
+    return parser.prompt_state(rendered)
+
+
+def _thinking_open(req: "OpenAICompletionRequest") -> bool:
+    """Is the model INSIDE a reasoning span at completion token 0? Feeds `parse(thinking_open=…)` and
+    the streaming splitter's initial state — i.e. it decides where an output with NO closing
+    delimiter goes, which is the difference between an answer and an empty `content`."""
+    if _thinking_opted_out(req):
         return False
-    if _effort_is_off(req):
+    return _prompt_thinking_state(req)[0]
+
+
+def _thinking_active(req: "OpenAICompletionRequest") -> bool:
+    """Whether reasoning can still appear in this completion — the gate for the reasoning-token budget
+    and the grammar think-gate. Weaker than `_thinking_open`: also true when the prompt carries no
+    delimiter at all, because the template left the opener to the MODEL (Gemma-4 with thinking on,
+    older Qwen3 templates) and the gate must stay armed for a span that has not opened YET. False
+    once the prompt has CLOSED the span, which is how every family spells thinking-off."""
+    if _thinking_opted_out(req):
         return False
-    return True
+    return _prompt_thinking_state(req)[1]
 
 
 _REASONING_PARSER = None
@@ -603,23 +698,29 @@ _REASONING_PARSER_SET = False
 
 
 def _reasoning_parser():
-    """Cached ReasoningParser. Built from the server's --reasoning-parser; on the default "auto" it
-    honors the MODEL author's declared reasoning format (generation_config.json `reasoning_parser`,
-    e.g. Laguna's `poolside_v1`) so the correct delimiters are selected, falling back to the generic
-    <think>/</think> when the model declares none or an unknown name."""
+    """Cached ReasoningParser for the served checkpoint, resolved ONCE (cascade: see
+    `resolve_reasoning_parser`). On the default "auto" the delimiters are DERIVED from the model's own
+    chat template rather than looked up by family name — a name table is a model-name branch by
+    another spelling, and a checkpoint with no row silently fell through to `<think>`/`</think>`,
+    matched nothing, and had its whole reply misrouted. An explicit --reasoning-parser still wins."""
     global _REASONING_PARSER, _REASONING_PARSER_SET
     if not _REASONING_PARSER_SET:
         cfg = get_global_state().config
-        name = getattr(cfg, "reasoning_parser", "auto")
-        if name == "auto":
-            try:
-                model_rp = load_generation_config(cfg.model_path).get("reasoning_parser")
-                if model_rp and get_reasoning_parser(model_rp) is not None:
-                    name = model_rp
-            except Exception:
-                pass
-        _REASONING_PARSER = get_reasoning_parser(name)
+        try:
+            declared = load_generation_config(cfg.model_path).get("reasoning_parser")
+        except Exception:  # noqa: BLE001
+            declared = None
+        _REASONING_PARSER, how = resolve_reasoning_parser(
+            _frontend_tokenizer(),
+            requested=getattr(cfg, "reasoning_parser", "auto"),
+            declared=declared,
+        )
         _REASONING_PARSER_SET = True
+        if _REASONING_PARSER is None:
+            logger.info("reasoning extraction DISABLED (%s)", how)
+        else:
+            logger.info("reasoning delimiters %r … %r (%s)",
+                        _REASONING_PARSER.start_token, _REASONING_PARSER.end_token, how)
     return _REASONING_PARSER
 
 
@@ -1363,8 +1464,14 @@ class FrontendManager:
                     final_delta["reasoning_content"] = r2
                 if c2:
                     final_delta["content"] = c2
-            if tail := reasoning_stream.flush():
-                final_delta["reasoning_content"] = final_delta.get("reasoning_content", "") + tail
+            # flush() returns BOTH tails: buffered reasoning (a partial close tag) and buffered
+            # content (a head held back while it might have been a model-side opener). Dropping the
+            # content one would silently truncate a reply shorter than the opening delimiter.
+            r_tail, c_tail = reasoning_stream.flush()
+            if r_tail:
+                final_delta["reasoning_content"] = final_delta.get("reasoning_content", "") + r_tail
+            if c_tail:
+                final_delta["content"] = final_delta.get("content", "") + c_tail
         elif nontool_tail:
             final_delta["content"] = nontool_tail
         usage = {
@@ -1564,10 +1671,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         reasoning_content: str | None = None
         body = result.final_text
         parser = _reasoning_parser()
-        if parser is not None and _thinking_active(req):
-            # thinking_open=True: reached only when thinking is active, so an un-closed </think> means
-            # a truncated chain-of-thought -> route it to reasoning_content, not the visible answer.
-            reasoning_content, body = parser.parse(result.final_text, thinking_open=True)
+        if parser is not None:
+            # Always attempt the split; `thinking_open` decides only where an output with NO closing
+            # delimiter goes. Gating the CALL on thinking state was the other half of the bug: it made
+            # "is a span open" and "should we parse at all" the same flag, so turning one off also
+            # threw away the split for output that plainly contains the closing delimiter.
+            reasoning_content, body = parser.parse(
+                result.final_text, thinking_open=_thinking_open(req))
         message: dict = {"role": "assistant", "content": body}
         if reasoning_content is not None:
             message["reasoning_content"] = reasoning_content
@@ -1684,10 +1794,11 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     if req.stream:
         parser = _reasoning_parser()
+        # `active` is the DERIVED span state, not a default: it says whether the model starts inside
+        # a reasoning span. A closed start is not "no splitting" — the splitter still watches for the
+        # model opening its own span and still splits on a close delimiter it meets mid-stream.
         reasoning_stream = (
-            parser.stream_state(active=True)
-            if parser is not None and _thinking_active(req)
-            else None
+            parser.stream_state(active=_thinking_open(req)) if parser is not None else None
         )
         # Stateful tool-call parser: only when tools are actually offered to the model (mirrors the
         # non-streaming path's `if req.tools`). `tool_choice:"none"` withholds the tools from the
@@ -1757,8 +1868,8 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             tc = _parse_json_tool_call(full_content, uid)
             if tc is None:
                 _p = _reasoning_parser()
-                if _p is not None and _thinking_active(req):
-                    _rc, _body = _p.parse(full_content, thinking_open=True)
+                if _p is not None:
+                    _rc, _body = _p.parse(full_content, thinking_open=_thinking_open(req))
                     tc = _parse_json_tool_call(_body, uid)
                     if tc is not None:
                         reasoning_prefix = _rc
@@ -1772,16 +1883,17 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         if _tc:
             tool_calls, remainder = _tc, (_c or "")
 
-    # Reasoning: split a thinking model's `<think>…</think>` scratch out of the (tool-stripped)
-    # remainder into a separate reasoning_content field (the opening tag is in the prompt, so the
-    # completion carries only the closing </think> + answer). No-op when disabled / thinking off.
-    # thinking_open=True: thinking is active here, so an output with NO closing </think> is a truncated
-    # chain-of-thought -> route it entirely to reasoning_content, not the visible answer.
+    # Reasoning: split the model's scratch reasoning out of the (tool-stripped) remainder into a
+    # separate reasoning_content field, on THIS checkpoint's delimiters (derived from its chat
+    # template, e.g. `<think>…</think>` for Qwen3/GLM, `<|channel>thought…<channel|>` for Gemma-4).
+    # `thinking_open` is derived from the rendered prompt and decides only where an output with NO
+    # closing delimiter goes; the split itself is always attempted, so a completion that plainly
+    # contains the closing delimiter is split whatever the request asked for.
     reasoning_content: str | None = None
     body = remainder
     parser = _reasoning_parser()
-    if parser is not None and _thinking_active(req):
-        reasoning_content, body = parser.parse(remainder, thinking_open=True)
+    if parser is not None:
+        reasoning_content, body = parser.parse(remainder, thinking_open=_thinking_open(req))
     if reasoning_prefix is not None:
         reasoning_content = reasoning_prefix if not reasoning_content else reasoning_prefix + reasoning_content
 
