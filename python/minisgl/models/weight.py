@@ -844,12 +844,39 @@ def _load_zaya_weight(
 # Sharding differs from every other model here in ONE respect that matters: the k/v head count is
 # PER LAYER (8 on the 25 sliding layers, 2 on the 5 full ones), so a single `config.num_kv_heads`
 # cannot drive the k/v split — `_shard_gemma4` recovers the layer type from the key instead.
+#
+# DiffusionGemma's `model.encoder.*` is NOT purely vision. Its text encoder is the SAME 30-layer
+# stack as the decoder, tied parameter for parameter — except `layer_scalar`, which is an nn.Buffer,
+# and HF's tying machinery ties Parameters only. So the checkpoint ships 30 loose encoder
+# `layer_scalar` tensors and nothing else textual. They are numerically equal to the decoder's here,
+# which is what lets ONE instantiated stack serve both roles — but that is a property of the export,
+# not of the architecture, so it is ASSERTED at load rather than assumed. A future export that
+# diverged would otherwise run the encoder pass with the decoder's scalars: no error, just a
+# quietly worse model.
 _GEMMA4_SKIP_PREFIXES = (
     "model.vision_tower.",
     "model.embed_vision.",
-    "model.encoder.",  # diffusion_gemma nests the whole vision encoder here
+    "model.encoder.vision_tower.",
+    "model.encoder.embed_vision.",
 )
 _GEMMA4_NAMESPACES = ("model.language_model.", "model.decoder.")
+_GEMMA4_ENCODER_TEXT = "model.encoder.language_model."
+
+
+def _gemma4_tie_check_key(name: str) -> str:
+    """The model-native decoder key an encoder-side TEXT tensor must equal.
+
+    Only `layer_scalar` may reach here. Anything else in the encoder text namespace means the export
+    stopped tying a parameter this engine serves from a single stack, so it is refused loudly."""
+    suffix = name.removeprefix(_GEMMA4_ENCODER_TEXT)
+    if not suffix.endswith(".layer_scalar"):
+        raise ValueError(
+            f"DiffusionGemma loader: untied encoder text tensor {name!r}. The port serves the "
+            f"encoder and decoder roles from ONE instantiated stack, which holds only while every "
+            f"encoder text parameter is tied to its decoder twin; the checkpoint's one legitimate "
+            f"exception is `layer_scalar` (a buffer, which HF's tying machinery cannot tie)."
+        )
+    return "model." + suffix
 
 
 def _gemma4_remap(name: str) -> str | None:
@@ -858,6 +885,8 @@ def _gemma4_remap(name: str) -> str | None:
         return None
     if name.startswith(_GEMMA4_SKIP_PREFIXES):
         return None
+    if name.startswith(_GEMMA4_ENCODER_TEXT):
+        return None  # checked against its decoder twin by the caller, never emitted
     for namespace in _GEMMA4_NAMESPACES:
         if name.startswith(namespace):
             name = "model." + name.removeprefix(namespace)
@@ -961,19 +990,42 @@ def _load_gemma4_weight(
         else:
             yield native_key, tensor
 
+    # The encoder/decoder tie check (see the family note above). Both sides are collected because
+    # the two namespaces land in different shards and neither ordering is guaranteed; 30 scalars is
+    # 30 floats, so buffering them costs nothing.
+    tie_encoder: Dict[str, torch.Tensor] = {}
+    tie_decoder: Dict[str, torch.Tensor] = {}
+
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for ckpt_name in f.keys():
+                if ckpt_name.startswith(_GEMMA4_ENCODER_TEXT):
+                    tie_encoder[_gemma4_tie_check_key(ckpt_name)] = f.get_tensor(ckpt_name)
+                    continue
                 native = _gemma4_remap(ckpt_name)
                 if native is None:
                     continue
                 raw = _shard_gemma4(
                     native, f.get_tensor(ckpt_name), tp_info.rank, tp_info.size, config
                 )
+                if native.endswith(".layer_scalar"):
+                    tie_decoder[native] = raw
                 yield from emit(native, raw)
 
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    for key, enc in tie_encoder.items():
+        dec = tie_decoder.get(key)
+        # Bit-equality, not a tolerance: these are the same trained scalar exported twice, so any
+        # difference at all means the two roles no longer share one stack.
+        if dec is None or not torch.equal(enc.reshape(-1).to(dec.dtype), dec.reshape(-1)):
+            raise ValueError(
+                f"DiffusionGemma loader: encoder/decoder {key!r} are not tied — encoder="
+                f"{enc.reshape(-1)[:4].tolist()} decoder="
+                f"{None if dec is None else dec.reshape(-1)[:4].tolist()}. This engine runs both "
+                f"roles through ONE instantiated stack, so a divergence here needs two scalar "
+                f"vectors selected by execution mode, not a tolerance."
+            )
 
 
 # ---- poolside/Laguna-XS-2.1 (SWA-hybrid gated-attention NVFP4 MoE) weight loader ----

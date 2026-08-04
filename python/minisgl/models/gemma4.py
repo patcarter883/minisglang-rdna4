@@ -215,9 +215,18 @@ class Gemma4DenseMLP(BaseOP):
     — the whole `mlp.*` namespace is in the compressed-tensors ignore list — but gated on the config
     rather than hard-coded, so a future fully-quantized Gemma4 builds correctly."""
 
-    def __init__(self, config: "ModelConfig", layer_id: int):
+    def __init__(
+        self,
+        config: "ModelConfig",
+        layer_id: int | None,
+        *,
+        quant_module: str | None = None,
+    ):
+        # `quant_module` names the module whose quantization policy this MLP follows, for the one
+        # instance that is NOT layer-scoped: DiffusionGemma's self-conditioning block is the same
+        # primitive at the same width and reuses this class rather than forking it.
         q = config.quant
-        name = f"model.layers.{layer_id}.mlp.gate_proj"
+        name = quant_module or f"model.layers.{layer_id}.mlp.gate_proj"
         qm = create_linear_method(
             q, quantized=q is not None and q.is_module_quantized(name)
         )
@@ -318,10 +327,17 @@ class Gemma4Model(BaseOP):
             self._embed_scale_cache = cache
         return cache
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _embed_scaled(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embedding lookup times sqrt(hidden). Shared with the DiffusionGemma canvas forward, which
+        inserts the self-conditioning block between this and the layer loop — the fp16 rounding of
+        the scale constant is load-bearing (see `_scale_tensor`), so both paths must go through it."""
         h = self.embed_tokens.forward(input_ids)
         if self._embed_scale is not None:
             h = h * self._scale_tensor(h)
+        return h
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        h = self._embed_scaled(input_ids)
         for layer in self.layers.op_list:
             h = layer.forward(h)
         return self.norm.forward(h)

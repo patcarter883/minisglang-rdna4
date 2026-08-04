@@ -19,6 +19,7 @@ _MODEL_REGISTRY = {
     # execution mode, not a separate decoder stack.
     "Gemma4ForConditionalGeneration": (".gemma4", "Gemma4ForConditionalGeneration"),
     "Gemma4ForCausalLM": (".gemma4", "Gemma4ForConditionalGeneration"),
+    "DiffusionGemmaForBlockDiffusion": (".diffusion_gemma", "DiffusionGemmaForBlockDiffusion"),
 }
 
 
