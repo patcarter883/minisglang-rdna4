@@ -137,15 +137,36 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
             return logits, hidden, None
         return logits
 
-    def forward_canvas(
+    def forward_canvas_hidden(
         self, input_ids: torch.Tensor, self_conditioning: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """One denoising step: full-vocab fp32 softcapped logits for EVERY canvas position.
+        """The CAPTURED half of a denoising step: the 30-layer backbone, ending at the final norm.
+
+        Split out of `forward_canvas` so the canvas cudagraph can capture the backbone WITHOUT the
+        LM head, which is a memory decision and not a stylistic one. The head is ~4 kernel launches
+        of the ~1000 a canvas step issues, so capturing it buys nothing measurable; but its output is
+        `[canvas, 262144]`, and every intermediate a captured region produces is pinned for the life
+        of the graph in its private pool — 134 MiB of fp16 logits plus three 268 MiB fp32 stages of
+        the softcap, ~1 GiB PER CAPTURED BATCH SIZE, on a 16 GB card that is already holding the
+        weights and the KV pool. The hidden state is `[canvas, 2816]` = 1.4 MiB. That is the trade.
+        """
+        return self.model.forward_canvas(input_ids, self_conditioning)
+
+    def canvas_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The EAGER tail of a denoising step: full-vocab fp32 softcapped logits for EVERY canvas
+        position.
 
         `logits_all_rows` rather than `lm_head.forward`, deliberately: the latter reduces to the
         last token on a prefill batch, and every canvas position is scored."""
-        hidden = self.model.forward_canvas(input_ids, self_conditioning)
         return self._softcapped(self.lm_head.logits_all_rows(hidden))
+
+    def forward_canvas(
+        self, input_ids: torch.Tensor, self_conditioning: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """One denoising step, backbone + head, for callers that want the whole thing eagerly (the
+        parity fixtures, and any path with no captured graph). The served step runs the two halves
+        separately — see `forward_canvas_hidden`."""
+        return self.canvas_logits(self.forward_canvas_hidden(input_ids, self_conditioning))
 
     def soft_embedding(self, logits: torch.Tensor) -> torch.Tensor:
         """The self-conditioning state to carry into the NEXT denoising step: `softmax(logits) @ E`

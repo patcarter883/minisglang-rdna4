@@ -118,6 +118,16 @@ class SchedulerDiffusionMixin:
     """`_diffusion_loop` and the canvas step. Mixed into Scheduler; every attribute it touches
     (`engine`, `cache_manager`, `token_pool`, the managers) is set up by `Scheduler.__init__`."""
 
+    # Per-step cost-split accumulator (see `_StepTimer`). A CLASS attribute, resolved once at import,
+    # rather than another line in `Scheduler.__init__`: there is exactly one scheduler per process and
+    # this is diagnostics, so it has no business widening the constructor's shared surface. None (the
+    # default) makes every timer call a single `if` on an attribute already in the instance dict.
+    _canvas_timing = (
+        {"n": 0, "bs": 0, "issue": 0.0, "tail": 0.0, "sampler": 0.0, "soft": 0.0, "step": 0.0}
+        if os.environ.get("MINISGL_CANVAS_TIMING") == "1"
+        else None
+    )
+
     # ---------------------------------------------------------------------------------------
     def _diffusion_loop(self) -> None:
         """One synchronous block-diffusion iteration.
@@ -265,41 +275,51 @@ class SchedulerDiffusionMixin:
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
         batch.input_ids = self.token_pool[input_mapping]
+        # NOTE no prepare_metadata here: `Engine.forward_canvas` owns it, because which metadata to
+        # build depends on whether the step replays a captured graph (static ring rows, filled by the
+        # backend) or runs eager. Building the eager rows unconditionally would keep an
+        # O(bs*(window+canvas)) per-step Python loop on the hot path — part of exactly the host cost
+        # capture exists to remove.
 
         # Self-conditioning: the PREVIOUS step's soft embedding, [L, hidden] per request. A request
         # on the first step of its block contributes zeros, which is EXACTLY what the reference does
-        # (`soft_embeddings = torch.zeros_like(inputs_embeds)`) — so a batch mixing fresh and
-        # mid-block requests is handled by concatenation, not by a per-request branch. All-fresh
-        # skips the block entirely (see DiffusionGemmaSelfConditioning.forward).
-        if all(s.soft_conditioning is None for s in states):
-            self_conditioning = None
-        else:
-            hidden = self.engine.model.model.embed_tokens.weight.shape[1]
-            self_conditioning = torch.cat([
-                s.soft_conditioning
-                if s.soft_conditioning is not None
-                else batch.input_ids.new_zeros(
-                    (L, hidden), dtype=self.engine.model.model.embed_tokens.weight.dtype
-                )
-                for s in states
-            ])
+        # (`soft_embeddings = torch.zeros_like(inputs_embeds)`), so a batch mixing fresh and mid-block
+        # requests is handled by concatenation, not by a per-request branch.
+        #
+        # ALWAYS A TENSOR, never None, even when every request is fresh. The model still accepts None
+        # (the parity fixtures use it, and it is the reference's own contract), but a captured canvas
+        # graph cannot branch on a Python value, so the served path has to be branch-free. It costs
+        # nothing and it is not an approximation: RMSNorm(0)=0, tanh-gelu(0)*0=0, down_proj carries no
+        # bias, so the whole block contributes exactly 0.0 and `x + 0.0` is bit-identical to skipping
+        # it (DiffusionGemmaSelfConditioning.forward says so in place).
+        emb_w = self.engine.model.model.embed_tokens.weight
+        self_conditioning = torch.cat([
+            s.soft_conditioning
+            if s.soft_conditioning is not None
+            else torch.zeros((L, emb_w.shape[1]), dtype=emb_w.dtype, device=device)
+            for s in states
+        ])
 
+        tm = _StepTimer(self)
         logits = self.engine.forward_canvas(batch, batch.input_ids, self_conditioning)
+        tm.mark_forward()
 
         # --- advance each request's denoising state ------------------------------------------
         reply: List[DetokenizeMsg] = []
         finished_now = set()
         for i, (req, state) in enumerate(zip(reqs, states)):
             out = state.step(logits[i * L : (i + 1) * L])
+            tm.mark_sampler()
             # The soft embedding is built HERE, from the temperature-scaled logits the sampler just
             # consumed, so the [L, 262144] fp32 tensor dies with this iteration instead of being
             # carried across the step boundary (see DiffusionGemmaForBlockDiffusion.soft_embedding).
             state.soft_conditioning = self.engine.model.soft_embedding(out.scaled)
             out.scaled = None
+            tm.mark_soft_embed()
             if state.finished:
                 self._canvas_commit(req, state, reply, finished_now)
+        tm.done(len(reqs))
 
         if finished_now:
             for req in finished_now:
@@ -408,6 +428,85 @@ class SchedulerDiffusionMixin:
         batch = Batch(reqs=[req], phase="decode")
         self._canvas_forward(batch, allocate=False)
         req.cached_len = req.device_len = c0 + n
+
+
+class _StepTimer:
+    """Per-denoising-step cost split — `MINISGL_CANVAS_TIMING=1`, diagnostics only, inert otherwise.
+
+    It answers ONE question that tok/s cannot: how much of a canvas step is the GPU doing work and
+    how much is the host failing to feed it. A canvas step is 256 tokens wide, so it *looks* like a
+    prefill and the launch-bound reasoning that applies to bs=1 decode looks inapplicable — but the
+    launch COUNT is ~30 layers x ~30 dispatches either way, and it does not shrink with the token
+    count. `fwd_issue` is the host wall spent returning from `forward_canvas` (pure launch cost, the
+    forward is async); `fwd_tail` is what remains of the GPU work after the host stopped issuing. A
+    step where issue >> tail is host-bound and is what cudagraph capture removes; a step where tail
+    dominates is compute-bound and capture cannot help it.
+
+    Costs two `torch.cuda.synchronize()` per step, so it is never on by default — but the canvas loop
+    is synchronous anyway (the stopping criteria read entropies back), so it perturbs less here than
+    it would on the autoregressive path."""
+
+    __slots__ = ("sched", "on", "t0", "t1", "t2", "sampler", "soft", "_mark")
+
+    def __init__(self, sched) -> None:
+        self.on = sched._canvas_timing is not None
+        self.sched = sched
+        if not self.on:
+            return
+        torch.cuda.synchronize(sched.device)
+        self.t0 = _now()
+        self.sampler = 0.0
+        self.soft = 0.0
+
+    def mark_forward(self) -> None:
+        if not self.on:
+            return
+        self.t1 = _now()  # host stopped issuing
+        torch.cuda.synchronize(self.sched.device)
+        self.t2 = self._mark = _now()  # ... and the GPU finished
+
+    def mark_sampler(self) -> None:
+        if not self.on:
+            return
+        torch.cuda.synchronize(self.sched.device)
+        t = _now()
+        self.sampler += t - self._mark
+        self._mark = t
+
+    def mark_soft_embed(self) -> None:
+        if not self.on:
+            return
+        torch.cuda.synchronize(self.sched.device)
+        t = _now()
+        self.soft += t - self._mark
+        self._mark = t
+
+    def done(self, bs: int) -> None:
+        if not self.on:
+            return
+        acc = self.sched._canvas_timing
+        acc["n"] += 1
+        acc["bs"] += bs
+        acc["issue"] += self.t1 - self.t0
+        acc["tail"] += self.t2 - self.t1
+        acc["sampler"] += self.sampler
+        acc["soft"] += self.soft
+        acc["step"] += _now() - self.t0
+        if acc["n"] % 10:
+            return
+        n = acc["n"]
+        logger.info_rank0(
+            f"[canvas-timing] n={n} bs={acc['bs']/n:.1f} per step: "
+            f"fwd_issue={acc['issue']/n*1e3:.1f}ms fwd_tail={acc['tail']/n*1e3:.1f}ms "
+            f"sampler={acc['sampler']/n*1e3:.1f}ms soft_embed={acc['soft']/n*1e3:.1f}ms "
+            f"step={acc['step']/n*1e3:.1f}ms"
+        )
+
+
+def _now() -> float:
+    import time
+
+    return time.perf_counter()
 
 
 # `_make_positions` / `_make_input_tuple` live in scheduler.py; importing them at module scope would

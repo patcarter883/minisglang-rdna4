@@ -248,27 +248,38 @@ class HIPAttnBackend(RDNA4Backend):
         self._cap_swa_cache_seqlens[:bs].copy_(cnt.to(torch.int32))
         self._cap_swa_page_table[:bs, :W].copy_(slots.to(torch.int32))
 
-    def _fill_decode_static(self, batch: "Batch") -> None:
-        """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding).
-        Runs eager, OUTSIDE the graph; it writes the exact tensors the captured kernel reads."""
-        reqs = batch.padded_reqs
+    def _fill_paged_static(
+        self, reqs: list, cache_seqlens: torch.Tensor, page_table: torch.Tensor, max_pages: int
+    ) -> None:
+        """Refresh a captured family's MAIN-POOL statics (cache_seqlens + page table) from `reqs`.
+
+        One body, shared by every fixed-shape capture family (decode, K+1 spec verify, fused-TiDAR
+        verify, block-diffusion canvas) because it was already four byte-identical copies and a
+        divergence between them is invisible: each one would still run, just against a stale or
+        mis-strided table. Runs eager, OUTSIDE the graph; it writes the exact tensors the captured
+        kernels read through their baked pointers.
+
+        Vectorized (was a per-req Python loop on the decode hot path): pull all rows' full max-width
+        strided page ids in one advanced-index op. Every kernel here bounds its key reads by
+        cache_seqlens, so writing the whole width — including the per-seq stale tail past that
+        sequence's own page count — is equivalent to a per-row `[:npages]` copy."""
         bs = len(reqs)
-        dev = self.kvcache.device
-        seqlens_k = [req.device_len for req in reqs]
-        self._cap_cache_seqlens[:bs].copy_(
-            torch.tensor(seqlens_k, dtype=torch.int32, device=dev)
+        dev = cache_seqlens.device
+        cache_seqlens[:bs].copy_(
+            torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
         )
         gpt = get_global_ctx().page_table  # global page_size=1 table
-        # Vectorized gather (was a per-req Python loop): pull all rows' full max-width strided page
-        # ids at once. The captured decode kernel bounds its reads by ctx_lens, so writing the whole
-        # width (incl. the per-seq stale tail beyond npages) is equivalent to the old per-row
-        # [:npages] copy — the tail is ignored either way.
         table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
-        rows = gpt[table_idx, : self._cap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
+        rows = gpt[table_idx, : max_pages * self.page_size : self.page_size]  # [bs, ncols]
         if self.page_size > 1:
             rows = torch.div(rows, self.page_size, rounding_mode="floor")
-        ncols = rows.shape[1]
-        self._cap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
+        page_table[:bs, : rows.shape[1]].copy_(rows.to(torch.int32))
+
+    def _fill_decode_static(self, batch: "Batch") -> None:
+        """Refresh the static decode buffers from `batch.padded_reqs` (real rows + dummy padding)."""
+        self._fill_paged_static(
+            batch.padded_reqs, self._cap_cache_seqlens, self._cap_page_table, self._cap_max_pages
+        )
 
     def prepare_for_capture(self, batch: "Batch") -> None:
         self._fill_decode_static(batch)
@@ -369,53 +380,43 @@ class HIPAttnBackend(RDNA4Backend):
         return md
 
     def _fill_verify_static(self, batch: "Batch") -> None:
-        """Refresh the static verify buffers from `batch.padded_reqs` (eager, OUTSIDE the graph).
-        cache_seqlens = device_len; page_table = each seq's page row (stale tail beyond cache_seqlens
-        is ignored by the paged-extend kernel's causal bound)."""
-        reqs = batch.padded_reqs
-        bs = len(reqs)
-        dev = self.kvcache.device
-        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
-        self._vcap_cache_seqlens[:bs].copy_(dls)
-        gpt = get_global_ctx().page_table  # global page_size=1 table
-        # Vectorized gather (was a per-req Python loop): same trick as _fill_decode_static — pull all
-        # rows' full max-width strided page ids in one advanced-index op. The paged-extend verify kernel
-        # bounds its key reads by cache_seqlens, so writing the whole width (incl. the per-seq stale tail
-        # beyond npages) is equivalent to the old per-row [:npages] copy. This runs every spec-decode
-        # verify step, so the per-req loop was pure overhead on the hot path.
-        table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
-        rows = gpt[table_idx, : self._vcap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
-        if self.page_size > 1:
-            rows = torch.div(rows, self.page_size, rounding_mode="floor")
-        ncols = rows.shape[1]
-        self._vcap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
+        """Refresh the static verify buffers from `batch.padded_reqs` (eager, OUTSIDE the graph)."""
+        self._fill_paged_static(
+            batch.padded_reqs, self._vcap_cache_seqlens, self._vcap_page_table,
+            self._vcap_max_pages,
+        )
 
-    def _fill_swa_verify_static(self, batch: "Batch") -> None:
-        """Refresh the persistent SWA ring-pool VERIFY buffers from `batch.padded_reqs` (eager, OUTSIDE
-        the graph). For each seq (device_len S, qlen K+1 new tokens): cached_len c0 = S - qlen, window
+    def _fill_swa_multiquery_static(
+        self, reqs: list, qlen: int, out_loc: torch.Tensor, page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> None:
+        """Refresh a fixed-qlen multi-query SWA ring-pool static set from `reqs` (eager, OUTSIDE the
+        graph). Shared by the K+1 spec verify and the block-diffusion canvas: the ROWS are identical
+        arithmetic, only the query count and the causality differ (the latter is a metadata flag, not
+        a row). For each seq (device_len S, qlen new tokens): cached_len c0 = S - qlen, window
         Wp = min(c0, W). Builds, per seq:
             out_loc (bs*qlen)   ring slot per NEW token = table_idx*R + (c0+j) % R
             page_table[i]       [ window slots  base+(p%R) for p in [c0-Wp, c0)  |  the qlen new slots ]
                                 (ascending absolute position; tail past Wp+qlen padded with 0)
             cache_seqlens[i]    Wp + qlen         (bounds the paged read; padded tail ignored)
-        These are the SAME ring slots the eager _build_swa_metadata / _gather_swa_windows would address
-        (store slots identical; window read = the last Wp positions at their ring slots p%R), so the
-        captured paged verify is greedy-identical to the eager dense extend. bs is tiny (<= max verify
-        bs) and qlen small, so the O(bs*(W+qlen)) build is negligible; one pinned H2D per buffer."""
-        reqs = batch.padded_reqs
+        These are the SAME ring slots the eager `_build_swa_metadata` / `_gather_swa_windows` (verify)
+        and `_build_swa_canvas_metadata` (canvas) address — store slots identical, window read = the
+        last Wp positions at their ring slots p%R — so a captured replay is bit-identical to the eager
+        forward it replaces. `page_table`'s ROW STRIDE is W+qlen and the kernel reads it as a dense
+        block, so it must be an allocation of exactly that width, never a narrow view of a wider one.
+        bs is tiny (<= the captured max), so the O(bs*(W+qlen)) python build is negligible against the
+        forward it feeds; one pinned H2D per buffer."""
         bs = len(reqs)
-        dev = self.kvcache.device
+        dev = out_loc.device
         W = self.swa_window
         R = self.swa_ring_stride
-        qlen = self._vcap_qlen
+        row_w = page_table.shape[1]
         out_slots: list[int] = []
         pt_rows: list[list[int]] = []
         ctx: list[int] = []
-        row_w = W + qlen
         for req in reqs:
             base = req.table_idx * R
-            S = req.device_len
-            c0 = S - qlen  # cached prefix before the K+1 new tokens
+            c0 = req.device_len - qlen  # cached prefix before the qlen new tokens
             Wp = min(c0, W) if c0 > 0 else 0
             new_slots = [base + ((c0 + j) % R) for j in range(qlen)]
             out_slots.extend(new_slots)
@@ -425,14 +426,14 @@ class HIPAttnBackend(RDNA4Backend):
             pt_rows.append(row)
             ctx.append(Wp + qlen)
         CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-        self._vcap_swa_out_loc[: bs * qlen].copy_(
-            torch.tensor(out_slots, **CPU).to(dev, non_blocking=True)
-        )
-        self._vcap_swa_page_table[:bs].copy_(
-            torch.tensor(pt_rows, **CPU).to(dev, non_blocking=True)
-        )
-        self._vcap_swa_cache_seqlens[:bs].copy_(
-            torch.tensor(ctx, **CPU).to(dev, non_blocking=True)
+        out_loc[: bs * qlen].copy_(torch.tensor(out_slots, **CPU).to(dev, non_blocking=True))
+        page_table[:bs].copy_(torch.tensor(pt_rows, **CPU).to(dev, non_blocking=True))
+        cache_seqlens[:bs].copy_(torch.tensor(ctx, **CPU).to(dev, non_blocking=True))
+
+    def _fill_swa_verify_static(self, batch: "Batch") -> None:
+        self._fill_swa_multiquery_static(
+            batch.padded_reqs, self._vcap_qlen, self._vcap_swa_out_loc,
+            self._vcap_swa_page_table, self._vcap_swa_cache_seqlens,
         )
 
     def prepare_verify_for_capture(self, batch: "Batch") -> None:
@@ -494,21 +495,10 @@ class HIPAttnBackend(RDNA4Backend):
 
     def _fill_fused_verify_static(self, batch: "Batch") -> None:
         """Refresh cache_seqlens + page_table from `batch.padded_reqs` (eager, OUTSIDE the graph)."""
-        reqs = batch.padded_reqs
-        bs = len(reqs)
-        dev = self.kvcache.device
-        dls = torch.tensor([req.device_len for req in reqs], dtype=torch.int32, device=dev)
-        self._fcap_cache_seqlens[:bs].copy_(dls)
-        gpt = get_global_ctx().page_table  # global page_size=1 table
-        # Vectorized gather (was a per-req Python loop) — identical trick to _fill_decode_static /
-        # _fill_verify_static: one advanced-index op over all rows; the kernel bounds key reads by
-        # cache_seqlens so the stale per-seq tail beyond npages is ignored.
-        table_idx = torch.tensor([req.table_idx for req in reqs], dtype=torch.long, device=gpt.device)
-        rows = gpt[table_idx, : self._fcap_max_pages * self.page_size : self.page_size]  # [bs, ncols]
-        if self.page_size > 1:
-            rows = torch.div(rows, self.page_size, rounding_mode="floor")
-        ncols = rows.shape[1]
-        self._fcap_page_table[:bs, :ncols].copy_(rows.to(torch.int32))
+        self._fill_paged_static(
+            batch.padded_reqs, self._fcap_cache_seqlens, self._fcap_page_table,
+            self._fcap_max_pages,
+        )
 
     def prepare_fused_verify_for_capture(self, batch: "Batch") -> None:
         # Dummy capture batch: cache_seqlens = fused_qlen (cached_len 0 dummy), page table -> dummy page.
@@ -610,3 +600,89 @@ class HIPAttnBackend(RDNA4Backend):
             if tq < tq_pad:
                 self._dcap_custom_mask[tq:tq_pad, : self._dcap_qlen].zero_()
         batch.attn_metadata = self._ddtree_verify_metadata_static(batch.padded_size)
+
+    # ---- BLOCK-DIFFUSION CANVAS cudagraph capture (bidirectional multi-query) ---------------------
+    # A canvas denoising step is the SAME static shape as the K+1 spec verify above — a fixed number
+    # of query tokens per sequence run through the paged-extend kernel against the main pool, plus a
+    # `[window | new]` ring row for the sliding layers — with exactly two differences:
+    #   * qlen is `canvas_length` (256), not num_draft+1; and
+    #   * `bidirectional=True`, which is what makes `_hip_prefill_paged` / `_swa_prefill_paged` run
+    #     causal=0 AND sliding_window=0. A canvas has no mask at all: every query attends every key
+    #     inside cache_seqlens, on BOTH layer geometries (measured, tools/canvas_attention_probe.py).
+    # It gets its OWN buffers rather than borrowing the verify family's for the reason
+    # init_verify_capture already documents about widths: a canvas ring row is `W + 256` wide where a
+    # verify row is `W + K+1`, and the kernel reads that table as a DENSE [bs, row_w] block, so a
+    # narrow view of a wider allocation would be silently mis-strided rather than an error. The fill
+    # helpers are shared (`_fill_paged_static` / `_fill_swa_multiquery_static`) — the rows are the
+    # same arithmetic, only the query count differs.
+    #
+    # WHY THIS IS WORTH CAPTURING AT ALL, given the step is 256 tokens wide rather than 1: a block runs
+    # the IDENTICAL forward k times (k = 12-19 measured), and everything that varies across those k
+    # steps is the CONTENTS of these buffers plus the input ids — the shapes and the slot addressing
+    # are fixed for the whole block. WHAT IT IS NOT is a speedup: measured, capture collapses the
+    # per-step host launch loop from 30.8 ms to 0.8 ms and moves the step by -0.3%, because that
+    # launch time was entirely overlapped with GPU work (gfx activity 100% median). It is carried for
+    # correctness and for the residual it will expose once the backbone shrinks, not for tok/s. See
+    # GraphRunner.capture_canvas_graphs and docs/DIFFUSIONGEMMA_BLOCK_DIFFUSION.md D6.
+    def init_canvas_capture(self, max_seq_len: int, bs_list: List[int], canvas_len: int) -> None:
+        dev = self.kvcache.device
+        self._ccap_max_bs = max(bs_list)
+        self._ccap_qlen = canvas_len
+        self._ccap_max_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self._ccap_cache_seqlens = torch.ones(self._ccap_max_bs, dtype=torch.int32, device=dev)
+        self._ccap_page_table = torch.zeros(
+            self._ccap_max_bs, self._ccap_max_pages, dtype=torch.int32, device=dev
+        )
+        self._ccap_cu_q = (
+            torch.arange(self._ccap_max_bs + 1, dtype=torch.int32, device=dev) * canvas_len
+        )
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._ccap_swa_out_loc = torch.zeros(
+                self._ccap_max_bs * canvas_len, dtype=torch.int32, device=dev
+            )
+            self._ccap_swa_page_table = torch.zeros(
+                self._ccap_max_bs, self.swa_window + canvas_len, dtype=torch.int32, device=dev
+            )
+            self._ccap_swa_cache_seqlens = torch.ones(
+                self._ccap_max_bs, dtype=torch.int32, device=dev
+            )
+
+    def _canvas_metadata_static(self, bs: int) -> RDNA4Metadata:
+        md = RDNA4Metadata(
+            cache_seqlens=self._ccap_cache_seqlens[:bs],
+            cu_seqlens_q=self._ccap_cu_q[: bs + 1],
+            max_seqlen_q=self._ccap_qlen,
+            max_seqlen_k=self._ccap_max_pages * self.page_size,
+            page_table=self._ccap_page_table[:bs],
+            cold_prefill=False,
+            # THE flag that separates this from a verify of the same shape. Dropping it would replay
+            # a perfectly healthy graph that applies a prefix-offset CAUSAL mask to the canvas — a
+            # different model, and one that still emits fluent text (rel_fro 0.60 apart, §C3).
+            bidirectional=True,
+        )
+        if self.swa_kv is not None and self.swa_window > 0:
+            md.swa_out_loc = self._ccap_swa_out_loc[: bs * self._ccap_qlen]
+            md.swa_verify_page_table = self._ccap_swa_page_table[:bs]
+            md.swa_verify_cache_seqlens = self._ccap_swa_cache_seqlens[:bs]
+        return md
+
+    def _prepare_canvas_static(self, batch: "Batch") -> None:
+        self._fill_paged_static(
+            batch.padded_reqs, self._ccap_cache_seqlens, self._ccap_page_table,
+            self._ccap_max_pages,
+        )
+        if self.swa_kv is not None and self.swa_window > 0:
+            self._fill_swa_multiquery_static(
+                batch.padded_reqs, self._ccap_qlen, self._ccap_swa_out_loc,
+                self._ccap_swa_page_table, self._ccap_swa_cache_seqlens,
+            )
+        batch.attn_metadata = self._canvas_metadata_static(batch.padded_size)
+
+    # Capture and replay prep are the same work — unlike the decode/verify families there is no mask
+    # to seed and no width to repoint — but both names exist so the GraphRunner call sites read the
+    # same as every other family.
+    def prepare_canvas_for_capture(self, batch: "Batch") -> None:
+        self._prepare_canvas_static(batch)
+
+    def prepare_canvas_for_replay(self, batch: "Batch") -> None:
+        self._prepare_canvas_static(batch)

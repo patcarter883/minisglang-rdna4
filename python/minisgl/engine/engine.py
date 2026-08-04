@@ -50,6 +50,15 @@ _GRAPH_ACT_MULT = 8
 _GRAPH_ASSUMED_AUX = 8
 # Slight round-up so the estimate errs toward preventing OOM rather than over-starving KV.
 _GRAPH_ROUNDUP = 1.1
+# Device bytes a BLOCK-DIFFUSION canvas graph costs per canvas token (graph pool + the warmup's
+# retained allocator growth, which never returns to the device). Deliberately NOT expressed as
+# `_GRAPH_ACT_MULT * hidden * dtype`: that multiplier was fitted against decode/verify graphs of one
+# to a few tokens per sequence, and a canvas step is a prefill-shaped 256-token forward through 30
+# layers of MoE — the same formula under-reserves it by ~50x. MEASURED on the served checkpoint
+# (DiffusionGemma-26B-A4B-int4, TP=2, canvas 256, bs=1): device-free fell 2.96 -> 2.41 GiB across
+# capture, i.e. ~2.2 MiB per canvas token. This is an OBSERVATION with headroom, not a derivation,
+# and it is named that way so nobody mistakes it for a model of the allocator.
+_CANVAS_GRAPH_BYTES_PER_TOKEN = int(2.5 * (1 << 20))
 
 
 def _swa_kv_geometry(mc: ModelConfig) -> Tuple[int, int]:
@@ -475,6 +484,10 @@ class Engine:
             max_running_req=config.max_running_req,
             cam=self.cam,
         )
+        # Block-diffusion canvas graphs. Unlike the spec-verify families this needs nothing from the
+        # scheduler (no proposer, no aux-capture layers) — the shape is fixed by the checkpoint's
+        # canvas_length — so it is captured here, beside the decode graphs, on the engine stream.
+        self._capture_canvas_graphs(config)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         # self.dp_cpu_group is the cross-replica gloo group over the dp ranks (one member per replica,
@@ -916,6 +929,14 @@ class Engine:
             total += T * vocab * f32 + 3 * T * i32
             total += (1 + _GRAPH_ASSUMED_AUX) * T * hidden * dt  # last_hidden + aux_hidden
             total += _GRAPH_ACT_MULT * T * hidden * dt
+        # Block-diffusion canvas graphs (captured in Engine.__init__, i.e. AFTER the KV pool is
+        # sized). Same reason every other term here exists: without it the pool takes the whole
+        # budget and capture OOMs at boot, on the one path where "graphs disabled" is not a graceful
+        # degradation but a 2-3x slower serve. Batch-size set must match _capture_canvas_graphs'.
+        if mc.is_block_diffusion and mc.canvas_length:
+            cbs = min(max_bs, config.max_running_req,
+                      max(1, config.max_forward_len // int(mc.canvas_length)))
+            total += cbs * int(mc.canvas_length) * _CANVAS_GRAPH_BYTES_PER_TOKEN
         total = int(total * _GRAPH_ROUNDUP)
         margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
         if margin:  # non-empty (empty env string is ignored)
@@ -1188,12 +1209,12 @@ class Engine:
             return self.model.forward(return_hidden=return_hidden)
 
     def forward_canvas(
-        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: "torch.Tensor | None"
+        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor
     ) -> torch.Tensor:
         """One block-diffusion denoising step. Returns full-vocab fp32 logits for EVERY canvas
         position, ``[sum(extend_len), vocab]``.
 
-        The three things it deliberately does NOT do are the whole reason it is not ``forward_batch``:
+        The two things it deliberately does NOT do are the whole reason it is not ``forward_batch``:
 
           * NO ``sampler.sample``. A canvas step needs per-position entropy over the full vocabulary,
             a per-position multinomial, an entropy-ordered acceptance set and a re-noise — none of
@@ -1203,18 +1224,68 @@ class Engine:
             overwritten on every one of the <=48 steps of a block, so ``cached_len``/``device_len``
             must stay exactly where the block started. Advancing them would allocate a fresh canvas
             of slots per step and leave the block attending its own denoising history.
-          * NO cudagraph replay — eager only for now. The shape is an ideal capture target (fixed
-            query count, fixed batch size, only the prefix length varies), so this is a gap to close,
-            not a property of the design.
+
+        The step is CUDAGRAPH-CAPTURED when the batch matches a captured size (see
+        ``GraphRunner.capture_canvas_graphs``); only the backbone is in the graph, the LM head runs
+        eagerly either way. Note where ``prepare_metadata`` sits: building the eager metadata is
+        itself a per-step O(bs*(window+canvas)) Python loop over ring slots, so it is built ONLY on
+        the eager branch — the captured branch's static rows are filled by
+        ``prepare_canvas_for_replay``. Doing both would leave a measurable part of the very host cost
+        capture exists to remove.
 
         ``canvas_ids`` is passed explicitly rather than read from ``batch.input_ids`` because the
         canvas is re-sampled between steps and never enters a request's host token buffer; the token
-        pool holds a copy only so the KV scatter can address the right slots."""
+        pool holds a copy only so the KV scatter can address the right slots. ``self_conditioning``
+        is always a real ``[tokens, hidden]`` tensor (zeros on the first step of a block) rather than
+        ``None``: a captured graph cannot branch on it, and zeros are bit-identical to skipping the
+        block (see ``DiffusionGemmaSelfConditioning.forward``)."""
         assert torch.cuda.current_stream() == self.stream
         assert batch.canvas, "forward_canvas requires a canvas batch (Batch.canvas is False)"
         _maybe_profile()
-        with self.ctx.forward_batch(batch):
-            return self.model.forward_canvas(canvas_ids, self_conditioning)
+        if self.graph_runner.can_use_canvas_graph(batch):
+            hidden = self.graph_runner.replay_canvas(batch, canvas_ids, self_conditioning)
+        else:
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                hidden = self.model.forward_canvas_hidden(canvas_ids, self_conditioning)
+        return self.model.canvas_logits(hidden)
+
+    def _capture_canvas_graphs(self, config: EngineConfig) -> None:
+        """Capture the block-diffusion canvas graphs, at boot, for every batch size the serve can
+        actually admit. No-op for every autoregressive model.
+
+        Two bounds, and both are real rather than defensive:
+          * ``max_graph_bs`` — the operator's own graph-coverage knob (``--cuda-graph-max-bs``, which
+            ``tools/serve.sh`` pins to the concurrency). Above it, capture is off by request.
+          * ``max_forward_len`` (= ``--max-extend-tokens`` on a served config) — a canvas step of
+            ``bs*canvas_length`` tokens IS a prefill of that many tokens as far as activation memory
+            is concerned, and the engine already refuses prefills above that budget. Capturing a
+            batch the forward budget forbids would reserve graph memory for a step that can never
+            run.
+        Sizes are CONTIGUOUS (1..max) rather than the decode bucket ladder, because the canvas path
+        matches bs EXACTLY (no dummy padding — a padded canvas row is a whole extra 256-token forward
+        through 30 layers), so a bucket gap is a batch size that silently runs eager."""
+        mc = config.model_config
+        if not mc.is_block_diffusion or self.graph_runner.max_graph_bs == 0:
+            return
+        canvas_len = int(mc.canvas_length)
+        by_tokens = max(1, config.max_forward_len // canvas_len)
+        max_bs = min(self.graph_runner.max_graph_bs, config.max_running_req, by_tokens)
+        if max_bs < 1:
+            return logger.info_rank0("canvas CUDA graph: no admissible batch size — capture skipped")
+        # Buffer dtype is the EMBEDDING's, not ``self.dtype``: the self-conditioning input and the
+        # backbone hidden are both in the embedding table's dtype, and a static buffer one step off
+        # would silently CAST on every copy_ instead of raising — a numerical difference against the
+        # eager path, on the input the whole denoising loop is conditioned on.
+        emb_w = self.model.model.embed_tokens.weight
+        with torch.cuda.stream(self.stream):
+            self.graph_runner.capture_canvas_graphs(
+                model=self.model,
+                canvas_len=canvas_len,
+                bs_list=list(range(1, max_bs + 1)),
+                hidden_size=emb_w.shape[1],
+                dtype=emb_w.dtype,
+            )
 
     def capture_spec_verify_graphs(
         self, needs_hidden: bool, num_aux: int, bs_list: "list[int]",

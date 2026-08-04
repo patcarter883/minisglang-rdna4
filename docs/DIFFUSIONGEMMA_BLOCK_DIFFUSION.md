@@ -1088,9 +1088,7 @@ emits all its tokens at once and tok/s therefore cannot show k at all.
 
 ### D4. What is still open
 
-* **cudagraph capture (§B7.7).** Eager only. Per this repo's standing rule that is not "done", and
-  the canvas is an unusually good capture target: fixed query count, fixed batch size, only the
-  prefix length varies — the same shape `_fill_swa_verify_static` already handles.
+* ~~**cudagraph capture (§B7.7).** Eager only.~~ **DONE, and it buys nothing — see §D6.**
 * **Concurrency (§R6).** Measured at bs=1 only. The forward shape is uniform, but the per-request
   TEMPERATURE differs (it is a function of that request's own step index), so a batched step needs a
   per-row scale; the code currently applies it per request in the sampler, which is correct but
@@ -1271,3 +1269,93 @@ the lever block diffusion needs, which is the ~85%-non-compute canvas step.
 tok/s was NOT re-measured with SWA-radix on (the cards were released); the gate's per-request wall
 times are within noise of the §D1 numbers, but that is not a tok/s measurement and is not claimed as
 one.
+
+---
+
+## D6. Cudagraph capture: byte-identical, and worth 0.3%
+
+The canvas is captured (`GraphRunner.capture_canvas_graphs`, `HIPAttnBackend.init_canvas_capture`,
+`Engine.forward_canvas`). §D4 called it "an unusually good capture target" and it is — the graph does
+exactly what a graph is supposed to do. It just turns out that what a graph does is not what this
+model needs.
+
+### D6.1 Correctness first: it is bit-identical, at every captured batch size
+
+Every serve verifies its own capture. The first two replays **at each captured batch size** also run
+the eager forward on the same inputs and compare the whole `[bs*256, 2816]` backbone hidden state:
+
+```
+[canvas-graph] REPLAY #1 engaged, bs=1 check 1/2 (qlen=256, T=256):
+               graph vs eager max|delta|=0.000e+00 over (256, 2816) BIT-IDENTICAL
+```
+
+`0.000e+00`, not "close" — the captured step is the same computation, not an approximation of it.
+Two replays rather than one because the first step of a block carries a ZERO self-conditioning
+signal and would not exercise that input; per BATCH SIZE rather than per serve because every
+captured bs has its own `cu_seqlens_q`, its own `[bs, W+256]` ring block table and its own `bs*256`
+store-slot vector. The first cut of this gate checked bs=1 four times and bs=2/3/4 not at all — a
+concurrent serve's first canvas steps happen while the other requests are still prefilling — which
+is precisely the shape of bug it exists to catch, so the gate is now keyed on bs.
+
+This matters more than usual here because **block diffusion has no greedy mode**: the canvas is drawn
+from noise and every step draws a multinomial, so cross-boot text identity is unobtainable in
+principle (and capture itself perturbs the process RNG offset by reserving a generator state). The
+in-process comparison is the only byte-identity claim available, and it is a stronger one than
+matching text — it compares the computation rather than a sample from it.
+
+### D6.2 It removes 97% of the launch cost and 0.3% of the step
+
+`MINISGL_CANVAS_TIMING=1` splits each denoising step. Marginal cost per step (differenced between
+report points, so the cumulative-average smear is removed), bs=1, TP=2, same session and harness for
+both legs:
+
+| | fwd_issue | fwd_tail | sampler | soft_embed | **step** |
+|---|---|---|---|---|---|
+| eager (`GRAPH_BS=0`) | 30.8 ms | 123.3 ms | 11.5 ms | 16.2 ms | **181.6 ms** |
+| captured | **0.8 ms** | 152.9 ms | 11.6 ms | 15.9 ms | **181.1 ms** |
+
+`fwd_issue` is the host wall spent inside `forward_canvas` issuing work; `fwd_tail` is the GPU work
+still outstanding when the host stops issuing. Capture collapses the launch loop **30.8 → 0.8 ms, a
+97% reduction**, and the step does not move (−0.3%, i.e. a wash; three consecutive 10-step windows in
+the captured leg read 181.2 / 181.1 / 181.1 ms, so this is not noise-limited).
+
+**That is the finding.** Those 30.8 ms of host launch were entirely overlapped with GPU work. There
+was no launch gap to reclaim, because the GPU is saturated — which is what the independent rocprofv3
+measurement says from the other side (gfx activity 100% median; bridging fp16→bf16 to engage the
+native tail kernels removed 38% of all dispatches for +3.2%). Two instruments, two methods, same
+conclusion. Anyone who re-derives "85% of the step is not compute" from a roofline estimate should
+read this table before acting on it.
+
+### D6.3 The step attribution, cross-checked
+
+The same table, against the profiler's phase breakdown of the same workload:
+
+| | this timer | rocprofv3 |
+|---|---|---|
+| forward (backbone + lm_head + softcap) | `issue+tail` = **154.1 ms** | 127.7 + 23.2 + 3.1 = **154.0 ms** |
+| soft_embedding | **16.2 ms** | **15.3 ms** |
+| sampler | 11.5 ms | (inside "sampler+host" ~17 ms) |
+| step | 181.6 ms | ~186 ms |
+
+0.1% apart on the forward, from a `torch.cuda.synchronize()`-bracketed host timer and a kernel
+tracer respectively. The step is **GEMM-efficiency bound inside the backbone**, and neither dispatch
+count nor bandwidth (umc ~24%) nor power (234 W median of a 320 W cap) is the constraint.
+
+### D6.4 What capture is still for
+
+It stays, for three reasons that are not tok/s. It is required by this repo's standing rule that
+eager-only is not "done". It is proven byte-identical, so it costs nothing to carry. And its value is
+*conditional on the rest of the stack*: the 30.8 ms of launch it removes is currently hidden behind
+127.7 ms of backbone GEMM, but the same graph removes the same 30 ms from whatever the residual
+becomes — so as the backbone shrinks, capture's share grows. It is item 4 of a stack, banked early.
+
+Two implementation notes worth keeping:
+
+* **The LM head is deliberately OUTSIDE the graph** (`forward_canvas_hidden` / `canvas_logits`). It
+  is ~4 launches of ~5000, but its output is `[256, 262144]`; capturing it would pin ~1 GiB of
+  vocab-wide fp16+fp32 transients in the graph's private pool **per captured batch size** on a 16 GB
+  card. The captured region ends at the final norm and hands back `[bs*256, 2816]` = 1.4 MiB.
+* **Exact bs match, no dummy padding**, unlike the decode and K+1-verify families. Padding a bs=3
+  canvas step up to a captured bs=4 would push an extra 256-token canvas through 30 layers to avoid
+  ~1 ms of launch — the wrong trade by two orders of magnitude. Uncaptured sizes fall back to the
+  eager forward, which is lossless.
