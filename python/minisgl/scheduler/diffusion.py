@@ -333,11 +333,13 @@ class SchedulerDiffusionMixin:
         for i, (req, state) in enumerate(zip(reqs, states)):
             out = state.step(logits[i * L : (i + 1) * L])
             tm.mark_sampler()
-            # The soft embedding is built HERE, from the temperature-scaled logits the sampler just
-            # consumed, so the [L, 262144] fp32 tensor dies with this iteration instead of being
-            # carried across the step boundary (see DiffusionGemmaForBlockDiffusion.soft_embedding).
-            state.soft_conditioning = self.engine.model.soft_embedding(out.scaled)
-            out.scaled = None
+            # The soft embedding is built HERE, from the softmax the sampler just consumed, so the
+            # [L, 262144] fp32 tensor dies with this iteration instead of being carried across the
+            # step boundary (see DiffusionGemmaForBlockDiffusion.soft_embedding). Handing over
+            # `probs` rather than the scaled logits is what stops this being a SECOND full-vocab
+            # softmax of the same distribution.
+            state.soft_conditioning = self.engine.model.soft_embedding(out.probs)
+            out.probs = None
             tm.mark_soft_embed()
             if state.finished:
                 self._canvas_commit(req, state, reply, finished_now)

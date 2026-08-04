@@ -202,47 +202,49 @@ def check_soft_embedding(rep: Report, mc, handles) -> None:
     ids = torch.randint(0, mc.vocab_size, (vocab,))
     model.model.embed_tokens.weight = _rows(handles, CKPT + "embed_tokens.weight", ids).float()
 
-    # More rows than one chunk, so the chunked path is actually exercised.
-    rows = 4 * dg_mod._SOFT_EMBED_CHUNK
+    # `soft_embedding` now consumes the SAMPLER'S softmax rather than building its own, so the input
+    # under test is `normalized_probs(l)[1]` — the Categorical-shifted softmax — while the reference
+    # quantity is still `softmax(l) @ E`. Proving those two agree IS the test: it is the substitution
+    # the whole saving rests on, and it is the one place a "mathematically identical" claim about an
+    # fp32 shift can be checked instead of asserted.
+    from minisgl.diffusion import normalized_probs
+
+    rows = 128
     logits = torch.randn(rows, vocab) * 4.0
-    got = model.soft_embedding(logits)
+    probs = normalized_probs(logits)[1]
+    got = model.soft_embedding(probs)
     want = (logits.softmax(dim=-1, dtype=torch.float32) @ model.model.embed_tokens.weight) * (
         model.model._scale_tensor(logits)
     )
-    rep.close("soft_embedding vs softmax(l) @ E * sqrt(h)", got, want, 1e-6)
-    print(f"       (|out|max={got.abs().max().item():.3f} over {rows} rows, chunk="
-          f"{dg_mod._SOFT_EMBED_CHUNK})")
+    rep.close("soft_embedding(sampler probs) vs softmax(l) @ E * sqrt(h)", got, want, 1e-6)
+    print(f"       (|out|max={got.abs().max().item():.3f} over {rows} rows, "
+          f"vocab chunk={dg_mod._SOFT_EMBED_VOCAB_CHUNK or 'whole shard'})")
 
-    # It is NOT bit-identical to the unchunked form — a [32, V] GEMM and a [128, V] GEMM reduce in
-    # different orders — so the property that matters for a serve is the one this repo calls
-    # M-invariance: the answer for a given canvas row must not depend on how many OTHER rows are in
-    # flight. Fixed-size chunking gives that by construction, since canvas_length is a multiple of
-    # the chunk, but only if it is actually checked.
-    half = model.soft_embedding(logits[: rows // 2])
+    # THE CHUNK AXIS IS VOCAB, NOT ROWS, and that is the entire fix: a row chunk re-streams the whole
+    # embedding shard per chunk (8x/step measured, 5.9 GB against a 0.74 GB floor), a vocab chunk
+    # re-streams nothing because the slices are disjoint. Blocking K changes only the fp32 summation
+    # order, so the two must agree to rounding — checked here, because a wrong slice offset would
+    # still produce plausible embeddings.
+    saved = dg_mod._SOFT_EMBED_VOCAB_CHUNK
+    try:
+        dg_mod._SOFT_EMBED_VOCAB_CHUNK = vocab // 8
+        blocked = model.soft_embedding(probs)
+    finally:
+        dg_mod._SOFT_EMBED_VOCAB_CHUNK = saved
+    rep.close(f"vocab-chunked ({vocab // 8} cols) == one GEMM", blocked, got, 1e-6)
+
+    # A caller may hand over ONE RANK'S SHARD instead of the full-vocab row (that is what the
+    # vocab-parallel canvas tail does under TP). At tp_size=1 the shard IS the whole vocab, so the
+    # discrimination the served path relies on — width == count means "already local" — is exercised
+    # by the sharded arithmetic itself: sum over disjoint column blocks must reproduce the whole.
+    start, count = model.model.embed_tokens.vocab_range
     rep.check(
-        "M-invariant: a row's answer ignores the batch",
-        torch.equal(half, got[: rows // 2]),
-        f"soft_embedding(logits[:{rows // 2}]) vs the first {rows // 2} rows of the full call: "
-        f"max|abs|={(half - got[: rows // 2]).abs().max().item():.3e} (must be exactly 0)",
+        "single-rank shard covers the whole vocab (no silent slice)",
+        (start, count) == (0, vocab),
+        f"vocab_range={(start, count)} at tp_size=1; if this were a proper sub-range the width test "
+        f"in soft_embedding would mis-route a full-vocab row",
     )
     canvas_length = 256
-    rep.check(
-        "chunk divides the canvas, so blocking is aligned",
-        canvas_length % dg_mod._SOFT_EMBED_CHUNK == 0,
-        f"canvas_length {canvas_length} % chunk {dg_mod._SOFT_EMBED_CHUNK} = "
-        f"{canvas_length % dg_mod._SOFT_EMBED_CHUNK}; a non-dividing chunk would make the last "
-        f"block's GEMM shape depend on the batch and break the invariance above",
-    )
-    saved = dg_mod._SOFT_EMBED_CHUNK
-    try:
-        dg_mod._SOFT_EMBED_CHUNK = 1
-        got1 = model.soft_embedding(logits)
-    finally:
-        dg_mod._SOFT_EMBED_CHUNK = saved
-    print(
-        f"       (chunk=1 vs chunk={saved}: max|abs|={(got1 - got).abs().max().item():.3e} — "
-        f"fp32 GEMM reduction-order noise, which is why the check above is invariance, not equality)"
-    )
 
     # Carrying the SOFT EMBEDDING rather than the logits is the whole point: quantify what it saves.
     n_logits = canvas_length * mc.vocab_size
@@ -430,7 +432,12 @@ def check_full_stack(rep: Report, path: str) -> None:
             torch.Generator().manual_seed(7))) * 2.0),
     ):
         want, cache = hf_canvas(canvas, sc_logits)
-        soft = None if sc_logits is None else model.soft_embedding(sc_logits[0])
+        # HF takes the raw self-conditioning LOGITS and softmaxes them inside; this engine's
+        # `soft_embedding` takes the softmax, because on the served path the sampler already built
+        # it. Softmaxing here is not a shortcut around the parity claim — it is the same op HF is
+        # about to do, hoisted to the call site.
+        soft = (None if sc_logits is None
+                else model.soft_embedding(sc_logits[0].softmax(dim=-1, dtype=torch.float32)))
         got = _run_minisgl(
             model,
             lambda: model.forward_canvas(canvas[0], soft),

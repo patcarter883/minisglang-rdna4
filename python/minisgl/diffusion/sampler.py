@@ -22,9 +22,12 @@ reasonable-looking implementation gets them wrong and still produces text:
 
 One deliberate divergence from the reference, for cost: the reference computes the full-vocabulary
 entropy TWICE per step (once in `accept_canvas`, once in the stopping criterion) and the softmax a
-third time for the multinomial. At the shipped canvas_length 256 and vocab 262144 each of those is a
-268 MiB fp32 transient. `step()` computes the softmax and the entropy ONCE and shares them. That is
-arithmetically identical, and the test replays it against the reference to prove so.
+third time for the multinomial — and a FOURTH time for the self-conditioning soft embedding, which
+in this engine is built at the producing step (`DiffusionGemmaForBlockDiffusion.soft_embedding`). At
+the shipped canvas_length 256 and vocab 262144 each of those is a 268 MiB fp32 transient. `step()`
+computes the softmax and the entropy ONCE and shares all four consumers off it (`DiffusionStep.probs`
+carries it to the last one). That is arithmetically identical, and the test replays it against the
+reference to prove so.
 """
 
 from __future__ import annotations
@@ -127,12 +130,14 @@ class DiffusionStep:
     entropy: torch.Tensor  # [L] fp32 — per-position entropy of the temperature-scaled logits
     mean_entropy: float
     done: bool  # stable AND confident: the block may stop early
-    # The temperature-scaled logits this step consumed — what the NEXT step's self-conditioning soft
-    # embedding must be built from (the reference carries `processed_logits`, i.e. post-temperature,
-    # not the raw ones). Returned rather than recomputed because it is a [L, vocab] fp32 tensor
-    # (268 MiB at the shipped 256 x 262144); the caller is expected to consume it immediately and
-    # drop it, which is the whole point of building the soft embedding at the producing step.
-    scaled: "torch.Tensor | None" = None
+    # The full-vocab fp32 softmax of the temperature-scaled logits — the tensor the entropy, the
+    # bound and the multinomial were all computed from, handed on so the NEXT step's self-conditioning
+    # soft embedding can be `probs @ E` instead of building a SECOND softmax of the same distribution
+    # (which is what `soft_embedding(scaled)` did, and it cost a whole extra full-vocab pass per step).
+    # It is a [L, vocab] fp32 tensor — 268 MiB at the shipped 256 x 262144 — so the caller is expected
+    # to consume it immediately and drop it, which is the whole point of building the soft embedding
+    # at the producing step rather than carrying anything vocab-wide across the boundary.
+    probs: "torch.Tensor | None" = None
 
 
 class CanvasState:
@@ -186,9 +191,11 @@ class CanvasState:
         assert not self.finished, "a finished canvas must not be stepped again"
         scaled = logits / cfg.temperature(self.step_index)
 
-        # ONE softmax and ONE entropy, shared by the multinomial, the acceptance bound and the
-        # stopping criterion (the reference computes the entropy twice and the softmax three times,
-        # each a 268 MiB fp32 transient at the shipped 256 x 262144).
+        # ONE softmax and ONE entropy, shared by the multinomial, the acceptance bound, the stopping
+        # criterion AND the next step's self-conditioning soft embedding (the reference computes the
+        # entropy twice and the softmax three times, each a 268 MiB fp32 transient at the shipped
+        # 256 x 262144; `soft_embedding` used to build a fourth). `probs` leaves on the DiffusionStep
+        # for that last consumer — see its field comment for why it must be dropped immediately.
         #
         # The shared tensor is the NORMALIZED-logit softmax, the one Categorical uses, because the
         # entropy is the consumer that cannot tolerate a rounding difference. The multinomial takes
@@ -241,7 +248,7 @@ class CanvasState:
             entropy=entropy,
             mean_entropy=mean_entropy,
             done=done,
-            scaled=scaled,
+            probs=probs,
         )
 
 

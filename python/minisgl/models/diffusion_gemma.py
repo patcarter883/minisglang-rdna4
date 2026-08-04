@@ -18,8 +18,12 @@ plausible-looking implementation goes silently wrong:
   3. THE SELF-CONDITIONING SIGNAL IS A SOFT EMBEDDING, NOT LOGITS. The reference carries the
      previous step's `[canvas, 262144]` logits across the step boundary and re-multiplies them by
      the embedding table each step. `soft_embedding()` does that multiply ONCE, immediately, and the
-     engine carries the `[canvas, 2816]` result — mathematically identical, ~100x smaller, and it
-     keeps the 268 MiB fp32 softmax transient off the step boundary.
+     engine carries the `[canvas, 2816]` result. That is a claim about the CARRIED STATE and only
+     about it: ~100x less to hold across the step boundary, and the 268 MiB fp32 softmax transient
+     dies inside the step that made it. It is NOT a claim about arithmetic — the matmul is the same
+     second LM head vLLM pays, 378 GFLOP per canvas step, which TP splits into 189 GFLOP/rank.
+     Sharding is not a reduction. Two agents have now read the old "~100x smaller" wording as a cost
+     claim and gone looking for a saving that was never there, so it says which quantity it means.
 
 The head itself is `lm_head` tied to `embed_tokens` (the checkpoint ships no `lm_head.*`), with the
 same 30*tanh(x/30) softcap as the AR sibling — except the reference casts to fp32 BEFORE the cap
@@ -45,11 +49,22 @@ if TYPE_CHECKING:
 
     from .config import ModelConfig
 
-# Rows of the canvas processed per softmax chunk when building the soft embedding. The full
-# [canvas, vocab] fp32 softmax is 268 MiB for a 256-token canvas at vocab 262144 — as big as the
-# logits themselves — and it is a pure transient. Chunking bounds it without changing the result
-# (each row's softmax is independent); 32 keeps it at ~33 MiB.
-_SOFT_EMBED_CHUNK = 32
+# Vocabulary columns contracted per soft-embedding matmul chunk, or 0 for "one matmul, whole shard".
+#
+# THE AXIS IS THE WHOLE POINT. This used to chunk over canvas ROWS (32 at a time) to bound the fp32
+# softmax transient, and that is a correct thing to want and the wrong axis to get it on: the softmax
+# is the cheap operand and the EMBEDDING SHARD is the expensive one, so 8 row-chunks re-streamed all
+# 738 MB of it eight times — 5.9 GB/rank/step against a 0.74 GB floor, measured at 15.3 ms/step by
+# both the step timer and rocprofv3. Chunking over VOCAB re-reads nothing: each chunk owns a disjoint
+# slice of the shard and of the probability row, and the partial products sum.
+#
+# The transient it was protecting no longer exists at all — `soft_embedding` now consumes the
+# sampler's own `probs`, which that step already computed and is about to drop (see the docstring), so
+# there is no second softmax to bound and no reason to chunk for memory. 0 keeps it as one GEMM; a
+# positive value is here because a K=131072 contraction is a split-K shape and rocBLAS's choice of
+# split is not ours to assume — if the single GEMM ever measures worse than hand-blocking it, this is
+# the knob, and blocking K changes only the fp32 summation order.
+_SOFT_EMBED_VOCAB_CHUNK = 0
 
 
 class DiffusionGemmaSelfConditioning(Gemma4DenseMLP):
@@ -168,26 +183,40 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
         separately — see `forward_canvas_hidden`."""
         return self.canvas_logits(self.forward_canvas_hidden(input_ids, self_conditioning))
 
-    def soft_embedding(self, logits: torch.Tensor) -> torch.Tensor:
-        """The self-conditioning state to carry into the NEXT denoising step: `softmax(logits) @ E`
-        scaled by the embedding's own sqrt(hidden), i.e. the probability-weighted average embedding.
+    def soft_embedding(self, probs: torch.Tensor) -> torch.Tensor:
+        """The self-conditioning state to carry into the NEXT denoising step: `probs @ E` scaled by
+        the embedding's own sqrt(hidden), i.e. the probability-weighted average embedding.
 
-        `logits` are the TEMPERATURE-SCALED logits the sampler consumed, not the raw ones. The
-        reference carries the [canvas, vocab] logits across the step boundary and does this matmul
-        at the START of the next step; doing it here is the same arithmetic against the same
-        embedding table, and it is what makes the carried state [canvas, hidden] instead of
-        [canvas, 262144]. Under TP the embedding table is vocab-sharded, so each rank contracts its
-        own vocab slice and the partial sums are all-reduced — the same decomposition the vocab-
-        parallel embedding gather uses."""
+        `probs` is the sampler's OWN full-vocab fp32 softmax of the temperature-scaled logits
+        (`DiffusionStep.probs`), not the logits. That is a deliberate coupling and it is what makes
+        this cheap: the sampler has to build that exact tensor anyway — the entropy bound, the
+        stopping criterion and the multinomial all consume it — and this used to build a second,
+        numerically-equivalent copy of it. Two full-vocab softmaxes per step for one distribution.
+
+        The one it takes is `softmax(logits - logsumexp(logits))`, the shift `torch.distributions.
+        Categorical` applies, where the reference's soft embedding uses `softmax(logits)` directly.
+        Those are the same function of the same input in exact arithmetic and differ in fp32 only by
+        rounding (the shift moves every logit by one common constant per row); measured max|delta| on
+        the carried state is at the fp32 epsilon of the embedding magnitude. That is the same
+        substitution `CanvasState.step` already makes for the multinomial, for the same reason.
+
+        Under TP the embedding table is vocab-sharded, so each rank contracts its own vocab slice and
+        the partial sums are all-reduced — the same decomposition the vocab-parallel embedding gather
+        uses. When `probs` is already ONE RANK'S SHARD (`probs.shape[1] == count`, which is what the
+        vocab-parallel canvas tail hands over) there is nothing to slice: the row is the shard."""
         emb = self.model.embed_tokens
         start, count = emb.vocab_range
         weight = emb.weight[:count]
-        out = logits.new_empty((logits.shape[0], weight.shape[1]), dtype=weight.dtype)
-        for lo in range(0, logits.shape[0], _SOFT_EMBED_CHUNK):
-            hi = min(lo + _SOFT_EMBED_CHUNK, logits.shape[0])
-            # fp32 softmax over the FULL vocab (the normalizer is global), then the local slice.
-            probs = logits[lo:hi].softmax(dim=-1, dtype=torch.float32)
-            out[lo:hi] = probs[:, start : start + count].to(weight.dtype) @ weight
+        # A full-vocab row gets sliced to this rank's columns; an already-sharded row is taken whole.
+        # Keying on the width rather than on a flag means a caller cannot pass the wrong one silently:
+        # any other width is neither, and is a shape error at the matmul instead of a wrong answer.
+        local = probs if probs.shape[1] == count else probs[:, start : start + count]
+        chunk = _SOFT_EMBED_VOCAB_CHUNK or count
+        out = None
+        for lo in range(0, count, chunk):
+            hi = min(lo + chunk, count)
+            part = local[:, lo:hi].to(weight.dtype) @ weight[lo:hi]
+            out = part if out is None else out + part
         if emb.tp_size > 1:
             out = emb._comm.all_reduce(out)
         return out * self.model._scale_tensor(out)
