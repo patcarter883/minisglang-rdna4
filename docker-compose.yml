@@ -195,6 +195,16 @@ x-lean-common: &lean-common
     # prefill only, bit-exact (disjoint rows) — measured +4.3% prefill TTFT @M1. Default ON; =0 to disable.
     MINISGL_MOE_ASYNC_AR: "${MINISGL_MOE_ASYNC_AR:-1}"
     MINISGL_MOE_ASYNC_AR_MIN_TOKENS: "${MINISGL_MOE_ASYNC_AR_MIN_TOKENS:-512}"
+    # Recurrent-radix snapshot store — the two knobs that decide how much VRAM prefix reuse costs.
+    # LADDER = interior resume points kept per sequence (engine default 4). It is also the FLOOR term
+    # in the store's cap: (ladder+1) * max_running snapshots, 16.4 MiB each on the 35B, so 4 -> 20
+    # snapshots -> ~0.33 GiB reserved OUT OF the same budget the KV pool is sized from. Lower it to
+    # trade interior resume points for pool tokens; 0 keeps only the end-of-sequence snapshot.
+    # BUDGET_GIB caps the store above that floor (engine default 0.375) — cross-request reuse only.
+    # Both were readable by the engine but not forwarded, so neither could be reached through compose
+    # (and therefore not from the control panel either). Empty = engine default.
+    MINISGL_GDN_RADIX_SNAP_LADDER: "${MINISGL_GDN_RADIX_SNAP_LADDER:-}"
+    MINISGL_GDN_RADIX_SNAP_BUDGET_GIB: "${MINISGL_GDN_RADIX_SNAP_BUDGET_GIB:-}"
 
 services:
   # ═══════════════════════════════════════════════════════════════════════════════════════════════
