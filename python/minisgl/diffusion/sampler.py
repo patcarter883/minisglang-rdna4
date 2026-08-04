@@ -67,6 +67,48 @@ class DiffusionSamplerConfig:
     confidence_threshold: float
     stability_threshold: int
 
+    @classmethod
+    def from_hf(cls, model_path: str, model_config) -> "DiffusionSamplerConfig":
+        """Build from the checkpoint's own `generation_config.json` + `ModelConfig`.
+
+        Every knob is the model author's, never a minisgl default: a wrong `entropy_bound` changes
+        how many tokens each step accepts, a wrong `confidence_threshold` changes when a block stops,
+        and both produce fluent output, so there is nothing to notice downstream. Missing keys raise
+        rather than fall back — a block-diffusion checkpoint shipping no denoising schedule is one
+        this engine cannot serve correctly, and saying so at boot is the only honest option."""
+        from minisgl.utils.hf import load_generation_config
+
+        gen = load_generation_config(model_path)
+        missing = [
+            k
+            for k in ("max_denoising_steps", "t_min", "t_max", "confidence_threshold",
+                      "stability_threshold", "sampler_config")
+            if k not in gen
+        ]
+        if missing or model_config.canvas_length is None:
+            raise ValueError(
+                f"block-diffusion serving needs the denoising schedule from "
+                f"{model_path}/generation_config.json; missing "
+                f"{missing or ['canvas_length (top-level config.json)']}. These are model "
+                f"properties, not tunables — guessing them yields fluent, wrong text."
+            )
+        sampler = gen["sampler_config"]
+        cls_name = sampler.get("_cls_name")
+        if cls_name != "EntropyBoundSamplerConfig":
+            raise NotImplementedError(
+                f"unsupported diffusion sampler {cls_name!r}; only EntropyBoundSampler is ported"
+            )
+        return cls(
+            canvas_length=int(model_config.canvas_length),
+            vocab_size=int(model_config.vocab_size),
+            max_denoising_steps=int(gen["max_denoising_steps"]),
+            t_min=float(gen["t_min"]),
+            t_max=float(gen["t_max"]),
+            entropy_bound=float(sampler["entropy_bound"]),
+            confidence_threshold=float(gen["confidence_threshold"]),
+            stability_threshold=int(gen["stability_threshold"]),
+        )
+
     def temperature(self, cur_step: int) -> float:
         """`cur_step` counts DOWN from max_denoising_steps to 1, so the schedule runs t_max -> ~t_min
         and the LAST step is the coldest. Reading it as an up-counter inverts the anneal, which
@@ -85,6 +127,12 @@ class DiffusionStep:
     entropy: torch.Tensor  # [L] fp32 — per-position entropy of the temperature-scaled logits
     mean_entropy: float
     done: bool  # stable AND confident: the block may stop early
+    # The temperature-scaled logits this step consumed — what the NEXT step's self-conditioning soft
+    # embedding must be built from (the reference carries `processed_logits`, i.e. post-temperature,
+    # not the raw ones). Returned rather than recomputed because it is a [L, vocab] fp32 tensor
+    # (268 MiB at the shipped 256 x 262144); the caller is expected to consume it immediately and
+    # drop it, which is the whole point of building the soft embedding at the producing step.
+    scaled: "torch.Tensor | None" = None
 
 
 class CanvasState:
@@ -110,6 +158,11 @@ class CanvasState:
         self.soft_conditioning: torch.Tensor | None = None
         self.argmax: torch.Tensor | None = None
         self.finished = False
+        # Last step's mean entropy — the quantity the confidence criterion tests. Kept so a commit
+        # can report how close the block actually got to the threshold rather than only whether it
+        # crossed it; a block that always exits on the step CAP is a different story from one that
+        # converges, and tok/s cannot tell them apart.
+        self.last_mean_entropy = float("nan")
         # The reference seeds the stability history with -1 so the FIRST step can never be "stable"
         # (a fresh canvas would otherwise compare equal to a fresh history and exit at step 1).
         self._history: list[torch.Tensor] = []
@@ -178,6 +231,7 @@ class CanvasState:
 
         self.canvas = canvas
         self.argmax = argmax
+        self.last_mean_entropy = mean_entropy
         self.step_index -= 1
         self.finished = done or self.step_index <= 0
         return DiffusionStep(
@@ -187,13 +241,8 @@ class CanvasState:
             entropy=entropy,
             mean_entropy=mean_entropy,
             done=done,
+            scaled=scaled,
         )
-
-    def scaled_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """The temperature-scaled logits for the step JUST taken, which is what the self-conditioning
-        soft embedding must be built from — the reference carries `processed_logits`, i.e. post
-        temperature, not the raw ones. `step()` has already decremented, hence the +1."""
-        return logits / self.config.temperature(self.step_index + 1)
 
 
 __all__ = [

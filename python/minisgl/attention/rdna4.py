@@ -41,6 +41,13 @@ class RDNA4Metadata(BaseAttnMetadata):
     # (0 allowed / -inf denied), indexed [packed_q_row, key_pos]. When set, the paged-extend kernel
     # runs with causal=0 and lets this carry the whole block structure. None for a normal serve.
     custom_mask: torch.Tensor | None = None
+    # Block-diffusion CANVAS batch: attend every query over every key inside `cache_seqlens`, with no
+    # causal mask and no window, on BOTH layer geometries. Distinct from `custom_mask`, which also
+    # forces causal=0 but carries an additive per-cell bias: a canvas needs no bias at all, and
+    # materializing an all-zero one would cost a [canvas, cur_len+canvas] fp32 tensor per layer per
+    # step to say nothing (measured bit-identical to passing None —
+    # tools/canvas_attention_probe.py). False on every autoregressive batch.
+    bidirectional: bool = False
     # ---- SWA (sliding-window) ring-pool metadata — populated ONLY for a SWA-hybrid model. The
     # sliding layers store/read from the separate window-bounded ring pool (ctx.swa_kv_cache), not
     # the full-context main pool, so they need their own out_loc / page_table / cache_seqlens:
@@ -404,9 +411,15 @@ class RDNA4Backend(BaseAttnBackend):
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         q = q.contiguous()
         scale = self._softmax_scale(q)
-        # Fused-TiDAR: a custom_mask carries the whole block structure -> run causal=0 and let the
-        # kernel's mask_bias arg apply it. None on a normal serve (plain prefix-offset causal).
+        # Two independent reasons to drop the prefix-offset causal mask, and they must not be
+        # conflated. Fused-TiDAR sets a `custom_mask` that CARRIES the block structure, so causal=0
+        # plus an additive bias. A block-diffusion CANVAS wants no mask at all: every one of its
+        # `canvas_length` queries attends every key in cache_seqlens. Passing an all-zero bias would
+        # be arithmetically identical (measured: bit-identical, tools/canvas_attention_probe.py) but
+        # would allocate a [canvas, cur_len+canvas] fp32 tensor per layer per denoising step to
+        # express nothing.
         custom_mask = getattr(metadata, "custom_mask", None)
+        non_causal = custom_mask is not None or metadata.bidirectional
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
             # calibration off), folded in the kernel. Descales sit between scale and causal.
@@ -417,18 +430,21 @@ class RDNA4Backend(BaseAttnBackend):
             # cleanly: it is folded into the scores BEFORE the additive mask, so the -inf/0 mask
             # entries mask the already-descaled scores exactly as on the bf16 path.
             ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]  # persistent device tensors (graph-safe)
-            fp8_causal = 0 if custom_mask is not None else 1
+            fp8_causal = 0 if non_causal else 1
             from minisgl._hip_engage import engaged
             engaged("attn_prefill_paged.flash_prefill_paged_fp8"
-                    + ("(masked)" if custom_mask is not None else ""))
+                    + ("(masked)" if custom_mask is not None
+                       else "(canvas)" if metadata.bidirectional else ""))
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
                 scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
                 custom_mask,  # mask_bias (None on a normal serve; the DDTree/TiDAR ancestor mask otherwise)
             )
-        causal = 0 if custom_mask is not None else 1
+        causal = 0 if non_causal else 1
         from minisgl._hip_engage import engaged
-        engaged("attn_prefill_paged.flash_prefill_paged" + ("(masked)" if custom_mask is not None else ""))
+        engaged("attn_prefill_paged.flash_prefill_paged"
+                + ("(masked)" if custom_mask is not None
+                   else "(canvas)" if metadata.bidirectional else ""))
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
             scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
@@ -567,9 +583,12 @@ class RDNA4Backend(BaseAttnBackend):
     def _swa_prefill_paged(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata, window: int
     ) -> torch.Tensor:
-        """CAPTURED spec-verify SWA attention: attend each seq's K+1 new tokens over its ring window +
-        those new tokens, read straight from the ring pool via the paged-extend kernel (attn_prefill_paged)
-        with causal=1 + sliding_window=W. The ring block table (metadata.swa_verify_page_table) lays out
+        """Multi-query SWA attention read straight from the ring pool through the paged-extend kernel.
+
+        Serves two shapes off the same rows. (1) CAPTURED spec-verify: each seq's K+1 new tokens over
+        its ring window + those new tokens, causal=1 + sliding_window=W. (2) BLOCK-DIFFUSION CANVAS:
+        each seq's canvas_length tokens over the same [window | new] rows, causal=0 + sliding_window=0
+        — see the `canvas` branch below. The ring block table (metadata.swa_verify_page_table) lays out
         cache index j -> ring slot as [window(Wp) | new(qlen)]; context_len (swa_verify_cache_seqlens) =
         Wp+qlen bounds the read. This is the capture-safe analogue of _swa_prefill_extend: no per-seq
         clone/cat and no host-sync of the window length — the same STATIC-buffer paged path the full
@@ -583,18 +602,27 @@ class RDNA4Backend(BaseAttnBackend):
         ctx_lens = metadata.swa_verify_cache_seqlens.to(torch.int32)
         q = q.contiguous()
         scale = self._softmax_scale(q)
+        # A CANVAS reads the same [Wp | new] ring rows but with NO mask: bidirectional over the
+        # window AND over the whole canvas. `sliding_window` must go to 0 as well as `causal`,
+        # because the kernel's window test is independent of the causal one — leaving it at W would
+        # re-impose a symmetric +/-W band across the canvas, which is a DIFFERENT model (the window
+        # in this architecture is a property of what the encoder cache RETAINED, never a mask over
+        # the canvas; measured rel_fro 0.60 apart in tools/canvas_attention_probe.py).
+        canvas = metadata.bidirectional
+        causal, sw = (0, 0) if canvas else (1, window)
+        tag = "(swa-canvas)" if canvas else "(swa-verify)"
         from minisgl._hip_engage import engaged
         if self.swa_kv.dtype == torch.float8_e4m3fn:
             ks, vs = self.swa_kv.k_descale[layer_id], self.swa_kv.v_descale[layer_id]  # persistent device tensors (graph-safe)
-            engaged("attn_prefill_paged.flash_prefill_paged_fp8(swa-verify)")
+            engaged("attn_prefill_paged.flash_prefill_paged_fp8" + tag)
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                scale, ks, vs, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+                scale, ks, vs, causal, sw, metadata.max_seqlen_q, 0, None,
             )
-        engaged("attn_prefill_paged.flash_prefill_paged(swa-verify)")
+        engaged("attn_prefill_paged.flash_prefill_paged" + tag)
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            scale, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+            scale, causal, sw, metadata.max_seqlen_q, 0, None,
         )
 
     def _swa_decode(
@@ -678,10 +706,19 @@ class RDNA4Backend(BaseAttnBackend):
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
         swa_out_loc = swa_page_table = swa_cache_seqlens = swa_table_idx = None
+        swa_canvas_page_table = swa_canvas_cache_seqlens = None
         if self.swa_kv is not None and self.swa_window > 0:
-            swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
-                reqs, seqlens_q, cached_lens, device
-            )
+            if batch.canvas:
+                # A canvas reads [window | canvas] in ONE row, which `_build_swa_metadata`'s
+                # cnt = min(S, W) cannot express (it caps the row at W and would drop the canvas
+                # keys the queries must see). Same ring, different row shape.
+                swa_out_loc, swa_canvas_page_table, swa_canvas_cache_seqlens = (
+                    self._build_swa_canvas_metadata(reqs, seqlens_q, cached_lens, device)
+                )
+            else:
+                swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
+                    reqs, seqlens_q, cached_lens, device
+                )
             swa_table_idx = [req.table_idx for req in reqs]  # ring block per seq (SWA extend gather)
 
         batch.attn_metadata = RDNA4Metadata(
@@ -695,7 +732,62 @@ class RDNA4Backend(BaseAttnBackend):
             swa_page_table=swa_page_table,
             swa_cache_seqlens=swa_cache_seqlens,
             swa_table_idx=swa_table_idx,
+            # A canvas rides the SAME ring fields the captured spec-verify uses, so _swa_forward's
+            # existing `swa_verify_page_table is not None` dispatch routes it with no new branch —
+            # the rows differ, the read path does not.
+            swa_verify_page_table=swa_canvas_page_table,
+            swa_verify_cache_seqlens=swa_canvas_cache_seqlens,
+            bidirectional=batch.canvas,
         )
+
+    def _build_swa_canvas_metadata(self, reqs, seqlens_q, cached_lens, device):
+        """Ring rows for a BLOCK-DIFFUSION canvas step: `[Wp window keys | qlen canvas keys]` per
+        request, `context_len = Wp + qlen`, read with causal=0 / sliding_window=0.
+
+        Two things separate this from `_build_swa_metadata`, and both are load-bearing.
+
+        1. THE ROW IS NOT CAPPED AT W. The read count there is `cnt = min(S, W)`, which for a canvas
+           at absolute positions [cur_len, cur_len+L) would return the last W positions and silently
+           drop either window keys or canvas keys depending on cur_len. A canvas query must see BOTH
+           the retained window and every one of its L siblings, so the row is the concatenation and
+           the length is Wp + L.
+        2. THE WINDOW IS THE PREFIX'S, NOT THE QUERY'S. Wp = min(cur_len, W) is computed from the
+           CACHED length, not from cur_len + L: every canvas position sees the SAME window, the one
+           the encoder left behind. A window that slid per canvas position would be a different
+           model, and a plausible-looking one.
+
+        This is also why the ring stride has to exceed W (see `_swa_ring_block` in engine.py): at
+        stride W the canvas position cur_len+j lands on the slot holding prefix position
+        cur_len+j-W, i.e. inside the window it is about to read — measured at 256 of 256 canvas
+        slots colliding (tools/canvas_attention_probe.py)."""
+        W = self.swa_window
+        R = self.swa_ring_stride
+        assert R > W, (
+            f"block-diffusion canvas needs a widened SWA ring (stride {R} <= window {W}); at "
+            f"stride == window every canvas slot aliases a live window slot and the decoder "
+            f"overwrites the prefix it must attend to"
+        )
+        out_slots: list[int] = []
+        rows: list[list[int]] = []
+        ctx_lens: list[int] = []
+        max_row = 0
+        for req, qlen, c0 in zip(reqs, seqlens_q, cached_lens):
+            base = req.table_idx * R
+            canvas_slots = [base + (p % R) for p in range(c0, c0 + qlen)]
+            out_slots.extend(canvas_slots)
+            Wp = min(c0, W)
+            row = [base + (p % R) for p in range(c0 - Wp, c0)] + canvas_slots
+            rows.append(row)
+            ctx_lens.append(Wp + qlen)
+            max_row = max(max_row, len(row))
+        CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        swa_out_loc = torch.tensor(out_slots, **CPU).to(device, non_blocking=True)
+        # Rectangular [bs, max_row]; short rows pad with slot 0 (the NULL slot). The kernel bounds
+        # its reads by context_len, so the pad is never attended — same trick as the main page table.
+        padded = [row + [0] * (max_row - len(row)) for row in rows]
+        page_table = torch.tensor(padded, **CPU).to(device, non_blocking=True)
+        cache_seqlens = torch.tensor(ctx_lens, **CPU).to(device, non_blocking=True)
+        return swa_out_loc, page_table, cache_seqlens
 
     def _build_swa_metadata(self, reqs, seqlens_q, cached_lens, device):
         """Ring-pool metadata for the sliding layers (SWA-hybrid only). Each request owns a fixed

@@ -69,6 +69,32 @@ def _swa_kv_geometry(mc: ModelConfig) -> Tuple[int, int]:
     return head_dim, num_kv_heads
 
 
+def _swa_ring_block(mc: ModelConfig, spec_config) -> int:
+    """Extra ring slots per sequence BEYOND the sliding window.
+
+    A plain window-sized ring (stride == W) is correct for single-query decode/extend, but any path
+    that writes a multi-token block into the ring BEFORE attending it needs those tokens in slots
+    disjoint from the live window, because position p and p+W share slot p%W once the sequence is
+    longer than W. Two such paths exist and they are mutually exclusive:
+
+      * SPEC VERIFY stores anchor + drafts (num_draft + 1) and the rejected drafts must not land on
+        a valid-window slot the next gather reads;
+      * BLOCK DIFFUSION stores a whole canvas_length canvas and REREADS the window in the same
+        forward — at stride W all 256 of 256 canvas slots alias a window slot, so the decoder would
+        overwrite the very prefix it must attend to (measured, tools/canvas_attention_probe.py).
+
+    Returns the larger of the two so one number serves both, and 0 when neither applies (stride ==
+    window, byte-identical to the pre-spec path).
+
+    Both the ring ALLOCATION and its byte RESERVATION in _determine_num_pages call this, for the same
+    reason _swa_kv_geometry exists: two independent copies of the arithmetic would drift, and the
+    failure is a ring sized for one stride addressed with another — a silently corrupt cache, not a
+    crash."""
+    spec_block = (spec_config.num_draft + 1) if spec_config is not None else 0
+    canvas_block = mc.canvas_length if mc.is_block_diffusion else 0
+    return max(spec_block, canvas_block)
+
+
 # --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
 # MINISGL_PROFILE=<trace.json> captures a window of forward steps on the primary rank into a Chrome
 # trace, then no-ops. Used to split per-step wall time into GPU-active vs launch-bubble overhead.
@@ -202,16 +228,11 @@ class Engine:
         if mc0.is_swa_hybrid:
             from minisgl.kvcache.mha_pool import MHAKVCache
 
-            # Ring STRIDE per sequence = window + spec block. A plain window-sized ring (stride == W)
-            # is correct for single-query decode/extend, but a K+1 spec-VERIFY stores its whole block
-            # (anchor + drafts) into the ring BEFORE attention; the rejected drafts then land in slots
-            # that COLLIDE with the live window (position p and p+W share slot p%W once len >= W), so
-            # the next step's window gather reads stale speculative keys. Widening the stride to
-            # window + num_draft + 1 gives the speculative block its own disjoint slots, so a rejected
-            # draft never overwrites a valid-window slot (position q and any window position p differ by
-            # < stride => distinct mod stride). No spec -> stride == window (byte-identical to Track A).
-            spec_block = (self.spec_config.num_draft + 1) if self.spec_config is not None else 0
-            swa_stride = mc0.sliding_window + spec_block
+            # Ring STRIDE per sequence = window + the multi-token block any path writes before it
+            # reads (spec verify's K+1, or block diffusion's whole canvas). See _swa_ring_block for
+            # why a stride of exactly W corrupts both. No spec and no canvas -> stride == window,
+            # byte-identical to Track A.
+            swa_stride = mc0.sliding_window + _swa_ring_block(mc0, self.spec_config)
             self.ctx.swa_ring_stride = swa_stride
             swa_slots = (config.max_running_req + 2) * swa_stride  # +1 NULL, +1 dummy
             # The ring holds the SLIDING layers, so it takes the SLIDING geometry — which for Gemma4
@@ -791,8 +812,7 @@ class Engine:
             # allocation uses, so the reserve can never describe a different pool than the one built.
             swa_head_dim, swa_num_kv_heads = _swa_kv_geometry(mc)
             local_kv = div_even(swa_num_kv_heads, tp, allow_replicate=True)
-            spec_block = (config.spec_config.num_draft + 1) if config.spec_config is not None else 0
-            swa_stride = mc.sliding_window + spec_block
+            swa_stride = mc.sliding_window + _swa_ring_block(mc, config.spec_config)
             total += (
                 2 * mc.num_swa_layers * num_slots * swa_stride
                 * local_kv * swa_head_dim * self.kv_dtype.itemsize
@@ -1166,6 +1186,35 @@ class Engine:
             return self.graph_runner.replay_verify(batch, return_hidden)
         with self.ctx.forward_batch(batch):
             return self.model.forward(return_hidden=return_hidden)
+
+    def forward_canvas(
+        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: "torch.Tensor | None"
+    ) -> torch.Tensor:
+        """One block-diffusion denoising step. Returns full-vocab fp32 logits for EVERY canvas
+        position, ``[sum(extend_len), vocab]``.
+
+        The three things it deliberately does NOT do are the whole reason it is not ``forward_batch``:
+
+          * NO ``sampler.sample``. A canvas step needs per-position entropy over the full vocabulary,
+            a per-position multinomial, an entropy-ordered acceptance set and a re-noise — none of
+            which is top-k/top-p sampling. Penalties, grammar and the reasoning gate are per-token
+            autoregressive concepts that do not apply here at all. ``minisgl.diffusion`` owns this.
+          * NO ``complete_one()``. The canvas is SCRATCH: the same ``canvas_length`` slots are
+            overwritten on every one of the <=48 steps of a block, so ``cached_len``/``device_len``
+            must stay exactly where the block started. Advancing them would allocate a fresh canvas
+            of slots per step and leave the block attending its own denoising history.
+          * NO cudagraph replay — eager only for now. The shape is an ideal capture target (fixed
+            query count, fixed batch size, only the prefix length varies), so this is a gap to close,
+            not a property of the design.
+
+        ``canvas_ids`` is passed explicitly rather than read from ``batch.input_ids`` because the
+        canvas is re-sampled between steps and never enters a request's host token buffer; the token
+        pool holds a copy only so the KV scatter can address the right slots."""
+        assert torch.cuda.current_stream() == self.stream
+        assert batch.canvas, "forward_canvas requires a canvas batch (Batch.canvas is False)"
+        _maybe_profile()
+        with self.ctx.forward_batch(batch):
+            return self.model.forward_canvas(canvas_ids, self_conditioning)
 
     def capture_spec_verify_graphs(
         self, needs_hidden: bool, num_aux: int, bs_list: "list[int]",

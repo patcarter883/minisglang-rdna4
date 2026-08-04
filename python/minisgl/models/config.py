@@ -135,6 +135,13 @@ class ModelConfig:
     # Gemma: embeddings are scaled by sqrt(hidden_size), CAST TO THE WEIGHT DTYPE before the
     # multiply (fp16 -> 53.0625, not 53.0660). None -> no scaling.
     embed_scale: float | None = None
+    # ---- Block diffusion (DiffusionGemma). The decoder denoises a FIXED-length canvas of this many
+    # tokens per block instead of emitting one token per step, so this is not a tuning knob: it sizes
+    # the per-request scratch slots, widens the SWA ring stride, and fixes the query count of every
+    # canvas forward. Read from the TOP-LEVEL config (`canvas_length`) — the text config knows
+    # nothing about it. None for every autoregressive model, which is what `is_block_diffusion` keys
+    # on, so no path anywhere branches on a model name.
+    canvas_length: int | None = None
     # ---- ZAYA CCA hybrid (cross-channel attention conv front-end + EDA/MOD MoE). None for non-Zaya.
     # Populated by from_hf ONLY when model_type == "zaya", so every other model keeps is_cca_hybrid
     # False. The schedule is implicit (even layer -> CCA attention, odd -> MoE), so there is no
@@ -193,6 +200,17 @@ class ModelConfig:
         """True for the Gemma4 backbone (`gemma4` autoregressive, `diffusion_gemma` block-diffusion).
         Both share one 30-layer stack, so every structural branch keys on this, not on the head."""
         return self.model_type in ("gemma4", "gemma4_text", "diffusion_gemma", "diffusion_gemma_text")
+
+    @property
+    def is_block_diffusion(self) -> bool:
+        """True for a block-diffusion decoder (DiffusionGemma): the model emits a whole
+        `canvas_length` block per commit, refined over up to `max_denoising_steps` NON-CAUSAL
+        forwards, instead of one token per step.
+
+        Keyed on `canvas_length` — a field only a block-diffusion checkpoint carries — and NOT on
+        model_type, because the backbone is shared with the autoregressive `gemma4` sibling and
+        every structural branch below this one must key on the STACK, not the head."""
+        return self.canvas_length is not None and self.canvas_length > 0
 
     @property
     def has_split_head_dim(self) -> bool:
@@ -296,8 +314,8 @@ class ModelConfig:
         ckpt_tensor_names: "Collection[str] | None" = None,
     ) -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
+        top = config
         if hasattr(config, "text_config") and config.text_config is not None:
-            top = config
             config = config.text_config
             for attr in ("architectures", "rope_theta", "rope_scaling"):
                 if not getattr(config, attr, None) and getattr(top, attr, None):
@@ -649,6 +667,10 @@ class ModelConfig:
             model_type=model_type,
             architectures=architectures,
             quant=quant,
+            # Block diffusion: `canvas_length` sits on the TOP-LEVEL config, not the text config, so
+            # it is read off `top` (which is `config` itself for a flat checkpoint). Absent -> None
+            # -> is_block_diffusion False, and every canvas branch downstream stays dead.
+            canvas_length=getattr(top, "canvas_length", None) or None,
             linear_num_key_heads=linear_num_key_heads,
             linear_num_value_heads=getattr(config, "linear_num_value_heads", None),
             linear_key_head_dim=getattr(config, "linear_key_head_dim", None),

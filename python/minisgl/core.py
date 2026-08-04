@@ -213,6 +213,16 @@ class Batch:
     # prefill; attention/MLA key on extend_len/max_seqlen_q and need no flag. False for every
     # normal batch. See scheduler._spec_decode_step and SPEC_DECODE.md.
     spec_verify: bool = field(default=False, init=False)
+    # Block-diffusion CANVAS batch (DiffusionGemma). Like a verify batch it is phase="decode" with
+    # extend_len = canvas_length query tokens per request, but it differs in two ways that no other
+    # path in the engine has:
+    #   * attention is BIDIRECTIONAL over [encoder KV | canvas KV] — the backend keys `causal=0`
+    #     off this flag, on both layer geometries;
+    #   * the canvas K/V is SCRATCH. Every denoising step overwrites the same slots, so
+    #     cached_len/device_len do NOT advance across the <=48 steps of a block, nothing is
+    #     sampled per step, and `complete_one` is never called.
+    # False for every autoregressive batch, so no existing path changes shape.
+    canvas: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:
