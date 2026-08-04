@@ -1,33 +1,43 @@
 """SWA-radix serve validation client (runs inside the lean container against localhost:1919).
 
-Three modes:
+Four modes:
   * reuse:  WARM the prefix P (so its sliding-window snapshot is cached), then generate B = P+suffix,
             which REUSES P via the sliding-layer window extend (rdna4.py::_swa_prefill_extend).
   * cold:   generate B directly against an empty/naive cache (no reuse) — the identity reference.
   * matrix: the full cold-vs-hit comparison in ONE process, over cases x max_tokens (below).
+  * repro:  no comparison at all — one prompt, N times, count distinct outputs. Run it on a
+            MINISGL_SWA_RADIX=0 serve to get the engine's own floor before trusting any verdict.
 
 Byte-identity gate: sha256 of the DECODED text (identical greedy output => identical bytes) must match
-between reuse and cold, for a prefix LONGER than the window and SHORTER. Also reports TTFT (time to
-first token) so the reuse prefill-skip benefit is measurable.
+between reuse and cold. Also reports TTFT so the reuse prefill-skip benefit is measurable.
 
 Why `matrix` exists. A single serve cannot serve a request COLD twice — the first one inserts it into
 the radix — so cold-vs-hit has to be staged. Each trial gets a unique salt (so its prefix has never
-been seen) and runs three steps:
+been seen) and runs:
 
-    [cold]    B1 = P+tail1, never seen        -> hit_tokens must be 0
+    [cold]    B1 = P+tail0, never seen        -> hit_tokens must be 0
     [full]    B1 again                        -> hit_tokens ~ len(B1): the whole prompt is reused
-    [partial] B2 = P+tail2, tail2 never seen  -> hit_tokens ~ len(P): a SHARED long prefix with a
+    [full2]   B1 a third time                 -> CONTROL: same prompt, cache state and prefill shape
+                                                 as [full], so a divergence here is the ENGINE
+    [cold2]   B2 on a FRESH salt, x3          -> cold reference for [partial] (see below)
+    [warm]    P alone                         -> puts a snapshot at align_down(len(P))
+    [partial] B2 = P+tail1                    -> hit_tokens ~ len(P): a SHARED long prefix with a
                                                  differing tail, the shape SWA-radix exists for
 
-cold-vs-full is a same-process comparison and is the core losslessness gate. The partial step has no
-in-process cold reference (running one would cache B2), so it is compared ACROSS a MINISGL_SWA_RADIX=1
-serve and a MINISGL_SWA_RADIX=0 serve driven with the SAME --run-id, i.e. byte-identical request
-sequences. The cold step doubles as the control for that comparison: it must agree across the two
-serves, or nothing cross-serve means anything.
+The [warm] step is load-bearing: a SWA serve keeps ONE snapshot per request, at that request's own
+page-aligned end (snapshot_ladder_depth == 0 for "swa"), so B1's snapshot sits PAST the shared prefix
+and B2's match boundary is refused — measured hit=0, i.e. a second cold request pretending to be a
+reuse test. [cold2] cannot be the same prompt as [partial] (asking for it cold would cache it and
+turn [partial] into a full hit), so it is B2 under a different salt; that is only legitimate because
+the recall tail's answer is the note text, which does not depend on the salt. It is measured three
+times and a cell whose reference is not self-stable reports INDETERMINATE rather than DIVERGED.
 
-Stay at or below 64 output tokens. This repo's serve is not bit-reproducible against itself past
-~32-64 tokens (batch-shape-dependent reductions), so a divergence beyond that window says nothing
-about the prefix cache.
+Pick max_tokens from a MEASURED floor, not from a rule of thumb. On gemma-4 with the prefix cache
+DISABLED, the same prompt 8-10 times gave: 10/10 identical at max_tokens 1/2/4, but 2 distinct at 16
+and 5 distinct at 32 with an open-ended continuation. Prefill is deterministic (max_tokens=1 is 10/10
+on a 3200-token prompt) — the jitter accumulates in DECODE, so the usable window is a property of how
+confident the probe's output is: the recall tails below are stable to 16, an open continuation only
+to 4. Run `--mode repro` first.
 
 TRUE greedy is not `temperature: 0` alone. `SamplingParams.is_greedy` (core.py) is
 `(temperature <= 0 or top_k == 1) and top_p == 1.0`, and an UNSET top_p inherits the checkpoint's
