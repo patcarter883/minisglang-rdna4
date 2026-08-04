@@ -1017,3 +1017,87 @@ has to be written either way, and writing it against a throwaway harness means w
 Recommendation: go straight to (b), in the order 4 -> 6 -> 5 -> 3 -> 7 (all mechanical, all with
 templates, verifiable by a single-step canvas forward against the CPU parity fixture), then 1/2/9/10
 as one `CanvasManager` change. Nothing about the autoregressive path needs to move.
+
+---
+
+## Part D — the execution mode, built and measured
+
+Part C ended at a blocker: seams 1-10 were each small, but there was nowhere to drive them from.
+That was resolved by taking option (b) — a scheduler loop, not a bespoke harness. This part records
+what the working system measures and what Parts A/B still get wrong.
+
+### D1. It generates, and it is faster than the autoregressive sibling
+
+`tools/diffusiongemma_generate.sh`, TP=2, bs=1, greedy, `minisgl-rdna4:gemma4`, the same harness and
+worktree for both models:
+
+| | 256-token completions | short completion |
+|---|---|---|
+| block diffusion | **72.3 / 81.1 tok/s** (13.8 / 12.3 ms/tok) | 23.3 tok/s (99 tok) |
+| gemma-4 (AR) | 44.1 / 44.2 tok/s (22.7 / 22.6 ms/tok) | 30.4 tok/s (117 tok) |
+
+**1.64-1.84x on full blocks.** The autoregressive sibling lands exactly on its documented 43.9
+tok/s, which is the guard that mattered most. Output is fully coherent — see the results file the
+harness writes.
+
+**The partial block is the honest cost shape.** 99 tokens still pays for a full 256-token canvas
+over 12 steps, so a short answer is ~2x WORSE per token than the AR sibling. Block diffusion wins on
+long outputs and loses on short ones; nothing in §B or §C predicted the sign of that.
+
+### D2. §R7 answered: k is 12-19, not 48
+
+```
+blocks=3   k: min=12  median=17  max=19  mean=16.0   of a possible 48
+forwards per emitted token = 0.078          (the autoregressive sibling is exactly 1.000)
+mean entropy at commit = 0.0007 / 0.0009 / 0.0049   against the 0.005 threshold
+```
+
+**12.8x fewer forwards**, at ~256x the query count each. Every block exited on the CONFIDENCE
+criterion, not on the step cap — so §R7's fear ("`confidence_threshold = 0.005` is a *tight* bar")
+is unfounded on real prompts, and §C3's 48-step worst case (3.66 ms/token of attention alone) does
+not occur. k is scraped from a per-commit `[canvas]` log line the scheduler emits, because a block
+emits all its tokens at once and tok/s therefore cannot show k at all.
+
+### D3. Further corrections to Parts A/B/C
+
+7. **§B8.1's file plan is wrong in two places.** There is no `scheduler/canvas_slots.py` and no
+   `diffusion/{stopping,state}.py`: the stopping criteria and the per-request state are 40 lines
+   that belong with the sampler they are a property of, and the canvas *slots* are ordinary
+   page-table slots owned by the CacheManager — giving them their own manager would have made a
+   committed block a special region instead of the ordinary radix-cacheable prefix it is. What is
+   real is `scheduler/diffusion.py` (the loop + a `CanvasManager` that owns only DENOISING state)
+   and `diffusion/sampler.py`.
+
+8. **§B8.2's `_canvas_block_step` is missing its most important line.** It ends at "commit the
+   block" and never re-encodes it. The KV left in the canvas slots is the decoder's BIDIRECTIONAL
+   K/V, which this model never serves from; the committed block must be re-run through the CAUSAL
+   encoder, in place, before the next block reads it. §B8.2's own prose has this ("that last line is
+   the elegant part") but the pseudocode does not.
+
+9. **§B7.6 understates the encoder problem.** The issue is not only that `_process_last_data`
+   assumes one token per request — it is that the encoder pass must not SAMPLE AT ALL. Its logits
+   are discarded by the reference. Routed through `forward_batch` it samples a token, appends it to
+   the request and emits it, and the result is a serve that looks like it works and prepends one
+   junk token to every generation.
+
+10. **`attention/hip.py` needs no canvas change**, despite constructing `RDNA4Metadata` at four
+    sites. All four are CAPTURE-path static builders (`_decode_metadata_static`,
+    `_verify_metadata_static`, `_fused_verify_metadata_static`, `_ddtree_verify_metadata_static`);
+    `HIPAttnBackend` does not override `prepare_metadata`, so the eager canvas path runs through
+    `RDNA4Backend`'s. It becomes a real gap only when the canvas step is captured (§B7.7).
+
+### D4. What is still open
+
+* **cudagraph capture (§B7.7).** Eager only. Per this repo's standing rule that is not "done", and
+  the canvas is an unusually good capture target: fixed query count, fixed batch size, only the
+  prefix length varies — the same shape `_fill_swa_verify_static` already handles.
+* **Concurrency (§R6).** Measured at bs=1 only. The forward shape is uniform, but the per-request
+  TEMPERATURE differs (it is a function of that request's own step index), so a batched step needs a
+  per-row scale; the code currently applies it per request in the sampler, which is correct but
+  serialises the fp32 softmax over `[canvas, vocab]` per request.
+* **SWA-radix.** Turned OFF for the canvas phase. Its window snapshot is taken at autoregressive
+  commit points and addresses the ring at the pre-canvas stride; re-validating it against a canvas
+  is its own piece of work, and leaving it on would silently seed a stale window.
+* **Chunked prefill and structured output** are REFUSED with a reason rather than silently ignored.
+* **§U5 (the third EOS id, 50)** is now moot in practice — every test block terminated correctly on
+  the resolved EOS set — but has not been isolated.
