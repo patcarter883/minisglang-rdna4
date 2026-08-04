@@ -174,30 +174,53 @@ large recurrent state (Laguna) needs `--max-running-req 2`.
    `minisgl-rdna4:comb` is the validated image; nothing is served from the merged code until `lean`
    is repointed or `MINISGL_IMAGE` is set (every command here sets it).
 
-## 5b. ReplaySSM under speculative decode — what is and is not known
+## 5b. ReplaySSM under speculative decode — BUILT and measured (2026-08-04)
 
-Asked and answered while chasing the MTP boot failure above, because both features spend the same
-budget:
+The question "what did ReplaySSM do for spec decode?" had the answer "nothing, and it was never
+measured": the replay rung lived only in `forward_decode`, a spec step runs `forward_verify`, and
+that verify bracketed itself with flush-before / invalidate-after — so every spec step threw the
+ring away. The kernel had reserved the better path from the beginning (`gdn_kernels.hip`: *"NOTE FOR
+THE SPEC-DECODE ROLLBACK PATH (not implemented here): rejecting d draft tokens is `ring_len -= d`,
+O(1), which is exactly the point"*). It is now built.
 
-* **It was never A/B'd under spec.** `tools/replay_serve_ab.sh` — the driver that produced the
-  "+2.1% at M=4, wash at M=1–2" result — boots both legs with `SPEC=none` (line 52). Re-running it
-  under spec needs a kernel package built WITHOUT `gdn_decode_conv_gated_replay`, and the two images
-  it used (`minisgl-rdna4:replayssm` / `:replayctl`) no longer exist on this box.
-* **By construction it cannot help a spec step.** The replay rung lives only in
-  `GDNLayer.forward_decode`. A spec step runs `forward_verify`, which FLUSHES the ring before its
-  varlen kernels and INVALIDATES it after (`gdn/layer.py:504,529`) — the ring's whole benefit is
-  deferring the `ssm_state` read-modify-write across consecutive decode steps, and a verify ends
-  that window every time. Confirmed engaged-at-capture only: under `SPEC=mtp` the boot log shows
-  `gdn_decode_conv_gated_replay` at plain-decode graph capture (01:39:14) and
-  `causal_conv1d_fwd_verify`/`gdn_prefill_verify` at spec-verify capture (01:39:25), and
-  `[hip-engage]` fires once per op, so it cannot distinguish per-step use afterwards.
-* **Its VRAM cost is NOT what breaks spec.** The ring is `L*(K+V)/(V*K)` of `ssm_state` — ~12.5% at
-  L=8, i.e. ~0.014 GiB of the 0.11 GiB "GDN/CCA recurrent state" reservation. The 0.38 GiB
-  recurrent-radix snapshot store is 27× bigger and is the thing that tips MTP over (§5.1).
+**Shape.** The verify APPENDS its draft window to the ring (`gdn_verify_replay`, the same shared
+step the decode kernel uses — one `gdn_replay_step_block`, two flush policies), and the accept step
+rewinds the rejected tail with a cursor decrement (`GDNStateCache.rollback_ring`). No per-token ssm
+scratch is produced or allocated. Exactly one flush is permitted, at the window start, with
+`reserve=q_len`; inside the window a flush is forbidden because folding destroys the S0 the rollback
+rewinds to — which caps a window at L=8 and makes the engine fall back to the materialising verify
+above that width.
 
-So: no measured effect, a mechanism that says "inert on spec steps", and a cost too small to be the
-spec blocker. If it matters enough to settle, the honest experiment is a control kernel package
-without the replay op, driven at `SPEC=mtp MEM_RATIO=0.86`.
+**Correctness gate** (`rdna4-hip-kernels/gdn/tests/test_verify_replay.py`): verify + rollback is
+**bit-exact (0.00e+00, bf16 and fp32 state)** against running the accepted tokens through the SERVED
+decode-replay path. That is the right oracle — once ReplaySSM is on, decode *is* replay, so a spec
+verify's job is to reproduce the replay trajectory, not the materialised one (which sits ~1 bf16 eps
+away and is reported for information only). Getting to bit-exact needed one fix: stage the ROUNDED
+`k` into LDS, or the verify loop ends up slightly MORE accurate than the decode path it must match.
+
+**Measured** (Qwen3.6-35B TP=2, MTP K=4, graph capture, CONC=4, `MEM_RATIO=0.86`; identical engine
+source in both legs, each asserting which verify kernel engaged; `tools/replay_verify_ab.sh`):
+
+| | materialising verify | ring append + rollback |
+|---|---|---|
+| decode tok/s, M=1 | 100.3 | **111.9 (+11.6%)** |
+| decode tok/s, M=4 | 245.6 | **272.2 (+10.8%)** |
+| TPOT M=1 | 26.9 ms | **22.9 ms** |
+| free VRAM after graph capture | 2.02 GiB | **2.22 GiB** |
+| acceptance (2 reps) | 28/29, 27/29 | 27/29, 28/29 |
+
+That is ~10× the ~1% I estimated from state-traffic accounting alone — the materialising verify was
+also carrying a register-spilling recurrence and a host-side gather/scatter, not just the snapshot
+write.
+
+**It does NOT fix the MTP boot failure** (§5.1): the 0.2 GiB it frees is a graph-capture allocation,
+and `_determine_num_pages` sizes the KV pool *before* capture, so `MEM_RATIO=0.80` still asserts.
+The radix snapshot store is still the thing to fix there.
+
+Two latent bugs fell out and are fixed in the same change: `install_verify_state` indexed the
+`[Q, N]` scratch with `arange(len(slots))` while `slots` holds only the still-running sequences (so
+any request finishing mid-batch handed every survivor another sequence's state), and a FINISHED
+request's slot was cloned into the recurrent radix cache without rolling back its rejected drafts.
 
 ## 6. Rules that bind this work (unchanged, still true)
 
