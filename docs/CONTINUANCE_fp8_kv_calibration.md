@@ -1,180 +1,180 @@
-# CONTINUANCE — finish the fp8-KV calibration work
+# CONTINUANCE — fp8-KV calibration
 
-**Written** 2026-08-04. **Repos/SHAs this describes:** `minisgl-rdna4` @ `dfd3e68a` (branch
-`rdna4`), `rdna4-hip-kernels` @ `02714ba` (branch `main`). Both merged and serve-validated.
+**Updated** 2026-08-04 (second pass). **Repos/SHAs:** `minisgl-rdna4` branch `rdna4` (this work
+merged on top of `b7ee6e68`), `rdna4-hip-kernels` @ `02714ba` — unchanged, no kernel edit was needed.
 
-Read this whole file before touching anything. The single most important fact is in §1: **the
-calibrator that shipped cannot calibrate any model this box actually serves.** Everything else is
-downstream of fixing that.
-
----
-
-## 0. What already landed — do NOT redo it
-
-`MINISGL_KV_FP8=1` is the **docker-compose default**, so the default serve has always run an fp8 KV
-cache. Until this work it did so uncalibrated and unsafe. Three things were fixed:
-
-1. **`finalize_kv_calibration()` had no caller anywhere in the repo.** Every `k_scale`/`v_scale`
-   stayed 1.0 — K/V cast straight to e4m3 with no range fitting, flushing everything below 2^-9 to
-   zero. Now `python/minisgl/kvcache/fp8_scales.py` resolves scales in `Engine.__init__` between
-   pool construction and graph capture.
-2. **The e4m3 store returned NaN above 448**, where torch saturates. Unreachable at scale 1.0 (raw
-   K/V amax is O(10–100)) but **guaranteed to fire the moment a max-calibrated scale puts the
-   largest observed value exactly at 448** — so fixing (1) without (2) would have shipped the bug.
-   One NaN key kills an entire softmax row. This, not the SWA path, is why Laguna and Qwen3.5-4B
-   emitted a single repeated token.
-3. Two engine reads hardcoded "the descale is 1.0": the SWA ring-window gather (a bare `.to(bf16)`,
-   18–40× off against Laguna's own checkpoint scales) and the Triton fallback.
-
-Also: **stochastic rounding was implemented, measured, and deleted.** Do not re-propose it for the
-KV cache. It was better on 1 of 84 (layer, context) cells, median 1.44–1.48× *worse*, 2.13× kernel
-time. SR removes a *coherent accumulating* bias; a KV cache is write-once storage so there is
-nothing to accumulate, and sign-symmetric activations already cancel RNE's bias to 1.6e-5 of RMS.
-It paid the textbook √2 variance penalty (rel-RMSE 0.0267 → 0.0382 = 1.43×) for nothing. The same
-technique **is** an 8× win on the GDN recurrent state, which is a recurrence — that contrast is the
-whole lesson and it is recorded in-source at both rounding sites.
-
-Scale resolution order, already implemented: **sidecar → checkpoint
-`quantization_config.kv_cache_scheme` + `self_attn.{k,v}_scale` broadcast per-head → loud warning +
-defined identity.** Int8 schemes are refused (an int8 scale is `amax/127` and would be misapplied).
-Global→compact layer mapping goes through `full_attn_layer_ids`/`swa_layer_ids` so SWA/GDN hybrids
-land in the right pool.
+The blocker the first pass ended on ("the calibrator cannot run on any model this box serves") is
+**resolved**: the calibrator runs at TP=N, and Qwen3.6-35B and Laguna-XS-2.1 are calibrated and
+serve-validated. §1–§3 are what is now known; §5 is what is left.
 
 ---
 
-## 1. THE BLOCKER — the calibrator cannot run on any production model
+## 0. What landed in pass 2
 
-`tools/kv_fp8_calibrate.py` runs **TP=1** ("the offline LLM API is TP=1", its docstring). Measured
-on this box:
+1. **`tools/kv_fp8_calibrate.py --tp N`** — one process per rank (`mp.spawn`, the shape
+   `server/launch.py` uses). Each rank owns `num_kv_heads/tp` heads and accumulates only its own
+   amax rows; the rows are gathered into GLOBAL per-head rows on the host (broadcast-per-source on
+   the gloo group) *before* any scale is computed, so the sidecar is TP-independent and
+   `fp8_scales._shard_row` re-slices it for whatever TP the serve runs at. Supporting changes:
+   * `LLM(...)` now takes `tp_info` (was hard-coded TP=1). A multi-rank OFFLINE run needs no ZMQ:
+     every rank derives the identical prompt list from the fixture and drives it locally.
+   * `SchedulerIOMixin.establish_inter_rank_link()` is a no-op in offline mode (it used to
+     AttributeError on `_send_into_ranks` the moment a multi-rank offline run entered `run_forever`).
+   * `kv_amax_to_descale()` in `mha_pool.py` — ONE formula, shared by the in-pool
+     `finalize_kv_calibration` and the host-side TP gather.
+   * Calibration runs with the recurrent-radix snapshot store OFF (`--gdn-radix` keeps it):
+     calibration chunks share no prefixes, so it reserved 0.59 GiB that Laguna's bf16 KV pool needed
+     — that reservation was the boot failure on Laguna.
+2. **`tools/make_kv_calib_fixture.py`** — deterministic builder for the calibration fixture,
+   INTERLEAVED by source so any prefix is still a mixture (the calibrator reads only the first
+   `--max-chunks`).
+3. **`tools/kv_scale_compare.py`** — numpy-only sidecar differ; the gate for any calibrator change.
+4. **`tools/kv_fp8_serve_ab.sh`** + **`tools/kv_ctx_capacity_probe.py`** — the RULE-4 serve
+   validation and the equal-VRAM experiment §3 of the first pass asked for.
 
-| model | on-disk size | fits one 16 GB card? |
+## 1. The fixture (durable, recorded)
+
+`/home/pat/fixtures/minisgl-kv-calib/kv_calib_v1.txt` — **2,009,224 bytes, sha256[:16]
+`c6b3888faa71d4b0`**, manifest beside it. Measured mixture: engine+kernel source 31.2%, babilong
+long-context needle samples 25.6%, repo markdown 21.1%, prose (wikitext-2) 14.9%, real tool/MCP JSON
+from this box's agent caches 9.9%. Rebuild byte-identically with
+`python3 tools/make_kv_calib_fixture.py`. The calibrator stamps size+hash into the sidecar metadata,
+so any scale table traces back to the data that produced it.
+
+## 2. Calibration results (TP=2, 131k tokens, ctx 4096 × 32 chunks)
+
+Sidecars + JSON reports in `/home/pat/fixtures/minisgl-kv-calib/sidecars/`.
+
+| model | pools | per-head K spread (median / max) | V spread | wall |
+|---|---|---|---|---|
+| `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 10L × 2H | **1.09× / 1.28×** | 1.11× / 1.89× | 34s |
+| `poolside/Laguna-XS-2.1-NVFP4` | 10L × 8H main + 30L × 8H SWA ring | 1.42× / 1.79× (main), 1.28× / 1.73× (ring) | 1.50× / 2.16×, 1.45× / 2.53× | 50s |
+| `QuantTrio/GLM-4.7-Flash-AWQ` | — | **refused: MLA** (see §5.1) | — | — |
+| `Qwen/Qwen3-0.6B` (reference) | 28L × 8H | 1.84× / 4.61× | 1.95× / 6.28× | 1s |
+
+**Per-head is not the story on the production models.** The first pass predicted this and it held:
+the 35B's spread is 1.09×, and at TP=2 it has ONE KV head per rank, so per-head is literally
+per-tensor there. What the sidecar buys on the 35B is *any* calibration at all — that checkpoint
+ships no `kv_cache_scheme`, so without it every scale is 1.0 (the loud boot warning).
+
+**Two independent checks that the numbers are right:**
+* **TP-invariance.** Qwen3-0.6B calibrated at TP=1 and TP=2 on the same fixture: median relative
+  difference **0**, 96.2% of entries within 1%, max 4.93e-2. TP=2 is run-to-run bit-identical; TP=1
+  drifts 4.8e-3 against itself. The residual TP delta is forward numerics (column/row sharding
+  changes reduction order), not the gather — a head-ordering bug would move whole heads, not 4% of
+  entries by <5%. It is not divergent decode tokens either: `--max-tokens 1` reproduces it exactly.
+  `tools/kv_scale_compare.py --tol 0.05` is the gate; a 2% tolerance would fail on TP noise alone.
+* **Against a vendor calibration.** Laguna ships its own per-tensor `k_scale`/`v_scale`
+  (`kv_cache_scheme`, minmax observer). Our fixture-derived per-head max vs their per-tensor scale,
+  40 layers: K ratio median **1.034** (range 0.907–1.270), V median **1.128** (0.920–1.585). An
+  independent calibration on different data lands within ~10% — the fixture is range-representative.
+
+## 3. Should `MINISGL_KV_FP8=1` stay the compose default? YES — measured
+
+Qwen3.6-35B TP=2, graph capture on, `CONC=4`; three legs, each asserting its own boot-log provenance
+(`tools/kv_fp8_serve_ab.sh`; artifacts under `/home/pat/fixtures/minisgl-kv-calib/serve_ab*`):
+
+| leg | KV pool | acceptance (3 reps) | decode tok/s M=1 / M=4 |
+|---|---|---|---|
+| bf16 (`MINISGL_KV_FP8=0`) | **26,720 tokens** | 27 / 26 / 27 of 29 | 90.8 / 251.1 |
+| fp8, no sidecar (today's default) | **53,440 tokens** | 27 of 29 | 90.4 / 252.9 |
+| fp8 + per-head sidecar | **53,440 tokens** | 27 / 28 / 27 of 29 | 90.6 / 251.6 |
+
+Throughput is a wash (<1%). Quality is a wash too — and the 26-vs-27 gap that a single run would
+have called a regression is **noise**: "generates syntactically plausible code" is a keyword
+assertion on free text and failed in 2 of 3 bf16 reps and 1 of 3 fp8 reps. Always run `ACC_REPS=3`;
+the serve is not bit-reproducible past ~32 tokens. The two failures common to every leg
+(`temperature>0 with different seeds diverges`, `natural stop -> finish_reason=stop`) are unrelated
+to the KV cache and are open serve bugs.
+
+**The decisive result is capacity** (`tools/kv_ctx_capacity_probe.py`, mid-context needle, same VRAM):
+
+| context | bf16 | fp8 + sidecar |
 |---|---|---|
-| `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 24 GB | **no** |
-| `poolside/Laguna-XS-2.1-NVFP4` | 20 GB | **no** |
-| `QuantTrio/GLM-4.7-Flash-AWQ` | 19 GB | **no** |
+| 7.2k prompt tokens | served, needle FOUND | served, FOUND |
+| 14.7k | served, FOUND | served, FOUND |
+| 30.7k | **rejected — "exceeds the servable maximum 26720 (KV pool)"** | served, **FOUND** |
+| 46.7k | **rejected** | served, **FOUND** |
+| 62.7k | rejected | rejected (max 53,440) |
 
-Both cards are 16,304 MB. So the per-head sidecar path — *the only source of per-head scales, since
-no checkpoint ships them* — currently works only for small models (it was validated on Qwen3.5-4B
-TP=1). **Nothing that this box serves in production can be calibrated today.** Any plan that starts
-"run the calibrator on the 35B" is dead on arrival; check this first.
+At equal VRAM fp8-KV does not trade accuracy for context on this model — it *adds* context bf16
+cannot serve at all, and retrieves correctly inside it. Keep the default ON.
 
-### Fixing it — the shape of the answer
-Prefer **teaching the calibrator TP=2**. The sidecar format is already right for it: each rank owns
-`num_kv_heads/tp` heads, the sidecar holds **global** per-head rows, and `fp8_scales._shard_row`
-already slices global rows per rank at serve time (one sidecar serves any TP). So the work is to run
-the calibration forward at TP=2 and gather per-head amax across ranks into global rows — not to
-change the file format or the serve side.
+**How to serve with a sidecar** — explicit path, deliberately NOT installed into the shared HF model
+dir (that would silently change every other agent's serve of the same checkpoint):
 
-Alternatives, both worse, listed so they are not re-discovered: calibrating through GTT spill
-(fits, but PCIe-bound at ~25–30 GB/s vs 707 GB/s HBM — see the `amdgpu_gtt_used_bytes` gauge, and
-note a spilled run gives *correct* amax, just slowly, so this is a fallback not an error); or
-CPU-offload calibration (slower still, and risks dtype drift from the served path).
+```
+cp /home/pat/fixtures/minisgl-kv-calib/sidecars/qwen35b-awq_tp2.safetensors ./kv_scales_qwen35b_tp2.safetensors
+MINISGL_KV_FP8=1 MINISGL_KV_FP8_SCALES=/engine/kv_scales_qwen35b_tp2.safetensors \
+  MINISGL_IMAGE=minisgl-rdna4:comb MODEL=qwen35b-awq TP=2 \
+  gpu-lease -n 2 --detach -- docker compose --profile serve up -d
+```
+The 35B sidecar is committed at the repo root for exactly this (2.3 KB; the serve mounts the repo at
+`/engine`). Boot must log `installed PER-HEAD scales from sidecar …` — that line IS the provenance.
 
-Whatever you choose, the invariant that must not break: **calibration runs against the bf16 cache**
-(`MINISGL_KV_FP8=0`, `MINISGL_KV_FP8_CALIBRATE=1`, set before `minisgl` is imported — they are read
-at pool construction). Measuring amax with an fp8 cache installed feeds fp8 error back into every
-later layer's activations and would require booting the very path being configured.
+**Laguna keeps its checkpoint scales.** Ours agree within ~10% but are up to 9% *smaller* on some
+layers (very slightly more clipping), and the checkpoint path is already serve-validated (25/29).
+No measurement says ours is better; do not switch without one.
 
----
+## 4. How to run a calibration (recipe that works)
 
-## 2. There is no calibration fixture — make one, and make it durable
+```
+MINISGL_IMAGE=minisgl-rdna4:comb \
+MINISGL_CMD='python /engine/tools/kv_fp8_calibrate.py --model <hf id> --tp 2 \
+  --text /fixtures/minisgl-kv-calib/kv_calib_v1.txt --ctx 4096 --max-chunks 32 \
+  --out /fixtures/minisgl-kv-calib/sidecars/<name>.safetensors --report <name>.report.json' \
+gpu-lease -n 2 -- docker compose --profile run run --rm -v /home/pat/fixtures:/fixtures run
+```
+Gotchas that cost time: run compose **from the worktree** (the `run` service mounts `.` as
+`/engine`); `minisgl-rdna4:lean` is stale — use `:comb`; the container writes as root (the tool
+chmods its own outputs 0644, but anything written before that needs a `chmod` run); a model with a
+large recurrent state (Laguna) needs `--max-running-req 2`.
 
-`--text` is **required** and no fixture exists in the repo (`fixtures/` does not exist; nothing
-matches `calib*`). The scale it produces is a promise about the range of everything the served model
-will ever store, so the text must be representative of real serving traffic — for this box that
-means agent/tool-call transcripts and long-context material, not a generic wikitext dump.
+## 5. What is left, in order
 
-Repo rule that applies directly here: **fixtures must be durable and recorded** — never write one to
-session tmpfs or the scratchpad, and echo its byte size. The tool already helps: it hashes the text
-and writes size + hash into the sidecar metadata so a scale table can be traced back to the data
-that produced it. Put the fixture somewhere committed or in a stable path and record which one
-produced which sidecar.
+1. **fp8 MLA is uncalibrated BY CONSTRUCTION, and that is not benign.** With the compose default
+   `MINISGL_KV_FP8=1`, an MLA model (GLM-4.7-Flash) allocates its latent cache as `float8_e4m3fn`
+   (`engine.py:148` → `kvcache/__init__.py:39`), `MLAKVCache.store_kv` is a bare `.to(cache.dtype)`
+   (`mla_pool.py:55`), and `install_kv_fp8_scales` skips MLA pools deliberately — so
+   `attention/mla.py:72` hands the kernels a **hard-coded descale of 1.0**. The per-head argument
+   genuinely does not apply (one latent, no head axis), but a **per-layer scalar** does, and the
+   plumbing already exists: the canonical MLA fp8 ops take the descale as a device tensor. Work:
+   give `MLAKVCache` an amax accumulator + per-layer descale, teach the calibrator to emit a
+   per-tensor sidecar for MLA, point `mla.py` at it instead of `torch.ones(1)`. Gate with the GLM
+   coherence smoke.
+2. **Decide the headroom policy with a measurement.** Every scale here is a pure max (`amax/448`),
+   so traffic wider than the fixture clips — gracefully (the kernel saturates; it does not NaN), but
+   it clips. The Laguna cross-check shows two honest calibrations of the same model disagreeing by
+   up to 1.59× on V, which is an argument for a margin (`amax * k / 448`); the cost of a too-large
+   scale is only subnormal flush. Measure `k ∈ {1.0, 1.25, 1.5}` against the acceptance suite and
+   the ctx probe before changing the formula. Do not just add a fudge factor.
+3. **Re-calibrate when the traffic mix changes.** The sidecar records the fixture's size+sha256; if
+   the box's workload shifts (new agent, new model family), rebuild the fixture and re-run rather
+   than trusting a scale fitted to old traffic.
+4. **Dead kernel fork to delete** (`rdna4-hip-kernels`): `tail/tail_rocm/tail_kernels_hip.hip` is an
+   OLD copy of the store path — per-tensor scale, int64 `out_loc`, and an `f32_to_e4m3` **without**
+   the 448 saturation the live file has. `build.toml` compiles only `tail_kernels.hip`, so it is
+   inert today, but it is exactly the copy-paste fork KERNEL_CORE_POLICY forbids and it reads as if
+   the NaN bug were still live.
+5. **`docker-compose.yml` still defaults to `minisgl-rdna4:lean`**, which predates the fp8 work.
+   `minisgl-rdna4:comb` is the validated image; nothing is served from the merged code until `lean`
+   is repointed or `MINISGL_IMAGE` is set (every command here sets it).
 
----
+## 6. Rules that bind this work (unchanged, still true)
 
-## 3. The open question you must answer with a measurement, not a preference
-
-**Should `MINISGL_KV_FP8=1` remain the compose default?**
-
-Known cost, measured with a real per-head sidecar on Qwen3.5-4B TP=1, graph capture on:
-**26/29 vs bf16's 27/29**, at 65.3 vs 65.1 tok/s (bs=1) and 222.9 vs 222.9 (bs=4). The single extra
-failure was a **mid-context fact retrieval at 7.7k tokens**. Laguna TP=2 on checkpoint scales was
-25/29 vs bf16 24/29 at 79.6 vs 78.6 tok/s.
-
-So on the evidence so far fp8 KV is roughly **throughput-neutral** and costs a little
-long-context accuracy. Its actual value is VRAM: it halves KV bytes, which buys context or
-concurrency. That trade has never been measured end-to-end on this box — *that* is the experiment
-worth running, not another accuracy microbench. Frame it as: at equal VRAM, does fp8-KV-plus-more-
-context beat bf16-KV-with-less?
-
-Note the interaction with ReplaySSM, which also just landed: the GDN ring is bought out of the same
-KV pool (L=8, +12.5% of the checkpoint). Both features spend the same budget.
-
----
-
-## 4. Per-head is the small part — calibrate the expectation
-
-Do not oversell per-head. Re-measured on real Qwen3-0.6B K/V over real text with the merged kernel:
-attention-output rel-RMSE **0.0775 → 0.0647 (−16.6%)**, better on 9 of 15 (layer, ctx) cells but
-*worse* on L0 (3/3) and L7 (2/3). Storage rel-RMSE is a **wash** (0.026797 → 0.026720).
-
-The mechanism is **only subnormal flush** — e4m3 is a floating format whose per-element exponent
-already tracks the value, so a too-large scale mostly just shifts a quiet head's exponents down at
-the same relative error. This is *not* the int8 situation where the scale **is** the resolution.
-Demonstrated through the real kernel: a wide-dynamic-range head is **74.4% flushed to zero**
-per-tensor vs **5.5%** per-head.
-
-Therefore per-head only pays where head amax spread is wide. Measured spread: **1.6–4.4× on
-Qwen3-0.6B** but only **1.29–1.55× on Qwen3.5-4B**, where per-head buys essentially nothing.
-**Measure the spread on the target model before investing in a sidecar for it** — it is cheap and it
-predicts the payoff.
-
----
-
-## 5. Rules and gates that bind this work
-
-- **Never calibrate mid-serve.** One descale must undo every store ever written under it, so
-  changing it later invalidates the whole cache. A captured graph provably picks up a late in-place
-  descale write (`max|Δ| = 4.85e-01`), and restoring the old value restores the output bit-exactly.
-  Scales must be final before any readable KV is written — hence the `Engine.__init__` placement,
-  which is a correctness requirement and not a convenience.
-- **RULE 4** (`rdna4-hip-kernels/KERNEL_CORE_POLICY.md`): not done until it boots at the served
-  TP/graph-capture config and answers. A microbench win that does not move the serve is not a win.
-- **No env-gating on merge.** If it merges it is ON; the worktree is the isolation, not a flag.
-- **Source isolation**: per-task git worktree, never mount the shared `$PWD`. Image builds need
-  **clean** worktrees for both contexts, a bumped `KERNELS_REF` (it is only a cache-buster label —
-  forget it and you ship stale kernels believing otherwise), and
-  `--build-context uprof=/home/pat/pkgs` or the build fails with a confusing "pull access denied".
-  **Preflight by importing the kernel packages in the built image**: an ABI mismatch presents as a
-  0%-GPU wedge until the readiness timeout, *not* a build error.
-- **GPU**: every workload through `gpu-lease -n 1 -- <cmd>` (bare command, let it block). `-n` is
-  how many cards, not which.
-- **Cross-card reproducibility**: GPU 0 is an RX 9070 XT, GPU 1 an RX 9070, and the lease assigns
-  whichever is free. The same parity case produces **different error digits** on the two cards. Use
-  the pass/fail margin against tolerance as the signal; a changed error figure between runs is not
-  by itself a regression.
-- Two gotchas that cost time last session: do **not** pass `-p <project>` to compose under
-  `gpu-lease` (the arbiter sets `COMPOSE_PROJECT_NAME=lease-<name>` and looks the container up by
-  it; overriding makes it think the launch failed and **release the lease** while your container
-  keeps running unleased). And a TTFT probe must match **any** delta chunk — GLM streams
-  `reasoning_content` before `content`, so filtering on `"content"` never fires.
-
----
-
-## 6. Suggested order of work
-
-1. Measure per-head amax spread on the target model(s) (§4). If it is ~1.3× the sidecar is not worth
-   building for that model, and the answer is checkpoint/per-tensor scales — say so and stop.
-2. Build the representative, durable calibration fixture (§2).
-3. Teach the calibrator TP=2 (§1). Gate it by reproducing the existing TP=1 Qwen3.5-4B sidecar
-   through the TP=2 path — same model, same text, scales should agree.
-4. Generate sidecars for the production models; serve-validate each under RULE 4 with graph capture.
-5. Answer §3 with an equal-VRAM context/concurrency experiment, and change or keep the compose
-   default on that evidence.
-
-## 7. Loose end, unrelated to fp8 but worth knowing
-
-`docker-compose.yml` defaults to `minisgl-rdna4:lean`, which is **38 hours older than the merged
-work described here**. `minisgl-rdna4:comb` is the validated image built from `dfd3e68a` +
-`02714ba` (ReplaySSM active at L=8, fp8 scale resolution live). Nothing is served from the merged
-code until `lean` is repointed or `MINISGL_IMAGE` is set.
+* **Never calibrate mid-serve.** One descale must undo every store ever written under it, and a
+  captured graph provably picks up a late in-place descale write (`max|Δ| = 4.85e-01`). Scales are
+  resolved in `Engine.__init__`, between pool construction and capture, and never touched again.
+* **Calibrate against the bf16 cache** (`MINISGL_KV_FP8=0` + `MINISGL_KV_FP8_CALIBRATE=1`, set before
+  `minisgl` is imported). Measuring amax through an fp8 cache feeds fp8 error into every later
+  layer's activations.
+* **Stochastic rounding stays deleted** on this store: write-once storage has no bias to accumulate,
+  and SR paid the √2 variance penalty for nothing (median 1.44–1.48× worse, 2.13× kernel time). The
+  same technique is an 8× win on the GDN recurrent state — recurrence vs storage is the distinction.
+* RULE 4: not done until it boots at the served TP with graph capture and answers.
+* Source isolation: per-task worktree, never mount the shared `$PWD`. GPU: `gpu-lease -n <cards>`,
+  let it block. Cross-card: GPU 0 is a 9070 XT and GPU 1 a 9070 — the same case yields different
+  error digits, so use the margin against tolerance as the signal.
+* Do **not** pass `-p <project>` to compose under `gpu-lease` (the arbiter looks the container up by
+  `COMPOSE_PROJECT_NAME=lease-<name>`; overriding it makes it release the lease under a live
+  container). A TTFT probe must match **any** delta chunk — GLM streams `reasoning_content` first.
