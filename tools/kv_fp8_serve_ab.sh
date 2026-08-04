@@ -80,7 +80,10 @@ provenance() {  # $1 leg -> assert the leg is the configuration it claims to be
           echo "PROVENANCE MISMATCH: fp8_uncal leg shows no fp8 scale resolution at all"; return 1; }
         echo "   NOTE: this leg resolved CHECKPOINT scales, not the identity — reported as such"; } ;;
     fp8_sidecar)
-      grep -q "installed PER-HEAD scales from sidecar" "$OUT/$leg.prov.txt" || {
+      # PER-HEAD (MHA / SWA-ring pools) or PER-LAYER latent (MLA) — both mean "the sidecar
+      # installed". The granularity is a property of the cache, not of whether the leg is
+      # configured the way it claims.
+      grep -qE "installed (PER-HEAD scales|PER-LAYER latent scales) from sidecar" "$OUT/$leg.prov.txt" || {
         echo "PROVENANCE MISMATCH: fp8_sidecar leg did NOT install the sidecar"; return 1; } ;;
   esac
   echo "   provenance OK"

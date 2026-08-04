@@ -63,13 +63,24 @@ class MLABackend(BaseAttnBackend):
         self._verify_op = mla_hip.mla_verify
         self._verify_fp8_op = mla_hip.mla_verify_fp8
         # fp8 (e4m3) latent KV cache — opt-in via MINISGL_KV_FP8=1 (the engine allocates the latent
-        # pool as float8_e4m3fn). Store is a plain bf16->e4m3 cast (scale 1.0), so decode dequant uses
-        # descale 1.0, matching the HIP MHA fp8 path. The prefill rebuild dequants in the model layer.
+        # pool as float8_e4m3fn). The store applies the pool's PER-LAYER scale, so every read must
+        # undo the SAME per-layer scale — `MLAKVCache.descale_view(layer)` is a 1-element view of
+        # the persistent table a calibration installs at boot. This was a hard-coded `torch.ones(1)`
+        # while the store was an unscaled cast; leaving it that way once MLA gained a calibration
+        # would dequantize every latent as if the scale were 1.0 (wrong numbers, no error).
+        # The VIEW is what keeps it graph-safe: stable address, value read through the pointer, so a
+        # captured decode/verify graph sees the installed scale instead of a baked constant.
         self.kv_is_fp8 = self.kvcache.dtype == torch.float8_e4m3fn
-        # canonical mla fp8 ops now take k/v_descale as DEVICE tensors (read [0]). MLA's descale is a
-        # static 1.0 (scale-1.0 store cast), so one persistent 1-elem tensor suffices — stable address,
-        # graph-safe (a fresh torch.tensor() per forward would break cuda-graph replay).
+        # Identity fallback for a pool that predates the per-layer table (never None, so the hot
+        # path has no branch beyond the one below).
         self._fp8_descale = torch.ones(1, dtype=torch.float32, device=self.kvcache.device)
+
+    def _descale(self, layer_id: int) -> torch.Tensor:
+        """This layer's latent descale for the fp8 kernels. ONE scalar per layer: the latent is a
+        single stored tensor read in both roles, so k_descale == v_descale == cache_descale (see
+        mla_kernels.hip's fp8 comment and the MLAKVCache class docstring)."""
+        view = getattr(self.kvcache, "descale_view", None)
+        return self._fp8_descale if view is None else view(layer_id)
 
     # ---- cache + kernels (called by the model's MLA layer) ----
     def store_latent(self, latent: torch.Tensor, out_loc: torch.Tensor, layer_id: int) -> None:
@@ -82,10 +93,11 @@ class MLABackend(BaseAttnBackend):
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         if self.kv_is_fp8:
-            # e4m3 latent cache: k_descale=v_descale=1.0 (store was a scale-1.0 cast).
+            # e4m3 latent cache: k_descale == v_descale == this layer's cache descale.
+            d = self._descale(layer_id)
             engaged("mla_hip.mla_decode_fp8")
             return self._decode_fp8_op(q, latent_cache, block_table, ctx_lens, self.scale,
-                                       self._fp8_descale, self._fp8_descale, 0, 0)
+                                       d, d, 0, 0)
         engaged("mla_hip.mla_decode")
         return self._decode_op(q, latent_cache, block_table, ctx_lens, self.scale, 0, 0)
 
@@ -102,10 +114,10 @@ class MLABackend(BaseAttnBackend):
         else:
             q_seq_idx, q_kbound = self._verify_indices(metadata)
         if self.kv_is_fp8:
+            d = self._descale(layer_id)
             engaged("mla_hip.mla_verify_fp8")
             return self._verify_fp8_op(
-                q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale,
-                self._fp8_descale, self._fp8_descale, 0, 0
+                q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, d, d, 0, 0
             )
         engaged("mla_hip.mla_verify")
         return self._verify_op(q, latent_cache, block_table, q_seq_idx, q_kbound, self.scale, 0, 0)
