@@ -50,6 +50,21 @@ class GDNGraphCapture:
         batch.gdn_metadata = self._metadata(batch.padded_size)
 
 
+def _replay_verify_available(qmax: int) -> bool:
+    """Will the GDN layers take the ReplaySSM verify (ring append) for a window of `qmax` tokens?
+
+    Same three conditions the layer checks (ring present, op built, window fits the ring), asked at
+    capture time so the capturer knows whether to allocate the per-token SSM scratch at all."""
+    try:
+        import gdn_hip as gdn
+
+        return (hasattr(gdn, "gdn_verify_replay")
+                and hasattr(gdn, "gdn_decode_conv_gated_replay")
+                and int(qmax) <= int(gdn.REPLAY_RING_LEN))
+    except Exception:
+        return False
+
+
 class GDNVerifyGraphCapture:
     """Static-buffer GDN metadata for cudagraph capture of the spec-VERIFY forward (the GDN analog of
     ``CCAVerifyGraphCapture``).
@@ -94,8 +109,16 @@ class GDNVerifyGraphCapture:
         self._has_init = torch.zeros(max_bs, dtype=torch.bool, device=device)
         self._conv = {int(lid): torch.zeros(Qmax, max_bs, conv_dim, conv_width, dtype=torch.float32,
                                             device=device) for lid in gdn_layer_ids}
-        self._ssm = {int(lid): torch.zeros(Qmax, max_bs, num_v_heads, head_v_dim, head_k_dim,
-                                           dtype=ssm_dtype, device=device) for lid in gdn_layer_ids}
+        # SSM scratch is allocated ONLY for the materialising verify. Under ReplaySSM the draft
+        # window lives in the ring and the accept is a cursor rewind, so there are no per-token
+        # states to stage — and this is the DOMINANT capture allocation on a GDN hybrid
+        # (Qmax * max_bs * HV * V * K per layer: 10 MB/layer at Q=5, bs=4, 16 v-heads, 128x128 bf16,
+        # i.e. ~300 MB across 30 layers). Skipping it is the VRAM half of the replay-verify win, and
+        # VRAM is what makes spec decode fail to boot on this box.
+        self._replay_verify = _replay_verify_available(Qmax)
+        self._ssm = {} if self._replay_verify else {
+            int(lid): torch.zeros(Qmax, max_bs, num_v_heads, head_v_dim, head_k_dim,
+                                  dtype=ssm_dtype, device=device) for lid in gdn_layer_ids}
 
     def set_width(self, qlen: int) -> None:
         """Select the captured width (`qlen` query rows/seq) whose metadata the next capture/replay
@@ -114,6 +137,7 @@ class GDNVerifyGraphCapture:
             capture_verify_state=True,
             verify_max_qlen=Q,
             conv_scratch={lid: buf[:Q, :bs] for lid, buf in self._conv.items()},
+            # empty under ReplaySSM — the scheduler reads its emptiness as "commit by rollback"
             ssm_scratch={lid: buf[:Q, :bs] for lid, buf in self._ssm.items()},
         )
 

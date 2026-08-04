@@ -200,12 +200,31 @@ class GDNStateCache:
         self.ssm_state[:, s : s + 1] = ssm
         self.reset_ring(s)           # a direct ssm_state WRITE: the ring's entries are now stale
 
+    def rollback_ring(self, slots: torch.Tensor, reject: torch.Tensor) -> None:
+        """Rewind `reject[i]` speculative entries from slot `slots[i]`'s ring, for every GDN layer.
+
+        The accept half of the ReplaySSM spec path: a verify appended its whole draft window to the
+        ring, so committing it is a CURSOR DECREMENT — no state is read, written, or scattered. Safe
+        because the verify kernel forbids a flush inside the window, so every entry above the
+        rollback point belongs to that window (rdna4-hip-kernels gdn_kernels.hip, FLUSH POLICY).
+        No-op without a ring (the materialising verify installs state instead)."""
+        if self._ring is None:
+            return
+        import gdn_hip as gdn
+
+        sl = slots.to(torch.long)
+        rj = reject.to(device=sl.device, dtype=torch.int32)
+        for lid in range(self.num_gdn_layers):
+            gdn.gdn_replay_rollback(sl, rj, self._ring[lid]["len"])
+
     def install_verify_state(
         self,
         conv_scratch: dict,
         ssm_scratch: dict,
         slots: torch.Tensor,
         t_index: torch.Tensor,
+        cols: torch.Tensor | None = None,
+        reject: torch.Tensor | None = None,
     ) -> None:
         """Install the per-token state captured by a spec-decode VERIFY forward into the live slots,
         for every GDN layer at once. ``conv_scratch``/``ssm_scratch`` map gdn_layer_id -> the kernel's
@@ -215,19 +234,32 @@ class GDNStateCache:
         snapshot + re-advance: the recurrent verify already computed the exact accepted-prefix state,
         we just gather it. Both conv + ssm are installed so the next decode step continues correctly.
 
-        Vectorized gather: scratch[t_index[i], i] -> state_cache[layer, slots[i]] for each seq i.
+        Vectorized gather: scratch[t_index[i], cols[i]] -> state_cache[layer, slots[i]].
+
+        ``cols`` is the sequence's column in the scratch, i.e. its index in the FORWARD's batch.
+        It is NOT `arange(len(slots))`: the caller installs only the still-running sequences, so
+        once any request in the batch finishes the two orders diverge and every surviving sequence
+        would be handed another sequence's state. Defaults to arange for callers that install the
+        whole batch.
+
+        ``reject`` (int32, [N]) switches the SSM half to the ReplaySSM path: with the draft window
+        in the ring there is no ssm scratch to gather, so the commit is `ring_len -= reject`. The
+        conv half is unchanged either way — conv has no ring.
         """
         n = slots.numel()
-        seq_ar = torch.arange(n, device=slots.device)
+        seq_ar = torch.arange(n, device=slots.device) if cols is None else cols.to(slots.device)
         for lid in range(self.num_gdn_layers):
             cs = conv_scratch[lid]  # [Q, N, C, W-1]
-            ss = ssm_scratch[lid]   # [Q, N, HV, V, K]
-            # gather the chosen t per seq: result [N, ...]
             conv_pick = cs[t_index, seq_ar]  # [N, C, W-1]
-            ssm_pick = ss[t_index, seq_ar]   # [N, HV, V, K]
             self.conv_state[lid, slots] = conv_pick.to(self.conv_state.dtype)
-            self.ssm_state[lid, slots] = ssm_pick.to(self.ssm_state.dtype)
-        self.reset_ring(slots)       # a direct ssm_state WRITE: the ring's entries are now stale
+            if reject is None:
+                ss = ssm_scratch[lid]   # [Q, N, HV, V, K]
+                ssm_pick = ss[t_index, seq_ar]   # [N, HV, V, K]
+                self.ssm_state[lid, slots] = ssm_pick.to(self.ssm_state.dtype)
+        if reject is None:
+            self.reset_ring(slots)   # a direct ssm_state WRITE: the ring's entries are now stale
+        else:
+            self.rollback_ring(slots, reject)
 
     def conv(self, gdn_layer_id: int) -> torch.Tensor:
         """conv_state for one GDN layer: (num_slots, conv_dim, conv_kernel-1)."""
