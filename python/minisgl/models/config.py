@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Collection, Dict
 from transformers import PretrainedConfig
 
 from minisgl.quant.config import QuantConfig
@@ -242,7 +242,12 @@ class ModelConfig:
         return (self.cca_time0 - 1) + (self.cca_time1 - 1)
 
     @classmethod
-    def from_hf(cls, config: PretrainedConfig, spec_algorithm: str = "mtp") -> ModelConfig:
+    def from_hf(
+        cls,
+        config: PretrainedConfig,
+        spec_algorithm: str = "mtp",
+        ckpt_tensor_names: "Collection[str] | None" = None,
+    ) -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
@@ -382,6 +387,41 @@ class ModelConfig:
         if spec_algorithm != "mtp" and not _mtp_forced:
             mtp_num_hidden_layers = 0
             num_nextn_predict_layers = 0
+
+        # A config field is a CLAIM; the tensors are the fact. `cyankiwi/Agents-A1-AWQ-INT4` declares
+        # `mtp_num_hidden_layers: 1` in its own config.json and ships ZERO mtp.* tensors — the
+        # quantizer dropped the head and left the field. Building from the claim produced a 22-buffer
+        # MTP head and then died in the weight loader with a bare `KeyError:
+        # 'mtp.pre_fc_norm_embedding.weight'` (layers/base.py `state_dict.pop`), which names a symptom
+        # and not a cause. So when we are about to build a head, verify the checkpoint actually ships
+        # one and say precisely what is wrong if it does not. `ckpt_tensor_names=None` (unit tests,
+        # any caller without the weights on disk) skips the cross-check and trusts the config.
+        # An EMPTY name set means we learned nothing (no safetensors on disk yet, a GGUF/other
+        # format, an unreadable index) — not "this checkpoint has no MTP". Treat it as unknown and
+        # trust the config, so a probe failure can never invent a startup error.
+        if (
+            (mtp_num_hidden_layers > 0 or num_nextn_predict_layers > 0)
+            and ckpt_tensor_names
+        ):
+            from .weight import checkpoint_ships_mtp
+
+            if not checkpoint_ships_mtp(ckpt_tensor_names, num_layers):
+                _claim = (
+                    f"MINISGL_MTP_LAYERS/MINISGL_NUM_NEXTN forced a head on"
+                    if _mtp_forced
+                    else f"its config declares mtp_num_hidden_layers="
+                         f"{mtp_num_hidden_layers} / num_nextn_predict_layers="
+                         f"{num_nextn_predict_layers}"
+                )
+                raise ValueError(
+                    f"speculative decoding was requested (--spec-algorithm mtp) and {_claim}, but "
+                    f"this checkpoint ships NO MTP tensors — no `mtp.*` keys and no appended "
+                    f"`layers.>={num_layers}` head among its {len(ckpt_tensor_names)} tensors. The "
+                    f"config claims a head the weights do not back (a quantizer that drops the MTP "
+                    f"head but leaves the field does exactly this). Serve it without self-speculation "
+                    f"(--spec-algorithm none, or ngram/eagle3/dflash, which need no MTP head), or use "
+                    f"a checkpoint revision that ships the head."
+                )
 
         # RMSNorm eps: Llama/Qwen use `rms_norm_eps`; ZAYA names it `norm_epsilon`.
         rms_norm_eps = getattr(config, "rms_norm_eps", None)

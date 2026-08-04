@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import glob
+import json
 import re
-from typing import Dict, Iterator, Tuple
+from typing import Collection, Dict, FrozenSet, Iterator, Tuple
 
 import safetensors
 import torch
@@ -44,6 +45,45 @@ def _is_beyond_decoder(name: str, num_layers: int) -> bool:
     layers past num_hidden_layers."""
     m = _LAYER_IDX_PATTERN.search(name)
     return m is not None and int(m.group(1)) >= num_layers
+
+
+def checkpoint_tensor_names(model_path: str) -> "FrozenSet[str]":
+    """Every tensor name in a checkpoint, WITHOUT reading a single tensor.
+
+    Prefers the safetensors index (`*.index.json` -> `weight_map`, one small JSON); falls back to the
+    per-file safetensors HEADERS, which `safe_open` reads lazily, so even a sharded 100 GB checkpoint
+    costs a few KB. Both the model builder and the streaming loader consult this (through
+    `ModelConfig.from_hf`) and must agree, so it is deliberately cheap enough to call twice."""
+    folder = download_hf_weight(model_path)
+    names: "set[str]" = set()
+    for index_file in glob.glob(f"{folder}/*.index.json"):
+        try:
+            with open(index_file) as fh:
+                names.update(json.load(fh).get("weight_map", {}).keys())
+        except (OSError, ValueError):
+            continue  # unreadable/malformed index -> fall through to the headers
+        if names:
+            return frozenset(names)
+    for file in glob.glob(f"{folder}/*.safetensors"):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            names.update(f.keys())
+    return frozenset(names)
+
+
+def checkpoint_ships_mtp(names: "Collection[str]", num_layers: int) -> bool:
+    """Does this checkpoint ACTUALLY ship a speculative (MTP / next-n) head?
+
+    Answered from the TENSORS, never from a config field — a config can claim a head the weights do
+    not back. Measured 2026-08-04: `cyankiwi/Agents-A1-AWQ-INT4` sets `mtp_num_hidden_layers: 1` in
+    its own config.json and ships ZERO `mtp.*` tensors (the quantizer dropped the head and left the
+    field), so trusting the field built a 22-buffer head that `load_state_dict` could not fill.
+
+    Uses the loader's own two namespaces, so this cannot drift from what load actually maps:
+      * Qwen3.5 / Qwen3.6  — a dedicated `mtp.*` namespace.
+      * GLM-4.x / DeepSeek — appended `(model.)layers.<n>`, n >= num_layers (`_is_beyond_decoder`,
+        the same predicate the loader skips/remaps them with).
+    """
+    return any(n.startswith("mtp.") or _is_beyond_decoder(n, num_layers) for n in names)
 
 
 def _remap_glm_mtp(name: str, num_layers: int) -> str | None:
@@ -939,7 +979,11 @@ def load_weight(
 
     model_folder = download_hf_weight(model_path)
     config = ModelConfig.from_hf(
-        cached_load_hf_config(model_path), spec_algorithm=spec_algorithm
+        cached_load_hf_config(model_path),
+        spec_algorithm=spec_algorithm,
+        # Same cross-check the model builder does, from the same source, so load_mtp cannot disagree
+        # with what was built (that disagreement is exactly how an unfillable head reaches the loader).
+        ckpt_tensor_names=checkpoint_tensor_names(model_path),
     )
     if config.is_gdn_hybrid:
         yield from _load_qwen3_5_weight(model_folder, device, config)

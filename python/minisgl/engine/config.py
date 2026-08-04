@@ -71,8 +71,15 @@ class EngineConfig:
     @cached_property
     def model_config(self) -> ModelConfig:
         from minisgl.models import ModelConfig
+        from minisgl.models.weight import checkpoint_tensor_names
 
-        return ModelConfig.from_hf(self.hf_config, spec_algorithm=self.spec_algorithm)
+        # Pass the checkpoint's actual tensor names so an MTP head is built from the WEIGHTS, not
+        # from a config field that may claim one the checkpoint does not ship (see from_hf).
+        # Header-only read; no tensor data. Skipped for dummy weights — there is no checkpoint.
+        names = None if self.use_dummy_weight else checkpoint_tensor_names(self.model_path)
+        return ModelConfig.from_hf(
+            self.hf_config, spec_algorithm=self.spec_algorithm, ckpt_tensor_names=names
+        )
 
     @property
     def max_seq_len(self) -> int:
