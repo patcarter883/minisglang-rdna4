@@ -42,6 +42,8 @@ from minisgl.diffusion import CanvasState, DiffusionSamplerConfig
 from minisgl.message import DetokenizeMsg
 from minisgl.utils import div_ceil, init_logger
 
+from .prefill import ChunkedReq
+
 if TYPE_CHECKING:
     pass
 
@@ -64,6 +66,9 @@ class CanvasManager:
         self.config = config
         self.device = device
         self._state: Dict[int, CanvasState] = {}
+        # Per-request RNG, allocated only for a seeded request and held across that request's blocks
+        # (a per-BLOCK generator would replay one block's noise in the next). Freed with the request.
+        self._gen: Dict[int, torch.Generator] = {}
         # Denoising steps actually spent per committed block. This is `k` — the number the whole
         # cost argument for block diffusion turns on, and the one an isolated kernel bench cannot
         # produce. Kept here rather than in a metric so it survives a serve with metrics off.
@@ -72,11 +77,23 @@ class CanvasManager:
     def get(self, uid: int) -> "CanvasState | None":
         return self._state.get(uid)
 
-    def begin(self, uid: int) -> CanvasState:
+    def begin(self, uid: int, seed: "int | None" = None) -> CanvasState:
         """Open a fresh block: a canvas of uniform-random ids over the WHOLE vocabulary (this
         architecture has no mask token), a null self-conditioning signal, and the step counter at
-        max_denoising_steps counting down."""
-        state = CanvasState(self.config, self.device)
+        max_denoising_steps counting down.
+
+        `seed` (SamplingParams.seed, None by default) installs a per-REQUEST generator, held across
+        the request's blocks so block 2 does not replay block 1's noise. It is the only way to
+        reproduce a block-diffusion generation: this path has no greedy mode — the canvas is drawn
+        from noise and every step draws a multinomial — so `temperature 0` pins nothing, and without
+        a seed two identical requests to one serve return different text. Unseeded requests keep the
+        process RNG, i.e. exactly the previous behaviour."""
+        gen = self._gen.get(uid)
+        if gen is None and seed is not None:
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(seed))
+            self._gen[uid] = gen
+        state = CanvasState(self.config, self.device, generator=gen)
         self._state[uid] = state
         return state
 
@@ -90,6 +107,7 @@ class CanvasManager:
     def free(self, uid: int) -> None:
         """Release a request entirely (finish/abort). Idempotent by construction."""
         self._state.pop(uid, None)
+        self._gen.pop(uid, None)
 
     @property
     def num_active(self) -> int:
@@ -137,6 +155,21 @@ class SchedulerDiffusionMixin:
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        # SWA-radix RESTORE, the canvas path's equivalent of the `_finish_prepare` gate the AR loop
+        # runs. A prompt encoder pass is an ordinary prefill and CAN hit a page-aligned window
+        # snapshot; without this the sliding layers would extend across a boundary whose window is
+        # whatever the recycled ring block last held — a silent stale window, and the reason the
+        # canvas serve shipped with SWA-radix switched off. Restricted to `is_prefill`, so the
+        # re-encode (phase="decode") is skipped: its ring already holds its own window.
+        #
+        # MEASURED (docs/…BLOCK_DIFFUSION.md §D5): a FULL prefix hit is byte-identical to a cold
+        # prefill, 4/4 cells, at 192 and 3184 reused tokens. A PARTIAL hit (shared prefix, differing
+        # tail) DIVERGED from its cold reference on a 3168-token prefix and the cause is NOT isolated
+        # — a canvas amplifies a 1-ULP prefill-shape difference far more than an AR decode does,
+        # because the entropy bound sorts 256 entropies and thresholds a cumulative sum, so one
+        # near-tie rewrites the whole block. Do not read the full-hit result as covering partial hits.
+        if self._swa_radix and batch.is_prefill:
+            self._restore_swa_states(batch)
         batch.input_ids = self.token_pool[input_mapping]
         # forward_verify is the engine's "no sampling, no complete_one" entry point. That contract is
         # exactly what an encoder pass needs: it writes the KV cache and its logits are discarded
@@ -149,8 +182,6 @@ class SchedulerDiffusionMixin:
         the state a block starts from."""
         reqs = batch.reqs
         for req in reqs:
-            if not hasattr(req, "sampling_params"):  # ChunkedReq
-                continue
             if req.sampling_params.is_constrained:
                 raise NotImplementedError(
                     "structured output is not supported for block diffusion: a grammar constrains "
@@ -158,18 +189,36 @@ class SchedulerDiffusionMixin:
                     f"{self._canvas_cfg.canvas_length} positions every step. Refusing rather than "
                     "silently ignoring the grammar."
                 )
-        if any(type(r).__name__ == "ChunkedReq" for r in reqs):
-            raise NotImplementedError(
-                "chunked prefill is not wired for block diffusion yet: a partial encoder pass leaves "
-                "cached_len mid-prompt, and the canvas must start from a complete prefix. Raise "
-                "--max-extend-tokens above the prompt length."
-            )
         self._canvas_forward(batch, allocate=True)
         for req in reqs:
+            # A CHUNK of a multi-forward encoder pass. This is not the "prompt longer than
+            # --max-extend-tokens" case it was originally refused as, and refusing it is what made
+            # SWA-radix unusable here: the snapshot-capable radix splits EVERY prefill at the last
+            # page boundary (PrefillAdder._add_one_req, `is_recurrent_radix`) so a window snapshot
+            # lands page-aligned — so a prompt whose length is not a multiple of page_size, i.e. 15
+            # out of 16 prompts, arrives as [aligned body][sub-page tail] and the body is a
+            # ChunkedReq. The body writes KV and nothing else: advance it to its own chunk end (the
+            # AR path gets this from forward_batch's complete_one, which forward_verify deliberately
+            # does not do), stash the page-aligned window so the tail's commit can attach it, and
+            # leave it out of the cache and the decode manager. `can_decode` is False for a chunk, so
+            # filter_reqs below already excludes it. The canvas still starts only from the COMPLETE
+            # prefix, which is what the original refusal was protecting.
+            if isinstance(req, ChunkedReq):
+                req.cached_len = req.device_len
+                if self._swa_radix:
+                    self._stash_swa_state(req)
+                continue
             # The whole prompt is now valid KV. No `complete_one()`: that would advance device_len by
             # the one autoregressive token this model does not produce.
             req.cached_len = req.device_len
-            self.cache_manager.cache_req(req, finished=False)
+            inserted = self.cache_manager.cache_req(req, finished=False)
+            # SWA-radix CAPTURE (the AR loop does this in `_process_last_data`, which the canvas loop
+            # does not go through). The prompt's sliding window is snapshotted onto the node just
+            # inserted, so the NEXT request sharing this prompt can restore it instead of
+            # re-encoding. Without it the only snapshots a canvas serve ever produced were the
+            # finish-commit ones, i.e. whole completed conversations.
+            if self._swa_radix:
+                self._maybe_capture_swa_state(req, inserted)
         self.decode_manager.filter_reqs(reqs)
 
     # ---------------------------------------------------------------------------------------
@@ -183,7 +232,7 @@ class SchedulerDiffusionMixin:
         for req in reqs:
             state = self.canvas_slots.get(req.uid)
             if state is None:
-                state = self.canvas_slots.begin(req.uid)
+                state = self.canvas_slots.begin(req.uid, req.sampling_params.seed)
                 # ONE allocation per block. `device_len` is set BEFORE allocate_paged because that is
                 # what it reads, and it then stays put for every step of the block (trap 2).
                 req.device_len = req.cached_len + L
@@ -330,14 +379,22 @@ class SchedulerDiffusionMixin:
                     finish_reason=("stop" if eos else "length") if finished else None,
                 )
             )
+        # The KV now in [c0, c0+n) is the decoder's BIDIRECTIONAL K/V, which this model never serves
+        # from (trap 4). Overwrite it with the causal encoder K/V. No allocation — these are the
+        # canvas's own slots.
+        #
+        # ALSO ON THE FINISHING BLOCK, which it did not used to be. `_free_req_resources` inserts the
+        # whole finished sequence into the prefix cache (and attaches its window snapshot), so a last
+        # block left un-re-encoded publishes the decoder's bidirectional K/V as a reusable prefix —
+        # in the main pool AND in the SWA ring. That is a prefix-cache correctness bug independent of
+        # SWA-radix: it poisons plain radix reuse of a completed conversation, which is exactly the
+        # multi-turn case prefix caching exists for. The cost is one causal forward per request, at
+        # the end, once.
+        if n:
+            self._canvas_reencode(req, c0, n)
         if finished:
             finished_now.add(req)
             return
-
-        # Not finished: the KV now in [c0, c0+n) is the decoder's BIDIRECTIONAL K/V, which this model
-        # never serves from (trap 4). Overwrite it with the causal encoder K/V the next block reads.
-        # No allocation — these are the canvas's own slots.
-        self._canvas_reencode(req, c0, n)
 
     def _canvas_reencode(self, req: Req, c0: int, n: int) -> None:
         """Causal encoder pass over the just-committed block, in place over its own slots.

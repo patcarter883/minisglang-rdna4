@@ -82,6 +82,15 @@ class SamplingParams:
     # None -> "default" (single-store back-compat). Every CAM op (deliver/write/facts/forget/stats/retrieve)
     # is scoped to this namespace so one conversation cannot read or overwrite another's memory.
     mem_namespace: str | None = None
+    # Per-request RNG seed. None (default) = draw from the process RNG, i.e. today's behaviour on
+    # every path. It exists because BLOCK DIFFUSION has no greedy mode at all: its canvas starts as
+    # uniform noise over the whole vocabulary and every denoising step draws a multinomial, so
+    # `temperature 0 / top_p 1 / top_k 1` — the autoregressive path's reproducibility switch — buys
+    # nothing there, and two identical requests to the same serve return different text. With a seed
+    # a block's whole denoising trajectory is a deterministic function of (prompt, seed), which is
+    # what lets a cold-vs-prefix-hit byte-identity gate exist for the canvas path at all (and lets a
+    # caller reproduce a generation). Read by the diffusion loop; the AR sampler is unaffected.
+    seed: int | None = None
 
     @property
     def is_greedy(self) -> bool:

@@ -85,6 +85,11 @@ class GenerateRequest(BaseModel):
     # it on/off for THIS call, overriding MINISGL_CAM_AUTO (None = server default). Lets a caller (or an
     # A/B harness) suppress the retrieve round-trip on a given turn.
     cam_read: bool | None = None
+    # Per-request RNG seed (None = the process RNG, i.e. unchanged). The knob that makes a
+    # BLOCK-DIFFUSION generation reproducible: that path samples a whole canvas from noise on every
+    # denoising step, so it has no greedy mode and `temperature 0` does not pin it. Inert for the
+    # autoregressive path, whose reproducibility switch is the greedy triple.
+    seed: int | None = None
 
 
 class Message(BaseModel):
@@ -199,6 +204,13 @@ class OpenAICompletionRequest(BaseModel):
     logprobs: bool | None = None
     top_logprobs: int | None = None
     logit_bias: dict | None = None
+    # `seed` USED to sit in the group above — declared so it could be rejected, but never actually
+    # checked by _reject_unsupported, so it was accepted and ignored. It is now HONOURED, and only
+    # where it means something: the BLOCK-DIFFUSION canvas, the one path here with no greedy mode
+    # (its canvas is drawn from noise and every denoising step draws a multinomial, so
+    # `temperature 0` pins nothing and two identical requests return different text). It reaches
+    # SamplingParams.seed -> CanvasManager.begin. On the autoregressive path it is inert, because
+    # reproducibility there is the greedy triple, not an RNG seed.
     seed: int | None = None
 
     # Per-call Markovian-RSA control (in-engine, same port). Absent / null -> ordinary single
@@ -1592,6 +1604,7 @@ async def generate(req: GenerateRequest, request: Request):
                 presence_penalty=req.presence_penalty,
                 frequency_penalty=req.frequency_penalty,
                 max_tokens=req.max_tokens,
+                seed=req.seed,
                 # unset -> the checkpoint's generation_config default (same resolution the OpenAI
                 # endpoints use), NOT the greedy SamplingParams default.
                 **dict(zip(("temperature", "top_p", "top_k"),
@@ -1778,6 +1791,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
                 presence_penalty=req.presence_penalty,
                 frequency_penalty=req.frequency_penalty,
                 max_tokens=req.max_tokens,
+                seed=req.seed,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 stop_keep=_tool_stop_keep(req),

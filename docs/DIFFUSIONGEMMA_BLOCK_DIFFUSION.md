@@ -1095,9 +1095,179 @@ emits all its tokens at once and tok/s therefore cannot show k at all.
   TEMPERATURE differs (it is a function of that request's own step index), so a batched step needs a
   per-row scale; the code currently applies it per request in the sampler, which is correct but
   serialises the fp32 softmax over `[canvas, vocab]` per request.
-* **SWA-radix.** Turned OFF for the canvas phase. Its window snapshot is taken at autoregressive
-  commit points and addresses the ring at the pre-canvas stride; re-validating it against a canvas
-  is its own piece of work, and leaving it on would silently seed a stale window.
-* **Chunked prefill and structured output** are REFUSED with a reason rather than silently ignored.
+* **SWA-radix.** ~~Turned OFF for the canvas phase.~~ **Now ON, the stated reason was wrong, FULL
+  prefix reuse is proven lossless, and PARTIAL prefix reuse is still open — see §D5.**
+* **Chunked prefill** ~~and~~ is now wired for the encoder pass (§D5), and it had to be: with the
+  prefix cache on, 15 out of 16 prompts arrive chunked. **Structured output** is still REFUSED with a
+  reason rather than silently ignored.
 * **§U5 (the third EOS id, 50)** is now moot in practice — every test block terminated correctly on
   the resolved EOS set — but has not been isolated.
+
+### D5. SWA-radix on the canvas: the stride argument was wrong, and the real bug was worse
+
+§D4 left SWA-radix off for the canvas phase on this reasoning: *"its window snapshot is taken at
+autoregressive commit points and addresses the ring at the pre-canvas stride."* **There is no
+pre-canvas stride.** `Engine.__init__` computes the ring stride exactly once, at boot, as
+
+```
+swa_ring_stride = sliding_window + _swa_ring_block(model_config, spec_config)
+                = sliding_window + max(num_draft + 1, canvas_length)
+```
+
+publishes it on `ctx.swa_ring_stride`, and every reader takes that one number —
+`rdna4.py`'s store/gather/decode, `hip.py`'s captured builders, and `SWAWindowSnapshotter`. On
+DiffusionGemma that is **1024 + 256 = 1280 in every phase**: the prompt encoder pass, every denoising
+step, the block re-encode, and the finish commit. The boot log says so in one line
+(`SWA ring KV: 25 layers x 3840 slots (window=1024, stride=1280, ...)`). Folding the two drifting
+stride computations into `_swa_ring_block` was ccd6b198 — the very commit §D4 cites — so the hazard
+it describes had already been removed when it was written. A snapshot cloned in one phase reads back
+byte-identically in another, and the snapshotter needed no stride change at all.
+
+The instinct was right and the mechanism was wrong, which made the risk assessment wrong in both
+directions. Three separate findings:
+
+**1. The real gap was a missing RESTORE, and it was live.** The canvas loop does not run through
+`_finish_prepare` (so `_restore_swa_states` never fired) or `_process_last_data` (so
+`_maybe_capture_swa_state` never fired at the prompt commit) — but it DOES reach
+`_free_req_resources`, which attaches a window snapshot to a finished request's radix node. So with
+SWA-radix at its default (ON, 12e18adb), a canvas serve produced snapshots, matched against them
+(`match_prefix` caps to a snapshotted node), reported `cached_len > 0` — and never seeded the ring.
+That is precisely the stale window §D4 feared, arrived at by a different route, and it is the one
+thing the `MINISGL_SWA_RADIX=0` in the harness was actually protecting against. Fixed by two calls
+in `scheduler/diffusion.py`: `_restore_swa_states` in `_canvas_forward` (prefill batches only) and
+`_maybe_capture_swa_state` on the handle `_canvas_encode` was already discarding.
+
+**2. Chunked prefill was not a "not yet wired" nicety — it was a hard blocker.** The
+snapshot-capable radix splits EVERY prefill at its last page boundary
+(`PrefillAdder._add_one_req`, `is_recurrent_radix`) so a window snapshot lands page-aligned. So a
+prompt whose length is not a multiple of `page_size` — 15 out of 16 prompts — arrives as
+`[aligned body][sub-page tail]`, the body is a `ChunkedReq`, and `_canvas_encode` raised. **Turning
+SWA-radix on without this would have killed the scheduler on the first real request**, which is
+exactly what the first validation run did. The refusal's own suggested remedy ("raise
+--max-extend-tokens") could not have helped: the split is page alignment, not budget. A chunk of the
+encoder pass needs three lines — advance it to its own chunk end (the AR path gets this free from
+`forward_batch`'s `complete_one`, which `forward_verify` deliberately does not do), stash the
+page-aligned window, and skip the cache/decode handoff. The canvas still starts only from a complete
+prefix, which is what the refusal was protecting.
+
+**3. The finishing block was published to the prefix cache as BIDIRECTIONAL K/V.** `_canvas_commit`
+re-encoded a committed block causally only when the request CONTINUED; on the finishing block it
+returned early, and `_free_req_resources` then inserted the whole sequence into the radix tree. Both
+the main-pool full-attention KV and the SWA window snapshot for that tail therefore held the
+decoder's bidirectional K/V — which this model never serves from. **This is a prefix-cache
+correctness bug independent of SWA-radix**: it poisons plain radix reuse of a completed conversation,
+i.e. the multi-turn case prefix caching exists for. The fix is to re-encode the finishing block too,
+one causal forward per request at the end.
+
+**Block diffusion has no greedy mode, so the gate needed a seed.** The AR losslessness gate (041036ed)
+turns on `temperature 0 / top_p 1 / top_k 1`. That pins nothing here: a canvas starts as uniform noise
+over the whole 262144-token vocabulary and every denoising step draws a multinomial, so two identical
+requests to one serve return different text and byte-identity is vacuous by construction.
+`SamplingParams.seed` (new, `None` = the previous behaviour on every path) installs a per-request
+generator, making a block's whole trajectory a deterministic function of (prompt, seed). The floor is
+also a different shape from the AR one: a block commits all 256 positions at once, so one flipped
+denoising step rewrites the whole answer — there is no "stable for the first k tokens" regime.
+
+**The partial-hit cell needs two serves.** Inside one serve the same prompt cannot be measured cold
+and then partially-hit: measuring it cold inserts it, so the second request is a FULL hit. The AR
+gate's workaround — a cold reference on a different salt — rests on the answer being
+salt-independent, which is true of an AR recall tail and false of a canvas. So the gate runs the same
+`--run-id` twice at `MINISGL_SWA_RADIX=1`, once with `--no-warm` (the `partial` step is then a genuine
+cold measurement of that exact prompt, hit=0) and once without, and the `cold` step — identical in
+both legs — is the cross-serve determinism control that decides whether the diff is admissible at
+all. `tools/swa_radix_canvas_test.sh` + `tools/swa_radix_canvas_verdict.py`.
+
+#### Measured — DiffusionGemma-26B-A4B-INT4, TP=2, bf16 KV, seed 20260804
+
+The floor first, because nothing below means anything without it. A SEEDED canvas is reproducible
+against itself, 4/4 cells, 3/3 requests each:
+
+```
+REPRO case=short  max_tokens=16  distinct=1 STABLE      REPRO case=xlong  max_tokens=16  distinct=1 STABLE
+REPRO case=short  max_tokens=32  distinct=1 STABLE      REPRO case=xlong  max_tokens=32  distinct=1 STABLE
+```
+
+That is a stronger floor than the AR path's (which was 2 distinct at 16 tokens and 5 at 32 on an
+open-ended probe), and it is a property of the seed, not of the model: the same cells UNSEEDED return
+a different answer every time.
+
+**FULL prefix hit — LOSSLESS, 4/4 byte-identical, with the reuse demonstrated from /metrics:**
+
+| case | max_tokens | cold sha | full-hit sha | hit tokens | prompt | verdict |
+|---|---|---|---|---|---|---|
+| short | 16 | d9bcfb25465a378b | d9bcfb25465a378b | **192** | 204 | IDENTICAL |
+| short | 32 | fdb8ef084105b614 | fdb8ef084105b614 | **192** | 204 | IDENTICAL |
+| xlong | 16 | f0b591bcab4424f6 | f0b591bcab4424f6 | **3184** | 3190 | IDENTICAL |
+| xlong | 32 | 03e7fd94dcb7eb35 | 03e7fd94dcb7eb35 | **3184** | 3190 | IDENTICAL |
+
+`cold` reads hit=0 and `full`/`full2` read hit=192/3184 on the same prompt in the same process, so the
+identity is the cache and not the harness; the serve log carries 20 `SWA-radix HIT: ... seeded ring
+window` lines over the run. The repeat control (`full` vs `full2`) is IDENTICAL 4/4. The probe is not
+degenerate — all four `cold` shas differ from each other and from their `partial` counterparts.
+
+**PARTIAL prefix hit — OPEN, and it DIVERGED on the long prefix. Not yet a losslessness verdict.**
+
+```
+case=short max_tokens=16  INADMISSIBLE  A.partial hit=192  B.partial hit=192   (same measurement twice)
+case=short max_tokens=32  INADMISSIBLE  A.partial hit=192  B.partial hit=192   (same measurement twice)
+case=xlong max_tokens=16  DIVERGED      A.partial hit=3168 B.partial hit=0     [cold control HELD]
+case=xlong max_tokens=32  DIVERGED      A.partial hit=3168 B.partial hit=0     [cold control HELD]
+```
+
+The two `short` cells are inadmissible for a reason worth writing down: `align_down(len(P))` and
+`align_down(len(B1))` are both 192 there, so B1's own snapshot already sits at the shared boundary and
+`--no-warm` does not produce a cold reference — the leg B request hit too. The construction needs
+`len(P)` and `len(B1)` to straddle different page boundaries.
+
+The two `xlong` cells are admissible (the `cold` control sha is identical across the two serves, so
+cross-serve output IS reproducible here) and they DIVERGED. **The cause is not isolated, and there are
+two live candidates:**
+
+  * **Prefill SHAPE, not window content.** The partial hit and its cold reference do not run the same
+    forward decomposition: cold is `[0,3184) + [3184,3192)` while the partial hit is
+    `[3168,3184) + [3184,3192)`, so every dense projection, the router and the head run at a different
+    M. That is the documented rocBLAS bf16 M-dependence ([[cca-prefix-cache-gemm-m-dependence]]) worth
+    ~1 ULP — and a canvas amplifies 1 ULP far more violently than an AR decode does, because the
+    entropy bound SORTS 256 per-position entropies and thresholds a cumulative sum, so a single
+    near-tie flips which tokens are accepted at step 1 and the whole block rewrites. This is the same
+    effect that made 5 of the AR gate's partial cells INDETERMINATE; with a stable reference it
+    presents as DIVERGED instead.
+  * **The chunked encoder path.** The `xlong` partial hit is the ONLY cell that goes through the new
+    multi-chunk `_canvas_encode` with a restored window, so a defect there is not excluded.
+
+Two observations argue for the first: the text is not corrupted the way a stale window would corrupt
+it (at `xlong/16` the partial-hit output is an exact PREFIX of the cold one —
+`" a square potential well stores energy in evenly spaced levels."` vs the same plus `" Note 11:"` —
+i.e. the trajectories agree for ~13 tokens and then part), and the full-hit cells prove the restore
+itself is exact at a 3184 boundary. But that is an argument, not a measurement.
+
+**THE EXPERIMENT THAT SETTLES IT, not yet run** (the cards were released to the cudagraph-capture
+agent): compare partial-hit against partial-hit across two independent serves at the same setting. If
+A.partial reproduces itself across serves, the partial path is deterministic and the A-vs-B
+difference is entirely prefill shape — which would make it a floor, not a loss. If it does not, the
+chunked restore is suspect. A second, sharper variant: pick prompt lengths so the partial hit and its
+cold reference decompose into the SAME chunk shapes.
+
+**STATUS.** SWA-radix is ON for the canvas phase (the engine default, unchanged) and the canvas loop
+now restores, captures, and survives chunked prefill. Full-prefix reuse is proven lossless.
+Partial-prefix reuse is UNVERIFIED and showed divergence on a 3168-token shared prefix. A deployment
+that needs a guarantee on partial reuse should set `MINISGL_SWA_RADIX=0` until the experiment above is
+run.
+
+#### TTFT and tok/s — the win is real but SMALL, and the reason is structural
+
+| case | cold TTFT | full-hit TTFT | saving |
+|---|---|---|---|
+| xlong (3190 tok prompt) | 10.14 s / 10.13 s | 9.38 s / 9.38 s | **0.76 s (7.5%)** |
+| short (204 tok prompt) | 8.48 s / 8.84 s | 8.37 s / 8.75 s | 0.11 s (1.2%) |
+
+The AR sibling's 12.4x TTFT on the same prefix does NOT transfer, and it never could have: a
+block-diffusion request is opaque until its block commits, so its "TTFT" is `prefill + k denoising
+steps`, and at k≈16 the denoise is ~9 s against a ~0.8 s prefill. **Prefix reuse removes 100% of the
+prefill and 0% of the denoise**, so the ceiling on this win is the prefill's share of the block —
+~8% at a 3.2k prompt, ~1% at 200 tokens. It grows with prompt length and shrinks with k; it is not
+the lever block diffusion needs, which is the ~85%-non-compute canvas step.
+
+tok/s was NOT re-measured with SWA-radix on (the cards were released); the gate's per-request wall
+times are within noise of the §D1 numbers, but that is not a tok/s measurement and is not claimed as
+one.

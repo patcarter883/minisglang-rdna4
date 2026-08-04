@@ -24,6 +24,14 @@ been seen) and runs:
     [partial] B2 = P+tail1                    -> hit_tokens ~ len(P): a SHARED long prefix with a
                                                  differing tail, the shape SWA-radix exists for
 
+`--no-warm` replaces the [cold2] construction with a TWO-LEG one: run the same `--run-id` twice, once
+with `--no-warm` (the [partial] step then never sees a warmed prefix, so it is a genuine COLD
+measurement of B2 — hit must read 0) and once without, and diff the two [partial] shas. This exists
+because within ONE serve the same prompt cannot be measured cold and then partially-hit — measuring
+it cold inserts it, and the second request becomes a FULL hit. [cold] is identical in both legs and
+is the cross-serve determinism control that says whether the diff is admissible. Required for a
+block-diffusion serve, where the salted [cold2] reference is meaningless (see below).
+
 The [warm] step is load-bearing: a SWA serve keeps ONE snapshot per request, at that request's own
 page-aligned end (snapshot_ladder_depth == 0 for "swa"), so B1's snapshot sits PAST the shared prefix
 and B2's match boundary is refused — measured hit=0, i.e. a second cold request pretending to be a
@@ -49,6 +57,17 @@ byte-identity result measured without this is an artefact, not a losslessness ve
 Cache-hit evidence: a "lossless" reuse proves nothing if nothing was reused, so the client reads
 /metrics around the B request and reports the DELTA in `minisgl_prefix_cache_hit_tokens_total` and
 `minisgl_prefix_cache_prompt_tokens_total`. reuse must show hit_tokens > 0; cold must show 0.
+
+BLOCK DIFFUSION (`--seed`). The same gate runs against a DiffusionGemma serve, but the greedy triple
+is not enough there and no amount of sampling params would be: the canvas execution mode has NO
+greedy path. A block starts as uniform noise over the whole vocabulary and every denoising step draws
+a multinomial, so two identical requests to one serve return different text and a byte-identity gate
+is vacuous by construction. `--seed N` pins the request's canvas generator (SamplingParams.seed), and
+the whole denoising trajectory then becomes a deterministic function of (prompt, seed) — which is
+exactly the property the gate needs, because a corrupted reused window changes the logits, the logits
+change the entropy ordering, and the trajectory diverges. Run `--mode repro --seed N` first: a seeded
+canvas has its own floor, and it is a WHOLE-BLOCK floor rather than a per-token one (a block is
+committed all at once, so a single flipped step rewrites the entire answer).
 """
 from __future__ import annotations
 
@@ -181,7 +200,8 @@ def measure(prompt: str, max_tokens: int, sampling: dict):
     }
 
 
-def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: int) -> int:
+def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: int,
+               warm: bool = True) -> int:
     failures = 0
     seen: "dict[str, str]" = {}  # cold sha -> which trial produced it (degeneracy guard)
     for case in cases:
@@ -208,7 +228,14 @@ def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: in
                 measure(build_prompts(case, f"{salt}z{i}", tail=1)[1], mt, sampling)
                 for i in range(ref_repeats)
             ]
-            cold2 = cold2s[0]
+            # `--ref-repeats 0` drops the salted reference entirely. It is the right setting for a
+            # BLOCK-DIFFUSION serve: the salt-independence the construction rests on is a property of
+            # the AR recall answer, and a canvas has no such property — a block re-samples all 256
+            # positions from noise conditioned on the whole prompt, so a different salt is simply a
+            # different generation and the cell can only ever report INDETERMINATE. Use the two-leg
+            # `--no-warm` construction below instead.
+            cold2 = cold2s[0] if cold2s else {"sha": "-", "text": "", "ttft": 0.0, "total": 0.0,
+                                              "hit": 0, "prompt": 0}
             ref_stable = len({r["sha"] for r in cold2s}) == 1
             # WARM P on its own before the partial step. A SWA serve keeps ONE snapshot per request,
             # at that request's own page-aligned end (snapshot_ladder_depth == 0 for "swa"), so B1's
@@ -216,13 +243,23 @@ def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: in
             # align_down(len(P)) has no snapshot behind it and is refused. Prefilling P by itself is
             # what puts a snapshot at that boundary. Without this the partial step silently measured
             # hit=0, i.e. a second cold request.
-            gen(p, 4, sampling)
-            time.sleep(0.7)  # let the async cache_req/attach settle before B2 reuses it
+            #
+            # `--no-warm` SKIPS this, which turns the `partial` step into a genuine COLD measurement
+            # of B2 (hit must read 0) in an otherwise byte-identical serve. That is the reference the
+            # partial cell actually needs, and the only one available: within ONE serve you cannot
+            # measure the same prompt cold and then partially-hit, because measuring it cold inserts
+            # it and the second request becomes a FULL hit. So the partial verdict is a TWO-LEG
+            # comparison — same MINISGL_SWA_RADIX, same run-id, one serve with --no-warm and one
+            # without — and `cold` (identical in both legs) is the cross-serve determinism control
+            # that says whether the comparison is admissible at all.
+            if warm:
+                gen(p, 4, sampling)
+                time.sleep(0.7)  # let the async cache_req/attach settle before B2 reuses it
             partial = measure(b2, mt, sampling)
             for label, r in (("cold", cold), ("full", full), ("full2", full2),
                              ("cold2", cold2), ("partial", partial)):
                 print(
-                    f"STEP run={run_id} case={case} max_tokens={mt} step={label} "
+                    f"STEP run={run_id} case={case} max_tokens={mt} warm={int(warm)} step={label} "
                     f"sha={r['sha']} hit={r['hit']} prompt={r['prompt']} "
                     f"ttft={r['ttft']:.4f} total={r['total']:.4f} nchars={len(r['text'])}"
                 )
@@ -230,14 +267,14 @@ def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: in
             repro = full["sha"] == full2["sha"]
             same_p = cold2["sha"] == partial["sha"]
             p_verdict = (
-                "INDETERMINATE" if not ref_stable else
+                "INDETERMINATE" if not (ref_stable and cold2s) else
                 ("IDENTICAL" if same_p else "DIVERGED")
             )
-            failures += (not same) + (ref_stable and not same_p)
+            failures += (not same) + bool(cold2s and ref_stable and not same_p)
             # The hit counters make the verdicts falsifiable: identical output with hit==0 on the
             # 'full'/'partial' steps would mean the cache was never consulted, i.e. nothing proved.
             print(
-                f"VERDICT run={run_id} case={case} max_tokens={mt} "
+                f"VERDICT run={run_id} case={case} max_tokens={mt} warm={int(warm)} "
                 f"cold_vs_full={'IDENTICAL' if same else 'DIVERGED'} "
                 f"cold2_vs_partial={p_verdict} "
                 f"repro_full_vs_full2={'IDENTICAL' if repro else 'DIVERGED'} "
@@ -250,7 +287,7 @@ def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: in
             if not same:
                 print(f"  COLD   : {cold['text']!r}")
                 print(f"  FULLHIT: {full['text']!r}")
-            if ref_stable and not same_p:
+            if cold2s and ref_stable and not same_p:
                 print(f"  COLD2  : {cold2['text']!r}")
                 print(f"  PARTHIT: {partial['text']!r}")
             if not repro:
@@ -264,7 +301,7 @@ def run_matrix(cases, token_counts, run_id: str, sampling: dict, ref_repeats: in
             # constant rather than by the cache.
             trial = f"{case}/{mt}"
             seen[trial] = cold["sha"]
-            if cold["sha"] == cold2["sha"]:
+            if cold2s and cold["sha"] == cold2["sha"]:
                 failures += 1
                 print(
                     f"  DEGENERATE {trial}: the note-7 and note-11 tails produced the SAME output "
@@ -308,7 +345,12 @@ def main():
     ap.add_argument("--repeats", type=int, default=5, help="repro mode: identical requests per cell")
     ap.add_argument("--ref-repeats", type=int, default=3,
                     help="matrix mode: cold references for the partial step; a cell whose reference "
-                         "is not self-stable reports INDETERMINATE instead of DIVERGED")
+                         "is not self-stable reports INDETERMINATE instead of DIVERGED. 0 drops the "
+                         "salted reference (use --no-warm two-leg instead; required for a canvas)")
+    ap.add_argument("--no-warm", action="store_true",
+                    help="matrix mode: do NOT warm the shared prefix, so the `partial` step is a "
+                         "genuine COLD measurement of the same prompt. Run one serve with it and "
+                         "one without, same --run-id, and diff the two `partial` shas")
     ap.add_argument("--case", choices=["long", "short", "xlong"], default="short")
     ap.add_argument("--cases", default="short,xlong", help="matrix mode: comma-separated")
     ap.add_argument("--token-counts", default="16,32,64", help="matrix mode: comma-separated")
@@ -319,8 +361,15 @@ def main():
     ap.add_argument("--temperature", type=float, default=GREEDY["temperature"])
     ap.add_argument("--top-p", type=float, default=GREEDY["top_p"])
     ap.add_argument("--top-k", type=int, default=GREEDY["top_k"])
+    # BLOCK DIFFUSION only. The canvas path has no greedy mode (see the module docstring), so this is
+    # what makes its output reproducible and the identity gate meaningful. Inert on an AR serve.
+    ap.add_argument("--seed", type=int, default=None,
+                    help="per-request RNG seed; REQUIRED for a block-diffusion serve, where the "
+                         "greedy triple pins nothing because the canvas is drawn from noise")
     a = ap.parse_args()
     sampling = {"temperature": a.temperature, "top_p": a.top_p, "top_k": a.top_k}
+    if a.seed is not None:
+        sampling["seed"] = a.seed
     greedy = (a.temperature <= 0.0 or a.top_k == 1) and a.top_p == 1.0  # core.py is_greedy
     print(f"[swa-radix] sampling={sampling} greedy={greedy}")
     if not greedy:
@@ -337,7 +386,7 @@ def main():
     if a.mode == "matrix":
         failures = run_matrix(
             a.cases.split(","), [int(t) for t in a.token_counts.split(",")], a.run_id, sampling,
-            a.ref_repeats,
+            a.ref_repeats, warm=not a.no_warm,
         )
         print(f"\n{'PASS' if failures == 0 else f'FAIL ({failures} divergences)'}")
         return failures

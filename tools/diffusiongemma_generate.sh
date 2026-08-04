@@ -41,9 +41,11 @@ start_server() {  # $1 = model, $2 = tag, $3.. = extra env assignments
   # WHOLE group. A plain kill leaks the workers, which keep the torch.distributed port bound and
   # make the NEXT phase fail with an unrelated-looking bind error.
   #
-  # SWA-radix OFF for the canvas phase: its window snapshot/restore is taken at autoregressive
-  # commit points and addresses the ring at the pre-canvas stride. Re-validating it against a
-  # canvas is its own piece of work; leaving it on would silently seed a stale window.
+  # SWA-radix is ON for the canvas phase too now (the engine default), so both phases run the same
+  # prefix cache. It used to be forced off here on a stride argument that turned out to be wrong:
+  # the ring stride is ONE boot-time constant that already includes canvas_length, identical in
+  # every phase. The real gap was that the canvas loop never called the RESTORE — fixed in
+  # scheduler/diffusion.py::_canvas_forward and gated by tools/swa_radix_canvas_test.sh.
   env "$@" MODEL="$model" TP=2 SPEC=none PORT=$PORT CONC=1 \
     setsid bash /engine/tools/serve.sh >"$LOG" 2>&1 &
   SERVER_PID=$!
@@ -108,7 +110,7 @@ PROMPTS=(
 )
 
 # ============================ phase 1: block diffusion ============================
-start_server "$DG_MODEL" canvas MINISGL_SWA_RADIX=0
+start_server "$DG_MODEL" canvas
 if wait_ready; then
   {
     echo "=========================== BLOCK DIFFUSION ==========================="
