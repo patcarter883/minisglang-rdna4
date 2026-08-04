@@ -159,8 +159,14 @@ class GLMMLAAttention(BaseOP):
             for req in batch.padded_reqs:
                 slots = page_table[req.table_idx, : req.device_len].long()
                 lat = latent_flat[slots]  # [L, kv_lora + rope]
-                if lat.dtype != q_full.dtype:  # fp8 KV cache -> dequant the stored latent (scale 1.0)
-                    lat = lat.to(q_full.dtype)
+                if lat.dtype != q_full.dtype:
+                    # fp8 latent cache -> DEQUANT with this layer's calibrated descale, the same one
+                    # the store divided by. A bare `.to(bf16)` here reads every cached token 1/scale
+                    # too small; it is only invisible while the scale happens to be 1.0, which is
+                    # exactly the shape of the SWA-ring bug the MHA path already had.
+                    lat = lat.to(q_full.dtype) * ctx.kv_cache.latent_descale[self._layer_id].to(
+                        q_full.dtype
+                    )
                 kv = self.kv_b_proj.forward(lat[:, : self.kv_lora_rank].contiguous())
                 kv = kv.view(-1, H, nope + vhd)
                 k_nope, v = kv[..., :nope], kv[..., nope:]  # [L,H,nope], [L,H,v]

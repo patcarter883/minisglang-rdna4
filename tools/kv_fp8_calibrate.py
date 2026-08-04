@@ -15,6 +15,13 @@ an fp8 cache already installed would feed fp8 error back into the activations of
 and would require booting the very fp8 path being configured. So: bf16 cache, exact activations,
 `MINISGL_KV_FP8_CALIBRATE=1` to accumulate.
 
+MLA. A latent cache (DeepSeek / GLM-4.x) has no head axis — it stores ONE compressed vector per
+token, read back in both the K and V roles, which is why the mla_hip fp8 kernels want
+`k_descale == v_descale == cache_descale`. So an MLA model is calibrated PER LAYER: one amax per
+layer, emitted as identical `k_scale`/`v_scale` scalars. This is the only source of an MLA scale at
+all — no checkpoint ships a latent-cache scale, and before this the fp8 latent cache was stored and
+read with an implicit 1.0 under the compose default `MINISGL_KV_FP8=1`.
+
 TP. `--tp N` runs the calibration forward at tensor parallelism N, ONE PROCESS PER RANK (the same
 spawn the server uses). This is not a nicety: every model this box actually serves — Qwen3.6-35B
 (24 GB), Laguna-XS-2.1 (20 GB), GLM-4.7-Flash (19 GB) — is bigger than one 16 GB card, so a TP=1
@@ -130,6 +137,7 @@ def _rank_main(rank: int, args, result_q) -> None:
     raw = open(args.text, "rb").read()
     tensors = {}
     report = {"model": args.model, "tp": tp, "pools": []}
+    granularity = "per_head"  # overwritten to per_layer_latent for an MLA model
 
     # inference_mode matches the served path (server/launch.py): no autograd graph is built for the
     # calibration forward, which on a 35B is the difference between fitting and not.
@@ -158,7 +166,7 @@ def _rank_main(rank: int, args, result_q) -> None:
             if not getattr(pool, "_calibrating", False):
                 print(
                     "FAIL: KV pool is not accumulating — MINISGL_KV_FP8_CALIBRATE did not take "
-                    "(is this an MHA pool? MLA has no head axis and cannot be per-head calibrated)",
+                    "(it is read at POOL CONSTRUCTION, so it must be set before minisgl is imported)",
                     file=sys.stderr,
                 )
                 result_q.put({"rank": rank, "error": "pool not accumulating"})
@@ -179,30 +187,46 @@ def _rank_main(rank: int, args, result_q) -> None:
         # rank-local reduction.
         for pool, layer_ids, name in pools:
             assert len(layer_ids) == pool.num_layers, (len(layer_ids), pool.num_layers)
+            # An MLA pool accumulates ONE amax per layer (the latent is a single stored tensor with
+            # no head axis) and is TP-REPLICATED, so its "global head count" is 1 and the gather
+            # reduces with MAX across ranks rather than concatenating shards.
+            heads = 1 if mc.is_mla else mc.num_kv_heads
             ka = _gather_global_amax(
-                pool._k_amax.float().cpu(), llm.tp_cpu_group, rank, tp, mc.num_kv_heads
+                pool._k_amax.float().cpu(), llm.tp_cpu_group, rank, tp, heads
             )
             va = _gather_global_amax(
-                pool._v_amax.float().cpu(), llm.tp_cpu_group, rank, tp, mc.num_kv_heads
+                pool._v_amax.float().cpu(), llm.tp_cpu_group, rank, tp, heads
             )
             if rank != 0:
                 continue
             kscale, vscale = kv_amax_to_descale(ka), kv_amax_to_descale(va)
             # Per-head spread (max head / min head, per layer) — the number that decides whether a
             # per-head sidecar is worth anything on this model at all (see the module docstring).
+            # Degenerates to 1.0 on MLA, where there is one column and the spread has no meaning;
+            # the interesting number there is the ACROSS-LAYER range of the amax itself.
             kspread = ka.amax(dim=1) / ka.amin(dim=1).clamp(min=1e-9)
             vspread = va.amax(dim=1) / va.amin(dim=1).clamp(min=1e-9)
-            print(
-                f"  pool {name}: {pool.num_layers}L x {mc.num_kv_heads}H (global) — "
-                f"K amax [{ka.min():.4g}, {ka.max():.4g}], V amax [{va.min():.4g}, {va.max():.4g}], "
-                f"per-head spread K median {kspread.median():.2f}x max {kspread.max():.2f}x, "
-                f"V median {vspread.median():.2f}x max {vspread.max():.2f}x"
-            )
+            if mc.is_mla:
+                print(
+                    f"  pool {name} (MLA latent, PER-LAYER scale): {pool.num_layers}L — "
+                    f"latent amax [{ka.min():.4g}, {ka.max():.4g}] "
+                    f"({float(ka.max() / ka.min().clamp(min=1e-9)):.2f}x across layers), "
+                    f"descale [{kscale.min():.4g}, {kscale.max():.4g}]"
+                )
+            else:
+                print(
+                    f"  pool {name}: {pool.num_layers}L x {mc.num_kv_heads}H (global) — "
+                    f"K amax [{ka.min():.4g}, {ka.max():.4g}], V amax [{va.min():.4g}, {va.max():.4g}], "
+                    f"per-head spread K median {kspread.median():.2f}x max {kspread.max():.2f}x, "
+                    f"V median {vspread.median():.2f}x max {vspread.max():.2f}x"
+                )
+            granularity = "per_layer_latent" if mc.is_mla else "per_head"
             report["pools"].append(
                 {
                     "pool": name,
+                    "granularity": granularity,
                     "layers": int(pool.num_layers),
-                    "global_kv_heads": int(mc.num_kv_heads),
+                    "global_kv_heads": 1 if mc.is_mla else int(mc.num_kv_heads),
                     "k_amax_min": float(ka.min()),
                     "k_amax_max": float(ka.max()),
                     "v_amax_min": float(va.min()),
@@ -233,7 +257,7 @@ def _rank_main(rank: int, args, result_q) -> None:
     meta = {
         "format": "minisgl-kv-fp8-e4m3",
         "convention": "k_scale is the DEQUANT factor: stored = k / k_scale (amax/448)",
-        "granularity": "per_head",
+        "granularity": granularity,
         "model": args.model,
         "calibration_tp": str(tp),
         "fixture": os.path.abspath(args.text),

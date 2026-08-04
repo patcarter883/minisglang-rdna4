@@ -31,6 +31,14 @@ serve-validated. §1–§3 are what is now known; §5 is what is left.
 3. **`tools/kv_scale_compare.py`** — numpy-only sidecar differ; the gate for any calibrator change.
 4. **`tools/kv_fp8_serve_ab.sh`** + **`tools/kv_ctx_capacity_probe.py`** — the RULE-4 serve
    validation and the equal-VRAM experiment §3 of the first pass asked for.
+5. **fp8 MLA is now calibrated too** — per LAYER, the only granularity a latent admits.
+   `MLAKVCache` gained an amax accumulator, a persistent per-layer descale/inv-scale table and a
+   scaled store; `attention/mla.py` passes a 1-element VIEW of that table to the fp8 decode/verify
+   ops instead of the old hard-coded `torch.ones(1)`; and the prefill MATERIALIZE path in
+   `glm4_moe_lite.py` multiplies the dequant by the same descale (a bare `.to(bf16)` there was the
+   third read site, the same shape of bug as the SWA ring gather on the MHA side).
+   `install_kv_fp8_scales` now drives MLA pools as well — they were excluded, which is how GLM ended
+   up serving an e4m3 latent cache with an implicit scale of 1.0 under the compose default.
 
 ## 1. The fixture (durable, recorded)
 
@@ -49,7 +57,7 @@ Sidecars + JSON reports in `/home/pat/fixtures/minisgl-kv-calib/sidecars/`.
 |---|---|---|---|---|
 | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | 10L × 2H | **1.09× / 1.28×** | 1.11× / 1.89× | 34s |
 | `poolside/Laguna-XS-2.1-NVFP4` | 10L × 8H main + 30L × 8H SWA ring | 1.42× / 1.79× (main), 1.28× / 1.73× (ring) | 1.50× / 2.16×, 1.45× / 2.53× | 50s |
-| `QuantTrio/GLM-4.7-Flash-AWQ` | — | **refused: MLA** (see §5.1) | — | — |
+| `QuantTrio/GLM-4.7-Flash-AWQ` (MLA) | 47L latent | n/a — **per-LAYER**: latent amax 4.06–11.75 (2.89× across layers), descale 0.00907–0.02623 | same scalar | 42s |
 | `Qwen/Qwen3-0.6B` (reference) | 28L × 8H | 1.84× / 4.61× | 1.95× / 6.28× | 1s |
 
 **Per-head is not the story on the production models.** The first pass predicted this and it held:
@@ -100,6 +108,12 @@ to the KV cache and are open serve bugs.
 At equal VRAM fp8-KV does not trade accuracy for context on this model — it *adds* context bf16
 cannot serve at all, and retrieves correctly inside it. Keep the default ON.
 
+**GLM-4.7-Flash (MLA), same three legs, TP=2 + graph capture:** KV pool **61,232 → 122,480
+tokens** (2× again), decode 56.6 (bf16) / 55.2 (fp8 uncal) / 55.2 (fp8 + per-layer sidecar) tok/s,
+acceptance 27/29 on every leg (2 reps each; the movers are the same leg-independent checks). The
+calibrated leg answering at all is the round-trip proof: the store now divides by 0.009–0.026, so a
+read that ignored the descale would be ~40–110× out and the suite would collapse, not score 27/29.
+
 **How to serve with a sidecar** — explicit path, deliberately NOT installed into the shared HF model
 dir (that would silently change every other agent's serve of the same checkpoint):
 
@@ -132,16 +146,16 @@ large recurrent state (Laguna) needs `--max-running-req 2`.
 
 ## 5. What is left, in order
 
-1. **fp8 MLA is uncalibrated BY CONSTRUCTION, and that is not benign.** With the compose default
-   `MINISGL_KV_FP8=1`, an MLA model (GLM-4.7-Flash) allocates its latent cache as `float8_e4m3fn`
-   (`engine.py:148` → `kvcache/__init__.py:39`), `MLAKVCache.store_kv` is a bare `.to(cache.dtype)`
-   (`mla_pool.py:55`), and `install_kv_fp8_scales` skips MLA pools deliberately — so
-   `attention/mla.py:72` hands the kernels a **hard-coded descale of 1.0**. The per-head argument
-   genuinely does not apply (one latent, no head axis), but a **per-layer scalar** does, and the
-   plumbing already exists: the canonical MLA fp8 ops take the descale as a device tensor. Work:
-   give `MLAKVCache` an amax accumulator + per-layer descale, teach the calibrator to emit a
-   per-tensor sidecar for MLA, point `mla.py` at it instead of `torch.ones(1)`. Gate with the GLM
-   coherence smoke.
+1. **MTP does not boot at the default memory ratio on the 35B — the recurrent-radix snapshot
+   store is why.** `MODEL=qwen35b-awq SPEC=mtp TP=2` at `MEM_RATIO=0.80` dies in
+   `_determine_num_pages` ("Not enough memory for KV cache after reserving recurrent state / draft
+   model / CUDA-graph buffers"). Measured cause, by elimination: the snapshot store reserves
+   **0.38 GiB** (cap=23 × 16.4 MiB, sized by ladder depth × max_running) against a post-weights
+   budget of ~1 GiB, and `--no-gdn-radix` at the SAME 0.80 boots fine (74,272-token pool). At
+   `MEM_RATIO=0.86` MTP boots with the store and runs **102.3 tok/s vs 90.4 no-spec at M=1**
+   (+13%, accept 2.78 of 5). `serve.sh` already special-cases the memory ratio for `dflash` and
+   explicitly says "MTP needs none of this" — that is now false. Fix: extend the case to `mtp`, or
+   size the snapshot store out of what is actually left.
 2. **Decide the headroom policy with a measurement.** Every scale here is a pure max (`amax/448`),
    so traffic wider than the fixture clips — gracefully (the kernel saturates; it does not NaN), but
    it clips. The Laguna cross-check shows two honest calibrations of the same model disagreeing by
@@ -159,6 +173,31 @@ large recurrent state (Laguna) needs `--max-running-req 2`.
 5. **`docker-compose.yml` still defaults to `minisgl-rdna4:lean`**, which predates the fp8 work.
    `minisgl-rdna4:comb` is the validated image; nothing is served from the merged code until `lean`
    is repointed or `MINISGL_IMAGE` is set (every command here sets it).
+
+## 5b. ReplaySSM under speculative decode — what is and is not known
+
+Asked and answered while chasing the MTP boot failure above, because both features spend the same
+budget:
+
+* **It was never A/B'd under spec.** `tools/replay_serve_ab.sh` — the driver that produced the
+  "+2.1% at M=4, wash at M=1–2" result — boots both legs with `SPEC=none` (line 52). Re-running it
+  under spec needs a kernel package built WITHOUT `gdn_decode_conv_gated_replay`, and the two images
+  it used (`minisgl-rdna4:replayssm` / `:replayctl`) no longer exist on this box.
+* **By construction it cannot help a spec step.** The replay rung lives only in
+  `GDNLayer.forward_decode`. A spec step runs `forward_verify`, which FLUSHES the ring before its
+  varlen kernels and INVALIDATES it after (`gdn/layer.py:504,529`) — the ring's whole benefit is
+  deferring the `ssm_state` read-modify-write across consecutive decode steps, and a verify ends
+  that window every time. Confirmed engaged-at-capture only: under `SPEC=mtp` the boot log shows
+  `gdn_decode_conv_gated_replay` at plain-decode graph capture (01:39:14) and
+  `causal_conv1d_fwd_verify`/`gdn_prefill_verify` at spec-verify capture (01:39:25), and
+  `[hip-engage]` fires once per op, so it cannot distinguish per-step use afterwards.
+* **Its VRAM cost is NOT what breaks spec.** The ring is `L*(K+V)/(V*K)` of `ssm_state` — ~12.5% at
+  L=8, i.e. ~0.014 GiB of the 0.11 GiB "GDN/CCA recurrent state" reservation. The 0.38 GiB
+  recurrent-radix snapshot store is 27× bigger and is the thing that tips MTP over (§5.1).
+
+So: no measured effect, a mechanism that says "inert on spec steps", and a cost too small to be the
+spec blocker. If it matters enough to settle, the honest experiment is a control kernel package
+without the replay op, driven at `SPEC=mtp MEM_RATIO=0.86`.
 
 ## 6. Rules that bind this work (unchanged, still true)
 

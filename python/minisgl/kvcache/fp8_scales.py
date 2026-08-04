@@ -18,7 +18,9 @@ RESOLUTION ORDER (first hit wins):
 
   a. `MINISGL_KV_FP8_SCALES=<file|dir>` — an explicit sidecar produced by `tools/kv_fp8_calibrate.py`
      from representative text. This is the only source that yields genuine PER-HEAD scales, because
-     per-head amax is a property of the ACTIVATIONS, not of the checkpoint.
+     per-head amax is a property of the ACTIVATIONS, not of the checkpoint. It is also the ONLY
+     source of any scale at all for an MLA (latent) cache, which is installed per LAYER — no
+     checkpoint ships a latent-cache scale.
   b. `<model_dir>/kv_scales.safetensors` — the same sidecar, discovered next to the weights.
   c. The CHECKPOINT'S OWN per-tensor scales: compressed-tensors ships `quantization_config.
      kv_cache_scheme` plus `model.layers.N.self_attn.{k,v}_scale`. Broadcast to every head. This is
@@ -204,9 +206,11 @@ def install_kv_fp8_scales(
     pools = [
         (p, tag)
         for p, tag in pools
-        # MLA pools are excluded by construction, not by omission: an MLA cache is ONE latent vector
-        # per token with no head axis at all, so a per-head (or even a per-query-head) descale has
-        # nothing to index — see the note in the mla_attend kernel.
+        # MLA pools are INCLUDED, at the only granularity they admit: an MLA cache is ONE latent
+        # vector per token with no head axis, so a per-head descale has nothing to index — but a
+        # PER-LAYER scalar does, and the mla_hip fp8 kernels take exactly that (k_descale ==
+        # v_descale == cache_descale). Excluding them, as this used to, left GLM serving an e4m3
+        # latent cache with an implicit scale of 1.0 under the compose default.
         if p is not None and getattr(p, "kv_is_fp8", False) and hasattr(p, "set_fp8_kv_scales")
     ]
     if not pools:
@@ -241,23 +245,39 @@ def install_kv_fp8_scales(
             f"fp8-KV scale install: pool has {pool.num_layers} layers but the config maps "
             f"{len(ids)} global layers onto it"
         )
+        # An MLA pool has no head axis and is TP-REPLICATED (the latent is shared across heads and
+        # not split across ranks), so there is nothing to shard: the row goes in whole and the pool
+        # reduces it to its single per-layer scalar itself.
+        is_mla = hasattr(pool, "latent_descale")
         missing = [gl for gl in ids if gl not in scaleset.scales]
         for compact, gl in enumerate(ids):
             got = scaleset.scales.get(gl)
             if got is None:
                 continue
             k, v = got
-            pool.set_fp8_kv_scales(
-                compact,
-                _shard_row(k, pool.num_kv_heads, global_heads),
-                _shard_row(v, pool.num_kv_heads, global_heads),
-            )
-        name = "SWA ring" if tag == "swa" else "main"
+            if is_mla:
+                pool.set_fp8_kv_scales(compact, k, v)
+            else:
+                pool.set_fp8_kv_scales(
+                    compact,
+                    _shard_row(k, pool.num_kv_heads, global_heads),
+                    _shard_row(v, pool.num_kv_heads, global_heads),
+                )
+        name = "MLA latent" if is_mla else ("SWA ring" if tag == "swa" else "main")
         if missing:
             logger.warning_rank0(
                 f"fp8-KV {name} pool: no scale for global layers {missing} — those layers keep "
                 f"the identity scale 1.0 (uncalibrated)."
             )
+        if is_mla:
+            kd = pool.latent_descale
+            logger.info_rank0(
+                f"fp8-KV {name} pool: installed PER-LAYER latent scales from {scaleset.source} — "
+                f"{pool.num_layers} layers (one scalar each: the latent is a single stored tensor "
+                f"read in both the K and V roles), descale range "
+                f"[{kd.min().item():.4g}, {kd.max().item():.4g}]"
+            )
+            continue
         kd = pool.k_descale
         logger.info_rank0(
             f"fp8-KV {name} pool: installed "
