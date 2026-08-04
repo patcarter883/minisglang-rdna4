@@ -2,8 +2,8 @@
 (``torch.ops.attn_hip.flash_prefill``) + native HIP paged flash-DECODE
 (``torch.ops.attn_decode.flash_decode_paged``). No Triton kernel is invoked on either path.
 
-Subclasses ``RDNA4Backend`` ONLY to reuse its ``__init__`` (kvcache / scale / page_size /
-fp8 detection) and ``prepare_metadata`` (which builds the ``RDNA4Metadata`` page-table +
+Subclasses ``RDNA4Backend`` ONLY to reuse its ``__init__`` (kvcache / softmax-scale policy /
+page_size / fp8 detection) and ``prepare_metadata`` (which builds the ``RDNA4Metadata`` page-table +
 cu_seqlens_q + cache_seqlens that both kernels consume). ``forward`` is fully overridden.
 
 The two kernel packages are framework-agnostic ``torch.ops`` extensions shared with vllm-gfx1201
@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, List
 import torch
 from minisgl.core import get_global_ctx
 
-from .rdna4 import RDNA4Backend, RDNA4Metadata
+from .rdna4 import _HIP_HEAD_DIMS, RDNA4Backend, RDNA4Metadata
 
 if TYPE_CHECKING:
     from minisgl.core import Batch
@@ -58,6 +58,12 @@ class HIPAttnBackend(RDNA4Backend):
         # a windowed mask, instead of the full-context main pool. layer_id is the compact swa id.
         if sliding_window > 0 and self.swa_kv is not None:
             return self._swa_forward(q, k, v, layer_id, metadata, sliding_window)
+        # Kernel-coverage gate on THIS query's head_dim (see RDNA4Backend.forward). This backend is
+        # Triton-free, so there is nothing to fall back to — but the kernels' own TORCH_CHECK fires
+        # three layers down and names neither the layer type nor the fact that a split-head_dim
+        # model's OTHER geometry is fine. Raise here, where that can be said.
+        if q.shape[-1] not in _HIP_HEAD_DIMS:
+            self._no_hip_kernel(q.shape[-1])
         # Persist the current tokens' K/V into the paged cache (decode + extend prefill read it back).
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if batch.is_prefill:
@@ -92,8 +98,9 @@ class HIPAttnBackend(RDNA4Backend):
     ) -> torch.Tensor:
         # At the backend boundary q is [tokens, Hq, D] (the attention layer view's it) but k/v are
         # still flat [tokens, Hk*D] -> reshape to [tokens, Hk, D] for the kernel. (store_kv above
-        # consumed the flat k/v, same as the Triton path.)
-        D = self.config.head_dim
+        # consumed the flat k/v, same as the Triton path.) D is THIS call's query width — GQA varies
+        # the head count, never the head width — because a split-head_dim model has no model-wide D.
+        D = q.shape[-1]
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         # flash_prefill is single-sequence; minisgl batches varlen sequences -> slice by
@@ -105,6 +112,7 @@ class HIPAttnBackend(RDNA4Backend):
         klen = metadata.cache_seqlens_list()  # memoized once per forward (was per-layer .tolist())
         from minisgl._hip_engage import engaged
         engaged("attn_hip.flash_prefill")
+        scale = self._softmax_scale(q)
         out = self._get_out_buf(q)  # persistent buffer (A2, inherited); eager prefill, never captured
 
         for i in range(len(cu) - 1):
@@ -119,7 +127,7 @@ class HIPAttnBackend(RDNA4Backend):
             )
             out[s:e] = self._prefill(
                 q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
-                self.scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
+                scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
             )
         return out
 
@@ -130,6 +138,7 @@ class HIPAttnBackend(RDNA4Backend):
         v_cache = self.kvcache.v_cache(layer_id)
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        scale = self._softmax_scale(q)
         from minisgl._hip_engage import engaged
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
@@ -137,9 +146,9 @@ class HIPAttnBackend(RDNA4Backend):
             # (0-dim views) the canonical op now requires — stable address, graph-safe.
             ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]
             engaged("attn_decode.flash_decode_paged_fp8")
-            return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0)
+            return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, scale, ks, vs, 0)
         engaged("attn_decode.flash_decode_paged")
-        return self._decode(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+        return self._decode(q, k_cache, v_cache, block_table, ctx_lens, scale, 0)
 
     # ---- cudagraph capture (DECODE only) -----------------------------------------------------
     # Decode is one token/seq, so the only per-step varying metadata the kernel reads is
