@@ -4079,6 +4079,7 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # state AFTER the last committed token). A finished seq frees its slot, so its state is moot.
         gdn_install_batch_idx: List[int] = []
         gdn_install_t_index: List[int] = []
+        gdn_finish_batch_idx, gdn_finish_t_index = [], []
         # Fresh per-uid target hidden seeds for the NEXT step's propose (draft-head proposers only).
         new_last_hidden: dict[int, torch.Tensor] = {}
         new_aux_hidden: dict[int, torch.Tensor] = {}
@@ -4271,6 +4272,14 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             if (gdn_state_indices is not None or cca_state_indices is not None) and not finished:
                 gdn_install_batch_idx.append(i)
                 gdn_install_t_index.append(len(keep) - 1)
+            elif gdn_state_indices is not None and finished:
+                # A FINISHED req's slot is freed — but not before _free_req_resources clones it into
+                # the recurrent radix cache, so its state is NOT moot: a later request that hits this
+                # prefix restores it. Under the ReplaySSM verify the committed state is one cursor
+                # decrement away, so rewind the rejected drafts here too and the cached state is the
+                # accepted prefix instead of "after every draft, accepted or not".
+                gdn_finish_batch_idx.append(i)
+                gdn_finish_t_index.append(len(keep) - 1)
 
             # Draft-head seed: the target hidden at the row that PRODUCED the last committed token
             # (block_start + len(keep)-1 — same index the GDN install uses). The draft for the next
@@ -4358,9 +4367,31 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             sel = torch.tensor(gdn_install_batch_idx, dtype=torch.long, device=device)
             slots = gdn_state_indices.to(torch.long)[sel]
             t_index = torch.tensor(gdn_install_t_index, dtype=torch.long, device=device)
+            # `sel` is BOTH the slot selector and the scratch COLUMN: the scratch is [Q, N] in full
+            # forward-batch order while this install list holds only the still-running sequences, so
+            # passing arange(len(slots)) (as this did) hands every survivor another sequence's state
+            # the moment any request in the batch finishes.
+            # ReplaySSM: when the verify appended its window to the ring there is no ssm scratch, and
+            # the commit is a cursor rewind of the rejected drafts (t_index is the LAST KEPT index,
+            # so rejected = qlen - (t_index+1)).
+            qlen = int(getattr(md, "verify_max_qlen", 0) or 0)
+            reject = None
+            if qlen and not md.ssm_scratch:
+                reject = (qlen - 1 - t_index).to(torch.int32)
             self.engine.gdn_state.install_verify_state(
-                md.conv_scratch, md.ssm_scratch, slots, t_index
+                md.conv_scratch, md.ssm_scratch, slots, t_index, cols=sel, reject=reject
             )
+        # Finished reqs (ReplaySSM only): rewind their rejected drafts so the radix clone taken in
+        # _free_req_resources caches the ACCEPTED-prefix state. Disjoint from the install list above,
+        # so no slot is rolled back twice.
+        if gdn_state_indices is not None and gdn_finish_batch_idx:
+            md = batch.gdn_metadata
+            qlen_f = int(getattr(md, "verify_max_qlen", 0) or 0)
+            if qlen_f and not md.ssm_scratch:
+                fsel = torch.tensor(gdn_finish_batch_idx, dtype=torch.long, device=device)
+                fslots = gdn_state_indices.to(torch.long)[fsel]
+                ft = torch.tensor(gdn_finish_t_index, dtype=torch.long, device=device)
+                self.engine.gdn_state.rollback_ring(fslots, (qlen_f - 1 - ft).to(torch.int32))
 
         # CCA: install the captured accepted-prefix conv window + prev_hs into each still-running seq's
         # slot (same install_batch_idx/t_index bookkeeping — a model is GDN XOR CCA, never both).

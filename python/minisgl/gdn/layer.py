@@ -501,7 +501,22 @@ class QwenGatedDeltaNet(nn.Module):
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
         state_idx = state_indices.long()
         has_init = has_initial_state.to(torch.uint8)
-        self._replay_flush(gdn, ring, ssm_state, state_idx)  # READ of ssm_state -> materialise first
+        # REPLAY VERIFY (the ring path). The draft window is APPENDED to the ring instead of
+        # materialised into ssm_state, so there is no flush before (the checkpoint + ring already ARE
+        # the state) and no invalidate after (the ring is not stale — it now holds this window). The
+        # accept step rewinds rejected drafts with a cursor decrement (GDNStateCache.rollback_ring)
+        # instead of scattering a per-token state snapshot back into the slot, so this path also
+        # returns ssm_scratch=None and never allocates it.
+        # Gated on the window fitting the ring: a mid-window flush would destroy the checkpoint the
+        # rollback rewinds to, so the kernel refuses q_len > L and we fall back to the materialising
+        # verify below.
+        use_replay = (
+            ring is not None
+            and hasattr(gdn, "gdn_verify_replay")
+            and int(max_qlen) <= int(ring["k"].shape[2])
+        )
+        if not use_replay:
+            self._replay_flush(gdn, ring, ssm_state, state_idx)  # READ of ssm_state -> materialise
 
         # Conv: bit-identical to forward_prefill's causal_conv1d_fwd, plus per-token window capture.
         engaged("gdn_hip.causal_conv1d_fwd_verify")
@@ -520,6 +535,18 @@ class QwenGatedDeltaNet(nn.Module):
         # verify. Captures the ssm state after each token. (No WMMA path: the chunk-size dependence is
         # exactly the non-bit-exactness this kernel removes.)
         q, k, v = self._split_conv_qkv(conv_out, n)
+        if use_replay:
+            engaged("gdn_hip.gdn_verify_replay")
+            core = gdn.gdn_verify_replay(
+                q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
+                query_start_loc, state_idx, has_init, ssm_state, *ring.args(),
+                self.head_k_dim ** -0.5, 1, int(max_qlen),
+            )
+            # ssm_scratch is None BY CONTRACT here: the per-token states the materialising path hands
+            # back exist only so the caller can pick the accepted one, and the ring makes that a
+            # cursor rewind. Verified bit-exact against the served decode trajectory
+            # (rdna4-hip-kernels tests/test_verify_replay.py).
+            return self._output_projection(core, z, n), conv_scratch, None
         engaged("gdn_hip.gdn_prefill_verify")
         core, ssm_scratch = gdn.gdn_prefill_verify(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,

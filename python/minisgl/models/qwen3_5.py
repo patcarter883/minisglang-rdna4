@@ -225,10 +225,15 @@ class GDNLinearAttn(BaseOP):
             pre_conv = md.conv_scratch.get(self._gdn_layer_id)
             if pre_conv is not None:
                 pre_conv.copy_(conv_scr)
-                md.ssm_scratch[self._gdn_layer_id].copy_(ssm_scr)
+                # ssm_scr is None on the ReplaySSM verify path (the window lives in the ring, so
+                # there is no per-token state to stage). Nothing to copy, and the capturer allocates
+                # no static ssm buffer for it either.
+                if ssm_scr is not None:
+                    md.ssm_scratch[self._gdn_layer_id].copy_(ssm_scr)
             else:
                 md.conv_scratch[self._gdn_layer_id] = conv_scr
-                md.ssm_scratch[self._gdn_layer_id] = ssm_scr
+                if ssm_scr is not None:
+                    md.ssm_scratch[self._gdn_layer_id] = ssm_scr
         elif ctx.batch.is_prefill or ctx.batch.spec_verify:
             out = self._gdn.forward_prefill(
                 x, conv, ssm, md.query_start_loc, md.state_indices, md.has_initial_state, ring=ring
