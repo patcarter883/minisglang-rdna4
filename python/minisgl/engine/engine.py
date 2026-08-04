@@ -21,7 +21,7 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_weight
+from minisgl.models import ModelConfig, create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import (
     div_even,
@@ -32,7 +32,7 @@ from minisgl.utils import (
     torch_dtype,
 )
 
-from .config import EngineConfig
+from .config import EngineConfig, resolve_prefix_cache, snapshot_ladder_depth
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
 
@@ -50,6 +50,23 @@ _GRAPH_ACT_MULT = 8
 _GRAPH_ASSUMED_AUX = 8
 # Slight round-up so the estimate errs toward preventing OOM rather than over-starving KV.
 _GRAPH_ROUNDUP = 1.1
+
+
+def _swa_kv_geometry(mc: ModelConfig) -> Tuple[int, int]:
+    """(head_dim, num_kv_heads) of the SLIDING layers' ring KV pool.
+
+    Gemma4's two layer types do not share a KV geometry: `head_dim`/`num_kv_heads` carry the
+    FULL-attention one (512 / 2) because they size the MAIN paged pool, and the sliding layers keep
+    their own (256 / 8). Every other SWA model (Laguna) leaves `swa_head_dim`/`swa_num_kv_heads`
+    None and gets back exactly the values it always used, so its sizing is unchanged.
+
+    Both the ring-pool ALLOCATION and its byte RESERVATION in _determine_num_pages go through this
+    one function on purpose: if they ever disagreed the engine would reserve one pool's bytes and
+    allocate another's — an OOM at boot or a silently under-allocated KV pool, neither of which
+    names the mismatch."""
+    head_dim = mc.swa_head_dim if mc.swa_head_dim is not None else mc.head_dim
+    num_kv_heads = mc.swa_num_kv_heads if mc.swa_num_kv_heads is not None else mc.num_kv_heads
+    return head_dim, num_kv_heads
 
 
 # --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
@@ -197,10 +214,15 @@ class Engine:
             swa_stride = mc0.sliding_window + spec_block
             self.ctx.swa_ring_stride = swa_stride
             swa_slots = (config.max_running_req + 2) * swa_stride  # +1 NULL, +1 dummy
+            # The ring holds the SLIDING layers, so it takes the SLIDING geometry — which for Gemma4
+            # is not the model-wide one (256/8 here vs the 512/2 that sizes the main pool). Sizing it
+            # off mc0.head_dim/num_kv_heads would hand store_kv a mis-shaped buffer view: wrong bytes
+            # per slot and a silently corrupt cache, not a crash. Same values as before for Laguna.
+            swa_head_dim, swa_num_kv_heads = _swa_kv_geometry(mc0)
             self.ctx.swa_kv_cache = self.swa_kv_cache = MHAKVCache(
-                num_kv_heads=mc0.num_kv_heads,
+                num_kv_heads=swa_num_kv_heads,
                 num_layers=mc0.num_swa_layers,
-                head_dim=mc0.head_dim,
+                head_dim=swa_head_dim,
                 num_pages=swa_slots,
                 page_size=1,  # ring is addressed by absolute slot; no page grouping
                 device=self.device,
@@ -208,7 +230,8 @@ class Engine:
             )
             logger.info_rank0(
                 f"SWA ring KV: {mc0.num_swa_layers} layers x {swa_slots} slots "
-                f"(window={mc0.sliding_window}, stride={swa_stride}, {config.max_running_req} seqs)"
+                f"(window={mc0.sliding_window}, stride={swa_stride}, {config.max_running_req} seqs, "
+                f"{swa_num_kv_heads} kv heads x {swa_head_dim})"
             )
         else:
             self.swa_kv_cache = None  # type: ignore[assignment]
@@ -651,13 +674,27 @@ class Engine:
         One snapshot is one slot's worth of recurrent state, and the cap is a VRAM budget shared with
         the scheduler (MINISGL_GDN_RADIX_SNAP_BUDGET_GIB), so both agree on the number. 0 when the
         model has no recurrent state or the recurrent radix is off."""
-        # gdn_radix is declared on SchedulerConfig, not EngineConfig — the object reaching the engine
-        # may be either, so read it defensively rather than assume the subclass.
-        if not getattr(config, "gdn_radix", True):
+        # THE gate: ask the shared resolver whether a snapshot store will exist at all, instead of
+        # re-deriving it here from gdn_radix + "per-slot bytes > 0". That local guess was WRONG for a
+        # SWA hybrid — per_slot counts the SWA ring, so it is > 0 with zero recurrent state, while
+        # gdn_radix (a GDN flag) says nothing about the SWA path, which the scheduler gates on
+        # MINISGL_SWA_RADIX. Result on gemma-4-26B-A4B TP=2: 0.98 GiB reserved on a 16 GB card for a
+        # store the scheduler had already decided not to build — ~100k KV tokens bought and thrown
+        # away. It also could not see `--cache-type naive`, which forces the same outcome.
+        # resolve_prefix_cache() is the single source of truth for both sides now (engine/config.py):
+        # same answer as before for GDN/CCA, zero for dense/MHA/MLA and for any hybrid whose snapshot
+        # path is switched off, and — with SWA-radix now default ON — a reservation for SWA hybrids
+        # that is matched by a store the scheduler really does build and fill.
+        if not resolve_prefix_cache(config).snapshot_kind:
             return 0
         # WITHOUT the ReplaySSM ring: a snapshot is what clone_slot() copies, which is conv+ssm only.
         # The ring is per LIVE slot, never cloned onto a radix node, so folding it into per_slot would
         # inflate this reservation by the ring's whole 25% for state that is never stored here.
+        # For snapshot_kind == "swa" this same expression yields the SWA ring's per-sequence bytes,
+        # which is what SWAWindowSnapshotter.clone() copies (all sliding layers x min(boundary, W)
+        # positions of K+V). Under spec the ring stride is window + num_draft + 1 while a snapshot is
+        # only `window` wide, so this over-reserves by the spec block — deliberately, on the side that
+        # cannot OOM. A model is GDN xor CCA xor SWA, so exactly one family contributes here.
         per_slot = (self._recurrent_state_bytes(config, replay_ring=False)
                     // max(1, config.max_running_req + 2))
         if per_slot <= 0:
@@ -678,9 +715,25 @@ class Engine:
     def _rec_snap_live_snapshots(config) -> int:
         """Snapshots the LIVE working set needs: each concurrent sequence's ladder plus its end
         boundary. The one number both the engine's reservation and the scheduler's LRU cap derive
-        from, so they cannot disagree about how much VRAM this store is allowed."""
-        ladder = max(0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4))
-        return (ladder + 1) * max(1, config.max_running_req)
+        from, so they cannot disagree about how much VRAM this store is allowed.
+
+        The ladder term means different things to the two snapshot kinds, and defaults accordingly:
+
+        * RECURRENT (GDN/CCA): interior resume points. A sequence really does hold `ladder` of them
+          plus its end boundary, so the default 4 is the working set and dropping it makes the ladder
+          thrash against itself.
+        * SWA: there IS no interior ladder — a window snapshot is taken at the page-aligned prefix
+          boundary and nowhere else, so the live set is one per concurrent sequence and the default
+          is 0. Anything above that buys purely CROSS-REQUEST reuse depth, which is expensive here in
+          a way it is not for GDN: a Gemma4 window snapshot is 100 MiB (W=1024 x 25 sliding layers x
+          4 local kv heads x 256 head_dim x K+V x 2 B) against 16.4 MiB for the 35B's recurrent
+          state, so inheriting GDN's ladder of 4 cost 1.95 GiB — 204,800 KV-pool tokens, 59% of
+          Gemma4's whole pool — to buy reuse depth the GDN A/B measured as worth nothing on this box
+          (cap 12 and cap 23 produced the same hits and the same TTFT).
+
+        MINISGL_GDN_RADIX_SNAP_LADDER overrides either, so a prefix-sharing-heavy deployment can buy
+        the depth back explicitly and pay the KV tokens knowingly."""
+        return (snapshot_ladder_depth(config) + 1) * max(1, config.max_running_req)
 
     @staticmethod
     def _replay_ring_bytes(mc, num_slots: int, num_v_heads: int, ssm_itemsize: int) -> int:
@@ -733,12 +786,16 @@ class Engine:
             # SWA ring KV pool (allocated AFTER the main pool): 2 (K+V) * num_swa_layers * num_slots *
             # STRIDE * local_kv_heads * head_dim * kv_dtype.itemsize. num_slots as above. Stride is the
             # per-seq ring stride = window + spec block (must match the pool sizing above); no spec => W.
-            local_kv = div_even(mc.num_kv_heads, tp, allow_replicate=True)
+            # The ring's geometry is the SLIDING one, which need not be the model-wide head_dim /
+            # num_kv_heads (Gemma4: 256/8 ring vs 512/2 main pool) — the same _swa_kv_geometry the
+            # allocation uses, so the reserve can never describe a different pool than the one built.
+            swa_head_dim, swa_num_kv_heads = _swa_kv_geometry(mc)
+            local_kv = div_even(swa_num_kv_heads, tp, allow_replicate=True)
             spec_block = (config.spec_config.num_draft + 1) if config.spec_config is not None else 0
             swa_stride = mc.sliding_window + spec_block
             total += (
                 2 * mc.num_swa_layers * num_slots * swa_stride
-                * local_kv * mc.head_dim * self.kv_dtype.itemsize
+                * local_kv * swa_head_dim * self.kv_dtype.itemsize
             )
         return total
 
@@ -858,6 +915,11 @@ class Engine:
                 * mc.num_kv_layers  # == num_layers for MLA (all-attention); matches pool alloc
             )
         else:
+            # head_dim / num_kv_heads are the MAIN pool's geometry, which for a SWA hybrid is the
+            # FULL-attention layers' (num_kv_layers counts exactly those). A split-head_dim model
+            # (Gemma4) keeps its sliding geometry in swa_head_dim/swa_num_kv_heads, charged to the
+            # ring pool by _recurrent_state_bytes — the two pools have different per-token costs and
+            # are billed separately.
             cache_per_page = (
                 2  # key + value
                 * mc.head_dim
@@ -892,13 +954,29 @@ class Engine:
             )
             num_pages = available_memory // cache_per_page
             if snap_memory:
+                # Name the snapshot KIND. "recurrent" is conv+ssm / conv+prev_hs clones; "swa" is
+                # sliding-window K/V clones — the same store, but a reader who sees "recurrent" on a
+                # model with no recurrent state (the old wording) reasonably concludes the accounting
+                # is broken. It was.
                 logger.info(
-                    f"Reserved {mem_GB(snap_memory)} for the recurrent-radix snapshot store "
+                    f"Reserved {mem_GB(snap_memory)} for the "
+                    f"{resolve_prefix_cache(config).snapshot_kind}-radix snapshot store "
                     f"(filled during serving); KV pool gets the remainder"
                 )
             if state_memory:
+                # This line covers THREE disjoint pools and used to name only two of them, so on a SWA
+                # model (Gemma4: 25 sliding layers x a 1024-token window) it reported a "GDN/CCA
+                # recurrent state" reservation for a model that has neither — legitimate memory,
+                # unrecognisable label. Name whichever one this model actually pays for.
+                _kinds = [
+                    n for n, on in (
+                        ("GDN", mc.is_gdn_hybrid),
+                        ("CCA", mc.is_cca_hybrid),
+                        ("SWA ring KV", getattr(mc, "is_swa_hybrid", False)),
+                    ) if on
+                ]
                 logger.info(
-                    f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
+                    f"Reserved {mem_GB(state_memory)} for {' + '.join(_kinds) or 'recurrent'} state "
                     f"({config.max_running_req} slots); KV pool gets the remainder"
                 )
             if draft_memory:

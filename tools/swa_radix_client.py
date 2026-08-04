@@ -21,9 +21,16 @@ URL = "http://localhost:1919/generate"
 
 
 def build_prompts(case: str):
-    if case == "long":                     # prefix > window (W=512 tokens)
-        unit = "The quantum harmonic oscillator exhibits discrete energy levels spaced evenly apart. "
+    unit = "The quantum harmonic oscillator exhibits discrete energy levels spaced evenly apart. "
+    if case == "long":                     # prefix > window on a W=512 model (Laguna): ~780 tokens
         P = "A rigorous study of physics. " + unit * 60
+    elif case == "xlong":
+        # Gemma4's window is 1024, so the 'long' case above sits BELOW it and exercises only the
+        # Wp == boundary path — the same path 'short' takes. The wraparound case (boundary > W, so the
+        # ring has overwritten positions the snapshot must still reconstruct in ascending order) is the
+        # one that can actually go wrong, and it is window-size-dependent, not model-name-dependent.
+        # ~2600 tokens covers W=1024 with room to spare and still covers W=512.
+        P = "A rigorous study of physics. " + unit * 200
     else:                                  # prefix < window
         P = "A rigorous study of physics. The quantum harmonic oscillator has discrete energy levels."
     suffix = " In summary, the single most important practical consequence for working engineers is that"
@@ -55,7 +62,7 @@ def gen(prompt: str, max_tokens: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["reuse", "cold"], required=True)
-    ap.add_argument("--case", choices=["long", "short"], required=True)
+    ap.add_argument("--case", choices=["long", "short", "xlong"], required=True)
     ap.add_argument("--max-tokens", type=int, default=48)
     a = ap.parse_args()
     P, B = build_prompts(a.case)

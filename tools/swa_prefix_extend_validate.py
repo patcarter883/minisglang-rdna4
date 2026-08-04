@@ -42,8 +42,17 @@ DEV = "cuda"
 torch.manual_seed(0)
 FAILS = []
 
-# Laguna sliding-layer shape (TP=1): 64 QO heads, 8 KV heads, head_dim 128, window 512.
-HQ, HK, D, W = 64, 8, 128, 512
+# GEOMETRY IS A PARAMETER, not a constant. The defaults below are Laguna's sliding layer (TP=1) —
+# the shape this gate was originally written against, so an unparameterised run is unchanged. But the
+# whole point of the gate is the flash BLOCK GROUPING, which depends on head_dim and window, and
+# Gemma4's sliding layers are NOT Laguna's: 256/8 at W=1024 (per rank at TP=2: 8 QO, 4 KV), against
+# a 512/2 main pool. Hardcoding one model's numbers would have "proved" losslessness for a shape the
+# serve never runs. Override with SWA_HQ / SWA_HK / SWA_D / SWA_W.
+import os as _os
+HQ = int(_os.environ.get("SWA_HQ", 64))
+HK = int(_os.environ.get("SWA_HK", 8))
+D = int(_os.environ.get("SWA_D", 128))
+W = int(_os.environ.get("SWA_W", 512))
 SCALE = D ** -0.5
 
 
@@ -148,23 +157,25 @@ def main():
     print("== SWA prefix-extend vs cold prefill (feasibility gate) ==")
     print(f"   shape HQ={HQ} HK={HK} D={D} W={W}\n")
     results = []
-    # Boundary cases the 'unsound' claim is about: prefix shorter/equal/longer than the window,
-    # single-token and multi-token extends, chunks that span the window boundary.
-    results.append(case("prefix longer than window, small extend", 1000, 64))
-    results.append(case("prefix longer than window, 1-token extend", 1000, 1))
-    results.append(case("prefix longer than window, big extend", 1000, 300))
-    results.append(case("prefix == window", 512, 64))
-    results.append(case("prefix shorter than window", 200, 64))
-    results.append(case("prefix shorter, extend crosses W", 400, 200))
+    # The cases are stated RELATIVE TO THE WINDOW, not in absolute tokens: "prefix longer than the
+    # window" is the thing under test, and at Laguna's W=512 a fixed 1000 means that while at Gemma4's
+    # W=1024 it would silently mean the opposite. S keeps the W=512 numbers bit-for-bit what they were.
+    S = max(1, W // 512)
+    results.append(case("prefix longer than window, small extend", 1000 * S, 64))
+    results.append(case("prefix longer than window, 1-token extend", 1000 * S, 1))
+    results.append(case("prefix longer than window, big extend", 1000 * S, 300))
+    results.append(case("prefix == window", W, 64))
+    results.append(case("prefix shorter than window", 200 * S, 64))
+    results.append(case("prefix shorter, extend crosses W", 400 * S, 200 * S))
     results.append(case("tiny prefix", 40, 24))
-    results.append(case("page-aligned prefix (256)", 768, 128))
+    results.append(case("page-aligned prefix", 768 * S, 128))
     print("\n== BC-aligned extend (front-pad to (L-W)%BC) => bit-identical for ANY boundary ==")
     ar = []
-    ar.append(case_bc_aligned("prefix longer than window, small extend", 1000, 64))
-    ar.append(case_bc_aligned("prefix longer than window, 1-token extend", 1000, 1))
-    ar.append(case_bc_aligned("prefix longer than window, big extend", 1000, 300))
-    ar.append(case_bc_aligned("non-aligned prefix", 993, 57))
-    ar.append(case_bc_aligned("non-aligned prefix", 777, 129))
+    ar.append(case_bc_aligned("prefix longer than window, small extend", 1000 * S, 64))
+    ar.append(case_bc_aligned("prefix longer than window, 1-token extend", 1000 * S, 1))
+    ar.append(case_bc_aligned("prefix longer than window, big extend", 1000 * S, 300))
+    ar.append(case_bc_aligned("non-aligned prefix", 993 * S, 57))
+    ar.append(case_bc_aligned("non-aligned prefix", 777 * S, 129))
     print(f"\nBC-aligned bit-identical: {sum(1 for b,_ in ar if b)}/{len(ar)}")
     print()
     n_bit = sum(1 for b, _ in results if b)

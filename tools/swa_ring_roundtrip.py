@@ -17,7 +17,17 @@ import attn_hip
 
 DEV = "cuda"
 torch.manual_seed(0)
-HQ, HK, D, W = 64, 8, 128, 512
+# GEOMETRY IS A PARAMETER, not a constant. The defaults below are Laguna's sliding layer (TP=1) —
+# the shape this gate was originally written against, so an unparameterised run is unchanged. But the
+# whole point of the gate is the flash BLOCK GROUPING, which depends on head_dim and window, and
+# Gemma4's sliding layers are NOT Laguna's: 256/8 at W=1024 (per rank at TP=2: 8 QO, 4 KV), against
+# a 512/2 main pool. Hardcoding one model's numbers would have "proved" losslessness for a shape the
+# serve never runs. Override with SWA_HQ / SWA_HK / SWA_D / SWA_W.
+import os as _os
+HQ = int(_os.environ.get("SWA_HQ", 64))
+HK = int(_os.environ.get("SWA_HK", 8))
+D = int(_os.environ.get("SWA_D", 128))
+W = int(_os.environ.get("SWA_W", 512))
 SCALE = D ** -0.5
 BC = 32
 
