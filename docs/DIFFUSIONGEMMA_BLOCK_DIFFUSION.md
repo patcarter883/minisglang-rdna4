@@ -1091,8 +1091,10 @@ emits all its tokens at once and tok/s therefore cannot show k at all.
 * ~~**cudagraph capture (§B7.7).** Eager only.~~ **DONE, and it buys nothing — see §D6.**
 * ~~**Concurrency (§R6).** Measured at bs=1 only.~~ **Measured 1/2/4; it saturates — see §D7.**
 * **SWA-radix.** ~~Turned OFF for the canvas phase.~~ **Now ON, the stated reason was wrong, and FULL
-  prefix reuse is proven lossless (§D5). PARTIAL prefix reuse is a KNOWN DEFECT, located to the
-  sliding-layer extend over a restored window in a page-split prefill (§D5.1) — not fixed.**
+  prefix reuse is proven lossless (§D5). PARTIAL prefix reuse is a KNOWN DEFECT: narrowed to the 23
+  tokens computed after a restore, with the snapshot, the reused pages and the extend kernel each
+  EXCLUDED by measurement (§D5.1). Mechanism not yet established; not fixed;
+  `MINISGL_SWA_RADIX=0` is the workaround.**
 * **Chunked prefill** ~~and~~ is now wired for the encoder pass (§D5), and it had to be: with the
   prefix cache on, 15 out of 16 prompts arrive chunked. **Structured output** is still REFUSED with a
   reason rather than silently ignored.
@@ -1238,7 +1240,7 @@ the §D1 baseline (44.1 / 44.2). The autoregressive sibling is unaffected. (The 
 completion reads `117 tokens in 5.67s = 20.6 tok/s`; that is the first request after boot and is not
 the guard — §D1's own 117-token figure, 30.4 tok/s, was also a warmed one.)
 
-### D5.1 The partial-hit divergence is a DEFECT, and it is located
+### D5.1 The partial-hit divergence is a DEFECT — located to the state, then MIS-located to the kernel
 
 §D5 offered two causes for the partial-hit divergence and leaned on the wrong one. **"Prefill-shape
 rocBLAS M-dependence" is not available as an explanation on this engine at all:** the dense path does
@@ -1289,23 +1291,65 @@ That also explains the shape of the symptom §D5 misread as a numerics tell: the
 being an exact PREFIX of the cold text is what a wrong attention result over a handful of positions
 looks like after an argmax canvas, not what a uniform 1-ULP perturbation looks like.
 
-**Why the full hit survives and the partial hit does not** is the remaining question, and the two
-paths differ in exactly one way: a full hit extends 5-7 tokens directly from the restored boundary in
-ONE forward, while a partial hit is page-split into a middle chunk `[3168,3184)` and a tail
-`[3184,3191)`, so the FIRST forward after the restore is a 16-token extend at BC front-pad
-`(3168-1024) % 32 == 0` rather than the full hit's `(3184-1024) % 32 == 16`. `_swa_prefill_extend`'s
-bit-identity to cold was validated on the autoregressive path
-(`tools/swa_prefix_extend_validate.py`, 0.000e+00 at every boundary); it is the pad-0 / short-chunk
-case that is now implicated and that the AR path evidently never exercised in the same shape.
+**The obvious suspect was the BC front-pad, and it is NOT guilty.** A full hit extends 5-7 tokens
+directly from the restored boundary in ONE forward; a partial hit page-splits into a middle chunk
+`[3168,3184)` and a tail `[3184,3191)`, so the first forward after the restore is a 16-token extend at
+front-pad `(3168-1024) % 32 == 0` against the full hit's `(3184-1024) % 32 == 16`. Every BC-aligned
+case in `tools/swa_prefix_extend_validate.py` happened to land on pad ∈ {2, 16, 18} — the residue is a
+property of whichever `(L, W)` pair the case picked — so **pad 0 had never been exercised**, and pad 0
+is exactly what a page-aligned radix boundary produces.
 
-**STATUS — NOT FIXED, and the next step is named.** Full-prefix reuse on the canvas is proven
-lossless. Partial-prefix reuse is a KNOWN DEFECT with a precise address: `_swa_prefill_extend`, on the
-first chunk after a window restore, when the prefill is page-split. The fix belongs in
-`attention/rdna4.py` (the extend and its BC front-pad), not in the snapshotter or the scheduler, and
-it needs its own bit-identity gate — `tools/swa_prefix_extend_validate.py` extended to the pad-0 /
-short-chunk case, which is cheap and needs no serve. Until then, a block-diffusion deployment that
-shares long prefixes across requests should set `MINISGL_SWA_RADIX=0`; full-prefix reuse (the same
-prompt twice) is unaffected and remains lossless.
+That gate now covers it. `case_production` reproduces `_swa_prefill_extend` line for line (zero-KEY
+pad, zero-QUERY front, drop `front` rows — the BC-aligned cases above front-pad with REAL keys, which
+is a different buffer and not the one that ships), plus a sweep of all 32 BC residues and 11 chunk
+lengths, run at the true Gemma4 sliding geometry (`HQ=8 HK=4 D=256 W=1024` per rank at TP=2):
+
+```
+PROD full-hit tail             (L=3184,M=5, pad=16)   bit-identical=True   max|cold-ext|=0.000e+00
+PROD partial-hit chunk1        (L=3168,M=16,pad=0)    bit-identical=True   max|cold-ext|=0.000e+00
+PROD partial-hit chunk2        (L=3184,M=7, pad=16)   bit-identical=True   max|cold-ext|=0.000e+00
+pad sweep    r = 0..31 at M=16     pads that are NOT bit-identical: none
+chunk sweep  M = 1..128 at pad=0   chunk lengths that are NOT bit-identical: none
+```
+
+**46/46 bit-identical, including the exact failing shape.** So the extend kernel reproduces a cold
+prefill byte for byte at the shape the serve runs, and the §D5.1 conclusion above — "located to the
+post-restore extend" — is WRONG. Recorded rather than quietly amended, because the gate that would
+have caught the over-claim is the same gate that had the pad-0 hole in it.
+
+**What is now excluded, each by measurement rather than argument:**
+
+| candidate | excluded by |
+|---|---|
+| snapshot clone/restore round-trip | `tests/swa_window_canvas_stride_test.py`, max abs delta 0.0 |
+| restored window CONTENT over `[2167,3168)`, all 25 sliding layers | state digest, 13/14 segments identical |
+| reused radix PAGES over `[0,3072)`, all 5 full layers | state digest, same |
+| tokens / positions / embeddings for the new span | `pool=swa layer=0` matches inside the differing segment |
+| the sliding extend kernel, every BC residue and chunk length | this gate, 46/46 at production geometry |
+| chunked-vs-single-pass numerics | the dense path is M-invariant by construction, not rocBLAS |
+
+**What remains.** The divergence is in `[3168,3191)` — the tokens computed after the restore — with
+correct inputs and a correct kernel, which is a contradiction, so one of the "correct"s is measured
+over the wrong span. The leading gap is structural in the instrument: the digest is taken at the END
+of the prefill, where `cached_len` has advanced, so a window-relative span **excludes the first
+`device_len - cached_len` positions the earlier chunk actually attended** — 23 positions here,
+`[2144,2167)`. `kvcache/state_digest.py` now digests `UNDER=64` positions past the window edge and
+emits per CHUNK as well as per commit, which closes that blind spot; the run that would use it has
+not completed (see below). The other live candidate is the FULL-attention paged extend over the
+reused pages, which the sliding-only gate above does not model at all.
+
+**STATUS — NOT FIXED, and deliberately not patched blind.** Full-prefix reuse on the canvas is proven
+lossless. Partial-prefix reuse is a KNOWN DEFECT whose mechanism is NOT yet established: the previous
+address was falsified, and reshaping the extend path on a hypothesis the gate contradicts would be
+worse than leaving it described — the autoregressive models ride that same path. A block-diffusion
+deployment that shares long prefixes across requests should set `MINISGL_SWA_RADIX=0`; full-prefix
+reuse (the same prompt twice) is unaffected and remains lossless.
+
+**A note on how the last run died, because it is the standing rule and it still bit.** The follow-up
+per-chunk bisect crashed with `NameError: _SOFT_EMBED_CHUNK` — not a defect in any of this, but
+another agent's mid-edit `models/diffusion_gemma.py` being read by a serve that mounted the SHARED
+worktree. Any re-run of `tools/swa_radix_canvas_locate.sh` must mount an isolated `git worktree`,
+exactly as CLAUDE.md's source-isolation rule says and as the earlier legs of this investigation did.
 
 ---
 

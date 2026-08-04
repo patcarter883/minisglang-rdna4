@@ -47,6 +47,14 @@ import torch
 # resolving the boundary between a reused prefix and the tail a chunked extend computes.
 SEG = 256
 
+# Extra positions digested BELOW the window start. The window a chunk READS is
+# [cached_len - W, cached_len), but the digest is taken at the END of the prefill, where cached_len
+# has advanced — so a window-relative span silently EXCLUDES the first (device_len - cached_len)
+# positions the earlier chunk actually attended. On the shape that exposed the block-diffusion
+# partial-hit defect that blind spot is 23 positions wide, i.e. exactly the region a "the restored
+# window is correct" conclusion was resting on without evidence. Digest past the edge instead.
+UNDER = 64
+
 
 def state_digest_enabled() -> bool:
     """Read in ONE place so the call site and any future reader cannot disagree about the gate."""
@@ -93,7 +101,7 @@ def swa_ring_digest(swa_kv, table_idx: int, boundary: int, window: int, ring_str
     ascending absolute position — the SAME addressing `SWAWindowSnapshotter._window_slots` and
     rdna4.py's gather use, so a mismatch here is a mismatch the attention kernel would actually
     read."""
-    Wp = min(boundary, window)
+    Wp = min(boundary + UNDER, window + UNDER, boundary)
     base = table_idx * ring_stride
     out = []
     for lid in range(swa_kv.num_layers):

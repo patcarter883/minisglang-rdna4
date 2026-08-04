@@ -201,8 +201,14 @@ class SchedulerDiffusionMixin:
                     f"{self._canvas_cfg.canvas_length} positions every step. Refusing rather than "
                     "silently ignoring the grammar."
                 )
+        # Captured BEFORE the forward: `cache_req` below replaces req.cache_handle with the
+        # INSERTED one, so reading the matched length afterwards reports the insert boundary.
+        matched_by_uid = {
+            r.uid: int(getattr(getattr(r, "cache_handle", None), "cached_len", 0) or 0) for r in reqs
+        }
         self._canvas_forward(batch, allocate=True)
         for req in reqs:
+            matched_chunk = matched_by_uid.get(req.uid, 0)
             # A CHUNK of a multi-forward encoder pass. This is not the "prompt longer than
             # --max-extend-tokens" case it was originally refused as, and refusing it is what made
             # SWA-radix unusable here: the snapshot-capable radix splits EVERY prefill at the last
@@ -219,11 +225,17 @@ class SchedulerDiffusionMixin:
                 req.cached_len = req.device_len
                 if self._swa_radix:
                     self._stash_swa_state(req)
+                # Digest the CHUNK too, not just the final commit. A page-split prefix hit runs its
+                # first forward over the restored window and its second over what that forward left
+                # behind, so a digest taken only at the end cannot say WHICH of the two moved.
+                if state_digest_enabled():
+                    log_prefill_state_digest(logger, "chunk", self.engine, req, self._swa_snap,
+                                             matched=matched_chunk)
                 continue
             # The whole prompt is now valid KV. No `complete_one()`: that would advance device_len by
             # the one autoregressive token this model does not produce.
             req.cached_len = req.device_len
-            matched = int(getattr(getattr(req, "cache_handle", None), "cached_len", 0) or 0)
+            matched = matched_chunk
             inserted = self.cache_manager.cache_req(req, finished=False)
             # SWA-radix CAPTURE (the AR loop does this in `_process_last_data`, which the canvas loop
             # does not go through). The prompt's sliding window is snapshotted onto the node just
