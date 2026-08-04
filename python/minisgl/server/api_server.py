@@ -204,6 +204,16 @@ class OpenAICompletionRequest(BaseModel):
     logprobs: bool | None = None
     top_logprobs: int | None = None
     logit_bias: dict | None = None
+    # TEXT-completions-only parameters (/v1/completions). Declared for the SAME reason as the block
+    # above — so they can be rejected instead of silently swallowed by the extra-field policy. Each
+    # one changes the answer: `echo` changes what the response contains (prompt + completion, not
+    # completion), `suffix` changes what is generated (fill-in-the-middle), `best_of` changes what is
+    # sampled (n candidates, return the best). Accepting any of them and doing nothing returns a 200
+    # that plausibly answers a DIFFERENT question, which is the exact failure _reject_unsupported
+    # exists to prevent. Unused by the chat lane, where they are not part of the protocol.
+    echo: bool | None = None
+    suffix: str | None = None
+    best_of: int | None = None
     # `seed` USED to sit in the group above — declared so it could be rejected, but never actually
     # checked by _reject_unsupported, so it was accepted and ignored. It is now HONOURED, and only
     # where it means something: the BLOCK-DIFFUSION canvas, the one path here with no greedy mode
@@ -581,6 +591,52 @@ def _reject_unsupported(req: "OpenAICompletionRequest") -> JSONResponse | None:
     return None
 
 
+def _reject_unsupported_text_completion(req: "OpenAICompletionRequest") -> JSONResponse | None:
+    """`_reject_unsupported`, plus the things that are meaningless on the RAW-prompt lane.
+
+    Same principle as its sibling: a parameter this endpoint cannot honour is a 400, never an
+    accepted-and-ignored field. The additions are all cases where the chat lane's machinery has no
+    counterpart here, and where the silent behaviour is the confusing one:
+
+    * `messages` — there is no chat template on this lane, so a messages array would be flattened to
+      nothing or stringified. The caller wants /v1/chat/completions.
+    * `tools` — tool specs are rendered INTO the chat template. With no template they are never shown
+      to the model, so the model answers in prose, no `<tool_call>` block is ever emitted, and the
+      caller sees `tool_calls: null` with no indication that its tools were dropped on the floor.
+    * `rsa` — the in-engine RSA loop drives chat rollouts; the chat lane already 400s a raw `prompt`
+      for the same reason.
+    * `echo` / `suffix` / `best_of` — see the request-model comment.
+    """
+    bad = _reject_unsupported(req)
+    if bad is not None:
+        return bad
+
+    def reject(msg: str, param: str) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": msg, "type": "invalid_request_error", "param": param,
+            "code": "unsupported_parameter"}})
+
+    if req.messages:
+        return reject("`messages` is not accepted by /v1/completions: this endpoint continues a RAW "
+                      "`prompt` with no chat template applied. Use /v1/chat/completions.", "messages")
+    if not isinstance(req.prompt, str) or not req.prompt:
+        return reject("`prompt` (a non-empty string) is required by /v1/completions.", "prompt")
+    if req.tools:
+        return reject("`tools` are not supported by /v1/completions: tool specs are rendered into the "
+                      "chat template, and this endpoint applies no template — the model would never "
+                      "see them. Use /v1/chat/completions.", "tools")
+    if req.rsa:
+        return reject("`rsa` requires `messages` (chat format), not a raw `prompt`.", "rsa")
+    if req.echo:
+        return reject("`echo` is not supported: this server returns the completion only.", "echo")
+    if req.suffix is not None:
+        return reject("`suffix` (fill-in-the-middle) is not supported by this server.", "suffix")
+    if req.best_of is not None and req.best_of != 1:
+        return reject(f"best_of={req.best_of} is not supported: this server samples a single "
+                      "candidate.", "best_of")
+    return None
+
+
 def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None:
     """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
     the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3 /
@@ -638,6 +694,9 @@ def _frontend_tokenizer():
 # not on message text — so one render per distinct kwargs set answers every request and the whole
 # cache is a handful of entries (unset / thinking-on / thinking-off).
 _PROMPT_PROBE_CACHE: Dict[tuple, str | None] = {}
+
+# Sentinel for "omit the `usage` key entirely", which is not the same as "usage: null".
+_NO_USAGE = object()
 
 
 def _probe_generation_prompt(kwargs: dict | None) -> str | None:
@@ -1514,6 +1573,69 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    async def stream_text_completions(self, uid: int, model: str, include_usage: bool = False):
+        """SSE for /v1/completions — the TEXT-completion wire shape, which is a different object from
+        the chat stream above and cannot be produced by it.
+
+        Every chunk is `{"object":"text_completion","choices":[{"index":0,"text":…}]}`; there is no
+        `delta`, no `role`, and no reasoning/tool channel to split into (see the route docstring: this
+        lane returns the raw continuation verbatim). `id`/`created`/`model` ride EVERY chunk, unlike
+        `stream_chat_completions` which omits `created`/`model` — openai-python's `Completion` model
+        declares all five as required, so a chunk missing them is a client-side ValidationError rather
+        than a rendered token."""
+        created = int(time.time())
+        prompt_tokens = completion_tokens = 0
+        finish_reason = "stop"
+
+        def _chunk(text: str, finish: str | None, usage: dict | None = _NO_USAGE) -> bytes:
+            payload = {
+                "id": f"cmpl-{uid}",
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "text": text, "logprobs": None, "finish_reason": finish}],
+            }
+            # `usage` is OMITTED on content chunks and PRESENT (possibly null) on the terminal one —
+            # an explicit null is how the spec says "the totals are not here", and a client that
+            # reads `chunk.usage` on the finish chunk must see the key, not a KeyError.
+            if usage is not _NO_USAGE:
+                payload["usage"] = usage
+            return f"data: {json.dumps(payload)}\n\n".encode()
+
+        async for ack in self.wait_for_ack(uid):
+            if getattr(ack, "error", None):
+                # Headers are already out, so this can no longer become a 4xx. Emit an explicit error
+                # event: an empty stream that simply stops is indistinguishable from a healthy but
+                # short completion, so the caller would treat a REFUSED request as a valid empty answer.
+                _err = json.dumps({"error": {"message": ack.error,
+                                             "type": "invalid_request_error",
+                                             "code": "context_length_exceeded"}})
+                yield f"data: {_err}\n\n".encode()
+                yield "data: [DONE]\n\n".encode()
+                return
+            completion_tokens = max(completion_tokens, ack.completion_tokens)
+            prompt_tokens = ack.prompt_tokens or prompt_tokens
+            if ack.finish_reason:
+                finish_reason = ack.finish_reason
+            if ack.incremental_output:
+                yield _chunk(ack.incremental_output, None)
+            if ack.finished:
+                break
+
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        # Terminal chunk carries finish_reason with an empty text, mirroring the chat lane's contract
+        # (and OpenAI's): usage rides here unless include_usage asked for the spec's dedicated
+        # trailing chunk, in which case it is null here and the totals follow with empty `choices`.
+        yield _chunk("", finish_reason, None if include_usage else usage)
+        if include_usage:
+            yield f"data: {json.dumps({'id': f'cmpl-{uid}', 'object': 'text_completion', 'created': created, 'model': model, 'choices': [], 'usage': usage})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+        logger.debug("Finished streaming text completion for user %s", uid)
+
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         # `request.is_disconnected()` is an event-loop receive() round-trip; awaiting it on EVERY
         # token is pure per-token overhead. Poll it on a cadence instead — at most once per
@@ -1625,7 +1747,11 @@ async def v1_root():
 
 
 @app.post("/v1/chat/completions")
-async def v1_completions(req: OpenAICompletionRequest, request: Request):
+async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
+    # Renamed from `v1_completions`. The old name asserted a route this app did not have: the only
+    # registration was (and is) `/v1/chat/completions`, so `/v1/completions` was a bare FastAPI 404
+    # and the misleading symbol is what made the hole look filled on a read of the file. The real
+    # `/v1/completions` is now its own handler below — this one is chat, and answers `chat.completion`.
     _bad = _reject_unsupported(req)
     if _bad is not None:
         return _bad
@@ -1927,6 +2053,146 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+@app.post("/v1/completions")
+async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
+    """OpenAI TEXT-completions: continue a RAW prompt, verbatim, with no chat template.
+
+    THIS ROUTE DID NOT EXIST. The chat handler above was named `v1_completions` while registered only
+    at `/v1/chat/completions`, so every `client.completions.create(...)` — and every `POST
+    /v1/completions` — got a bare FastAPI 404. That reads to a caller as a broken server rather than
+    an unimplemented endpoint, and the misleading handler name is what kept it unnoticed.
+
+    Re-pointing the chat handler at this path would have been the wrong fix, and NOT for the reason
+    it first looks like. The chat handler already accepts a raw `prompt` (the tokenizer applies the
+    chat template only to a messages LIST — tokenize.py `isinstance(msg.text, list)`), so an alias
+    would not have silently templated the prompt. The damage is the RESPONSE: that lane always
+    answers `{"object":"chat.completion","choices":[{"message":{…}}]}`, which has no `text` key at
+    all. A text-completions client reads `choices[0].text`, finds nothing, and either raises a
+    validation error or renders an empty completion — a 200 that lost the answer. Two protocols,
+    two response objects, two handlers; the request model is shared because the REQUEST fields
+    genuinely overlap.
+
+    Deliberately NOT inherited from the chat lane:
+
+    * The reasoning split. `/v1/completions` has no `reasoning_content` field to split INTO, so
+      routing the model's scratch out of `text` would delete it with nowhere to put it — the exact
+      silent total-output-loss that 450f8ab9 fixed, in the other direction. The contract here is the
+      raw continuation, delimiters and all, so the caller can parse it however it likes. Note the
+      derivation itself still behaves on this lane: `_prompt_thinking_state` has a raw branch that
+      reads `parser.prompt_state(req.prompt)` directly (the prompt IS the rendered prompt here), so
+      `thinking_open` is honest — we simply do not act on it by splitting.
+    * The reasoning-budget backstop, EXCEPT when the raw prompt is genuinely mid-span. The backstop
+      FORCE-EMITS the close delimiter once the budget is spent, and the scheduler caps that budget at
+      3/4 of max_tokens (scheduler `_maybe_arm_think_gate`) — so on the chat lane's `_thinking_active`
+      test, which is True merely because the model COULD open a span, a plain 40-token raw completion
+      would have `<channel|>` injected at token 30 by a server the caller never asked to edit its
+      output. On the chat lane that injection is invisible (the reasoning split eats it); here it
+      would land in `text`. So arm it only on `_thinking_open`, i.e. the prompt itself left a span
+      open, where force-closing is a legitimate continuation of what the prompt started.
+    * Tool-call parsing (see `_reject_unsupported_text_completion`: tools are a 400, not a no-op).
+
+    Everything else IS shared, deliberately: `_resolve_sampling` (so an unset field inherits the
+    checkpoint's generation_config.json exactly as the chat lane does — and note that inheritance is
+    why `temperature: 0` alone is NOT greedy on a checkpoint shipping top_p 0.95, since `is_greedy`
+    in core.py is `(temperature <= 0 or top_k == 1) and top_p == 1.0`), the stop/penalty/seed/
+    ignore_eos plumbing, `response_format` grammars (sampler-level, template-independent), the
+    transparent-CAM hooks, and the engine-refusal 400.
+    """
+    _bad = _reject_unsupported_text_completion(req)
+    if _bad is not None:
+        return _bad
+    state = get_global_state()
+    prompt: str = req.prompt  # type: ignore[assignment]  # guaranteed a non-empty str by the reject above
+
+    # TRANSPARENT CAM, same as /generate and the chat lane's raw-prompt branch: learn from the prompt,
+    # then fold relevant known facts back in. Both halves are off unless enabled, and both take a
+    # per-request override so a caller that needs a literally-untouched prompt can say so.
+    _cam_ns = request.headers.get("x-cam-namespace")
+    if os.environ.get("MINISGL_CAM_WRITE_SYNC") == "1":
+        await _cam_auto_write(prompt, override=req.cam_write, ns=_cam_ns)
+    else:
+        _schedule_cam_auto_write(prompt, override=req.cam_write, ns=_cam_ns)
+    prompt = await _cam_auto_augment(prompt, ns=_cam_ns, override=req.cam_read)
+
+    # Arm the reasoning backstop ONLY for a prompt that is itself mid-span — see the docstring.
+    _think_delim = _reasoning_close_delim(req) if _thinking_open(req) else None
+    uid = state.new_user()
+    await state.send_one(
+        TokenizeMsg(
+            uid=uid,
+            text=prompt,
+            sampling_params=SamplingParams(
+                ignore_eos=req.ignore_eos,
+                presence_penalty=req.presence_penalty,
+                frequency_penalty=req.frequency_penalty,
+                max_tokens=req.max_tokens,
+                seed=req.seed,
+                **dict(zip(("temperature", "top_p", "top_k"),
+                           _resolve_sampling(req, state.config.model_path))),
+                stop=_norm_stop(req.stop),
+                grammar=_grammar_from_response_format(req.response_format),
+                think_close_delim=_think_delim,
+                think_budget=_resolve_think_budget(req) if _think_delim else None,
+            ),
+        )
+    )
+
+    if req.stream:
+        return StreamingResponse(
+            state.stream_with_cancellation(
+                state.stream_text_completions(
+                    uid, req.model, bool((req.stream_options or {}).get("include_usage"))),
+                request, uid,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming: accumulate into a list and "".join once — `+=` in the loop is O(n^2) in the
+    # output length (same reason as the chat lane).
+    chunks: List[str] = []
+    prompt_tokens = completion_tokens = 0
+    finish_reason = "stop"
+    rejected: str | None = None
+    async for ack in state.wait_for_ack(uid):
+        if getattr(ack, "error", None):
+            rejected = ack.error
+            break
+        chunks.append(ack.incremental_output)
+        completion_tokens = max(completion_tokens, ack.completion_tokens)
+        prompt_tokens = ack.prompt_tokens or prompt_tokens
+        if ack.finish_reason:
+            finish_reason = ack.finish_reason
+        if ack.finished:
+            break
+    if rejected is not None:
+        # The engine refused (e.g. prompt longer than the KV pool). A real 4xx: an empty 200 would
+        # look like the model chose to emit nothing, and returning nothing at all hangs the caller
+        # until its own timeout.
+        return JSONResponse(status_code=400, content={"error": {
+            "message": rejected, "type": "invalid_request_error", "param": "prompt",
+            "code": "context_length_exceeded"}})
+
+    return {
+        "id": f"cmpl-{uid}",
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "text": "".join(chunks),
+                "logprobs": None,
                 "finish_reason": finish_reason,
             }
         ],

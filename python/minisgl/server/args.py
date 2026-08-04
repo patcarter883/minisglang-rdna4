@@ -26,7 +26,9 @@ class ServerArgs(SchedulerConfig):
     reasoning_parser: str = "auto"
     # Server-side DEFAULT Markovian-RSA parameters (set by the --rsa-* flags). A per-request `rsa`
     # field on /v1/chat/completions patches these; RSA runs ONLY when a request opts in (rsa present
-    # and enabled), so a normal call is an ordinary single completion. See api_server.v1_completions.
+    # and enabled), so a normal call is an ordinary single completion. See
+    # api_server.v1_chat_completions (RSA is chat-only: /v1/completions 400s an `rsa` field, because
+    # the rollout loop drives chat messages and has nothing to do with a raw prompt).
     rsa_defaults: RSAParams = field(default_factory=RSAParams)
 
     @property
