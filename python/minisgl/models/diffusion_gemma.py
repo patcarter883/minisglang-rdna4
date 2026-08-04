@@ -168,12 +168,27 @@ class DiffusionGemmaForBlockDiffusion(BaseLLMModel):
         return self.model.forward_canvas(input_ids, self_conditioning)
 
     def canvas_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """The EAGER tail of a denoising step: full-vocab fp32 softcapped logits for EVERY canvas
-        position.
+        """The EAGER tail of a denoising step: fp32 softcapped logits for EVERY canvas position, over
+        THIS RANK'S vocabulary columns — `[rows, vocab/tp]`, NOT `[rows, vocab]`.
 
-        `logits_all_rows` rather than `lm_head.forward`, deliberately: the latter reduces to the
-        last token on a prefill batch, and every canvas position is scored."""
-        return self._softcapped(self.lm_head.logits_all_rows(hidden))
+        `logits_local_shard` rather than `lm_head.forward`, deliberately, for two reasons. The
+        obvious one: `forward` reduces to the last token on a prefill batch, and every canvas
+        position is scored. The load-bearing one: nothing downstream INDEXES the vocabulary
+        dimension, it only REDUCES over it — logsumexp, softmax, entropy, argmax, multinomial, and
+        `soft_embedding`'s `probs @ E` — and every one of those decomposes over disjoint column
+        blocks into a per-rank partial plus a `[canvas]`-sized message. So the all_gather that used
+        to sit here materialised a 134 MiB tensor on both ranks (plus a `permute().contiguous()` over
+        all of it, to undo the gather's rank-major interleave) that neither rank ever read a column
+        of. It cost 23.2 ms of a 190 ms step, and the softcap that follows it another 3.1 ms for
+        capping columns this rank does not own.
+
+        THE RETURN SHAPE IS TP-DEPENDENT, which is unusual in this file and is why it says so twice.
+        `CanvasState.step` reads the width and reduces accordingly (it refuses a width that is
+        neither the whole vocabulary nor this rank's shard), and `soft_embedding` takes the shard
+        whole instead of slicing it. At tp_size == 1 the shard IS the vocabulary and every caller —
+        including the parity fixtures, which compare full-vocab canvas logits against HF — sees
+        exactly what it saw before."""
+        return self._softcapped(self.lm_head.logits_local_shard(hidden))
 
     def forward_canvas(
         self, input_ids: torch.Tensor, self_conditioning: torch.Tensor | None = None

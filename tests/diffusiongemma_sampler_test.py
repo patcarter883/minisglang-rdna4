@@ -255,8 +255,149 @@ def main() -> int:
         f" — the history seeds empty, exactly as the reference seeds it with -1",
     )
 
+    check_vocab_parallel(rep)
+
     print(f"\n{'PASS' if rep.failures == 0 else f'FAIL ({rep.failures} checks)'}")
     return 1 if rep.failures else 0
+
+
+# ==================================================================================================
+def check_vocab_parallel(rep: Report) -> None:
+    """[5] The SHARDED tail computes what the whole-vocabulary tail computes.
+
+    The served path under TP does NOT run the code section [3] replays. `canvas_logits` stops
+    all_gathering, so each rank's `step()` sees `[canvas, vocab/tp]` and reduces across the group;
+    the reference replay above can only ever exercise `tp_size == 1`. That gap is the whole risk of
+    the change, so it is closed here rather than argued: two real Python threads run
+    `sharded_canvas_tail` in SPMD lockstep over the two halves of one logits block, through a
+    barrier-synchronised stand-in for the collectives, and the result is compared against the
+    single-tensor path on the SAME logits.
+
+    Threads rather than a stub that "simulates" both ranks inside one call, because the ORDER of the
+    four messages is part of what is under test: a stub cannot deadlock and a real barrier can, so a
+    reduction issued in a different order on different ranks fails here instead of hanging a serve.
+    """
+    import threading
+
+    from minisgl.diffusion import normalized_probs, sharded_canvas_tail
+
+    print("\n[5] the VOCAB-PARALLEL tail == the whole-vocabulary tail")
+    SIZE = 2
+    width = VOCAB // SIZE
+    torch.manual_seed(99)
+    logits = torch.randn(CANVAS, VOCAB) * 3.0
+
+    class _ThreadShard:
+        """`VocabShard`'s two collectives over Python threads: a barrier, then a shared slot."""
+
+        def __init__(self, rank: int, barrier, slot) -> None:
+            self.size, self.rank = SIZE, rank
+            self.start, self.width = rank * width, width
+            self._barrier, self._slot = barrier, slot
+
+        def _exchange(self, x):
+            self._slot[self.rank] = x
+            self._barrier.wait()
+            out = list(self._slot)
+            self._barrier.wait()
+            return out
+
+        def gather(self, x):
+            return torch.stack(self._exchange(x.clone()))
+
+        def total(self, x):
+            return torch.stack(self._exchange(x.clone())).sum(dim=0)
+
+    def spmd(block, seeds):
+        """Run `sharded_canvas_tail` on both column halves of `block`, one thread per rank."""
+        barrier, slot, out = threading.Barrier(SIZE), [None] * SIZE, [None] * SIZE
+
+        def run(rank):
+            gen = torch.Generator().manual_seed(seeds[rank])
+            local = block[:, rank * width : (rank + 1) * width].contiguous()
+            out[rank] = sharded_canvas_tail(local, _ThreadShard(rank, barrier, slot), VOCAB, gen)
+
+        threads = [threading.Thread(target=run, args=(r,)) for r in range(SIZE)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        return out, threads
+
+    # The two ranks get DIFFERENT generators on purpose: an implementation that used its own draws
+    # instead of the one that comes off the wire disagrees, which is precisely the pre-existing
+    # unseeded-request divergence this replaces.
+    out, threads = spmd(logits, [4321, 8765])
+    if not rep.check(
+        "both ranks returned (no collective-ordering deadlock)",
+        all(o is not None for o in out) and not any(t.is_alive() for t in threads),
+        f"{sum(o is not None for o in out)}/{SIZE} ranks completed",
+    ):
+        return
+
+    log_probs, probs = normalized_probs(logits)
+    want_entropy = -(probs * log_probs).sum(dim=-1)
+    want_argmax = torch.argmax(logits, dim=-1)
+
+    # The per-rank probability shard must BE the corresponding columns of the global softmax — that
+    # is exactly the contract `soft_embedding` relies on when it takes the shard whole.
+    dp = max(
+        (out[r][0] - probs[:, r * width : (r + 1) * width]).abs().max().item() for r in range(SIZE)
+    )
+    # 2 ULP at p ~ 1 (fp32 eps is 1.19e-7). It cannot be exact and should not be asserted to be:
+    # `torch.softmax` normalises by a sum its own fused kernel accumulates, the sharded path by a sum
+    # accumulated per shard and then added. Same algorithm, different association.
+    rep.check("probs shard == the global softmax's columns", dp < 2.4e-7,
+              f"max|delta|={dp:.3e} (fp32 eps at p=1 is {torch.finfo(torch.float32).eps:.3e})")
+    de = max((out[r][1] - want_entropy).abs().max().item() for r in range(SIZE))
+    rep.check("entropy == the whole-vocabulary entropy", de < 1e-5, f"max|delta|={de:.3e}")
+    rep.check(
+        "argmax == torch.argmax over the whole row, on EVERY rank",
+        all(torch.equal(out[r][2], want_argmax) for r in range(SIZE)),
+        f"mismatches={int((out[0][2] != want_argmax).sum())} of {CANVAS} — the combine takes the "
+        f"lowest GLOBAL index among the maximal values, which is torch.argmax's own tie rule",
+    )
+    rep.check(
+        "the multinomial draw is identical on every rank (different generators!)",
+        all(torch.equal(out[r][3], out[0][3]) for r in range(SIZE)),
+        f"rank0 sampled[:6]={out[0][3][:6].tolist()} rank1 sampled[:6]={out[1][3][:6].tolist()}",
+    )
+    rep.check(
+        "the renoise is identical on every rank (different generators!)",
+        all(torch.equal(out[r][4], out[0][4]) for r in range(SIZE)),
+        f"rank0 noise[:6]={out[0][4][:6].tolist()} rank1 noise[:6]={out[1][4][:6].tolist()}",
+    )
+    sampled = out[0][3]
+    p_sampled = probs[torch.arange(CANVAS), sampled]
+    rep.check(
+        "every sampled id is in range and carries real probability mass",
+        bool(((sampled >= 0) & (sampled < VOCAB)).all()) and float(p_sampled.min()) > 0,
+        f"min p(sampled)={float(p_sampled.min()):.3e}, ids in "
+        f"[{int(sampled.min())}, {int(sampled.max())}] of {VOCAB}",
+    )
+
+    # An inverse-CDF draw is NOT `torch.multinomial`, so the claim about it is distributional, not
+    # byte-level. Two ends of that claim: a peaked row must always land on its mode (including when
+    # the mode lives on the rank that is not rank 0 — column 7 and column VOCAB-7 cover both), and a
+    # uniform row must spread.
+    for col in (7, VOCAB - 7):
+        peaked = torch.full((4, VOCAB), -30.0)
+        peaked[:, col] = 30.0
+        hits = sum(int((spmd(peaked, [t * 10, t * 10 + 5])[0][0][3] == col).all()) for t in range(6))
+        rep.check(
+            f"a peaked row always draws its mode (column {col}, rank {col // width})",
+            hits == 6,
+            f"{hits}/6 trials — the search must land in the column holding the mass, whichever "
+            f"rank owns it, and only that rank can report the hit",
+        )
+    flat = torch.zeros(4, VOCAB)
+    drawn = {int(v) for t in range(12) for v in spmd(flat, [t * 7 + 1, t * 7 + 3])[0][0][3]}
+    rep.check(
+        "a uniform row does NOT collapse to one column",
+        len(drawn) > 20,
+        f"{len(drawn)} distinct ids over 48 draws from a flat {VOCAB}-way distribution; a broken "
+        f"ownership test would pin every draw to one rank's first or last column",
+    )
 
 
 if __name__ == "__main__":

@@ -10,14 +10,18 @@ from .sampler import (
     CanvasState,
     DiffusionSamplerConfig,
     DiffusionStep,
+    VocabShard,
     categorical_entropy,
     normalized_probs,
+    sharded_canvas_tail,
 )
 
 __all__ = [
     "CanvasState",
     "DiffusionSamplerConfig",
     "DiffusionStep",
+    "VocabShard",
     "categorical_entropy",
     "normalized_probs",
+    "sharded_canvas_tail",
 ]
