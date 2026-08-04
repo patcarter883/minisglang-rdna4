@@ -33,6 +33,21 @@ if os.environ.get("MINISGL_TAIL_HIP", "1") != "0":
 _FP8_MAX = 448.0  # e4m3 (OCP) max representable magnitude
 
 
+def kv_amax_to_descale(amax: torch.Tensor) -> torch.Tensor:
+    """`amax -> e4m3 DESCALE` — the one place the calibration formula lives.
+
+    `descale = amax / 448`, so the largest observed magnitude lands exactly at e4m3's max and the
+    store is `x / descale`. A (layer, head) that never stored has amax 0, which means "no data", not
+    "scale 0": it keeps 1.0, degrading to the un-calibrated direct cast rather than dividing by zero.
+
+    Shared by `finalize_kv_calibration` (in-pool, TP=1) and `tools/kv_fp8_calibrate.py`, which at
+    TP>1 must gather the per-rank amax into GLOBAL per-head rows on the HOST before converting — a
+    pool only ever holds its own head shard. One formula, two callers, so a TP=2 sidecar is
+    numerically the table a TP=1 run would have written."""
+    scale = (amax / _FP8_MAX).clamp(min=1e-4)
+    return torch.where(amax > 0, scale, torch.ones_like(scale))
+
+
 class MHAKVCache(BaseKVCachePool):
     """
     Base class for key-value caches.
@@ -192,12 +207,9 @@ class MHAKVCache(BaseKVCachePool):
         graph, which does pick the new value up)."""
         if not self._calibrating:
             return
-        # scale[l, h] = amax[l, h] / FP8_MAX, clamped off zero. A (layer, head) that never stored
-        # has amax 0 -> keep scale 1.0 so it degrades to the un-calibrated direct cast.
-        kscale = (self._k_amax / _FP8_MAX).clamp_(min=1e-4)
-        vscale = (self._v_amax / _FP8_MAX).clamp_(min=1e-4)
-        kscale = torch.where(self._k_amax > 0, kscale, torch.ones_like(kscale))
-        vscale = torch.where(self._v_amax > 0, vscale, torch.ones_like(vscale))
+        # scale[l, h] = amax[l, h] / FP8_MAX, clamped off zero (see kv_amax_to_descale).
+        kscale = kv_amax_to_descale(self._k_amax)
+        vscale = kv_amax_to_descale(self._v_amax)
         # In-place into the persistent tensors -> addresses stay stable, so any graph already
         # captured against them replays with the new values instead of a stale baked constant.
         self.k_descale.copy_(kscale)
