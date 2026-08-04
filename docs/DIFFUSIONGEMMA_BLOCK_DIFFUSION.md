@@ -1504,3 +1504,122 @@ Nothing in the serving layer closes that gap; it is a kernel-efficiency problem.
     bound and streams the shard once; the sampler's `probs` is also already exactly `softmax(scaled)`,
     so the softmax inside it is recomputed. Not fixed here — recorded so it is not re-derived.
 
+
+## D8. The per-step TAIL: 58.6 ms → 12.8 ms, and where the step actually went
+
+§D7.1 item 14 recorded that `soft_embedding` "chunks over the wrong axis" and left it. This section
+is that fix plus the two it exposed. The canvas step is **190.3 → 150.5 ms (−21%)** and end-to-end
+throughput on the harness prompts is **49.9 → 82.1 tok/s**, on a serve whose backbone was not touched.
+
+All four legs below are `MINISGL_CANVAS_TIMING=1` marginal splits (consecutive report points
+differenced, so the boot is not smeared into the steady state), bs=1, TP=2, CONC=1, bf16 KV,
+`minisgl-rdna4:gemma4`, each served from its **own isolated git worktree** — four agents were editing
+the shared tree concurrently and a serve re-reads Python lazily for the whole run, so a shared-tree
+mount is how you get plausible numbers off code nobody wrote.
+
+| leg | fwd_issue | fwd_tail | sampler | soft_embed | **step** | e2e mean |
+|---|---|---|---|---|---|---|
+| `9c12a6c3` baseline | 0.8 | 159.8 | 11.3 | 16.5 | **190.3** | 49.9 tok/s |
+| + soft_embedding over VOCAB | 0.8 | 159.7 | 11.5 | 3.9 | **178.2** | 61.6 tok/s |
+| + vocab-parallel tail | 0.6 | 151.2 | 4.9 | 3.8 | **162.9** | 76.4 tok/s |
+| + `_PIPE_M` 512 → 256 | 0.7 | 139.0 | 4.7 | 3.8 | **150.5** | 82.1 tok/s |
+
+Run-to-run, measured by repeating two of the legs in a separate lease and a separate boot: **0.2–0.5%
+on `step`**. Every delta above is an order of magnitude clear of that. `e2e mean` is far noisier than
+`step` and must be read as a consequence, not as the measurement: it multiplies the step by *k*, the
+realised denoising steps, which is data-dependent and moves with any trajectory perturbation.
+
+### D8.1 What each fix was
+
+1. **`soft_embedding` chunked over canvas ROWS.** 8 chunks × the whole 738 MB embedding shard =
+   5.9 GB/rank/step against a 0.74 GB floor, exactly as §D7.1-14 predicted. It also built a SECOND
+   full-vocab fp32 softmax of a distribution `CanvasState.step` had already computed for the entropy
+   bound and the multinomial. Chunk axis moved to vocab (and at this shape one GEMM suffices);
+   `DiffusionStep.probs` carries the sampler's softmax to its last consumer. **16.5 → 3.9 ms.**
+2. **The LM head all_gathered `[256, 262144]` that no rank ever indexed.** Every consumer of canvas
+   logits is a *reduction* over the vocabulary, and a reduction decomposes over disjoint column
+   blocks. The gather moved 67 MB/rank and was followed by a `permute().contiguous()` over the whole
+   result purely to undo its own rank-major interleave. Now `ParallelLMHead.logits_local_shard`
+   returns this rank's columns and `sharded_canvas_tail` reduces with four `[k, canvas]` messages per
+   request per step. **−9.3 ms in `fwd_tail`, −6.4 ms in `sampler`** (the sampler's elementwise
+   passes halve, net of the new collectives — so those cost under 6.4 ms and, at a few KiB, almost
+   certainly under 1).
+3. **`minv`'s rd→pipe threshold was 512.** `dense_gemm_rd` bypasses LDS, so every M-tile streams the
+   whole B matrix from HBM and its cost grows as `ceil(M/64)·N·K`. On the canvas LM-head shard
+   (`[256,2816]×[2816,131072]`) that is **16.4 ms at 11.5 TFLOP/s**; `dense_gemm_pipe` does it in
+   **2.7 ms**. The two are bit-identical — `max|rd − pipe| = 0.000e+00` in all 27 cells of a
+   three-shape × nine-M sweep — so this is a pure selector fix with no invariant traded. **−12.9 ms.**
+
+### D8.2 A live correctness bug fell out of (2)
+
+The schedulers are `mp.set_start_method("spawn")` processes, so their default torch generators are
+seeded non-deterministically and **independently**. An **unseeded** canvas request therefore drew a
+different `torch.multinomial` and a different `_noise()` on each TP rank. Both feed the next
+forward's `input_ids`, and `VocabParallelEmbedding` all-reduces a *masked* gather — so each rank
+contributed rows only for the ids **it** drew, and with a 2-way split roughly a quarter of every
+canvas got the sum of two unrelated embeddings and another quarter got zero. It produced fluent text
+throughout, which is precisely why nothing caught it.
+
+A vocab-parallel multinomial has to make the draw lockstep regardless, so it now is — **by
+construction**, not by trusting two RNGs: rank 0's uniform deviates and renoise ids come off
+collectives A and D, which had to be sent anyway. `SamplingParams.seed` requests already agreed and
+are byte-unaffected. The engine reports the state of the ranks' generators once per process:
+
+```
+[canvas] TP rank 1: RNG deviates DIVERGED from rank 0 on the first sharded step
+         (rank 0's are used either way — the draw is lockstep by construction, not by luck)
+```
+
+Every canvas number in Parts D1–D7 was taken on unseeded requests and is therefore a measurement of
+the *diverged* engine. The timings stand (the work per step is unchanged by which ids the canvas
+holds); **the quality and *k* results should be re-read as lower bounds.**
+
+### D8.3 Correctness, and what is NOT claimed
+
+Block diffusion has no greedy mode — uniform-noise canvas, multinomial every step — so cross-boot
+byte identity is unobtainable in principle and `temperature 0` pins nothing. The gates used:
+
+* **Seeded self-reproducibility on the serve.** `seed=20260804`, same prompt ×3 → `DISTINCT=1` on
+  every leg. This is also the gate that would fail loudly if the ranks ever disagreed again.
+* **Fixes 1 and 2 are NOT bit-preserving vs the baseline, and say so.** fp32 GEMM reduction order
+  changes when you stop splitting a contraction 8 ways; the softmax handed to `soft_embedding` is the
+  Categorical-shifted one; and an inverse-CDF draw is not `torch.multinomial`. All are the same
+  functions in exact arithmetic. A 1-ULP move in the carried state re-sorts 256 entropies through a
+  thresholded cumulative sum, so the block's text changes — that is the architecture, not a defect.
+* **Fix 3 IS bit-preserving end to end**, which is the strongest available statement: the seeded
+  request returns sha `a11ffd81ad883e04` before *and* after, same 103 tokens, same per-block step
+  counts (17/17/17/17/14/15/16).
+* **The sharded tail is unit-tested against the whole-vocabulary tail**
+  (`tests/diffusiongemma_sampler_test.py` [5]). The served TP path is no longer the one the 48-step
+  bit-exact reference replay exercises (that can only be `tp_size == 1`), so two **real threads** run
+  `sharded_canvas_tail` SPMD over the halves of one logits block through a barrier — threads, not an
+  in-call stub, because the *order* of the four messages is under test and only a real barrier can
+  deadlock on a mis-ordered reduction. probs shard matches the global softmax's columns to 1.19e-07
+  (1 fp32 ULP at p=1), entropy to 1.0e-06, argmax exactly, and the draw is identical on both ranks
+  *with deliberately different per-rank generators*.
+* **AR guard**: gemma-4-26B-A4B TP=2, 256-token completion, **44.2 → 44.3 tok/s**. It matters for fix
+  3, which is the only one of the three that touches a shared engine path.
+* 11/11 CPU tests, plus the new [5] block (the sampler test goes 7 → 16 checks).
+
+### D8.4 What is left, measured — and why the fused sampler kernel is NOT next
+
+Per-stage, at the served shape, one rank (`[256,2816]×[2816,131072]`, gfx1201):
+
+| stage | now | was |
+|---|---|---|
+| LM-head GEMM (`dense_gemm_pipe`) | 2.73 ms | 16.4 ms + a 67 MB/rank all_gather + a full-tensor permute |
+| softcap (`tanh(x/30)·30`, fp32) | 1.51 ms | 3.1 ms (it capped both shards) |
+| sampler (temperature 0.40 + exp 1.02 + cumsum 0.59 + entropy + argsort + 4 collectives) | 4.8 ms | 16.7 ms |
+| `soft_embedding` (GEMM 3.07 of it) | 3.8 ms | 15.3 ms |
+| **tail total** | **≈12.8 ms** | **58.6 ms** |
+
+A fused one-launch canvas sampler (softcap + temperature + logsumexp + softmax + entropy + argmax +
+multinomial + accept + renoise) was the planned third fix. On these numbers it is now worth **~4 ms
+of a 150 ms step (≈2.7%)** — and it would have to fuse *across a TP shard boundary*, i.e. carry the
+four collectives inside or around the launch. That is a large kernel with real distributed-correctness
+risk for 2.7%. **Shelved on evidence, not skipped**: revisit only if the backbone shrinks enough to
+make 4 ms matter.
+
+The step is now **150.5 ms, of which ~137 ms is the backbone**. Every remaining lever is in there.
+§D6.4's argument still holds and is now sharper: cudagraph capture removes 30 ms of launch that is
+currently hidden behind the backbone, and its share grows as everything around it shrinks.
