@@ -435,12 +435,16 @@ def w4a8_moe(
     kernel: str = "wmma",
     block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
     weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
+    activation: str = "silu",  # gated activation on the gemm1 [gate|up] output: "silu" | "gelu"
 ) -> torch.Tensor:
-    """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
+    """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> gated activation
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
     w4a8_fp8_wmma `_run_grouped_moe` (non-GEMV, unfused-silu) path. Returns (M, K).
     `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight decode instead of uniform int4
     (the scales are the E8M0 group exponents folded to fp16; w13_zeros/w2_zeros MUST be None).
+    `activation` picks the gated activation: "silu" (default, and the only one with a fused gemm1
+    epilogue) or "gelu" == HF `gelu_pytorch_tanh` (Gemma4's routed experts), which forces the
+    unfused gemm1 path below.
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
@@ -495,12 +499,26 @@ def w4a8_moe(
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their
     # NATIVE dtype — a bf16 model no longer round-trips bf16->fp16->bf16 here (out1 follows x's dtype).
     x16 = _moe_time("cast", lambda: x.contiguous())
-    # Gated gemm1 + SiLU-mul. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
+    # Gated gemm1 + activation. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
     # dropping the separate silu launch and the (P, 2*inter) out1 round-trip. The gemm1-epilogue fusion
     # is now available at DECODE too via the moe_gemv_decode_silu kernel (kernel="gemv"), not just the
-    # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
-    # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
-    if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
+    # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, fp32, or activation != silu) =
+    # gemm1 -> (P,2*inter) then tail_hip.silu_and_mul (fp32-internal HIP) / the torch reference.
+    #
+    # `activation` is a POLICY over this one shared body, never a kernel fork (KERNEL_CORE_POLICY.md).
+    # The `activation == "silu"` guard on the fused branch is load-bearing: the fused epilogue is
+    # HARD-WIRED to silu, so letting a gelu model reach it would compute the wrong activation and
+    # still return correctly-shaped, finite, plausible logits — a silent quality regression with no
+    # crash to catch it. Cost of the guard is that gelu pays the extra (P, 2*inter) round-trip and a
+    # second launch.
+    # FOLLOW-UP (KERNEL_CORE_POLICY.md: a new activation is a policy on the existing core, NOT a new
+    # kernel and NOT a permanent slow path): template `mmq_fp8_moe_gemm1_silu` / `_silu_flag` on the
+    # epilogue functor so the activation becomes a kernel argument and gelu runs at fused speed. Until
+    # that lands, gelu is correct-but-slower here by construction.
+    assert activation in ("silu", "gelu"), (
+        f"w4a8_moe supports activation 'silu' or 'gelu' (gelu_pytorch_tanh); got {activation!r}"
+    )
+    if activation == "silu" and _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
         # PREFILL (block_m in {64,128}): the silu-fused flagship register-tiled gemm1 flag — bit-exact
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
@@ -534,7 +552,14 @@ def w4a8_moe(
             ),
         )  # (P, 2*inter) in x's dtype
         d = out1.shape[1] // 2
-        if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        if activation == "gelu":
+            # `gelu_tanh_and_mul`, NOT `gelu_and_mul` — the latter is the exact erf gelu (both its
+            # native tail_hip arm and its torch arm), while every gelu-MoE checkpoint we serve
+            # declares HF `gelu_pytorch_tanh`. Torch-only: there is no native tanh-gelu tail kernel.
+            from minisgl.layers.activation import gelu_tanh_and_mul
+
+            buf2 = _moe_time("gelu", lambda: gelu_tanh_and_mul(out1.contiguous()).contiguous())
+        elif _TAIL_HIP and out1.dtype in _SILU_DTYPES:
             import tail_hip  # canonical package: silu_and_mul is a module-level callable
 
             engaged("tail_hip.silu_and_mul")
@@ -1188,7 +1213,9 @@ def rxf_moe_regdirect(
     return acc.to(x.dtype)
 
 
-def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 128) -> str:
+def _pick_dense_kernel(
+    m: int, weight_is_e2m1: bool = False, group_size: int = 128, k: int | None = None
+) -> str:
     """Per-M dense-linear kernel selection, at the MEASURED crossovers (gfx1201).
 
     - m <= gemv_max -> decode_gemv: a streaming GEMV that reads each weight once and dots it against
@@ -1213,7 +1240,16 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
     if weight_is_e2m1 and group_size % 32 != 0 and not _NVFP4_GEMV:
         return "wmma_tiled_tuned"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
-    if m <= gemv_max:
+    # decode_gemv's K granularity. Its inner warp-step consumes K in 32-k units (4x int32 b128 per
+    # lane), so a tail chunk is covered exactly when the lanes divide it; the b128 weight load
+    # additionally needs the (N, K/8) row int32-offset 16-byte aligned, i.e. K % 32 == 0.
+    #
+    # This guard is a CORRECTNESS backstop, not a performance policy. Falling through to the WMMA
+    # GEMM would put the served M=1 band on a prefill kernel — the decode-through-a-GEMM
+    # anti-pattern this repo has already measured as an occupancy collapse at bs=1 — so any shape
+    # that lands in the decode band and gets refused here is a KERNEL bug to fix in the tail, not a
+    # shape to route around. (`k=None`: caller did not pass K; keep the historical behaviour.)
+    if m <= gemv_max and (k is None or k % _W4A8_GEMV_K_MULTIPLE == 0):
         return "decode_gemv"
     if weight_is_e2m1 and group_size % 32 != 0:
         return "wmma_tiled_tuned"
@@ -1225,6 +1261,15 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
 # decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
 _W4A8_GEMV_MAX_INT4 = 8
 _W4A8_GEMV_MAX_E2M1 = 16
+# K granularity the decode GEMV can consume. Tracks the kernel's own precondition — raise/lower this
+# ONLY together with the kernel, never to route a shape away from the decode path (see
+# _pick_dense_kernel: a refused decode-band shape means the kernel tail needs fixing).
+# 32 is what the b128 weight load actually requires: the 4-word read must stay in-row and 16-byte
+# aligned, i.e. (K/8) % 4 == 0. The kernel's K-on-lanes sweep already drops out-of-row lanes to a
+# zero contribution, so a partial final wave was always handled — shipped shapes like K=8704 (8 full
+# waves + 16 lanes) exercise it. The previous 512 was a stale inheritance from the LDS K-tiling that
+# consolidation retired, and it cost Gemma4 (K=2816) the decode GEMV entirely.
+_W4A8_GEMV_K_MULTIPLE = 32
 # Prefill regime: wmma_tiled_tuned dominates from here up (~2-4x prefill_wmma, bit-exact, graph-safe,
 # both dtypes). Below it (small-M/wide-N mid-band) prefill_wmma's conservative config still wins
 # (re-bench: tiled loses only at N>=6144, M<=32). True prefill/chunked-prefill M is always >> 64.
@@ -1249,7 +1294,11 @@ def w4a8_linear(
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
-        kernel = _pick_dense_kernel(x2d.shape[0], weight_is_e2m1, group_size)
+        # w_packed is (N, K/8) int32, so K is 8x its last dim — pass it so the selector can respect
+        # decode_gemv's K granularity precondition rather than letting the kernel assert on it.
+        kernel = _pick_dense_kernel(
+            x2d.shape[0], weight_is_e2m1, group_size, k=w_packed.shape[-1] * 8
+        )
     engaged(f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
     return fp8_wmma.mmq_fp8_gemm(
         x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
@@ -1265,7 +1314,7 @@ def w4a8_linear_silu(
     weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
-    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%16==0);
+    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%32==0, group_size%16==0);
     BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
     import fp8_wmma
 
