@@ -39,7 +39,23 @@ _BN = int(os.environ.get("MINISGL_MINV_BN", "64"))            # WMMA N-tile (div
 # It is BIT-IDENTICAL to the register-direct (rd) and LDS kernels (same 16-wide K-reduction order, no
 # split-K), so switching rd<->pipe by M stays M-invariant. rd still wins the small-M decode hot path
 # (register-direct, no LDS staging / __syncthreads overhead), so we only reach for pipe at M >= _PIPE_M.
-_PIPE_M = int(os.environ.get("MINISGL_MINV_PIPE_M", "512"))   # M threshold to switch rd -> pipe
+#
+# 512 WAS TOO HIGH, AND ON A WIDE OUTPUT IT WAS CATASTROPHIC. rd is LDS-bypassing, so every M-tile
+# streams the whole B matrix from HBM: its cost grows with ceil(M/64) * N * K, and above the decode
+# regime it collapses. Measured (gfx1201, bf16, K=2816; ms, rd -> pipe):
+#
+#     M    N=131072 (an LM-head shard)   N=5632 (gate_up)   N=2816 (o_proj)
+#    128     9.199 ->  1.513  (6.1x)     0.090 -> 0.084     0.038 -> 0.078   rd
+#    192    13.340 ->  2.700  (4.9x)     0.146 -> 0.091     0.077 -> 0.082   ~tie
+#    256    16.400 ->  2.735  (6.0x)     0.226 -> 0.091     0.099 -> 0.081
+#    384    21.087 ->  3.953  (5.3x)     0.377 -> 0.174     0.157 -> 0.099
+#
+# 256 is the lowest threshold at which pipe wins on EVERY shape measured, narrow outputs included,
+# so that is where it goes — not lower, because rd still owns M<=128 on narrow N. Nothing about
+# correctness moves: `max|rd - pipe|` is 0.000e+00 in all 27 cells of that sweep, which is the file's
+# own structural claim (identical fixed 16-wide K order, no split-K) confirmed rather than assumed.
+# Decode is untouched either way — M <= _DECODE_GEMV_MAXM leaves through the GEMV above this.
+_PIPE_M = int(os.environ.get("MINISGL_MINV_PIPE_M", "256"))   # M threshold to switch rd -> pipe
 _PIPE_MI = int(os.environ.get("MINISGL_MINV_PIPE_MI", "2"))   # pipe register-block M-subtiles/warp
 _PIPE_PBK = int(os.environ.get("MINISGL_MINV_PIPE_PBK", "64"))  # pipe K-chunk (needs IN % PBK == 0)
 _warned: set[str] = set()
