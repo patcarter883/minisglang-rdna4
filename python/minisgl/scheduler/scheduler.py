@@ -1474,26 +1474,25 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         per = self._rec_snapshot_nbytes()
         if per <= 0:
             return
-        # 0.375 GiB covers the LIVE working set with headroom — (ladder depth + 1) per concurrent
-        # request, measured at 20 x 16.4 MiB = 328 MiB here — and little more. This store is reserved
-        # out of the same budget the KV pool is sized from (engine._rec_snapshot_store_bytes), so
-        # every GiB given to it is a GiB of context taken away: at --memory-ratio 0.85 a 0.75 GiB
-        # budget cost ~157k pool tokens, wiping out most of the reason to raise the ratio. Above the
-        # working set the store only buys CROSS-REQUEST prefix reuse — a bonus, not a correctness
-        # requirement. Raise it if branch-heavy traffic wants deeper reuse and you have the VRAM.
-        budget = int(float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.375) * (1 << 30))
-        # Floor at the LIVE working set — (ladder depth + 1 end) per concurrent request. Below that
-        # the store evicts entries this batch is still going to attach, so the ladder would thrash
-        # against itself and interior resume points would vanish before anyone could use them.
-        floor = (self._rec_snap_ladder_depth + 1) * max(1, max_running)
-        cap = max(4, floor, budget // per)
+        # The cap is DERIVED from the live working set — (ladder depth + 1 end) per concurrent
+        # request — not from a chosen number of GiB. Below that the store evicts entries this batch
+        # is still going to attach, so the ladder thrashes against itself; above it, the store only
+        # buys CROSS-REQUEST reuse, and that measured worth nothing on this box: cap 12 and cap 23
+        # produced the SAME hits and the SAME TTFT on agent- and chat-shaped prefix-sharing traffic
+        # (tools/rec_radix_ab.sh), while the difference cost 36,704 KV pool tokens out of the very
+        # budget the pool is sized from. MINISGL_GDN_RADIX_SNAP_BUDGET_GIB remains as an explicit
+        # override for branch-heavy traffic that wants deeper reuse and has the VRAM to pay for it.
+        live = (self._rec_snap_ladder_depth + 1) * max(1, max_running)
+        env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
+        cap = max(4, live, (int(float(env_gib) * (1 << 30)) // per) if env_gib else 0)
         if os.environ.get("MINISGL_GDN_RADIX_MAX_SNAPSHOTS"):
             cap = min(cap, pc.max_rec_snapshots)  # explicit override still wins downward
         pc.max_rec_snapshots = int(cap)
         logger.info_rank0(
             f"recurrent-radix snapshot store: cap={pc.max_rec_snapshots} x {per/(1<<20):.1f} MiB "
-            f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB (ladder depth "
-            f"{self._rec_snap_ladder_depth}, max_running={max_running})"
+            f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB "
+            f"({'BUDGET override' if env_gib else 'derived'}: live working set = (ladder "
+            f"{self._rec_snap_ladder_depth} + 1) x max_running {max_running} = {live})"
         )
 
     def _attach_rec_ladder(self, req: Req, handle) -> None:

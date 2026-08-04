@@ -28,6 +28,12 @@ boot() {  # $1 leg
     off)     env=(EXTRA_ARGS=--no-gdn-radix) ;;
     ladder0) env=(MINISGL_GDN_RADIX_SNAP_LADDER=0) ;;
     ladder4) env=(MINISGL_GDN_RADIX_SNAP_LADDER=4) ;;
+    # The proposed trade: a smaller prefill chunk so short prompts have interior boundaries at all
+    # (below max_extend_tokens the ladder has nothing to attach to), a shallower ladder so the cap's
+    # FLOOR drops, and a budget low enough to actually bank that — the budget is what sets the
+    # reservation, the ladder only floors it.
+    tuned)   env=(MINISGL_GDN_RADIX_SNAP_LADDER=2 MINISGL_GDN_RADIX_SNAP_BUDGET_GIB=0.20
+                  "EXTRA_ARGS=--max-prefill-length 2048") ;;
     *) echo "unknown leg $leg"; return 2 ;;
   esac
   echo "== boot leg=$leg (${env[*]}) =="

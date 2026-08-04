@@ -662,13 +662,25 @@ class Engine:
                     // max(1, config.max_running_req + 2))
         if per_slot <= 0:
             return 0
-        budget = int(
-            float(os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB") or 0.375) * (1 << 30)
-        )
-        # The scheduler floors the cap at the live working set, so reserve at least that much.
-        floor = (int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4) + 1) * max(
-            1, config.max_running_req)
-        return max(budget, floor * per_slot)
+        # DERIVED, not a magic GiB: the store's job is to hold every live sequence's ladder plus its
+        # end snapshot, which is exactly (ladder + 1) * max_running_req entries. Anything above that
+        # is cross-request reuse, and it measured worth nothing here — cap 12 and cap 23 produced the
+        # SAME hit count and the same TTFT on both agent- and chat-shaped prefix-sharing traffic
+        # (tools/rec_radix_ab.sh), while the difference cost 36,704 KV pool tokens. So the default is
+        # the working set; MINISGL_GDN_RADIX_SNAP_BUDGET_GIB stays as an explicit override for a
+        # deployment that wants deeper reuse and has the VRAM to buy it.
+        live = self._rec_snap_live_snapshots(config)
+        env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
+        budget = int(float(env_gib) * (1 << 30)) if env_gib else 0
+        return max(budget, live * per_slot)
+
+    @staticmethod
+    def _rec_snap_live_snapshots(config) -> int:
+        """Snapshots the LIVE working set needs: each concurrent sequence's ladder plus its end
+        boundary. The one number both the engine's reservation and the scheduler's LRU cap derive
+        from, so they cannot disagree about how much VRAM this store is allowed."""
+        ladder = max(0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4))
+        return (ladder + 1) * max(1, config.max_running_req)
 
     @staticmethod
     def _replay_ring_bytes(mc, num_slots: int, num_v_heads: int, ssm_itemsize: int) -> int:
