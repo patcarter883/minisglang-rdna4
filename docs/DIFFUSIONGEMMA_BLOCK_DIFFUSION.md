@@ -1089,10 +1089,7 @@ emits all its tokens at once and tok/s therefore cannot show k at all.
 ### D4. What is still open
 
 * ~~**cudagraph capture (§B7.7).** Eager only.~~ **DONE, and it buys nothing — see §D6.**
-* **Concurrency (§R6).** Measured at bs=1 only. The forward shape is uniform, but the per-request
-  TEMPERATURE differs (it is a function of that request's own step index), so a batched step needs a
-  per-row scale; the code currently applies it per request in the sampler, which is correct but
-  serialises the fp32 softmax over `[canvas, vocab]` per request.
+* ~~**Concurrency (§R6).** Measured at bs=1 only.~~ **Measured 1/2/4; it saturates — see §D7.**
 * **SWA-radix.** ~~Turned OFF for the canvas phase.~~ **Now ON, the stated reason was wrong, FULL
   prefix reuse is proven lossless, and PARTIAL prefix reuse is still open — see §D5.**
 * **Chunked prefill** ~~and~~ is now wired for the encoder pass (§D5), and it had to be: with the
@@ -1359,3 +1356,67 @@ Two implementation notes worth keeping:
   canvas step up to a captured bs=4 would push an extra 256-token canvas through 30 layers to avoid
   ~1 ms of launch — the wrong trade by two orders of magnitude. Uncaptured sizes fall back to the
   eager forward, which is lossless.
+
+## D7. Concurrency: it saturates at bs≈2, and it is not a route to 300 tok/s
+
+§D4 recorded a suspicion that per-request temperature "serialises the fp32 softmax". **That is not a
+blocker and never was.** The forward was already batched — one canvas step concatenates every
+in-flight block into a single forward — and only the per-request sampler tail is serial, which is
+inherent work (it scales with the batch either way), not a serialisation defect. bs>1 needed no new
+machinery; it needed measuring.
+
+Marginal step cost against the batch size actually present in the step (captured leg, `CONC=4`):
+
+| bs | step | throughput index (bs/step) | vs bs=1 |
+|---|---|---|---|
+| 1.0 | 181.1 ms | 5.52 | 1.00x |
+| 2.0 | 268.6 ms | 7.45 | 1.35x |
+| 2.4 | 312.6 ms | 7.68 | 1.39x |
+| 3.5 | 433.7 ms | 8.07 | 1.46x |
+
+and end to end, aggregate over concurrent 256-token requests:
+
+```
+conc=1    ~35 tok/s          (99-106 token partial blocks)
+conc=2    348 tok in 3.87s =  89.9 tok/s
+conc=4    751 tok in 8.07s =  93.0 tok/s      <- +3.4% over conc=2
+```
+
+**Batching buys ~1.35x by bs=2 and then flattens: bs=2 → bs=4 is +3.4%.** The step cost grows very
+nearly linearly with the batch (181 → 269 → 434 ms), which is what a GPU that is *already saturated
+at 256 rows* does when you give it more rows. The 8.1 GB/card expert-weight stream does amortize —
+that is the 1.35x — but past bs≈2 the GEMM work dominates and scales with the row count, so
+aggregate throughput is flat.
+
+So concurrency is not the missing multiple either. The measured ceiling on this box is **~93 tok/s
+aggregate**, against a 300 tok/s target and a backbone that alone costs 127.7 ms of a ~50 ms budget.
+Nothing in the serving layer closes that gap; it is a kernel-efficiency problem.
+
+### D7.1 Further corrections to Part D
+
+11. **§D3 item 10 is now wrong, exactly as it predicted.** `attention/hip.py` needed no canvas change
+    only while the canvas ran eager. Capturing it required a fifth static-metadata family
+    (`init_canvas_capture` / `_canvas_metadata_static` / `prepare_canvas_for_{capture,replay}`).
+    The rows are the SAME arithmetic as `_fill_swa_verify_static` at a different qlen, so the two now
+    share `_fill_swa_multiquery_static`, and the four byte-identical main-pool fills across the
+    decode / verify / fused-verify / canvas families share `_fill_paged_static`.
+
+12. **The step is 186 ms, not 208 ms.** The 208 came from pairing k=17 (the median) with the 72.3
+    tok/s leg; the correct pairing for that leg is k=19. Measured 181-187 ms across five legs.
+
+13. **`_moe_block_m` already picks the right tile, and the reference does not.** At 256 canvas rows
+    with 128 experts the average is ~16 rows/expert, and `_moe_block_m` picks the 16-row minimum —
+    zero padding waste — as a pure function of static shapes, which is also what makes it
+    capture-safe (a captured graph bakes the tile the eager step would have chosen). vLLM's selector
+    picks 32 on the identical shape, padding 16 real rows into a 32-row tile.
+
+14. **`soft_embedding` saves storage, not arithmetic, and pays 8x for it in traffic.** §A/§C's
+    framing ("~100x smaller than carrying the logits") is a claim about the carried STATE and it is
+    true. It is not a claim about cost, and the cost is the same second-LM-head vLLM pays: 378 GFLOP
+    per step in total, TP-sharded to 189 GFLOP/card — sharding is not a reduction. Worse, chunking
+    over 32 canvas ROWS to bound the fp32 softmax transient (268 MiB → 33 MiB) makes each of the 8
+    chunks re-stream the whole 738 MB embedding shard: ~5.9 GB/card/step against a 0.74 GB floor,
+    measured at 15-16 ms/step by both instruments. Chunking over VOCAB instead keeps the transient
+    bound and streams the shard once; the sampler's `probs` is also already exactly `softmax(scaled)`,
+    so the softmax inside it is recomputed. Not fixed here — recorded so it is not re-derived.
+
