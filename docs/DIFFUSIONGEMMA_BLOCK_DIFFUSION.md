@@ -884,3 +884,136 @@ itself is unaffected — minisgl derives the same geometry from the same two con
 (`scheduler.py:318`) reads the generation config, so this should come out right, but it is worth an
 eyeball at Stage 5 — an unmatched terminator on a canvas model doesn't truncate one token late, it
 emits a full extra 256-token block.
+
+---
+
+## Part C — what was built, what the doc got wrong, and what is left
+
+Everything below was executed. Parts A and B above were written from source; this part is the
+measurement, and it corrects Part A/B where the two disagree.
+
+### C1. Landed
+
+| stage | commit | evidence |
+|---|---|---|
+| model + loader + registration | `feat(diffusiongemma): register the block-diffusion head…` | `tests/diffusiongemma_build_test.py` PASS at TP=1 and TP=2: declared 805 == emitted 805, 0 missing / 0 extra / 0 mis-shaped / 0 mis-typed / 0 duplicated |
+| numerical parity, both roles | `test(diffusiongemma): numerical parity for BOTH execution roles…` | `tests/diffusiongemma_parity_test.py` PASS: canvas logits rel_fro 4.3e-07 / 5.9e-07, encoder-role final hidden rel_fro 2.4e-07, self-conditioning and `soft_embedding` BIT-EXACT |
+| entropy-bound sampler | `feat(diffusion): the entropy-bound sampler…` | `tests/diffusiongemma_sampler_test.py` PASS: 39-step replay against the reference with 0 mismatches on the accepted mask, sampled canvas, argmax canvas, entropies and the early-exit flag |
+| canvas attention feasibility | `probe(diffusiongemma): the paged kernel does serve a non-causal canvas` | `tools/canvas_attention_probe.py` PASS on a 9070 — see §C3 |
+
+§B8's central verdict is confirmed: **the decoder stack is reusable as is.** DiffusionGemma's
+parameter set is the autoregressive sibling's 802 keys plus exactly three
+(`model.self_conditioning.{pre_norm,gate_up_proj,down_proj}`), differenced by building both models
+side by side, and one instantiated stack reproduces both the causal encoder and the bidirectional
+decoder to fp32 round-off.
+
+### C2. Where Part A/B is wrong
+
+1. **§U4 is INVERTED for the shipped transformers.** The doc says to always pass `global_head_dim`
+   and `num_global_key_value_heads` or `per_layer_config[i].num_key_value_heads` reads `None`. In
+   transformers **5.14.1** — the version in the serve image — `per_layer_config` is already `None`
+   on the real config and both attention classes read `config.global_head_dim` / `config.head_dim`
+   directly. POPULATING `per_layer_config` is the trap in this version: it marks the config
+   heterogeneous and every `config.head_dim` read raises
+   `AmbiguousGlobalPerLayerAttributeError`. The doc's advice comes from the older scratchpad copy.
+
+2. **Every line-number citation in Parts A/B is stale by roughly 60–70 lines** against the current
+   tree (`scheduler.py:3895` is now `:3962`; `rdna4.py:637-692` is now `:643-698`). The seam table in
+   §C4 carries current numbers.
+
+3. **§B7.9(a) understates the loader break.** Narrowing `_GEMMA4_SKIP_PREFIXES` was necessary but
+   not sufficient: the compressed-tensors `ignore` list is stored in the CHECKPOINT's key space
+   (`model.decoder.layers.0.mlp.gate_proj`) and `_norm_ignore` stripped only the `language_model.`
+   infix, so on this checkpoint **nothing in the ignore list matched at all** — the dense MLP, all
+   30 routers and the self-conditioning block would have been built int4 against fp16 tensors. The
+   symptom is ~90 modules declaring `weight_packed` where the loader emits `weight`, with nothing
+   pointing at a namespace mismatch.
+
+4. **§R1 (`head_dim 512`) is resolved in SOURCE but not in every IMAGE.** The 512 instantiations
+   exist across `attn_decode` / `attn_hip` / `attn_prefill_paged` in the
+   `rdna4-hip-kernels-gemma4serve` worktree. They do NOT exist in `rdna4-hip-kernels` main, and the
+   `/opt/kernels` baked into `minisgl-rdna4:lean` refuses them
+   (`attn_prefill_paged split: head_dim 512 unsupported (64/128/256)`). `_HIP_HEAD_DIMS` already
+   lists 512, so `_no_hip_kernel`'s "the loaded package is older than the engine" note is exactly
+   right — but only a canvas/verify path reaches it, which is why a bs=1 autoregressive serve with a
+   cold prefill never noticed. **Any canvas work must run on an image built from the gemma4serve
+   kernels.**
+
+5. **§B7.3's fix is understated.** The ring aliasing is not a partial overlap: at `R = W` with a
+   256-token canvas, **256 of 256** canvas slots land on a slot inside the window they must read.
+
+6. **§B8.2's "a canvas needs a `custom_mask`" is wrong, and the correction saves memory.** The full
+   layers reach `causal=0` today only when `metadata.custom_mask` is set, but the KERNEL takes
+   `causal` independently: `causal=0, mask_bias=None` is dense bidirectional attention, measured
+   bit-identical to passing an all-zero mask. A canvas therefore needs no `[256, cur_len+256]` fp32
+   bias at all — 2.2 MiB per layer per step at a 2000-token prefix.
+
+### C3. Measured on the card (`tools/canvas_attention_probe.py`, RX 9070, `minisgl-rdna4:gemma4`)
+
+Geometry is DiffusionGemma at TP=2: sliding 8 q / 4 kv at head_dim 256, full 8 q / 1 kv at head_dim
+512, window 1024, canvas 256, prefix 2000, softmax scale 1.0.
+
+```
+[A] sliding layers, causal=0 + sliding_window=0 over a [Wp | canvas] RING block table
+      vs dense bidirectional            rel_fro 1.46e-03   (bf16 accumulation noise)
+      the SHIPPED causal=1 ring path    rel_fro 6.02e-01   -- a different model
+      canvas query 0 sees canvas key 255 (max|abs| 0.0 between two identical queries)
+[B] full layers, causal=0, mask_bias=None, head_dim 512
+      vs dense bidirectional            rel_fro 1.34e-03
+      an all-zero mask_bias is redundant (bit-identical)
+[C] ring stride   R = 1024 -> 256/256 canvas slots alias a window slot
+                  R = 1280 -> 0
+[D] cost at q=256   sliding (1280 keys)  causal=0  428.0 us   causal=1  401.7 us   1.07x
+                    full    (2256 keys)  causal=0 1759.1 us   causal=1 1699.8 us   1.03x
+                    per denoising step (25 sliding + 5 full) = 19.5 ms
+                    48 steps = 936 ms for a 256-token block = 3.66 ms/token of attention
+```
+
+**§R4 is answered: non-causal costs essentially nothing extra** (1.03–1.07x, not the 2x the doubled
+score-cell count would suggest — the kernel is not score-bound at this shape).
+
+**§R7 now has a number, and it is the thing to watch.** 3.66 ms/token of attention *alone* at the
+48-step worst case, against the autoregressive sibling's 22.8 ms/token *total* (43.9 tok/s). There is
+headroom, but only because 48 steps is the ceiling; the 5 full-attention layers cost 8.8 ms of the
+19.5 ms step at 1 kv head per rank, which is ~5.4 TFLOP/s of a card that does far more, so that
+kernel shape is the first thing to look at if the step cost matters. **This is an isolated kernel
+bench, not a serve measurement** — per this repo's standing rule it bounds feasibility and predicts
+nothing about end-to-end tok/s. `k`, the realised steps per block, is still entirely unmeasured and
+is what decides whether block diffusion wins.
+
+### C4. What is left — the execution mode, with current line numbers
+
+| # | seam | file:line | state |
+|---|---|---|---|
+| 1 | `Req.complete_one()` hard-codes `+1` | `core.py:158-160`, applied at `engine/engine.py:1087-1088` | a canvas step must not go through `Engine.forward_batch` |
+| 2 | multi-query staging | `scheduler.py:3962` (`req.device_len = c0 + len(d) + 1`) | template exists; canvas wants `c0 + 256`, held across all <=48 steps |
+| 3 | non-causal on the 5 full layers | `attention/rdna4.py:409, 429` | **works today** — pass `causal=0` with `mask_bias=None` (§C3 B) |
+| 4 | non-causal on the 25 sliding layers | `attention/rdna4.py:590-598` | `_swa_prefill_paged` hardcodes `causal=1, sliding_window=W, mask_bias=None`; the kernel accepts the other combination and it is correct (§C3 A), so this is ~20 lines of Python, not a kernel change |
+| 5 | ring stride widening | `engine/engine.py:210-215` AND `engine/engine.py:792-796` | two independent `spec_block` computations that must move in lockstep; both need `+ canvas_length` |
+| 6 | SWA read window capped at `W` | `attention/rdna4.py:722, 729` (`cnt = min(S, W)`) | cannot express `Wp + 256`; `attention/hip.py:414-426` (`_fill_swa_verify_static`) already builds exactly the `[window | new]` row shape needed |
+| 7 | forward entry point | `engine/engine.py:1153-1168` | `forward_verify` calls `model.forward()`, not `forward_canvas`; needs a sibling |
+| 8 | LM-head reduction | `layers/embedding.py:134` | done — `forward_canvas` uses `logits_all_rows` |
+| 9 | slot lifecycle | `scheduler/recurrent_slots.py:55-90` | pattern to copy: uid-keyed, allocate-once, idempotent free, `KeyError` on a miss |
+| 10 | page rollback | `scheduler.py:4406-4415` | must become a no-op until block end (the 256 slots are reused across all steps) |
+| 11 | **no GPU harness exists** | — | nothing in `tools/` or `tests/` boots a model + paged KV pool outside the scheduler; the closest are `tools/swa_ring_roundtrip.py` (kernels only, no `Context`) and `tools/kv_fp8_perhead_check.py` (pool only, no model) |
+
+**Seam 11 is the real blocker, and it is a design decision, not a missing capability.** Seams 1–10 are
+each small and each has a working template. But there is nowhere to *drive* them from: a canvas
+generation needs an encoder prefill (pages, radix, positions), then <=48 canvas steps that reuse the
+same slots, then a commit and a re-encode — and the only thing in the tree that can sequence that is
+`Scheduler.run_forever`. The two options are
+
+  (a) **a bespoke boot** that reproduces `Engine.__init__`'s ordering by hand (`Context(page_size)`
+      -> `set_global_ctx` -> `ctx.page_table` -> main `MHAKVCache` -> `ctx.swa_ring_stride` -> SWA
+      `MHAKVCache` -> backend -> model; the backend snapshots the stride at `rdna4.py:131`, so the
+      order is load-bearing). Fast to a first generation, but it is a second copy of the engine's
+      sizing logic that will drift; and
+
+  (b) **`Scheduler._diffusion_loop` + `CanvasManager`** as a peer of `_spec_decode_step` — the shape
+      §B8.3 argues for and the one that ends up in production.
+
+(b) is right and (a) is a trap: the doc's own §B7.6 lifecycle work (`ENCODE -> DENOISE xk -> COMMIT`)
+has to be written either way, and writing it against a throwaway harness means writing it twice.
+Recommendation: go straight to (b), in the order 4 -> 6 -> 5 -> 3 -> 7 (all mechanical, all with
+templates, verifiable by a single-step canvas forward against the CPU parity fixture), then 1/2/9/10
+as one `CanvasManager` change. Nothing about the autoregressive path needs to move.
