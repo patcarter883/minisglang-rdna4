@@ -42,6 +42,8 @@ from minisgl.diffusion import CanvasState, DiffusionSamplerConfig
 from minisgl.message import DetokenizeMsg
 from minisgl.utils import div_ceil, init_logger
 
+from minisgl.kvcache.state_digest import log_prefill_state_digest, state_digest_enabled
+
 from .prefill import ChunkedReq
 
 if TYPE_CHECKING:
@@ -221,6 +223,7 @@ class SchedulerDiffusionMixin:
             # The whole prompt is now valid KV. No `complete_one()`: that would advance device_len by
             # the one autoregressive token this model does not produce.
             req.cached_len = req.device_len
+            matched = int(getattr(getattr(req, "cache_handle", None), "cached_len", 0) or 0)
             inserted = self.cache_manager.cache_req(req, finished=False)
             # SWA-radix CAPTURE (the AR loop does this in `_process_last_data`, which the canvas loop
             # does not go through). The prompt's sliding window is snapshotted onto the node just
@@ -229,6 +232,13 @@ class SchedulerDiffusionMixin:
             # finish-commit ones, i.e. whole completed conversations.
             if self._swa_radix:
                 self._maybe_capture_swa_state(req, inserted)
+            # BISECT INSTRUMENT (MINISGL_STATE_DIGEST=1, inert otherwise). The encoder pass has just
+            # produced the ENTIRE state a canvas is a pure function of, so hashing it here decides —
+            # before the sampler can obscure it — whether a prefix-reused prefill left the same KV as
+            # a cold one. See kvcache/state_digest.py and tools/canvas_state_bisect.py.
+            if state_digest_enabled():
+                log_prefill_state_digest(logger, "encode", self.engine, req, self._swa_snap,
+                                         matched=matched)
         self.decode_manager.filter_reqs(reqs)
 
     # ---------------------------------------------------------------------------------------

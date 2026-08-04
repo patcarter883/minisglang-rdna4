@@ -1090,8 +1090,9 @@ emits all its tokens at once and tok/s therefore cannot show k at all.
 
 * ~~**cudagraph capture (§B7.7).** Eager only.~~ **DONE, and it buys nothing — see §D6.**
 * ~~**Concurrency (§R6).** Measured at bs=1 only.~~ **Measured 1/2/4; it saturates — see §D7.**
-* **SWA-radix.** ~~Turned OFF for the canvas phase.~~ **Now ON, the stated reason was wrong, FULL
-  prefix reuse is proven lossless, and PARTIAL prefix reuse is still open — see §D5.**
+* **SWA-radix.** ~~Turned OFF for the canvas phase.~~ **Now ON, the stated reason was wrong, and FULL
+  prefix reuse is proven lossless (§D5). PARTIAL prefix reuse is a KNOWN DEFECT, located to the
+  sliding-layer extend over a restored window in a page-split prefill (§D5.1) — not fixed.**
 * **Chunked prefill** ~~and~~ is now wired for the encoder pass (§D5), and it had to be: with the
   prefix cache on, 15 out of 16 prompts arrive chunked. **Structured output** is still REFUSED with a
   reason rather than silently ignored.
@@ -1215,39 +1216,8 @@ The two `short` cells are inadmissible for a reason worth writing down: `align_d
 `len(P)` and `len(B1)` to straddle different page boundaries.
 
 The two `xlong` cells are admissible (the `cold` control sha is identical across the two serves, so
-cross-serve output IS reproducible here) and they DIVERGED. **The cause is not isolated, and there are
-two live candidates:**
-
-  * **Prefill SHAPE, not window content.** The partial hit and its cold reference do not run the same
-    forward decomposition: cold is `[0,3184) + [3184,3192)` while the partial hit is
-    `[3168,3184) + [3184,3192)`, so every dense projection, the router and the head run at a different
-    M. That is the documented rocBLAS bf16 M-dependence ([[cca-prefix-cache-gemm-m-dependence]]) worth
-    ~1 ULP — and a canvas amplifies 1 ULP far more violently than an AR decode does, because the
-    entropy bound SORTS 256 per-position entropies and thresholds a cumulative sum, so a single
-    near-tie flips which tokens are accepted at step 1 and the whole block rewrites. This is the same
-    effect that made 5 of the AR gate's partial cells INDETERMINATE; with a stable reference it
-    presents as DIVERGED instead.
-  * **The chunked encoder path.** The `xlong` partial hit is the ONLY cell that goes through the new
-    multi-chunk `_canvas_encode` with a restored window, so a defect there is not excluded.
-
-Two observations argue for the first: the text is not corrupted the way a stale window would corrupt
-it (at `xlong/16` the partial-hit output is an exact PREFIX of the cold one —
-`" a square potential well stores energy in evenly spaced levels."` vs the same plus `" Note 11:"` —
-i.e. the trajectories agree for ~13 tokens and then part), and the full-hit cells prove the restore
-itself is exact at a 3184 boundary. But that is an argument, not a measurement.
-
-**THE EXPERIMENT THAT SETTLES IT, not yet run** (the cards were released to the cudagraph-capture
-agent): compare partial-hit against partial-hit across two independent serves at the same setting. If
-A.partial reproduces itself across serves, the partial path is deterministic and the A-vs-B
-difference is entirely prefill shape — which would make it a floor, not a loss. If it does not, the
-chunked restore is suspect. A second, sharper variant: pick prompt lengths so the partial hit and its
-cold reference decompose into the SAME chunk shapes.
-
-**STATUS.** SWA-radix is ON for the canvas phase (the engine default, unchanged) and the canvas loop
-now restores, captures, and survives chunked prefill. Full-prefix reuse is proven lossless.
-Partial-prefix reuse is UNVERIFIED and showed divergence on a 3168-token shared prefix. A deployment
-that needs a guarantee on partial reuse should set `MINISGL_SWA_RADIX=0` until the experiment above is
-run.
+cross-serve output IS reproducible here) and they DIVERGED. **It is a DEFECT, not noise, and the
+first explanation offered here was wrong** — see §D5.1.
 
 #### TTFT and tok/s — the win is real but SMALL, and the reason is structural
 
@@ -1263,9 +1233,79 @@ prefill and 0% of the denoise**, so the ceiling on this win is the prefill's sha
 ~8% at a 3.2k prompt, ~1% at 200 tokens. It grows with prompt length and shrinks with k; it is not
 the lever block diffusion needs, which is the ~85%-non-compute canvas step.
 
-tok/s was NOT re-measured with SWA-radix on (the cards were released); the gate's per-request wall
-times are within noise of the §D1 numbers, but that is not a tok/s measurement and is not claimed as
-one.
+**AR guard, re-run with SWA-radix ON: `256 tokens in 5.79s = 44.2 tok/s = 22.6 ms/token`** — exactly
+the §D1 baseline (44.1 / 44.2). The autoregressive sibling is unaffected. (The same leg's short
+completion reads `117 tokens in 5.67s = 20.6 tok/s`; that is the first request after boot and is not
+the guard — §D1's own 117-token figure, 30.4 tok/s, was also a warmed one.)
+
+### D5.1 The partial-hit divergence is a DEFECT, and it is located
+
+§D5 offered two causes for the partial-hit divergence and leaned on the wrong one. **"Prefill-shape
+rocBLAS M-dependence" is not available as an explanation on this engine at all:** the dense path does
+not use rocBLAS, and its kernels are M-invariant by construction. `layers/minv.py::minv_linear`
+exists precisely so a chunked prefill is bit-identical to a single pass — verified 0.0 across all 40
+CCA layers by `tools/cca_chunk_bisect.py` — and Gemma4's router and lm_head both go through it. So a
+chunked-vs-single difference cannot come from numerics, and the divergence is a bug.
+
+**The instrument.** Text is the worst possible place to debug this: it has been through 30 layers, a
+16-step denoising trajectory and an entropy bound that SORTS 256 values, so one flipped bit anywhere
+rewrites the whole answer and no amount of reading it says where. `kvcache/state_digest.py` +
+`tools/canvas_state_bisect.py` are the `cca_chunk_bisect` move applied one level down, to STATE
+instead of activations, on the observation that
+
+> a prefill is correct iff the KV it leaves behind is bit-identical to a cold prefill's,
+
+because decode, the canvas and the sampler are all pure functions of it. `MINISGL_STATE_DIGEST=1`
+makes `_canvas_encode` sha256 the KV it just produced, per layer, per pool, per 256-position segment;
+two serves (partial hit / same prompt cold) are then diffed cell by cell.
+
+**Measured.** Two controls first, and both hold: the full-hit request's state is byte-identical to
+its cold reference at all 190 cells (`boundary 3189 — IDENTICAL`), and the cold request's state is
+byte-identical ACROSS the two serves — so cross-serve KV determinism is not in question. Then the
+partial hit (match at 3168), at boundary 3191, segmented by absolute position:
+
+```
+seg     0 ..  2816   0/5 .. 0/30 cells differ      <- the whole REUSED span: IDENTICAL
+seg  3072:3191      29/30 cells differ             <- the only segment that moves
+  the one cell that still MATCHES inside it:  pool=swa layer=0
+```
+
+**That pair of facts is the whole finding.**
+
+*The cache is EXACT.* Thirteen of fourteen segments — every position below 3072, in both pools, at
+every layer — are byte-identical. The reuse boundary is 3168, so the entire restored window and the
+entire reused page span are proven correct. Segment `3072:3191` straddles the boundary, but positions
+`[3072,3168)` have exactly the same provenance as `[2816,3072)` (restored window / reused pages), and
+those match — so the divergence lives in `[3168,3191)`: the 23 tokens the forward COMPUTED after the
+restore. **Not the snapshot, not the radix pages, not the tokens.**
+
+*And it is the SLIDING layer that goes first.* `pool=swa layer=0` matches even inside the differing
+segment. The first sliding layer's stored K/V is a pure function of the token embeddings and
+positions — no attention output feeds it — so its matching proves tokens, positions and embeddings
+are right for the new span too. Layer 1 differing means layer 0's ATTENTION OUTPUT differs. Same
+queries, same keys, same values, different result.
+
+That also explains the shape of the symptom §D5 misread as a numerics tell: the partial-hit text
+being an exact PREFIX of the cold text is what a wrong attention result over a handful of positions
+looks like after an argmax canvas, not what a uniform 1-ULP perturbation looks like.
+
+**Why the full hit survives and the partial hit does not** is the remaining question, and the two
+paths differ in exactly one way: a full hit extends 5-7 tokens directly from the restored boundary in
+ONE forward, while a partial hit is page-split into a middle chunk `[3168,3184)` and a tail
+`[3184,3191)`, so the FIRST forward after the restore is a 16-token extend at BC front-pad
+`(3168-1024) % 32 == 0` rather than the full hit's `(3184-1024) % 32 == 16`. `_swa_prefill_extend`'s
+bit-identity to cold was validated on the autoregressive path
+(`tools/swa_prefix_extend_validate.py`, 0.000e+00 at every boundary); it is the pad-0 / short-chunk
+case that is now implicated and that the AR path evidently never exercised in the same shape.
+
+**STATUS — NOT FIXED, and the next step is named.** Full-prefix reuse on the canvas is proven
+lossless. Partial-prefix reuse is a KNOWN DEFECT with a precise address: `_swa_prefill_extend`, on the
+first chunk after a window restore, when the prefill is page-split. The fix belongs in
+`attention/rdna4.py` (the extend and its BC front-pad), not in the snapshotter or the scheduler, and
+it needs its own bit-identity gate — `tools/swa_prefix_extend_validate.py` extended to the pad-0 /
+short-chunk case, which is cheap and needs no serve. Until then, a block-diffusion deployment that
+shares long prefixes across requests should set `MINISGL_SWA_RADIX=0`; full-prefix reuse (the same
+prompt twice) is unaffected and remains lossless.
 
 ---
 
