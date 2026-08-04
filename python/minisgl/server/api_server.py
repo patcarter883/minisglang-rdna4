@@ -924,6 +924,12 @@ _TOOL_CLOSERS = {
 }
 
 
+# Seconds of dead air tolerated while a tool-call block is buffering before an SSE keepalive comment
+# goes out. Short enough to beat the usual 30-60s proxy/client idle timeouts, long enough that a
+# normal (fast-closing) block never emits one.
+_TOOL_BLOCK_KEEPALIVE_S = 10.0
+
+
 def _earliest_opener(text: str) -> Tuple[int, str | None]:
     """Index + token of the earliest complete tool-block opener in ``text`` (``(-1, None)`` if none)."""
     best_idx, best_tok = -1, None
@@ -972,6 +978,26 @@ class ToolCallStreamState:
         # then: the turn did not complete, and a client told "stop" renders that markup to the user
         # as the final answer instead of continuing or retrying.
         self.unparsed_tail = False
+        # One-shot latch for the oversize-block warning (see `held_chars`).
+        self._warned_oversize = False
+
+    @property
+    def held_chars(self) -> int:
+        """How much output is currently trapped in an unclosed block. Zero outside a block (the
+        partial-opener buffer is a handful of chars and always drains). While this is nonzero the
+        stream emits NOTHING to the client, so the caller uses it to keep the wire alive."""
+        return len(self.buf) if self.in_tool else 0
+
+    def warn_if_oversize(self, threshold: int = 8192) -> bool:
+        """True exactly once, when the held body first crosses ``threshold``. A tool call whose
+        arguments run to kilobytes with no closer in sight is the signature of a model that latched
+        an opener and kept decoding — measured 2026-08-04: ~60k tokens generated, zero delivered,
+        because `push` holds the whole body and the client just sees a dead connection. Surfacing it
+        in the serve log is the only way that failure is visible while it is happening."""
+        if self.in_tool and not self._warned_oversize and len(self.buf) >= threshold:
+            self._warned_oversize = True
+            return True
+        return False
 
     def _parse_block(self, block: str) -> Tuple[str, dict] | None:
         if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
@@ -1036,6 +1062,7 @@ class ToolCallStreamState:
                 tool_deltas.extend(self._emit_call(block))
                 self.in_tool = False
                 self.opener = None
+                self._warned_oversize = False  # re-arm: a LATER block can go oversize too
         return ("".join(content_parts) or None), tool_deltas
 
     def flush(self) -> Tuple[str | None, List[dict]]:
@@ -1230,6 +1257,10 @@ class FrontendManager:
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
+        # Wall-clock of the last byte written. While `tool_stream` is holding an unclosed block it
+        # emits nothing, so without this the socket goes silent for as long as the model keeps
+        # decoding into that block — indistinguishable, from the client, from a hung server.
+        last_write = time.monotonic()
 
         def _chunk(delta: dict) -> bytes:
             payload = {
@@ -1284,6 +1315,25 @@ class FrontendManager:
                 yield _chunk(delta)
             for td in tool_deltas:
                 yield _chunk({"tool_calls": [td]})
+            if delta or tool_deltas:
+                last_write = time.monotonic()
+            elif tool_stream is not None and tool_stream.held_chars:
+                # Nothing to emit because the whole body is trapped in an unclosed tool block. Keep
+                # the wire alive with an SSE COMMENT — legal per the SSE spec, ignored by every
+                # OpenAI client (it is not a `data:` line, so it never reaches the delta stream), and
+                # enough to stop idle-timeout proxies and client stall detectors from firing on a
+                # server that is in fact still decoding.
+                if time.monotonic() - last_write >= _TOOL_BLOCK_KEEPALIVE_S:
+                    last_write = time.monotonic()
+                    yield b": tool-call block open\n\n"
+                if tool_stream.warn_if_oversize():
+                    logger.warning(
+                        "uid=%s has %d chars buffered inside an unclosed %s block after %d completion "
+                        "tokens — nothing has been streamed to the client since the opener. Either the "
+                        "model is generating a very large tool argument or it latched an opener it will "
+                        "never close; the turn will only surface when max_tokens is hit.",
+                        uid, tool_stream.held_chars, tool_stream.opener, completion_tokens,
+                    )
 
             if ack.finished:
                 break
