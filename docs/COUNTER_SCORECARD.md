@@ -9,7 +9,7 @@ Every regime call in this repo was reached by INFERENCE — ISA instruction coun
 experiments, and percentages taken against a roofline that was later corrected. Hardware counters now
 work on gfx1201, so this measures them.
 
-Reproduce: `gpu-lease -n 2 -- bash tools/counter_probe/scorecard/run_sweep.sh phase0_timing phase1_waitsplit phase2_kernels`
+Reproduce: `GPU_LEASE_WEDGE_WATCH=0 gpu-lease -n 2 -- bash tools/counter_probe/scorecard/run_sweep.sh phase0_timing phase1_waitsplit phase2_kernels phase3_g2fuse`
 then `python3 tools/counter_probe/scorecard/scorecard.py`.
 
 ---
@@ -215,21 +215,32 @@ cache. Measured honestly (weights rotated past the 64 MB MALL, graph-replay time
 
 **My counters independently reproduce the same shape-dependence, which is the mechanism.** Because I
 compute HBM bytes from `GL2C_MISS` rather than from an assumed working set, the numbers are not
-inflated by cache hits — and they still split hard by shape:
+inflated by cache hits. Bytes and time are **matched per dispatch** (both means over the same 4
+dispatches) — mixing mean bytes with the *minimum* time produced an impossible 127.6% on one
+cache-resident shape, which is the tell for exactly this mistake:
 
-| shape | band | fp8 | int4 |
-|---|---|---:|---:|
-| 16384² (synthetic, 139–268 MB) | HBM-streaming | **94.5%** | **88.4%** |
-| 4096² | cache-adjacent | 96.7% | 80.5% |
-| bf16 LM head N=32768 K=2048 | production | — | **62.6%** |
-| bf16 in_proj_qkvz N=6144 K=2048 | production | — | **32.6%** |
-| bf16 shared.down N=2048 K=256 | production | — | **22.6%** |
-| MoE gemm1 M=1 … M=5 | production | — | **44.9 … 67.9%** |
+| shape | weights | HBM MB/dispatch | mean ns | GB/s | **% of 706.6** | Occ% | MemUnit% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **N=K=2048 int4** (production) | 2.1 MB | 2.17 | 8,600 | 252.3 | **35.7** | 24.8 | 44.5 |
+| **N=K=2048 fp8** (production) | 4.2 MB | 4.21 | 13,980 | 301.1 | **42.6** | 54.2 | 49.6 |
+| **N=6144 K=2048 int4** (production) | 6.3 MB | 6.50 | 14,390 | 451.9 | **64.0** | 52.7 | 64.4 |
+| **N=6144 K=2048 fp8** (production) | 12.6 MB | 12.62 | 25,720 | 490.8 | **69.5** | 64.8 | 60.8 |
+| N=K=4096 int4 | 8.4 MB | 8.66 | 16,490 | 525.4 | 74.4 | 52.1 | 56.4 |
+| N=K=16384 int4 (synthetic) | 134.2 MB | 139.02 | 223,812 | 621.1 | **87.9** | 77.4 | 97.2 |
+| N=K=16384 fp8 (synthetic) | 268.4 MB | 268.56 | 442,134 | 607.4 | **86.0** | 78.8 | 85.7 |
+
+and the bf16 loader at real serve shapes: LM head **62.6%**, in_proj_qkvz **32.6%**,
+shared.down **22.6%**; MoE gemm1 **44.9 → 67.9%**.
 
 **A GEMV only approaches the roofline at shapes far larger than anything the engine launches.** The
 81% was taken in the synthetic regime and then read as a property of "the decode GEMV". At the shapes
-actually served, the same kernels read **22.6–67.9%** of 706.6 GB/s. That is real, unclosed headroom,
-and this verdict was wrongly holding the door shut on it.
+actually served, the same kernels read **22.6–69.5%** of 706.6 GB/s — against 86–88% at 16384². That
+is real, unclosed headroom, and this verdict was wrongly holding the door shut on it.
+
+Note also that every production shape here has a weight footprint of **2–13 MB, far inside the 64 MB
+MALL**, yet `GL2C_MISS × 256` still accounts for essentially the whole weight on every dispatch — the
+weights are not being retained between launches. So "% of HBM roofline" is not even the right frame
+for these shapes; they are dominated by per-launch streaming and occupancy, not by the HBM ceiling.
 
 **Generalisable:** never quote a percentage-of-roofline without the shape and the cache state it was
 taken at, and never let a synthetic sizing sweep stand in for the served geometry.
