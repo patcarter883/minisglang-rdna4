@@ -247,37 +247,66 @@ for these shapes; they are dominated by per-launch streaming and occupancy, not 
 **Generalisable:** never quote a percentage-of-roofline without the shape and the cache state it was
 taken at, and never let a synthetic sizing sweep stand in for the served geometry.
 
-### 4. "Serving is overhead-bound, memory controller ≤27% at every batch size" — **CONFIRMED as an aggregate; the INFERENCE drawn from it is REFUTED**
+### 4. "Serving is overhead-bound, memory controller ≤27% at every batch size" — **REFINED** (directionally right, figure slightly low, and the inference is wrong)
 
-The aggregate is real (Prometheus `amdgpu_umc_activity_percent`: 15% at bs=1, 24–27% at bs=32). What
-does not follow is the conclusion people drew from it — that the decode kernels are far from
-bandwidth-bound and therefore carry ~10× headroom.
+**Now measured on a live serve** (Qwen3.6-35B-A3B-AWQ TP=2, `SPEC=none`, perf level **auto**,
+rocprofv3 `--kernel-trace`, no `--pmc`):
 
-Per-kernel, in the decode band: **int4 dense 87.9%**, **fp8 dense 86.0%** (both at 16384²), **LM head MemUnit 96.9%**,
-**MoE gemm1 62.6% at M=5**. The big GEMVs are at or near the memory ceiling. The ≤27% aggregate is
-therefore **dilution** — small kernels, launch-floor shapes (0.3% of roofline), and inter-kernel gaps
-averaged in with saturated ones — not evidence of slack inside the kernels that dominate the time.
+| | bs=1 | bs=4 |
+|---|---:|---:|
+| achieved bandwidth / 706.6 GB/s | **31.5%** | **31.1%** |
+| bandwidth counting **busy time only** | 44.3% | 40.6% |
 
-Also worth recording: for the Laguna model the ≤27% figure in the docs is a **bytes/step ÷ 706.6
-derivation, not a counter reading**, and it was derived for Laguna rather than the served Qwen 35B.
+So the ceiling is **~31%, not ≤27%** — directionally right, modestly understated. The byte table is
+not "35B at 4 bits": only the routed experts are quantized (everything else bf16), it is a GDN hybrid
+with KV in 10 of 40 layers, and experts are charged as the expected **union** over the batch rather
+than `bs × top_k`. Top buckets at bs=1: GDN weights 41%, lm_head 21%, routed experts 12%.
 
-### 5. "bs=1 decode is inter-kernel-gap bound, ~68% idle" — **REFUTED** (the number is a profiler artifact)
+**The inference remains refuted, and now for a sharper reason.** The step is *not* idle-dominated
+(28.8% idle, below) — yet bandwidth is still only 31%, and **even counting only kernel-execution time
+the GPU reaches just 44.3%**. So the deficit is **inside the kernels, not between them**. That is
+exactly where the per-kernel sweep localises it: the production MoE gemm2 at **2.2% occupancy**, the
+served GEMV shapes at **13.0–69.5%** of roofline. Claims 4 and 5 have been used together to argue
+"overhead-bound ⇒ fuse and amortise"; measured, they do not compose that way.
 
-Running the repo's own analyser over the recorded Qwen 35B decode trace
-(`tools/loads/qwen35b_mtp_decode.pt.trace.json.gz`) reports 78.2% idle — apparently *worse* than the
-claim. But the same parse reports **per-step wall 161.9 ms (6.2 tok/s)** and **GPU-busy 35.3 ms/step**,
-against a real served step of **~11 ms**. GPU-busy alone is **3× the entire real step**, and wall is
-inflated ~15×. **The trace cannot measure idle fraction; the idle figure it yields is manufactured by
-the profiler.** This is the documented mechanism — the repo already records that `with_stack`
-inflates launch-heavy decode ~6× and that an "84% idle" scare was mostly artifact.
+### 5. "bs=1 decode is inter-kernel-gap bound, ~68% idle" — **REFUTED**, close to inverted
 
-The repo's cleanest measurement of the same quantity, from `MINISGL_GRAPH_TIMING` plus client TPOT on
-Qwen 35B TP=2 bs=1, is **2.30 ms non-GPU out of 11.12 ms = 20.7%**, and that is an **upper bound**
-(client-side TPOT also contains tokeniser, streaming and socket time). The "68%" originates from
-**Laguna-XS**, a much smaller model where tiny kernels make gaps comparable to kernel time — it was
-never a Qwen 35B number.
+**Directly measured: the bs=1 decode step is 71% GPU-BUSY.**
 
-**So the framing is right in direction and roughly 3× overstated in magnitude for the served model.**
+| | bs=1 | bs=4 |
+|---|---:|---:|
+| wall/step (unprofiled control, median) | **10.970 ms** (p10–p90 10.8–12.0), 89.6 tok/s | 15.767 ms |
+| GPU-busy/step, **union of kernel intervals** | **7.809 ms** | 12.057 ms |
+| GPU-busy/step, naive sum | 9.197 ms | 14.036 ms |
+| kernels/step | 1,144 | 1,436 |
+| **idle** | **28.8%** | **23.5%** |
+
+Union, not sum: kernels on different streams overlap, so summing double-counts and can exceed wall.
+
+**Why the wall is trustworthy, which was the whole difficulty.** The marker-derived wall inside the
+profiling window was 61.4 ms/step — that is the *instrument*, not the workload: rocprofv3 costs
+~50 ms/step while its window is open and it lands entirely in the inter-kernel gaps. The profiled run
+shows this in its own data (median gap 11.3 ms vs mean 28.0 ms; 200 in-window steps at ~61 ms against
+400 out-of-window at ~11 ms). The control leg, same image, settles it at **10.970 ms** with a tight
+p10–p90. Any residual error is safe-direction — inflated kernel durations would make idle look
+*lower*, not higher, so 28.8% is if anything an overestimate.
+
+**Where 68% came from.** It is a **Laguna-XS** number — a much smaller model whose tiny kernels make
+gaps comparable to kernel time — and it was never a Qwen 35B measurement. The torch-profiler route
+that appears to confirm it is an artifact: the repo's own analyser over
+`tools/loads/qwen35b_mtp_decode.pt.trace.json.gz` reports 78.2% idle, but also **161.9 ms/step wall
+and 35.3 ms/step GPU-busy** against a real 10.97 ms step — GPU-busy alone exceeds the entire real
+step by 3×. A profiler-derived idle fraction on this stack manufactures its own answer and would keep
+re-confirming itself on every re-profile.
+
+**Two things established on the way that are worth as much as the number:** the plain-decode loops
+carried **no ROCTx markers at all** (only `_run_spec_step` did), so a `SPEC=none` serve was simply
+unprofilable; and `minisgl-rdna4:lean-prof` had gone stale and can no longer boot today's engine (a
+`tail_hip_C::store_kv()` ABI change), so it is now derived from whatever `lean` currently is.
+
+**Not established:** bs=8 — the engine will not boot at `max-running-requests=8` on 16 GB cards for
+this hybrid (per-sequence recurrent state is reserved up front), so "at every batch size" rests on
+two points, not a sweep. Only rank0/card0 was traced, and only `SPEC=none`.
 
 ### 6. "Occupancy is THE lever" — **CONFIRMED where waves are available; the useful output is the REGIME BOUNDARY**
 
@@ -358,15 +387,19 @@ already-saturated one (LM head MemUnit 96.9%), and inapplicable where N caps wav
 cost was spending it as a global rule instead of asking per kernel which resource is scarce — and the
 mirror-image failure (39 dense tiles spilling 632 B/lane, priced as free) went unlooked-for.
 
-**4. "bs=1 decode is ~68% idle" (claim 5).**
-Overstated ~3× for the served model — the clean figure is 20.7%, itself an upper bound — and the 68%
-is a **profiler artifact** that would keep re-confirming itself on every re-profile. It pointed
-gap-closing and megakernel work at a ceiling three times larger than the one that exists.
+**4. "bs=1 decode is ~68% idle" (claim 5) — refuted, close to inverted.**
+Measured on a live serve: the step is **71% GPU-BUSY** (7.809 ms of a 10.970 ms wall; **28.8% idle**,
+23.5% at bs=4). The 68% is a **Laguna-XS** number that was never a Qwen 35B measurement, and the
+torch-profiler route that appears to confirm it is an artifact that manufactures its own answer. This
+sent gap-closing and megakernel work after a bubble roughly **2.4× larger than the one that exists** —
+and, worse, pointed *between* the kernels when the deficit is inside them.
 
-**5. "Serving is overhead-bound / umc ≤27%" (claim 4) — aggregate true, inference false.**
-The ≤27% is real but is *dilution*. The inference that kernels therefore carry ~10× slack does not
-follow uniformly: some are at 86–97% of the memory unit, while the MoE gemm2 is at 2.2% occupancy.
-Averaging those into one framing number hid both facts and licensed a 3–10× megakernel search.
+**5. "Serving is overhead-bound / umc ≤27%" (claim 4) — directionally right, and the inference is the problem.**
+Measured 31.5% (bs=1) / 31.1% (bs=4), so the figure is modestly understated rather than wrong. The
+damage is in how it was used: paired with claim 5 to argue "overhead-bound ⇒ fuse and amortise". The
+serve says otherwise — the step is not idle-dominated, and **even counting only kernel-execution time
+the GPU reaches just 44.3%**. The slack is *inside* the kernels (MoE gemm2 at 2.2% occupancy; served
+GEMV shapes at 13.0–69.5% of roofline), which is precisely where fusion does not help.
 
 **6. "LM-head GEMV is the serve lever" (claim 7) — the win is real, the closure is not.**
 MemUnit 96.9% converted into only 50.4% of roofline, where int4 streaming converts a comparable 97.2%
@@ -404,8 +437,13 @@ an isolated microbench — this scorecard is full of isolated numbers that did n
 
 ## Open / not done
 
-- **Claims 4 and 5 on a live serve under `rocprofv3`** — blocked by a real constraint, not skipped:
-  the serve image is ROCm 7.2.1 where `--pmc` hangs, counters need 7.14, and a `.so` built in one
-  image will not load in another (failing *silently as a hang*). Doing it properly means rebuilding
-  the whole kernel set against 7.14 torch.
+- **Hardware COUNTERS on a live serve** (as opposed to the `--kernel-trace` timing now done for
+  claims 4 and 5). Blocked by a real constraint, not skipped: the serve image is ROCm 7.2.1 where
+  `--pmc` hangs, counters need 7.14, and a `.so` built in one image will not load in another —
+  failing *silently as a 0%-GPU hang*. Doing it properly means rebuilding the whole kernel set
+  against 7.14 torch. This would let the in-kernel deficit found at claim 4 be attributed per kernel
+  on the served path rather than inferred from the isolated sweep.
+- **bs ≥ 8** — the engine will not boot at `max-running-requests=8` on 16 GB cards for this hybrid
+  (per-sequence recurrent state is reserved up front), so "at every batch size" rests on bs=1 and
+  bs=4. Only rank0/card0 was traced, and only `SPEC=none`.
 - **Prefill band (M ≥ 64)** entirely — claims 8 and 9 live there.
