@@ -97,6 +97,19 @@ SHAPES = [
     ("q27.gate_up  tp2", 5120, 17408, 32, torch.bfloat16, True),
     ("q27.gate_up  tp1", 5120, 34816, 32, torch.bfloat16, True),
     ("lm_head      tp2", 2816, 131072, 32, torch.float16, False),
+    # ---- the g=128 COLUMN ---------------------------------------------------------------------
+    # It used to be ONE shape (glm.gate_up above): 15 of the surface's 210 cells, all at the same
+    # (K, N). Every structural term ever tried improves that column and costs more than it buys on
+    # the 195-cell g=32 one -- and with 15 cells of a single (K, N) there is no way to separate a
+    # real group-size effect from that one shape's N. group_size is a QUANTIZATION policy, not a
+    # shape property: a g=128 checkpoint carries the same linears a g=32 one does, so the honest
+    # g=128 fixture is the g=32 N/K ladder re-quantised. K stays a multiple of 128 for all of these.
+    ("glm.q_proj   tp2", 2048, 2048, 128, torch.bfloat16, True),
+    ("glm.o_proj   tp2", 2048, 2816, 128, torch.bfloat16, True),
+    ("g128 N=4096", 2048, 4096, 128, torch.bfloat16, True),
+    ("glm.down     tp2", 8704, 5120, 128, torch.bfloat16, True),
+    ("g128 N=17408", 5120, 17408, 128, torch.bfloat16, True),
+    ("g128 lm_head", 2816, 131072, 128, torch.float16, False),
 ]
 MS = [1, 8, 17, 24, 32, 48, 63, 64, 96, 128, 192, 256, 512, 1024, 2048]
 

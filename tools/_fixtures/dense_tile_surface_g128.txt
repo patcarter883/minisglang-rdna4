@@ -1,0 +1,5 @@
+device: AMD Radeon RX 9070 XT   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles (36): 16x64 16x128 32x32 32x64 32x64x2 32x64x4 32x128 32x128x4 64x32 64x64 64x64x2 64x128 64x128x2 64x128x4 80x128 96x128 96x128x2 112x128 128x32 128x64 128x64x2 128x128 128x128x2 128x128x4 128x256 192x128 192x128x2 256x32 256x64 256x128 256x128x2 256x192 256x256 384x128 512x64 512x128
+arms: (skipped)
+graph-replay timed; rotation sized in BYTES past the 64 MB MALL; us per call
+

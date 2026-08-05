@@ -50,9 +50,18 @@ def gm(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else float("nan")
 
 
-def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuffled, cu, p):
+def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuffled, cu, p,
+         real_rows=None):
     """Byte-for-byte the arithmetic of tile_select.h::core_terms, with the structural knobs of the
-    variant grid spliced in at the two points that are being questioned (ROUNDS and LATENCY)."""
+    variant grid spliced in at the three points that are being questioned (ROUNDS, LATENCY, and the
+    REAL-ROW fraction).
+
+    `real_rows` is how many rows of the launch hold DATA: M for dense, the routed row total for MoE.
+    `row_blocks*bm - real_rows` is masked padding, and the two kernels treat it the same way -- the
+    staging loop and the WMMAs are NOT predicated on a row being live, so the padding ISSUES at full
+    price, but `stage_act_word(x, M, ...)` / `if (a_valid)` elide its global read and the epilogue
+    `if (abs_m >= M) continue` / `if (offs_token >= num_valid_tokens) continue` elide its store. A
+    masked M-warp therefore costs issue slots and earns NO latency to hide."""
     if lds > LDS_BUDGET or bm % 16 or bn % 16 or warps_n < 1:
         return None
     nwarps_m, nfrag = bm // 16, bn // 16
@@ -74,34 +83,79 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
         return None
     rounds = cd(wgs, cu)
     live = min(bpc, rounds)
-    occ = min(WAVES_PER_CU, live * nwarps)
+    # ---- THE REAL-ROW TERM, the one under test -------------------------------------------------
+    # A block covers `rpb` real rows on average; the WMMA M axis is 16 rows wide, so only
+    # ceil(rpb/16) of the block's BM/16 M-warps hold any data at all. The rest issue, but they load
+    # nothing and store nothing, so they generate no latency for co-residency to hide. Counting them
+    # in OCC is the model paying a tall tile for waves that are pure waste -- which is exactly
+    # backwards, and it is the half that actively rewards the wrong tile.
+    rr = p.get("rr", "off")
+    rpb = (real_rows / row_blocks) if real_rows else float(bm)
+    live_m = min(nwarps_m, max(1, cd(int(math.ceil(rpb)), 16)))
+    phi = live_m / nwarps_m
+    eff_nwarps = (live_m * warps_n) if rr in ("occ", "both") else nwarps
+    occ = min(WAVES_PER_CU, live * eff_nwarps)
     a_it = k_steps if shuffled else cd(bm * g // 4, threads)
     b_it = cd(bn * (g // 8), threads)
     lds_it = k_steps * (nfrag_w if shuffled else nfrag_w + 1)
-    pt = p["cA"] * a_it + p["cB"] * b_it + p["cL"] * lds_it + p["cW"] * k_steps * nfrag_w
+    wmma_it = k_steps * nfrag_w
+    if rr in ("work", "both"):
+        # the other half of the question: charge the A-gather and the WMMAs only for the M-warps
+        # that hold data. NOTE this is NOT what the ISA does -- the masked warps issue -- so it is
+        # here to be falsified, not assumed.
+        a_it *= phi
+        wmma_it *= phi
+    # cL/cW are PER STAGING POLICY in tile_select.h (C_LDSRD_STAGED/C_WMMA_STAGED = 0.25 vs
+    # C_LDSRD_SHUF/C_WMMA_SHUF = 1.0): the LdsStaged k-loop prefetches a_nx/b_nx so its ds_reads sit
+    # off the WMMA dependency chain, the Shuffled one reads b_cur immediately before the mma that
+    # consumes it. Scoring both surfaces at the staged constants -- which this harness did -- prices
+    # a model that does not ship, and under-charges the MoE side's per-warp WMMA/ds_read by 4x,
+    # which is precisely the term that grows with BM.
+    cL = p["cL_SHUF"] if (shuffled and p.get("cL_SHUF") is not None) else p["cL"]
+    cW = p["cW_SHUF"] if (shuffled and p.get("cW_SHUF") is not None) else p["cW"]
+    # Split per_thread into the two halves the LATENCY term treats differently:
+    #   pt_chain -- the k-loop's own dependency chain, walked by EVERY warp: the A fragment, the
+    #               NFRAG_W ds_reads and the NFRAG_W mmas. It is proportional to NFRAG_W and it is
+    #               what a warp waits on.
+    #   pt_coop  -- `stage_b`, which the WHOLE workgroup cooperates on before a barrier, so it
+    #               shrinks as THREADS grows and is a bandwidth cost, not a latency chain.
+    pt_chain = p["cA"] * a_it + cL * lds_it + cW * wmma_it
+    pt = pt_chain + p["cB"] * b_it
     # ---- LATENCY, the term under test ----------------------------------------------------------
     # `1 + LAT/OCC` says a CU with OCC resident waves hides LAT units of latency. That is a
     # STEADY-STATE law and it is being applied to launches that are a handful of waves deep, where
     # a workgroup's latency is paid once at the head of the pipe and never amortised again. DEPTH
     # caps how much of LAT occupancy is allowed to hide: a launch of ROUNDS rounds cannot amortise
     # more latency than it has rounds to amortise it over.
+    # LAT follows the ACTIVATION-STAGING POLICY in the shipped header (LAT_LDS_STAGED=32,
+    # LAT_SHUFFLED=8), so the harness must too -- scoring the MoE surface at the dense constant
+    # measures a model that does not ship. `LAT_SHUF=None` collapses to one constant for the
+    # single-LAT sweeps below.
+    L = p["LAT"] if (not shuffled or p.get("LAT_SHUF") is None) else p["LAT_SHUF"]
     if p["lat"] == "const":
-        lat = 1.0 + p["LAT"] / occ
+        div = occ
     elif p["lat"] == "depth":
-        eff = min(float(occ), p["LAT"] * min(1.0, rounds / p["ROUNDS_FLOOR"]) + 1.0)
-        lat = 1.0 + p["LAT"] / max(eff, 1.0)
+        div = max(min(float(occ), L * min(1.0, rounds / p["ROUNDS_FLOOR"]) + 1.0), 1.0)
     elif p["lat"] == "ilp":
-        lat = 1.0 + p["LAT"] / (occ * (1.0 + p["alpha"] * (nfrag_w - 1)))
+        div = occ * (1.0 + p["alpha"] * (nfrag_w - 1))
     elif p["lat"] == "cap":
-        lat = 1.0 + p["LAT"] / max(occ, p["OCC_FLOOR"])
+        div = max(occ, p["OCC_FLOOR"])
     else:
         raise SystemExit(f"unknown lat mode {p['lat']}")
-    return rounds * k_groups * threads * pt * lat
+    # `stall` = "pt" reproduces the shipped `ISSUE * (1 + LAT/OCC)` exactly. "chain" says the
+    # exposed stall is the k-loop DEPENDENCY CHAIN, not the cooperative staging that rides in front
+    # of a barrier -- i.e. a tile that spreads the same B stage over twice the threads does not
+    # thereby halve its latency.
+    stall_pt = pt if p.get("stall", "pt") == "pt" else pt_chain
+    issue = rounds * k_groups * threads * pt
+    stall = rounds * k_groups * threads * stall_pt * L / div
+    return issue + stall
 
 
 def dense_cost(M, N, K, g, bm, bn, wn, cu, p):
     lds = (bm + bn) * (g + 8) + 4 * bn
-    return core(bm, bn, wn, g, cd(M, bm), cd(N, bn), 1, K / g, lds, False, cu, p)
+    # dense real rows = M exactly; the padding is ceil(M/BM)*BM - M, paid once on the last row-block
+    return core(bm, bn, wn, g, cd(M, bm), cd(N, bn), 1, K / g, lds, False, cu, p, real_rows=M)
 
 
 def moe_warps_n(bm, bn):
@@ -133,7 +187,9 @@ def moe_cost(rows, E, N, K, g, bm, bn, cu, p, gtile=4):
     while gt > 1 and per * gt > 40960:
         gt -= 1
     rb = moe_padded_rows(rows, E, bm) // bm
-    return core(bm, bn, wn, g, rb, cd(N, bn), 1, kg, per * gt, True, cu, p)
+    # MoE real rows = the ROUTED row total; `moe_align` pads each expert up to bm, so at decode
+    # (rows < E) every one of the rb blocks holds ONE real row no matter how tall bm is.
+    return core(bm, bn, wn, g, rb, cd(N, bn), 1, kg, per * gt, True, cu, p, real_rows=rows)
 
 
 def load(path, moe):
@@ -165,6 +221,7 @@ def main() -> int:
         res = {}
         for tag, cells, isd in (("dense", D, True), ("moe", Mo, False)):
             per_g, allr, small, big = defaultdict(list), [], [], []
+            lmh, lmh_sm = [], []          # the LM head is its own surface: N=131072 per rank
             for k, d in cells.items():
                 best, bc = None, None
                 for c in d:
@@ -187,25 +244,65 @@ def main() -> int:
                 allr.append(r)
                 per_g[k[3] if isd else k[5]].append(r)
                 (small if k[-1] <= 32 else big).append(r)
+                if isd and k[2] >= 100000:          # k = (name, K, N, g, M)
+                    lmh.append(r)
+                    if k[4] <= 32:
+                        lmh_sm.append(r)
             res[tag] = dict(gm=gm(allr), worst=max(allr) if allr else 0,
                             g32=gm(per_g.get(32, [])), g128=gm(per_g.get(128, [])),
-                            small=gm(small), big=gm(big), n=len(allr))
+                            small=gm(small), big=gm(big), n=len(allr),
+                            lmh=gm(lmh), lmh_sm=gm(lmh_sm))
         return res
 
     def show(tag, p):
         s = score(p)
         d, m = s["dense"], s["moe"]
-        print(f"{tag:<46} DENSE gm={d['gm']:.4f} worst={d['worst']:.2f} "
-              f"g32={d['g32']:.3f} g128={d['g128']:.3f} | "
-              f"MOE gm={m['gm']:.4f} worst={m['worst']:.2f} "
+        print(f"{tag:<40} DENSE gm={d['gm']:.4f} w={d['worst']:.2f} "
+              f"g32={d['g32']:.3f} g128={d['g128']:.3f} lmh={d['lmh']:.3f}/{d['lmh_sm']:.3f} | "
+              f"MOE gm={m['gm']:.4f} w={m['worst']:.2f} "
               f"M<=32={m['small']:.3f} M>32={m['big']:.3f}")
         return s
 
     base = dict(cA=1.0, cB=16.0, cL=0.25, cW=0.25, LAT=32.0, alpha=0.25,
-                lat="const", OCC_FLOOR=8, ROUNDS_FLOOR=8)
+                lat="const", OCC_FLOOR=8, ROUNDS_FLOOR=8, rr="off",
+                cL_SHUF=None, cW_SHUF=None, LAT_SHUF=None)
 
-    print("\n=== SHIPPED ===")
-    show("const LAT=32", base)
+    # The model as it actually SHIPS in tile_select.h: every constant that follows the activation-
+    # staging policy takes its shuffled value on the MoE surface.
+    ship = dict(base, LAT=32.0, LAT_SHUF=8.0, cL_SHUF=1.0, cW_SHUF=1.0)
+
+    print("\n=== SHIPPED (per-policy LAT: staged 32 / shuffled 8, rr=off) ===")
+    show("SHIPPED", ship)
+
+    # ------------------------------------------------------------------------------------------
+    # THE REAL-ROW TERM. Three surfaces (dense g=128, the LM head at M<=32, MoE at M<=32) were all
+    # off in the same direction and the model has no term for the fraction of a tile's rows that
+    # hold data. `rr=occ` denies masked M-warps their occupancy credit; `rr=work` instead discounts
+    # the issue cost; `rr=both` does both. Only one of them is what the ISA does.
+    print("\n=== REAL-ROW term, on the SHIPPED constants (32/8) ===")
+    for mode in ("off", "occ", "work", "both"):
+        show(f"rr={mode}", dict(ship, rr=mode))
+
+    print("\n=== stall=chain: the exposed stall is the k-loop chain, not the cooperative stage ===")
+    for mode in ("off", "occ", "work", "both"):
+        show(f"stall=chain rr={mode}", dict(ship, stall="chain", rr=mode))
+
+    print("\n=== stall=chain, refitting the two per-policy LATENCY constants ===")
+    best = []
+    for st in ("pt", "chain"):
+        for mode in ("off", "occ", "work", "both"):
+            for Ld in (4, 8, 16, 24, 32, 48, 64, 96, 128):
+                for Ls in (1, 2, 4, 8, 16, 32, 64):
+                    p = dict(ship, stall=st, rr=mode, LAT=float(Ld), LAT_SHUF=float(Ls))
+                    s = score(p)
+                    best.append((max(s["dense"]["gm"], s["moe"]["gm"]), s, p))
+    best.sort(key=lambda r: r[0])
+    for mx, s, p in best[:20]:
+        d, m = s["dense"], s["moe"]
+        print(f"  max={mx:.4f} stall={p['stall']:<5} rr={p['rr']:<4} LATd={p['LAT']:<5g} "
+              f"LATs={p['LAT_SHUF']:<4g} | D gm={d['gm']:.4f}/w{d['worst']:.2f} "
+              f"g32={d['g32']:.3f} g128={d['g128']:.3f} lmh={d['lmh']:.3f}/{d['lmh_sm']:.3f}"
+              f" | M gm={m['gm']:.4f}/w{m['worst']:.2f} sm={m['small']:.3f} big={m['big']:.3f}")
 
     print("\n=== the LATENCY constant alone ===")
     for L in (4, 8, 12, 16, 24, 32, 48):
