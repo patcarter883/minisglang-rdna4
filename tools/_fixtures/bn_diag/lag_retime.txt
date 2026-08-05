@@ -1,0 +1,31 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles: 128x64,32x64x4,64x128x4,64x64x2,32x64,128x128x4   experiments: cells
+
+====================================================================================================
+CELL RE-TIME -- one shape, the tiles that matter, diag off. CONTROL FIRST: the same
+build recorded twice, so a later delta has a noise floor to clear.
+====================================================================================================
+--- cellsA  K=2048 N=16384 g=32 M=17   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   166.8   32x64x4=   233.7 (1.40x)   64x128x4=   268.5 (1.61x)   64x64x2=   222.4 (1.33x)   32x64=   313.8 (1.88x)   128x128x4=   152.5 (0.91x)
+--- cellsB  K=2048 N=16384 g=32 M=17   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   148.4   32x64x4=   225.6 (1.52x)   64x128x4=   264.1 (1.78x)   64x64x2=   224.4 (1.51x)   32x64=   317.3 (2.14x)   128x128x4=   152.7 (1.03x)
+--- cellsA  K=2048 N=16384 g=32 M=24   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   151.6   32x64x4=   263.3 (1.74x)   64x128x4=   270.2 (1.78x)   64x64x2=   233.0 (1.54x)   32x64=   338.0 (2.23x)   128x128x4=   151.6 (1.00x)
+--- cellsB  K=2048 N=16384 g=32 M=24   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   147.6   32x64x4=   261.5 (1.77x)   64x128x4=   267.1 (1.81x)   64x64x2=   230.7 (1.56x)   32x64=   314.1 (2.13x)   128x128x4=   150.8 (1.02x)
+--- cellsA  K=2048 N=16384 g=32 M=32   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   147.7   32x64x4=   272.3 (1.84x)   64x128x4=   270.0 (1.83x)   64x64x2=   234.3 (1.59x)   32x64=   321.0 (2.17x)   128x128x4=   151.1 (1.02x)
+--- cellsB  K=2048 N=16384 g=32 M=32   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   147.1   32x64x4=   271.5 (1.85x)   64x128x4=   266.1 (1.81x)   64x64x2=   234.1 (1.59x)   32x64=   315.0 (2.14x)   128x128x4=   149.7 (1.02x)
+--- cellsA  K=2048 N=16384 g=32 M=48   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   155.2   32x64x4=   393.0 (2.53x)   64x128x4=   265.9 (1.71x)   64x64x2=   223.7 (1.44x)   32x64=   298.0 (1.92x)   128x128x4=   150.3 (0.97x)
+--- cellsB  K=2048 N=16384 g=32 M=48   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   153.9   32x64x4=   393.7 (2.56x)   64x128x4=   267.7 (1.74x)   64x64x2=   223.9 (1.45x)   32x64=   297.4 (1.93x)   128x128x4=   149.2 (0.97x)
+--- cellsA  K=2048 N=16384 g=32 M=64   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   154.6   32x64x4=   386.0 (2.50x)   64x128x4=   262.1 (1.70x)   64x64x2=   228.6 (1.48x)   32x64=   317.1 (2.05x)   128x128x4=   151.1 (0.98x)
+--- cellsB  K=2048 N=16384 g=32 M=64   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                  128x64=   155.0   32x64x4=   385.2 (2.49x)   64x128x4=   261.5 (1.69x)   64x64x2=   229.2 (1.48x)   32x64=   305.8 (1.97x)   128x128x4=   151.1 (0.97x)
+
+done

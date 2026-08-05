@@ -1,0 +1,56 @@
+device: AMD Radeon RX 9070 XT   WGPs=32 -> 64 CUs
+fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+us per call; graph-replay timed; rotation sized in BYTES past the 64 MB MALL
+
+=== q35.moe    tp2  E=256 top_k=8 hidden=2048 inter=768 g=128 ===
+    gemm1 N=1536 K=2048   gemm2 N=2048 K=768
+    control (same build, recorded twice): M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+    chooser tile vs prev tile:            M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1        32x32/32     16x64       73.54     73.49      74.11   1.00x    0.99x
+         2      32x192/192     16x64      174.85    175.64     174.77   1.00x    1.01x
+         8      32x192/192     16x64      321.26    318.25     303.15   0.99x    1.05x
+        32      32x192/192     16x64     1022.53    991.46    1000.10   0.97x    0.99x
+
+=== q35.moe    tp1  E=256 top_k=8 hidden=2048 inter=1536 g=128 ===
+    gemm1 N=3072 K=2048   gemm2 N=2048 K=1536
+    control (same build, recorded twice): M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+    chooser tile vs prev tile:            M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1       32x192/32     16x64      123.64    123.98     123.85   1.00x    1.00x
+         2      32x192/192     16x64      286.84    286.83     287.19   1.00x    1.00x
+         8      32x192/192     16x64      600.35    599.59     558.47   1.00x    1.07x
+        32      32x192/192     16x64     2074.59   1962.60    2098.81   0.95x    0.94x
+
+=== glm.moe    tp2  E=128 top_k=8 hidden=2048 inter=768 g=128 ===
+    gemm1 N=1536 K=2048   gemm2 N=2048 K=768
+    control (same build, recorded twice): M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+    chooser tile vs prev tile:            M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1        32x32/32     16x64       69.28     69.85      69.57   1.01x    1.00x
+         2      32x192/192     16x64      173.70    167.17     166.75   0.96x    1.00x
+         8      32x192/192     16x64      299.24    288.36     288.22   0.96x    1.00x
+        32      32x192/192     16x64      857.69    852.04     853.38   0.99x    1.00x
+
+=== g32.moe    tp2  E=128 top_k=4 hidden=2048 inter=1024 g=32 ===
+    gemm1 N=2048 K=2048   gemm2 N=2048 K=1024
+    control (same build, recorded twice): M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+    chooser tile vs prev tile:            M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1        32x32/32     16x64       61.04     60.84      61.16   1.00x    0.99x
+         2        32x64/64     16x64      104.31    103.96     104.48   1.00x    1.00x
+         8        32x64/64     16x64      248.86    243.67     230.32   0.98x    1.06x
+        32        32x64/64     16x64      686.03    651.09     652.46   0.95x    1.00x
+
+=== narrowN    tp2  E=64 top_k=4 hidden=1024 inter=512 g=128 ===
+    gemm1 N=1024 K=1024   gemm2 N=1024 K=512
+    control (same build, recorded twice): M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+    chooser tile vs prev tile:            M=1:ATOMIC.0.000e+00  M=2:ATOMIC.0.000e+00  M=3:0.000e+00  M=17:0.000e+00  M=32:0.000e+00
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1        64x16/16     16x64       36.71     36.60      36.85   1.00x    0.99x
+         2        32x32/32     16x64       49.17     48.68      48.64   0.99x    1.00x
+         8      32x192/192     16x64       99.94    100.55     100.04   1.01x    1.01x
+        32      32x192/192     16x64      205.48    205.42     205.92   1.00x    1.00x
+
+TOTAL over the measured cells: chooser 7569 us vs prev 7360 us = 0.972x
+done.

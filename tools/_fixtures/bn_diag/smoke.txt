@@ -1,0 +1,18 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles: 32x64x4,32x128x4   experiments: stage
+
+====================================================================================================
+STAGE ABLATION -- which stage carries the gap? (VLLM_W4A8_V7_DIAG)
+====================================================================================================
+--- stage  K=2816 N=8192 g=32 M=1   rotation 14 x 13.0 MB = 182 MB
+    diag=0  full                  32x64x4=    73.0   32x128x4=   104.2 (1.43x)
+    diag=1  no_wmma               32x64x4=    65.0   32x128x4=    90.4 (1.39x)
+    diag=2  no_global             32x64x4=    65.3   32x128x4=    87.1 (1.33x)
+    diag=4  no_ldswrite           32x64x4=    52.5   32x128x4=    67.7 (1.29x)
+    diag=8  no_ldsread            32x64x4=    64.6   32x128x4=    93.8 (1.45x)
+    diag=16 no_wscale             32x64x4=    52.5   32x128x4=    81.3 (1.55x)
+    diag=18 no_global+no_wscale   32x64x4=    54.0   32x128x4=    75.0 (1.39x)
+
+done

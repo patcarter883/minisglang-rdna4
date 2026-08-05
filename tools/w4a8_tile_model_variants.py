@@ -35,6 +35,7 @@ from collections import defaultdict
 
 ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off")
 LDS_BUDGET = 65536
+LINE = 128            # gfx1201 cache line, bytes
 WAVES_PER_CU = 32
 VGPR_PER_SIMD = 1536
 WAVES_PER_SIMD_MAX = 16
@@ -97,6 +98,48 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
     occ = min(WAVES_PER_CU, live * eff_nwarps)
     a_it = k_steps if shuffled else cd(bm * g // 4, threads)
     b_it = cd(bn * (g // 8), threads)
+    # ---- SCALE-LINE TRAFFIC, the term that separates BN at high WARPS_N ---------------------------
+    # MEASURED, by ablation, not hypothesised: at lm_head g=32 M=1 the 32x64x4 / 32x128x4 gap is
+    # 3.71x with everything on, 4.17x with the WMMAs off, 4.77x with the LDS writes off, 4.17x with
+    # the LDS reloads off -- and 1.17x with the GLOBAL READS off, 1.61x with ONLY the per-group
+    # w_scale read off. The gap lives entirely in the per-group weight-scale read.
+    #
+    # WHY it is a BN term while every other term washes. Both kernels read
+    #     w_scales[abs_n * num_k_groups + g]
+    # once per weight row per k-group. Consecutive rows are `2*k_groups` BYTES apart, so as soon as
+    # that stride reaches a 128 B cache line EVERY row is a SEPARATE line and the read pulls 128 B
+    # to use 2. One such line spans 64 consecutive k-groups, so the reuse is there to be had -- but
+    # only if the line SURVIVES, and what the block must retain to collect it is
+    #     blocks_per_cu * BN lines * 128 B,
+    # in which BN is the only tile term. Doubling BN halves the block count and doubles the lines
+    # each block retains: the ISSUE washes exactly (which is why the model saw a wash) and the
+    # RETENTION does not wash at all -- it doubles the footprint against a fixed cache. Past the
+    # cache the access is cyclic, and cyclic LRU past capacity collects NOTHING, so this is a cliff
+    # and not a slope.
+    #
+    # The second gate is where a miss lands. If the shape's WHOLE live scale footprint (N lines,
+    # independent of BN) still fits L2, the reuse is collected in L2 instead and the cliff never
+    # fires. That is measured too: sweeping N at g=32 with everything else fixed, the 64-vs-128 gap
+    # is 1.48x / 1.45x / 1.31x at N = 4096 / 8192 / 16384 and 3.55x / 4.25x / 3.98x at N = 32768 /
+    # 65536 / 131072 -- a step exactly where N*128 crosses 4 MB.
+    #
+    # Both sizes are HARDWARE, taken from the ablation's own knees, not fitted to the surface.
+    scale_it = 0.0
+    if p.get("sline", "off") != "off":
+        stride = 2.0 * k_groups                       # bytes between adjacent rows' group scales
+        lines = float(bn) if stride >= LINE else max(1.0, bn * stride / LINE)
+        span = min(float(k_groups), LINE / 2.0)       # k-groups one retained line serves
+        foot = bpc * lines * LINE                     # bytes the CU must retain
+        live_ws = n_blocks * lines * LINE             # the shape's whole live scale footprint
+        held = (foot <= p["L0"]) or (live_ws < p["L2"])
+        # A HELD line is a cache hit and adds no traffic, so the term is ZERO there -- it is a pure
+        # penalty that fires only where the physics says the cliff is, and can never nudge a pick on
+        # a shape that has no cliff. Past the cliff the block re-fetches a full LINE per row per
+        # k-group, for the 2 bytes it wanted.
+        per_block = 0.0 if held else lines * LINE
+        # into the SAME units as a_it/b_it: dwords per thread per k-group, so it rides the existing
+        # C_BSTAGE and introduces no new fitted constant.
+        scale_it = per_block / 4.0 / threads
     lds_it = k_steps * (nfrag_w if shuffled else nfrag_w + 1)
     wmma_it = k_steps * nfrag_w
     if rr in ("work", "both"):
@@ -120,7 +163,7 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
     #   pt_coop  -- `stage_b`, which the WHOLE workgroup cooperates on before a barrier, so it
     #               shrinks as THREADS grows and is a bandwidth cost, not a latency chain.
     pt_chain = p["cA"] * a_it + cL * lds_it + cW * wmma_it
-    pt = pt_chain + p["cB"] * b_it
+    pt = pt_chain + p["cB"] * (b_it + scale_it)
     # ---- LATENCY, the term under test ----------------------------------------------------------
     # `1 + LAT/OCC` says a CU with OCC resident waves hides LAT units of latency. That is a
     # STEADY-STATE law and it is being applied to launches that are a handful of waves deep, where
@@ -379,6 +422,72 @@ def main() -> int:
               f"g32={d['g32']:.3f} g128={d['g128']:.3f} | "
               f"M gm={m['gm']:.4f}/w{m['worst']:.2f} sm={m['small']:.3f} big={m['big']:.3f}"
               f"   lat={p['lat']} LAT={p['LAT']} cA={p['cA']} cB={p['cB']} {ex}")
+
+    # ==============================================================================================
+    # THE WN_SET QUESTION -- can the chooser be allowed WARPS_N > 1 WITHOUT regressing a cell?
+    # ==============================================================================================
+    # Scored the way the chooser actually decides: argmin over the tiles the chooser is ALLOWED to
+    # pick (WN restricted to wn_set) intersected with the tiles the cell measured, then compared to
+    # that cell's measured oracle over ALL tiles. Restricting the argmin to measured tiles is what
+    # keeps the variants comparable -- an unrestricted argmin silently changes which cells score.
+    # `REGRESSED` is the only number that decides shippability: a cell that the wn=1 chooser served
+    # well and the widened one serves worse is the exact failure this chooser exists to prevent.
+    def chooser(p, wn_set, cells, isd):
+        picks = {}
+        for k, d in cells.items():
+            best = bc = None
+            for c in d:
+                bm, bn, wn = tile_of(c)
+                if wn not in wn_set:
+                    continue
+                if isd:
+                    name, K, N, g, M = k
+                    cst = dense_cost(M, N, K, g, bm, bn, wn, args.cu, p)
+                else:
+                    name, E, tk, hid, inter, g, M = k
+                    cst = moe_cost(M * tk, E, 2 * inter, hid, g, bm, bn, args.cu, p)
+                if cst is None:
+                    continue
+                if best is None or cst < best:
+                    best, bc = cst, c
+            if bc is not None:
+                picks[k] = (bc, d[bc] / min(d.values()))
+        return picks
+
+    print("\n" + "=" * 110)
+    print("WN_SET -- widening the chooser's WARPS_N axis, with and without the SCALE-LINE term")
+    print("=" * 110)
+    L0L2 = dict(L0=32768, L2=4 << 20)
+    variants = [
+        ("shipped model, WN={1}          ", dict(ship), (1,)),
+        ("shipped model, WN={1,2,4}      ", dict(ship), (1, 2, 4)),
+        ("+ scale-line term, WN={1}      ", dict(ship, sline="on", **L0L2), (1,)),
+        ("+ scale-line term, WN={1,2}    ", dict(ship, sline="on", **L0L2), (1, 2)),
+        ("+ scale-line term, WN={1,2,4}  ", dict(ship, sline="on", **L0L2), (1, 2, 4)),
+    ]
+    ref = None
+    for tag, p, wns in variants:
+        line = [f"{tag}"]
+        for label, cells, isd in (("DENSE", D, True), ("MOE", Mo, False)):
+            pk = chooser(p, wns, cells, isd)
+            rs = [r for _, r in pk.values()]
+            line.append(f"{label} gm={gm(rs):.4f} w={max(rs):.2f} n={len(rs)}")
+        print("  ".join(line))
+        if ref is None:
+            ref = {k: v[1] for k, v in chooser(p, wns, D, True).items()}
+            refm = {k: v[1] for k, v in chooser(p, wns, Mo, False).items()}
+            continue
+        for label, cells, isd, base in (("dense", D, True, ref), ("moe", Mo, False, refm)):
+            pk = chooser(p, wns, cells, isd)
+            bad = sorted(((v[1] / base[k], k, v[0]) for k, v in pk.items()
+                          if k in base and v[1] > base[k] * 1.02), reverse=True)
+            if bad:
+                print(f"      REGRESSED {len(bad)} {label} cells vs the shipped WN={{1}} chooser; "
+                      f"worst {bad[0][0]:.2f}x")
+                for f, k, c in bad[:8]:
+                    print(f"         {f:5.2f}x  {k}  picked {c}")
+            else:
+                print(f"      REGRESSED 0 {label} cells vs the shipped WN={{1}} chooser")
     return 0
 
 
