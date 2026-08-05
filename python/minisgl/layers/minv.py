@@ -23,8 +23,24 @@ SCOPE ("as close to M-invariant as realistically possible")
     Applied for eager bf16/fp16 GEMMs whose K is WMMA-friendly (IN % 16 == 0). Falls back to F.linear
     (with a one-time warning) for: fp32/other dtypes, IN not a multiple of 16, or under cudagraph
     capture (static shapes are already self-consistent, and the arange/route tensors would allocate
-    mid-capture). Integer (int8) matmuls are already exact/M-invariant; quantized-expert and attention
-    kernels are already fixed-tile HIP.
+    mid-capture). Integer (int8) matmuls are already exact/M-invariant.
+
+    "quantized-expert and attention kernels are already fixed-tile HIP" USED TO STAND HERE. It was an
+    assertion, never a measurement, and it is only half true (measured 2026-08-05,
+    tools/quant_m_invariance.py, 7 shipped dense shapes + the Gemma4-shaped grouped MoE):
+      * each quantized kernel ARM is indeed fixed-tile and M-invariant on its own — rows[0:m] computed
+        alone are bit-identical to the same rows inside a batch of 2048, max|delta| = 0, for all three
+        dense arms — and the grouped-MoE `_moe_block_m` tile (16/32/64/128) is bit-NEUTRAL;
+      * but quant/kernels.py DISPATCHES BETWEEN ARMS as a function of M, and the arms are not all the
+        same numbers. Dense: prefill_wmma == wmma_tiled_tuned bit-for-bit, but decode_gemv differs from
+        both by up to 1.953e-3 abs (~1e-3 rel). MoE: gemm1 swaps gemv<->wmma at M=32 (up to 4.9e-4),
+        and gemm2 swaps its gather-reduce for an ATOMIC SCATTER at M<=2 which is not even deterministic
+        against itself (measured 9.5e-7 to 2.4e-4 between two identical consecutive calls).
+    So a quantized model is M-invariant only WITHIN an arm band. `_W4A8_GEMV_MAX_INT4` was raised
+    8 -> 16 for exactly the reason `_DECODE_GEMV_MAXM = 16` exists below — to put ordinary decode and
+    spec-decode verify on the same arm. The MoE gemm2 seam at M<=2 has no such fix and is a standing
+    limit: on a MoE target, verify (M>=3) is ALWAYS on a different gemm2 arm from plain decode (M=1),
+    at every K and every batch size.
 """
 from __future__ import annotations
 

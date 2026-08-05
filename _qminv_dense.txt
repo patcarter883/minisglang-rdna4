@@ -1,0 +1,554 @@
+device: AMD Radeon RX 9070 XT
+fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+minisgl.quant.kernels: /engine/python/minisgl/quant/kernels.py
+crossovers: gemv_max_int4=8 gemv_max_e2m1=16 tiled_min=64 gemv_K_mult=32 moe_gemm1_gemv_max=32
+
+=== DENSE g4.o_proj(local,rank)  K=2048 N=2816 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv           7.629e-06    7.629e-06            0
+           2 decode_gemv           1.221e-04    1.221e-04            0
+           4 decode_gemv           1.953e-03    1.953e-03            0
+           5 decode_gemv           1.953e-03    1.953e-03            0
+           8 decode_gemv           1.953e-03    1.953e-03            0
+           9 prefill_wmma          1.953e-03    1.953e-03            0
+          10 prefill_wmma          1.953e-03    1.953e-03            0
+          16 prefill_wmma          1.953e-03    1.953e-03            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned      7.629e-06  7.278e-04       0/1     
+           2 decode_gemv        wmma_tiled_tuned      1.221e-04  7.278e-04       0/2     
+           4 decode_gemv        wmma_tiled_tuned      1.953e-03  9.091e-04       0/4     
+           5 decode_gemv        wmma_tiled_tuned      1.953e-03  9.091e-04       0/5     
+           8 decode_gemv        wmma_tiled_tuned      1.953e-03  9.091e-04       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE g4.o_proj(global,rank)  K=4096 N=2816 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv                   0            0            0
+           2 decode_gemv           2.441e-04    2.441e-04            0
+           4 decode_gemv           2.441e-04    2.441e-04            0
+           5 decode_gemv           2.441e-04    2.441e-04            0
+           8 decode_gemv           9.766e-04    9.766e-04            0
+           9 prefill_wmma          9.766e-04    9.766e-04            0
+          10 prefill_wmma          9.766e-04    9.766e-04            0
+          16 prefill_wmma          1.953e-03    1.953e-03            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned              0          0       0/1     
+           2 decode_gemv        wmma_tiled_tuned      2.441e-04  9.416e-04       0/2     
+           4 decode_gemv        wmma_tiled_tuned      2.441e-04  9.416e-04       0/4     
+           5 decode_gemv        wmma_tiled_tuned      2.441e-04  1.527e-03       0/5     
+           8 decode_gemv        wmma_tiled_tuned      9.766e-04  1.527e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE g4.o_proj(global,tp1)  K=8192 N=2816 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv           1.953e-03    1.953e-03            0
+           2 decode_gemv           1.953e-03    1.953e-03            0
+           4 decode_gemv           1.953e-03    1.953e-03            0
+           5 decode_gemv           1.953e-03    1.953e-03            0
+           8 decode_gemv           1.953e-03    1.953e-03            0
+           9 prefill_wmma          1.953e-03    1.953e-03            0
+          10 prefill_wmma          1.953e-03    1.953e-03            0
+          16 prefill_wmma          1.953e-03    1.953e-03            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned      1.953e-03  7.752e-04       0/1     
+           2 decode_gemv        wmma_tiled_tuned      1.953e-03  9.058e-04       0/2     
+           4 decode_gemv        wmma_tiled_tuned      1.953e-03  1.866e-03       0/4     
+           5 decode_gemv        wmma_tiled_tuned      1.953e-03  1.866e-03       0/5     
+           8 decode_gemv        wmma_tiled_tuned      1.953e-03  1.866e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE g4.qkv_q(rank)  K=2816 N=2048 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv           2.441e-04    2.441e-04            0
+           2 decode_gemv           2.441e-04    2.441e-04            0
+           4 decode_gemv           4.883e-04    4.883e-04            0
+           5 decode_gemv           1.953e-03    1.953e-03            0
+           8 decode_gemv           1.953e-03    1.953e-03            0
+           9 prefill_wmma          1.953e-03    1.953e-03            0
+          10 prefill_wmma          1.953e-03    1.953e-03            0
+          16 prefill_wmma          1.953e-03    1.953e-03            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned      2.441e-04  7.452e-04       0/1     
+           2 decode_gemv        wmma_tiled_tuned      2.441e-04  9.259e-04       0/2     
+           4 decode_gemv        wmma_tiled_tuned      4.883e-04  9.259e-04       0/4     
+           5 decode_gemv        wmma_tiled_tuned      1.953e-03  9.259e-04       0/5     
+           8 decode_gemv        wmma_tiled_tuned      1.953e-03  2.384e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE g4.gate_up(rank)  K=2816 N=2112 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv                   0            0            0
+           2 decode_gemv                   0            0            0
+           4 decode_gemv           9.766e-04    9.766e-04            0
+           5 decode_gemv           9.766e-04    9.766e-04            0
+           8 decode_gemv           9.766e-04    9.766e-04            0
+           9 prefill_wmma          9.766e-04    9.766e-04            0
+          10 prefill_wmma          9.766e-04    9.766e-04            0
+          16 prefill_wmma          9.766e-04    9.766e-04            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned              0          0       0/1     
+           2 decode_gemv        wmma_tiled_tuned              0          0       0/2     
+           4 decode_gemv        wmma_tiled_tuned      9.766e-04  7.315e-04       0/4     
+           5 decode_gemv        wmma_tiled_tuned      9.766e-04  7.315e-04       0/5     
+           8 decode_gemv        wmma_tiled_tuned      9.766e-04  2.333e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE g4.dense_down(rank)  K=1056 N=2816 g=32 float16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv           3.052e-05    3.052e-05            0
+           2 decode_gemv           3.052e-05    3.052e-05            0
+           4 decode_gemv           9.766e-04    9.766e-04            0
+           5 decode_gemv           9.766e-04    9.766e-04            0
+           8 decode_gemv           9.766e-04    9.766e-04            0
+           9 prefill_wmma          9.766e-04    9.766e-04            0
+          10 prefill_wmma          9.766e-04    9.766e-04            0
+          16 prefill_wmma          9.766e-04    9.766e-04            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned      3.052e-05  6.207e-04       0/1     
+           2 decode_gemv        wmma_tiled_tuned      3.052e-05  6.207e-04       0/2     
+           4 decode_gemv        wmma_tiled_tuned      9.766e-04  1.192e-03       0/4     
+           5 decode_gemv        wmma_tiled_tuned      9.766e-04  1.192e-03       0/5     
+           8 decode_gemv        wmma_tiled_tuned      9.766e-04  1.192e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== SPEC: plain decode (M=1 per seq) vs verify (M=bs*(K+1)) ===
+
+  g4.o_proj(local,rank)  K=2048 N=2816
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          9.537e-07          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          2.441e-04          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          9.766e-04          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          4.768e-07          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          3.815e-06          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          3.815e-06          0/32     (0.00%)
+
+  g4.o_proj(global,rank)  K=4096 N=2816
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          9.766e-04          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          4.883e-04          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          9.766e-04          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          4.768e-07          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          1.221e-04          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          1.953e-03          0/32     (0.00%)
+
+  g4.o_proj(global,tp1)  K=8192 N=2816
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          6.104e-05          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          9.766e-04          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          1.953e-03          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          1.953e-03          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          4.883e-04          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          9.766e-04          0/32     (0.00%)
+
+  g4.qkv_q(rank)  K=2816 N=2048
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma                  0          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          6.104e-05          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          9.537e-07          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          1.953e-03          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          6.104e-05          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          2.384e-07          0/32     (0.00%)
+
+  g4.gate_up(rank)  K=2816 N=2112
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          9.766e-04          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          6.104e-05          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          7.629e-06          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          9.766e-04          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          4.768e-07          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          1.907e-06          0/32     (0.00%)
+
+  g4.dense_down(rank)  K=1056 N=2816
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          9.766e-04          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          2.441e-04          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma          1.192e-07          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma                  0          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          5.960e-08          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          1.953e-03          0/32     (0.00%)
+
+=== DENSE q35.o_proj(rank)  K=2048 N=4096 g=128 bfloat16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv           2.384e-07    2.384e-07            0
+           2 decode_gemv           2.384e-07    2.384e-07            0
+           4 decode_gemv           2.441e-04    2.441e-04            0
+           5 decode_gemv           2.441e-04    2.441e-04            0
+           8 decode_gemv           2.441e-04    2.441e-04            0
+           9 prefill_wmma          2.441e-04    2.441e-04            0
+          10 prefill_wmma          2.441e-04    2.441e-04            0
+          16 prefill_wmma          2.441e-04    2.441e-04            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned      2.384e-07  2.384e-03       0/1     
+           2 decode_gemv        wmma_tiled_tuned      2.384e-07  2.384e-03       0/2     
+           4 decode_gemv        wmma_tiled_tuned      2.441e-04  5.128e-03       0/4     
+           5 decode_gemv        wmma_tiled_tuned      2.441e-04  5.128e-03       0/5     
+           8 decode_gemv        wmma_tiled_tuned      2.441e-04  5.128e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== DENSE q35.gate_up(rank)  K=4096 N=3072 g=128 bfloat16 ===
+  [A] ARM AGREEMENT (same x, different kernel)
+           M engine arm           gemv~pwmma   gemv~tiled  pwmma~tiled
+           1 decode_gemv                   0            0            0
+           2 decode_gemv                   0            0            0
+           4 decode_gemv                   0            0            0
+           5 decode_gemv                   0            0            0
+           8 decode_gemv           2.384e-07    2.384e-07            0
+           9 prefill_wmma          2.384e-07    2.384e-07            0
+          10 prefill_wmma          2.384e-07    2.384e-07            0
+          16 prefill_wmma          3.815e-06    3.815e-06            0
+          17 prefill_wmma                  -            -            0
+          20 prefill_wmma                  -            -            0
+          32 prefill_wmma                  -            -            0
+          33 prefill_wmma                  -            -            0
+          64 wmma_tiled_tuned              -            -            0
+          65 wmma_tiled_tuned              -            -            0
+         128 wmma_tiled_tuned              -            -            0
+         129 wmma_tiled_tuned              -            -            0
+         192 wmma_tiled_tuned              -            -            0
+         256 wmma_tiled_tuned              -            -            0
+         512 wmma_tiled_tuned              -            -            0
+        1024 wmma_tiled_tuned              -            -            0
+        2048 wmma_tiled_tuned              -            -            0
+  [B] ARM SELF-INVARIANCE  rows[0:m] alone  vs  inside a batch of Mref
+      decode_gemv          Mref=16    worst max|delta| = 0
+      prefill_wmma         Mref=2048  worst max|delta| = 0
+      wmma_tiled_tuned     Mref=2048  worst max|delta| = 0
+  [C] ENGINE AUTO-DISPATCH INVARIANCE  (what chunked prefill / radix / verify see)
+           m arm(m)             arm(Mref)                max|d|    max rel   argmax flips
+           1 decode_gemv        wmma_tiled_tuned              0          0       0/1     
+           2 decode_gemv        wmma_tiled_tuned              0          0       0/2     
+           4 decode_gemv        wmma_tiled_tuned              0          0       0/4     
+           5 decode_gemv        wmma_tiled_tuned              0          0       0/5     
+           8 decode_gemv        wmma_tiled_tuned      2.384e-07  2.384e-03       0/8     
+           9 prefill_wmma       wmma_tiled_tuned              0          0       0/9     
+          10 prefill_wmma       wmma_tiled_tuned              0          0       0/10    
+          16 prefill_wmma       wmma_tiled_tuned              0          0       0/16    
+          17 prefill_wmma       wmma_tiled_tuned              0          0       0/17    
+          20 prefill_wmma       wmma_tiled_tuned              0          0       0/20    
+          32 prefill_wmma       wmma_tiled_tuned              0          0       0/32    
+          33 prefill_wmma       wmma_tiled_tuned              0          0       0/33    
+          64 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/64    
+          65 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/65    
+         128 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/128   
+         129 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/129   
+         192 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/192   
+         256 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/256   
+         512 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/512   
+        1024 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/1024  
+        2048 wmma_tiled_tuned   wmma_tiled_tuned              0          0       0/2048  
+  [D] ROW SPLIT  cat(auto(x[:h]), auto(x[h:]))  vs  auto(x)   [rowchunked_ar_span]
+      rows=256    split 2 -> max|delta| = 0            argmax flips 0/256
+      rows=512    split 2 -> max|delta| = 0            argmax flips 0/512
+      rows=1024   split 2 -> max|delta| = 0            argmax flips 0/1024
+      rows=2048   split 2 -> max|delta| = 0            argmax flips 0/2048
+
+=== SPEC: plain decode (M=1 per seq) vs verify (M=bs*(K+1)) ===
+
+  q35.o_proj(rank)  K=2048 N=4096
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma                  0          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          3.906e-03          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma                  0          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma                  0          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma          9.537e-07          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          6.104e-05          0/32     (0.00%)
+
+  q35.gate_up(rank)  K=4096 N=3072
+       bs   K  Mver arm@1          arm@Mver            max|d| row0  argmax flips (all rows)
+        1   4     5 decode_gemv    decode_gemv                   0          0/5      (0.00%)
+        2   4    10 decode_gemv    prefill_wmma          6.104e-05          0/10     (0.00%)
+        4   4    20 decode_gemv    prefill_wmma          2.441e-04          0/20     (0.00%)
+        8   4    40 decode_gemv    prefill_wmma                  0          0/40     (0.00%)
+        1  15    16 decode_gemv    prefill_wmma          3.815e-06          0/16     (0.00%)
+        2  15    32 decode_gemv    prefill_wmma                  0          0/32     (0.00%)
+        1   7     8 decode_gemv    decode_gemv                   0          0/8      (0.00%)
+        4   7    32 decode_gemv    prefill_wmma          9.766e-04          0/32     (0.00%)
+
+done.

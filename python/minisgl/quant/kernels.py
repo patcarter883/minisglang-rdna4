@@ -1228,9 +1228,33 @@ def _pick_dense_kernel(
       no in-op at::zeros). One dtype-generic rule — no int4-vs-e2m1 branch.
     - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> prefill_wmma: its conservative config still
       wins the small-M/wide-N corner (re-bench: tiled loses only at N>=6144, M<=32).
+      FOLLOW-UP (measured 2026-08-05, tools/w4a8_dense_arm_cost.py, graph-timed, MALL-busted): none of
+      the shipped shapes is N>=6144, and at N<6144 the mid-band rule is BACKWARDS — wmma_tiled_tuned
+      beats prefill_wmma at every mid-band M on all 7 shapes (g4.o_proj(local) M=20: 77.0 vs 140.5 us;
+      M=32: 76.7 vs 146.9. g4.dense_down M=32: 41.6 vs 106.6). The two arms are BIT-IDENTICAL, so this
+      is free to fix and carries no numerics risk; it is left alone here only because this change set
+      is about M-invariance and a dispatch flip deserves its own sweep across the N>=6144 corner the
+      rule was written for.
 
     The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
     in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
+
+    DO THE ARMS AGREE? (measured 2026-08-05, tools/quant_m_invariance.py, RX 9070 XT, 7 shipped
+    shapes: Gemma4 o_proj 2048/4096/8192 x 2816, qkv, gate_up, dense_down at g=32 fp16; Qwen3.6-35B
+    o_proj/gate_up at g=128 bf16.)  Nobody had ever asked, and the answer decides whether a quantized
+    model is M-invariant at all -- the property layers/minv.py exists to guarantee for the bf16 path,
+    on which chunked prefill, prefix/radix caching and spec-decode VERIFY all depend.
+
+        prefill_wmma  vs  wmma_tiled_tuned :  max|delta| = 0.000e+00  at EVERY M, EVERY shape.
+        decode_gemv   vs  either WMMA arm  :  up to 1.953e-3 abs (fp16 g32) / 2.441e-4 (bf16 g128),
+                                              ~1e-3 relative.
+        each arm against ITSELF across M   :  0.000e+00 (rows[0:m] alone == the same rows inside a
+                                              batch of 2048, for all three arms).
+
+    So: every arm is individually M-invariant, and the M >= 64 crossover is FREE because the two WMMA
+    arms are the same numbers. The quantized dense path has exactly ONE lossy seam -- decode_gemv <->
+    WMMA at `gemv_max` -- and it sits inside the spec-verify band (verify M = bs*(K+1)). That is why
+    _W4A8_GEMV_MAX_INT4 is 16 and not 8; see its comment.
     """
     # NVFP4 (group-16) e2m1 now rides decode_gemv in the decode band: the unified Int4Fp8GemvLoader
     # folds a per-16-K-half scale (group<32 branch), so the streaming GEMV serves group-16 at M<=gemv_max
@@ -1256,10 +1280,35 @@ def _pick_dense_kernel(
     return "wmma_tiled_tuned" if m >= _W4A8_PREFILL_TILED_MIN else "prefill_wmma"
 
 
-# gemv<->wmma crossover per decode path (measured). decode_gemv asserts M<=16 in-kernel, so E2M1 caps
-# at 16; int4 crosses lower because its WMMA tile reclaims M=16 on a dense model. Both >= the M<=2
-# decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
-_W4A8_GEMV_MAX_INT4 = 8
+# gemv<->wmma crossover per decode path. decode_gemv asserts M<=16 in-kernel, so 16 is the ceiling for
+# BOTH weight formats — and both now sit AT it. This used to be 8 for int4, on the claim that "its WMMA
+# tile reclaims M=16 on a dense model". That claim is FALSE at every shape this engine dispatches, and
+# it cost twice: it left performance on the floor AND it put a numerics seam in the middle of the
+# spec-verify band.
+#
+# THE NUMERICS HALF. `_pick_dense_kernel`'s docstring records the measurement: the two WMMA arms are
+# bit-identical to each other, and each arm is M-invariant on its own, so decode_gemv <-> WMMA is the
+# only crossover at which a token's value depends on how many tokens shared its batch. Spec VERIFY runs
+# M = bs*(K+1) while plain decode runs M=1, so with the cap at 8 an MTP K=4 verify at bs>=2 (M=10) or a
+# DFlash K=15 verify at bs=1 (M=16) ran a DIFFERENT KERNEL from the decode it is compared against. At 16
+# the whole band the kernel can serve is one arm — exactly the reasoning layers/minv.py already applies
+# to the bf16 path (`_DECODE_GEMV_MAXM = 16`, "so that ordinary decode and spec-decode VERIFY land on
+# the SAME kernel rather than opposite sides of the threshold"). Honest limit: this MOVES the seam to
+# M=16, it does not remove it — verify wider than 16 rows still crosses, and the kernel cannot go higher.
+#
+# THE PERF HALF (graph-replay timed, weights rotated past the 64 MB MALL; tools/w4a8_dense_arm_cost.py,
+# 2026-08-05, RX 9070 XT). decode_gemv is FASTER than both WMMA arms at every M in 1..16, on every
+# shape — the M=9..16 band was being handed to `prefill_wmma`, the slowest of the three:
+#     us at M=16          decode_gemv   prefill_wmma (dispatched)   wmma_tiled   -> speedup
+#     g4.o_proj(local)        40.6            135.6                    77.4         3.34x
+#     g4.o_proj(global)       65.2            188.4                   139.0         2.89x
+#     g4.qkv_q                38.5            122.8                    96.9         3.19x
+#     g4.gate_up              44.5            124.6                    97.0         2.80x
+#     g4.dense_down           35.3            112.2                    41.7         3.18x
+#     q35.o_proj              50.6             65.1                    66.2         1.29x
+#     q35.gate_up             66.0            115.3                   115.6         1.75x
+# so the fix is not a correctness tax, it is a strict win in the band it touches.
+_W4A8_GEMV_MAX_INT4 = 16
 _W4A8_GEMV_MAX_E2M1 = 16
 # K granularity the decode GEMV can consume. Tracks the kernel's own precondition — raise/lower this
 # ONLY together with the kernel, never to route a shape away from the decode path (see

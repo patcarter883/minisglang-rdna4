@@ -10,11 +10,19 @@ because conflating them is how a "bit-exact by construction" argument quietly st
 
   CLAIM 2 -- a ROW SPLIT is bit-exact only if the PRODUCER is bit-exact under a change of row count.
       The all_reduce half is structural (disjoint rows -> each row is an independent 2-rank sum). The
-      producer half is NOT. `rowchunked_ar_span` feeds fewer rows to whatever compute sits inside it,
-      and this repo's fused MoE grouped GEMM chooses block_m from the workload and reduces gemm2 with
-      atomics -- a reduction whose ORDER depends on M. So "disjoint rows => bit-exact", the argument
-      the original Qwen3.5-MoE async-AR carried in its docstring, covers the collective but NOT
-      necessarily the expert compute it splits.
+      producer half has to be MEASURED. `rowchunked_ar_span` feeds fewer rows to whatever compute sits
+      inside it, and this repo's fused MoE grouped GEMM chooses block_m from the workload and reduces
+      gemm2 with atomics. So "disjoint rows => bit-exact", the argument the original Qwen3.5-MoE
+      async-AR carried in its docstring, covers the collective but NOT the expert compute it splits.
+
+      SETTLED 2026-08-05 (tools/quant_m_invariance.py): the producer half IS exact at every row count
+      this span engages at. Dense W4A8 and the grouped MoE both measure max|delta| = 0.000e+00 at rows
+      256/512/1024/2048 split into 2 -- INCLUDING rows=2048, where the split moves `_moe_block_m` from
+      128 to 64, so the workload-derived tile is bit-neutral. What IS lossy is a chunk small enough to
+      cross a KERNEL-ARM boundary (MoE gemm1 gemv<->wmma at 32 rows; dense decode_gemv<->WMMA at 8/16),
+      so `rowchunked_ar_span` now clamps the chunk count to keep every chunk above them. Do NOT
+      re-derive this from a `torch.mm`: no producer inside this span calls one, and doing so is how the
+      seam acquired a "row split is lossy" verdict it did not deserve.
 
       This is the whole reason the test exists rather than the docstring. It measures, per producer:
         - a row-independent LINEAR producer (must be exact -- if this fails the seam is broken)
