@@ -95,10 +95,18 @@ MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "0") != "0"
 # where the grid is actually known -- the same rule, and the same function, that carves the fused
 # gather-reduce gemm2's top_k reduction.
 _MOE_SPLITK_AUTO = 0
+# A/B handle, not a feature gate — the twin of MINISGL_MOE_G2_SPLIT_K on the fused arm. `legacy`
+# reproduces the retired `4 if M == 1 else 1` so a control leg can measure what the shipped constant
+# actually cost end-to-end; any integer forces that slice count. Unset = derive.
+_MOE_SPLITK_FORCE = _os.environ.get("MINISGL_MOE_SPLITK_SCATTER", "")
 
 
 def _moe_split_k(M: int) -> int:
     """K-slices for the decode scatter gemm2. 0 = derive from the launched grid (see above)."""
+    if _MOE_SPLITK_FORCE == "legacy":
+        return 4 if M == 1 else 1
+    if _MOE_SPLITK_FORCE.isdigit():
+        return int(_MOE_SPLITK_FORCE)
     return _MOE_SPLITK_AUTO
 
 # Native HIP moe_align (moe_hip) replacing the vLLM moe_align_block_size host op. On by default;

@@ -14,10 +14,14 @@
 # must show `split_k>1`, or the comparison is new-vs-itself and the run is VOID.
 #
 # BAND: DECODE. bs = 1, 5, 6.
-#   * bs=1 is M=1, which does NOT reach this kernel at all (w4a8_moe takes the M<=2 atomic-scatter
-#     branch). It is here as a NEGATIVE CONTROL: the split must move it by nothing but noise.
-#   * bs=5 and bs=6 are M=5 / M=6, the served points that DO reach the fused gather-reduce.
+#   * bs=5 and bs=6 are M=5 / M=6, the served points that reach the FUSED gather-reduce.
 #     CONC=6 is the recorded 35B/16GB TP=2 ceiling, so M can never exceed 6 on this model/box.
+#   * bs=1 is M=1, which takes the M<=2 atomic-SCATTER branch instead. Which leg it belongs to
+#     depends on ARM:
+#       ARM=fused   (default) — both legs derive the scatter split, so bs=1 is a NEGATIVE CONTROL
+#                    for the fused change and must move by nothing but noise.
+#       ARM=scatter          — the base leg reproduces the retired `4 if M == 1 else 1` constant
+#                    and bs=1 becomes the measured row, while bs=5/6 are then the controls.
 set -uo pipefail
 
 WT="${WT:-/home/pat/code/minisgl-rdna4-g2sk}"
@@ -59,10 +63,13 @@ echo "engine  $WT   @ $(git -C "$WT" rev-parse --short HEAD)" | tee -a "$OUT"
 echo "kernels $KERN @ $(git -C "$KERN" rev-parse --short HEAD)  (ONE build, both legs)" | tee -a "$OUT"
 
 FAIL=0
+ARM="${ARM:-fused}"
 for leg in base new; do
-  case "$leg" in
-    base) SKENV="MINISGL_MOE_G2_SPLIT_K=1" ;;   # forced unsplit
-    new)  SKENV="MINISGL_MOE_G2_SPLIT_K=" ;;    # derived from occupancy
+  case "$ARM/$leg" in
+    fused/base)   SKENV="MINISGL_MOE_G2_SPLIT_K=1" ;;        # forced unsplit (fused arm)
+    fused/new)    SKENV="MINISGL_MOE_G2_SPLIT_K=" ;;         # derived
+    scatter/base) SKENV="MINISGL_MOE_SPLITK_SCATTER=legacy" ;;  # the retired M==1 ? 4 : 1
+    scatter/new)  SKENV="MINISGL_MOE_SPLITK_SCATTER=" ;;     # derived
   esac
   echo "" | tee -a "$OUT"
   echo "########## LEG $leg  ($SKENV) ##########" | tee -a "$OUT"
@@ -97,16 +104,30 @@ for leg in base new; do
   echo "  g2-split ledger: ${LEDGER:-<none captured>}" | tee -a "$OUT"
   SPLITS=$(printf '%s' "$LEDGER" | grep -oE 'split_k=[0-9]+' | sort -u | tr '\n' ' ')
   echo "  split_k values seen: ${SPLITS:-<none>}" | tee -a "$OUT"
-  if [ "$leg" = "base" ]; then
-    case "$SPLITS" in
-      "split_k=1 ") echo "  PROVENANCE OK: base ran unsplit" | tee -a "$OUT" ;;
-      *) echo "  PROVENANCE FAIL: base saw '$SPLITS' — A/B void" | tee -a "$OUT"; FAIL=1 ;;
-    esac
+  # The [g2-split] ledger only speaks for the FUSED arm; the scatter arm's count is chosen inside
+  # run_moe_gemm and is not printed, so an ARM=scatter run is asserted on its env instead.
+  if [ "$ARM" = fused ]; then
+    if [ "$leg" = "base" ]; then
+      case "$SPLITS" in
+        "split_k=1 ") echo "  PROVENANCE OK: base ran unsplit" | tee -a "$OUT" ;;
+        *) echo "  PROVENANCE FAIL: base saw '$SPLITS' — A/B void" | tee -a "$OUT"; FAIL=1 ;;
+      esac
+    else
+      case "$SPLITS" in
+        *split_k=[2-9]*) echo "  PROVENANCE OK: new ran split" | tee -a "$OUT" ;;
+        *) echo "  PROVENANCE FAIL: new never split ('$SPLITS') — A/B void" | tee -a "$OUT"; FAIL=1 ;;
+      esac
+    fi
   else
-    case "$SPLITS" in
-      *split_k=[2-9]*) echo "  PROVENANCE OK: new ran split" | tee -a "$OUT" ;;
-      *) echo "  PROVENANCE FAIL: new never split ('$SPLITS') — A/B void" | tee -a "$OUT"; FAIL=1 ;;
-    esac
+    ENVSEEN=$(docker inspect g2sk-serve --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+              | grep -c "^MINISGL_MOE_SPLITK_SCATTER=legacy$")
+    if [ "$leg" = base ] && [ "${ENVSEEN:-0}" = 0 ]; then
+      echo "  PROVENANCE FAIL: base did not carry SPLITK_SCATTER=legacy — A/B void" | tee -a "$OUT"; FAIL=1
+    elif [ "$leg" = new ] && [ "${ENVSEEN:-0}" != 0 ]; then
+      echo "  PROVENANCE FAIL: new carried the legacy constant — A/B void" | tee -a "$OUT"; FAIL=1
+    else
+      echo "  PROVENANCE OK: scatter arm leg=$leg" | tee -a "$OUT"
+    fi
   fi
 
   ( cd "$WT" && docker compose -p "$PROJ" --profile serve down ) >/dev/null 2>&1

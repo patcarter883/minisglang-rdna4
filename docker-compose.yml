@@ -67,6 +67,9 @@ x-lean-common: &lean-common
     # SAME binary, _DEBUG makes the launcher print the count it chose (the A/B's provenance).
     MINISGL_MOE_G2_SPLIT_K: "${MINISGL_MOE_G2_SPLIT_K:-}"
     MINISGL_MOE_G2_SPLIT_DEBUG: "${MINISGL_MOE_G2_SPLIT_DEBUG:-}"
+    # Twin handle for the SCATTER arm's K carve (M<=2). "legacy" reproduces the retired
+    # `4 if M == 1 else 1` so a control leg can measure what that constant cost e2e.
+    MINISGL_MOE_SPLITK_SCATTER: "${MINISGL_MOE_SPLITK_SCATTER:-}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
