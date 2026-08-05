@@ -1,0 +1,873 @@
+device: AMD Radeon RX 9070 XT   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+arms: ('prefill_wmma', 'wmma_tiled_tuned', 'prefill_wmma_ashuffle')
+graph-replay timed; rotation sized in BYTES to exceed the 64 MB MALL; us per call
+
+########## REAL SHIPPED SHAPES ##########
+
+=== g4.q_proj      tp1  K=2816 N=4096 g=32 float16 zeros=sym  (rotation 27 x 6.49 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 143.97                103.59                124.98         wmma_tiled_tuned    1.21x
+      20                 141.84                103.52                124.99         wmma_tiled_tuned    1.21x
+      24                 141.27                102.61                124.08         wmma_tiled_tuned    1.21x
+      32                 148.39                102.18                123.64         wmma_tiled_tuned    1.21x
+      33                 160.33                101.55                129.86         wmma_tiled_tuned    1.28x
+      40                 160.56                100.67                129.59         wmma_tiled_tuned    1.29x
+      48                 166.80                100.13                129.05         wmma_tiled_tuned    1.29x
+      56                 175.67                 99.47                135.57         wmma_tiled_tuned    1.36x
+      63                 181.93                 98.61                134.98         wmma_tiled_tuned    1.37x
+      64                 181.28                 98.46                134.95         wmma_tiled_tuned    1.37x
+      80                 160.08                105.36                141.65         wmma_tiled_tuned    1.34x
+      96                 172.47                105.56                149.08         wmma_tiled_tuned    1.41x
+     128                 240.34                105.97                163.38         wmma_tiled_tuned    1.54x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.q_proj      tp2  K=2816 N=2048 g=32 float16 zeros=sym  (rotation 53 x 3.24 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 128.29                 97.09                119.34         wmma_tiled_tuned    1.23x
+      20                 132.31                 97.05                119.73         wmma_tiled_tuned    1.23x
+      24                 132.66                 96.85                119.91         wmma_tiled_tuned    1.24x
+      32                 139.67                 97.00                120.03         wmma_tiled_tuned    1.24x
+      33                 152.94                 97.06                126.90         wmma_tiled_tuned    1.31x
+      40                 153.86                 97.00                127.31         wmma_tiled_tuned    1.31x
+      48                 160.99                 97.04                127.15         wmma_tiled_tuned    1.31x
+      56                 169.16                 97.18                134.41         wmma_tiled_tuned    1.38x
+      63                 176.72                 97.32                134.70         wmma_tiled_tuned    1.38x
+      64                 176.64                 97.31                134.66         wmma_tiled_tuned    1.38x
+      80                 174.73                104.13                141.56         wmma_tiled_tuned    1.36x
+      96                 174.87                104.70                148.84         wmma_tiled_tuned    1.42x
+     128                 218.11                104.65                163.31         wmma_tiled_tuned    1.56x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.kv_proj     tp2  K=2816 N=1024 g=32 float16 zeros=sym  (rotation 105 x 1.62 MB = 170 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 129.99                 95.82                119.36         wmma_tiled_tuned    1.25x
+      20                 132.37                 95.80                119.73         wmma_tiled_tuned    1.25x
+      24                 132.39                 95.94                119.88         wmma_tiled_tuned    1.25x
+      32                 140.09                 96.11                120.03         wmma_tiled_tuned    1.25x
+      33                 153.28                 96.08                126.92         wmma_tiled_tuned    1.32x
+      40                 153.73                 96.16                127.29         wmma_tiled_tuned    1.32x
+      48                 161.31                 96.13                127.41         wmma_tiled_tuned    1.33x
+      56                 169.51                 96.28                134.54         wmma_tiled_tuned    1.40x
+      63                 176.94                 96.10                134.77         wmma_tiled_tuned    1.40x
+      64                 177.10                 96.23                134.78         wmma_tiled_tuned    1.40x
+      80                 173.34                103.26                141.73         wmma_tiled_tuned    1.37x
+      96                 173.56                103.37                148.57         wmma_tiled_tuned    1.44x
+     128                 219.42                103.75                163.35         wmma_tiled_tuned    1.57x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.o_proj      tp1  K=4096 N=2816 g=32 float16 zeros=sym  (rotation 27 x 6.49 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 202.72                139.14                159.44         wmma_tiled_tuned    1.15x
+      20                 206.03                139.46                159.17         wmma_tiled_tuned    1.14x
+      24                 207.24                139.46                159.01         wmma_tiled_tuned    1.14x
+      32                 217.75                139.07                159.26         wmma_tiled_tuned    1.15x
+      33                 310.53                138.96                170.31         wmma_tiled_tuned    1.23x
+      40                 307.53                139.64                170.15         wmma_tiled_tuned    1.22x
+      48                 333.21                139.38                170.26         wmma_tiled_tuned    1.22x
+      56                 332.02                140.02                180.87         wmma_tiled_tuned    1.29x
+      63                 350.30                140.05                180.99         wmma_tiled_tuned    1.29x
+      64                 341.72                140.34                181.18         wmma_tiled_tuned    1.29x
+      80                 245.54                154.35                194.57         wmma_tiled_tuned    1.26x
+      96                 251.90                151.51                202.50         wmma_tiled_tuned    1.34x
+     128                 420.39                152.35                224.57         wmma_tiled_tuned    1.47x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.o_proj      tp2  K=2048 N=2816 g=32 float16 zeros=sym  (rotation 53 x 3.24 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 128.29                 75.54                 98.17         wmma_tiled_tuned    1.30x
+      20                 133.86                 77.43                100.53         wmma_tiled_tuned    1.30x
+      24                 133.81                 77.31                100.68         wmma_tiled_tuned    1.30x
+      32                 140.01                 77.36                100.69         wmma_tiled_tuned    1.30x
+      33                 191.24                 77.38                105.79         wmma_tiled_tuned    1.37x
+      40                 193.55                 77.24                106.12         wmma_tiled_tuned    1.37x
+      48                 199.10                 77.38                106.16         wmma_tiled_tuned    1.37x
+      56                 197.40                 77.31                111.33         wmma_tiled_tuned    1.44x
+      63                 212.61                 77.68                111.51         wmma_tiled_tuned    1.44x
+      64                 212.56                 77.80                111.55         wmma_tiled_tuned    1.43x
+      80                 142.38                 83.24                116.63         wmma_tiled_tuned    1.40x
+      96                 142.84                 83.35                121.80         wmma_tiled_tuned    1.46x
+     128                 240.35                 83.50                132.36         wmma_tiled_tuned    1.59x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.gate_up     tp1  K=2816 N=4224 g=32 float16 zeros=sym  (rotation 27 x 6.69 MB = 181 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 136.77                140.39                142.11             prefill_wmma    1.03x
+      20                 139.88                141.55                142.40             prefill_wmma    1.01x
+      24                 140.94                140.18                142.71         wmma_tiled_tuned    1.01x
+      32                 148.54                141.99                142.76         wmma_tiled_tuned    1.01x
+      33                 162.09                137.69                149.88         wmma_tiled_tuned    1.09x
+      40                 163.38                137.63                150.39         wmma_tiled_tuned    1.09x
+      48                 170.60                135.97                150.37         wmma_tiled_tuned    1.11x
+      56                 181.44                138.57                157.74         wmma_tiled_tuned    1.14x
+      63                 188.65                130.87                155.01         wmma_tiled_tuned    1.18x
+      64                 188.88                136.74                158.00         wmma_tiled_tuned    1.16x
+      80                 169.01                136.54                164.95         wmma_tiled_tuned    1.21x
+      96                 178.74                134.42                159.78         wmma_tiled_tuned    1.19x
+     128                 422.31                132.18                166.05         wmma_tiled_tuned    1.26x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.gate_up     tp2  K=2816 N=2112 g=32 float16 zeros=sym  (rotation 52 x 3.35 MB = 174 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 130.02                 96.79                119.67         wmma_tiled_tuned    1.24x
+      20                 133.33                 96.86                119.87         wmma_tiled_tuned    1.24x
+      24                 133.67                 96.84                119.96         wmma_tiled_tuned    1.24x
+      32                 141.84                 97.08                119.91         wmma_tiled_tuned    1.24x
+      33                 154.29                 96.95                127.00         wmma_tiled_tuned    1.31x
+      40                 155.16                 97.04                127.16         wmma_tiled_tuned    1.31x
+      48                 162.41                 97.19                127.34         wmma_tiled_tuned    1.31x
+      56                 170.43                 97.10                134.45         wmma_tiled_tuned    1.38x
+      63                 177.75                 97.25                134.66         wmma_tiled_tuned    1.38x
+      64                 177.99                 97.25                134.76         wmma_tiled_tuned    1.39x
+      80                 176.87                104.12                141.79         wmma_tiled_tuned    1.36x
+      96                 176.22                104.38                148.88         wmma_tiled_tuned    1.43x
+     128                 259.37                104.72                163.19         wmma_tiled_tuned    1.56x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== g4.down        tp2  K=1056 N=2816 g=32 float16 zeros=sym  (rotation 102 x 1.67 MB = 171 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                  69.22                 44.73                 68.43         wmma_tiled_tuned    1.53x
+      20                  73.12                 44.74                 68.55         wmma_tiled_tuned    1.53x
+      24                  73.30                 44.72                 68.54         wmma_tiled_tuned    1.53x
+      32                  76.27                 44.89                 68.69         wmma_tiled_tuned    1.53x
+      33                  79.65                 45.01                 71.01         wmma_tiled_tuned    1.58x
+      40                  80.99                 44.90                 71.15         wmma_tiled_tuned    1.58x
+      48                  83.72                 44.97                 71.37         wmma_tiled_tuned    1.59x
+      56                  87.00                 45.16                 74.08         wmma_tiled_tuned    1.64x
+      63                  89.90                 45.32                 74.21         wmma_tiled_tuned    1.64x
+      64                  89.97                 45.31                 74.21         wmma_tiled_tuned    1.64x
+      80                  86.41                 48.55                 76.97         wmma_tiled_tuned    1.59x
+      96                  86.76                 48.63                 79.76         wmma_tiled_tuned    1.64x
+     128                 113.49                 49.09                 85.14         wmma_tiled_tuned    1.73x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q35.q_proj     tp1  K=2048 N=4096 g=32 bfloat16 zeros=awq  (rotation 36 x 4.85 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 150.99                 80.97                125.92         wmma_tiled_tuned    1.56x
+      20                 141.22                 80.98                126.00         wmma_tiled_tuned    1.56x
+      24                 144.06                 80.82                123.18         wmma_tiled_tuned    1.52x
+      32                 155.43                 80.97                121.24         wmma_tiled_tuned    1.50x
+      33                 189.38                 81.08                131.20         wmma_tiled_tuned    1.62x
+      40                 191.00                 80.80                130.12         wmma_tiled_tuned    1.61x
+      48                 200.40                 80.88                130.42         wmma_tiled_tuned    1.61x
+      56                 207.12                 80.96                136.77         wmma_tiled_tuned    1.69x
+      63                 218.38                 81.61                135.28         wmma_tiled_tuned    1.66x
+      64                 219.08                 81.41                134.91         wmma_tiled_tuned    1.66x
+      80                 152.41                 86.75                141.30         wmma_tiled_tuned    1.63x
+      96                 150.09                 86.93                138.60         wmma_tiled_tuned    1.59x
+     128                 236.52                 87.19                135.76         wmma_tiled_tuned    1.56x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q35.q_proj     tp2  K=2048 N=2048 g=32 bfloat16 zeros=awq  (rotation 71 x 2.42 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 157.59                 78.15                124.07         wmma_tiled_tuned    1.59x
+      20                 152.85                 78.06                124.12         wmma_tiled_tuned    1.59x
+      24                 159.00                 77.93                124.46         wmma_tiled_tuned    1.60x
+      32                 184.06                 77.91                124.73         wmma_tiled_tuned    1.60x
+      33                 195.52                 78.00                130.17         wmma_tiled_tuned    1.67x
+      40                 196.56                 77.87                129.64         wmma_tiled_tuned    1.66x
+      48                 201.43                 77.78                130.28         wmma_tiled_tuned    1.67x
+      56                 207.22                 78.09                135.75         wmma_tiled_tuned    1.74x
+      63                 212.56                 78.46                135.67         wmma_tiled_tuned    1.73x
+      64                 212.49                 78.52                135.31         wmma_tiled_tuned    1.72x
+      80                 143.17                 84.36                140.99         wmma_tiled_tuned    1.67x
+      96                 165.30                 83.81                146.67         wmma_tiled_tuned    1.75x
+     128                 237.51                 84.20                157.53         wmma_tiled_tuned    1.87x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q35.o_proj     tp2  K=2048 N=2048 g=32 bfloat16 zeros=awq  (rotation 71 x 2.42 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 158.52                 78.37                124.68         wmma_tiled_tuned    1.59x
+      20                 152.59                 78.23                124.62         wmma_tiled_tuned    1.59x
+      24                 150.88                 77.97                124.83         wmma_tiled_tuned    1.60x
+      32                 184.42                 78.21                124.97         wmma_tiled_tuned    1.60x
+      33                 193.86                 78.15                129.87         wmma_tiled_tuned    1.66x
+      40                 196.74                 77.95                129.94         wmma_tiled_tuned    1.67x
+      48                 201.26                 77.81                130.25         wmma_tiled_tuned    1.67x
+      56                 206.82                 78.19                135.67         wmma_tiled_tuned    1.74x
+      63                 212.44                 78.65                135.79         wmma_tiled_tuned    1.73x
+      64                 212.58                 78.61                136.06         wmma_tiled_tuned    1.73x
+      80                 143.44                 84.15                141.06         wmma_tiled_tuned    1.68x
+      96                 165.33                 84.49                148.67         wmma_tiled_tuned    1.76x
+     128                 236.99                 84.65                159.07         wmma_tiled_tuned    1.88x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.q_proj     tp1  K=5120 N=6144 g=32 bfloat16 zeros=awq  (rotation 11 x 18.19 MB = 200 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 245.54                274.38                237.68    prefill_wmma_ashuffle    1.03x
+      20                 248.94                274.48                237.64    prefill_wmma_ashuffle    1.05x
+      24                 252.81                269.99                237.99    prefill_wmma_ashuffle    1.06x
+      32                 266.69                272.84                238.38    prefill_wmma_ashuffle    1.12x
+      33                 293.70                272.22                252.55    prefill_wmma_ashuffle    1.08x
+      40                 297.39                271.17                252.56    prefill_wmma_ashuffle    1.07x
+      48                 301.14                259.33                246.10    prefill_wmma_ashuffle    1.05x
+      56                 317.26                260.83                254.53    prefill_wmma_ashuffle    1.02x
+      63                 325.45                253.15                252.86    prefill_wmma_ashuffle    1.00x
+      64                 324.13                251.19                251.03    prefill_wmma_ashuffle    1.00x
+      80                 350.90                253.89                272.97         wmma_tiled_tuned    1.08x
+      96                 357.54                254.87                286.23         wmma_tiled_tuned    1.12x
+     128                 823.40                253.59                305.20         wmma_tiled_tuned    1.20x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.q_proj     tp2  K=5120 N=3072 g=32 bfloat16 zeros=awq  (rotation 20 x 9.09 MB = 182 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 290.55                173.51                170.53    prefill_wmma_ashuffle    1.02x
+      20                 288.58                172.96                169.75    prefill_wmma_ashuffle    1.02x
+      24                 295.43                172.96                169.84    prefill_wmma_ashuffle    1.02x
+      32                 311.74                173.17                170.06    prefill_wmma_ashuffle    1.02x
+      33                 338.21                173.15                188.64         wmma_tiled_tuned    1.09x
+      40                 328.78                173.49                187.68         wmma_tiled_tuned    1.08x
+      48                 340.96                173.58                187.42         wmma_tiled_tuned    1.08x
+      56                 363.85                173.83                200.29         wmma_tiled_tuned    1.15x
+      63                 374.75                174.55                199.27         wmma_tiled_tuned    1.14x
+      64                 371.57                174.54                198.14         wmma_tiled_tuned    1.14x
+      80                 288.91                187.34                213.73         wmma_tiled_tuned    1.14x
+      96                 290.23                187.27                225.32         wmma_tiled_tuned    1.20x
+     128                 466.64                188.41                251.63         wmma_tiled_tuned    1.34x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.o_proj     tp2  K=3072 N=5120 g=32 bfloat16 zeros=awq  (rotation 20 x 9.09 MB = 182 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 196.98                181.76                174.53    prefill_wmma_ashuffle    1.04x
+      20                 203.04                181.59                174.37    prefill_wmma_ashuffle    1.04x
+      24                 204.34                181.49                174.54    prefill_wmma_ashuffle    1.04x
+      32                 216.17                181.88                174.95    prefill_wmma_ashuffle    1.04x
+      33                 230.83                182.08                182.44         wmma_tiled_tuned    1.00x
+      40                 232.47                175.94                182.74         wmma_tiled_tuned    1.04x
+      48                 238.35                160.21                183.14         wmma_tiled_tuned    1.14x
+      56                 248.64                160.30                190.95         wmma_tiled_tuned    1.19x
+      63                 252.57                160.55                190.99         wmma_tiled_tuned    1.19x
+      64                 253.10                160.58                190.65         wmma_tiled_tuned    1.19x
+      80                 199.08                165.69                200.89         wmma_tiled_tuned    1.20x
+      96                 202.96                167.14                209.42         wmma_tiled_tuned    1.21x
+     128                 612.03                169.11                226.04         wmma_tiled_tuned    1.34x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.gate_up    tp1  K=5120 N=34816 g=32 bfloat16 zeros=awq  (rotation 3 x 103.06 MB = 309 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 803.46                997.61                972.90             prefill_wmma    1.21x
+      20                 839.40               1001.13                976.78             prefill_wmma    1.16x
+      24                 849.79               1001.38                981.89             prefill_wmma    1.16x
+      32                 895.18               1008.02                993.00             prefill_wmma    1.11x
+      33                 955.73               1009.44               1085.41             prefill_wmma    1.06x
+      40                 980.61               1012.83               1119.76             prefill_wmma    1.03x
+      48                1051.18               1014.49               1132.97         wmma_tiled_tuned    1.04x
+      56                1155.94               1019.48               1189.87         wmma_tiled_tuned    1.13x
+      63                1201.24               1025.83               1192.27         wmma_tiled_tuned    1.16x
+      64                1205.26               1021.29               1200.48         wmma_tiled_tuned    1.18x
+      80                1911.95               1309.77               1260.30    prefill_wmma_ashuffle    1.04x
+      96                2005.70               1306.81               1328.87         wmma_tiled_tuned    1.02x
+     128                3527.46               1314.98               1463.55         wmma_tiled_tuned    1.11x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.gate_up    tp2  K=5120 N=17408 g=32 bfloat16 zeros=awq  (rotation 5 x 51.53 MB = 258 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 502.50                628.62                588.92             prefill_wmma    1.17x
+      20                 503.99                621.12                585.78             prefill_wmma    1.16x
+      24                 510.68                618.74                584.90             prefill_wmma    1.15x
+      32                 537.71                615.16                584.78             prefill_wmma    1.09x
+      33                 594.14                613.98                617.82             prefill_wmma    1.03x
+      40                 602.12                608.67                620.97             prefill_wmma    1.01x
+      48                 633.31                616.03                624.36         wmma_tiled_tuned    1.01x
+      56                 667.89                608.78                660.54         wmma_tiled_tuned    1.09x
+      63                 697.37                614.21                660.04         wmma_tiled_tuned    1.07x
+      64                 697.81                607.74                657.33         wmma_tiled_tuned    1.08x
+      80                 982.65                644.42                699.10         wmma_tiled_tuned    1.08x
+      96                1050.59                647.99                739.03         wmma_tiled_tuned    1.14x
+     128                2075.08                648.19                818.88         wmma_tiled_tuned    1.26x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q27.down       tp2  K=8704 N=5120 g=32 bfloat16 zeros=awq  (rotation 8 x 25.76 MB = 206 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 448.92                462.84                429.88    prefill_wmma_ashuffle    1.04x
+      20                 457.63                461.22                419.95    prefill_wmma_ashuffle    1.09x
+      24                 448.28                450.93                412.69    prefill_wmma_ashuffle    1.09x
+      32                 467.83                460.23                407.08    prefill_wmma_ashuffle    1.13x
+      33                 505.96                437.46                427.45    prefill_wmma_ashuffle    1.02x
+      40                 494.66                441.48                415.71    prefill_wmma_ashuffle    1.06x
+      48                 523.99                425.82                401.84    prefill_wmma_ashuffle    1.06x
+      56                 561.83                429.27                424.70    prefill_wmma_ashuffle    1.01x
+      63                 583.30                427.83                428.88         wmma_tiled_tuned    1.00x
+      64                 584.21                430.27                425.72    prefill_wmma_ashuffle    1.01x
+      80                 581.30                423.11                448.22         wmma_tiled_tuned    1.06x
+      96                 576.12                429.25                465.41         wmma_tiled_tuned    1.08x
+     128                1306.11                425.45                514.27         wmma_tiled_tuned    1.21x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== lag.gate_up    tp1  K=2048 N=16384 g=32 bfloat16 zeros=awq  (rotation 10 x 19.40 MB = 194 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 226.90                209.78                222.25         wmma_tiled_tuned    1.06x
+      20                 231.11                211.83                222.14         wmma_tiled_tuned    1.05x
+      24                 233.70                210.66                215.43         wmma_tiled_tuned    1.02x
+      32                 248.65                206.47                215.39         wmma_tiled_tuned    1.04x
+      33                 256.41                207.54                224.53         wmma_tiled_tuned    1.08x
+      40                 255.27                206.02                225.35         wmma_tiled_tuned    1.09x
+      48                 268.87                207.04                226.71         wmma_tiled_tuned    1.10x
+      56                 284.37                205.75                237.63         wmma_tiled_tuned    1.15x
+      63                 296.37                206.46                239.02         wmma_tiled_tuned    1.16x
+      64                 296.87                205.99                239.50         wmma_tiled_tuned    1.16x
+      80                 385.03                212.24                254.01         wmma_tiled_tuned    1.20x
+      96                 414.85                213.57                265.40         wmma_tiled_tuned    1.24x
+     128                 772.11                213.95                284.19         wmma_tiled_tuned    1.33x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== lag.gate_up    tp2  K=2048 N=8192 g=32 bfloat16 zeros=awq  (rotation 19 x 9.70 MB = 184 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 149.18                128.29                142.68         wmma_tiled_tuned    1.11x
+      20                 149.26                127.71                142.38         wmma_tiled_tuned    1.11x
+      24                 149.41                130.44                142.35         wmma_tiled_tuned    1.09x
+      32                 160.53                118.33                142.07         wmma_tiled_tuned    1.20x
+      33                 201.38                115.69                146.84         wmma_tiled_tuned    1.27x
+      40                 201.27                115.19                146.92         wmma_tiled_tuned    1.28x
+      48                 206.73                112.93                146.32         wmma_tiled_tuned    1.30x
+      56                 212.71                114.52                151.86         wmma_tiled_tuned    1.33x
+      63                 222.58                112.64                152.76         wmma_tiled_tuned    1.36x
+      64                 222.51                117.59                152.96         wmma_tiled_tuned    1.30x
+      80                 223.55                114.56                156.92         wmma_tiled_tuned    1.37x
+      96                 259.43                114.50                158.97         wmma_tiled_tuned    1.39x
+     128                 465.26                117.27                166.08         wmma_tiled_tuned    1.42x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== lag.q_proj     tp1  K=2048 N=6144 g=32 bfloat16 zeros=awq  (rotation 25 x 7.27 MB = 182 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 137.53                125.00                119.58    prefill_wmma_ashuffle    1.05x
+      20                 140.18                124.61                119.44    prefill_wmma_ashuffle    1.04x
+      24                 143.70                124.10                119.00    prefill_wmma_ashuffle    1.04x
+      32                 149.20                124.19                119.09    prefill_wmma_ashuffle    1.04x
+      33                 180.47                124.17                124.55         wmma_tiled_tuned    1.00x
+      40                 181.65                124.37                124.57         wmma_tiled_tuned    1.00x
+      48                 187.54                124.49                124.62         wmma_tiled_tuned    1.00x
+      56                 196.99                124.42                130.30         wmma_tiled_tuned    1.05x
+      63                 200.37                124.68                130.38         wmma_tiled_tuned    1.05x
+      64                 201.34                124.70                130.17         wmma_tiled_tuned    1.04x
+      80                 152.38                125.48                132.21         wmma_tiled_tuned    1.05x
+      96                 160.41                118.77                126.49         wmma_tiled_tuned    1.07x
+     128                 449.27                108.88                132.19         wmma_tiled_tuned    1.21x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== lag.down       tp2  K=4096 N=2048 g=32 bfloat16 zeros=awq  (rotation 36 x 4.85 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 291.94                143.11                188.96         wmma_tiled_tuned    1.32x
+      20                 296.62                143.17                185.00         wmma_tiled_tuned    1.29x
+      24                 308.21                143.06                187.89         wmma_tiled_tuned    1.31x
+      32                 313.76                143.39                183.05         wmma_tiled_tuned    1.28x
+      33                 332.10                143.25                200.13         wmma_tiled_tuned    1.40x
+      40                 337.94                143.56                199.27         wmma_tiled_tuned    1.39x
+      48                 335.93                143.20                198.09         wmma_tiled_tuned    1.38x
+      56                 339.59                144.25                210.24         wmma_tiled_tuned    1.46x
+      63                 375.78                144.66                208.91         wmma_tiled_tuned    1.44x
+      64                 349.56                144.73                209.44         wmma_tiled_tuned    1.45x
+      80                 250.36                154.19                215.08         wmma_tiled_tuned    1.39x
+      96                 318.53                155.18                231.38         wmma_tiled_tuned    1.49x
+     128                 429.66                156.55                253.43         wmma_tiled_tuned    1.62x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== glm.gate_up    tp2  K=2048 N=10240 g=128 bfloat16 zeros=awq  (rotation 17 x 10.90 MB = 185 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                  98.42                154.28                235.36             prefill_wmma    1.57x
+      20                  99.19                155.40                236.50             prefill_wmma    1.57x
+      24                 101.25                155.05                235.66             prefill_wmma    1.53x
+      32                 109.80                152.91                237.15             prefill_wmma    1.39x
+      33                 115.90                152.69                252.61             prefill_wmma    1.32x
+      40                 119.30                160.59                253.52             prefill_wmma    1.35x
+      48                 128.20                160.28                256.35             prefill_wmma    1.25x
+      56                 142.34                156.77                268.24             prefill_wmma    1.10x
+      63                 151.28                153.71                273.69             prefill_wmma    1.02x
+      64                 151.17                147.05                273.54         wmma_tiled_tuned    1.03x
+      80                 190.09                149.95                292.46         wmma_tiled_tuned    1.27x
+      96                 210.46                155.88                314.27         wmma_tiled_tuned    1.35x
+     128                 388.54                160.59                337.16         wmma_tiled_tuned    2.10x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q35b4.gate_up  tp2  K=2560 N=9216 g=32 bfloat16 zeros=awq  (rotation 14 x 13.64 MB = 191 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 158.63                228.49                273.59             prefill_wmma    1.44x
+      20                 162.86                241.34                265.18             prefill_wmma    1.48x
+      24                 159.81                230.02                261.51             prefill_wmma    1.44x
+      32                 160.64                226.37                248.83             prefill_wmma    1.41x
+      33                 176.40                228.72                298.50             prefill_wmma    1.30x
+      40                 169.71                231.24                295.01             prefill_wmma    1.36x
+      48                 176.11                229.32                291.85             prefill_wmma    1.30x
+      56                 195.89                229.41                304.70             prefill_wmma    1.17x
+      63                 199.33                221.80                303.64             prefill_wmma    1.11x
+      64                 201.00                219.33                299.74             prefill_wmma    1.09x
+      80                 270.83                223.75                288.78         wmma_tiled_tuned    1.21x
+      96                 291.08                224.48                279.38         wmma_tiled_tuned    1.24x
+     128                 769.63                226.19                300.41         wmma_tiled_tuned    1.33x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== q35b4.down     tp2  K=4608 N=2560 g=32 bfloat16 zeros=awq  (rotation 26 x 6.82 MB = 177 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 333.62                156.65                182.55         wmma_tiled_tuned    1.17x
+      20                 327.39                158.04                178.62         wmma_tiled_tuned    1.13x
+      24                 319.56                157.98                178.38         wmma_tiled_tuned    1.13x
+      32                 334.66                158.33                178.52         wmma_tiled_tuned    1.13x
+      33                 342.83                158.15                191.45         wmma_tiled_tuned    1.21x
+      40                 365.03                158.59                191.26         wmma_tiled_tuned    1.21x
+      48                 355.76                158.56                190.97         wmma_tiled_tuned    1.20x
+      56                 366.41                158.85                202.78         wmma_tiled_tuned    1.28x
+      63                 403.88                159.57                203.16         wmma_tiled_tuned    1.27x
+      64                 387.37                159.24                202.66         wmma_tiled_tuned    1.27x
+      80                 281.56                170.23                211.69         wmma_tiled_tuned    1.24x
+      96                 282.45                170.32                220.01         wmma_tiled_tuned    1.29x
+     128                 455.81                171.49                237.43         wmma_tiled_tuned    1.38x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+########## SYNTHETIC (M, N) SURFACE  (bf16, g=32, sym) ##########
+
+=== grid K=2048 N=1024  K=2048 N=1024 g=32 bfloat16 zeros=sym  (rotation 144 x 1.18 MB = 170 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 157.33                 73.93                100.04         wmma_tiled_tuned    1.35x
+      20                 156.94                 73.75                105.38         wmma_tiled_tuned    1.43x
+      24                 164.65                 73.65                104.63         wmma_tiled_tuned    1.42x
+      32                 166.43                 73.78                111.90         wmma_tiled_tuned    1.52x
+      33                 212.14                 73.72                118.66         wmma_tiled_tuned    1.61x
+      40                 213.14                 73.84                119.32         wmma_tiled_tuned    1.62x
+      48                 218.17                 73.63                120.13         wmma_tiled_tuned    1.63x
+      56                 224.11                 73.53                126.73         wmma_tiled_tuned    1.72x
+      63                 229.29                 74.22                126.50         wmma_tiled_tuned    1.70x
+      64                 228.58                 74.17                127.13         wmma_tiled_tuned    1.71x
+      80                 136.42                 79.77                129.32         wmma_tiled_tuned    1.62x
+      96                 137.10                 79.59                143.19         wmma_tiled_tuned    1.72x
+     128                 252.18                 80.13                155.92         wmma_tiled_tuned    1.95x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=2048  K=2048 N=2048 g=32 bfloat16 zeros=sym  (rotation 73 x 2.36 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 146.73                 76.09                 98.34         wmma_tiled_tuned    1.29x
+      20                 130.87                 76.05                 98.44         wmma_tiled_tuned    1.29x
+      24                 131.28                 75.88                 98.53         wmma_tiled_tuned    1.30x
+      32                 136.93                 76.05                 98.61         wmma_tiled_tuned    1.30x
+      33                 194.77                 76.08                103.78         wmma_tiled_tuned    1.36x
+      40                 195.19                 75.82                103.92         wmma_tiled_tuned    1.37x
+      48                 200.38                 75.58                104.14         wmma_tiled_tuned    1.38x
+      56                 205.70                 75.94                109.23         wmma_tiled_tuned    1.44x
+      63                 211.31                 76.32                109.43         wmma_tiled_tuned    1.43x
+      64                 211.50                 76.25                109.44         wmma_tiled_tuned    1.44x
+      80                 138.98                 81.69                114.53         wmma_tiled_tuned    1.40x
+      96                 145.43                 81.62                119.83         wmma_tiled_tuned    1.47x
+     128                 234.54                 81.97                134.68         wmma_tiled_tuned    1.64x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=2816  K=2048 N=2816 g=32 bfloat16 zeros=sym  (rotation 53 x 3.24 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 128.79                 75.98                 98.01         wmma_tiled_tuned    1.29x
+      20                 133.49                 77.81                100.49         wmma_tiled_tuned    1.29x
+      24                 134.31                 77.74                100.56         wmma_tiled_tuned    1.29x
+      32                 140.31                 77.74                100.58         wmma_tiled_tuned    1.29x
+      33                 194.34                 77.78                105.57         wmma_tiled_tuned    1.36x
+      40                 195.50                 77.64                105.75         wmma_tiled_tuned    1.36x
+      48                 200.48                 77.76                105.93         wmma_tiled_tuned    1.36x
+      56                 206.57                 77.73                111.21         wmma_tiled_tuned    1.43x
+      63                 214.96                 78.12                111.36         wmma_tiled_tuned    1.43x
+      64                 215.54                 78.19                111.20         wmma_tiled_tuned    1.42x
+      80                 143.57                 83.70                116.50         wmma_tiled_tuned    1.39x
+      96                 143.82                 83.78                121.90         wmma_tiled_tuned    1.45x
+     128                 241.19                 83.98                132.45         wmma_tiled_tuned    1.58x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=4096  K=2048 N=4096 g=32 bfloat16 zeros=sym  (rotation 37 x 4.72 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 128.37                 79.22                 99.89         wmma_tiled_tuned    1.26x
+      20                 133.58                 79.25                100.00         wmma_tiled_tuned    1.26x
+      24                 133.77                 78.91                100.20         wmma_tiled_tuned    1.27x
+      32                 139.62                 78.93                100.28         wmma_tiled_tuned    1.27x
+      33                 179.95                 79.03                105.02         wmma_tiled_tuned    1.33x
+      40                 186.27                 78.82                105.44         wmma_tiled_tuned    1.34x
+      48                 190.75                 78.65                105.65         wmma_tiled_tuned    1.34x
+      56                 195.25                 78.73                110.84         wmma_tiled_tuned    1.41x
+      63                 199.74                 79.06                111.07         wmma_tiled_tuned    1.40x
+      64                 201.06                 79.09                111.14         wmma_tiled_tuned    1.41x
+      80                 147.80                 84.98                116.23         wmma_tiled_tuned    1.37x
+      96                 148.58                 84.90                105.04         wmma_tiled_tuned    1.24x
+     128                 232.91                 84.73                125.23         wmma_tiled_tuned    1.48x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=6144  K=2048 N=6144 g=32 bfloat16 zeros=sym  (rotation 25 x 7.08 MB = 177 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 133.54                121.18                117.07    prefill_wmma_ashuffle    1.04x
+      20                 137.26                121.47                117.34    prefill_wmma_ashuffle    1.04x
+      24                 140.72                121.55                117.13    prefill_wmma_ashuffle    1.04x
+      32                 146.73                121.73                117.32    prefill_wmma_ashuffle    1.04x
+      33                 166.88                121.86                123.21         wmma_tiled_tuned    1.01x
+      40                 171.64                121.86                123.44         wmma_tiled_tuned    1.01x
+      48                 180.19                122.07                123.37         wmma_tiled_tuned    1.01x
+      56                 183.07                122.00                128.86         wmma_tiled_tuned    1.06x
+      63                 194.45                122.12                128.91         wmma_tiled_tuned    1.06x
+      64                 194.11                122.20                128.78         wmma_tiled_tuned    1.05x
+      80                 147.28                125.01                134.34         wmma_tiled_tuned    1.07x
+      96                 167.20                124.94                129.89         wmma_tiled_tuned    1.04x
+     128                 440.69                112.34                130.11         wmma_tiled_tuned    1.16x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=8192  K=2048 N=8192 g=32 bfloat16 zeros=sym  (rotation 19 x 9.44 MB = 179 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 141.96                121.71                136.49         wmma_tiled_tuned    1.12x
+      20                 142.38                121.83                137.24         wmma_tiled_tuned    1.13x
+      24                 147.76                121.87                137.75         wmma_tiled_tuned    1.13x
+      32                 148.86                113.92                138.68         wmma_tiled_tuned    1.22x
+      33                 196.53                111.62                144.10         wmma_tiled_tuned    1.29x
+      40                 188.90                111.26                144.53         wmma_tiled_tuned    1.30x
+      48                 204.26                112.32                145.10         wmma_tiled_tuned    1.29x
+      56                 211.03                112.91                150.38         wmma_tiled_tuned    1.33x
+      63                 217.62                111.62                148.78         wmma_tiled_tuned    1.33x
+      64                 218.59                115.81                149.93         wmma_tiled_tuned    1.29x
+      80                 208.84                110.50                151.55         wmma_tiled_tuned    1.37x
+      96                 255.59                111.63                153.94         wmma_tiled_tuned    1.38x
+     128                 477.78                112.65                171.63         wmma_tiled_tuned    1.52x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=11264  K=2048 N=11264 g=32 bfloat16 zeros=sym  (rotation 14 x 12.98 MB = 182 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 170.55                216.22                200.01             prefill_wmma    1.17x
+      20                 179.10                222.45                196.46             prefill_wmma    1.10x
+      24                 160.54                204.20                192.91             prefill_wmma    1.20x
+      32                 158.33                200.58                182.40             prefill_wmma    1.15x
+      33                 169.46                194.42                196.17             prefill_wmma    1.15x
+      40                 169.66                195.33                191.72             prefill_wmma    1.13x
+      48                 189.42                175.96                191.56         wmma_tiled_tuned    1.08x
+      56                 189.85                183.27                198.36         wmma_tiled_tuned    1.04x
+      63                 195.93                175.29                199.84         wmma_tiled_tuned    1.12x
+      64                 204.08                177.16                197.59         wmma_tiled_tuned    1.12x
+      80                 252.53                181.14                199.97         wmma_tiled_tuned    1.10x
+      96                 274.32                179.71                214.81         wmma_tiled_tuned    1.20x
+     128                 644.15                175.87                242.12         wmma_tiled_tuned    1.38x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2048 N=16384  K=2048 N=16384 g=32 bfloat16 zeros=sym  (rotation 10 x 18.87 MB = 189 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 200.92                205.07                210.50             prefill_wmma    1.02x
+      20                 202.94                206.28                210.22             prefill_wmma    1.02x
+      24                 203.93                204.05                210.68             prefill_wmma    1.00x
+      32                 213.64                202.40                209.71         wmma_tiled_tuned    1.04x
+      33                 232.61                202.90                218.91         wmma_tiled_tuned    1.08x
+      40                 232.64                204.54                221.22         wmma_tiled_tuned    1.08x
+      48                 246.81                205.84                222.12         wmma_tiled_tuned    1.08x
+      56                 257.69                203.44                232.49         wmma_tiled_tuned    1.14x
+      63                 270.54                202.01                233.74         wmma_tiled_tuned    1.16x
+      64                 270.20                201.73                233.65         wmma_tiled_tuned    1.16x
+      80                 356.55                206.56                247.36         wmma_tiled_tuned    1.20x
+      96                 383.28                208.07                257.78         wmma_tiled_tuned    1.24x
+     128                 803.78                208.54                288.80         wmma_tiled_tuned    1.38x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=1024  K=2816 N=1024 g=32 bfloat16 zeros=sym  (rotation 105 x 1.62 MB = 170 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 135.19                100.04                121.24         wmma_tiled_tuned    1.21x
+      20                 134.67                 97.60                119.35         wmma_tiled_tuned    1.22x
+      24                 132.87                 96.53                118.96         wmma_tiled_tuned    1.23x
+      32                 140.52                 96.66                119.18         wmma_tiled_tuned    1.23x
+      33                 154.57                 96.66                126.24         wmma_tiled_tuned    1.31x
+      40                 155.04                 96.58                126.48         wmma_tiled_tuned    1.31x
+      48                 162.82                 96.51                126.38         wmma_tiled_tuned    1.31x
+      56                 170.62                 96.75                133.90         wmma_tiled_tuned    1.38x
+      63                 178.03                 96.75                134.09         wmma_tiled_tuned    1.39x
+      64                 177.97                 96.78                134.17         wmma_tiled_tuned    1.39x
+      80                 174.38                104.13                141.40         wmma_tiled_tuned    1.36x
+      96                 175.14                104.06                148.44         wmma_tiled_tuned    1.43x
+     128                 224.23                104.64                163.46         wmma_tiled_tuned    1.56x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=2048  K=2816 N=2048 g=32 bfloat16 zeros=sym  (rotation 53 x 3.24 MB = 172 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 128.56                 97.50                119.04         wmma_tiled_tuned    1.22x
+      20                 132.43                 97.48                119.24         wmma_tiled_tuned    1.22x
+      24                 132.78                 97.43                119.52         wmma_tiled_tuned    1.23x
+      32                 140.17                 97.58                119.15         wmma_tiled_tuned    1.22x
+      33                 154.08                 97.59                126.48         wmma_tiled_tuned    1.30x
+      40                 154.90                 97.55                126.44         wmma_tiled_tuned    1.30x
+      48                 162.21                 97.66                126.66         wmma_tiled_tuned    1.30x
+      56                 170.08                 97.68                134.08         wmma_tiled_tuned    1.37x
+      63                 177.51                 97.77                134.02         wmma_tiled_tuned    1.37x
+      64                 177.50                 97.80                134.19         wmma_tiled_tuned    1.37x
+      80                 175.85                104.89                141.45         wmma_tiled_tuned    1.35x
+      96                 176.34                105.19                148.69         wmma_tiled_tuned    1.41x
+     128                 219.23                105.45                163.86         wmma_tiled_tuned    1.55x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=2816  K=2816 N=2816 g=32 bfloat16 zeros=sym  (rotation 39 x 4.46 MB = 174 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 131.58                 97.29                117.80         wmma_tiled_tuned    1.21x
+      20                 135.50                 97.93                117.77         wmma_tiled_tuned    1.20x
+      24                 134.92                 98.25                118.31         wmma_tiled_tuned    1.20x
+      32                 144.48                 98.34                120.36         wmma_tiled_tuned    1.22x
+      33                 157.41                 98.43                126.96         wmma_tiled_tuned    1.29x
+      40                 158.51                 98.41                127.14         wmma_tiled_tuned    1.29x
+      48                 166.02                 97.61                125.88         wmma_tiled_tuned    1.29x
+      56                 174.37                 98.63                134.93         wmma_tiled_tuned    1.37x
+      63                 181.80                 98.52                135.13         wmma_tiled_tuned    1.37x
+      64                 182.06                 98.57                134.51         wmma_tiled_tuned    1.36x
+      80                 180.35                105.44                142.28         wmma_tiled_tuned    1.35x
+      96                 180.61                105.74                149.38         wmma_tiled_tuned    1.41x
+     128                 236.32                106.04                141.92         wmma_tiled_tuned    1.34x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=4096  K=2816 N=4096 g=32 bfloat16 zeros=sym  (rotation 27 x 6.49 MB = 175 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 131.80                 98.53                119.30         wmma_tiled_tuned    1.21x
+      20                 135.88                 98.58                119.69         wmma_tiled_tuned    1.21x
+      24                 136.01                 98.65                119.42         wmma_tiled_tuned    1.21x
+      32                 143.93                 98.87                119.85         wmma_tiled_tuned    1.21x
+      33                 156.73                 98.93                126.56         wmma_tiled_tuned    1.28x
+      40                 157.68                 99.01                126.87         wmma_tiled_tuned    1.28x
+      48                 165.21                 99.21                127.13         wmma_tiled_tuned    1.28x
+      56                 174.04                 99.10                134.48         wmma_tiled_tuned    1.36x
+      63                 181.73                 99.10                134.46         wmma_tiled_tuned    1.36x
+      64                 181.68                 99.14                134.58         wmma_tiled_tuned    1.36x
+      80                 161.97                105.88                141.59         wmma_tiled_tuned    1.34x
+      96                 172.05                106.25                148.74         wmma_tiled_tuned    1.40x
+     128                 241.36                106.67                163.50         wmma_tiled_tuned    1.53x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=6144  K=2816 N=6144 g=32 bfloat16 zeros=sym  (rotation 19 x 9.73 MB = 185 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 118.01                125.32                119.33             prefill_wmma    1.01x
+      20                 119.60                125.44                120.82             prefill_wmma    1.01x
+      24                 120.76                125.35                121.27             prefill_wmma    1.00x
+      32                 128.65                127.11                122.50    prefill_wmma_ashuffle    1.04x
+      33                 143.90                127.30                129.01         wmma_tiled_tuned    1.01x
+      40                 145.21                127.26                129.92         wmma_tiled_tuned    1.02x
+      48                 153.10                127.22                130.91         wmma_tiled_tuned    1.03x
+      56                 163.39                127.49                138.01         wmma_tiled_tuned    1.08x
+      63                 171.49                127.77                138.98         wmma_tiled_tuned    1.09x
+      64                 171.62                127.76                138.95         wmma_tiled_tuned    1.09x
+      80                 189.19                134.12                148.46         wmma_tiled_tuned    1.11x
+      96                 192.65                135.55                156.01         wmma_tiled_tuned    1.15x
+     128                 409.94                136.87                171.28         wmma_tiled_tuned    1.25x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=8192  K=2816 N=8192 g=32 bfloat16 zeros=sym  (rotation 14 x 12.98 MB = 182 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 130.20                131.22                127.85    prefill_wmma_ashuffle    1.02x
+      20                 134.32                132.33                128.28    prefill_wmma_ashuffle    1.03x
+      24                 135.94                132.52                128.26    prefill_wmma_ashuffle    1.03x
+      32                 144.45                133.01                129.28    prefill_wmma_ashuffle    1.03x
+      33                 157.70                133.36                136.33         wmma_tiled_tuned    1.02x
+      40                 159.79                133.66                137.06         wmma_tiled_tuned    1.03x
+      48                 168.46                134.50                137.58         wmma_tiled_tuned    1.02x
+      56                 180.52                135.17                145.31         wmma_tiled_tuned    1.07x
+      63                 189.04                135.80                145.64         wmma_tiled_tuned    1.07x
+      64                 189.28                135.46                145.59         wmma_tiled_tuned    1.07x
+      80                 264.04                142.12                155.32         wmma_tiled_tuned    1.09x
+      96                 296.92                143.27                163.39         wmma_tiled_tuned    1.14x
+     128                 467.53                142.86                180.28         wmma_tiled_tuned    1.26x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=11264  K=2816 N=11264 g=32 bfloat16 zeros=sym  (rotation 11 x 17.84 MB = 196 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 166.46                212.04                213.99             prefill_wmma    1.27x
+      20                 165.93                211.10                215.00             prefill_wmma    1.27x
+      24                 168.63                209.25                212.12             prefill_wmma    1.24x
+      32                 178.95                208.75                204.38             prefill_wmma    1.14x
+      33                 195.25                209.75                216.69             prefill_wmma    1.07x
+      40                 196.56                209.75                217.36             prefill_wmma    1.07x
+      48                 206.45                209.97                218.76             prefill_wmma    1.02x
+      56                 223.93                210.51                232.47         wmma_tiled_tuned    1.06x
+      63                 233.18                211.04                233.43         wmma_tiled_tuned    1.10x
+      64                 233.68                211.07                234.57         wmma_tiled_tuned    1.11x
+      80                 334.48                226.49                250.51         wmma_tiled_tuned    1.11x
+      96                 361.29                228.31                265.87         wmma_tiled_tuned    1.16x
+     128                 661.79                228.01                294.72         wmma_tiled_tuned    1.29x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=2816 N=16384  K=2816 N=16384 g=32 bfloat16 zeros=sym  (rotation 8 x 25.95 MB = 208 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 246.12                248.40                244.46    prefill_wmma_ashuffle    1.01x
+      20                 251.36                252.52                246.62    prefill_wmma_ashuffle    1.02x
+      24                 253.96                253.05                248.20    prefill_wmma_ashuffle    1.02x
+      32                 270.19                253.71                250.54    prefill_wmma_ashuffle    1.01x
+      33                 294.36                253.93                261.75         wmma_tiled_tuned    1.03x
+      40                 300.04                255.14                263.87         wmma_tiled_tuned    1.03x
+      48                 315.56                256.52                266.49         wmma_tiled_tuned    1.04x
+      56                 335.81                257.30                280.44         wmma_tiled_tuned    1.09x
+      63                 351.60                257.46                282.70         wmma_tiled_tuned    1.10x
+      64                 352.11                258.14                282.51         wmma_tiled_tuned    1.09x
+      80                 473.84                270.85                300.49         wmma_tiled_tuned    1.11x
+      96                 509.44                272.56                316.11         wmma_tiled_tuned    1.16x
+     128                 923.10                272.08                348.11         wmma_tiled_tuned    1.28x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=1024  K=5120 N=1024 g=32 bfloat16 zeros=sym  (rotation 58 x 2.95 MB = 171 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 350.64                174.82                256.26         wmma_tiled_tuned    1.47x
+      20                 340.93                170.14                241.16         wmma_tiled_tuned    1.42x
+      24                 343.82                167.36                232.71         wmma_tiled_tuned    1.39x
+      32                 379.97                167.30                260.86         wmma_tiled_tuned    1.56x
+      33                 401.30                167.33                266.09         wmma_tiled_tuned    1.59x
+      40                 404.22                167.54                274.23         wmma_tiled_tuned    1.64x
+      48                 421.78                167.41                283.13         wmma_tiled_tuned    1.69x
+      56                 438.53                167.58                297.73         wmma_tiled_tuned    1.78x
+      63                 484.11                167.52                276.71         wmma_tiled_tuned    1.65x
+      64                 482.07                167.78                291.09         wmma_tiled_tuned    1.73x
+      80                 292.14                180.73                300.05         wmma_tiled_tuned    1.62x
+      96                 292.66                181.27                347.93         wmma_tiled_tuned    1.61x
+     128                 549.67                181.86                409.85         wmma_tiled_tuned    2.25x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=2048  K=5120 N=2048 g=32 bfloat16 zeros=sym  (rotation 30 x 5.90 MB = 177 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 344.85                167.89                187.45         wmma_tiled_tuned    1.12x
+      20                 336.65                167.74                186.87         wmma_tiled_tuned    1.11x
+      24                 343.65                168.06                187.29         wmma_tiled_tuned    1.11x
+      32                 338.68                168.20                187.88         wmma_tiled_tuned    1.12x
+      33                 381.17                168.25                200.57         wmma_tiled_tuned    1.19x
+      40                 395.96                168.17                200.83         wmma_tiled_tuned    1.19x
+      48                 392.90                168.26                201.44         wmma_tiled_tuned    1.20x
+      56                 421.23                168.72                214.67         wmma_tiled_tuned    1.27x
+      63                 468.10                169.19                214.99         wmma_tiled_tuned    1.27x
+      64                 466.08                168.87                215.28         wmma_tiled_tuned    1.27x
+      80                 288.53                182.08                227.77         wmma_tiled_tuned    1.25x
+      96                 291.55                183.21                240.94         wmma_tiled_tuned    1.32x
+     128                 507.25                182.67                267.34         wmma_tiled_tuned    1.46x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=2816  K=5120 N=2816 g=32 bfloat16 zeros=sym  (rotation 22 x 8.11 MB = 178 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 304.42                167.63                161.71    prefill_wmma_ashuffle    1.04x
+      20                 293.38                167.69                161.63    prefill_wmma_ashuffle    1.04x
+      24                 296.50                167.91                161.69    prefill_wmma_ashuffle    1.04x
+      32                 309.63                168.24                162.01    prefill_wmma_ashuffle    1.04x
+      33                 327.35                168.28                175.12         wmma_tiled_tuned    1.04x
+      40                 327.18                168.32                175.10         wmma_tiled_tuned    1.04x
+      48                 336.05                168.35                175.53         wmma_tiled_tuned    1.04x
+      56                 352.20                168.53                188.93         wmma_tiled_tuned    1.12x
+      63                 363.64                168.89                189.27         wmma_tiled_tuned    1.12x
+      64                 361.50                168.79                189.30         wmma_tiled_tuned    1.12x
+      80                 293.69                181.13                202.63         wmma_tiled_tuned    1.12x
+      96                 283.25                182.08                215.69         wmma_tiled_tuned    1.18x
+     128                 464.20                182.49                243.58         wmma_tiled_tuned    1.33x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=4096  K=5120 N=4096 g=32 bfloat16 zeros=sym  (rotation 16 x 11.80 MB = 189 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 243.12                170.25                164.53    prefill_wmma_ashuffle    1.03x
+      20                 249.95                170.21                164.63    prefill_wmma_ashuffle    1.03x
+      24                 250.64                170.60                164.66    prefill_wmma_ashuffle    1.04x
+      32                 263.92                171.45                165.12    prefill_wmma_ashuffle    1.04x
+      33                 293.40                170.94                178.15         wmma_tiled_tuned    1.04x
+      40                 294.86                171.24                178.17         wmma_tiled_tuned    1.04x
+      48                 301.02                171.31                178.57         wmma_tiled_tuned    1.04x
+      56                 317.12                171.59                191.98         wmma_tiled_tuned    1.12x
+      63                 325.38                171.65                192.31         wmma_tiled_tuned    1.12x
+      64                 325.54                171.73                192.41         wmma_tiled_tuned    1.12x
+      80                 296.02                183.98                206.04         wmma_tiled_tuned    1.12x
+      96                 301.41                185.58                219.43         wmma_tiled_tuned    1.18x
+     128                 451.20                185.56                246.64         wmma_tiled_tuned    1.33x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=6144  K=5120 N=6144 g=32 bfloat16 zeros=sym  (rotation 11 x 17.69 MB = 195 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 239.60                262.84                240.02             prefill_wmma    1.00x
+      20                 240.94                269.04                236.75    prefill_wmma_ashuffle    1.02x
+      24                 246.88                268.02                238.99    prefill_wmma_ashuffle    1.03x
+      32                 261.18                267.11                236.47    prefill_wmma_ashuffle    1.10x
+      33                 286.47                266.44                251.58    prefill_wmma_ashuffle    1.06x
+      40                 287.81                268.92                251.80    prefill_wmma_ashuffle    1.07x
+      48                 298.90                259.08                243.71    prefill_wmma_ashuffle    1.06x
+      56                 316.93                265.27                249.45    prefill_wmma_ashuffle    1.06x
+      63                 323.25                264.52                249.31    prefill_wmma_ashuffle    1.06x
+      64                 322.24                260.39                246.61    prefill_wmma_ashuffle    1.06x
+      80                 342.00                247.25                262.45         wmma_tiled_tuned    1.06x
+      96                 349.30                247.86                276.07         wmma_tiled_tuned    1.11x
+     128                 815.26                241.63                311.22         wmma_tiled_tuned    1.29x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=8192  K=5120 N=8192 g=32 bfloat16 zeros=sym  (rotation 9 x 23.59 MB = 212 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 256.60                251.92                242.87    prefill_wmma_ashuffle    1.04x
+      20                 261.54                253.33                241.99    prefill_wmma_ashuffle    1.05x
+      24                 263.99                253.90                243.31    prefill_wmma_ashuffle    1.04x
+      32                 278.87                254.83                241.65    prefill_wmma_ashuffle    1.05x
+      33                 286.81                239.92                239.91    prefill_wmma_ashuffle    1.00x
+      40                 286.96                237.56                241.13         wmma_tiled_tuned    1.02x
+      48                 302.95                237.92                242.70         wmma_tiled_tuned    1.02x
+      56                 323.48                238.58                256.31         wmma_tiled_tuned    1.07x
+      63                 339.24                238.99                257.74         wmma_tiled_tuned    1.08x
+      64                 339.61                237.30                258.26         wmma_tiled_tuned    1.09x
+      80                 475.71                251.94                274.31         wmma_tiled_tuned    1.09x
+      96                 544.65                253.72                289.42         wmma_tiled_tuned    1.14x
+     128                 855.84                251.39                330.55         wmma_tiled_tuned    1.31x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=11264  K=5120 N=11264 g=32 bfloat16 zeros=sym  (rotation 7 x 32.44 MB = 227 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 319.03                390.76                356.46             prefill_wmma    1.12x
+      20                 318.14                376.15                355.03             prefill_wmma    1.12x
+      24                 321.16                384.35                356.18             prefill_wmma    1.11x
+      32                 322.35                385.24                359.70             prefill_wmma    1.12x
+      33                 350.39                384.26                383.13             prefill_wmma    1.09x
+      40                 354.31                382.48                385.08             prefill_wmma    1.08x
+      48                 369.60                380.84                386.59             prefill_wmma    1.03x
+      56                 402.26                378.50                412.34         wmma_tiled_tuned    1.06x
+      63                 421.03                383.47                413.14         wmma_tiled_tuned    1.08x
+      64                 422.29                376.38                414.41         wmma_tiled_tuned    1.10x
+      80                 629.10                405.91                444.00         wmma_tiled_tuned    1.09x
+      96                 673.47                403.26                470.06         wmma_tiled_tuned    1.17x
+     128                1292.01                404.48                520.76         wmma_tiled_tuned    1.29x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+=== grid K=5120 N=16384  K=5120 N=16384 g=32 bfloat16 zeros=sym  (rotation 5 x 47.19 MB = 236 MB) ===
+       M           prefill_wmma      wmma_tiled_tuned prefill_wmma_ashuffle                   winner   margin
+      17                 474.51                443.12                435.73    prefill_wmma_ashuffle    1.02x
+      20                 482.10                451.17                437.90    prefill_wmma_ashuffle    1.03x
+      24                 487.14                451.06                439.69    prefill_wmma_ashuffle    1.03x
+      32                 514.70                452.16                444.39    prefill_wmma_ashuffle    1.02x
+      33                 564.65                449.62                465.93         wmma_tiled_tuned    1.04x
+      40                 575.36                453.19                469.81         wmma_tiled_tuned    1.04x
+      48                 603.93                454.58                473.02         wmma_tiled_tuned    1.04x
+      56                 638.39                455.95                498.55         wmma_tiled_tuned    1.09x
+      63                 667.06                456.76                503.05         wmma_tiled_tuned    1.10x
+      64                 667.42                457.18                503.25         wmma_tiled_tuned    1.10x
+      80                 892.30                481.69                536.38         wmma_tiled_tuned    1.11x
+      96                 955.88                486.41                572.14         wmma_tiled_tuned    1.18x
+     128                1677.26                482.19                637.21         wmma_tiled_tuned    1.32x
+    bit-identity M=17: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+    bit-identity M=128: wmma_tiled_tuned-vs-prefill_wmma: 0.000e+00   prefill_wmma_ashuffle-vs-prefill_wmma: 0.000e+00
+
+done.
