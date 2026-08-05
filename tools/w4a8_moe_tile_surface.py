@@ -33,6 +33,7 @@ WHAT IT MEASURES, in order (the order matters -- see CONTROL):
 from __future__ import annotations
 
 import argparse
+import csv as csvmod
 import math
 import os
 import sys
@@ -174,7 +175,8 @@ def main() -> int:
     args = ap.parse_args()
 
     fh = open(args.out, "w") if args.out else None
-    ch = open(args.csv, "w") if args.csv else None
+    ch = open(args.csv, "w", newline="") if args.csv else None
+    cw = csvmod.writer(ch) if ch else None
 
     def out(s=""):
         print(s, flush=True)
@@ -182,9 +184,12 @@ def main() -> int:
             fh.write(s + "\n")
             fh.flush()
 
-    def csv(s):
-        if ch:
-            ch.write(s + "\n")
+    def csv(fields):
+        """Rows go through csv.writer, NOT an f-string. A provenance value that contains the
+        separator (the arbiter's leased-card SET is "0,1" under -n 2) otherwise becomes an extra
+        unnamed column, and every by-name reader misaligns from that point on."""
+        if cw:
+            cw.writerow(fields)
             ch.flush()
 
     sys.path.insert(0, "/engine/python")
@@ -228,12 +233,18 @@ def main() -> int:
     DEV = torch.device(f"cuda:{want}")
     dev_name = torch.cuda.get_device_name(want)
     cu = torch.cuda.get_device_properties(want).multi_processor_count * 2
-    card = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    # The arbiter exports the SET of leased cards ("0,1" under -n 2); the cuda ordinal we picked by
+    # PROPERTIES indexes it, which is what turns the set back into the one card that was timed.
+    lease = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    _ids = [s.strip() for s in lease.split(",") if s.strip()]
+    card = _ids[want] if want < len(_ids) else "?"
     excl = os.environ.get("TILE_EXCLUSIVE", "0")
-    csv("name,E,top_k,hidden,inter,g,M,cand,us,reps,R,dev,cu,card,exclusive")
+    csv(["name", "E", "top_k", "hidden", "inter", "g", "M", "cand", "us", "reps", "R",
+         "dev", "cu", "card", "lease", "exclusive"])
 
     out(f"tiles {len(BM_SET)}x{len(BN_SET)}   shapes {len(shapes)}   M {ms}")
-    out(f"device: {dev_name}   CUs={cu}   physical card={card}   exclusive_box={excl}")
+    out(f"device: {dev_name}   CUs={cu}   physical card={card}   lease={lease}   "
+        f"exclusive_box={excl}")
     out(f"chooser CU is PINNED (tile_select.h); torch {torch.__version__}\n")
 
     for name, E, top_k, hidden, inter, g in shapes:
@@ -264,8 +275,8 @@ def main() -> int:
                         out(f"  M={M:>5} {bm}x{bn}: REFUSED {type(exc).__name__}: {str(exc)[:110]}")
                         continue
                     rows.append((us, f"{bm}x{bn}"))
-                    csv(f"{name},{E},{top_k},{hidden},{inter},{g},{M},{bm}x{bn},{us:.3f},{reps},{R},"
-                        f"{dev_name},{cu},{card},{excl}")
+                    csv([name, E, top_k, hidden, inter, g, M, f"{bm}x{bn}", f"{us:.3f}", reps, R,
+                         dev_name, cu, card, lease, excl])
                     if base is None:
                         base = us
             os.environ.pop("VLLM_W4A8_MOE_BN", None)

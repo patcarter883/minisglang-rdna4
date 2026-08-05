@@ -21,8 +21,11 @@ LDS_MAX = 65536
 
 
 def parse_tile(c: str):
-    a, b = c.split("x")
-    return int(a), int(b)
+    """(BM, BN, WARPS_N). The surface carries "BMxBN" AND "BMxBNxWN" since the WARPS_N axis was
+    swept; a two-field unpack raised on every WN row, which is why this tool stopped running at
+    all against the card-0 fixtures."""
+    p = c.split("x")
+    return int(p[0]), int(p[1]), int(p[2]) if len(p) > 2 else 1
 
 
 def legal(bm, bn, g):
@@ -34,14 +37,22 @@ def rule_shipped(M, N, K, g, cu, tiles):
     return "256x128"
 
 
+def tname(t) -> str:
+    return f"{t[0]}x{t[1]}" if t[2] == 1 else f"{t[0]}x{t[1]}x{t[2]}"
+
+
 def _pick(tiles, g, want_bm, want_bn):
-    """Nearest instantiated tile at or above (want_bm, want_bn), preferring exact BM."""
-    ok = [(a, b) for (a, b) in tiles if legal(a, b, g)]
-    cand = [(a, b) for (a, b) in ok if a >= want_bm and b >= want_bn]
+    """Nearest instantiated tile at or above (want_bm, want_bn), preferring exact BM.
+
+    These pre-cost-model heuristics have no WARPS_N opinion, so they pick among the wn=1 tiles and
+    are scored honestly against a surface that also contains wn>1 -- rather than being silently
+    handed a WN choice they never expressed."""
+    ok = [t for t in tiles if legal(t[0], t[1], g) and t[2] == 1]
+    cand = [t for t in ok if t[0] >= want_bm and t[1] >= want_bn]
     if not cand:
         cand = ok
     cand.sort(key=lambda t: (t[0] * t[1], t[0]))
-    return f"{cand[0][0]}x{cand[0][1]}"
+    return tname(cand[0])
 
 
 def rule_bm_from_m(M, N, K, g, cu, tiles):
@@ -54,9 +65,9 @@ def make_rule_wg(min_wg_mult=1.0, prefer_bn=128):
 
     def r(M, N, K, g, cu, tiles):
         bm_want = min(256, max(16, 1 << (max(M, 16) - 1).bit_length()))
-        ok = sorted([t for t in tiles if legal(t[0], t[1], g)])
+        ok = sorted([t for t in tiles if legal(t[0], t[1], g) and t[2] == 1])
         best = None
-        for bm, bn in ok:
+        for bm, bn, _wn in ok:
             if bm < bm_want and bm * 2 <= bm_want:
                 continue
             wg = -(-M // bm) * (-(-N // bn))
@@ -65,10 +76,10 @@ def make_rule_wg(min_wg_mult=1.0, prefer_bn=128):
             # among the legal ones prefer the largest BN (WMMA ILP), then BM closest to bm_want
             key = (-bn, abs(bm - bm_want))
             if best is None or key < best[0]:
-                best = (key, (bm, bn))
+                best = (key, (bm, bn, 1))
         if best is None:
             return _pick(ok, g, bm_want, 32)
-        return f"{best[1][0]}x{best[1][1]}"
+        return tname(best[1])
 
     return r
 
@@ -186,16 +197,17 @@ def main() -> int:
     bym = defaultdict(list)
     for (name, K, N, g, M), (ob, us) in oracle.items():
         bym[M].append(parse_tile(ob))
-    print(f"{'M':>6}  {'BM histogram':<46}{'BN histogram'}")
+    print(f"{'M':>6}  {'BM histogram':<40}{'BN histogram':<24}{'WARPS_N histogram'}")
     for M in sorted(bym):
-        bmh = defaultdict(int)
-        bnh = defaultdict(int)
-        for a, b in bym[M]:
+        bmh, bnh, wnh = defaultdict(int), defaultdict(int), defaultdict(int)
+        for a, b, w in bym[M]:
             bmh[a] += 1
             bnh[b] += 1
+            wnh[w] += 1
         s1 = " ".join(f"{k}:{v}" for k, v in sorted(bmh.items()))
         s2 = " ".join(f"{k}:{v}" for k, v in sorted(bnh.items()))
-        print(f"{M:>6}  {s1:<46}{s2}")
+        s3 = " ".join(f"{k}:{v}" for k, v in sorted(wnh.items()))
+        print(f"{M:>6}  {s1:<40}{s2:<24}{s3}")
 
     print("\nORACLE BN vs N  (does BN track the dispatch width?)")
     byn = defaultdict(lambda: defaultdict(int))

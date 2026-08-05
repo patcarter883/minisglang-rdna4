@@ -32,6 +32,7 @@ TIMING -- the two traps this repo has already paid for, plus one this sweep adds
 from __future__ import annotations
 
 import argparse
+import csv as csvmod
 import os
 import sys
 
@@ -68,6 +69,25 @@ TILES_WN = [
     (64, 64, 2), (64, 128, 2), (64, 128, 4), (128, 64, 2), (128, 128, 2), (128, 128, 4),
     (256, 128, 2), (32, 64, 2), (32, 64, 4), (32, 128, 4), (192, 128, 2), (96, 128, 2),
 ]
+
+
+def provenance_cards(want: int):
+    """(physical card TIMED, the whole leased set) -- two facts, never one column.
+
+    The arbiter exports the SET of physical cards it handed us, and under `-n 2` that is a comma
+    list ("0,1"). Recording that set in a column named `card` was wrong twice over: it does not say
+    which card the numbers came from, and its embedded comma made every data row carry one MORE
+    field than the header named, so csv.DictReader silently swept the tail into restkey and pandas
+    misaligns. The cuda ordinal we selected by properties INDEXES that set, which is what turns the
+    set back into the single card that was timed. The set is still worth recording -- an exclusive
+    two-card hold is a different thermal/power environment from a one-card hold -- so it gets its
+    own `lease` column, and both are written through csv.writer so a separator can never again
+    become a field boundary.
+    """
+    lease = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    ids = [s.strip() for s in lease.split(",") if s.strip()]
+    card = ids[want] if want < len(ids) else "?"
+    return card, lease
 
 
 def tile3(t):
@@ -296,22 +316,25 @@ def main() -> int:
     DEV = torch.device(f"cuda:{want}")
     dev_name = torch.cuda.get_device_name(want)
     cu = torch.cuda.get_device_properties(want).multi_processor_count * 2
-    card = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    card, lease = provenance_cards(want)
     # Whether the box was HELD EXCLUSIVELY. The two cards share board power, PSU headroom, PCIe and
     # case thermals, so a neighbour under load moves these numbers without ever touching this card.
     # That is the distinction the pre-existing fixtures cannot make about themselves.
     excl = os.environ.get("TILE_EXCLUSIVE", "0")
-    out(f"device: {dev_name}   CUs={cu}   physical card={card}   exclusive_box={excl}   "
-        f"fp8_wmma: {W.__file__}")
+    out(f"device: {dev_name}   CUs={cu}   physical card={card}   lease={lease}   "
+        f"exclusive_box={excl}   fp8_wmma: {W.__file__}")
     out(f"tiles ({len(tiles)}): " + " ".join(tile_name(t) for t in tiles))
     out(f"arms: {'(skipped)' if args.no_arms else ARMS}")
     out("graph-replay timed; rotation sized in BYTES past the 64 MB MALL; us per call\n")
 
-    cf = open(args.csv, "w") if args.csv else None
-    if cf:
+    cf = open(args.csv, "w", newline="") if args.csv else None
+    cw = csvmod.writer(cf) if cf else None
+    if cw:
         # Provenance goes in the ROWS, not a header comment: these files get merged, and a merge is
-        # exactly where the card silently stops being visible.
-        cf.write("name,K,N,g,dtype,M,cand,us,reps,R,dev,cu,card,exclusive\n")
+        # exactly where the card silently stops being visible. Written through csv.writer so a value
+        # containing the separator is QUOTED rather than silently becoming an extra column.
+        cw.writerow(["name", "K", "N", "g", "dtype", "M", "cand", "us", "reps", "R",
+                     "dev", "cu", "card", "lease", "exclusive"])
 
     for name, K, N, g, dt, zeros in shapes:
         # tile3() yields (BM, BN, WARPS_N) but legal() takes (bm, bn, g, wn) -- splat them into the
@@ -360,12 +383,10 @@ def main() -> int:
                 line += f"   worst tile {worst_tile} {t[worst_tile]:.2f} ({t[worst_tile]/t[best]:.2f}x)"
             out(line)
             out("        " + "  ".join(f"{c}={t[c]:.1f}" for c in order))
-            if cf:
+            if cw:
                 for c in order:
-                    cf.write(
-                        f"{name},{K},{N},{g},{str(dt).split('.')[-1]},{M},{c},"
-                        f"{t[c]:.3f},{rp[c]},{R},{dev_name},{cu},{card},{excl}\n"
-                    )
+                    cw.writerow([name, K, N, g, str(dt).split(".")[-1], M, c,
+                                 f"{t[c]:.3f}", rp[c], R, dev_name, cu, card, lease, excl])
                 cf.flush()
             del x
         del ws
