@@ -34,12 +34,16 @@ say "base: wt=$BASE_WT img=$BASE_IMG sha=$(git -C "$BASE_WT" rev-parse --short H
 say "cand: wt=$CAND_WT img=$CAND_IMG sha=$(git -C "$CAND_WT" rev-parse --short HEAD) dirty=$(git -C "$CAND_WT" status --porcelain | wc -l)"
 
 # --- image/source provenance: does the image hold the kernel source it claims to? ----------------
-for pair in "base:$BASE_IMG:/home/pat/code/rdna4-hip-kernels-glmbase" \
-            "cand:$CAND_IMG:/home/pat/code/rdna4-hip-kernels-glmfix"; do
-  leg=${pair%%:*}; rest=${pair#*:}; img=${rest%%:*}; kwt=${rest#*:}
+# '|' as the delimiter, NOT ':' — an image reference contains a colon (minisgl-rdna4:glmab-base),
+# so a ':'-split silently cut the tag in half and this whole check reported MISSING while looking
+# like it had run. A provenance check that cannot fail loudly is worse than none.
+for pair in "base|$BASE_IMG|/home/pat/code/rdna4-hip-kernels-glmbase" \
+            "cand|$CAND_IMG|/home/pat/code/rdna4-hip-kernels-glmfix"; do
+  leg=${pair%%|*}; rest=${pair#*|}; img=${rest%%|*}; kwt=${rest#*|}
   got=$(docker run --rm --entrypoint bash "$img" -lc 'md5sum /opt/rdna4-hip-kernels/mla/mla_rocm/mla_attend.h' | awk '{print $1}')
   want=$(md5sum "$kwt/mla/mla_rocm/mla_attend.h" | awk '{print $1}')
   say "provenance $leg: image mla_attend.h md5=${got:-MISSING} worktree md5=$want"
+  [ -n "$got" ] && [ "$got" = "$want" ] || { say "ABORT: $leg image does not hold the kernel source it claims"; exit 3; }
 done
 
 leg_run() {  # tag wt img rep

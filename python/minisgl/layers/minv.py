@@ -124,6 +124,7 @@ def _warn_once(key: str, msg: str) -> None:
 # Measured vs the old threshold of 2: +19.8% at conc=4, +7.9% at conc=8, neutral at bs=1
 # (tools/_maxm_ab.sh).
 _DECODE_GEMV_MAXM = 16
+_fallback_seen: set = set()
 _decode_gemv_fn = None
 _decode_gemv_probed = False
 
@@ -176,7 +177,12 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
         # bf16, so the ~190 dense_bf16_gemv dispatches/step on GLM — and every rocBLAS escape like
         # this one — were invisible to the "profile what is DISPATCHED" check that the ledger exists
         # to serve. engaged() is first-call-per-name only, so this costs one set lookup per call.
-        engaged(f"torch.F_linear(ROCBLAS_FALLBACK:dt={weight.dtype},K={weight.shape[-1]})")
+        # Build the tag only once per (dtype, K): engaged() is first-call-per-NAME, but the
+        # f-string feeding it would otherwise be evaluated on every call of a fallback path.
+        _fb_key = (weight.dtype, weight.shape[-1])
+        if _fb_key not in _fallback_seen:
+            _fallback_seen.add(_fb_key)
+            engaged(f"torch.F_linear(ROCBLAS_FALLBACK:dt={weight.dtype},K={weight.shape[-1]})")
         return F.linear(x, weight, bias)
 
     # DECODE fast path: the WMMA-tiled dense_gemm is built for large M and stalls at M=1 — it pads M

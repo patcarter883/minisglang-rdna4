@@ -1,0 +1,301 @@
+WARNING: skipped 6 torn CSV rows (concurrent TP-rank writes)
+  coverage Agent 1:   672071 dispatches over  49.44 s   *** TRUNCATED — DO NOT USE ***
+  coverage Agent 2:  1364112 dispatches over 147.48 s   FULL
+trace: /home/pat/code/minisgl-rdna4-glmfix/rpv3-ksweep-prof-cand-187609844249
+steps: 800   loop kinds: {'overlap_step': 800}   agents: ['Agent 1', 'Agent 2']
+  Agent 1 = AMD Radeon RX 9070 XT
+  Agent 2 = AMD Radeon RX 9070
+  Agent 3 = AMD Ryzen 7 7800X3D 8-Core Processor
+
+=== window iters 120..319 (200 steps) marker wall/step 142.896 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 1465 kernels/step  busy(UNION) 6.570 ms = 4.6%  IDLE 95.4%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      2.2980    53.0  34.98     19160         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      1.3256   106.0  20.18      6400         0     128    2048  100.0    48    30     6    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      0.4894    25.7   7.45     19041         0      96    3072   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.4539    25.7   6.91     17680         0     512    2048  100.0   100     0     1    64     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::  
+      0.3513    26.2   5.35     13400         0      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.3417   236.1   5.20      1360         0       1       4    0.2    90   100     2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.3007    26.2   4.58     11440         0      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.2967    26.2   4.52     11320         0      10      80    3.9   100   100     1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.2650    25.7   4.03     10320         0      96    1536   75.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1708    51.3   2.60      3360      4480       1       8    0.4   100   100     1    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.1639    25.7   2.49      6360         0      64    1024   50.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1413    26.2   2.15      5361      1310      80     160    7.8   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  OCC<25
+      0.1184    26.2   1.80      4520         0     160    1280   62.5   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.1166   104.9   1.77      1080         0       1       8    0.4   100   100     1    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.1140    79.2   1.74      1520         0       1       8    0.4    99    99     2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.1034    53.0   1.57      1960      2747       1       8    0.4   100   100     1    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0998    78.1   1.52      1160      1415       1       8    0.4   100   100     1    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.0844    52.5   1.28      1600         0       2      16    0.8   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0828    54.1   1.26      1480         0       1       4    0.2   100   100     1    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0818    25.7   1.24      3160         0       1       8    0.4   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.0718    25.7   1.09      2800       553       1       8    0.4   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0684    26.2   1.04      2560     12104       6      48    2.3   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0658    26.2   1.00      2480         0       2       8    0.4   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0653    25.7   0.99      2560      4380       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0624    26.8   0.95      2320         2       1       8    0.4   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0566    25.7   0.86      2200       252      64     512   25.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0557    26.2   0.85      2120         0       1       4    0.2   100   100     1    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.0464    27.3   0.71      1600         0       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0461    26.2   0.70      1760         0       2      16    0.8   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0400    26.2   0.61      1520         0       1       8    0.4   100   100     1    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.0289    25.7   0.44      1080      3851       1       8    0.4   100   100     1    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.0277    10.1   0.42      2400     26600       1      16    0.8    89   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0211    25.7   0.32       800      9261       2      16    0.8   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0185     0.6   0.28     32320      3922       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0074     0.6   0.11     13240      4172       4      16    0.8   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0060     0.6   0.09      9040     16746      64    1024   50.0   100     0     1    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float  
+      0.0040     1.2   0.06      2840     35072       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0039     1.1   0.06      2440      4713       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0033     1.1   0.05      2440      3922       1       8    0.4   100   100     1    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0021     0.6   0.03      2360     16662       1       4    0.2   100   100     1     8     0  anon::elementwise_kernel_with_index_grid_stride<int, at::nat  WG<64,OCC<25
+      0.0019     1.1   0.03      1760      5298       1       8    0.4   100   100     1    24     0  at::native::vectorized_elementwise_kernel<4, at::native::com  WG<64,OCC<25
+      0.0019     0.6   0.03      2400      4252       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0019     0.6   0.03      2720      4328       1       8    0.4   100   100     1    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocpri  WG<64,OCC<25
+      0.0018     0.6   0.03      3200      4033       4      16    0.8   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0013     0.6   0.02      2160     33248       1       8    0.4   100   100     1    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUn  WG<64,OCC<25
+  Agent 2 [AMD Radeon RX 9070]: 1160 kernels/step  busy(UNION) 5.731 ms = 4.0%  IDLE 96.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      1.0890    42.0  19.00      8320      4160       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.9328    84.0  16.28      6440      4160     128    2048  100.0    42    34     6    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      0.4535    20.3   7.91     22320      4120      96    3072   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.3759    20.3   6.56     18480      4160     512    2048  100.0   100     0     1    64     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::  
+      0.2814    20.8   4.91     13560      4160      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.2748   186.9   4.79      1400      4160       1       4    0.2    90   100     2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.2388    20.8   4.17     11520      4120      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.2386    20.8   4.16     11480      4120      10      80    3.9   100   100     1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.2232    20.3   3.90     10960      4120      96    1536   75.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1654    20.3   2.89      8120      4120      64    1024   50.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1367    40.7   2.39      3520      4160       1       8    0.4   100   100     1    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.1130    20.8   1.97      5480      4160      80     160    7.8   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  OCC<25
+      0.0937    83.1   1.63      1120      4120       1       8    0.4   100   100     1    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.0921    62.7   1.61      1560      4160       1       8    0.4    99    99     2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.0878    20.8   1.53      4320      4120     160    1280   62.5   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.0830    42.0   1.45      1960      4160       1       8    0.4   100   100     1    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0804    61.9   1.40      1160      4200       1       8    0.4   100   100     1    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.0679    41.5   1.19      1640      4120       2      16    0.8   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0656    20.3   1.14      3200      4160       1       8    0.4   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.0613    42.9   1.07      1480      4160       1       4    0.2   100   100     1    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0573    20.3   1.00      2800      4120       1       8    0.4   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0542    20.8   0.95      2600      4160       6      48    2.3   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0527    20.8   0.92      2520      4120       2       8    0.4   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0525    20.3   0.92      2600      4160       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0500    21.2   0.87      2360      4120       1       8    0.4   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0459    20.3   0.80      2240      4160      64     512   25.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0446    20.8   0.78      2120      4160       1       4    0.2   100   100     1    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.0384    21.7   0.67      1600      4160       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0369    20.8   0.64      1760      4160       2      16    0.8   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0321    20.8   0.56      1560      4160       1       8    0.4   100   100     1    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.0261     8.0   0.46      2600     24200       1      16    0.8    90   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0224    20.3   0.39      1080      4160       1       8    0.4   100   100     1    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.0170    20.3   0.30       840      4160       2      16    0.8   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0129     0.4   0.22     29400      4320       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0059     0.4   0.10     13400      4200       4      16    0.8   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0059     0.4   0.10     10880      4560      64    1024   50.0   100     0     1    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float  
+      0.0031     0.9   0.05      3160     50361       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0031     0.9   0.05      2640      4360       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0023     0.9   0.04      2480      4280       1       8    0.4   100   100     1    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0015     0.4   0.03      2680      4200       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0015     0.9   0.03      1640      4280       1       8    0.4   100   100     1    24     0  at::native::vectorized_elementwise_kernel<4, at::native::com  WG<64,OCC<25
+      0.0014     0.4   0.02      3200      4280       4      16    0.8   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0013     0.5   0.02      2320     22000       1       4    0.2   100   100     1     8     0  anon::elementwise_kernel_with_index_grid_stride<int, at::nat  WG<64,OCC<25
+      0.0013     0.4   0.02      2200     49560       1      32    1.6   100   100     1     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocpri  WG<64,OCC<25
+      0.0013     0.4   0.02      2840      4280       1       8    0.4   100   100     1    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocpri  WG<64,OCC<25
+
+=== window iters 620..819 (200 steps) marker wall/step 162.477 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 1899 kernels/step  busy(UNION) 13.264 ms = 8.2%  IDLE 91.8%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      3.3134    62.9  24.98     35920         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      2.5708   125.7  19.38     12760         0     128    2048  100.0    42    44     6    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      1.7331    30.4  13.07     57121         0     576   18432   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      1.3787    30.4  10.39     45321         0     384    3072   75.0   100     0     1   120     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, g  
+      1.1679    31.1   8.80     37480         0      10      80    3.9   100   100     1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.6192    30.4   4.67     20320         0      96    1536   75.0   100     0     1    96     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.4507   279.9   3.40      1560         0       4      16    0.8    49   100     3    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.4196    30.4   3.16     13680         0     128    2048  100.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.4147    31.1   3.13     13360         0      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.3711    31.1   2.80     11880         0     960    7680  100.0   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.3591    31.1   2.71     11520         0      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.2646   125.1   1.99      2240      1416      15      60    2.9    29    98     5    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.2523    31.1   1.90      8121      1614     300     600   29.3   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  
+      0.1992    60.9   1.50      3440      9521       6      48    2.3   100   100     1    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.1866    94.0   1.41      2160         0       2      16    0.8    76    98     3    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.1488    92.6   1.12      1360      1588       2      16    0.8    48   100     3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.1450   124.4   1.09      1160         0       2      16    0.8    53   100     2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.1314    62.2   0.99      2460         0       2      16    0.8   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.1233    62.9   0.93      1921      2486       6      48    2.3   100   100     1    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.1202    30.4   0.91      3920         0     384    3072  100.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0991    31.1   0.75      3160     15402      30     240   11.7   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.0983    64.2   0.74      1480        96       1       4    0.2   100   100     1    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0968    30.4   0.73      3160      1087       6      48    2.3   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.0878     0.7   0.66    133681      4071       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0852    30.4   0.64      2800     12816       6      48    2.3   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0827    30.4   0.62      2720      6626       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0808    31.1   0.61      2560         0       7      28    1.4   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0775    31.1   0.58      2480         0       4      32    1.6   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0738    31.1   0.56      2360         0       1       8    0.4   100   100     1    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.0738    31.8   0.56      2320        92       6      48    2.3   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0538    15.3   0.41      2520     20001       1      16    0.8    90   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0394    31.8   0.30      1200       244       6       6    0.3    97   100     2    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0363    30.4   0.27      1160      6416       2      16    0.8   100   100     1     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0345    30.4   0.26      1080      7668       6      48    2.3   100   100     1    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.0282    30.4   0.21       840      1524       1       8    0.4   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0262    30.4   0.20       840      2934      12      96    4.7   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0198     0.7   0.15     29521      3099     320    5120  100.0   100     0     1    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float  
+      0.0132     3.3   0.10      2320      3766       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0088     0.7   0.07     13240      4136      24      96    4.7   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0060     0.7   0.05     11160      4844       6      48    2.3   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.0056     1.3   0.04      3160     20278       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0050     2.0   0.04      2280      4020       1       8    0.4   100   100     1    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0044     1.3   0.03      2160     12668       1       8    0.4   100   100     1    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUn  WG<64,OCC<25
+      0.0042     1.4   0.03      2880     40588       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0036     1.3   0.03      2360      3882       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+  Agent 2 [AMD Radeon RX 9070]: 971 kernels/step  busy(UNION) 8.017 ms = 4.9%  IDLE 95.1%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      1.3445    64.3  16.77     13000      4160     128    2048  100.0    41    44     6    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      1.2893    32.1  16.08     15200      4160       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.9977    15.6  12.45     64120      4121     576   18432   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.8235    15.6  10.27     52921      4160     384    3072   75.0   100     0     1   120     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, g  
+      0.6041    15.9   7.53     37920      4160      10      80    3.9   100   100     1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.3905    15.6   4.87     25080      4160      96    1536   75.0   100     0     1    96     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.2610    15.9   3.26     16241      4120     960    7680  100.0   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.2552    15.6   3.18     16400      4120     128    2048  100.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.2316   143.1   2.89      1600      4160       4      16    0.8    50   100     3    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.2149    15.9   2.68     13520      4160      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.1847    15.9   2.30     11600      4160      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.1391    64.0   1.73      2240      4160      15      60    2.9    29    98     5    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.1327    15.9   1.66      8320      4160     240     480   23.4   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  OCC<25
+      0.1039    31.1   1.30      3340      4120       6      48    2.3   100   100     1    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.0982    48.1   1.23      2200      4160       2      16    0.8    76    98     3    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.0771    47.4   0.96      1400      4120       2      16    0.8    48   100     3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.0770    63.6   0.96      1200      4120       2      16    0.8    53   100     2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.0689    31.8   0.86      2600      4120       2      16    0.8   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0647    15.6   0.81      4120      4160     384    3072  100.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0624    32.1   0.78      1920      4120       6      48    2.3   100   100     1    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0522    32.8   0.65      1520      4160       1       4    0.2   100   100     1    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0516    15.9   0.64      3240      4160      30     240   11.7   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.0505    15.6   0.63      3240      4160       6      48    2.3   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.0444    15.6   0.55      2840      4120       6      48    2.3   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0433    15.6   0.54      2760      4160       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0421    15.9   0.52      2640      4120       7      28    1.4   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0409    15.9   0.51      2560      4160       4      32    1.6   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.0386    15.9   0.48      2400      4160       1       8    0.4   100   100     1    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.0385    16.2   0.48      2360      4120       6      48    2.3   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0354     0.3   0.44    103740      4400       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0299     7.8   0.37      2700     18400       1      16    0.8    91   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0203    16.2   0.25      1240      4160       6       6    0.3    98   100     2    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0193    15.6   0.24      1240      4160       2      16    0.8   100   100     1     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0178    15.6   0.22      1160      4160       6      48    2.3   100   100     1    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.0144    15.6   0.18       920      4160       1       8    0.4   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0140    15.6   0.18       880      4120      12      96    4.7   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0109     0.3   0.14     31440      4320     320    5120  100.0   100     0     1    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float  
+      0.0062     1.7   0.08      2480      4240       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0045     0.3   0.06     13440      4160      24      96    4.7   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0032     0.7   0.04      3400     18000       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0025     1.0   0.03      2280      4280       1       8    0.4   100   100     1    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0025     0.3   0.03      3000      4360       6      48    2.3   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.0023     0.7   0.03      3160     17800       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0020     0.7   0.03      2200     16740       1       8    0.4   100   100     1    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUn  WG<64,OCC<25
+      0.0018     0.7   0.02      2560      4280       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+
+=== window iters 1130..1329 (200 steps) marker wall/step 162.547 ms  classes={'decode': 199} ===
+  Agent 2 [AMD Radeon RX 9070]: 2870 kernels/step  busy(UNION) 22.857 ms = 14.1%  IDLE 85.9%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      4.0045   190.0  17.52     13000      4160     128    2048  100.0    42    44     6    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      3.3330    95.0  14.58     15200      4160       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      2.6043    46.0  11.39     56840      4160     576   18432   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      2.3772    46.0  10.40     51680      4160     384    3072   75.0   100     0     1   120     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, g  
+      1.7857    47.0   7.81     37880      4160      10      80    3.9   100   100     1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      1.1533    46.0   5.05     25040      4160      96    1536   75.0   100     0     1    96     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.8041    47.0   3.52     16560      4120     960    7680  100.0   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.7525    46.0   3.29     16321      4120     128    2048  100.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.6775   423.0   2.96      1560      4160       4      16    0.8    50   100     3    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.6357    47.0   2.78     13520      4160      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.5486    47.0   2.40     11600      4160      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.4064   189.0   1.78      2240      4160      15      60    2.9    29    98     5    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.3970    47.0   1.74      8440      4160     240     480   23.4   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  OCC<25
+      0.3037    92.0   1.33      3280      4160       6      48    2.3   100   100     1    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.2876   142.0   1.26      2200      4160       2      16    0.8    76    98     3    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.2294   140.0   1.00      1360      4160       2      16    0.8    47   100     3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.2240   188.0   0.98      1200      4160       2      16    0.8    53   100     2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.2021    94.0   0.88      2580      4120       2      16    0.8   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.1906    46.0   0.83      4120      4160     384    3072  100.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.1816    95.0   0.79      1920      4160       6      48    2.3   100   100     1    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.1515    47.0   0.66      3200      4160      30     240   11.7   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.1512    97.0   0.66      1480      4160       1       4    0.2   100   100     1    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.1484    46.0   0.65      3200      4160       6      48    2.3   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.1303    46.0   0.57      2840      4160       6      48    2.3   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.1267    46.0   0.55      2720      4160       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.1238    47.0   0.54      2600      4120       7      28    1.4   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.1201    47.0   0.53      2560      4160       4      32    1.6   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.1131    47.0   0.49      2400      4160       1       8    0.4   100   100     1    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.1125    48.0   0.49      2320      4160       6      48    2.3   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.1085     1.0   0.47    103681      4440       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0913    23.1   0.40      2480     18320       1      16    0.8    90   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0589    48.0   0.26      1200      4160       6       6    0.3    98   100     2    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0558    46.0   0.24      1200      4160       2      16    0.8   100   100     1     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0512    46.0   0.22      1120      4160       6      48    2.3   100   100     1    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.0405    46.0   0.18       840      4160       1       8    0.4   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0401    46.0   0.18       840      4160      12      96    4.7   100   100     1     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0385     1.0   0.17     38240      4320     384    6144  100.0   100     0     1    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float  
+      0.0228     6.0   0.10      2480      4280       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0134     1.0   0.06     13400      4200      24      96    4.7   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0091     2.0   0.04      3360     19160       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0073     1.0   0.03      2960      4440       6      48    2.3   100   100     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  WG<64,OCC<25
+      0.0073     3.0   0.03      2280      4280       1       8    0.4   100   100     1    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0070     2.1   0.03      3200     28720       1       4    0.2   100   100     1    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.0052     2.0   0.02      2520      4280       1       4    0.2   100   100     1    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.0034     2.0   0.01      1760      4280       1       8    0.4   100   100     1    24     0  at::native::vectorized_elementwise_kernel<4, at::native::com  WG<64,OCC<25
+
+=== window iters 1600..1799 (200 steps) marker wall/step 121.556 ms  classes={'decode': 121, 'prefill': 78} ===
+  Agent 2 [AMD Radeon RX 9070]: 1811 kernels/step  busy(UNION) 65.587 ms = 54.0%  IDLE 46.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+     16.8444     9.4  25.68   1750911      4120    1050    8400   37.5    50     0     5   224     0  anon::mla_prefill_kernel<__hip_bfloat16, 256, 256, 16, 16, 8  
+     11.8397    56.8  18.05     12960      4121       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      8.6089     9.2  13.13    922226      4160    2016    8064   50.0    50     0     5   176     0  w4a8_tile::moe_gemm1_silu_flag_w4_kernel<__hip_bfloat16, 64,  
+      6.8711     9.2  10.48    737005      4080    5376   43008  100.0    50     0     5    96     0  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<__hip_bfloat16, w4  
+      4.8346    47.6   7.37     74920      4080     224    1792   56.2    37    11     6   160     0  dense_gemm::dense_gemm_pipe_kernel<64, 2, 64, 1, false, __hi  
+      3.1451     9.2   4.80    337482      4081     240    5760   75.0   100     0     1   112     0  w4a8_fp8_wmma::mmq_fp8_gemm_wmma_tiled_tuned_kernel<__hip_bf  
+      1.3361     9.2   2.04    144321      4080     112    1792   50.0   100     0     1   192     0  w4a8_fp8_wmma::mmq_fp8_gemm_wmma_tiled_tuned_kernel<__hip_bf  
+      1.0236    18.9   1.56     53220      4040    1792   14336  100.0   100     0     1     8     0  at::native::anon::CatArrayBatchedCopy<at::native::anon::Opaq  
+      0.9353    75.6   1.43      6440      4160     128    2048  100.0    38    30     6    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      0.7782    27.5   1.19      2280      4160   10752   86016  100.0    47     0     6    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.7277    75.1   1.11     11560      4080      28     448   21.9    95   100     3    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.7164     9.2   1.09     77320      4040   13416  107328  100.0     5     0    27     8     0  w4a8_fp8_moe::moe_gather_reduce_kernel<__hip_bfloat16>  
+      0.7059   252.9   1.08      1680      4120       1       4    0.2    31    35    57    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.5773    55.0   0.88      3760      4120       1       8    0.4    21    21    28    16     0  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<__hip_bfloa  WG<64,OCC<25
+      0.4546    65.9   0.69      5640      4080       1       4    0.2     9     9    75    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.4066    18.3   0.62     22280      4120      96    3072   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.3375    18.3   0.51     18440      4160     512    2048  100.0   100     0     1    64     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::  
+      0.3285    27.5   0.50      2840      4120       1       8    0.4    16    16    28    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.3269    77.1   0.50      2960      4120       4      16    0.8    44    62    29    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::nat  WG<64,OCC<25
+      0.3201    27.5   0.49      3240      4120       1       8    0.4    18    18    28    32     0  anon::moe_topk_softmax_kernel<1, 4, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.3103    28.7   0.47      2400      4120       1       8    0.4    14    14    28    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.2708    86.1   0.41      1560      4160       1       8    0.4    28    41    46    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.2686    18.6   0.41     14440      4160     160    1280   62.5   100     0     1    72     0  mla_attend::mla_split_kernel<__hip_bfloat16, 512, 64, 16, ml  
+      0.2632    56.8   0.40      2000      4120       1       8    0.4    28    28    28    32     0  anon::rms_norm_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.2532    18.6   0.39     13521      4160      40     160    7.8   100   100     1   256     0  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  WG<64,OCC<25
+      0.2158    18.6   0.33     11520      4120      40     160    7.8   100   100     1   128     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x64x32_MI16  WG<64,OCC<25
+      0.2142    18.7   0.33     11480      4120      10      80    3.9   100   100     1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.2132    56.2   0.33      1720      4120       2      16    0.8    29    50    12    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.2106    56.9   0.32      3960      4040    1792   14336  100.0    40     0     7     8     0  at::native::vectorized_elementwise_kernel<8, at::native::Fil  
+      0.2039   112.4   0.31      1160      4120       1       8    0.4    41    59    19    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUD  WG<64,OCC<25
+      0.2010    18.3   0.31     10960      4120      96    1536   75.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1891    27.5   0.29      2600      4160       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.1886    84.7   0.29      1600      4120       1       8    0.4    43    57    32    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfl  WG<64,OCC<25
+      0.1872     9.2   0.29     20001      4120      27     216   10.5    60   100     2    72     0  dense_gemm::dense_gemm_rd_kernel<64, false, __hip_bfloat16>  WG<64,OCC<25
+      0.1594    28.1   0.24      2640      4120       2       8    0.4    30    30    28    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu  WG<64,OCC<25
+      0.1535    27.5   0.23      1120      4120       1       8    0.4    13    13    28    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUD  WG<64,OCC<25
+      0.1484    18.3   0.23      8120      4120      64    1024   50.0   100     0     1    88     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1322     9.8   0.20     12240      4000    1257   10056  100.0     7     0    51    72     0  anon::gated_mul_kernel<__hip_bfloat16, anon::SiluAct>  
+      0.1072    28.1   0.16      1800      4120       2      16    0.8    31    31    13     8     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+      0.1025    18.6   0.16      5480      4160      80     160    7.8   100     0     1     8     0  mla_attend::mla_combine_kernel<__hip_bfloat16, 512>  OCC<25
+      0.0881    28.1   0.13      1560      4120       1       8    0.4    33    33     9    40     0  at::native::vectorized_elementwise_kernel<4, at::native::Con  WG<64,OCC<25
+      0.0779    27.5   0.12       840      4120       2      16    0.8    20    20    28     8     0  at::native::vectorized_elementwise_kernel<4, at::native::Fil  WG<64,OCC<25
+      0.0585    19.1   0.09      2560      4080    1649    3298  100.0     3     0    81    16     0  at::native::vectorized_gather_kernel<16, long>  
+      0.0534     9.4   0.08      5560      4000     942    3768  100.0    10     0    21    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  
+      0.0487    18.6   0.07      2600      4160       6      48    2.3   100   100     1    16     0  at::native::anon::CatArrayBatchedCopy_contig<at::native::ano  WG<64,OCC<25
+
+wrote /home/pat/code/minisgl-rdna4-glmfix/tools/counter_probe/results/glm_ab/prof-cand.kernels.json
+wrote /home/pat/code/minisgl-rdna4-glmfix/tools/counter_probe/results/glm_ab/prof-cand.kernels.csv
