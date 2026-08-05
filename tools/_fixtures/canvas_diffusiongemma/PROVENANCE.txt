@@ -21,3 +21,27 @@ surface undispatched), THIS checkpoint runs 115 dense W4A8 GEMMs per canvas step
 M=256, i.e. squarely inside the tile chooser's M>=64 domain.
 
 cu=64 is the 9070 XT. Note `multi_processor_count` reports WGPs (32), never assert 64 from it.
+
+--- step_breakdown.txt / trace_report.txt / roofline.txt -----------------------------------------
+run      : ~/.cache/minisgl-perf/canvas_rocprof-13142533174.txt (trace leg)
+           ~/.cache/minisgl-perf/canvas_rocprof-122634245152.txt (base leg: tok/s, canvas-timing,
+           hip-engage ledger)
+trace    : ~/.cache/minisgl-perf/cvout-13142533174/  (rocprofv3 --kernel-trace --marker-trace
+           --selected-regions --stats, 40 canvas steps, window canvas_step#20..#60)
+perf lvl : AUTO on both legs. No counter run was mixed in; `profile_standard` pins clocks non-boost
+           and its absolute times belong to a different surface.
+
+TWO LEGS, TWO INSTRUMENTS, ON PURPOSE. MINISGL_CANVAS_TIMING costs two torch.cuda.synchronize() per
+step and serialises the overlap the trace measures; rocprofv3 stretches the step (139.15 ms traced
+vs 97.70 ms un-profiled = 1.424x). So the ABSOLUTE step comes from the base leg and the SHARES come
+from the trace, and the deflated `real` column is stated as derived, not measured.
+
+OCCUPANCY WITHOUT --pmc. rocprofv3 --kernel-trace already emits VGPR_Count, Scratch_Size,
+LDS_Block_Size, Workgroup_Size and Grid_Size per dispatch, so waves/SIMD follows from the gfx1201
+law -- min(16, 1536 // (ceil(VGPR/24)*24)) -- with no counter run, no ROCm 7.14 image, and no
+profile_standard window. That is where every occupancy number in step_breakdown.txt comes from.
+What it does NOT give is the VALU/VMEM/LDS issue split; that still needs --pmc.
+
+ONE RANK. A TP=2 serve traces both ranks through the inherited LD_PRELOAD; this trace carries a
+single agent, and every per-step figure is therefore one card's work, which is what a per-step cost
+should mean.

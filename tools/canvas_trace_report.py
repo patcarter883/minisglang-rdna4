@@ -76,11 +76,31 @@ def family(name: str) -> str:
 
 
 def short(name: str) -> str:
-    n = re.sub(r"\(.*\)$", "", name)
-    n = re.sub(r"<[^<>]*>", "<>", n)
-    for _ in range(3):
-        n = re.sub(r"<[^<>]*>", "<>", n)
-    return n[:78]
+    """Collapse template args and the arg list but KEEP the function name.
+
+    Naively stripping `<...>` and `(...)` turns `void ns::kern<A,B>(args)` into the string `"void "`
+    for every templated kernel in the trace -- which silently MERGED attention and the tail kernels
+    into one 16 ms/step row here. Strip the arg list first, then peel balanced template brackets, and
+    if what survives is only a storage-class keyword, fall back to the raw prefix."""
+    # `(anonymous namespace)::` comes BEFORE the real name and contains parentheses, so stripping
+    # from the first `(` would erase the whole name. Every HIP kernel in this repo is in an anonymous
+    # namespace, so this is the common case, not an edge one.
+    n = name.strip().strip('"').replace("(anonymous namespace)::", "")
+    d = 0
+    out = []
+    for ch in n:  # drop everything inside balanced <> at any depth
+        if ch == "<":
+            d += 1
+            if d == 1:
+                out.append("<>")
+        elif ch == ">":
+            d = max(0, d - 1)
+        elif d == 0:
+            out.append(ch)
+    n = "".join(out)
+    n = re.sub(r"\(.*$", "", n).strip()          # the (arg list) and anything after it
+    n = re.sub(r"^(void|__global__)\s+", "", n)  # storage class carries no information
+    return (n or name.strip().strip('"'))[:76]
 
 
 def main() -> int:
@@ -154,11 +174,34 @@ def main() -> int:
     n_fam: dict[str, int] = collections.Counter()
     by_k: dict[tuple[str, str], int] = collections.Counter()
     n_k: dict[tuple[str, str], int] = collections.Counter()
+    # A TP=2 serve traces BOTH ranks through the inherited LD_PRELOAD. Their kernels are disjoint
+    # device streams, so summing across agents reports two cards' work as one step and doubles every
+    # per-step figure. Default to the busiest single agent (= one rank = one card, which is what a
+    # per-step cost should mean) and say so; `--agent all` opts into the sum deliberately.
+    want_agent = sys.argv[sys.argv.index("--agent") + 1] if "--agent" in sys.argv else None
+    agents: dict[str, int] = collections.Counter()
+    for r in _rows(kf):
+        s = _num(r, "Start_Timestamp", "Start_Timestamp(ns)")
+        e = _num(r, "End_Timestamp", "End_Timestamp(ns)")
+        if e > s and lo <= s <= hi:
+            agents[(r.get("Agent_Id") or "?").strip().strip('"')] += e - s
+    if agents:
+        print("\nagents (ranks/cards) in the window:  "
+              + ", ".join(f"{a}={v/1e6:.1f}ms" for a, v in agents.most_common()))
+    if want_agent is None and len(agents) > 1:
+        want_agent = agents.most_common(1)[0][0]
+        print(f"  -> reporting AGENT {want_agent} only (one rank = one card). "
+              f"Use --agent all to sum both ranks.")
+    if want_agent == "all":
+        want_agent = None
+
     total = ndisp = 0
     for r in _rows(kf):
         s = _num(r, "Start_Timestamp", "Start_Timestamp(ns)")
         e = _num(r, "End_Timestamp", "End_Timestamp(ns)")
         if e <= s or not (lo <= s <= hi):
+            continue
+        if want_agent and (r.get("Agent_Id") or "?").strip().strip('"') != want_agent:
             continue
         nm = (r.get("Kernel_Name") or r.get("Name") or "?").strip().strip('"')
         dur = e - s
