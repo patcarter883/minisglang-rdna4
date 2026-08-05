@@ -23,13 +23,16 @@ done
 V=$(rocprofv3 --version 2>&1 | awk "/rocm_version/{print \$2; exit}")
 echo "### rocm=$V rocprofiler-sdk=$(rocprofv3 --version 2>&1 | awk "/version:/{print \$2; exit}")"
 
-echo "=== pmc-check (no workload, no counters programmed) ==="
-timeout -s KILL 120 rocprofv3-avail pmc-check 2>&1 | tail -20
+echo "=== pmc-check (takes explicit counters; it does NOT enumerate) ==="
+timeout -s KILL 120 rocprofv3-avail pmc-check SQ_WAVES SQ_INSTS_VALU 2>&1 | tail -20
 
+# `rocprofv3 --list-avail`, NOT `rocprofv3-avail list`: different tools, different output formats. The
+# latter emits nothing this grep matches, so it reports count=0 and "absent" for EVERY counter on EVERY
+# stack -- which reads as "gfx1201 advertises nothing" when it only means "wrong command".
 echo "=== advertised counter NAMES for gfx1201 ==="
-timeout -s KILL 120 rocprofv3-avail list 2>&1 \
+timeout -s KILL 120 rocprofv3 --list-avail 2>&1 \
   | grep -oE "Counter_Name[[:space:]]*:[[:space:]]*[A-Za-z0-9_]+" \
-  | awk -F: "{gsub(/ |\t/,\"\",\$2); print \$2}" | sort -u > /tmp/names.txt
+  | sed -E "s/.*:[[:space:]]*//" | sort -u > /tmp/names.txt
 echo "count=$(wc -l < /tmp/names.txt)"
 echo "--- are the ones the utilisation breakdown needs advertised? ---"
 for c in SQ_WAVES SQ_INSTS_VALU SQ_INSTS_SALU SQ_INSTS_LDS SQ_INST_CYCLES_VALU \

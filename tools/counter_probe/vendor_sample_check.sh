@@ -43,9 +43,23 @@ for c in SQ_WAVES SQ_INSTS_VALU SQ_INSTS_SALU SQ_INSTS_LDS SQ_INSTS_SMEM SQ_INST
   [ "$v" = "0" ] && printf "%-24s %-6s %s\n" "$c" ZERO "$v" || printf "%-24s %-6s %s\n" "$c" OK "$v"
 done
 
-echo "=== 2) rocprof-compute ($(rocprof-compute --version 2>&1 | head -1)) on the same binary ==="
-cd /tmp && timeout -s KILL 600 rocprof-compute profile -n vend --path /out/rpc -- /tmp/instmix \
-  >/out/rocprof_compute.log 2>&1
-echo "rocprof-compute profile rc=$?"
-tail -25 /out/rocprof_compute.log
+echo "=== 2) rocprof-compute: is gfx1201 even a supported arch? ==="
+# Ask BEFORE profiling. rocprof-compute is the frontend anyone reaching for a roofline will try next,
+# and the arch list is the whole answer: no gfx12 entry means it cannot analyse this card at all,
+# independently of whether the underlying counters read. Measured 2026-08-05 on rocprof-compute 3.7.0
+# (bundled with ROCm 7.14): supported = gfx908 gfx90a gfx940 gfx941 gfx942 gfx950 gfx1150 gfx1151
+# gfx1152. NO gfx1200/gfx1201 -> rocprof-compute is NOT an option on RDNA4. Do not spend a window
+# on it. (gfx115x is RDNA3.5, not RDNA4 -- easy to misread as "close enough".)
+# --list-metrics REQUIRES an arch argument, so calling it bare errors out and greps clean — which
+# would report "no gfx12" from a usage error rather than from the arch list. Read the supported-arch
+# list out of --help, where it is printed verbatim under --list-metrics.
+rocprof-compute --help 2>&1 | sed -n "/--list-metrics/,/--list-blocks/p" | head -15
+echo "--- gfx12 present in that list? ---"
+if rocprof-compute --help 2>&1 | sed -n "/--list-metrics/,/--list-blocks/p" | grep -q "gfx12"; then
+  echo "  YES -> retry a real profile run"
+  cd /tmp && timeout -s KILL 600 rocprof-compute profile -n vend -- /tmp/instmix >/out/rocprof_compute.log 2>&1
+  echo "  rocprof-compute profile rc=$?"; tail -25 /out/rocprof_compute.log
+else
+  echo "  NO -> gfx1201 unsupported by rocprof-compute; nothing to run."
+fi
 '
