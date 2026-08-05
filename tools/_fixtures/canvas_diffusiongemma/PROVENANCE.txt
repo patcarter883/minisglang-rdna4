@@ -1,0 +1,23 @@
+Fixtures for the DiffusionGemma block-diffusion (canvas) profiling pass.
+
+engine   : minisgl-rdna4 4d719ad6 (+ the canvas ROCTx markers in this branch)
+kernels  : rdna4-hip-kernels 8a8bca6
+image    : minisgl-rdna4:dgprof-base / :dgprof  (built from BOTH worktrees clean; the
+           pre-existing :post-tile-prof could NOT be used -- its mmq_fp8_moe_gemm predates the
+           `x_fp8` producer-quant kwarg this engine passes, and the serve dies in graph capture with
+           `TypeError: mmq_fp8_moe_gemm() got an unexpected keyword argument 'x_fp8'`)
+model    : cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4, TP=2, canvas_length=256
+radix    : MINISGL_SWA_RADIX=0 pinned (documented workaround for the unresolved chunked-encoder
+           divergence on PARTIAL prefix hits; also what the 72.3/81.1 baseline was taken under)
+
+--- dense_tile_selection.txt -------------------------------------------------------------------
+HOST-SIDE ONLY, NO GPU, NO LEASE: fp8_wmma.dense_tile_explain(M,N,K,group,cu) is a pure function of
+the cost model, so this is reproducible on any box and is not a timing.
+
+WHY IT MATTERS. The checkpoint's compressed-tensors `ignore` list holds the dense MLP
+(mlp.{gate,up,down}_proj), the router and self_conditioning -- but NOT self_attn.{q,k,v,o}_proj. So
+unlike Qwen3.6-35B-A3B-AWQ (whose ignore list covers every dense linear, making its whole dense-tile
+surface undispatched), THIS checkpoint runs 115 dense W4A8 GEMMs per canvas step per rank, all at
+M=256, i.e. squarely inside the tile chooser's M>=64 domain.
+
+cu=64 is the 9070 XT. Note `multi_processor_count` reports WGPs (32), never assert 64 from it.
