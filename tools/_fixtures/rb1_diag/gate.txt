@@ -1,0 +1,22 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+fixture: /engine/tools/_fixtures/dense_tile_surface_card0.csv  (10380 recorded cells)
+
+====================================================================================================
+GATE -- the probe must reproduce the RECORDED fixture cells it reasons about.
+A probe that silently disagrees with the fixture is measuring its own configuration.
+====================================================================================================
+--- gate  lag.gate_up  tp1  K=2048 N=16384 g=32 bfloat16 zeros=awq  M=32   rotation 10 x 19.4 MB = 194 MB
+    diag=0  full                  32x64x4=   357.4 [fixture 354.7, +1%]   128x64=   154.6 [fixture 151.0, +2%] (0.43x)
+--- gate  lag.gate_up  tp1  K=2048 N=16384 g=32 bfloat16 zeros=awq  M=48   rotation 10 x 19.4 MB = 194 MB
+    diag=0  full                  32x64x4=   134.8 [fixture 140.6, +4%]   128x64=   163.6 [fixture 161.6, +1%] (1.21x)
+--- gate  lm_head      tp2  K=2816 N=131072 g=32 float16 zeros=sym  M=32   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   678.9 [fixture 690.0, +2%]   128x64=  1299.8 [fixture 1361.1, +5%] (1.91x)
+--- gate  lm_head      tp2  K=2816 N=131072 g=32 float16 zeros=sym  M=48   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=  1180.9 [fixture 1368.3, +14%]   128x64=  1369.5 [fixture 1429.6, +4%] (1.16x)
+
+GATE PASSED.
+
+
+done

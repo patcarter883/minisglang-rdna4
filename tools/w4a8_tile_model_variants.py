@@ -129,9 +129,71 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
         stride = 2.0 * k_groups                       # bytes between adjacent rows' group scales
         lines = float(bn) if stride >= LINE else max(1.0, bn * stride / LINE)
         span = min(float(k_groups), LINE / 2.0)       # k-groups one retained line serves
-        foot = bpc * lines * LINE                     # bytes the CU must retain
-        live_ws = n_blocks * lines * LINE             # the shape's whole live scale footprint
-        held = (foot <= p["L0"]) or (live_ws < p["L2"])
+        # ---- THE SWIZZLE DIVISOR: what the CU must retain DEPENDS ON row_blocks -----------------
+        # MEASURED by ablation (tools/_fixtures/rb1_diag/stage.txt), lag.gate_up tp1 32x64x4,
+        # swiz=1, the shipped launch:
+        #     M=32 (rb==1)  full 323.1 us   no_wscale 113.0 us  ->  the w_scale read is 65% of it
+        #     M=48 (rb==2)  full 136.5 us   no_wscale 116.0 us  ->  the w_scale read is 15% of it
+        # 1.5x the work, 2.4x FASTER, and 210 of the 323 us that vanish are the per-group w_scale
+        # global read. No other bit moves it: no_wmma -2%, no_ldsread -1%, no_ldswrite -22%.
+        # The carrier is the SAME scale line the BN term already prices -- what is new is that its
+        # RETENTION is a function of row_blocks.
+        #
+        # WHY. swiz=1 puts the row-block axis on grid.x, so the `row_blocks` workgroups that share
+        # one block_n slab are dispatched CONSECUTIVELY and share its scale lines. At row_blocks==1
+        # grid.x==1: the swizzle is a structural NO-OP, and every resident workgroup retains its own
+        # slab. So the retained set is bpc/row_blocks slabs, not bpc.
+        # The same ablation proves the swizzle is the carrier from the other side: at rb==2, turning
+        # the swizzle OFF puts the cliff straight back -- 493.9 us full / 157.4 no_wscale at swiz=0
+        # against 136.5 / 116.0 at swiz=1. And at rb==1 the two orders are IDENTICAL (320.2 vs
+        # 323.1), which is what "the swizzle is a no-op there" means, and which independently
+        # falsifies a gridDim.x==1 dispatch/shader-engine story.
+        rb_div = max(1, row_blocks) if (p.get("sline") == "rb" and not shuffled) else 1
+        foot = cd(bpc, rb_div) * lines * LINE          # bytes the CU must retain
+        # ---- WHAT IS ACTUALLY LIVE IN L2, and the ROW_BLOCKS==1 CLIFF it explains --------------
+        # `n_blocks * lines * LINE` is the shape's TOTAL scale footprint, and a total is not what a
+        # cache has to hold: the cache has to hold what is CONCURRENTLY LIVE. The launch has
+        # `cu * blocks_per_cu` workgroups resident at once, and under the dense swizzle (swiz=1,
+        # which is what ships) the ROW-BLOCK axis is grid.x -- the FAST axis -- so the `row_blocks`
+        # workgroups that share one block_n weight slab are dispatched CONSECUTIVELY and are
+        # co-resident. The number of DISTINCT slabs whose scale lines must be retained at once is
+        # therefore ceil(resident / row_blocks), not n_blocks.
+        #
+        # That single correction is the whole ROW_BLOCKS == 1 cliff, and it is DERIVED, not fitted:
+        # at row_blocks == 1 the swizzle is a NO-OP (grid.x == 1, nothing to interleave), every
+        # resident workgroup streams its own slab, and the live set is the full `resident` count.
+        # At row_blocks == 2 it HALVES, and where that halving steps back across L2 the cliff
+        # switches off -- which is exactly the discontinuity the surface shows.
+        #
+        # MEASURED, on the recorded ablation fixtures (tools/_fixtures/bn_diag/), lm_head g=32:
+        #   32x128x4 (BN=128, 128 lines x 128 B = 16 KB/slab, bpc=4 -> resident 256):
+        #       rb==1  256 slabs x 16 KB = 4.19 MB > L2 4 MB -> MISS   2481-2505 us
+        #       rb==2  128 slabs x 16 KB = 2.10 MB < L2      -> HELD   1181-1272 us
+        #                                                    (2x the work, 2.0x FASTER)
+        #     and the swiz A/B confirms the carrier: at rb==2, swiz=1 1180.7 vs swiz=0 4637.5
+        #     (3.9x) -- turn the swizzle off and the rb==2 point returns to the un-reused price,
+        #     2x the rb==1 point, exactly linear.
+        #   32x64x4 (BN=64, 8 KB/slab): rb==1 is 256 x 8 KB = 2.10 MB < L2 -> HELD at EVERY rb,
+        #     so this tile shows NO cliff (622 -> 1368 us, plain 2x) and the swizzle buys only
+        #     1.19x. The term correctly stays silent there.
+        # The falsified alternative is recorded too: a grid-DIMENSION degeneracy at gridDim.x==1
+        # (all workgroups landing on one shader engine) predicts swiz=0 and swiz=1 differ at
+        # rb==1. They do not -- 613.1 vs 624.9 and 206.7 vs 212.6 us, i.e. identical -- because at
+        # rb==1 BOTH orders are the un-swizzled one. The dispatcher is innocent; the cache is not.
+        if p.get("sline") == "rb" and not shuffled:
+            resident = cu * bpc
+            slabs = min(float(n_blocks), float(cd(resident, max(1, row_blocks))))
+        else:
+            slabs = float(n_blocks)
+        live_ws = slabs * lines * LINE                # concurrently-live scale footprint
+        # `<=` vs `<` is not a taste question here: the access is CYCLIC (the block re-walks the
+        # same `lines` lines once per k-group), and cyclic LRU over a working set EQUAL to capacity
+        # collects nothing -- the line it needs next is always the one just evicted. So a footprint
+        # that exactly equals L0 is a MISS, not a hit. That distinction decides the shape this whole
+        # investigation is about: lag.gate_up tp1 at 32x64x4 has foot = 4 x 64 lines x 128 B =
+        # 32768 B = L0 EXACTLY, and it is measured missing (the w_scale read is 65% of the kernel).
+        l0_held = (foot < p["L0"]) if p.get("sline") == "rb" else (foot <= p["L0"])
+        held = l0_held or (live_ws < p["L2"] and not p.get("no_l2_rescue"))
         # A HELD line is a cache hit and adds no traffic, so the term is ZERO there -- it is a pure
         # penalty that fires only where the physics says the cliff is, and can never nudge a pick on
         # a shape that has no cliff. Past the cliff the block re-fetches a full LINE per row per
@@ -516,6 +578,16 @@ def main() -> int:
         ("+ scale-line term, WN={1}      ", dict(ship, sline="on", **L0L2), (1,)),
         ("+ scale-line term, WN={1,2}    ", dict(ship, sline="on", **L0L2), (1, 2)),
         ("+ scale-line term, WN={1,2,4}  ", dict(ship, sline="on", **L0L2), (1, 2, 4)),
+        # ---- the SAME term, with the live set counted CONCURRENTLY (the rb==1 cliff) -----------
+        # No new constant: L0/L2 are unchanged and `resident/row_blocks` is the swizzle the header
+        # already documents. This is the only change between "on" and "rb".
+        ("+ rb-swizzle sline, WN={1}     ", dict(ship, sline="rb", **L0L2), (1,)),
+        ("+ rb-swizzle sline, WN={1,2}   ", dict(ship, sline="rb", **L0L2), (1, 2)),
+        ("+ rb-swizzle sline, WN={1,2,4} ", dict(ship, sline="rb", **L0L2), (1, 2, 4)),
+        ("+ rb-swizzle, no L2 rescue {1} ", dict(ship, sline="rb", no_l2_rescue=True, **L0L2), (1,)),
+        ("+ rb-swizzle, no L2 rescue{1,2}", dict(ship, sline="rb", no_l2_rescue=True, **L0L2), (1, 2)),
+        ("+ rb-swizzle, no L2 resc{1,2,4}", dict(ship, sline="rb", no_l2_rescue=True, **L0L2),
+         (1, 2, 4)),
     ]
     ref = None
     for tag, p, wns in variants:
