@@ -236,6 +236,8 @@ def main() -> int:
     ap.add_argument("--shapes", default="", help="comma list of substrings to keep")
     ap.add_argument("--no-arms", action="store_true")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--allow-any-card", action="store_true",
+                    help="time on a non-64-CU card. ONLY for deliberately measuring the\n                          price of the CU pin; never for deriving or validating the model.")
     args = ap.parse_args()
 
     fh = open(args.out, "w") if args.out else None
@@ -260,18 +262,64 @@ def main() -> int:
     if args.smoke:
         shapes, ms, tiles = shapes[:2], [17, 256], tiles[:4]
 
-    out(f"device: {torch.cuda.get_device_name(0)}   fp8_wmma: {W.__file__}")
+    # ---- CARD PROVENANCE, and a GUARD ----------------------------------------------------------
+    # This box is a MISMATCHED pair -- GPU 0 is a 64-CU RX 9070 XT, GPU 1 a 56-CU RX 9070 with a
+    # lower power cap and different clocks -- and `gpu-lease` assigns the lowest FREE card with no
+    # flag to pin one. A surface merged from both cards is not one surface: it reads as run-to-run
+    # noise but is a systematic offset on exactly the occupancy-bound cells this model is fitted to.
+    #
+    # Worse for THIS tool specifically: the chooser it feeds ships a 64-CU-PINNED decision
+    # (tile_select.h PINNED_CU / minisgl _PINNED_DISPATCH_CU). Timing on the 56-CU card measures a
+    # knowingly mis-tiled kernel, so those numbers cannot derive or validate the model at all. The
+    # one legitimate card-1 measurement is the PRICE of the pin, which is already recorded and is
+    # not this sweep.
+    # SELECT the 64-CU card BY DEVICE PROPERTIES, never by ordinal. Under a two-card lease both
+    # physical cards are visible and their ORDER is not guaranteed, so "cuda:0 is the XT" is exactly
+    # the assumption that produced a whole WARPS_N surface on the 56-CU card.
+    global DEV
+    want = None
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        n = p.multi_processor_count * 2                      # WGPs -> CUs
+        out(f"  visible cuda:{i} = {p.name}  CUs={n}")
+        if n == 64 and want is None:
+            want = i
+    if want is None and not args.allow_any_card:
+        out("REFUSING TO TIME: no 64-CU card visible. The chooser ships a 64-CU PINNED decision "
+            "(tile_select.h PINNED_CU), so timing on the 56-CU RX 9070 measures a knowingly "
+            "mis-tiled kernel and cannot derive or validate the model. Re-lease until card 0 is "
+            "held (--allow-any-card only for deliberately pricing the pin).")
+        return 2
+    if want is None:
+        want = 0
+    torch.cuda.set_device(want)
+    DEV = torch.device(f"cuda:{want}")
+    dev_name = torch.cuda.get_device_name(want)
+    cu = torch.cuda.get_device_properties(want).multi_processor_count * 2
+    card = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    # Whether the box was HELD EXCLUSIVELY. The two cards share board power, PSU headroom, PCIe and
+    # case thermals, so a neighbour under load moves these numbers without ever touching this card.
+    # That is the distinction the pre-existing fixtures cannot make about themselves.
+    excl = os.environ.get("TILE_EXCLUSIVE", "0")
+    out(f"device: {dev_name}   CUs={cu}   physical card={card}   exclusive_box={excl}   "
+        f"fp8_wmma: {W.__file__}")
     out(f"tiles ({len(tiles)}): " + " ".join(tile_name(t) for t in tiles))
     out(f"arms: {'(skipped)' if args.no_arms else ARMS}")
     out("graph-replay timed; rotation sized in BYTES past the 64 MB MALL; us per call\n")
 
     cf = open(args.csv, "w") if args.csv else None
     if cf:
-        cf.write("name,K,N,g,dtype,M,cand,us,reps,R\n")
+        # Provenance goes in the ROWS, not a header comment: these files get merged, and a merge is
+        # exactly where the card silently stops being visible.
+        cf.write("name,K,N,g,dtype,M,cand,us,reps,R,dev,cu,card,exclusive\n")
 
     for name, K, N, g, dt, zeros in shapes:
-        legal_tiles = [tile_name(t) for t in tiles if legal(*tile3(t), g=g)]
-        skipped = [tile_name(t) for t in tiles if not legal(*tile3(t), g=g)]
+        # tile3() yields (BM, BN, WARPS_N) but legal() takes (bm, bn, g, wn) -- splat them into the
+        # right slots rather than letting WARPS_N land in the `g` position.
+        legal_tiles = [tile_name(t) for t in tiles
+                       if legal(tile3(t)[0], tile3(t)[1], g, tile3(t)[2])]
+        skipped = [tile_name(t) for t in tiles
+                   if not legal(tile3(t)[0], tile3(t)[1], g, tile3(t)[2])]
         cands = ([] if args.no_arms else list(ARMS)) + legal_tiles
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} "
             f"zeros={'awq' if zeros else 'sym'} ===")
@@ -316,7 +364,7 @@ def main() -> int:
                 for c in order:
                     cf.write(
                         f"{name},{K},{N},{g},{str(dt).split('.')[-1]},{M},{c},"
-                        f"{t[c]:.3f},{rp[c]},{R}\n"
+                        f"{t[c]:.3f},{rp[c]},{R},{dev_name},{cu},{card},{excl}\n"
                     )
                 cf.flush()
             del x

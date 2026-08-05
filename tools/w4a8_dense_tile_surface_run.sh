@@ -25,6 +25,8 @@ docker run --rm --name tilesurface-$$ \
   --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
   -e HF_HUB_OFFLINE=1 -e MINISGL_HIP_ENGAGE_LOG=0 \
+  -e TILE_EXCLUSIVE="${TILE_EXCLUSIVE:-0}" -e LEASE_ROCR_DEVICES="${LEASE_ROCR_DEVICES:-}" \
   -v "$WT":/engine "${MOUNT_K[@]}" \
   --entrypoint bash "$IMG" -lc \
-    "PYTHONPATH=/opt/kernels:/engine/python:/engine python /engine/${TOOL} $*"
+    'PYTHONPATH=/opt/kernels:/engine/python:/engine exec python /engine/'"${TOOL}"' "$@"' \
+    _ "$@"

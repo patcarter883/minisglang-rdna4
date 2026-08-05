@@ -208,9 +208,32 @@ def main() -> int:
     shapes = [s for s in SHAPES if (not args.shapes or any(t in s[0] for t in args.shapes.split(",")))]
     if args.smoke:
         shapes, ms = shapes[:1], ms[:2]
-    csv("name,E,top_k,hidden,inter,g,M,cand,us,reps,R")
+    # CARD PROVENANCE + GUARD -- identical rule to the dense surface tool, and for the same reason:
+    # this box is a mismatched pair (64-CU RX 9070 XT / 56-CU RX 9070), `gpu-lease` assigns the
+    # lowest FREE card, and the chooser this fixture derives ships a 64-CU PINNED decision. A cell
+    # timed on the 56-CU card prices a knowingly mis-tiled kernel, and merged into the surface it is
+    # indistinguishable from noise. Select the card BY PROPERTIES, never by ordinal.
+    global DEV
+    want = None
+    for i in range(torch.cuda.device_count()):
+        pr = torch.cuda.get_device_properties(i)
+        n = pr.multi_processor_count * 2
+        out(f"  visible cuda:{i} = {pr.name}  CUs={n}")
+        if n == 64 and want is None:
+            want = i
+    if want is None:
+        out("REFUSING TO TIME: no 64-CU card visible (chooser is 64-CU PINNED). Re-lease card 0.")
+        return 2
+    torch.cuda.set_device(want)
+    DEV = torch.device(f"cuda:{want}")
+    dev_name = torch.cuda.get_device_name(want)
+    cu = torch.cuda.get_device_properties(want).multi_processor_count * 2
+    card = os.environ.get("LEASE_ROCR_DEVICES", os.environ.get("ROCR_VISIBLE_DEVICES", "?"))
+    excl = os.environ.get("TILE_EXCLUSIVE", "0")
+    csv("name,E,top_k,hidden,inter,g,M,cand,us,reps,R,dev,cu,card,exclusive")
 
     out(f"tiles {len(BM_SET)}x{len(BN_SET)}   shapes {len(shapes)}   M {ms}")
+    out(f"device: {dev_name}   CUs={cu}   physical card={card}   exclusive_box={excl}")
     out(f"chooser CU is PINNED (tile_select.h); torch {torch.__version__}\n")
 
     for name, E, top_k, hidden, inter, g in shapes:
@@ -241,7 +264,8 @@ def main() -> int:
                         out(f"  M={M:>5} {bm}x{bn}: REFUSED {type(exc).__name__}: {str(exc)[:110]}")
                         continue
                     rows.append((us, f"{bm}x{bn}"))
-                    csv(f"{name},{E},{top_k},{hidden},{inter},{g},{M},{bm}x{bn},{us:.3f},{reps},{R}")
+                    csv(f"{name},{E},{top_k},{hidden},{inter},{g},{M},{bm}x{bn},{us:.3f},{reps},{R},"
+                        f"{dev_name},{cu},{card},{excl}")
                     if base is None:
                         base = us
             os.environ.pop("VLLM_W4A8_MOE_BN", None)

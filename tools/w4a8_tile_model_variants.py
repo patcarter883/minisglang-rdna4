@@ -192,28 +192,59 @@ def moe_cost(rows, E, N, K, g, bm, bn, cu, p, gtile=4):
     return core(bm, bn, wn, g, rb, cd(N, bn), 1, kg, per * gt, True, cu, p, real_rows=rows)
 
 
-def load(path, moe):
+def tile_of(cand):
+    """A measured candidate is "BMxBN" (WARPS_N=1) or "BMxBNxWN". Returns (bm, bn, wn) or None."""
+    parts = cand.split("x")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        bm, bn = int(parts[0]), int(parts[1])
+        wn = int(parts[2]) if len(parts) == 3 else 1
+    except ValueError:
+        return None
+    return bm, bn, wn
+
+
+def load(path, moe, paths=()):
+    """Load one or more surface CSVs into {cell: {cand: us}}.
+
+    Rows whose `cand` is an ARM (a whole-kernel alternative, not a tile) are dropped, as are rows
+    that do not parse -- a fixture written by two concurrent processes can carry a torn line, and a
+    silently mis-parsed row would enter the oracle as a fake best.
+    """
     t = defaultdict(dict)
-    for r in csv.DictReader(open(path)):
-        if r["cand"] in ARMS:
+    for p in (path, *paths):
+        if not p:
             continue
-        if moe:
-            k = (r["name"], int(r["E"]), int(r["top_k"]), int(r["hidden"]), int(r["inter"]),
-                 int(r["g"]), int(r["M"]))
-        else:
-            k = (r["name"], int(r["K"]), int(r["N"]), int(r["g"]), int(r["M"]))
-        t[k][r["cand"]] = float(r["us"])
+        for r in csv.DictReader(open(p)):
+            if r["cand"] in ARMS or tile_of(r["cand"]) is None:
+                continue
+            try:
+                if moe:
+                    k = (r["name"], int(r["E"]), int(r["top_k"]), int(r["hidden"]),
+                         int(r["inter"]), int(r["g"]), int(r["M"]))
+                else:
+                    k = (r["name"], int(r["K"]), int(r["N"]), int(r["g"]), int(r["M"]))
+                us = float(r["us"])
+            except (ValueError, TypeError, KeyError):
+                continue
+            if us <= 0.0:
+                continue
+            t[k][r["cand"]] = us
     return {k: d for k, d in t.items() if len(d) >= 4}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dense", default="tools/_fixtures/dense_tile_surface.csv")
+    ap.add_argument("--dense-extra", default="", help="comma list of extra dense surface CSVs "
+                    "(the widened g=128 column and the WARPS_N re-sweep are separate files)")
     ap.add_argument("--moe", default="tools/_fixtures/moe_tile_surface.csv")
     ap.add_argument("--cu", type=int, default=64)
     args = ap.parse_args()
 
-    D = load(args.dense, moe=False)
+    extra = tuple(x for x in args.dense_extra.split(",") if x)
+    D = load(args.dense, moe=False, paths=extra)
     Mo = load(args.moe, moe=True)
     print(f"dense cells {len(D)}   moe cells {len(Mo)}   CU={args.cu}")
 
@@ -225,11 +256,13 @@ def main() -> int:
             for k, d in cells.items():
                 best, bc = None, None
                 for c in d:
-                    bm, bn = (int(v) for v in c.split("x"))
+                    bm, bn, wn = tile_of(c)
                     if isd:
                         name, K, N, g, M = k
-                        # the dense surface was swept at WARPS_N=1 (the only thing that shipped)
-                        cst = dense_cost(M, N, K, g, bm, bn, 1, args.cu, p)
+                        # WARPS_N comes from the CANDIDATE now: the surface carries "BMxBNxWN"
+                        # tiles since the WN axis was swept, and scoring one at wn=1 would price a
+                        # launch that never happened.
+                        cst = dense_cost(M, N, K, g, bm, bn, wn, args.cu, p)
                     else:
                         name, E, tk, hid, inter, g, M = k
                         # score on gemm1's shape; gemm2 rides the same block_m and BN sweep
