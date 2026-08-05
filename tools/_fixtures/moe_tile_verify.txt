@@ -1,0 +1,11 @@
+device: AMD Radeon RX 9070 XT   WGPs=32 -> 64 CUs
+fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+us per call; graph-replay timed; rotation sized in BYTES past the 64 MB MALL
+
+=== q35.moe    tp2  E=256 top_k=8 hidden=2048 inter=768 g=128 ===
+    gemm1 N=1536 K=2048   gemm2 N=2048 K=768
+         M         chooser      prev  chooser us   prev us  prev+chBN    gain  BN only
+         1        32x32/32     16x64       88.97     72.63      85.43   0.82x    0.85x
+         2      32x192/192     16x64      151.13    168.22     171.41   1.11x    0.98x
+         8      32x192/192     16x64      346.54    336.33     321.33   0.97x    1.05x
+        32      32x192/192     16x64     1309.66    995.65     994.04   0.76x    1.00x

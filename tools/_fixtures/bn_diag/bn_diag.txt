@@ -1,0 +1,120 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles: 32x64x4,32x128x4   experiments: stage,swiz,nsweep,ksweep
+
+====================================================================================================
+STAGE ABLATION -- which stage carries the gap? (VLLM_W4A8_V7_DIAG)
+====================================================================================================
+--- stage  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   671.2   32x128x4=  2492.8 (3.71x)
+    diag=1  no_wmma               32x64x4=   594.6   32x128x4=  2480.7 (4.17x)
+    diag=2  no_global             32x64x4=   456.1   32x128x4=   532.0 (1.17x)
+    diag=4  no_ldswrite           32x64x4=   508.2   32x128x4=  2423.5 (4.77x)
+    diag=8  no_ldsread            32x64x4=   603.5   32x128x4=  2515.2 (4.17x)
+    diag=16 no_wscale             32x64x4=   439.5   32x128x4=   707.8 (1.61x)
+    diag=18 no_global+no_wscale   32x64x4=   343.5   32x128x4=   443.9 (1.29x)
+--- stage  K=2816 N=131072 g=32 M=32   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   680.2   32x128x4=  2506.9 (3.69x)
+    diag=1  no_wmma               32x64x4=   650.8   32x128x4=  2498.4 (3.84x)
+    diag=2  no_global             32x64x4=   432.9   32x128x4=   473.0 (1.09x)
+    diag=4  no_ldswrite           32x64x4=   569.8   32x128x4=  2454.2 (4.31x)
+    diag=8  no_ldsread            32x64x4=   662.0   32x128x4=  2485.5 (3.75x)
+    diag=16 no_wscale             32x64x4=   497.2   32x128x4=   738.7 (1.49x)
+    diag=18 no_global+no_wscale   32x64x4=   355.7   32x128x4=   428.9 (1.21x)
+--- stage  K=2816 N=131072 g=32 M=48   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=  1501.1   32x128x4=  4595.7 (3.06x)
+    diag=1  no_wmma               32x64x4=  1418.3   32x128x4=  4631.6 (3.27x)
+    diag=2  no_global             32x64x4=   798.8   32x128x4=   888.1 (1.11x)
+    diag=4  no_ldswrite           32x64x4=  1203.5   32x128x4=  4565.9 (3.79x)
+    diag=8  no_ldsread            32x64x4=  1424.4   32x128x4=  4621.7 (3.24x)
+    diag=16 no_wscale             32x64x4=   960.5   32x128x4=  1548.2 (1.61x)
+    diag=18 no_global+no_wscale   32x64x4=   681.1   32x128x4=   824.3 (1.21x)
+--- stage  K=2816 N=131072 g=128 M=1   rotation 2 x 190.3 MB = 381 MB
+    diag=0  full                  32x64x4=   466.8   32x128x4=   589.7 (1.26x)
+    diag=1  no_wmma               32x64x4=   426.1   32x128x4=   524.6 (1.23x)
+    diag=2  no_global             32x64x4=   420.4   32x128x4=   501.6 (1.19x)
+    diag=4  no_ldswrite           32x64x4=   317.8   32x128x4=   373.6 (1.18x)
+    diag=8  no_ldsread            32x64x4=   465.0   32x128x4=   596.3 (1.28x)
+    diag=16 no_wscale             32x64x4=   463.0   32x128x4=   580.6 (1.25x)
+    diag=18 no_global+no_wscale   32x64x4=   392.7   32x128x4=   453.4 (1.15x)
+--- stage  K=2816 N=131072 g=128 M=32   rotation 2 x 190.3 MB = 381 MB
+    diag=0  full                  32x64x4=   529.3   32x128x4=   636.4 (1.20x)
+    diag=1  no_wmma               32x64x4=   482.8   32x128x4=   583.0 (1.21x)
+    diag=2  no_global             32x64x4=   409.8   32x128x4=   470.8 (1.15x)
+    diag=4  no_ldswrite           32x64x4=   377.2   32x128x4=   427.4 (1.13x)
+    diag=8  no_ldsread            32x64x4=   521.8   32x128x4=   661.3 (1.27x)
+    diag=16 no_wscale             32x64x4=   527.8   32x128x4=   648.5 (1.23x)
+    diag=18 no_global+no_wscale   32x64x4=   401.3   32x128x4=   438.2 (1.09x)
+--- stage  K=2816 N=131072 g=128 M=48   rotation 2 x 190.3 MB = 381 MB
+    diag=0  full                  32x64x4=  1003.1   32x128x4=  1386.0 (1.38x)
+    diag=1  no_wmma               32x64x4=   906.7   32x128x4=  1278.9 (1.41x)
+    diag=2  no_global             32x64x4=   797.0   32x128x4=   936.0 (1.17x)
+    diag=4  no_ldswrite           32x64x4=   701.6   32x128x4=   808.2 (1.15x)
+    diag=8  no_ldsread            32x64x4=   998.1   32x128x4=  1384.3 (1.39x)
+    diag=16 no_wscale             32x64x4=   992.6   32x128x4=  1358.8 (1.37x)
+    diag=18 no_global+no_wscale   32x64x4=   767.4   32x128x4=   847.4 (1.10x)
+====================================================================================================
+SWIZZLE -- does putting M on the fast grid axis move it?
+====================================================================================================
+--- swiz  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                 swiz=0  32x64x4=   621.5   32x128x4=  2501.1 (4.02x)
+    diag=0  full                 swiz=1  32x64x4=   613.4   32x128x4=  2480.8 (4.04x)
+--- swiz  K=2816 N=131072 g=32 M=32   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                 swiz=0  32x64x4=   682.0   32x128x4=  2468.9 (3.62x)
+    diag=0  full                 swiz=1  32x64x4=   673.9   32x128x4=  2495.3 (3.70x)
+--- swiz  K=2816 N=131072 g=32 M=48   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                 swiz=0  32x64x4=  1416.9   32x128x4=  4637.5 (3.27x)
+    diag=0  full                 swiz=1  32x64x4=  1244.7   32x128x4=  1180.7 (0.95x)
+====================================================================================================
+N SWEEP -- is the variable BN, or BN x how deeply the grid covers the machine?
+====================================================================================================
+--- nsweep  K=2816 N=4096 g=32 M=1   rotation 27 x 6.5 MB = 175 MB
+    diag=0  full                  32x64x4=    59.8   32x128x4=    88.3 (1.48x)
+--- nsweep  K=2816 N=8192 g=32 M=1   rotation 14 x 13.0 MB = 182 MB
+    diag=0  full                  32x64x4=    64.9   32x128x4=    94.1 (1.45x)
+--- nsweep  K=2816 N=16384 g=32 M=1   rotation 8 x 26.0 MB = 208 MB
+    diag=0  full                  32x64x4=    94.2   32x128x4=   123.0 (1.31x)
+--- nsweep  K=2816 N=32768 g=32 M=1   rotation 5 x 51.9 MB = 260 MB
+    diag=0  full                  32x64x4=   168.6   32x128x4=   598.3 (3.55x)
+--- nsweep  K=2816 N=65536 g=32 M=1   rotation 3 x 103.8 MB = 311 MB
+    diag=0  full                  32x64x4=   324.6   32x128x4=  1378.4 (4.25x)
+--- nsweep  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   624.3   32x128x4=  2481.8 (3.98x)
+--- nsweep  K=2816 N=4096 g=128 M=1   rotation 30 x 5.9 MB = 178 MB
+    diag=0  full                  32x64x4=    48.6   32x128x4=    76.4 (1.57x)
+--- nsweep  K=2816 N=8192 g=128 M=1   rotation 16 x 11.9 MB = 190 MB
+    diag=0  full                  32x64x4=    53.8   32x128x4=    80.9 (1.50x)
+--- nsweep  K=2816 N=16384 g=128 M=1   rotation 9 x 23.8 MB = 214 MB
+    diag=0  full                  32x64x4=    77.8   32x128x4=    95.5 (1.23x)
+--- nsweep  K=2816 N=32768 g=128 M=1   rotation 5 x 47.6 MB = 238 MB
+    diag=0  full                  32x64x4=   136.1   32x128x4=   171.7 (1.26x)
+--- nsweep  K=2816 N=65536 g=128 M=1   rotation 3 x 95.2 MB = 285 MB
+    diag=0  full                  32x64x4=   247.0   32x128x4=   318.5 (1.29x)
+--- nsweep  K=2816 N=131072 g=128 M=1   rotation 2 x 190.3 MB = 381 MB
+    diag=0  full                  32x64x4=   466.8   32x128x4=   582.2 (1.25x)
+====================================================================================================
+K SWEEP at fixed g -- does the gap track K/g (the w_scales row stride) or g alone?
+====================================================================================================
+--- ksweep  K=1024 N=131072 g=32 M=1   rotation 4 x 75.5 MB = 302 MB
+    diag=0  full                  32x64x4=   195.1   32x128x4=   484.7 (2.48x)
+--- ksweep  K=2048 N=131072 g=32 M=1   rotation 3 x 151.0 MB = 453 MB
+    diag=0  full                  32x64x4=   566.6   32x128x4=  2095.3 (3.70x)
+--- ksweep  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   625.4   32x128x4=  2501.9 (4.00x)
+--- ksweep  K=4096 N=131072 g=32 M=1   rotation 2 x 302.0 MB = 604 MB
+    diag=0  full                  32x64x4=  1961.4   32x128x4=  5020.5 (2.56x)
+--- ksweep  K=8192 N=131072 g=32 M=1   rotation 2 x 604.0 MB = 1208 MB
+    diag=0  full                  32x64x4=  4311.7   32x128x4= 10529.0 (2.44x)
+--- ksweep  K=1024 N=131072 g=128 M=1   rotation 4 x 69.2 MB = 277 MB
+    diag=0  full                  32x64x4=   170.6   32x128x4=   204.0 (1.20x)
+--- ksweep  K=2048 N=131072 g=128 M=1   rotation 3 x 138.4 MB = 415 MB
+    diag=0  full                  32x64x4=   358.1   32x128x4=   457.3 (1.28x)
+--- ksweep  K=2816 N=131072 g=128 M=1   rotation 2 x 190.3 MB = 381 MB
+    diag=0  full                  32x64x4=   470.1   32x128x4=   582.1 (1.24x)
+--- ksweep  K=4096 N=131072 g=128 M=1   rotation 2 x 276.8 MB = 554 MB
+    diag=0  full                  32x64x4=   693.7   32x128x4=   874.9 (1.26x)
+--- ksweep  K=8192 N=131072 g=128 M=1   rotation 2 x 553.6 MB = 1107 MB
+    diag=0  full                  32x64x4=  1778.1   32x128x4=  2370.0 (1.33x)
+
+done

@@ -1,0 +1,55 @@
+device: AMD Radeon RX 9070   WGPs=28 -> TRUE CU=56   pinned CU=64
+fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+us per call; graph-replay timed; rotation sized in BYTES past the 64 MB MALL
+
+=== g4.q_proj    tp2  K=2816 N=2048 g=32 ===
+         M  pinned64    true56    oracle    pin us   true us  oracle us  pin/true  pin/orc
+         1     32x16     32x16     64x32     78.15     78.15      73.67    1.000x   1.061x
+        17     32x16     32x16    128x32     81.03     81.03      78.30    1.000x   1.035x
+        32     32x16     32x16    128x32     89.31     89.31      78.66    1.000x   1.135x
+        64     64x32     64x32    128x32     93.20     93.20      85.49    1.000x   1.090x
+       128     64x32    128x64     64x32     94.98    102.95      95.91    0.923x   0.990x
+       512    128x64    256x96    128x64    140.73    132.13     140.91    1.065x   0.999x
+
+=== q27.q_proj   tp1  K=5120 N=6144 g=32 ===
+         M  pinned64    true56    oracle    pin us   true us  oracle us  pin/true  pin/orc
+         1     64x32     64x32     64x32    150.20    150.20     150.48    1.000x   0.998x
+        17     64x32     64x32     64x32    187.30    187.30     186.25    1.000x   1.006x
+        32     64x32     64x32     64x32    187.88    187.88     187.44    1.000x   1.002x
+        64     64x32     64x32    128x32    214.75    214.75     206.24    1.000x   1.041x
+       128    192x96    128x64    128x32    244.88    231.32     230.73    1.059x   1.061x
+       512    256x96   256x128   256x128    638.22    549.88     547.67    1.161x   1.165x
+
+=== lag.gate_up  tp2  K=2048 N=8192 g=32 ===
+         M  pinned64    true56    oracle    pin us   true us  oracle us  pin/true  pin/orc
+         1     64x32     64x32     64x32     78.32     78.32      78.16    1.000x   1.002x
+        17     64x32     64x32     32x32    108.00    108.00     101.86    1.000x   1.060x
+        32     64x32     64x32     64x32     97.34     97.34      96.03    1.000x   1.014x
+        64     64x32     64x32    128x64    105.29    105.29     100.31    1.000x   1.050x
+       128    128x64    128x64    128x64    116.37    116.37     115.48    1.000x   1.008x
+       512   256x128   256x128   256x128    322.58    322.58     325.13    1.000x   0.992x
+
+=== glm.gate_up  tp2  K=2048 N=10240 g=128 ===
+         M  pinned64    true56    oracle    pin us   true us  oracle us  pin/true  pin/orc
+         1     64x32     64x32     32x32     95.13     95.13      80.68    1.000x   1.179x
+        17     64x32     64x32     64x64    107.24    107.24      94.81    1.000x   1.131x
+        32     64x32     64x32     64x64    120.29    120.29     102.27    1.000x   1.176x
+        64     64x32     64x32   128x128    150.50    150.50     110.56    1.000x   1.361x
+       128    128x96    128x96   128x128    116.22    116.22     130.71    1.000x   0.889x
+       512    256x64   256x128   256x128    390.62    295.49     303.25    1.322x   1.288x
+
+=== lag.gate_up  tp1  K=2048 N=16384 g=32 ===
+         M  pinned64    true56    oracle    pin us   true us  oracle us  pin/true  pin/orc
+         1    128x64    128x64     64x32    182.39    182.39     160.81    1.000x   1.134x
+        17    128x64    128x64    128x64    170.42    170.42     167.48    1.000x   1.018x
+        32    128x64    128x64    128x64    164.10    164.10     164.22    1.000x   0.999x
+        64    128x64    128x64    128x64    174.92    174.92     175.07    1.000x   0.999x
+       128    128x64    128x64    128x64    196.86    196.86     199.41    1.000x   0.987x
+       512   256x128   256x128   256x128    584.23    584.23     590.05    1.000x   0.990x
+
+cells where the TRUE-CU rule would pick a different tile: 5/30
+total: pinned 5481 us   true-CU 5284 us   oracle 5158 us
+  cost of PINNING the CU count on this card: 1.0374x
+  chooser (pinned) vs this card's per-cell oracle: 1.0627x
+
+done.

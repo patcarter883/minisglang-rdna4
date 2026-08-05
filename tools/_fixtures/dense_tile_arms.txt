@@ -1,0 +1,231 @@
+device: AMD Radeon RX 9070 XT   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tile-equalized set: ['16x128', '32x128', '64x128', '128x128', '256x128', '256x256', '384x128', '512x128']
+graph-replay timed; rotation sized in BYTES past the 64 MB MALL; us per call
+
+=== g4.q_proj    tp2  K=2816 N=2048 g=32 float16 zeros=sym ===
+    M=   17  own-best: tiled=101.9(256x128)  ash=118.4(384x128)  prefill=146.5(prefill)   winner=tiled by 1.16x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.04 32x128:T1.12 64x128:T1.75 128x128:T1.38 256x128:T1.20 256x256:A2.77 384x128:T1.04 512x128:T1.01
+    M=   24  own-best: tiled=97.7(256x128)  ash=116.5(384x128)  prefill=129.4(prefill)   winner=tiled by 1.19x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.16 32x128:T1.35 64x128:T1.74 128x128:T1.40 256x128:T1.22 256x256:A2.84 384x128:T1.07 512x128:T1.04
+    M=   32  own-best: tiled=97.2(256x128)  ash=120.1(256x128)  prefill=135.1(prefill)   winner=tiled by 1.24x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.33 32x128:T1.30 64x128:T1.94 128x128:T1.49 256x128:T1.24 256x256:A2.85 384x128:T1.14 512x128:T1.04
+    M=   48  own-best: tiled=97.3(256x128)  ash=124.0(384x128)  prefill=156.2(prefill)   winner=tiled by 1.27x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.25 32x128:A1.07 64x128:T2.04 128x128:T1.51 256x128:T1.31 256x256:A3.00 384x128:T1.14 512x128:T1.09
+    M=   63  own-best: tiled=97.5(256x128)  ash=131.2(384x128)  prefill=171.0(prefill)   winner=tiled by 1.35x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.21 32x128:T1.19 64x128:T1.31 128x128:T1.64 256x128:T1.38 256x256:A2.97 384x128:T1.21 512x128:T1.10
+    M=   64  own-best: tiled=97.2(256x128)  ash=131.3(384x128)  prefill=171.2(prefill)   winner=tiled by 1.35x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.26 32x128:T1.18 64x128:T1.29 128x128:T1.64 256x128:T1.38 256x256:A2.94 384x128:T1.21 512x128:T1.10
+    M=  128  own-best: tiled=105.1(256x128)  ash=147.6(512x128)  prefill=211.1(prefill)   winner=tiled by 1.40x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.28 32x128:T1.06 64x128:T1.54 128x128:T1.87 256x128:T1.55 256x256:A2.66 384x128:T1.32 512x128:T1.21
+    M=  256  own-best: tiled=128.2(256x128)  ash=184.1(512x128)  prefill=373.6(prefill:smallm_off)   winner=tiled by 1.44x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.10 32x128:T1.20 64x128:A1.01 128x128:T1.77 256x128:T1.77 256x256:A1.33 384x128:T1.49 512x128:T1.34
+    M=  512  own-best: tiled=133.1(256x128)  ash=203.9(384x128)  prefill=297.0(prefill)   winner=tiled by 1.53x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.54 32x128:T1.07 64x128:A1.08 128x128:T1.66 256x128:T1.69 256x256:T1.11 384x128:T1.44 512x128:T1.51
+    M= 2048  own-best: tiled=334.0(256x128)  ash=470.4(512x128)  prefill=1222.0(prefill)   winner=tiled by 1.41x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.31 32x128:T1.19 64x128:A1.48 128x128:T1.52 256x128:T1.53 256x256:A1.36 384x128:T1.48 512x128:T1.40
+
+=== g4.gate_up   tp1  K=2816 N=4224 g=32 float16 zeros=sym ===
+    M=   17  own-best: tiled=131.4(128x128)  prefill=140.1(prefill)  ash=143.7(256x128)   winner=tiled by 1.07x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.10 32x128:T1.21 64x128:T1.45 128x128:T1.26 256x128:A1.00 256x256:A1.75 384x128:A1.10 512x128:A1.14
+    M=   24  own-best: tiled=130.6(128x128)  prefill=138.7(prefill)  ash=142.7(256x128)   winner=tiled by 1.06x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.17 32x128:T1.27 64x128:T1.50 128x128:T1.27 256x128:T1.02 256x256:A1.73 384x128:A1.09 512x128:A1.12
+    M=   32  own-best: tiled=125.9(128x128)  ash=142.8(256x128)  prefill=145.7(prefill)   winner=tiled by 1.13x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.30 32x128:T1.31 64x128:T1.56 128x128:T1.38 256x128:T1.00 256x256:A1.73 384x128:A1.03 512x128:A1.12
+    M=   48  own-best: tiled=121.7(128x128)  ash=150.5(256x128)  prefill=167.2(prefill)   winner=tiled by 1.24x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.31 32x128:T1.14 64x128:T1.70 128x128:T1.55 256x128:T1.10 256x256:A1.68 384x128:A1.03 512x128:A1.08
+    M=   63  own-best: tiled=123.4(128x128)  ash=153.5(256x128)  prefill=181.5(prefill)   winner=tiled by 1.24x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.30 32x128:T1.25 64x128:T1.76 128x128:T1.64 256x128:T1.14 256x256:A1.63 384x128:A1.01 512x128:A1.06
+    M=   64  own-best: tiled=122.1(128x128)  ash=155.9(256x128)  prefill=183.8(prefill)   winner=tiled by 1.28x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.29 32x128:T1.28 64x128:T1.78 128x128:T1.66 256x128:T1.15 256x256:A1.62 384x128:T1.01 512x128:A1.08
+    M=  128  own-best: tiled=130.6(256x128)  ash=166.8(256x128)  prefill=410.2(prefill)   winner=tiled by 1.28x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.23 32x128:T1.15 64x128:T1.74 128x128:T1.93 256x128:T1.28 256x256:A1.42 384x128:T1.24 512x128:T1.12
+    M=  256  own-best: tiled=142.0(256x128)  ash=238.3(256x128)  prefill=592.9(prefill:smallm_off)   winner=tiled by 1.68x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.29 32x128:T1.13 64x128:A1.31 128x128:T1.62 256x128:T1.68 256x256:A1.15 384x128:T1.38 512x128:T1.26
+    M=  512  own-best: tiled=279.7(256x128)  ash=408.7(256x128)  prefill=824.5(prefill:smallm_off)   winner=tiled by 1.46x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.99 32x128:A1.14 64x128:A1.93 128x128:T1.48 256x128:T1.46 256x256:A1.55 384x128:T1.24 512x128:T1.57
+    M= 2048  own-best: tiled=695.5(256x128)  ash=1127.2(256x128)  prefill=2507.7(prefill:smallm_off)   winner=tiled by 1.62x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.15 32x128:T1.17 64x128:A1.25 128x128:T1.58 256x128:T1.62 256x256:A1.40 384x128:T1.45 512x128:T1.52
+
+=== q27.q_proj   tp1  K=5120 N=6144 g=32 bfloat16 zeros=awq ===
+    M=   17  own-best: ash=235.9(256x128)  prefill=248.0(prefill)  tiled=252.0(128x128)   winner=ash by 1.05x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.38 32x128:T1.33 64x128:T1.20 128x128:T1.18 256x128:A1.18 256x256:A2.00 384x128:T1.25 512x128:T1.25
+    M=   24  own-best: ash=238.3(256x128)  prefill=245.7(prefill)  tiled=250.8(128x128)   winner=ash by 1.03x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.37 32x128:T1.43 64x128:T1.24 128x128:T1.17 256x128:A1.16 256x256:A2.01 384x128:T1.24 512x128:T1.34
+    M=   32  own-best: ash=238.6(256x128)  tiled=250.8(128x128)  prefill=262.8(prefill)   winner=ash by 1.05x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.36 32x128:T1.45 64x128:T1.32 128x128:T1.23 256x128:A1.14 256x256:A2.00 384x128:T1.28 512x128:T1.33
+    M=   48  own-best: ash=247.2(256x128)  tiled=256.9(128x128)  prefill=294.6(prefill)   winner=ash by 1.04x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.36 32x128:T1.34 64x128:T1.31 128x128:T1.29 256x128:A1.08 256x256:A1.92 384x128:T1.33 512x128:T1.39
+    M=   63  own-best: tiled=247.7(128x128)  ash=249.2(256x128)  prefill=320.0(prefill)   winner=tiled by 1.01x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.37 32x128:T1.45 64x128:T1.55 128x128:T1.44 256x128:A1.01 256x256:A1.88 384x128:T1.52 512x128:T1.42
+    M=   64  own-best: tiled=249.3(128x128)  ash=255.1(256x128)  prefill=317.8(prefill)   winner=tiled by 1.02x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.34 32x128:T1.46 64x128:T1.43 128x128:T1.41 256x128:A1.03 256x256:A1.85 384x128:T1.48 512x128:T1.40
+    M=  128  own-best: tiled=253.5(256x128)  ash=303.6(256x128)  prefill=795.5(prefill)   winner=tiled by 1.20x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T3.01 32x128:T1.35 64x128:T1.39 128x128:T1.70 256x128:T1.20 256x256:A1.63 384x128:T1.37 512x128:T1.34
+    M=  256  own-best: tiled=279.4(256x128)  ash=441.6(256x128)  prefill=1048.4(prefill)   winner=tiled by 1.58x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.51 32x128:T2.84 64x128:T1.51 128x128:T1.54 256x128:T1.58 256x256:A1.32 384x128:T1.52 512x128:T1.34
+    M=  512  own-best: tiled=487.5(256x128)  ash=789.1(256x128)  prefill=1646.8(prefill)   winner=tiled by 1.62x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.54 32x128:T1.09 64x128:A1.66 128x128:T1.29 256x128:T1.62 256x256:A1.47 384x128:T1.56 512x128:T1.32
+    M= 2048  own-best: tiled=1819.4(256x128)  ash=2544.1(512x128)  prefill=6381.3(prefill)   winner=tiled by 1.40x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.68 32x128:T1.30 64x128:A1.06 128x128:T1.45 256x128:T1.48 256x256:A1.39 384x128:T1.45 512x128:T1.34
+
+=== lag.gate_up  tp2  K=2048 N=8192 g=32 bfloat16 zeros=awq ===
+    M=   17  own-best: tiled=126.2(256x128)  ash=140.5(256x128)  prefill=147.6(prefill)   winner=tiled by 1.11x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.29 32x128:T1.15 64x128:A1.01 128x128:T1.43 256x128:T1.11 256x256:A1.45 384x128:A1.09 512x128:T1.11
+    M=   24  own-best: tiled=124.3(256x128)  ash=139.5(256x128)  prefill=146.8(prefill)   winner=tiled by 1.12x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.28 32x128:T1.22 64x128:A1.03 128x128:T1.50 256x128:T1.12 256x256:A1.47 384x128:A1.09 512x128:T1.00
+    M=   32  own-best: tiled=115.2(256x128)  ash=140.4(256x128)  prefill=152.9(prefill)   winner=tiled by 1.22x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.30 32x128:T1.26 64x128:T1.03 128x128:T1.78 256x128:T1.22 256x256:A1.45 384x128:A1.04 512x128:T1.05
+    M=   48  own-best: tiled=110.5(128x128)  ash=151.9(256x128)  prefill=196.1(prefill)   winner=tiled by 1.38x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.32 32x128:T1.18 64x128:T1.04 128x128:T2.00 256x128:T1.35 256x256:A1.33 384x128:A1.14 512x128:T1.13
+    M=   63  own-best: tiled=112.3(256x128)  ash=150.9(256x128)  prefill=206.8(prefill)   winner=tiled by 1.34x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.26 32x128:T1.20 64x128:T1.06 128x128:T2.15 256x128:T1.34 256x256:A1.37 384x128:A1.21 512x128:T1.08
+    M=   64  own-best: tiled=111.9(128x128)  ash=151.4(256x128)  prefill=207.2(prefill)   winner=tiled by 1.35x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.29 32x128:T1.24 64x128:A1.04 128x128:T2.06 256x128:T1.31 256x256:A1.37 384x128:A1.23 512x128:T1.11
+    M=  128  own-best: tiled=117.8(256x128)  ash=166.0(256x128)  prefill=420.5(prefill:smallm_off)   winner=tiled by 1.41x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.02 32x128:T1.28 64x128:A1.15 128x128:T2.05 256x128:T1.41 256x256:A1.19 384x128:T1.15 512x128:T1.62
+    M=  256  own-best: tiled=136.5(256x128)  ash=230.3(256x128)  prefill=507.9(prefill)   winner=tiled by 1.69x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.02 32x128:T1.76 64x128:A1.17 128x128:T1.16 256x128:T1.69 256x256:A1.19 384x128:T1.63 512x128:T1.70
+    M=  512  own-best: tiled=246.1(256x128)  ash=450.0(256x128)  prefill=957.0(prefill)   winner=tiled by 1.83x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.79 32x128:T1.62 64x128:A1.17 128x128:T1.53 256x128:T1.83 256x256:T1.08 384x128:T1.58 512x128:T1.29
+    M= 2048  own-best: tiled=932.4(256x128)  ash=1425.2(512x128)  prefill=3491.1(prefill:smallm_off)   winner=tiled by 1.53x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.49 32x128:T1.42 64x128:T1.02 128x128:T1.29 256x128:T1.58 256x256:A1.40 384x128:T1.31 512x128:T1.41
+
+=== q35b4.gate_up tp2  K=2560 N=9216 g=32 bfloat16 zeros=awq ===
+    M=   17  own-best: tiled=158.5(128x128)  prefill=161.4(prefill)  ash=178.5(128x128)   winner=tiled by 1.02x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.40 32x128:T1.37 64x128:T1.31 128x128:T1.13 256x128:T1.23 256x256:A1.78 384x128:T1.17 512x128:T1.11
+    M=   24  own-best: tiled=155.6(128x128)  prefill=162.0(prefill)  ash=178.6(128x128)   winner=tiled by 1.04x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.38 32x128:T1.42 64x128:T1.34 128x128:T1.15 256x128:T1.14 256x256:A1.82 384x128:T1.06 512x128:T1.15
+    M=   32  own-best: tiled=149.1(128x128)  prefill=161.3(prefill)  ash=179.0(128x128)   winner=tiled by 1.08x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.42 32x128:T1.50 64x128:T1.39 128x128:T1.20 256x128:T1.16 256x256:A1.78 384x128:A1.00 512x128:T1.13
+    M=   48  own-best: tiled=142.8(128x128)  prefill=170.4(prefill)  ash=181.9(128x128)   winner=tiled by 1.19x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.40 32x128:T1.51 64x128:T1.48 128x128:T1.27 256x128:T1.36 256x256:A1.72 384x128:A1.07 512x128:T1.20
+    M=   63  own-best: tiled=139.8(128x128)  ash=190.2(128x128)  prefill=196.3(prefill)   winner=tiled by 1.36x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.41 32x128:T1.47 64x128:T1.58 128x128:T1.36 256x128:T1.38 256x256:A1.71 384x128:T1.21 512x128:T1.19
+    M=   64  own-best: tiled=141.2(128x128)  ash=186.6(128x128)  prefill=199.1(prefill)   winner=tiled by 1.32x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.43 32x128:T1.46 64x128:T1.57 128x128:T1.32 256x128:T1.45 256x256:A1.72 384x128:T1.15 512x128:T1.22
+    M=  128  own-best: tiled=153.2(128x128)  ash=248.0(128x128)  prefill=782.2(prefill:smallm_off)   winner=tiled by 1.62x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.97 32x128:T1.48 64x128:T1.56 128x128:T1.62 256x128:T1.38 256x256:A1.54 384x128:T1.27 512x128:T1.48
+    M=  256  own-best: tiled=260.6(256x128)  ash=386.2(64x128)  prefill=953.2(prefill)   winner=tiled by 1.48x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.69 32x128:T1.30 64x128:A1.29 128x128:T1.50 256x128:T1.55 256x256:A1.21 384x128:T1.87 512x128:T1.62
+    M=  512  own-best: tiled=376.1(256x128)  ash=611.8(256x128)  prefill=1432.7(prefill)   winner=tiled by 1.63x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.99 32x128:T1.04 64x128:A1.73 128x128:T1.11 256x128:T1.63 256x256:A1.11 384x128:T1.39 512x128:T1.19
+    M= 2048  own-best: tiled=1452.3(256x128)  ash=1918.4(512x128)  prefill=5059.2(prefill:smallm_off)   winner=tiled by 1.32x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T3.47 32x128:T1.56 64x128:T1.06 128x128:T1.38 256x128:T1.38 256x256:A1.41 384x128:T1.35 512x128:T1.30
+
+=== glm.gate_up  tp2  K=2048 N=10240 g=128 bfloat16 zeros=awq ===
+      (M=17 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=17 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=17 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=17 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   17  own-best: prefill=101.0(prefill)  tiled=122.5(128x128)  ash=185.1(64x128)   winner=prefill by 1.21x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.04 32x128:T1.18 64x128:T1.41 128x128:T2.04 256x128:T1.54
+      (M=24 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=24 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=24 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=24 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   24  own-best: prefill=102.5(prefill)  tiled=116.9(128x128)  ash=188.7(64x128)   winner=prefill by 1.14x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.05 32x128:T1.22 64x128:T1.42 128x128:T2.03 256x128:T1.54
+      (M=32 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=32 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=32 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=32 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   32  own-best: tiled=107.9(128x128)  prefill=111.1(prefill)  ash=198.3(64x128)   winner=tiled by 1.03x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.23 32x128:T1.30 64x128:T1.46 128x128:T2.29 256x128:T1.57
+      (M=48 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=48 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=48 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=48 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   48  own-best: tiled=102.7(128x128)  prefill=128.6(prefill)  ash=208.3(384x128)   winner=tiled by 1.25x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.73 32x128:T2.23 64x128:T1.55 128x128:T2.53 256x128:T1.60
+      (M=63 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=63 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=63 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=63 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   63  own-best: tiled=106.9(128x128)  prefill=146.1(prefill)  ash=211.2(384x128)   winner=tiled by 1.37x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.30 32x128:T2.50 64x128:T1.59 128x128:T2.37 256x128:T1.68
+      (M=64 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=64 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=64 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=64 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=   64  own-best: tiled=106.8(128x128)  prefill=146.2(prefill)  ash=209.4(384x128)   winner=tiled by 1.37x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.33 32x128:T2.52 64x128:T1.62 128x128:T2.53 256x128:T1.69
+      (M=128 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=128 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=128 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=128 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=  128  own-best: tiled=125.9(128x128)  ash=254.9(512x128)  prefill=393.9(prefill:smallm_off)   winner=tiled by 2.02x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.99 32x128:T2.53 64x128:T1.36 128x128:T2.72 256x128:T2.18
+      (M=256 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=256 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=256 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=256 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=  256  own-best: tiled=204.9(256x128)  ash=333.3(384x128)  prefill=523.1(prefill:smallm_off)   winner=tiled by 1.63x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T3.81 32x128:T1.88 64x128:T1.83 128x128:T2.27 256x128:T1.96
+      (M=512 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=512 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=512 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=512 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M=  512  own-best: tiled=288.2(256x128)  ash=491.6(512x128)  prefill=931.4(prefill:smallm_off)   winner=tiled by 1.71x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.53 32x128:T2.47 64x128:T1.88 128x128:T2.28 256x128:T2.31
+      (M=2048 tiled@256x256: RuntimeError: V7_CFG 256x256 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=2048 tiled@384x128: RuntimeError: V7_CFG 384x128 needs 69632 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=2048 tiled@512x128: RuntimeError: V7_CFG 512x128 needs 87040 B of LDS at group_size=128 (max 65536); pick a smalle)
+      (M=2048 ash@256x256: AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.d)
+    M= 2048  own-best: tiled=962.2(256x128)  ash=1714.8(512x128)  prefill=3445.5(prefill:smallm_off)   winner=tiled by 1.78x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T3.01 32x128:T2.46 64x128:T1.90 128x128:T2.01 256x128:T2.79
+
+=== lag.gate_up  tp1  K=2048 N=16384 g=32 bfloat16 zeros=awq ===
+    M=   17  own-best: tiled=207.7(256x128)  ash=215.7(256x128)  prefill=226.6(prefill)   winner=tiled by 1.04x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.48 32x128:T1.09 64x128:T1.06 128x128:T1.02 256x128:T1.04 256x256:A1.52 384x128:A1.27 512x128:A1.01
+    M=   24  own-best: tiled=203.6(256x128)  ash=207.2(256x128)  prefill=228.5(prefill)   winner=tiled by 1.02x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.40 32x128:T1.11 64x128:T1.06 128x128:T1.03 256x128:T1.02 256x256:A1.53 384x128:A1.24 512x128:A1.04
+    M=   32  own-best: tiled=195.7(256x128)  ash=208.3(256x128)  prefill=244.0(prefill)   winner=tiled by 1.06x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.36 32x128:T1.16 64x128:T1.07 128x128:T1.04 256x128:T1.06 256x256:A1.54 384x128:A1.21 512x128:A1.16
+    M=   48  own-best: tiled=199.0(256x128)  ash=219.6(256x128)  prefill=262.6(prefill)   winner=tiled by 1.10x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.42 32x128:T1.28 64x128:T1.10 128x128:T1.08 256x128:T1.10 256x256:A1.50 384x128:A1.60 512x128:A1.19
+    M=   63  own-best: tiled=196.6(256x128)  ash=230.7(256x128)  prefill=288.1(prefill)   winner=tiled by 1.17x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.61 32x128:T1.15 64x128:T1.13 128x128:T1.12 256x128:T1.17 256x256:A1.47 384x128:A1.55 512x128:A1.16
+    M=   64  own-best: tiled=196.8(256x128)  ash=230.9(256x128)  prefill=288.8(prefill)   winner=tiled by 1.17x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.65 32x128:T1.14 64x128:T1.13 128x128:T1.12 256x128:T1.17 256x256:A1.45 384x128:A1.54 512x128:A1.14
+    M=  128  own-best: tiled=211.0(256x128)  ash=289.7(256x128)  prefill=745.5(prefill:smallm_off)   winner=tiled by 1.37x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.74 32x128:T2.25 64x128:T1.13 128x128:T1.19 256x128:T1.37 256x256:A1.32 384x128:T1.11 512x128:T1.35
+    M=  256  own-best: tiled=249.0(256x128)  ash=422.7(256x128)  prefill=955.7(prefill)   winner=tiled by 1.70x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.72 32x128:T1.73 64x128:A1.22 128x128:T1.20 256x128:T1.70 256x256:A1.16 384x128:T1.50 512x128:T1.71
+    M=  512  own-best: tiled=464.4(256x128)  ash=845.3(256x128)  prefill=1843.6(prefill)   winner=tiled by 1.82x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.89 32x128:T1.43 64x128:A1.18 128x128:T1.45 256x128:T1.82 256x256:A1.15 384x128:T1.43 512x128:T1.09
+    M= 2048  own-best: tiled=1967.0(256x128)  ash=2813.3(512x128)  prefill=7116.7(prefill)   winner=tiled by 1.43x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.65 32x128:T1.68 64x128:T1.25 128x128:T1.42 256x128:T1.46 256x256:A1.35 384x128:T1.41 512x128:T1.38
+
+=== q27.gate_up  tp1  K=5120 N=34816 g=32 bfloat16 zeros=awq ===
+    M=   17  own-best: prefill=797.0(prefill)  ash=951.2(256x128)  tiled=982.3(256x128)   winner=prefill by 1.19x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.07 32x128:T1.13 64x128:A1.10 128x128:T1.20 256x128:A1.03 256x256:A1.90 384x128:A1.06 512x128:T1.10
+    M=   24  own-best: prefill=822.5(prefill)  ash=963.0(256x128)  tiled=975.6(128x128)   winner=prefill by 1.17x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.86 32x128:T1.14 64x128:A1.21 128x128:T1.21 256x128:A1.01 256x256:A1.94 384x128:A1.06 512x128:T1.06
+    M=   32  own-best: prefill=869.7(prefill)  ash=969.0(256x128)  tiled=969.7(128x128)   winner=prefill by 1.11x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.80 32x128:T1.19 64x128:A1.07 128x128:T1.26 256x128:A1.02 256x256:A1.91 384x128:T1.02 512x128:T1.05
+    M=   48  own-best: tiled=990.7(256x128)  prefill=1001.9(prefill)  ash=1046.6(256x128)   winner=tiled by 1.01x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.77 32x128:T1.13 64x128:A1.14 128x128:T1.32 256x128:T1.06 256x256:A1.87 384x128:T1.04 512x128:T1.11
+    M=   63  own-best: tiled=1001.7(128x128)  prefill=1172.1(prefill)  ash=1174.8(256x128)   winner=tiled by 1.17x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.39 32x128:A1.11 64x128:A1.04 128x128:T1.41 256x128:T1.16 256x256:A1.79 384x128:T1.11 512x128:T1.09
+    M=   64  own-best: tiled=1002.1(256x128)  prefill=1173.3(prefill)  ash=1176.8(256x128)   winner=tiled by 1.17x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.36 32x128:A1.18 64x128:A1.12 128x128:T1.37 256x128:T1.17 256x256:A1.82 384x128:T1.17 512x128:T1.09
+    M=  128  own-best: tiled=1272.1(256x128)  ash=1432.4(256x128)  prefill=3381.4(prefill)   winner=tiled by 1.13x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T2.90 32x128:T1.54 64x128:T1.10 128x128:T1.44 256x128:T1.13 256x256:A1.64 384x128:T1.14 512x128:T1.12
+    M=  256  own-best: tiled=1477.8(256x128)  ash=2083.6(256x128)  prefill=4632.6(prefill)   winner=tiled by 1.41x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.88 32x128:T1.83 64x128:T1.28 128x128:T1.42 256x128:T1.41 256x256:A1.35 384x128:T1.28 512x128:T1.18
+    M=  512  own-best: tiled=2537.6(256x128)  ash=3668.5(512x128)  prefill=9001.1(prefill:smallm_off)   winner=tiled by 1.45x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.71 32x128:T1.43 64x128:T1.18 128x128:T1.29 256x128:T1.49 256x256:A1.34 384x128:T1.31 512x128:A1.29
+    M= 2048  own-best: tiled=9401.2(256x128)  ash=14301.6(512x128)  prefill=34885.8(prefill:smallm_off)   winner=tiled by 1.52x
+             tile-equalized (T=tiled A=ash, ratio): 16x128:T1.98 32x128:T1.84 64x128:T1.34 128x128:T1.55 256x128:T1.56 256x256:A1.35 384x128:T1.54 512x128:T1.46
+
+done.

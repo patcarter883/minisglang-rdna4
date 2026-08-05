@@ -343,6 +343,23 @@ def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     (num_tokens*top_k / num_experts). Pure function of static shapes => cudagraph-capture-safe (a
     captured decode graph always sees small M => 16, exactly as before). ``MINISGL_MOE_BLOCK_M`` forces
     a value (16/32/64/128) for autotuning / to restore the historical fixed 16.
+
+    WHY THIS IS STILL ONE VARIABLE, with the shared analytic chooser sitting next to it. The dense
+    tile became a cost-model choice (fp8_wmma/tile_select.h) and the same model now covers the
+    grouped MoE core — ``fp8_wmma.moe_tile_choose(rows, E, n1, k1, g1, n2, k2, g2)`` returns the
+    (block_m, BN, BN) this function would defer to, host-side and cudagraph-safe. It is NOT wired
+    yet because it was measured, over 28 (shape, M) cells x 25 tiles (tools/w4a8_moe_tile_surface.py,
+    graph-replay timed, expert stacks rotated past the 64 MB MALL by BYTE count):
+
+        M >= 64 : 1.80x - 3.01x FASTER than this rule    (which asks for 16 rows where the oracle
+                                                          wants 32x192 — a 2.3-3.0x miss)
+        M <= 32 : 0.76x - 0.85x, i.e. up to 24% SLOWER   <-- the served decode point
+
+    At M<=32 an expert holds ~1 routed row, so a block is nearly all masked padding, and no term in
+    that model prices it. This rule is near-oracle exactly there (1.00x on almost every M<=32 cell)
+    and 2.3-3.0x off exactly where the model is right. Trading 1.9x of prefill for 24% of decode is
+    the wrong trade, so the rule stays until the model has the missing term — see the OPEN note in
+    tile_select.h, and tools/w4a8_moe_tile_verify.py for the three-arm A/B that produced these.
     """
     forced = _os.environ.get("MINISGL_MOE_BLOCK_M")
     if forced:
@@ -1213,27 +1230,6 @@ def rxf_moe_regdirect(
     return acc.to(x.dtype)
 
 
-def _tiled_last_wave_occupancy(n: int) -> float:
-    """How full is `wmma_tiled_tuned`'s LAST dispatch wave at output width `n`?
-
-    In the mid-band (M < its BM=256) the tiled kernel's grid is exactly ceil(N / BN) workgroups —
-    one row-block, one column-block per BN=128 slice of N — so the whole launch is `tiles` blocks
-    over the device's CUs. When `tiles` is a multiple of the CU count every wave is full; when it is
-    not, the last wave runs at `tiles / (waves * CU)` occupancy and the kernel pays a full wave for a
-    fraction of a wave's work. That is the term the mid-band surface is non-monotonic in, and it is a
-    property of the DEVICE as much as of the shape — see `_pick_dense_kernel`.
-
-    Returns 1.0 when the CU count cannot be read (no HIP device: CPU tests, meta init), which makes
-    the caller prefer `wmma_tiled_tuned` — the right default, since it is the mid-band winner
-    everywhere the wave is full.
-    """
-    cu = _device_cu_count()
-    if cu <= 0:
-        return 1.0
-    tiles = -(-n // _W4A8_TILED_BN)
-    return tiles / (cu * -(-tiles // cu))
-
-
 _CU_COUNT: dict[int, int] = {}
 
 
@@ -1300,67 +1296,49 @@ def _pick_dense_kernel(
       all M rows (amortizing the weight read), writing straight to `out`. Serves the decode/decode-
       batch band; measured crossover int4 M<=8, e2m1 M<=16 (also the only e2m1-capable small-M kernel;
       decode_gemv's in-kernel cap is 16).
-    - m >= _W4A8_PREFILL_TILED_MIN -> wmma_tiled_tuned: the tuned tiled WMMA GEMM. Dominates the prefill
-      regime ~2-4x over prefill_wmma (re-bench), for BOTH int4 AND e2m1 now that the tiled kernel is
-      e2m1-bit-exact and carries the packed-store. Bit-exact + graph-capture-safe (writes to `out`,
-      no in-op at::zeros). One dtype-generic rule — no int4-vs-e2m1 branch.
-    - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> a THREE-WAY surface: wmma_tiled_tuned for
-      the large majority, prefill_wmma in a wide-N corner, prefill_wmma_ashuffle in a tall-K box.
-      The old rule sent the WHOLE mid-band to prefill_wmma on the claim that "its conservative config
-      still wins the small-M/wide-N corner (tiled loses only at N>=6144, M<=32)". Measured, the claim
-      is right that a corner exists and wrong about where it is, and it has no N term at all — so a
-      wide-N conclusion was applied at every width, and the rule was BACKWARDS on essentially every
-      shape this engine dispatches.
+    - m > gemv_max -> wmma_tiled_tuned, at EVERY M, N, K and group size. One arm, no surface.
 
-    THE MID-BAND SURFACE (measured 2026-08-05, tools/w4a8_dense_midband_surface.py, CUDA-graph-replay
-    timed with the weights rotated past the 64 MB MALL by BYTE count; 24 shipped shapes x 24 synthetic
-    (M,N) grid cells x 13 M values x 3 arms, RX 9070 XT; fixture _midband_surface.txt). Of the 432
-    mid-band cells wmma_tiled_tuned wins 306, prefill_wmma_ashuffle 67, prefill_wmma 59.
+    THIS USED TO BE A THREE-WAY ARM DISPATCH and it was measured to be one — a wide-N corner to
+    prefill_wmma, a tall-K/mid-N box to prefill_wmma_ashuffle, the rest to wmma_tiled_tuned, fitted
+    over 432 mid-band cells. Every one of those measurements was CONFOUNDED, in a way that is worth
+    writing down because it is a general trap: the three arms each carried their OWN tile knob, their
+    OWN tile SET, and their OWN independently-frozen 256x128 default. Only prefill_wmma had a small-M
+    tile (a hardcoded `M<128 -> BM=64`), and only ashuffle shipped BM=16/32. So "which arm wins at
+    M=17" was answering "which arm happens to expose a tile near M=17" — an accident of which
+    launcher had been tuned, not a property of any algorithm. The arms are bit-identical to each
+    other; there was never any numerics in it.
 
-        rule                                    total us over the per-cell oracle   worst single cell
-        always prefill_wmma  (THE OLD RULE)                 +40.6%                  3.09x  N=1024 M=63
-        always wmma_tiled_tuned (retire both)               + 4.8%                  1.57x  N=10240 M=17
-        + wide-N corner                                     + 1.36%                 1.17x  N=9216  M=56
-        + ashuffle box            (THE NEW RULE)            + 0.55%                 1.17x  N=9216  M=56
+    The fix was in the kernel: wmma_tiled_tuned now derives (BM x BN) from the shape via an analytic
+    cost model over a 77-tile lattice (rdna4-hip-kernels fp8_wmma_rocm/tile_select.h). Against a
+    per-cell oracle over 210 graph-replay-timed cells the hard-wired 256x128 was 1.331x off (worst
+    2.95x); the best possible CONSTANT tile is 1.120x; the chooser is 1.042x. Re-timed live it is
+    1.296x faster than the hard-wire over 88 cells, peaking at 2.89x.
 
-      So the old rule was not a small mis-tune: on a narrow-N layer at M=63 it ran the mid-band 3x
-      slower than the arm sitting next to it. Both prefill arms nevertheless HAVE regimes — retiring
-      them costs 1.57x on GLM-4.7-Flash's gate_up (N=10240, M=17: 98.4 us vs 154.3 us) and 1.44x on
-      Qwen3.5-4B's (N=9216) — so this is `keep, bounded` for both, not `retire`.
-      CAUTION on ashuffle: it wins more CELLS than prefill_wmma but its median cell is worth only
-      1.038x, which is near the timing floor. Only the part of its band that survived a 3-pass
-      repeat on BOTH cards is routed; see _W4A8_ASHUFFLE_MIN_K.
+    WITH THE TILE DERIVED, THE ARMS HAVE NO REGIME (tools/w4a8_dense_tile_surface.py and
+    tools/w4a8_dense_tile_arms.py; fixtures _tile_surface.csv, _tile_arms.csv, _tile_verify.txt):
 
-    WHY NO SINGLE CONSTANT EXPRESSES IT. The surface is NOT monotonic in N. wmma_tiled_tuned wins at
-    N=8192 and N=16384 and loses at 9216 / 10240 / 11264 / 17408 / 34816, which is not noise: in the
-    mid-band its grid is exactly ceil(N/128) workgroups, and 8192 and 16384 are precisely the widths
-    at which that count (64, 128) is a whole number of 64-CU dispatch waves. Everywhere else the last
-    wave runs half empty and prefill_wmma — which tiles N by 64, i.e. quantizes at twice the
-    resolution, and takes a BM=64 small-M tile instead of padding M up to 256 — wins.
-    The deciding term is therefore the DEVICE's CU count, not a shape constant, and this box proves
-    it: on the RX 9070 (56 CUs, GPU 1) prefill_wmma wins at N=8192 AND N=16384, exactly where it
-    LOSES on the RX 9070 XT (64 CUs, GPU 0). Same shape, same M, opposite arm — so the two ranks of
-    one TP=2 job genuinely want different kernels, and any fixed N threshold is wrong on one of them.
-    Measured on both cards, 14/14 cells agree with the CU-derived rule and 0/14 with a fixed N
-    (tools/w4a8_dense_midband_crosscard.py; fixtures _midband_crosscard_{0,1}.txt).
+        at their SHIPPED tiles, 210 cells       prefill_wmma 0 wins, ashuffle 0 wins
+        TILE-EQUALIZED, 610 same-tile pairs     tiled 1.225x faster geomean than ashuffle
+        each arm at its OWN best tile, 80 cells tiled 70, ashuffle 5, prefill_wmma 5
+                                                 — and all 10 losses are an artifact of restricting
+                                                 tiled to ashuffle's 8-tile set; over the full
+                                                 lattice it takes them back (q27.gate_up tp1
+                                                 N=34816 M=17: prefill 800 us, tiled@256x128 986 us,
+                                                 the chooser's actual pick 128x64 634 us)
+        prefill_wmma small-M tile OFF           2.204x SLOWER across the mid-band than ON
 
-    THE STRUCTURAL FIX IS IN THE KERNEL, NOT HERE. This whole corner exists because
-    wmma_tiled_tuned's tile is HARD-WIRED to BM=256 x BN=128 while prefill_wmma already derives a
-    small-M tile (BM=64) from M. The tiled kernel accepts its tile at runtime (VLLM_W4A8_V7_CFG), and
-    swept over that knob it beats BOTH shipped arms across nearly the whole mid-band
-    (tools/w4a8_dense_midband_tilecfg.py, fixture _midband_tilecfg.txt; bit-identical at every tile):
+      ashuffle IS algorithmically different (B-only LDS, double-buffered, A-layout shuffle) and it
+      shows: at the 256x256 tile it beats tiled by 1.64x, the one place its staging pays. That is a
+      reason to fold its staging into the shared core as a policy, not a reason to keep a second
+      kernel and a dispatch rule — its own-best never catches tiled's own-best at any cell.
 
-        N=9216  M=17 :  prefill 160.2   tiled@256x128 235.6 (shipped)   tiled@64x64 114.5   -> 2.06x
-        N=10240 M=17 :  prefill  98.9   tiled@256x128 155.9 (shipped)   tiled@64x64  91.4   -> 1.71x
-        N=8192  M=17 :  prefill 145.4   tiled@256x128 127.8 (shipped)   tiled@64x64  98.2   -> 1.30x
-        N=2048  M=32 :  prefill 140.0   tiled@256x128  97.0 (shipped)   tiled@256x64 84.3   -> 1.15x
-
-      i.e. the tile is worth up to 2.06x and the ARM is worth at most ~1.6x — the arm choice this
-      function makes is the smaller half of the win, and it only exists because the bigger half was
-      left on the floor. The right fix is a shape-derived tile inside `mmq_fp8_gemm`'s tiled
-      launcher (it already does exactly this for prefill_wmma's SBM=64 path), after which the
-      mid-band arms plausibly have no regime at all and BOTH prefill arms can be retired. Until then
-      this dispatch is the best available from the three arms as shipped.
+      ONE regime survives at ~1.06x: GLM (group_size=128, N=10240) at M=17..24, prefill 100.8 us vs
+      the chooser's 106.9. That is ~6 us — one kernel dispatch on this box — and it is precisely
+      what the tiled path pays and prefill does not: prefill FUSES the activation fp8-quant into its
+      prologue, while wmma_tiled_tuned takes pre-quantized activations and so eats a separate
+      `compute_act_fp8_and_scales_kernel` launch plus an (M,K) uint8 HBM round-trip inside
+      `mmq_fp8_gemm`. Producer-side fusion is the fix; a second GEMM is not. Note the tiled arm was
+      carrying that handicap in every number above and still won.
 
     The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
     in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
@@ -1412,29 +1390,46 @@ def _pick_dense_kernel(
     # able to reach prefill_wmma in the mid-band. It is a property of the ARMS, not of e2m1.
     if group_size % 32 != 0:
         return "wmma_tiled_tuned"
-    if m >= _W4A8_PREFILL_TILED_MIN:
-        return "wmma_tiled_tuned"
-    # THE MID-BAND — a three-way surface, not a threshold. Over the 432 measured mid-band cells
-    # wmma_tiled_tuned takes 306; the other 126 split between TWO DISJOINT regions belonging to two
-    # different arms, neither of which a single constant can name. `n=None` (caller did not pass N)
-    # keeps wmma_tiled_tuned, which is both the safe arm and the majority one.
-    if n is None:
-        return "wmma_tiled_tuned"
-    # (a) THE WIDE-N CORNER — tiled's coarse N tiling leaves a ragged dispatch wave. Device-dependent.
-    if (
-        n >= _W4A8_PREFILL_WIDE_N
-        and m <= _W4A8_PREFILL_WIDE_MAX_M
-        and _tiled_last_wave_occupancy(n) < _W4A8_TILED_WAVE_FULL
-    ):
-        return "prefill_wmma"
-    # (b) THE TALL-K / MID-N BOX — prefill_wmma_ashuffle, a third arm that shipped in the package but
-    #     appeared in no dispatch, wins here at EVERY mid-band M on BOTH cards.
-    if (
-        k is not None
-        and k >= _W4A8_ASHUFFLE_MIN_K
-        and _W4A8_ASHUFFLE_MIN_N <= n <= _W4A8_ASHUFFLE_MAX_N
-    ):
-        return "prefill_wmma_ashuffle"
+    # THE MID-BAND IS NO LONGER A SURFACE, so there is no longer an M threshold here either.
+    #
+    # It used to be a three-way arm dispatch — a wide-N corner to prefill_wmma, a tall-K/mid-N box
+    # to prefill_wmma_ashuffle, the rest to wmma_tiled_tuned. That whole surface was an artifact of
+    # a MISSING TILE SELECTOR, not of anything algorithmic. The three arms each carried their own
+    # tile knob, their own tile SET, and their own independently-frozen 256x128 default, so "which
+    # arm wins at M=17" was really "which arm happens to expose a tile near M=17": prefill_wmma was
+    # the only arm with a small-M branch (M<128 -> BM=64) and ashuffle the only one shipping
+    # BM=16/32. wmma_tiled_tuned now derives its tile from the shape (an analytic cost model over a
+    # 77-tile lattice; kernels' tile_select.h), the asymmetry is gone, and so is the surface.
+    #
+    # RE-MEASURED with the chooser live (graph-replay timed, weights rotated past the 64 MB MALL by
+    # BYTE count; tools/w4a8_dense_tile_surface.py + tools/w4a8_dense_tile_arms.py, fixtures
+    # _tile_surface.csv / _tile_arms.csv / _tile_verify.txt):
+    #
+    #   * at their SHIPPED tiles, over 210 cells (14 dense shapes x M=1..2048), prefill_wmma and
+    #     prefill_wmma_ashuffle win ZERO cells against the tiled arm's per-cell oracle tile.
+    #   * TILE-EQUALIZED over ashuffle's whole 8-tile set (which wmma_tiled_tuned now instantiates
+    #     in full), 610 same-tile pairs: tiled is 1.225x faster geomean. ashuffle leads at exactly
+    #     one tile, 256x256 (1.64x its way) — real, and it is where its B-only double-buffered
+    #     staging pays — but its own-best never catches tiled's own-best.
+    #   * at EACH ARM'S OWN BEST TILE, 80 cells: tiled wins 70. All 10 losses are an artifact of
+    #     restricting tiled to the 8-tile common set; over the full lattice it takes them back —
+    #     the loudest, q27.gate_up tp1 N=34816 M=17, is prefill 800 us vs tiled@256x128 986 us, and
+    #     the chooser's actual pick there (128x64) is 634 us.
+    #   * prefill_wmma with VLLM_W4A8_DENSE_SMALLM_OFF=1 is 2.204x SLOWER across the mid-band than
+    #     with it on. Its entire mid-band edge was that one hardcoded tile.
+    #
+    # ONE regime survives, at ~1.06x: GLM (group_size=128, N=10240) at M=17..24 — prefill 100.8 us
+    # vs the chooser's 106.9. That gap is ~6 us, i.e. ONE kernel dispatch on this box, and it is
+    # exactly what the tiled path pays and prefill does not: prefill FUSES the activation fp8-quant
+    # into its prologue, while wmma_tiled_tuned consumes pre-quantized activations and therefore
+    # eats a separate `compute_act_fp8_and_scales_kernel` launch plus an (M,K) uint8 HBM round-trip
+    # inside `mmq_fp8_gemm`. The fix is producer-side fusion (quantise in the RMSNorm/residual that
+    # already has the values in registers), not a second GEMM — and note the tiled arm carried that
+    # handicap in every number above and still won.
+    #
+    # `k` and `n` are still taken and still used above (decode_gemv's K precondition); they no
+    # longer select an arm. The two prefill arms remain in the package, reachable by explicit
+    # `kernel=`, so the sweeps above stay reproducible — but nothing dispatches to them.
     return "wmma_tiled_tuned"
 
 
@@ -1477,65 +1472,16 @@ _W4A8_GEMV_MAX_E2M1 = 16
 # waves + 16 lanes) exercise it. The previous 512 was a stale inheritance from the LDS K-tiling that
 # consolidation retired, and it cost Gemma4 (K=2816) the decode GEMV entirely.
 _W4A8_GEMV_K_MULTIPLE = 32
-# Prefill regime: wmma_tiled_tuned dominates from here up (~2-4x prefill_wmma, bit-exact, graph-safe,
-# both dtypes) at EVERY N measured, on BOTH cards. True prefill/chunked-prefill M is always >> 64.
-_W4A8_PREFILL_TILED_MIN = 64
-
-# ---- the mid-band wide-N corner (all three terms measured; see _pick_dense_kernel's docstring) ----
-# These are NOT three independent knobs to tune: they are one measured region, and the region is
-# non-convex in N, so it takes a shape term, an M term AND a device term to fence. Moving any of them
-# without re-running tools/w4a8_dense_midband_surface.py re-opens the mistake this replaced — a rule
-# whose comment asserted a corner ("tiled loses only at N>=6144, M<=32") that had never been measured
-# and that, applied to the whole mid-band, cost up to 3.09x on a single shape.
-#
-# N floor. Below this width wmma_tiled_tuned wins the mid-band on every shape and both cards,
-# regardless of how ragged its last wave is — the launch is under one wave either way, so the tail
-# never costs a full wave. Measured: at N=6144 tiled wins 4/4 shapes on GPU 0 and 1/1 on GPU 1.
-_W4A8_PREFILL_WIDE_N = 8192
-# M ceiling. prefill_wmma's edge is its BM=64 small-M tile; it decays as M fills wmma_tiled_tuned's
-# BM=256 tile and is gone by M~56. The per-shape crossover ranges 32..63 (N=9216 and N=10240 keep
-# prefill_wmma ahead through 63; N=11264/17408/34816 give it up at 48), so this is a compromise, not
-# a cliff. 48 is the optimum on BOTH scores over the measured surface -- 0.45% off the per-cell
-# oracle and a 1.17x worst single cell, against 0.50%/1.30x at 40 and 0.70%/1.13x at 56.
-_W4A8_PREFILL_WIDE_MAX_M = 48
-# wmma_tiled_tuned's N tile, i.e. the BN in its `dim3 grid(ceil(M/BM), ceil(N/BN))`. Tracks the
-# kernel's VLLM_W4A8_V7_CFG default of "256x128"; if that default changes, this must change with it.
-_W4A8_TILED_BN = 128
-# What counts as "the last dispatch wave is full enough that the tail costs nothing". At 1.0 this is
-# exactly "ceil(N/BN) divides the CU count"; 0.9 leaves a margin so a near-multiple (e.g. 63 tiles on
-# a 64-CU card) is still treated as full. Every measured cell sits far from this edge — the ragged
-# cases run 0.56-0.85 and the full ones exactly 1.00 — so the threshold is not load-bearing between
-# them; it exists so an unmeasured width degrades toward wmma_tiled_tuned rather than away from it.
-_W4A8_TILED_WAVE_FULL = 0.9
-
-# ---- the mid-band tall-K / mid-N box, served by prefill_wmma_ashuffle --------------------------
-# The third arm. `prefill_wmma_ashuffle` has been in the fp8_wmma package the whole time (it gets A
-# out of LDS with a warp-shuffle transpose, leaving LDS to B alone and double-buffering it) and was
-# in NO dispatch — so the mid-band was being argued as a two-way threshold when it is a three-way
-# surface. It takes 67 of the 432 measured mid-band cells, MORE than prefill_wmma's 59.
-#
-# Cell count is the wrong statistic for a dispatch, though, and it nearly bought a third arm for
-# nothing: ashuffle's MEDIAN winning cell is worth 1.038x against a ~1.5% run-to-run spread, i.e.
-# most of those 67 cells are coin flips, while prefill_wmma's are worth up to 1.57x. What survives a
-# 3-pass repeat on BOTH cards (tools/w4a8_dense_midband_ashuffle.py, fixtures
-# _midband_ashuffle_{0,1}.txt — 71/72 cells kept the same winner all three passes) is a narrow box:
-#
-#     K=5120 N=6144  (Qwen3.6-27B q_proj, TP=1) : ashuffle wins EVERY M 17..63, both cards,
-#                                                 1.00-1.09x on GPU 0, 1.08-1.16x on GPU 1
-#     K=8704 N=5120  (Qwen3.6-27B down,   TP=2) : ashuffle wins EVERY M 17..63, both cards,
-#                                                 1.01-1.12x on GPU 0, 1.03-1.16x on GPU 1
-#     K=5120 N=8192                             : NOT in the box — GPU 0 gives it to ashuffle at
-#                                                 M<=32 and GPU 1 to prefill_wmma at every M, so it
-#                                                 is card-split and is left to the (a) rule above
-#     K=5120 N=1024 / K=2048 N=2048 (controls)  : ashuffle LOSES 1.3-1.8x — hence a two-sided N box
-#
-# Adding it takes the mid-band residual from 1.36% to 0.55% of the per-cell oracle and does NOT
-# raise the worst cell (1.17x either way). The bounds are deliberately TIGHT: outside them this arm
-# loses by up to 1.8x, and the box is fitted to the two shipped shape families that populate it, so
-# widening it is a measurement, not an edit.
-_W4A8_ASHUFFLE_MIN_K = 5120
-_W4A8_ASHUFFLE_MIN_N = 5120
-_W4A8_ASHUFFLE_MAX_N = 6144
+# The prefill/mid-band ARM constants that used to live here — _W4A8_PREFILL_TILED_MIN,
+# _W4A8_PREFILL_WIDE_N, _W4A8_PREFILL_WIDE_MAX_M, _W4A8_TILED_BN, _W4A8_TILED_WAVE_FULL,
+# _W4A8_ASHUFFLE_{MIN_K,MIN_N,MAX_N}, and the _tiled_last_wave_occupancy() they fed — are DELETED,
+# not merely unused. All eight described a THREE-WAY ARM SURFACE that only existed because
+# wmma_tiled_tuned's tile was hard-wired to 256x128 while the other two arms carried tiles of their
+# own. With the tile derived from the shape in the kernel (tile_select.h), the surface is gone and
+# every one of those constants is a fossil that would silently re-open the mistake the moment
+# someone "tuned" it. `_W4A8_TILED_BN = 128` in particular was a COPY of the kernel's default tile
+# living in a second file — exactly the kind of duplicated constant that goes stale; the tile is
+# now asked for, not assumed (`fp8_wmma.dense_tile_explain(M, N, K, group_size)`).
 
 
 def w4a8_linear(

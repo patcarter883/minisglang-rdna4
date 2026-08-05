@@ -1,0 +1,35 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles: 32x64x4,32x128x4   experiments: stage,swiz
+
+====================================================================================================
+STAGE ABLATION -- which stage carries the gap? (VLLM_W4A8_V7_DIAG)
+====================================================================================================
+--- stage  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=   668.2   32x128x4=  2501.4 (3.74x)
+    diag=1  no_wmma               32x64x4=   598.5   32x128x4=  2526.8 (4.22x)
+    diag=2  no_global             32x64x4=   453.3   32x128x4=   521.1 (1.15x)
+    diag=4  no_ldswrite           32x64x4=   511.3   32x128x4=  2439.7 (4.77x)
+    diag=8  no_ldsread            32x64x4=   606.9   32x128x4=  2490.0 (4.10x)
+    diag=16 no_wscale             32x64x4=   438.8   32x128x4=   703.1 (1.60x)
+    diag=18 no_global+no_wscale   32x64x4=   343.7   32x128x4=   440.9 (1.28x)
+--- stage  K=2816 N=131072 g=32 M=48   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                  32x64x4=  1187.2   32x128x4=  1201.8 (1.01x)
+    diag=1  no_wmma               32x64x4=  1158.8   32x128x4=  1127.7 (0.97x)
+    diag=2  no_global             32x64x4=   828.2   32x128x4=   917.4 (1.11x)
+    diag=4  no_ldswrite           32x64x4=   951.4   32x128x4=   915.0 (0.96x)
+    diag=8  no_ldsread            32x64x4=  1336.7   32x128x4=  1300.6 (0.97x)
+    diag=16 no_wscale             32x64x4=   950.3   32x128x4=  1053.0 (1.11x)
+    diag=18 no_global+no_wscale   32x64x4=   694.9   32x128x4=   822.3 (1.18x)
+====================================================================================================
+SWIZZLE -- does putting M on the fast grid axis move it?
+====================================================================================================
+--- swiz  K=2816 N=131072 g=32 M=1   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                 swiz=1  32x64x4=   624.9   32x128x4=  2475.7 (3.96x)
+    diag=0  full                 swiz=0  32x64x4=   613.1   32x128x4=  2472.5 (4.03x)
+--- swiz  K=2816 N=131072 g=32 M=48   rotation 2 x 207.6 MB = 415 MB
+    diag=0  full                 swiz=1  32x64x4=  1225.6   32x128x4=  1190.2 (0.97x)
+    diag=0  full                 swiz=0  32x64x4=  1453.9   32x128x4=  4623.5 (3.18x)
+
+done

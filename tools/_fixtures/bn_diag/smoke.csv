@@ -1,0 +1,15 @@
+exp,K,N,g,M,tile,diag,diagname,swiz,us,reps,R,dev,cu,card,lease,exclusive
+stage,2816,8192,32,1,32x64x4,0,full,0,72.980,18,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,0,full,0,104.176,13,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,1,no_wmma,0,65.049,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,1,no_wmma,0,90.446,15,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,2,no_global,0,65.292,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,2,no_global,0,87.134,16,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,4,no_ldswrite,0,52.529,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,4,no_ldswrite,0,67.750,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,8,no_ldsread,0,64.585,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,8,no_ldsread,0,93.819,14,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,16,no_wscale,0,52.510,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,16,no_wscale,0,81.319,17,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x64x4,18,no_global+no_wscale,0,53.953,20,14,AMD Radeon RX 9070 XT,64,0,"0,1",1
+stage,2816,8192,32,1,32x128x4,18,no_global+no_wscale,0,75.028,19,14,AMD Radeon RX 9070 XT,64,0,"0,1",1

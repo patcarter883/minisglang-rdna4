@@ -1,0 +1,28 @@
+  visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
+  visible cuda:1 = AMD Radeon RX 9070  CUs=56
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1   fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+tiles: 128x64,32x64x4,64x128x4,32x64   experiments: swiz
+
+====================================================================================================
+SWIZZLE -- does putting M on the fast grid axis move it?
+====================================================================================================
+--- swiz  K=2048 N=16384 g=32 M=1   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   183.8   32x64x4=   212.6 (1.16x)   64x128x4=   270.2 (1.47x)   32x64=   307.7 (1.67x)
+    diag=0  full                 swiz=0  128x64=   167.9   32x64x4=   206.7 (1.23x)   64x128x4=   270.5 (1.61x)   32x64=   308.6 (1.84x)
+--- swiz  K=2048 N=16384 g=32 M=17   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   162.1   32x64x4=   227.9 (1.41x)   64x128x4=   266.6 (1.64x)   32x64=   316.3 (1.95x)
+    diag=0  full                 swiz=0  128x64=   162.2   32x64x4=   226.0 (1.39x)   64x128x4=   266.4 (1.64x)   32x64=   316.4 (1.95x)
+--- swiz  K=2048 N=16384 g=32 M=32   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   148.3   32x64x4=   272.5 (1.84x)   64x128x4=   268.4 (1.81x)   32x64=   344.7 (2.32x)
+    diag=0  full                 swiz=0  128x64=   148.3   32x64x4=   273.0 (1.84x)   64x128x4=   270.2 (1.82x)   32x64=   339.3 (2.29x)
+--- swiz  K=2048 N=16384 g=32 M=48   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   156.9   32x64x4=   131.5 (0.84x)   64x128x4=   266.8 (1.70x)   32x64=   255.8 (1.63x)
+    diag=0  full                 swiz=0  128x64=   156.7   32x64x4=   391.2 (2.50x)   64x128x4=   266.3 (1.70x)   32x64=   319.1 (2.04x)
+--- swiz  K=2048 N=16384 g=32 M=64   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   157.5   32x64x4=   135.4 (0.86x)   64x128x4=   262.4 (1.67x)   32x64=   300.1 (1.91x)
+    diag=0  full                 swiz=0  128x64=   157.0   32x64x4=   387.2 (2.47x)   64x128x4=   262.0 (1.67x)   32x64=   308.4 (1.96x)
+--- swiz  K=2048 N=16384 g=32 M=128   rotation 10 x 18.9 MB = 189 MB
+    diag=0  full                 swiz=1  128x64=   179.2   32x64x4=   244.0 (1.36x)   64x128x4=   183.3 (1.02x)   32x64=   426.1 (2.38x)
+    diag=0  full                 swiz=0  128x64=   181.0   32x64x4=   509.2 (2.81x)   64x128x4=   390.1 (2.16x)   32x64=   472.8 (2.61x)
+
+done
