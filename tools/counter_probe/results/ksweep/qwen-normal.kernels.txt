@@ -1,0 +1,99 @@
+WARNING: skipped 6 torn CSV rows (concurrent TP-rank writes)
+  coverage Agent 1:   998740 dispatches over  98.58 s   FULL
+  coverage Agent 2:    59048 dispatches over   3.28 s   *** TRUNCATED — DO NOT USE ***
+trace: /home/pat/code/minisgl-rdna4-ksweep/rpv3-ksweep-qwen-normal-109053051622
+steps: 800   loop kinds: {'normal_step': 800}   agents: ['Agent 1', 'Agent 2']
+  Agent 1 = AMD Radeon RX 9070 XT
+  Agent 2 = AMD Radeon RX 9070
+  Agent 3 = AMD Ryzen 7 7800X3D 8-Core Processor
+
+=== window iters 120..319 (200 steps) marker wall/step 60.414 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 807 kernels/step  busy(UNION) 5.441 ms = 9.0%  IDLE 91.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      2.8115   183.5  51.67      3920         0     384    6144  100.0    33    17     8    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      0.9321    59.2  17.13     12760         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.5842    29.2  10.74     19520         0    1024    4096  100.0   100     0     1    40     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::  
+      0.4319    29.2   7.94     14760         0      64    2048   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.4233    21.9   7.78     14720         6       8      64    3.1   100   100     1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 1  WG<64,OCC<25
+      0.1955    29.2   3.59      6680         0       1       8    0.4   100   100     1    48     0  anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>  WG<64,OCC<25
+      0.1833     7.3   3.37     25040         0     128    1024   50.0   100     0     1   112     0  anon::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 25  
+      0.1418    29.2   2.61      4840         0       8      64    3.1   100   100     1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.0819    29.2   1.51      2800      2915       1       8    0.4   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0690    29.3   1.27      2360      8640       1       8    0.4   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0565    30.1   1.04      1680      5234       1      16    0.8    88   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0523    29.2   0.96      1800      7962       2       8    0.4   100   100     1    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.0487    36.6   0.89      1320      2187       1       8    0.4   100   100     1    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sig  WG<64,OCC<25
+      0.0471    29.2   0.87      1561      4375     128    1024   50.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+  Agent 2 [AMD Radeon RX 9070]: 297 kernels/step  busy(UNION) 2.395 ms = 4.0%  IDLE 96.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      0.9013    67.5  37.63      3920      4160     384    6144  100.0    34    20     8    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      0.4686    21.8  19.57     10920      4200       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.2118    10.8   8.85     19680      4160    1024    4096  100.0   100     0     1    40     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::  
+      0.1921    10.7   8.02     17840      4160      64    2048   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      0.1605     8.1   6.70     15200      4200       8      64    3.1   100   100     1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 1  WG<64,OCC<25
+      0.0730    10.7   3.05      6800      4160       1       8    0.4   100   100     1    48     0  anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>  WG<64,OCC<25
+      0.0523    10.7   2.18      4880      4160       8      64    3.1   100   100     1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.0481     2.7   2.01     17960      4200     128    1024   50.0   100     0     1   112     0  anon::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 25  
+      0.0304    10.8   1.27      2840      4160       1       8    0.4   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.0256    10.8   1.07      2360      4160       1       8    0.4   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+      0.0229    11.0   0.96      1480      4320       1      16    0.8    91   100     4    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0193    10.7   0.81      1800      4160       2       8    0.4   100   100     1    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.0180    13.4   0.75      1320      4160       1       8    0.4   100   100     1    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sig  WG<64,OCC<25
+      0.0179    10.8   0.75      1640      4160     128    1024   50.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+
+=== window iters 620..819 (200 steps) marker wall/step 81.172 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 1398 kernels/step  busy(UNION) 13.989 ms = 17.2%  IDLE 82.8%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      5.7815   251.0  41.33     12000         0     384    6144  100.0    25    35     8    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      3.2840    81.0  23.48     17320         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      1.6951    40.0  12.12     42201         0     384   12288   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      1.2783    40.0   9.14     31960         0      48     384   18.8   100   100     1    80     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, g  WG<64,OCC<25
+      0.7846    30.0   5.61     20920       132      48     384   18.8   100   100     1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 1  WG<64,OCC<25
+      0.6070    40.0   4.34     14960         0     768    6144  100.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.5315    40.0   3.80     13280         0       8      64    3.1   100   100     1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.3568   211.0   2.55      1800       142      12      48    2.3    42    97     5    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.2461    10.0   1.76     24640         0     768    6144   75.0   100     0     1   112     0  anon::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 25  
+      0.1867    40.0   1.33      4680         0       6      48    2.3   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.1768     1.0   1.26    177001      3958       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.1128    40.0   0.81      2840      8554       6      48    2.3   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.1093    40.0   0.78      2720      8262       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0951    40.0   0.68      2360     11328       6      48    2.3   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+
+=== window iters 1130..1329 (200 steps) marker wall/step 83.541 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 1397 kernels/step  busy(UNION) 13.946 ms = 16.7%  IDLE 83.3%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+      5.7911   251.0  41.53     11960         0     384    6144  100.0    25    35     8    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      3.5135    81.0  25.19     16241         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      1.5024    40.0  10.77     37400         0     384   12288   75.0   100     0     1   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::I  
+      1.2342    40.0   8.85     30881         0      48     384   18.8   100   100     1    80     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, g  WG<64,OCC<25
+      0.8018    30.0   5.75     21200         0      48     384   18.8   100   100     1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 1  WG<64,OCC<25
+      0.6088    40.0   4.37     15000         0     768    6144  100.0   100     0     1    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.5304    40.0   3.80     13240         0       8      64    3.1   100   100     1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  WG<64,OCC<25
+      0.3495   211.0   2.51      1720       273      12      48    2.3    42    97     5    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  WG<64,OCC<25
+      0.2507    10.0   1.80     25120         0     768    6144   75.0   100     0     1   112     0  anon::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 25  
+      0.1857    40.0   1.33      4640         0       6      48    2.3   100   100     1    32     0  anon::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe  WG<64,OCC<25
+      0.1771     1.0   1.27    177202      3918       2      16    0.8   100   100     1   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.1115    40.0   0.80      2760      8564       6      48    2.3   100   100     1    40     0  anon::rms_norm_add_kernel<__hip_bfloat16, true>  WG<64,OCC<25
+      0.1083    40.0   0.78      2720      7497       1       8    0.4   100   100     1    16     0  anon::moe_align_kernel  WG<64,OCC<25
+      0.0935    40.0   0.67      2320     10746       6      48    2.3   100   100     1    32     0  anon::rms_norm_add_kernel<__hip_bfloat16, false>  WG<64,OCC<25
+
+=== window iters 1600..1799 (200 steps) marker wall/step 131.487 ms  classes={'prefill': 79, 'decode': 120} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 1391 kernels/step  busy(UNION) 100.529 ms = 76.5%  IDLE 23.5%
+     ms/step  n/step  %busy   ns/disp  gapAfter   domWG   waves   occ%  dom% strv% grids  vgpr   scr  kernel
+     48.7404    16.1  48.48   3012432         0    2624    2624   50.0    42     0     5   184     0  w4a8_fp8_moe::moe_gemm1_silu_ashuffle_kernel<__hip_bfloat16,  
+     25.5999    72.8  25.47     23880         0       8      64    3.1   100   100     1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      8.6328    16.1   8.59    533445         0   20992   83968  100.0    42     0     5    40     0  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<__hip_bfloat16, w4  
+      5.5497    11.9   5.52    845068         0      16     128    6.2   100   100     1   184     0  gdn_prefill_wmma_kernel<c10::BFloat16, c10::BFloat16, 128, 1  WG<64,OCC<25
+      3.0268    11.9   3.01    471644         0      16     128    6.2   100   100     1    40     0  causal_conv1d_fwd_kernel<c10::BFloat16>  WG<64,OCC<25
+      2.7904    12.1   2.78    230522         0     624    2496   31.2    49     0     4   256     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI  
+      2.5465     2.0   2.53   1269454         0     832    3328   31.2    42     0     5   248     0  anon::flash_prefill_paged_fp8_kernel<__hip_bfloat16, 256, 4,  
+      2.1248    36.2   2.11     42120         0      32     256   12.5    46    46     4   160     0  dense_gemm::dense_gemm_pipe_kernel<64, 2, 64, 1, false, __hi  WG<64,OCC<25
+      1.9211   105.1   1.91      3960         0    7760  124160  100.0    30    14     8    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+      1.0416    20.1   1.04     33840         0      52     416   20.3    58    87     4    72     0  dense_gemm::dense_gemm_rd_kernel<64, false, __hip_bfloat16>  WG<64,OCC<25
+      0.8645    16.1   0.86     53561         0    6656   53248  100.0    42     0     5     8     0  w4a8_fp8_moe::moe_gather_reduce_kernel<__hip_bfloat16>  
+      0.7784   123.1   0.77      2600      2850    3328   13312  100.0    17    24    53    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::nat  
+      0.7359    40.0   0.73      8081      2436   10496   83968  100.0    37     0    20    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.6875    20.1   0.68     23840      4072     384    6144  100.0    28    43     7    48     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::B  
+
+wrote /home/pat/code/minisgl-rdna4-ksweep/tools/counter_probe/results/ksweep/qwen-normal.kernels.json
+wrote /home/pat/code/minisgl-rdna4-ksweep/tools/counter_probe/results/ksweep/qwen-normal.kernels.csv
