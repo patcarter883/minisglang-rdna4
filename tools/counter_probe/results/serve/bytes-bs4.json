@@ -1,0 +1,22 @@
+{
+ "per_card_step_bytes": {
+  "self_attn": 272634880.0,
+  "linear_attn(GDN)": 1011553920.0,
+  "router": 41943040,
+  "norms/other": 331776,
+  "shared_expert": 251822080,
+  "routed_experts": 1110488400.0,
+  "lm_head": 508559360.0,
+  "embed_row": 16384,
+  "kv_cache_read": 13107200,
+  "gdn_state_rw": 251658240
+ },
+ "total_bytes": 3462115280.0,
+ "hbm_gbs": 706.6,
+ "bs": 4,
+ "ctx": 640,
+ "tp": 2,
+ "step_ms": 15.767,
+ "achieved_gbs": 219.57983636709582,
+ "pct_of_roofline": 31.075550009495586
+}

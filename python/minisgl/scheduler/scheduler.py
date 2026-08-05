@@ -411,6 +411,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self._rtx_step = 0
         self._rtx_skip = int(os.environ.get("MINISGL_ROCTX_SKIP") or "20")
         self._rtx_steps = int(os.environ.get("MINISGL_ROCTX_STEPS") or "20")
+        # MINISGL_ROCTX_WINDOWS="start:len,start:len,…" — SEVERAL collection windows in one run,
+        # for the plain-decode loops only (the spec step keeps the single SKIP/STEPS window).
+        # One window per run means one BOOT per measured batch size, and booting a 35B at TP=2 with
+        # graph capture costs more than the measurement does; a run that has to compare bs=1 against
+        # bs=8 then spends most of its GPU lease loading weights twice. Windows are matched by
+        # loop-iteration index, which is deterministic because `ignore_eos` + `max_tokens` fixes how
+        # many decode steps each driving request costs. Unset => the single SKIP/STEPS window.
+        _wins = (os.environ.get("MINISGL_ROCTX_WINDOWS") or "").strip()
+        if _wins:
+            self._rtx_windows = [
+                (int(a), int(a) + int(b))
+                for a, b in (w.split(":") for w in _wins.split(",") if w.strip())
+            ]
+        else:
+            self._rtx_windows = [(self._rtx_skip, self._rtx_skip + self._rtx_steps)]
 
         # --- env-gated per-stage HOST-overhead profiler (diagnostics only) -----------------------
         # MINISGL_HOSTPROF=<N> accumulates wall time by named loop stage and logs the breakdown every
@@ -1022,11 +1037,16 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         serve pays one `if` per step and allocates nothing.
         """
         self._rtx_step += 1
-        if self._rtx_step == self._rtx_skip:
-            _roctx.resume()
-        elif self._rtx_step == self._rtx_skip + self._rtx_steps:
-            _roctx.pause()
-        _roctx.push(name)
+        for _start, _end in self._rtx_windows:
+            if self._rtx_step == _start:
+                _roctx.resume()
+            elif self._rtx_step == _end:
+                _roctx.pause()
+        # The range NAME carries the loop index. Two things need it: proving WHICH iterations the
+        # window actually caught (a window placed by step count is only as good as that check), and
+        # cutting the kernel trace into steps — marker and kernel timestamps come from the same
+        # rocprofv3 clock, so consecutive range starts ARE the per-step wall boundaries.
+        _roctx.push(f"{name}#{self._rtx_step}")
 
     @torch.inference_mode()
     def run_forever(self) -> None:

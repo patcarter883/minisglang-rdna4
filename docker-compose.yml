@@ -151,6 +151,9 @@ x-lean-common: &lean-common
     MINISGL_ROCTX: "${MINISGL_ROCTX:-}"
     MINISGL_ROCTX_SKIP: "${MINISGL_ROCTX_SKIP:-}"
     MINISGL_ROCTX_STEPS: "${MINISGL_ROCTX_STEPS:-}"
+    # PLAIN-decode loops only: "start:len,start:len,…" opens SEVERAL windows in one run, so one boot
+    # can trace bs=1 and bs=8 (booting a 35B at TP=2 costs more than the measurement).
+    MINISGL_ROCTX_WINDOWS: "${MINISGL_ROCTX_WINDOWS:-}"
     # Per-phase spec step timing: =1 logs [spec-timing] propose/stage/forward/accept ms every 50 steps
     # (cuda-synchronized, so these are real GPU times, not queue times). Already implemented in the
     # scheduler but never forwarded, so it could not be reached through compose — which is the only

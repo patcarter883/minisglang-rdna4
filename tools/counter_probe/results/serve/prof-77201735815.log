@@ -1,0 +1,57 @@
+run=77201735815 mode=prof image=minisgl-rdna4:lean-prof port=22415
+commit=0d1f169869ff0fb485e144368627957d2e1557be dirty=4
+lease: ROCR_VISIBLE_DEVICES=0,1 HIP_VISIBLE_DEVICES=0,1 LEASE_ROCR_DEVICES=0,1
+serve: MODEL=qwen35b-awq SPEC=none TP=2 CONC=4 GRAPH_BS=4 MEM_RATIO=0.86 ATTN=hip KV_FP8=0
+roctx: WINDOWS=200:200,800:200 EXIT_AFTER_STEPS=1100
+drive: warm=16 tokA=600 tokB=600 M_B=4
+cmd:   exec rocprofv3 --kernel-trace --marker-trace --selected-regions --stats --output-format csv -d /engine/rpv3-busy-77201735815 -o busy -- /engine/tools/serve.sh
+perf_level card1=auto
+ Network cscoreprof77201735815_default Created 
+ Container cscore-prof-77201735815 Creating 
+ Container cscore-prof-77201735815 Created 
+ Container cscore-prof-77201735815 Starting 
+ Container cscore-prof-77201735815 Started 
+container=1ad2fac533b955823f55e714b7254d1b80cc16760aee46a7fe8e0a8514c632a5
+boot: engine raised while PID 1 stayed alive — not waiting out the timeout
+boot_ok=0
+=== BOOT FAILED — engine log tail ===
+  File "/engine/python/minisgl/engine/graph.py", line 350, in _capture_graphs
+    self.buffer.logits[:bs] = model.forward()
+                              ^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/models/qwen3_5.py", line 740, in forward
+    return self.lm_head.forward(self.model.forward(input_ids))
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/models/qwen3_5.py", line 439, in forward
+    x, layer_res = layer.forward(x, residual)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/utils/torch_utils.py", line 33, in wrapper
+    return fn(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/models/qwen3_5.py", line 335, in forward
+    x = _lp_timed(mixer, self._attn_op.forward, x)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/models/qwen3_5.py", line 63, in _lp_timed
+    return fn(arg)
+           ^^^^^^^
+  File "/engine/python/minisgl/utils/torch_utils.py", line 33, in wrapper
+    return fn(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/models/qwen3_5.py", line 173, in forward
+    o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/layers/attention.py", line 63, in forward
+    o = ctx.attn_backend.forward(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/python/minisgl/attention/hip.py", line 68, in forward
+    self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+  File "/engine/python/minisgl/kvcache/mha_pool.py", line 189, in store_kv
+    _STORE_KV(
+  File "/opt/venv/lib/python3.12/site-packages/torch/_ops.py", line 1280, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: tail_hip_C::store_kv() expected at most 7 argument(s) but received 9 argument(s). Declaration: tail_hip_C::store_kv(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache, Tensor out_loc, float k_scale, float v_scale) -> ()
+[rank0]:[W805 13:12:41.617947281 ProcessGroupNCCL.cpp:1622] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W20260805 13:12:42.347144 139717352752512 simple_timer.cpp:55] [rocprofv3] output generation ::     0.010601 sec
+W20260805 13:12:42.349990 139717352752512 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.013489 sec
+W20260805 13:12:42.351419 140468555703680 simple_timer.cpp:55] [rocprofv3] output generation ::     0.011321 sec
+W20260805 13:12:42.353516 140468555703680 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.013459 sec
