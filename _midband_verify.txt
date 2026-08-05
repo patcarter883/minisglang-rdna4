@@ -1,0 +1,108 @@
+device: AMD Radeon RX 9070 XT   MPs(WGPs)=32   CUs=64
+fp8_wmma: /opt/kernels/fp8_wmma/__init__.py
+us per call, graph-replay timed, rotation sized in BYTES past the 64 MB MALL
+
+=== g4.q_proj     tp2  K=2816 N=2048 g=32  tiles=16  last-wave occ=0.250   (rotation 53 x 3.2 MB = 172 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17       wmma_tiled_tuned          prefill_wmma    103.08    136.95    0.75x    0.000e+00
+      20       wmma_tiled_tuned          prefill_wmma    102.61    138.01    0.74x    0.000e+00
+      32       wmma_tiled_tuned          prefill_wmma    102.18    144.98    0.70x    0.000e+00
+      40       wmma_tiled_tuned          prefill_wmma    101.29    158.54    0.64x    0.000e+00
+      48       wmma_tiled_tuned          prefill_wmma    100.52    164.75    0.61x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma     99.33    171.59    0.58x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma     98.65    177.65    0.56x    0.000e+00
+
+=== g4.down       tp2  K=1056 N=2816 g=32  tiles=22  last-wave occ=0.344   (rotation 102 x 1.7 MB = 171 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17       wmma_tiled_tuned          prefill_wmma     43.55     72.14    0.60x    0.000e+00
+      20       wmma_tiled_tuned          prefill_wmma     44.79     72.97    0.61x    0.000e+00
+      32       wmma_tiled_tuned          prefill_wmma     44.89     76.13    0.59x    0.000e+00
+      40       wmma_tiled_tuned          prefill_wmma     44.94     80.87    0.56x    0.000e+00
+      48       wmma_tiled_tuned          prefill_wmma     45.07     83.81    0.54x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma     45.22     86.96    0.52x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma     45.36     89.99    0.50x    0.000e+00
+
+=== q35.o_proj    tp2  K=2048 N=2048 g=32  tiles=16  last-wave occ=0.250   (rotation 71 x 2.4 MB = 172 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17       wmma_tiled_tuned          prefill_wmma     76.06    153.95    0.49x    0.000e+00
+      20       wmma_tiled_tuned          prefill_wmma     78.13    146.16    0.53x    0.000e+00
+      32       wmma_tiled_tuned          prefill_wmma     77.85    185.95    0.42x    0.000e+00
+      40       wmma_tiled_tuned          prefill_wmma     77.88    195.89    0.40x    0.000e+00
+      48       wmma_tiled_tuned          prefill_wmma     78.04    201.95    0.39x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma     78.15    207.24    0.38x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma     78.46    213.26    0.37x    0.000e+00
+
+=== q27.q_proj    tp1  K=5120 N=6144 g=32  tiles=48  last-wave occ=0.750   (rotation 11 x 18.2 MB = 200 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17  prefill_wmma_ashuffle          prefill_wmma    233.62    247.41    0.94x    0.000e+00
+      20  prefill_wmma_ashuffle          prefill_wmma    233.98    248.12    0.94x    0.000e+00
+      32  prefill_wmma_ashuffle          prefill_wmma    238.24    269.90    0.88x    0.000e+00
+      40  prefill_wmma_ashuffle          prefill_wmma    252.59    299.09    0.84x    0.000e+00
+      48  prefill_wmma_ashuffle          prefill_wmma    246.63    311.52    0.79x    0.000e+00
+      56  prefill_wmma_ashuffle          prefill_wmma    256.83    318.29    0.81x    0.000e+00
+      63  prefill_wmma_ashuffle          prefill_wmma    254.06    329.28    0.77x    0.000e+00
+
+=== q27.down      tp2  K=8704 N=5120 g=32  tiles=40  last-wave occ=0.625   (rotation 8 x 25.8 MB = 206 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17  prefill_wmma_ashuffle          prefill_wmma    407.82    424.36    0.96x    0.000e+00
+      20  prefill_wmma_ashuffle          prefill_wmma    412.03    424.52    0.97x    0.000e+00
+      32  prefill_wmma_ashuffle          prefill_wmma    405.88    449.96    0.90x    0.000e+00
+      40  prefill_wmma_ashuffle          prefill_wmma    427.63    491.02    0.87x    0.000e+00
+      48  prefill_wmma_ashuffle          prefill_wmma    408.71    518.19    0.79x    0.000e+00
+      56  prefill_wmma_ashuffle          prefill_wmma    425.70    562.77    0.76x    0.000e+00
+      63  prefill_wmma_ashuffle          prefill_wmma    426.48    578.36    0.74x    0.000e+00
+
+=== lag.gate_up   tp2  K=2048 N=8192 g=32  tiles=64  last-wave occ=1.000   (rotation 19 x 9.7 MB = 184 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17       wmma_tiled_tuned          prefill_wmma    124.31    145.34    0.86x    0.000e+00
+      20       wmma_tiled_tuned          prefill_wmma    124.42    147.98    0.84x    0.000e+00
+      32       wmma_tiled_tuned          prefill_wmma    115.36    152.11    0.76x    0.000e+00
+      40       wmma_tiled_tuned          prefill_wmma    115.31    190.19    0.61x    0.000e+00
+      48       wmma_tiled_tuned          prefill_wmma    114.29    195.42    0.58x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma    115.73    202.32    0.57x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma    114.30    207.49    0.55x    0.000e+00
+
+=== q35b4.gate_up tp2  K=2560 N=9216 g=32  tiles=72  last-wave occ=0.562   (rotation 14 x 13.6 MB = 191 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17           prefill_wmma          prefill_wmma    161.50    161.78    1.00x    0.000e+00
+      20           prefill_wmma          prefill_wmma    163.39    163.82    1.00x    0.000e+00
+      32           prefill_wmma          prefill_wmma    166.31    168.42    0.99x    0.000e+00
+      40           prefill_wmma          prefill_wmma    176.36    176.42    1.00x    0.000e+00
+      48           prefill_wmma          prefill_wmma    180.18    181.44    0.99x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma    226.28    203.17    1.11x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma    226.68    206.23    1.10x    0.000e+00
+
+=== glm.gate_up   tp2  K=2048 N=10240 g=128  tiles=80  last-wave occ=0.625   (rotation 17 x 10.9 MB = 185 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17           prefill_wmma          prefill_wmma     99.12    100.15    0.99x    0.000e+00
+      20           prefill_wmma          prefill_wmma    101.62    101.53    1.00x    0.000e+00
+      32           prefill_wmma          prefill_wmma    112.65    112.84    1.00x    0.000e+00
+      40           prefill_wmma          prefill_wmma    122.45    122.57    1.00x    0.000e+00
+      48           prefill_wmma          prefill_wmma    131.57    131.71    1.00x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma    148.44    140.77    1.05x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma    151.74    150.41    1.01x    0.000e+00
+
+=== lag.gate_up   tp1  K=2048 N=16384 g=32  tiles=128  last-wave occ=1.000   (rotation 10 x 19.4 MB = 194 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17       wmma_tiled_tuned          prefill_wmma    207.55    228.29    0.91x    0.000e+00
+      20       wmma_tiled_tuned          prefill_wmma    211.12    229.89    0.92x    0.000e+00
+      32       wmma_tiled_tuned          prefill_wmma    203.88    248.81    0.82x    0.000e+00
+      40       wmma_tiled_tuned          prefill_wmma    206.24    255.53    0.81x    0.000e+00
+      48       wmma_tiled_tuned          prefill_wmma    205.69    268.35    0.77x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma    206.08    284.15    0.73x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma    205.30    297.74    0.69x    0.000e+00
+
+=== q27.gate_up   tp2  K=5120 N=17408 g=32  tiles=136  last-wave occ=0.708   (rotation 5 x 51.5 MB = 258 MB) ===
+       M           NEW dispatch          OLD dispatch    new us    old us  new/old   max|delta|
+      17           prefill_wmma          prefill_wmma    496.72    506.55    0.98x    0.000e+00
+      20           prefill_wmma          prefill_wmma    507.93    508.14    1.00x    0.000e+00
+      32           prefill_wmma          prefill_wmma    541.86    541.71    1.00x    0.000e+00
+      40           prefill_wmma          prefill_wmma    602.93    600.85    1.00x    0.000e+00
+      48           prefill_wmma          prefill_wmma    633.87    633.09    1.00x    0.000e+00
+      56       wmma_tiled_tuned          prefill_wmma    611.33    662.16    0.92x    0.000e+00
+      63       wmma_tiled_tuned          prefill_wmma    615.25    693.76    0.89x    0.000e+00
+
+cells where the dispatch CHANGED: 55 / 70
+mid-band total: new 14644 us  vs  old 17754 us  = 1.21x
+
+done.

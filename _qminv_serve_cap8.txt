@@ -1,0 +1,17 @@
+prompts=12 max_tokens=24 greedy
+
+-- leg 1: SERIAL (decode M=1) ...
+-- leg 2: SERIAL again (reproducibility FLOOR) ...
+-- leg 3: CONCURRENT x12 (decode M<=12) ...
+-- leg 4: CONCURRENT x12 again ...
+
+FLOOR   serial vs serial       : 0/12 prompts differ
+FLOOR   conc   vs conc         : 2/12 prompts differ
+M TEST  serial(M=1) vs conc(M=N): 1/12 prompts differ
+
+first divergences:
+  [2] at char 1  prompt='List three causes of the fall of the Wes'
+        M=1 : ...' Fall of the Western'
+        M=N : ...' The fall of the'
+
+VERDICT: no token-level M-dependence above the engine's own reproducibility floor.

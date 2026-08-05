@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Collection, Dict
 from transformers import PretrainedConfig
@@ -28,6 +29,17 @@ def _rotary_from_subdict(
     partial = sub.get("partial_rotary_factor")
     rotary_dim = int(head_dim * partial) if partial is not None else head_dim
     rope_type = sub.get("rope_type", "default")
+    if rope_type == "proportional":
+        # Gemma4's partial rotary is NOT the usual "rotate a contiguous prefix". The reference builds
+        # a HALF-WIDTH inv_freq of `partial*head_dim/2` live frequencies whose exponent denominator is
+        # the FULL head_dim, then ZERO-PADS it back out to head_dim/2 and rotates full-width. With
+        # head_dim 512 / partial 0.25 that rotates channel pairs (i, i+256) for i<64 — the set
+        # {0..63} u {256..319} — whereas a prefix-partial rope pairs (i, i+64) over {0..127} and
+        # divides the exponent by 128. Different frequencies AND different pairing: silently wrong
+        # relative position, grammatical-but-degenerate output. Carrying it as FULL rotary with a
+        # zero-padded inv_freq (built in layers/rotary.py `case "proportional"`) reproduces it
+        # exactly, and keeps the NeoX tail_hip kernel usable since rotary_dim == head_dim.
+        rotary_dim = head_dim
     scaling = sub if rope_type not in (None, "default") else None
     return RotaryConfig(
         head_dim=head_dim,
@@ -101,6 +113,35 @@ class ModelConfig:
     # carries the FULL-attention rope (Laguna: yarn θ=5e5, partial-0.5). None -> every layer shares
     # `rotary_config`. The model builder picks per-layer by the attn schedule.
     sliding_rotary_config: RotaryConfig | None = None
+    # ---- Gemma4 (`gemma4` / `diffusion_gemma`): a SWA hybrid whose two layer types differ in
+    # head_dim AND kv-head count, not just in QO head count the way Laguna does. `head_dim` /
+    # `num_kv_heads` above carry the FULL-attention geometry (512 / 2) because they size the MAIN
+    # paged pool, which for a SWA hybrid holds exactly the full-attention layers; these two carry
+    # the SLIDING geometry (256 / 8) for the separate ring pool. None -> the two types share one
+    # geometry (every other SWA model), so nothing downstream has to branch.
+    swa_head_dim: int | None = None
+    swa_num_kv_heads: int | None = None
+    # Softmax scale override. Gemma4 uses 1.0 — the usual 1/sqrt(d) temperature is folded into its
+    # LEARNED k_norm (a near-constant 0.1260 on sliding / 0.0623 on full layers), so applying
+    # head_dim**-0.5 on top would roughly double (sliding) or halve (full) the logit temperature
+    # with no error anywhere. None -> the usual head_dim**-0.5.
+    attn_softmax_scale: float | None = None
+    # Gemma4 `attention_k_eq_v`: the FULL-attention layers ship no v_proj at all. V is not an alias
+    # of the cached K — it is the PRE-norm, PRE-RoPE k_proj output passed through an unweighted
+    # RMSNorm, so both tensors must still be materialised and cached independently.
+    attention_k_eq_v: bool = False
+    # Gemma: logits = c * tanh(logits / c), applied after lm_head. None -> no cap.
+    final_logit_softcapping: float | None = None
+    # Gemma: embeddings are scaled by sqrt(hidden_size), CAST TO THE WEIGHT DTYPE before the
+    # multiply (fp16 -> 53.0625, not 53.0660). None -> no scaling.
+    embed_scale: float | None = None
+    # ---- Block diffusion (DiffusionGemma). The decoder denoises a FIXED-length canvas of this many
+    # tokens per block instead of emitting one token per step, so this is not a tuning knob: it sizes
+    # the per-request scratch slots, widens the SWA ring stride, and fixes the query count of every
+    # canvas forward. Read from the TOP-LEVEL config (`canvas_length`) — the text config knows
+    # nothing about it. None for every autoregressive model, which is what `is_block_diffusion` keys
+    # on, so no path anywhere branches on a model name.
+    canvas_length: int | None = None
     # ---- ZAYA CCA hybrid (cross-channel attention conv front-end + EDA/MOD MoE). None for non-Zaya.
     # Populated by from_hf ONLY when model_type == "zaya", so every other model keeps is_cca_hybrid
     # False. The schedule is implicit (even layer -> CCA attention, odd -> MoE), so there is no
@@ -153,6 +194,30 @@ class ModelConfig:
             and self.layer_types is not None
             and any(t == "sliding_attention" for t in self.layer_types)
         )
+
+    @property
+    def is_gemma4(self) -> bool:
+        """True for the Gemma4 backbone (`gemma4` autoregressive, `diffusion_gemma` block-diffusion).
+        Both share one 30-layer stack, so every structural branch keys on this, not on the head."""
+        return self.model_type in ("gemma4", "gemma4_text", "diffusion_gemma", "diffusion_gemma_text")
+
+    @property
+    def is_block_diffusion(self) -> bool:
+        """True for a block-diffusion decoder (DiffusionGemma): the model emits a whole
+        `canvas_length` block per commit, refined over up to `max_denoising_steps` NON-CAUSAL
+        forwards, instead of one token per step.
+
+        Keyed on `canvas_length` — a field only a block-diffusion checkpoint carries — and NOT on
+        model_type, because the backbone is shared with the autoregressive `gemma4` sibling and
+        every structural branch below this one must key on the STACK, not the head."""
+        return self.canvas_length is not None and self.canvas_length > 0
+
+    @property
+    def has_split_head_dim(self) -> bool:
+        """True when the sliding and full layers do NOT share a head_dim, so the two KV pools need
+        different geometry and the attention backend cannot cache one softmax scale / one reshape
+        width for the whole model."""
+        return self.swa_head_dim is not None and self.swa_head_dim != self.head_dim
 
     @property
     def swa_layer_ids(self) -> list[int]:
@@ -249,8 +314,8 @@ class ModelConfig:
         ckpt_tensor_names: "Collection[str] | None" = None,
     ) -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
+        top = config
         if hasattr(config, "text_config") and config.text_config is not None:
-            top = config
             config = config.text_config
             for attr in ("architectures", "rope_theta", "rope_scaling"):
                 if not getattr(config, attr, None) and getattr(top, attr, None):
@@ -312,7 +377,12 @@ class ModelConfig:
             or getattr(config, "num_experts", None)
             or getattr(config, "n_routed_experts", 0)
         )
-        num_experts_per_tok = getattr(config, "num_experts_per_tok", 0)
+        # Gemma4 spells the routed top-k `top_k_experts`; everyone else uses `num_experts_per_tok`.
+        # Defaulting to 0 here is silent death (the MoE routes nothing), so read both names.
+        num_experts_per_tok = (
+            getattr(config, "num_experts_per_tok", 0)
+            or getattr(config, "top_k_experts", 0)
+        )
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         if is_cca:
             # ZAYA top-k: moe_router_topk (Megatron) / num_experts_per_tok (HF, read just above).
@@ -502,6 +572,47 @@ class ModelConfig:
             _lts = getattr(config, "layer_types", None)
             if _lts is not None and any(t == "sliding_attention" for t in _lts):
                 layer_types = tuple(_lts)
+        # Gemma4's two layer types differ in head_dim (256 sliding / 512 full) and kv-head count
+        # (8 / 2), not just in QO head count. `head_dim`/`num_kv_heads` are rebound to the FULL
+        # geometry because they size the main paged pool (= the full-attention layers for a SWA
+        # hybrid); the sliding geometry is carried separately for the ring pool.
+        swa_head_dim = None
+        swa_num_kv_heads = None
+        _is_gemma4 = model_type in (
+            "gemma4", "gemma4_text", "diffusion_gemma", "diffusion_gemma_text"
+        )
+        # `attention_k_eq_v` decides whether the FULL-attention layers ship a v_proj at all, so
+        # getting it wrong is not a tuning error — it changes the parameter set. Gemma4 declares it;
+        # DiffusionGemma DELETES it (its @strict config subclass rebinds the field to an
+        # AttributeError sentinel) while keeping the behaviour hard-coded in its attention class.
+        # A plain getattr therefore reads False for DiffusionGemma and the model builds 30 v_projs
+        # for a checkpoint that ships 25 — a KeyError at load. So when the config is silent, decide
+        # from the TENSORS, exactly as the MTP head is decided: a checkpoint whose v_proj count is
+        # short of num_layers is a k_eq_v checkpoint.
+        attention_k_eq_v = getattr(config, "attention_k_eq_v", None)
+        if _is_gemma4 and not isinstance(attention_k_eq_v, bool):
+            if ckpt_tensor_names:
+                _v_layers = {
+                    m.group(1)
+                    for n in ckpt_tensor_names
+                    if ".self_attn.v_proj." in n
+                    and (m := re.search(r"(?:^|\.)layers\.(\d+)\.", n)) is not None
+                }
+                attention_k_eq_v = 0 < len(_v_layers) < num_layers
+            else:
+                # No tensor list (unit tests, config-only callers): every shipping Gemma4-family
+                # checkpoint to date is k_eq_v, and guessing False would silently mis-shape the
+                # model, whereas guessing True is caught loudly by an unexpected v_proj key.
+                attention_k_eq_v = True
+        attention_k_eq_v = bool(attention_k_eq_v)
+        if _is_gemma4:
+            _global_head_dim = getattr(config, "global_head_dim", None)
+            if _global_head_dim:
+                swa_head_dim, head_dim = head_dim, _global_head_dim
+                swa_num_kv_heads, num_kv_heads = (
+                    num_kv_heads,
+                    getattr(config, "num_global_key_value_heads", None) or num_kv_heads,
+                )
         if layer_types is not None and any(t == "sliding_attention" for t in layer_types):
             # Per-layer QO head counts (Laguna: 48 full / 64 sliding).
             _heads = getattr(config, "num_attention_heads_per_layer", None)
@@ -509,7 +620,9 @@ class ModelConfig:
                 attn_head_counts = tuple(int(h) for h in _heads)
             # Two RoPE schemes: rope_parameters nests one sub-dict per attention type. Build the
             # FULL rope into rotary_config below (override the generic single-rope parse) and the
-            # SLIDING rope into sliding_rotary_config.
+            # SLIDING rope into sliding_rotary_config. Each is built over ITS OWN head_dim — for
+            # Gemma4 those differ (512 full / 256 sliding), and feeding the full head_dim to the
+            # sliding rope would mis-size its cos/sin cache.
             if isinstance(rope_params, dict) and "full_attention" in rope_params:
                 _maxpos = config.max_position_embeddings
                 _full_rope_override = _rotary_from_subdict(
@@ -517,7 +630,9 @@ class ModelConfig:
                 )
                 if "sliding_attention" in rope_params:
                     sliding_rotary_config = _rotary_from_subdict(
-                        rope_params["sliding_attention"], head_dim, _maxpos
+                        rope_params["sliding_attention"],
+                        swa_head_dim if swa_head_dim is not None else head_dim,
+                        _maxpos,
                     )
 
         return cls(
@@ -552,6 +667,10 @@ class ModelConfig:
             model_type=model_type,
             architectures=architectures,
             quant=quant,
+            # Block diffusion: `canvas_length` sits on the TOP-LEVEL config, not the text config, so
+            # it is read off `top` (which is `config` itself for a flat checkpoint). Absent -> None
+            # -> is_block_diffusion False, and every canvas branch downstream stays dead.
+            canvas_length=getattr(top, "canvas_length", None) or None,
             linear_num_key_heads=linear_num_key_heads,
             linear_num_value_heads=getattr(config, "linear_num_value_heads", None),
             linear_key_head_dim=getattr(config, "linear_key_head_dim", None),
@@ -566,6 +685,15 @@ class ModelConfig:
             ),
             attn_head_counts=attn_head_counts,
             sliding_rotary_config=sliding_rotary_config,
+            swa_head_dim=swa_head_dim,
+            swa_num_kv_heads=swa_num_kv_heads,
+            # Gemma4 hard-codes scaling=1.0 in its attention (modeling_gemma4.py:1153); the
+            # temperature lives in the learned k_norm instead. Every other family leaves this None
+            # and keeps the standard head_dim**-0.5.
+            attn_softmax_scale=1.0 if _is_gemma4 else None,
+            attention_k_eq_v=attention_k_eq_v,
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
+            embed_scale=(config.hidden_size**0.5) if _is_gemma4 else None,
             kv_lora_rank=kv_lora_rank,
             q_lora_rank=q_lora_rank,
             qk_nope_head_dim=qk_nope_head_dim,

@@ -18,13 +18,17 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
-    # Reasoning-content extraction for thinking models. "auto"/"qwen3"/"deepseek_r1"/"glm" split the
-    # completion on `</think>` into reasoning_content + content; "none" disables it. See
-    # server/reasoning.py. Safe no-op on models that never emit the closing tag.
+    # Reasoning-content extraction for thinking models: split the completion on the model's reasoning
+    # close delimiter into reasoning_content + content. "auto" (default) DERIVES the delimiters from
+    # the checkpoint's own chat template, so a family with different markup (Gemma-4's asymmetric
+    # `<|channel>thought` … `<channel|>`) works with no code change; a named family FORCES that pair;
+    # "none" disables extraction. See server/reasoning.py for the cascade.
     reasoning_parser: str = "auto"
     # Server-side DEFAULT Markovian-RSA parameters (set by the --rsa-* flags). A per-request `rsa`
     # field on /v1/chat/completions patches these; RSA runs ONLY when a request opts in (rsa present
-    # and enabled), so a normal call is an ordinary single completion. See api_server.v1_completions.
+    # and enabled), so a normal call is an ordinary single completion. See
+    # api_server.v1_chat_completions (RSA is chat-only: /v1/completions 400s an `rsa` field, because
+    # the rollout loop drives chat messages and has nothing to do with a raw prompt).
     rsa_defaults: RSAParams = field(default_factory=RSAParams)
 
     @property
@@ -274,11 +278,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=str,
         dest="reasoning_parser",
         default=ServerArgs.reasoning_parser,
-        choices=["auto", "none", "qwen3", "qwen", "deepseek_r1", "deepseek-r1", "glm"],
-        help="Reasoning-content parser for thinking models. Splits a completion on the closing "
-        "think tag (</think>) into reasoning_content + content on /v1/chat/completions. 'auto' "
-        "(default) uses <think>/</think> and is a safe no-op on models that never emit the tag; "
-        "'none' disables it.",
+        choices=["auto", "none", "qwen3", "qwen", "deepseek_r1", "deepseek-r1", "glm",
+                 "poolside_v1", "poolside"],
+        help="Reasoning-content parser for thinking models: splits a completion on the model's "
+        "reasoning close delimiter into reasoning_content + content on /v1/chat/completions. "
+        "'auto' (default) DERIVES the delimiter pair from the served checkpoint's own chat "
+        "template — it handles families whose markup is not <think>/</think> (Gemma-4 uses "
+        "<|channel>thought … <channel|>) with no code change. Pass a family name to FORCE that "
+        "pair (the escape hatch for a checkpoint whose template declares nothing), or 'none' to "
+        "disable extraction entirely. The resolved pair and where it came from are logged at boot.",
     )
 
     # --- speculative decoding (off by default; see SPEC_DECODE.md) -------------------------------

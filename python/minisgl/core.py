@@ -82,6 +82,15 @@ class SamplingParams:
     # None -> "default" (single-store back-compat). Every CAM op (deliver/write/facts/forget/stats/retrieve)
     # is scoped to this namespace so one conversation cannot read or overwrite another's memory.
     mem_namespace: str | None = None
+    # Per-request RNG seed. None (default) = draw from the process RNG, i.e. today's behaviour on
+    # every path. It exists because BLOCK DIFFUSION has no greedy mode at all: its canvas starts as
+    # uniform noise over the whole vocabulary and every denoising step draws a multinomial, so
+    # `temperature 0 / top_p 1 / top_k 1` — the autoregressive path's reproducibility switch — buys
+    # nothing there, and two identical requests to the same serve return different text. With a seed
+    # a block's whole denoising trajectory is a deterministic function of (prompt, seed), which is
+    # what lets a cold-vs-prefix-hit byte-identity gate exist for the canvas path at all (and lets a
+    # caller reproduce a generation). Read by the diffusion loop; the AR sampler is unaffected.
+    seed: int | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -213,6 +222,16 @@ class Batch:
     # prefill; attention/MLA key on extend_len/max_seqlen_q and need no flag. False for every
     # normal batch. See scheduler._spec_decode_step and SPEC_DECODE.md.
     spec_verify: bool = field(default=False, init=False)
+    # Block-diffusion CANVAS batch (DiffusionGemma). Like a verify batch it is phase="decode" with
+    # extend_len = canvas_length query tokens per request, but it differs in two ways that no other
+    # path in the engine has:
+    #   * attention is BIDIRECTIONAL over [encoder KV | canvas KV] — the backend keys `causal=0`
+    #     off this flag, on both layer geometries;
+    #   * the canvas K/V is SCRATCH. Every denoising step overwrites the same slots, so
+    #     cached_len/device_len do NOT advance across the <=48 steps of a block, nothing is
+    #     sampled per step, and `complete_one` is never called.
+    # False for every autoregressive batch, so no existing path changes shape.
+    canvas: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:

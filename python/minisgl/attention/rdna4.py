@@ -18,6 +18,16 @@ if TYPE_CHECKING:
 # at the same residue mod BC as a cold prefill => identical block grouping => bit-identical.
 _SWA_BC_ALIGN = 32
 
+# head_dims the native-HIP attention kernels cover. All three (attn_decode / attn_hip /
+# attn_prefill_paged) switch on exactly this set and TORCH_CHECK anything else, so one tuple gates
+# every op. It is tested PER CALL, not once per model: a split-head_dim model runs two geometries
+# through ONE backend instance (Gemma4: 256-wide sliding layers and 512-wide full-attention layers).
+# 512 is Gemma4's full-attention geometry; the three packages carry it via the same templated cores
+# (the prefill pair needs the D-split warp ladder to stay spill-free at that width). Keep this tuple
+# in step with the kernels' own switch arms — it exists to turn an unsupported width into a message
+# that names the geometry, not to be a second, quieter source of truth about what is built.
+_HIP_HEAD_DIMS = (64, 128, 256, 512)
+
 
 @dataclass
 class RDNA4Metadata(BaseAttnMetadata):
@@ -31,6 +41,13 @@ class RDNA4Metadata(BaseAttnMetadata):
     # (0 allowed / -inf denied), indexed [packed_q_row, key_pos]. When set, the paged-extend kernel
     # runs with causal=0 and lets this carry the whole block structure. None for a normal serve.
     custom_mask: torch.Tensor | None = None
+    # Block-diffusion CANVAS batch: attend every query over every key inside `cache_seqlens`, with no
+    # causal mask and no window, on BOTH layer geometries. Distinct from `custom_mask`, which also
+    # forces causal=0 but carries an additive per-cell bias: a canvas needs no bias at all, and
+    # materializing an all-zero one would cost a [canvas, cur_len+canvas] fp32 tensor per layer per
+    # step to say nothing (measured bit-identical to passing None —
+    # tools/canvas_attention_probe.py). False on every autoregressive batch.
+    bidirectional: bool = False
     # ---- SWA (sliding-window) ring-pool metadata — populated ONLY for a SWA-hybrid model. The
     # sliding layers store/read from the separate window-bounded ring pool (ctx.swa_kv_cache), not
     # the full-context main pool, so they need their own out_loc / page_table / cache_seqlens:
@@ -95,8 +112,9 @@ class RDNA4Backend(BaseAttnBackend):
     the native HIP flash kernels (``attn_decode`` / ``attn_hip`` / ``attn_prefill_paged``) — no Triton
     kernel runs. The tuned Triton ``unified_attention`` path (lifted from vLLM's ``triton_attn``) is
     the ``MINISGL_ATTN_HIP=0`` opt-out only; hence the rename off the old ``triton_rdna4`` name. A
-    head_dim the HIP prefill kernels don't cover (not 64/128/256) raises rather than silently using
-    Triton. cudagraph capture is not yet supported here: run with ``--cuda-graph-max-bs 0`` (the
+    head_dim the HIP kernels don't cover (not ``_HIP_HEAD_DIMS``) raises rather than silently using
+    Triton — checked per call, since a split-head_dim model routes two geometries through one
+    instance. cudagraph capture is not yet supported here: run with ``--cuda-graph-max-bs 0`` (the
     ``hip`` subclass adds decode capture)."""
 
     # Number of parallel tiled-softmax segments for the 3D flash-decode path
@@ -119,7 +137,15 @@ class RDNA4Backend(BaseAttnBackend):
         # SIZE stays self.swa_window; only slot addressing (store/gather/decode-read) strides by this.
         self.swa_ring_stride = getattr(ctx, "swa_ring_stride", self.swa_window)
         self.page_size = ctx.page_size
-        self.scale = config.head_dim**-0.5
+        # Softmax temperature is resolved PER CALL from the query's own head_dim (see
+        # _softmax_scale), never cached once per model: a split-head_dim model runs both geometries
+        # through this one backend instance, so a single config.head_dim**-0.5 would silently apply
+        # the full layers' temperature to the sliding ones — wrong logits on 25 of 30 layers with no
+        # error anywhere. `attn_softmax_scale` overrides the 1/sqrt(d) form outright when the config
+        # sets one (Gemma4: 1.0 — the temperature lives in its learned k_norm instead). A uniform
+        # model resolves exactly the value this line used to cache.
+        self._scale_override = config.attn_softmax_scale
+        self._scale_by_head_dim: dict[int, float] = {}
         # fp8 (e4m3fn) KV path: detected from the actual KV buffer dtype. The native-HIP ops read
         # the pool's [num_kv_heads] descale ROW per layer (per-head capable) and fold it into the
         # score/accumulator. The Triton unified FALLBACK below can only take ONE scalar, so its
@@ -168,11 +194,49 @@ class RDNA4Backend(BaseAttnBackend):
             self._hip_prefill_paged_fp8_op = (
                 attn_prefill_paged.flash_prefill_paged_fp8  # fp8-KV paged extend prefill
             )
-            # All three attention kernels now cover head_dim 64/128/256: decode (attn_decode), cold
+            # All three attention kernels cover head_dim 64/128/256: decode (attn_decode), cold
             # prefill (attn_hip) and extend/paged prefill (attn_prefill_paged) — 256 (Qwen3.5/3.6
-            # full-attn) uses head_dim-dependent BR/BC=16 tiling to fit the 64 KB gfx1201 LDS. So no
-            # head_dim falls back to Triton on the HIP path.
-            self._hip_prefill_ok = config.head_dim in (64, 128, 256)
+            # full-attn) uses head_dim-dependent BR/BC=16 tiling to fit the 64 KB gfx1201 LDS. The
+            # coverage check is _HIP_HEAD_DIMS, applied per call in forward() (a split-head_dim model
+            # has no single answer). No covered head_dim falls back to Triton on the HIP path.
+
+    def _softmax_scale(self, q: torch.Tensor) -> float:
+        """Softmax temperature for THIS call, taken from the query's actual head_dim (q is
+        ``[tokens | bs, Hq, D]`` on every path here). Per call because one backend instance serves
+        both geometries of a split-head_dim model."""
+        override = self._scale_override
+        if override is not None:
+            return override
+        head_dim = q.shape[-1]
+        scale = self._scale_by_head_dim.get(head_dim)
+        if scale is None:
+            scale = self._scale_by_head_dim[head_dim] = float(head_dim) ** -0.5
+        return scale
+
+    def _no_hip_kernel(self, head_dim: int) -> None:
+        """Raise for a head_dim the native-HIP kernels do not cover. Called only off the failing
+        branch, so the gate itself stays a bare tuple test on the hot path.
+
+        Deliberately does NOT fall through to the Triton unified kernel: that is a different code
+        path with different numerics, and silently taking it when a kernel is missing is exactly the
+        behaviour this backend's old "triton_rdna4" name papered over. Opting into Triton has to be
+        an explicit MINISGL_ATTN_HIP=0."""
+        note = ""
+        if head_dim in _HIP_HEAD_DIMS:
+            # The width IS in the supported set, so the kernels this process actually loaded are
+            # older than the engine — the classic symptom of an image whose /opt/kernels predates
+            # the source, which otherwise surfaces as a bare TORCH_CHECK from inside the .so.
+            note = (
+                f" head_dim={head_dim} IS in this engine's supported set, so the LOADED kernel "
+                "package is older than the engine — rebuild /opt/kernels (or mount a package built "
+                "in this same image; a .so from another image will not load at all)."
+            )
+        raise RuntimeError(
+            f"native-HIP attention (MINISGL_ATTN_HIP=1) has no kernel for head_dim={head_dim} "
+            f"(attn_decode / attn_hip / attn_prefill_paged all cover "
+            f"{'/'.join(str(d) for d in _HIP_HEAD_DIMS)})." + note + " Set MINISGL_ATTN_HIP=0 to "
+            "opt into the Triton unified_attention fallback instead."
+        )
 
     def _get_out_buf(self, q: torch.Tensor) -> torch.Tensor:
         """Persistent [tokens, Hq, D] attention-output buffer, reused across forwards instead of a
@@ -221,25 +285,20 @@ class RDNA4Backend(BaseAttnBackend):
         # tokens' K/V into the paged cache, so the decode kernel reads them back; the cold-prefill
         # kernel computes attention over the contiguous new-token K/V directly.
         if self._attn_hip:
+            # Gate on THIS query's head_dim, not the model's: a split-head_dim model reaches here
+            # with 256 on its sliding layers and 512 on its full ones, and only one of those has a
+            # kernel. Covers decode as well as prefill — all three ops share _HIP_HEAD_DIMS.
+            if q.shape[-1] not in _HIP_HEAD_DIMS:
+                self._no_hip_kernel(q.shape[-1])
             if metadata.max_seqlen_q == 1:
                 return self._hip_decode(q, layer_id, metadata)
-            if self._hip_prefill_ok:  # head_dim 64/128/256
-                if metadata.cold_prefill:
-                    # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
-                    # since it reads inline k/v, not the cache).
-                    return self._hip_prefill(q, k, v, metadata)
-                # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset causal
-                # mask. fp8 variant folds the per-tensor descale (bf16 + fp8 KV both covered).
-                return self._hip_prefill_paged(q, layer_id, metadata)
-            # Native-HIP is on but there is no HIP prefill kernel for this head_dim. Do NOT silently
-            # fall through to the Triton kernel (a different code path with different numerics) — that
-            # silent fallback was the misleading behaviour behind this backend's old "triton_rdna4"
-            # name. Fail loud instead.
-            raise RuntimeError(
-                f"native-HIP attention (MINISGL_ATTN_HIP=1) has no prefill kernel for head_dim="
-                f"{self.config.head_dim} (supported: 64/128/256). Set MINISGL_ATTN_HIP=0 to use the "
-                f"Triton unified_attention fallback instead."
-            )
+            if metadata.cold_prefill:
+                # dense prefill over the contiguous new-token K/V (works for fp8 KV too,
+                # since it reads inline k/v, not the cache).
+                return self._hip_prefill(q, k, v, metadata)
+            # extend / radix-hit prefill: paged K/V prefix + new tokens, prefix-offset causal
+            # mask. fp8 variant folds the per-tensor descale (bf16 + fp8 KV both covered).
+            return self._hip_prefill_paged(q, layer_id, metadata)
         # Deliberate Triton path: reached ONLY when MINISGL_ATTN_HIP=0 (an explicit opt-out for
         # A/B / debugging), never as a silent fallback from the native-HIP path above.
         from minisgl._hip_engage import engaged
@@ -258,7 +317,7 @@ class RDNA4Backend(BaseAttnBackend):
             max_seqlen_q=metadata.max_seqlen_q,
             seqused_k=metadata.cache_seqlens,
             max_seqlen_k=metadata.max_seqlen_k,
-            softmax_scale=self.scale,
+            softmax_scale=self._softmax_scale(q),
             causal=True,
             window_size=(-1, -1),  # no sliding window
             block_table=metadata.page_table,
@@ -302,14 +361,15 @@ class RDNA4Backend(BaseAttnBackend):
         v_cache = self.kvcache.v_cache(layer_id)
         block_table = metadata.page_table.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
+        scale = self._softmax_scale(q)
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (1.0 if
             # MINISGL_KV_FP8_CALIBRATE=0), folded into the score/accumulator by the kernel.
             ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]  # persistent device tensors (graph-safe)
             return self._hip_decode_fp8_op(
-                q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0
+                q, k_cache, v_cache, block_table, ctx_lens, scale, ks, vs, 0
             )
-        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, scale, 0)
 
     def _hip_prefill(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, metadata: RDNA4Metadata
@@ -318,10 +378,14 @@ class RDNA4Backend(BaseAttnBackend):
         # tokens). q is [tokens, Hq, D]; k/v arrive flat [tokens, Hk*D] -> reshape to [tokens, Hk, D]
         # (store_kv above already consumed the flat k/v). flash_prefill is single-sequence, so slice
         # the varlen batch by cu_seqlens_q and run each independently.
-        D = self.config.head_dim
+        # D comes from THIS call's q, not config.head_dim: GQA varies the head COUNT, never the head
+        # width, so k/v share q's D — while a split-head_dim model's two layer types do not share a
+        # model-wide D, and reshaping 256-wide k/v by 512 is a wrong-shape view, not an error.
+        D = q.shape[-1]
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         cu = metadata.cu_seqlens_q_list()  # memoized once per forward (was per-layer .tolist())
+        scale = self._softmax_scale(q)
         out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
@@ -329,7 +393,7 @@ class RDNA4Backend(BaseAttnBackend):
                 continue
             out[s:e] = self._hip_prefill_op(
                 q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
-                self.scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
+                scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
             )
         return out
 
@@ -346,9 +410,16 @@ class RDNA4Backend(BaseAttnBackend):
         cu_q = metadata.cu_seqlens_q.to(torch.int32)
         ctx_lens = metadata.cache_seqlens.to(torch.int32)
         q = q.contiguous()
-        # Fused-TiDAR: a custom_mask carries the whole block structure -> run causal=0 and let the
-        # kernel's mask_bias arg apply it. None on a normal serve (plain prefix-offset causal).
+        scale = self._softmax_scale(q)
+        # Two independent reasons to drop the prefix-offset causal mask, and they must not be
+        # conflated. Fused-TiDAR sets a `custom_mask` that CARRIES the block structure, so causal=0
+        # plus an additive bias. A block-diffusion CANVAS wants no mask at all: every one of its
+        # `canvas_length` queries attends every key in cache_seqlens. Passing an all-zero bias would
+        # be arithmetically identical (measured: bit-identical, tools/canvas_attention_probe.py) but
+        # would allocate a [canvas, cur_len+canvas] fp32 tensor per layer per denoising step to
+        # express nothing.
         custom_mask = getattr(metadata, "custom_mask", None)
+        non_causal = custom_mask is not None or metadata.bidirectional
         if self.kv_is_fp8:
             # fp8 (e4m3) paged KV: per-tensor descale = the calibrated store scale (A5; 1.0 if
             # calibration off), folded in the kernel. Descales sit between scale and causal.
@@ -359,21 +430,24 @@ class RDNA4Backend(BaseAttnBackend):
             # cleanly: it is folded into the scores BEFORE the additive mask, so the -inf/0 mask
             # entries mask the already-descaled scores exactly as on the bf16 path.
             ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]  # persistent device tensors (graph-safe)
-            fp8_causal = 0 if custom_mask is not None else 1
+            fp8_causal = 0 if non_causal else 1
             from minisgl._hip_engage import engaged
             engaged("attn_prefill_paged.flash_prefill_paged_fp8"
-                    + ("(masked)" if custom_mask is not None else ""))
+                    + ("(masked)" if custom_mask is not None
+                       else "(canvas)" if metadata.bidirectional else ""))
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                self.scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+                scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
                 custom_mask,  # mask_bias (None on a normal serve; the DDTree/TiDAR ancestor mask otherwise)
             )
-        causal = 0 if custom_mask is not None else 1
+        causal = 0 if non_causal else 1
         from minisgl._hip_engage import engaged
-        engaged("attn_prefill_paged.flash_prefill_paged" + ("(masked)" if custom_mask is not None else ""))
+        engaged("attn_prefill_paged.flash_prefill_paged"
+                + ("(masked)" if custom_mask is not None
+                   else "(canvas)" if metadata.bidirectional else ""))
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            self.scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
+            scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
         )
 
     # ---- SWA (sliding-window) ring-pool attention (Laguna sliding layers) ----------------------
@@ -390,6 +464,9 @@ class RDNA4Backend(BaseAttnBackend):
             "The Triton unified path does not wire the SWA ring pool."
         )
         assert metadata.swa_out_loc is not None, "SWA metadata missing (is_swa_hybrid not wired?)"
+        # Same per-call kernel-coverage gate as forward(); a sliding layer's head_dim is its own.
+        if q.shape[-1] not in _HIP_HEAD_DIMS:
+            self._no_hip_kernel(q.shape[-1])
         if metadata.max_seqlen_q == 1:
             self.swa_kv.store_kv(k, v, metadata.swa_out_loc, layer_id)
             return self._swa_decode(q, layer_id, metadata)
@@ -471,10 +548,11 @@ class RDNA4Backend(BaseAttnBackend):
         position => same non-masked key SET+values as a cold prefill; the `pad` zero rows (all window-
         masked, value-irrelevant) align the flash block grouping to cold => BIT-IDENTICAL. `windows`
         (from _gather_swa_windows) is per-seq None|(pad, k_win, v_win); k/v are the inline new bf16 K/V."""
-        D = self.config.head_dim
+        D = q.shape[-1]  # the SLIDING layers' head_dim, which need not be the model-wide one
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         cu = metadata.cu_seqlens_q_list()
+        scale = self._softmax_scale(q)
         out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
@@ -484,7 +562,7 @@ class RDNA4Backend(BaseAttnBackend):
             if win is None:  # cold seq in a mixed batch: plain windowed prefill over its own tokens
                 out[s:e] = self._hip_prefill_op(
                     q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
-                    self.scale, 1, window,
+                    scale, 1, window,
                 )
                 continue
             pad, k_win, v_win = win  # [Wp, Hk, D]
@@ -498,16 +576,19 @@ class RDNA4Backend(BaseAttnBackend):
             k_ext = torch.cat(parts_k, dim=0).contiguous()
             v_ext = torch.cat(parts_v, dim=0).contiguous()
             q_ext = torch.cat([q.new_zeros((front, q.shape[1], D)), q[s:e]], dim=0).contiguous()
-            out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, self.scale, 1, window)
+            out_ext = self._hip_prefill_op(q_ext, k_ext, v_ext, scale, 1, window)
             out[s:e] = out_ext[front:]
         return out
 
     def _swa_prefill_paged(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata, window: int
     ) -> torch.Tensor:
-        """CAPTURED spec-verify SWA attention: attend each seq's K+1 new tokens over its ring window +
-        those new tokens, read straight from the ring pool via the paged-extend kernel (attn_prefill_paged)
-        with causal=1 + sliding_window=W. The ring block table (metadata.swa_verify_page_table) lays out
+        """Multi-query SWA attention read straight from the ring pool through the paged-extend kernel.
+
+        Serves two shapes off the same rows. (1) CAPTURED spec-verify: each seq's K+1 new tokens over
+        its ring window + those new tokens, causal=1 + sliding_window=W. (2) BLOCK-DIFFUSION CANVAS:
+        each seq's canvas_length tokens over the same [window | new] rows, causal=0 + sliding_window=0
+        — see the `canvas` branch below. The ring block table (metadata.swa_verify_page_table) lays out
         cache index j -> ring slot as [window(Wp) | new(qlen)]; context_len (swa_verify_cache_seqlens) =
         Wp+qlen bounds the read. This is the capture-safe analogue of _swa_prefill_extend: no per-seq
         clone/cat and no host-sync of the window length — the same STATIC-buffer paged path the full
@@ -520,18 +601,28 @@ class RDNA4Backend(BaseAttnBackend):
         cu_q = metadata.cu_seqlens_q.to(torch.int32)
         ctx_lens = metadata.swa_verify_cache_seqlens.to(torch.int32)
         q = q.contiguous()
+        scale = self._softmax_scale(q)
+        # A CANVAS reads the same [Wp | new] ring rows but with NO mask: bidirectional over the
+        # window AND over the whole canvas. `sliding_window` must go to 0 as well as `causal`,
+        # because the kernel's window test is independent of the causal one — leaving it at W would
+        # re-impose a symmetric +/-W band across the canvas, which is a DIFFERENT model (the window
+        # in this architecture is a property of what the encoder cache RETAINED, never a mask over
+        # the canvas; measured rel_fro 0.60 apart in tools/canvas_attention_probe.py).
+        canvas = metadata.bidirectional
+        causal, sw = (0, 0) if canvas else (1, window)
+        tag = "(swa-canvas)" if canvas else "(swa-verify)"
         from minisgl._hip_engage import engaged
         if self.swa_kv.dtype == torch.float8_e4m3fn:
             ks, vs = self.swa_kv.k_descale[layer_id], self.swa_kv.v_descale[layer_id]  # persistent device tensors (graph-safe)
-            engaged("attn_prefill_paged.flash_prefill_paged_fp8(swa-verify)")
+            engaged("attn_prefill_paged.flash_prefill_paged_fp8" + tag)
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                self.scale, ks, vs, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+                scale, ks, vs, causal, sw, metadata.max_seqlen_q, 0, None,
             )
-        engaged("attn_prefill_paged.flash_prefill_paged(swa-verify)")
+        engaged("attn_prefill_paged.flash_prefill_paged" + tag)
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            self.scale, 1, window, metadata.max_seqlen_q, 0, None,  # causal=1, sliding_window=W
+            scale, causal, sw, metadata.max_seqlen_q, 0, None,
         )
 
     def _swa_decode(
@@ -544,12 +635,13 @@ class RDNA4Backend(BaseAttnBackend):
         # The ring block IS the window (<= W recent keys, all causal-valid for the newest query), so
         # no extra window mask is needed — sliding_window=0. Byte-identical to a full decode over a
         # <=W-length cache.
+        scale = self._softmax_scale(q)
         if self.swa_kv.dtype == torch.float8_e4m3fn:
             ks, vs = self.swa_kv.k_descale[layer_id], self.swa_kv.v_descale[layer_id]  # persistent device tensors (graph-safe)
             return self._hip_decode_fp8_op(
-                q, k_cache, v_cache, block_table, ctx_lens, self.scale, ks, vs, 0
+                q, k_cache, v_cache, block_table, ctx_lens, scale, ks, vs, 0
             )
-        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, self.scale, 0)
+        return self._hip_decode_op(q, k_cache, v_cache, block_table, ctx_lens, scale, 0)
 
     def _swa_prefill_cold(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -557,10 +649,14 @@ class RDNA4Backend(BaseAttnBackend):
     ) -> torch.Tensor:
         # Dense cold prefill over the inline prompt K/V with a CAUSAL + WINDOW mask (the kernel's
         # native sliding_window arg). The ring store above kept the last `window` tokens for decode.
-        D = self.config.head_dim
+        # D is the SLIDING layer's own head_dim. It used to be config.head_dim, which is the FULL
+        # layers' geometry on a split-head_dim model — this path would then have reshaped 256-wide
+        # k/v as 512-wide and attended garbage.
+        D = q.shape[-1]
         k = k.view(-1, k.shape[-1] // D, D)
         v = v.view(-1, v.shape[-1] // D, D)
         cu = metadata.cu_seqlens_q_list()  # memoized once per forward (was per-layer .tolist())
+        scale = self._softmax_scale(q)
         out = self._get_out_buf(q)
         for i in range(len(cu) - 1):
             s, e = cu[i], cu[i + 1]
@@ -568,7 +664,7 @@ class RDNA4Backend(BaseAttnBackend):
                 continue
             out[s:e] = self._hip_prefill_op(
                 q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
-                self.scale, 1, window,  # causal=1, sliding_window=window
+                scale, 1, window,  # causal=1, sliding_window=window
             )
         return out
 
@@ -610,10 +706,19 @@ class RDNA4Backend(BaseAttnBackend):
             new_page_table.div_(self.page_size, rounding_mode="floor")
 
         swa_out_loc = swa_page_table = swa_cache_seqlens = swa_table_idx = None
+        swa_canvas_page_table = swa_canvas_cache_seqlens = None
         if self.swa_kv is not None and self.swa_window > 0:
-            swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
-                reqs, seqlens_q, cached_lens, device
-            )
+            if batch.canvas:
+                # A canvas reads [window | canvas] in ONE row, which `_build_swa_metadata`'s
+                # cnt = min(S, W) cannot express (it caps the row at W and would drop the canvas
+                # keys the queries must see). Same ring, different row shape.
+                swa_out_loc, swa_canvas_page_table, swa_canvas_cache_seqlens = (
+                    self._build_swa_canvas_metadata(reqs, seqlens_q, cached_lens, device)
+                )
+            else:
+                swa_out_loc, swa_page_table, swa_cache_seqlens = self._build_swa_metadata(
+                    reqs, seqlens_q, cached_lens, device
+                )
             swa_table_idx = [req.table_idx for req in reqs]  # ring block per seq (SWA extend gather)
 
         batch.attn_metadata = RDNA4Metadata(
@@ -627,7 +732,62 @@ class RDNA4Backend(BaseAttnBackend):
             swa_page_table=swa_page_table,
             swa_cache_seqlens=swa_cache_seqlens,
             swa_table_idx=swa_table_idx,
+            # A canvas rides the SAME ring fields the captured spec-verify uses, so _swa_forward's
+            # existing `swa_verify_page_table is not None` dispatch routes it with no new branch —
+            # the rows differ, the read path does not.
+            swa_verify_page_table=swa_canvas_page_table,
+            swa_verify_cache_seqlens=swa_canvas_cache_seqlens,
+            bidirectional=batch.canvas,
         )
+
+    def _build_swa_canvas_metadata(self, reqs, seqlens_q, cached_lens, device):
+        """Ring rows for a BLOCK-DIFFUSION canvas step: `[Wp window keys | qlen canvas keys]` per
+        request, `context_len = Wp + qlen`, read with causal=0 / sliding_window=0.
+
+        Two things separate this from `_build_swa_metadata`, and both are load-bearing.
+
+        1. THE ROW IS NOT CAPPED AT W. The read count there is `cnt = min(S, W)`, which for a canvas
+           at absolute positions [cur_len, cur_len+L) would return the last W positions and silently
+           drop either window keys or canvas keys depending on cur_len. A canvas query must see BOTH
+           the retained window and every one of its L siblings, so the row is the concatenation and
+           the length is Wp + L.
+        2. THE WINDOW IS THE PREFIX'S, NOT THE QUERY'S. Wp = min(cur_len, W) is computed from the
+           CACHED length, not from cur_len + L: every canvas position sees the SAME window, the one
+           the encoder left behind. A window that slid per canvas position would be a different
+           model, and a plausible-looking one.
+
+        This is also why the ring stride has to exceed W (see `_swa_ring_block` in engine.py): at
+        stride W the canvas position cur_len+j lands on the slot holding prefix position
+        cur_len+j-W, i.e. inside the window it is about to read — measured at 256 of 256 canvas
+        slots colliding (tools/canvas_attention_probe.py)."""
+        W = self.swa_window
+        R = self.swa_ring_stride
+        assert R > W, (
+            f"block-diffusion canvas needs a widened SWA ring (stride {R} <= window {W}); at "
+            f"stride == window every canvas slot aliases a live window slot and the decoder "
+            f"overwrites the prefix it must attend to"
+        )
+        out_slots: list[int] = []
+        rows: list[list[int]] = []
+        ctx_lens: list[int] = []
+        max_row = 0
+        for req, qlen, c0 in zip(reqs, seqlens_q, cached_lens):
+            base = req.table_idx * R
+            canvas_slots = [base + (p % R) for p in range(c0, c0 + qlen)]
+            out_slots.extend(canvas_slots)
+            Wp = min(c0, W)
+            row = [base + (p % R) for p in range(c0 - Wp, c0)] + canvas_slots
+            rows.append(row)
+            ctx_lens.append(Wp + qlen)
+            max_row = max(max_row, len(row))
+        CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        swa_out_loc = torch.tensor(out_slots, **CPU).to(device, non_blocking=True)
+        # Rectangular [bs, max_row]; short rows pad with slot 0 (the NULL slot). The kernel bounds
+        # its reads by context_len, so the pad is never attended — same trick as the main page table.
+        padded = [row + [0] * (max_row - len(row)) for row in rows]
+        page_table = torch.tensor(padded, **CPU).to(device, non_blocking=True)
+        cache_seqlens = torch.tensor(ctx_lens, **CPU).to(device, non_blocking=True)
+        return swa_out_loc, page_table, cache_seqlens
 
     def _build_swa_metadata(self, reqs, seqlens_q, cached_lens, device):
         """Ring-pool metadata for the sliding layers (SWA-hybrid only). Each request owns a fixed

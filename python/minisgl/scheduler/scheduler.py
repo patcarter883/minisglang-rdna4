@@ -34,6 +34,9 @@ from .cache import CacheManager
 from .cca_slots import CCASlotManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from minisgl.diffusion import DiffusionSamplerConfig
+
+from .diffusion import CanvasManager, SchedulerDiffusionMixin
 from .ep import SchedulerEPMixin
 from .gdn_slots import GDNSlotManager
 from .io import SchedulerIOMixin
@@ -98,9 +101,9 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
-class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
+class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
-        from minisgl.engine import Engine
+        from minisgl.engine import Engine, resolve_prefix_cache, snapshot_ladder_depth
 
         self.engine = Engine(config)
 
@@ -112,20 +115,41 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        # GDN-hybrid models MUST use the non-radix ("naive") prefix cache: GDN recurrent state
-        # is not prefix-cacheable, and a radix hit would report cached_len>0 with no state behind
-        # it (silent garbage). Force it here; dense models keep config.cache_type.
-        cache_type = config.cache_type
+        # WHICH prefix cache to build is NOT decided here any more. It is resolved once, from config,
+        # by engine/config.py::resolve_prefix_cache — because the ENGINE needs the same answer while it
+        # sizes the KV pool (the snapshot store is a VRAM reservation subtracted from the pool). Those
+        # two decisions used to be made independently and they disagreed: the engine keyed off
+        # `gdn_radix` + "per-slot state bytes > 0", which is TRUE for a SWA hybrid (the per-slot term
+        # counts the SWA ring) regardless of what the SWA flag said — while THIS code, reading that
+        # flag, forced 'naive' and never stored a snapshot. gemma-4-26B-A4B TP=2 paid 0.98 GiB of a
+        # 16 GB card — ~100k KV tokens — for a store that could not exist. Neither side saw the other's
+        # condition, and the engine saw `cache_type == "naive"` not at all. One resolver, both readers;
+        # they cannot drift apart again — including in the direction that matters more now that
+        # SWA-radix defaults ON, where the reservation must be PRESENT because the store is real.
+        plan = resolve_prefix_cache(config)
+        cache_type = plan.cache_type
+        self._rec_radix = plan.snapshot_kind == "recurrent"
+        self._swa_radix = plan.snapshot_kind == "swa"
+        self._swa_snap = None
+        mc0 = config.model_config
+        # The resolver works off ModelConfig predicates; the engine built its state caches off the very
+        # same ones. Assert they agree rather than trust it — the failure this guards is a radix hit
+        # reporting cached_len>0 with no state behind it, which is silent garbage, not a crash.
+        has_recurrent_state = (
+            self.engine.gdn_state is not None or self.engine.cca_state is not None
+        )
+        assert not self._rec_radix or has_recurrent_state, (
+            "recurrent radix selected but the engine built no GDN/CCA state cache"
+        )
+        assert not self._swa_radix or self.engine.swa_kv_cache is not None, (
+            "SWA radix selected but the engine built no sliding-window ring pool"
+        )
         # GDN AND CCA recurrent state are both non-prefix-cacheable UNLESS we checkpoint it: a plain
         # radix hit would report cached_len>0 with no recurrent state behind it (silent garbage).
         # The --gdn-radix flag (default on) opts into the recurrent-radix cache, which snapshots the linear-attention
         # recurrent state at page-aligned prefix-commit boundaries and restores it on a hit (lossless
         # under the bit-exact recurrent kernel; see radix_cache.py). Default OFF -> force 'naive' as
         # before, so the recurrent path is byte-unchanged unless explicitly enabled.
-        has_recurrent_state = (
-            self.engine.gdn_state is not None or self.engine.cca_state is not None
-        )
-        self._rec_radix = False
         # Recurrent radix COMPOSES with expert-parallelism: EP's ep_loop runs the SAME shared prep path
         # as the normal loop — _finish_prepare (recurrent-state RESTORE) + _process_last_data /
         # _free_req_resources (SNAPSHOT) — and it is synchronous (the ordering the snapshot needs). EP
@@ -174,33 +198,29 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # CCA too. Both GDN and CCA recurrent state are prefix-cacheable, and the spec-decode gate
         # that used to remain has been REMOVED — measured lossless, see the block above.
         # See [[cca-prefix-cache-gemm-m-dependence]].
-        if has_recurrent_state and cache_type != "naive":
-            if config.gdn_radix:
-                self._rec_radix = True
-                cache_type = "recurrent_radix"
+        if has_recurrent_state:
+            if self._rec_radix:
                 logger.warning_rank0(
                     "recurrent-state hybrid model: using recurrent radix prefix cache (page-aligned "
                     "recurrent-state snapshots reused on prefix hits; --no-gdn-radix to disable)"
                 )
             else:
-                why = "GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)"
                 logger.warning_rank0(
-                    f"recurrent-state hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
-                    + why
+                    f"recurrent-state hybrid model: prefix cache {cache_type!r} "
+                    f"(was {config.cache_type!r}); " + plan.reason
                 )
-                cache_type = "naive"
         # SWA-radix prefix caching (Laguna / any sliding-window-attention hybrid). Its FULL-attention
         # layers are already radix-cacheable; its SLIDING layers keep a window-bounded ring whose
         # boundary is transient — so, exactly like GDN/CCA recurrent state, we SNAPSHOT the window at
         # the page-aligned prefix boundary and RESTORE it on a hit (rdna4.py::_swa_prefill_extend runs
         # the cross-boundary extend; PROVEN bit-identical to cold with a BC front-pad). We reuse the
         # snapshot-capable radix ('recurrent_radix': match-cap to a snapshotted boundary + attach), and
-        # gate off spec-decode (a second snapshot system) like recurrent radix. Feature-flagged
-        # (MINISGL_SWA_RADIX, default off) so the naive SWA path is byte-unchanged until proven.
-        mc0 = config.model_config
-        self._swa_radix = False
-        self._swa_snap = None
-        _swa_on = os.environ.get("MINISGL_SWA_RADIX", "0") != "0"
+        # DEFAULT ON as of this change (MINISGL_SWA_RADIX=0 disables). It was flag-gated off purely as
+        # merge-time conservatism — byte-identity to a cold prefill was already proven per-layer and
+        # per-decode-step, with ~11x lower TTFT on a reused long prefix — so the flag's practical
+        # effect was to keep a validated win switched off while the KV pool paid for it anyway, since
+        # the engine's reservation never read the flag. Both now read it through resolve_prefix_cache,
+        # so ON means "reserved AND used" and 0 means "neither".
         # SWA-radix COMPOSES with spec-decode (unlike recurrent radix). The window snapshot/restore is
         # made ring-STRIDE-aware (SWAWindowSnapshotter takes swa_ring_stride = window + num_draft + 1
         # under spec): a snapshot reads/writes the committed window at slots table_idx*R + pos%R, exactly
@@ -210,10 +230,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # prefix-HIT restore runs at the reusing request's PREFILL (a non-spec_verify batch, see
         # _restore_swa_states / the _finish_prepare gate), before any spec propose/verify — no ordering
         # conflict with the widened-ring verify path Track B added.
-        if getattr(mc0, "is_swa_hybrid", False) and cache_type != "naive":
-            if _swa_on:
-                self._swa_radix = True
-                cache_type = "recurrent_radix"
+        if getattr(mc0, "is_swa_hybrid", False):
+            if self._swa_radix:
                 logger.warning_rank0(
                     "SWA-hybrid model: SWA-radix prefix cache ENABLED (page-aligned sliding-window "
                     "snapshots reused on prefix hits; MINISGL_SWA_RADIX=0 to disable)"
@@ -222,10 +240,10 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 )
             else:
                 logger.warning_rank0(
-                    f"SWA-hybrid model: forcing prefix cache 'naive' (was {cache_type!r}); "
-                    "SWA-radix disabled (MINISGL_SWA_RADIX=0)"
+                    f"SWA-hybrid model: prefix cache {cache_type!r} (was {config.cache_type!r}); "
+                    + plan.reason
+                    + " — no snapshot store, and the engine reserved no VRAM for one"
                 )
-                cache_type = "naive"
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
@@ -266,6 +284,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
             CCASlotManager(self.engine.cca_state)
             if self.engine.cca_state is not None
             else None
+        )
+        # Block-diffusion canvas lifecycle — active ONLY for a checkpoint that declares a
+        # `canvas_length` (DiffusionGemma). None for every autoregressive model, which is also what
+        # `run_forever` keys the loop selection on: `config` is not retained past __init__, so the
+        # decision is captured here as an attribute exactly like `_rec_radix` / `gdn_slots`.
+        self._canvas_cfg = (
+            DiffusionSamplerConfig.from_hf(config.model_path, config.model_config)
+            if config.model_config.is_block_diffusion
+            else None
+        )
+        self.canvas_slots = (
+            CanvasManager(self._canvas_cfg, self.device) if self._canvas_cfg is not None else None
         )
         # Recurrent-radix prefix caching binds to the single active recurrent state cache + its slot
         # manager (a model is GDN xor CCA, never both). None unless --gdn-radix enabled it above.
@@ -777,12 +807,15 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # attach_rec_state_at. Keep the DEEPEST ones: divergence is overwhelmingly near the end of the
         # prompt (shared document/system prefix, differing question or turn at the tail).
         self._rec_snap_ladder: dict[int, list[tuple[int, object]]] = {}
-        self._rec_snap_ladder_depth = max(
-            0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4)
-        )
+        # Shared with the engine's reservation (engine/config.py): the SWA kind has no interior
+        # ladder, so its default is 0 while GDN/CCA keeps 4. Reading one helper is what stops the
+        # trimmer and the VRAM reservation describing different numbers of snapshots.
+        self._rec_snap_ladder_depth = snapshot_ladder_depth(config)
         # Must run AFTER the ladder depth is known and the cache manager exists: the snapshot store is
-        # now a real VRAM consumer and has to be bounded and logged, not left at a magic count.
-        self._size_rec_snapshot_budget(config.max_running_req)
+        # now a real VRAM consumer and has to be bounded and logged, not left at a magic count. Takes
+        # the whole config (not just max_running) so it can ask the engine for the SAME live-snapshot
+        # count and the SAME reservation the KV pool was sized around, and print them together.
+        self._size_rec_snapshot_budget(config)
         # Reasoning + structured output: while a constrained req is still inside its `<think>…</think>`
         # reasoning span, the grammar matcher must NOT advance or mask (else the JSON schema suppresses
         # the reasoning phase → truncated / CoT-leaked answers). uid -> think-close token id, present
@@ -1042,6 +1075,18 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # ordering requirement — its window snapshot is cloned from the live ring at a commit point and
         # RESTORED (ring seed + metadata.swa_prefix) in _finish_prepare right before the forward, which
         # only the synchronous loop guarantees — so it forces the non-overlap loop too.
+        # Block diffusion runs its own synchronous loop for the same reason spec decode does: whether
+        # a block stops early is a data-dependent host sync (the stability + confidence criteria read
+        # the entropies back), which the zero-sync overlap path cannot express. It also has a
+        # completely different request lifecycle (ENCODE -> DENOISE xk -> COMMIT), so it sits BESIDE
+        # the autoregressive loop rather than inside it. See scheduler/diffusion.py.
+        if self.canvas_slots is not None:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                while True:
+                    self._diffusion_loop()
+                    if self._bounded_exit_reached():
+                        return
         if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -1340,6 +1385,9 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # Release the CCA conv-state slot (idempotent — overlap scheduling can free a req twice).
         if self.cca_slots is not None:
             self.cca_slots.free(req.uid)
+        # Release any in-flight block-diffusion canvas state (idempotent).
+        if self.canvas_slots is not None:
+            self.canvas_slots.free(req.uid)
         # Release any spec-decode proposer draft state (MTP persistent per-uid KV; n-gram no-op).
         if self._proposer is not None:
             self._proposer.free(req.uid)
@@ -1437,9 +1485,31 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
 
     def _rec_snapshot_nbytes(self) -> int:
-        """Bytes held by ONE recurrent-state snapshot — i.e. what clone_slot() copies: the [:, s:s+1]
-        slice of each state tensor across all layers (GDN: conv+ssm; CCA: conv+prev_hs)."""
+        """Bytes held by ONE snapshot in the radix store.
+
+        GDN/CCA: what clone_slot() copies — the [:, s:s+1] slice of each state tensor across all
+        layers (GDN: conv+ssm; CCA: conv+prev_hs).
+
+        SWA: what SWAWindowSnapshotter.clone() copies — K and V for all sliding layers over at most
+        `window` positions. This arm was MISSING, and _size_rec_snapshot_budget bailed out on
+        `_rec_cache is None` before reaching it, so a SWA-radix serve was the one configuration whose
+        snapshot store had NO derived cap at all: it kept the create-time default of 64 entries while
+        the engine reserved for (ladder+1) x max_running. At max_running 6 that is 30 reserved vs 64
+        storable — the store can quietly take 2.1x the VRAM the KV pool was sized around, which is the
+        exact late prefill-activation OOM this whole budget exists to prevent. That was survivable
+        while SWA-radix was an opt-in nobody opted into; it is not, now that it is the default path for
+        every sliding-window hybrid. Same working set, same cap, both sides."""
         c = self._rec_cache
+        if c is None:
+            snap = self._swa_snap
+            if snap is None:
+                return 0
+            # Ring geometry, not the main pool's: a split-head_dim model (Gemma4) has a different
+            # head_dim/kv_heads on its sliding layers. Read it off the ring tensors so this cannot
+            # describe a different pool than the one the snapshot actually clones.
+            k0 = snap.swa_kv.k_cache(0)
+            per_pos = (k0.numel() // k0.shape[0]) * k0.element_size()  # one slot of K, one layer
+            return 2 * snap.num_layers * snap.W * per_pos              # x2 for K+V
         total = 0
         for name in ("conv_state", "ssm_state", "prev_hs"):
             t = getattr(c, name, None)
@@ -1447,8 +1517,8 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
                 total += (t.numel() // t.shape[1]) * t.element_size()
         return total
 
-    def _size_rec_snapshot_budget(self, max_running: int) -> None:
-        """Bound the radix snapshot LRU by VRAM, not by a magic count.
+    def _size_rec_snapshot_budget(self, config) -> None:
+        """Bound the radix snapshot LRU by VRAM, not by a magic count. GDN/CCA *and* SWA.
 
         The cap defaulted to 64 back when a snapshot was created at most ONCE per committed sequence,
         so the LRU effectively never filled and its cost was invisible. The interior-resume ladder
@@ -1465,15 +1535,31 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
 
         So derive the cap from an explicit budget and LOG it, the way every other VRAM reservation
         here is logged. Sized to cover the live working set — (ladder depth + 1) per concurrent
-        request — with headroom, rather than an arbitrary number."""
-        if self._rec_cache is None:
-            return
+        request — with headroom, rather than an arbitrary number.
+
+        SWA-radix reaches this too, and did not before: the gate was `_rec_cache is None`, which is the
+        GDN/CCA cache, so a sliding-window serve returned here immediately and kept the create-time
+        default of 64 entries while the engine reserved (ladder+1) x max_running. At max_running 4 that
+        is 20 reserved against 64 storable — the store may take 3.2x the VRAM the KV pool was sized
+        around, which is precisely the late prefill-activation OOM this budget exists to prevent, and
+        it survived only because SWA-radix was an opt-in nobody opted into. It is the default now. The
+        gate is therefore "is a snapshot-capable radix ACTIVE", the same question resolve_prefix_cache
+        answers for the engine — one store, described identically by both sides.
+
+        The ENTRY COUNT is deliberately the same formula for both kinds, but it does not mean the same
+        thing, and that is worth stating: GDN/CCA spend the depth on the INTERIOR resume ladder
+        (_attach_rec_ladder), SWA has no ladder — it keeps one end-of-prefix window per sequence — so
+        for SWA the same budget becomes CROSS-REQUEST reuse depth instead. That is not slack: it is the
+        only reuse a SWA model has (warm a prefix, reuse it on a later request), and a cap of merely
+        max_running would let a batch's own inserts evict the warm prefix the next request wants. Same
+        number, honestly earned on both paths, and — the point — the same number the engine reserved."""
         pc = getattr(self.cache_manager, "prefix_cache", None)
         if not getattr(pc, "recurrent", False):
             return
         per = self._rec_snapshot_nbytes()
         if per <= 0:
             return
+        kind = "recurrent" if self._rec_cache is not None else "SWA-window"
         # The cap is DERIVED from the live working set — (ladder depth + 1 end) per concurrent
         # request — not from a chosen number of GiB. Below that the store evicts entries this batch
         # is still going to attach, so the ladder thrashes against itself; above it, the store only
@@ -1482,16 +1568,27 @@ class Scheduler(SchedulerEPMixin, SchedulerIOMixin):
         # (tools/rec_radix_ab.sh), while the difference cost 36,704 KV pool tokens out of the very
         # budget the pool is sized from. MINISGL_GDN_RADIX_SNAP_BUDGET_GIB remains as an explicit
         # override for branch-heavy traffic that wants deeper reuse and has the VRAM to pay for it.
-        live = (self._rec_snap_ladder_depth + 1) * max(1, max_running)
+        #
+        # Call the ENGINE's own helper rather than recompute (ladder+1)*max_running here. That
+        # duplicate was harmless only as long as both copies read the same env var and neither
+        # changed; the entry count is half of "does the reservation describe this store?", so make it
+        # one function like the on/off predicate now is.
+        live = self.engine._rec_snap_live_snapshots(config)
+        max_running = config.max_running_req
         env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
         cap = max(4, live, (int(float(env_gib) * (1 << 30)) // per) if env_gib else 0)
         if os.environ.get("MINISGL_GDN_RADIX_MAX_SNAPSHOTS"):
             cap = min(cap, pc.max_rec_snapshots)  # explicit override still wins downward
         pc.max_rec_snapshots = int(cap)
+        # Print the engine's RESERVATION next to the cap. They are computed from the same live count
+        # and the same per-snapshot bytes, so any mismatch here is a real divergence and visible at
+        # boot — not something to be discovered later as an OOM inside a prefill activation.
+        reserved = self.engine._rec_snapshot_store_bytes(config)
         logger.info_rank0(
-            f"recurrent-radix snapshot store: cap={pc.max_rec_snapshots} x {per/(1<<20):.1f} MiB "
+            f"{kind}-radix snapshot store: cap={pc.max_rec_snapshots} x {per/(1<<20):.1f} MiB "
             f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB "
-            f"({'BUDGET override' if env_gib else 'derived'}: live working set = (ladder "
+            f"(engine reserved {reserved/(1<<30):.2f} GiB; "
+            f"{'BUDGET override' if env_gib else 'derived'}: live working set = (ladder "
             f"{self._rec_snap_ladder_depth} + 1) x max_running {max_running} = {live})"
         )
 

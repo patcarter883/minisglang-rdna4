@@ -21,7 +21,7 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_weight
+from minisgl.models import ModelConfig, create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import (
     div_even,
@@ -32,7 +32,7 @@ from minisgl.utils import (
     torch_dtype,
 )
 
-from .config import EngineConfig
+from .config import EngineConfig, resolve_prefix_cache, snapshot_ladder_depth
 from .graph import GraphRunner, get_free_memory, mem_GB
 from .sample import BatchSamplingArgs, Sampler
 
@@ -50,6 +50,58 @@ _GRAPH_ACT_MULT = 8
 _GRAPH_ASSUMED_AUX = 8
 # Slight round-up so the estimate errs toward preventing OOM rather than over-starving KV.
 _GRAPH_ROUNDUP = 1.1
+# Device bytes a BLOCK-DIFFUSION canvas graph costs per canvas token (graph pool + the warmup's
+# retained allocator growth, which never returns to the device). Deliberately NOT expressed as
+# `_GRAPH_ACT_MULT * hidden * dtype`: that multiplier was fitted against decode/verify graphs of one
+# to a few tokens per sequence, and a canvas step is a prefill-shaped 256-token forward through 30
+# layers of MoE — the same formula under-reserves it by ~50x. MEASURED on the served checkpoint
+# (DiffusionGemma-26B-A4B-int4, TP=2, canvas 256, bs=1): device-free fell 2.96 -> 2.41 GiB across
+# capture, i.e. ~2.2 MiB per canvas token. This is an OBSERVATION with headroom, not a derivation,
+# and it is named that way so nobody mistakes it for a model of the allocator.
+_CANVAS_GRAPH_BYTES_PER_TOKEN = int(2.5 * (1 << 20))
+
+
+def _swa_kv_geometry(mc: ModelConfig) -> Tuple[int, int]:
+    """(head_dim, num_kv_heads) of the SLIDING layers' ring KV pool.
+
+    Gemma4's two layer types do not share a KV geometry: `head_dim`/`num_kv_heads` carry the
+    FULL-attention one (512 / 2) because they size the MAIN paged pool, and the sliding layers keep
+    their own (256 / 8). Every other SWA model (Laguna) leaves `swa_head_dim`/`swa_num_kv_heads`
+    None and gets back exactly the values it always used, so its sizing is unchanged.
+
+    Both the ring-pool ALLOCATION and its byte RESERVATION in _determine_num_pages go through this
+    one function on purpose: if they ever disagreed the engine would reserve one pool's bytes and
+    allocate another's — an OOM at boot or a silently under-allocated KV pool, neither of which
+    names the mismatch."""
+    head_dim = mc.swa_head_dim if mc.swa_head_dim is not None else mc.head_dim
+    num_kv_heads = mc.swa_num_kv_heads if mc.swa_num_kv_heads is not None else mc.num_kv_heads
+    return head_dim, num_kv_heads
+
+
+def _swa_ring_block(mc: ModelConfig, spec_config) -> int:
+    """Extra ring slots per sequence BEYOND the sliding window.
+
+    A plain window-sized ring (stride == W) is correct for single-query decode/extend, but any path
+    that writes a multi-token block into the ring BEFORE attending it needs those tokens in slots
+    disjoint from the live window, because position p and p+W share slot p%W once the sequence is
+    longer than W. Two such paths exist and they are mutually exclusive:
+
+      * SPEC VERIFY stores anchor + drafts (num_draft + 1) and the rejected drafts must not land on
+        a valid-window slot the next gather reads;
+      * BLOCK DIFFUSION stores a whole canvas_length canvas and REREADS the window in the same
+        forward — at stride W all 256 of 256 canvas slots alias a window slot, so the decoder would
+        overwrite the very prefix it must attend to (measured, tools/canvas_attention_probe.py).
+
+    Returns the larger of the two so one number serves both, and 0 when neither applies (stride ==
+    window, byte-identical to the pre-spec path).
+
+    Both the ring ALLOCATION and its byte RESERVATION in _determine_num_pages call this, for the same
+    reason _swa_kv_geometry exists: two independent copies of the arithmetic would drift, and the
+    failure is a ring sized for one stride addressed with another — a silently corrupt cache, not a
+    crash."""
+    spec_block = (spec_config.num_draft + 1) if spec_config is not None else 0
+    canvas_block = mc.canvas_length if mc.is_block_diffusion else 0
+    return max(spec_block, canvas_block)
 
 
 # --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
@@ -185,22 +237,22 @@ class Engine:
         if mc0.is_swa_hybrid:
             from minisgl.kvcache.mha_pool import MHAKVCache
 
-            # Ring STRIDE per sequence = window + spec block. A plain window-sized ring (stride == W)
-            # is correct for single-query decode/extend, but a K+1 spec-VERIFY stores its whole block
-            # (anchor + drafts) into the ring BEFORE attention; the rejected drafts then land in slots
-            # that COLLIDE with the live window (position p and p+W share slot p%W once len >= W), so
-            # the next step's window gather reads stale speculative keys. Widening the stride to
-            # window + num_draft + 1 gives the speculative block its own disjoint slots, so a rejected
-            # draft never overwrites a valid-window slot (position q and any window position p differ by
-            # < stride => distinct mod stride). No spec -> stride == window (byte-identical to Track A).
-            spec_block = (self.spec_config.num_draft + 1) if self.spec_config is not None else 0
-            swa_stride = mc0.sliding_window + spec_block
+            # Ring STRIDE per sequence = window + the multi-token block any path writes before it
+            # reads (spec verify's K+1, or block diffusion's whole canvas). See _swa_ring_block for
+            # why a stride of exactly W corrupts both. No spec and no canvas -> stride == window,
+            # byte-identical to Track A.
+            swa_stride = mc0.sliding_window + _swa_ring_block(mc0, self.spec_config)
             self.ctx.swa_ring_stride = swa_stride
             swa_slots = (config.max_running_req + 2) * swa_stride  # +1 NULL, +1 dummy
+            # The ring holds the SLIDING layers, so it takes the SLIDING geometry — which for Gemma4
+            # is not the model-wide one (256/8 here vs the 512/2 that sizes the main pool). Sizing it
+            # off mc0.head_dim/num_kv_heads would hand store_kv a mis-shaped buffer view: wrong bytes
+            # per slot and a silently corrupt cache, not a crash. Same values as before for Laguna.
+            swa_head_dim, swa_num_kv_heads = _swa_kv_geometry(mc0)
             self.ctx.swa_kv_cache = self.swa_kv_cache = MHAKVCache(
-                num_kv_heads=mc0.num_kv_heads,
+                num_kv_heads=swa_num_kv_heads,
                 num_layers=mc0.num_swa_layers,
-                head_dim=mc0.head_dim,
+                head_dim=swa_head_dim,
                 num_pages=swa_slots,
                 page_size=1,  # ring is addressed by absolute slot; no page grouping
                 device=self.device,
@@ -208,7 +260,8 @@ class Engine:
             )
             logger.info_rank0(
                 f"SWA ring KV: {mc0.num_swa_layers} layers x {swa_slots} slots "
-                f"(window={mc0.sliding_window}, stride={swa_stride}, {config.max_running_req} seqs)"
+                f"(window={mc0.sliding_window}, stride={swa_stride}, {config.max_running_req} seqs, "
+                f"{swa_num_kv_heads} kv heads x {swa_head_dim})"
             )
         else:
             self.swa_kv_cache = None  # type: ignore[assignment]
@@ -431,6 +484,10 @@ class Engine:
             max_running_req=config.max_running_req,
             cam=self.cam,
         )
+        # Block-diffusion canvas graphs. Unlike the spec-verify families this needs nothing from the
+        # scheduler (no proposer, no aux-capture layers) — the shape is fixed by the checkpoint's
+        # canvas_length — so it is captured here, beside the decode graphs, on the engine stream.
+        self._capture_canvas_graphs(config)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         # self.dp_cpu_group is the cross-replica gloo group over the dp ranks (one member per replica,
@@ -492,12 +549,28 @@ class Engine:
                 )
                 self.dp_cpu_group = tp_cpu_group
             # Install the custom_ar one-shot all-reduce as the default all_reduce (TP==2 + P2P only;
-            # falls back to RCCL otherwise). Graph-safe + ~1.3x on the small decode/verify tensors; large
-            # (prefill) all_reduces exceed the slot and self-fall-back to RCCL. Cap the IPC slot at 8 MB
-            # (covers any decode/verify batch) so the fine-grained buffers stay small.
+            # falls back to RCCL otherwise). Graph-safe, and now faster than RCCL at EVERY payload, not
+            # just the small decode ones.
+            #
+            # The slot used to be capped at 8 MB with the note that large prefill all_reduces "exceed
+            # the slot and self-fall-back to RCCL". That cap was written when custom_ar read the peer one
+            # ELEMENT at a time and so was 2.7x SLOWER than RCCL on big tensors — falling back was the
+            # right call. The vectorized (16-byte) peer read inverted that. Measured on this box, TP=2,
+            # bf16, hidden 2816 (tools/tp_collective_regime_sweep.py, custom_ar vs RCCL, us/call):
+            #
+            #     1024 rows ( 5.8 MB)   492.8 vs  581.7   1.18x       <- already under the old cap
+            #     2048 rows (11.5 MB)   963.6 vs 1127.6   1.17x       <- fell back to RCCL, needlessly
+            #     3200 rows (18.0 MB)  1494.5 vs 1713.7   1.15x
+            #     8192 rows (46.1 MB)  3777.8 vs 4361.6   1.15x
+            #
+            # So the cap was costing ~15% on every prefill collective. Size the slot for the largest
+            # forward the engine can actually issue, bounded by MINISGL_CAR_MAX_MIB (default 64) so a
+            # very wide model cannot silently reserve an unbounded amount of fine-grained IPC memory.
+            # Cost is 2 slots (double-buffered) at that size, per rank.
+            car_cap_mib = int(os.environ.get("MINISGL_CAR_MAX_MIB", "").strip() or 64)
             car_max_bytes = min(
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize,
-                8 * 1024 * 1024,
+                car_cap_mib * 1024 * 1024,
             )
             enable_custom_ar_distributed(config.tp_info, tp_cpu_group, car_max_bytes)
         return tp_cpu_group
@@ -651,13 +724,27 @@ class Engine:
         One snapshot is one slot's worth of recurrent state, and the cap is a VRAM budget shared with
         the scheduler (MINISGL_GDN_RADIX_SNAP_BUDGET_GIB), so both agree on the number. 0 when the
         model has no recurrent state or the recurrent radix is off."""
-        # gdn_radix is declared on SchedulerConfig, not EngineConfig — the object reaching the engine
-        # may be either, so read it defensively rather than assume the subclass.
-        if not getattr(config, "gdn_radix", True):
+        # THE gate: ask the shared resolver whether a snapshot store will exist at all, instead of
+        # re-deriving it here from gdn_radix + "per-slot bytes > 0". That local guess was WRONG for a
+        # SWA hybrid — per_slot counts the SWA ring, so it is > 0 with zero recurrent state, while
+        # gdn_radix (a GDN flag) says nothing about the SWA path, which the scheduler gates on
+        # MINISGL_SWA_RADIX. Result on gemma-4-26B-A4B TP=2: 0.98 GiB reserved on a 16 GB card for a
+        # store the scheduler had already decided not to build — ~100k KV tokens bought and thrown
+        # away. It also could not see `--cache-type naive`, which forces the same outcome.
+        # resolve_prefix_cache() is the single source of truth for both sides now (engine/config.py):
+        # same answer as before for GDN/CCA, zero for dense/MHA/MLA and for any hybrid whose snapshot
+        # path is switched off, and — with SWA-radix now default ON — a reservation for SWA hybrids
+        # that is matched by a store the scheduler really does build and fill.
+        if not resolve_prefix_cache(config).snapshot_kind:
             return 0
         # WITHOUT the ReplaySSM ring: a snapshot is what clone_slot() copies, which is conv+ssm only.
         # The ring is per LIVE slot, never cloned onto a radix node, so folding it into per_slot would
         # inflate this reservation by the ring's whole 25% for state that is never stored here.
+        # For snapshot_kind == "swa" this same expression yields the SWA ring's per-sequence bytes,
+        # which is what SWAWindowSnapshotter.clone() copies (all sliding layers x min(boundary, W)
+        # positions of K+V). Under spec the ring stride is window + num_draft + 1 while a snapshot is
+        # only `window` wide, so this over-reserves by the spec block — deliberately, on the side that
+        # cannot OOM. A model is GDN xor CCA xor SWA, so exactly one family contributes here.
         per_slot = (self._recurrent_state_bytes(config, replay_ring=False)
                     // max(1, config.max_running_req + 2))
         if per_slot <= 0:
@@ -678,9 +765,25 @@ class Engine:
     def _rec_snap_live_snapshots(config) -> int:
         """Snapshots the LIVE working set needs: each concurrent sequence's ladder plus its end
         boundary. The one number both the engine's reservation and the scheduler's LRU cap derive
-        from, so they cannot disagree about how much VRAM this store is allowed."""
-        ladder = max(0, int(os.environ.get("MINISGL_GDN_RADIX_SNAP_LADDER") or 4))
-        return (ladder + 1) * max(1, config.max_running_req)
+        from, so they cannot disagree about how much VRAM this store is allowed.
+
+        The ladder term means different things to the two snapshot kinds, and defaults accordingly:
+
+        * RECURRENT (GDN/CCA): interior resume points. A sequence really does hold `ladder` of them
+          plus its end boundary, so the default 4 is the working set and dropping it makes the ladder
+          thrash against itself.
+        * SWA: there IS no interior ladder — a window snapshot is taken at the page-aligned prefix
+          boundary and nowhere else, so the live set is one per concurrent sequence and the default
+          is 0. Anything above that buys purely CROSS-REQUEST reuse depth, which is expensive here in
+          a way it is not for GDN: a Gemma4 window snapshot is 100 MiB (W=1024 x 25 sliding layers x
+          4 local kv heads x 256 head_dim x K+V x 2 B) against 16.4 MiB for the 35B's recurrent
+          state, so inheriting GDN's ladder of 4 cost 1.95 GiB — 204,800 KV-pool tokens, 59% of
+          Gemma4's whole pool — to buy reuse depth the GDN A/B measured as worth nothing on this box
+          (cap 12 and cap 23 produced the same hits and the same TTFT).
+
+        MINISGL_GDN_RADIX_SNAP_LADDER overrides either, so a prefix-sharing-heavy deployment can buy
+        the depth back explicitly and pay the KV tokens knowingly."""
+        return (snapshot_ladder_depth(config) + 1) * max(1, config.max_running_req)
 
     @staticmethod
     def _replay_ring_bytes(mc, num_slots: int, num_v_heads: int, ssm_itemsize: int) -> int:
@@ -733,12 +836,15 @@ class Engine:
             # SWA ring KV pool (allocated AFTER the main pool): 2 (K+V) * num_swa_layers * num_slots *
             # STRIDE * local_kv_heads * head_dim * kv_dtype.itemsize. num_slots as above. Stride is the
             # per-seq ring stride = window + spec block (must match the pool sizing above); no spec => W.
-            local_kv = div_even(mc.num_kv_heads, tp, allow_replicate=True)
-            spec_block = (config.spec_config.num_draft + 1) if config.spec_config is not None else 0
-            swa_stride = mc.sliding_window + spec_block
+            # The ring's geometry is the SLIDING one, which need not be the model-wide head_dim /
+            # num_kv_heads (Gemma4: 256/8 ring vs 512/2 main pool) — the same _swa_kv_geometry the
+            # allocation uses, so the reserve can never describe a different pool than the one built.
+            swa_head_dim, swa_num_kv_heads = _swa_kv_geometry(mc)
+            local_kv = div_even(swa_num_kv_heads, tp, allow_replicate=True)
+            swa_stride = mc.sliding_window + _swa_ring_block(mc, config.spec_config)
             total += (
                 2 * mc.num_swa_layers * num_slots * swa_stride
-                * local_kv * mc.head_dim * self.kv_dtype.itemsize
+                * local_kv * swa_head_dim * self.kv_dtype.itemsize
             )
         return total
 
@@ -839,6 +945,14 @@ class Engine:
             total += T * vocab * f32 + 3 * T * i32
             total += (1 + _GRAPH_ASSUMED_AUX) * T * hidden * dt  # last_hidden + aux_hidden
             total += _GRAPH_ACT_MULT * T * hidden * dt
+        # Block-diffusion canvas graphs (captured in Engine.__init__, i.e. AFTER the KV pool is
+        # sized). Same reason every other term here exists: without it the pool takes the whole
+        # budget and capture OOMs at boot, on the one path where "graphs disabled" is not a graceful
+        # degradation but a 2-3x slower serve. Batch-size set must match _capture_canvas_graphs'.
+        if mc.is_block_diffusion and mc.canvas_length:
+            cbs = min(max_bs, config.max_running_req,
+                      max(1, config.max_forward_len // int(mc.canvas_length)))
+            total += cbs * int(mc.canvas_length) * _CANVAS_GRAPH_BYTES_PER_TOKEN
         total = int(total * _GRAPH_ROUNDUP)
         margin = os.environ.get("MINISGL_GRAPH_RESERVE_MARGIN_GB")
         if margin:  # non-empty (empty env string is ignored)
@@ -858,6 +972,11 @@ class Engine:
                 * mc.num_kv_layers  # == num_layers for MLA (all-attention); matches pool alloc
             )
         else:
+            # head_dim / num_kv_heads are the MAIN pool's geometry, which for a SWA hybrid is the
+            # FULL-attention layers' (num_kv_layers counts exactly those). A split-head_dim model
+            # (Gemma4) keeps its sliding geometry in swa_head_dim/swa_num_kv_heads, charged to the
+            # ring pool by _recurrent_state_bytes — the two pools have different per-token costs and
+            # are billed separately.
             cache_per_page = (
                 2  # key + value
                 * mc.head_dim
@@ -892,13 +1011,29 @@ class Engine:
             )
             num_pages = available_memory // cache_per_page
             if snap_memory:
+                # Name the snapshot KIND. "recurrent" is conv+ssm / conv+prev_hs clones; "swa" is
+                # sliding-window K/V clones — the same store, but a reader who sees "recurrent" on a
+                # model with no recurrent state (the old wording) reasonably concludes the accounting
+                # is broken. It was.
                 logger.info(
-                    f"Reserved {mem_GB(snap_memory)} for the recurrent-radix snapshot store "
+                    f"Reserved {mem_GB(snap_memory)} for the "
+                    f"{resolve_prefix_cache(config).snapshot_kind}-radix snapshot store "
                     f"(filled during serving); KV pool gets the remainder"
                 )
             if state_memory:
+                # This line covers THREE disjoint pools and used to name only two of them, so on a SWA
+                # model (Gemma4: 25 sliding layers x a 1024-token window) it reported a "GDN/CCA
+                # recurrent state" reservation for a model that has neither — legitimate memory,
+                # unrecognisable label. Name whichever one this model actually pays for.
+                _kinds = [
+                    n for n, on in (
+                        ("GDN", mc.is_gdn_hybrid),
+                        ("CCA", mc.is_cca_hybrid),
+                        ("SWA ring KV", getattr(mc, "is_swa_hybrid", False)),
+                    ) if on
+                ]
                 logger.info(
-                    f"Reserved {mem_GB(state_memory)} for GDN/CCA recurrent state "
+                    f"Reserved {mem_GB(state_memory)} for {' + '.join(_kinds) or 'recurrent'} state "
                     f"({config.max_running_req} slots); KV pool gets the remainder"
                 )
             if draft_memory:
@@ -1088,6 +1223,85 @@ class Engine:
             return self.graph_runner.replay_verify(batch, return_hidden)
         with self.ctx.forward_batch(batch):
             return self.model.forward(return_hidden=return_hidden)
+
+    def forward_canvas(
+        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor
+    ) -> torch.Tensor:
+        """One block-diffusion denoising step. Returns full-vocab fp32 logits for EVERY canvas
+        position, ``[sum(extend_len), vocab]``.
+
+        The two things it deliberately does NOT do are the whole reason it is not ``forward_batch``:
+
+          * NO ``sampler.sample``. A canvas step needs per-position entropy over the full vocabulary,
+            a per-position multinomial, an entropy-ordered acceptance set and a re-noise — none of
+            which is top-k/top-p sampling. Penalties, grammar and the reasoning gate are per-token
+            autoregressive concepts that do not apply here at all. ``minisgl.diffusion`` owns this.
+          * NO ``complete_one()``. The canvas is SCRATCH: the same ``canvas_length`` slots are
+            overwritten on every one of the <=48 steps of a block, so ``cached_len``/``device_len``
+            must stay exactly where the block started. Advancing them would allocate a fresh canvas
+            of slots per step and leave the block attending its own denoising history.
+
+        The step is CUDAGRAPH-CAPTURED when the batch matches a captured size (see
+        ``GraphRunner.capture_canvas_graphs``); only the backbone is in the graph, the LM head runs
+        eagerly either way. Note where ``prepare_metadata`` sits: building the eager metadata is
+        itself a per-step O(bs*(window+canvas)) Python loop over ring slots, so it is built ONLY on
+        the eager branch — the captured branch's static rows are filled by
+        ``prepare_canvas_for_replay``. Doing both would leave a measurable part of the very host cost
+        capture exists to remove.
+
+        ``canvas_ids`` is passed explicitly rather than read from ``batch.input_ids`` because the
+        canvas is re-sampled between steps and never enters a request's host token buffer; the token
+        pool holds a copy only so the KV scatter can address the right slots. ``self_conditioning``
+        is always a real ``[tokens, hidden]`` tensor (zeros on the first step of a block) rather than
+        ``None``: a captured graph cannot branch on it, and zeros are bit-identical to skipping the
+        block (see ``DiffusionGemmaSelfConditioning.forward``)."""
+        assert torch.cuda.current_stream() == self.stream
+        assert batch.canvas, "forward_canvas requires a canvas batch (Batch.canvas is False)"
+        _maybe_profile()
+        if self.graph_runner.can_use_canvas_graph(batch):
+            hidden = self.graph_runner.replay_canvas(batch, canvas_ids, self_conditioning)
+        else:
+            self.attn_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                hidden = self.model.forward_canvas_hidden(canvas_ids, self_conditioning)
+        return self.model.canvas_logits(hidden)
+
+    def _capture_canvas_graphs(self, config: EngineConfig) -> None:
+        """Capture the block-diffusion canvas graphs, at boot, for every batch size the serve can
+        actually admit. No-op for every autoregressive model.
+
+        Two bounds, and both are real rather than defensive:
+          * ``max_graph_bs`` — the operator's own graph-coverage knob (``--cuda-graph-max-bs``, which
+            ``tools/serve.sh`` pins to the concurrency). Above it, capture is off by request.
+          * ``max_forward_len`` (= ``--max-extend-tokens`` on a served config) — a canvas step of
+            ``bs*canvas_length`` tokens IS a prefill of that many tokens as far as activation memory
+            is concerned, and the engine already refuses prefills above that budget. Capturing a
+            batch the forward budget forbids would reserve graph memory for a step that can never
+            run.
+        Sizes are CONTIGUOUS (1..max) rather than the decode bucket ladder, because the canvas path
+        matches bs EXACTLY (no dummy padding — a padded canvas row is a whole extra 256-token forward
+        through 30 layers), so a bucket gap is a batch size that silently runs eager."""
+        mc = config.model_config
+        if not mc.is_block_diffusion or self.graph_runner.max_graph_bs == 0:
+            return
+        canvas_len = int(mc.canvas_length)
+        by_tokens = max(1, config.max_forward_len // canvas_len)
+        max_bs = min(self.graph_runner.max_graph_bs, config.max_running_req, by_tokens)
+        if max_bs < 1:
+            return logger.info_rank0("canvas CUDA graph: no admissible batch size — capture skipped")
+        # Buffer dtype is the EMBEDDING's, not ``self.dtype``: the self-conditioning input and the
+        # backbone hidden are both in the embedding table's dtype, and a static buffer one step off
+        # would silently CAST on every copy_ instead of raising — a numerical difference against the
+        # eager path, on the input the whole denoising loop is conditioned on.
+        emb_w = self.model.model.embed_tokens.weight
+        with torch.cuda.stream(self.stream):
+            self.graph_runner.capture_canvas_graphs(
+                model=self.model,
+                canvas_len=canvas_len,
+                bs_list=list(range(1, max_bs + 1)),
+                hidden_size=emb_w.shape[1],
+                dtype=emb_w.dtype,
+            )
 
     def capture_spec_verify_graphs(
         self, needs_hidden: bool, num_aux: int, bs_list: "list[int]",

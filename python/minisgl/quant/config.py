@@ -9,11 +9,22 @@ def _norm_ignore(patterns: tuple[str, ...]) -> tuple[str, ...]:
     """Strip the multimodal wrapper infix so ignore entries — stored in the checkpoint's native
     key space (e.g. 'model.language_model.layers.0.linear_attn.in_proj_b') — match the loader's
     de-wrapped module names ('model.layers.0.linear_attn.in_proj_b'; the loader strips
-    'language_model.'). `re:`-prefixed regexes are left untouched (the author controls them)."""
+    'language_model.'). `re:`-prefixed regexes are left untouched (the author controls them).
+
+    DiffusionGemma nests the text stack under `model.decoder.` and the loader de-wraps that the same
+    way, so the same strip must apply — and its failure mode is nastier than a missed ignore usually
+    is. The dense MLP, the router and the self-conditioning block are ALL fp16 in that checkpoint via
+    entries like 'model.decoder.layers.0.mlp.gate_proj'; if they do not match, every one of those
+    modules is built QUANTIZED against tensors the checkpoint ships unpacked, and the model declares
+    `weight_packed` where the loader emits `weight` — a wall of missing/extra keys at boot with no
+    hint that a namespace mismatch caused it. Anchored at the start, unlike the `language_model.`
+    infix strip, because `decoder.` is a plausible substring of a genuine module path."""
     out = []
     for p in patterns:
         if p and not p.startswith("re:"):
             p = p.replace("language_model.", "")
+            if p.startswith("model.decoder."):
+                p = "model." + p.removeprefix("model.decoder.")
         out.append(p)
     return tuple(out)
 

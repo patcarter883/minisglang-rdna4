@@ -42,8 +42,17 @@ DEV = "cuda"
 torch.manual_seed(0)
 FAILS = []
 
-# Laguna sliding-layer shape (TP=1): 64 QO heads, 8 KV heads, head_dim 128, window 512.
-HQ, HK, D, W = 64, 8, 128, 512
+# GEOMETRY IS A PARAMETER, not a constant. The defaults below are Laguna's sliding layer (TP=1) —
+# the shape this gate was originally written against, so an unparameterised run is unchanged. But the
+# whole point of the gate is the flash BLOCK GROUPING, which depends on head_dim and window, and
+# Gemma4's sliding layers are NOT Laguna's: 256/8 at W=1024 (per rank at TP=2: 8 QO, 4 KV), against
+# a 512/2 main pool. Hardcoding one model's numbers would have "proved" losslessness for a shape the
+# serve never runs. Override with SWA_HQ / SWA_HK / SWA_D / SWA_W.
+import os as _os
+HQ = int(_os.environ.get("SWA_HQ", 64))
+HK = int(_os.environ.get("SWA_HK", 8))
+D = int(_os.environ.get("SWA_D", 128))
+W = int(_os.environ.get("SWA_W", 512))
 SCALE = D ** -0.5
 
 
@@ -144,28 +153,107 @@ def case_bc_aligned(name, L, M):
     return bit, dmax
 
 
+def case_production(name, L, M, expect_bit=True):
+    """The SHAPE THE SERVE ACTUALLY RUNS: `rdna4.py::_swa_prefill_extend`, reproduced line for line.
+
+    `case_bc_aligned` above is NOT this. It front-pads with REAL prefix keys taken from further back;
+    production front-pads with ZEROS, and skips the pad entirely when `pad == 0`. Those are different
+    buffers, and only one of them ships. The gap mattered: every BC-aligned case above lands on
+    pad in {2, 16, 18} — the residue is a property of the (L, W) pair the case happens to pick — so
+    `pad == 0` was never exercised, and `pad == 0` is exactly what a page-aligned radix boundary
+    produces (L=3168, W=1024 -> (3168-1024) % 32 == 0). A serve hit it on the first partial prefix
+    reuse and the gate had nothing to say."""
+    N = L + M
+    q = torch.randn(N, HQ, D, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(N, HK, D, device=DEV, dtype=torch.bfloat16)
+    v = torch.randn(N, HK, D, device=DEV, dtype=torch.bfloat16)
+    out_cold = _prefill(q, k, v)[L:]
+
+    Wp = min(L, W)
+    pad = (L - Wp) % BC
+    k_win, v_win = k[L - Wp:L], v[L - Wp:L]
+    Hk = k_win.shape[1]
+    front = pad + Wp
+    # EXACTLY rdna4.py: zero KEYS for the pad, zero QUERIES for the whole front, drop `front` rows.
+    parts_k = ([k_win.new_zeros((pad, Hk, D))] if pad else []) + [k_win, k[L:N]]
+    parts_v = ([v_win.new_zeros((pad, Hk, D))] if pad else []) + [v_win, v[L:N]]
+    k_ext = torch.cat(parts_k, dim=0)
+    v_ext = torch.cat(parts_v, dim=0)
+    q_ext = torch.cat([q.new_zeros((front, HQ, D)), q[L:N]], dim=0)
+    out_ext = _prefill(q_ext, k_ext, v_ext)[front:]
+
+    bit = torch.equal(out_cold, out_ext)
+    dmax = (out_cold.float() - out_ext.float()).abs().max().item()
+    _record(f"PROD {name} (L={L},M={M},pad={pad})", bit == expect_bit,
+            f"bit-identical={bit} max|cold-ext|={dmax:.3e}"
+            + ("" if bit == expect_bit else f"  <-- EXPECTED bit-identical={expect_bit}"))
+    return bit, dmax, pad
+
+
+def sweep_pad(M):
+    """Every BC residue at a fixed chunk length. The failure this gate exists to catch is a property
+    of `pad`, so sweeping it is the only way to find out WHICH residues are sound rather than
+    inferring soundness from whichever residues the round numbers happened to produce."""
+    print(f"\n-- pad sweep at M={M} (L chosen so (L-W) % BC walks 0..{BC - 1}) --")
+    bad = []
+    for r in range(BC):
+        L = W + 2 * BC * 8 + r          # L-Wp = 512+r on any W, so the residue is exactly r
+        bit, dmax, pad = case_production(f"pad={r:2d}", L, M, expect_bit=True)
+        if not bit:
+            bad.append((pad, dmax))
+    print(f"   pads that are NOT bit-identical: {[p for p, _ in bad] or 'none'}")
+    return bad
+
+
+def sweep_chunk(pad_target=0):
+    """Chunk lengths at a fixed pad. A partial prefix hit produces a SHORT first chunk (the page
+    remainder), which the round-number cases above never produced either."""
+    print(f"\n-- chunk sweep at pad={pad_target} --")
+    bad = []
+    for M in (1, 2, 5, 7, 16, 17, 31, 32, 33, 64, 128):
+        L = W + 2 * BC * 8 + pad_target
+        bit, dmax, _ = case_production(f"M={M:3d}", L, M, expect_bit=True)
+        if not bit:
+            bad.append((M, dmax))
+    print(f"   chunk lengths that are NOT bit-identical: {[m for m, _ in bad] or 'none'}")
+    return bad
+
+
 def main():
     print("== SWA prefix-extend vs cold prefill (feasibility gate) ==")
     print(f"   shape HQ={HQ} HK={HK} D={D} W={W}\n")
     results = []
-    # Boundary cases the 'unsound' claim is about: prefix shorter/equal/longer than the window,
-    # single-token and multi-token extends, chunks that span the window boundary.
-    results.append(case("prefix longer than window, small extend", 1000, 64))
-    results.append(case("prefix longer than window, 1-token extend", 1000, 1))
-    results.append(case("prefix longer than window, big extend", 1000, 300))
-    results.append(case("prefix == window", 512, 64))
-    results.append(case("prefix shorter than window", 200, 64))
-    results.append(case("prefix shorter, extend crosses W", 400, 200))
+    # The cases are stated RELATIVE TO THE WINDOW, not in absolute tokens: "prefix longer than the
+    # window" is the thing under test, and at Laguna's W=512 a fixed 1000 means that while at Gemma4's
+    # W=1024 it would silently mean the opposite. S keeps the W=512 numbers bit-for-bit what they were.
+    S = max(1, W // 512)
+    results.append(case("prefix longer than window, small extend", 1000 * S, 64))
+    results.append(case("prefix longer than window, 1-token extend", 1000 * S, 1))
+    results.append(case("prefix longer than window, big extend", 1000 * S, 300))
+    results.append(case("prefix == window", W, 64))
+    results.append(case("prefix shorter than window", 200 * S, 64))
+    results.append(case("prefix shorter, extend crosses W", 400 * S, 200 * S))
     results.append(case("tiny prefix", 40, 24))
-    results.append(case("page-aligned prefix (256)", 768, 128))
+    results.append(case("page-aligned prefix", 768 * S, 128))
     print("\n== BC-aligned extend (front-pad to (L-W)%BC) => bit-identical for ANY boundary ==")
     ar = []
-    ar.append(case_bc_aligned("prefix longer than window, small extend", 1000, 64))
-    ar.append(case_bc_aligned("prefix longer than window, 1-token extend", 1000, 1))
-    ar.append(case_bc_aligned("prefix longer than window, big extend", 1000, 300))
-    ar.append(case_bc_aligned("non-aligned prefix", 993, 57))
-    ar.append(case_bc_aligned("non-aligned prefix", 777, 129))
+    ar.append(case_bc_aligned("prefix longer than window, small extend", 1000 * S, 64))
+    ar.append(case_bc_aligned("prefix longer than window, 1-token extend", 1000 * S, 1))
+    ar.append(case_bc_aligned("prefix longer than window, big extend", 1000 * S, 300))
+    ar.append(case_bc_aligned("non-aligned prefix", 993 * S, 57))
+    ar.append(case_bc_aligned("non-aligned prefix", 777 * S, 129))
     print(f"\nBC-aligned bit-identical: {sum(1 for b,_ in ar if b)}/{len(ar)}")
+
+    # ---- the shapes the SERVE runs, which is what this gate missed the first time ----------------
+    print("\n== PRODUCTION extend (rdna4.py::_swa_prefill_extend, zero-key pad) ==")
+    # The three shapes a block-diffusion partial prefix hit actually produces on Gemma4 (W=1024,
+    # page_size=16): a FULL hit extends a few tokens from a page-aligned boundary with pad 16, and a
+    # PARTIAL hit page-splits into a short chunk at pad 0 followed by the page remainder.
+    case_production("full-hit tail", 3184, 5)
+    case_production("partial-hit chunk1 (page-split)", 3168, 16)
+    case_production("partial-hit chunk2", 3184, 7)
+    sweep_pad(16)
+    sweep_chunk(0)
     print()
     n_bit = sum(1 for b, _ in results if b)
     print(f"bit-identical cases: {n_bit}/{len(results)}")

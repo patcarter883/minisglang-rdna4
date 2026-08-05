@@ -435,12 +435,16 @@ def w4a8_moe(
     kernel: str = "wmma",
     block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
     weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
+    activation: str = "silu",  # gated activation on the gemm1 [gate|up] output: "silu" | "gelu"
 ) -> torch.Tensor:
-    """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> silu_and_mul
+    """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> gated activation
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
     w4a8_fp8_wmma `_run_grouped_moe` (non-GEMV, unfused-silu) path. Returns (M, K).
     `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight decode instead of uniform int4
     (the scales are the E8M0 group exponents folded to fp16; w13_zeros/w2_zeros MUST be None).
+    `activation` picks the gated activation: "silu" (default, and the only one with a fused gemm1
+    epilogue) or "gelu" == HF `gelu_pytorch_tanh` (Gemma4's routed experts), which forces the
+    unfused gemm1 path below.
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
@@ -495,12 +499,26 @@ def w4a8_moe(
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their
     # NATIVE dtype — a bf16 model no longer round-trips bf16->fp16->bf16 here (out1 follows x's dtype).
     x16 = _moe_time("cast", lambda: x.contiguous())
-    # Gated gemm1 + SiLU-mul. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
+    # Gated gemm1 + activation. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
     # dropping the separate silu launch and the (P, 2*inter) out1 round-trip. The gemm1-epilogue fusion
     # is now available at DECODE too via the moe_gemv_decode_silu kernel (kernel="gemv"), not just the
-    # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, or fp32) = gemm1 -> (P,2*inter) then
-    # tail_hip.silu_and_mul (fp32-internal HIP) / the torch silu+mul reference.
-    if _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
+    # WMMA prefill path. UNFUSED fallback (MINISGL_MOE_FUSED_SILU=0, fp32, or activation != silu) =
+    # gemm1 -> (P,2*inter) then tail_hip.silu_and_mul (fp32-internal HIP) / the torch reference.
+    #
+    # `activation` is a POLICY over this one shared body, never a kernel fork (KERNEL_CORE_POLICY.md).
+    # The `activation == "silu"` guard on the fused branch is load-bearing: the fused epilogue is
+    # HARD-WIRED to silu, so letting a gelu model reach it would compute the wrong activation and
+    # still return correctly-shaped, finite, plausible logits — a silent quality regression with no
+    # crash to catch it. Cost of the guard is that gelu pays the extra (P, 2*inter) round-trip and a
+    # second launch.
+    # FOLLOW-UP (KERNEL_CORE_POLICY.md: a new activation is a policy on the existing core, NOT a new
+    # kernel and NOT a permanent slow path): template `mmq_fp8_moe_gemm1_silu` / `_silu_flag` on the
+    # epilogue functor so the activation becomes a kernel argument and gelu runs at fused speed. Until
+    # that lands, gelu is correct-but-slower here by construction.
+    assert activation in ("silu", "gelu"), (
+        f"w4a8_moe supports activation 'silu' or 'gelu' (gelu_pytorch_tanh); got {activation!r}"
+    )
+    if activation == "silu" and _MOE_FUSED_SILU and x16.dtype in _FUSED_SILU_DTYPES:
         # PREFILL (block_m in {64,128}): the silu-fused flagship register-tiled gemm1 flag — bit-exact
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
@@ -534,7 +552,14 @@ def w4a8_moe(
             ),
         )  # (P, 2*inter) in x's dtype
         d = out1.shape[1] // 2
-        if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+        if activation == "gelu":
+            # `gelu_tanh_and_mul`, NOT `gelu_and_mul` — the latter is the exact erf gelu (both its
+            # native tail_hip arm and its torch arm), while every gelu-MoE checkpoint we serve
+            # declares HF `gelu_pytorch_tanh`. Torch-only: there is no native tanh-gelu tail kernel.
+            from minisgl.layers.activation import gelu_tanh_and_mul
+
+            buf2 = _moe_time("gelu", lambda: gelu_tanh_and_mul(out1.contiguous()).contiguous())
+        elif _TAIL_HIP and out1.dtype in _SILU_DTYPES:
             import tail_hip  # canonical package: silu_and_mul is a module-level callable
 
             engaged("tail_hip.silu_and_mul")
@@ -1188,7 +1213,87 @@ def rxf_moe_regdirect(
     return acc.to(x.dtype)
 
 
-def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 128) -> str:
+def _tiled_last_wave_occupancy(n: int) -> float:
+    """How full is `wmma_tiled_tuned`'s LAST dispatch wave at output width `n`?
+
+    In the mid-band (M < its BM=256) the tiled kernel's grid is exactly ceil(N / BN) workgroups —
+    one row-block, one column-block per BN=128 slice of N — so the whole launch is `tiles` blocks
+    over the device's CUs. When `tiles` is a multiple of the CU count every wave is full; when it is
+    not, the last wave runs at `tiles / (waves * CU)` occupancy and the kernel pays a full wave for a
+    fraction of a wave's work. That is the term the mid-band surface is non-monotonic in, and it is a
+    property of the DEVICE as much as of the shape — see `_pick_dense_kernel`.
+
+    Returns 1.0 when the CU count cannot be read (no HIP device: CPU tests, meta init), which makes
+    the caller prefer `wmma_tiled_tuned` — the right default, since it is the mid-band winner
+    everywhere the wave is full.
+    """
+    cu = _device_cu_count()
+    if cu <= 0:
+        return 1.0
+    tiles = -(-n // _W4A8_TILED_BN)
+    return tiles / (cu * -(-tiles // cu))
+
+
+_CU_COUNT: dict[int, int] = {}
+
+
+# Dispatch reasons about THIS CU count on every rank, not the physical one.
+#
+# The mid-band winner tracks the device's CU count, and this box is a MISMATCHED pair — 64 on the
+# RX 9070 XT, 56 on the RX 9070 — so the true per-device rule picks a DIFFERENT arm on each rank of
+# a single TP=2 job (measured: prefill_wmma wins N=8192 and N=16384 on the 9070 and loses both on
+# the XT). That is not merely untidy, it is not REPRODUCIBLE: the arbiter leases whichever card is
+# free, so rank 0 is sometimes the XT and sometimes the 9070, and the same job dispatches
+# differently run to run. Every pathway that recomputes a token — prefix/radix reuse, chunked
+# prefill, spec verify — assumes a token's kernel does not depend on which physical card it landed
+# on.
+#
+# Pinning costs no accuracy: the three arms are bit-identical (0.000e+00 at every M across all 48
+# shapes), so this only changes WHICH equally-correct kernel runs. It costs the 9070 taking the XT's
+# arm where the two disagree, which the measured surface bounds at ~1.17x on a handful of wide-N
+# mid-band cells — cheap for determinism.
+#
+# MINISGL_DISPATCH_CU=auto (or 0) re-derives from the physical device; any integer pins that value
+# instead, e.g. after a hardware change.
+_PINNED_DISPATCH_CU = 64
+
+
+def _device_cu_count() -> int:
+    """CU count the dispatch reasons about — PINNED to `_PINNED_DISPATCH_CU` so both ranks of a TP
+    job agree regardless of which physical card each was leased. See the note above.
+
+    The physical values, for reference: torch reports RDNA's WORKGROUP PROCESSORS in
+    `multi_processor_count` (32 on the RX 9070 XT, 28 on the RX 9070) and a WGP is 2 CUs, so the
+    dispatch unit count is twice it — 64 and 56 respectively. Measured: the mid-band boundary
+    tracks 2x this number on BOTH cards and tracks neither `multi_processor_count` alone."""
+    env = _os.environ.get("MINISGL_DISPATCH_CU")
+    if env is None:
+        return _PINNED_DISPATCH_CU
+    if env not in ("0", "auto"):
+        return int(env)
+    # Explicit opt-in to the PHYSICAL count: heterogeneous dispatch across a mismatched pair, and
+    # not reproducible across a re-lease. Only for measuring the per-device surface.
+    try:
+        idx = torch.cuda.current_device()
+    except Exception:  # noqa: BLE001  — no HIP device at all
+        return 0
+    cu = _CU_COUNT.get(idx)
+    if cu is None:
+        try:
+            cu = torch.cuda.get_device_properties(idx).multi_processor_count * 2
+        except Exception:  # noqa: BLE001
+            cu = 0
+        _CU_COUNT[idx] = cu
+    return cu
+
+
+def _pick_dense_kernel(
+    m: int,
+    weight_is_e2m1: bool = False,
+    group_size: int = 128,
+    k: int | None = None,
+    n: int | None = None,
+) -> str:
     """Per-M dense-linear kernel selection, at the MEASURED crossovers (gfx1201).
 
     - m <= gemv_max -> decode_gemv: a streaming GEMV that reads each weight once and dots it against
@@ -1199,11 +1304,88 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
       regime ~2-4x over prefill_wmma (re-bench), for BOTH int4 AND e2m1 now that the tiled kernel is
       e2m1-bit-exact and carries the packed-store. Bit-exact + graph-capture-safe (writes to `out`,
       no in-op at::zeros). One dtype-generic rule — no int4-vs-e2m1 branch.
-    - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> prefill_wmma: its conservative config still
-      wins the small-M/wide-N corner (re-bench: tiled loses only at N>=6144, M<=32).
+    - mid-band (gemv_max < m < _W4A8_PREFILL_TILED_MIN) -> a THREE-WAY surface: wmma_tiled_tuned for
+      the large majority, prefill_wmma in a wide-N corner, prefill_wmma_ashuffle in a tall-K box.
+      The old rule sent the WHOLE mid-band to prefill_wmma on the claim that "its conservative config
+      still wins the small-M/wide-N corner (tiled loses only at N>=6144, M<=32)". Measured, the claim
+      is right that a corner exists and wrong about where it is, and it has no N term at all — so a
+      wide-N conclusion was applied at every width, and the rule was BACKWARDS on essentially every
+      shape this engine dispatches.
+
+    THE MID-BAND SURFACE (measured 2026-08-05, tools/w4a8_dense_midband_surface.py, CUDA-graph-replay
+    timed with the weights rotated past the 64 MB MALL by BYTE count; 24 shipped shapes x 24 synthetic
+    (M,N) grid cells x 13 M values x 3 arms, RX 9070 XT; fixture _midband_surface.txt). Of the 432
+    mid-band cells wmma_tiled_tuned wins 306, prefill_wmma_ashuffle 67, prefill_wmma 59.
+
+        rule                                    total us over the per-cell oracle   worst single cell
+        always prefill_wmma  (THE OLD RULE)                 +40.6%                  3.09x  N=1024 M=63
+        always wmma_tiled_tuned (retire both)               + 4.8%                  1.57x  N=10240 M=17
+        + wide-N corner                                     + 1.36%                 1.17x  N=9216  M=56
+        + ashuffle box            (THE NEW RULE)            + 0.55%                 1.17x  N=9216  M=56
+
+      So the old rule was not a small mis-tune: on a narrow-N layer at M=63 it ran the mid-band 3x
+      slower than the arm sitting next to it. Both prefill arms nevertheless HAVE regimes — retiring
+      them costs 1.57x on GLM-4.7-Flash's gate_up (N=10240, M=17: 98.4 us vs 154.3 us) and 1.44x on
+      Qwen3.5-4B's (N=9216) — so this is `keep, bounded` for both, not `retire`.
+      CAUTION on ashuffle: it wins more CELLS than prefill_wmma but its median cell is worth only
+      1.038x, which is near the timing floor. Only the part of its band that survived a 3-pass
+      repeat on BOTH cards is routed; see _W4A8_ASHUFFLE_MIN_K.
+
+    WHY NO SINGLE CONSTANT EXPRESSES IT. The surface is NOT monotonic in N. wmma_tiled_tuned wins at
+    N=8192 and N=16384 and loses at 9216 / 10240 / 11264 / 17408 / 34816, which is not noise: in the
+    mid-band its grid is exactly ceil(N/128) workgroups, and 8192 and 16384 are precisely the widths
+    at which that count (64, 128) is a whole number of 64-CU dispatch waves. Everywhere else the last
+    wave runs half empty and prefill_wmma — which tiles N by 64, i.e. quantizes at twice the
+    resolution, and takes a BM=64 small-M tile instead of padding M up to 256 — wins.
+    The deciding term is therefore the DEVICE's CU count, not a shape constant, and this box proves
+    it: on the RX 9070 (56 CUs, GPU 1) prefill_wmma wins at N=8192 AND N=16384, exactly where it
+    LOSES on the RX 9070 XT (64 CUs, GPU 0). Same shape, same M, opposite arm — so the two ranks of
+    one TP=2 job genuinely want different kernels, and any fixed N threshold is wrong on one of them.
+    Measured on both cards, 14/14 cells agree with the CU-derived rule and 0/14 with a fixed N
+    (tools/w4a8_dense_midband_crosscard.py; fixtures _midband_crosscard_{0,1}.txt).
+
+    THE STRUCTURAL FIX IS IN THE KERNEL, NOT HERE. This whole corner exists because
+    wmma_tiled_tuned's tile is HARD-WIRED to BM=256 x BN=128 while prefill_wmma already derives a
+    small-M tile (BM=64) from M. The tiled kernel accepts its tile at runtime (VLLM_W4A8_V7_CFG), and
+    swept over that knob it beats BOTH shipped arms across nearly the whole mid-band
+    (tools/w4a8_dense_midband_tilecfg.py, fixture _midband_tilecfg.txt; bit-identical at every tile):
+
+        N=9216  M=17 :  prefill 160.2   tiled@256x128 235.6 (shipped)   tiled@64x64 114.5   -> 2.06x
+        N=10240 M=17 :  prefill  98.9   tiled@256x128 155.9 (shipped)   tiled@64x64  91.4   -> 1.71x
+        N=8192  M=17 :  prefill 145.4   tiled@256x128 127.8 (shipped)   tiled@64x64  98.2   -> 1.30x
+        N=2048  M=32 :  prefill 140.0   tiled@256x128  97.0 (shipped)   tiled@256x64 84.3   -> 1.15x
+
+      i.e. the tile is worth up to 2.06x and the ARM is worth at most ~1.6x — the arm choice this
+      function makes is the smaller half of the win, and it only exists because the bigger half was
+      left on the floor. The right fix is a shape-derived tile inside `mmq_fp8_gemm`'s tiled
+      launcher (it already does exactly this for prefill_wmma's SBM=64 path), after which the
+      mid-band arms plausibly have no regime at all and BOTH prefill arms can be retired. Until then
+      this dispatch is the best available from the three arms as shipped.
 
     The dead small-M WMMA variants (nsplit/splitk/regdirect_shuffle) were REMOVED (they allocated an
     in-op at::zeros((M,N),f32) that blew up VRAM under CUDA-graph capture); no override knob remains.
+
+    DO THE ARMS AGREE? (measured 2026-08-05, tools/quant_m_invariance.py, RX 9070 XT, 7 shipped
+    shapes: Gemma4 o_proj 2048/4096/8192 x 2816, qkv, gate_up, dense_down at g=32 fp16; Qwen3.6-35B
+    o_proj/gate_up at g=128 bf16.)  Nobody had ever asked, and the answer decides whether a quantized
+    model is M-invariant at all -- the property layers/minv.py exists to guarantee for the bf16 path,
+    on which chunked prefill, prefix/radix caching and spec-decode VERIFY all depend.
+
+        prefill_wmma  vs  wmma_tiled_tuned :  max|delta| = 0.000e+00  at EVERY M, EVERY shape.
+                                              (re-confirmed on the 2026-08-05 mid-band sweep: 0.000e+00
+                                              at every one of the 48 shapes, and also for the third,
+                                              UNDISPATCHED arm prefill_wmma_ashuffle and for every
+                                              VLLM_W4A8_V7_CFG tile of wmma_tiled_tuned. So the whole
+                                              mid-band question is pure performance.)
+        decode_gemv   vs  either WMMA arm  :  up to 1.953e-3 abs (fp16 g32) / 2.441e-4 (bf16 g128),
+                                              ~1e-3 relative.
+        each arm against ITSELF across M   :  0.000e+00 (rows[0:m] alone == the same rows inside a
+                                              batch of 2048, for all three arms).
+
+    So: every arm is individually M-invariant, and the M >= 64 crossover is FREE because the two WMMA
+    arms are the same numbers. The quantized dense path has exactly ONE lossy seam -- decode_gemv <->
+    WMMA at `gemv_max` -- and it sits inside the spec-verify band (verify M = bs*(K+1)). That is why
+    _W4A8_GEMV_MAX_INT4 is 16 and not 8; see its comment.
     """
     # NVFP4 (group-16) e2m1 now rides decode_gemv in the decode band: the unified Int4Fp8GemvLoader
     # folds a per-16-K-half scale (group<32 branch), so the streaming GEMV serves group-16 at M<=gemv_max
@@ -1213,22 +1395,147 @@ def _pick_dense_kernel(m: int, weight_is_e2m1: bool = False, group_size: int = 1
     if weight_is_e2m1 and group_size % 32 != 0 and not _NVFP4_GEMV:
         return "wmma_tiled_tuned"
     gemv_max = _W4A8_GEMV_MAX_E2M1 if weight_is_e2m1 else _W4A8_GEMV_MAX_INT4
-    if m <= gemv_max:
+    # decode_gemv's K granularity. Its inner warp-step consumes K in 32-k units (4x int32 b128 per
+    # lane), so a tail chunk is covered exactly when the lanes divide it; the b128 weight load
+    # additionally needs the (N, K/8) row int32-offset 16-byte aligned, i.e. K % 32 == 0.
+    #
+    # This guard is a CORRECTNESS backstop, not a performance policy. Falling through to the WMMA
+    # GEMM would put the served M=1 band on a prefill kernel — the decode-through-a-GEMM
+    # anti-pattern this repo has already measured as an occupancy collapse at bs=1 — so any shape
+    # that lands in the decode band and gets refused here is a KERNEL bug to fix in the tail, not a
+    # shape to route around. (`k=None`: caller did not pass K; keep the historical behaviour.)
+    if m <= gemv_max and (k is None or k % _W4A8_GEMV_K_MULTIPLE == 0):
         return "decode_gemv"
-    if weight_is_e2m1 and group_size % 32 != 0:
+    # BOTH prefill arms hard-require group_size % 32 == 0 in-kernel; only wmma_tiled_tuned carries a
+    # runtime group size (its BKT=0 instantiation). This used to be checked for e2m1 alone, which
+    # left an int4 group-16 checkpoint — they exist, CohereLabs North-Mini-Code w4a16 ships g=16 —
+    # able to reach prefill_wmma in the mid-band. It is a property of the ARMS, not of e2m1.
+    if group_size % 32 != 0:
         return "wmma_tiled_tuned"
-    return "wmma_tiled_tuned" if m >= _W4A8_PREFILL_TILED_MIN else "prefill_wmma"
+    if m >= _W4A8_PREFILL_TILED_MIN:
+        return "wmma_tiled_tuned"
+    # THE MID-BAND — a three-way surface, not a threshold. Over the 432 measured mid-band cells
+    # wmma_tiled_tuned takes 306; the other 126 split between TWO DISJOINT regions belonging to two
+    # different arms, neither of which a single constant can name. `n=None` (caller did not pass N)
+    # keeps wmma_tiled_tuned, which is both the safe arm and the majority one.
+    if n is None:
+        return "wmma_tiled_tuned"
+    # (a) THE WIDE-N CORNER — tiled's coarse N tiling leaves a ragged dispatch wave. Device-dependent.
+    if (
+        n >= _W4A8_PREFILL_WIDE_N
+        and m <= _W4A8_PREFILL_WIDE_MAX_M
+        and _tiled_last_wave_occupancy(n) < _W4A8_TILED_WAVE_FULL
+    ):
+        return "prefill_wmma"
+    # (b) THE TALL-K / MID-N BOX — prefill_wmma_ashuffle, a third arm that shipped in the package but
+    #     appeared in no dispatch, wins here at EVERY mid-band M on BOTH cards.
+    if (
+        k is not None
+        and k >= _W4A8_ASHUFFLE_MIN_K
+        and _W4A8_ASHUFFLE_MIN_N <= n <= _W4A8_ASHUFFLE_MAX_N
+    ):
+        return "prefill_wmma_ashuffle"
+    return "wmma_tiled_tuned"
 
 
-# gemv<->wmma crossover per decode path (measured). decode_gemv asserts M<=16 in-kernel, so E2M1 caps
-# at 16; int4 crosses lower because its WMMA tile reclaims M=16 on a dense model. Both >= the M<=2
-# decode fast path, so the served decode batch (<= max_running_req) stays on the faster kernel.
-_W4A8_GEMV_MAX_INT4 = 8
+# gemv<->wmma crossover per decode path. decode_gemv asserts M<=16 in-kernel, so 16 is the ceiling for
+# BOTH weight formats — and both now sit AT it. This used to be 8 for int4, on the claim that "its WMMA
+# tile reclaims M=16 on a dense model". That claim is FALSE at every shape this engine dispatches, and
+# it cost twice: it left performance on the floor AND it put a numerics seam in the middle of the
+# spec-verify band.
+#
+# THE NUMERICS HALF. `_pick_dense_kernel`'s docstring records the measurement: the two WMMA arms are
+# bit-identical to each other, and each arm is M-invariant on its own, so decode_gemv <-> WMMA is the
+# only crossover at which a token's value depends on how many tokens shared its batch. Spec VERIFY runs
+# M = bs*(K+1) while plain decode runs M=1, so with the cap at 8 an MTP K=4 verify at bs>=2 (M=10) or a
+# DFlash K=15 verify at bs=1 (M=16) ran a DIFFERENT KERNEL from the decode it is compared against. At 16
+# the whole band the kernel can serve is one arm — exactly the reasoning layers/minv.py already applies
+# to the bf16 path (`_DECODE_GEMV_MAXM = 16`, "so that ordinary decode and spec-decode VERIFY land on
+# the SAME kernel rather than opposite sides of the threshold"). Honest limit: this MOVES the seam to
+# M=16, it does not remove it — verify wider than 16 rows still crosses, and the kernel cannot go higher.
+#
+# THE PERF HALF (graph-replay timed, weights rotated past the 64 MB MALL; tools/w4a8_dense_arm_cost.py,
+# 2026-08-05, RX 9070 XT). decode_gemv is FASTER than both WMMA arms at every M in 1..16, on every
+# shape — the M=9..16 band was being handed to `prefill_wmma`, the slowest of the three:
+#     us at M=16          decode_gemv   prefill_wmma (dispatched)   wmma_tiled   -> speedup
+#     g4.o_proj(local)        40.6            135.6                    77.4         3.34x
+#     g4.o_proj(global)       65.2            188.4                   139.0         2.89x
+#     g4.qkv_q                38.5            122.8                    96.9         3.19x
+#     g4.gate_up              44.5            124.6                    97.0         2.80x
+#     g4.dense_down           35.3            112.2                    41.7         3.18x
+#     q35.o_proj              50.6             65.1                    66.2         1.29x
+#     q35.gate_up             66.0            115.3                   115.6         1.75x
+# so the fix is not a correctness tax, it is a strict win in the band it touches.
+_W4A8_GEMV_MAX_INT4 = 16
 _W4A8_GEMV_MAX_E2M1 = 16
+# K granularity the decode GEMV can consume. Tracks the kernel's own precondition — raise/lower this
+# ONLY together with the kernel, never to route a shape away from the decode path (see
+# _pick_dense_kernel: a refused decode-band shape means the kernel tail needs fixing).
+# 32 is what the b128 weight load actually requires: the 4-word read must stay in-row and 16-byte
+# aligned, i.e. (K/8) % 4 == 0. The kernel's K-on-lanes sweep already drops out-of-row lanes to a
+# zero contribution, so a partial final wave was always handled — shipped shapes like K=8704 (8 full
+# waves + 16 lanes) exercise it. The previous 512 was a stale inheritance from the LDS K-tiling that
+# consolidation retired, and it cost Gemma4 (K=2816) the decode GEMV entirely.
+_W4A8_GEMV_K_MULTIPLE = 32
 # Prefill regime: wmma_tiled_tuned dominates from here up (~2-4x prefill_wmma, bit-exact, graph-safe,
-# both dtypes). Below it (small-M/wide-N mid-band) prefill_wmma's conservative config still wins
-# (re-bench: tiled loses only at N>=6144, M<=32). True prefill/chunked-prefill M is always >> 64.
+# both dtypes) at EVERY N measured, on BOTH cards. True prefill/chunked-prefill M is always >> 64.
 _W4A8_PREFILL_TILED_MIN = 64
+
+# ---- the mid-band wide-N corner (all three terms measured; see _pick_dense_kernel's docstring) ----
+# These are NOT three independent knobs to tune: they are one measured region, and the region is
+# non-convex in N, so it takes a shape term, an M term AND a device term to fence. Moving any of them
+# without re-running tools/w4a8_dense_midband_surface.py re-opens the mistake this replaced — a rule
+# whose comment asserted a corner ("tiled loses only at N>=6144, M<=32") that had never been measured
+# and that, applied to the whole mid-band, cost up to 3.09x on a single shape.
+#
+# N floor. Below this width wmma_tiled_tuned wins the mid-band on every shape and both cards,
+# regardless of how ragged its last wave is — the launch is under one wave either way, so the tail
+# never costs a full wave. Measured: at N=6144 tiled wins 4/4 shapes on GPU 0 and 1/1 on GPU 1.
+_W4A8_PREFILL_WIDE_N = 8192
+# M ceiling. prefill_wmma's edge is its BM=64 small-M tile; it decays as M fills wmma_tiled_tuned's
+# BM=256 tile and is gone by M~56. The per-shape crossover ranges 32..63 (N=9216 and N=10240 keep
+# prefill_wmma ahead through 63; N=11264/17408/34816 give it up at 48), so this is a compromise, not
+# a cliff. 48 is the optimum on BOTH scores over the measured surface -- 0.45% off the per-cell
+# oracle and a 1.17x worst single cell, against 0.50%/1.30x at 40 and 0.70%/1.13x at 56.
+_W4A8_PREFILL_WIDE_MAX_M = 48
+# wmma_tiled_tuned's N tile, i.e. the BN in its `dim3 grid(ceil(M/BM), ceil(N/BN))`. Tracks the
+# kernel's VLLM_W4A8_V7_CFG default of "256x128"; if that default changes, this must change with it.
+_W4A8_TILED_BN = 128
+# What counts as "the last dispatch wave is full enough that the tail costs nothing". At 1.0 this is
+# exactly "ceil(N/BN) divides the CU count"; 0.9 leaves a margin so a near-multiple (e.g. 63 tiles on
+# a 64-CU card) is still treated as full. Every measured cell sits far from this edge — the ragged
+# cases run 0.56-0.85 and the full ones exactly 1.00 — so the threshold is not load-bearing between
+# them; it exists so an unmeasured width degrades toward wmma_tiled_tuned rather than away from it.
+_W4A8_TILED_WAVE_FULL = 0.9
+
+# ---- the mid-band tall-K / mid-N box, served by prefill_wmma_ashuffle --------------------------
+# The third arm. `prefill_wmma_ashuffle` has been in the fp8_wmma package the whole time (it gets A
+# out of LDS with a warp-shuffle transpose, leaving LDS to B alone and double-buffering it) and was
+# in NO dispatch — so the mid-band was being argued as a two-way threshold when it is a three-way
+# surface. It takes 67 of the 432 measured mid-band cells, MORE than prefill_wmma's 59.
+#
+# Cell count is the wrong statistic for a dispatch, though, and it nearly bought a third arm for
+# nothing: ashuffle's MEDIAN winning cell is worth 1.038x against a ~1.5% run-to-run spread, i.e.
+# most of those 67 cells are coin flips, while prefill_wmma's are worth up to 1.57x. What survives a
+# 3-pass repeat on BOTH cards (tools/w4a8_dense_midband_ashuffle.py, fixtures
+# _midband_ashuffle_{0,1}.txt — 71/72 cells kept the same winner all three passes) is a narrow box:
+#
+#     K=5120 N=6144  (Qwen3.6-27B q_proj, TP=1) : ashuffle wins EVERY M 17..63, both cards,
+#                                                 1.00-1.09x on GPU 0, 1.08-1.16x on GPU 1
+#     K=8704 N=5120  (Qwen3.6-27B down,   TP=2) : ashuffle wins EVERY M 17..63, both cards,
+#                                                 1.01-1.12x on GPU 0, 1.03-1.16x on GPU 1
+#     K=5120 N=8192                             : NOT in the box — GPU 0 gives it to ashuffle at
+#                                                 M<=32 and GPU 1 to prefill_wmma at every M, so it
+#                                                 is card-split and is left to the (a) rule above
+#     K=5120 N=1024 / K=2048 N=2048 (controls)  : ashuffle LOSES 1.3-1.8x — hence a two-sided N box
+#
+# Adding it takes the mid-band residual from 1.36% to 0.55% of the per-cell oracle and does NOT
+# raise the worst cell (1.17x either way). The bounds are deliberately TIGHT: outside them this arm
+# loses by up to 1.8x, and the box is fitted to the two shipped shape families that populate it, so
+# widening it is a measurement, not an edit.
+_W4A8_ASHUFFLE_MIN_K = 5120
+_W4A8_ASHUFFLE_MIN_N = 5120
+_W4A8_ASHUFFLE_MAX_N = 6144
 
 
 def w4a8_linear(
@@ -1249,7 +1556,16 @@ def w4a8_linear(
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
     if kernel is None:
-        kernel = _pick_dense_kernel(x2d.shape[0], weight_is_e2m1, group_size)
+        # w_packed is (N, K/8) int32, so K is 8x its last dim and N is its leading dim. BOTH are
+        # dispatch terms: K for decode_gemv's granularity precondition (else the kernel asserts), N
+        # for the mid-band wide-N corner (which is not expressible in M alone — see the selector).
+        kernel = _pick_dense_kernel(
+            x2d.shape[0],
+            weight_is_e2m1,
+            group_size,
+            k=w_packed.shape[-1] * 8,
+            n=w_packed.shape[0],
+        )
     engaged(f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
     return fp8_wmma.mmq_fp8_gemm(
         x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
@@ -1265,7 +1581,7 @@ def w4a8_linear_silu(
     weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
     """FUSED dense gate_up GEMV + silu_and_mul: (M, K) @ (2*inter, K)^T -> silu(gate)*up -> (M, inter).
-    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%512==0, group_size%16==0);
+    ONE launch, no (M, 2*inter) HBM round-trip. Decode-only (M<=16, K%32==0, group_size%16==0);
     BIT-EXACT to w4a8_linear(gate_up) + silu_and_mul. Output follows x's dtype (fp16/bf16)."""
     import fp8_wmma
 

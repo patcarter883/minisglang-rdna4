@@ -392,7 +392,14 @@ def enable_custom_ar_distributed(
         )
     )
     from minisgl.utils import init_logger
-    init_logger(__name__).info_rank0("custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.3x vs RCCL)")
+    # Report the SLOT SIZE, because it is what decides whether a given all_reduce gets this path at all
+    # (anything larger self-falls-back to RCCL) — and therefore what an A/B on the cap is actually
+    # varying. "ENABLED" alone cannot distinguish a serve that uses it for every collective from one
+    # that uses it for none of the prefill ones.
+    init_logger(__name__).info_rank0(
+        f"custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.15-1.2x vs RCCL at every size; "
+        f"slot {slot_bytes / (1 << 20):.1f} MiB -> covers up to {slot_bytes} B/collective)"
+    )
 
 
 def enable_pynccl_distributed(

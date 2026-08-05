@@ -151,6 +151,27 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
 
+    def logits_local_shard(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits over THIS RANK'S vocab columns only — `logits_all_rows` without the all_gather.
+
+        For a caller that reduces over the vocabulary rather than indexing into it, gathering is pure
+        cost. The block-diffusion canvas is the case: it scores 256 rows x 262144 columns EVERY
+        denoising step and every consumer (logsumexp, softmax, entropy, argmax, multinomial, and the
+        soft embedding's `probs @ E`) is a reduction that decomposes over disjoint column blocks. The
+        gather moved 67 MB/rank and was followed by a `permute().contiguous()` over the whole
+        [256, 262144] result to undo the rank-major interleave — 23.2 ms of a 190 ms step, to
+        materialise on both ranks a tensor neither of them indexes.
+
+        Returns `[rows, count]` where `count` is the VALID width from `vocab_range`, not the padded
+        shard width. Those differ on the last rank whenever tp_size does not divide the vocabulary,
+        and the padded columns are uninitialised weight rows — `logits_all_rows` drops them after the
+        gather (`[:, :num_embeddings]`), so a shard-consuming caller must drop them here or it
+        silently samples tokens that do not exist."""
+        module = self.tied_embedding or self
+        _, count = self.vocab_range
+        logits = _lm_head_linear(x, module.weight, self.bias)
+        return logits if logits.shape[1] == count else logits[:, :count]
+
     @nvtx_annotate("LMHead")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()

@@ -23,45 +23,11 @@ if TYPE_CHECKING:
     from minisgl.quant.config import QuantConfig
 
 
-# ---------------------------------------------------------------------------------------------------
-# Phase-1 comms/compute overlap for the MoE TP all-reduce (MINISGL_MOE_ASYNC_AR, default ON; =0 to disable).
-#
-# The fused shared+routed MoE output all_reduce (25 MB bf16 at 6.6k prefill tokens, TP=2) runs on the
-# compute stream today -> the GPU idles during it (27.7% of prefill wall, 100% exposed). Splitting the
-# output into 2 DISJOINT row chunks and running chunk-0's all_reduce on a SIDE STREAM (RCCL) concurrent
-# with chunk-1's expert GEMM on the main stream hides chunk-0's collective behind compute. Disjoint
-# token rows => BIT-EXACT: each row's all_reduce is an independent 2-rank elementwise SUM (2 addends,
-# no reduction reordering), so a row-split yields byte-identical results.
-#
-# EAGER PREFILL ONLY — never under graph capture (async side-stream collectives are graph-unsafe), and
-# gated above a token threshold where the overlap outweighs the doubled kernel-launch + the exposed
-# 2nd-chunk-AR drain. See ASYNC_AR_INVESTIGATION.md / ASYNC_AR_PHASE1.md.
-# ---------------------------------------------------------------------------------------------------
-_MOE_ASYNC_AR = os.environ.get("MINISGL_MOE_ASYNC_AR", "1") != "0"
-_MOE_ASYNC_AR_MIN_TOKENS = int(os.environ.get("MINISGL_MOE_ASYNC_AR_MIN_TOKENS", "512"))
-_moe_ar_side_stream: "torch.cuda.Stream | None" = None
-
-
-def moe_async_ar_enabled() -> bool:
-    """Whether Phase-1 chunked async MoE all-reduce is engaged (MINISGL_MOE_ASYNC_AR, default ON)."""
-    return _MOE_ASYNC_AR
-
-
-def moe_async_ar_min_tokens() -> int:
-    """Minimum token count to take the async path (MINISGL_MOE_ASYNC_AR_MIN_TOKENS, default 512).
-    Below this the doubled launch + exposed drain outweigh the hidden collective; prefill only."""
-    return _MOE_ASYNC_AR_MIN_TOKENS
-
-
-def get_moe_ar_side_stream() -> "torch.cuda.Stream":
-    """Lazily-created, process-wide side CUDA stream carrying the overlapped MoE all_reduce. One shared
-    stream is correct: the collectives are ordered by submission on the communicator (both TP ranks
-    submit chunk-0 then chunk-1 all_reduce in program order -> RCCL matches them), and per-chunk events
-    serialize each AR against its producer/consumer on the main stream."""
-    global _moe_ar_side_stream
-    if _moe_ar_side_stream is None:
-        _moe_ar_side_stream = torch.cuda.Stream()
-    return _moe_ar_side_stream
+# The MoE all-reduce's comms/compute overlap used to live here as MINISGL_MOE_ASYNC_AR, a Qwen3.5-MoE-
+# only side-stream chunking of this one collective. It is now the model-agnostic primitive in
+# layers/tp_overlap.py (MINISGL_TP_OVERLAP / MINISGL_TP_AR_CHUNKS), which Qwen3.5-MoE and Gemma4 both
+# call. Nothing MoE-specific was lost: the trick was never about experts, only about having independent
+# compute to hide a collective behind.
 
 
 class _GroupedGPTQExperts(BaseOP):
@@ -483,11 +449,31 @@ class MoEQuantMethod:
         raise NotImplementedError
 
     def ep_local(
-        self, w13, w2, g_hidden, local_weights, local_ids, *, top_k: int, renormalize: bool
+        self, w13, w2, g_hidden, local_weights, local_ids, *, top_k: int, renormalize: bool,
+        activation: str = "silu",
     ) -> "torch.Tensor":
         """EP per-rank shard kernel: run THIS rank's local expert stack (w13/w2 already the
-        [E_local,...] shard) over the all_gather'd tokens with local-remapped ids/weights."""
+        [E_local,...] shard) over the all_gather'd tokens with local-remapped ids/weights.
+
+        `activation` mirrors `apply`'s and MUST be honoured: this path used to take no activation at
+        all, so an EP serve of a gelu model produced silu experts — same weights, same shapes, no
+        error, just wrong numbers on one deployment topology only. Every override either implements
+        the activation or rejects it; none may ignore it."""
         raise NotImplementedError(f"{type(self).__name__} does not support expert parallelism")
+
+
+# Gated activations the `kernels.w4a8_moe` family serves. "gelu" is HF `gelu_pytorch_tanh` (Gemma4's
+# routed experts), which that kernel applies on its UNFUSED gemm1 path. Kept as one shared gate so a
+# scheme cannot drift into accepting an activation its kernel does not actually implement — the
+# failure mode being silent (right shapes, wrong numbers), not a crash.
+_W4A8_ACTIVATIONS = ("silu", "gelu")
+
+
+def _check_activation(scheme: str, activation: str, allowed=_W4A8_ACTIVATIONS) -> None:
+    if activation not in allowed:
+        raise NotImplementedError(
+            f"MoE {scheme} path supports activation {'|'.join(allowed)}; got {activation!r}"
+        )
 
 
 class _UnquantizedMoEMethod(MoEQuantMethod):
@@ -539,10 +525,10 @@ class _W4A8MoEMethod(MoEQuantMethod):
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
               top_k, renormalize, activation, apply_router_weight_on_input):
-        assert activation == "silu" and not apply_router_weight_on_input, (
-            "MoE W4A8 path is silu-only without router-weight-on-input"
-        )
+        _check_activation("W4A8", activation)
+        assert not apply_router_weight_on_input, "MoE W4A8 path has no router-weight-on-input"
         if getattr(w13, "_w_rep", None) is not None:
+            self._reject_w4a16_activation(activation)
             # W4A16 (fp16-act) path: int4 weights repacked to register-direct _w_rep in post_load;
             # scales/zeros stay op-layout (w4a16_moe consumes _scales_op/_zeros_op directly, see its
             # (E,2*inter,K//g) / (E,(2*inter)//8,K//g) signature). AWQ/GPTQ int4 is asymmetric -> pass
@@ -560,10 +546,27 @@ class _W4A8MoEMethod(MoEQuantMethod):
             hidden_states, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
+            activation=activation,
         )
 
-    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+    @staticmethod
+    def _reject_w4a16_activation(activation: str) -> None:
+        # `kernels.w4a16_moe` (the MINISGL_MOE_W4A16=1 register-direct path, selected in post_load by
+        # building _w_rep) still hard-codes silu on its tail. Reaching it with gelu would compute silu
+        # and return a perfectly well-formed wrong answer, and the env that selects it is a PERF knob
+        # nobody associates with numerics — so refuse loudly instead. Fix is the same one-liner as
+        # w4a8_moe's (thread the activation to its tail) plus a gelu tail kernel.
+        if activation != "silu":
+            raise NotImplementedError(
+                f"MoE W4A16 (MINISGL_MOE_W4A16=1) is silu-only; got activation {activation!r}. "
+                "Unset MINISGL_MOE_W4A16 to serve this model through the W4A8 path."
+            )
+
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
+                 activation="silu"):
+        _check_activation("W4A8", activation)
         if getattr(w13, "_w_rep", None) is not None:
+            self._reject_w4a16_activation(activation)
             inter = w13._scales_op.shape[1] // 2
             return kernels.w4a16_moe(
                 g_hidden, w13._w_rep, w13._scales_op, w13._zeros_op,
@@ -576,6 +579,7 @@ class _W4A8MoEMethod(MoEQuantMethod):
             g_hidden, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
             None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
+            activation=activation,
         )
 
 
@@ -596,10 +600,10 @@ class _MxFp4MoEMethod(MoEQuantMethod):
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
               top_k, renormalize, activation, apply_router_weight_on_input):
-        assert activation == "silu" and not apply_router_weight_on_input, (
-            "MoE MXFP4 path is silu-only without router-weight-on-input"
-        )
+        _check_activation("MXFP4", activation)
+        assert not apply_router_weight_on_input, "MoE MXFP4 path has no router-weight-on-input"
         if getattr(w13, "_w_rep", None) is not None:
+            _W4A8MoEMethod._reject_w4a16_activation(activation)
             # Register-direct b128, fp16 acts direct (see _GroupedMxFp4Experts.post_load). Qwen3.5-MoE
             # hands raw router_logits (no model-side route), so forward them + top_k/renormalize and let
             # w4a16_moe fuse softmax+topk (topk_ids stays None); a noaux_tc precomputed route passes through.
@@ -615,11 +619,14 @@ class _MxFp4MoEMethod(MoEQuantMethod):
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            weight_is_e2m1=True,
+            weight_is_e2m1=True, activation=activation,
         )
 
-    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
+                 activation="silu"):
+        _check_activation("MXFP4", activation)
         if getattr(w13, "_w_rep", None) is not None:
+            _W4A8MoEMethod._reject_w4a16_activation(activation)
             inter = w13._scales_rd.shape[1] // 2
             return kernels.w4a16_moe(
                 g_hidden, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
@@ -630,7 +637,7 @@ class _MxFp4MoEMethod(MoEQuantMethod):
             g_hidden, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
-            weight_is_e2m1=True,
+            weight_is_e2m1=True, activation=activation,
         )
 
 
@@ -652,22 +659,23 @@ class _NvFp4MoEMethod(MoEQuantMethod):
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
               top_k, renormalize, activation, apply_router_weight_on_input):
-        assert activation == "silu" and not apply_router_weight_on_input, (
-            "MoE NVFP4 path is silu-only without router-weight-on-input"
-        )
+        _check_activation("NVFP4", activation)
+        assert not apply_router_weight_on_input, "MoE NVFP4 path has no router-weight-on-input"
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            weight_is_e2m1=True,
+            weight_is_e2m1=True, activation=activation,
         )
 
-    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
+                 activation="silu"):
+        _check_activation("NVFP4", activation)
         return kernels.w4a8_moe(
             g_hidden, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
-            weight_is_e2m1=True,
+            weight_is_e2m1=True, activation=activation,
         )
 
 
@@ -685,9 +693,12 @@ class _RXFMoEMethod(MoEQuantMethod):
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
               top_k, renormalize, activation, apply_router_weight_on_input):
-        assert activation == "silu" and not apply_router_weight_on_input, (
-            "MoE RXF path is silu-only without router-weight-on-input"
-        )
+        # Still silu-ONLY, deliberately: both `kernels.rxf_moe` and `rxf_moe_regdirect` hard-code
+        # silu_and_mul on their tail, and no RXF checkpoint we serve declares a gelu. Rejecting is the
+        # point — the alternative is a gelu model quietly getting silu experts. Adding gelu here is
+        # the same one-line policy threading w4a8_moe just got, on those two functions.
+        _check_activation("RXF", activation, allowed=("silu",))
+        assert not apply_router_weight_on_input, "MoE RXF path has no router-weight-on-input"
         if getattr(w13, "_w_rep", None) is not None:
             # Register-direct b128 (LDS-bypass) — the default RXF path (~2x rxf_moe at decode,
             # bit-exact). post_load built _w_rep/_wide and dropped weight_packed.
@@ -765,7 +776,10 @@ class _FP8MoEMethod(MoEQuantMethod):
             None, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
         )
 
-    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize):
+    def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
+                 activation="silu"):
+        # Every kernel below (w8a16 / w8a8_moe / regdirect) has a silu-only tail.
+        _check_activation("fp8 W8A8", activation, allowed=("silu",))
         if self._w8a16_fn is not None:
             # Kernel requires bf16 acts; guard the cast (no-op when already bf16) — see forward().
             acts = g_hidden if g_hidden.dtype == torch.bfloat16 else g_hidden.to(torch.bfloat16)
@@ -1017,7 +1031,8 @@ class MoELayer(BaseOP):
             final_hidden_states = self._ep_dispatch(
                 hidden_states, ep_w, ep_i,
                 lambda gh, lw, li: method.ep_local(
-                    w13, w2, gh, lw, li, top_k=self.top_k, renormalize=self.renormalize
+                    w13, w2, gh, lw, li, top_k=self.top_k, renormalize=self.renormalize,
+                    activation=self.activation,
                 ),
             )
         else:

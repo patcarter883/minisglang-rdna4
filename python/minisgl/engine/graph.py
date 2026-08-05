@@ -109,6 +109,62 @@ class VerifyCaptureBuffer:
         self.positions[s] = batch.positions
 
 
+@dataclass
+class CanvasCaptureBuffer:
+    """Static I/O for a captured BLOCK-DIFFUSION canvas step (DiffusionGemma).
+
+    Flat over tokens, `T = bs * canvas_len` leading rows, exactly like VerifyCaptureBuffer — the
+    canvas is a fixed-width multi-query batch and nothing about its buffers is per-request.
+
+    Two fields have no analogue in any other capture family:
+
+      * `self_cond` — the PREVIOUS denoising step's soft embedding, an INPUT that changes every
+        step. The eager path passes `None` on the first step of a block and lets the model skip the
+        self-conditioning MLP; a graph cannot branch, so this buffer is ZEROED for that case
+        instead. That is exact, not an approximation: RMSNorm(0)=0, tanh-gelu(0)*0=0 and down_proj
+        carries no bias, so the block contributes exactly zero and `x + 0.0` is bit-identical to
+        skipping it (see DiffusionGemmaSelfConditioning.forward).
+      * `hidden` — the OUTPUT is the backbone's final-norm hidden state, NOT logits. The LM head
+        stays eager; see DiffusionGemmaForBlockDiffusion.forward_canvas_hidden for why (a captured
+        head would pin ~1 GiB of vocab-sized transients per captured batch size).
+    """
+
+    qlen: int
+    input_ids: torch.Tensor
+    out_loc: torch.Tensor
+    positions: torch.Tensor
+    self_cond: torch.Tensor
+    hidden: torch.Tensor
+
+    @classmethod
+    def init(cls, max_bs: int, qlen: int, hidden_size: int, dtype, device) -> "CanvasCaptureBuffer":
+        T = max_bs * qlen
+        return cls(
+            qlen=qlen,
+            input_ids=torch.zeros(T, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(T, dtype=torch.int32, device=device),
+            positions=torch.zeros(T, dtype=torch.int32, device=device),
+            self_cond=torch.zeros(T, hidden_size, dtype=dtype, device=device),
+            hidden=torch.empty(T, hidden_size, dtype=dtype, device=device),
+        )
+
+    def total(self, batch: Batch) -> int:
+        return batch.padded_size * self.qlen
+
+    def set_batch(self, batch: Batch) -> None:
+        s = slice(self.total(batch))
+        batch.input_ids = self.input_ids[s]
+        batch.out_loc = self.out_loc[s]
+        batch.positions = self.positions[s]
+
+    def copy_from(self, batch: Batch, canvas_ids: torch.Tensor, self_cond: torch.Tensor) -> None:
+        s = slice(self.total(batch))
+        self.input_ids[s] = canvas_ids
+        self.out_loc[s] = batch.out_loc
+        self.positions[s] = batch.positions
+        self.self_cond[s] = self_cond
+
+
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
@@ -236,6 +292,9 @@ class GraphRunner:
         # Spec-decode verify graphs are captured LATER (capture_verify_graphs), after the scheduler
         # builds the proposer + programs the target's aux-capture layers — None until then.
         self._verify = None
+        # BLOCK-DIFFUSION canvas graphs (capture_canvas_graphs) — None for every model that is not a
+        # block-diffusion checkpoint, which is what can_use_canvas_graph keys on.
+        self._canvas = None
         self._verify_max_seq_len = max_seq_len
         self._verify_vocab = vocab_size
         import os as _os
@@ -831,6 +890,154 @@ class GraphRunner:
         n = batch.size * v["qlen"]
         return vbuf.logits[:n]
 
+    # ---- BLOCK-DIFFUSION CANVAS graph capture (DiffusionGemma denoising step) ---------------------
+    def capture_canvas_graphs(
+        self,
+        model: BaseLLMModel,
+        canvas_len: int,
+        bs_list: List[int],
+        hidden_size: int,
+        dtype: torch.dtype,
+    ) -> None:
+        """Capture one canvas-step graph per bs in `bs_list`.
+
+        WHY A 256-TOKEN STEP IS WORTH CAPTURING, AND WHAT IT IS WORTH. Every other capture family here
+        exists because the forward is TINY (one token per sequence) and therefore host-launch-bound. A
+        canvas step is 256 tokens wide, which looks like a prefill — but it issues ~5k dispatches and
+        a block runs the IDENTICAL forward k times (k = 12-19 measured) with nothing varying but the
+        buffer contents. That is the textbook capture case.
+
+        IT IS NOT A SPEEDUP HERE, and saying so in place is the point of this paragraph. Measured on
+        the served checkpoint (bs=1, TP=2, marginal per-step, same harness on both legs): capture
+        takes `fwd_issue` — the host launch loop — from 30.8 ms to 0.8 ms, a 97% reduction, and moves
+        the STEP by -0.3% (181.6 -> 181.1 ms). Those 30.8 ms were entirely overlapped with GPU work;
+        an independent rocprofv3 pass measures gfx activity at 100% median and found that removing
+        38% of all dispatches bought 3.2%. There is no launch gap to reclaim. The step is
+        GEMM-efficiency bound inside the backbone (127.7 ms of a 186 ms step).
+
+        So this is carried for correctness — it is proven bit-identical, and eager-only is not "done"
+        in this repo — and because its 30 ms is currently hidden behind the backbone: the same graph
+        removes the same 30 ms from whatever the residual becomes, so its share grows as the rest of
+        the stack lands. Do not quote it as a tok/s win.
+
+        EXACT bs MATCH, no padding — deliberately, and unlike the decode/K+1-verify families. Padding
+        a bs=3 canvas step up to a captured bs=4 would push a whole extra 256-token canvas through 30
+        layers of attention and MoE, which is ~33% more compute to avoid ~1 ms of launch overhead.
+        Anything not captured falls back to the eager forward, which is lossless (see
+        `can_use_canvas_graph`). That is the same contract `can_use_fused_verify` uses, for the same
+        reason.
+
+        Logits-free: the captured region ends at the backbone's final norm and the LM head runs
+        eagerly (`forward_canvas_hidden` / `canvas_logits`). See CanvasCaptureBuffer."""
+        if not bs_list or not hasattr(self.attn_backend, "init_canvas_capture"):
+            return logger.info_rank0("canvas CUDA graph: unsupported backend / disabled")
+        dev = self.device
+        max_bs = max(bs_list)
+        self.attn_backend.init_canvas_capture(self._verify_max_seq_len, bs_list, canvas_len)
+        cbuf = CanvasCaptureBuffer.init(max_bs, canvas_len, hidden_size, dtype, dev)
+        # A canvas dummy owns canvas_len query tokens over its own (dummy-page) slots, cached_len 0 —
+        # the same construction the verify capture uses, at the canvas width.
+        cdummy = Req(
+            input_ids=torch.zeros(canvas_len, dtype=torch.int32, device="cpu"),
+            table_idx=self.dummy_req.table_idx, cached_len=0, output_len=1, uid=-1,
+            sampling_params=None, cache_handle=None,  # type: ignore
+        )
+        torch.cuda.synchronize(dev)
+        free0 = get_free_memory(dev)
+        logger.info_rank0(
+            f"Capturing CANVAS CUDA graphs (canvas={canvas_len}) sizes={sorted(bs_list)}; "
+            f"free {mem_GB(free0)}"
+        )
+        graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        pool = None
+        for bs in tqdm(sorted(bs_list, reverse=True), desc="Capturing canvas graphs",
+                       unit="batch", disable=not get_tp_info().is_primary()):
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[cdummy] * bs, phase="decode")
+            batch.canvas = True  # -> causal=0 on both geometries + the [window | canvas] ring rows
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_canvas_for_capture(batch)
+            cbuf.set_batch(batch)
+            T = cbuf.total(batch)
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
+                cbuf.hidden[:T] = model.forward_canvas_hidden(
+                    cbuf.input_ids[:T], cbuf.self_cond[:T]
+                )  # warmup
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    cbuf.hidden[:T] = model.forward_canvas_hidden(
+                        cbuf.input_ids[:T], cbuf.self_cond[:T]
+                    )
+            if pool is None:
+                pool = graph.pool()
+            graph_map[bs] = graph
+        self._canvas = {"buf": cbuf, "graphs": graph_map, "qlen": canvas_len,
+                        "bs_list": sorted(bs_list), "model": model, "replays": 0,
+                        # bs -> how many eager-vs-replay comparisons that size has had (cap 2 each).
+                        "checked": {}}
+        logger.info_rank0(f"canvas graphs captured; free {mem_GB(get_free_memory(dev))}")
+
+    def can_use_canvas_graph(self, batch: Batch) -> bool:
+        # capturable iff: canvas graphs exist, the batch IS a canvas step, the req count EXACTLY
+        # matches a captured bs (no padding — see capture_canvas_graphs), and every req stages exactly
+        # canvas_len query tokens. A block whose extent has been truncated, or a bs above the captured
+        # set, falls back to the eager forward and is still lossless.
+        if self._canvas is None or not getattr(batch, "canvas", False):
+            return False
+        if batch.size not in self._canvas["graphs"]:
+            return False
+        return all(r.extend_len == self._canvas["qlen"] for r in batch.reqs)
+
+    def replay_canvas(
+        self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor
+    ) -> torch.Tensor:
+        """Replay the captured canvas step and return the backbone hidden state `[bs*L, hidden]`.
+
+        The first two replays AT EACH CAPTURED BATCH SIZE also run the eager forward and compare,
+        because "the graph engaged" and "the graph computes the right thing" are different claims and
+        only the second one matters. A canvas graph that addresses the wrong ring slots, or that lost
+        `bidirectional`, produces fluent text and a plausible tok/s — there is nothing downstream that
+        would notice.
+
+        PER BATCH SIZE, not per serve, and that distinction is the whole point: every captured bs has
+        its OWN cu_seqlens_q, its own `[bs, W+256]` ring block table and its own `bs*256` store-slot
+        vector, so a bug in the per-bs row build is invisible to a check that only ever ran at bs=1.
+        The first measurement of this did exactly that — it verified bs=1 four times and bs=2/3/4 not
+        at all, because a concurrent serve's first two canvas steps happen while the other requests
+        are still prefilling. Two replays each rather than one because the first step of a block
+        carries a ZERO self-conditioning signal and would not exercise that input.
+
+        The eager forward re-stores the same K/V into the same slots from the same inputs, so running
+        it first is idempotent; it costs two extra forwards per captured size, once."""
+        v = self._canvas
+        v["replays"] += 1
+        checked = v["checked"]
+        bs = batch.size
+        check = checked.get(bs, 0) < 2
+        if check:
+            checked[bs] = checked.get(bs, 0) + 1
+        cbuf: CanvasCaptureBuffer = v["buf"]
+        eager = None
+        if check:
+            # Eager reference FIRST, off the scheduler-built (non-static) metadata, before
+            # prepare_canvas_for_replay swaps in the static one.
+            self.attn_backend.prepare_metadata(batch)
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
+                eager = v["model"].forward_canvas_hidden(canvas_ids, self_conditioning).clone()
+        cbuf.copy_from(batch, canvas_ids, self_conditioning)
+        self.attn_backend.prepare_canvas_for_replay(batch)
+        v["graphs"][batch.size].replay()
+        T = batch.size * v["qlen"]
+        out = cbuf.hidden[:T]
+        if check:
+            delta = (out.float() - eager.float()).abs().max().item()
+            logger.info_rank0(
+                f"[canvas-graph] REPLAY #{v['replays']} engaged, bs={bs} check "
+                f"{checked[bs]}/2 (qlen={v['qlen']}, T={T}): graph vs eager "
+                f"max|delta|={delta:.3e} over {tuple(out.shape)} "
+                + ("BIT-IDENTICAL" if delta == 0.0 else "*** NOT bit-identical ***")
+            )
+        return out
+
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
     def destroy_cuda_graphs(self) -> None:
         del self.graph_map
@@ -840,4 +1047,6 @@ class GraphRunner:
             del self._fused_verify
         if self._ddtree_verify is not None:
             del self._ddtree_verify
+        if self._canvas is not None:
+            del self._canvas
         gc.collect()
