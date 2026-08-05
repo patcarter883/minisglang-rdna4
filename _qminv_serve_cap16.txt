@@ -1,0 +1,20 @@
+prompts=12 max_tokens=24 greedy
+
+-- leg 1: SERIAL (decode M=1) ...
+-- leg 2: SERIAL again (reproducibility FLOOR) ...
+-- leg 3: CONCURRENT x12 (decode M<=12) ...
+-- leg 4: CONCURRENT x12 again ...
+
+FLOOR   serial vs serial       : 0/12 prompts differ
+FLOOR   conc   vs conc         : 1/12 prompts differ
+M TEST  serial(M=1) vs conc(M=N): 2/12 prompts differ
+
+first divergences:
+  [2] at char 1  prompt='List three causes of the fall of the Wes'
+        M=1 : ...' Fall of the Western'
+        M=N : ...' The fall of the'
+  [7] at char 7  prompt='Describe the water cycle briefly.'
+        M=1 : ...' Water Cycle (Hy'
+        M=N : ...' Water cycle (Hy'
+
+VERDICT: M-dependence reached the tokens (M test exceeds the floor).

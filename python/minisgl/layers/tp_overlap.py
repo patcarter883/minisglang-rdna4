@@ -23,28 +23,57 @@ Two application patterns fall out, and they compose:
                      split at all, so it is bit-exact in the strongest possible sense: the identical
                      collective runs on the identical tensor and only its STREAM differs.
   ROW-CHUNK overlap -- a row-independent span reduces chunk i while computing chunk i+1. This is the
-                     original Qwen3.5-MoE trick, and it is LOSSY on this box. See below.
+                     original Qwen3.5-MoE trick. It IS bit-exact for every producer the engine puts
+                     inside it, provided the chunks stay above the producer's kernel crossovers --
+                     which `rowchunked_ar_span` now enforces structurally. See below.
 
 `rowchunked_ar_span` below is the second pattern expressed on the first primitive, and Qwen3.5-MoE now
 calls it instead of carrying its own copy.
 
-THE BIT-EXACTNESS RESULT (measured; tools/tp_overlap_bitexact.py)
------------------------------------------------------------------
+THE BIT-EXACTNESS RESULT (measured; tools/quant_m_invariance.py, 2026-08-05, RX 9070 XT)
+----------------------------------------------------------------------------------------
+CORRECTION (this section previously said the opposite; the evidence for that was invalid).
+
 The inherited justification for row chunking was: "disjoint rows => BIT-EXACT, because each row's
-all_reduce is an independent 2-rank elementwise SUM". That argument is sound, and it is about the
-COLLECTIVE. It says nothing about the PRODUCER, and the producer is where it fails.
+all_reduce is an independent 2-rank elementwise SUM". That argument is sound and it is about the
+COLLECTIVE; it says nothing about the PRODUCER. Splitting rows changes M for every GEMM inside the
+span, and kernel selection IS M-dependent -- so the question is real. It was then answered with the
+WRONG INSTRUMENT: a bare `torch.mm` (rows=3200 split 2 -> max|delta| = 1.562e-02), and the default
+was set to 1 on that basis.
 
-Splitting rows changes M for every GEMM inside the span, and a GEMM's tiling/algorithm selection is
-M-dependent. Measured, on a bare `torch.mm` -- no MoE, no atomics, just rocBLAS:
+No engine path puts a `torch.mm`/`F.linear` inside a row-split span:
+  * the UNQUANTIZED producers route through `minv_linear` (layers/minv.py), which exists precisely
+    because rocBLAS picks its kernel by shape. It is M-invariant BY CONSTRUCTION (full K-reduction
+    per output tile, fixed order, no split-K), and its three `dense_gemm` arms (rd/pipe/lds) are
+    bit-identical to each other at 0.000e+00 across every crossover, M=129/192 included.
+  * the QUANTIZED producers route through quant/kernels.py -- measured now, for the first time:
 
-    rows=3200, split into 2   ->  max|delta| = 1.562e-02   (producer alone, collective not involved)
-    rows=2048, split into 2   ->  max|delta| = 0            (this shape happens to pick the same kernel)
-    rows=256,  split into 2   ->  max|delta| = 7.812e-03
+    DENSE W4A8, 7 shipped shapes (Gemma4 o_proj 2048/4096/8192 x 2816, qkv, gate_up, dense_down at
+    g=32 fp16; Qwen3.6-35B o_proj/gate_up at g=128 bf16), rows 256/512/1024/2048, split into 2:
+        max|delta| = 0.000e+00  at every one.
+    MoE W4A8 (E=128, top_k=8, hidden 2816, inter 352 -- the Qwen3.5-MoE-shaped producer this span
+    actually wraps), rows 256/512/1024/2048, split into 2:
+        max|delta| = 0.000e+00  at every one, INCLUDING rows=2048, where the split changes the
+        grouped tile `_moe_block_m` from 128 to 64. The workload-derived tile is bit-NEUTRAL; it had
+        been assumed lossy and it is not.
 
-So the row split is **not lossless**, it merely *looked* lossless at whichever shape was first tried.
-`MINISGL_TP_AR_CHUNKS` therefore defaults to **1** (no split): overlap comes from branch independence,
-which is exact. Row chunking remains available for callers with no independent branch -- Qwen3.5-MoE is
-exactly that case -- but it is opt-in and it is a lossy/perf trade, not a free one.
+WHAT THE ACTUAL CONSTRAINT IS. Both producers are M-dependent -- just not at these row counts. Every
+individual kernel arm is M-invariant on its own (verified: rows[0:m] computed alone == the same rows
+inside a batch of 2048, max|delta| = 0, for all three dense arms). The ONLY way a token's value
+changes is if the row count moves it onto a DIFFERENT ARM:
+
+    dense: `prefill_wmma` and `wmma_tiled_tuned` are BIT-IDENTICAL to each other (0.000e+00 at every
+           M on every shape), so the M=64 crossover is free. The one lossy dense crossover is
+           decode_gemv <-> WMMA at M <= _W4A8_GEMV_MAX_INT4 (measured up to 1.953e-3 abs, fp16).
+    MoE:   the lossy crossovers are gemm1 gemv <-> wmma at M <= _MOE_GEMM1_GEMV_MAX (32, measured up
+           to 4.9e-4 abs) and the gemm2 atomic scatter at M <= 2 (which is additionally
+           non-deterministic run to run, by design and already documented in quant/kernels.py).
+
+This span only engages at `n >= _MIN_TOKENS` (256), so at the shipped `k=2` every chunk is >= 128
+rows -- above every crossover, which is exactly why the measurement is 0. The guard that was needed
+is therefore not "never split", it is "never split so finely that a chunk lands below 33 rows", and
+that is now enforced in code (`_MIN_CHUNK_ROWS`) instead of by a blanket default of 1. Default
+restored to 2.
 
 The no-split path measures max|delta| = 0.000e+00 at every shape tested, including two collectives
 outstanding at once.
@@ -83,7 +112,8 @@ it cannot return with one outstanding -- and is the recommended way to use this 
 Env:
   MINISGL_TP_OVERLAP=0            disable entirely (every async_all_reduce becomes a plain one)
   MINISGL_TP_OVERLAP_MIN_TOKENS   rows below which overlap is not worth the doubled launch (default 256)
-  MINISGL_TP_AR_CHUNKS            row chunks for rowchunked_ar_span (default 2)
+  MINISGL_TP_AR_CHUNKS            row chunks for rowchunked_ar_span (default 2; clamped so no chunk
+                                  falls below _MIN_CHUNK_ROWS, which is what keeps it bit-exact)
 """
 
 from __future__ import annotations
@@ -119,9 +149,18 @@ _ENABLED = os.environ.get("MINISGL_TP_OVERLAP", "").strip() != "0"
 # 13.7 us and a [256, 2816] one is 139.8 us, against a per-call side-stream cost of ~2 events plus a
 # cross-stream wait), so the doubled launch outweighs anything it could hide.
 _MIN_TOKENS = _env_int("MINISGL_TP_OVERLAP_MIN_TOKENS", 256)
-# DEFAULT 1 = no row split. See "THE BIT-EXACTNESS RESULT" above: splitting rows is NOT lossless on
-# this box, because the producer's GEMM is M-dependent. Row chunking is opt-in and lossy.
-_CHUNKS = max(1, _env_int("MINISGL_TP_AR_CHUNKS", 1))
+# DEFAULT 2 = the original two-chunk split. See "THE BIT-EXACTNESS RESULT" above: the row split is
+# bit-exact for both real producers (dense W4A8 and the grouped MoE) at every row count this span
+# engages at. It was defaulted to 1 on a `torch.mm` measurement of a kernel the engine never calls.
+_CHUNKS = max(1, _env_int("MINISGL_TP_AR_CHUNKS", 2))
+# Rows below which a chunk changes the producer's KERNEL ARM rather than just its grid, which is the
+# one thing that makes a row split lossy. Set by the highest measured crossover of any producer that
+# can sit inside this span: the grouped MoE gemm1 swaps its scalar GEMV for WMMA at
+# `quant/kernels.py::_MOE_GEMM1_GEMV_MAX` = 32 rows (the dense crossovers are lower: 8/16 for
+# decode_gemv, and prefill_wmma == wmma_tiled_tuned bit-for-bit so the 64 crossover is free).
+# The chunk count is clamped against this, so an operator raising MINISGL_TP_AR_CHUNKS cannot
+# silently turn an exact split into a lossy one -- it just gets fewer chunks.
+_MIN_CHUNK_ROWS = 33
 _side_stream: "torch.cuda.Stream | None" = None
 _announced = False
 
@@ -293,21 +332,29 @@ def rowchunked_ar_span(
     row only) and must return the UNREDUCED rank-local partial -- typically by passing `reduce=False`
     to a row-parallel projection or MoE layer.
 
-    NOT BIT-EXACT, and default-off (MINISGL_TP_AR_CHUNKS=1) for that reason. The COLLECTIVE half is
-    exact -- disjoint rows make each row's all_reduce an independent 2-rank elementwise SUM. The
-    PRODUCER half is not: fewer rows means a different M, and GEMM kernel selection is M-dependent, so
-    `produce(x[:n//2])` and the first half of `produce(x)` can differ in the last bits. Measured at up
-    to 1.6e-2 on bf16 for a plain `torch.mm`; see the module docstring and tools/tp_overlap_bitexact.py.
-    Use this only where there is no independent branch to overlap against and the trade is worth it.
+    BIT-EXACT as long as every chunk stays >= `_MIN_CHUNK_ROWS`, which this function ENFORCES by
+    clamping `k`. The COLLECTIVE half is exact unconditionally -- disjoint rows make each row's
+    all_reduce an independent 2-rank elementwise SUM. The PRODUCER half is exact because each
+    quantized/minv kernel ARM is itself M-invariant, and a chunk that stays above the crossovers picks
+    the same arm as the whole. Measured 0.000e+00 for the dense W4A8 producer and for the grouped MoE
+    producer at rows 256/512/1024/2048 split into 2 -- including the case where the split changes
+    `_moe_block_m` 128 -> 64. See the module docstring and tools/quant_m_invariance.py.
+
+    (This docstring previously said "NOT BIT-EXACT ... measured at up to 1.6e-2 on bf16 for a plain
+    `torch.mm`". That measurement was of rocBLAS, which no producer inside this span uses -- the
+    unquantized ones go through `minv_linear` and the quantized ones through quant/kernels.py.)
 
     Both TP ranks derive the split from `x.shape[0]`, which they hold identically (it is
     post-attention-all_reduce), so they chunk the same way and submit the same collectives in the same
-    order -- the split is deterministic even though it is not lossless.
+    order.
 
     Falls back to the plain `produce(x)` + one all_reduce when overlap is off, under capture, below the
     token threshold, or at num_chunks == 1 -- so callers need no gate of their own."""
     n = x.shape[0]
     k = tp_overlap_chunks() if num_chunks is None else num_chunks
+    # Clamp so no chunk drops below the producer's kernel-arm crossover. A chunk that crosses would
+    # make the split lossy, and it is not the caller's job to know where the crossovers are.
+    k = min(k, max(1, n // _MIN_CHUNK_ROWS))
     if k <= 1 or not _overlappable(x) or n < k:
         return comm.all_reduce(produce(x))
 
