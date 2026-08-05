@@ -1771,3 +1771,212 @@ rounds *mid-chain* — `normed = (xf * rsqrt(var+eps)).to(fp16)` and only then m
 fp32 reference rounded to fp16: `max|Δ| ≤ 2.0e-3` across bf16 and fp16 at every shape in
 `tail/tests/test_tail.py`, `store_kv` bit-exact, e4m3 saturation unchanged. This is the same
 convention every bf16 model in this repo has been served under since the tail kernels landed.
+
+---
+
+## Part D10 — the step is 97.7 ms, and the collective is no longer the story
+
+First profiling pass on this workload since the gfx1201 hardware counters became usable, and the
+first one at all with the canvas loop instrumented: `_diffusion_loop` is a peer of the plain-decode
+and spec loops but was the only one of the three with **no ROCTx markers**, so
+`rocprofv3 --selected-regions` never opened a window and a block-diffusion serve traced *empty*. The
+markers (`canvas_step#N` / `canvas_fwd` / `canvas_sampler` / `canvas_soft_embed` / `canvas_encode`)
+and the two-leg harness `tools/canvas_rocprof.sh` land with this section.
+
+Fixtures: `tools/_fixtures/canvas_diffusiongemma/` (breakdown, roofline, tile selection, both raw
+logs, and PROVENANCE). Engine `4d719ad6`, kernels `8a8bca6`, image `minisgl-rdna4:dgprof` built from
+clean worktrees of both, TP=2, CONC=1, bs=1, `MINISGL_SWA_RADIX=0` pinned, auto perf level.
+
+### D10.0 Three things that had to be fixed before a number existed
+
+1. **`minisgl-rdna4:post-tile-prof` cannot run this engine.** Its `mmq_fp8_moe_gemm` predates the
+   `x_fp8` producer-quant kwarg, and the serve dies inside graph capture with
+   `TypeError: ... unexpected keyword argument 'x_fp8'`. The image had to be rebuilt from both
+   worktrees. This is the ABI-split rule with a new symptom: not a wedge, a `TypeError`.
+2. **The marker window is in STEP space.** `_rtx_step` counts canvas steps, and a 256-token block is
+   only k≈9–26 of them, so a window at step 60 off one request never opens.
+3. **`MINISGL_EXIT_AFTER_STEPS` must be reachable.** It counts loop iterations, and the canvas loop
+   *blocks* when idle, so the count is ≈ steps + prefills. A bound of 250 was never reached, the
+   engine never returned, rocprofv3 never ran its destructor, and the trap tore the container down —
+   the abort-without-writing failure `propose_rocprof.sh` documents. The trace came back empty three
+   times, from three different causes, before it came back at all.
+
+### D10.1 The baseline, today
+
+`[canvas-timing]` differenced over the same window twice (n=60→70 and n=70→80) — the cumulative
+average makes the raw report points useless on their own, and the two windows agree to 1.8%:
+
+| marginal, per canvas step | n=60→70 | n=70→80 |
+|---|---|---|
+| `fwd_issue` | 0.3 | 0.9 |
+| `fwd_tail` | 88.5 | 88.5 |
+| `sampler` | 4.7 | 4.9 |
+| `soft_embed` | 3.5 | 3.7 |
+| **`step`** | **99.5** | **97.7** |
+
+**97.7 ms**, against **150.5 ms** in §D8 and **133.4 ms** in §D9. The AR vectorisation (`74a01eb6`)
+landed *after* §D9 was written, so neither recorded figure contains it — and neither does the 82
+tok/s in flight. Note `fwd_tail` is 88.5 of the 97.7: the backbone is 91% of the step.
+
+End-to-end tok/s stays as noisy as §D8 warned, and for the reason §D8 gives — it multiplies the step
+by *k*, which is data-dependent. Four measured requests: **75.8 / 49.0 / 106.5 / 53.0 tok/s**, with
+k = 12/19/9/19 at 95–103 emitted tokens. Reading tok/s as the measurement here is a mistake; the step
+is the measurement, and *k* is a separate (and larger) lever.
+
+### D10.2 Where the step goes
+
+Trace, one rank, 40 canvas steps. rocprofv3 stretches the step (139.15 ms traced vs 97.70
+un-profiled = **1.424x**), so shares come from the trace and the `real` column divides by that.
+
+| phase | real ms/step | share |
+|---|---|---|
+| `canvas_fwd` (backbone) | 52.8 | 72.4% |
+| `canvas_sampler` | 13.0 | 17.8% |
+| gap between phases | 4.7 | 6.4% |
+| `canvas_encode` (amortised) | 2.2 | 3.0% |
+| `canvas_soft_embed` | **0.2** | 0.3% |
+
+| kernel family | real ms/step | share | disp/step |
+|---|---|---|---|
+| MoE grouped GEMM | 22.4 | 31.5% | 66.8 |
+| **collective** | **13.3** | **18.3%** | 107.6 |
+| dense GEMM W4A8 | 10.3 | 15.8% | 400.2 |
+| attention | 8.5 | 11.8% | 64.5 |
+| torch elementwise/copy | 7.2 | 9.9% | 1065.8 |
+| dense GEMM fp16 | 5.8 | 7.9% | 109.9 |
+| tail (native) | 3.2 | 4.4% | 556.1 |
+
+**Summed kernel busy is 74.6% of the marker wall** — a quarter of the canvas step is inter-kernel
+gap, *under graph capture*.
+
+### D10.3 The "collective-bound 33%" claim does not survive
+
+§D9.3 measured `one_shot_ar` at 44.71 ms of 128.77 ms profiled busy = **34.7%**, on engine
+`9fc1c892` — i.e. **pre-vectorisation**. Today, on `custom_ar::one_shot_ar_vec_kernel`: 107.6
+calls/step at 176 µs traced (124 µs deflated) = **13.3 ms/step = 18.3%**. The collective is no longer
+the largest item, and optimising on the basis that it is would be optimising a stale trace.
+
+**And what is left is not payload-bound.** The kernel launches **8 workgroups** on a 64-CU card and
+moves 1.44 MB in 124 µs = 11.6 GB/s, which is nowhere near any link. A one-shot all-reduce *spins*
+until its peer arrives, so this number is mostly **rank skew**, exactly as §D9.3 said when the same
+row fell 6.5 ms because work was removed *symmetrically from both ranks*. Shrinking the payload will
+not move it; making the two ranks arrive together, or issuing fewer of them (107.6 per step is ~3.6
+per layer), will.
+
+### D10.4 The dense W4A8 path IS live here — unlike Qwen — and it is under-occupied
+
+The check that had to happen first. `Qwen3.6-35B-A3B-AWQ` leaves **every** dense linear in bf16, so
+its dense-tile surface is never dispatched. This checkpoint's compressed-tensors `ignore` list holds
+`mlp.{gate,up,down}_proj`, `router.proj` and `self_conditioning` — but **not**
+`self_attn.{q,k,v,o}_proj`. (`quant/config.py::_norm_ignore` rewrites the checkpoint's
+`model.decoder.` namespace to the loader's `model.`, which is what makes those entries match at all.)
+
+Confirmed at runtime, not inferred — the ledger reports `[hip-engage]
+fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned)`, and the trace counts **132.2 dispatches/step** of it. So
+**115 dense W4A8 GEMMs per canvas step per rank, all at M=256**, squarely inside the chooser's M≥64
+band that `tile_select.h` notes "no tile-selection change here moves a decode step". Here it moves
+every step.
+
+What the chooser picks, and what the hardware then does (grid/VGPR straight from the kernel trace):
+
+| shape | tile | wgs | waves/SIMD | runner-up |
+|---|---|---|---|---|
+| SWA q_proj | 128x64 | 64 | 8/32 model, **12/16 measured** | 192x64 at 1.100x |
+| SWA k/v_proj | 64x32 | 128 | 8/32 | 128x32 at **1.000x** |
+| SWA o_proj | 192x96 | **60** | 12/32 | 128x64 at 1.009x |
+| FULL q_proj | 128x64 | 128 | 16/32 | 256x64 at **1.000x** |
+| FULL k_proj | 64x32 | 64 | 4/32 | 80x32 at 1.028x |
+| FULL o_proj | 192x96 | **60** | 12/32 | 128x64 at 1.009x |
+
+Three of six launch ≤64 workgroups in ONE round — one block per CU, no co-residency — and the two
+`o_proj` shapes launch **60 workgroups on 64 CUs**, leaving four CUs with no work at all. The
+measured kernel carries **VGPR=112 → 12 of 16 waves/SIMD**.
+
+The recently-merged near-tie band is **inert here**: it exists to keep the 256x128 incumbent when the
+argmin is within 1.10x, and 256x128 is not close at any of these shapes. Meanwhile the actual
+runner-ups sit at 1.000x and 1.009x — margins the model explicitly cannot resolve — and are being
+broken arbitrarily.
+
+The result is a GEMM at **neither** roofline: 0.312 GB and 284 GFLOP in 9.26 ms = **4.8% of the
+706.6 GB/s HBM ceiling and ~8% of fp8 WMMA peak**. Being bound by neither is what 64 workgroups at
+12/16 waves means.
+
+Beside it, `compute_act_fp8_and_scales_kernel` fires **132.2 times per step** for 1.0 ms. The
+producer-side activation quant that deletes exactly this dispatch is built and bit-exact, and the
+ledger shows no `+prequant` tag — **it is not engaged on this path.**
+
+### D10.5 The five full-attention layers cost more than the twenty-five sliding ones
+
+| kernel | disp/step | real ms/step |
+|---|---|---|
+| `flash_prefill_paged_fp8_split_kernel<__half, 512, 8>` | 5.0 | 4.74 |
+| `flash_prefill_reduce_kernel<__half, 512>` | 5.0 | 2.17 |
+| `flash_prefill_paged_fp8_split_kernel<__half, 256, 4>` | 25.0 | 1.35 |
+| `flash_prefill_reduce_kernel<__half, 256>` | 25.0 | 0.21 |
+
+**5 full layers = 6.91 ms; 25 sliding layers = 1.56 ms.** Per layer that is 1.38 ms against 0.062 ms
+— **22x**. Two compounding causes: `global_head_dim` is 512 against the sliding layers' 256, and the
+full layers attend the whole `[encoder KV ++ canvas]` while the sliding ones see a 1024 window. The
+split kernel measures **VGPR=248 → 5 of 16 waves/SIMD**, i.e. 31% occupancy and register-bound; and
+the fp32-partial `reduce` pass costs another 2.17 ms on its own for five layers.
+
+### D10.6 Two open items from §D8 are CONFIRMED FIXED; one regression is NOT
+
+* **`soft_embedding` re-streaming the 738 MB shard 8x**: fixed and confirmed from the trace —
+  `canvas_soft_embed` is **0.2 ms/step**, against 15.3 ms in §D7.1-14. The 8 chunks are gone.
+* **The LM-head `all_gather` of `[256, 262144]`**: gone. No gather of the vocab-parallel logits
+  appears in the trace.
+* **The fused canvas sampler**: still shelved, and the trace supports that. `canvas_sampler` is
+  13.0 ms/step, but only **0.2 ms** of it is in the SAMPLER kernel family — the rest is elementwise,
+  a share of the collectives, and one 1.86 ms rocBLAS `Cijk_...MT64x64x32` dispatch. A fused sampler
+  would not touch most of it.
+* **REGRESSION — cudagraph capture is no longer bit-identical.** §D6.1 asserts "bit-identical, at
+  every captured batch size". Today the engine's own in-process check says otherwise, on both replays
+  of every boot:
+
+  ```
+  [canvas-graph] REPLAY #1 engaged, bs=1 check 1/2 (qlen=256, T=256):
+        graph vs eager max|delta|=1.575e+01 over (256, 2816) *** NOT bit-identical ***
+  [canvas-graph] REPLAY #2 ... max|delta|=8.957e+00 ... *** NOT bit-identical ***
+  ```
+
+  A max|Δ| of 15.75 on a backbone hidden state is not a rounding difference. The served canvas is
+  replaying a graph that computes something materially different from the eager forward it was
+  captured from, and every number in D10 is taken on that graph. **This is the first thing to chase,
+  ahead of any performance work** — it is a correctness claim the doc currently makes and the engine
+  currently denies, and the likely suspects are the kernels that changed underneath it (the MoE
+  producer act-quant path, or the templated tail).
+
+### D10.7 The ranked gap to 200 tok/s
+
+At 97.7 ms/step and the observed k≈9–26 over ~100-token blocks, the realised rate is 49–107 tok/s.
+Reaching 200 needs roughly a **2.5–3x** step reduction (or the same factor out of *k*, which is a
+different and unexplored lever — §D7 never established what sets it).
+
+1. **MoE grouped GEMM — 22.4 ms/step (23% of the step).** *Mechanism: it is a pure weight stream at
+   40.6% of roofline.* 256 canvas rows x top-8 over 128 experts is ~16 rows/expert, so **every**
+   expert is touched and the whole 6.42 GB/rank expert set is read every step. That part is the
+   architecture. What is not: 287 GB/s against 706.6. The kernel is already at **full occupancy**
+   (VGPR=40 → 16/16 waves, 2728 workgroups), so this is not an occupancy fix — it is the
+   reduction/arithmetic-intensity floor at block_m=16, and the lever is the same split-K/gemm2 grid
+   work already in flight on the Qwen path.
+2. **The collective — 13.3 ms/step (14%).** *Mechanism: spin-barrier, i.e. rank skew, not payload.*
+   8 workgroups moving 1.44 MB in 124 µs is not a bandwidth number. 107.6 all-reduces per step is
+   ~3.6 per layer; the levers are **fewer** of them (fuse the attention-`o_proj` and MoE reductions)
+   and **symmetric** rank work, not a faster kernel.
+3. **Dense W4A8 — 10.3 ms/step (11%).** *Mechanism: under-occupancy the tile chooser is choosing.*
+   64 workgroups on 64 CUs at 12/16 waves, 4.8% of HBM and 8% of fp8 peak. Two concrete moves, both
+   cheap: (a) the chooser is picking among 1.000x/1.009x ties at these shapes with a band that only
+   protects a 256x128 incumbent that is never in contention — extend the tie-break to prefer the tile
+   that **launches more workgroups**; (b) engage the producer act-quant that already exists and
+   deletes 132 dispatches/step.
+
+Below those, in order: the **25% inter-kernel gap** (24.8 ms/step idle under capture); **attention**
+at 8.5 ms with the 5 full layers taking 80% of it at 5/16 waves; and the **810 torch elementwise
+dispatches/step** costing 5.2 ms, 37% of which launch ≤64 workgroups — the fusion targets §D9.5
+already named and left to `models/gemma4.py`.
+
+**Not measured here:** the VALU/VMEM/LDS issue split, which still needs `--pmc` under
+`profile_standard` in the ROCm 7.14 image against replayed shapes. Everything above comes from the
+kernel trace, which already carries VGPR/scratch/LDS/grid per dispatch — so occupancy needed no
+counter run at all.
