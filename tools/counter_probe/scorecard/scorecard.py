@@ -61,9 +61,14 @@ def counters(tag):
 
 
 def timing(tag):
-    """MIN kernel duration at auto clocks. Min, not mean: the first dispatch in a trace carries
-    lazy code-object load and one-off cache warming, and with only 4 dispatches it drags the mean
-    badly (dense_4096 int4: mean 51,831 ns vs min 15,240 ns). Min is the steady-state estimate."""
+    """MEAN kernel duration at auto clocks, over the SAME set of dispatches the counters cover.
+
+    Mean, not min, and this is not a matter of taste. The counters are summed over all 4 dispatches
+    and divided by 4, so the byte figure is an AVERAGE. Pairing an average byte count with the
+    FASTEST dispatch's time is a category error whenever the two differ -- and on a shape whose
+    weights fit the 64 MB MALL the fastest dispatch is precisely the most-cached one. Doing that
+    produced 127.6% of roofline on N=6144 K=2048 fp8: physically impossible, and the tell for this
+    exact mismatch. Bytes and time must come from the same population."""
     d = os.path.join(ROOT, "phase0", tag)
     per = defaultdict(list)
     for f in glob.glob(os.path.join(d, "**", "*kernel_trace.csv"), recursive=True):
@@ -86,7 +91,7 @@ def rows(tag, label, band):
         miss = c.get("GL2C_MISS", 0.0)
         hit = c.get("GL2C_HIT", 0.0)
         hbm_bytes = miss * BYTES_PER_L2_MISS
-        ns = t.get(k, (0, 0, 0))[0]
+        ns = t.get(k, (0, 0, 0))[1]        # [1] = mean, matched to the counters' mean bytes
         gbs = (hbm_bytes / ns) if ns else 0.0        # bytes/ns == GB/s
         out.append(dict(
             tag=tag, label=label, band=band, kern=k,
@@ -115,7 +120,7 @@ SPEC = [
 
 if __name__ == "__main__":
     print(f"roofline denominator = {HBM_PEAK_GBS} GB/s ; HBM bytes = GL2C_MISS x {BYTES_PER_L2_MISS:.0f} B")
-    print("counters @ profile_standard (pinned) ; times @ auto (min of 4 dispatches)\n")
+    print("counters @ profile_standard (pinned) ; times @ auto (MEAN of the same 4 dispatches)\n")
     h = ("shape", "kernel", "band", "waves", "Occ%", "Mem%", "ISS%", "L2hit%", "HBM_MB", "min_ns", "GB/s", "%706.6", "VALU/wv")
     print(f"{h[0]:<30}{h[1]:<26}{h[2]:<24}{h[3]:>8}{h[4]:>6}{h[5]:>6}{h[6]:>6}{h[7]:>7}{h[8]:>9}{h[9]:>10}{h[10]:>8}{h[11]:>8}{h[12]:>9}")
     print("-" * 158)

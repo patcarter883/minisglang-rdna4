@@ -49,25 +49,27 @@ trusted: fp8 `SQ_BUSY_CYCLES` 3,460,536 vs recorded 3,460,996; int4 2,030,756 vs
 
 ## The measurement
 
-All rows are the **DECODE band, M ≤ 32**. Counters @ `profile_standard`; times = min of 4 dispatches
-@ `auto`.
+All rows are the **DECODE band, M ≤ 32**. Counters @ `profile_standard`; times @ `auto`, **mean over
+the same 4 dispatches the counters cover** — see the byte/time matching note under claim 3.
 
-| shape | kernel | band | waves | Occ% | MemUnit% | IssueWait% | L2 hit% | HBM MB | min ns | GB/s | **% of 706.6** |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| dense GEMV 4096² | fp8 | cache-adjacent | 4,096 | 61.9 | 66.7 | 2.6 | 54.2 | 16.81 | 24,600 | 683.2 | **96.7** |
-| dense GEMV 4096² | int4 | cache-adjacent | 2,048 | 52.1 | 56.4 | 12.3 | 56.7 | 8.66 | 15,240 | 568.5 | **80.5** |
-| dense GEMV 16384² | fp8 | HBM-streaming | 16,384 | 78.8 | 85.7 | 0.4 | 58.8 | 268.56 | 402,126 | 667.8 | **94.5** |
-| dense GEMV 16384² | int4 | HBM-streaming | 8,192 | 77.4 | **97.2** | 2.1 | 62.5 | 139.02 | 222,643 | 624.4 | **88.4** |
-| bf16 shared.gate N=1 K=2048 | bf16 | launch-floor | 16 | **0.1** | 27.4 | 0.2 | 49.3 | 0.01 | 4,520 | 2.0 | **0.3** |
-| bf16 shared.down N=2048 K=256 | bf16 | small-N | 64 | **1.1** | 34.1 | 0.1 | 63.0 | 1.05 | 6,600 | 159.7 | **22.6** |
-| bf16 in_proj_qkvz N=6144 K=2048 | bf16 | large-N | 6,144 | 71.5 | 80.1 | 0.3 | 54.1 | 25.18 | 109,282 | 230.4 | **32.6** |
-| bf16 LM head N=32768 K=2048 | bf16 | large-N | 32,768 | **87.8** | **96.9** | 0.1 | 55.6 | 134.29 | 303,644 | 442.3 | **62.6** |
-| MoE gemm1 M=1 | int4 | decode | 4,096 | 35.7 | 63.1 | 11.2 | 56.7 | 8.66 | 27,280 | 317.5 | **44.9** |
-| MoE gemm1 M=5 | int4 | decode | 16,384 | 44.8 | 80.4 | 16.2 | 57.8 | 34.66 | 72,241 | 479.8 | **67.9** |
-| MoE gemm1 M=6 | int4 | decode | 16,384 | 45.5 | 81.2 | 16.8 | 58.9 | 34.67 | 78,121 | 443.8 | **62.8** |
-| MoE gemm1 M=30 | int4 | decode | 16,384 | 42.9 | 81.3 | 27.6 | 75.6 | 34.91 | 229,164 | 152.4 | **21.6** |
-| MoE gemm2 (unfused) M=1 | int4 | decode | 8,192 | 63.4 | 80.6 | 28.2 | **95.9** | 4.92 | 123,282 | 39.9 | **5.6** |
-| MoE gemm2 (unfused) M=5/6/30 | int4 | decode | 32,768 | 69.7 | 88.2 | 28.4 | **96.2** | 19.67 | ~467,300 | 42.1 | **6.0** |
+| shape | kernel | band | waves | Occ% | MemUnit% | IssueWait% | L2 hit% | HBM MB | mean ns | GB/s | **% of 706.6** | VALU/wave |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| dense GEMV 4096² | fp8 | cache-adjacent | 4,096 | 61.9 | 66.7 | 2.6 | 54.2 | 16.81 | 34,480 | 487.4 | **69.0** | 854 |
+| dense GEMV 4096² | int4 | cache-adjacent | 2,048 | 52.1 | 56.4 | 12.3 | 56.7 | 8.66 | 16,490 | 525.4 | **74.4** | 1,391 |
+| dense GEMV 16384² | fp8 | HBM-streaming | 16,384 | 78.8 | 85.7 | 0.4 | 58.8 | 268.56 | 442,134 | 607.4 | **86.0** | 3,086 |
+| dense GEMV 16384² | int4 | HBM-streaming | 8,192 | 77.4 | **97.2** | 2.1 | 62.5 | 139.02 | 223,812 | 621.1 | **87.9** | 5,039 |
+| bf16 shared.gate N=1 K=2048 | bf16 | launch-floor | 16 | **0.1** | 27.4 | 0.2 | 49.3 | 0.01 | 10,060 | 0.9 | **0.1** | 52 |
+| bf16 shared.down N=2048 K=256 | bf16 | small-N | 64 | **1.1** | 34.1 | 0.1 | 63.0 | 1.05 | 11,480 | 91.8 | **13.0** | 253 |
+| bf16 in_proj_qkvz N=6144 K=2048 | bf16 | large-N | 6,144 | 71.5 | 80.1 | 0.3 | 54.1 | 25.18 | 112,971 | 222.9 | **31.5** | 162 |
+| bf16 LM head N=32768 K=2048 | bf16 | large-N | 32,768 | **87.8** | **96.9** | 0.1 | 55.6 | 134.29 | 377,274 | 355.9 | **50.4** | 162 |
+| MoE gemm1 M=1 | int4 | decode | 4,096 | 35.7 | 63.1 | 11.2 | 56.7 | 8.66 | 28,200 | 307.2 | **43.5** | 862 |
+| MoE gemm1 M=5 | int4 | decode | 16,384 | 44.8 | 80.4 | 16.2 | 57.8 | 34.66 | 78,351 | 442.3 | **62.6** | 938 |
+| MoE gemm1 M=6 | int4 | decode | 16,384 | 45.5 | 81.2 | 16.8 | 58.9 | 34.67 | 99,521 | 348.3 | **49.3** | 1,015 |
+| MoE gemm1 M=30 | int4 | decode | 16,384 | 42.9 | 81.3 | 27.6 | 75.6 | 34.91 | 233,682 | 149.4 | **21.1** | 2,918 |
+| MoE gemm2 (unfused) M=1 | int4 | decode | 8,192 | 63.4 | 80.6 | 28.2 | **95.9** | 4.92 | 127,832 | 38.5 | **5.4** | 3,193 |
+| MoE gemm2 (unfused) M=5/6/30 | int4 | decode | 32,768 | 69.7 | 88.2 | 28.4 | **96.2** | 19.67 | ~470,000 | ~40 | **~5.6** | 3,193 |
+
+**Production fused MoE gemm2 (`grid.y = M`) — the served path — is tabulated under claim 2.**
 
 ---
 
@@ -145,17 +147,17 @@ The claim silently pools two regimes.
 - **Large-N (the shapes that carry the time): CONFIRMED.** LM head Occ **87.8%**, MemUnit **96.9%**;
   in_proj_qkvz Occ 71.5%, MemUnit 80.1%. These are memory-unit-saturated. Nothing in tiling.
 - **Small-N: NOT at a bandwidth floor — at a LAUNCH floor, with occupancy of 0.1–1.1%.**
-  `shared.gate` (N=1) runs **16 waves** on a 64-CU part and reaches 0.3% of roofline; `shared.down`
-  runs **64 waves** at 22.6%. Calling this "at its floor" is true only in the sense that the fixed
+  `shared.gate` (N=1) runs **16 waves** on a 64-CU part and reaches 0.1% of roofline; `shared.down`
+  runs **64 waves** at 13.0%. Calling this "at its floor" is true only in the sense that the fixed
   per-dispatch cost dominates — it is not a bandwidth statement.
 - The counters also **explain** why KSPLIT (adding waves to exactly these shapes) regressed: at
   ~4.5 µs with 16 waves the kernel is dominated by fixed cost, and extra waves add a barrier without
   removing it. And the e2e launch-count falsifications stand independently — under CUDA-graph capture
   there is no per-dispatch cost to recover.
 
-**One real gap the counters expose:** the LM head sits at **MemUnit 96.9% but only 62.6% of roofline**.
+**One real gap the counters expose:** the LM head sits at **MemUnit 96.9% but only 50.4% of roofline**.
 The memory path is saturated with requests that are not achieving peak bandwidth — unlike int4
-streaming, which converts MemUnit 97.2% into 88.4% of peak. That is a **~1.4× efficiency gap on the
+streaming, which converts MemUnit 97.2% into 87.9% of peak. That is a **~1.7× efficiency gap on the
 single largest decode GEMV**, and it is an access-pattern/request-efficiency problem, not an
 occupancy or launch one. See claim 7.
 
@@ -164,12 +166,12 @@ occupancy or launch one. See claim 7.
 The claim is a fixed ~17 µs floor plus a per-output-column cost, with padding free and the working
 set cache-resident.
 
-- **The M-scaling does not fit a floor-plus-column model.** gemm1: 27.3 / 72.2 / 78.1 / 229.2 µs at
+- **The M-scaling does not fit a floor-plus-column model.** gemm1: 28.2 / 78.4 / 99.5 / 233.7 µs at
   M = 1 / 5 / 6 / 30 while HBM bytes go 8.66 / 34.66 / 34.67 / 34.91 MB. From M=5→30 the bytes are
-  **flat** and the time grows **3.2×** — the incremental cost there is neither a floor nor columns,
+  **flat** and the time grows **3.0×** — the incremental cost there is neither a floor nor columns,
   it is **compute on real rows** (VALU/wave 938 → 2,918).
-- **gemm1 is not floor-bound at M=1 either**: MemUnit 63.1%, reaching 44.9% of roofline, rising to
-  **67.9% at M=5**. It is weight-streaming-limited in M=1→5 and compute-limited above.
+- **gemm1 is not floor-bound at M=1 either**: MemUnit 63.1%, reaching 43.5% of roofline, rising to
+  **62.6% at M=5**. It is weight-streaming-limited in M=1→5 and compute-limited above.
 - **The unfused gemm2 is L2-bandwidth bound, not reduction-floor bound**: **L2 hit 96%**,
   MemUnit 88%, **5.6–6.0% of HBM roofline**, and the **highest `WAVE_ISSUE_WAIT` anywhere (28%)**.
   It re-reads weights out of L2 roughly 25× rather than streaming them. Its cost is also
@@ -229,12 +231,12 @@ cache-resident shape, which is the tell for exactly this mistake:
 | N=K=16384 int4 (synthetic) | 134.2 MB | 139.02 | 223,812 | 621.1 | **87.9** | 77.4 | 97.2 |
 | N=K=16384 fp8 (synthetic) | 268.4 MB | 268.56 | 442,134 | 607.4 | **86.0** | 78.8 | 85.7 |
 
-and the bf16 loader at real serve shapes: LM head **62.6%**, in_proj_qkvz **32.6%**,
-shared.down **22.6%**; MoE gemm1 **44.9 → 67.9%**.
+and the bf16 loader at real serve shapes: LM head **50.4%**, in_proj_qkvz **31.5%**,
+shared.down **13.0%**; MoE gemm1 **43.5 → 62.6%**.
 
 **A GEMV only approaches the roofline at shapes far larger than anything the engine launches.** The
 81% was taken in the synthetic regime and then read as a property of "the decode GEMV". At the shapes
-actually served, the same kernels read **22.6–69.5%** of 706.6 GB/s — against 86–88% at 16384². That
+actually served, the same kernels read **13.0–69.5%** of 706.6 GB/s — against 86–88% at 16384². That
 is real, unclosed headroom, and this verdict was wrongly holding the door shut on it.
 
 Note also that every production shape here has a weight footprint of **2–13 MB, far inside the 64 MB
@@ -251,8 +253,8 @@ The aggregate is real (Prometheus `amdgpu_umc_activity_percent`: 15% at bs=1, 24
 does not follow is the conclusion people drew from it — that the decode kernels are far from
 bandwidth-bound and therefore carry ~10× headroom.
 
-Per-kernel, in the decode band: **int4 dense 88.4%**, **fp8 dense 94.5%**, **LM head MemUnit 96.9%**,
-**MoE gemm1 67.9% at M=5**. The big GEMVs are at or near the memory ceiling. The ≤27% aggregate is
+Per-kernel, in the decode band: **int4 dense 87.9%**, **fp8 dense 86.0%** (both at 16384²), **LM head MemUnit 96.9%**,
+**MoE gemm1 62.6% at M=5**. The big GEMVs are at or near the memory ceiling. The ≤27% aggregate is
 therefore **dilution** — small kernels, launch-floor shapes (0.3% of roofline), and inter-kernel gaps
 averaged in with saturated ones — not evidence of slack inside the kernels that dominate the time.
 
@@ -308,8 +310,8 @@ The gfx1201 occupancy law (established twice independently from 105 VGPR counts,
 ### 7. "LM-head GEMV is the serve lever (5.4× over rocBLAS)" — **CONFIRMED as a win, and it is NOT finished**
 
 It is the largest single decode GEMV measured (134.3 MB/step, 32,768 waves) and it is well-optimised
-— Occ 87.8%, MemUnit 96.9%. But it converts that into only **62.6% of roofline**, where int4
-streaming converts a comparable MemUnit 97.2% into **88.4%**. That is a **~1.4× residual gap on the
+— Occ 87.8%, MemUnit 96.9%. But it converts that into only **50.4% of roofline**, where int4
+streaming converts a comparable MemUnit 97.2% into **87.9%**. That is a **~1.7× residual gap on the
 biggest decode GEMV**, and the counters localise it: not occupancy (87.8%), not issue contention
 (0.1%), but **per-request memory efficiency**. This is live headroom the "it's the serve lever, we
 won it" framing has been treating as spent.
@@ -318,7 +320,7 @@ won it" framing has been treating as spent.
 
 I did not instrument that kernel, but the scorecard contains a direct quantitative analogue.
 Collapsing a decode GEMV's grid to a handful of blocks is measured here at
-**`shared.gate`: 16 waves → 0.1% occupancy → 0.3% of roofline (2.0 GB/s)**, versus 87.8% / 62.6% for
+**`shared.gate`: 16 waves → 0.1% occupancy → 0.1% of roofline (0.9 GB/s)**, versus 87.8% / 50.4% for
 the same loader family at large N. A one-block-per-token fusion produces exactly that grid collapse,
 and a 2–3 order-of-magnitude loss is entirely consistent with a 33× slowdown. Occupancy really is the
 explanation *in this specific case* — which is not in tension with claim 6, because here the fusion
@@ -346,7 +348,7 @@ supplies parallelism, so this is a multiple, not a few percent, on the MoE decod
 
 **2. "Decode GEMV is at 81% of HBM" (claim 3).**
 Reproduces only against a hardcoded 640 GB/s constant with a hot cache. Honestly measured, fp8 reads
-**55–63%**; my counters put the *served* shapes at **22.6–67.9%** of 706.6 GB/s, with only the
+**55–63%**; my counters put the *served* shapes at **13.0–69.5%** of 706.6 GB/s, with only the
 synthetic 16384² reaching 88–94%. A whole class of decode GEMV work was closed off on a number taken
 at a geometry the engine never launches.
 
@@ -363,12 +365,12 @@ gap-closing and megakernel work at a ceiling three times larger than the one tha
 
 **5. "Serving is overhead-bound / umc ≤27%" (claim 4) — aggregate true, inference false.**
 The ≤27% is real but is *dilution*. The inference that kernels therefore carry ~10× slack does not
-follow uniformly: some are at 88–97% of the memory unit, while the MoE gemm2 is at 2.2% occupancy.
+follow uniformly: some are at 86–97% of the memory unit, while the MoE gemm2 is at 2.2% occupancy.
 Averaging those into one framing number hid both facts and licensed a 3–10× megakernel search.
 
 **6. "LM-head GEMV is the serve lever" (claim 7) — the win is real, the closure is not.**
-MemUnit 96.9% converted into only 62.6% of roofline, where int4 streaming converts a comparable 97.2%
-into 88.4%. ~1.4× of per-request memory efficiency remains on the largest single decode GEMV.
+MemUnit 96.9% converted into only 50.4% of roofline, where int4 streaming converts a comparable 97.2%
+into 87.9%. ~1.7× of per-request memory efficiency remains on the largest single decode GEMV.
 
 **7. "Dense GEMV is at its floor" (claim 1) — least headroom lost.**
 Correct for large-N; only the small-N framing was loose, and the launch-count lever is independently
