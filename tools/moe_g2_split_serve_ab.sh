@@ -30,6 +30,13 @@ IMG="${G2_IMG:-minisgl-rdna4:post-tile}"
 MODEL="${MODEL:-qwen35b-awq}"
 TOKS="${TOKS:-256}"
 REPS="${REPS:-3}"
+# SPEC=none ON PURPOSE. serve.sh's default for this model is MTP, and with a draft width the decode
+# batch the MoE sees is a spec-VERIFY width, not bs — measured on the first attempt, the fused kernel
+# saw M=4 and M=6 for a bs=1/5/6 sweep, and M=1/M=2 (the scatter arm) never appeared on the decode
+# path at all. That is a legitimate serving configuration, but it is not the one the kernel surface
+# was swept at, and reporting a bs number against a different M is how a kernel result stops being
+# checkable. With SPEC=none, bs=n gives M=n exactly: bs=1 -> M=1 (scatter), bs=5/6 -> M=5/6 (fused).
+SPEC="${SPEC:-none}"
 CONC="${CONC:-6}"
 # PIN the pool: an auto-sized pool differs between legs, so the legs would admit different work and
 # the comparison would be of admission policy rather than of the GEMM.
@@ -44,7 +51,7 @@ cp -a "$KERN/fp8_wmma/torch-ext/fp8_wmma" "$WT/_kern/fp8_wmma"
 
 fatal_log() {
   ( cd "$WT" && docker compose -p "$PROJ" --profile serve logs --no-color 2>&1 ) \
-    | grep -qE 'Traceback \(most recent call last\)|AssertionError|RuntimeError|CUDA error|HIP error|torch.OutOfMemoryError'
+    | grep -qaE 'Traceback \(most recent call last\)|AssertionError|RuntimeError|CUDA error|HIP error|torch.OutOfMemoryError'
 }
 wait_ready() {  # "Up" is NOT ready; fail fast on a rank traceback, otherwise wait.
   local i
@@ -80,7 +87,7 @@ for leg in base new; do
     MINISGL_IMAGE="$IMG" \
     MINISGL_PYTHONPATH="/engine/_kern:/opt/kernels:/engine/python:/engine" \
     MINISGL_MOE_G2_SPLIT_DEBUG=1 "$SKENV" \
-    MODEL="$MODEL" TP=2 CONC="$CONC" LEASE_NAME="g2sk" \
+    MODEL="$MODEL" TP=2 CONC="$CONC" SPEC="$SPEC" LEASE_NAME="g2sk" \
     EXTRA_ARGS="--num-pages $NUM_PAGES" \
     docker compose -p "$PROJ" --profile serve up -d ) >/dev/null 2>&1
 
@@ -93,14 +100,25 @@ for leg in base new; do
 
   # ---- drive first so the served shape is actually reached, THEN read the ledger ----
   for bs in 1 5 6; do
-    echo "  --- bs=$bs ---" | tee -a "$OUT"
+    case "$ARM/$bs" in
+      fused/1)      note="(control: M=1 is the scatter arm, untouched by this leg)" ;;
+      scatter/1)    note="(MEASURED: M=1 scatter arm)" ;;
+      scatter/5|scatter/6) note="(control: M=5/6 is the fused arm, untouched by this leg)" ;;
+      *)            note="(MEASURED: M=$bs fused arm)" ;;
+    esac
+    echo "  --- bs=$bs $note ---" | tee -a "$OUT"
     for r in $(seq 1 "$REPS"); do
       python3 "$WT/tools/_moe_actquant_driver.py" "$bs" "$TOKS" 2>&1 | sed "s/^/    rep$r /" | tee -a "$OUT"
     done
   done
 
-  LEDGER=$( ( cd "$WT" && docker compose -p "$PROJ" --profile serve logs 2>&1 ) \
-            | grep -oE '\[g2-split\][^\n]*' | sort -u | tr '\n' '|' )
+  # `docker logs <container>`, NOT `docker compose logs`: compose captures none of the engine's
+  # output for this service (13 lines, stopping at "Tokenize server is ready"), so a ledger read from
+  # it is always empty and every provenance assertion built on it silently passes or silently voids.
+  # And the pattern is `.*`, not `[^\n]*`: in POSIX ERE a bracket expression has no \n escape, so
+  # `[^\n]*` means "not backslash, not the letter n" — it truncated each line at "bylane", i.e.
+  # BEFORE the split_k= field the assertion is looking for.
+  LEDGER=$( docker logs "${PROJ#lease-}-serve" 2>&1 | grep -aoE '\[g2-split\].*' | sort -u | tr '\n' '|' )
   echo "  g2-split ledger: ${LEDGER:-<none captured>}" | tee -a "$OUT"
   SPLITS=$(printf '%s' "$LEDGER" | grep -oE 'split_k=[0-9]+' | sort -u | tr '\n' ' ')
   echo "  split_k values seen: ${SPLITS:-<none>}" | tee -a "$OUT"
@@ -119,7 +137,7 @@ for leg in base new; do
       esac
     fi
   else
-    ENVSEEN=$(docker inspect g2sk-serve --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    ENVSEEN=$(docker inspect "${PROJ#lease-}-serve" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
               | grep -c "^MINISGL_MOE_SPLITK_SCATTER=legacy$")
     if [ "$leg" = base ] && [ "${ENVSEEN:-0}" = 0 ]; then
       echo "  PROVENANCE FAIL: base did not carry SPLITK_SCATTER=legacy — A/B void" | tee -a "$OUT"; FAIL=1
