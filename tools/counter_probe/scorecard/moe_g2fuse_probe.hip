@@ -85,22 +85,43 @@ static void fatal(const char* fmt, ...) {
 }
 
 // ============================================================================
-// ==== BEGIN VERBATIM COPY from moe_kernel.hip @ 2ade7c1 — DO NOT EDIT ====
+// ==== BEGIN VERBATIM COPY from moe_kernel.hip @ e82e2eb — DO NOT EDIT ====
+// Re-extracted mechanically from the live source (not re-typed) when the top_k split on
+// grid.z landed, so the probe measures the kernel the serve runs, split included.
 // Both bodies below are byte-for-byte the production sources (moe_kernel.hip lines ~899-908 and
 // ~973-1066), kept inside their original `namespace w4a8_fp8_moe`. Only the surrounding torch
 // launchers were dropped. Any change here silently invalidates every counter this probe collects.
 // ============================================================================
 namespace w4a8_fp8_moe {
 
+// `arrival` is the fused gemm2's k-slice arrival counter (see the SPLIT note on
+// moe_gemm2_gather_reduce_core). It is zeroed HERE, inside a kernel that already launches, rather
+// than by its own at::zeros — a per-MoE-layer fill dispatch is exactly the launch-count cost this
+// file spends paragraphs removing elsewhere, and the counter must be re-zeroed on every cudagraph
+// REPLAY, which a captured prelude kernel gives for free. nullptr/0 when the slice count is 1.
 static __global__ void moe_build_inverse_map_kernel(
     const int* __restrict__ sorted_token_ids,       // (P,)
     const int* __restrict__ num_tokens_post_padded,  // (1,)
-    int*       __restrict__ slot_to_row,             // (M*top_k,) pre-filled -1
-    int P, int M_tk) {
+    int*       __restrict__ meta,                    // [0,M_tk) slot_to_row, pre-filled -1;
+                                                     // [M_tk, M_tk+n_arrival) k-slice counters
+    int P, int M_tk, int n_arrival = 0) {
+    // ONE restrict pointer for both regions ON PURPOSE. They live in the same allocation (the
+    // counters ride in slot_to_row's tail so a split costs no extra dispatch), so handing the
+    // compiler two `__restrict__` pointers into it would be an aliasing LIE: UB, and the kind that
+    // pays out as dropped stores under a vectoriser rather than as a fault. Derived from one
+    // pointer, the question does not arise.
+    // (Honest provenance: this was written while chasing a max|d| 1.3e-1 that appeared only at
+    // M >= 16. That turned out to be the PARITY HARNESS, not this — it compared legs run in
+    // separate PROCESSES, and moe_align's row assignment within an expert block is not stable
+    // across processes, so the two legs were not reading the same buf2 rows. The aliasing removal
+    // is kept because it is correct, NOT because it was measured to fix anything.)
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_arrival;
+         i += gridDim.x * blockDim.x)
+        meta[M_tk + i] = 0;
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= P || r >= num_tokens_post_padded[0]) return;
     const int slot = sorted_token_ids[r];
-    if (slot < M_tk) slot_to_row[slot] = r;          // valid (token,slot) -> its row
+    if (slot < M_tk) meta[slot] = r;                 // valid (token,slot) -> its row
 }
 
 template <typename OT, class WLoad, int NWARPS, int COLS, bool BYLANE = false>
@@ -111,10 +132,15 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
     const typename WLoad::WScaleT* __restrict__ w_scales,     // (E, N, K/group) fp16
     const int*                     __restrict__ w_zeros,      // (E, N/8, K/group) int32 or nullptr
     const int*                     __restrict__ expert_ids,   // (P/block_m,) int32
-    const int*                     __restrict__ slot_to_row,  // (M*top_k,) int32, -1 = missing
+    int*                           __restrict__ slot_to_row,  // (M*top_k [+ M*gridDim.x],) int32
     const float*                   __restrict__ topk_weights, // (M*top_k,) fp32
     float*                         __restrict__ out,          // (M, N) fp32
-    int M, int N, int K, int group_size, int top_k, int block_m, bool weight_is_e2m1) {
+    int M, int N, int K, int group_size, int top_k, int block_m, bool weight_is_e2m1,
+    float*                         __restrict__ partial = nullptr,  // (top_k, M, N) fp32; k_slices>1
+    int k_slices = 1) {
+    // The k-slice arrival counters are the TAIL of slot_to_row, derived from the same pointer —
+    // never a second __restrict__ into the same allocation (that would be UB). See the prelude.
+    int* arrival = slot_to_row + M * top_k;
 
     const int t       = blockIdx.y;          // token
     const int warp_id = threadIdx.x >> 5;
@@ -123,6 +149,12 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
     const int num_groups = K / group_size;
     const int col_base   = (blockIdx.x * NWARPS + warp_id) * COLS;
     const int sbase      = t * top_k;
+    // k_slices is grid-uniform, so every branch on it is uniform across the block — no divergence,
+    // and the __syncthreads() in the fixup is reached by all threads or by none.
+    const int kz    = (k_slices > 1) ? (int)blockIdx.z : 0;
+    const long pbase = (long)t * N;                  // partial[k][t][*] = partial + k*M*N + t*N
+
+    __shared__ int s_last;
 
     if constexpr (BYLANE) {
         // One column per LANE (COLS unused): each lane sweeps ALL of K in registers, so there is no
@@ -131,9 +163,14 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
         // summation order differs.
         const int nc = (blockIdx.x * NWARPS + warp_id) * 32 + lane;
         float red1 = 0.0f;
-        for (int k = 0; k < top_k; ++k) {
+        for (int k = kz; k < top_k; k += k_slices) {
             const int r = slot_to_row[sbase + k];
-            if (r < 0) continue;                              // missing slot -> contributes 0
+            if (r < 0) {                                      // missing slot -> contributes 0
+                if (k_slices > 1 && nc < N)
+                    __hip_atomic_store(&partial[(long)k * M * N + pbase + nc], 0.0f,
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                continue;
+            }
             const int e = expert_ids[r / block_m];
             const typename WLoad::WT*      wq_e = WLoad::wq_expert(w_data,   e, N, K);
             const typename WLoad::WScaleT* ws_e = WLoad::ws_expert(w_scales, e, N, num_groups);
@@ -148,10 +185,35 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
                     weight_is_e2m1);
                 const float wsc = WLoad::wscale_epi(ws_e, nc);
                 const OT rounded = gemv_decode::cvt_out<OT>(acc[0] * asc * wsc);
-                red1 += tw * (float)rounded;
+                const float term = tw * (float)rounded;
+                if (k_slices > 1)
+                    __hip_atomic_store(&partial[(long)k * M * N + pbase + nc], term,
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                else red1 += term;
             }
         }
-        if (nc < N) out[(long)t * N + nc] = red1;
+        if (k_slices == 1) {
+            if (nc < N) out[pbase + nc] = red1;
+            return;
+        }
+        // Last slice to arrive folds the token's top_k terms in ASCENDING k — the identical left
+        // fold the unsplit path does in `red1`, hence max|Δ|=0.
+        __threadfence();                 // RELEASE: this block's partial writes, before it arrives
+        __syncthreads();
+        if (threadIdx.x == 0)
+            s_last = (__hip_atomic_fetch_add(&arrival[t * (int)gridDim.x + (int)blockIdx.x], 1,
+                                             __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT)
+                      == k_slices - 1);
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();                 // ACQUIRE: see the OTHER slices' partials, not a stale L1
+        if (nc < N) {
+            float red = 0.0f;
+            for (int k = 0; k < top_k; ++k)
+                red += __hip_atomic_load(&partial[(long)k * M * N + pbase + nc],
+                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            out[pbase + nc] = red;
+        }
         return;
     }
 
@@ -161,9 +223,20 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
     for (int c = 0; c < COLS; ++c) red[c] = 0.0f;
 
     // OUTER over the token's top_k experts (ascending k == gather_reduce fold order).
-    for (int k = 0; k < top_k; ++k) {
+    for (int k = kz; k < top_k; k += k_slices) {
         const int r = slot_to_row[sbase + k];
-        if (r < 0) continue;                                  // missing slot -> contributes 0
+        if (r < 0) {                                          // missing slot -> contributes 0
+            if (k_slices > 1 && lane == 0) {
+                #pragma unroll
+                for (int c = 0; c < COLS; ++c) {
+                    const int nc = col_base + c;
+                    if (nc < N)
+                        __hip_atomic_store(&partial[(long)k * M * N + pbase + nc], 0.0f,
+                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                }
+            }
+            continue;
+        }
         const int e = expert_ids[r / block_m];
         const typename WLoad::WT*      wq_e = WLoad::wq_expert(w_data,   e, N, K);
         const typename WLoad::WScaleT* ws_e = WLoad::ws_expert(w_scales, e, N, num_groups);
@@ -185,20 +258,50 @@ static __global__ void __launch_bounds__(NWARPS * 32) moe_gemm2_gather_reduce_co
             if (lane == 0 && nc < N) {
                 const float wsc = WLoad::wscale_epi(ws_e, nc);
                 const OT rounded = gemv_decode::cvt_out<OT>(acc[0] * asc * wsc);
-                red[c] += tw * (float)rounded;
+                const float term = tw * (float)rounded;
+                if (k_slices > 1)
+                    __hip_atomic_store(&partial[(long)k * M * N + pbase + nc], term,
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                else red[c] += term;
             }
         }
     }
+    if (k_slices == 1) {
+        if (lane == 0) {
+            #pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const int nc = col_base + c;
+                if (nc < N) out[pbase + nc] = red[c];
+            }
+        }
+        return;
+    }
+    __threadfence();                     // RELEASE (see the BYLANE twin above)
+    __syncthreads();
+    if (threadIdx.x == 0)
+        s_last = (__hip_atomic_fetch_add(&arrival[t * (int)gridDim.x + (int)blockIdx.x], 1,
+                                         __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT)
+                  == k_slices - 1);
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();                     // ACQUIRE
     if (lane == 0) {
         #pragma unroll
         for (int c = 0; c < COLS; ++c) {
             const int nc = col_base + c;
-            if (nc < N) out[(long)t * N + nc] = red[c];
+            if (nc < N) {
+                float acc2 = 0.0f;
+                for (int k = 0; k < top_k; ++k)
+                    acc2 += __hip_atomic_load(&partial[(long)k * M * N + pbase + nc],
+                                              __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                out[pbase + nc] = acc2;
+            }
         }
     }
 }
 
 }  // namespace w4a8_fp8_moe
+
 // ==== END VERBATIM COPY ====
 
 // ============================================================================
@@ -287,11 +390,13 @@ struct Args {
     const __half* w_scales;
     const int*    w_zeros;        // nullptr — the served W4A8 checkpoints are symmetric
     const int*    expert_ids;
-    const int*    slot_to_row;
+    int*          slot_to_row;    // (M*top_k [+ M*gridDim.x]) — the arrival counters are its tail
     const float*  topk_weights;
     float*        out;
     int M, N, K, group_size, top_k, block_m;
     bool weight_is_e2m1;
+    float*        partial;        // (top_k, M, N) fp32, nullptr when k_slices == 1
+    int           k_slices;
 };
 
 template <typename OT, int COLS, bool BYLANE>
@@ -299,7 +404,7 @@ static void launch_fused(const Args& a, dim3 grid, dim3 block) {
     w4a8_fp8_moe::moe_gemm2_gather_reduce_core<OT, Int4Fp8GemvLoader, 8, COLS, BYLANE>
         <<<grid, block>>>(a.x_fp8, a.act_scales, a.w_data, a.w_scales, a.w_zeros, a.expert_ids,
                           a.slot_to_row, a.topk_weights, a.out, a.M, a.N, a.K, a.group_size,
-                          a.top_k, a.block_m, a.weight_is_e2m1);
+                          a.top_k, a.block_m, a.weight_is_e2m1, a.partial, a.k_slices);
 }
 
 template <typename OT>
@@ -415,7 +520,7 @@ int main(int argc, char** argv) {
 
     auto* d_asc  = dupload(h_asc);
     auto* d_tw   = dupload(h_tw);
-    auto* d_str  = dupload(h_str);
+    auto* d_str  = dupload(h_str);   // resized below when the k-slice split is on
     auto* d_sti  = dupload(h_sti);
     auto* d_eid  = dupload(h_eid);
     auto* d_ntp  = dupload(h_ntp);
@@ -426,8 +531,32 @@ int main(int argc, char** argv) {
 
     // ---- (2) inverse map: slot -> padded row. The fused kernel takes slot_to_row, NOT
     // sorted_token_ids. Same launch config as the production prelude.
+    // ---- k-slice split on grid.z (G2FUSE_SPLIT_K; 1 = the pre-split grid, for the "before" row).
+    // The probe takes the count EXPLICITLY rather than re-deriving it, because a counter run wants
+    // to name the configuration it is measuring, not discover it.
+    int k_slices = 1;
+    if (const char* e = std::getenv("G2FUSE_SPLIT_K")) k_slices = std::atoi(e);
+    if (k_slices < 1) k_slices = 1;
+    while (k_slices > 1 && top_k % k_slices != 0) k_slices--;   // slices must divide top_k
+    const int n_arrival = (k_slices > 1) ? (int)grid.x * M : 0;
+
+    // slot_to_row carries the arrival counters in its TAIL (production layout: one allocation, one
+    // pointer, zeroed by the prelude that already launches).
+    if (n_arrival > 0) {
+        HIP_CHECK(hipFree(d_str));
+        std::vector<int> h_str2(h_str);
+        h_str2.resize((size_t)numel + n_arrival, -1);
+        d_str = dupload(h_str2);
+    }
+    float* d_partial = nullptr;
+    if (k_slices > 1) {
+        HIP_CHECK(hipMalloc(&d_partial, (size_t)top_k * M * N * sizeof(float)));
+        HIP_CHECK(hipMemset(d_partial, 0, (size_t)top_k * M * N * sizeof(float)));
+    }
+    grid.z = k_slices;
+
     w4a8_fp8_moe::moe_build_inverse_map_kernel<<<dim3((P + 255) / 256), dim3(256)>>>(
-        d_sti, d_ntp, d_str, P, numel);
+        d_sti, d_ntp, d_str, P, numel, n_arrival);
     HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipGetLastError());
 
@@ -452,8 +581,11 @@ int main(int argc, char** argv) {
                         numel, numel, P);
     }
 
+    std::printf("[g2fuse] SPLIT: k_slices=%d -> grid=(%u,%u,%u) = %u blocks, %u waves\n",
+                k_slices, grid.x, grid.y, grid.z, grid.x * grid.y * grid.z,
+                grid.x * grid.y * grid.z * NW);
     Args a{d_x_fp8, d_asc, d_wdata, d_wscal, d_wzero, d_eid, d_str, d_tw, d_out,
-           M, N, K, group_size, top_k, block_m, /*weight_is_e2m1=*/false};
+           M, N, K, group_size, top_k, block_m, /*weight_is_e2m1=*/false, d_partial, k_slices};
 
     // ---- WARM-UP outside the counted region, so lazy code-object load / first-touch page-in is
     // not attributed to the measured dispatches.
@@ -487,5 +619,6 @@ int main(int argc, char** argv) {
     HIP_CHECK(hipFree(d_asc));   HIP_CHECK(hipFree(d_tw));    HIP_CHECK(hipFree(d_str));
     HIP_CHECK(hipFree(d_sti));   HIP_CHECK(hipFree(d_eid));   HIP_CHECK(hipFree(d_ntp));
     HIP_CHECK(hipFree(d_out));
+    if (d_partial) HIP_CHECK(hipFree(d_partial));
     return 0;
 }

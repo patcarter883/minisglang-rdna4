@@ -78,20 +78,36 @@ RXF_REGDIRECT = _os.environ.get("MINISGL_RXF_REGDIRECT", "1") != "0"
 # (fp8 acts). Weights repacked to _w_rep/_scales_rd in post_load only when this is on.
 MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "0") != "0"
 
-# Decode gemm2 split-K, DERIVED FROM THE SHAPE (no flag), the same way _moe_block_m is. The scatter
-# GEMM at M==1 is occupancy-starved -- grid is only (N/BN, P/block_m), a handful of blocks -- so the
-# K=inter contraction is carved across grid.z and the scatter's atomicAdd (already the reduction)
-# combines the slices for free. M>=2 has enough blocks and takes no slicing.
-# This used to be MINISGL_MOE_SPLITK pointing at a whole separate moe_splitk_hip package. That
-# package hardcoded fp16 activations, so on a bf16 model it raised on the first decode step -- its
-# "1.767x" could never run in production. Split-K is now an axis on the shared fp8_wmma core, which
-# is activation-dtype generic, so it works for fp16 AND bf16.
-_MOE_SPLITK_DECODE = 4          # k-slices at M==1; clamped to K/group_size inside the launcher
+# Decode gemm2 split-K. This used to be MINISGL_MOE_SPLITK pointing at a whole separate
+# moe_splitk_hip package. That package hardcoded fp16 activations, so on a bf16 model it raised on
+# the first decode step -- its "1.767x" could never run in production. Split-K is now an axis on the
+# shared fp8_wmma core, which is activation-dtype generic, so it works for fp16 AND bf16.
+#
+# THE COUNT IS NO LONGER DECIDED HERE. It used to be `4 if M == 1 else 1`, described in its own
+# docstring as "workload-derived" while actually being a constant plus an equality test:
+#   * no sweep produced the 4, and it was never swept across M at all;
+#   * `M == 1` left M=2 -- an equally occupancy-starved shape -- with NO split, purely because of
+#     the shape of the test rather than anything measured;
+#   * and the thing it has to be derived FROM (the launched grid: ceil(N/BN) x P/block_m blocks of
+#     nwm*WARPS_N waves, against this card's SIMD count) is not visible from Python at all. BN and
+#     WARPS_N are chosen inside the kernel launcher.
+# So the engine now asks for 0 = "derive it", and `moe_split_slices` in moe_kernel.hip resolves it
+# where the grid is actually known -- the same rule, and the same function, that carves the fused
+# gather-reduce gemm2's top_k reduction.
+_MOE_SPLITK_AUTO = 0
+# A/B handle, not a feature gate — the twin of MINISGL_MOE_G2_SPLIT_K on the fused arm. `legacy`
+# reproduces the retired `4 if M == 1 else 1` so a control leg can measure what the shipped constant
+# actually cost end-to-end; any integer forces that slice count. Unset = derive.
+_MOE_SPLITK_FORCE = _os.environ.get("MINISGL_MOE_SPLITK_SCATTER", "")
 
 
 def _moe_split_k(M: int) -> int:
-    """K-slices for the decode scatter gemm2. Workload-derived: 1 = no slicing."""
-    return _MOE_SPLITK_DECODE if M == 1 else 1
+    """K-slices for the decode scatter gemm2. 0 = derive from the launched grid (see above)."""
+    if _MOE_SPLITK_FORCE == "legacy":
+        return 4 if M == 1 else 1
+    if _MOE_SPLITK_FORCE.isdigit():
+        return int(_MOE_SPLITK_FORCE)
+    return _MOE_SPLITK_AUTO
 
 # Native HIP moe_align (moe_hip) replacing the vLLM moe_align_block_size host op. On by default;
 # MINISGL_MOE_ALIGN=0 reverts to the vLLM reference.

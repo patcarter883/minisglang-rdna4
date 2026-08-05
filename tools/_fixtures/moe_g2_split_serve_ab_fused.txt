@@ -1,0 +1,51 @@
+MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
+engine  /home/pat/code/minisgl-rdna4-g2sk   @ 7df58612
+kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
+
+########## LEG base  (MINISGL_MOE_G2_SPLIT_K=1) ##########
+  --- bs=1 (control: M=1 is the scatter arm, untouched by this leg) ---
+    rep1 bs=1 tokens=384 decode_tok_s=92.69 wall=4.16s
+    rep2 bs=1 tokens=384 decode_tok_s=93.26 wall=4.14s
+    rep3 bs=1 tokens=384 decode_tok_s=93.04 wall=4.15s
+    rep4 bs=1 tokens=384 decode_tok_s=93.32 wall=4.14s
+    rep5 bs=1 tokens=384 decode_tok_s=93.20 wall=4.14s
+  --- bs=5 (MEASURED: M=5 fused arm) ---
+    rep1 bs=5 tokens=1920 decode_tok_s=269.64 wall=7.14s
+    rep2 bs=5 tokens=1920 decode_tok_s=273.82 wall=7.03s
+    rep3 bs=5 tokens=1920 decode_tok_s=272.17 wall=7.07s
+    rep4 bs=5 tokens=1920 decode_tok_s=271.93 wall=7.08s
+    rep5 bs=5 tokens=1920 decode_tok_s=273.14 wall=7.05s
+  --- bs=6 (MEASURED: M=6 fused arm) ---
+    rep1 bs=6 tokens=2304 decode_tok_s=329.08 wall=7.02s
+    rep2 bs=6 tokens=2304 decode_tok_s=328.00 wall=7.05s
+    rep3 bs=6 tokens=2304 decode_tok_s=329.05 wall=7.02s
+    rep4 bs=6 tokens=2304 decode_tok_s=328.18 wall=7.04s
+    rep5 bs=6 tokens=2304 decode_tok_s=328.06 wall=7.05s
+  g2-split ledger: [g2-split] N=2048 K=256 M=32 bylane=1 nx=8 base_blocks=256 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=4 bylane=1 nx=8 base_blocks=32 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=5 bylane=1 nx=8 base_blocks=40 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=6 bylane=1 nx=8 base_blocks=48 top_k=8 -> split_k=1|
+  split_k values seen: split_k=1 
+  PROVENANCE OK: base ran unsplit
+
+########## LEG new  (MINISGL_MOE_G2_SPLIT_K=) ##########
+  --- bs=1 (control: M=1 is the scatter arm, untouched by this leg) ---
+    rep1 bs=1 tokens=384 decode_tok_s=92.90 wall=4.16s
+    rep2 bs=1 tokens=384 decode_tok_s=93.40 wall=4.13s
+    rep3 bs=1 tokens=384 decode_tok_s=93.07 wall=4.14s
+    rep4 bs=1 tokens=384 decode_tok_s=93.07 wall=4.14s
+    rep5 bs=1 tokens=384 decode_tok_s=93.29 wall=4.14s
+  --- bs=5 (MEASURED: M=5 fused arm) ---
+    rep1 bs=5 tokens=1920 decode_tok_s=273.10 wall=7.05s
+    rep2 bs=5 tokens=1920 decode_tok_s=272.55 wall=7.07s
+    rep3 bs=5 tokens=1920 decode_tok_s=272.27 wall=7.07s
+    rep4 bs=5 tokens=1920 decode_tok_s=272.73 wall=7.06s
+    rep5 bs=5 tokens=1920 decode_tok_s=273.31 wall=7.04s
+  --- bs=6 (MEASURED: M=6 fused arm) ---
+    rep1 bs=6 tokens=2304 decode_tok_s=330.89 wall=6.98s
+    rep2 bs=6 tokens=2304 decode_tok_s=329.36 wall=7.02s
+    rep3 bs=6 tokens=2304 decode_tok_s=328.49 wall=7.04s
+    rep4 bs=6 tokens=2304 decode_tok_s=328.86 wall=7.03s
+    rep5 bs=6 tokens=2304 decode_tok_s=330.89 wall=6.98s
+  g2-split ledger: [g2-split] N=2048 K=256 M=32 bylane=1 nx=8 base_blocks=256 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=4 bylane=1 nx=8 base_blocks=32 top_k=8 -> split_k=4|[g2-split] N=2048 K=256 M=5 bylane=1 nx=8 base_blocks=40 top_k=8 -> split_k=2|[g2-split] N=2048 K=256 M=6 bylane=1 nx=8 base_blocks=48 top_k=8 -> split_k=2|
+  split_k values seen: split_k=1 split_k=2 split_k=4 
+  PROVENANCE OK: new ran split
+
+=== done (provenance asserted) ===

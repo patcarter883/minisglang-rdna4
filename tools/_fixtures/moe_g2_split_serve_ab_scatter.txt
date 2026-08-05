@@ -1,0 +1,51 @@
+MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
+engine  /home/pat/code/minisgl-rdna4-g2sk   @ 6dfdae04
+kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
+
+########## LEG base  (MINISGL_MOE_SPLITK_SCATTER=legacy) ##########
+  --- bs=1 (MEASURED: M=1 scatter arm) ---
+    rep1 bs=1 tokens=384 decode_tok_s=91.36 wall=4.22s
+    rep2 bs=1 tokens=384 decode_tok_s=91.95 wall=4.19s
+    rep3 bs=1 tokens=384 decode_tok_s=91.65 wall=4.21s
+    rep4 bs=1 tokens=384 decode_tok_s=91.79 wall=4.20s
+    rep5 bs=1 tokens=384 decode_tok_s=91.44 wall=4.22s
+  --- bs=5 (control: M=5/6 is the fused arm, untouched by this leg) ---
+    rep1 bs=5 tokens=1920 decode_tok_s=270.99 wall=7.10s
+    rep2 bs=5 tokens=1920 decode_tok_s=273.73 wall=7.03s
+    rep3 bs=5 tokens=1920 decode_tok_s=271.59 wall=7.09s
+    rep4 bs=5 tokens=1920 decode_tok_s=273.41 wall=7.04s
+    rep5 bs=5 tokens=1920 decode_tok_s=271.86 wall=7.08s
+  --- bs=6 (control: M=5/6 is the fused arm, untouched by this leg) ---
+    rep1 bs=6 tokens=2304 decode_tok_s=330.93 wall=6.98s
+    rep2 bs=6 tokens=2304 decode_tok_s=328.69 wall=7.03s
+    rep3 bs=6 tokens=2304 decode_tok_s=329.57 wall=7.02s
+    rep4 bs=6 tokens=2304 decode_tok_s=327.37 wall=7.06s
+    rep5 bs=6 tokens=2304 decode_tok_s=330.27 wall=7.00s
+  g2-split ledger: [g2-split] N=2048 K=256 M=32 bylane=1 nx=8 base_blocks=256 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=4 bylane=1 nx=8 base_blocks=32 top_k=8 -> split_k=4|[g2-split] N=2048 K=256 M=5 bylane=1 nx=8 base_blocks=40 top_k=8 -> split_k=2|[g2-split] N=2048 K=256 M=6 bylane=1 nx=8 base_blocks=48 top_k=8 -> split_k=2|
+  split_k values seen: split_k=1 split_k=2 split_k=4 
+  PROVENANCE OK: scatter arm leg=base
+
+########## LEG new  (MINISGL_MOE_SPLITK_SCATTER=) ##########
+  --- bs=1 (MEASURED: M=1 scatter arm) ---
+    rep1 bs=1 tokens=384 decode_tok_s=92.02 wall=4.19s
+    rep2 bs=1 tokens=384 decode_tok_s=89.29 wall=4.32s
+    rep3 bs=1 tokens=384 decode_tok_s=88.20 wall=4.38s
+    rep4 bs=1 tokens=384 decode_tok_s=88.17 wall=4.38s
+    rep5 bs=1 tokens=384 decode_tok_s=88.31 wall=4.38s
+  --- bs=5 (control: M=5/6 is the fused arm, untouched by this leg) ---
+    rep1 bs=5 tokens=1920 decode_tok_s=245.33 wall=7.86s
+    rep2 bs=5 tokens=1920 decode_tok_s=249.65 wall=7.72s
+    rep3 bs=5 tokens=1920 decode_tok_s=250.33 wall=7.70s
+    rep4 bs=5 tokens=1920 decode_tok_s=252.54 wall=7.63s
+    rep5 bs=5 tokens=1920 decode_tok_s=253.77 wall=7.59s
+  --- bs=6 (control: M=5/6 is the fused arm, untouched by this leg) ---
+    rep1 bs=6 tokens=2304 decode_tok_s=303.90 wall=7.61s
+    rep2 bs=6 tokens=2304 decode_tok_s=310.39 wall=7.45s
+    rep3 bs=6 tokens=2304 decode_tok_s=312.49 wall=7.39s
+    rep4 bs=6 tokens=2304 decode_tok_s=310.95 wall=7.43s
+    rep5 bs=6 tokens=2304 decode_tok_s=311.66 wall=7.42s
+  g2-split ledger: [g2-split] N=2048 K=256 M=32 bylane=1 nx=8 base_blocks=256 top_k=8 -> split_k=1|[g2-split] N=2048 K=256 M=4 bylane=1 nx=8 base_blocks=32 top_k=8 -> split_k=4|[g2-split] N=2048 K=256 M=5 bylane=1 nx=8 base_blocks=40 top_k=8 -> split_k=2|[g2-split] N=2048 K=256 M=6 bylane=1 nx=8 base_blocks=48 top_k=8 -> split_k=2|
+  split_k values seen: split_k=1 split_k=2 split_k=4 
+  PROVENANCE OK: scatter arm leg=new
+
+=== done (provenance asserted) ===

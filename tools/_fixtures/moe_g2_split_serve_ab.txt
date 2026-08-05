@@ -1,0 +1,49 @@
+MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
+engine  /home/pat/code/minisgl-rdna4-g2sk   @ 7a9b9663
+kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
+
+########## LEG base  (MINISGL_MOE_G2_SPLIT_K=1) ##########
+  --- bs=1 ---
+    rep1 bs=1 tokens=157 decode_tok_s=40.04 wall=3.95s
+    rep2 bs=1 tokens=157 decode_tok_s=40.24 wall=3.92s
+    rep3 bs=1 tokens=154 decode_tok_s=40.62 wall=3.81s
+    rep4 bs=1 tokens=146 decode_tok_s=40.70 wall=3.61s
+    rep5 bs=1 tokens=154 decode_tok_s=40.59 wall=3.82s
+  --- bs=5 ---
+    rep1 bs=5 tokens=757 decode_tok_s=98.82 wall=7.68s
+    rep2 bs=5 tokens=774 decode_tok_s=98.71 wall=7.86s
+    rep3 bs=5 tokens=741 decode_tok_s=99.32 wall=7.48s
+    rep4 bs=5 tokens=768 decode_tok_s=98.13 wall=7.85s
+    rep5 bs=5 tokens=767 decode_tok_s=98.85 wall=7.78s
+  --- bs=6 ---
+    rep1 bs=6 tokens=895 decode_tok_s=114.44 wall=7.84s
+    rep2 bs=6 tokens=949 decode_tok_s=113.52 wall=8.38s
+    rep3 bs=6 tokens=923 decode_tok_s=113.66 wall=8.14s
+    rep4 bs=6 tokens=931 decode_tok_s=113.53 wall=8.22s
+    rep5 bs=6 tokens=904 decode_tok_s=112.66 wall=8.04s
+  g2-split ledger: [g2-split] N=2048 K=256 M=10 byla|[g2-split] N=2048 K=256 M=12 byla|[g2-split] N=2048 K=256 M=16 byla|[g2-split] N=2048 K=256 M=18 byla|[g2-split] N=2048 K=256 M=20 byla|[g2-split] N=2048 K=256 M=24 byla|[g2-split] N=2048 K=256 M=30 byla|[g2-split] N=2048 K=256 M=32 byla|[g2-split] N=2048 K=256 M=3 byla|[g2-split] N=2048 K=256 M=4 byla|[g2-split] N=2048 K=256 M=5 byla|[g2-split] N=2048 K=256 M=6 byla|[g2-split] N=2048 K=256 M=8 byla|
+  split_k values seen: <none>
+  PROVENANCE FAIL: base saw '' — A/B void
+
+########## LEG new  (MINISGL_MOE_G2_SPLIT_K=) ##########
+  --- bs=1 ---
+    rep1 bs=1 tokens=158 decode_tok_s=40.99 wall=3.88s
+    rep2 bs=1 tokens=146 decode_tok_s=41.29 wall=3.56s
+    rep3 bs=1 tokens=156 decode_tok_s=41.21 wall=3.80s
+    rep4 bs=1 tokens=163 decode_tok_s=40.96 wall=4.00s
+    rep5 bs=1 tokens=152 decode_tok_s=40.93 wall=3.73s
+  --- bs=5 ---
+    rep1 bs=5 tokens=761 decode_tok_s=100.16 wall=7.63s
+    rep2 bs=5 tokens=790 decode_tok_s=98.24 wall=8.07s
+    rep3 bs=5 tokens=743 decode_tok_s=101.29 wall=7.35s
+    rep4 bs=5 tokens=776 decode_tok_s=100.11 wall=7.77s
+    rep5 bs=5 tokens=770 decode_tok_s=99.72 wall=7.74s
+  --- bs=6 ---
+    rep1 bs=6 tokens=929 decode_tok_s=115.67 wall=8.05s
+    rep2 bs=6 tokens=919 decode_tok_s=113.47 wall=8.12s
+    rep3 bs=6 tokens=935 decode_tok_s=112.24 wall=8.35s
+    rep4 bs=6 tokens=924 decode_tok_s=114.39 wall=8.10s
+    rep5 bs=6 tokens=913 decode_tok_s=112.18 wall=8.17s
+  g2-split ledger: [g2-split] N=2048 K=256 M=10 byla|[g2-split] N=2048 K=256 M=12 byla|[g2-split] N=2048 K=256 M=16 byla|[g2-split] N=2048 K=256 M=18 byla|[g2-split] N=2048 K=256 M=20 byla|[g2-split] N=2048 K=256 M=24 byla|[g2-split] N=2048 K=256 M=30 byla|[g2-split] N=2048 K=256 M=32 byla|[g2-split] N=2048 K=256 M=3 byla|[g2-split] N=2048 K=256 M=4 byla|[g2-split] N=2048 K=256 M=5 byla|[g2-split] N=2048 K=256 M=6 byla|[g2-split] N=2048 K=256 M=8 byla|
+  split_k values seen: <none>
+  PROVENANCE FAIL: new never split ('') — A/B void
