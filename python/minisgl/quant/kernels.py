@@ -1237,11 +1237,42 @@ def _tiled_last_wave_occupancy(n: int) -> float:
 _CU_COUNT: dict[int, int] = {}
 
 
+# Dispatch reasons about THIS CU count on every rank, not the physical one.
+#
+# The mid-band winner tracks the device's CU count, and this box is a MISMATCHED pair — 64 on the
+# RX 9070 XT, 56 on the RX 9070 — so the true per-device rule picks a DIFFERENT arm on each rank of
+# a single TP=2 job (measured: prefill_wmma wins N=8192 and N=16384 on the 9070 and loses both on
+# the XT). That is not merely untidy, it is not REPRODUCIBLE: the arbiter leases whichever card is
+# free, so rank 0 is sometimes the XT and sometimes the 9070, and the same job dispatches
+# differently run to run. Every pathway that recomputes a token — prefix/radix reuse, chunked
+# prefill, spec verify — assumes a token's kernel does not depend on which physical card it landed
+# on.
+#
+# Pinning costs no accuracy: the three arms are bit-identical (0.000e+00 at every M across all 48
+# shapes), so this only changes WHICH equally-correct kernel runs. It costs the 9070 taking the XT's
+# arm where the two disagree, which the measured surface bounds at ~1.17x on a handful of wide-N
+# mid-band cells — cheap for determinism.
+#
+# MINISGL_DISPATCH_CU=auto (or 0) re-derives from the physical device; any integer pins that value
+# instead, e.g. after a hardware change.
+_PINNED_DISPATCH_CU = 64
+
+
 def _device_cu_count() -> int:
-    """CUs on the current device. torch reports RDNA's WORKGROUP PROCESSORS in
+    """CU count the dispatch reasons about — PINNED to `_PINNED_DISPATCH_CU` so both ranks of a TP
+    job agree regardless of which physical card each was leased. See the note above.
+
+    The physical values, for reference: torch reports RDNA's WORKGROUP PROCESSORS in
     `multi_processor_count` (32 on the RX 9070 XT, 28 on the RX 9070) and a WGP is 2 CUs, so the
     dispatch unit count is twice it — 64 and 56 respectively. Measured: the mid-band boundary
     tracks 2x this number on BOTH cards and tracks neither `multi_processor_count` alone."""
+    env = _os.environ.get("MINISGL_DISPATCH_CU")
+    if env is None:
+        return _PINNED_DISPATCH_CU
+    if env not in ("0", "auto"):
+        return int(env)
+    # Explicit opt-in to the PHYSICAL count: heterogeneous dispatch across a mismatched pair, and
+    # not reproducible across a re-lease. Only for measuring the per-device surface.
     try:
         idx = torch.cuda.current_device()
     except Exception:  # noqa: BLE001  — no HIP device at all
