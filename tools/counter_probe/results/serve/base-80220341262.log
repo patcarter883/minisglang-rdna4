@@ -1,0 +1,33 @@
+run=80220341262 mode=base image=minisgl-rdna4:lean-prof-today port=22462
+commit=0d1f169869ff0fb485e144368627957d2e1557be dirty=5
+lease: ROCR_VISIBLE_DEVICES=0,1 HIP_VISIBLE_DEVICES=0,1 LEASE_ROCR_DEVICES=0,1
+serve: MODEL=qwen35b-awq SPEC=none TP=2 CONC=4 GRAPH_BS=4 MEM_RATIO=0.86 ATTN=hip KV_FP8=1
+roctx: WINDOWS=n/a EXIT_AFTER_STEPS=n/a
+drive: warm=16 tokA=600 tokB=600 M_B=4
+cmd:   exec /engine/tools/serve.sh
+perf_level card1=auto
+ Network cscorebase80220341262_default Created 
+ Container cscore-base-80220341262 Creating 
+ Container cscore-base-80220341262 Created 
+ Container cscore-base-80220341262 Starting 
+ Container cscore-base-80220341262 Started 
+container=aac352960586237eaebe8458849a64dd6d88c48efcb3f10c81eab5b9b3cc6d6b
+boot_ok=1
+[drive] ready=True
+[drive] warmup: {"label": "warmup", "M": 1, "max_tokens": 16, "wall_s": 3.420207182003651, "tokens": 16, "gap_ms_median": 11.1929289996624, "gap_ms_mean": 38.870230732330434, "gap_ms_p10": 6.419434584677219, "gap_ms_p90": 179.89634819095954, "n_gaps": 15, "errors": [], "step_ms_from_gaps": 11.1929289996624, "agg_tok_s": 4.678079177246439}
+[drive] A_bs1: {"label": "A_bs1", "M": 1, "max_tokens": 600, "wall_s": 6.698088287957944, "tokens": 600, "gap_ms_median": 10.969674971420318, "gap_ms_mean": 11.135027944833315, "gap_ms_p10": 10.835810971911997, "gap_ms_p90": 12.003650015685707, "n_gaps": 599, "errors": [], "step_ms_from_gaps": 10.969674971420318, "agg_tok_s": 89.57779805302071}
+[drive] B: {"label": "B_bs4", "M": 4, "max_tokens": 600, "wall_s": 9.583420823037159, "tokens": 2400, "gap_ms_median": 15.767486998811364, "gap_ms_mean": 15.888473065550562, "gap_ms_p10": 14.68109309207648, "gap_ms_p90": 17.56330239586532, "n_gaps": 2396, "errors": [], "step_ms_from_gaps": 15.767486998811364, "agg_tok_s": 250.4324963201811}
+[drive] wrote /home/pat/code/minisgl-rdna4-cscore/tools/counter_probe/results/serve/base-80220341262.phases.json
+[1m[2026-08-05|13:19:50|core|rank=0][0m [32mINFO    [0m recurrent-radix HIT: uid=1 restored recurrent state at cached_len=48 (skips re-prefill of the shared prefix)
+[1m[2026-08-05|13:19:59|core|rank=0][0m [32mINFO    [0m recurrent-radix HIT: uid=2 restored recurrent state at cached_len=48 (skips re-prefill of the shared prefix)
+[1m[2026-08-05|13:19:59|core|rank=0][0m [32mINFO    [0m recurrent-radix HIT: uid=3 restored recurrent state at cached_len=48 (skips re-prefill of the shared prefix)
+[1m[2026-08-05|13:19:59|core|rank=0][0m [32mINFO    [0m recurrent-radix HIT: uid=4 restored recurrent state at cached_len=48 (skips re-prefill of the shared prefix)
+[1m[2026-08-05|13:19:59|core|rank=0][0m [32mINFO    [0m recurrent-radix HIT: uid=5 restored recurrent state at cached_len=48 (skips re-prefill of the shared prefix)
+=== engine log tail ===
+[1m[2026-08-05|13:19:30|core|rank=0][0m [32mINFO    [0m Reserved 0.32 GiB for the recurrent-radix snapshot store (filled during serving); KV pool gets the remainder
+[1m[2026-08-05|13:19:30|core|rank=1][0m [32mINFO    [0m Reserved 0.32 GiB for the recurrent-radix snapshot store (filled during serving); KV pool gets the remainder
+[1m[2026-08-05|13:19:30|core|rank=0][0m [32mINFO    [0m Reserved 0.11 GiB for GDN state (4 slots); KV pool gets the remainder
+[1m[2026-08-05|13:19:30|core|rank=1][0m [32mINFO    [0m Reserved 0.11 GiB for GDN state (4 slots); KV pool gets the remainder
+[1m[2026-08-05|13:19:30|core|rank=0][0m [32mINFO    [0m Reserved 0.00 GiB for CUDA graph capture (max_bs=4); KV pool gets the remainder
+[1m[2026-08-05|13:19:30|core|rank=1][0m [32mINFO    [0m Reserved 0.00 GiB for CUDA graph capture (max_bs=4); KV pool gets the remainder
+OUT=/home/pat/code/minisgl-rdna4-cscore/tools/counter_probe/results/serve/base-80220341262.log RPDIR=none

@@ -1,0 +1,9 @@
+run=72354961404 mode=prof image=minisgl-rdna4:lean-prof port=21919
+commit=0d1f169869ff0fb485e144368627957d2e1557be dirty=4
+lease: ROCR_VISIBLE_DEVICES=0,1 HIP_VISIBLE_DEVICES=0,1 LEASE_ROCR_DEVICES=0,1
+serve: MODEL=qwen35b-awq SPEC=none TP=2 CONC=8 GRAPH_BS=8 MEM_RATIO=0.80 ATTN=hip
+roctx: WINDOWS=200:200,800:200 EXIT_AFTER_STEPS=1100
+drive: warm=16 tokA=600 tokB=600 M_B=8
+cmd:   exec rocprofv3 --kernel-trace --marker-trace --selected-regions --stats --output-format csv -d /engine/rpv3-busy-72354961404 -o busy -- /engine/tools/serve.sh
+perf_level card1=auto
+container=60394e09810b8f6534dbd4fcae417cabb954599db0a66c8b1df295ff5e189740

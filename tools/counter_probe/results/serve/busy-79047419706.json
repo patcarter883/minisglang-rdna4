@@ -1,0 +1,170 @@
+{
+ "rpdir": "rpv3-busy-79047419706",
+ "agents": {
+  "Agent 1": "AMD Radeon RX 9070 XT",
+  "Agent 2": "AMD Radeon RX 9070",
+  "Agent 3": "AMD Ryzen 7 7800X3D 8-Core Processor"
+ },
+ "windows": [
+  {
+   "iters": [
+    200,
+    399
+   ],
+   "n_steps": 200,
+   "wall_ms_per_step": 61.444651839195984,
+   "agents": {
+    "Agent 1": {
+     "kernels_per_step": 1144.3266331658292,
+     "busy_union_ms_per_step": 7.808972914572864,
+     "busy_sum_ms_per_step": 9.196975572864321,
+     "busy_frac_union": 0.12708954613347592,
+     "busy_frac_sum": 0.14967902490412527,
+     "idle_frac": 0.8729104538665241,
+     "top_kernels": [
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hip_bfloa",
+       "n_per_step": 251.0,
+       "ms_per_step": 3.8256141457286432
+      },
+      {
+       "name": "void custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>(HIP_vector_type<unsigned int, 4u",
+       "n_per_step": 81.0,
+       "ms_per_step": 1.4749138994974873
+      },
+      {
+       "name": "void w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w4a8_tile::Int4F",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.7983052462311558
+      },
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader, true, t",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.5927609547738694
+      },
+      {
+       "name": "void gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>(c10::BFloa",
+       "n_per_step": 30.0,
+       "ms_per_step": 0.5811282311557788
+      },
+      {
+       "name": "void (anonymous namespace)::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 256, 16, 4",
+       "n_per_step": 10.0,
+       "ms_per_step": 0.29137008040201007
+      },
+      {
+       "name": "void (anonymous namespace)::moe_route_align_kernel<1, 8, true, c10::BFloat16>(c10::BFloat1",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.2673781457286432
+      },
+      {
+       "name": "void w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>(__hip_bfloat16 const*, unsig",
+       "n_per_step": 80.0,
+       "ms_per_step": 0.20828602512562813
+      },
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hip_bfloa",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.19822947236180904
+      },
+      {
+       "name": "void (anonymous namespace)::rms_norm_add_kernel<__hip_bfloat16>(__hip_bfloat16 const*, __h",
+       "n_per_step": 80.0,
+       "ms_per_step": 0.179814175879397
+      },
+      {
+       "name": "__amd_rocclr_copyBuffer",
+       "n_per_step": 41.130653266331656,
+       "ms_per_step": 0.08155018090452261
+      },
+      {
+       "name": "void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.07073978894472362
+      }
+     ]
+    }
+   }
+  },
+  {
+   "iters": [
+    800,
+    999
+   ],
+   "n_steps": 200,
+   "wall_ms_per_step": 82.4675432361809,
+   "agents": {
+    "Agent 1": {
+     "kernels_per_step": 1436.3015075376884,
+     "busy_union_ms_per_step": 12.057248753768844,
+     "busy_sum_ms_per_step": 14.03582088442211,
+     "busy_frac_union": 0.1462059894186223,
+     "busy_frac_sum": 0.17019812078340402,
+     "idle_frac": 0.8537940105813777,
+     "top_kernels": [
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hip_bfloa",
+       "n_per_step": 251.0,
+       "ms_per_step": 4.951847527638192
+      },
+      {
+       "name": "void custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>(HIP_vector_type<unsigned int, 4u",
+       "n_per_step": 81.0,
+       "ms_per_step": 3.0219053567839196
+      },
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader, true, t",
+       "n_per_step": 40.0,
+       "ms_per_step": 1.192972798994975
+      },
+      {
+       "name": "void w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLo",
+       "n_per_step": 40.0,
+       "ms_per_step": 1.034174351758794
+      },
+      {
+       "name": "void w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>(__hip_bfloat16 const*, unsig",
+       "n_per_step": 80.0,
+       "ms_per_step": 0.6981289597989949
+      },
+      {
+       "name": "void gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>(c10::BFloa",
+       "n_per_step": 30.0,
+       "ms_per_step": 0.681374120603015
+      },
+      {
+       "name": "void gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hip_bfloa",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.41305351256281403
+      },
+      {
+       "name": "void at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_impl_noca",
+       "n_per_step": 211.0,
+       "ms_per_step": 0.358376040201005
+      },
+      {
+       "name": "void (anonymous namespace)::flash_decode_paged_fp8_split_kernel<__hip_bfloat16, 256, 16, 4",
+       "n_per_step": 10.0,
+       "ms_per_step": 0.29759806030150754
+      },
+      {
+       "name": "void (anonymous namespace)::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe_core::S",
+       "n_per_step": 40.0,
+       "ms_per_step": 0.18515052763819095
+      },
+      {
+       "name": "void (anonymous namespace)::rms_norm_add_kernel<__hip_bfloat16>(__hip_bfloat16 const*, __h",
+       "n_per_step": 80.0,
+       "ms_per_step": 0.1769864673366834
+      },
+      {
+       "name": "ncclDevKernel_Generic_4(ncclDevKernelArgsStorage<4096ul>)",
+       "n_per_step": 1.0,
+       "ms_per_step": 0.1084109648241206
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

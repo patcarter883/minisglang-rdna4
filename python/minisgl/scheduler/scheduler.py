@@ -411,6 +411,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self._rtx_step = 0
         self._rtx_skip = int(os.environ.get("MINISGL_ROCTX_SKIP") or "20")
         self._rtx_steps = int(os.environ.get("MINISGL_ROCTX_STEPS") or "20")
+        # MINISGL_ROCTX_WINDOWS="start:len,start:len,…" — SEVERAL collection windows in one run,
+        # for the plain-decode loops only (the spec step keeps the single SKIP/STEPS window).
+        # One window per run means one BOOT per measured batch size, and booting a 35B at TP=2 with
+        # graph capture costs more than the measurement does; a run that has to compare bs=1 against
+        # bs=8 then spends most of its GPU lease loading weights twice. Windows are matched by
+        # loop-iteration index, which is deterministic because `ignore_eos` + `max_tokens` fixes how
+        # many decode steps each driving request costs. Unset => the single SKIP/STEPS window.
+        _wins = (os.environ.get("MINISGL_ROCTX_WINDOWS") or "").strip()
+        if _wins:
+            self._rtx_windows = [
+                (int(a), int(a) + int(b))
+                for a, b in (w.split(":") for w in _wins.split(",") if w.strip())
+            ]
+        else:
+            self._rtx_windows = [(self._rtx_skip, self._rtx_skip + self._rtx_steps)]
 
         # --- env-gated per-stage HOST-overhead profiler (diagnostics only) -----------------------
         # MINISGL_HOSTPROF=<N> accumulates wall time by named loop stage and logs the breakdown every
@@ -1006,6 +1021,33 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         )
         return True
 
+    def _rtx_step_begin(self, name: str) -> None:
+        """Open a ROCTx range for ONE plain-decode scheduler-loop iteration, and move the gated
+        collection window along. Caller MUST pair it with `_roctx.pop()`.
+
+        The SPEC step annotates its own phases (propose/stage/verify_forward/accept, ~line 3890), so
+        `--selected-regions` already works there. The PLAIN decode loops had no markers at all, which
+        made a SPEC=none serve unprofilable in the same way: with `--selected-regions` the collection
+        window never opens and the trace is empty, and without it the trace is the WHOLE process —
+        model load plus graph capture, which is where roctx.py measured 919,939 dispatches over 35.8 s
+        with the steady decode phase a 7 s tail to be recovered by post-filtering. It also supplies the
+        thing a kernel trace cannot supply on its own: where one decode STEP ends and the next begins.
+
+        Gated on a bool at the call site rather than wrapped in a context manager so an unprofiled
+        serve pays one `if` per step and allocates nothing.
+        """
+        self._rtx_step += 1
+        for _start, _end in self._rtx_windows:
+            if self._rtx_step == _start:
+                _roctx.resume()
+            elif self._rtx_step == _end:
+                _roctx.pause()
+        # The range NAME carries the loop index. Two things need it: proving WHICH iterations the
+        # window actually caught (a window placed by step count is only as good as that check), and
+        # cutting the kernel trace into steps — marker and kernel timestamps come from the same
+        # rocprofv3 clock, so consecutive range starts ARE the per-step wall boundaries.
+        _roctx.push(f"{name}#{self._rtx_step}")
+
     @torch.inference_mode()
     def run_forever(self) -> None:
         # Establish the rank0->rank{1..} PUB/SUB fan-out before any request flows, so the first
@@ -1087,18 +1129,33 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     self._diffusion_loop()
                     if self._bounded_exit_reached():
                         return
+        # `_rtx` is read ONCE: roctx.enabled() is a module-global test, but reading it per iteration
+        # on the hottest loop in the server buys nothing.
+        _rtx = _roctx.enabled()
         if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
-                    self.normal_loop()
+                    if _rtx:
+                        self._rtx_step_begin("normal_step")
+                    try:
+                        self.normal_loop()
+                    finally:
+                        if _rtx:
+                            _roctx.pop()
                     if self._bounded_exit_reached():
                         return
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
-                data = self.overlap_loop(data)
+                if _rtx:
+                    self._rtx_step_begin("overlap_step")
+                try:
+                    data = self.overlap_loop(data)
+                finally:
+                    if _rtx:
+                        _roctx.pop()
                 if self._bounded_exit_reached():
                     return
 

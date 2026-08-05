@@ -1,0 +1,180 @@
+GPU-BUSY vs WALL ON A REAL minisgl DECODE SERVE — provenance
+=============================================================
+Date            2026-08-05
+Box             AMD Ryzen 7 7800X3D + 2x gfx1201 (card0 RX 9070 XT 16GB, card1 RX 9070 16GB)
+Perf level      auto  (power_dpm_force_performance_level NOT touched, on either card)
+Counters        NONE. --kernel-trace / --marker-trace only. `--pmc` HANGS on this image; not used.
+Worktree        /home/pat/code/minisgl-rdna4-cscore   branch probe/counter-scorecard
+Engine commit   0d1f169869ff0fb485e144368627957d2e1557be (+ the uncommitted roctx patch below)
+Lease           gpu-lease -n 2  (both cards, every GPU command; ROCR=0,1 HIP=0,1 injected by the arbiter)
+
+
+IMAGE — REBUILT, and this is load-bearing
+------------------------------------------
+minisgl-rdna4:lean-prof-today, built by tools/counter_probe/scorecard/serve/build_prof_image.sh
+from minisgl-rdna4:lean (2026-08-05 20:16:33 +1000).
+
+The pre-existing minisgl-rdna4:lean-prof (2026-08-02) CANNOT run this measurement. The engine source
+is hot-mounted from the worktree (today's) but /opt/kernels is BAKED into the image (three days old),
+and the kernel ABI moved in between:
+
+    RuntimeError: tail_hip_C::store_kv() expected at most 7 argument(s) but received 9 argument(s).
+    Declaration: tail_hip_C::store_kv(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(b!) v_cache,
+                                      Tensor out_loc, float k_scale, float v_scale) -> ()
+
+per-tensor fp8-KV scales -> per-head. MINISGL_KV_FP8=0 does NOT avoid it (the call signature changed,
+not just the dtype policy), and MINISGL_TAIL_HIP=0 does avoid it but swaps the HIP tail for a torch
+fallback — i.e. it changes the very kernel mix being timed. The image had to be fixed instead.
+
+What `lean-prof` actually was, discovered by diffing the two images: TWO things, both needed.
+  1. torch/lib/librocprofiler-sdk.so symlinked to /opt/rocm/lib/librocprofiler-sdk.so.1. Torch's
+     vendored copy registers after rocprofv3 closes its configuration window -> core dump in
+     rocprofiler_configure.
+  2. LD_LIBRARY_PATH=/opt/rocprof-deps. Without it the rocprofv3 LD_PRELOAD cannot resolve libdw, and
+     because the preload applies to every exec in the container the first casualty is /usr/bin/env:
+       /usr/bin/env: error while loading shared libraries: libdw.so.1: cannot open shared object file
+     The library is PRESENT in both images, merely unreachable — it reads as a missing package and is
+     not one.
+
+BOTH legs run this SAME image. Running the control on stock `lean` would have compared a wall measured
+on one kernel package against busy time measured on another.
+
+
+SERVED CONFIG (identical in both legs)
+--------------------------------------
+model            cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+tp 2, dp 1, ep 0, --disable-pynccl, --attention-backend hip, --page-size 16, --cache-type radix
+spec             none            <- deliberate: the model's default is mtp; this measures PLAIN decode
+max-running-req  4    cuda-graph-max-bs 4    memory-ratio 0.86    fp8 KV on (production default)
+port             unique per run (22000 + RUN_ID % 900)
+
+CONC=8 does NOT boot on this pair — engine.py::_determine_num_pages asserts
+"Not enough memory for KV cache after reserving recurrent state / draft model / CUDA-graph buffers".
+This is a GDN HYBRID: 30 of its 40 layers hold a per-sequence recurrent state reserved up front for
+max-running-requests, so max-running trades against the KV pool far more steeply than on a dense-KV
+model. 4 @ 0.86 boots. Reported concurrency points are therefore M=1 and M=4, not M=1 and M=8.
+
+Scheduler loop actually taken: normal_loop (NOT overlap_loop). `gdn_radix=True` makes
+snapshot_kind == "recurrent", and run_forever forces the synchronous non-overlap loop when
+_rec_radix is set. Confirmed in the engine log ("Reserved 0.32 GiB for the recurrent-radix snapshot
+store"). The ROCTx ranges in the trace are named normal_step#<n>.
+
+
+COMMANDS
+--------
+# build the profiling image (CPU only, no lease)
+bash tools/counter_probe/scorecard/serve/build_prof_image.sh
+
+# profiled leg -> kernel intervals
+MODE=prof gpu-lease -n 2 -- bash tools/counter_probe/scorecard/serve/serve_busy_trace.sh
+# in-container:
+#   rocprofv3 --kernel-trace --marker-trace --selected-regions --stats --output-format csv \
+#             -d /engine/rpv3-busy-79047419706 -o busy -- /engine/tools/serve.sh
+#   MINISGL_ROCTX=1  MINISGL_ROCTX_WINDOWS=200:200,800:200  MINISGL_EXIT_AFTER_STEPS=1100
+
+# control leg -> true wall (same image, no profiler)
+MODE=base gpu-lease -n 2 -- bash tools/counter_probe/scorecard/serve/serve_busy_trace.sh
+
+# analysis (CPU only)
+python3 tools/counter_probe/scorecard/serve/parse_busy.py rpv3-busy-79047419706 \
+        --json-out tools/counter_probe/results/serve/busy-79047419706.json
+python3 tools/counter_probe/scorecard/serve/byte_model.py --bs 1 --ctx 640 --step-ms 10.970
+python3 tools/counter_probe/scorecard/serve/byte_model.py --bs 4 --ctx 640 --step-ms 15.767
+
+Runs: prof RUN_ID=79047419706 (port 22006), base RUN_ID=80220341262.
+Raw kernel trace (249 MB, not in git): ~/.cache/minisgl-perf/rpv3-busy-79047419706/
+Raw logs: prof-79047419706.log, base-80220341262.log, *.phases.json in this directory.
+
+
+METHOD
+------
+* Busy = UNION of kernel intervals, per AGENT (= per card), clipped to the marker window. The naive
+  SUM is reported beside it so the double-count is visible rather than assumed away.
+* Wall = the CONTROL leg's median inter-token gap. NOT the marker-derived wall, and not the profiled
+  run's mean — see "the instrument" below.
+* Step boundaries come from ROCTx ranges named normal_step#<iteration>, one per scheduler-loop
+  iteration, emitted by the new scheduler.py::_rtx_step_begin. rocprofv3 stamps marker and kernel
+  records from the same clock, so they are directly comparable.
+* Windows are placed by loop-iteration index; the driver's phases have fixed token counts
+  (ignore_eos + max_tokens) so that index is deterministic.
+
+
+GATES CHECKED
+-------------
+serve reached the GPU        yes — rocm-smi 95% / 96% on both cards during the run; 89.6 tok/s at bs=1
+in-graph dispatches present  yes — 516,125 KERNEL_DISPATCH rows over 400 collected steps
+                             (1144/step at bs=1, 1436/step at bs=4). NOT one graph-launch entry.
+trace flushed normally       yes — MINISGL_EXIT_AFTER_STEPS=1100, container exited on its own
+window landed where intended yes — marker iterations 200..399 (phase A, bs=1) and 800..999 (phase B,
+                             bs=4), contiguous, 200 steps each
+union <= sum, union <= span  yes, both windows
+agents                       only Agent 1 (RX 9070 XT) appears in the trace. rank1's process was not
+                             traced, so all busy numbers are ONE CARD. That is the intended unit.
+
+
+RAW NUMBERS
+-----------
+CONTROL LEG (no profiler) — 600 tokens/stream, ignore_eos, temperature 0
+  bs=1   median 10.970 ms   mean 11.135   p10 10.836   p90 12.004   n=599    89.58 tok/s
+  bs=4   median 15.767 ms   mean 15.888   p10 14.681   p90 17.563   n=2396  250.43 tok/s aggregate
+  (warmup bs=1 median 11.193 ms)
+
+PROFILED LEG — card 0, in-window
+  bs=1  iters 200..399   busy UNION  7.8090 ms/step   busy SUM  9.1970 ms/step   1144.3 kernels/step
+  bs=4  iters 800..999   busy UNION 12.0572 ms/step   busy SUM 14.0358 ms/step   1436.3 kernels/step
+  (warmup bs=1 median 11.109 ms; phase A median 11.306 ms — i.e. the profiler with collection PAUSED
+   does not stretch the wall, matching the control's 10.970/11.193 ms)
+
+DERIVED
+  bs=1   busy 7.8090 / wall 10.970 = 71.2 % busy   ->  IDLE 28.8 %   (vs mean-wall: 29.9 %)
+  bs=4   busy 12.0572 / wall 15.767 = 76.5 % busy  ->  IDLE 23.5 %   (vs mean-wall: 24.1 %)
+
+BYTES (per card per step; full table from the safetensors headers, see byte_model.py)
+  bs=1  2444.02 MB / 10.970 ms = 222.8 GB/s = 31.5 % of 706.6 GB/s
+  bs=4  3462.12 MB / 15.767 ms = 219.6 GB/s = 31.1 % of 706.6 GB/s
+  during BUSY time only:
+  bs=1  2444.02 MB /  7.809 ms = 313.0 GB/s = 44.3 %
+  bs=4  3462.12 MB / 12.057 ms = 287.1 GB/s = 40.6 %
+
+
+THE INSTRUMENT — why the marker-derived wall is NOT the answer
+--------------------------------------------------------------
+Marker wall/step inside the collection window was 61.445 ms (bs=1) and 82.468 ms (bs=4), against a
+true 10.970 / 15.767 ms. rocprofv3 recording ~1200 dispatches per step costs ~50 ms/step, and it lands
+entirely in the INTER-KERNEL GAPS (host-side dispatch interception), not inside kernel execution.
+
+This is visible in the profiled driver's own numbers: phase A's median gap was 11.306 ms while its
+mean was 28.008 ms — the ~400 steps outside the window ran at the true ~11 ms and the 200 steps inside
+it ran at ~61 ms. The control leg then confirms it independently: 10.970 ms median with p10-p90 of
+10.8-12.0 ms, a tight steady state with no such tail.
+
+Direction of any residual error is safe for the conclusion: if the profiler inflated kernel DURATIONS
+at all, busy would be over-stated, so the true idle fraction would be even LOWER than reported here —
+i.e. further from "68% idle", not closer.
+
+
+VERDICTS
+--------
+Claim 5 "bs=1 decode is inter-kernel-gap bound, ~68% idle"
+  REFUTED, and close to inverted. Measured 28.8 % idle / 71.2 % busy at bs=1 on a real serve.
+  The 68 %-idle figure is consistent with a torch-profiler-derived number, which this workload
+  inflates ~3x (the repo's own recorded trace reports 35.3 ms GPU-busy against a real 11 ms step).
+
+Claim 4 "serving is overhead-bound, memory controller <=27% at every batch size"
+  DIRECTIONALLY RIGHT, FIGURE SLIGHTLY LOW. Measured 31.5 % (bs=1) and 31.1 % (bs=4) of the 706.6
+  GB/s roofline. Nowhere near bandwidth-saturated at either batch size, so "not bandwidth-bound"
+  holds; "<=27%" does not, on this model at these two points.
+  Note the two claims do not compose the way they are usually used together: the step is NOT
+  idle-dominated (28.8 % idle), yet bandwidth is still only 31 %. Even counting ONLY the time kernels
+  are executing, the GPU reaches just 44.3 % (bs=1) / 40.6 % (bs=4) of HBM. The gap is inside the
+  kernels, not between them.
+
+
+NOT ESTABLISHED
+---------------
+* M=8. The engine will not boot at max-running-requests=8 on 16 GB cards for this GDN hybrid, so
+  "at EVERY batch size" is tested at two points (1 and 4), not across a sweep.
+* rank1 / card 1. Only rank0's process was traced; the busy numbers are one card.
+* Whether rocprofv3 perturbs individual kernel durations was not measured directly, only bounded by
+  its direction (see above).
+* SPEC=none only. The MTP spec-decode step has a different kernel mix and is not covered here.
