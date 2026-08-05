@@ -215,6 +215,59 @@ arithmetic predicts and it should be stated as the result rather than dressed up
 same order as the 1.5% run-to-run spread. **A bit-exact 1.12–1.16× on this kernel is worth keeping
 because it is free, but it does not buy a measurable serve.**
 
+**Scatter arm — the within-run A/B is VOID, and the CONTROL ROWS are what proved it.** A foreign
+container appeared on the leased cards partway through the `new` leg. The reporter says:
+
+| bs | role | base | new | ratio |
+|---|---|---:|---:|---:|
+| 1 | MEASURED | 91.65 | 88.31 | 0.964× |
+| 5 | **control** | 271.86 | 250.33 | **0.921×** |
+| 6 | **control** | 329.57 | 310.95 | **0.944×** |
+
+bs=5 and bs=6 are the **controls** for this arm — M=5/6 are on the fused kernel, which this leg does
+not change in either direction — and they moved **−7.9% and −5.7%**. Nothing about a scatter slice
+count can do that. The leg also degrades monotonically within itself (bs=1: 92.02 → 89.29 → 88.20 →
+88.17 → 88.31) where every other leg on the box held ±0.7%. **No ratio is quoted from that leg**, and
+the reason the contamination is visible at all is that the harness carries controls it expects not to
+move. Its base (legacy `4`) leg ran before the interference and is clean: bs=1 = 91.36 / 91.95 /
+91.65 / 91.79 / 91.44, median **91.65**, spread 0.6%, provenance asserted.
+
+What survives is a **cross-leg** comparison of three legs that are each internally clean and were
+each provenance-asserted, taken minutes apart on the same binary and the same pinned pool:
+
+| scatter split at M=1 | leg | bs=1 median | spread |
+|---|---|---:|---|
+| derived (`2`) | fused-arm base | 93.04 | 92.69–93.32 |
+| derived (`2`) | fused-arm new | 93.07 | 92.90–93.40 |
+| **legacy (`4`)** | scatter-arm base | **91.65** | 91.36–91.95 |
+
+**≈ +1.5% at bs=1 from dropping the frozen `4`** — three legs, non-overlapping ranges, consistent
+with the isolated 26.64 → 19.11 µs (~7.5 µs × 40 layers ≈ 300 µs on a 10.75 ms step ≈ 2.8%, so the
+serve realises about half of it). This is a cross-run comparison, not a within-run A/B, and it should
+be re-run as one on an uncontended box before it is treated as settled.
+
+### Occupancy: reported as launch geometry, not as counters
+
+The counter path (`tools/counter_probe/scorecard/phase4_g2split.sh`, and the probe now carries the
+split — it builds clean under ROCm 7.14) was **deliberately not run**. It requires
+`power_dpm_force_performance_level=profile_standard`, which is a **global, per-card** setting, and
+another agent was demonstrably on the cards. Pinning clocks under someone else's job silently
+corrupts their timings with no error anywhere — the exact trap the protocol warns about — and no
+occupancy number is worth that. The run is set up and takes one uncontended window.
+
+What is exact without counters is the launch geometry, since occupancy is computed from it. BYLANE
+tiles N by `NWARPS*32 = 256`, so blocks `= ceil(2048/256) · M · sk` and waves `= blocks · 8`:
+
+| M | before: blocks / waves | after: sk | after: blocks / waves | factor |
+|---|---:|---:|---:|---:|
+| 5 | 40 / 320 | 2 | 80 / 640 | 2× |
+| 6 | 48 / 384 | 2 | 96 / 768 | 2× |
+| 3 | 24 / 192 | 4 | 96 / 768 | 4× |
+
+Against the scorecard's measured 12.3% (M=5) and 14.8% (M=6), doubling the resident wave count puts
+these in the mid-20s%. That is an inference from a measured baseline plus an exact launch config —
+**not a counter reading**, and it is not written down as one.
+
 ### Honest sizing, before anyone extrapolates
 
 The isolated win is 1.12–1.39× **on one kernel**, and that kernel is roughly 40 × 50 µs ≈ 2 ms of a
