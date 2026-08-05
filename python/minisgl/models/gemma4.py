@@ -50,6 +50,8 @@ from minisgl.layers import (
     gelu_tanh_and_mul,
 )
 from minisgl.layers.norm import RMSNormNoScale
+from minisgl.layers.tp_overlap import ar_span, overlap_active, tp_overlap_chunks
+from minisgl.distributed import DistributedCommunicator
 from minisgl.quant import create_linear_method
 from minisgl.utils import div_even, nvtx_annotate
 
@@ -277,6 +279,38 @@ class Gemma4DecoderLayer(BaseOP):
 
         self.post_feedforward_layernorm = RMSNorm(hidden, eps=eps)
         self.layer_scalar = torch.empty(1)
+        self._comm = DistributedCommunicator()
+
+    def _ffn(self, residual: torch.Tensor, span: "ar_span") -> tuple:
+        """The FFN half of the layer, issued for one row range. Returns the two OUTSTANDING all_reduce
+        handles plus the row range's residual; the caller consumes them once every chunk is issued.
+
+        Splitting issue from consumption is the whole point: the dense branch's all_reduce is handed to
+        the side stream and the MoE branch — which is independent of it, the two meet only at
+        `dense + moe` and each carries its OWN post-norm, so they cannot be fused into one collective —
+        computes underneath it on the main stream."""
+        dense_partial = self.mlp.forward(
+            self.pre_feedforward_layernorm.forward(residual), reduce=False
+        )
+        ar_dense = span.all_reduce(dense_partial)
+        # The router reads the RAW residual, not the norm-2 output the experts consume.
+        topk_weights, topk_ids = self.router.forward(residual)
+        moe_partial = self.experts.forward(
+            hidden_states=self.pre_feedforward_layernorm_2.forward(residual),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            reduce=False,
+        )
+        ar_moe = span.all_reduce(moe_partial)
+        return ar_dense, ar_moe, residual
+
+    def _combine(self, ar_dense, ar_moe, residual: torch.Tensor) -> torch.Tensor:
+        dense = self.post_feedforward_layernorm_1.forward(ar_dense.wait())
+        moe = self.post_feedforward_layernorm_2.forward(ar_moe.wait())
+        h = self.post_feedforward_layernorm.forward(dense + moe)
+        h = residual + h
+        # Rescales the WHOLE residual stream, not just the FFN branch.
+        return h * self.layer_scalar
 
     @nvtx_annotate("Layer")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -288,23 +322,28 @@ class Gemma4DecoderLayer(BaseOP):
         h = self.post_attention_layernorm.forward(h)
         h = residual + h
 
-        residual = h
-        dense = self.mlp.forward(self.pre_feedforward_layernorm.forward(h))
-        dense = self.post_feedforward_layernorm_1.forward(dense)
-
-        # The router reads the RAW residual, not the norm-2 output the experts consume.
-        topk_weights, topk_ids = self.router.forward(residual)
-        moe = self.experts.forward(
-            hidden_states=self.pre_feedforward_layernorm_2.forward(residual),
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-        )
-        moe = self.post_feedforward_layernorm_2.forward(moe)
-
-        h = self.post_feedforward_layernorm.forward(dense + moe)
-        h = residual + h
-        # Rescales the WHOLE residual stream, not just the FFN branch.
-        return h * self.layer_scalar
+        # The FFN half is ROW-INDEPENDENT (norms, router, MLP, MoE and the adds are all per-row), which
+        # is what licenses both overlaps below. Attention is not, so the split starts here.
+        #
+        # chunks == 1 (default): no row split at all. The dense all_reduce simply rides the side stream
+        # while the MoE computes, which is bit-exact in the strongest sense — the identical collective
+        # on the identical tensor, differing only in stream.
+        # chunks > 1: additionally pipeline row chunks, so chunk i's MoE all_reduce (the one with
+        # nothing after it to hide behind) overlaps chunk i+1's dense+MoE compute. Disjoint rows keep
+        # the COLLECTIVE exact, but they also change M for the MoE grouped GEMM, whose fused gemm2
+        # reduction order is M-dependent — so this arm is a MEASURED bit-exactness claim, not a
+        # structural one. See tools/tp_overlap_bitexact.py.
+        n = h.shape[0]
+        k = tp_overlap_chunks()
+        with ar_span(self._comm) as span:
+            # Split rows only when the collectives will actually be overlapped. Under capture (or below
+            # the threshold) every all_reduce is inline, so a split would buy no overlap while still
+            # paying the extra launches and changing the MoE grouped-GEMM's M.
+            if k <= 1 or n < 2 * k or not overlap_active(h):
+                return self._combine(*self._ffn(h, span))
+            bounds = [(n * i) // k for i in range(k + 1)]
+            pending = [self._ffn(h[bounds[i] : bounds[i + 1]], span) for i in range(k)]
+            return torch.cat([self._combine(*p) for p in pending], dim=0)
 
 
 class Gemma4Model(BaseOP):

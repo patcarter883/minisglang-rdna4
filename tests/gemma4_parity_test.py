@@ -467,8 +467,10 @@ def check_layer(rep: Report, mc, tc, handles) -> None:
     ref.self_attn = _stub_module(lambda **kw: (kw["hidden_states"] @ attn_w.T, None))
     # minisgl calls experts(hidden, topk_weights, topk_ids); the reference calls it
     # (hidden, top_k_index, top_k_weights) — the adapter is the ONLY difference allowed.
+    # `reduce` is part of the real MoELayer/LinearRowParallel signature (it lets a caller take the
+    # un-reduced partial); the stubs are single-rank, so they accept it and ignore it.
     mine.experts = types.SimpleNamespace(
-        forward=lambda hidden_states, topk_weights, topk_ids: shared_experts(
+        forward=lambda hidden_states, topk_weights, topk_ids, reduce=True: shared_experts(
             hidden_states, topk_ids, topk_weights
         )
     )
@@ -478,7 +480,7 @@ def check_layer(rep: Report, mc, tc, handles) -> None:
 
     # Isolate the wiring from the activation: identical MLP on both sides.
     mlp_w = torch.randn(mc.hidden_size, mc.hidden_size) * 0.02
-    mine.mlp = types.SimpleNamespace(forward=lambda h: h @ mlp_w.T)
+    mine.mlp = types.SimpleNamespace(forward=lambda h, reduce=True: h @ mlp_w.T)
     ref.mlp = _stub_module(lambda h: h @ mlp_w.T)
     rep.close("decoder layer, dataflow only (stub MLP)",
               mine.forward(x.clone()), ref(x.clone()), 1e-6)

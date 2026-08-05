@@ -549,12 +549,28 @@ class Engine:
                 )
                 self.dp_cpu_group = tp_cpu_group
             # Install the custom_ar one-shot all-reduce as the default all_reduce (TP==2 + P2P only;
-            # falls back to RCCL otherwise). Graph-safe + ~1.3x on the small decode/verify tensors; large
-            # (prefill) all_reduces exceed the slot and self-fall-back to RCCL. Cap the IPC slot at 8 MB
-            # (covers any decode/verify batch) so the fine-grained buffers stay small.
+            # falls back to RCCL otherwise). Graph-safe, and now faster than RCCL at EVERY payload, not
+            # just the small decode ones.
+            #
+            # The slot used to be capped at 8 MB with the note that large prefill all_reduces "exceed
+            # the slot and self-fall-back to RCCL". That cap was written when custom_ar read the peer one
+            # ELEMENT at a time and so was 2.7x SLOWER than RCCL on big tensors — falling back was the
+            # right call. The vectorized (16-byte) peer read inverted that. Measured on this box, TP=2,
+            # bf16, hidden 2816 (tools/tp_collective_regime_sweep.py, custom_ar vs RCCL, us/call):
+            #
+            #     1024 rows ( 5.8 MB)   492.8 vs  581.7   1.18x       <- already under the old cap
+            #     2048 rows (11.5 MB)   963.6 vs 1127.6   1.17x       <- fell back to RCCL, needlessly
+            #     3200 rows (18.0 MB)  1494.5 vs 1713.7   1.15x
+            #     8192 rows (46.1 MB)  3777.8 vs 4361.6   1.15x
+            #
+            # So the cap was costing ~15% on every prefill collective. Size the slot for the largest
+            # forward the engine can actually issue, bounded by MINISGL_CAR_MAX_MIB (default 64) so a
+            # very wide model cannot silently reserve an unbounded amount of fine-grained IPC memory.
+            # Cost is 2 slots (double-buffered) at that size, per rank.
+            car_cap_mib = int(os.environ.get("MINISGL_CAR_MAX_MIB", "").strip() or 64)
             car_max_bytes = min(
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize,
-                8 * 1024 * 1024,
+                car_cap_mib * 1024 * 1024,
             )
             enable_custom_ar_distributed(config.tp_info, tp_cpu_group, car_max_bytes)
         return tp_cpu_group
