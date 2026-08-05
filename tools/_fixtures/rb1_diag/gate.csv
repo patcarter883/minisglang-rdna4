@@ -1,0 +1,9 @@
+exp,shape,K,N,g,dtype,zeros,M,rb,tile,diag,diagname,swiz,us,reps,R,dev,cu,card,lease,exclusive
+gate,lag.gate_up  tp1,2048,16384,32,bfloat16,1,32,1,32x64x4,0,full,1,357.408,5,10,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lag.gate_up  tp1,2048,16384,32,bfloat16,1,32,1,128x64,0,full,1,154.635,11,10,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lag.gate_up  tp1,2048,16384,32,bfloat16,1,48,2,32x64x4,0,full,1,134.843,14,10,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lag.gate_up  tp1,2048,16384,32,bfloat16,1,48,1,128x64,0,full,1,163.607,12,10,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lm_head      tp2,2816,131072,32,float16,0,32,1,32x64x4,0,full,1,678.858,14,2,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lm_head      tp2,2816,131072,32,float16,0,32,1,128x64,0,full,1,1299.801,7,2,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lm_head      tp2,2816,131072,32,float16,0,48,2,32x64x4,0,full,1,1180.926,7,2,AMD Radeon RX 9070 XT,64,0,"0,1",1
+gate,lm_head      tp2,2816,131072,32,float16,0,48,1,128x64,0,full,1,1369.495,8,2,AMD Radeon RX 9070 XT,64,0,"0,1",1
