@@ -142,6 +142,50 @@ GEMM traffic, and it is not displacing anything.
 traffic and 747 KB flows between consecutive GEMMs. If eviction-driven fusion is ever worth doing on
 this engine, prefill is where to look — not decode.
 
+### Confirmed directly: `hot` vs MALL-rotated vs flush-interleaved (ISO, auto clocks, serve toolchain)
+
+`tools/counter_probe/ksweep/cache_gap_probe.hip` — same `gemv_decode_core<>` template the serve runs,
+built by the SAME ROCm 7.2.1 compiler as the serve image (a 7.14 build would have been a compiler A/B
+wearing a cache-state costume). `%` is of 706.6 GB/s.
+
+| shape | weights | **hot** | **rotated past MALL** | evict 8 MB | evict 64 MB | evict 256 MB |
+|---|---:|---:|---:|---:|---:|---:|
+| lm_head bf16 32768×2048 | 128 MB | **95.7** | **95.1** | 95.8 | 95.5 | 96.8 |
+| synthetic int4 16384² | 134 MB | **85.6** | **85.4** | — | — | — |
+| in_proj_qkvz bf16 6144×2048 | 24 MB | 72.7 | 74.3 | 70.5 | 76.2 | 80.2 |
+| fp8 4096² | 16.8 MB | **95.0** | **58.8** | 93.8 | 25.1 | 67.4 |
+| qkv int4 6144×2048 | 6.3 MB | **58.3** | **39.7** | 57.3 | 21.8 | 44.0 |
+| moe-expert-like int4 2048² | 2.1 MB | **31.4** | **22.9** | 31.7 | 21.3 | 23.8 |
+| shared_down bf16 2048×256 | 1 MB | **22.2** | **15.6** | 19.1 | 14.6 | 18.1 |
+
+Two clean regimes, and they settle it:
+
+* **Weights larger than the 64 MB MALL: `hot` == `rotated`.** lm_head 95.7 vs 95.1, synthetic 85.6 vs
+  85.4. There is no gap to explain — these kernels genuinely sit near roofline in both conditions.
+* **Weights smaller than the MALL: `hot` overstates by 1.3–1.6×** (fp8 4096² reads 95.0% hot and
+  **58.8%** rotated). The microbench is holding a working set the serve cannot hold, because the
+  serve's *total* weight stream is 1.12–2.58× the MALL every step.
+* **Interleaved flushing does essentially nothing until it approaches the MALL size** — the 8–32 MB
+  columns track `hot`. The serve pushes **2.9–15.1 KB** between GEMMs, four orders of magnitude below
+  that.
+
+**The hardware counters close it** (ROCm 7.14, `profile_standard`; ratios only — every timestamp on
+that leg is clock-pinned and is not comparable with the table above):
+
+| shape | `GL2C_MISS` hot | `GL2C_MISS` evict 256 MB | OccupancyPercent | MemUnitBusy |
+|---|---:|---:|---:|---:|
+| lm_head | 524,561 | **524,561** | 88 | 97 |
+| in_proj_qkvz | 98,369 | **98,369** | 74 | 80 |
+| moe-expert-like int4 | 8,474 | **8,474** | 25 | 44 |
+
+**A 256 MB interleaved flush changes the L2 miss count by zero on every shape.** The eviction
+mechanism does not exist even when driven 20,000× harder than the serve drives it. (lm_head's 88 /
+97 also reproduces `COUNTER_SCORECARD.md`'s 87.8 / 96.9, which cross-validates the whole chain.)
+
+**Methodological consequence, and it is the reusable part:** the honest isolated baseline for any
+served GEMV is the **rotated** number, never `hot`. Every "% of roofline" in this repo taken
+back-to-back on a sub-64 MB weight is overstated by up to 1.6×.
+
 ---
 
 ## Suspect `moe_align` — REFUTED as an induced cost, with the grid that proves it
@@ -229,6 +273,48 @@ every alternative goes through RCCL. Recorded as an observation, not a backlog i
 **The single biggest prefill kernel is capped at 50% occupancy by its 184 VGPRs** (184 → 8 waves/SIMD
 by the granule law), not by launch size. That is a register-pressure lever, and it is the largest
 untouched item in this document.
+
+---
+
+## GLM-4.7-Flash — a different mix, and a different regime
+
+MLA + MoE, no recurrent state, so it runs `overlap_loop` **natively**. Both agents were fully
+collected in this trace (the truncation is nondeterministic, not systematic).
+
+| batch | true wall/step | busy/step | **busy %** | tok/s |
+|---|---:|---:|---:|---:|
+| bs=1 | 18.042 ms | 2.975 ms | **16.5%** | 55.2 |
+| bs=6 | 26.588 ms | 20.410 ms | **76.8%** | 223.8 |
+
+**GLM at bs=1 is 83.5% IDLE — while already using overlap scheduling.** That is the opposite regime
+from Qwen (50.5% busy at bs=1) and it is the strongest evidence that the scheduler loop is not the
+lever: the model that already has overlap is the one that is idle.
+
+Top deficits, bs=1 (rank 0, busy 2.975 ms):
+
+| %busy | WG | occ% | VGPR | kernel |
+|---:|---:|---:|---:|---|
+| 21.75 | 8 | 3.1 | 32 | `custom_ar::one_shot_ar_vec_kernel` (not a target) |
+| 18.92 | 128 | 100 | 24 | `gemv_decode_core<Bf16GemvLoader>` — clean |
+| **14.62** | **10** | **3.9** | 24 | **`mla_attend::mla_combine_kernel<bf16,512>`** |
+| 5.13 | 40 | 7.8 | 256 | rocBLAS `Cijk_…MT128x128x32` |
+| 5.06 | **4** | **0.2** | 120 | rocBLAS `Cijk_…MT16x16x32` |
+| 4.53 | 40 | 7.8 | 128 | rocBLAS `Cijk_…MT64x64x32` |
+
+Two GLM-specific findings the Qwen trace could not show:
+
+1. **`mla_combine_kernel` is the largest fixable GLM deficit** — 14.6% of decode busy at **10
+   workgroups / 3.9% occupancy** (60 WG / 23.4% at bs=6). Same shape of hole as the MoE gemm2, same
+   split-K tool applies.
+2. **Three rocBLAS Tensile kernels total 14.7% of GLM's decode busy at 0.2–7.8% occupancy.** These
+   are library GEMMs the engine has not routed to its own core — which reaches 75–100% on the same
+   band. GLM also dispatches `fp8_wmma.mmq_fp8_gemm(decode_gemv)` and `mmq_fp8_gemm_silu(int4)`,
+   i.e. **the quantized dense GEMM that Qwen never touches** (Qwen's `modules_to_not_convert` leaves
+   every dense linear bf16). Any dense-GEMM work must be justified against GLM, not Qwen.
+
+GLM prefill repeats Qwen's pattern — the dominant kernels are **register-capped, not starved**:
+`anon::mla_prefill_kernel` 23.3% at 1050 WG / **37.5% occ / 224 VGPR**, and
+`moe_gemm1_silu_flag_w4_kernel` 12.0% at 2016 WG / **50% occ / 176 VGPR**.
 
 ---
 
