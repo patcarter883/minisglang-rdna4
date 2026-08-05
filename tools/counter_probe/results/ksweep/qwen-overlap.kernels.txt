@@ -1,0 +1,267 @@
+WARNING: skipped 200 torn CSV rows (concurrent TP-rank writes)
+trace: /home/pat/code/minisgl-rdna4-ksweep/rpv3-ksweep-qwen-overlap-11209231732
+steps: 800   loop kinds: {'overlap_step': 800}   agents: ['Agent 1', 'Agent 2']
+  Agent 1 = AMD Radeon RX 9070 XT
+  Agent 2 = AMD Radeon RX 9070
+  Agent 3 = AMD Ryzen 7 7800X3D 8-Core Processor
+
+=== window iters 120..319 (200 steps) marker wall/step 60.118 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 683 kernels/step  busy(UNION) 4.656 ms = 7.7%  IDLE 92.3%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+      2.3746   155.2  51.00      3920         0     384    6144  100.0    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      0.8162    50.1  17.53     12720         0       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.5684   144.1  12.21      2360      1746       1       8    0.4   112     0    WG<64,OCC<25
+      0.4926    24.7  10.58     19520         0    1024    4096  100.0    40     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w4a8_tile  
+      0.3654    24.7   7.85     14760         0      64    2048   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      0.3618    18.5   7.77     14680       590       8      64    3.1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.1199    24.7   2.58      4840         0       8      64    3.1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.0505    25.5   1.09      1760      6168       1      16    0.8    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0440    24.7   0.95      1760      7757       2       8    0.4    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0410    30.9   0.88      1280      2017       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.0397    24.7   0.85      1560      4342     128    1024   50.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0320    20.4   0.69      1480     11303       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0282    24.7   0.61      1120      4612       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  WG<64,OCC<25
+      0.0263    24.7   0.57      1040      2632       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0234     0.6   0.50     37160      3055       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0231    12.4   0.50      1880       576       2       8    0.4    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0202    24.7   0.43       800      2401       2      16    0.8     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0162     6.2   0.35      2640         0       3      24    1.2     8     0  at::native::  WG<64,OCC<25
+      0.0101     2.5   0.22      3040     17270       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0082     0.6   0.18     13240      4141       4      16    0.8    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0081     0.6   0.17      9980     11672      64    1024   50.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0065     6.2   0.14      1040      7939       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0051     1.3   0.11      2880     37155       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0037     1.2   0.08      2160     19032       3      24    1.2    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0034     1.2   0.07      2360      3596       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0021     1.2   0.04      1720      5158       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0020     0.6   0.04      3240      3992       4      16    0.8    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0020     0.6   0.04      2440      4048       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0019     0.6   0.04      2700      4357       1       8    0.4    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0014     0.6   0.03      2240     10052     122     976   47.7    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_cop  
+      0.0013     0.6   0.03      2120     34480       1      32    1.6     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0012     0.6   0.03      1960      3973       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0009     0.6   0.02      1480      4209       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::init_lookback_scan_state_kernel<rocprim::R  WG<64,OCC<25
+      0.0009     0.6   0.02      1520      5032       1       8    0.4    40     0  at::native::vectorized_elementwise_kernel<16, at::native::BinaryFunctor<bool,   WG<64,OCC<25
+      0.0007     0.6   0.02      1200      5072       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add  WG<64,OCC<25
+      0.0007     0.6   0.02      1160      4481       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)  WG<64,OCC<25
+      0.0002     0.0   0.00      2400     40516       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+  Agent 2 [AMD Radeon RX 9070]: 421 kernels/step  busy(UNION) 3.268 ms = 5.4%  IDLE 94.6%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+      1.2778    95.8  39.10      3920      4160     384    6144  100.0    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      0.5397    30.9  16.52     11240      4200       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.3263    88.9   9.99      2360      4160       1       8    0.4   112     0    WG<64,OCC<25
+      0.2995    15.3   9.17     19600      4160    1024    4096  100.0    40     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w4a8_tile  
+      0.2709    15.3   8.29     17760      4160      64    2048   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      0.2216    11.4   6.78     15080      4160       8      64    3.1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.0740    15.3   2.26      4840      4121       8      64    3.1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.0366    15.7   1.12      1560      4320       1      16    0.8    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0275    15.3   0.84      1800      4160       2       8    0.4    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0255    19.1   0.78      1320      4160       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.0254    15.3   0.78      1640      4160     128    1024   50.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0198    12.6   0.61      1480      4200       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0175    15.3   0.54      1120      4160       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  WG<64,OCC<25
+      0.0163    15.3   0.50      1080      4160       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0146     0.4   0.45     38481      4440       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0144     7.6   0.44      1880      4120       2       8    0.4    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0128    15.3   0.39       840      4160       2      16    0.8     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0102     3.8   0.31      2680      4160       3      24    1.2     8     0  at::native::  WG<64,OCC<25
+      0.0077     1.5   0.24      3361     16640       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0051     0.4   0.16     13360      4160       4      16    0.8    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0050     0.4   0.15     11040      4680      64    1024   50.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0041     3.8   0.12      1080      4160       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0028     0.8   0.09      3240     27040       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0020     0.8   0.06      2640      4400       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0017     0.8   0.05      2160     18020       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0013     0.8   0.04      1740      4280       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0012     0.4   0.04      3200      4200       4      16    0.8    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0012     0.4   0.04      2720      4320       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0011     0.4   0.03      2840      4280       1       8    0.4    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0009     0.4   0.03      2320     10880     122     976   47.7    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_cop  
+      0.0008     0.4   0.03      2160      4160       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0008     0.4   0.02      2120     49801       1      32    1.6     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0006     0.4   0.02      1640      4280       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::init_lookback_scan_state_kernel<rocprim::R  WG<64,OCC<25
+      0.0006     0.4   0.02      1520      4240       1       8    0.4    40     0  at::native::vectorized_elementwise_kernel<16, at::native::BinaryFunctor<bool,   WG<64,OCC<25
+      0.0005     0.4   0.01      1160      4240       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add  WG<64,OCC<25
+      0.0004     0.4   0.01      1160      4160       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)  WG<64,OCC<25
+      0.0001     0.0   0.00      2560     54480       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+
+=== window iters 620..819 (200 steps) marker wall/step 80.226 ms  classes={'decode': 199} ===
+  Agent 1 [AMD Radeon RX 9070 XT]: 885 kernels/step  busy(UNION) 8.834 ms = 11.0%  IDLE 89.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+      3.6637   159.0  41.47     12000         0     384    6144  100.0    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      1.9083    51.4  21.60     17921         0       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      1.1725    25.3  13.27     46361         0     384   12288   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      0.8426    25.4   9.54     33040         0      48     384   18.8    80     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode::Int4Fp  WG<64,OCC<25
+      0.6116   172.6   6.92      2640      4684       6      48    2.3   112     0    WG<64,OCC<25
+      0.4946    18.9   5.60     20841       364      48     384   18.8   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.3799    25.3   4.30     14760         0     768    6144  100.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.3350    25.2   3.79     13280         0       8      64    3.1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.2269   133.8   2.57      1800       113      12      48    2.3    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.1129     0.6   1.28    177402      4048       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0505    25.2   0.57      2000      3926      12      48    2.3    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0496    13.4   0.56      2680     22161       1      16    0.8    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0426    31.5   0.48      1320      2978       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.0346    25.4   0.39      1360      4549       3      24    1.2     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0336    21.0   0.38      1560      2108       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0296    25.5   0.34      1160      4881       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  WG<64,OCC<25
+      0.0295    25.5   0.33      1120      2708       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0251    25.3   0.28      1000      2448       1       8    0.4     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std  WG<64,OCC<25
+      0.0226    25.3   0.26       880      9152      12      96    4.7     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0190     0.6   0.21     30120      4212     320    5120  100.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0179     6.4   0.20      2800       214      18     144    7.0     8     0  at::native::  WG<64,OCC<25
+      0.0127     2.6   0.14      3160     14587       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0085     0.6   0.10     13201      4288      24      96    4.7    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0079     6.3   0.09      1200      7057       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0049     1.9   0.06      2280      3917       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0045     0.6   0.05      7000      9683     728    5824  100.0    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_cop  
+      0.0041     1.3   0.05      2920     42285       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0041     1.3   0.05      2160     20478       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0035     1.2   0.04      2400      4087       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0022     1.3   0.02      1720      3480       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0020     0.6   0.02      2800      4442       1       8    0.4    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0014     0.6   0.02      2160     20012       1       8    0.4     8     0  at::native::unrolled_elementwise_kernel<at::native::FillFunctor<int>, std::arr  WG<64,OCC<25
+      0.0014     0.6   0.02      2120      3947       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0013     0.6   0.02      2120     49658       1      32    1.6     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0011     0.6   0.01      1560      4214       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::init_lookback_scan_state_kernel<rocprim::R  WG<64,OCC<25
+      0.0011     0.6   0.01      1640      5014       6      48    2.3    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0010     0.6   0.01      1560      4972       1       8    0.4    40     0  at::native::vectorized_elementwise_kernel<16, at::native::BinaryFunctor<bool,   WG<64,OCC<25
+      0.0008     0.6   0.01      1240      5488       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add  WG<64,OCC<25
+      0.0008     0.6   0.01      1160      4887       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)  WG<64,OCC<25
+      0.0001     0.0   0.00      2600     52008       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+  Agent 2 [AMD Radeon RX 9070]: 511 kernels/step  busy(UNION) 5.506 ms = 6.9%  IDLE 93.1%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+      2.2341    91.6  40.57     12080      4160     384    6144  100.0    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      0.7732    14.6  14.04     53160      4160     384   12288   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      0.6582    29.6  11.95     10200      4160       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      0.4981    14.8   9.05     33640      4160      48     384   18.8    80     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode::Int4Fp  WG<64,OCC<25
+      0.3665    99.3   6.66      2680      4160       6      48    2.3   112     0    WG<64,OCC<25
+      0.2746    10.8   4.99     21000      4160      48     384   18.8   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.1934    14.5   3.51     13320      4160       8      64    3.1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.1331    76.9   2.42      1800      4160      12      48    2.3    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0720    14.7   1.31      4880      4160     768    6144  100.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.0595     0.4   1.08    157761      4160       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0311     7.6   0.57      2680     24360       1      16    0.8    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0296    14.6   0.54      2040      4120      12      48    2.3    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0254    18.2   0.46      1360      4160       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.0198    12.1   0.36      1560      4160       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0185    14.8   0.34      1240      4160       3      24    1.2     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0175    14.8   0.32      1160      4160       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  WG<64,OCC<25
+      0.0173    14.8   0.31      1120      4120       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0136    14.7   0.25       920      4160       1       8    0.4     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std  WG<64,OCC<25
+      0.0133    14.6   0.24       881      4160      12      96    4.7     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0117     0.4   0.21     31880      4280     320    5120  100.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0105     3.7   0.19      2840      4160      18     144    7.0     8     0  at::native::  WG<64,OCC<25
+      0.0065     1.4   0.12      3360     16920       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0050     0.4   0.09     13360      4120      24      96    4.7    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0046     3.6   0.08      1240      4160       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0028     1.1   0.05      2340      4280       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0027     0.4   0.05      7040     10800     728    5824  100.0    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_cop  
+      0.0024     0.7   0.04      3080     21640       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0019     0.7   0.03      2640      4240       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0017     0.7   0.03      2040      4600       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0013     0.7   0.02      1760      4220       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0011     0.4   0.02      2960      4260       1       8    0.4    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0011     0.4   0.02      2200     23520       1       8    0.4     8     0  at::native::unrolled_elementwise_kernel<at::native::FillFunctor<int>, std::arr  WG<64,OCC<25
+      0.0010     0.4   0.02      2080     17200       1      32    1.6     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0009     0.4   0.02      2260      4300       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0006     0.4   0.01      1700      4320       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::init_lookback_scan_state_kernel<rocprim::R  WG<64,OCC<25
+      0.0006     0.4   0.01      1560      4240       1       8    0.4    40     0  at::native::vectorized_elementwise_kernel<16, at::native::BinaryFunctor<bool,   WG<64,OCC<25
+      0.0005     0.4   0.01      1440      4160       6      48    2.3    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0005     0.4   0.01      1200      4280       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add  WG<64,OCC<25
+      0.0004     0.4   0.01      1200      4120       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)  WG<64,OCC<25
+      0.0001     0.0   0.00      2860     67620       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+
+=== window iters 1130..1329 (200 steps) marker wall/step 80.499 ms  classes={'decode': 199} ===
+  Agent 2 [AMD Radeon RX 9070]: 1397 kernels/step  busy(UNION) 15.290 ms = 19.0%  IDLE 81.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+      6.0943   251.0  39.86     12080      4160     384    6144  100.0    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      2.1451    81.0  14.03     10240      4160       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+      1.9954    40.0  13.05     50080      4160     384   12288   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      1.3318    40.0   8.71     33280      4160      48     384   18.8    80     0  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode::Int4Fp  WG<64,OCC<25
+      0.9977   273.1   6.53      2680      4160       6      48    2.3   112     0    WG<64,OCC<25
+      0.8061    30.0   5.27     21361      4160      48     384   18.8   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.5334    40.0   3.49     13320      4160       8      64    3.1    32     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.3627   211.0   2.37      1800      4160      12      48    2.3    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.1956    40.0   1.28      4880      4160     768    6144  100.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.1576     1.0   1.03    157682      4200       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0877    21.1   0.57      2520     27440       1      16    0.8    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.0811    40.0   0.53      2040      4120      12      48    2.3    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0693    50.0   0.45      1360      4160       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.0537    33.0   0.35      1560      4160       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0494    40.0   0.32      1240      4160       3      24    1.2     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0469    40.0   0.31      1160      4160       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  WG<64,OCC<25
+      0.0469    40.0   0.31      1120      4120       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0387     1.0   0.25     38520      4320     384    6144  100.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0365    40.0   0.24       920      4160       1       8    0.4     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std  WG<64,OCC<25
+      0.0361    40.0   0.24       880      4160      12      96    4.7     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0284    10.0   0.19      2840      4160      18     144    7.0     8     0  at::native::  WG<64,OCC<25
+      0.0194     4.0   0.13      3400     16600       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0134     1.0   0.09     13400      4160      24      96    4.7    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0125    10.0   0.08      1240      4160       6      48    2.3    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0077     3.0   0.05      2320      4320       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0071     1.0   0.05      7040     10880     728    5824  100.0    16     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_cop  
+      0.0070     2.1   0.05      3120     24640       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0054     2.0   0.04      2640      4240       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0046     2.0   0.03      2080      4440       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0034     2.0   0.02      1760      4240       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0030     1.0   0.02      2960      4280       1       8    0.4    64     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0028     1.0   0.02      2120     28520       1      32    1.6     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0023     1.0   0.02      2280      4320       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::trampoline_kernel<rocprim::ROCPRIM_400200_  WG<64,OCC<25
+      0.0017     1.0   0.01      1680      4320       1       8    0.4     8     0  rocprim::ROCPRIM_400200_NS::detail::init_lookback_scan_state_kernel<rocprim::R  WG<64,OCC<25
+      0.0016     1.0   0.01      1560      4240       1       8    0.4    40     0  at::native::vectorized_elementwise_kernel<16, at::native::BinaryFunctor<bool,   WG<64,OCC<25
+      0.0015     1.0   0.01      1440      4200       6      48    2.3    16     0  at::native::vectorized_gather_kernel<16, long>  WG<64,OCC<25
+      0.0012     1.0   0.01      1200      4280       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add  WG<64,OCC<25
+      0.0012     1.0   0.01      1200      4160       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)  WG<64,OCC<25
+      0.0002     0.1   0.00      2600     75160       1       4    0.2    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+
+=== window iters 1600..1799 (200 steps) marker wall/step 125.619 ms  classes={'decode': 119, 'prefill': 80} ===
+  Agent 2 [AMD Radeon RX 9070]: 1077 kernels/step  busy(UNION) 101.766 ms = 81.0%  IDLE 19.0%
+     ms/step  n/step  %busy   ns/disp  gapAfter      WG   waves   occ%  vgpr   scr  kernel
+     55.8482    16.1  54.88   3435810      4000    2640    2640   50.0   184     0  w4a8_fp8_moe::moe_gemm1_silu_ashuffle_kernel<__hip_bfloat16, 64>  
+     10.2576    56.4  10.08     23880      4160       8      64    3.1    32     0  custom_ar::one_shot_ar_vec_kernel<__hip_bfloat16, 8>  WG<64,OCC<25
+     10.2205    16.1  10.04    631926      3960   21120   84480  100.0    40     0  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8,   
+      5.5655     6.0   5.47    915488      4000      16     128    6.2   184     0  gdn_prefill_wmma_kernel<c10::BFloat16, c10::BFloat16, 128, 128>  WG<64,OCC<25
+      4.9390   185.3   4.85      3240      4080     840    3360   31.2   248     0    
+      3.1413    12.1   3.09    251502      4040     672    2688   31.2   256     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x32_MI16x16x1_SN_LDSB0_A  
+      3.0623     6.0   3.01    504024      3920      16     128    6.2    40     0  causal_conv1d_fwd_kernel<c10::BFloat16>  WG<64,OCC<25
+      2.1690    36.2   2.13     43000      4240      32     256   12.5   160     0  dense_gemm::dense_gemm_pipe_kernel<64, 2, 64, 1, false, __hip_bfloat16>  WG<64,OCC<25
+      1.4798    99.7   1.45      3960      4121     384    6144  100.0    24     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  
+      0.9961    16.1   0.98     61600      3960    6728   53824  100.0     8     0  w4a8_fp8_moe::moe_gather_reduce_kernel<__hip_bfloat16>  
+      0.7668    31.9   0.75     43460      4080   10560   84480  100.0    16     0  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>  
+      0.6993    68.2   0.69      8200      3960    3364   13456  100.0    32     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  
+      0.4933    20.1   0.48     21880      4160      56     448   21.9    72     0  dense_gemm::dense_gemm_rd_kernel<64, false, __hip_bfloat16>  WG<64,OCC<25
+      0.4806    16.1   0.47     29120      6460      14     112    5.5    72     0  dense_gemm::dense_gemm_kernel<64, __hip_bfloat16>  WG<64,OCC<25
+      0.4329     6.0   0.43     71040      4000   26912  107648  100.0    16     0  rmsnorm_gated_kernel<c10::BFloat16>  
+      0.4296    74.6   0.42      5520      4120      28     448   21.9    16     0  __amd_rocclr_copyBuffer  WG<64,OCC<25
+      0.3535    11.9   0.35     27780      4160       8      64    3.1   176     0  gdn_decode_conv_gated_kernel<c10::BFloat16, c10::BFloat16, 128, 128, true>  WG<64,OCC<25
+      0.3139    15.9   0.31     19760      4120    1024    4096  100.0    40     0  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w4a8_tile  
+      0.2825    15.9   0.28     17840      4120      64    2048   75.0   112     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Int4Fp8GemvLoader,   
+      0.2349    31.9   0.23     10600      4160       2       8    0.4    48     0  at::native::elementwise_kernel_manual_unroll<128, 8, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.2093    14.4   0.21     18880      4040    2688   21504  100.0     8     0  at::native::  
+      0.2001    31.9   0.20     10800      9200     841    6728  100.0    32     0  at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::  
+      0.1877    55.7   0.18      2960      4000     128    1024   50.0     8     0  at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFlo  
+      0.1156    37.9   0.11      1920      4160       1       8    0.4    48     0  at::native::vectorized_elementwise_kernel<8, at::native::sigmoid_kernel_cuda(a  WG<64,OCC<25
+      0.1144    31.9   0.11      5840      4080       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_  WG<64,OCC<25
+      0.0822     6.0   0.08     13560      4040     210     210   10.3    48     0  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT16x16x32_MI16x16x1_SN_LDSB1_AFC  OCC<25
+      0.0773    15.9   0.08      4880      4120       8      64    3.1    16     0  gemv_decode::gemv_decode_core<__hip_bfloat16, gemv_decode::Bf16GemvLoader<__hi  WG<64,OCC<25
+      0.0680    31.9   0.07      2960      4080       2      16    0.8     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>, s  WG<64,OCC<25
+      0.0481    26.6   0.05      1800      4120       1       4    0.2    16     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0401    24.1   0.04      1600      4040       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::index_fill_kernel_imp  WG<64,OCC<25
+      0.0337     6.0   0.03      1080      4080       1       8    0.4    32     0  at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BF  WG<64,OCC<25
+      0.0314    16.1   0.03      1960      3960      42     336   16.4     8     0  w4a8_fp8_moe::moe_build_inverse_map_kernel  WG<64,OCC<25
+      0.0232    16.1   0.02      1400      3960       7      56    2.7     8     0  at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<int>, std  WG<64,OCC<25
+      0.0231     0.6   0.02     38760      4840       2      16    0.8   256   776  ncclDevKernel_Generic_4  WG<64,OCC<25,SPILL776B
+      0.0195     0.6   0.02     13360      4120       4      16    0.8    24     0  at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_im  WG<64,OCC<25
+      0.0152     0.2   0.01     74100      4160   15360   61440  100.0    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  
+      0.0109     6.0   0.01      1800      4000      16      64    3.1   144     0  gdn_replay_flush_kernel<c10::BFloat16, 128, 128>  WG<64,OCC<25
+      0.0106     2.2   0.01      3360      4280       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0053     1.2   0.01      3360      4240       1       4    0.2    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0047     0.4   0.00     11280      4320      64    1024   50.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgM  
+      0.0024     1.2   0.00      1880      4280       1       8    0.4    24     0  at::native::vectorized_elementwise_kernel<4, at::native::compare_scalar_kernel  WG<64,OCC<25
+      0.0021     0.8   0.00      2440      4360       1       8    0.4    16     0  __amd_rocclr_fillBufferAligned  WG<64,OCC<25
+      0.0021     1.0   0.00      1881      4160       1       8    0.4    16     0  at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<int, in  WG<64,OCC<25
+      0.0020     0.6   0.00      3160      4120       4      16    0.8    16     0  at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::  WG<64,OCC<25
+      0.0020     0.2   0.00      9880      4080      64    1024   50.0    40     0  at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::nati  
+
+wrote /home/pat/code/minisgl-rdna4-ksweep/tools/counter_probe/results/ksweep/qwen-overlap.kernels.json
+wrote /home/pat/code/minisgl-rdna4-ksweep/tools/counter_probe/results/ksweep/qwen-overlap.kernels.csv

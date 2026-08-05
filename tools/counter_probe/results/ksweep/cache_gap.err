@@ -1,0 +1,112 @@
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] bf16 M=1 N=32768 K=2048 flush=0MB rot=1  total 198656 ns  flush 0 ns  GEMV 198656 ns  676.0 GB/s = 95.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] bf16 M=1 N=32768 K=2048 flush=0MB rot=2  total 199885 ns  flush 0 ns  GEMV 199885 ns  671.8 GB/s = 95.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=8MB rot=1  total 205371 ns  flush 6912 ns  GEMV 198459 ns  676.6 GB/s = 95.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=16MB rot=1  total 208903 ns  flush 11138 ns  GEMV 197765 ns  679.0 GB/s = 96.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=32MB rot=1  total 226217 ns  flush 28055 ns  GEMV 198162 ns  677.7 GB/s = 95.9% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=64MB rot=1  total 242152 ns  flush 43085 ns  GEMV 199066 ns  674.6 GB/s = 95.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=128MB rot=1  total 395021 ns  flush 195939 ns  GEMV 199082 ns  674.5 GB/s = 95.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=32768 K=2048 flush=256MB rot=1  total 584717 ns  flush 388398 ns  GEMV 196319 ns  684.0 GB/s = 96.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] bf16 M=1 N=6144 K=2048 flush=0MB rot=1  total 49042 ns  flush 0 ns  GEMV 49042 ns  513.5 GB/s = 72.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] bf16 M=1 N=6144 K=2048 flush=0MB rot=9  total 47935 ns  flush 0 ns  GEMV 47935 ns  525.3 GB/s = 74.3% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=8MB rot=1  total 57510 ns  flush 6944 ns  GEMV 50566 ns  498.0 GB/s = 70.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=16MB rot=1  total 59799 ns  flush 11131 ns  GEMV 48669 ns  517.4 GB/s = 73.2% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=32MB rot=1  total 79205 ns  flush 27986 ns  GEMV 51219 ns  491.7 GB/s = 69.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=64MB rot=1  total 89405 ns  flush 42665 ns  GEMV 46740 ns  538.8 GB/s = 76.2% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=128MB rot=1  total 246325 ns  flush 196292 ns  GEMV 50033 ns  503.3 GB/s = 71.2% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=6144 K=2048 flush=256MB rot=1  total 432897 ns  flush 388468 ns  GEMV 44428 ns  566.8 GB/s = 80.2% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] bf16 M=1 N=2048 K=256 flush=0MB rot=1  total 6717 ns  flush 0 ns  GEMV 6717 ns  156.8 GB/s = 22.2% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] bf16 M=1 N=2048 K=256 flush=0MB rot=193  total 9554 ns  flush 0 ns  GEMV 9554 ns  110.2 GB/s = 15.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=8MB rot=1  total 15476 ns  flush 7684 ns  GEMV 7792 ns  135.2 GB/s = 19.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=16MB rot=1  total 20402 ns  flush 12186 ns  GEMV 8215 ns  128.2 GB/s = 18.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=32MB rot=1  total 39233 ns  flush 30387 ns  GEMV 8845 ns  119.1 GB/s = 16.9% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=64MB rot=1  total 53132 ns  flush 42941 ns  GEMV 10191 ns  103.3 GB/s = 14.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=128MB rot=1  total 206806 ns  flush 195804 ns  GEMV 11002 ns  95.7 GB/s = 13.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] bf16 M=1 N=2048 K=256 flush=256MB rot=1  total 396707 ns  flush 388465 ns  GEMV 8242 ns  127.8 GB/s = 18.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] int4 M=1 N=2048 K=2048 flush=0MB rot=1  total 9778 ns  flush 0 ns  GEMV 9778 ns  221.8 GB/s = 31.4% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] int4 M=1 N=2048 K=2048 flush=0MB rot=94  total 13413 ns  flush 0 ns  GEMV 13413 ns  161.7 GB/s = 22.9% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=8MB rot=1  total 17372 ns  flush 7702 ns  GEMV 9670 ns  224.3 GB/s = 31.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=16MB rot=1  total 21473 ns  flush 12194 ns  GEMV 9279 ns  233.7 GB/s = 33.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=32MB rot=1  total 40443 ns  flush 30108 ns  GEMV 10335 ns  209.9 GB/s = 29.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=64MB rot=1  total 57519 ns  flush 43142 ns  GEMV 14378 ns  150.8 GB/s = 21.3% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=128MB rot=1  total 211470 ns  flush 195865 ns  GEMV 15605 ns  139.0 GB/s = 19.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=2048 K=2048 flush=256MB rot=1  total 400977 ns  flush 388100 ns  GEMV 12876 ns  168.4 GB/s = 23.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] int4 M=1 N=6144 K=2048 flush=0MB rot=1  total 15775 ns  flush 0 ns  GEMV 15775 ns  412.2 GB/s = 58.3% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] int4 M=1 N=6144 K=2048 flush=0MB rot=32  total 23164 ns  flush 0 ns  GEMV 23164 ns  280.7 GB/s = 39.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=8MB rot=1  total 23644 ns  flush 7584 ns  GEMV 16060 ns  404.9 GB/s = 57.3% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=16MB rot=1  total 28452 ns  flush 12109 ns  GEMV 16342 ns  397.9 GB/s = 56.3% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=32MB rot=1  total 46928 ns  flush 30469 ns  GEMV 16459 ns  395.1 GB/s = 55.9% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=64MB rot=1  total 85201 ns  flush 42957 ns  GEMV 42244 ns  153.9 GB/s = 21.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=128MB rot=1  total 217408 ns  flush 195819 ns  GEMV 21590 ns  301.2 GB/s = 42.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=6144 K=2048 flush=256MB rot=1  total 409101 ns  flush 388208 ns  GEMV 20893 ns  311.2 GB/s = 44.0% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] fp8 M=1 N=4096 K=4096 flush=0MB rot=1  total 25044 ns  flush 0 ns  GEMV 25044 ns  671.1 GB/s = 95.0% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] fp8 M=1 N=4096 K=4096 flush=0MB rot=12  total 40443 ns  flush 0 ns  GEMV 40443 ns  415.5 GB/s = 58.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=8MB rot=1  total 33002 ns  flush 7651 ns  GEMV 25351 ns  662.9 GB/s = 93.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=16MB rot=1  total 37059 ns  flush 12029 ns  GEMV 25030 ns  671.4 GB/s = 95.0% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=32MB rot=1  total 55206 ns  flush 30414 ns  GEMV 24792 ns  677.9 GB/s = 95.9% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=64MB rot=1  total 137250 ns  flush 42673 ns  GEMV 94576 ns  177.7 GB/s = 25.1% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=128MB rot=1  total 233452 ns  flush 196012 ns  GEMV 37440 ns  448.9 GB/s = 63.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] fp8 M=1 N=4096 K=4096 flush=256MB rot=1  total 424163 ns  flush 388892 ns  GEMV 35271 ns  476.5 GB/s = 67.4% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[hot] int4 M=1 N=16384 K=16384 flush=0MB rot=1  total 229049 ns  flush 0 ns  GEMV 229049 ns  604.5 GB/s = 85.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[rot] int4 M=1 N=16384 K=16384 flush=0MB rot=2  total 229334 ns  flush 0 ns  GEMV 229334 ns  603.8 GB/s = 85.4% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=8MB rot=1  total 246684 ns  flush 7086 ns  GEMV 239598 ns  577.9 GB/s = 81.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=16MB rot=1  total 266874 ns  flush 11156 ns  GEMV 255718 ns  541.5 GB/s = 76.6% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=32MB rot=1  total 287544 ns  flush 27963 ns  GEMV 259581 ns  533.4 GB/s = 75.5% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=64MB rot=1  total 327772 ns  flush 42971 ns  GEMV 284801 ns  486.2 GB/s = 68.8% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=128MB rot=1  total 424696 ns  flush 195976 ns  GEMV 228719 ns  605.4 GB/s = 85.7% of 706.6
+[dev] AMD Radeon RX 9070 XT gfx=gfx1201 WGP=32 clk=2400000kHz
+[evict] int4 M=1 N=16384 K=16384 flush=256MB rot=1  total 615428 ns  flush 388103 ns  GEMV 227325 ns  609.1 GB/s = 86.2% of 706.6

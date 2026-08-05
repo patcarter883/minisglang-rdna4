@@ -1,0 +1,90 @@
+WARNING: skipped 6 torn CSV rows (concurrent TP-rank writes)
+  coverage Agent 1:   998740 dispatches over  98.58 s   FULL
+  coverage Agent 2:    59048 dispatches over   3.28 s   *** TRUNCATED — DO NOT USE ***
+
+########## qwen-normal  window 120..319  (200 steps, 60.414 ms/step) ##########
+
+--- Agent 1 [AMD Radeon RX 9070 XT] ---
+  MoE dispatches (grid = work-items; wg = grid/block):
+      0.5842 ms/step  x  29.2  grid=(4096, 8, 4) block=(128, 1, 1) -> 1024 WG  (grid.y=8)  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w
+      0.1955 ms/step  x  29.2  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>
+      0.0471 ms/step  x  29.2  grid=(32768, 1, 1) block=(256, 1, 1) -> 128 WG  (grid.y=1)  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>
+  align-family kernels/step: {'anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>': 29.24, '__amd_rocclr_fillBufferAligned': 1.47}
+  family                ms/step  %kernel-time  disp/step   workitems/step   MB/step(2B r+w)  MB/step(4B r+w)
+    gemm                  4.395         68.0      337.0         17992348             72.0            143.9
+    elementwise           0.671         10.4      379.1           198533              0.8              1.6
+    allreduce             0.932         14.4       59.2           121275              0.5              1.0
+    other                 0.466          7.2       32.2            48286              0.2              0.4
+
+--- Agent 2 [AMD Radeon RX 9070] ---
+  MoE dispatches (grid = work-items; wg = grid/block):
+      0.2118 ms/step  x  10.8  grid=(4096, 8, 4) block=(128, 1, 1) -> 1024 WG  (grid.y=8)  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w
+      0.0730 ms/step  x  10.7  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>
+      0.0179 ms/step  x  10.8  grid=(32768, 1, 1) block=(256, 1, 1) -> 128 WG  (grid.y=1)  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>
+  align-family kernels/step: {'anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>': 10.75, '__amd_rocclr_fillBufferAligned': 0.53}
+  family                ms/step  %kernel-time  disp/step   workitems/step   MB/step(2B r+w)  MB/step(4B r+w)
+    gemm                  1.497         62.5      123.9          6603245             26.4             52.8
+    elementwise           0.253         10.6      139.2            72106              0.3              0.6
+    allreduce             0.469         19.6       21.8            44603              0.2              0.4
+    other                 0.177          7.4       11.8            17751              0.1              0.1
+
+  AR rank skew (OBSERVATION ONLY — custom_ar is not an optimisation target): 22 collectives/step
+    median |arrival skew| 3210336629 ns   signed median -3210336629 ns (Agent 2 minus Agent 1)
+    AR duration median: Agent 1=12840 ns  Agent 2=10920 ns
+    total |skew| if fully exposed: 70371.003 ms/step
+
+########## qwen-normal  window 620..819  (200 steps, 81.172 ms/step) ##########
+
+--- Agent 1 [AMD Radeon RX 9070 XT] ---
+  MoE dispatches (grid = work-items; wg = grid/block):
+      1.2783 ms/step  x  40.0  grid=(2048, 6, 1) block=(256, 1, 1) -> 48 WG  (grid.y=6)  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode
+      0.6070 ms/step  x  40.0  grid=(196608, 1, 1) block=(256, 1, 1) -> 768 WG  (grid.y=1)  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>
+      0.1867 ms/step  x  40.0  grid=(1536, 1, 1) block=(256, 1, 1) -> 6 WG  (grid.y=1)  anon::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe_core::Sof
+      0.1093 ms/step  x  40.0  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_align_kernel
+      0.0543 ms/step  x  40.0  grid=(768, 1, 1) block=(256, 1, 1) -> 3 WG  (grid.y=1)  w4a8_fp8_moe::moe_build_inverse_map_kernel
+  align-family kernels/step: {'anon::moe_align_kernel': 40.0, '__amd_rocclr_fillBufferAligned': 3.0}
+  family                ms/step  %kernel-time  disp/step   workitems/step   MB/step(2B r+w)  MB/step(4B r+w)
+    gemm                 10.490         65.1      541.0         41236480            164.9            329.9
+    elementwise           1.351          8.4      732.3          1641040              6.6             13.1
+    allreduce             3.284         20.4       81.0           165888              0.7              1.3
+    other                 0.986          6.1       44.0           373248              1.5              3.0
+
+########## qwen-normal  window 1130..1329  (200 steps, 83.541 ms/step) ##########
+
+--- Agent 1 [AMD Radeon RX 9070 XT] ---
+  MoE dispatches (grid = work-items; wg = grid/block):
+      1.2342 ms/step  x  40.0  grid=(2048, 6, 1) block=(256, 1, 1) -> 48 WG  (grid.y=6)  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode
+      0.6088 ms/step  x  40.0  grid=(196608, 1, 1) block=(256, 1, 1) -> 768 WG  (grid.y=1)  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>
+      0.1857 ms/step  x  40.0  grid=(1536, 1, 1) block=(256, 1, 1) -> 6 WG  (grid.y=1)  anon::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe_core::Sof
+      0.1083 ms/step  x  40.0  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_align_kernel
+      0.0528 ms/step  x  40.0  grid=(768, 1, 1) block=(256, 1, 1) -> 3 WG  (grid.y=1)  w4a8_fp8_moe::moe_build_inverse_map_kernel
+  align-family kernels/step: {'anon::moe_align_kernel': 40.0, '__amd_rocclr_fillBufferAligned': 3.0}
+  family                ms/step  %kernel-time  disp/step   workitems/step   MB/step(2B r+w)  MB/step(4B r+w)
+    gemm                 10.264         63.8      541.0         41236480            164.9            329.9
+    elementwise           1.320          8.2      731.3          1673570              6.7             13.4
+    allreduce             3.513         21.8       81.0           165888              0.7              1.3
+    other                 1.002          6.2       44.0           373248              1.5              3.0
+
+########## qwen-normal  window 1600..1799  (200 steps, 131.487 ms/step) ##########
+
+--- Agent 1 [AMD Radeon RX 9070 XT] ---
+  MoE dispatches (grid = work-items; wg = grid/block):
+     48.7404 ms/step  x  16.1  grid=(128, 656, 1) block=(32, 1, 1) -> 2624 WG  (grid.y=656)  w4a8_fp8_moe::moe_gemm1_silu_ashuffle_kernel<__hip_bfloat16, 64>
+      8.6328 ms/step  x  16.1  grid=(4096, 656, 1) block=(128, 1, 1) -> 20992 WG  (grid.y=656)  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<__hip_bfloat16, w4a8_tile::W
+      0.8645 ms/step  x  16.1  grid=(2048, 832, 1) block=(256, 1, 1) -> 6656 WG  (grid.y=832)  w4a8_fp8_moe::moe_gather_reduce_kernel<__hip_bfloat16>
+      0.7359 ms/step  x  40.0  grid=(32768, 1, 1) block=(256, 1, 1) -> 128 WG  (grid.y=1)  w4a8_fp8_moe::moe_compute_act_fp8_kernel<__hip_bfloat16>
+      0.4314 ms/step  x  22.5  grid=(212992, 1, 1) block=(256, 1, 1) -> 832 WG  (grid.y=1)  anon::moe_topk_softmax_kernel<1, 8, true, c10::BFloat16, moe_core::Sof
+      0.3361 ms/step  x  16.7  grid=(4096, 8, 4) block=(128, 1, 1) -> 1024 WG  (grid.y=8)  w4a8_tile::moe_gemm_tiled_kernel<__hip_bfloat16, w4a8_tile::WmmaFp8, w
+      0.2605 ms/step  x  22.5  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_align_kernel
+      0.2230 ms/step  x   6.4  grid=(2048, 4, 1) block=(256, 1, 1) -> 32 WG  (grid.y=4)  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<__hip_bfloat16, gemv_decode
+      0.1207 ms/step  x  17.5  grid=(256, 1, 1) block=(256, 1, 1) -> 1 WG  (grid.y=1)  anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>
+      0.0399 ms/step  x  22.5  grid=(10496, 1, 1) block=(256, 1, 1) -> 41 WG  (grid.y=1)  w4a8_fp8_moe::moe_build_inverse_map_kernel
+      0.0165 ms/step  x   0.8  grid=(4096, 16, 1) block=(128, 1, 1) -> 512 WG  (grid.y=16)  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<__hip_bfloat16, w4a8_tile::W
+  align-family kernels/step: {'anon::moe_align_kernel': 22.51, '__amd_rocclr_fillBufferAligned': 1.0, 'anon::moe_route_align_kernel<1, 8, true, c10::BFloat16>': 17.49}
+  family                ms/step  %kernel-time  disp/step   workitems/step   MB/step(2B r+w)  MB/step(4B r+w)
+    gemm                 76.471         68.2      487.6        140235205            560.9           1121.9
+    elementwise           3.804          3.4      760.3         90086354            360.3            720.7
+    allreduce            25.600         22.8       72.8           149010              0.6              1.2
+    other                 6.305          5.6       69.8           919118              3.7              7.4
+
+wrote /home/pat/code/minisgl-rdna4-ksweep/tools/counter_probe/results/ksweep/qwen-normal.analysis.json
