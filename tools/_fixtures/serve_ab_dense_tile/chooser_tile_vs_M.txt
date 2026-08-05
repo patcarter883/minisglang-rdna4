@@ -1,0 +1,43 @@
+AFTER chooser tile vs M for GLM shared-path gate_up (N=10240 K=2048 g=128).
+BEFORE always ran this arm at the HARDWIRED 256x128, so any row that is not 256x128 is a
+tile the A/B changed. cu=64 is the RX 9070 XT (card 0), cu=56 the RX 9070 (card 1).
+
+--- cu=64 ---
+  M=   17  tile=64x32     runner-up=80x32     (1.083x)   <-- differs from 256x128
+  M=   32  tile=64x32     runner-up=80x32     (1.083x)   <-- differs from 256x128
+  M=   64  tile=64x32     runner-up=80x32     (1.083x)   <-- differs from 256x128
+  M=  128  tile=128x96    runner-up=128x32    (1.051x)   <-- differs from 256x128
+  M=  192  tile=192x32    runner-up=256x96    (1.064x)   <-- differs from 256x128
+  M=  256  tile=256x96    runner-up=256x64    (1.100x)   <-- differs from 256x128
+  M=  320  tile=384x64    runner-up=384x32    (1.061x)   <-- differs from 256x128
+  M=  384  tile=384x64    runner-up=384x32    (1.061x)   <-- differs from 256x128
+  M=  448  tile=256x64    runner-up=256x128   (1.036x)   <-- differs from 256x128
+  M=  480  tile=256x64    runner-up=256x128   (1.036x)   <-- differs from 256x128
+  M=  512  tile=256x64    runner-up=256x128   (1.036x)   <-- differs from 256x128
+  M=  544  tile=384x64    runner-up=256x128   (1.184x)   <-- differs from 256x128
+  M=  576  tile=384x64    runner-up=256x128   (1.184x)   <-- differs from 256x128
+  M=  640  tile=384x64    runner-up=256x128   (1.184x)   <-- differs from 256x128
+  M=  768  tile=384x64    runner-up=256x128   (1.184x)   <-- differs from 256x128
+  M= 1024  tile=256x128   runner-up=384x64    (1.081x)
+  M= 1536  tile=384x64    runner-up=256x128   (1.184x)   <-- differs from 256x128
+  M= 2048  tile=256x128   runner-up=384x64    (1.013x)
+
+--- cu=56 ---
+  M=   17  tile=64x32     runner-up=128x96    (1.022x)   <-- differs from 256x128
+  M=   32  tile=64x32     runner-up=128x96    (1.022x)   <-- differs from 256x128
+  M=   64  tile=64x32     runner-up=128x96    (1.022x)   <-- differs from 256x128
+  M=  128  tile=128x96    runner-up=128x64    (1.065x)   <-- differs from 256x128
+  M=  192  tile=256x96    runner-up=192x96    (1.080x)   <-- differs from 256x128
+  M=  256  tile=256x96    runner-up=256x64    (1.100x)   <-- differs from 256x128
+  M=  320  tile=384x64    runner-up=384x32    (1.273x)   <-- differs from 256x128
+  M=  384  tile=384x64    runner-up=384x32    (1.273x)   <-- differs from 256x128
+  M=  448  tile=256x128   runner-up=256x96    (1.053x)
+  M=  480  tile=256x128   runner-up=256x96    (1.053x)
+  M=  512  tile=256x128   runner-up=256x96    (1.053x)
+  M=  544  tile=384x64    runner-up=256x96    (1.169x)   <-- differs from 256x128
+  M=  576  tile=384x64    runner-up=256x96    (1.169x)   <-- differs from 256x128
+  M=  640  tile=384x64    runner-up=256x96    (1.169x)   <-- differs from 256x128
+  M=  768  tile=384x64    runner-up=256x96    (1.169x)   <-- differs from 256x128
+  M= 1024  tile=256x128   runner-up=384x64    (1.013x)
+  M= 1536  tile=384x64    runner-up=256x128   (1.110x)   <-- differs from 256x128
+  M= 2048  tile=256x128   runner-up=384x64    (1.013x)

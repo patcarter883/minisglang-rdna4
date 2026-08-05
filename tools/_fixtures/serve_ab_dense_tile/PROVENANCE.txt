@@ -1,0 +1,100 @@
+SERVED-PATH A/B for the dense-tile + activation-quant work        measured 2026-08-05, TP=2
+==========================================================================================
+
+THE QUESTION
+    Everything recorded for the dense-tile / act-quant work so far is ISOLATED KERNEL TIMING.
+    What does it buy on the SERVED path? TTFT across a prompt ladder, prefill tok/s, decode tok/s.
+
+WHAT WAS COMPARED
+    BEFORE  engine 6dc09973  + kernels 36d1ac4   image minisgl-rdna4:pre-tile   655c1b4362bc
+    AFTER   engine 0a3c017d  + kernels 2ade7c1   image minisgl-rdna4:post-tile  89773ba16230
+    Both images built from CLEAN DETACHED WORKTREES of both repos, hipify twins purged, with
+    --build-context uprof=/home/pat/pkgs and KERNELS_REF bumped to the kernels sha.
+
+    NOT USED: minisgl-rdna4:lean (08b0fecd2d10), the image the task named as "already built and
+    GPU-verified". It does not correspond to kernels 2ade7c1. Checked file by file:
+        fp8_wmma/moe_kernel.hip           == 2ade7c1
+        fp8_wmma/w4a8_fp8_wmma_kernel.hip == NEITHER commit (an intermediate working state)
+        fp8_wmma/torch_binding.cpp        == NEITHER commit
+        tail/tail_kernels.hip             == 36d1ac4   (i.e. the act-quant producer is ABSENT:
+        tail/torch_binding.cpp            == 36d1ac4    tail_hip.rms_norm_quant does not exist)
+    So `lean` is a MIXTURE — new fp8_wmma, old tail — and benchmarking it would have compared an
+    unknown intermediate. minisgl-rdna4:post-tile was built to be exactly 2ade7c1 and is (all four
+    md5s match `git show 2ade7c1:<path>`), and it does carry tail_hip.rms_norm_quant.
+
+PROVENANCE ASSERTION THAT PROVES THE TWO IMAGES DIFFER   (printed by every leg, see *.server.log)
+    probe                                   BEFORE                          AFTER
+    fp8_wmma.dense_tile_explain             False                           True
+    fp8_wmma.moe_tile_choose                False                           True
+    tail_hip.rms_norm_quant                 False                           True
+    fp8_wmma_rocm/tile_select.h present     False                           True
+    engine _pick_dense_kernel arms          decode_gemv, prefill_wmma,      decode_gemv,
+                                            prefill_wmma_ashuffle,          wmma_tiled_tuned
+                                            wmma_tiled_tuned
+    engine RMSNormFused.forward_quant       False                           True
+    md5 w4a8_fp8_wmma_kernel.hip            c00f79b3…(==36d1ac4)            88f0dea3…(==2ade7c1)
+    md5 tail_kernels.hip                    924f52a3…(==36d1ac4)            12c78da3…(==2ade7c1)
+
+HARDWARE / CONFIG
+    Cards: gpu-lease -n 2 -> [0,1] every leg. Card 0 = RX 9070 XT (64 CU, reports 32 WGP via
+    multi_processor_count); card 1 = RX 9070 (56 CU, reports 28). One leg at a time, serially.
+    Serve: python -m minisgl --tensor-parallel-size 2 --graph 16 --memory-ratio 0.90
+           --max-running-requests 24 --num-pages <pinned> --no-gdn-radix --disable-pynccl
+      QWEN cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit  --attention-backend hip   --num-pages 16384
+      GLM  QuantTrio/GLM-4.7-Flash-AWQ        --attention-backend auto  --num-pages 1024
+           (MLA forces page_size 16, so 1024 pages == the same 16384 tokens)
+
+TWO MEASUREMENT CONTROLS THAT WERE NECESSARY, NOT COSMETIC
+  1. CACHE-BUSTED PROMPTS. tools/serve_matrix_bench.py reuses one fixed long prompt for every
+     prefill cell, so after its own warmup every prefill is a RADIX PREFIX-CACHE HIT and its TTFT
+     is a cache lookup, not a prefill. This A/B is entirely about prefill GEMM cost, so
+     tools/ab_tile_serve_bench.py prefixes every single request with fresh random hex.
+  2. PINNED KV POOL. Left to auto-size, the pool is whatever VRAM survives the model plus the
+     recurrent-radix/GDN/graph reservations — on a 16 GB card that is the SCRAPS (0.02 GiB), and
+     the two images' kernel packages differ in code-object footprint by enough to swing it 42%
+     (BEFORE 2448 vs AFTER 1424 servable tokens; see unpinned_kvpool/). A different pool changes
+     which requests are ADMITTED, so that run compared admission policy, not GEMM cost. --num-pages
+     makes the pool a constant. (The 42% swing is itself a real cost of the larger tile lattice.)
+  Also --no-gdn-radix: the recurrent-radix snapshot store clones per-request GDN state from the
+  torch allocator beyond its own accounting reservation, and it killed BOTH Qwen legs at the same
+  point in rep 3 with `torch.OutOfMemoryError ... gdn_state.clone_slot` (see
+  discarded_run_gdn_radix_oom/). It is a stochastic, history-dependent allocator inside a
+  measurement of GEMM cost, and because this bench cache-busts every prompt it can never register a
+  hit anyway. Off, it is pure removed variance. Inert for MLA/GLM.
+
+WHICH MODEL EXERCISES THE CHANGED KERNEL — the load-bearing finding
+    The engine's own hip-engage ledger, per leg:
+      QWEN dispatches  fp8_wmma.dense_bf16_gemv[gdn_proj]  and the MoE gemms — and NO
+           fp8_wmma.mmq_fp8_gemm(...) AT ALL. cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit's
+           modules_to_not_convert covers every linear_attn.*, every self_attn.{q,k,v,o}_proj and
+           every mlp.shared_expert.* projection, i.e. the checkpoint leaves ALL dense linears in
+           bf16 and quantizes only the routed experts. The W4A8 dense GEMM the tile work optimizes
+           is therefore never called on the production model.
+      GLM  dispatches  fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned)  (prefill) and
+           fp8_wmma.mmq_fp8_gemm(decode_gemv)  (decode). QuantTrio/GLM-4.7-Flash-AWQ excludes only
+           mlp.gate., model.layers.0. and self_attn, so its MoE-shared/dense MLP linears ARE W4A8.
+    GLM is thus the only leg that can see the dense tile at all, and it is also the model carrying
+    the one known isolated regression (glm.gate_up tp2 M=512, 0.8141x).
+
+RESULT (medians of 3 reps; full numbers in comparison.txt, raw repeats in the JSONs)
+    QWEN  every cell within 0.7%, no cell outside run-to-run spread. Flat, as predicted by the
+          engage ledger.
+    GLM   flat everywhere EXCEPT prefill at ~516 prompt tokens, where AFTER is 2.4% SLOWER on TTFT
+          (192.17 -> 196.80 ms) with DISJOINT ranges ([191.87-193.41] vs [196.43-197.53]).
+          That is the recorded glm.gate_up tp2 M=512 0.8141x surfacing end-to-end, diluted from
+          22.8% on the kernel to 2.4% on TTFT. chooser_tile_vs_M.txt shows why and how narrow it
+          is: at M=448..512 on a 64-CU card the chooser takes 256x64 over the old hardwired
+          256x128 on a claimed 1.036x — a near-tie in the model, and 1.228x the WRONG way in
+          reality. On the 56-CU card it takes 256x128 at those M, so at TP=2 the two ranks pick
+          different tiles and the slower rank gates the step.
+    Decode is flat on both models at M=1/4/16 (<=0.7%), which is what "serving is overhead-bound"
+    and "bs=1 decode is inter-kernel-gap bound" predict.
+
+FILES
+    comparison.txt            BEFORE/AFTER medians + [min-max] + ratios, both models
+    {QWEN,GLM}_{BEFORE,AFTER}.json        every raw repeat (medians are recomputable)
+    {QWEN,GLM}_{BEFORE,AFTER}.server.log  boot log incl. the provenance probe + hip-engage ledger
+    all_legs.txt              full console of the four legs that produced the numbers above
+    chooser_tile_vs_M.txt     AFTER's tile choice vs M for GLM's gate_up, both CU counts
+    unpinned_kvpool/          earlier Qwen pair, auto-sized pool: shows the 2448 vs 1424 swing
+    discarded_run_gdn_radix_oom/  the run with --gdn-radix on; both Qwen legs OOM'd in rep 3

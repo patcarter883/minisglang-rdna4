@@ -1,0 +1,55 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[1m[2026-08-05|11:18:39][0m [32mINFO    [0m Parsed arguments:
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=16, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=16, page_size=1, memory_ratio=0.9, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=16384, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=False, _unique_suffix='.pid=42', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|11:18:43|initializer][0m [32mINFO    [0m Tokenize server 0 is ready
+[1m[2026-08-05|11:18:43|core|rank=0][0m [33mWARNING [0m Page size is overridden to 16 for the native-HIP attention backend
+[1m[2026-08-05|11:18:43|core|rank=0][0m [32mINFO    [0m Auto-selected MoE backend: fused
+[1m[2026-08-05|11:18:44|core|rank=0][0m [32mINFO    [0m custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.15-1.2x vs RCCL at every size; slot 32.0 MiB -> covers up to 33554432 B/collective)
+[1m[2026-08-05|11:18:44|core|rank=0][0m [32mINFO    [0m Free memory before loading model: 15.65 GiB
+Loading weights:   0%|          | 0/6 [00:00<?, ?it/s]Loading weights:  17%|█▋        | 1/6 [00:12<01:02, 12.49s/it]Loading weights:  33%|███▎      | 2/6 [00:21<00:41, 10.46s/it]Loading weights:  50%|█████     | 3/6 [00:34<00:34, 11.41s/it]Loading weights:  67%|██████▋   | 4/6 [00:43<00:21, 10.68s/it]Loading weights: 100%|██████████| 6/6 [00:46<00:00,  5.73s/it]Loading weights: 100%|██████████| 6/6 [00:46<00:00,  7.72s/it]
+[1m[2026-08-05|11:19:38|core|rank=1][0m [32mINFO    [0m Allocating 262144 tokens for KV cache, K + V = 2.50 GiB
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Allocating 262144 tokens for KV cache, K + V = 2.50 GiB
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m GDN state: 30 layers x 18 slots (conv_dim=8192); conv warmup done
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Free memory after initialization: 1.69 GiB
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2, 4, 8, 12, 16]
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 1.69 GiB
+Preparing for capturing CUDA graphs...:   0%|          | 0/6 [00:00<?, ?batch/s]Capturing graphs: bs = 16  | avail_mem = 1.67 GiB:   0%|          | 0/6 [00:00<?, ?batch/s][1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv[gdn_proj]
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_decode_conv_gated_replay
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm_add
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.silu_and_mul
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] moe_hip.moe_route_align
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv)
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rope
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.store_kv
+[1m[2026-08-05|11:19:39|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_decode.flash_decode_paged
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+Capturing graphs: bs = 16  | avail_mem = 1.67 GiB:  17%|█▋        | 1/6 [00:10<00:51, 10.21s/batch]Capturing graphs: bs = 12  | avail_mem = 1.42 GiB:  17%|█▋        | 1/6 [00:10<00:51, 10.21s/batch]Capturing graphs: bs = 8   | avail_mem = 1.41 GiB:  17%|█▋        | 1/6 [00:10<00:51, 10.21s/batch]Capturing graphs: bs = 4   | avail_mem = 1.41 GiB:  17%|█▋        | 1/6 [00:10<00:51, 10.21s/batch]Capturing graphs: bs = 4   | avail_mem = 1.41 GiB:  67%|██████▋   | 4/6 [00:10<00:03,  1.96s/batch]Capturing graphs: bs = 2   | avail_mem = 1.41 GiB:  67%|██████▋   | 4/6 [00:10<00:03,  1.96s/batch][1m[2026-08-05|11:19:49|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter
+Capturing graphs: bs = 1   | avail_mem = 1.41 GiB:  67%|██████▋   | 4/6 [00:10<00:03,  1.96s/batch]Capturing graphs: bs = 1   | avail_mem = 1.41 GiB: 100%|██████████| 6/6 [00:10<00:00,  1.73s/batch]
+[1m[2026-08-05|11:19:49|core|rank=0][0m [32mINFO    [0m Free GPU memory after capturing CUDA graphs: 1.41 GiB
+[1m[2026-08-05|11:19:49|core|rank=0][0m [33mWARNING [0m recurrent-state hybrid model: prefix cache 'naive' (was 'radix'); GDN/CCA recurrent state is not prefix-cacheable (--no-gdn-radix set)
+[1m[2026-08-05|11:19:49|initializer][0m [32mINFO    [0m Scheduler is ready
+[1m[2026-08-05|11:19:49|FrontendAPI][0m [32mINFO    [0m API server is ready to serve on 0.0.0.0:1919
+INFO:     Started server process [42]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:1919 (Press CTRL+C to quit)
+[1m[2026-08-05|11:19:51|FrontendAPI][0m [32mINFO    [0m reasoning delimiters '<think>' … '</think>' (derived from chat template (opener common to both renders))
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_prefill_wmma
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.rmsnorm_gated
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma)
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma)
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[1m[2026-08-05|11:19:52|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_hip.flash_prefill
+[1m[2026-08-05|11:19:54|core|rank=0][0m [32mINFO    [0m TP comms/compute overlap ENGAGED (side stream; first tensor (265, 2048), min_tokens=256, row chunks=2)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [42]
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 2 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
