@@ -201,8 +201,30 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
         #   pbm=128 wins M=192..384 (grid stays wide, no wasted M-padding); pbm=256 wins from M>=512,
         #   and already from M>=192 on an LM-head-width OUT, where the N-grid is thousands of tiles
         #   wide so the only remaining lever is active warps per block (8 at pbm=256 vs 4 at 128).
-        pbm = 256 if (M >= 512 or (OUT >= 65536 and M >= 192)) else 128
-        out = _dg.dense_gemm_pipe(_padded(pbm), weight, pbm, BN, _PIPE_MI, _PIPE_PBK)[:M]
+        # pbm=64 additionally wins M<256 once MI=1 removes the register pressure: the tile shrinks
+        # but the grid widens, and at M=192 that is the trade that pays (gate_up 45.3/47.4 us at
+        # bm64 vs >47.9 at bm128; mlp.down 24.8 vs 25.9; qkv 66.1 best). At M=256 bm128 retakes it
+        # (mlp.down 26.2 vs 27.4), which is where this steps up.
+        pbm = 256 if (M >= 512 or (OUT >= 65536 and M >= 192)) else (128 if M >= 256 else 64)
+        # MI is the per-warp M-register-blocking factor, and it is the OCCUPANCY knob — the
+        # accumulator is acc[MI][NFRAG], i.e. MI*NFRAG*8 VGPRs, which at BN=64/MI=2 is 64 of the
+        # kernel's 156 and at BN=128/MI=2 is 128 of 220. MI=1 halves it: measured 156->89 VGPR
+        # (9->16 waves/SIMD) at BN=64/PBK=64 and 220->121 (6->12) at BN=128/PBK=64, 0 scratch in
+        # every case. It costs no REUSE — B is staged in LDS once per block and read from there by
+        # every warp, so halving MI only doubles the per-warp ds_read while block_m = n_warps*MI*16
+        # is held constant by doubling n_warps.
+        #
+        # It wins where the machine is not yet saturated, i.e. the short-M end, and loses to MI=2 at
+        # pbm=256 where 8 warps x MI=2 is what fills the block. Best-of-family vs rocBLAS (cold,
+        # CUDA-graph-replay device time): gate_up M=192 45.3 us MI=1 vs 47.9 MI=2 (0.82x rocBLAS),
+        # mlp.down M=192 24.8 MI=1, M=256 26.2 MI=1; qkv M=192 66.1 MI=1.
+        #
+        # SAFE TO GATE ON M: every (MI, ADIV, PBK, BN) instantiation issues the identical WMMA
+        # sequence into the identical accumulator chain, so they are bit-identical to each other and
+        # to lds/rd (verified 0.000e+00 over 36-54 configs x 4 shapes x 4 M). This is the same class
+        # of threshold as the pbm one above, NOT the kind the split-K arm would have needed.
+        mi = _PIPE_MI if pbm >= 256 else 1
+        out = _dg.dense_gemm_pipe(_padded(pbm), weight, pbm, BN, mi, _PIPE_PBK)[:M]
     if bias is not None:
         out = out + bias
     return out.reshape(*orig_shape[:-1], OUT)
