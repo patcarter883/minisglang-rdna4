@@ -1623,3 +1623,151 @@ make 4 ms matter.
 The step is now **150.5 ms, of which ~137 ms is the backbone**. Every remaining lever is in there.
 §D6.4's argument still holds and is now sharper: cudagraph capture removes 30 ms of launch that is
 currently hidden behind the backbone, and its share grows as everything around it shrinks.
+
+---
+
+## Part D9 — the tail kernels were bf16-only, this checkpoint is fp16, and nothing said so
+
+### D9.1 The defect
+
+`rdna4-hip-kernels/tail` ships six elementwise ops. Two of them — `silu_and_mul`, `gelu_and_mul` —
+were `template <typename scalar_t>`. The other four, sitting in the *same file*, were hard-typed
+`__hip_bfloat16` in both the kernel bodies and the binding guards (`"bf16 only"`): `rms_norm`,
+`rms_norm_add`, `rope`, `store_kv`. The engine's `layers/_tail_hip.active()` therefore asked
+`dtype == bfloat16`, because that was all the kernels accepted.
+
+Gemma4 and DiffusionGemma are **fp16**. So on every call, on every layer, for the whole serve, the
+gate answered NO and the engine ran the eager torch decomposition instead — 7 launches per RMSNorm,
+~6 per RoPE, an `index_put_` per KV store. This does not fail. It produces plausible output at
+plausible speed. The **only** observable tell was that a serve log for these two models contained
+**zero `[hip-engage] tail_hip.*` lines** while every other kernel family reported in:
+
+```
+leg A (baseline, engine 9fc1c892, minisgl-rdna4:gemma4):
+  [hip-engage] attn_decode.flash_decode_paged        [hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv)
+  [hip-engage] attn_hip.flash_prefill                [hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma)
+  [hip-engage] attn_prefill_paged.flash_prefill_paged(canvas)   ... 14 lines, and
+  tail_hip.*  ->  COUNT 0     (canvas phase AND autoregressive phase)
+```
+
+Two further gates were hiding behind the first, and neither is fp16-specific:
+
+* `RMSNormNoScale` (transformers `with_scale=False`) had **no native path at all**, because
+  `tail_hip.rms_norm` required a weight tensor and the checkpoint ships none for those norms. Gemma4
+  runs two per layer — `self_attn.v_norm` and `router.norm` — i.e. 60 of the ~331 norms in a step.
+* `gelu_tanh_and_mul` (HF `gelu_pytorch_tanh`, Gemma4's activation for **both** the dense MLP and the
+  routed experts) had no kernel because adding a third activation looked like a third copy of
+  `silu_mul_kernel`. It is now a policy (`GeluTanhAct`) on one `gated_mul_kernel<scalar_t, Act>`.
+
+### D9.2 What was measured
+
+Same harness (`tools/diffusiongemma_generate.sh`), same image (`minisgl-rdna4:gemma4`), TP=2, bs=1,
+`MINISGL_CANVAS_TIMING=1`, each leg from its own isolated git worktree, back to back on the same box.
+`[canvas-timing]` reports CUMULATIVE averages, so every figure below is **differenced between report
+points** over the *same* window (n=30→40) in both legs.
+
+| marginal, per canvas step | A: baseline | C: templated tail + tanh-gelu | Δ |
+|---|---|---|---|
+| `fwd_issue` | 0.60 ms | 0.50 ms | −0.10 |
+| **`fwd_tail` (the backbone)** | **137.90 ms** | **122.00 ms** | **−15.90 (−11.5%)** |
+| `sampler` | 4.80 ms | 4.80 ms | **0.00** |
+| `soft_embed` | 3.50 ms | 3.60 ms | +0.10 |
+| **step** | **147.50 ms** | **133.40 ms** | **−14.10 (−9.6%)** |
+
+The two untouched phases landing on 4.80/4.80 and 3.50/3.60 is the provenance check: the differencing
+method and the two legs agree to 0.1 ms on everything this change does not touch, so the −15.9 ms in
+`fwd_tail` is the change and not the weather. (C's steadiest window, n=40→50, reads 130.60 ms — i.e.
+−11.5% — but n=30→40 is the honest same-window comparison.)
+
+**The autoregressive sibling is where this lands hardest.**
+
+| gemma-4-26B-A4B AR, 256-token greedy | A | C |
+|---|---|---|
+| prompt 2 | 254 tok in 5.81 s = **43.7 tok/s** (22.9 ms/tok) | 254 tok in 3.41 s = **74.4 tok/s** (13.4 ms/tok) |
+| prompt 3 | 256 tok in 5.84 s = **43.8 tok/s** (22.8 ms/tok) | 256 tok in 3.42 s = **74.8 tok/s** (13.4 ms/tok) |
+
+**+70%, at identical emitted-token counts.** That is not a bandwidth result and it is not luck — it
+is the reason the canvas number is the *smaller* of the two.
+
+### D9.3 Dispatches removed, measured
+
+`rocprofv3 --kernel-trace`, 5 s window at t=180 s (past boot and graph capture), TP=2, per rank,
+**both legs on engine 9fc1c892** so the counts are same-engine. Steps are calibrated off the MoE
+grouped GEMM, which fires exactly 60× per canvas step per rank — a structural constant, so the
+window calibrates without trusting wall-clock. (Kernel-trace inflates *small* kernels more than
+large ones, so the elementwise device times below are upper bounds and the GEMM ones lower bounds;
+the dispatch COUNTS are exact.)
+
+| per canvas step, per rank | A: baseline | C: templated tail + tanh-gelu | Δ |
+|---|---|---|---|
+| **total dispatches** | **5 365** | **2 195** | **−3 170 (−59%)** |
+| torch elementwise/copy | 4 580.8 · 21.96 ms | 928.4 · 8.36 ms | −3 652 disp · −13.60 ms |
+| native `tail_hip` | **0** · 0.00 ms | 499.4 · 2.20 ms | +499 disp · +2.20 ms |
+| collective (`one_shot_ar`) | 99.2 · 51.19 ms | 96.8 · 44.71 ms | −6.48 ms |
+| our kernels + misc | 652.2 · 81.57 ms | 641.2 · 73.45 ms | −8.12 ms |
+| profiled busy | 154.80 ms | 128.77 ms | −26.03 ms |
+
+Net: **−3 153 elementwise dispatches/step/rank**, and the whole eager norm/rope/activation workload
+(21.96 ms of profiled device time) collapses into 499 native dispatches costing 2.20 ms. The
+`one_shot_ar` row falling 6.5 ms is a consequence, not a separate win: a one-shot all-reduce *spins*
+until its peer arrives, so removing work symmetrically from both ranks shortens the barrier too.
+
+The four native kernels appear in the trace exactly where the model says they should:
+`rms_norm_kernel<__half>` 343.3 calls/step, `gated_mul_kernel<__half, GeluTanhAct>` 62.8,
+`rope_kernel<__half>` 61.9, `store_kv_kernel<__half, __half>` 30.9.
+
+### D9.4 The traffic model was WRONG; the dispatch model was right
+
+The prior session's hypothesis was **7.8 GB/step of avoidable HBM traffic** from the eager RMSNorm
+decomposition. The *arithmetic* reproduces almost exactly — 36 B/element eager (`.float()`,
+`.pow(2)`, `.mean(-1)`, `+eps`, `rsqrt`, `*`, `.to(fp16)`, `*gain`) versus 4 B/element native, over
+206.5 M norm elements/step/rank = **6.6 GB/step**, or **7.6 GB** including RoPE and the gated
+activation. The *roofline attribution* does not.
+
+The largest intermediate in one eager norm is the fp32 copy of a `[256, 2816]` activation: **2.88 MB**
+— inside the 8 MB L2, far inside the 64 MB Infinity Cache. And the baseline trace measures it
+directly: `pow_tensor` moves 8 B/element over 720 896 elements in **3.09 µs = 1 867 GB/s**, which is
+**264% of the 706.6 GB/s HBM roofline**. Traffic that runs at 2.6× the HBM roofline was never in HBM.
+
+So "remove 7.6 GB of HBM traffic" was never the mechanism, and the GB figure — though correct as
+arithmetic — has no predictive value here. What the change actually removes is **3 153 dispatches per
+step per rank**, each with a fixed per-dispatch cost that dwarfs its own work at these sizes. That
+reframes both earlier negative results correctly:
+
+* the fp16→bf16 **bridge** removed launches but *added* two casts per call, and left the
+  `with_scale=False` norms, the KV store and the tanh-gelu in torch — hence +3.2%;
+* **cudagraph capture** cut the *host* launch loop 30.8 → 0.8 ms for −0.3%, because the host was
+  never the bottleneck. The **device-side** per-dispatch cost was, and a captured graph still issues
+  every one of those 5 365 dispatches — it only stops the CPU from having to ask for them.
+
+The canvas step (N=256 rows) is the *unfavourable* case for this fix: the kernels are big enough that
+per-dispatch overhead is a minority of their cost, so it buys 9.6%. AR decode (N=1 row) is the
+favourable case: every one of those ~3 100 dispatches is almost pure overhead, which is why the same
+patch is worth +70% there. **Dispatch count matters in inverse proportion to rows per step** — the
+single most useful thing this measurement establishes, and the reason "5 070 dispatches/step" was
+worth chasing on the canvas but was *undersold* as a lever for the autoregressive sibling.
+
+### D9.5 What is still elementwise, and who owns it
+
+928 torch dispatches/step survive. From the trace, the fusable chains left in the backbone are:
+
+1. `h = post_feedforward_layernorm(dense + moe); h = residual + h; return h * layer_scalar` — an
+   add, a norm, an add and a scalar multiply, 4 ops × 30 layers. One `rms_norm` variant taking a
+   second addend and an output scale would fold all four.
+2. `Gemma4Router.forward`: `RMSNormNoScale(x) * self.scale * hidden**-0.5` is **already** expressible
+   as one call — `rms_norm(x, scale * hidden**-0.5, eps, plus_one=0)` — because a weighted RMSNorm is
+   exactly "normalize, then multiply by a per-channel vector". 3 launches → 1, no new kernel, and the
+   constant folds into the weight at load time.
+3. `torch.cat([q, k, v])` in `Gemma4Attention.forward` — 2 `CatArrayBatchedCopy` per layer.
+
+All three live in `models/gemma4.py`, which another agent owns; they are recorded here rather than
+taken. Item 2 is the cheapest real win left in the backbone.
+
+### D9.6 Numerics
+
+Not bit-identical to the torch fallback, and strictly closer to the fp32 reference. The eager path
+rounds *mid-chain* — `normed = (xf * rsqrt(var+eps)).to(fp16)` and only then multiplies by
+`(weight + 1)`. The kernel carries fp32 through the gain and rounds once, at the store. Parity vs the
+fp32 reference rounded to fp16: `max|Δ| ≤ 2.0e-3` across bf16 and fp16 at every shape in
+`tail/tests/test_tail.py`, `store_kv` bit-exact, e4m3 saturation unchanged. This is the same
+convention every bf16 model in this repo has been served under since the tail kernels landed.

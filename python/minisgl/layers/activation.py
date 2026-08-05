@@ -52,8 +52,15 @@ def gelu_tanh_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     # never crashes and never trips a shape/dtype check; it just quietly shifts every expert output.
     # Hence a SEPARATE entry point rather than a keyword on gelu_and_mul: a caller that means "tanh"
     # must not be able to land on the erf path by defaulting.
-    # No native fast path exists because the baked `tail_hip` gelu kernel is erf-only — see the
-    # KERNEL_CORE_POLICY follow-up recorded in minisgl/quant/kernels.py::w4a8_moe.
+    # The native kernel is the SAME gated-mul core as silu/erf-gelu with a different activation
+    # policy (KERNEL_CORE_POLICY: a new activation is a policy on the shared core, not a new
+    # kernel). `is not None` because an older baked .so predates the op.
+    if _tail_hip.active(x) and _tail_hip.gelu_tanh_and_mul is not None:
+        result = _tail_hip.gelu_tanh_and_mul(x.contiguous())
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
     return _gated(x, lambda t: F.gelu(t, approximate="tanh"), out)
 
 
