@@ -43,6 +43,7 @@ from minisgl.utils import div_even, init_logger, nvtx_annotate
 
 from .base import BaseLLMModel
 from .utils import GatedMLP as Qwen3MLP
+from .utils import mlp_accepts_producer_actquant, norm_then_mlp
 
 logger = init_logger(__name__)
 
@@ -324,6 +325,9 @@ class Qwen3_5DecoderLayer(BaseOP):
             size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True
         )
         self._layer_id = layer_id
+        # Decided ONCE: the MLP's quant scheme and EP topology are fixed at load, so whether the
+        # post-attention norm should also emit the e4m3 activation form cannot change per step.
+        self._fuse_actquant = mlp_accepts_producer_actquant(self.mlp)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(
@@ -333,8 +337,11 @@ class Qwen3_5DecoderLayer(BaseOP):
         x, residual = self.input_layernorm.forward(x, residual)
         mixer = "gdn" if type(self._attn_op).__name__ == "GDNLinearAttn" else "attn"
         x = _lp_timed(mixer, self._attn_op.forward, x)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = _lp_timed("ffn", self.mlp.forward, x)
+        x, residual = norm_then_mlp(
+            self.post_attention_layernorm, self.mlp, x, residual,
+            fuse_actquant=self._fuse_actquant,
+            time_mlp=lambda fn, h: _lp_timed("ffn", fn, h),
+        )
         return x, residual
 
 
@@ -641,6 +648,9 @@ class Qwen3_5MTPHead(BaseOP):
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.norm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
+        # Same construction-time decision as the backbone decoder layer. The MTP block is built with
+        # force_no_ep=True, so it can never be the EP case that refuses the pair.
+        self._fuse_actquant = mlp_accepts_producer_actquant(self.mlp)
         # Tied to the TARGET embed + lm_head (hidden, not loaded/saved as MTP weights).
         self._embed = embed
         self._lm_head = lm_head
@@ -658,8 +668,8 @@ class Qwen3_5MTPHead(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft(x, positions, cache, step)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
+                                    fuse_actquant=self._fuse_actquant)
         hidden = x + residual
         normed = self.norm.forward(hidden, None)[0]
         # Full-vocab logits via the (tied) lm_head's TP all_gather — identical on every rank.
@@ -679,8 +689,8 @@ class Qwen3_5MTPHead(BaseOP):
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft_masked(
             x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
+                                    fuse_actquant=self._fuse_actquant)
         hidden = x + residual
         normed = self.norm.forward(hidden, None)[0]
         logits = self._lm_head.logits_all_rows(normed)

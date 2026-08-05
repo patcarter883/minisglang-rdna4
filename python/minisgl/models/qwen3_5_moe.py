@@ -84,7 +84,22 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         self.shared_expert = Qwen3_5MoeSharedExpert(config)
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 
-    def _fused_partial(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def accepts_producer_actquant(self) -> bool:
+        """Can this block consume the feeding RMSNorm's (x_fp8, act_scales) pair?
+
+        Only the ROUTED experts are quantized in this architecture — the router gate, the shared-
+        expert gate and the whole shared expert are in the checkpoint's ignore list and stay bf16 —
+        so exactly ONE consumer per layer can use the pair, not the two or three a dense block would
+        offer. Under EP the pair cannot be used at all (MoELayer refuses it: the all_gather reorders
+        rows). Asked rather than assumed so the decoder layer never builds a pair nobody will take:
+        the producer's quant epilogue is not free, and paying for it with no consumer is a net loss.
+        """
+        e = self.experts
+        return bool(getattr(e._moe_method, "supports_producer_actquant", False)) and not e.enable_ep
+
+    def _fused_partial(self, hidden_states: torch.Tensor,
+                       x_fp8: torch.Tensor | None = None,
+                       act_scales: torch.Tensor | None = None) -> torch.Tensor:
         """Fused shared+routed row-parallel PARTIAL (no all_reduce) over `hidden_states` rows. Both
         down-projections are row-parallel, so each rank holds a partial; the caller reduces once
         (sum_r(routed_r + shared_r) == routed_full + shared_full). Row-independent -> safe to call over
@@ -96,15 +111,25 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
         router_logits = self.gate.forward(hidden_states)
         routed_out = experts.forward(
-            hidden_states=hidden_states, router_logits=router_logits, reduce=False
+            hidden_states=hidden_states, router_logits=router_logits, reduce=False,
+            x_fp8=x_fp8, act_scales=act_scales,
         )
         return routed_out + shared_out
 
     @nvtx_annotate("MoE")
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                x_fp8: torch.Tensor | None = None,
+                act_scales: torch.Tensor | None = None) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         experts = self.experts
+        # `hidden_states` was just .view()'d to 2D, which is the shape the pair already describes
+        # (the producer ran on the same (T,H) rows). If a caller ever reshapes rather than views,
+        # this catches it instead of letting the pair describe a different tensor.
+        if x_fp8 is not None and x_fp8.shape[0] != hidden_states.shape[0]:
+            raise AssertionError(
+                f"producer pair has {x_fp8.shape[0]} rows, hidden_states has {hidden_states.shape[0]}"
+            )
         # Fuse the shared + routed TP all-reduces into ONE. Both down-projections are row-parallel, so
         # each rank holds a partial; summing the two partials locally and reducing once is exact
         # (sum_r(routed_r + shared_r) == routed_full + shared_full). Saves one all_reduce/layer — 40
@@ -124,7 +149,10 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         # into ONE collective and so has no second independent branch to hide it behind, which means a
         # row split is the only overlap available here — hence: opt in, knowing the trade.
         if fuse:
-            combined = rowchunked_ar_span(experts._comm, hidden_states, self._fused_partial)
+            combined = rowchunked_ar_span(
+                experts._comm, hidden_states, self._fused_partial,
+                row_aligned=(x_fp8, act_scales),
+            )
             return combined.view(num_tokens, hidden_dim)
         # "shared" sub-bucket of the layer-prof "ffn" total (MINISGL_LAYER_PROF). Summed over all
         # layers, reported per-step -> direct per-step shared-expert cost (Task B #18 attribution).
@@ -136,7 +164,8 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         shared_out = torch.sigmoid(self.shared_expert_gate.forward(hidden_states)) * shared_out
         router_logits = self.gate.forward(hidden_states)
         routed_out = experts.forward(
-            hidden_states=hidden_states, router_logits=router_logits, reduce=not fuse
+            hidden_states=hidden_states, router_logits=router_logits, reduce=not fuse,
+            x_fp8=x_fp8, act_scales=act_scales,
         )
         combined = routed_out + shared_out
         if fuse:

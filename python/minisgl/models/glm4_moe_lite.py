@@ -49,7 +49,7 @@ from minisgl.quant import create_linear_method, kernels
 from minisgl.utils import div_even, nvtx_annotate
 
 from .base import BaseLLMModel
-from .utils import GatedMLP
+from .utils import GatedMLP, mlp_accepts_producer_actquant, norm_then_mlp
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -285,13 +285,32 @@ class GLMSparseBlock(BaseOP):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights.float().contiguous(), topk_ids.int().contiguous()
 
+    def accepts_producer_actquant(self) -> bool:
+        """Can this block consume the feeding RMSNorm's (x_fp8, act_scales) pair?
+
+        GLM differs from Qwen3.5-MoE here: real AWQ GLM-4.7-Flash checkpoints quantize the SHARED
+        expert alongside the routed ones, so in principle one producer could feed two consumers.
+        Only the routed-expert GEMM1 is wired today — the shared expert is a dense `LinearTP` and
+        the dense linear layers do not take the pair yet (`LinearMethod.apply` has no parameter for
+        it). That second consumer is the obvious follow-up and it is free once the dense seam exists.
+        """
+        e = self.experts
+        return bool(getattr(e._moe_method, "supports_producer_actquant", False)) and not e.enable_ep
+
     @nvtx_annotate("MoE")
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                x_fp8: torch.Tensor | None = None,
+                act_scales: torch.Tensor | None = None) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if x_fp8 is not None and x_fp8.shape[0] != hidden_states.shape[0]:
+            raise AssertionError(
+                f"producer pair has {x_fp8.shape[0]} rows, hidden_states has {hidden_states.shape[0]}"
+            )
         topk_weights, topk_ids = self._noaux_tc(self.gate.forward(hidden_states))
         routed = self.experts.forward(
-            hidden_states, topk_weights=topk_weights, topk_ids=topk_ids
+            hidden_states, topk_weights=topk_weights, topk_ids=topk_ids,
+            x_fp8=x_fp8, act_scales=act_scales,
         )
         shared = self.shared_experts.forward(hidden_states)
         return (routed + shared).view(num_tokens, hidden_dim)
@@ -310,6 +329,8 @@ class GLMDecoderLayer(BaseOP):
             size=config.hidden_size, eps=config.rms_norm_eps
         )
         self._layer_id = layer_id
+        # Decided ONCE at construction: quant scheme and EP topology are fixed at load.
+        self._fuse_actquant = mlp_accepts_producer_actquant(self.mlp)
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(
@@ -317,8 +338,8 @@ class GLMDecoderLayer(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
+                                    fuse_actquant=self._fuse_actquant)
         return x, residual
 
 
@@ -545,6 +566,7 @@ class GLMMTPHead(BaseOP):
         )
         self.shared_head = GLMMTPSharedHead(config)
         self._layer_id = layer_id
+        self._fuse_actquant = mlp_accepts_producer_actquant(self.mlp)
         self.hidden_size = config.hidden_size  # for the buffered-propose seed buffer alloc (spec/mtp.py)
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -565,8 +587,8 @@ class GLMMTPHead(BaseOP):
         # post_attention_layernorm(residual) -> mlp(residual). The fused vector is the layer input.
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft(x, positions, cache, step)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
+                                    fuse_actquant=self._fuse_actquant)
         hidden = x + residual  # residual stream after the layer
         logits = self.shared_head.forward(hidden)
         return logits, hidden
@@ -603,8 +625,8 @@ class GLMMTPHead(BaseOP):
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft_masked(
             x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
-        x = self.mlp.forward(x)
+        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
+                                    fuse_actquant=self._fuse_actquant)
         hidden = x + residual
         logits = self.shared_head.forward(hidden)
         return logits, hidden

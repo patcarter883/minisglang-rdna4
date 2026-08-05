@@ -1,0 +1,65 @@
+# ANALYSIS (appended by hand; the raw run is below)
+#
+# BAND: DECODE. model=Qwen3.6-35B-A3B-AWQ-4bit TP=2, 40 MoE layers, MTP spec K=4, CONC=6,
+# --num-pages 2048 pinned, kernel package IDENTICAL in both legs. Provenance asserted BOTH ways
+# (new engaged `gemm1_silu(gemv+prequant)`, base did not).
+#
+#  bs   base med   new med   delta     base range        new range        ranges
+#   1     40.45     40.97    +1.29%    [39.76,40.71]    [40.18,41.13]    OVERLAP
+#   5     99.68     98.65    -1.03%    [98.71,100.76]   [98.47,100.07]   OVERLAP
+#   6    112.83    115.47    +2.34%    [111.39,115.54]  [114.18,115.74]  OVERLAP
+#
+# VERDICT: INSIDE NOISE at every decode point. Ranges overlap everywhere and the sign is not even
+# consistent across bs. This is NOT a null that contradicts the mechanism -- it is the size the
+# mechanism predicts:
+#
+#   dispatches removed / step = 40 backbone MoE blocks + 4 MTP draft steps = 44
+#   44 x 3.1 us (recorded served launch cost at M=1) = 0.136 ms
+#   bs=1 step is 24.72 ms  ->  predicted 0.55%    (bs=5: 0.27%, bs=6: 0.26%)
+#
+# 0.55% is below what a 3-rep serve A/B can resolve. So the honest statement is: the fusion removes
+# exactly the work it claims to remove, bit-exactly, and that work is ~0.5% of a decode step.
+#
+# CORRECTION to the framing this task was briefed with: "1 of 7 decode dispatches (~14%)" is 14% of
+# the MoE expert-compute dispatch COUNT, not 14% of step time. Dispatch count and step time are not
+# interchangeable -- the removed kernel is one of the cheapest in the step.
+#
+# M=30 was in the brief and is NOT measured because it is UNREACHABLE: --max-running-requests is 6
+# on the 35B at TP=2 on 16 GB cards, so decode M can never exceed 6 on this model/box.
+#
+MoE producer act-quant serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile  toks=256 reps=3
+kernel package (CONSTANT across legs): _kern/fp8_wmma
+
+########## LEG base  (/home/pat/code/minisgl-rdna4-moeactq-base @ 0a73de1c) ##########
+  engaged gemm1 arms: fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv) 
+  PROVENANCE OK: no +prequant on base
+  --- bs=1 ---
+    rep1 bs=1 tokens=100 decode_tok_s=39.76 wall=2.54s
+    rep2 bs=1 tokens=106 decode_tok_s=40.45 wall=2.64s
+    rep3 bs=1 tokens=104 decode_tok_s=40.71 wall=2.58s
+  --- bs=5 ---
+    rep1 bs=5 tokens=515 decode_tok_s=100.76 wall=5.13s
+    rep2 bs=5 tokens=527 decode_tok_s=98.71 wall=5.36s
+    rep3 bs=5 tokens=520 decode_tok_s=99.68 wall=5.23s
+  --- bs=6 ---
+    rep1 bs=6 tokens=604 decode_tok_s=112.83 wall=5.38s
+    rep2 bs=6 tokens=637 decode_tok_s=115.54 wall=5.53s
+    rep3 bs=6 tokens=603 decode_tok_s=111.39 wall=5.44s
+
+########## LEG new  (/home/pat/code/minisgl-rdna4-moeactq @ 0a73de1c) ##########
+  engaged gemm1 arms: fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv+prequant) 
+  PROVENANCE OK: +prequant present
+  --- bs=1 ---
+    rep1 bs=1 tokens=102 decode_tok_s=40.18 wall=2.56s
+    rep2 bs=1 tokens=105 decode_tok_s=40.97 wall=2.59s
+    rep3 bs=1 tokens=107 decode_tok_s=41.13 wall=2.62s
+  --- bs=5 ---
+    rep1 bs=5 tokens=512 decode_tok_s=98.47 wall=5.22s
+    rep2 bs=5 tokens=528 decode_tok_s=100.07 wall=5.30s
+    rep3 bs=5 tokens=505 decode_tok_s=98.65 wall=5.14s
+  --- bs=6 ---
+    rep1 bs=6 tokens=594 decode_tok_s=115.47 wall=5.16s
+    rep2 bs=6 tokens=630 decode_tok_s=115.74 wall=5.56s
+    rep3 bs=6 tokens=613 decode_tok_s=114.18 wall=5.39s
+
+=== done (provenance asserted) ===
