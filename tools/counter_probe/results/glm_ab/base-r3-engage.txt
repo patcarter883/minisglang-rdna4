@@ -1,0 +1,12 @@
+fp8_wmma.mmq_fp8_gemm(decode_gemv)
+fp8_wmma.mmq_fp8_gemm_silu(int4)
+fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv+prequant)
+fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce
+fp8_wmma.mmq_fp8_moe_gemm_scatter
+mla_hip.mla_decode_fp8
+moe_hip.moe_align
+moe_hip.moe_topk_sigmoid_bias
+tail_hip.rms_norm
+tail_hip.rms_norm_add
+tail_hip.rms_norm_add_quant
+tail_hip.silu_and_mul

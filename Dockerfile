@@ -145,6 +145,13 @@ RUN . /opt/venv/bin/activate && python /opt/fetch_att_decoder.py /opt/rocprof-de
 
 ENV KERNCAP_DEPS=/opt/rocprof-deps \
     ATT_DECODER_DIR=/opt/rocprof-decoder
+# NOTE for anyone profiling an image built from THIS Dockerfile: /opt/rocprof-deps holds the only
+# libdw.so.1 / libelf.so.1 in the image and nothing puts it on the loader path, so a plain
+# `rocprofv3 -- ...` dies at exec with "libdw.so.1: cannot open shared object file" and the harness
+# reports only boot_ok=0 with no clue. Setting LD_LIBRARY_PATH=/opt/rocprof-deps globally is NOT the
+# fix — it shadows torch's own libs and aborts an unrelated dlopen during import (SIGABRT inside
+# PyImport_ImportModuleLevelObject; measured 2026-08-06). Profile with an image that already has it
+# resolved, or scope the variable to the rocprofv3 exec only.
 
 # ---- AMD uProf 5.3.521: the CPU profiler -------------------------------------------------------
 # WHY: this stack keeps turning out to be HOST-bound rather than GPU-bound (35B MoE decode is
