@@ -453,6 +453,8 @@ def w4a8_moe(
     block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
     weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
     activation: str = "silu",  # gated activation on the gemm1 [gate|up] output: "silu" | "gelu"
+    x_fp8: torch.Tensor | None = None,  # PRODUCER-quantized activations — see below
+    act_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> gated activation
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
@@ -462,6 +464,17 @@ def w4a8_moe(
     `activation` picks the gated activation: "silu" (default, and the only one with a fused gemm1
     epilogue) or "gelu" == HF `gelu_pytorch_tanh` (Gemma4's routed experts), which forces the
     unfused gemm1 path below.
+    PRODUCER-SIDE ACTIVATION QUANT. `x_fp8`/`act_scales` are the (M,K) e4m3 bits + (M,) f32 per-row
+    scale returned by `tail_hip.rms_norm_quant` / `rms_norm_add_quant` — the post-attention RMSNorm
+    feeding this sparse block, which already held the rows in registers. Supplying them deletes
+    GEMM1's `moe_compute_act_fp8_kernel` dispatch and its (M,K) activation re-read, BIT-IDENTICALLY
+    (verified max|Δ|=0 at M=1/5/6/30 across int4-sym/int4-asym/e2m1 and every gemm1 arm).
+
+    Only GEMM1 can take it, and that is structural, not an oversight: GEMM2's input is the (P,inter)
+    post-activation buffer written by GEMM1's epilogue, so no norm ever holds those rows. One
+    producer therefore removes exactly ONE dispatch per MoE layer per step — this is a LAUNCH-COUNT
+    win, and it is worth having only because decode at bs=1 is gap-bound, not bandwidth-bound.
+
     NOTE: imports vLLM's moe_align_block_size from the image (a small util) — port to a
     torch/Triton implementation later (PERF_NOTES)."""
     import torch.nn.functional as F
@@ -516,6 +529,18 @@ def w4a8_moe(
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their
     # NATIVE dtype — a bf16 model no longer round-trips bf16->fp16->bf16 here (out1 follows x's dtype).
     x16 = _moe_time("cast", lambda: x.contiguous())
+    # The producer pair describes `x` AS GIVEN. If `.contiguous()` had to copy, or if a caller ever
+    # reshapes x here, the pair would silently describe a different tensor — so tie them together
+    # loudly rather than trusting the invariant to hold forever.
+    if x_fp8 is not None:
+        assert act_scales is not None, "w4a8_moe: x_fp8 and act_scales must be supplied together"
+        assert x_fp8.shape == (M, K) and act_scales.shape == (M,), (
+            f"w4a8_moe: producer pair must be (M,K)=({M},{K}) and (M,)=({M},); "
+            f"got {tuple(x_fp8.shape)} and {tuple(act_scales.shape)}"
+        )
+    elif act_scales is not None:
+        raise AssertionError("w4a8_moe: act_scales given without x_fp8")
+    _pq = "+prequant" if x_fp8 is not None else ""
     # Gated gemm1 + activation. FUSED path (default): one kernel writes silu(gate)*up -> (P, inter),
     # dropping the separate silu launch and the (P, 2*inter) out1 round-trip. The gemm1-epilogue fusion
     # is now available at DECODE too via the moe_gemv_decode_silu kernel (kernel="gemv"), not just the
@@ -542,30 +567,33 @@ def w4a8_moe(
         _flag1 = _MOE_FLAG and block_m in (64, 128) and \
             (w13.shape[-1] * 8) // w13_scales.shape[-1] in (32, 64, 128)
         if _flag1:
-            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}")
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}{_pq}")
             buf2 = _moe_time(
                 "gemm1silu",
                 lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu_flag(
                     x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                     w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+                    x_fp8=x_fp8, act_scales=act_scales,
                 ),
             )  # (P, inter) in x's dtype
         else:
-            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1})")
+            engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu({gemm1_kernel}{_e2m1}{_pq})")
             buf2 = _moe_time(
                 "gemm1silu",
                 lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
                     x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                     kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+                    x_fp8=x_fp8, act_scales=act_scales,
                 ),
             )  # (P, inter) in x's dtype
     else:
-        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1})")
+        engaged(f"fp8_wmma.mmq_fp8_moe_gemm({gemm1_kernel}{_e2m1}{_pq})")
         out1 = _moe_time(
             "gemm1",
             lambda: fp8_wmma.mmq_fp8_moe_gemm(
                 x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
                 kernel=gemm1_kernel, w_zeros=w13_zeros, weight_is_e2m1=weight_is_e2m1,
+                x_fp8=x_fp8, act_scales=act_scales,
             ),
         )  # (P, 2*inter) in x's dtype
         d = out1.shape[1] // 2

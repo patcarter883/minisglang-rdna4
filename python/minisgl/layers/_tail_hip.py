@@ -46,6 +46,17 @@ if ENABLED:
     _rms_norm = tail_hip.rms_norm
     _rms_norm_add = tail_hip.rms_norm_add
     _rope = tail_hip.rope
+    # PRODUCER-SIDE act-quant twins. OPTIONAL for the same reason gelu_and_mul is: an older baked
+    # .so predates them and a hard attribute lookup would crash the import for every model.
+    #
+    # These being ABSENT here is what made the producer fusion a silent no-op for its whole life:
+    # norm.py gates on `hasattr(_tail_hip, "rms_norm_quant")`, and this module re-exports a FIXED op
+    # list, so the attribute was missing even on an image whose tail_hip had the op. `forward_quant`
+    # then returned a None pair on every call, every consumer re-quantized exactly as before, and
+    # nothing anywhere said so — the only tell was the absence of `+prequant` in the engage ledger.
+    # That is precisely the failure mode this file's own docstring already warns about for fp16.
+    _rms_norm_quant = getattr(tail_hip, "rms_norm_quant", None)
+    _rms_norm_add_quant = getattr(tail_hip, "rms_norm_add_quant", None)
 
     def silu_and_mul(*args, **kwargs):
         _engaged("tail_hip.silu_and_mul")
@@ -62,6 +73,16 @@ if ENABLED:
     def rope(*args, **kwargs):
         _engaged("tail_hip.rope")
         return _rope(*args, **kwargs)
+
+    if _rms_norm_quant is not None:
+        def rms_norm_quant(*args, **kwargs):
+            _engaged("tail_hip.rms_norm_quant")
+            return _rms_norm_quant(*args, **kwargs)
+
+    if _rms_norm_add_quant is not None:
+        def rms_norm_add_quant(*args, **kwargs):
+            _engaged("tail_hip.rms_norm_add_quant")
+            return _rms_norm_add_quant(*args, **kwargs)
 
     if _gelu_and_mul is not None:
         def gelu_and_mul(*args, **kwargs):

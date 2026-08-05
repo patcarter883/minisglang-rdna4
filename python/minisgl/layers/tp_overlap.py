@@ -322,9 +322,10 @@ class ar_span:
 def rowchunked_ar_span(
     comm: "DistributedCommunicator",
     x: torch.Tensor,
-    produce: Callable[[torch.Tensor], torch.Tensor],
+    produce: Callable[..., torch.Tensor],
     *,
     num_chunks: int | None = None,
+    row_aligned: "tuple[torch.Tensor | None, ...] | None" = None,
 ) -> torch.Tensor:
     """Run a ROW-INDEPENDENT producer over disjoint row chunks, reducing chunk i while computing i+1.
 
@@ -348,15 +349,29 @@ def rowchunked_ar_span(
     post-attention-all_reduce), so they chunk the same way and submit the same collectives in the same
     order.
 
+    `row_aligned` is a tuple of tensors whose dim-0 is THE SAME ROW AXIS as `x` -- e.g. the producer-
+    side act-quant pair (x_fp8 (n,K), act_scales (n,)) -- and which must therefore be sliced by the
+    SAME bounds and handed to `produce` alongside the row chunk: `produce(x_chunk, *aligned_chunks)`.
+    A `None` entry passes through as `None` (unsliced), so a caller with no pair needs no branch.
+    This exists because slicing `x` while passing the pair whole would scale every token by another
+    token's amax -- wrong numbers, right shapes, no error. Making the alignment the primitive's job
+    is what keeps that impossible to get wrong at a call site.
+
     Falls back to the plain `produce(x)` + one all_reduce when overlap is off, under capture, below the
     token threshold, or at num_chunks == 1 -- so callers need no gate of their own."""
+    aligned = tuple(row_aligned or ())
+    for t in aligned:
+        if t is not None and t.shape[0] != x.shape[0]:
+            raise AssertionError(
+                f"rowchunked_ar_span: row_aligned entry has {t.shape[0]} rows, x has {x.shape[0]}"
+            )
     n = x.shape[0]
     k = tp_overlap_chunks() if num_chunks is None else num_chunks
     # Clamp so no chunk drops below the producer's kernel-arm crossover. A chunk that crosses would
     # make the split lossy, and it is not the caller's job to know where the crossovers are.
     k = min(k, max(1, n // _MIN_CHUNK_ROWS))
     if k <= 1 or not _overlappable(x) or n < k:
-        return comm.all_reduce(produce(x))
+        return comm.all_reduce(produce(x, *aligned))
 
     bounds = [(n * i) // k for i in range(k + 1)]
     parts: List[AsyncAllReduce] = []
@@ -366,5 +381,6 @@ def rowchunked_ar_span(
             # produce() runs on the MAIN stream; the PREVIOUS chunk's collective is on the side stream
             # and overlaps it. The last chunk's collective has nothing after it and stays exposed --
             # that is the (k-1)/k ceiling on what this can hide.
-            parts.append(span.all_reduce(produce(x[lo:hi])))
+            sl = tuple(None if t is None else t[lo:hi] for t in aligned)
+            parts.append(span.all_reduce(produce(x[lo:hi], *sl)))
     return torch.cat([p.wait() for p in parts], dim=0)

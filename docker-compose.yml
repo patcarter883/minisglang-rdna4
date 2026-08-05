@@ -47,7 +47,9 @@ x-lean-common: &lean-common
     # /opt/kernels (canonical HIP kernels, baked into the image) FIRST so nothing under /engine can
     # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
     # moe_bf16 / rxf, still vendored here until ported upstream).
-    PYTHONPATH: /opt/kernels:/engine/python:/engine
+    # PARAMETERIZED so an A/B can put a freshly-built kernel package AHEAD of the baked
+    # /opt/kernels without rebuilding the image. Default is byte-identical to the old value.
+    PYTHONPATH: "${MINISGL_PYTHONPATH:-/opt/kernels:/engine/python:/engine}"
     HF_HUB_OFFLINE: "0"
     TORCH_BLAS_PREFER_HIPBLASLT: "0"
     # Fragmentation guard: on the 16 GB cards a full-model + graph-capture footprint (e.g. the 35B

@@ -434,6 +434,12 @@ class MoEQuantMethod:
 
     supports_ep: bool = False  # can this scheme run the EP all_gather/mask/all_reduce shard path?
     needs_precomputed_route: bool = False  # True -> forward MUST be handed topk_weights/topk_ids
+    # Can GEMM1 consume the PRODUCER's (x_fp8, act_scales) pair from the feeding RMSNorm?
+    # This is opt-IN and checked at the call site rather than letting every scheme silently accept
+    # and drop the pair: a dropped pair reads as "producer fusion is free" while the pre-kernel
+    # quietly still ran, which is precisely the shape of A/B lie this repo has killed five of.
+    # False here means the sparse block does not even build the pair, so nothing is wasted either.
+    supports_producer_actquant: bool = False
 
     def create_experts(self, num_experts: int, out_features: int, in_features: int):
         """Allocate the per-expert weight container for ONE GEMM (STACKED over `num_experts` on
@@ -444,8 +450,15 @@ class MoEQuantMethod:
     def apply(
         self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
         top_k: int, renormalize: bool, activation: str, apply_router_weight_on_input: bool,
+        x_fp8=None, act_scales=None,
     ) -> "torch.Tensor":
-        """Plain (non-EP) forward over the full replicated expert stack."""
+        """Plain (non-EP) forward over the full replicated expert stack.
+
+        `x_fp8`/`act_scales`: the PRODUCER-quantized activation pair from the RMSNorm feeding this
+        sparse block (tail_hip `rms_norm_quant`). A scheme that cannot use it must IGNORE it, never
+        assert on it — but a scheme that can use it must actually pass it down, because a silently
+        dropped pair reads as "producer fusion is free" while the pre-kernel quietly still ran.
+        """
         raise NotImplementedError
 
     def ep_local(
@@ -483,7 +496,8 @@ class _UnquantizedMoEMethod(MoEQuantMethod):
         return torch.empty(num_experts, out_features, in_features)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         if topk_ids is not None:
             # Route computed in the model (Zaya top-1 + MOD, GLM noaux_tc). The moe_backend fuses
             # softmax+topk internally so it can't take a precomputed route — call the stacked kernel.
@@ -508,6 +522,7 @@ class _W4A8MoEMethod(MoEQuantMethod):
     CHECKPOINT layout (the container's post_load converts each to the op's grouped triple)."""
 
     supports_ep = True
+    supports_producer_actquant = True
 
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
@@ -524,11 +539,17 @@ class _W4A8MoEMethod(MoEQuantMethod):
         return self._cls(num_experts, out_features, in_features, self._quant)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         _check_activation("W4A8", activation)
         assert not apply_router_weight_on_input, "MoE W4A8 path has no router-weight-on-input"
         if getattr(w13, "_w_rep", None) is not None:
             self._reject_w4a16_activation(activation)
+            # NOTE the producer pair is deliberately NOT forwarded here. `kernels.w4a16_moe` is a
+            # FP16-ACTIVATION path -- it never quantizes activations at all -- so there is no
+            # act-quant dispatch to delete and nothing the e4m3 rows could be handed to. Dropping
+            # the pair is correct, and it is visible: the engage ledger prints `w4a16_moe` with no
+            # `+prequant`, so an A/B cannot mistake this branch for a fused one.
             # W4A16 (fp16-act) path: int4 weights repacked to register-direct _w_rep in post_load;
             # scales/zeros stay op-layout (w4a16_moe consumes _scales_op/_zeros_op directly, see its
             # (E,2*inter,K//g) / (E,(2*inter)//8,K//g) signature). AWQ/GPTQ int4 is asymmetric -> pass
@@ -546,7 +567,7 @@ class _W4A8MoEMethod(MoEQuantMethod):
             hidden_states, w13._w_op, w13._scales_op, w13._zeros_op,
             w2._w_op, w2._scales_op, w2._zeros_op,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            activation=activation,
+            activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
 
     @staticmethod
@@ -591,6 +612,7 @@ class _MxFp4MoEMethod(MoEQuantMethod):
     every expert buffer; a shard is a pure dim-0 slice)."""
 
     supports_ep = True
+    supports_producer_actquant = True
 
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
@@ -599,7 +621,8 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         return _GroupedMxFp4Experts(num_experts, out_features, in_features, self._quant)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         _check_activation("MXFP4", activation)
         assert not apply_router_weight_on_input, "MoE MXFP4 path has no router-weight-on-input"
         if getattr(w13, "_w_rep", None) is not None:
@@ -619,7 +642,7 @@ class _MxFp4MoEMethod(MoEQuantMethod):
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            weight_is_e2m1=True, activation=activation,
+            weight_is_e2m1=True, activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
@@ -649,6 +672,8 @@ class _NvFp4MoEMethod(MoEQuantMethod):
     `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE hands raw router_logits, which w4a8_moe routes
     internally (topk_ids None). EP-capable like the other e2m1 experts (E on dim 0)."""
 
+    supports_producer_actquant = True
+
     supports_ep = True
 
     def __init__(self, quant: "QuantConfig"):
@@ -658,14 +683,15 @@ class _NvFp4MoEMethod(MoEQuantMethod):
         return _GroupedNvFp4Experts(num_experts, out_features, in_features, self._quant)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         _check_activation("NVFP4", activation)
         assert not apply_router_weight_on_input, "MoE NVFP4 path has no router-weight-on-input"
         return kernels.w4a8_moe(
             hidden_states, w13._w_op, w13._scales_op, None,
             w2._w_op, w2._scales_op, None,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            weight_is_e2m1=True, activation=activation,
+            weight_is_e2m1=True, activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
 
     def ep_local(self, w13, w2, g_hidden, local_weights, local_ids, *, top_k, renormalize,
@@ -692,7 +718,8 @@ class _RXFMoEMethod(MoEQuantMethod):
         return _GroupedRXFExperts(num_experts, out_features, in_features, self._quant)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         # Still silu-ONLY, deliberately: both `kernels.rxf_moe` and `rxf_moe_regdirect` hard-code
         # silu_and_mul on their tail, and no RXF checkpoint we serve declares a gelu. Rejecting is the
         # point — the alternative is a gelu model quietly getting silu experts. Adding gelu here is
@@ -742,7 +769,8 @@ class _FP8MoEMethod(MoEQuantMethod):
         return _GroupedFP8Experts(num_experts, out_features, in_features)
 
     def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input):
+              top_k, renormalize, activation, apply_router_weight_on_input,
+              x_fp8=None, act_scales=None):
         assert topk_ids is not None, "fp8 experts use the precomputed-route path (ZAYA top-1 + MOD)"
         if self._w8a16_fn is not None:
             # W8A16 opt-in: dequant the fp8 weight tile to bf16 IN-REGISTER (no full-stack
@@ -1009,6 +1037,8 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
         reduce: bool = True,
+        x_fp8: torch.Tensor | None = None,
+        act_scales: torch.Tensor | None = None,
     ):
         # Either pass raw `router_logits` (fused softmax+topk inside the kernel) OR a precomputed
         # `topk_weights`/`topk_ids` route (GLM/DeepSeek noaux_tc, ZAYA top-1 computed in the model).
@@ -1016,6 +1046,24 @@ class MoELayer(BaseOP):
         # owns routing + the EP dispatch/combine + the TP all-reduce.
         method = self._moe_method
         w13, w2 = self.gate_up_proj, self.down_proj
+        # PRODUCER-SIDE act quant: the pair describes `hidden_states` ROW FOR ROW. Under EP the rows
+        # are all_gather'd and re-ordered before the local kernel sees them (see _ep_dispatch), so a
+        # pair that was not gathered alongside them would be silently mismatched -- every token would
+        # be scaled by another token's amax. That is a wrong-numbers bug with no crash, so refuse it
+        # here rather than dropping it quietly. Packing the pair INTO the byte-packed gather is the
+        # real fix and is tractable (it is +K bytes and +4 bytes per row on an existing cat), but it
+        # is unmeasured, so the call sites simply do not build a pair when EP is on.
+        if x_fp8 is not None and self.enable_ep:
+            raise NotImplementedError(
+                "MoE producer-side act-quant is not wired through the EP all_gather: the gather "
+                "re-orders rows, so (x_fp8, act_scales) must be packed into it or not supplied. "
+                "Pass x_fp8=None when enable_ep is set."
+            )
+        if x_fp8 is not None and not method.supports_producer_actquant:
+            raise NotImplementedError(
+                f"{type(method).__name__} cannot consume a producer-quantized activation pair; "
+                "passing one would silently drop it and make an A/B read as if fusion applied."
+            )
         if self.enable_ep:
             # Expert-parallel dispatch/combine (only schemes with method.supports_ep reach here). EP
             # can't defer routing to the kernel (it must all_gather a route), so precompute topk here —
@@ -1042,6 +1090,7 @@ class MoELayer(BaseOP):
                 top_k=self.top_k, renormalize=self.renormalize,
                 activation=self.activation,
                 apply_router_weight_on_input=self.apply_router_weight_on_input,
+                x_fp8=x_fp8, act_scales=act_scales,
             )
         # EP already all_reduce'd over the dp/EP group (which subsumes any per-replica TP reduce —
         # ZAYA is tp_size=1 anyway), so skip the TP epilogue when the EP path ran. reduce=False also
