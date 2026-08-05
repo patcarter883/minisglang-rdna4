@@ -236,10 +236,10 @@ def load(path, moe, paths=()):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dense", default="tools/_fixtures/dense_tile_surface.csv")
+    ap.add_argument("--dense", default="tools/_fixtures/dense_tile_surface_card0.csv")
     ap.add_argument("--dense-extra", default="", help="comma list of extra dense surface CSVs "
                     "(the widened g=128 column and the WARPS_N re-sweep are separate files)")
-    ap.add_argument("--moe", default="tools/_fixtures/moe_tile_surface.csv")
+    ap.add_argument("--moe", default="tools/_fixtures/moe_tile_surface_card0.csv")
     ap.add_argument("--cu", type=int, default=64)
     args = ap.parse_args()
 
