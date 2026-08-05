@@ -18,6 +18,10 @@ _STORE_KV = None
 # numbers, no error. So the schema is probed once here and checked at pool construction, where it
 # can fail loudly at boot instead of quietly at token 1.
 _STORE_KV_PER_HEAD = False
+# Activation dtypes the templated kernel instantiates (TAIL_DISPATCH_FLOAT in tail_kernels.hip). The
+# CACHE dtype is dispatched independently inside the kernel (bf16/fp16/fp8_e4m3), so an fp16 model
+# with an fp8 KV pool is one launch, same as a bf16 one.
+_STORE_KV_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 if os.environ.get("MINISGL_TAIL_HIP", "1") != "0":
     try:
         import tail_hip
@@ -158,7 +162,11 @@ class MHAKVCache(BaseKVCachePool):
         k_cache = self._k_buffer[layer_id].view(self._storage_shape)
         v_cache = self._v_buffer[layer_id].view(self._storage_shape)
 
-        if _STORE_KV is not None and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16:
+        # The kernel is templated on BOTH the activation dtype and the cache dtype, so the gate is
+        # "k and v agree on a supported float dtype", not "k and v are bf16". The old bf16 test sent
+        # every fp16 checkpoint down the torch scatter+cast below — which its own comment calls
+        # "not the served path".
+        if _STORE_KV is not None and k.dtype == v.dtype and k.dtype in _STORE_KV_DTYPES:
             from minisgl._hip_engage import engaged
 
             engaged("tail_hip.store_kv")
