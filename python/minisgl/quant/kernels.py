@@ -343,6 +343,23 @@ def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     (num_tokens*top_k / num_experts). Pure function of static shapes => cudagraph-capture-safe (a
     captured decode graph always sees small M => 16, exactly as before). ``MINISGL_MOE_BLOCK_M`` forces
     a value (16/32/64/128) for autotuning / to restore the historical fixed 16.
+
+    WHY THIS IS STILL ONE VARIABLE, with the shared analytic chooser sitting next to it. The dense
+    tile became a cost-model choice (fp8_wmma/tile_select.h) and the same model now covers the
+    grouped MoE core — ``fp8_wmma.moe_tile_choose(rows, E, n1, k1, g1, n2, k2, g2)`` returns the
+    (block_m, BN, BN) this function would defer to, host-side and cudagraph-safe. It is NOT wired
+    yet because it was measured, over 28 (shape, M) cells x 25 tiles (tools/w4a8_moe_tile_surface.py,
+    graph-replay timed, expert stacks rotated past the 64 MB MALL by BYTE count):
+
+        M >= 64 : 1.80x - 3.01x FASTER than this rule    (which asks for 16 rows where the oracle
+                                                          wants 32x192 — a 2.3-3.0x miss)
+        M <= 32 : 0.76x - 0.85x, i.e. up to 24% SLOWER   <-- the served decode point
+
+    At M<=32 an expert holds ~1 routed row, so a block is nearly all masked padding, and no term in
+    that model prices it. This rule is near-oracle exactly there (1.00x on almost every M<=32 cell)
+    and 2.3-3.0x off exactly where the model is right. Trading 1.9x of prefill for 24% of decode is
+    the wrong trade, so the rule stays until the model has the missing term — see the OPEN note in
+    tile_select.h, and tools/w4a8_moe_tile_verify.py for the three-arm A/B that produced these.
     """
     forced = _os.environ.get("MINISGL_MOE_BLOCK_M")
     if forced:

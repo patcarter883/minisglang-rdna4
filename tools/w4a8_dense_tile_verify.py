@@ -93,13 +93,16 @@ def main() -> int:
     worst = (1.0, None)
     for name, K, N, g, dt, zeros in SHAPES:
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} ===")
-        out(f"    {'M':>6}{'chooser':>10}{'shipped':>10}{'sweptOracle':>13}"
-            f"{'chooser us':>12}{'256x128 us':>12}{'gain':>8}{'vs oracle':>11}")
+        out(f"    {'M':>6}{'chooser':>12}{'shipped':>10}{'sweptOracle':>13}"
+            f"{'chooser us':>12}{'256x128 us':>12}{'wn=1 us':>11}"
+            f"{'gain':>8}{'wn gain':>9}{'vs oracle':>11}")
         for M in MS:
             ws, R, wb = rotation(N, K, g, zeros, M)
             x = (torch.randn(M, K, device=DEV) * 0.3).to(dt)
             expl = W.dense_tile_explain(M, N, K, g)
-            pick = expl.split("tile        = ")[1].split()[0]
+            _tf = expl.split("tile        = ")[1].split()
+            pick, wn = _tf[0], int(_tf[1].split("=")[1])
+            pick_l = f"{pick}x{wn}"
             os.environ.pop("VLLM_W4A8_V7_CFG", None)
             t_new, _ = time_graph(
                 lambda w: W.mmq_fp8_gemm(
@@ -109,6 +112,16 @@ def main() -> int:
             )
             os.environ["VLLM_W4A8_V7_CFG"] = "256x128"
             t_old, _ = time_graph(
+                lambda w: W.mmq_fp8_gemm(
+                    x, w[0], w[1], kernel="wmma_tiled_tuned", w_zeros=w[2], weight_is_e2m1=False
+                ),
+                ws,
+            )
+            # WARPS_N ISOLATED: the same tile with the N-warp split forced OFF. That is the
+            # capability folded in from `prefill_wmma`'s core, so this column is what it bought (or
+            # cost) on its own, with the tile held equal.
+            os.environ["VLLM_W4A8_V7_CFG"] = f"{pick}x1"
+            t_wn1, _ = time_graph(
                 lambda w: W.mmq_fp8_gemm(
                     x, w[0], w[1], kernel="wmma_tiled_tuned", w_zeros=w[2], weight_is_e2m1=False
                 ),
@@ -134,8 +147,9 @@ def main() -> int:
             ratio = (t_new / t_orc) if t_orc else float("nan")
             if t_orc and t_new / t_orc > worst[0]:
                 worst = (t_new / t_orc, f"{name} M={M} chooser {pick} vs oracle {ob[0]}")
-            out(f"    {M:>6}{pick:>10}{'256x128':>10}{(ob[0] if ob else '-'):>13}"
-                f"{t_new:>12.2f}{t_old:>12.2f}{t_old/t_new:>7.2f}x{ratio:>10.2f}x")
+            out(f"    {M:>6}{pick_l:>12}{'256x128':>10}{(ob[0] if ob else '-'):>13}"
+                f"{t_new:>12.2f}{t_old:>12.2f}{t_wn1:>11.2f}"
+                f"{t_old/t_new:>7.2f}x{t_wn1/t_new:>8.2f}x{ratio:>10.2f}x")
             del x, ws
             torch.cuda.empty_cache()
 

@@ -59,6 +59,27 @@ TILES_EXT = [
     (128, 32), (256, 32), (256, 256), (384, 128), (512, 64), (512, 128),
 ]
 
+# The WARPS_N axis, which NO surface has ever been swept over: `mmq_fp8_gemm_wmma_tiled_tuned_kernel`
+# grew the N-warp column split that `prefill_wmma`'s core and the MoE core already had, so a tile is
+# now (BM, BN, WARPS_N) and the third field is unmeasured. That is exactly why tile_select.h's WN_SET
+# is {1}: a chooser allowed to search WARPS_N wins up to 5.68x on individual cells and loses 2.93x on
+# the LM head at M<=32, which is what fitting a term against no data looks like. Sweep these.
+TILES_WN = [
+    (64, 64, 2), (64, 128, 2), (64, 128, 4), (128, 64, 2), (128, 128, 2), (128, 128, 4),
+    (256, 128, 2), (32, 64, 2), (32, 64, 4), (32, 128, 4), (192, 128, 2), (96, 128, 2),
+]
+
+
+def tile3(t):
+    """A tile is (BM, BN) or (BM, BN, WARPS_N); normalise to the triple."""
+    return (t[0], t[1], t[2] if len(t) > 2 else 1)
+
+
+def tile_name(t) -> str:
+    bm, bn, wn = tile3(t)
+    return f"{bm}x{bn}" if wn == 1 else f"{bm}x{bn}x{wn}"
+
+
 # (name, K, N, group, dtype, awq_zeros). Every quantized dense linear the engine dispatches, at TP=1
 # and TP=2 per-rank, spanning N from 2048 to the LM head's 131072 and K from 2048 to 8704.
 SHAPES = [
@@ -158,8 +179,12 @@ def time_graph(fn, ws, budget_us: float = CELL_BUDGET_US, max_reps: int = 20, mi
     return us, reps
 
 
-def legal(bm: int, bn: int, g: int) -> bool:
-    return (bm + bn) * (g + 8) <= LDS_MAX
+def legal(bm: int, bn: int, g: int, wn: int = 1) -> bool:
+    """LDS fit, plus WARPS_N legality: the workgroup is (BM/16)*WN warps and the hardware caps it at
+    1024 threads, and WN must split NFRAG = BN/16 evenly."""
+    if (bm + bn) * (g + 8) > LDS_MAX:
+        return False
+    return (bm // 16) * wn <= 32 and (bn // 16) % wn == 0 and (bn // 16) >= wn
 
 
 def make_call(W, cand: str, x, e2m1: bool):
@@ -193,7 +218,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
     ap.add_argument("--csv", default="")
-    ap.add_argument("--tiles", default="all", choices=["all", "shipped", "ext"])
+    ap.add_argument("--tiles", default="all", choices=["all", "shipped", "ext", "wn"])
     ap.add_argument("--ms", default="", help="comma list; default the full 1..2048 ladder")
     ap.add_argument("--shapes", default="", help="comma list of substrings to keep")
     ap.add_argument("--no-arms", action="store_true")
@@ -211,9 +236,8 @@ def main() -> int:
     import fp8_wmma as W
 
     torch.manual_seed(0)
-    tiles = {"all": TILES_SHIPPED + TILES_EXT, "shipped": TILES_SHIPPED, "ext": TILES_EXT}[
-        args.tiles
-    ]
+    tiles = {"all": TILES_SHIPPED + TILES_EXT + TILES_WN, "shipped": TILES_SHIPPED,
+             "ext": TILES_EXT, "wn": TILES_WN}[args.tiles]
     tiles = sorted(set(tiles))
     ms = [int(v) for v in args.ms.split(",")] if args.ms else list(MS)
     shapes = SHAPES
@@ -224,7 +248,7 @@ def main() -> int:
         shapes, ms, tiles = shapes[:2], [17, 256], tiles[:4]
 
     out(f"device: {torch.cuda.get_device_name(0)}   fp8_wmma: {W.__file__}")
-    out(f"tiles ({len(tiles)}): " + " ".join(f"{a}x{b}" for a, b in tiles))
+    out(f"tiles ({len(tiles)}): " + " ".join(tile_name(t) for t in tiles))
     out(f"arms: {'(skipped)' if args.no_arms else ARMS}")
     out("graph-replay timed; rotation sized in BYTES past the 64 MB MALL; us per call\n")
 
@@ -233,8 +257,8 @@ def main() -> int:
         cf.write("name,K,N,g,dtype,M,cand,us,reps,R\n")
 
     for name, K, N, g, dt, zeros in shapes:
-        legal_tiles = [f"{a}x{b}" for a, b in tiles if legal(a, b, g)]
-        skipped = [f"{a}x{b}" for a, b in tiles if not legal(a, b, g)]
+        legal_tiles = [tile_name(t) for t in tiles if legal(*tile3(t), g=g)]
+        skipped = [tile_name(t) for t in tiles if not legal(*tile3(t), g=g)]
         cands = ([] if args.no_arms else list(ARMS)) + legal_tiles
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} "
             f"zeros={'awq' if zeros else 'sym'} ===")

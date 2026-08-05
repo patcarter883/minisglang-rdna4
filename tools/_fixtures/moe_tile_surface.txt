@@ -1,0 +1,250 @@
+tiles 4x7   shapes 5   M [1, 2, 8, 32, 64, 256, 1024]
+chooser CU is PINNED (tile_select.h); torch 2.14.0.dev20260803+rocm7.2
+
+=== q35.moe    tp2  E=256 top_k=8 hidden=2048 inter=768 g=128 ===
+    gemm1 N=1536 K=2048   gemm2 N=2048 K=768
+  M=    1 R=  2 (594 MB)  oracle   16x64    72.14us | prev   16x64    72.14us | chooser   64x32   142.29us  gain 0.51x  vs oracle 1.97x
+  M=    2 R=  2 (594 MB)  oracle  32x192   140.38us | prev   16x64   168.91us | chooser   64x32   267.99us  gain 0.63x  vs oracle 1.91x
+  M=    8 R=  2 (594 MB)  oracle  16x128   317.14us | prev   16x64   317.84us | chooser   64x32   863.15us  gain 0.37x  vs oracle 2.72x
+  M=   32 R=  2 (594 MB)  oracle   16x32   985.44us | prev   16x64   989.91us | chooser   64x32  2335.11us  gain 0.42x  vs oracle 2.37x
+  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 R=  2 (594 MB)  oracle  32x192  2160.70us | prev   16x64  6303.07us | chooser   64x32  3243.26us  gain 1.94x  vs oracle 1.50x
+  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 R=  2 (594 MB)  oracle  32x192  2566.20us | prev   16x64  6881.91us | chooser   64x32  3615.35us  gain 1.90x  vs oracle 1.41x
+  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 R=  2 (594 MB)  oracle   64x32  3461.73us | prev   32x64  6235.97us | chooser   64x32  3461.73us  gain 1.80x  vs oracle 1.00x
+
+=== q35.moe    tp1  E=256 top_k=8 hidden=2048 inter=1536 g=128 ===
+    gemm1 N=3072 K=2048   gemm2 N=2048 K=1536
+  M=    1 R=  2 (1188 MB)  oracle   16x64   111.44us | prev   16x64   111.44us | chooser   64x32   316.57us  gain 0.35x  vs oracle 2.84x
+  M=    2 R=  2 (1188 MB)  oracle  32x128   234.29us | prev   16x64   287.37us | chooser   64x32   564.79us  gain 0.51x  vs oracle 2.41x
+  M=    8 R=  2 (1188 MB)  oracle   16x96   554.77us | prev   16x64   577.85us | chooser   64x32  1676.63us  gain 0.34x  vs oracle 3.02x
+  M=   32 R=  2 (1188 MB)  oracle   16x16  2005.65us | prev   16x64  2135.18us | chooser   64x32  4218.75us  gain 0.51x  vs oracle 2.10x
+  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 R=  2 (1188 MB)  oracle  32x192  3898.29us | prev   16x64 11583.09us | chooser   64x32  5986.44us  gain 1.93x  vs oracle 1.54x
+  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 R=  2 (1188 MB)  oracle  32x192  4781.43us | prev   16x64 13477.31us | chooser   64x32  6922.24us  gain 1.95x  vs oracle 1.45x
+  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 R=  2 (1188 MB)  oracle  64x192  6126.51us | prev   32x64 11456.21us | chooser   64x32  6135.12us  gain 1.87x  vs oracle 1.00x
+
+=== glm.moe    tp2  E=128 top_k=8 hidden=2048 inter=704 g=128 ===
+    gemm1 N=1408 K=2048   gemm2 N=2048 K=704
+  M=    1 16x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 16x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 32x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 64x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    1  no legal tile
+  M=    2 16x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 16x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 32x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 64x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    2  no legal tile
+  M=    8 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=    8 R=  2 (272 MB)  oracle  16x128   293.11us | prev   16x64   294.57us | chooser   64x32   817.47us  gain 0.36x  vs oracle 2.79x
+  M=   32 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   32 R=  2 (272 MB)  oracle   16x64   802.70us | prev   16x64   802.70us | chooser   64x32  1780.39us  gain 0.45x  vs oracle 2.22x
+  M=   64 16x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 32x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 64x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 64x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=   64  no legal tile
+  M=  256 16x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 32x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 64x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 64x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M=  256  no legal tile
+  M= 1024 16x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 32x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 64x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 64x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x16: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x32: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x64: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x96: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x128: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x192: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024 128x256: REFUSED RuntimeError: group_size must be mult of 16 and <=128; got 140
+  M= 1024  no legal tile
+
+=== g32.moe    tp2  E=128 top_k=4 hidden=2048 inter=1024 g=32 ===
+    gemm1 N=2048 K=2048   gemm2 N=2048 K=1024
+  M=    1 R=  2 (432 MB)  oracle   16x64    61.03us | prev   16x64    61.03us | chooser   32x32    70.67us  gain 0.86x  vs oracle 1.16x
+  M=    2 R=  2 (432 MB)  oracle   16x32   101.16us | prev   16x64   101.33us | chooser   32x64   106.18us  gain 0.95x  vs oracle 1.05x
+  M=    8 R=  2 (432 MB)  oracle  16x128   225.44us | prev   16x64   226.38us | chooser   32x64   238.67us  gain 0.95x  vs oracle 1.06x
+  M=   32 R=  2 (432 MB)  oracle   16x64   643.82us | prev   16x64   643.82us | chooser   32x64   851.09us  gain 0.76x  vs oracle 1.32x
+  M=   64 R=  2 (432 MB)  oracle  32x256  1377.79us | prev   16x64  3191.37us | chooser   32x64  2772.50us  gain 1.15x  vs oracle 2.01x
+  M=  256 R=  2 (432 MB)  oracle  32x256  1582.00us | prev   16x64  3544.91us | chooser   32x64  2979.92us  gain 1.19x  vs oracle 1.88x
+  M= 1024 R=  2 (432 MB)  oracle  32x256  2413.69us | prev   32x64  3589.30us | chooser   32x64  3589.30us  gain 1.00x  vs oracle 1.49x
+
+=== narrowN    tp2  E=64 top_k=4 hidden=1024 inter=512 g=128 ===
+    gemm1 N=1024 K=1024   gemm2 N=1024 K=512
+  M=    1 R=  5 (49 MB)  oracle   16x64    37.24us | prev   16x64    37.24us | chooser  128x16    78.24us  gain 0.48x  vs oracle 2.10x
+  M=    2 R=  5 (49 MB)  oracle   16x16    43.94us | prev   16x64    50.42us | chooser   64x32    75.99us  gain 0.66x  vs oracle 1.73x
+  M=    8 R=  5 (49 MB)  oracle  16x256    98.99us | prev   16x64    99.03us | chooser   64x32   147.01us  gain 0.67x  vs oracle 1.49x
+  M=   32 R=  5 (49 MB)  oracle   16x32   204.85us | prev   16x64   205.65us | chooser   64x32   246.92us  gain 0.83x  vs oracle 1.21x
+  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=   64 R=  5 (49 MB)  oracle   64x16   270.36us | prev   16x64   644.73us | chooser   64x32   274.18us  gain 2.35x  vs oracle 1.01x
+  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M=  256 R=  5 (49 MB)  oracle   64x16   315.38us | prev   16x64   962.99us | chooser   64x32   319.54us  gain 3.01x  vs oracle 1.01x
+  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
+Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
+  M= 1024 R=  5 (49 MB)  oracle   64x16   454.58us | prev   64x64   470.57us | chooser   64x32   462.09us  gain 1.02x  vs oracle 1.02x
+
+done.
