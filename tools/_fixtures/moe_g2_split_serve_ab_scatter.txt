@@ -1,0 +1,5 @@
+MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
+engine  /home/pat/code/minisgl-rdna4-g2sk   @ 6dfdae04
+kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
+
+########## LEG base  (MINISGL_MOE_SPLITK_SCATTER=legacy) ##########

@@ -192,6 +192,29 @@ being called at M = 3, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 30, 32 — and **M=1 
 so the scatter arm is not on the decode path at all under MTP. Run 2 pins `SPEC=none` so that
 `bs = n` gives `M = n` and the served points line up with the swept surface.
 
+### Run 2 — `SPEC=none`, so `bs = n` means `M = n`
+
+The right configuration to quote a bs number against, and it also restores the throughput the
+scorecard recorded (bs=1 ≈ 93 tok/s, vs 89.6 there; under MTP the same bs=1 measured 40.6 — MTP is
+costing this model well over half its single-stream decode, which is its own finding and not this
+one). Provenance asserted per leg from the `[g2-split]` ledger: base saw `split_k=1` only, new saw
+`split_k = 1, 2, 4`.
+
+**Fused arm** (bs=1 is the control — M=1 is the scatter arm and this leg does not touch it):
+
+| bs | role | base (unsplit) | range | new (derived) | range | ratio |
+|---|---|---:|---|---:|---|---:|
+| 1 | control | 93.04 | 92.69–93.32 | 93.07 | 92.90–93.40 | 1.000 |
+| 5 | MEASURED | 272.17 | 269.64–273.82 | 272.73 | 272.27–273.31 | 1.002 |
+| 6 | MEASURED | 328.18 | 328.00–329.08 | 329.36 | 328.49–330.89 | 1.004 |
+
+**The fused split does not resolve end to end.** The control behaves (1.000), so the harness is
+sound; the measured rows move +0.2% and +0.4% with leg ranges that overlap. That is what the
+arithmetic predicts and it should be stated as the result rather than dressed up: the kernel is
+~45 µs × 40 layers ≈ 1.8 ms of an 18.4 ms step at bs=5, so 13% off it is ~1.3% of the step — the
+same order as the 1.5% run-to-run spread. **A bit-exact 1.12–1.16× on this kernel is worth keeping
+because it is free, but it does not buy a measurable serve.**
+
 ### Honest sizing, before anyone extrapolates
 
 The isolated win is 1.12–1.39× **on one kernel**, and that kernel is roughly 40 × 50 µs ≈ 2 ms of a
