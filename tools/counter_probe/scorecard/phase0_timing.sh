@@ -32,6 +32,11 @@ trace() {  # trace <tag> <args...>
 }
 
 trace dense_4096   dense 1 4096 4096 128
+# PRODUCTION decode shapes (Qwen3.6-35B-A3B TP=2, hidden 2048). The synthetic 16384^2 below is the
+# regime the "81% of HBM" verdict was taken in; these are the shapes the engine actually launches,
+# and the two do not agree.
+trace dense_prod_2048 dense 1 2048 2048 128
+trace dense_prod_6144 dense 1 6144 2048 128
 trace dense_16384  dense 1 16384 16384 128
 trace bf16_down    bf16 1 2048 256
 trace bf16_gate    bf16 1 1 2048
@@ -43,3 +48,17 @@ for m in 1 5 6 30; do
 done
 
 echo "=== phase0 done (auto perf level) ==="
+
+# Fused MoE decode gemm2 — the production path. Needs its own binary.
+hipcc -O3 --offload-arch=gfx1201 -I/kern/fp8_wmma/fp8_wmma_rocm \
+      -o /tmp/g2 /probe/scorecard/moe_g2fuse_probe.hip 2>&1 | grep -iE " error" | head -10
+if [ -x /tmp/g2 ]; then
+  trace_g2() { local tag="$1"; shift; local d="$OUT/$tag"; rm -rf "$d"; mkdir -p "$d"
+    echo "--- trace $tag :: /tmp/g2 $* ---"
+    timeout -s KILL 300 rocprofv3 --kernel-trace -f csv -d "$d" -- /tmp/g2 "$@" >"$d/run.log" 2>&1; }
+  for m in 1 5 6 30; do
+    trace_g2 "g2f_K512_M$m" $m 32 8 512 2048 128 16
+    trace_g2 "g2f_K256_M$m" $m 32 8 256 2048 128 16
+  done
+fi
+echo "=== phase0 (with g2fuse) done ==="
