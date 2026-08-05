@@ -1,0 +1,51 @@
+gpu-lease: waiting for 2 free GPU(s)…
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+######## AVAIL: 7.14 ########
+==== TARGET: rocm/dev-ubuntu-24.04:7.14.0-full ====
+### rocm=7.14.0 rocprofiler-sdk=1.3.2
+=== pmc-check (takes explicit counters; it does NOT enumerate) ===
+W0805 12:04:12.349140      17 metadata.cpp:273] rocprofiler_iterate_agent_supported_counters failed for agent 3 (gfx1036) :: Agent HW architecture is not supported, no counter metrics found.
+Fatal error: SQ_WAVES SQ_INSTS_VALU not collected on agent gfx1036
+=== advertised counter NAMES for gfx1201 ===
+count=143
+--- are the ones the utilisation breakdown needs advertised? ---
+  ADVERTISED  SQ_WAVES
+  ADVERTISED  SQ_INSTS_VALU
+  ADVERTISED  SQ_INSTS_SALU
+  ADVERTISED  SQ_INSTS_LDS
+  ADVERTISED  SQ_INST_CYCLES_VALU
+  absent      SQ_ACTIVE_INST_VALU
+  absent      SQ_THREAD_CYCLES_VALU
+  ADVERTISED  GRBM_GUI_ACTIVE
+  ADVERTISED  VALUBusy
+  ADVERTISED  MemUnitBusy
+  ADVERTISED  OccupancyPercent
+  ADVERTISED  FetchSize
+######## AVAIL: host 7.2.4 ########
+==== TARGET: HOST /opt/rocm ====
+### rocm=7.2.4 rocprofiler-sdk=1.1.0
+=== pmc-check (takes explicit counters; it does NOT enumerate) ===
+W20260805 22:04:13.555839 140714029250432 metadata.cpp:254] rocprofiler_iterate_agent_supported_counters failed for agent 3 (gfx1036) :: Agent HW architecture is not supported, no counter metrics found.
+Fatal error: SQ_WAVES SQ_INSTS_VALU not collected on agent gfx1036
+=== advertised counter NAMES for gfx1201 ===
+count=143
+--- are the ones the utilisation breakdown needs advertised? ---
+  ADVERTISED  SQ_WAVES
+  ADVERTISED  SQ_INSTS_VALU
+  ADVERTISED  SQ_INSTS_SALU
+  ADVERTISED  SQ_INSTS_LDS
+  ADVERTISED  SQ_INST_CYCLES_VALU
+  absent      SQ_ACTIVE_INST_VALU
+  absent      SQ_THREAD_CYCLES_VALU
+  ADVERTISED  GRBM_GUI_ACTIVE
+  ADVERTISED  VALUBusy
+  ADVERTISED  MemUnitBusy
+  ADVERTISED  OccupancyPercent
+  ADVERTISED  FetchSize
+######## rocprof-compute arch support ########
+=== 2) rocprof-compute: is gfx1201 even a supported arch? ===
+usage: rocprof-compute [mode] [options]
+tool: error: argument --list-metrics: expected one argument
+--- gfx12 present in that list? ---
+  NO -> gfx1201 unsupported by rocprof-compute; nothing to run.
+ALLDONE3

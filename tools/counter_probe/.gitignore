@@ -1,0 +1,3 @@
+# rocprofv3 leaves a per-pass output DIRECTORY next to the .csv we copy out; the csv is the fixture.
+p*/
+rpc/

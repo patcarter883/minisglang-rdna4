@@ -1,0 +1,29 @@
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+==== TARGET: minisgl-rdna4:lean ====
+### stack: rocm=7.2.1 rocprofv3=1.1.0
+### harness: 22264 bytes
+=== A: bare (no profiler) ===
+bare harness                                1s  rc=0
+=== B: TRACE (attach, no counters) ===
+--kernel-trace                              0s  rc=0
+=== C: ONE COUNTER ===
+environment: line 22:    79 Killed                  timeout -s KILL "$LIM_I" "$@" > $OUT/log 2>&1
+--pmc SQ_WAVES                           > 90s  HUNG (SIGKILLed)
+   NO counter csv
+=== D: UTILISATION SET ===
+environment: line 22:    92 Killed                  timeout -s KILL "$LIM_I" "$@" > $OUT/log 2>&1
+--pmc VALU/VMEM/LDS                      > 90s  HUNG (SIGKILLed)
+   NO counter csv
+=== E: what does the driver advertise? ===
+Name:gfx1201
+Counter_Name        :	gfx_target_version
+Description         :	Constant value gfx_target_version from agent properties
+Expression          :	reduce(SQ_INSTS_SALU,sum)/reduce(SQ_WAVES,sum)
+Expression          :	reduce(SQ_INSTS_SMEM,sum)/reduce(SQ_WAVES,sum)
+Counter_Name        :	SQ_INSTS_VALU
+Counter_Name        :	SQ_WAVES
+Description         :	Count number of waves sent to distributed sequencers (SQs). This value represents the number of waves that are sent to each SQ. This only counts new waves sent since the start of collection (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). A sum of all SQ_WAVES values will give the total number of waves started by the application during the collection timeframe. Returns one value per-SE (aggregates of SIMD values).
+Counter_Name        :	SQ_WAVES_sum
+Description         :	Gives the total number of waves currently enqueued by the application during the collection timeframe (for dispatch profiling this is the timeframe of kernel execution, for agent profiling it is the timeframe between start_context and read counter data). See SQ_WAVES for more details.
+Expression          :	reduce(SQ_WAVES,sum)
+Counter_Name        :	VALUBusy
