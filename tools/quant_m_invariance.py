@@ -108,7 +108,7 @@ def dense_suite(shapes, ms, dtype, group, out):
                 if arm == "decode_gemv" and M > GEMV_MAX_M:
                     continue
                 res[arm] = W.mmq_fp8_gemm(xm, wp, sc, kernel=arm, w_zeros=None, weight_is_e2m1=False)
-            picked = _pick_dense_kernel(M, False, group, k=K)
+            picked = _pick_dense_kernel(M, False, group, k=K, n=N)
             def d(a, b):
                 if a not in res or b not in res:
                     return "-"
@@ -140,8 +140,8 @@ def dense_suite(shapes, ms, dtype, group, out):
             sub = w4a8_linear(x[:m].contiguous(), wp, sc, None, group)
             mx, rl = rel(sub, big[:m])
             fl = (sub.argmax(-1) != big[:m].argmax(-1)).sum().item()
-            out(f"      {m:>6} {_pick_dense_kernel(m, False, group, k=K):<18} "
-                f"{_pick_dense_kernel(MMAX, False, group, k=K):<18} {fmt(mx):>12} {fmt(rl):>10} "
+            out(f"      {m:>6} {_pick_dense_kernel(m, False, group, k=K, n=N):<18} "
+                f"{_pick_dense_kernel(MMAX, False, group, k=K, n=N):<18} {fmt(mx):>12} {fmt(rl):>10} "
                 f"{fl:>7}/{m:<6}")
 
         # ---- D. row split (the rowchunked_ar_span producer) ------------------------------------
@@ -185,8 +185,8 @@ def spec_suite(shapes, dtype, group, out):
                              for i in range(Mver)], dim=0)
             mx0 = (ver[0].float() - dec[0].float()).abs().max().item()
             fl = (ver.argmax(-1) != dec.argmax(-1)).sum().item()
-            out(f"      {bs:>3} {kk:>3} {Mver:>5} {_pick_dense_kernel(1, False, group, k=K):<14} "
-                f"{_pick_dense_kernel(Mver, False, group, k=K):<18} {fmt(mx0):>12} "
+            out(f"      {bs:>3} {kk:>3} {Mver:>5} {_pick_dense_kernel(1, False, group, k=K, n=N):<14} "
+                f"{_pick_dense_kernel(Mver, False, group, k=K, n=N):<18} {fmt(mx0):>12} "
                 f"{fl:>10}/{Mver:<6} ({100.0*fl/Mver:.2f}%)")
         del wp, sc
         torch.cuda.empty_cache()

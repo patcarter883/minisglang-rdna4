@@ -1,0 +1,60 @@
+device: AMD Radeon RX 9070  CUs=56   3 independent passes per cell
+gain = best(prefill_wmma, wmma_tiled_tuned) / ashuffle, per pass; >1 means ashuffle wins
+
+=== BAND  q27.q_proj tp1  K=5120 N=6144  (rotation 11 x 17.7 MB = 195 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        1.103    1.088    1.086      0.017   prefill_wmma_ashuffle
+      24        1.097    1.099    1.090      0.008   prefill_wmma_ashuffle
+      32        1.156    1.154    1.151      0.005   prefill_wmma_ashuffle
+      40        1.082    1.104    1.080      0.023   prefill_wmma_ashuffle
+      48        1.123    1.123    1.126      0.004   prefill_wmma_ashuffle
+      63        1.107    1.078    1.106      0.029   prefill_wmma_ashuffle
+
+=== BAND  q27.down   tp2  K=8704 N=5120  (rotation 8 x 25.1 MB = 201 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        1.105    1.126    1.129      0.024   prefill_wmma_ashuffle
+      24        1.131    1.136    1.138      0.007   prefill_wmma_ashuffle
+      32        1.153    1.148    1.158      0.010   prefill_wmma_ashuffle
+      40        1.033    1.066    1.032      0.034   prefill_wmma_ashuffle
+      48        1.077    1.059    1.076      0.018   prefill_wmma_ashuffle
+      63        1.038    1.046    1.039      0.008   prefill_wmma_ashuffle
+
+=== BAND  grid  K=5120 N=8192  (rotation 9 x 23.6 MB = 212 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        0.759    0.764    0.763      0.005            prefill_wmma
+      24        0.780    0.777    0.778      0.002            prefill_wmma
+      32        0.815    0.816    0.816      0.001            prefill_wmma
+      40        0.819    0.820    0.819      0.001            prefill_wmma
+      48        0.855    0.855    0.853      0.002            prefill_wmma
+      63        0.907    0.906    0.909      0.003            prefill_wmma
+
+=== CTRL  grid  K=5120 N=1024  (rotation 58 x 2.9 MB = 171 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        0.625    0.624    0.633      0.009        wmma_tiled_tuned
+      24        0.624    0.611    0.615      0.013        wmma_tiled_tuned
+      32        0.591    0.597    0.575      0.022        wmma_tiled_tuned
+      40        0.529    0.546    0.550      0.021        wmma_tiled_tuned
+      48        0.555    0.554    0.543      0.013        wmma_tiled_tuned
+      63        0.524    0.521    0.523      0.003        wmma_tiled_tuned
+
+=== CTRL  q35.o_proj tp2  K=2048 N=2048  (rotation 73 x 2.4 MB = 172 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        0.779    0.782    0.780      0.003        wmma_tiled_tuned
+      24        0.776    0.777    0.777      0.000        wmma_tiled_tuned
+      32        0.779    0.777    0.774      0.005        wmma_tiled_tuned
+      40        0.736    0.736    0.739      0.003        wmma_tiled_tuned
+      48        0.735    0.737    0.737      0.003        wmma_tiled_tuned
+      63        0.696    0.700    0.697      0.005        wmma_tiled_tuned
+
+=== CTRL  glm.gate_up tp2  K=2048 N=10240  (rotation 16 x 11.8 MB = 189 MB) ===
+       M   gain pass1    pass2    pass3     spread       winner (3 passes)
+      17        0.849    0.883    0.849      0.034            prefill_wmma
+      24        0.887    0.846    0.886      0.041            prefill_wmma
+      32        0.860    0.898    0.851      0.047            prefill_wmma
+      40        0.921    0.916    0.920      0.004            prefill_wmma
+      48        0.949    0.958    0.949      0.009            prefill_wmma
+      63        0.981    0.949    0.982      0.033  FLIPPED: pref/wmma/pref
+
+cells whose winner was STABLE across 3 passes: 35; FLIPPED: 1
+
+done.
