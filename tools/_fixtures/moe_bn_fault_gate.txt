@@ -1,0 +1,35 @@
+device: AMD Radeon RX 9070 XT  WGPs=32 -> 64 CUs
+shape: q35.moe tp2 {'E': 256, 'top_k': 8, 'hidden': 2048, 'inter': 768, 'g': 128}
+
+A. VLLM_W4A8_MOE_BN UNSET (cfg.BN = 0 -> the chooser sentinel)
+        M   exit  note
+        1      0  RESULT ok finite=True absmax=0.115723
+        2      0  RESULT ok finite=True absmax=0.115723
+        8      0  RESULT ok finite=True absmax=0.151367
+       32      0  RESULT ok finite=True absmax=0.277344
+       33      0  RESULT ok finite=True absmax=0.277344
+       64      0  RESULT ok finite=True absmax=0.277344
+      129      0  RESULT ok finite=True absmax=0.166992
+      512      0  RESULT ok finite=True absmax=0.213867
+
+B. CONTROL -- same M ladder, VLLM_W4A8_MOE_BN=64 (cfg.BN non-zero)
+        M   exit  note
+       33      0  RESULT ok finite=True absmax=0.277344
+       64      0  RESULT ok finite=True absmax=0.277344
+      129      0  RESULT ok finite=True absmax=0.166992
+      512      0  RESULT ok finite=True absmax=0.213867
+
+C. FUSED gemm1+silu at M=64, every requested BN read against BN=64
+   The tile is a LAUNCH parameter, so every BN must return the SAME bytes.
+   bad_cols > 0 = the grid was sized for the requested BN but the kernel was
+   instantiated at another one -> columns the grid never reached.
+       BN   exit  note
+       16      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+       32      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+       64      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+       96      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+      128      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+      192      0  RESULT inter=768 rows=512 maxdelta=0.000e+00 bad_cols=0/768
+      256      1  RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536); pick a smaller BN  <-- REFUSED
+
+VERDICT: FAULTS PRESENT (1 bad cells)

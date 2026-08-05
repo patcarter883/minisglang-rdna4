@@ -183,6 +183,35 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
         div = occ * (1.0 + p["alpha"] * (nfrag_w - 1))
     elif p["lat"] == "cap":
         div = max(occ, p["OCC_FLOOR"])
+    elif p["lat"] in ("wg", "wgmix"):
+        # ---- THE BARRIER IS A WHOLE-WORKGROUP STALL, so WARPS INSIDE IT CANNOT COVER IT ----------
+        # This is not a new hypothesis; it is what the shipped header ALREADY SAYS the term means:
+        #   "Every wave in the workgroup stops at that barrier together, so nothing inside the
+        #    workgroup hides the staging latency and ONLY CO-RESIDENCY CAN. That is exactly the
+        #    regime LAT/OCC describes."
+        # But the code then divides by `occ = live * nwarps`, and `nwarps` is precisely the count of
+        # warps INSIDE the workgroup -- the ones that sentence says cannot cover it. The covering
+        # resource is `live`: the number of OTHER RESIDENT WORKGROUPS on the CU.
+        #
+        # That mis-statement is a SIGN FLIP on exactly the axis that regresses. WARPS_N multiplies
+        # `nwarps` while adding not one resident workgroup, and it actively REDUCES co-residency
+        # (bpc = wps*2/nwarps), so the shipped denominator hands a WARPS_N=4 tile a ~4x latency
+        # credit for a change that makes the covering resource WORSE. Hence "short-rounds launches
+        # preferring a tall tile": where `rounds` clamps `live` low, the spurious nwarps factor is
+        # the only thing left moving, and it points the wrong way.
+        #
+        # DERIVED, not fitted: the structure follows from the barrier, and LAT stays ONE constant.
+        # Its SCALE necessarily changes with the denominator's units (dividing by ~4-8x less), so
+        # the sweep re-reads it on its plateau -- that is a re-scale of an existing constant, not a
+        # new one.
+        #   "wg"    -- the whole stall is barrier-bound: div = live.
+        #   "wgmix" -- only WG_F of the stall is the barrier; the rest is per-wave memory latency
+        #              that co-resident WAVES do hide. div = live * (1 + (nwarps-1)*(1-WG_F)).
+        if p["lat"] == "wg":
+            div = max(float(live), 1.0)
+        else:
+            f = p.get("WG_F", 1.0)
+            div = max(float(live) * (1.0 + (eff_nwarps - 1) * (1.0 - f)), 1.0)
     else:
         raise SystemExit(f"unknown lat mode {p['lat']}")
     # `stall` = "pt" reproduces the shipped `ISSUE * (1 + LAT/OCC)` exactly. "chain" says the
@@ -488,6 +517,58 @@ def main() -> int:
                     print(f"         {f:5.2f}x  {k}  picked {c}")
             else:
                 print(f"      REGRESSED 0 {label} cells vs the shipped WN={{1}} chooser")
+
+    # ==============================================================================================
+    # THE OCCUPANCY TERM: what actually covers a WHOLE-WORKGROUP BARRIER STALL
+    # ==============================================================================================
+    # Baseline for "REGRESSED" is the SAME reference the block above used: the shipped model
+    # restricted to WN={1}, i.e. what ships today. A widened chooser is shippable only if it
+    # regresses nothing against that.
+    print("\n" + "=" * 110)
+    print("OCC DENOMINATOR -- `live*nwarps` (shipped) vs `live` (co-resident WORKGROUPS, derived)")
+    print("=" * 110)
+    print("The shipped header already states the physics: the LdsStaged core hits __syncthreads()")
+    print("once per K-group and 'nothing inside the workgroup hides the staging latency, only")
+    print("co-residency can'. The code then divides by live*NWARPS -- the warps inside it. WARPS_N")
+    print("multiplies that numerator while REDUCING bpc=wps*2/nwarps, so the shipped term credits")
+    print("WARPS_N ~4x for making the covering resource worse. Below, the denominator is `live`.")
+    print("LAT is re-read on its plateau because the denominator's UNITS changed; it stays ONE")
+    print("constant and no new one is introduced.\n")
+    occ_variants = []
+    for lat in (2.0, 3.0, 4.0, 6.0, 8.0, 12.0):
+        occ_variants.append(
+            (f"wg   div=live            LAT={lat:>4}",
+             dict(ship, sline="on", lat="wg", LAT=lat, LAT_SHUF=lat / 4.0, **L0L2)))
+    for f in (0.5, 0.75, 0.9):
+        for lat in (4.0, 8.0, 16.0):
+            occ_variants.append(
+                (f"wgmix f={f} LAT={lat:>4}      ",
+                 dict(ship, sline="on", lat="wgmix", WG_F=f, LAT=lat, LAT_SHUF=lat / 4.0, **L0L2)))
+    best = None
+    for tag, p in occ_variants:
+        row = [tag]
+        nreg = {}
+        for label, cells, isd, base in (("D", D, True, ref), ("M", Mo, False, refm)):
+            pk = chooser(p, (1, 2, 4), cells, isd)
+            rs = [r for _, r in pk.values()]
+            bad = [(v[1] / base[k], k, v[0]) for k, v in pk.items()
+                   if k in base and v[1] > base[k] * 1.02]
+            nreg[label] = sorted(bad, reverse=True)
+            row.append(f"{label} gm={gm(rs):.4f} w={max(rs):.2f} reg={len(bad):>3}"
+                       + (f"/{bad and max(b[0] for b in bad) or 1.0:.2f}x" if bad else "/-    "))
+        print("  ".join(row))
+        score = (len(nreg["D"]) + len(nreg["M"]),
+                 gm([r for _, r in chooser(p, (1, 2, 4), D, True).values()]))
+        if best is None or score < best[0]:
+            best = (score, tag, p, nreg)
+    if best:
+        print(f"\nBEST on (fewest regressions, then dense geomean): {best[1].strip()}")
+        for label in ("D", "M"):
+            bad = best[3][label]
+            print(f"  {label}: {len(bad)} regressed"
+                  + (f", worst {bad[0][0]:.2f}x" if bad else ""))
+            for f_, k, c in bad[:12]:
+                print(f"     {f_:5.2f}x  {k}  picked {c}")
     return 0
 
 

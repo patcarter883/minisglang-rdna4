@@ -1,105 +1,81 @@
   visible cuda:0 = AMD Radeon RX 9070 XT  CUs=64
   visible cuda:1 = AMD Radeon RX 9070  CUs=56
 tiles 4x7   shapes 5   M [1, 2, 8, 32, 64, 256, 1024]
-device: AMD Radeon RX 9070 XT   CUs=64   physical card=0,1   exclusive_box=1
+device: AMD Radeon RX 9070 XT   CUs=64   physical card=0   lease=0,1   exclusive_box=1
 chooser CU is PINNED (tile_select.h); torch 2.14.0.dev20260803+rocm7.2
 
 === q35.moe    tp2  E=256 top_k=8 hidden=2048 inter=768 g=128 ===
     gemm1 N=1536 K=2048   gemm2 N=2048 K=768
-  M=    1 R=  2 (594 MB)  oracle   16x64    72.32us | prev   16x64    72.32us | chooser   32x32    90.14us  gain 0.80x  vs oracle 1.25x
-  M=    2 R=  2 (594 MB)  oracle  32x192   141.04us | prev   16x64   168.22us | chooser  32x192   141.04us  gain 1.19x  vs oracle 1.00x
-  M=    8 R=  2 (594 MB)  oracle  16x192   317.34us | prev   16x64   319.52us | chooser  32x192   328.01us  gain 0.97x  vs oracle 1.03x
-  M=   32 R=  2 (594 MB)  oracle   16x32   995.87us | prev   16x64   996.41us | chooser  32x192  1286.92us  gain 0.77x  vs oracle 1.29x
-  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 R=  2 (594 MB)  oracle  32x192  2183.17us | prev   16x64  6360.59us | chooser  32x192  2183.17us  gain 2.91x  vs oracle 1.00x
-  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 R=  2 (594 MB)  oracle  32x192  2574.37us | prev   16x64  6903.69us | chooser  32x192  2574.37us  gain 2.68x  vs oracle 1.00x
-  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 R=  2 (594 MB)  oracle  32x192  3544.98us | prev   32x64  6243.45us | chooser  32x192  3544.98us  gain 1.76x  vs oracle 1.00x
+  M=    1 R=  2 (594 MB)  oracle   16x64    72.38us | prev   16x64    72.38us | chooser   32x32    89.97us  gain 0.80x  vs oracle 1.24x
+  M=    2 R=  2 (594 MB)  oracle  32x192   139.17us | prev   16x64   168.30us | chooser  32x192   139.17us  gain 1.21x  vs oracle 1.00x
+  M=    8 R=  2 (594 MB)  oracle  16x256   317.65us | prev   16x64   318.65us | chooser  32x192   328.88us  gain 0.97x  vs oracle 1.04x
+  M=   32 R=  2 (594 MB)  oracle   16x32   996.48us | prev   16x64   999.28us | chooser  32x192  1284.79us  gain 0.78x  vs oracle 1.29x
+  M=   64 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 R=  2 (594 MB)  oracle   32x16  2607.73us | prev   16x64  6217.11us | chooser  32x192  7892.50us  gain 0.79x  vs oracle 3.03x
+  M=  256 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 R=  2 (594 MB)  oracle   32x16  3079.46us | prev   16x64  6856.67us | chooser  32x192  9264.06us  gain 0.74x  vs oracle 3.01x
+  M= 1024 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 R=  2 (594 MB)  oracle  64x192  3557.00us | prev   32x64  6245.63us | chooser  32x192 12658.62us  gain 0.49x  vs oracle 3.56x
 
 === q35.moe    tp1  E=256 top_k=8 hidden=2048 inter=1536 g=128 ===
     gemm1 N=3072 K=2048   gemm2 N=2048 K=1536
-  M=    1 R=  2 (1188 MB)  oracle   16x64   120.28us | prev   16x64   120.28us | chooser  32x192   139.77us  gain 0.86x  vs oracle 1.16x
-  M=    2 R=  2 (1188 MB)  oracle  32x128   234.10us | prev   16x64   286.85us | chooser  32x192   239.15us  gain 1.20x  vs oracle 1.02x
-  M=    8 R=  2 (1188 MB)  oracle   16x96   558.16us | prev   16x64   578.11us | chooser  32x192   598.62us  gain 0.97x  vs oracle 1.07x
-  M=   32 R=  2 (1188 MB)  oracle   16x32  2023.54us | prev   16x64  2157.27us | chooser  32x192  2724.67us  gain 0.79x  vs oracle 1.35x
-  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 R=  2 (1188 MB)  oracle  32x192  3942.36us | prev   16x64 11487.13us | chooser  32x192  3942.36us  gain 2.91x  vs oracle 1.00x
-  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 R=  2 (1188 MB)  oracle  32x192  4788.54us | prev   16x64 12693.59us | chooser  32x192  4788.54us  gain 2.65x  vs oracle 1.00x
-  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 R=  2 (1188 MB)  oracle   64x32  6073.40us | prev   32x64 11469.63us | chooser  32x192  6746.90us  gain 1.70x  vs oracle 1.11x
+  M=    1 R=  2 (1188 MB)  oracle   16x64   120.78us | prev   16x64   120.78us | chooser  32x192   140.33us  gain 0.86x  vs oracle 1.16x
+  M=    2 R=  2 (1188 MB)  oracle  32x128   234.12us | prev   16x64   287.07us | chooser  32x192   239.28us  gain 1.20x  vs oracle 1.02x
+  M=    8 R=  2 (1188 MB)  oracle   16x96   560.55us | prev   16x64   578.13us | chooser  32x192   597.60us  gain 0.97x  vs oracle 1.07x
+  M=   32 R=  2 (1188 MB)  oracle   16x32  2027.18us | prev   16x64  2152.16us | chooser  32x192  2729.78us  gain 0.79x  vs oracle 1.35x
+  M=   64 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 R=  2 (1188 MB)  oracle   32x16  4996.81us | prev   16x64 11390.39us | chooser  32x192 15419.40us  gain 0.74x  vs oracle 3.09x
+  M=  256 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 R=  2 (1188 MB)  oracle   32x16  5785.71us | prev   16x64 12956.90us | chooser  32x192 18108.14us  gain 0.72x  vs oracle 3.13x
+  M= 1024 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 R=  2 (1188 MB)  oracle   64x32  6128.07us | prev   32x64 11477.15us | chooser  32x192 24858.20us  gain 0.46x  vs oracle 4.06x
 
 === glm.moe    tp2  E=128 top_k=8 hidden=2048 inter=768 g=128 ===
     gemm1 N=1536 K=2048   gemm2 N=2048 K=768
-  M=    1 R=  2 (297 MB)  oracle   16x64    70.55us | prev   16x64    70.55us | chooser   32x32    87.64us  gain 0.81x  vs oracle 1.24x
-  M=    2 R=  2 (297 MB)  oracle  32x192   141.04us | prev   16x64   166.23us | chooser  32x192   141.04us  gain 1.18x  vs oracle 1.00x
-  M=    8 R=  2 (297 MB)  oracle  16x128   304.94us | prev   16x64   305.13us | chooser  32x192   319.15us  gain 0.96x  vs oracle 1.05x
-  M=   32 R=  2 (297 MB)  oracle   16x32   853.11us | prev   16x64   855.18us | chooser  32x192  1079.16us  gain 0.79x  vs oracle 1.26x
-  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 R=  2 (297 MB)  oracle  32x192  1195.64us | prev   16x64  3708.37us | chooser  32x192  1195.64us  gain 3.10x  vs oracle 1.00x
-  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 R=  2 (297 MB)  oracle  32x192  1286.20us | prev   16x64  4687.33us | chooser  32x192  1286.20us  gain 3.64x  vs oracle 1.00x
-  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 R=  2 (297 MB)  oracle 128x256  2097.48us | prev   64x64  2423.06us | chooser  64x192  2287.56us  gain 1.06x  vs oracle 1.09x
+  M=    1 R=  2 (297 MB)  oracle   16x64    70.48us | prev   16x64    70.48us | chooser   32x32    87.22us  gain 0.81x  vs oracle 1.24x
+  M=    2 R=  2 (297 MB)  oracle  32x192   140.74us | prev   16x64   165.54us | chooser  32x192   140.74us  gain 1.18x  vs oracle 1.00x
+  M=    8 R=  2 (297 MB)  oracle  16x192   304.20us | prev   16x64   305.91us | chooser  32x192   318.72us  gain 0.96x  vs oracle 1.05x
+  M=   32 R=  2 (297 MB)  oracle   16x32   851.00us | prev   16x64   855.21us | chooser  32x192  1074.89us  gain 0.80x  vs oracle 1.26x
+  M=   64 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 R=  2 (297 MB)  oracle   32x16  1428.92us | prev   16x64  3827.68us | chooser  32x192  4771.91us  gain 0.80x  vs oracle 3.34x
+  M=  256 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 R=  2 (297 MB)  oracle   32x16  1518.27us | prev   16x64  4671.45us | chooser  32x192  4907.84us  gain 0.95x  vs oracle 3.23x
+  M= 1024 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 R=  2 (297 MB)  oracle  128x32  2108.56us | prev   64x64  2420.49us | chooser  64x192  2292.15us  gain 1.06x  vs oracle 1.09x
 
 === g32.moe    tp2  E=128 top_k=4 hidden=2048 inter=1024 g=32 ===
     gemm1 N=2048 K=2048   gemm2 N=2048 K=1024
-  M=    1 R=  2 (432 MB)  oracle   16x64    61.48us | prev   16x64    61.48us | chooser   32x32    70.60us  gain 0.87x  vs oracle 1.15x
-  M=    2 R=  2 (432 MB)  oracle  16x128   100.21us | prev   16x64   101.54us | chooser   32x64   105.94us  gain 0.96x  vs oracle 1.06x
-  M=    8 R=  2 (432 MB)  oracle   16x96   218.73us | prev   16x64   219.65us | chooser   32x64   231.69us  gain 0.95x  vs oracle 1.06x
-  M=   32 R=  2 (432 MB)  oracle   16x32   643.71us | prev   16x64   648.20us | chooser   32x64   853.31us  gain 0.76x  vs oracle 1.33x
-  M=   64 R=  2 (432 MB)  oracle  32x256  1364.68us | prev   16x64  3179.11us | chooser   32x64  2725.39us  gain 1.17x  vs oracle 2.00x
-  M=  256 R=  2 (432 MB)  oracle  32x256  1581.47us | prev   16x64  3352.40us | chooser   32x64  2957.08us  gain 1.13x  vs oracle 1.87x
-  M= 1024 R=  2 (432 MB)  oracle  32x256  2432.70us | prev   32x64  3579.19us | chooser   32x64  3579.19us  gain 1.00x  vs oracle 1.47x
+  M=    1 R=  2 (432 MB)  oracle   16x64    61.59us | prev   16x64    61.59us | chooser   32x32    70.26us  gain 0.88x  vs oracle 1.14x
+  M=    2 R=  2 (432 MB)  oracle  16x128   100.54us | prev   16x64   101.23us | chooser   32x64   104.94us  gain 0.96x  vs oracle 1.04x
+  M=    8 R=  2 (432 MB)  oracle   16x64   217.49us | prev   16x64   217.49us | chooser   32x64   230.99us  gain 0.94x  vs oracle 1.06x
+  M=   32 R=  2 (432 MB)  oracle   16x64   644.32us | prev   16x64   644.32us | chooser   32x64   854.98us  gain 0.75x  vs oracle 1.33x
+  M=   64 R=  2 (432 MB)  oracle   32x16  1648.35us | prev   16x64  3180.34us | chooser   32x64  2754.92us  gain 1.15x  vs oracle 1.67x
+  M=  256 R=  2 (432 MB)  oracle   16x16  1969.44us | prev   16x64  3384.86us | chooser   32x64  2962.71us  gain 1.14x  vs oracle 1.50x
+  M= 1024 R=  2 (432 MB)  oracle   32x16  2821.35us | prev   32x64  3574.37us | chooser   32x64  3574.37us  gain 1.00x  vs oracle 1.27x
 
 === narrowN    tp2  E=64 top_k=4 hidden=1024 inter=512 g=128 ===
     gemm1 N=1024 K=1024   gemm2 N=1024 K=512
-  M=    1 R=  5 (49 MB)  oracle   16x64    37.16us | prev   16x64    37.16us | chooser   64x16    73.28us  gain 0.51x  vs oracle 1.97x
-  M=    2 R=  5 (49 MB)  oracle  16x128    48.99us | prev   16x64    51.18us | chooser   32x32    57.89us  gain 0.88x  vs oracle 1.18x
-  M=    8 R=  5 (49 MB)  oracle  16x256   101.14us | prev   16x64   101.55us | chooser  32x192   105.25us  gain 0.96x  vs oracle 1.04x
-  M=   32 R=  5 (49 MB)  oracle   16x16   208.17us | prev   16x64   209.55us | chooser  32x192   242.07us  gain 0.87x  vs oracle 1.16x
-  M=   64 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=   64 R=  5 (49 MB)  oracle   64x16   273.11us | prev   16x64   653.78us | chooser  32x192   276.92us  gain 2.36x  vs oracle 1.01x
-  M=  256 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M=  256 R=  5 (49 MB)  oracle   64x16   321.39us | prev   16x64   942.47us | chooser  32x192   326.55us  gain 2.89x  vs oracle 1.02x
-  M= 1024 16x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 32x256: REFUSED AcceleratorError: CUDA error: invalid argument
-Search for `hipErrorInvalidValue' in https://rocm.docs.amd.com/projects/HIP/en/la
-  M= 1024 R=  5 (49 MB)  oracle  64x128   457.79us | prev   64x64   473.29us | chooser   64x32   463.11us  gain 1.02x  vs oracle 1.01x
+  M=    1 R=  5 (49 MB)  oracle   16x64    36.91us | prev   16x64    36.91us | chooser   64x16    72.20us  gain 0.51x  vs oracle 1.96x
+  M=    2 R=  5 (49 MB)  oracle  16x128    48.50us | prev   16x64    50.45us | chooser   32x32    57.11us  gain 0.88x  vs oracle 1.18x
+  M=    8 R=  5 (49 MB)  oracle  16x192    99.40us | prev   16x64    99.83us | chooser  32x192   102.92us  gain 0.97x  vs oracle 1.04x
+  M=   32 R=  5 (49 MB)  oracle   16x16   207.44us | prev   16x64   209.98us | chooser  32x192   242.11us  gain 0.87x  vs oracle 1.17x
+  M=   64 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=   64 R=  5 (49 MB)  oracle   64x16   272.45us | prev   16x64   646.30us | chooser  32x192   887.38us  gain 0.73x  vs oracle 3.26x
+  M=  256 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M=  256 R=  5 (49 MB)  oracle   64x16   318.55us | prev   16x64   910.01us | chooser  32x192   981.72us  gain 0.93x  vs oracle 3.08x
+  M= 1024 16x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=16 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 32x256: REFUSED RuntimeError: fused MoE gemm1+silu (ashuffle): block_m=32 BN=256 GTILE=1 needs 69632 B of LDS at group_size=128 (max 65536);
+  M= 1024 R=  5 (49 MB)  oracle   64x16   455.08us | prev   64x64   467.63us | chooser   64x32   462.95us  gain 1.01x  vs oracle 1.02x
 
 done.

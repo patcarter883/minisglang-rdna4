@@ -34,19 +34,25 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from w4a8_moe_tile_surface import DEV, SHAPES, rotation, time_graph  # noqa: E402
 
-# THE M CEILING IS A PRE-EXISTING KERNEL FAULT, NOT A CHOICE.
-# `w4a8_moe(kernel="wmma")` on q35.moe tp2 (E=256, top_k=8, hidden=2048, inter=768, g=128) takes the
-# process down with SIGFPE (exit 136) for M > 32. Bisected per M, and gated by a CONTROL: the
-# PREVIOUS build (rdna4-hip-kernels @ 8b7c6f5, no scale-line term) faults at exactly the same M, so
-# it is not a regression from anything in this branch. It has been invisible because this is the
-# only tool that exercised those M at all -- it reported timings up to M=32 and then died, and its
-# BIT-IDENTITY GATE SAT AFTER THE TIMING LOOP, so the gate had never once executed. Both halves are
-# fixed here: correctness runs FIRST, and the ladders stop at the last M that the kernel survives,
-# so the tool now produces a complete verdict instead of a partial log and a non-zero exit.
-# Raise these the moment the M>32 fault is fixed -- they are a quarantine, not a judgement about
-# which M matter.
-MS = [1, 2, 8, 32]
-BITID_MS = [1, 2, 3, 17, 32]
+# THE M>32 QUARANTINE IS LIFTED -- the fault it guarded is FIXED.
+#
+# `w4a8_moe(kernel="wmma")` used to take the process down with SIGFPE (exit 136) for M > 32. The
+# cause was NOT in the kernel, and 32 was NOT a kernel threshold: `make_moe_tile_config` defaults
+# `cfg.BN = 0` as an "ask the chooser" SENTINEL, and the FUSED gemm1+silu launcher consumed it
+# unguarded (`int bn = cfg.BN;`) before computing `grid.x = ceil(inter / bn)` -- a HOST integer
+# divide by zero. 32 is minisgl's `_MOE_GEMM1_GEMV_MAX`: at M <= 32 gemm1 routes to the GEMV body
+# and returns before that line, so M=33 was simply the first M that reached it. Verified by
+# bisection: faults at 33, clean at 32, clean at every M once VLLM_W4A8_MOE_BN is set.
+#
+# Fixed in rdna4-hip-kernels by guarding the sentinel and routing every grouped launcher through
+# the ONE compiled BN lattice (W4A8_MOE_BN_DISPATCH, tile_select.h) -- which also killed a SILENT
+# mis-launch in the same launchers, where the grid was sized with the RUNTIME bn while the body
+# strode a different TEMPLATE BN. See tools/w4a8_moe_bn_fault_repro.py for the standing gate.
+#
+# The ORDERING below is still load-bearing and stays: correctness runs BEFORE timing. A gate placed
+# after the thing that crashes is exactly why this fault survived so long -- it had never once run.
+MS = [1, 2, 8, 32, 64, 256]
+BITID_MS = [1, 2, 3, 17, 32, 33, 64, 129, 512]
 
 
 def prev_block_m(M: int, E: int, top_k: int) -> int:

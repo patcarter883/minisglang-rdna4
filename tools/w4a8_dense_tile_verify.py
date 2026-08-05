@@ -24,13 +24,16 @@ Three things, in order:
 from __future__ import annotations
 
 import argparse
+import csv as csvmod
+import math
 import os
 import sys
 
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from w4a8_dense_tile_surface import DEV, rotation, time_graph  # noqa: E402
+import w4a8_dense_tile_surface as S  # noqa: E402
+from w4a8_dense_tile_surface import provenance_cards, rotation, time_graph  # noqa: E402
 
 SHAPES = [
     ("g4.q_proj    tp2", 2816, 2048, 32, torch.float16, False),
@@ -52,15 +55,25 @@ BITID_MS = [1, 17, 33, 64, 129, 512]
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
+    ap.add_argument("--csv", default="")
     ap.add_argument("--oracle-csv", default="/engine/_tile_surface.csv")
+    ap.add_argument("--allow-any-card", action="store_true",
+                    help="time on a non-64-CU card. ONLY for deliberately pricing the CU pin.")
     args = ap.parse_args()
     fh = open(args.out, "w") if args.out else None
+    cfh = open(args.csv, "w", newline="") if args.csv else None
+    cw = csvmod.writer(cfh) if cfh else None
 
     def out(s=""):
         print(s, flush=True)
         if fh:
             fh.write(s + "\n")
             fh.flush()
+
+    def csv(row):
+        if cw:
+            cw.writerow(row)
+            cfh.flush()
 
     import fp8_wmma as W
 
@@ -84,13 +97,38 @@ def main() -> int:
         out(f"(no oracle csv: {e})")
 
     torch.manual_seed(0)
-    p = torch.cuda.get_device_properties(0)
-    out(f"device: {p.name}   WGPs={p.multi_processor_count} -> {2*p.multi_processor_count} CUs")
+    # SELECT THE 64-CU CARD BY DEVICE PROPERTIES, NEVER BY ORDINAL. Under a two-card lease both
+    # physical cards are visible and their order is not guaranteed, and the chooser this gates
+    # ships a 64-CU-PINNED decision -- timing it on the 56-CU RX 9070 measures a mis-tiled kernel.
+    want = None
+    for i in range(torch.cuda.device_count()):
+        if torch.cuda.get_device_properties(i).multi_processor_count * 2 == 64:
+            want = i
+            break
+    if want is None and not args.allow_any_card:
+        out("REFUSING TO TIME: no 64-CU card visible (the chooser is 64-CU PINNED). Re-lease card 0.")
+        return 2
+    if want is None:
+        want = 0
+    torch.cuda.set_device(want)
+    S.DEV = DEV = torch.device(f"cuda:{want}")
+    dev_name = torch.cuda.get_device_name(want)
+    cu = torch.cuda.get_device_properties(want).multi_processor_count * 2
+    card, lease = provenance_cards(want)
+    excl = os.environ.get("TILE_EXCLUSIVE", "0")
+    out(f"device: {dev_name}   CUs={cu}   physical card={card}   lease={lease}   "
+        f"exclusive_box={excl}")
     out(f"fp8_wmma: {W.__file__}")
     out("us per call; graph-replay timed; rotation sized in BYTES past the 64 MB MALL\n")
+    csv(["name", "K", "N", "g", "dtype", "M", "chooser", "chooser_us", "hardwire_us",
+         "wn1_us", "oracle_cand", "oracle_us", "gain", "dev", "cu", "card", "lease", "exclusive"])
 
     tot_new = tot_old = 0.0
     worst = (1.0, None)
+    # THE MERGE NUMBER: chooser vs the SHIPPED HARD-WIRE, per cell. A total-time ratio is dominated
+    # by the few biggest cells; the geomean is the per-cell answer, and the regressions are the
+    # thing a total can hide entirely.
+    gains: list[tuple[float, str]] = []
     for name, K, N, g, dt, zeros in SHAPES:
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} ===")
         out(f"    {'M':>6}{'chooser':>12}{'shipped':>10}{'sweptOracle':>13}"
@@ -147,6 +185,11 @@ def main() -> int:
             ratio = (t_new / t_orc) if t_orc else float("nan")
             if t_orc and t_new / t_orc > worst[0]:
                 worst = (t_new / t_orc, f"{name} M={M} chooser {pick} vs oracle {ob[0]}")
+            gains.append((t_old / t_new, f"{name} M={M} chooser {pick_l}"))
+            csv([name, K, N, g, str(dt).split(".")[-1], M, pick_l, f"{t_new:.3f}",
+                 f"{t_old:.3f}", f"{t_wn1:.3f}", (ob[0] if ob else ""),
+                 (f"{t_orc:.3f}" if t_orc else ""), f"{t_old / t_new:.4f}",
+                 dev_name, cu, card, lease, excl])
             out(f"    {M:>6}{pick_l:>12}{'256x128':>10}{(ob[0] if ob else '-'):>13}"
                 f"{t_new:>12.2f}{t_old:>12.2f}{t_wn1:>11.2f}"
                 f"{t_old/t_new:>7.2f}x{t_wn1/t_new:>8.2f}x{ratio:>10.2f}x")
@@ -170,12 +213,31 @@ def main() -> int:
         torch.cuda.empty_cache()
         out("")
 
-    out(f"TOTAL over the measured cells: chooser {tot_new:.0f} us vs shipped 256x128 "
-        f"{tot_old:.0f} us = {tot_old/tot_new:.3f}x")
-    out(f"worst cell vs the swept oracle: {worst[0]:.2f}x  ({worst[1]})")
+    # ------------------------------------------------------------------ the merge verdict
+    gm = math.exp(sum(math.log(gm_) for gm_, _ in gains) / len(gains)) if gains else float("nan")
+    gains_sorted = sorted(gains)
+    regressed = [(r, w) for r, w in gains_sorted if r < 1.0]
+    out("=" * 78)
+    out(f"CHOOSER vs the SHIPPED HARD-WIRE 256x128 -- live, {dev_name} ({cu} CU), "
+        f"physical card {card}, lease {lease}, exclusive_box={excl}")
+    out(f"  cells                : {len(gains)}  ({len(SHAPES)} shapes x {len(MS)} M)")
+    out(f"  GEOMEAN              : {gm:.4f}x")
+    out(f"  total-time ratio     : {tot_old/tot_new:.4f}x  "
+        f"(chooser {tot_new:.0f} us vs 256x128 {tot_old:.0f} us)")
+    if gains_sorted:
+        out(f"  BEST cell            : {gains_sorted[-1][0]:.4f}x  ({gains_sorted[-1][1]})")
+        out(f"  worst cell           : {gains_sorted[0][0]:.4f}x  ({gains_sorted[0][1]})")
+    out(f"  REGRESSED cells      : {len(regressed)}/{len(gains)}"
+        + ("  -- none" if not regressed else ""))
+    for r, w in regressed:
+        out(f"      {r:.4f}x  {w}")
+    out(f"  worst vs swept oracle: {worst[0]:.2f}x  ({worst[1]})")
+    out("=" * 78)
     out("\ndone.")
     if fh:
         fh.close()
+    if cfh:
+        cfh.close()
     return 0
 
 
