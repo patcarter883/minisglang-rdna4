@@ -31,7 +31,7 @@ def variant(name: str) -> str | None:
 # vals[variant][counter] = [per-dispatch value]; meta[variant] = static launch info
 vals = collections.defaultdict(lambda: collections.defaultdict(list))
 meta, dur = {}, collections.defaultdict(list)
-for f in sorted(glob.glob(f"{d}/p*.csv")):
+for f in sorted(glob.glob(f"{d}/p*.csv") + glob.glob(f"{d}/q*.csv")):
     seen = collections.defaultdict(set)
     for row in csv.DictReader(open(f)):
         v = variant(row["Kernel_Name"])

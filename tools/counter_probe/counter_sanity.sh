@@ -31,11 +31,18 @@
 # every derived metric built on them (VALUBusy, MemUnitBusy, ValuPipeIssueUtil, FetchSize, L2CacheHit,
 # OccupancyPercent, LDSBankConflict, WAVE_*_WAIT).
 #
-# SO: the "counters wedge the card" half of the old rule is STALE, but the conclusion is unchanged —
-# the VALU/SALU/VMEM/LDS utilisation breakdown STILL cannot be measured on this hardware, so
-# regime calls ("this kernel is VALU-bound") remain inferences. What IS newly measurable per dispatch:
-# wave count, SQ busy cycles, GPU active cycles, icache traffic.
-# SQ_WAVES is verified exact (saxpy grid 1<<20 / block 256 -> 4096 WGs x 8 wave32 = 32768).
+# *** THE ZEROS ABOVE ARE AN ARTEFACT OF THE POWER STATE, NOT A BROKEN COUNTER. *** Re-measured under
+# `profile_standard` (perf_level_counters.sh), EVERY one of those "hard zero" counters returns a real
+# value: SQ_INSTS_VALU/SALU/LDS, SQ_INST_CYCLES_VALU/VMEM, SQ_WAIT_ANY, SQ_BUSY_CYCLES. gfx1201's
+# default `auto` perf level GATES THE PERFMON CLOCK in those blocks, so they accumulate nothing while
+# still reporting rc=0 and a well-formed CSV.
+#
+# => ALWAYS PIN THE PERF LEVEL BEFORE COLLECTING. A sweep run at `auto` measures the power state, not
+#    the counters, and produces a confident, wrong "these counters are dead on this hardware".
+#    The table above is retained ONLY as the signature of the gated state, so it is recognisable.
+# SQ_WAVES is verified exact (saxpy grid 1<<20 / block 256 -> 4096 WGs x 8 wave32 = 32768) and reads
+# correctly at BOTH perf levels, which is exactly why the gated state is so easy to mistake for a
+# working collection.
 set -uo pipefail
 IMG="${1:-rocm/dev-ubuntu-24.04:7.14.0-full}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

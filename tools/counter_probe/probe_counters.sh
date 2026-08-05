@@ -36,8 +36,11 @@
 #
 # => PROFILE ON 7.14, SERVE ON 7.2.1. The kernel source is shared, so a counter measurement taken in
 #    7.14 transfers; a .so does not (build kernel packages in the image that will run them).
-#    But see counter_sanity.sh before trusting any number: on 7.14 collection SUCCEEDS while most
-#    counters still read a hard zero, which is a quieter failure than the hang.
+#    AND PIN THE PERF LEVEL. At the default `auto`, 7.14 collection SUCCEEDS (rc=0, well-formed CSV)
+#    while every SQ_INSTS_*/SQ_INST_CYCLES_*/SQ_WAIT_*/TA_*/TCP_*/GL2C_* reads a hard ZERO, because
+#    gfx1201's `auto` power state gates the perfmon clock in those blocks. Under `profile_standard`
+#    they all return real values. That silent-zero mode is far more dangerous than the hang: the hang
+#    stops you, the zeros hand you a confident wrong answer. See perf_level_counters.sh.
 #
 # TWO TRAPS THIS SCRIPT ENCODES — both cost a lease to learn:
 #   1. `timeout N` IS NOT ENOUGH. When rocprofiler-sdk aborts, it deadlocks inside its own signal
