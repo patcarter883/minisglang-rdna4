@@ -1,0 +1,48 @@
+MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
+engine  /home/pat/code/minisgl-rdna4-g2sk   @ cbb59a7b
+kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
+
+########## LEG base  (MINISGL_MOE_G2_SPLIT_K=1) ##########
+  BOOT FAILED:
+    g2sk-serve  |     return kernels.w4a8_moe(
+    g2sk-serve  |            ^^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/utils/torch_utils.py", line 33, in wrapper
+    g2sk-serve  |     return fn(self, *args, **kwargs)
+    g2sk-serve  |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 597, in w4a8_moe
+    g2sk-serve  |     buf2 = _moe_time(
+    g2sk-serve  |            ^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/models/qwen3_5_moe.py", line 152, in forward
+    g2sk-serve  |     combined = rowchunked_ar_span(
+    g2sk-serve  |                ^^^^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 227, in _moe_time
+    g2sk-serve  |     return fn()
+    g2sk-serve  |            ^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/layers/tp_overlap.py", line 374, in rowchunked_ar_span
+    g2sk-serve  |     return comm.all_reduce(produce(x, *aligned))
+    g2sk-serve  |                            ^^^^^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 599, in <lambda>
+    g2sk-serve  |     lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
+    g2sk-serve  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/models/qwen3_5_moe.py", line 113, in _fused_partial
+    g2sk-serve  |     routed_out = experts.forward(
+    g2sk-serve  |                  ^^^^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/layers/moe.py", line 1087, in forward
+    g2sk-serve  |     final_hidden_states = method.apply(
+    g2sk-serve  |                           ^^^^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/layers/moe.py", line 566, in apply
+    g2sk-serve  |     return kernels.w4a8_moe(
+    g2sk-serve  |            ^^^^^^^^^^^^^^^^^
+    g2sk-serve  | TypeError: mmq_fp8_moe_gemm1_silu() got an unexpected keyword argument 'x_fp8'
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 597, in w4a8_moe
+    g2sk-serve  |     buf2 = _moe_time(
+    g2sk-serve  |            ^^^^^^^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 227, in _moe_time
+    g2sk-serve  |     return fn()
+    g2sk-serve  |            ^^^^
+    g2sk-serve  |   File "/engine/python/minisgl/quant/kernels.py", line 599, in <lambda>
+    g2sk-serve  |     lambda: fp8_wmma.mmq_fp8_moe_gemm1_silu(
+    g2sk-serve  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    g2sk-serve  | TypeError: mmq_fp8_moe_gemm1_silu() got an unexpected keyword argument 'x_fp8'
+
+########## LEG new  (MINISGL_MOE_G2_SPLIT_K=) ##########

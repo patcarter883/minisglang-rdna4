@@ -46,8 +46,23 @@ OUT="${OUT:-$WT/tools/_fixtures/moe_g2_split_serve_ab.txt}"
 mkdir -p "$(dirname "$OUT")"
 
 # The engine imports fp8_wmma from _kern first; make it the freshly built package.
-rm -rf "$WT/_kern"; mkdir -p "$WT/_kern"
+#
+# `rm -rf` ALONE IS NOT ENOUGH and failing to notice cost a whole 4-boot window. The serve container
+# runs as root and drops a root-owned __pycache__/ inside the mounted package, which a non-root
+# `rm -rf` cannot remove -- so the directory SURVIVES, `cp -a src dst` then copies INTO it as
+# _kern/fp8_wmma/fp8_wmma, the import falls through to the stale baked /opt/kernels, and the serve
+# dies on a TypeError from an older signature. Clear it with sudo if needed, then ASSERT the layout.
+rm -rf "$WT/_kern" 2>/dev/null || true
+[ -e "$WT/_kern" ] && sudo rm -rf "$WT/_kern"
+mkdir -p "$WT/_kern"
 cp -a "$KERN/fp8_wmma/torch-ext/fp8_wmma" "$WT/_kern/fp8_wmma"
+if [ ! -f "$WT/_kern/fp8_wmma/__init__.py" ] || [ -e "$WT/_kern/fp8_wmma/fp8_wmma" ]; then
+  echo "FATAL: _kern/fp8_wmma is not a clean package copy — legs would run the BAKED kernels" >&2
+  ls -la "$WT/_kern/fp8_wmma" >&2
+  exit 2
+fi
+# Keep the container from writing root-owned bytecode back into the mount next time.
+export PYTHONDONTWRITEBYTECODE=1
 
 fatal_log() {
   ( cd "$WT" && docker compose -p "$PROJ" --profile serve logs --no-color 2>&1 ) \
@@ -86,7 +101,7 @@ for leg in base new; do
   ( cd "$WT" && env \
     MINISGL_IMAGE="$IMG" \
     MINISGL_PYTHONPATH="/engine/_kern:/opt/kernels:/engine/python:/engine" \
-    MINISGL_MOE_G2_SPLIT_DEBUG=1 "$SKENV" \
+    PYTHONDONTWRITEBYTECODE=1 MINISGL_MOE_G2_SPLIT_DEBUG=1 "$SKENV" \
     MODEL="$MODEL" TP=2 CONC="$CONC" SPEC="$SPEC" LEASE_NAME="g2sk" \
     EXTRA_ARGS="--num-pages $NUM_PAGES" \
     docker compose -p "$PROJ" --profile serve up -d ) >/dev/null 2>&1
@@ -98,6 +113,10 @@ for leg in base new; do
     FAIL=1; continue
   fi
 
+  # A SUCCESSFUL BOOT IS ITSELF PROVENANCE for the kernel package: the baked /opt/kernels fp8_wmma
+  # predates the producer act-quant signature, so an engine that fell back to it dies at the first
+  # MoE layer with `mmq_fp8_moe_gemm1_silu() got an unexpected keyword argument 'x_fp8'`. Reaching
+  # /health means _kern won the PYTHONPATH.
   # ---- drive first so the served shape is actually reached, THEN read the ledger ----
   for bs in 1 5 6; do
     case "$ARM/$bs" in

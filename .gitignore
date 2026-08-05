@@ -94,3 +94,6 @@ tools/_pcab_*.txt
 rpv3out-*/
 docker-compose.rocprof-*.yml
 _tp_overlap_ab/
+
+# Kernel packages staged into the mount by an A/B harness (built .so, root-owned pycache).
+/_kern/
