@@ -45,3 +45,68 @@ What it does NOT give is the VALU/VMEM/LDS issue split; that still needs --pmc.
 ONE RANK. A TP=2 serve traces both ranks through the inherited LD_PRELOAD; this trace carries a
 single agent, and every per-step figure is therefore one card's work, which is what a per-step cost
 should mean.
+
+================================================================================================
+ADDENDUM — the §D10.6 "graph capture is no longer bit-identical" regression, root-caused and the
+baseline re-taken. engine minisgl-rdna4 a198d715 + 6a6a3d67, kernels 8a8bca6, image
+minisgl-rdna4:dgprof (rebuilt-free: this engine mounts at /engine and only /opt/kernels is baked),
+TP=2, CONC=1, bs=1, MINISGL_SWA_RADIX=0 pinned, auto perf level, exclusive `gpu-lease -n 2`.
+
+--- bitexact_metadata_localise.txt -------------------------------------------------------------
+tools/canvas_graph_bitexact.sh, arm `matched` (default serve config). The in-process gate with its
+four controls plus the free host-side metadata diff. This is the run that ENDED the search:
+
+    METADATA DIFF max_seqlen_k: sched=276 static=262144
+    metadata page_table: values agree over [:1,:18], row width differs
+                         sched=(1, 18) static=(1, 16384)
+    metadata swa_verify_page_table: values agree over [:1,:276], row width differs
+                         sched=(1, 276) static=(1, 1280)
+    graph vs eager[matched regime] = 8.324e+00  *** NOT bit-identical ***
+    eager self-consistency = 0.000e+00 | replay self-consistency = 0.000e+00
+    eager-fallback regime (side-stream AR + 2 row chunks) vs matched = 0.000e+00
+    LOCALISE: eager[static replay metadata] vs eager[scheduler metadata] = 8.324e+00
+              graph vs eager[static replay metadata]                    = 0.000e+00
+
+Read the last two lines together: the graph reproduces its own capture EXACTLY, and the entire
+divergence is that the static metadata selects a different attention kernel. The regime line
+acquits `tp_overlap` — the FFN row split and the side-stream all_reduce are bit-exact in serve,
+which had only ever been claimed op-level (tools/quant_m_invariance.py).
+
+--- bitexact_nosplit_proof.txt -----------------------------------------------------------------
+Same harness, arm `nosplit` = MINISGL_ATTN_MAX_SPLITS=1. ONE ENV VAR, no code change: both paths
+take the single-pass kernel and
+
+    graph vs eager[matched regime] = 0.000e+00  BIT-IDENTICAL
+    LOCALISE: eager[static] vs eager[scheduler] = 0.000e+00
+
+with the page-table width diff STILL PRESENT. So the width is not the divergence in itself — it is
+the divergence because `prefill_split_policy(max_blocks * block_size, ...)` reads it. num_splits is
+1 for the eager path (288 <= MIN_CTX 1024) and 64 for the captured one (262144).
+
+--- baseline_retake_bitidentical_graph.txt -----------------------------------------------------
+tools/canvas_rocprof.sh LEGS=base, EXTRA_ENV='MINISGL_ATTN_MAX_SPLITS: "1"'. The §D10.1 baseline
+re-taken on a graph the gate certifies BIT-IDENTICAL on both replays. Marginal per canvas step,
+differenced out of the cumulative average over six consecutive 10-step windows:
+
+    window   fwd_issue  fwd_tail  sampler  soft_embed   STEP
+    10->20         0.6      77.2      4.7         3.5   86.0
+    20->30         0.4      76.9      4.8         3.4   88.0
+    30->40         0.6      77.5      4.6         3.4   86.2
+    40->50         0.5      77.1      5.1         3.6   89.6
+    50->60         0.7      77.3      4.7         3.2   88.2
+    60->70         0.8      77.6      4.7         3.6   85.7
+
+~86.9 ms/step (spread 4.5%) against §D10.1's 97.7 ms — 11% FASTER. Two changes are in that number
+and this run does not separate them: the graph no longer dispatches 30 layers of 64-way split-K
+attention plus a reduce pass, and the producer act-quant is engaged (`+prequant` in the ledger).
+They cannot be separated by measurement any more, because the gate now REFUSES to serve the
+broken graph.
+
+tok/s over four measured requests: 92.1 / 54.9 / 73.1 / 58.8 — inside the same 49-107 spread §D10.1
+reports, for the same reason (k is data-dependent). The step is the measurement; tok/s is not.
+
+WHAT THIS VOIDS IN §D10. Every attention row in D10.2/D10.5 was measured on the mis-selected path:
+`flash_prefill_paged_fp8_split_kernel` at 5.0 and 25.0 dispatches/step, `flash_prefill_reduce_kernel`
+at the same counts, and the 8.5 ms/step attention total describe a kernel selection the served
+canvas should never have made. The MoE, collective, dense-GEMM and elementwise rows are unaffected
+in mechanism but their SHARES are all shares of a step that was 12% too long.

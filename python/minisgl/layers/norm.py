@@ -67,6 +67,28 @@ class RMSNorm(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return _rms_norm(x, self.weight, self.eps, self.plus_one)
 
+    def forward_quant(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """`forward`, plus the fp8-e4m3 form of the output for the w4a8 linears it feeds.
+
+        The un-fused twin of `RMSNormFused.forward_quant`, for the PRE-norm position that has no
+        residual to add — which is where an attention block's q/k/v projections get their input.
+        Returns (out, x_fp8, act_scales); the pair is None when the native kernel does not apply, and
+        the caller then simply does not pass it, which re-quantizes exactly as before.
+
+        WHY THIS ONE MATTERS MORE THAN ITS SHAPE SUGGESTS. In Gemma4 `input_layernorm`'s output feeds
+        THREE separate dense linears — q_proj/k_proj/v_proj are not merged, the checkpoint ships them
+        apart — and each was launching its own `compute_act_fp8_and_scales_kernel` over the SAME
+        (M, K) rows. One producer quant therefore replaces THREE consumer quants, not one.
+
+        `out` is bit-identical to `forward` either way, so a call site can switch on this without a
+        numerics review."""
+        r = _rms_norm_quant(x, self.weight, self.eps, self.plus_one)
+        if r is None:
+            return _rms_norm(x, self.weight, self.eps, self.plus_one), None, None
+        return r[0], r[1], r[2]
+
     def forward_inplace(self, x: torch.Tensor) -> None:
         x.copy_(_rms_norm(x, self.weight, self.eps, self.plus_one))
 

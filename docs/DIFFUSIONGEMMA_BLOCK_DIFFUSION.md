@@ -1930,9 +1930,9 @@ the fp32-partial `reduce` pass costs another 2.17 ms on its own for five layers.
   13.0 ms/step, but only **0.2 ms** of it is in the SAMPLER kernel family — the rest is elementwise,
   a share of the collectives, and one 1.86 ms rocBLAS `Cijk_...MT64x64x32` dispatch. A fused sampler
   would not touch most of it.
-* **REGRESSION — cudagraph capture is no longer bit-identical.** §D6.1 asserts "bit-identical, at
-  every captured batch size". Today the engine's own in-process check says otherwise, on both replays
-  of every boot:
+* **REGRESSION — cudagraph capture is no longer bit-identical. ROOT-CAUSED; see §D11.**
+  §D6.1 asserts "bit-identical, at every captured batch size". Today the engine's own in-process
+  check says otherwise, on both replays of every boot:
 
   ```
   [canvas-graph] REPLAY #1 engaged, bs=1 check 1/2 (qlen=256, T=256):
@@ -1980,3 +1980,167 @@ already named and left to `models/gemma4.py`.
 `profile_standard` in the ROCm 7.14 image against replayed shapes. Everything above comes from the
 kernel trace, which already carries VGPR/scratch/LDS/grid per dispatch — so occupancy needed no
 counter run at all.
+
+
+## Part D11 — the capture ran a DIFFERENT attention kernel, §D10's step was 12% too long, and the gate only printed
+
+§D10.6's `max|delta|=1.575e+01` is not a rounding difference, was not the MoE producer act-quant,
+and was not the templated tail. It is one line of kernel-selection arithmetic reading one number
+that is not the same on the two paths.
+
+### D11.1 The mechanism
+
+`attn_prefill_paged`'s split-K planner is keyed on the block-table ROW WIDTH:
+
+```c
+prefill_split_policy(max_blocks * block_size, align, base_grid, &num_splits, &chunk);
+```
+
+with the stated justification that a shape-derived number is "constant across capture/replay". It
+is constant — and it is a **different constant on each path**:
+
+| | where the width comes from | width | `prefill_split_policy` |
+|---|---|---|---|
+| eager (`prepare_metadata`) | `page_table[idx, :max_seqlen_k:page_size]` | 18 pages = **288** | 288 ≤ `MIN_CTX` (1024) → **num_splits = 1, single-pass** |
+| graph (`_canvas_metadata_static`) | the static capture buffer, sized from `max_seq_len` | 16384 pages = **262144** | → **num_splits = 64, split-K + a reduce pass** |
+| graph, sliding layers | `_ccap_swa_page_table`, `swa_window + canvas_len` | **1280** (sched: 276) | 1280 > 1024 → **split too** |
+
+So the captured canvas ran `flash_prefill_paged_fp8_split_kernel` + `flash_prefill_reduce_kernel`
+on all 30 layers while the eager forward it was captured from ran the single-pass kernel. Two
+different kernels, same inputs — against the split path's own claim of "bit-identical (mod fp32
+accum order) to the single-pass kernel".
+
+### D11.2 Isolated, in one boot, by making the gate say which variable moved
+
+The old gate compared the captured region against an eager forward that differed from it in **two**
+ways at once — the graph mechanism, and the program, because `tp_overlap` is capture-transparent
+(under capture every all_reduce is inline and Gemma4's FFN row split is off). A gate that does not
+hold the second one fixed cannot attribute its own number, which is why 1.575e+01 sat in the doc
+with four plausible suspects and no way to choose. The gate now takes its reference inside
+`inline_collectives()` and reports four controls plus a free host-side metadata diff:
+
+```
+METADATA DIFF max_seqlen_k: sched=276 static=262144
+metadata page_table: values agree over [:1,:18], row width differs sched=(1,18) static=(1,16384)
+graph vs eager[matched regime]                   = 8.324e+00   *** NOT bit-identical ***
+eager self-consistency                           = 0.000e+00
+replay self-consistency                          = 0.000e+00
+eager-fallback regime (side-stream AR + 2 chunks) = 0.000e+00
+LOCALISE: eager[static replay metadata] vs eager[scheduler metadata] = 8.324e+00
+          graph vs eager[static replay metadata]                     = 0.000e+00
+```
+
+Read the last two lines together: **the graph reproduces its own capture exactly**, and the whole
+divergence is that the static metadata selects a different kernel. `ref max|x|` is 41.44, so 8.324
+is **20% of full scale** — the split path is not merely reassociating, it is wrong in this corner.
+
+Then the proof, with **one env var and no code change** — `MINISGL_ATTN_MAX_SPLITS=1` forces
+single-pass on both paths, the page-table width diff still present:
+
+```
+graph vs eager[matched regime] = 0.000e+00  BIT-IDENTICAL
+LOCALISE: eager[static] vs eager[scheduler] = 0.000e+00
+```
+
+Two things fall out on the way. **The row split is acquitted**: the `eager-fallback regime` line
+reads 0.000e+00 at both `MINISGL_TP_AR_CHUNKS=2` and `=1`, so the side-stream all_reduce and the
+two-chunk FFN split are bit-exact *in serve*, which `tp_overlap.py` had only ever claimed op-level.
+And **there is no bisect answer**: the divergence is a property of the shape the capture allocates,
+so it has been latent since capture landed (`d3f42c6e`) for any config whose static page table
+exceeds `MIN_CTX`. §D6.1's `0.000e+00` predates the split-K path. Bisecting engine commits would
+have found the split-K merge and named the wrong thing.
+
+### D11.3 The fix is in the kernel, and "cap the capture" is not it
+
+The obvious engine patch — bound `_ccap_max_pages` the way the DDTree family bounds `_dcap_max_kv`
+— **does not work**, and the reason is worth stating so it is not tried again. No static width can
+equal a dynamic context in general; capping only moves the crossover. Capping *below* `MIN_CTX`
+would make the graph bit-identical and then drop the canvas to the eager fallback after ~3 blocks
+(context = prompt + 256·blocks passes 1024 almost immediately), which is a worse trade than the bug.
+
+The split decision has to be a **caller-supplied constant that both paths pass** — the engine
+already knows one number that bounds every replay of a given graph. That is a kernel signature
+change plus engine plumbing, and it is the open item. Until it lands the gate **raises** rather than
+serving a graph that computes something else; `MINISGL_ATTN_MAX_SPLITS=1` is the operator workaround
+and is what the numbers below were taken under.
+
+The same defect is latent in **every capture family that sizes its page table from `max_seq_len`**
+(`_vcap_max_pages` does); only the DDTree family caps. Their gates have simply not been exercised on
+a context long enough to cross `MIN_CTX`.
+
+### D11.4 §D10 re-taken: 97.7 → 86.9 ms/step, and every attention row is void
+
+On a graph the gate certifies BIT-IDENTICAL at both replays, six consecutive 10-step windows
+differenced out of the cumulative average (TP=2, bs=1, CONC=1, `MINISGL_SWA_RADIX=0`):
+
+| window | `fwd_issue` | `fwd_tail` | `sampler` | `soft_embed` | **step** |
+|---|---|---|---|---|---|
+| n=10→20 | 0.6 | 77.2 | 4.7 | 3.5 | **86.0** |
+| n=20→30 | 0.4 | 76.9 | 4.8 | 3.4 | **88.0** |
+| n=30→40 | 0.6 | 77.5 | 4.6 | 3.4 | **86.2** |
+| n=40→50 | 0.5 | 77.1 | 5.1 | 3.6 | **89.6** |
+| n=50→60 | 0.7 | 77.3 | 4.7 | 3.2 | **88.2** |
+| n=60→70 | 0.8 | 77.6 | 4.7 | 3.6 | **85.7** |
+
+**~86.9 ms/step**, spread 4.5%, against §D10.1's **97.7 ms** — **11% faster**, because the old
+number was paying for 30 layers of 64-way split-K attention plus a reduce pass that should never
+have been dispatched. Two changes are in that figure and this run does not separate them (the other
+is §D11.5's producer act-quant); they cannot be separated any more, because the gate now refuses to
+serve the broken graph. tok/s over four requests: 92.1 / 54.9 / 73.1 / 58.8 — the same 49–107 spread
+§D10.1 reports, for the same reason.
+
+**What this voids.** Every attention row in §D10.2 and the whole of §D10.5 was measured on the
+mis-selected path: `flash_prefill_paged_fp8_split_kernel` at 5.0 and 25.0 dispatches/step,
+`flash_prefill_reduce_kernel` at the same counts, and the 8.5 ms/step attention total describe a
+kernel selection the served canvas should never have made. §D10.5's "the five full-attention layers
+cost more than the twenty-five sliding ones" is not a statement about this architecture; it is a
+statement about a 64-way split of a 276-token context. The MoE, collective, dense-GEMM and
+elementwise rows are unaffected in *mechanism*, but every one of their SHARES is a share of a step
+that was 12% too long.
+
+### D11.5 The two §D10.7 items, landed and falsified
+
+**Producer act-quant (item 3(b)) — LANDED.** It was never wired on the dense path at all: only
+`layers/moe.py` took the pair. Gemma4 does not merge QKV, so `input_layernorm`'s output feeds THREE
+separate w4a8 linears that each launched their own `compute_act_fp8_and_scales_kernel` over the same
+rows. `RMSNorm.forward_quant` + a `supports_producer_actquant` declaration on the linear method
+closes it. Verified BY PRESENCE, not by absence of an error:
+
+```
+[hip-engage] tail_hip.rms_norm_quant
+[hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned+prequant)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv+prequant)
+```
+
+Bit-exactness was *measured*, not asserted: the canvas gate read 8.324e+00 before and 8.324e+00
+after, with eager self-consistency 0.000e+00 on both — engaging the fusion moved the number by
+exactly zero while an unrelated defect held it constant.
+
+**The near-tie tie-break (item 3(a)) — the complaint is right, the proposed cure is FALSIFIED.**
+The band *is* inert at these shapes and the tie *was* broken by `BM_SET`'s declaration order, which
+is not a decision. `tile_better` now states the order — cost, then MORE WORKGROUPS, then a stable
+lattice key — applied where the model expresses **no preference at all** (three of the seven canvas
+shapes are exact ties: SWA k/v_proj 64x32 == 128x32, FULL q_proj 128x64 == 256x64). It moves **zero
+picks** on both scorers, which is the point: the accidental order already agreed with the only prior
+that survives scoring.
+
+Extending it into the band, as §D10.7 asks, does not survive:
+
+| gband | restricted-argmin geomean | moved | better | worse | lattice-wide: scored-on-a-measured-tile | moved | both measured |
+|---|---|---|---|---|---|---|---|
+| 1.000 | 1.0333 | 0 | 0 | 0 | 205/300 | 0 | 0 |
+| 1.020 | 1.0328 | 3 | 3 | 0 | 205/300 | 11 | 3 |
+| 1.060 | 1.0309 | 11 | 8 | 2 | 197/300 | 33 | 3 |
+| 1.100 | **1.0396** | 32 | 9 | **22** | **139/300** | 134 | **0** |
+
+At the full band it is a net loss on the restricted scorer, and the lattice-wide geomean's apparent
+improvement (1.2525 → 1.1313) is an artefact — it picks unmeasured tiles on 66 more cells, so it is
+scored on an easier subset. The honest column is *both measured*, and there it is **zero**: 134
+picks move and not one is verifiable. Five relatives (max occupancy, min ragged tail, min rounds,
+largest BM, smallest tile) are all worse than doing nothing.
+
+**What is actually left on the dense path is the occupancy TERM, not a tie-break.**
+`occ = min(blocks_per_cu, rounds) * nwarps` prices what *could* be resident; at `rounds == 1` with
+`wgs < cu` what actually launched is smaller — the two `o_proj` shapes launch 60 workgroups on 64
+CUs at 12/32 waves. Fixing that RE-RANKS the lattice, which a tie-break deliberately does not, so it
+needs the surface re-swept rather than a prior re-argued.

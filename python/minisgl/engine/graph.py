@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
 from minisgl.distributed import get_tp_info
+from minisgl.layers.tp_overlap import inline_collectives, tp_overlap_chunks
 from minisgl.utils import init_logger
 from tqdm import tqdm
 
@@ -987,6 +988,46 @@ class GraphRunner:
             return False
         return all(r.extend_len == self._canvas["qlen"] for r in batch.reqs)
 
+    @staticmethod
+    def _canvas_metadata_diff(a, b, bs: int) -> None:
+        """Log every field on which the SCHEDULER-built canvas metadata and the STATIC (graph)
+        canvas metadata disagree. Host-side, no GPU work beyond the compares themselves; runs only
+        on the two gated check replays per batch size."""
+        if a is None or b is None:
+            return logger.info_rank0("[canvas-graph] metadata diff: one side is None")
+        names = [n for n in dir(a) if not n.startswith("_") and not callable(getattr(a, n, None))]
+        for n in sorted(names):
+            x, y = getattr(a, n, None), getattr(b, n, None)
+            if x is None and y is None:
+                continue
+            if (x is None) != (y is None):
+                logger.info_rank0(f"[canvas-graph] METADATA DIFF {n}: sched={x!r:.60} static={y!r:.60}")
+                continue
+            if isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor):
+                # Compare the LIVE extent only: the static buffers are padded to their captured
+                # width and the scheduler's are cut to the batch, so a shape difference alone is not
+                # a divergence — a difference inside the read extent is.
+                nmin = min(x.shape[0], y.shape[0])
+                same_tail = (x.shape[1:] == y.shape[1:])
+                if same_tail and torch.equal(x[:nmin].cpu(), y[:nmin].cpu()):
+                    if x.shape != y.shape:
+                        logger.info_rank0(
+                            f"[canvas-graph] metadata {n}: values agree over [:{nmin}], shapes "
+                            f"differ sched={tuple(x.shape)} static={tuple(y.shape)}")
+                    continue
+                if not same_tail:
+                    w = min(x.shape[-1], y.shape[-1]) if x.dim() > 1 and y.dim() > 1 else 0
+                    if w and torch.equal(x[:nmin, :w].cpu(), y[:nmin, :w].cpu()):
+                        logger.info_rank0(
+                            f"[canvas-graph] metadata {n}: values agree over [:{nmin},:{w}], row "
+                            f"width differs sched={tuple(x.shape)} static={tuple(y.shape)}")
+                        continue
+                logger.info_rank0(
+                    f"[canvas-graph] METADATA DIFF {n}: sched{tuple(x.shape)}={x.flatten()[:12].tolist()} "
+                    f"static{tuple(y.shape)}={y.flatten()[:12].tolist()}")
+            elif x != y:
+                logger.info_rank0(f"[canvas-graph] METADATA DIFF {n}: sched={x!r} static={y!r}")
+
     def replay_canvas(
         self, batch: Batch, canvas_ids: torch.Tensor, self_conditioning: torch.Tensor
     ) -> torch.Tensor:
@@ -1007,7 +1048,22 @@ class GraphRunner:
         carries a ZERO self-conditioning signal and would not exercise that input.
 
         The eager forward re-stores the same K/V into the same slots from the same inputs, so running
-        it first is idempotent; it costs two extra forwards per captured size, once."""
+        it first is idempotent; it costs three extra forwards per captured size, twice.
+
+        THE REFERENCE MUST BE IN THE GRAPH'S OWN COLLECTIVE REGIME, and getting that wrong is what
+        made this gate report `max|delta|=1.575e+01` with nothing to attribute it to. `tp_overlap` is
+        capture-TRANSPARENT: under capture every all_reduce is inline and `Gemma4DecoderLayer.forward`
+        takes its no-row-split branch, while the eager path puts collectives on a side stream and (at
+        the default `MINISGL_TP_AR_CHUNKS=2`) splits the FFN into two 128-row chunks. So a bare
+        "graph vs eager" varies TWO things at once — the graph mechanism AND the program — and cannot
+        say which one it caught. The reference below is therefore taken inside
+        `inline_collectives()`, which pins the eager forward to the same program the capture recorded.
+        The regime difference is not swept under the rug: it is measured separately, on the same
+        inputs, and reported as its own number.
+
+        AND IT RAISES. This check printed `*** NOT bit-identical ***` and served on, which is how a
+        real divergence rode in the doc's §D6.1 "bit-identical" claim for a full measurement pass. A
+        gate whose failure mode is a log line is not a gate."""
         v = self._canvas
         v["replays"] += 1
         checked = v["checked"]
@@ -1016,26 +1072,89 @@ class GraphRunner:
         if check:
             checked[bs] = checked.get(bs, 0) + 1
         cbuf: CanvasCaptureBuffer = v["buf"]
-        eager = None
+        ref = ref_again = ref_serve = None
         if check:
-            # Eager reference FIRST, off the scheduler-built (non-static) metadata, before
+            # Eager references FIRST, off the scheduler-built (non-static) metadata, before
             # prepare_canvas_for_replay swaps in the static one.
             self.attn_backend.prepare_metadata(batch)
+            model = v["model"]
             with get_global_ctx().forward_batch(batch), torch.inference_mode():
-                eager = v["model"].forward_canvas_hidden(canvas_ids, self_conditioning).clone()
+                with inline_collectives():
+                    # THE reference: same inputs, same program as the captured region.
+                    ref = model.forward_canvas_hidden(canvas_ids, self_conditioning).clone()
+                    # Determinism control. If THIS is non-zero the eager forward is not a fixed
+                    # function of its inputs (an atomic reduction, a race), and no graph-vs-eager
+                    # number below means anything until that is fixed.
+                    ref_again = model.forward_canvas_hidden(canvas_ids, self_conditioning).clone()
+                # The eager FALLBACK path exactly as an uncaptured bs would run it: side-stream
+                # collectives + the row split. Reported, not gated — see below.
+                ref_serve = model.forward_canvas_hidden(canvas_ids, self_conditioning).clone()
+        md_sched = getattr(batch, "attn_metadata", None) if check else None
         cbuf.copy_from(batch, canvas_ids, self_conditioning)
         self.attn_backend.prepare_canvas_for_replay(batch)
+        ref_static = None
+        if check:
+            # FREE, host-side: the two metadata objects field by field. `prepare_metadata` and
+            # `prepare_canvas_for_replay` are two INDEPENDENT implementations of the same canvas
+            # geometry (`_build_swa_canvas_metadata` vs `_fill_swa_multiquery_static`), and a graph
+            # can only be as right as the second one. Any line printed here is a divergence between
+            # what the scheduler believes and what the graph reads.
+            self._canvas_metadata_diff(md_sched, getattr(batch, "attn_metadata", None), bs)
+            # THE LOCALISING PROBE. Same eager forward, same inputs, same collective regime — but
+            # under the STATIC metadata `prepare_canvas_for_replay` just installed, which is what the
+            # graph reads. Two deterministic forwards differing only in metadata:
+            #   ref_static != ref  -> prepare_canvas_for_replay builds a DIFFERENT geometry than the
+            #                         scheduler does, and the graph is faithfully replaying it.
+            #   ref_static == ref  -> the metadata agrees and the divergence is in the captured
+            #                         region itself (a pointer that moved, a pool alias).
+            # It runs on the STATIC buffers the graph will read, so it must come AFTER copy_from and
+            # BEFORE the replay; it re-stores the same K/V to the same slots, so it is idempotent.
+            with get_global_ctx().forward_batch(batch), torch.inference_mode():
+                with inline_collectives():
+                    ref_static = v["model"].forward_canvas_hidden(
+                        cbuf.input_ids[: batch.size * v["qlen"]],
+                        cbuf.self_cond[: batch.size * v["qlen"]],
+                    ).clone()
         v["graphs"][batch.size].replay()
         T = batch.size * v["qlen"]
         out = cbuf.hidden[:T]
         if check:
-            delta = (out.float() - eager.float()).abs().max().item()
+            first = out.clone()
+            v["graphs"][batch.size].replay()  # replay determinism control
+            second = cbuf.hidden[:T].clone()
+
+            def _d(a, b):
+                return (a.float() - b.float()).abs().max().item()
+
+            d_graph = _d(first, ref)              # THE claim
+            d_eager_self = _d(ref, ref_again)     # eager determinism
+            d_graph_self = _d(first, second)      # replay determinism
+            d_regime = _d(ref_serve, ref)         # cost of the eager path's overlap + row split
+            d_meta = _d(ref_static, ref)          # STATIC metadata vs scheduler metadata, both eager
+            d_vs_static = _d(first, ref_static)   # does the graph reproduce eager-under-ITS metadata
+            scale = ref.float().abs().max().item()
             logger.info_rank0(
-                f"[canvas-graph] REPLAY #{v['replays']} engaged, bs={bs} check "
-                f"{checked[bs]}/2 (qlen={v['qlen']}, T={T}): graph vs eager "
-                f"max|delta|={delta:.3e} over {tuple(out.shape)} "
-                + ("BIT-IDENTICAL" if delta == 0.0 else "*** NOT bit-identical ***")
+                f"[canvas-graph] REPLAY #{v['replays']} engaged, bs={bs} check {checked[bs]}/2 "
+                f"(qlen={v['qlen']}, T={T}, ref max|x|={scale:.4g} over {tuple(out.shape)}): "
+                f"graph vs eager[matched regime] max|delta|={d_graph:.3e} "
+                + ("BIT-IDENTICAL" if d_graph == 0.0 else "*** NOT bit-identical ***")
+                + f" | eager self-consistency={d_eager_self:.3e}"
+                f" | replay self-consistency={d_graph_self:.3e}"
+                f" | eager-fallback regime (side-stream AR + {tp_overlap_chunks()} row chunks) "
+                f"vs matched={d_regime:.3e}"
+                f" | LOCALISE: eager[static replay metadata] vs eager[scheduler metadata]"
+                f"={d_meta:.3e}; graph vs eager[static replay metadata]={d_vs_static:.3e}"
             )
+            if d_graph != 0.0 or d_graph_self != 0.0:
+                raise RuntimeError(
+                    "[canvas-graph] captured canvas step is NOT bit-identical to the eager forward "
+                    f"it was captured from (bs={bs}, T={T}): graph vs matched-regime eager "
+                    f"max|delta|={d_graph:.3e}, replay-vs-replay={d_graph_self:.3e}, "
+                    f"eager-vs-eager={d_eager_self:.3e}, ref max|x|={scale:.4g}. "
+                    "A replay that does not reproduce its own capture addresses different memory or "
+                    "runs a different kernel than was recorded; every number taken on this graph is "
+                    "void. Read GraphRunner.replay_canvas before relaxing this."
+                )
         return out
 
     # NOTE: This must be called before freeing NCCL resources to prevent program hang
