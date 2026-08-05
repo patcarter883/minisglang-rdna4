@@ -118,6 +118,7 @@ Env:
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import TYPE_CHECKING, Callable, List
 
@@ -130,6 +131,7 @@ __all__ = [
     "AsyncAllReduce",
     "ar_span",
     "async_all_reduce",
+    "inline_collectives",
     "rowchunked_ar_span",
     "tp_overlap_chunks",
     "tp_overlap_enabled",
@@ -163,6 +165,8 @@ _CHUNKS = max(1, _env_int("MINISGL_TP_AR_CHUNKS", 2))
 _MIN_CHUNK_ROWS = 33
 _side_stream: "torch.cuda.Stream | None" = None
 _announced = False
+# Set only by `inline_collectives()` below -- a measurement scope, not an operator knob.
+_FORCE_INLINE = False
 
 
 def tp_overlap_enabled() -> bool:
@@ -236,10 +240,33 @@ def _overlappable(x: torch.Tensor) -> bool:
     was."""
     return (
         _ENABLED
+        and not _FORCE_INLINE
         and x.is_cuda
         and x.shape[0] >= _MIN_TOKENS
         and not torch.cuda.is_current_stream_capturing()
     )
+
+
+@contextlib.contextmanager
+def inline_collectives():
+    """Run the enclosed forward in the collective regime a CAPTURED GRAPH contains.
+
+    `_overlappable` excludes capture, so a captured region holds inline collectives and no row split
+    while the eager path holds side-stream collectives and (at chunks>1) a row split. That is by
+    design, but it means "graph vs eager" is TWO differences at once: the graph mechanism, and a
+    different program. A bit-exactness gate that does not hold the second one fixed cannot say which
+    it caught — which is exactly how `[canvas-graph]` came to report a 1.575e+01 delta with nothing
+    to attribute it to.
+
+    This is a MEASUREMENT scope, not a knob: nothing in the serve loop enters it, and it takes no
+    env var. Its one caller is `GraphRunner.replay_canvas`'s reference forward."""
+    global _FORCE_INLINE
+    prev = _FORCE_INLINE
+    _FORCE_INLINE = True
+    try:
+        yield
+    finally:
+        _FORCE_INLINE = prev
 
 
 def async_all_reduce(comm: "DistributedCommunicator", x: torch.Tensor) -> AsyncAllReduce:

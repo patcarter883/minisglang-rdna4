@@ -31,8 +31,8 @@
 #
 #   gpu-lease -n 2 --timeout 7200 -- bash tools/canvas_rocprof.sh
 set -uo pipefail
-WT=${WT:-/home/pat/code/minisgl-rdna4-dgprof}
-IMAGE=${MINISGL_IMAGE:-minisgl-rdna4:post-tile-prof}
+WT=${WT:-/home/pat/code/minisgl-rdna4-cgfix}
+IMAGE=${MINISGL_IMAGE:-minisgl-rdna4:dgprof}
 DG_MODEL=${DG_MODEL:-cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4}
 SCRATCH=${SCRATCH:-$HOME/.cache/minisgl-perf}
 SWA_RADIX=${SWA_RADIX:-0}
@@ -65,6 +65,11 @@ RPDIR=cvout-$RUN_ID
 : > "$OUT"
 rm -rf "${WT:?}/$RPDIR"; mkdir -p "$WT/$RPDIR"
 export COMPOSE_PROJECT_NAME="minisglcv$RUN_ID"
+# A UNIQUE HOST PORT: other agents on this box serve the same compose file on the same two cards,
+# and a 1919 collision makes `up -d` fail before the container exists (which then reads as a boot
+# crash with an empty docker log).
+PORT=${PORT:-$((1920 + RANDOM % 900))}
+export MINISGL_HOST_PORT="$PORT"
 
 say() { echo "$@" | tee -a "$OUT"; }
 say "=== canvas_rocprof run=$RUN_ID image=$IMAGE model=$DG_MODEL"
@@ -84,6 +89,10 @@ write_yml() {  # $1 = command line, $2... = extra "KEY: val" env lines
     echo "    command: [\"$cmd\"]"
     echo "    environment:"
     echo "      MINISGL_SWA_RADIX: \"$SWA_RADIX\""
+    # EXTRA_ENV: newline-free "KEY: val" lines, semicolon-separated. Exists so a leg can pin an
+    # attention/kernel knob (e.g. MINISGL_ATTN_MAX_SPLITS) without a second copy of this file.
+    IFS=';' read -ra _ee <<< "${EXTRA_ENV:-}"
+    for kv in "${_ee[@]}"; do [ -n "$kv" ] && echo "      $kv"; done
     for kv in "$@"; do echo "      $kv"; done
   } > "$YMLF"
 }
@@ -95,10 +104,10 @@ trap 'down; rm -f "$YMLF"' EXIT INT TERM
 # a sha is recorded for provenance only, never as an identity gate (uniform-noise canvas + a
 # multinomial every step => two boots differ no matter what is pinned).
 drive() {  # $1 = n requests, $2 = max_tokens
-  python3 - "$1" "$2" <<'PY' 2>&1
+  python3 - "$1" "$2" "$PORT" <<'PY' 2>&1
 import hashlib, json, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
-n, maxtok = int(sys.argv[1]), int(sys.argv[2])
+n, maxtok, port = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 PROMPTS = [
     "Write one paragraph explaining why the sky is blue.",
     "List three differences between a list and a tuple in Python.",
@@ -110,7 +119,7 @@ def one(i):
         "model": "m", "max_tokens": maxtok, "temperature": 0.0, "stream": False,
         "messages": [{"role": "user", "content": PROMPTS[i % len(PROMPTS)]}],
     }).encode()
-    rq = urllib.request.Request("http://localhost:1919/v1/chat/completions", body,
+    rq = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions", body,
                                 {"Content-Type": "application/json"})
     t0 = time.perf_counter()
     try:
@@ -140,8 +149,8 @@ wait_ready() {  # "Container Up" is NOT ready: poll the HTTP health AND require 
     if docker logs "$c" 2>&1 | grep -qaE "Traceback \(most recent call last\)|RuntimeError|torch.OutOfMemoryError"; then
       say "!! traceback in the log"; docker logs "$c" 2>&1 | grep -aA20 "Traceback" | tail -50 | tee -a "$OUT"; return 1
     fi
-    if curl -s --max-time 3 http://localhost:1919/health >/dev/null 2>&1 \
-       || curl -s --max-time 3 http://localhost:1919/v1/models >/dev/null 2>&1; then
+    if curl -s --max-time 3 http://localhost:$PORT/health >/dev/null 2>&1 \
+       || curl -s --max-time 3 http://localhost:$PORT/v1/models >/dev/null 2>&1; then
       say "== ready after ~$((i*3))s"; return 0
     fi
     sleep 3
