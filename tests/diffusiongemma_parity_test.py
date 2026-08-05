@@ -335,7 +335,7 @@ def _build_minisgl(mc, hf_model):
     for i, layer in enumerate(model.model.layers.op_list):
         ref_experts = hf_model.model.decoder.layers[i].experts
         layer.experts = _types.SimpleNamespace(
-            forward=lambda hidden_states, topk_weights, topk_ids, _e=ref_experts: _e(
+            forward=lambda hidden_states, topk_weights, topk_ids, reduce=True, _e=ref_experts: _e(
                 hidden_states, topk_ids, topk_weights
             )
         )

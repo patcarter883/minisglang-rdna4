@@ -25,11 +25,7 @@ from minisgl.layers import (
     MoELayer,
     silu_and_mul,
 )
-from minisgl.layers.moe import (
-    get_moe_ar_side_stream,
-    moe_async_ar_enabled,
-    moe_async_ar_min_tokens,
-)
+from minisgl.layers.tp_overlap import rowchunked_ar_span
 from minisgl.quant import create_linear_method
 from minisgl.utils import nvtx_annotate
 
@@ -104,37 +100,6 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         )
         return routed_out + shared_out
 
-    def _forward_async_ar(self, hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
-        """Phase-1 comms/compute overlap: split the fused shared+routed partial into 2 DISJOINT row
-        chunks and hide chunk-0's TP all_reduce (side stream, RCCL) behind chunk-1's expert compute
-        (main stream). Disjoint rows => BIT-EXACT (each row's all_reduce is an independent 2-rank
-        elementwise SUM). Eager prefill only; both TP ranks split at the same deterministic `half`
-        (identical `num_tokens` post attention-AR) and submit chunk-0 then chunk-1 all_reduce in program
-        order, so RCCL matches the collectives -> no desync/deadlock. Per-chunk events serialize each AR
-        against its producer (side waits) and consumer (main waits) -> no half-reduced read."""
-        experts = self.experts
-        half = num_tokens // 2  # deterministic + identical n on both ranks => identical split
-        row_chunks = (hidden_states[:half], hidden_states[half:])
-        main = torch.cuda.current_stream()
-        side = get_moe_ar_side_stream()
-        partials: list[torch.Tensor] = []
-        ar_done: list[torch.cuda.Event] = []
-        for h in row_chunks:
-            combined = self._fused_partial(h)  # main stream (chunk-1 compute overlaps chunk-0's AR)
-            ready = torch.cuda.Event()
-            ready.record(main)          # combined producer complete on the main stream
-            side.wait_event(ready)      # side AR must not start before combined is ready
-            with torch.cuda.stream(side):
-                combined.record_stream(side)        # allocator: the side stream also uses this tensor
-                experts._comm.all_reduce(combined)  # in-place RCCL SUM on the side stream
-                done = torch.cuda.Event()
-                done.record(side)
-            partials.append(combined)
-            ar_done.append(done)
-        for done in ar_done:
-            main.wait_event(done)       # main must not read a chunk before its AR completes
-        return torch.cat(partials, dim=0)
-
     @nvtx_annotate("MoE")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -146,16 +111,20 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         # fewer collectives/step on the 40-layer 35B at TP=2. Only in the pure-TP path: EP reduces the
         # routed experts over a DIFFERENT (dp/EP) group, so there the two must stay separate.
         fuse = experts.tp_size > 1 and not experts.enable_ep
-        # Phase-1 comms/compute overlap (eager prefill only): hide chunk-0's fused all_reduce behind
-        # chunk-1's expert GEMM. Off by default; never under graph capture (side-stream collectives are
-        # graph-unsafe) and only above a token threshold where the overlap beats the doubled launch.
-        if (
-            fuse
-            and moe_async_ar_enabled()
-            and num_tokens >= moe_async_ar_min_tokens()
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            combined = self._forward_async_ar(hidden_states, num_tokens)
+        # Comms/compute overlap: hide chunk i's fused all_reduce behind chunk i+1's expert GEMM. This
+        # used to be a bespoke ~30-line side-stream dance here; it is now `rowchunked_ar_span`, the
+        # shared primitive in layers/tp_overlap.py, which every TP model uses. The gate moved in there
+        # too — the helper itself falls back to the plain produce+all_reduce under graph capture, below
+        # the token threshold, or when overlap is off, so there is no condition to keep in sync here.
+        #
+        # It is now DEFAULT-OFF (MINISGL_TP_AR_CHUNKS=1), which is a deliberate behaviour change. The
+        # row split was documented here as bit-exact "by construction"; it is not, and never was — the
+        # argument covers the all_reduce but not the expert GEMM, whose kernel choice depends on M.
+        # Measured up to 1.6e-2 on bf16 (tools/tp_overlap_bitexact.py). This block fuses shared+routed
+        # into ONE collective and so has no second independent branch to hide it behind, which means a
+        # row split is the only overlap available here — hence: opt in, knowing the trade.
+        if fuse:
+            combined = rowchunked_ar_span(experts._comm, hidden_states, self._fused_partial)
             return combined.view(num_tokens, hidden_dim)
         # "shared" sub-bucket of the layer-prof "ffn" total (MINISGL_LAYER_PROF). Summed over all
         # layers, reported per-step -> direct per-step shared-expert cost (Task B #18 attribution).
