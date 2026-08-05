@@ -1,0 +1,39 @@
+=== canvas_graph_bitexact run=157900715293 image=minisgl-rdna4:dgprof
+=== engine=57473d66 swa_radix=0 conc=1 arms=matched port=2551
+
+############ ARM matched  ()
+== ready after ~69s
+req: FAILED RemoteDisconnected: Remote end closed connection without response
+--- [canvas-graph]
+[1m[2026-08-05|16:03:28|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF max_seqlen_k: sched=276 static=262144
+[1m[2026-08-05|16:03:28|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata page_table: values agree over [:1,:18], row width differs sched=(1, 18) static=(1, 16384)
+[1m[2026-08-05|16:03:28|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF swa_table_idx: sched=[0] static=None
+[1m[2026-08-05|16:03:28|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata swa_verify_page_table: values agree over [:1,:276], row width differs sched=(1, 276) static=(1, 1280)
+[1m[2026-08-05|16:03:28|core|rank=0][0m [32mINFO    [0m [canvas-graph] REPLAY #1 engaged, bs=1 check 1/2 (qlen=256, T=256, ref max|x|=41.44 over (256, 2816)): graph vs eager[matched regime] max|delta|=8.324e+00 *** NOT bit-identical *** | eager self-consistency=0.000e+00 | replay self-consistency=0.000e+00 | eager-fallback regime (side-stream AR + 2 row chunks) vs matched=0.000e+00 | LOCALISE: eager[static replay metadata] vs eager[scheduler metadata]=8.324e+00; graph vs eager[static replay metadata]=0.000e+00
+RuntimeError: [canvas-graph] captured canvas step is NOT bit-identical to the eager forward it was captured from (bs=1, T=256): graph vs matched-regime eager max|delta|=8.324e+00, replay-vs-replay=0.000e+00, eager-vs-eager=0.000e+00, ref max|x|=41.44. A replay that does not reproduce its own capture addresses different memory or runs a different kernel than was recorded; every number taken on this graph is void. Read GraphRunner.replay_canvas before relaxing this.
+RuntimeError: [canvas-graph] captured canvas step is NOT bit-identical to the eager forward it was captured from (bs=1, T=256): graph vs matched-regime eager max|delta|=8.324e+00, replay-vs-replay=0.000e+00, eager-vs-eager=0.000e+00, ref max|x|=41.44. A replay that does not reproduce its own capture addresses different memory or runs a different kernel than was recorded; every number taken on this graph is void. Read GraphRunner.replay_canvas before relaxing this.
+--- overlap provenance / gate failure
+RuntimeError: [canvas-graph] captured canvas step is NOT bit-identical to the eager forward it was captured from (bs=1, T=256): graph vs matched-regime eager max|delta|=8.324e+00, replay-vs-replay=0.000e+00, eager-vs-eager=0.000e+00, ref max|x|=41.44. A replay that does not reproduce its own capture addresses different memory or runs a different kernel than was recorded; every number taken on this graph is void. Read GraphRunner.replay_canvas before relaxing this.
+RuntimeError: [canvas-graph] captured canvas step is NOT bit-identical to the eager forward it was captured from (bs=1, T=256): graph vs matched-regime eager max|delta|=8.324e+00, replay-vs-replay=0.000e+00, eager-vs-eager=0.000e+00, ref max|x|=41.44. A replay that does not reproduce its own capture addresses different memory or runs a different kernel than was recorded; every number taken on this graph is void. Read GraphRunner.replay_canvas before relaxing this.
+--- [hip-engage]
+[hip-engage] attn_decode.flash_decode_paged_fp8
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(canvas)
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(swa-canvas)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv+prequant)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned+prequant)
+[hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm(gemv)
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma)
+[hip-engage] moe_hip.moe_align
+[hip-engage] tail_hip.gelu_tanh_and_mul
+[hip-engage] tail_hip.rms_norm
+[hip-engage] tail_hip.rms_norm_quant
+[hip-engage] tail_hip.rope
+[hip-engage] tail_hip.store_kv
+
+=== done. out=/home/pat/.cache/minisgl-perf/canvas_bitexact-157900715293.txt

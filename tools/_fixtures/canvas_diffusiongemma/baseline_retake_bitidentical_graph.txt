@@ -1,0 +1,86 @@
+=== canvas_rocprof run=16170473507 image=minisgl-rdna4:dgprof model=cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4
+=== engine=57473d66  swa_radix=0 conc=1
+
+############ LEG base — served baseline + canvas timing + the hip-engage ledger
+== ready after ~66s
+--- warmup
+req0: 64 tok in 5.43s = 11.8 tok/s sha=c243c631c0af3ea3
+WALL 5.43s
+--- measured 1
+req0: 103 tok in 1.12s = 92.1 tok/s sha=45be4566bc7ea0f3
+WALL 1.12s
+--- measured 2
+req0: 105 tok in 1.91s = 54.9 tok/s sha=a673ffb0bdc5f714
+WALL 1.91s
+--- measured 3
+req0: 101 tok in 1.38s = 73.1 tok/s sha=ab800407929c958c
+WALL 1.38s
+--- measured 4
+req0: 107 tok in 1.82s = 58.8 tok/s sha=aef808a824f84d4a
+WALL 1.82s
+
+--- [canvas-timing] (cumulative; difference consecutive points for the marginal step)
+[1m[2026-08-05|16:12:25|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=10 bs=1.0 per step: fwd_issue=94.4ms fwd_tail=62.8ms sampler=46.3ms soft_embed=38.1ms step=244.2ms
+[1m[2026-08-05|16:12:26|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=20 bs=1.0 per step: fwd_issue=47.5ms fwd_tail=70.0ms sampler=25.5ms soft_embed=20.8ms step=165.1ms
+[1m[2026-08-05|16:12:27|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=30 bs=1.0 per step: fwd_issue=31.8ms fwd_tail=72.3ms sampler=18.6ms soft_embed=15.0ms step=139.4ms
+[1m[2026-08-05|16:12:27|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=40 bs=1.0 per step: fwd_issue=24.0ms fwd_tail=73.6ms sampler=15.1ms soft_embed=12.1ms step=126.1ms
+[1m[2026-08-05|16:12:28|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=50 bs=1.0 per step: fwd_issue=19.3ms fwd_tail=74.3ms sampler=13.1ms soft_embed=10.4ms step=118.8ms
+[1m[2026-08-05|16:12:29|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=60 bs=1.0 per step: fwd_issue=16.2ms fwd_tail=74.8ms sampler=11.7ms soft_embed=9.2ms step=113.7ms
+[1m[2026-08-05|16:12:30|core|rank=0][0m [32mINFO    [0m [canvas-timing] n=70 bs=1.0 per step: fwd_issue=14.0ms fwd_tail=75.2ms sampler=10.7ms soft_embed=8.4ms step=109.7ms
+
+--- [hip-engage] ledger: WHICH kernels this checkpoint actually dispatches
+[hip-engage] attn_decode.flash_decode_paged_fp8
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(canvas)
+[hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(swa-canvas)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv+prequant)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned)
+[hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned+prequant)
+[hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm2_gather_reduce
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm(gemv)
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter
+[hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma)
+[hip-engage] moe_hip.moe_align
+[hip-engage] tail_hip.gelu_tanh_and_mul
+[hip-engage] tail_hip.rms_norm
+[hip-engage] tail_hip.rms_norm_quant
+[hip-engage] tail_hip.rope
+[hip-engage] tail_hip.store_kv
+
+--- KV pool / cache plan / canvas config
+ServerArgs(model_path='cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.float16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=1, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=1, page_size=16, memory_ratio=0.8, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=None, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=True, _unique_suffix='.pid=1', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|16:12:03|core|rank=0][0m [32mINFO    [0m Reserved 0.18 GiB for SWA ring KV state (1 slots); KV pool gets the remainder
+[1m[2026-08-05|16:12:03|core|rank=1][0m [32mINFO    [0m Reserved 0.18 GiB for SWA ring KV state (1 slots); KV pool gets the remainder
+[1m[2026-08-05|16:12:03|core|rank=0][0m [32mINFO    [0m Reserved 0.69 GiB for CUDA graph capture (max_bs=1); KV pool gets the remainder
+[1m[2026-08-05|16:12:03|core|rank=0][0m [32mINFO    [0m Allocating 567888 tokens for KV cache, K + V = 2.71 GiB
+[1m[2026-08-05|16:12:03|core|rank=1][0m [32mINFO    [0m Reserved 0.69 GiB for CUDA graph capture (max_bs=1); KV pool gets the remainder
+[1m[2026-08-05|16:12:03|core|rank=1][0m [32mINFO    [0m Allocating 567888 tokens for KV cache, K + V = 2.71 GiB
+[1m[2026-08-05|16:12:14|core|rank=0][0m [32mINFO    [0m Capturing CANVAS CUDA graphs (canvas=256) sizes=[1]; free 3.51 GiB
+[1m[2026-08-05|16:12:14|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(swa-canvas)
+[1m[2026-08-05|16:12:14|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_prefill_paged.flash_prefill_paged_fp8(canvas)
+[1m[2026-08-05|16:12:14|core|rank=0][0m [32mINFO    [0m canvas graphs captured; free 3.43 GiB
+Capturing canvas graphs:   0%|          | 0/1 [00:00<?, ?batch/s]Capturing canvas graphs: 100%|██████████| 1/1 [00:00<00:00,  7.25batch/s]Capturing canvas graphs: 100%|██████████| 1/1 [00:00<00:00,  7.24batch/s]
+[1m[2026-08-05|16:12:14|core|rank=0][0m [33mWARNING [0m SWA-hybrid model: prefix cache 'naive' (was 'radix'); SWA-radix disabled (MINISGL_SWA_RADIX=0) — no snapshot store, and the engine reserved no VRAM for one
+[1m[2026-08-05|16:12:22|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF max_seqlen_k: sched=279 static=262144
+[1m[2026-08-05|16:12:22|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata page_table: values agree over [:1,:18], row width differs sched=(1, 18) static=(1, 16384)
+[1m[2026-08-05|16:12:22|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF swa_table_idx: sched=[0] static=None
+[1m[2026-08-05|16:12:22|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata swa_verify_page_table: values agree over [:1,:279], row width differs sched=(1, 279) static=(1, 1280)
+[1m[2026-08-05|16:12:23|core|rank=0][0m [32mINFO    [0m [canvas-graph] REPLAY #1 engaged, bs=1 check 1/2 (qlen=256, T=256, ref max|x|=42.5 over (256, 2816)): graph vs eager[matched regime] max|delta|=0.000e+00 BIT-IDENTICAL | eager self-consistency=0.000e+00 | replay self-consistency=0.000e+00 | eager-fallback regime (side-stream AR + 2 row chunks) vs matched=0.000e+00 | LOCALISE: eager[static replay metadata] vs eager[scheduler metadata]=0.000e+00; graph vs eager[static replay metadata]=0.000e+00
+[1m[2026-08-05|16:12:23|core|rank=1][0m [32mINFO    [0m [canvas] TP rank 1: RNG deviates AGREED with rank 0 on the first sharded step (rank 0's are used either way — the draw is lockstep by construction, not by luck)
+[1m[2026-08-05|16:12:23|core|rank=0][0m [32mINFO    [0m [canvas] TP rank 0: RNG deviates AGREED with rank 0 on the first sharded step (rank 0's are used either way — the draw is lockstep by construction, not by luck)
+[1m[2026-08-05|16:12:24|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF max_seqlen_k: sched=279 static=262144
+[1m[2026-08-05|16:12:24|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata page_table: values agree over [:1,:18], row width differs sched=(1, 18) static=(1, 16384)
+[1m[2026-08-05|16:12:24|core|rank=0][0m [32mINFO    [0m [canvas-graph] METADATA DIFF swa_table_idx: sched=[0] static=None
+[1m[2026-08-05|16:12:24|core|rank=0][0m [32mINFO    [0m [canvas-graph] metadata swa_verify_page_table: values agree over [:1,:279], row width differs sched=(1, 279) static=(1, 1280)
+[1m[2026-08-05|16:12:24|core|rank=0][0m [32mINFO    [0m [canvas-graph] REPLAY #2 engaged, bs=1 check 2/2 (qlen=256, T=256, ref max|x|=43.59 over (256, 2816)): graph vs eager[matched regime] max|delta|=0.000e+00 BIT-IDENTICAL | eager self-consistency=0.000e+00 | replay self-consistency=0.000e+00 | eager-fallback regime (side-stream AR + 2 row chunks) vs matched=0.000e+00 | LOCALISE: eager[static replay metadata] vs eager[scheduler metadata]=0.000e+00; graph vs eager[static replay metadata]=0.000e+00
+
+--- [canvas] per-block k (denoising steps actually realised)
+[canvas] uid=0 block@23 steps=10/48 emitted=64 mean_entropy=0.0036 eos=True finished=True
+[canvas] uid=1 block@23 steps=12/48 emitted=104 mean_entropy=0.0044 eos=True finished=True
+[canvas] uid=2 block@23 steps=21/48 emitted=106 mean_entropy=0.0036 eos=True finished=True
+[canvas] uid=3 block@23 steps=15/48 emitted=102 mean_entropy=0.0029 eos=True finished=True
+[canvas] uid=4 block@23 steps=20/48 emitted=108 mean_entropy=0.0041 eos=True finished=True
+
+=== done. out=/home/pat/.cache/minisgl-perf/canvas_rocprof-16170473507.txt  trace=/home/pat/.cache/minisgl-perf/cvout-16170473507
