@@ -152,13 +152,19 @@ wait_ready() {  # "Container Up" is NOT ready: poll the HTTP health AND require 
 EXTRA=""
 [ -n "$NUM_PAGES" ] && EXTRA="--num-pages $NUM_PAGES"
 
+# EXPORTED OUTSIDE THE LEG GATES. When this lived inside the `base` block, `LEGS=trace` skipped it and
+# the trace leg booted serve.sh's DEFAULT model -- qwen35b-awq with spec, GDN state and a
+# recurrent-radix store -- which died on KV sizing. The failure looked like an OOM in THIS workload
+# and was not this workload at all. Compose reads these from the environment, so they must be set
+# before ANY `DC up`.
+export MODEL="$DG_MODEL" SPEC=none TP=2 CONC="$CONC" GRAPH_BS="$CONC" EXTRA_ARGS="$EXTRA"
+
 # =============================================================================================
 if [[ ",$LEGS," == *",base,"* ]]; then
 say ""; say "############ LEG base — served baseline + canvas timing + the hip-engage ledger"
 # =============================================================================================
 write_yml "exec /engine/tools/serve.sh" "MINISGL_CANVAS_TIMING: \"1\""
 down
-export MODEL="$DG_MODEL" SPEC=none TP=2 CONC="$CONC" GRAPH_BS="$CONC" EXTRA_ARGS="$EXTRA"
 unset MINISGL_ROCTX MINISGL_EXIT_AFTER_STEPS
 DC up -d >/dev/null 2>&1
 if wait_ready; then
