@@ -24,6 +24,40 @@ def _rms_norm(
     return normed * (weight + 1.0) if plus_one else normed * weight
 
 
+def _rms_norm_quant(
+    x: torch.Tensor, weight: torch.Tensor | None, eps: float, plus_one: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """The SAME norm, plus the fp8-e4m3 form of its own output row.
+
+    PRODUCER-SIDE ACTIVATION QUANT. A w4a8/w8a8 linear needs per-token fp8 activations; today the
+    GEMM op launches its own `compute_act_fp8_and_scales_kernel` and re-reads the whole (M,K)
+    activation to build them. The norm that produced those values already held them in registers, one
+    block per row, with a block reduce — so the quant is an EPILOGUE there, not a kernel anywhere.
+    It is deliberately NOT a standalone elementwise op (that trades one dispatch for another), and
+    the quant stays SEPARATE from the GEMM (the core keeps consuming `x_fp8` + `act_scales`).
+
+    Returns (out, x_fp8, act_scales) — a bit-identical `out`, and a pair `w4a8_linear` consumes
+    bit-identically — or None when the native kernel is unavailable (a torch-decomposition dtype, or
+    a tail_hip build predating the op). None is the ONLY fallback, it is explicit at the call site,
+    and it changes performance, never numerics.
+    """
+    if not _tail_hip.active(x, weight) or not hasattr(_tail_hip, "rms_norm_quant"):
+        return None
+    return _tail_hip.rms_norm_quant(x.contiguous(), weight, eps, int(plus_one))
+
+
+def _rms_norm_add_quant(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor | None, eps: float,
+    plus_one: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """`_rms_norm_quant` for the fused residual-add norm. `residual` is mutated in place to
+    (x + residual) exactly as `rms_norm_add` does, and must stay the SAME storage."""
+    if (not _tail_hip.active(x, residual, weight) or not residual.is_contiguous()
+            or not hasattr(_tail_hip, "rms_norm_add_quant")):
+        return None
+    return _tail_hip.rms_norm_add_quant(x.contiguous(), residual, weight, eps, int(plus_one))
+
+
 class RMSNorm(BaseOP):
     def __init__(self, size: int, eps: float, *, plus_one: bool = False) -> None:
         self.eps = eps
@@ -79,3 +113,28 @@ class RMSNormFused(BaseOP):
         residual.add_(x)
         x.copy_(_rms_norm(residual, self.weight, self.eps, self.plus_one))
         return x, residual
+
+    def forward_quant(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """`forward`, plus the fp8-e4m3 form of the output for a downstream w4a8/w8a8 linear.
+
+        Returns (out, residual, x_fp8, act_scales). The pair is None when the fused kernel does not
+        apply, and the caller then just does not pass it to the linear — which re-quantizes exactly
+        as it always did. `out` and `residual` are bit-identical to `forward` either way, so a call
+        site can switch on this without a numerics review.
+
+        See `minisgl.quant.kernels.w4a8_linear`'s x_fp8/act_scales for why this lives on the PRODUCER:
+        the norm already holds the row in registers, so the alternative is a separate act-quant
+        dispatch plus an (M,K) re-read per dense linear.
+        """
+        if residual is None:
+            r = _rms_norm_quant(x, self.weight, self.eps, self.plus_one)
+            if r is None:
+                return _rms_norm(x, self.weight, self.eps, self.plus_one), x, None, None
+            return r[0], x, r[1], r[2]
+        r = _rms_norm_add_quant(x, residual, self.weight, self.eps, self.plus_one)
+        if r is None:
+            out, res = self.forward(x, residual)
+            return out, res, None, None
+        return r[0], residual, r[1], r[2]

@@ -1,0 +1,21 @@
+name,K,N,g,M,dtype,arm,tile,us_median,us_min,us_max,reps,R_rotation,weight_bytes,device
+q27.gate_up tp1,5120,34816,32,17,bfloat16,prefill_wmma,-,764.356,763.446,772.558,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,17,bfloat16,tiled@best,256x128,984.066,980.003,986.103,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,17,bfloat16,tiled(chooser),-,612.608,609.748,614.719,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,17,bfloat16,tiled(chooser)+producer_fused,-,614.548,611.917,616.760,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,24,bfloat16,prefill_wmma,-,779.701,771.608,787.365,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,24,bfloat16,tiled@best,128x128,841.161,838.506,842.582,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,24,bfloat16,tiled(chooser),-,620.122,611.766,624.081,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,24,bfloat16,tiled(chooser)+producer_fused,-,616.794,615.188,617.216,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,32,bfloat16,prefill_wmma,-,822.408,816.873,827.473,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,32,bfloat16,tiled@best,128x128,845.133,843.885,847.171,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,32,bfloat16,tiled(chooser),-,627.017,610.858,632.221,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+q27.gate_up tp1,5120,34816,32,32,bfloat16,tiled(chooser)+producer_fused,-,624.068,623.962,625.417,3,3,100270080,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,17,bfloat16,prefill_wmma,-,102.835,102.818,102.914,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,17,bfloat16,tiled@best,128x128,122.005,121.843,122.259,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,17,bfloat16,tiled(chooser),-,108.378,108.338,108.476,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,17,bfloat16,tiled(chooser)+producer_fused,-,103.873,103.828,104.061,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,24,bfloat16,prefill_wmma,-,106.271,106.132,106.408,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,24,bfloat16,tiled@best,128x128,121.316,120.807,121.327,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,24,bfloat16,tiled(chooser),-,112.633,112.564,112.699,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201
+glm.gate_up tp2,2048,10240,128,24,bfloat16,tiled(chooser)+producer_fused,-,107.760,107.654,107.861,3,17,10813440,AMD Radeon RX 9070 XT (32 WGP = 64 CU) gfx1201

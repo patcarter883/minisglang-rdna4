@@ -1418,14 +1418,36 @@ def _pick_dense_kernel(
     #   * prefill_wmma with VLLM_W4A8_DENSE_SMALLM_OFF=1 is 2.204x SLOWER across the mid-band than
     #     with it on. Its entire mid-band edge was that one hardcoded tile.
     #
-    # ONE regime survives, at ~1.06x: GLM (group_size=128, N=10240) at M=17..24 — prefill 100.8 us
-    # vs the chooser's 106.9. That gap is ~6 us, i.e. ONE kernel dispatch on this box, and it is
-    # exactly what the tiled path pays and prefill does not: prefill FUSES the activation fp8-quant
-    # into its prologue, while wmma_tiled_tuned consumes pre-quantized activations and therefore
-    # eats a separate `compute_act_fp8_and_scales_kernel` launch plus an (M,K) uint8 HBM round-trip
-    # inside `mmq_fp8_gemm`. The fix is producer-side fusion (quantise in the RMSNorm/residual that
-    # already has the values in registers), not a second GEMM — and note the tiled arm carried that
-    # handicap in every number above and still won.
+    # ONE regime used to survive, at ~1.06x: GLM (group_size=128, N=10240) at M=17..24 — prefill
+    # 100.8 us vs the chooser's 106.9. That gap was ~6 us, i.e. ONE kernel dispatch on this box, and
+    # it was exactly what the tiled path paid and prefill did not: prefill FUSES the activation
+    # fp8-quant into its prologue, while wmma_tiled_tuned consumes pre-quantized activations and
+    # therefore ate a separate `compute_act_fp8_and_scales_kernel` launch plus an (M,K) uint8 HBM
+    # round-trip inside `mmq_fp8_gemm`. The prescribed fix was producer-side fusion (quantise in the
+    # RMSNorm/residual that already has the values in registers), not a second GEMM.
+    #
+    # THAT FIX IS BUILT, AND IT CLOSES THE REGIME. tail_hip `rms_norm_quant`/`rms_norm_add_quant`
+    # emit the e4m3 row as an EPILOGUE on a kernel that was already one-block-per-row with a block
+    # reduce (no extra LDS, no grid change), and `w4a8_linear(x_fp8=, act_scales=)` feeds them to the
+    # SAME core — a WLoad-style activation POLICY, not a new kernel. Bit-identical at
+    # M=1/17/33/64/129/512 in bf16 and fp16 through this auto-dispatch.
+    #
+    # RE-MEASURED end-to-end (producer + linear, graph-replay, card 0, rotation past the 64 MB MALL;
+    # tools/w4a8_producer_actquant.py, fixture tools/_fixtures/producer_actquant_card0.csv). The
+    # probe reproduces dense_tile_arms.csv on the shipped arms first:
+    #
+    #   * glm.gate_up tp2 M=17: prefill 102.8 / chooser 108.4 (1.054x — the recorded 1.06x, hit
+    #     almost exactly) / chooser+FUSED 103.9. The fusion is worth 1.043x here, and 1.045x at
+    #     M=24, leaving prefill ahead by 1.010x / 1.014x — noise.
+    #   * q27.gate_up tp1 M=17/24/32: the CHOOSER (612-627 us) was ALREADY 1.24-1.32x FASTER than
+    #     prefill (764-822 us) before any fusion. The fixture's "prefill wins 1.11-1.23x" there was
+    #     measured against the best of the RESTRICTED common tile set (841-984 us), never against
+    #     the chooser — the same restriction artifact called out three bullets up.
+    #
+    # => 5/5 cells. `prefill_wmma` no longer wins anywhere on this surface and is RETIRABLE. The
+    # measured saving is a flat ~3-5 us per dense linear (one dispatch), so it reads as ~4% at
+    # glm's 108 us and as noise at q27's 620 — it is a DISPATCH win, not a bandwidth one, and it
+    # scales with launch count, not with shape.
     #
     # `k` and `n` are still taken and still used above (decode_gemv's K precondition); they no
     # longer select an arm. The two prefill arms remain in the package, reachable by explicit
@@ -1492,12 +1514,25 @@ def w4a8_linear(
     group_size: int,
     kernel: str | None = None,
     weight_is_e2m1: bool = False,  # True -> decode nibbles as MXFP4 (OCP E2M1); w_zeros must be None
+    x_fp8: torch.Tensor | None = None,  # PRODUCER-quantized activations — see below
+    act_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dense W4A8 GEMM: (M, K) @ (N, K)^T -> (M, N). Output follows the activation dtype (fp16 OR
     bf16 — the kernel is activation-dtype-generic), so a bf16 model runs cast-free (the caller's
     out.to(x.dtype) is then a no-op). `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight
     decode instead of uniform int4 (scales are the E8M0 group exponents folded to fp16; w_zeros MUST
-    be None — the op asserts symmetric)."""
+    be None — the op asserts symmetric).
+
+    PRODUCER-SIDE ACTIVATION QUANT. `x_fp8`/`act_scales` are the (M,K) e4m3 bits + (M,) f32 per-row
+    scale returned by `tail_hip.rms_norm_quant` / `rms_norm_add_quant` — the RMSNorm or residual-add
+    feeding this linear, which already held the values in registers. Supplying them deletes the op's
+    own `compute_act_fp8_and_scales_kernel` dispatch and the (M,K) activation re-read, and the result
+    is BIT-IDENTICAL (the producer runs the same amax/448 with the same 1e-8 floor, the same
+    reciprocal-multiply and the same UNCLAMPED f32_to_e4m3, over the same rounded output row).
+    This closes the one regime `_pick_dense_kernel` still credits to `prefill_wmma`. BOTH
+    auto-dispatched arms (`decode_gemv`, `wmma_tiled_tuned`) consume the pair, so ONE producer fusion
+    covers 100% of the served dense surface; the two prefill arms quantize in-prologue and the op
+    REFUSES the pair loudly rather than ignoring it."""
     import fp8_wmma
 
     x2d = x  # native dtype straight into the op (fp16 or bf16); no bf16->fp16 round-trip
@@ -1512,9 +1547,13 @@ def w4a8_linear(
             k=w_packed.shape[-1] * 8,
             n=w_packed.shape[0],
         )
-    engaged(f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''})")
+    engaged(
+        f"fp8_wmma.mmq_fp8_gemm({kernel}{'+e2m1' if weight_is_e2m1 else ''}"
+        f"{'+prequant' if x_fp8 is not None else ''})"
+    )
     return fp8_wmma.mmq_fp8_gemm(
-        x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1
+        x2d, w_packed, scales, kernel=kernel, w_zeros=w_zeros, weight_is_e2m1=weight_is_e2m1,
+        x_fp8=x_fp8, act_scales=act_scales,
     )
 
 
