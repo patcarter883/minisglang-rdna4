@@ -37,9 +37,15 @@ DG_MODEL=${DG_MODEL:-cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4}
 SCRATCH=${SCRATCH:-$HOME/.cache/minisgl-perf}
 SWA_RADIX=${SWA_RADIX:-0}
 CONC=${CONC:-1}
-STEPS=${STEPS:-260}          # scheduler-loop iterations before the engine returns (trace leg)
-RTX_SKIP=${RTX_SKIP:-60}     # past boot + graph capture + the first block's encoder pass
+# A canvas BLOCK is 256 tokens wide and costs k~14-21 denoising steps, so ONE 256-token request is
+# only ~17 canvas steps -- and `_rtx_step` counts canvas steps, not loop iterations (idle iterations
+# never reach `_canvas_step`). A window placed at step 60 off a single request would therefore never
+# open, and the trace would be empty for the SECOND time, from a different cause. The trace leg
+# drives REPS sequential requests so the step counter reaches the window.
+STEPS=${STEPS:-250}          # scheduler-loop iterations before the engine returns (trace leg)
+RTX_SKIP=${RTX_SKIP:-20}     # past the first block: its encoder pass and cold caches
 RTX_STEPS=${RTX_STEPS:-40}
+REPS=${REPS:-6}              # sequential requests on the trace leg
 MAXTOK=${MAXTOK:-256}
 NUM_PAGES=${NUM_PAGES:-}     # pinned on BOTH legs once known; empty => engine sizes it, and we read
                              # the size back out of the log so the trace leg can pin the SAME pool.
@@ -146,9 +152,14 @@ export MODEL="$DG_MODEL" SPEC=none TP=2 CONC="$CONC" GRAPH_BS="$CONC" EXTRA_ARGS
 unset MINISGL_ROCTX MINISGL_EXIT_AFTER_STEPS
 DC up -d >/dev/null 2>&1
 if wait_ready; then
+  # [canvas-timing] reports CUMULATIVE averages every 10 steps, so the marginal step is the
+  # difference of two consecutive report points. One 256-token request is only ~17 canvas steps =~2
+  # report points, which is not enough to difference a steady state out of a boot transient. Four
+  # measured requests give ~7-10 points.
   say "--- warmup"; drive 1 64 >>"$OUT" 2>&1
-  say "--- measured"; drive 1 "$MAXTOK" | tee -a "$OUT"
-  say "--- measured (repeat)"; drive 1 "$MAXTOK" | tee -a "$OUT"
+  for _r in 1 2 3 4; do
+    say "--- measured $_r"; drive 1 "$MAXTOK" | tee -a "$OUT"
+  done
   say ""; say "--- [canvas-timing] (cumulative; difference consecutive points for the marginal step)"
   docker logs "minisglcv-$RUN_ID" 2>&1 | grep -a "\[canvas-timing\]" | tail -12 | tee -a "$OUT"
   say ""; say "--- [hip-engage] ledger: WHICH kernels this checkpoint actually dispatches"
@@ -170,8 +181,13 @@ write_yml "exec rocprofv3 --kernel-trace --marker-trace --selected-regions --sta
 down
 DC up -d >/dev/null 2>&1
 if wait_ready; then
-  say "--- driving (the engine exits MID-request at its step bound, by design: we want the trace)"
-  drive 1 "$MAXTOK" >>"$OUT" 2>&1
+  say "--- driving $REPS sequential requests (the engine exits MID-request at its step bound, by"
+  say "    design: we want the trace, not the answer). Sequential, not concurrent, so the canvas"
+  say "    step measured is the bs=1 step the baseline leg timed."
+  for _r in $(seq 1 "$REPS"); do
+    drive 1 "$MAXTOK" >>"$OUT" 2>&1
+    docker inspect -f '{{.State.Running}}' "minisglcv-$RUN_ID" 2>/dev/null | grep -q true || break
+  done
   say "--- waiting for the engine to hit its bound and exit on its own (no signals)"
   for _ in $(seq 1 200); do
     [ "$(docker inspect -f '{{.State.Running}}' "minisglcv-$RUN_ID" 2>/dev/null)" = "true" ] || break
