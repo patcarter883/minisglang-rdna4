@@ -41,6 +41,7 @@ from minisgl.core import Batch, Req
 from minisgl.diffusion import CanvasState, DiffusionSamplerConfig
 from minisgl.message import DetokenizeMsg
 from minisgl.utils import div_ceil, init_logger
+from minisgl.utils import roctx as _roctx
 
 from minisgl.kvcache.state_digest import log_prefill_state_digest, state_digest_enabled
 
@@ -191,7 +192,21 @@ class SchedulerDiffusionMixin:
     def _canvas_encode(self, batch: Batch) -> None:
         """The prompt encoder pass: an ordinary causal prefill that writes the KV cache and emits
         NOTHING. The request then enters the decode manager with `cached_len == device_len`, which is
-        the state a block starts from."""
+        the state a block starts from.
+
+        Marked separately from `canvas_step` because an encoder pass is a DIFFERENT shape (causal,
+        prompt-length) and runs once per block, not once per denoising step. Folding the two together
+        would smear a prefill into the per-step average that every conclusion here rests on."""
+        _enc_rtx = _roctx.enabled()
+        if _enc_rtx:
+            _roctx.push("canvas_encode")
+        try:
+            self._canvas_encode_inner(batch)
+        finally:
+            if _enc_rtx:
+                _roctx.pop()
+
+    def _canvas_encode_inner(self, batch: Batch) -> None:
         reqs = batch.reqs
         for req in reqs:
             if req.sampling_params.is_constrained:
@@ -255,7 +270,25 @@ class SchedulerDiffusionMixin:
 
     # ---------------------------------------------------------------------------------------
     def _canvas_step(self, reqs: List[Req]) -> None:
-        """One denoising step for every in-flight block, then commit whichever blocks finished."""
+        """One denoising step for every in-flight block, then commit whichever blocks finished.
+
+        MARKERS. The canvas loop is a peer of the plain-decode and spec loops (`run_forever`), and it
+        was the one of the three with NO ROCTx markers at all: with `--selected-regions` the
+        collection window never opened, so a block-diffusion serve traced EMPTY, and without it the
+        trace is the whole process (weights + graph capture). Routing through `_rtx_step_begin` puts
+        the canvas step under the same MINISGL_ROCTX_SKIP/STEPS window as every other loop, and the
+        range name carries the step index — consecutive range starts ARE the per-step wall
+        boundaries, which is the one thing a flat kernel trace cannot supply."""
+        if _roctx.enabled():
+            self._rtx_step_begin("canvas_step")
+            try:
+                self._canvas_step_inner(reqs)
+            finally:
+                _roctx.pop()
+            return
+        self._canvas_step_inner(reqs)
+
+    def _canvas_step_inner(self, reqs: List[Req]) -> None:
         device = self.device
         cfg = self._canvas_cfg
         L = cfg.canvas_length
@@ -324,21 +357,37 @@ class SchedulerDiffusionMixin:
         ])
 
         tm = _StepTimer(self)
+        # The phase ranges mirror _StepTimer's split (fwd / sampler / soft_embed) so the trace and the
+        # host-side timer answer the same question two ways. `_StepTimer` costs two syncs per step and
+        # must NOT be on during a trace; these cost a push/pop and do not synchronize.
+        _rtx = _roctx.enabled()
+        if _rtx:
+            _roctx.push("canvas_fwd")
         logits = self.engine.forward_canvas(batch, batch.input_ids, self_conditioning)
+        if _rtx:
+            _roctx.pop()
         tm.mark_forward()
 
         # --- advance each request's denoising state ------------------------------------------
         reply: List[DetokenizeMsg] = []
         finished_now = set()
         for i, (req, state) in enumerate(zip(reqs, states)):
+            if _rtx:
+                _roctx.push("canvas_sampler")
             out = state.step(logits[i * L : (i + 1) * L])
+            if _rtx:
+                _roctx.pop()
             tm.mark_sampler()
             # The soft embedding is built HERE, from the softmax the sampler just consumed, so the
             # [L, 262144] fp32 tensor dies with this iteration instead of being carried across the
             # step boundary (see DiffusionGemmaForBlockDiffusion.soft_embedding). Handing over
             # `probs` rather than the scaled logits is what stops this being a SECOND full-vocab
             # softmax of the same distribution.
+            if _rtx:
+                _roctx.push("canvas_soft_embed")
             state.soft_conditioning = self.engine.model.soft_embedding(out.probs)
+            if _rtx:
+                _roctx.pop()
             out.probs = None
             tm.mark_soft_embed()
             if state.finished:
