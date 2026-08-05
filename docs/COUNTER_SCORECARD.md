@@ -376,6 +376,21 @@ into 87.9%. ~1.7× of per-request memory efficiency remains on the largest singl
 Correct for large-N; only the small-N framing was loose, and the launch-count lever is independently
 dead under graph capture.
 
+### The one concrete next move this implies
+
+The #1 finding names its own fix. `moe_gemm2_gather_reduce_core` launches
+`grid = (ceil(N/per_block), M)`, so at bs=1 the second grid dimension contributes **1** and the
+kernel gets 8 workgroups. Nothing about the maths requires that: the reduction over `K` is a
+per-output-row sum, so it admits **exactly the split-K treatment that already worked on attention
+decode** — add a `k_split` grid dimension, have each split accumulate a partial, and reduce. That
+change took `flash_decode_paged` from 16 CTAs to 1024 at B=1 and bought 12.9×. The MoE gemm2 is in
+the same shape of hole (8 CTAs, 2.2% occupancy) and the same tool fits.
+
+Two cautions carried over from that work: the split must be **shape-derived** so the grid stays
+capture-constant under CUDA graphs, and `num_splits == 1` must fall back to the single-pass path so
+short/large-M cases stay byte-identical. Measure it **sampled and end-to-end on the serve**, not as
+an isolated microbench — this scorecard is full of isolated numbers that did not transfer.
+
 ### Confirmed, and worth as much as the refutations
 - **Fusion of the MoE gemm2 was a genuine ~6× win** (20,280 ns vs 123,282 ns at K=256 M=1).
 - **Padding really is free in gemm1** — but it is the dominant cost in the *unfused* gemm2 (92% wasted
