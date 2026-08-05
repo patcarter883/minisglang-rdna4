@@ -42,11 +42,20 @@ CONC=${CONC:-1}
 # never reach `_canvas_step`). A window placed at step 60 off a single request would therefore never
 # open, and the trace would be empty for the SECOND time, from a different cause. The trace leg
 # drives REPS sequential requests so the step counter reaches the window.
-STEPS=${STEPS:-250}          # scheduler-loop iterations before the engine returns (trace leg)
+# STEPS MUST BE REACHABLE, and that is a stricter requirement than it looks. `_bounded_exit_reached`
+# counts scheduler-loop ITERATIONS, and the canvas loop BLOCKS in `receive_msg` whenever nothing is
+# runnable -- so idle time does not accumulate iterations. The count is therefore ~= (canvas steps) +
+# (prefills), and MEASURED here: 5 requests produced 26+12+19+9+19 = 85 canvas steps. A bound of 250
+# was never reached, the engine never returned, rocprofv3 never ran its destructor, and the trap tore
+# the container down -- which is precisely the abort-without-writing failure propose_rocprof.sh warns
+# about. The trace came back EMPTY for the third distinct reason in one session. Bound it BELOW what
+# the drive loop actually produces.
+STEPS=${STEPS:-75}           # scheduler-loop iterations before the engine returns (trace leg)
 RTX_SKIP=${RTX_SKIP:-20}     # past the first block: its encoder pass and cold caches
 RTX_STEPS=${RTX_STEPS:-40}
 REPS=${REPS:-6}              # sequential requests on the trace leg
 MAXTOK=${MAXTOK:-256}
+LEGS=${LEGS:-base,trace}   # comma list; a trace re-run should not re-pay for the base boot
 NUM_PAGES=${NUM_PAGES:-}     # pinned on BOTH legs once known; empty => engine sizes it, and we read
                              # the size back out of the log so the trace leg can pin the SAME pool.
 mkdir -p "$SCRATCH"
@@ -144,6 +153,7 @@ EXTRA=""
 [ -n "$NUM_PAGES" ] && EXTRA="--num-pages $NUM_PAGES"
 
 # =============================================================================================
+if [[ ",$LEGS," == *",base,"* ]]; then
 say ""; say "############ LEG base — served baseline + canvas timing + the hip-engage ledger"
 # =============================================================================================
 write_yml "exec /engine/tools/serve.sh" "MINISGL_CANVAS_TIMING: \"1\""
@@ -171,8 +181,10 @@ if wait_ready; then
   docker logs "minisglcv-$RUN_ID" 2>&1 | grep -oaE "\[canvas\] uid.*" | tail -12 | tee -a "$OUT"
 fi
 down
+fi
 
 # =============================================================================================
+if [[ ",$LEGS," == *",trace,"* ]]; then
 say ""; say "############ LEG trace — rocprofv3 kernel+marker trace, marker-gated to the canvas step"
 # =============================================================================================
 write_yml "exec rocprofv3 --kernel-trace --marker-trace --selected-regions --stats --output-format csv -d /engine/$RPDIR -o canvas -- /engine/tools/serve.sh" \
@@ -198,4 +210,5 @@ fi
 say "--- trace files"
 find "$WT/$RPDIR" -type f -size +0 2>/dev/null | tee -a "$OUT"
 cp -r "$WT/$RPDIR" "$SCRATCH/" 2>/dev/null
+fi
 say ""; say "=== done. out=$OUT  trace=$SCRATCH/$RPDIR"
