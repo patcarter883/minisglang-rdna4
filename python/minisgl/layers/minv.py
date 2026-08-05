@@ -34,30 +34,56 @@ import torch
 
 _BLOCK_M = int(os.environ.get("MINISGL_MINV_BLOCK_M", "64"))  # WMMA M-tile (mult of 16, <=128)
 _BN = int(os.environ.get("MINISGL_MINV_BN", "64"))            # WMMA N-tile (divides most OUT dims)
-# Large-M path: the deep-pipelined dense_gemm_pipe kernel runs at rocBLAS parity at large M (gate_up
-# M=4096: ~113 vs rocBLAS ~114 TFLOPS, cca_q/down M=1024 BEAT it) after the RDNA4 LDS bank-conflict pad.
-# It is BIT-IDENTICAL to the register-direct (rd) and LDS kernels (same 16-wide K-reduction order, no
-# split-K), so switching rd<->pipe by M stays M-invariant. rd still wins the small-M decode hot path
-# (register-direct, no LDS staging / __syncthreads overhead), so we only reach for pipe at M >= _PIPE_M.
+# ---------------------------------------------------------------------------------------------
+# WHICH KERNEL, AND WHY. All three dense_gemm kernels are bit-identical (identical fixed 16-wide K
+# order, no split-K), so this dispatch may pick purely on speed and stays M-invariant whatever it
+# picks. It used to be ONE constant, `_PIPE_M`, and one constant cannot express this surface:
 #
-# 512 WAS TOO HIGH, AND ON A WIDE OUTPUT IT WAS CATASTROPHIC. rd is LDS-bypassing, so every M-tile
-# streams the whole B matrix from HBM: its cost grows with ceil(M/64) * N * K, and above the decode
-# regime it collapses. Measured (gfx1201, bf16, K=2816; ms, rd -> pipe):
+#   rd (register-direct: no LDS, no barrier) re-reads the WHOLE B panel once per 16 rows of M — it has
+#     no LDS staging and no M-register-blocking, so its cost grows as ~ceil(M/16)*OUT*IN. That is free
+#     when the panel is small or M is small and catastrophic otherwise. The ISA says why, and it is
+#     NOT this repo's usual answer: rd does not spill (VGPR 38-82, scratch 0, LDS 0 — the best
+#     occupancy of the three). Per 16-wide K step at BN=64 it issues 5 global b128 loads, 4 WMMAs and
+#     4 `s_wait_loadcnt` — a dependent load->wait->mma chain with ZERO prefetch depth, so every WMMA
+#     is gated on a fresh ~300-cycle global load and only wave count hides any of it.
+#   pipe prefetches a whole K-chunk ahead (A into a register double-buffer, B into a double-buffered
+#     LDS tile), so its inner loop is ds_read + WMMA with the global loads a chunk in front: 32 WMMAs
+#     per 6 `s_wait_loadcnt` at BN=64, and B read once per block_m (128-256) instead of once per 16.
+#     The price is a fixed ~25-60 us floor (VGPR 153-217, LDS staging, a barrier per K-chunk) and a
+#     coarse grid, so it needs BOTH a wide OUT and real M before it pays for itself.
+#   lds is the general fallback and the only one that can mask a ragged OUT tile.
 #
-#     M    N=131072 (an LM-head shard)   N=5632 (gate_up)   N=2816 (o_proj)
-#    128     9.199 ->  1.513  (6.1x)     0.090 -> 0.084     0.038 -> 0.078   rd
-#    192    13.340 ->  2.700  (4.9x)     0.146 -> 0.091     0.077 -> 0.082   ~tie
-#    256    16.400 ->  2.735  (6.0x)     0.226 -> 0.091     0.099 -> 0.081
-#    384    21.087 ->  3.953  (5.3x)     0.377 -> 0.174     0.157 -> 0.099
+# Thresholds are from dense_gemm/local/sweep_policy.py: a CUDA-graph-timed sweep of every callable
+# tile over the shapes this engine actually dispatches, with the weights rotated past the 64 MB
+# Infinity Cache. Both of those matter. A per-call `synchronize()` has a ~40 us wall floor on this
+# box — larger than most of these kernels, so it makes them all look identical below M~192. And a
+# hot-weight benchmark flatters `rd` specifically, because re-reading B costs nothing when B never
+# leaves cache; under a 30-layer ~700 MB weight working set it is not in cache.
 #
-# 256 is the lowest threshold at which pipe wins on EVERY shape measured, narrow outputs included,
-# so that is where it goes — not lower, because rd still owns M<=128 on narrow N. Nothing about
-# correctness moves: `max|rd - pipe|` is 0.000e+00 in all 27 cells of that sweep, which is the file's
-# own structural claim (identical fixed 16-wide K order, no split-K) confirmed rather than assumed.
-# Decode is untouched either way — M <= _DECODE_GEMV_MAXM leaves through the GEMV above this.
-_PIPE_M = int(os.environ.get("MINISGL_MINV_PIPE_M", "256"))   # M threshold to switch rd -> pipe
+# Result vs rocBLAS (best-of-family / rocBLAS, cold, RX 9070) on the four shapes Gemma4 and
+# DiffusionGemma actually route here: gate_up 0.76-1.21x, down 1.05-1.19x, router 1.12-1.26x,
+# lm_head 0.93-1.09x — we BEAT it at M=64..128 on gate_up and at M<=128 on the LM head. The residual
+# deficit is bounded by ~1.26x and is kernel debt to close, not a reason to call rocBLAS: F.linear is
+# reached only through minv_supported()'s dtype / ragged-K fallback.
+_RD_MAX_M = int(os.environ.get("MINISGL_MINV_RD_MAX_M", "128"))
+# ...but M alone is not enough, which is the flaw a single threshold cannot fix: rd's B re-read scales
+# with OUT too, so an LM-head-width output leaves rd's regime almost immediately. At the SAME M=128,
+# rd is the fastest kernel on gate_up (35.5 us vs pipe 51.0) and the slowest on the LM head (2216 us
+# vs pipe 1242) — the ranking inverts on OUT, not on M. M*OUT is the term that separates them; 512K
+# puts every real shape on the correct side with an order of magnitude of margin (gate_up M=128 ->
+# 270K rd, down M=128 -> 360K rd, lm_head M=32 -> 4.2M pipe).
+_RD_MAX_MN = int(os.environ.get("MINISGL_MINV_RD_MAX_MN", str(512 * 1024)))
+# Narrow OUT: pipe's grid is (ceil(OUT/BN), ceil(M/block_m)). Gemma4's router is OUT=128 — TWO N-tiles
+# at BN=64 — so pipe runs 2-4 workgroups on a 64-CU part and costs a FLAT ~42 us at every M, while rd
+# does the same work in ~16 us. This is the regression the previous single `_PIPE_M=256` shipped: it
+# sent every router call at the 256-token canvas to pipe, 2.6x slower, 30 calls per step.
+_PIPE_MIN_OUT = int(os.environ.get("MINISGL_MINV_PIPE_MIN_OUT", "512"))
 _PIPE_MI = int(os.environ.get("MINISGL_MINV_PIPE_MI", "2"))   # pipe register-block M-subtiles/warp
-_PIPE_PBK = int(os.environ.get("MINISGL_MINV_PIPE_PBK", "64"))  # pipe K-chunk (needs IN % PBK == 0)
+# pipe K-chunk. IN % PBK != 0 is FINE now — the kernel grew a zero-filled K-tail. It did not have one,
+# and that silently excluded a whole layer class: a row-parallel down_proj shards IN by the TP degree,
+# so Gemma4's intermediate 2112 becomes IN=1056 at TP=2, which is not a multiple of 64, so `mlp.down`
+# could never reach pipe at any M and sat on rd forever (M=1024: 110 us rd -> 78 us pipe).
+_PIPE_PBK = int(os.environ.get("MINISGL_MINV_PIPE_PBK", "64"))
 _warned: set[str] = set()
 
 
@@ -156,23 +182,27 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     # All three dense_gemm kernels (rd / pipe / lds) run the FULL K-reduction per output tile in the
     # identical fixed 16-wide order with NO split-K, so every one is bit-identical per output row and
     # interchangeable -> the dispatch below is M-invariant regardless of which kernel a given M picks.
-    #   * ragged OUT (OUT % BN != 0): the LDS kernel masks it (register-direct can't mask a ragged tile).
-    #   * large M (>= _PIPE_M, full tiles, IN % PBK == 0): the deep-pipelined kernel at ~rocBLAS parity.
-    #   * else (small-M decode hot path): register-direct (LDS-bypass), which wins there.
     # Full-tile kernels need block_m | M and BN | OUT; pad M up to the tile (padded rows are sliced off
-    # and never touch the real rows).
+    # and never touch the real rows). See the threshold block at the top of this file for the measured
+    # surface each clause encodes.
+    def _padded(bm: int) -> torch.Tensor:
+        Mp = ((M + bm - 1) // bm) * bm
+        return x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
+
     if OUT % BN != 0:
-        out = _dg.dense_gemm(x2, weight, block_m, BN)  # LDS kernel: handles ragged OUT
-    elif M >= _PIPE_M and IN % _PIPE_PBK == 0:
-        pbm = 256 if M >= 1024 else 128                # deeper M -> more warps sharing the LDS B tile
-        pbn = 128 if OUT % 128 == 0 else BN            # wider N-tile when OUT allows (fewer A reloads)
-        Mp = ((M + pbm - 1) // pbm) * pbm
-        xp = x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
-        out = _dg.dense_gemm_pipe(xp, weight, pbm, pbn, _PIPE_MI, _PIPE_PBK)[:M]
+        # ragged OUT: only the LDS kernel masks a partial N-tile (a direct fragment load cannot).
+        out = _dg.dense_gemm(x2, weight, block_m, BN)
+    elif OUT < _PIPE_MIN_OUT or (M <= _RD_MAX_M and M * OUT <= _RD_MAX_MN):
+        # rd's regime: either the N-grid is too narrow for pipe to fill the machine (routers), or the
+        # B re-read volume is still small. rd BEATS rocBLAS through most of this band.
+        out = _dg.dense_gemm_rd(_padded(block_m), weight, block_m, BN)[:M]
     else:
-        Mp = ((M + block_m - 1) // block_m) * block_m
-        xp = x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
-        out = _dg.dense_gemm_rd(xp, weight, block_m, BN)[:M]
+        # pipe: B read once per pbm rows, prefetched a K-chunk ahead.
+        #   pbm=128 wins M=192..384 (grid stays wide, no wasted M-padding); pbm=256 wins from M>=512,
+        #   and already from M>=192 on an LM-head-width OUT, where the N-grid is thousands of tiles
+        #   wide so the only remaining lever is active warps per block (8 at pbm=256 vs 4 at 128).
+        pbm = 256 if (M >= 512 or (OUT >= 65536 and M >= 192)) else 128
+        out = _dg.dense_gemm_pipe(_padded(pbm), weight, pbm, BN, _PIPE_MI, _PIPE_PBK)[:M]
     if bias is not None:
         out = out + bias
     return out.reshape(*orig_shape[:-1], OUT)
