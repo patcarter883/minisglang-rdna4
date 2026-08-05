@@ -1,0 +1,11 @@
+# DiffusionGemma canvas (M=256) dense W4A8 tile selection, cu=64, group_size=32, TP=2 shard N.
+# HOST-SIDE, NO GPU: fp8_wmma.dense_tile_explain. Counts are per canvas step.
+# shape        n/step      tile   wgs  rnds  waves/CU  blk/CU  runner-up
+  SWA q_proj       25    128x64    64     1    8/32         3  192x64 wn=1 at cost 3.036e+06 (1.100x)
+  SWA k_proj       25     64x32   128     2    8/32         4  128x32 wn=1 at cost 2.534e+06 (1.000x)
+  SWA v_proj       25     64x32   128     2    8/32         4  128x32 wn=1 at cost 2.534e+06 (1.000x)
+  SWA o_proj       25    192x96    60     1   12/32         1  128x64 wn=1 at cost 2.408e+06 (1.009x)
+  FULL q_proj       5    128x64   128     2   16/32         3  256x64 wn=1 at cost 3.312e+06 (1.000x)
+  FULL k_proj       5     64x32    64     1    4/32         4  80x32 wn=1 at cost 2.344e+06 (1.028x)
+  FULL o_proj       5    192x96    60     1   12/32         1  128x64 wn=1 at cost 4.817e+06 (1.009x)
+# TOTAL dense W4A8 GEMMs per canvas step per rank: 115

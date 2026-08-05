@@ -28,7 +28,10 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-STEP_RE = re.compile(r"^(overlap_step|normal_step)#(\d+)$")
+# `canvas_step` is the block-diffusion loop (scheduler/diffusion.py::_canvas_step). It is a peer of
+# the plain-decode loops, opened through the same `_rtx_step_begin`, so it carries the same
+# `<loop>#<iteration>` shape and the busy/wall arithmetic below applies to it unchanged.
+STEP_RE = re.compile(r"^(overlap_step|normal_step|canvas_step)#(\d+)$")
 
 
 def union_ns(intervals: list[tuple[int, int]]) -> int:

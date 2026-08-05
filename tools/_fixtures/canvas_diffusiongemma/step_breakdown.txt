@@ -1,0 +1,43 @@
+DiffusionGemma block-diffusion canvas step — kernel decomposition, ONE RANK (one card).
+engine 4d719ad6+markers | kernels 8a8bca6 | image minisgl-rdna4:dgprof | TP=2 CONC=1 bs=1
+model cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4 | canvas=256 | MINISGL_SWA_RADIX=0 | fp8 KV
+
+window: 40 canvas steps (ROCTx canvas_step#20..#60, --selected-regions)
+  marker wall UNDER rocprofv3 : 139.15 ms/step
+  marginal step, NO profiler  : 97.70 ms/step   (base leg, [canvas-timing] n=70->80)
+  => profiler inflation        : 1.424x. Columns below are AS TRACED; the `real` column
+     divides by that. Kernel-trace inflates SMALL kernels more than large ones, so `real`
+     is a lower bound for the elementwise rows and near-exact for the big GEMMs.
+  summed kernel busy           : 103.75 ms/step = 74.6% of the marker wall
+     (the other 25.4% is inter-kernel gap; single agent, so no stream double-count)
+
+=== BY PHASE (ROCTx range)
+    traced    real   share    disp  phase
+     75.14   52.76   72.4%          canvas_fwd
+     18.50   12.99   17.8%          canvas_sampler
+      6.68    4.69    6.4%          gap
+      3.12    2.19    3.0%          canvas_encode
+      0.30    0.21    0.3%          canvas_soft_embed
+
+=== TOP KERNELS with OCCUPANCY, straight from the kernel trace (no --pmc needed)
+# gfx1201 occupancy law: waves/SIMD = min(16, 1536 // (ceil(VGPR/24)*24)), granule 24, cap 16.
+# `wgs` = workgroups launched. The card has 64 CUs (multi_processor_count reports 32 WGPs).
+#  traced    real  share    disp       us  VGPR  scr    LDS   wg    wgs  w/SIMD  kernel
+   31.879  22.383  30.7%    64.5   494.25    40    0      0  128   2728      16  w4a8_tile::moe_gemm_tiled_ashuffle_kernel<>
+   18.978  13.324  18.3%   107.6   176.33    16    0    512  256      8      16  custom_ar::one_shot_ar_vec_kernel<>
+   13.181   9.255  12.7%   132.2    99.67   112    0    512  256     64      12  w4a8_fp8_wmma::mmq_fp8_gemm_wmma_tiled_tuned_kerne
+    8.670   6.087   8.4%    30.0   288.99   248    0  23040  128    512       5  flash_prefill_paged_fp8_split_kernel<>
+    4.210   2.956   4.1%   406.8    10.35    16    0      0  256      1      16  at::native::vectorized_elementwise_kernel<>
+    4.106   2.883   4.0%    63.1    65.10    96    0      0  256     66      16  dense_gemm::dense_gemm_pipe_kernel<>
+    3.722   2.613   3.6%   382.6     9.73    32    0    512  256    256      16  rms_norm_kernel<>
+    3.384   2.376   3.3%    30.0   112.81    24    0      0   32   2048      16  flash_prefill_reduce_kernel<>
+    3.228   2.267   3.1%   402.8     8.02    16    0      0  128      1      16  at::native::elementwise_kernel_manual_unroll<>
+    2.648   1.859   2.6%     1.0  2715.51   128    0  12800  128    176      10  Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT64x
+    1.448   1.017   1.4%   132.2    10.95    16    0    512  256    256      16  w4a8_fp8_wmma::compute_act_fp8_and_scales_kernel<>
+    1.001   0.703   1.0%    69.0    14.51    16    0    512  256    256      16  w4a8_fp8_moe::moe_compute_act_fp8_kernel<>
+    0.996   0.699   1.0%    46.6    21.38    32    0    512  512      4      16  at::native::reduce_kernel<>
+    0.905   0.635   0.9%    43.5    20.81    72    0      0  256      8      16  dense_gemm::dense_gemm_rd_kernel<>
+    0.835   0.586   0.8%     2.2   371.15   120    0      0  256   2024      12  w4a8_fp8_moe::moe_gemm2_gather_reduce_core<>
+    0.737   0.517   0.7%    32.2    22.85     8    0      0  256   2816      16  w4a8_fp8_moe::moe_gather_reduce_kernel<>
+    0.566   0.397   0.5%     3.1   179.59   256  776  21504  256      1       5  ncclDevKernel_Generic_4
+    0.549   0.385   0.5%     1.0   548.91    24    0      0  512    256      16  at::native::tensor_kernel_scan_innermost_dim<>

@@ -1,0 +1,13 @@
+Canvas step, ONE RANK. Bytes/FLOPs derived from the checkpoint geometry; ms = the
+profiler-deflated ('real') column of step_breakdown.txt. HBM roofline = 706.6 GB/s.
+
+  kernel                         bytes           flops       time            achieved bandwidth
+  MoE grouped GEMM            6.423 GB     365.4 GFLOP   22.38 ms    287.0 GB/s =  40.6% HBM      16.3 TFLOP/s
+  dense W4A8 (self_attn)      0.312 GB     284.2 GFLOP    9.26 ms     33.7 GB/s =   4.8% HBM      30.7 TFLOP/s
+
+  MoE reads the ENTIRE expert weight set every step: 6.42 GB/step/rank.
+  That is the architecture (256 rows x top-8 over 128 experts = 16 rows/expert -> every
+  expert is hit), not a defect -- but 40% of roofline on a pure weight stream is not.
+
+  The dense W4A8 GEMM is at neither roofline: ~4.5% of HBM and ~8% of fp8 WMMA peak.
+  It is bound by NEITHER, which is what 64 workgroups on 64 CUs at 12/16 waves means.
