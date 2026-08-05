@@ -1,0 +1,279 @@
+########## LEG QWEN_BEFORE (minisgl-rdna4:pre-tile) ##########
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+[ab_tile] LEG=QWEN_BEFORE IMAGE=minisgl-rdna4:pre-tile REPO=/home/pat/code/minisgl-rdna4-abpretile HIP=0,1 ROCR=0,1
+######## PROVENANCE [QWEN_BEFORE] ########
+[prov] fp8_wmma.dense_tile_explain : False
+[prov] fp8_wmma.moe_tile_choose    : False
+[prov] tail_hip.rms_norm_quant     : False
+[prov] md5 c00f79b3d34f83c20428f64e05bb7ec1  w4a8_fp8_wmma_kernel.hip
+[prov] md5 7f9619fd7111c93fc117b5a652fdd21c  moe_kernel.hip
+[prov] md5 924f52a330af4adc8b5804ccfd020e28  tail_kernels.hip
+[prov] tile_select.h present       : False
+[prov] engine _pick_dense_kernel arms: ['decode_gemv', 'prefill_wmma', 'prefill_wmma_ashuffle', 'wmma_tiled_tuned']
+[prov] engine RMSNormFused.forward_quant: False
+###################################
+[setup] hip pkgs import OK
+[launch] QWEN_BEFORE attn=hip graph=16 tp=2 -> /engine/tools/_ab_tile_out/QWEN_BEFORE.server.log
+[launch] ready
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=16, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=16, page_size=1, memory_ratio=0.9, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=16384, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=False, _unique_suffix='.pid=42', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|11:17:40|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2, 4, 8, 12, 16]
+[1m[2026-08-05|11:17:40|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 1.69 GiB
+[warmup] QWEN_BEFORE
+
+===== rep 1/3  [QWEN_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    174    124.48        --     1397.8
+prefill w360    534    245.01        --     2179.5
+prefill w730   1017    350.61        --     2900.7
+prefill w1460   1974    585.20        --     3373.2
+   decode M1     --        --     10.87       87.7
+   decode M4     --        --     15.71      233.7
+  decode M16     --        --     29.27      501.9
+
+===== rep 2/3  [QWEN_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    177    138.16        --     1281.1
+prefill w360    530    239.95        --     2208.8
+prefill w730   1019    352.56        --     2890.3
+prefill w1460   1975    585.25        --     3374.6
+   decode M1     --        --     10.85       87.8
+   decode M4     --        --     15.68      234.7
+  decode M16     --        --     29.16      504.1
+
+===== rep 3/3  [QWEN_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    178    138.29        --     1287.1
+prefill w360    534    241.11        --     2214.7
+prefill w730   1021    351.69        --     2903.2
+prefill w1460   1979    585.48        --     3380.1
+   decode M1     --        --     10.92       87.3
+   decode M4     --        --     16.02      229.8
+  decode M16     --        --     29.88      493.7
+
+===== MEDIANS (3 reps) [QWEN_BEFORE] =====
+          cell   ptok   TTFT ms   TPOT ms      tok/s
+   prefill w90    177    138.16        --     1287.1
+  prefill w360    534    241.11        --     2208.8
+  prefill w730   1019    351.69        --     2900.7
+ prefill w1460   1975    585.25        --     3374.6
+     decode M1     --        --     10.87       87.7
+     decode M4     --        --     15.71      233.7
+    decode M16     --        --     29.27      501.9
+[out] /engine/tools/_ab_tile_out/QWEN_BEFORE.json
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv
+      1 fp8_wmma.mmq_fp8_moe_gemm(wmma
+[done] QWEN_BEFORE
+[ab_tile] QWEN_BEFORE exited rc=0
+########## LEG QWEN_BEFORE done ##########
+########## LEG QWEN_AFTER (minisgl-rdna4:post-tile) ##########
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+[ab_tile] LEG=QWEN_AFTER IMAGE=minisgl-rdna4:post-tile REPO=/home/pat/code/minisgl-rdna4-abposttile HIP=0,1 ROCR=0,1
+######## PROVENANCE [QWEN_AFTER] ########
+[prov] fp8_wmma.dense_tile_explain : True
+[prov] fp8_wmma.moe_tile_choose    : True
+[prov] tail_hip.rms_norm_quant     : True
+[prov] md5 88f0dea34cfd4a45a600cce6d8db6c2b  w4a8_fp8_wmma_kernel.hip
+[prov] md5 f79b95552f72e010bbf7059750295873  moe_kernel.hip
+[prov] md5 12c78da384a3a92edf160ba4650d44f9  tail_kernels.hip
+[prov] tile_select.h present       : True
+[prov] engine _pick_dense_kernel arms: ['decode_gemv', 'wmma_tiled_tuned']
+[prov] engine RMSNormFused.forward_quant: True
+###################################
+[setup] hip pkgs import OK
+[launch] QWEN_AFTER attn=hip graph=16 tp=2 -> /engine/tools/_ab_tile_out/QWEN_AFTER.server.log
+[launch] ready
+ServerArgs(model_path='cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=16, attention_backend='hip', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=16, page_size=1, memory_ratio=0.9, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=16384, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=False, _unique_suffix='.pid=42', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2, 4, 8, 12, 16]
+[1m[2026-08-05|11:19:38|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 1.69 GiB
+[warmup] QWEN_AFTER
+
+===== rep 1/3  [QWEN_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    174    125.31        --     1388.6
+prefill w360    531    245.28        --     2164.9
+prefill w730   1021    352.73        --     2894.6
+prefill w1460   1977    587.26        --     3366.5
+   decode M1     --        --     10.92       87.1
+   decode M4     --        --     15.72      233.5
+  decode M16     --        --     29.79      494.0
+
+===== rep 2/3  [QWEN_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    180    140.28        --     1283.1
+prefill w360    534    241.53        --     2210.9
+prefill w730   1018    352.35        --     2889.2
+prefill w1460   1976    586.46        --     3369.4
+   decode M1     --        --     11.04       86.3
+   decode M4     --        --     15.77      233.3
+  decode M16     --        --     29.39      499.5
+
+===== rep 3/3  [QWEN_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    177    138.10        --     1281.6
+prefill w360    532    240.86        --     2208.7
+prefill w730   1018    350.67        --     2903.0
+prefill w1460   1977    585.14        --     3378.7
+   decode M1     --        --     10.94       87.2
+   decode M4     --        --     16.10      229.6
+  decode M16     --        --     29.44      499.8
+
+===== MEDIANS (3 reps) [QWEN_AFTER] =====
+          cell   ptok   TTFT ms   TPOT ms      tok/s
+   prefill w90    177    138.10        --     1283.1
+  prefill w360    532    241.53        --     2208.7
+  prefill w730   1018    352.35        --     2894.6
+ prefill w1460   1977    586.46        --     3369.4
+     decode M1     --        --     10.94       87.1
+     decode M4     --        --     15.77      233.3
+    decode M16     --        --     29.44      499.5
+[out] /engine/tools/_ab_tile_out/QWEN_AFTER.json
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv
+      1 fp8_wmma.mmq_fp8_moe_gemm(wmma
+[done] QWEN_AFTER
+[ab_tile] QWEN_AFTER exited rc=0
+########## LEG QWEN_AFTER done ##########
+########## LEG GLM_BEFORE (minisgl-rdna4:pre-tile) ##########
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+[ab_tile] LEG=GLM_BEFORE IMAGE=minisgl-rdna4:pre-tile REPO=/home/pat/code/minisgl-rdna4-abpretile HIP=0,1 ROCR=0,1
+######## PROVENANCE [GLM_BEFORE] ########
+[prov] fp8_wmma.dense_tile_explain : False
+[prov] fp8_wmma.moe_tile_choose    : False
+[prov] tail_hip.rms_norm_quant     : False
+[prov] md5 c00f79b3d34f83c20428f64e05bb7ec1  w4a8_fp8_wmma_kernel.hip
+[prov] md5 7f9619fd7111c93fc117b5a652fdd21c  moe_kernel.hip
+[prov] md5 924f52a330af4adc8b5804ccfd020e28  tail_kernels.hip
+[prov] tile_select.h present       : False
+[prov] engine _pick_dense_kernel arms: ['decode_gemv', 'prefill_wmma', 'prefill_wmma_ashuffle', 'wmma_tiled_tuned']
+[prov] engine RMSNormFused.forward_quant: False
+###################################
+[setup] hip pkgs import OK
+[launch] GLM_BEFORE attn=auto graph=16 tp=2 -> /engine/tools/_ab_tile_out/GLM_BEFORE.server.log
+[launch] ready
+ServerArgs(model_path='QuantTrio/GLM-4.7-Flash-AWQ', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=16, attention_backend='auto', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=16, page_size=1, memory_ratio=0.9, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=1024, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=False, _unique_suffix='.pid=42', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|11:21:24|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2, 4, 8, 12, 16]
+[1m[2026-08-05|11:21:24|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 5.43 GiB
+[warmup] GLM_BEFORE
+
+===== rep 1/3  [GLM_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    160    201.71        --      793.2
+prefill w360    522    193.41        --     2699.0
+prefill w730   1000    300.50        --     3327.8
+prefill w1460   1956    372.42        --     5252.1
+   decode M1     --        --     17.69       53.7
+   decode M4     --        --     24.24      154.2
+  decode M16     --        --     42.93      363.2
+
+===== rep 2/3  [GLM_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    163    231.78        --      703.3
+prefill w360    518    191.87        --     2699.8
+prefill w730   1004    300.84        --     3337.3
+prefill w1460   1954    370.49        --     5274.1
+   decode M1     --        --     17.71       53.7
+   decode M4     --        --     24.27      154.0
+  decode M16     --        --     42.49      366.8
+
+===== rep 3/3  [GLM_BEFORE] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    164    230.94        --      710.1
+prefill w360    516    192.17        --     2685.1
+prefill w730   1002    301.79        --     3320.2
+prefill w1460   1959    373.12        --     5250.4
+   decode M1     --        --     17.86       53.3
+   decode M4     --        --     24.49      152.8
+  decode M16     --        --     42.81      363.9
+
+===== MEDIANS (3 reps) [GLM_BEFORE] =====
+          cell   ptok   TTFT ms   TPOT ms      tok/s
+   prefill w90    163    230.94        --      710.1
+  prefill w360    518    192.17        --     2699.0
+  prefill w730   1002    300.84        --     3327.8
+ prefill w1460   1956    372.42        --     5252.1
+     decode M1     --        --     17.71       53.7
+     decode M4     --        --     24.27      154.0
+    decode M16     --        --     42.81      363.9
+[out] /engine/tools/_ab_tile_out/GLM_BEFORE.json
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv
+      1 fp8_wmma.mmq_fp8_moe_gemm(wmma
+      1 fp8_wmma.mmq_fp8_gemm_silu(int4
+      1 fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned
+      1 fp8_wmma.mmq_fp8_gemm(decode_gemv
+[done] GLM_BEFORE
+[ab_tile] GLM_BEFORE exited rc=0
+########## LEG GLM_BEFORE done ##########
+########## LEG GLM_AFTER (minisgl-rdna4:post-tile) ##########
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+[ab_tile] LEG=GLM_AFTER IMAGE=minisgl-rdna4:post-tile REPO=/home/pat/code/minisgl-rdna4-abposttile HIP=0,1 ROCR=0,1
+######## PROVENANCE [GLM_AFTER] ########
+[prov] fp8_wmma.dense_tile_explain : True
+[prov] fp8_wmma.moe_tile_choose    : True
+[prov] tail_hip.rms_norm_quant     : True
+[prov] md5 88f0dea34cfd4a45a600cce6d8db6c2b  w4a8_fp8_wmma_kernel.hip
+[prov] md5 f79b95552f72e010bbf7059750295873  moe_kernel.hip
+[prov] md5 12c78da384a3a92edf160ba4650d44f9  tail_kernels.hip
+[prov] tile_select.h present       : True
+[prov] engine _pick_dense_kernel arms: ['decode_gemv', 'wmma_tiled_tuned']
+[prov] engine RMSNormFused.forward_quant: True
+###################################
+[setup] hip pkgs import OK
+[launch] GLM_AFTER attn=auto graph=16 tp=2 -> /engine/tools/_ab_tile_out/GLM_AFTER.server.log
+[launch] ready
+ServerArgs(model_path='QuantTrio/GLM-4.7-Flash-AWQ', tp_info=DistributedInfo(rank=0, size=2), dtype=torch.bfloat16, dp_info=DpInfo(dp_rank=0, dp_size=1), enable_ep=False, max_running_req=16, attention_backend='auto', moe_backend='auto', cuda_graph_bs=None, cuda_graph_max_bs=16, page_size=1, memory_ratio=0.9, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=False, max_seq_len_override=None, num_page_override=1024, spec_algorithm='none', spec_num_draft=4, spec_ngram_max=3, spec_ngram_min=1, spec_draft_model_path=None, max_extend_tokens=8192, cache_type='radix', offline_mode=False, gdn_radix=False, _unique_suffix='.pid=42', server_host='0.0.0.0', server_port=1919, num_tokenizer=0, silent_output=False, reasoning_parser='auto', rsa_defaults=RSAParams(enabled=True, n=16, k=4, t=2, tail_tokens=4096, think_budget=None, max_tokens=8192, agg_max_tokens=None, temperature=0.8, top_p=1.0, top_k=-1, ignore_eos=False, stop=[], selection='auto', max_concurrency=16, request_timeout=1800.0, max_retries=1))
+[1m[2026-08-05|11:22:54|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2, 4, 8, 12, 16]
+[1m[2026-08-05|11:22:54|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 5.43 GiB
+[warmup] GLM_AFTER
+
+===== rep 1/3  [GLM_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    162    204.45        --      792.4
+prefill w360    519    197.53        --     2627.4
+prefill w730   1002    301.89        --     3319.1
+prefill w1460   1960    371.93        --     5269.9
+   decode M1     --        --     17.75       53.5
+   decode M4     --        --     23.98      155.8
+  decode M16     --        --     42.66      365.2
+
+===== rep 2/3  [GLM_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    164    231.40        --      708.7
+prefill w360    518    196.80        --     2632.1
+prefill w730   1002    301.81        --     3319.9
+prefill w1460   1961    373.67        --     5248.0
+   decode M1     --        --     17.72       53.7
+   decode M4     --        --     24.21      154.6
+  decode M16     --        --     42.90      363.3
+
+===== rep 3/3  [GLM_AFTER] =====
+    workload   ptok   TTFT ms   TPOT ms      tok/s
+ prefill w90    163    230.67        --      706.6
+prefill w360    519    196.43        --     2642.1
+prefill w730   1004    302.48        --     3319.3
+prefill w1460   1958    372.06        --     5262.6
+   decode M1     --        --     17.66       53.8
+   decode M4     --        --     24.29      153.9
+  decode M16     --        --     42.65      365.4
+
+===== MEDIANS (3 reps) [GLM_AFTER] =====
+          cell   ptok   TTFT ms   TPOT ms      tok/s
+   prefill w90    163    230.67        --      708.7
+  prefill w360    519    196.80        --     2632.1
+  prefill w730   1002    301.89        --     3319.3
+ prefill w1460   1960    372.06        --     5262.6
+     decode M1     --        --     17.72       53.7
+     decode M4     --        --     24.21      154.6
+    decode M16     --        --     42.66      365.2
+[out] /engine/tools/_ab_tile_out/GLM_AFTER.json
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma
+      1 fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv
+      1 fp8_wmma.mmq_fp8_moe_gemm(wmma
+      1 fp8_wmma.mmq_fp8_gemm_silu(int4
+      1 fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned
+      1 fp8_wmma.mmq_fp8_gemm(decode_gemv
+[done] GLM_AFTER
+[ab_tile] GLM_AFTER exited rc=0
+########## LEG GLM_AFTER done ##########
+ALL LEGS COMPLETE
