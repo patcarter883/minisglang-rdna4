@@ -61,6 +61,12 @@ x-lean-common: &lean-common
     # re-index) — see CLAUDE.md visible-devices recipe.
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
+    # Fused MoE decode gemm2 top_k split (grid.z). The split itself is DERIVED from occupancy in
+    # the kernel launcher and is NOT gated — these two are sweep/A-B handles, exactly like
+    # VLLM_W4A8_MOE_BN: _K forces a slice count so a control leg can run the unsplit grid from the
+    # SAME binary, _DEBUG makes the launcher print the count it chose (the A/B's provenance).
+    MINISGL_MOE_G2_SPLIT_K: "${MINISGL_MOE_G2_SPLIT_K:-}"
+    MINISGL_MOE_G2_SPLIT_DEBUG: "${MINISGL_MOE_G2_SPLIT_DEBUG:-}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
