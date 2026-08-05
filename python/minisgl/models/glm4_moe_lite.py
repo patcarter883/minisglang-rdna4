@@ -45,6 +45,8 @@ from minisgl.layers import (
     get_rope,
     silu_and_mul,
 )
+from minisgl._hip_engage import engaged
+from minisgl.layers.minv import minv_linear
 from minisgl.quant import create_linear_method, kernels
 from minisgl.utils import div_even, nvtx_annotate
 
@@ -108,6 +110,11 @@ class GLMMLAAttention(BaseOP):
         w = self.kv_b_proj.weight.view(H, self.qk_nope + self.v_head_dim, kv_lora)
         self._w_uk = w[:, : self.qk_nope, :].contiguous()  # [H, qk_nope, kv_lora]
         self._w_uv = w[:, self.qk_nope :, :].contiguous()  # [H, v_head_dim, kv_lora]
+        # NB: the two einsums below stay on rocBLAS DELIBERATELY. They are batched-over-heads
+        # per-head projections, so the 2-D `minv` seam cannot express them, and the obvious
+        # conclusion from the kernel sweep — "Tensile runs them at 7.8% occupancy, our GEMV runs the
+        # same band at 75-100%, therefore route them" — was BUILT AND MEASURED, and is FALSE. See
+        # the rejected-lever note in rdna4-hip-kernels/KERNEL_CORE_POLICY.md for the numbers.
 
     @nvtx_annotate("MLA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -141,12 +148,14 @@ class GLMMLAAttention(BaseOP):
             # ABSORBED form: q_nope·W_UK -> latent space, attend over the paged latent, then ·W_UV.
             # q_len == 1 -> single-token decode kernel; q_len > 1 -> spec-decode multi-query VERIFY
             # (confirmed + drafts) over the same paged latent (no prefix re-materialization).
+            engaged("torch.einsum(ROCBLAS_BMM:mla_absorb_uk)")
             q_absorbed = torch.einsum("thn,hnl->thl", q_nope, self._w_uk)  # [T,H,kv_lora]
             q_full = torch.cat([q_absorbed, q_rope], dim=-1)  # [T,H,kv_lora+rope]
             if metadata.max_seqlen_q == 1:
                 o_latent = backend.decode(q_full, self._layer_id, metadata)  # [T,H,kv_lora]
             else:
                 o_latent = backend.verify(q_full, self._layer_id, metadata)  # [T,H,kv_lora]
+            engaged("torch.einsum(ROCBLAS_BMM:mla_absorb_uv)")
             o = torch.einsum("thl,hdl->thd", o_latent, self._w_uv)  # [T,H,v]
         else:
             # MATERIALIZED prefill: rebuild full per-head K/V for each seq from the latent cache
@@ -192,7 +201,14 @@ class GLMTopkGate(BaseOP):
         self.e_score_correction_bias = torch.empty(num_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight)  # [T, E] logits
+        # NOT F.linear. This is a bf16 [T,2048] x [64,2048] with no bias — precisely what
+        # minv_linear's decode arm routes to the shared dense GEMV — but it was written against
+        # a bare `torch.empty` weight rather than a Linear, so it bypassed the dispatch seam
+        # entirely and landed on a rocBLAS Tensile MT16x16x32 solution that fields FOUR workgroups
+        # (0.2% occupancy) on a 64-CU part: ~13.5 us of essentially pure launch overhead, once per
+        # MoE layer per step. minv_linear keeps its own F.linear fallback for shapes the GEMV
+        # declines, so this is a routing change, not a new constraint.
+        return minv_linear(x, self.weight)  # [T, E] logits
 
 
 class GLMSharedExpert(BaseOP):
