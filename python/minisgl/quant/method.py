@@ -203,8 +203,16 @@ class W4A8LinearMethod:
         if qz is not None:
             del layer.qzeros
 
+    # This method's GEMM takes the producer's (x_fp8, act_scales) pair; `_LinearTPImpl.forward`
+    # reads this flag rather than probing the signature, so a method that cannot use the pair needs
+    # no keyword argument and no branch. The W4A16 WIDE arm below cannot (it consumes bf16/fp16
+    # activations directly and never quantizes), so the pair is dropped there — explicitly, at the
+    # one place that knows, rather than silently at the kernel.
+    supports_producer_actquant = True
+
     def apply(
-        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None,
+        *, x_fp8: torch.Tensor | None = None, act_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_w_rep_wide", None) is not None:
             out = kernels.w4a16_linear(
@@ -222,6 +230,8 @@ class W4A8LinearMethod:
                 layer._scales_op,  # type: ignore[attr-defined]
                 layer._zeros_op,  # type: ignore[attr-defined]
                 self.quant.group_size,
+                x_fp8=x_fp8,
+                act_scales=act_scales,
             )
         out = out.to(x.dtype)
         if bias is not None:

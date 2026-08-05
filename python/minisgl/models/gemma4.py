@@ -164,14 +164,25 @@ class Gemma4Attention(BaseOP):
         self.plan = plan
 
     @nvtx_annotate("MHA")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_fp8: torch.Tensor | None = None,
+        act_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`x_fp8`/`act_scales`: the fp8 form of `x` computed by the `input_layernorm` that produced
+        it (`RMSNorm.forward_quant`). q/k/v are three SEPARATE linears over the SAME rows, so without
+        the pair each one re-reads (M, K) and launches its own `compute_act_fp8_and_scales_kernel` —
+        the same activation quantized three times per layer. Bit-identical when it fires; `None` (an
+        unquantized checkpoint, or a tail_hip predating the op) just restores exactly that."""
         n = x.shape[0]
-        q = self.q_proj.forward(x)
-        k = self.k_proj.forward(x)
+        q = self.q_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
+        k = self.k_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
         # On a full layer V reuses k_proj's OUTPUT, not the cached key: the key that reaches the KV
         # pool has since been k_norm'd (a learned gain) and RoPE'd, neither of which V gets. Reading
         # it back off the key would silently rotate the values.
-        v_src = self.v_proj.forward(x) if self.v_proj is not None else k
+        v_src = (self.v_proj.forward(x, x_fp8=x_fp8, act_scales=act_scales)
+                 if self.v_proj is not None else k)
         v = self._v_norm.forward(v_src.view(n, self._nkv_local, self._head_dim)).view(n, -1)
         # AttentionLayer q/k-norms and RoPEs the q,k slices in place; v is a copy made by the cat,
         # so the pre-RoPE value computed above survives untouched.
@@ -315,8 +326,12 @@ class Gemma4DecoderLayer(BaseOP):
     @nvtx_annotate("Layer")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        h = self.input_layernorm.forward(x)
-        h = self.self_attn.forward(h)
+        # PRODUCER-SIDE act-quant: the norm already holds the row in registers, so the fp8 form of
+        # its own output is an epilogue there rather than three separate (M, K) re-reads in
+        # q/k/v_proj. `forward_quant` is bit-identical to `forward` and returns a None pair when the
+        # native kernel does not apply, so this call site needs no gate on the checkpoint.
+        h, h_fp8, h_scales = self.input_layernorm.forward_quant(x)
+        h = self.self_attn.forward(h, h_fp8, h_scales)
         # Post-norm on the attention OUTPUT, then the residual add — not the usual pre-norm order,
         # so the fused rmsnorm+residual-add op does not apply here.
         h = self.post_attention_layernorm.forward(h)

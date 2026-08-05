@@ -37,8 +37,24 @@ class _LinearTPImpl(BaseOP):
         self._method.create_weights(self, local_osize, local_isize)
         self.bias = torch.empty(local_osize) if has_bias else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._method.apply(self, x, self.bias)
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        x_fp8: torch.Tensor | None = None,
+        act_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """`x_fp8`/`act_scales`: the PRODUCER-quantized activation pair from the RMSNorm that
+        produced `x` (`RMSNorm.forward_quant` / `RMSNormFused.forward_quant`). A method that cannot
+        use it MUST ignore it rather than fail — `supports_producer_actquant` is the declaration, and
+        a caller that has the pair should pass it unconditionally rather than gate on the checkpoint.
+
+        THE PAIR IS BOUND TO `x`, ROW FOR ROW. Slicing `x` without slicing the pair scales every
+        token by another token's amax — wrong numbers, right shapes, no error — so any row split
+        above this must carry both (see `tp_overlap.rowchunked_ar_span`'s `row_aligned`)."""
+        if x_fp8 is None or not getattr(self._method, "supports_producer_actquant", False):
+            return self._method.apply(self, x, self.bias)
+        return self._method.apply(self, x, self.bias, x_fp8=x_fp8, act_scales=act_scales)
 
     def forward_swiglu(self, x: torch.Tensor) -> torch.Tensor:
         """SwiGLU for a MERGED gate_up projection: this linear outputs [.., 2*inter] = [gate | up];
