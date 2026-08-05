@@ -165,3 +165,37 @@ counters ride in `slot_to_row`'s tail; passing both as separate `__restrict__` p
 the compiler that pays out as dropped stores under a vectoriser, not as a fault. Both are now derived
 from one pointer. (This was found while chasing the phantom above; it is kept because it is correct,
 **not** because it was measured to fix anything.)
+
+---
+
+## Served end-to-end
+
+Same binary in both legs; the base leg forces the unsplit grid with an env override, so a compiler or
+layout difference cannot be read as the effect. `--num-pages 2048` pinned so the legs admit identical
+work. Aggregate decode tok/s (TTFT excluded), **median of 5**.
+
+### Run 1 — serve.sh defaults, which means **MTP is on**
+
+| bs | base (unsplit) | new (derived) | ratio | spread |
+|---|---:|---:|---:|---|
+| 1 | 40.59 | **40.99** | **1.010×** | base 40.04–40.70, new 40.93–41.29 (disjoint) |
+| 5 | 98.82 | **100.11** | **1.013×** | base 98.13–99.32, new 98.24–101.29 |
+| 6 | 113.53 | 113.47 | 0.999× | base 112.66–114.44, new 112.18–115.67 |
+
+**+1.0% and +1.3% at bs=1 and bs=5; nothing at bs=6.** The bs=1 legs do not overlap at all
+(base max 40.70 < new min 40.93), so that one is outside the run-to-run spread. bs=5 is at the edge
+of it. bs=6 is a wash.
+
+**But these bs labels do not mean what they look like.** With a draft width the decode batch the MoE
+sees is a spec-VERIFY width, not `bs`. The `[g2-split]` ledger for this run shows the fused kernel
+being called at M = 3, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 30, 32 — and **M=1 and M=2 never appear**,
+so the scatter arm is not on the decode path at all under MTP. Run 2 pins `SPEC=none` so that
+`bs = n` gives `M = n` and the served points line up with the swept surface.
+
+### Honest sizing, before anyone extrapolates
+
+The isolated win is 1.12–1.39× **on one kernel**, and that kernel is roughly 40 × 50 µs ≈ 2 ms of a
+step measured in tens of ms. A ~1% end-to-end result is the *expected* size of this change, not a
+disappointment and not evidence that the kernel measurement was wrong. It is worth having because it
+is free at runtime and bit-exact — but the decode step has many other kernels, and this one is no
+longer among the starved ones.

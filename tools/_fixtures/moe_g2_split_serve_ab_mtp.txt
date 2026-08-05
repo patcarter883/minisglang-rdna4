@@ -1,3 +1,4 @@
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
 MoE fused-gemm2 top_k split serve A/B  model=qwen35b-awq TP=2  image=minisgl-rdna4:post-tile toks=384 reps=5 conc=6
 engine  /home/pat/code/minisgl-rdna4-g2sk   @ 7a9b9663
 kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
@@ -47,3 +48,5 @@ kernels /home/pat/code/rdna4-hip-kernels-g2sk @ e82e2eb  (ONE build, both legs)
   g2-split ledger: [g2-split] N=2048 K=256 M=10 byla|[g2-split] N=2048 K=256 M=12 byla|[g2-split] N=2048 K=256 M=16 byla|[g2-split] N=2048 K=256 M=18 byla|[g2-split] N=2048 K=256 M=20 byla|[g2-split] N=2048 K=256 M=24 byla|[g2-split] N=2048 K=256 M=30 byla|[g2-split] N=2048 K=256 M=32 byla|[g2-split] N=2048 K=256 M=3 byla|[g2-split] N=2048 K=256 M=4 byla|[g2-split] N=2048 K=256 M=5 byla|[g2-split] N=2048 K=256 M=6 byla|[g2-split] N=2048 K=256 M=8 byla|
   split_k values seen: <none>
   PROVENANCE FAIL: new never split ('') — A/B void
+tools/moe_g2_split_serve_ab.sh: line 115: syntax error near unexpected token `)'
+tools/moe_g2_split_serve_ab.sh: line 115: ` is the scatter arm, untouched by this leg)" ;;'
