@@ -349,7 +349,7 @@ supplies parallelism, so this is a multiple, not a few percent, on the MoE decod
 **2. "Decode GEMV is at 81% of HBM" (claim 3).**
 Reproduces only against a hardcoded 640 GB/s constant with a hot cache. Honestly measured, fp8 reads
 **55–63%**; my counters put the *served* shapes at **13.0–69.5%** of 706.6 GB/s, with only the
-synthetic 16384² reaching 88–94%. A whole class of decode GEMV work was closed off on a number taken
+synthetic 16384² reaching 86–88%. A whole class of decode GEMV work was closed off on a number taken
 at a geometry the engine never launches.
 
 **3. "Occupancy is THE lever" (claim 6) — mis-scoped rather than wrong.**

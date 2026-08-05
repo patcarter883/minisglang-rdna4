@@ -1006,6 +1006,28 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         )
         return True
 
+    def _rtx_step_begin(self, name: str) -> None:
+        """Open a ROCTx range for ONE plain-decode scheduler-loop iteration, and move the gated
+        collection window along. Caller MUST pair it with `_roctx.pop()`.
+
+        The SPEC step annotates its own phases (propose/stage/verify_forward/accept, ~line 3890), so
+        `--selected-regions` already works there. The PLAIN decode loops had no markers at all, which
+        made a SPEC=none serve unprofilable in the same way: with `--selected-regions` the collection
+        window never opens and the trace is empty, and without it the trace is the WHOLE process —
+        model load plus graph capture, which is where roctx.py measured 919,939 dispatches over 35.8 s
+        with the steady decode phase a 7 s tail to be recovered by post-filtering. It also supplies the
+        thing a kernel trace cannot supply on its own: where one decode STEP ends and the next begins.
+
+        Gated on a bool at the call site rather than wrapped in a context manager so an unprofiled
+        serve pays one `if` per step and allocates nothing.
+        """
+        self._rtx_step += 1
+        if self._rtx_step == self._rtx_skip:
+            _roctx.resume()
+        elif self._rtx_step == self._rtx_skip + self._rtx_steps:
+            _roctx.pause()
+        _roctx.push(name)
+
     @torch.inference_mode()
     def run_forever(self) -> None:
         # Establish the rank0->rank{1..} PUB/SUB fan-out before any request flows, so the first
@@ -1087,18 +1109,33 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     self._diffusion_loop()
                     if self._bounded_exit_reached():
                         return
+        # `_rtx` is read ONCE: roctx.enabled() is a module-global test, but reading it per iteration
+        # on the hottest loop in the server buys nothing.
+        _rtx = _roctx.enabled()
         if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
-                    self.normal_loop()
+                    if _rtx:
+                        self._rtx_step_begin("normal_step")
+                    try:
+                        self.normal_loop()
+                    finally:
+                        if _rtx:
+                            _roctx.pop()
                     if self._bounded_exit_reached():
                         return
         else:
             assert torch.cuda.current_stream() == self.stream
             data = None
             while True:
-                data = self.overlap_loop(data)
+                if _rtx:
+                    self._rtx_step_begin("overlap_step")
+                try:
+                    data = self.overlap_loop(data)
+                finally:
+                    if _rtx:
+                        _roctx.pop()
                 if self._bounded_exit_reached():
                     return
 
