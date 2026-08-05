@@ -282,9 +282,11 @@ def main() -> int:
     out(f"fp8_wmma: {W.__file__}")
     import minisgl.quant.kernels as QK
     out(f"minisgl.quant.kernels: {QK.__file__}")
+    # `tiled_min` is GONE: above gemv_max there is exactly one dense arm now, so the only dense
+    # crossover left is decode_gemv <-> wmma_tiled_tuned. The tile the WMMA arm picks is no longer a
+    # constant in this file either -- ask the kernel (dense_tile_explain), do not mirror it.
     out(f"crossovers: gemv_max_int4={QK._W4A8_GEMV_MAX_INT4} gemv_max_e2m1={QK._W4A8_GEMV_MAX_E2M1} "
-        f"tiled_min={QK._W4A8_PREFILL_TILED_MIN} gemv_K_mult={QK._W4A8_GEMV_K_MULTIPLE} "
-        f"moe_gemm1_gemv_max={QK._MOE_GEMM1_GEMV_MAX}")
+        f"gemv_K_mult={QK._W4A8_GEMV_K_MULTIPLE} moe_gemm1_gemv_max={QK._MOE_GEMM1_GEMV_MAX}")
 
     MS = [1, 2, 4, 5, 8, 9, 10, 16, 17, 20, 32, 33, 64, 65, 128, 129, 192, 256, 512, 1024, 2048]
 
