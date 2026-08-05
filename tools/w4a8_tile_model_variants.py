@@ -200,6 +200,29 @@ def core(bm, bn, warps_n, g, row_blocks, n_blocks, z_blocks, k_groups, lds, shuf
         # preferring a tall tile": where `rounds` clamps `live` low, the spurious nwarps factor is
         # the only thing left moving, and it points the wrong way.
         #
+        # ---- VERDICT: FALSIFIED. Kept, because the next agent will otherwise derive it again. ----
+        # Scored on the 300-cell card-0 dense surface against the shipped WN={1} chooser:
+        #     shipped + scale-line, WN={1,2,4}   dense gm 1.0753  worst 2.48  REGRESSED 30
+        #     wg    div=live        LAT 2..12    dense gm 1.54-1.63  worst 4.26  REGRESSED 196-233
+        #     wgmix f=0.5  LAT=16               dense gm 1.1004  worst 2.48  REGRESSED 37
+        #     wgmix f=0.75 LAT=8                dense gm 1.1401  worst 2.35  REGRESSED 36
+        # Every variant is WORSE than what ships. The reading: `occ` is doing DOUBLE DUTY. It stands
+        # for the barrier's covering resource (co-resident workgroups, which is what the header
+        # describes) AND for memory-level parallelism (independent in-flight loads, which extra
+        # warps genuinely do provide). Removing the nwarps factor removes both, and the second one
+        # is real. A correct term has to SPLIT the stall, not re-point the whole denominator.
+        #
+        # What the surface actually says, and what the next attempt should start from: the anomaly
+        # is a ROW_BLOCKS == 1 CLIFF, not a WARPS_N effect. Measuring us(rb==1) against that same
+        # tile's own per-row-block trend us(rb==2)/2 over the whole surface:
+        #     WARPS_N=1  n=452  geomean 1.577   WARPS_N=2  n=160  geomean 1.516
+        #     WARPS_N=4  n=80   geomean 1.646   worst 5.04x (lag.gate_up tp1 32x64x4, M=32->48:
+        #                                       354.7us -> 140.6us, i.e. 2.5x FASTER with 2x the work)
+        # It is present at EVERY WARPS_N, so it is not a WN term -- but it is a term the model does
+        # not have at all, and it is WN-COUPLED IN EFFECT because a tall tile stays at rb==1 over a
+        # much longer M range than a short one. That coupling is the "short-rounds launches
+        # preferring a tall tile" signature, made quantitative.
+        #
         # DERIVED, not fitted: the structure follows from the barrier, and LAT stays ONE constant.
         # Its SCALE necessarily changes with the denominator's units (dividing by ~4-8x less), so
         # the sweep re-reads it on its plateau -- that is a re-scale of an existing constant, not a
