@@ -27,6 +27,8 @@ from minisgl.spec import (
     verify_greedy,
     verify_sampled,
 )
+from minisgl.kvcache._envutil import env_int
+from minisgl.kvcache.ghost_cache import ghost_oracle_path
 from minisgl.spec.accept_gpu import accept_greedy_ondevice, truncate_at_eos_ondevice
 from minisgl.utils import div_ceil, init_logger, load_tokenizer, resolve_stop_token_ids
 
@@ -101,6 +103,12 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+# Ghost-oracle log cadence, in admitted requests. Measure-only; see kvcache/ghost_cache.py.
+# env_int, not int(os.environ.get(...)): compose passes "${VAR:-}", so an unset knob arrives SET to
+# the empty string and the plain spelling raises at import — a boot crash instead of a default.
+_GHOST_REPORT_EVERY = env_int("MINISGL_GHOST_ORACLE_EVERY", 200)
+
+
 class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine, resolve_prefix_cache, snapshot_ladder_depth
@@ -112,6 +120,15 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
+
+        # Ghost-oracle report cadence (measure-only; see run_when_idle). Counted in requests so the
+        # log cadence is identical on every TP rank.
+        self._ghost_next_report = _GHOST_REPORT_EVERY
+        # Only ONE writer per DP replica, else the two TP ranks race on os.replace. Every rank holds
+        # identical oracle state (same requests, deterministic hashing), so rank 0's file is the
+        # replica's state — not a sample of it.
+        self._ghost_path = ghost_oracle_path(config.model_path, config.dp_info.dp_rank)
+        self._ghost_writer = config.tp_info.rank == 0
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
@@ -247,6 +264,20 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
+        # Resume the ghost oracle from the previous run. Loaded on EVERY rank, not just the writer:
+        # the ranks must hold identical state or their summaries diverge and the log stops being a
+        # single number. A load failure (missing, truncated, different page_size) is a fresh start,
+        # never an error — the probe is not allowed to block a boot.
+        if self.cache_manager.ghost_oracle is not None and self._ghost_path:
+            try:
+                resumed = self.cache_manager.ghost_oracle.load(self._ghost_path)
+            except (OSError, ValueError) as e:
+                logger.warning_rank0(f"ghost-oracle: load failed ({e}); starting fresh")
+                resumed = False
+            logger.info_rank0(
+                f"ghost-oracle: {'RESUMED' if resumed else 'fresh start'} at {self._ghost_path}"
+                + (f" — {self.cache_manager.ghost_oracle.summary()}" if resumed else "")
+            )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -888,6 +919,22 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if self._opd_dir and self._opd_buf:
             self._flush_opd()
         self.cache_manager.check_integrity()
+        # Ghost oracle (measure-only, default OFF): report on the idle tick rather than plumbing four
+        # counters through message/ -> tokenizer -> api_server -> Prometheus for a temporary probe.
+        # Rate-limited by request count, not wall clock, so a quiet box does not spam the log and the
+        # cadence is identical across TP ranks. Harvest with `grep ghost-oracle` on the serve log.
+        oracle = self.cache_manager.ghost_oracle
+        if oracle is not None and oracle.requests >= self._ghost_next_report:
+            logger.info_rank0(oracle.summary())
+            self._ghost_next_report = oracle.requests + _GHOST_REPORT_EVERY
+            # Checkpoint on the idle tick, NOT via atexit: the container's SIGTERM does not run
+            # atexit handlers (the DFlash capture flush above exists for the same reason), so a
+            # restart would otherwise lose everything since boot.
+            if self._ghost_path and self._ghost_writer:
+                try:
+                    oracle.save(self._ghost_path)
+                except OSError as e:  # a probe must never take the serve down
+                    logger.warning_rank0(f"ghost-oracle: save failed ({e}); continuing in-memory")
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -1500,6 +1547,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if slot is None:
             return
         snap = self._rec_cache.clone_slot(slot)
+        if snap is None:
+            # Host arena exhausted. Skipping the stash is the SAME outcome the store already
+            # produces at its four existing drop sites (_enforce_rec_cap, evict, free, ladder trim):
+            # match_prefix caps the reusable prefix to the deepest node that HAS a snapshot, so this
+            # costs a shallower match and more re-prefill — never a wrong answer.
+            return
         self._pending_rec_snap[req.uid] = (cached_len, snap)
         # Also retain it as an INTERIOR resume point. Same clone — no extra state capture — so the
         # only cost is holding the last `_rec_snap_ladder_depth` of them until this sequence inserts.
@@ -1539,7 +1592,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         slot = self._rec_slots.slot_for(req.uid)
         if slot is None:
             return
-        self.cache_manager.attach_rec_state(handle, self._rec_cache.clone_slot(slot))
+        snap = self._rec_cache.clone_slot(slot)
+        if snap is None:  # arena exhausted; see _stash_rec_state
+            return
+        self.cache_manager.attach_rec_state(handle, snap)
 
     def _rec_snapshot_nbytes(self) -> int:
         """Bytes held by ONE snapshot in the radix store.
@@ -1634,6 +1690,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         max_running = config.max_running_req
         env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
         cap = max(4, live, (int(float(env_gib) * (1 << 30)) // per) if env_gib else 0)
+        # HOST TIER: the store no longer competes with the KV pool, so the cap is the ARENA's frame
+        # count, not a VRAM budget. Deriving it from _rec_snapshot_store_bytes here would read the
+        # device STAGING size (16.4 MiB = 1 frame) and collapse the cap to the floor, silently
+        # turning the host tier into a store that holds four snapshots.
+        arena = getattr(self.engine, "snapshot_host_arena", None)
+        if arena is not None:
+            cap = max(cap, arena.num_frames - max_running)
         if os.environ.get("MINISGL_GDN_RADIX_MAX_SNAPSHOTS"):
             cap = min(cap, pc.max_rec_snapshots)  # explicit override still wins downward
         pc.max_rec_snapshots = int(cap)
@@ -1641,10 +1704,19 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # and the same per-snapshot bytes, so any mismatch here is a real divergence and visible at
         # boot — not something to be discovered later as an OOM inside a prefill activation.
         reserved = self.engine._rec_snapshot_store_bytes(config)
+        # With the host tier on, `reserved` is DEVICE STAGING and the store lives in pinned host
+        # RAM — two different pools. Printing them as one number ("cap x MiB vs engine reserved")
+        # would read as a permanent 20:1 divergence at every boot and train the operator to ignore
+        # the one line that exists to catch real drift. So name all three.
+        where = (
+            f"HOST {arena.nbytes/(1<<30):.2f} GiB pinned ({arena.num_frames} frames) + "
+            f"device staging {reserved/(1<<20):.1f} MiB"
+            if arena is not None
+            else f"engine reserved {reserved/(1<<30):.2f} GiB"
+        )
         logger.info_rank0(
             f"{kind}-radix snapshot store: cap={pc.max_rec_snapshots} x {per/(1<<20):.1f} MiB "
-            f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB "
-            f"(engine reserved {reserved/(1<<30):.2f} GiB; "
+            f"= {pc.max_rec_snapshots*per/(1<<30):.2f} GiB ({where}; "
             f"{'BUDGET override' if env_gib else 'derived'}: live working set = (ladder "
             f"{self._rec_snap_ladder_depth} + 1) x max_running {max_running} = {live})"
         )

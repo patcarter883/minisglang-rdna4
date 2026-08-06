@@ -2,6 +2,15 @@ from __future__ import annotations
 
 import torch
 
+from .host_arena import (
+    FrameComponent,
+    FrameLayout,
+    HostSnapshot,
+    get_snapshot_side_stream,
+    host_tier_enabled,
+    stage_ring_depth,
+)
+
 
 class GDNStateCache:
     """Per-sequence recurrent state for GDN (Gated Delta Net) layers.
@@ -99,10 +108,53 @@ class GDNStateCache:
                 # real breakage in gdn_hip surfaces loudly at the first forward, not here.
                 pass
 
+        # ---- host-tier snapshot plumbing -------------------------------------------------------
+        # The byte layout of ONE snapshot, shared by the pinned host frame and the device staging
+        # buffer so a capture/restore is one contiguous copy instead of a per-component loop.
+        # Mirrors clone_slot's `[:, s:s+1]` slices exactly, so the scatter back is a shape-matched
+        # assignment with no reshape.
+        self.snapshot_layout = FrameLayout(
+            (
+                FrameComponent("conv", dtype, (num_gdn_layers, 1, conv_dim, conv_kernel - 1)),
+                FrameComponent(
+                    "ssm", self._ssm_dtype, (num_gdn_layers, 1, num_v_heads, head_v_dim, head_k_dim)
+                ),
+            )
+        )
+        self._host_arena = None
+        self._stage: list | None = None
+        self._stage_i = 0
+        # Allocated EAGERLY, here, for the same reason as the replay ring above: this runs before
+        # the KV pool is sized (engine.py:301 vs :1003), and `_rec_snapshot_store_bytes` reserves
+        # exactly this. Allocating device memory lazily, after the pool is sized, is precisely the
+        # over-commit that reservation exists to prevent.
+        depth = stage_ring_depth() if host_tier_enabled() else 0
+        if depth > 0 and device.type == "cuda":
+            self._stage = []
+            for _ in range(depth):
+                flat = torch.empty(self.snapshot_layout.nbytes, dtype=torch.uint8, device=device)
+                self._stage.append(
+                    {"flat": flat, "views": self.snapshot_layout.views(flat), "lastuse": None}
+                )
+
         # LIFO free-list of slot ids. Slot 0 is the reserved NULL block (see class
         # docstring): the range STOPS at 1, so slot 0 is never popped/allocated.
         self.NULL_SLOT = 0
         self._free: list[int] = list(range(num_slots - 1, 0, -1))
+
+    # ---- host tier --------------------------------------------------------------------------
+
+    def attach_host_arena(self, arena) -> None:
+        """Point snapshots at a pinned host arena. Until this is called (or if it is never called,
+        e.g. the pin failed at boot) `clone_slot` keeps returning device clones, which is the
+        untouched legacy behaviour and the other half of the A/B."""
+        assert self._stage, "host arena attached but no device staging ring was allocated"
+        self._host_arena = arena
+
+    def _next_stage(self) -> dict:
+        st = self._stage[self._stage_i]
+        self._stage_i = (self._stage_i + 1) % len(self._stage)
+        return st
 
     def alloc_many(self, n: int) -> torch.Tensor:
         """Allocate n state slots; returns their ids as an int32 device tensor."""
@@ -182,23 +234,98 @@ class GDNStateCache:
 
     def clone_slot(self, slot: int):
         """Slot-agnostic snapshot of ONE slot's conv+ssm state across all GDN layers, for radix
-        prefix-caching. Returns an opaque handle (cloned tensors, no source-slot binding) that
-        `load_slot` can install into a DIFFERENT slot — a future request that hits the cached prefix
-        restores this exact recurrent state instead of re-prefilling the shared prefix. ~17 MB / slot
-        for the 35B (all 30 GDN layers, per rank)."""
+        prefix-caching. Returns an opaque handle (no source-slot binding) that `load_slot` can
+        install into a DIFFERENT slot — a future request that hits the cached prefix restores this
+        exact recurrent state instead of re-prefilling the shared prefix. 16.406 MiB / slot for the
+        35B (all 30 GDN layers, per rank).
+
+        Returns a `HostSnapshot` when the host tier is on, else the legacy device 2-tuple. Both are
+        opaque to every consumer (`radix_cache.py` stores it as `rec_state: Any`), which is what
+        makes the two paths an env-var A/B rather than a fork. Returns **None** when the pinned
+        arena is exhausted — a dropped snapshot is behaviourally identical to the LRU drop the
+        store already performs at four other sites, and `match_prefix` caps the reusable prefix to
+        the deepest node that HAS a snapshot, so the result is a shallower match (more re-prefill),
+        never a wrong one.
+        """
         s = int(slot)
+        # A direct ssm_state READ: materialise the ReplaySSM ring FIRST, or the checkpoint is stale
+        # by up to REPLAY_RING_LEN decode steps and the restore silently installs an out-of-date
+        # state (wrong text, no crash). gdn_state.py:67-78.
         self.flush_ring(torch.tensor([s], dtype=torch.long, device=self._device))
-        return (self.conv_state[:, s : s + 1].clone(), self.ssm_state[:, s : s + 1].clone())
+        arena = self._host_arena
+        if arena is None:
+            return (self.conv_state[:, s : s + 1].clone(), self.ssm_state[:, s : s + 1].clone())
+
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "clone_slot on a capturing stream: a side-stream D2H cannot be recorded into a graph"
+        )
+        side = get_snapshot_side_stream()
+        idx = arena.alloc(write_stream=side)
+        if idx is None:
+            return None
+        snap = HostSnapshot(arena, idx)
+        cur = torch.cuda.current_stream()
+        st = self._next_stage()
+        if st["lastuse"] is not None:
+            # The staging buffer is shared between capture and restore; a new gather must not
+            # overwrite bytes a previous D2H has not finished reading. Missing this corrupts an
+            # ALREADY-STORED snapshot, so the damage surfaces later on an unrelated request.
+            cur.wait_event(st["lastuse"])
+            st["lastuse"] = None
+        # Gather live (strided) state into the contiguous staging frame on the compute stream. This
+        # is the isolation point: after it, the slow PCIe leg reads STAGING, not live state, so the
+        # next forward never waits on PCIe.
+        st["views"]["conv"].copy_(self.conv_state[:, s : s + 1])
+        st["views"]["ssm"].copy_(self.ssm_state[:, s : s + 1])
+        ev_gather = torch.cuda.Event()
+        ev_gather.record(cur)
+        side.wait_event(ev_gather)  # else the D2H reads staging before the gather filled it
+        with torch.cuda.stream(side):
+            snap.flat.copy_(st["flat"], non_blocking=True)  # ONE contiguous 16.4 MiB D2H
+        ev_d2h = torch.cuda.Event()
+        ev_d2h.record(side)
+        st["lastuse"] = ev_d2h
+        arena.set_lastuse(idx, ev_d2h)
+        snap.set_event(ev_d2h)
+        return snap
 
     def load_slot(self, slot: int, snap) -> None:
         """Install a `clone_slot` snapshot into `slot` (conv + ssm, all GDN layers). The recurrent
         state is decomposition-invariant under the bit-exact recurrent kernel, so continuing a prefill
-        from this restored state is byte-identical to prefilling the shared prefix from zero."""
+        from this restored state is byte-identical to prefilling the shared prefix from zero.
+
+        Everything runs on the CURRENT (compute) stream, so the H2D, the scatter and `reset_ring`
+        are trivially ordered and the forward that follows is ordered behind them for free. That
+        same-stream property is load-bearing: moving the H2D to a side stream without eventing it
+        back would let the scatter read unfilled staging, and `has_initial_state` is True on this
+        path so the prefill kernel would consume the garbage.
+        """
         s = int(slot)
-        conv, ssm = snap
-        self.conv_state[:, s : s + 1] = conv
-        self.ssm_state[:, s : s + 1] = ssm
-        self.reset_ring(s)           # a direct ssm_state WRITE: the ring's entries are now stale
+        if not isinstance(snap, HostSnapshot):
+            conv, ssm = snap
+            self.conv_state[:, s : s + 1] = conv
+            self.ssm_state[:, s : s + 1] = ssm
+            self.reset_ring(s)       # a direct ssm_state WRITE: the ring's entries are now stale
+            return
+
+        cur = torch.cuda.current_stream()
+        snap.wait()                  # order this stream after the capture D2H that filled the frame
+        st = self._next_stage()
+        if st["lastuse"] is not None:
+            cur.wait_event(st["lastuse"])
+            st["lastuse"] = None
+        # Explicit copy_ with non_blocking, NOT `conv_state[...] = pinned_tensor`: __setitem__
+        # cannot pass non_blocking, so torch would run the copy synchronously and stall the host for
+        # the whole transfer plus a pipeline drain — on the TTFT critical path.
+        st["flat"].copy_(snap.flat, non_blocking=True)
+        self.conv_state[:, s : s + 1] = st["views"]["conv"]
+        self.ssm_state[:, s : s + 1] = st["views"]["ssm"]
+        self.reset_ring(s)           # AFTER the scatter; before it, the ring would retain entries
+                                     # belonging to the state we just overwrote (gdn_state.py:74-75)
+        ev = torch.cuda.Event()
+        ev.record(cur)
+        st["lastuse"] = ev
+        snap.note_read(ev)           # a later capture into this frame must wait for our read
 
     def rollback_ring(self, slots: torch.Tensor, reject: torch.Tensor) -> None:
         """Rewind `reject[i]` speculative entries from slot `slots[i]`'s ring, for every GDN layer.
