@@ -70,5 +70,6 @@ done
 say "=== engage ledgers (did the same kernels fire on both legs?) ==="
 for f in "$RES"/*-engage.txt; do say "--- $(basename "$f")"; sed 's/^/    /' "$f" | tee -a "$MASTER"; done
 say "=== report ==="
-python3 "$CAND_WT/tools/counter_probe/ksweep/glm_ab_report.py" --results "$RES" 2>&1 | tee -a "$MASTER"
+python3 "$CAND_WT/tools/counter_probe/ksweep/glm_ab_report.py" --results "$RES" \
+  --band "$MODEL TP=2, SPEC=$SPEC, CONC=$CONC, pinned --num-pages ${NUM_PAGES:-3072}" 2>&1 | tee -a "$MASTER"
 say "=== done. results=$RES"
