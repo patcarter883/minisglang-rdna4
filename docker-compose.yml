@@ -43,6 +43,10 @@ x-lean-common: &lean-common
     # Engine source (kernels are NOT here anymore — they come from /opt/kernels in the image).
     - .:/engine
     - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+    # Ghost-oracle state. A DURABLE host path on purpose: it accumulates over days and must outlive
+    # both the container and this worktree (which goes away when the branch merges), so it does not
+    # belong in a container layer or under /engine.
+    - ${GHOST_ORACLE_DIR:-/home/pat/fixtures/minisgl-ghost-oracle}:/ghost
   environment: &lean-env
     # /opt/kernels (canonical HIP kernels, baked into the image) FIRST so nothing under /engine can
     # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
@@ -75,6 +79,33 @@ x-lean-common: &lean-common
     # Twin handle for the SCATTER arm's K carve (M<=2). "legacy" reproduces the retired
     # `4 if M == 1 else 1` so a control leg can measure what that constant cost e2e.
     MINISGL_MOE_SPLITK_SCATTER: "${MINISGL_MOE_SPLITK_SCATTER:-}"
+    # ---- host-RAM tier for the recurrent-radix snapshot store ----------------------------------
+    # The store used to be a VRAM reservation subtracted from the KV pool (20 snapshots x 16.4 MiB
+    # = 0.32 GiB = 67,200 KV tokens on the 35B at TP=2/CONC=4). Holding it in PINNED HOST RAM hands
+    # those tokens back — and since the ceiling is min(max_position_embeddings, pool), i.e.
+    # pool-bound, they are also context. A snapshot is a fixed size regardless of how much context
+    # it represents and is touched once at a prefix hit, never on the decode path, so the trade is
+    # PCIe-vs-recompute (~0.33 ms) not PCIe-vs-VRAM. Default ON; =0 restores device clones.
+    MINISGL_REC_SNAP_HOST: "${MINISGL_REC_SNAP_HOST:-1}"
+    # Device staging frames. 1 = one contiguous 16.4 MiB DMA each way, and the next forward waits
+    # only on the ~30 us gather instead of the whole PCIe leg. 0 wins the last 2.4% of the pool but
+    # turns the copy into 60 per-layer calls ON the critical path. Empty = 1.
+    MINISGL_REC_SNAP_STAGE_RING: "${MINISGL_REC_SNAP_STAGE_RING:-}"
+    # Pinned arena size. Empty = derived from the live working set + the in-flight ladder.
+    MINISGL_REC_SNAP_HOST_GIB: "${MINISGL_REC_SNAP_HOST_GIB:-}"
+    # ---- ghost oracle (MEASURE-ONLY; decides whether a host KV tier is worth building) ----------
+    # Reports how much cross-request prefix reuse the cache throws away, SPLIT into "KV was resident
+    # but the snapshot had been dropped" (-> raise the snapshot cap) vs "neither was resident"
+    # (-> needs a host KV tier). Costs a .tolist() + O(pages) hashing per admitted request, so it is
+    # OFF unless asked for. Harvest with `grep ghost-oracle` on the serve log.
+    MINISGL_GHOST_ORACLE: "${MINISGL_GHOST_ORACLE:-0}"
+    MINISGL_GHOST_ORACLE_EVERY: "${MINISGL_GHOST_ORACLE_EVERY:-}"
+    # Persist counters AND the seen-prefix LRU across restarts. The LRU is the part that must
+    # survive: `potential` is defined against prompts seen EARLIER, so a cold start makes every
+    # prompt look novel and systematically UNDER-reports reuse — biasing the answer toward "don't
+    # build it". Keyed by model inside the dir, so changing model parks a file rather than mixing
+    # two tokenizers' hashes into one number. Empty = in-memory only.
+    MINISGL_GHOST_ORACLE_DIR: "${MINISGL_GHOST_ORACLE_DIR:-/ghost}"
     MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
@@ -477,6 +508,9 @@ services:
       # Local checkpoints (ZAYA, Laguna) and DFlash drafts, so a model alias can name a path.
       - ${MODELS_DIR:-/home/pat/models}:/models
       - ${DRAFT_DIR:-/home/pat/code/_models}:/drafts:ro
+      # This service REDEFINES volumes rather than inheriting *lean-common's, so /ghost has to be
+      # repeated here — the anchor's copy does not merge in. Durable host path; see the anchor.
+      - ${GHOST_ORACLE_DIR:-/home/pat/fixtures/minisgl-ghost-oracle}:/ghost
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"

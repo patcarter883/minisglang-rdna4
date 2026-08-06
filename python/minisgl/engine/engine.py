@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
@@ -20,6 +21,7 @@ from minisgl.distributed import (
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
+from minisgl.kvcache.host_arena import PinnedFrameArena, host_tier_enabled, stage_ring_depth
 from minisgl.layers import set_rope_device
 from minisgl.models import ModelConfig, create_model, load_weight
 from minisgl.moe import create_moe_backend
@@ -364,6 +366,15 @@ class Engine:
             )
         else:
             self.cca_state = None  # type: ignore[var-annotated]  # CCAStateCache | None
+
+        # Pinned host arena for the recurrent-radix snapshot store. HERE, not in
+        # _determine_num_pages: the pool is sized at line ~220, BEFORE either state cache exists
+        # (which is exactly why _recurrent_state_bytes is config-derived rather than measured), so
+        # attaching an arena from there would find no cache to attach it to. Ordering is fine — the
+        # arena is HOST memory and does not come out of the device budget; the only device cost is
+        # the staging ring, which each state cache allocates in its own ctor and which
+        # _rec_snapshot_store_bytes already reserved.
+        self._build_snapshot_host_arena(config)
 
         # ======================= CAM editable-memory (Option B, Phase 0) ========================
         # Build the CAM store+tap+router IN THE BACKEND, reusing the SERVED model's weights (no
@@ -749,17 +760,95 @@ class Engine:
                     // max(1, config.max_running_req + 2))
         if per_slot <= 0:
             return 0
+        # HOST TIER: the snapshots themselves now live in pinned host RAM, so the only DEVICE
+        # memory this feature needs is the staging ring — one contiguous frame that the gather
+        # writes and the D2H reads. At depth 1 that is 16.4 MiB instead of 0.32 GiB, handing
+        # ~64k KV tokens back to the pool (141,408 -> ~205,248 on the 35B at TP=2/CONC=4). The
+        # snapshot is a fixed size regardless of context length and is touched once, off the decode
+        # path, so PCIe-vs-recompute is the relevant comparison and it is not close.
+        if host_tier_enabled():
+            return stage_ring_depth() * per_slot
         # DERIVED, not a magic GiB: the store's job is to hold every live sequence's ladder plus its
-        # end snapshot, which is exactly (ladder + 1) * max_running_req entries. Anything above that
-        # is cross-request reuse, and it measured worth nothing here — cap 12 and cap 23 produced the
-        # SAME hit count and the same TTFT on both agent- and chat-shaped prefix-sharing traffic
-        # (tools/rec_radix_ab.sh), while the difference cost 36,704 KV pool tokens. So the default is
-        # the working set; MINISGL_GDN_RADIX_SNAP_BUDGET_GIB stays as an explicit override for a
-        # deployment that wants deeper reuse and has the VRAM to buy it.
+        # end snapshot, which is exactly (ladder + 1) * max_running_req entries.
+        #
+        # A NOTE ON THE OLD JUSTIFICATION HERE: this comment used to claim "cap 12 and cap 23
+        # produced the SAME hit count and the same TTFT ... while the difference cost 36,704 KV pool
+        # tokens", citing tools/rec_radix_ab.sh. The archived fixtures for that script
+        # (/home/pat/fixtures/minisgl-kv-calib/rec_radix_ab/) do not contain that comparison: both
+        # store legs booted at the SAME cap 23 and varied only the LADDER DEPTH (0 vs 4), which is
+        # what came back identical. The "cap 12" leg is the `tuned` arm, which also changes ladder
+        # AND --max-prefill-length, so it is not a cap-only A/B; the 36,704 figure traces to commit
+        # 209e4aaa as 11 x 16.4 MiB arithmetic, not a measurement. What IS supported: interior
+        # resume points buy nothing. Cross-request CAP depth was never measured — and with the store
+        # in host RAM it stops costing pool tokens, so it is now worth measuring properly.
         live = self._rec_snap_live_snapshots(config)
         env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
         budget = int(float(env_gib) * (1 << 30)) if env_gib else 0
         return max(budget, live * per_slot)
+
+    def _build_snapshot_host_arena(self, config: EngineConfig) -> None:
+        """Allocate the pinned host arena and point the live state cache at it.
+
+        Best-effort by design. A multi-GiB `cudaHostRegister` can be slow or can fail outright under
+        a cgroup memory limit, and this is a CACHE — on any failure we log loudly and leave the
+        state cache on its legacy device-clone path, which is byte-identical behaviour, just with
+        the old VRAM cost. Never crash a serve for a cache.
+        """
+        self.snapshot_host_arena = None
+        if not host_tier_enabled():
+            return
+        if resolve_prefix_cache(config).snapshot_kind != "recurrent":
+            return  # SWA frames are 100 MiB and its clone is a gather; deferred (Stage 1c/2).
+        cache = self.gdn_state if self.gdn_state is not None else self.cca_state
+        if cache is None or getattr(cache, "_stage", None) is None:
+            return
+        frames = self._rec_snap_host_arena_frames(config)
+        layout = cache.snapshot_layout
+        try:
+            t0 = time.perf_counter()
+            arena = PinnedFrameArena(layout, frames)
+            cache.attach_host_arena(arena)
+            self.snapshot_host_arena = arena
+            logger.info(
+                f"recurrent-radix snapshot store: HOST tier — {arena.stats()} "
+                f"({layout.nbytes / (1 << 20):.2f} MiB/frame, pinned in "
+                f"{time.perf_counter() - t0:.2f}s); device staging "
+                f"{stage_ring_depth()} x {layout.nbytes / (1 << 20):.2f} MiB"
+            )
+        except (RuntimeError, MemoryError) as e:
+            logger.warning(
+                f"recurrent-radix snapshot store: pinning {frames} x "
+                f"{layout.nbytes / (1 << 20):.1f} MiB FAILED ({e}); falling back to device clones. "
+                "The KV pool was already sized for the host tier, so it is now oversized relative "
+                "to the store — restart with MINISGL_REC_SNAP_HOST=0 for a consistent boot."
+            )
+            self.snapshot_host_arena = None
+
+    def _rec_snap_host_arena_frames(self, config: EngineConfig) -> int:
+        """Pinned host frames to allocate for the snapshot store.
+
+        `live` is the working set that must never be dropped. The extra `ladder * max_running` term
+        covers snapshots held in `_pending_rec_snap` / `_rec_snap_ladder` that have NOT yet reached
+        the radix store — today those are device clones sitting OUTSIDE both `_enforce_rec_cap` and
+        this reservation, i.e. ~0.256 GiB of unreserved VRAM. They move to host too, which is why
+        the measured free-VRAM improvement will exceed the reservation delta, and why the reclaim
+        must be validated on POOL TOKENS from the boot log rather than a mem_get_info delta.
+
+        The 1.25 is headroom for the attach transition, where a snapshot is momentarily referenced
+        by both the ladder list and the radix node.
+        """
+        from .config import snapshot_ladder_depth
+
+        live = self._rec_snap_live_snapshots(config)
+        inflight = snapshot_ladder_depth(config) * max(1, config.max_running_req)
+        env = os.environ.get("MINISGL_REC_SNAP_HOST_GIB")
+        frames = -(-int(1.25 * (live + inflight)) // 1)
+        if env:
+            per_slot = (self._recurrent_state_bytes(config, replay_ring=False)
+                        // max(1, config.max_running_req + 2))
+            if per_slot > 0:
+                frames = max(1, int(float(env) * (1 << 30)) // per_slot)
+        return max(1, frames)
 
     @staticmethod
     def _rec_snap_live_snapshots(config) -> int:

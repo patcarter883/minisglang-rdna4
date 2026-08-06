@@ -127,6 +127,8 @@ class RadixPrefixCache(BasePrefixCache):
         self.protected_size = 0
         self.root_node = RadixTreeNode(self.key_fn)
         self.root_node.ref_count = 1  # root is always protected
+        # Measure-only; see match_prefix. Not part of cache state.
+        self.last_kv_prefix_len = 0
 
         # Recurrent-state radix (GDN/CCA). When True, match_prefix additionally caps the returned
         # prefix to the deepest node carrying a recurrent-state snapshot (so KV reuse and recurrent
@@ -184,6 +186,11 @@ class RadixPrefixCache(BasePrefixCache):
 
     def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
         node, prefix_len = self._tree_walk(input_ids)
+        # MEASURE-ONLY: the UNCAPPED KV match, before the recurrent snapshot cap below trims it.
+        # The ghost oracle needs both numbers to tell "the KV was evicted" apart from "the KV was
+        # there but its snapshot had been dropped" — two failures with completely different fixes
+        # (a host KV tier vs. a bigger snapshot cap). Nothing reads this on the serving path.
+        self.last_kv_prefix_len = prefix_len
         if not self.recurrent:
             return MatchResult(RadixCacheHandle(prefix_len, node))
         # Recurrent radix: KV alone is NOT enough — reusing a prefix requires the recurrent state at

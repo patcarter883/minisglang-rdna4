@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 from minisgl.core import Req
 from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
+from minisgl.kvcache._envutil import env_int
+from minisgl.kvcache.ghost_cache import GhostPrefixOracle, ghost_oracle_enabled
 from minisgl.utils import div_ceil
 
 if TYPE_CHECKING:
@@ -23,11 +25,26 @@ class CacheManager:
         self.num_pages = num_pages
         self.page_table = page_table
         self.page_size = page_size
+        # Go/no-go oracle for a host-RAM KV tier. Default OFF; costs a .tolist() + O(pages)
+        # hashing per admitted request when on. See kvcache/ghost_cache.py.
+        self.ghost_oracle = (
+            GhostPrefixOracle(page_size, env_int("MINISGL_GHOST_ORACLE_CAPACITY", 1 << 18))
+            if ghost_oracle_enabled()
+            else None
+        )
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        return self.prefix_cache.match_prefix(req.input_ids[: input_len - 1])
+        ids = req.input_ids[: input_len - 1]
+        result = self.prefix_cache.match_prefix(ids)
+        if self.ghost_oracle is not None:
+            # Measure-only. `last_kv_prefix_len` is the tree walk BEFORE the recurrent snapshot cap
+            # (radix_cache.match_prefix); it equals cached_len for a dense/naive cache, which is why
+            # the getattr default is the capped value rather than 0.
+            kv_len = getattr(self.prefix_cache, "last_kv_prefix_len", result.cuda_handle.cached_len)
+            self.ghost_oracle.observe(ids.tolist(), result.cuda_handle.cached_len, kv_len)
+        return result
 
     @property
     def available_size(self) -> int:
