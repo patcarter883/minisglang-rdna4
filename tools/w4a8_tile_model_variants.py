@@ -550,6 +550,7 @@ def main() -> int:
         picks = {}
         for k, d in cells.items():
             best = bc = None
+            costs = {}
             for c in d:
                 bm, bn, wn = tile_of(c)
                 if wn not in wn_set:
@@ -562,8 +563,21 @@ def main() -> int:
                     cst = moe_cost(M * tk, E, 2 * inter, hid, g, bm, bn, args.cu, p)
                 if cst is None:
                     continue
+                costs[c] = cst
                 if best is None or cst < best:
                     best, bc = cst, c
+            # ---- THE NEAR-TIE BAND (tile_select.h::NEAR_TIE_BAND) ------------------------------
+            # An argmin acts on any margin, however small; the model's measured PAIRWISE ranking
+            # error is 1.10 (below a predicted 1.10x it calls the pair right 45-58% of the time --
+            # a coin flip -- and the tile it prefers is measured 0.96-1.05x the one it rejects). So
+            # inside that band the chooser keeps the INCUMBENT tile 256x128, the one the dense core
+            # was hard-wired to and tuned around, instead of coin-flipping. `tie_break` is the
+            # incumbent tile, `tie_band` the multiplier; absent, this is the plain argmin.
+            tb = p.get("tie_break")
+            if isd and tb and bc is not None and tile_of(bc)[:2] != tb:
+                inc = f"{tb[0]}x{tb[1]}"
+                if inc in costs and costs[inc] <= best * p.get("tie_band", 1.0):
+                    bc = inc
             if bc is not None:
                 picks[k] = (bc, d[bc] / min(d.values()))
         return picks
@@ -664,6 +678,98 @@ def main() -> int:
                   + (f", worst {bad[0][0]:.2f}x" if bad else ""))
             for f_, k, c in bad[:12]:
                 print(f"     {f_:5.2f}x  {k}  picked {c}")
+
+    # ==============================================================================================
+    # THE NEAR-TIE BAND -- do not switch tiles on a margin the model cannot resolve
+    # ==============================================================================================
+    # This is the ONE variant that changes no term of the cost model: same costs, same lattice, a
+    # different ARGMIN POLICY. A pure argmin acts on a 3% predicted gap as though it were a decision,
+    # and it is not -- measured pairwise over this surface (every ordered pair of measured WN=1
+    # tiles, bucketed by the model's predicted margin) the model ranks a pair right 45-58% of the
+    # time below 1.10x and the tile it prefers measures 0.96-1.05x the one it rejects. From 1.10 up,
+    # accuracy climbs monotonically (66.7% / 74.0% / 79.3% / 82.2% / 91.0% / 95.4%). So 1.10 is the
+    # model's ranking error, and inside it the chooser keeps the INCUMBENT 256x128 -- the tile
+    # wmma_tiled_tuned was hard-wired to, and around which every other part of the core was tuned.
+    #
+    # This shipped as a REGRESSION first: at glm.gate_up tp2 g=128 M=448..512 the argmin preferred
+    # 256x64 by a predicted 1.036x and the measurement says 256x128 is 1.19x faster -- +2.4% on a
+    # ~516-token GLM TP=2 prefill TTFT, disjoint ranges.
+    #
+    # NOTE the restricted argmin makes this a HARDER test than the lattice-wide one, not an easier
+    # one: 256x128 is in the measured set of essentially every cell, so every capture here is a
+    # move between two MEASURED tiles and cannot hide in an unmeasured pick.
+    print("\n" + "=" * 110)
+    print("NEAR-TIE BAND -- keep the incumbent 256x128 when the argmin's margin is inside the")
+    print("model's own measured pairwise ranking error. Cost model UNCHANGED; argmin POLICY changed.")
+    print("=" * 110)
+
+    # ---- WHERE THE BAND COMES FROM. Not fitted, and deliberately NOT the 1.036 geomean-vs-oracle
+    # number: geomean regret measures how good the SELECTION ends up, and a tie threshold needs how
+    # well the model ORDERS A PAIR. Measured directly -- every ordered pair of measured WN=1 tiles in
+    # every cell, bucketed by the model's PREDICTED margin, scored against the MEASUREMENT.
+    edges = [1.02, 1.04, 1.06, 1.08, 1.10, 1.15, 1.20, 1.30, 1.50, float("inf")]
+
+    def rank_table(label, cellf, tilef):
+        buck = defaultdict(lambda: [0, 0, []])
+        for k, d in D.items():
+            if not cellf(k):
+                continue
+            name, K, N, g, M = k
+            ts = []
+            for c, us in d.items():
+                bm, bn, wn = tile_of(c)
+                if wn != 1 or not tilef(bm, bn):     # the chooser may only pick WN=1
+                    continue
+                cst = dense_cost(M, N, K, g, bm, bn, 1, args.cu, ship)
+                if cst:
+                    ts.append((cst, us))
+            for i, (ca, ua) in enumerate(ts):
+                for j, (cb, ub) in enumerate(ts):
+                    if i == j or cb <= ca:
+                        continue
+                    e = next(x for x in edges if cb / ca < x)
+                    b = buck[e]
+                    b[1] += 1
+                    b[0] += (ua < ub)
+                    b[2].append(ua / ub)
+        lo, cols = 1.0, []
+        for e in edges:
+            if e not in buck:
+                continue
+            right, tot, rat = buck[e]
+            cols.append(f"[{lo:.2f},{min(e, 9.99):.2f}) n={tot:<5} {100*right/tot:5.1f}% gm={gm(rat):.3f}")
+            lo = e
+        print(f"  {label:<18} " + "  ".join(cols))
+
+    print("\nPAIRWISE RANKING ACCURACY -- 'model RIGHT %' and the MEASURED us(model's pick)/us(other),")
+    print("bucketed by the model's own PREDICTED margin. Below ~1.10 the model is at CHANCE and the")
+    print("tile it prefers is not faster; from 1.10 up, accuracy climbs monotonically. THAT is the band.")
+    rank_table("ALL", lambda k: True, lambda bm, bn: True)
+    rank_table("g=32", lambda k: k[3] == 32, lambda bm, bn: True)
+    rank_table("g=128", lambda k: k[3] == 128, lambda bm, bn: True)
+    rank_table("M<=64", lambda k: k[4] <= 64, lambda bm, bn: True)
+    rank_table("M>=96 PREFILL", lambda k: k[4] >= 96, lambda bm, bn: True)
+    rank_table("no lm_head", lambda k: k[2] < 100000, lambda bm, bn: True)
+    rank_table("BM>=64 only", lambda k: True, lambda bm, bn: bm >= 64)
+    print()
+    tie_ref = None
+    for band in (1.0, 1.02, 1.04, 1.06, 1.10, 1.15, 1.20, 1.30):
+        p = dict(ship, tie_break=(256, 128), tie_band=band)
+        pk = chooser(p, (1,), D, True)
+        rs = [r for _, r in pk.values()]
+        if tie_ref is None:
+            tie_ref = {k: v for k, v in pk.items()}
+        moved = [k for k in pk if pk[k][0] != tie_ref[k][0]]
+        worse = [(pk[k][1] / tie_ref[k][1], k, tie_ref[k][0], pk[k][0])
+                 for k in moved if pk[k][1] > tie_ref[k][1] * 1.02]
+        better = [(pk[k][1] / tie_ref[k][1], k, tie_ref[k][0], pk[k][0])
+                  for k in moved if pk[k][1] < tie_ref[k][1] * 0.98]
+        print(f"  band={band:<5} DENSE gm={gm(rs):.4f} w={max(rs):.2f} n={len(rs)}  "
+              f"moved={len(moved):<3} BETTER={len(better):<3} WORSE={len(worse)}")
+        for f_, k, b, t in sorted(better)[:6]:
+            print(f"       BETTER {f_:5.3f}x  {k}  {b} -> {t}")
+        for f_, k, b, t in sorted(worse, reverse=True)[:6]:
+            print(f"       WORSE  {f_:5.3f}x  {k}  {b} -> {t}")
     return 0
 
 
