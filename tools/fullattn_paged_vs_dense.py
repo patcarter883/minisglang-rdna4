@@ -47,7 +47,7 @@ def case(name, L, M, PS):
     ctx = torch.tensor([N], device=DEV, dtype=torch.int32)
     out_ext = attn_prefill_paged.flash_prefill_paged(
         q[L:].contiguous(), kc, vc, block_table, cu_q, ctx,
-        SCALE, 1, 0, M, 0, None,
+        SCALE, 1, 0, M, N, 0, None,   # ..., max_seqlen_q, split_ctx, kv_block_stride, mask_bias
     )
     bit = torch.equal(out_cold, out_ext)
     dmax = (out_cold.float() - out_ext.float()).abs().max().item()

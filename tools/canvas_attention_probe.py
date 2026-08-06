@@ -98,8 +98,10 @@ def run(op, q, kc, vc, rows, ctx, causal, sliding_window, mask=None):
     block_table = torch.tensor([rows], dtype=torch.int32, device=DEV)
     cu_q = torch.tensor([0, q.shape[0]], dtype=torch.int32, device=DEV)
     ctx_lens = torch.tensor([ctx], dtype=torch.int32, device=DEV)
+    # split_ctx (the engine's context bound; REQUIRED since the kernel stopped inferring the split
+    # decision from the block-table row width) sits between max_seqlen_q and kv_block_stride.
     args = [q.contiguous(), kc, vc, block_table, cu_q, ctx_lens,
-            SCALE, causal, sliding_window, q.shape[0], 0]
+            SCALE, causal, sliding_window, q.shape[0], max(int(ctx), 1), 0]
     if mask is not None:
         args.append(mask)
     return op(*args)

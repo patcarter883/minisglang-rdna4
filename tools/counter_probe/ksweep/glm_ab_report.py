@@ -14,6 +14,10 @@ import statistics
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True)
+    # The banner used to hardcode "GLM ... SPEC=none". This report is now driven for Qwen
+    # under SPEC=mtp too, and a report that names the wrong model is how a measurement gets
+    # filed against the wrong config.
+    ap.add_argument("--band", default="GLM-4.7-Flash-AWQ TP=2, SPEC=none, pinned --num-pages")
     a = ap.parse_args()
 
     legs = {}
@@ -33,7 +37,7 @@ def main() -> None:
         print(f"\n[report] need both legs; have {sorted(legs)}")
         return
 
-    print("\n================ GLM TP=2 serve A/B  (MODE=base: no profiler attached) ================")
+    print(f"\n================ serve A/B: {a.band}  (MODE=base: no profiler attached) ================")
     print(f"{'phase':12s} {'n':>2s} {'base tok/s':>11s} {'cand tok/s':>11s} {'delta':>8s} "
           f"{'base spread':>12s} {'cand spread':>12s} {'verdict':>10s}")
     for label in ("decode_bs1", "decode_bs5", "decode_bs6", "prefill"):
@@ -53,7 +57,7 @@ def main() -> None:
         verdict = "NOISE" if abs(delta) <= band else ("WIN" if delta > 0 else "LOSS")
         print(f"{label:12s} {min(len(bt), len(ct)):2d} {mb:11.2f} {mc:11.2f} {delta:+7.2f}% "
               f"{sb:11.2f}% {sc:11.2f}% {verdict:>10s}")
-    print("\nBAND: served decode, GLM-4.7-Flash-AWQ TP=2, SPEC=none, pinned --num-pages, auto clocks.")
+    print(f"\nBAND: served decode, {a.band}, auto clocks.")
 
 
 if __name__ == "__main__":

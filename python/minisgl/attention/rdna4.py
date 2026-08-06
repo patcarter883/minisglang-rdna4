@@ -166,6 +166,9 @@ class RDNA4Backend(BaseAttnBackend):
         # Persistent attention-output buffer, reused across forwards (eager paths only). See
         # _get_out_buf; grown to the largest token count seen so no per-forward torch.empty_like.
         self._out_buf: torch.Tensor | None = None
+        # attn_prefill_paged's split-K policy input; see the `split_ctx` property. Resolved lazily
+        # because the global page table is allocated after the backend is constructed.
+        self._split_ctx: int | None = None
         # 3D flash-decode segment scratch (f32), lazily sized on first forward.
         self._seq_threshold_3D = 0
         self._segm_output: torch.Tensor | None = None
@@ -199,6 +202,49 @@ class RDNA4Backend(BaseAttnBackend):
             # full-attn) uses head_dim-dependent BR/BC=16 tiling to fit the 64 KB gfx1201 LDS. The
             # coverage check is _HIP_HEAD_DIMS, applied per call in forward() (a split-head_dim model
             # has no single answer). No covered head_dim falls back to Triton on the HIP path.
+
+    # ---- the split-K policy input, and why the ENGINE owns it ---------------------------------
+    # `attn_prefill_paged` chooses between its single-pass kernel and split-K + reduce from a context
+    # bound. It used to READ that bound off the block table's row width, and the row width is not the
+    # same number on the two paths that must agree: the eager metadata allocates the row at the
+    # batch's true context (`page_table[idx, :max_seqlen_k:page_size]`), while every capture family
+    # allocates a STATIC row sized from max_seq_len. So a captured graph ran split-K + reduce where
+    # the eager forward it was captured from ran the single-pass kernel — two different kernels on
+    # the same inputs, measured on the DiffusionGemma canvas at max|delta| = 8.324e+00 against a
+    # hidden state whose own max is 41.44, and reproduced in isolation for the K+1 spec-verify and
+    # chunked-prefill shapes (attn_prefill_paged/tests/test_split_width_invariance.py).
+    #
+    # The kernel no longer infers it. `split_ctx` is a required op argument with NO default, and it
+    # comes from the CAPACITY OF THE POOL BEING READ — a serve-lifetime constant that is therefore
+    # trivially the same at capture, at replay, and on every eager forward:
+    #
+    #   main paged pool -> `self.split_ctx`, the global page table's token width (aligned_max_seq_len)
+    #   SWA ring pool   -> `window + max_seqlen_q`, the ring row's own capacity
+    #
+    # THE CONSEQUENCE, STATED BECAUSE IT IS A REAL TRADE. A captured graph bakes its launch
+    # configuration, so the split decision CANNOT depend on the running context length — only on
+    # numbers fixed for the serve. Context length therefore no longer informs it, and the only
+    # discriminator left is SHAPE (`base_grid` vs MINISGL_ATTN_PREFILL_FILL_CTAS). A thin-grid call
+    # over a short context now splits where the old eager path would have gone single-pass. That is
+    # the honest cost of making the two paths agree; the alternative — letting each path pick for
+    # itself — is the bug.
+    @property
+    def split_ctx(self) -> int:
+        """Context bound for the MAIN paged pool: the global page table's token width. Identical on
+        the eager and captured paths by construction (there is only one global page table)."""
+        sc = self._split_ctx
+        if sc is None:
+            sc = self._split_ctx = int(get_global_ctx().page_table.shape[1])
+            # Say it once, in the serve log. There is no gate for the spec-verify capture families
+            # (only the canvas has one), so this line is what makes the split-K policy input
+            # auditable on a model whose graphs nobody has diffed.
+            from minisgl.utils import init_logger
+            init_logger(__name__).info_rank0(
+                f"[attn] attn_prefill_paged split_ctx={sc} (global page-table token width); the "
+                "SAME value is passed on the eager and captured paths, and the kernel no longer "
+                "infers it from the block-table row width"
+            )
+        return sc
 
     def _softmax_scale(self, q: torch.Tensor) -> float:
         """Softmax temperature for THIS call, taken from the query's actual head_dim (q is
@@ -437,7 +483,8 @@ class RDNA4Backend(BaseAttnBackend):
                        else "(canvas)" if metadata.bidirectional else ""))
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q, 0,  # k/v_descale, causal, sw, kv_block_stride
+                scale, ks, vs, fp8_causal, 0, metadata.max_seqlen_q,
+                self.split_ctx, 0,  # split-K policy input (see `split_ctx`), kv_block_stride
                 custom_mask,  # mask_bias (None on a normal serve; the DDTree/TiDAR ancestor mask otherwise)
             )
         causal = 0 if non_causal else 1
@@ -447,7 +494,8 @@ class RDNA4Backend(BaseAttnBackend):
                    else "(canvas)" if metadata.bidirectional else ""))
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            scale, causal, 0, metadata.max_seqlen_q, 0, custom_mask,  # ..., kv_block_stride, mask_bias
+            scale, causal, 0, metadata.max_seqlen_q,
+            self.split_ctx, 0, custom_mask,  # split_ctx, kv_block_stride, mask_bias
         )
 
     # ---- SWA (sliding-window) ring-pool attention (Laguna sliding layers) ----------------------
@@ -610,6 +658,10 @@ class RDNA4Backend(BaseAttnBackend):
         # the canvas; measured rel_fro 0.60 apart in tools/canvas_attention_probe.py).
         canvas = metadata.bidirectional
         causal, sw = (0, 0) if canvas else (1, window)
+        # Split-K policy input for the RING pool (see `split_ctx`): a ring row is [<=window kept
+        # slots | max_seqlen_q new ones], so that sum is its capacity. `window` is the layer's
+        # config and `max_seqlen_q` is the graph's fixed width, so both paths compute the same int.
+        ring_split_ctx = int(window) + int(metadata.max_seqlen_q)
         tag = "(swa-canvas)" if canvas else "(swa-verify)"
         from minisgl._hip_engage import engaged
         if self.swa_kv.dtype == torch.float8_e4m3fn:
@@ -617,12 +669,12 @@ class RDNA4Backend(BaseAttnBackend):
             engaged("attn_prefill_paged.flash_prefill_paged_fp8" + tag)
             return self._hip_prefill_paged_fp8_op(
                 q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-                scale, ks, vs, causal, sw, metadata.max_seqlen_q, 0, None,
+                scale, ks, vs, causal, sw, metadata.max_seqlen_q, ring_split_ctx, 0, None,
             )
         engaged("attn_prefill_paged.flash_prefill_paged" + tag)
         return self._hip_prefill_paged_op(
             q, k_cache, v_cache, block_table, cu_q, ctx_lens,
-            scale, causal, sw, metadata.max_seqlen_q, 0, None,
+            scale, causal, sw, metadata.max_seqlen_q, ring_split_ctx, 0, None,
         )
 
     def _swa_decode(

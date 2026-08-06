@@ -2144,3 +2144,106 @@ largest BM, smallest tile) are all worse than doing nothing.
 `wgs < cu` what actually launched is smaller — the two `o_proj` shapes launch 60 workgroups on 64
 CUs at 12/32 waves. Fixing that RE-RANKS the lattice, which a tie-break deliberately does not, so it
 needs the surface re-swept rather than a prior re-argued.
+
+---
+
+## Part D12 — §D11.3's open item is CLOSED: the caller supplies the split decision
+
+§D11.3 left one thing open — "the split decision has to be a caller-supplied constant that both
+paths pass" — and said the gate would keep raising until it landed. It has landed.
+
+### D12.1 The change
+
+**Kernel** (`attn_prefill_paged`, `8644f41`). `prefill_split_policy` is keyed on a new **required**
+op argument `split_ctx`; `max_blocks * block_size` is **deleted**, not demoted to a fallback, and the
+argument carries no default. A silent fallback is precisely what let this ship since capture landed.
+
+**Engine** (`77498b4e`). Both paths pass the **capacity of the pool being read**, which is a
+serve-lifetime constant and therefore trivially the same at capture, at replay, and eagerly:
+
+| call site | `split_ctx` |
+|---|---|
+| main paged pool (`_hip_prefill_paged`) | the global page table's token width (`aligned_max_seq_len`) |
+| SWA ring pool (`_swa_prefill_paged`) | `window + max_seqlen_q` — the ring row's own capacity |
+
+That is four call sites and therefore **every** family that reaches the op: K+1 spec verify, fused
+TiDAR verify, DDTree tree verify, the canvas, and eager chunked/radix-hit prefill.
+
+**DDTree was NOT exempt.** §D11.3 said "only the DDTree family caps". It does — at
+`MINISGL_DDTREE_MAXCTX`, whose default is **2048**, which is still above the kernel's `MIN_CTX` of
+1024. The cap moved the crossover; it did not remove it.
+
+**Eager prefill was exposed too, with no graph involved.** The eager row width is the **batch max**
+context, so the same request got a different split depending on which requests it was batched with.
+
+### D12.2 The regression test the old tests could not be
+
+`attn_prefill_paged/tests/test_graph_capture.py` captures and replays with the **same** block table,
+so the width never varies and the divergence is invisible to it. The new
+`tests/test_split_width_invariance.py` states the invariant directly — same inputs, two row widths,
+require bit-identical — with **no graph in sight**. Pre-fix it fails 6 of 12 shapes (verify K+1,
+long-context verify, chunked prefill; bf16 and fp8, 2.4e-4 to 1.9e-3 absolute). Post-fix all 18,
+including the production Qwen3.6-35B-A3B verify geometry and the DDTree capped-table shape, are
+`0.000e+00`.
+
+### D12.3 The canvas gate, with `MINISGL_ATTN_MAX_SPLITS` UNSET
+
+```
+METADATA DIFF max_seqlen_k: sched=276 static=262144
+metadata page_table: values agree over [:1,:18], row width differs sched=(1,18) static=(1,16384)
+metadata swa_verify_page_table: values agree over [:1,:276], row width differs sched=(1,276) static=(1,1280)
+graph vs eager[matched regime]                    = 0.000e+00 BIT-IDENTICAL
+eager self-consistency                            = 0.000e+00
+replay self-consistency                           = 0.000e+00
+eager-fallback regime (side-stream AR + 2 chunks) = 0.000e+00
+LOCALISE: eager[static replay metadata] vs eager[scheduler metadata] = 0.000e+00
+          graph vs eager[static replay metadata]                     = 0.000e+00
+```
+
+The point is the first three lines together with the fourth: **the width divergence is still there
+and is now inert.** The LOCALISE line that read `8.324e+00` reads `0.000e+00`, without the env knob.
+
+### D12.4 What it costs, and the design consequence that is not going away
+
+`tools/canvas_step_time.sh` + `tools/canvas_timing_windows.py` (differenced 10-step windows, TP=2,
+bs=1, `MINISGL_SWA_RADIX=0`, `MINISGL_CANVAS_TIMING=1`, seven windows each):
+
+| arm | median step | spread |
+|---|---|---|
+| `fixed` — split-K selected, `MINISGL_ATTN_MAX_SPLITS` unset | **101.2 ms** | 6.2% |
+| `nosplit` — `MINISGL_ATTN_MAX_SPLITS=1` | **91.4 ms** | 10.2% |
+
+Both gate at `0.000e+00`. The ratio, **1.107**, is what split-K costs this canvas, and it agrees with
+§D11.4's 97.7 / 86.9 = 1.124 — the ~4 ms level offset against §D11.4 is the timing syncs and a longer
+generation (`fwd_tail` climbs 77.9 → 84.7 ms across the windows as context grows). **The fix does not
+add a cost; it makes the eager path pay the one the captured graph was already paying**, and
+`MINISGL_ATTN_MAX_SPLITS=1` is now a consistent operator lever rather than a workaround for a bug.
+
+**The consequence worth stating.** A captured graph bakes its launch configuration, so the split
+decision cannot depend on the running context length — only on numbers fixed for the serve. Context
+length therefore no longer informs it and the only discriminator left is SHAPE (`base_grid` vs
+`MINISGL_ATTN_PREFILL_FILL_CTAS`). A thin-grid call over a short context now splits where the old
+eager path went single-pass; the canvas is exactly that shape (`base_grid` = Hq × 16 q-tiles, under
+the 512-CTA fill threshold) over a 276-token context. Making split-K context-aware again needs the
+work distribution to move device-side (num_splits is the grid and must stay host-constant, so only
+`chunk` can), which is a separate change with its own measurement.
+
+### D12.5 Served regression: none
+
+Interleaved median-of-2, `tools/split_ctx_serve_ab.sh`, base = engine `fdc482a8` + kernels `a45a14d`
+in a purpose-built image, provenance asserted per leg on the kernel file that changed:
+
+| model | phase | base | cand | delta |
+|---|---|---|---|---|
+| GLM-4.7-Flash-AWQ, SPEC=none | bs=1 / 5 / 6 | 61.34 / 195.91 / 237.11 | 61.45 / 196.18 / 238.26 | +0.18% / +0.14% / +0.49% — all NOISE |
+| Qwen3.6-35B-A3B-AWQ, SPEC=mtp | bs=1 / 5 / 6 | 43.76 / 129.84 / 157.23 | 43.60 / 129.51 / 157.26 | −0.37% / −0.25% / +0.01% |
+
+GLM reproduces its standing 61.53 / 196.44 / 237.55. Qwen's −0.37% at bs=1 sits just outside a
+0.14–0.26% repeat spread and is flat for practical purposes; the captured verify graph's split
+decision is **unchanged** by the fix (the static verify row width already equalled the page-table
+width), so this is expected — what moved is the eager path, onto the same kernel.
+
+**GLM has no exposure at all**, and the engage ledger says so rather than an argument: it is MLA, its
+decode and verify run `mla_hip.mla_decode_fp8` / `mla_verify`, and `attn_prefill_paged` never appears.
+Qwen's ledger carries both `gdn_hip.gdn_verify_replay` (the verify graph IS replaying) and
+`attn_prefill_paged.flash_prefill_paged_fp8`, which is the exposure, live, on its default config.
