@@ -48,8 +48,14 @@ import os
 
 import torch
 
-_BLOCK_M = int(os.environ.get("MINISGL_MINV_BLOCK_M", "64"))  # WMMA M-tile (mult of 16, <=128)
-_BN = int(os.environ.get("MINISGL_MINV_BN", "64"))            # WMMA N-tile (divides most OUT dims)
+# OVERRIDES, not defaults. These were the pinned tile for every shape and every M; the tile is now
+# derived per shape from a measured surface (see the selection block in minv_linear). 0 = derive.
+# They stay as an escape hatch and as the knob the sweep harness drives.
+_BLOCK_M_OVERRIDE = int(os.environ.get("MINISGL_MINV_BLOCK_M", "0"))  # WMMA M-tile (mult of 16, <=128)
+_BN_OVERRIDE = int(os.environ.get("MINISGL_MINV_BN", "0"))            # WMMA N-tile (must divide OUT)
+# The signature defaults below keep working for direct callers that pass neither.
+_BLOCK_M = _BLOCK_M_OVERRIDE or 64
+_BN = _BN_OVERRIDE or 64
 # ---------------------------------------------------------------------------------------------
 # WHICH KERNEL, AND WHY. All three dense_gemm kernels are bit-identical (identical fixed 16-wide K
 # order, no split-K), so this dispatch may pick purely on speed and stays M-invariant whatever it
@@ -100,6 +106,52 @@ _PIPE_MI = int(os.environ.get("MINISGL_MINV_PIPE_MI", "2"))   # pipe register-bl
 # so Gemma4's intermediate 2112 becomes IN=1056 at TP=2, which is not a multiple of 64, so `mlp.down`
 # could never reach pipe at any M and sat on rd forever (M=1024: 110 us rd -> 78 us pipe).
 _PIPE_PBK = int(os.environ.get("MINISGL_MINV_PIPE_PBK", "64"))
+# ---- SPLIT-K REDUCTION ORDER --------------------------------------------------------------------
+# A narrow-OUT, deep-K GEMM (the router) has no parallelism to give: rd's loop is a dependent
+# global-load -> s_wait -> WMMA chain IN/16 deep, so it costs ~IN/16 L2 latencies and is FLAT in M
+# (18.3-19.6 us from M=16 to M=1024 at IN=2816/OUT=128). Cutting K into SK slices divides that chain
+# and multiplies the grid, and it is the ONLY thing that has ever beaten rocBLAS on this shape: 0.57x
+# at M=16, 0.83x at M=384, where the whole non-split tile lattice's own oracle never got below 1.19x.
+#
+# TWO SEPARATE DECISIONS, and conflating them is what stalled this for a session:
+#
+#  1. WHICH SHAPES use the split-K reduction order. This IS a bit-move against plain rd, so it is a
+#     per-shape commitment that must hold at EVERY M — never a function of M. `split_k_slices(IN)`
+#     reads IN and nothing else, by construction, so one order serves the whole M ladder.
+#  2. HOW that order is scheduled. `grid_split=True` fans slices across blockIdx.z and reduces fp32
+#     partials; `False` walks the same slices in one block with a running total. These are
+#     BIT-IDENTICAL (gated below), so this one is free to depend on M — and must, because the
+#     fan-out wins only while M cannot fill the machine on its own (2.79x rocBLAS at M=2048).
+#
+# Gates, all green on card 0, 2026-08-07 (fixture: rdna4-hip-kernels
+# tools/_fixtures/splitk_router_ladder_card0.txt):
+#   * schedule bit-identity, every M on the ladder 16..8192: torch.equal == True
+#   * M-invariance ACROSS the schedule boundary: M=1024 (slice) vs chunks of 16/32/64/128/192/256
+#     (grid) -> max|d| 0.000e+00
+#   * EXPERT-FLIP, the criterion that actually decides an MoE router (dense_gemm/local/
+#     splitk_router_flips.py against real captured gemma4_router.pt, 5 layers / 2800 real rows):
+#     0/22400 top-k index mismatches. A "max rel delta 3e-7" would have said nothing here — top-k is
+#     a step function and one ULP can reroute a token.
+# Cost above the crossover: the sliced schedule tracks plain rd within +/-1% (16 extra VGPRs at BN=32).
+#
+# ANY NEW SHAPE that enters this band changes numerics and needs splitk_router_flips.py re-run
+# against a real capture of ITS inputs. OUT<=256 keeps the band to the router class deliberately.
+# IN >= 1024 guarantees split_k_slices() >= 2 — below it the op falls back to PLAIN RD ORDER
+# internally, which would silently re-mix the two orders for the same weight.
+# rd N-tile selection (see the block in minv_linear). _CUS is the gfx1201 compute-unit count — note
+# torch reports WGPs, not CUs, so do NOT read this from device properties.
+_CUS = 64
+# A-traffic must be worth the halved grid. Fitted between mlp.down M=192 (M*IN=203K, wants bn64) and
+# mlp.gate_up M=64 (180K, wants bn32).
+_RD_BN64_MIN_MN = 192 * 1024
+# ...and the halved grid must still leave the machine reasonably busy. THIS IS THE WEAKEST CONSTANT
+# IN THE FILE: the fixture has exactly two shapes in the regime where it bites and they disagree —
+# o_proj M=128 (44 tiles at bn64) wants bn64, mlp.gate_up M=128 (33 tiles) wants bn32 — so any value
+# in (33, 44] fits and nothing in the data picks one. Re-fit it if a third shape lands in the band.
+_RD_BN64_MIN_TILES = 40
+_SPLITK_MAX_OUT = int(os.environ.get("MINISGL_MINV_SPLITK_MAX_OUT", "256"))
+_SPLITK_MIN_IN = int(os.environ.get("MINISGL_MINV_SPLITK_MIN_IN", "1024"))
+_SPLITK_GRID_MAX_M = int(os.environ.get("MINISGL_MINV_SPLITK_GRID_MAX_M", "448"))
 _warned: set[str] = set()
 
 
@@ -161,7 +213,7 @@ def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
-                *, block_m: int = _BLOCK_M, BN: int = _BN) -> torch.Tensor:
+                *, block_m: int | None = None, BN: int | None = None) -> torch.Tensor:
     """M-invariant drop-in for F.linear: C = x @ weight^T (+bias). Accepts N-D x (flattened to 2-D).
     Falls back to F.linear when the M-invariant kernel is unavailable for this dtype/shape/context."""
     import torch.nn.functional as F
@@ -219,13 +271,92 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
         Mp = ((M + bm - 1) // bm) * bm
         return x2 if Mp == M else torch.nn.functional.pad(x2, (0, 0, 0, Mp - M))
 
-    if OUT % BN != 0:
+    # ---- TILE SELECTION: block_m and BN are per-shape now, not module constants -------------------
+    # They used to be `_BLOCK_M = 64` and `_BN = 64` for EVERY shape and every M, so two of the four
+    # real axes were pinned. The ARM rule below is unchanged — it is right on 34 of 36 cells — but the
+    # tile it hands the arm was a constant, and the surface says the tile is where the loss is.
+    #
+    # Fixture: tools/_fixtures/dense_gemm_surface_card0.csv in rdna4-hip-kernels (2,844 cells: the 6
+    # served shapes x M in {16,64,128,192,256,512} x the full lds/rd/pipe lattice INCLUDING MI=1,
+    # cold weights rotated past the 64 MB MALL, CUDA-graph-replay device time, rocBLAS in every cell).
+    # Scored against the per-cell oracle over our own arms:
+    #
+    #                      vs oracle   vs rocBLAS   beats rocBLAS   worst cell
+    #   pinned (before)      1.0812      1.1580         9/36          1.89x
+    #   THIS RULE            1.0204      1.0928        13/36          1.33x     and ZERO regressions
+    #
+    #   * rd's block_m TRACKS M. The oracle picks bm16/48 at M=16, bm64 at M=64, bm128 at M=128 on
+    #     every shape — obvious in hindsight, since rd's warps each own 16 rows and a bm below M just
+    #     launches more row-blocks of the same work while a bm above M pads.
+    #   * rd's BN follows OUT, not M. Wide outputs want 64, narrow want 32 (the router's whole grid is
+    #     OUT/BN tiles, so halving BN doubles the only parallelism it has).
+    #   * pipe needed one more staircase step: at an LM-head-width OUT the oracle is bm128 from M=128,
+    #     but the old staircase held bm64 until M=256, which was the single worst cell in the set
+    #     (lm_head M=128, 1.89x rocBLAS). The existing `OUT>=65536 and M>=192 -> 256` clause is right
+    #     and is kept; this adds the step below it.
+    #
+    # NOTE the MI=1 trap this fixture had to be rebuilt to avoid: `mi = _PIPE_MI if pbm >= 256 else 1`
+    # means the engine runs MI=1 everywhere below pbm=256, but the sweep's config list predated those
+    # instantiations and carried only MI in {2,4}. Scoring against it silently graded the policy on
+    # configs it never launches. If you extend the lattice here, extend PIPE_INST with it.
+    _wide = OUT >= 65536
+    if OUT < _PIPE_MIN_OUT or (M <= _RD_MAX_M and M * OUT <= _RD_MAX_MN):
+        # bm MUST NOT force an M-pad. `_padded()` rounds M up to bm and that pad is a real
+        # allocate+copy inside minv_linear — but the fitting surface hoisted it OUT of the timed
+        # region (sweep_policy.py builds `xp = {bm: pad(x, bm)}` once, before gbench), so every
+        # config whose bm does not divide M was priced too cheap and this rule then picked one.
+        # Measured end-to-end: router M=192 chose bm128 (pad 192->256) at 25.3 us against 21.2 for
+        # the unpadded bm64 it replaced — a +19.1% REGRESSION — while the surface claimed
+        # bm128/bn32 there was 16.07 us, i.e. a ~9 us pad the surface never charged.
+        # bm barely moves the router (15.6-16.1 us across the whole bm lattice at bn32), so the
+        # right objective is: minimise PADDED ROWS first, then take the largest such tile (fewest
+        # row-blocks). Exact for every M that is a multiple of any lattice entry.
+        bm = min((16, 32, 48, 64, 96, 128), key=lambda b: (-(-M // b) * b, -b))
+        # rd's N-tile. `OUT >= 4096 -> 64 else 32` was wrong because OUT alone cannot express the
+        # trade; there are two effects pulling opposite ways and only one of them scales with M:
+        #   * A-TRAFFIC. rd re-reads the whole A panel once per N-tile, so A bytes ~ (OUT/BN)*M*IN.
+        #     Doubling BN halves it. GROWS with M.
+        #   * PARALLELISM. The grid is (OUT/BN)*ceil(M/bm) blocks. Doubling BN halves it, and below
+        #     the 64-CU count that is pure loss. FLAT in M.
+        # So the crossover lives in M and is different per OUT. Fitted on the 30 rd cells of
+        # dense_gemm_surface_card0.csv: right on every cell the engine can actually dispatch (rd is
+        # reachable only at M<=128, plus the router at every M) except mlp.gate_up M=128.
+        # The cell this fixes: o_proj M=128 was taking bn32 at 57.6 us against 43.3 at bn64 (-25%),
+        # the worst cell in the whole A/B at 2.05x rocBLAS.
+        rb = -(-M // bm)
+        _t32, _t64 = (OUT // 32) * rb, (OUT // 64) * rb
+        if OUT % 64 or _t32 < _CUS:
+            # Router class: the machine is not full even at the finest tile, so every block counts
+            # and halving the grid can only hurt. (OUT=128 is 4 tiles at bn32, 2 at bn64.)
+            bn = 32
+        elif _t64 >= _CUS or (M * IN >= _RD_BN64_MIN_MN and _t64 >= _RD_BN64_MIN_TILES):
+            bn = 64
+        else:
+            bn = 32
+    else:
+        bn = 128 if _wide else 64
+        bm = 256 if (M >= 512 or (_wide and M >= 192)) else (
+            128 if (M >= 256 or (_wide and M >= 128)) else 64)
+    # Precedence: explicit argument > env override > derived. No engine call site passes either
+    # (all eight go through `minv_linear(x, weight[, bias])`), so the derived tile is what serves;
+    # the arguments exist for the sweep harness and for a caller that knows better.
+    bn = BN or _BN_OVERRIDE or bn
+    bm = block_m or _BLOCK_M_OVERRIDE or bm
+
+    if OUT % bn != 0:
         # ragged OUT: only the LDS kernel masks a partial N-tile (a direct fragment load cannot).
-        out = _dg.dense_gemm(x2, weight, block_m, BN)
+        # Checked against the tile actually chosen, not a module constant — that is the whole point.
+        out = _dg.dense_gemm(x2, weight, bm, bn)
+    elif OUT <= _SPLITK_MAX_OUT and IN >= _SPLITK_MIN_IN:
+        # Split-K reduction order — committed by SHAPE (see the note at the top of this file), so
+        # every M on this weight reduces identically. Only the SCHEDULE below reads M, and it may,
+        # because the two schedules are bit-identical.
+        out = _dg.dense_gemm_rd_sk(_padded(bm), weight, bm, bn, 0,
+                                   M < _SPLITK_GRID_MAX_M)[:M]
     elif OUT < _PIPE_MIN_OUT or (M <= _RD_MAX_M and M * OUT <= _RD_MAX_MN):
         # rd's regime: either the N-grid is too narrow for pipe to fill the machine (routers), or the
         # B re-read volume is still small. rd BEATS rocBLAS through most of this band.
-        out = _dg.dense_gemm_rd(_padded(block_m), weight, block_m, BN)[:M]
+        out = _dg.dense_gemm_rd(_padded(bm), weight, bm, bn)[:M]
     else:
         # pipe: B read once per pbm rows, prefetched a K-chunk ahead.
         #   pbm=128 wins M=192..384 (grid stays wide, no wasted M-padding); pbm=256 wins from M>=512,
@@ -235,7 +366,7 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
         # but the grid widens, and at M=192 that is the trade that pays (gate_up 45.3/47.4 us at
         # bm64 vs >47.9 at bm128; mlp.down 24.8 vs 25.9; qkv 66.1 best). At M=256 bm128 retakes it
         # (mlp.down 26.2 vs 27.4), which is where this steps up.
-        pbm = 256 if (M >= 512 or (OUT >= 65536 and M >= 192)) else (128 if M >= 256 else 64)
+        pbm = bm   # chosen above, with the extra wide-OUT step at M>=128
         # MI is the per-warp M-register-blocking factor, and it is the OCCUPANCY knob — the
         # accumulator is acc[MI][NFRAG], i.e. MI*NFRAG*8 VGPRs, which at BN=64/MI=2 is 64 of the
         # kernel's 156 and at BN=128/MI=2 is 128 of 220. MI=1 halves it: measured 156->89 VGPR
@@ -254,7 +385,7 @@ def minv_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
         # to lds/rd (verified 0.000e+00 over 36-54 configs x 4 shapes x 4 M). This is the same class
         # of threshold as the pbm one above, NOT the kind the split-K arm would have needed.
         mi = _PIPE_MI if pbm >= 256 else 1
-        out = _dg.dense_gemm_pipe(_padded(pbm), weight, pbm, BN, mi, _PIPE_PBK)[:M]
+        out = _dg.dense_gemm_pipe(_padded(pbm), weight, pbm, bn, mi, _PIPE_PBK)[:M]
     if bias is not None:
         out = out + bias
     return out.reshape(*orig_shape[:-1], OUT)
