@@ -157,11 +157,13 @@ class W4A8LinearMethod:
                 layer._w_packed_op = wp
             else:
                 layer._w_packed_op = (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
-            layer._scales_op = layer.weight_scale.to(torch.float16).contiguous()  # type: ignore[attr-defined]
+            # GROUP-MAJOR: the op indexes scales `[g*N + n]` / zeros `[g*(N/8) + n/8]`, so N is the
+            # contiguous axis and a fragment's 16 lanes coalesce into one request.
+            layer._scales_op = layer.weight_scale.to(torch.float16).transpose(0, 1).contiguous()  # type: ignore[attr-defined]
             zp = getattr(layer, "weight_zero_point", None)
             if zp is None:
                 # SYMMETRIC: constant zero-point 8 (uint4b8), zeros_op all 0x88.
-                zeros = torch.empty((N // pf, G), dtype=torch.int32)
+                zeros = torch.empty((G, N // pf), dtype=torch.int32)
                 zeros.view(torch.uint8).fill_(0x88)
                 layer._zeros_op = zeros.to(wp.device)
             else:
@@ -170,7 +172,9 @@ class W4A8LinearMethod:
                 # the SAME uint4b8-vs-two's-complement transform: W_u and Z_u then live in one unsigned
                 # domain and the op computes scale*(W_u - Z_u) = scale*(q - zp), exact.
                 zp = zp.contiguous()
-                layer._zeros_op = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+                zp = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+                # The 4-bit packing runs along N *within* each int32, so transposing (N//pf, G) is safe.
+                layer._zeros_op = zp.transpose(0, 1).contiguous()  # (N//pf, G) -> (G, N//pf)
                 del layer.weight_zero_point
             del layer.weight_packed, layer.weight_scale
             return
@@ -290,7 +294,8 @@ class MxFp4LinearMethod:
                 f"groups); an fp32 group-scale path may be needed for this checkpoint."
             )
         layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32
-        layer._scales_op = conv["scales"]  # (N, K//32) fp16
+        # GROUP-MAJOR: the op indexes scales `[g*N + n]` so N is the contiguous axis (coalesced read).
+        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//32, N) fp16
         del layer.weight_packed, layer.weight_scale
 
     def apply(
@@ -340,6 +345,11 @@ class RXFLinearMethod:
         )
         layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
         layer.weight_scale = torch.empty((N, K // 32), dtype=torch.float16)
+
+    def process_weights_after_load(self, layer: "BaseOP") -> None:
+        # GROUP-MAJOR scale: the op indexes it `[g*N + n]`, so N must be the contiguous axis for the
+        # 16-lane fragment read to coalesce. The checkpoint ships channel-major, so transpose here.
+        layer.weight_scale = layer.weight_scale.transpose(0, 1).contiguous()  # type: ignore[attr-defined]
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
@@ -409,7 +419,8 @@ class NvFp4LinearMethod:
 
         conv = nvfp4.convert_nvfp4_weight(layer.weight_packed, layer.weight_scale)  # type: ignore[attr-defined]
         layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32 E2M1 codes
-        layer._scales_op = conv["scales"]  # (N, K//16) fp16 per-group
+        # GROUP-MAJOR: the op indexes scales `[g*N + n]` so N is the contiguous axis (coalesced read).
+        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//16, N) fp16 per-group
         del layer.weight_packed, layer.weight_scale
 
     def apply(
