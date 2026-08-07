@@ -12,9 +12,15 @@
 # the values remain comparable across passes. Correctness beats the wall-clock saving.
 
 pmc_have_counter() {  # <csvdir> <counter>  -> 0 if at least one row for that counter exists
-  local d="$1" c="$2"
-  find "$d" -name "*counter_collection.csv" -print0 2>/dev/null \
-    | xargs -0 -r grep -l "\"$c\"" >/dev/null 2>&1
+  # NO CSV AT ALL MUST NOT READ AS SUCCESS. This was `find ... | xargs -r grep -l`, whose exit
+  # status is grep's -- and with `-r`, xargs never RUNS grep when the input is empty, so the
+  # pipeline exits 0 and a run that produced nothing reported every counter "OK". Seen 2026-08-07:
+  # a collection dying rc=127 (rocprofv3 not on PATH under a non-login shell) printed a full column
+  # of OK and only the empty summary gave it away. Count the matches instead of trusting the pipe.
+  local d="$1" c="$2" n
+  n=$(find "$d" -name "*counter_collection.csv" -print0 2>/dev/null \
+        | xargs -0 -r grep -l "\"$c\"" 2>/dev/null | wc -l)
+  [ "${n:-0}" -gt 0 ]
 }
 
 # pmc_run <outdir> <tag> "<space separated counters>" -- <command...>

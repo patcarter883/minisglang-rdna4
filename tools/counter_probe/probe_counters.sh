@@ -34,8 +34,27 @@
 # under a `timeout 90`. That is the same errno-22 ring_buffer signature recorded in June 2026 for
 # --kernel-trace, so the host 7.2.4 packaging is a REGRESSION relative to the 7.2.1 container.
 #
-# => PROFILE ON 7.14, SERVE ON 7.2.1. The kernel source is shared, so a counter measurement taken in
-#    7.14 transfers; a .so does not (build kernel packages in the image that will run them).
+# => PROFILE ON 7.14, SERVE ON 7.2.1. A .so does not move between images (build kernel packages in
+#    the image that will run them).
+#
+#    CORRECTED 2026-08-07 — "the kernel source is shared, so a counter measurement taken in 7.14
+#    transfers" WAS WRITTEN HERE AND IS FALSE. Sharing the source does not share the ISA: 7.14
+#    ships AMD clang 23, 7.2.1 ships clang 22. Measured on fp8_wmma/w4a8_fp8_wmma_kernel.hip,
+#    compiling the SAME file with the SAME flags under the two toolchains leaves only **8 of 2074**
+#    kernels identical, and the worst instantiation moves VGPR 256 -> 87 with 288 B of scratch
+#    spill dropping to zero. Every torch-free probe in this tree is compiled by whatever hipcc the
+#    profiling image ships, i.e. clang 23 — so those numbers describe a binary that is not served.
+#    (docs/KERNEL_PERF_BACKLOG.md already recorded clang 23 raising occupancy on 112-124 of 513
+#    kernels in moe_kernel.hip; nobody joined it to this line.)
+#
+#    THE FIX, and a worked example: COMPILE in minisgl-rdna4:lean (7.2.1 hipcc, the shipped
+#    toolchain) and only RUN in the 7.14 image. A 7.2.1-built HIP binary executes correctly on
+#    rdna4-rocm7.14 — note NOT on rocm/dev-ubuntu-24.04:7.14.0-full, which has no libamdhip64.so.7.
+#    Then GATE it: rdna4-hip-kernels fp8_wmma/local/{build_moe_w4a16_probe.sh,isa_equivalence.py}
+#    disassemble the probe and the real build object and refuse to collect unless the register
+#    footprint matches exactly. Compare against the .o, not the .so — the .so's .hip_fatbin is a
+#    CONCATENATION of per-TU bundles and clang-offload-bundler --unbundle silently returns only the
+#    first, so dumping the .so finds zero kernels and reads as a mismatch.
 #    AND PIN THE PERF LEVEL. At the default `auto`, 7.14 collection SUCCEEDS (rc=0, well-formed CSV)
 #    while every SQ_INSTS_*/SQ_INST_CYCLES_*/SQ_WAIT_*/TA_*/TCP_*/GL2C_* reads a hard ZERO, because
 #    gfx1201's `auto` power state gates the perfmon clock in those blocks. Under `profile_standard`
