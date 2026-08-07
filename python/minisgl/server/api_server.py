@@ -945,7 +945,26 @@ _SQUARE_WRAP_RE = re.compile(r"\[(/?(?:" + "|".join(_TOOL_WRAPPERS) + r"))\]")
 _ARG_KV_RE = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>", re.DOTALL)
 # Orphan wrapper open/close tags left in content after a call is parsed (e.g. the model emitted an opener
 # but no closer around an inline function) — strip them so `content` isn't polluted with dangling markup.
-_ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>")
+_ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>|<\|tool_call>|<tool_call\|>")
+# (E) GEMMA-4 native. The wrapper is PIPE-INSIDE and ASYMMETRIC — `<|tool_call>` … `<tool_call|>` —
+# so no `_TOOL_WRAPPERS` entry matches, and `<tool_call>` is NOT a substring of `<|tool_call>`:
+# exactly the trap the `_TOOL_STRUCT_WRAPPERS` comment already records for ZAYA. Both delimiters are
+# real special tokens in the checkpoint tokenizer, as is `<|"|>`, which is how the template spells a
+# STRING DELIMITER. Per the checkpoint's chat_template.jinja:
+#     '<|tool_call>call:' + name + '{' + key ':' format_argument(value) … + '}<tool_call|>'
+# where format_argument renders str -> `<|"|>s<|"|>`, bool -> true/false, mapping -> `{k:v,…}`,
+# sequence -> `[a,b]`, anything else raw. `escape_keys=False` propagates from the top level, so EVERY
+# key is BARE — the body is JSON-shaped but is NOT JSON. Live example (session facc711200c0, which
+# leaked the whole block into `content` with tool_calls=[]):
+#     <|tool_call>call:web_extract{urls:[<|"|>https://a.aliexpress.com/_mPWq9G7<|"|>]}<tool_call|>
+_GEMMA_TOOL_BLOCK_RE = re.compile(r"<\|tool_call>\s*(.*?)\s*<tool_call\|>", re.DOTALL)
+_GEMMA_TOOL_UNCLOSED_RE = re.compile(r"<\|tool_call>(?!.*<tool_call\|>)(.*)$", re.DOTALL)
+_GEMMA_CALL_HEAD_RE = re.compile(r"^call:\s*([A-Za-z_][\w.]*)\s*(?=\{)")
+_GEMMA_BAREWORD_RE = re.compile(r"[A-Za-z_]\w*")
+_GEMMA_QUOTE = '<|"|>'
+# What a function name may look like. Used to stop the permissive bare-name branch (D) from turning
+# an unparsed body into a tool call named after its own leading junk.
+_TOOL_NAME_RE = re.compile(r"[A-Za-z_][\w.\-]*")
 # A wrapper opener with NO matching closer anywhere after it — the truncated-mid-call shape. Group 1 is
 # the block body (opener to end of text) to hand to the same inner parsers.
 _UNCLOSED_WRAP_RE = re.compile(
@@ -994,9 +1013,72 @@ def _coerce(val: str):
         return val
 
 
+def _gemma_args_to_json(text: str) -> str:
+    """Gemma-4 argument-object syntax -> JSON text, in one pass.
+
+    Two things differ from JSON and both must be handled together, because you cannot tell a key from
+    a string without tracking where the string delimiters are:
+      * strings are delimited by the `<|"|>` TOKEN, not by `"`, and their contents are raw (a URL with
+        a `"` or a newline in it must be re-escaped, which is why this rebuilds them via json.dumps
+        rather than swapping the delimiter for a quote character);
+      * keys are BARE (`urls:` not `"urls":`), since the template propagates escape_keys=False.
+    Literals true/false/null are barewords too, so a bareword only becomes a key when the next
+    non-space character is ':'. Everything else (braces, brackets, commas, numbers) passes through."""
+    out: List[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith(_GEMMA_QUOTE, i):
+            j = text.find(_GEMMA_QUOTE, i + len(_GEMMA_QUOTE))
+            if j < 0:
+                raise ValueError("unterminated <|\"|> string")
+            out.append(json.dumps(text[i + len(_GEMMA_QUOTE) : j]))
+            i = j + len(_GEMMA_QUOTE)
+            continue
+        m = _GEMMA_BAREWORD_RE.match(text, i)
+        if m:
+            word = m.group(0)
+            k = m.end()
+            rest = k
+            while rest < n and text[rest].isspace():
+                rest += 1
+            if word not in ("true", "false", "null") and rest < n and text[rest] == ":":
+                out.append(json.dumps(word))  # bare KEY -> quoted
+            else:
+                out.append(word)  # true/false/null, or a bareword we leave for json to reject
+            i = k
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _parse_gemma_tool_call(inner: str) -> Tuple[str, dict] | None:
+    """(E) Gemma-4 native: `call:NAME{k:v,…}` -> (name, args). None if it isn't that shape.
+
+    The object is decoded with raw_decode rather than by brace-counting: once the strings are proper
+    JSON, raw_decode tracks nesting AND string contents correctly, so a `}` inside an argument value
+    cannot terminate the object early."""
+    head = _GEMMA_CALL_HEAD_RE.match(inner.strip())
+    if not head:
+        return None
+    body = inner.strip()[head.end() :]
+    try:
+        args, _ = json.JSONDecoder().raw_decode(_gemma_args_to_json(body))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return (head.group(1), args) if isinstance(args, dict) else None
+
+
 def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     """Parse one <tool_call> body (either format) -> (name, arguments_dict), or None."""
     inner = inner.strip()
+    # (E) Gemma-4 native `call:NAME{…}`. MUST be tried before (D): its body starts with neither `{`
+    # nor `<`, so (D)'s bare-name branch would otherwise claim it and split on the first `<` — which
+    # lands INSIDE the `<|"|>` string delimiter, yielding a tool call literally named
+    # `call:web_extract{urls:[` with no arguments. A wrong call is worse than an unparsed one.
+    gemma = _parse_gemma_tool_call(inner)
+    if gemma is not None:
+        return gemma
     if inner.startswith("{"):  # (A) Hermes JSON
         try:
             call = json.loads(inner)
@@ -1015,9 +1097,14 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     # head then arg_key/arg_value pairs (no `<function=>` wrapper). The head is the text before the
     # first tag; args from the pairs (empty for a no-arg call). Guarded to not shadow A/B/C (which
     # start with `{` or `<`), so this only fires on the bare-name form.
+    # The head must be a PLAUSIBLE FUNCTION NAME, not merely non-empty. Without this, any body that
+    # reached (D) unparsed became a tool call named after its own leading junk — e.g. a Gemma-4 body
+    # whose arguments were malformed split on the `<` of the `<|"|>` delimiter and produced a call
+    # literally named `call:bad{x:someBareword}`. Refusing is correct there: an unparsed call is
+    # visible, a WRONG call is dispatched.
     if inner and not inner.startswith(("{", "<")):
         name = inner.split("<", 1)[0].strip()
-        if name:
+        if name and _TOOL_NAME_RE.fullmatch(name):
             args = {k.strip(): _coerce(v.strip()) for k, v in _ARG_KV_RE.findall(inner)}
             return name, args
     return None
@@ -1049,9 +1136,13 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     text = _SQUARE_WRAP_RE.sub(r"<\1>", text)
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         _add(m.group(1))
+    # (E) Gemma-4's asymmetric `<|tool_call>…<tool_call|>` block — a separate scan because its closer
+    # is not `</opener>`, so it cannot ride the shared wrapper alternation.
+    for m in _GEMMA_TOOL_BLOCK_RE.finditer(text):
+        _add(m.group(1))
     # Bare blocks in whatever text remains after removing the wrapped blocks (so an inner block is not
     # double-counted): canonical `<function=…></function>`, then the inline `<function=NAME(...)>` form.
-    remainder = _TOOL_CALL_BLOCK_RE.sub("", text)
+    remainder = _GEMMA_TOOL_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text))
     for m in _BARE_FN_BLOCK_RE.finditer(remainder):
         _add(m.group(0))
     for m in _INLINE_FN_RE.finditer(_BARE_FN_BLOCK_RE.sub("", remainder)):
@@ -1063,7 +1154,7 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     # JSON/XML is already complete this recovers a real tool call, and when it genuinely is truncated we
     # say so in the log instead of silently passing markup off as the model's answer.
     if not tool_calls:
-        unclosed = _UNCLOSED_WRAP_RE.search(text)
+        unclosed = _GEMMA_TOOL_UNCLOSED_RE.search(text) or _UNCLOSED_WRAP_RE.search(text)
         if unclosed:
             before = len(tool_calls)
             _add(unclosed.group(1))
@@ -1076,7 +1167,8 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
             )
     if not tool_calls:
         return text, []
-    content = _INLINE_FN_RE.sub("", _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", text)))
+    content = _GEMMA_TOOL_BLOCK_RE.sub("", text)
+    content = _INLINE_FN_RE.sub("", _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", content)))
     content = _ORPHAN_WRAP_RE.sub("", content).strip()  # drop any dangling wrapper opener/closer
     return (content or None), tool_calls
 
@@ -1087,8 +1179,12 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
 # the parser degrades to whatever the model actually emits. Detection mirrors the reasoning streamer:
 # text before any opener flows through as `content`; once inside a block the markup is withheld and,
 # on the closing tag, re-emitted as OpenAI streaming `delta.tool_calls`.
-_TOOL_OPENERS = ("<tool_call>", "<zyphra_tool_call>", "<tools>", "<function=")
+# ORDER MATTERS: `<|tool_call>` must precede `<tool_call>`. They are different strings (the pipe sits
+# INSIDE the angle bracket) so neither contains the other, but keeping the Gemma opener first makes the
+# asymmetry explicit to anyone extending this table — its closer is `<tool_call|>`, NOT `</…>`.
+_TOOL_OPENERS = ("<|tool_call>", "<tool_call>", "<zyphra_tool_call>", "<tools>", "<function=")
 _TOOL_CLOSERS = {
+    "<|tool_call>": "<tool_call|>",  # Gemma-4: asymmetric, pipe-inside
     "<tool_call>": "</tool_call>",
     "<zyphra_tool_call>": "</zyphra_tool_call>",
     "<tools>": "</tools>",
@@ -1171,19 +1267,30 @@ class ToolCallStreamState:
             return True
         return False
 
+    # `<function=…>` is the one opener that is part of its own body — the regex parsers need the tag
+    # itself — so it is the ONLY case where the block is passed through whole. Every other opener is a
+    # WRAPPER and must be stripped. This was previously an explicit allow-list of wrapper openers,
+    # which silently excluded Gemma-4: its block reached the inner parsers with `<|tool_call>` still
+    # attached, matched nothing, and `_emit_call` dropped it as malformed — so a valid call vanished
+    # from a STREAMED response entirely (no content, no tool_calls, finish_reason=stop). Keyed on the
+    # exception instead of the members, so the next wrapper family is handled by default.
+    _WHOLE_BLOCK_OPENER = "<function="
+
     def _parse_block(self, block: str) -> Tuple[str, dict] | None:
-        if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
-            closer = _TOOL_CLOSERS[self.opener]
-            inner = block[len(self.opener):-len(closer)]
-            return _parse_one_tool_call(inner)
-        return _parse_one_tool_call(block)  # <function=…></function>, regex finds the fn tag
+        if self.opener == self._WHOLE_BLOCK_OPENER:
+            return _parse_one_tool_call(block)  # regex finds the fn tag inside
+        inner = block[len(self.opener):]
+        closer = _TOOL_CLOSERS[self.opener]
+        if inner.endswith(closer):  # tolerate a block handed over without its closer
+            inner = inner[: -len(closer)]
+        return _parse_one_tool_call(inner)
 
     def _parse_unclosed(self, buf: str) -> Tuple[str, dict] | None:
         """Parse a block the stream ended INSIDE (opener seen, closer never arrived). Same inner
         formats as ``_parse_block``; the only difference is there is no closer to strip."""
-        if self.opener in ("<tool_call>", "<zyphra_tool_call>", "<tools>"):
-            return _parse_one_tool_call(buf[len(self.opener):])
-        return _parse_one_tool_call(buf)
+        if self.opener == self._WHOLE_BLOCK_OPENER:
+            return _parse_one_tool_call(buf)
+        return _parse_one_tool_call(buf[len(self.opener):])
 
     def _emit_parsed(self, name: str, args) -> List[dict]:
         args_str = args if isinstance(args, str) else json.dumps(args)
