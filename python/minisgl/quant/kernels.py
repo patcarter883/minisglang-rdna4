@@ -518,7 +518,19 @@ def w4a8_moe(
     # per-16-K-half scale (group<32 branch), so the MoE gemm1+silu / gemm / scatter / gather-reduce GEMV
     # kernels serve group_size 16 exactly like group-32 MXFP4/int4 — one shared core, no fork. Runtime
     # group_size = K / n_groups, K = w13.shape[-1]*8 (int32 packs 8 e2m1 nibbles); %16 covers 16/32/128.
-    _grp = (w13.shape[-1] * 8) // w13_scales.shape[-1]
+    # scales are GROUP-major (E, K//group, N) -> the group count is shape[1], NOT shape[-1]. Reading
+    # shape[-1] here yields N, which makes _grp nonsense, turns _gemv_ok False, and silently drops
+    # decode gemm1 onto the prefill WMMA arm (~8.7x slower on this GEMM). Cost the serve A/B 1.5-1.8x
+    # of decode before it was caught -- the kernel bench and the bit-identity gate both pass shapes
+    # explicitly, so neither can see a DISPATCH regression. Measured 2026-08-07.
+    _grp = (w13.shape[-1] * 8) // w13_scales.shape[1]
+    # A wrong axis here does not raise -- it just quietly picks a slower kernel, which is invisible to
+    # every parity/bench harness (they pass shapes explicitly). Make it loud instead.
+    assert _grp in (16, 32, 64, 128), (
+        f"w4a8_moe: derived group_size={_grp} from K={w13.shape[-1] * 8} and "
+        f"G={w13_scales.shape[1]}; scales must be GROUP-major (E, K//group, N), got "
+        f"{tuple(w13_scales.shape)}"
+    )
     _gemv_ok = (_grp % 32 == 0) or (_grp % 16 == 0 and _NVFP4_GEMV)
     gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
@@ -588,7 +600,7 @@ def w4a8_moe(
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
         _flag1 = _MOE_FLAG and block_m in (64, 128) and \
-            (w13.shape[-1] * 8) // w13_scales.shape[-1] in (32, 64, 128)
+            (w13.shape[-1] * 8) // w13_scales.shape[1] in (32, 64, 128)  # scales (E, G, N): G=shape[1]
         if _flag1:
             engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}{_pq}")
             buf2 = _moe_time(
@@ -689,7 +701,7 @@ def w4a8_moe(
     # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
     # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
     _flag2 = _MOE_FLAG and block_m == 128 and \
-        (w2.shape[-1] * 8) // w2_scales.shape[-1] in (32, 64, 128)  # flag supports group 32/64/128
+        (w2.shape[-1] * 8) // w2_scales.shape[1] in (32, 64, 128)  # group 32/64/128; scales (E,G,N)
     if _flag2:
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")
         out2 = _moe_time(
@@ -1018,7 +1030,7 @@ def w8a8_moe_regdirect(
     M, K = x.shape
     E = w13_rep.shape[0]
     dev = x.device
-    N13 = w13_scales.shape[1]  # 2*inter (gemm1 output width)
+    N13 = w13_scales.shape[2]  # 2*inter (gemm1 output width); scales are (E, K//group, 2*inter)
     tw = topk_weights.to(torch.float32).contiguous()
     ti = topk_ids.to(torch.int32).contiguous()
 
