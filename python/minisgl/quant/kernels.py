@@ -260,11 +260,7 @@ def awq_to_op_layout(
     bits: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Convert ONE dense AWQ matrix to the op's native layout:
-    w_packed (N, K//pf) int32, scales (K//group, N) fp16, zeros (K//group, N//pf) int32.
-
-    Scales/zeros keep the CHECKPOINT's group-major order: the op indexes them `[g*N + n]` so that a
-    fragment's 16 lanes (which differ only in `n`) coalesce into one request. AWQ already ships
-    (K//group, N), so the scale conversion is now a dtype cast with no transpose at all.
+    w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32.
     Ported from w4a8_fp8_wmma/moe_experts.py:_awq_to_op_layout_single (per-matrix).
     NOTE: one-shot unpack — transient (N, K) tensor; chunk for very large matrices
     (PERF_NOTES; the 27B OOM)."""
@@ -283,18 +279,16 @@ def awq_to_op_layout(
     for j in range(pf):
         w_packed |= (uw[:, j::pf] & mask) << (j * bits)
 
-    scales_op = scales.contiguous().to(torch.float16)  # (G, N) — already group-major
+    scales_op = scales.t().contiguous().to(torch.float16)  # (G, N) -> (N, G)
 
     zeros_op = None
     if qzeros is not None:
         G = qzeros.shape[0]
         uz = (qzeros.unsqueeze(-1) >> shifts) & mask  # (G, Np, pf)
-        uz = uz[:, :, rev].reshape(G, N).contiguous().to(torch.int32)  # (G, N)
-        # Repack 8 CHANNELS per int32 along N, group-major: channel n = i*pf + j lands in word i,
-        # nibble j — exactly what the kernel's `(wz[g*(N/8) + n/8] >> ((n%8)*4)) & 0xF` decodes.
-        zeros_op = torch.zeros((G, N // pf), dtype=torch.int32, device=dev)
+        uz = uz[:, :, rev].reshape(G, N).t().contiguous().to(torch.int32)  # (N, G)
+        zeros_op = torch.zeros((N // pf, G), dtype=torch.int32, device=dev)
         for j in range(pf):
-            zeros_op |= (uz[:, j::pf] & mask) << (j * bits)
+            zeros_op |= (uz[j::pf, :] & mask) << (j * bits)
 
     return w_packed, scales_op, zeros_op
 
@@ -307,8 +301,7 @@ def gptq_to_op_layout(
     bits: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert ONE dense GPTQ matrix to the op's native layout
-    (w_packed (N, K//pf) int32, scales (K//group, N) fp16, zeros (K//group, N//pf) int32).
-    Scales/zeros stay GROUP-MAJOR so the op's 16-lane scale read coalesces (see awq_to_op_layout).
+    (w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32).
 
     GPTQ vs AWQ: int32 is packed along INPUT (K) with NATURAL nibble order (no AWQ interleave),
     and qzeros are ALWAYS present — the dequant zero point is `unpacked_qzeros + 1` (AutoGPTQ's
@@ -330,18 +323,18 @@ def gptq_to_op_layout(
     for j in range(pf):
         w_packed |= (uw[:, j::pf] & mask) << (j * bits)
 
-    scales_op = scales.contiguous().to(torch.float16)  # (G, N) — already group-major
+    scales_op = scales.t().contiguous().to(torch.float16)  # (G, N) -> (N, G)
 
-    # qzeros: unpack (G, N//pf, pf) NATURAL along N -> (G, N), fold +1, repack 8 channels/int32 -> (G, N//pf).
+    # qzeros: unpack (G, N//pf, pf) NATURAL along N -> (G, N), fold +1, -> (N, G), repack/N.
     assert qzeros is not None, "GPTQ always ships qzeros"
     G = qzeros.shape[0]
     uz = (qzeros.unsqueeze(-1) >> shifts) & mask  # (G, N//pf, pf)
     uz = uz.reshape(G, N) + 1  # (G, N) actual zero point; col = np*pf + j (natural)
     assert int(uz.max()) <= mask, f"GPTQ zero+1 overflows {bits}b (max={int(uz.max())})"
-    uz = uz.contiguous().to(torch.int32)  # (G, N)
-    zeros_op = torch.zeros((G, N // pf), dtype=torch.int32, device=dev)
+    uz = uz.t().contiguous().to(torch.int32)  # (N, G)
+    zeros_op = torch.zeros((N // pf, G), dtype=torch.int32, device=dev)
     for j in range(pf):
-        zeros_op |= (uz[:, j::pf] & mask) << (j * bits)
+        zeros_op |= (uz[j::pf, :] & mask) << (j * bits)
 
     return w_packed, scales_op, zeros_op
 
@@ -518,19 +511,7 @@ def w4a8_moe(
     # per-16-K-half scale (group<32 branch), so the MoE gemm1+silu / gemm / scatter / gather-reduce GEMV
     # kernels serve group_size 16 exactly like group-32 MXFP4/int4 — one shared core, no fork. Runtime
     # group_size = K / n_groups, K = w13.shape[-1]*8 (int32 packs 8 e2m1 nibbles); %16 covers 16/32/128.
-    # scales are GROUP-major (E, K//group, N) -> the group count is shape[1], NOT shape[-1]. Reading
-    # shape[-1] here yields N, which makes _grp nonsense, turns _gemv_ok False, and silently drops
-    # decode gemm1 onto the prefill WMMA arm (~8.7x slower on this GEMM). Cost the serve A/B 1.5-1.8x
-    # of decode before it was caught -- the kernel bench and the bit-identity gate both pass shapes
-    # explicitly, so neither can see a DISPATCH regression. Measured 2026-08-07.
-    _grp = (w13.shape[-1] * 8) // w13_scales.shape[1]
-    # A wrong axis here does not raise -- it just quietly picks a slower kernel, which is invisible to
-    # every parity/bench harness (they pass shapes explicitly). Make it loud instead.
-    assert _grp in (16, 32, 64, 128), (
-        f"w4a8_moe: derived group_size={_grp} from K={w13.shape[-1] * 8} and "
-        f"G={w13_scales.shape[1]}; scales must be GROUP-major (E, K//group, N), got "
-        f"{tuple(w13_scales.shape)}"
-    )
+    _grp = (w13.shape[-1] * 8) // w13_scales.shape[-1]
     _gemv_ok = (_grp % 32 == 0) or (_grp % 16 == 0 and _NVFP4_GEMV)
     gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
@@ -600,7 +581,7 @@ def w4a8_moe(
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
         _flag1 = _MOE_FLAG and block_m in (64, 128) and \
-            (w13.shape[-1] * 8) // w13_scales.shape[1] in (32, 64, 128)  # scales (E, G, N): G=shape[1]
+            (w13.shape[-1] * 8) // w13_scales.shape[-1] in (32, 64, 128)
         if _flag1:
             engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}{_pq}")
             buf2 = _moe_time(
@@ -701,7 +682,7 @@ def w4a8_moe(
     # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
     # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
     _flag2 = _MOE_FLAG and block_m == 128 and \
-        (w2.shape[-1] * 8) // w2_scales.shape[1] in (32, 64, 128)  # group 32/64/128; scales (E,G,N)
+        (w2.shape[-1] * 8) // w2_scales.shape[-1] in (32, 64, 128)  # flag supports group 32/64/128
     if _flag2:
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")
         out2 = _moe_time(
@@ -1030,7 +1011,7 @@ def w8a8_moe_regdirect(
     M, K = x.shape
     E = w13_rep.shape[0]
     dev = x.device
-    N13 = w13_scales.shape[2]  # 2*inter (gemm1 output width); scales are (E, K//group, 2*inter)
+    N13 = w13_scales.shape[1]  # 2*inter (gemm1 output width)
     tw = topk_weights.to(torch.float32).contiguous()
     ti = topk_ids.to(torch.int32).contiguous()
 

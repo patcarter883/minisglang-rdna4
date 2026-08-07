@@ -134,11 +134,10 @@ class _GroupedAWQExperts(BaseOP):
 class _GroupedRXFExperts(BaseOP):
     """RXF W4(NL)-A8 experts for one MoE GEMM (w13 or w2), STACKED over E.
 
-    RXF ships weights op-layout already (no AWQ/GPTQ unpack-transpose-repack): weight_packed
-    (E, N, K/2) uint8 NL indices, weight_scale (E, N, K/32) fp16 per-group scale, group=32,
-    symmetric NL codebook (no zero-points). N=out, K=in per expert. `post_load` transposes the SCALE
-    to group-major (E, K/32, N) — the op indexes it `[g*N + n]`, so N must be the contiguous axis for
-    the 16-lane fragment read to coalesce. Consumed by kernels.rxf_moe."""
+    RXF ships op-layout already (no AWQ/GPTQ unpack-transpose-repack), so these buffers are
+    loaded as-is and need no post_load: weight_packed (E, N, K/2) uint8 NL indices, weight_scale
+    (E, N, K/32) fp16 per-group scale, group=32, symmetric NL codebook (no zero-points). N=out,
+    K=in per expert. Consumed by kernels.rxf_moe."""
 
     def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
         N, K = out_features, in_features
@@ -154,13 +153,10 @@ class _GroupedRXFExperts(BaseOP):
         raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
 
     def post_load(self) -> None:
-        # GROUP-MAJOR scale, for BOTH the LDS and register-direct paths (they share the same kernel
-        # scale contract, so this must NOT sit behind the RXF_REGDIRECT gate — that would feed the
-        # LDS path a channel-major tensor and silently compute wrong numbers).
-        self.weight_scale = self.weight_scale.transpose(1, 2).contiguous()  # (E, N, K/32) -> (E, K/32, N)
         # Register-direct b128: pre-permute the NL codes into WMMA-B lane order (repack_rxf_w_rep_moe)
-        # for kernels.rxf_moe_regdirect (~2x the LDS-staged rxf_moe at decode). Drop weight_packed
-        # (the LDS path's buffer) — never both. Off -> keep the as-is buffers for the LDS rxf_moe.
+        # for kernels.rxf_moe_regdirect (~2x the LDS-staged rxf_moe at decode). weight_scale stays in
+        # its native layout. Drop weight_packed (the LDS path's buffer) — never both. Off -> keep the
+        # as-is buffers for the LDS rxf_moe.
         if not kernels.RXF_REGDIRECT:
             return
         import fp8_wmma  # rxf folded into fp8_wmma
@@ -235,23 +231,19 @@ class _GroupedCompressedTensorsExperts(BaseOP):
         # Detected, not assumed — see the class docstring. XOR only for two's-complement packing.
         uint4b8 = _ct_packed_is_uint4b8(wp)
         self._w_op = wp if uint4b8 else (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
-        # GROUP-MAJOR scales/zeros: the op indexes `[g*N + n]`, so N must be the CONTIGUOUS axis (a
-        # fragment's 16 lanes differ only in n, and then coalesce into one request). The
-        # compressed-tensors checkpoint ships channel-major, so this path transposes; AWQ/GPTQ already
-        # ship group-major and no longer transpose at all (quant/kernels.py awq_to_op_layout).
-        self._scales_op = self.weight_scale.to(torch.float16).transpose(1, 2).contiguous()  # (E, G, N)
+        self._scales_op = self.weight_scale.to(torch.float16).contiguous()
         zp = getattr(self, "weight_zero_point", None)
         if zp is None:
             # SYMMETRIC: zero-point == 8 for every (output, group); every packed nibble 8 -> 0x88888888.
-            zeros = torch.empty((E, G, N // pf), dtype=torch.int32)
+            zeros = torch.empty((E, N // pf, G), dtype=torch.int32)
             zeros.view(torch.uint8).fill_(0x88)
             self._zeros_op = zeros.to(wp.device)
         else:
-            # ASYMMETRIC: same sign convention as the weight, so the same transform. The 4-bit packing
-            # runs along N *within* each int32, so transposing the (N//pf, G) axes leaves it intact.
+            # ASYMMETRIC: same sign convention as the weight, so the same transform.
             zp = zp.contiguous()
-            zp = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
-            self._zeros_op = zp.transpose(1, 2).contiguous()  # (E, N//pf, G) -> (E, G, N//pf)
+            self._zeros_op = (
+                zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+            )
             del self.weight_zero_point
         del self.weight_packed, self.weight_scale
         if kernels.MOE_W4A16 != "0":
@@ -304,12 +296,9 @@ class _GroupedMxFp4Experts(BaseOP):
             import fp8_wmma
 
             wide = kernels._w4a16_wide(self._quant.group_size)  # g=32 -> 2
-            self._w_rep, _scales_rd = fp8_wmma.mxfp4_to_w_rep_moe(
+            self._w_rep, self._scales_rd = fp8_wmma.mxfp4_to_w_rep_moe(
                 self.weight_packed, self.weight_scale, N, K, wide
             )
-            # mxfp4_to_w_rep_moe passes the E8M0->fp16 scale through in CHECKPOINT (E, N, K//32) order;
-            # the op wants it GROUP-MAJOR so its `[g*N + n]` read coalesces.
-            self._scales_rd = _scales_rd.transpose(1, 2).contiguous()  # (E, K//32, N)
             del self.weight_packed, self.weight_scale
             return
 
@@ -326,8 +315,7 @@ class _GroupedMxFp4Experts(BaseOP):
                 f"/ {info['e8m0_nan_groups']} e8m0-NaN groups); an fp32 group-scale path may be needed."
             )
         self._w_op = conv["w_packed"]  # (E, N, K//8) int32
-        # GROUP-MAJOR for the op's coalesced `[g*N + n]` scale read (see _GroupedAWQExperts).
-        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//32, N) fp16
+        self._scales_op = conv["scales"]  # (E, N, K//32) fp16
         del self.weight_packed, self.weight_scale
 
 
@@ -360,8 +348,7 @@ class _GroupedNvFp4Experts(BaseOP):
 
         conv = nvfp4.convert_nvfp4_moe(self.weight_packed, self.weight_scale)
         self._w_op = conv["w_packed"]  # (E, N, K//8) int32
-        # GROUP-MAJOR for the op's coalesced `[g*N + n]` scale read (see _GroupedAWQExperts).
-        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//16, N) fp16
+        self._scales_op = conv["scales"]  # (E, N, K//16) fp16
         del self.weight_packed, self.weight_scale
 
 
@@ -567,7 +554,7 @@ class _W4A8MoEMethod(MoEQuantMethod):
             # scales/zeros stay op-layout (w4a16_moe consumes _scales_op/_zeros_op directly, see its
             # (E,2*inter,K//g) / (E,(2*inter)//8,K//g) signature). AWQ/GPTQ int4 is asymmetric -> pass
             # zeros; weight_is_e2m1=False (true int4, not MXFP4). Same route fallback as w4a8_moe.
-            inter = w13._scales_op.shape[2] // 2  # (E, G, 2*inter) -> group-major, N is last
+            inter = w13._scales_op.shape[1] // 2
             return kernels.w4a16_moe(
                 hidden_states, w13._w_rep, w13._scales_op, w13._zeros_op,
                 w2._w_rep, w2._scales_op, w2._zeros_op,
@@ -601,7 +588,7 @@ class _W4A8MoEMethod(MoEQuantMethod):
         _check_activation("W4A8", activation)
         if getattr(w13, "_w_rep", None) is not None:
             self._reject_w4a16_activation(activation)
-            inter = w13._scales_op.shape[2] // 2  # (E, G, 2*inter) -> group-major, N is last
+            inter = w13._scales_op.shape[1] // 2
             return kernels.w4a16_moe(
                 g_hidden, w13._w_rep, w13._scales_op, w13._zeros_op,
                 w2._w_rep, w2._scales_op, w2._zeros_op,
@@ -643,7 +630,7 @@ class _MxFp4MoEMethod(MoEQuantMethod):
             # Register-direct b128, fp16 acts direct (see _GroupedMxFp4Experts.post_load). Qwen3.5-MoE
             # hands raw router_logits (no model-side route), so forward them + top_k/renormalize and let
             # w4a16_moe fuse softmax+topk (topk_ids stays None); a noaux_tc precomputed route passes through.
-            inter = w13._scales_rd.shape[2] // 2  # (E, G, 2*inter) group-major -> inter
+            inter = w13._scales_rd.shape[1] // 2  # 2*inter -> inter
             return kernels.w4a16_moe(
                 hidden_states, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
                 hidden_states.shape[1], inter, self._quant.group_size,
@@ -663,7 +650,7 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         _check_activation("MXFP4", activation)
         if getattr(w13, "_w_rep", None) is not None:
             _W4A8MoEMethod._reject_w4a16_activation(activation)
-            inter = w13._scales_rd.shape[2] // 2  # (E, G, 2*inter) group-major -> inter
+            inter = w13._scales_rd.shape[1] // 2
             return kernels.w4a16_moe(
                 g_hidden, w13._w_rep, w13._scales_rd, None, w2._w_rep, w2._scales_rd, None,
                 g_hidden.shape[1], inter, self._quant.group_size,
