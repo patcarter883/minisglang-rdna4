@@ -260,7 +260,11 @@ def awq_to_op_layout(
     bits: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Convert ONE dense AWQ matrix to the op's native layout:
-    w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32.
+    w_packed (N, K//pf) int32, scales (K//group, N) fp16, zeros (K//group, N//pf) int32.
+
+    Scales/zeros keep the CHECKPOINT's group-major order: the op indexes them `[g*N + n]` so that a
+    fragment's 16 lanes (which differ only in `n`) coalesce into one request. AWQ already ships
+    (K//group, N), so the scale conversion is now a dtype cast with no transpose at all.
     Ported from w4a8_fp8_wmma/moe_experts.py:_awq_to_op_layout_single (per-matrix).
     NOTE: one-shot unpack — transient (N, K) tensor; chunk for very large matrices
     (PERF_NOTES; the 27B OOM)."""
@@ -279,16 +283,18 @@ def awq_to_op_layout(
     for j in range(pf):
         w_packed |= (uw[:, j::pf] & mask) << (j * bits)
 
-    scales_op = scales.t().contiguous().to(torch.float16)  # (G, N) -> (N, G)
+    scales_op = scales.contiguous().to(torch.float16)  # (G, N) — already group-major
 
     zeros_op = None
     if qzeros is not None:
         G = qzeros.shape[0]
         uz = (qzeros.unsqueeze(-1) >> shifts) & mask  # (G, Np, pf)
-        uz = uz[:, :, rev].reshape(G, N).t().contiguous().to(torch.int32)  # (N, G)
-        zeros_op = torch.zeros((N // pf, G), dtype=torch.int32, device=dev)
+        uz = uz[:, :, rev].reshape(G, N).contiguous().to(torch.int32)  # (G, N)
+        # Repack 8 CHANNELS per int32 along N, group-major: channel n = i*pf + j lands in word i,
+        # nibble j — exactly what the kernel's `(wz[g*(N/8) + n/8] >> ((n%8)*4)) & 0xF` decodes.
+        zeros_op = torch.zeros((G, N // pf), dtype=torch.int32, device=dev)
         for j in range(pf):
-            zeros_op |= (uz[j::pf, :] & mask) << (j * bits)
+            zeros_op |= (uz[:, j::pf] & mask) << (j * bits)
 
     return w_packed, scales_op, zeros_op
 
@@ -301,7 +307,8 @@ def gptq_to_op_layout(
     bits: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert ONE dense GPTQ matrix to the op's native layout
-    (w_packed (N, K//pf) int32, scales (N, K//group) fp16, zeros (N//pf, K//group) int32).
+    (w_packed (N, K//pf) int32, scales (K//group, N) fp16, zeros (K//group, N//pf) int32).
+    Scales/zeros stay GROUP-MAJOR so the op's 16-lane scale read coalesces (see awq_to_op_layout).
 
     GPTQ vs AWQ: int32 is packed along INPUT (K) with NATURAL nibble order (no AWQ interleave),
     and qzeros are ALWAYS present — the dequant zero point is `unpacked_qzeros + 1` (AutoGPTQ's
@@ -323,18 +330,18 @@ def gptq_to_op_layout(
     for j in range(pf):
         w_packed |= (uw[:, j::pf] & mask) << (j * bits)
 
-    scales_op = scales.t().contiguous().to(torch.float16)  # (G, N) -> (N, G)
+    scales_op = scales.contiguous().to(torch.float16)  # (G, N) — already group-major
 
-    # qzeros: unpack (G, N//pf, pf) NATURAL along N -> (G, N), fold +1, -> (N, G), repack/N.
+    # qzeros: unpack (G, N//pf, pf) NATURAL along N -> (G, N), fold +1, repack 8 channels/int32 -> (G, N//pf).
     assert qzeros is not None, "GPTQ always ships qzeros"
     G = qzeros.shape[0]
     uz = (qzeros.unsqueeze(-1) >> shifts) & mask  # (G, N//pf, pf)
     uz = uz.reshape(G, N) + 1  # (G, N) actual zero point; col = np*pf + j (natural)
     assert int(uz.max()) <= mask, f"GPTQ zero+1 overflows {bits}b (max={int(uz.max())})"
-    uz = uz.t().contiguous().to(torch.int32)  # (N, G)
-    zeros_op = torch.zeros((N // pf, G), dtype=torch.int32, device=dev)
+    uz = uz.contiguous().to(torch.int32)  # (G, N)
+    zeros_op = torch.zeros((G, N // pf), dtype=torch.int32, device=dev)
     for j in range(pf):
-        zeros_op |= (uz[j::pf, :] & mask) << (j * bits)
+        zeros_op |= (uz[:, j::pf] & mask) << (j * bits)
 
     return w_packed, scales_op, zeros_op
 
