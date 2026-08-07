@@ -23,7 +23,8 @@
 #   CONC    concurrent requests                         (default 4)
 #
 # LESS-USED, still here rather than in eight copies:
-#   ATTN (auto|hip|triton), MEM_RATIO, GRAPH_BS, PAGE_SIZE, CACHE_TYPE, PORT, EXTRA_ARGS.
+#   ATTN (auto|hip|triton), MEM_RATIO, GRAPH_BS, PAGE_SIZE, CACHE_TYPE, PORT, EXTRA_ARGS,
+#   MAX_PREFILL_LENGTH (chunked-prefill chunk, default 2048 — see the note at its assignment).
 #   EXTRA_ARGS is appended verbatim and wins — the escape hatch for anything not modelled here.
 #
 # Print the composed line without running it:  DRY_RUN=1 tools/serve.sh
@@ -115,6 +116,18 @@ MEM_RATIO="${MEM_RATIO:-$mem_default}"
 GRAPH_BS="${GRAPH_BS:-$CONC}"
 PAGE_SIZE="${PAGE_SIZE:-16}"
 CACHE_TYPE="${CACHE_TYPE:-radix}"
+# Chunked-prefill chunk size. 2048, NOT the engine's 8192 default, because the engine default is
+# unsafe on wide-activation models: gemma-4-26B-A4B (hidden 2816, 2*inter 1408, top_k 8, vocab 262144)
+# reproducibly killed the scheduler worker mid-forward at 8192 — a ~7k-token prompt arrives as ONE
+# chunk and the forward cannot fit in the ~2.85 GiB left after the KV pool. MEASURED 2026-08-07
+# (MINISGL_PREFILL_MEM_PROBE=1, TP=2): at a 2048 cap the peak is ~186 MiB per chunk and FLAT in
+# context, and `reserved` STOPS ratcheting (13476 -> 13646 -> 13646) because uniform block sizes let
+# the caching allocator reuse segments; at 8192 the same prompt OOM'd on an 18 MiB allocation with
+# devfree at 0. Note the scheduler's own activation guard cannot prevent this — it only shrinks once
+# free memory is ALREADY low, so it never trips on the first oversized chunk.
+# Qwen3.6-35B ran fine at 8192 and is capped here only for uniformity; raise per-launch with
+# MAX_PREFILL_LENGTH=8192 if a model wants bigger chunks and has the headroom.
+MAX_PREFILL_LENGTH="${MAX_PREFILL_LENGTH:-2048}"
 
 # --- spec decode ---------------------------------------------------------------------------------
 spec_args=()
@@ -205,6 +218,7 @@ cmd=(python -m minisgl
   --cuda-graph-max-bs "$GRAPH_BS"
   --max-running-requests "$CONC"
   --memory-ratio "$MEM_RATIO"
+  --max-prefill-length "$MAX_PREFILL_LENGTH"
   "${ctx_args[@]}"
   "${spec_args[@]}"
 )

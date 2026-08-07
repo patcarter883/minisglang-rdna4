@@ -145,6 +145,22 @@ x-lean-common: &lean-common
     # curve) to JSON. Diagnostic only — it syncs per call, so never set it on a timed run.
     MINISGL_MOE_ROUTE_STATS: "${MINISGL_MOE_ROUTE_STATS:-}"
     MINISGL_MOE_ROUTE_STATS_N: "${MINISGL_MOE_ROUTE_STATS_N:-}"
+    # Prefill working-set probe (engine.py forward_batch): =1 logs, per PREFILL step, the peak
+    # allocation delta plus the ABSOLUTE alloc/reserved/device-free levels. The absolute levels are
+    # the point — a previous investigation found the per-step delta FLAT (~465 MiB at 8192 tokens,
+    # independent of ctx and bs) while the card still filled up, so the OOM lives in the baseline
+    # climbing between steps, not in one step's spike. It synchronizes per prefill: diagnostic only,
+    # never set it on a timed run. Was engine-side only and unreachable from compose until now.
+    MINISGL_PREFILL_MEM_PROBE: "${MINISGL_PREFILL_MEM_PROBE:-}"
+    # Prefill activation guard (scheduler.py): affordable = (devfree - SAFETY) / KIB_PER_TOKEN.
+    # The default 64 KiB/token was MEASURED ON Qwen3.6-35B (58-65 KiB/token) and is MODEL-SPECIFIC —
+    # it is not a universal constant. Measured on gemma-4-26B-A4B (2026-08-07, pf-probe, TP=2):
+    #     1696 tok -> 142.8 MiB   2912 tok -> 245.4 MiB   4192 tok -> 386.7 MiB
+    # i.e. a MARGINAL ~100 KiB/token, ~1.6x the Qwen figure, because gemma4's MoE prefill buffers are
+    # wider per token (hidden 2816 vs 2048, 2*inter 1408 vs 1024, same top_k=8). With the Qwen value
+    # the guard admits a chunk that cannot fit and the worker dies mid-forward. Set it per model.
+    MINISGL_PREFILL_ACT_KIB_PER_TOKEN: "${MINISGL_PREFILL_ACT_KIB_PER_TOKEN:-}"
+    MINISGL_PREFILL_ACT_SAFETY_MIB: "${MINISGL_PREFILL_ACT_SAFETY_MIB:-}"
     # Decode-GEMV tiling override for the fused MoE gemm2 (gemv_decode.h select_gemv_tiling).
     # 0 forces the K-on-lanes sweep, which is what every group-16 (NVFP4) shape got before
     # Int4Fp8GemvLoader declared bylane_min_group_v=16 — i.e. the matched A/B baseline, same binary.
@@ -527,6 +543,12 @@ services:
       PAGE_SIZE: "${PAGE_SIZE:-}"
       CACHE_TYPE: "${CACHE_TYPE:-}"
       DRAFT: "${DRAFT:-}"
+      # Chunked-prefill chunk size. Pinned to 2048 as the SERVICE default (serve.sh carries the same
+      # default and the measurement behind it): the engine's own 8192 reproducibly kills the worker
+      # mid-forward on wide-activation models — gemma-4-26B-A4B took a ~7k-token prompt as one chunk
+      # and OOM'd with devfree at 0. Overridable per launch (MAX_PREFILL_LENGTH=8192) for a model
+      # with the headroom to want bigger chunks.
+      MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-2048}"
       EXTRA_ARGS: "${EXTRA_ARGS:-}"
     entrypoint: ["bash", "-lc"]
     command: ["exec /engine/tools/serve.sh"]
