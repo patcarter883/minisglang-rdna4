@@ -193,10 +193,19 @@ class ReasoningStreamState:
     ``(reasoning_delta, content_delta)`` (either may be None). Buffers a possible partial closing tag
     so a close delimiter split across two chunks is still detected.
 
-    ``active`` is the prompt-derived ``span_open``. When it is False the state still WATCHES the head
-    of the stream for a model-side opener (Gemma-4 thinking-on writes its own ``<|channel>thought``),
-    holding back only as many characters as the opener is long. Without that watch the entire chain
-    of thought would stream out as ``content`` — the streaming twin of the non-stream misroute."""
+    ``active`` is the prompt-derived ``span_open``. The head of the stream is WATCHED for a model-side
+    opener either way, because both states can meet one and both need it gone:
+
+    * ``active=False`` — Gemma-4 thinking-on writes its own ``<|channel>thought``, and without the
+      watch the entire chain of thought streams out as ``content``: the streaming twin of the
+      non-stream misroute.
+    * ``active=True`` — the model may ECHO the opener even though the prompt already put it inside the
+      span. Non-streaming ``parse`` drops such an echo (``pre.split(start_token, 1)[-1]``), so leaving
+      it in would put raw markup at the head of every streamed ``reasoning_content`` and disagree with
+      the other lane on identical bytes.
+
+    Only as many characters are held back as the opener is long, and text that turns out NOT to be an
+    opener is released into whichever channel the state was already in."""
 
     def __init__(self, start_token: str, end_token: str, active: bool) -> None:
         self.start_token = start_token
@@ -205,8 +214,8 @@ class ReasoningStreamState:
         self.pending = ""     # held-back tail that might be a partial end token
         self._content_started = False  # have we emitted any answer text yet
         self._reasoning_started = False  # have we emitted any reasoning text yet
-        # Watch for a model-side opener only while the span is closed and nothing has been emitted.
-        self._probing = bool(start_token) and not active
+        # Watch the head for an opener in BOTH states (see the class docstring).
+        self._probing = bool(start_token)
         self._probe = ""      # head of the stream, held while it could still become the opener
 
     def _emit_content(self, text: str) -> Optional[str]:
@@ -245,9 +254,14 @@ class ReasoningStreamState:
                 return None, None    # still a viable prefix of the opener — keep holding
             if not head:
                 return None, None    # nothing but the template's leading newlines so far
-            # First character that rules the opener out: this is answer text, release it.
+            # First character that rules the opener out. It is ordinary text, and which channel it
+            # belongs to is the state we were told to start in — inside the span it is reasoning, and
+            # only outside it is the answer. Emitting it as content unconditionally would leak a
+            # prompt-opened chain of thought that simply did not re-echo its opener.
             self._probing = False
             out, self._probe = self._probe, ""
+            if self.active:
+                return self._push_active(out)
             return None, self._emit_content(out)
         if not self.active:
             return None, self._emit_content(delta)
@@ -273,14 +287,23 @@ class ReasoningStreamState:
 
     def flush(self) -> Tuple[Optional[str], Optional[str]]:
         """Emit any buffered tail at stream end, as ``(reasoning_tail, content_tail)``. Two buffers can
-        hold text: the partial-close-tag tail (still inside reasoning => reasoning) and the opener
-        probe (the whole completion was shorter than the opener and a prefix of it => content, since
-        no span was ever opened). Dropping either would silently truncate the reply."""
+        hold text: the opener probe (the whole completion was shorter than the opener and a prefix of
+        it, so it never became one) and the partial-close-tag tail (still inside reasoning). Dropping
+        either would silently truncate the reply.
+
+        The probe drains FIRST and through the same routing as ``push`` — it precedes the close-tag
+        tail chronologically, and releasing it can itself leave a partial closer pending."""
         reasoning = content = None
-        if self.active and self.pending:
-            reasoning, self.pending = self._emit_reasoning(self.pending), ""
         if self._probe:
-            content, self._probe = self._emit_content(self._probe), ""
+            out, self._probe = self._probe, ""
+            self._probing = False
+            if self.active:
+                reasoning, content = self._push_active(out)
+            else:
+                content = self._emit_content(out)
+        if self.active and self.pending:
+            tail, self.pending = self._emit_reasoning(self.pending), ""
+            reasoning = ((reasoning or "") + (tail or "")) or None
         self._probing = False
         return (reasoning or None), content
 
