@@ -136,6 +136,33 @@ for active, want in ((False, ("", "<|c")), (True, ("<|c", ""))):
     r_s, c_s = stream(CHAN, ["<|c"], active=active)
     check(f"active={active}: flushed, not dropped", (r_s, c_s) == want, repr((r_s, c_s)))
 
+print("PURE 8: a SECOND closer is markup, not answer text — the reasoning-budget backstop")
+# β force-closes the span at the budget; the model does not notice, keeps thinking, and emits its
+# OWN closer when it finishes. That one arrives in the content phase. Observed on gemma-4 at
+# reasoning_effort=low: `…pointer overhead."<channel|>Radix trees save memory by…` shipped as the
+# visible answer. A stream cannot rpartition, so the boundary legitimately differs from `parse` —
+# but raw markup must not survive in either lane.
+FORCED = ["I", " think", "<channel|>", "more", " scratch", "<channel|>", "The", " answer", "."]
+r_s, c_s = stream(CHAN, FORCED, active=True)
+check("no markup in content", "<channel|>" not in c_s, repr(c_s))
+check("no markup in reasoning", "<channel|>" not in r_s, repr(r_s))
+check("answer text survives intact", c_s == "more scratchThe answer.", repr(c_s))
+check("reasoning is the pre-β scratch", r_s == "I think", repr(r_s))
+
+print("PURE 9: a stale closer SPLIT across chunks is caught, and nothing is truncated")
+r_s, c_s = stream(CHAN, ["I", "<channel|>", "answer", " a<chan", "nel|>b"], active=True)
+check("split closer stripped", "<channel|>" not in c_s and "chan" not in c_s, repr(c_s))
+check("surrounding text kept", c_s == "answer ab", repr(c_s))
+# A held-back partial that turns out NOT to be a closer must still be delivered.
+r_s, c_s = stream(CHAN, ["I", "<channel|>", "answer<"], active=True)
+check("held partial flushed at stream end", c_s == "answer<", repr(c_s))
+
+print("PURE 10: a completion that never opened a span is passed through byte for byte")
+# The strip is armed only by having consumed a closer, so text that merely CONTAINS the delimiter on
+# a non-reasoning turn is not silently edited.
+r_s, c_s = stream(CHAN, ["the tag ", "<channel|>", " is literal"], active=False)
+check("untouched when no span ever closed", c_s == "the tag <channel|> is literal", repr(c_s))
+
 
 # ---------------------------------------------------------------------------------------------
 # ARTIFACT: the real template — does `add_generation_prompt` append anything?
