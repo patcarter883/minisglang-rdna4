@@ -481,6 +481,34 @@ def _effort_is_off(req: "OpenAICompletionRequest") -> bool:
     return req.thinking is False
 
 
+def _effort_is_on(req: "OpenAICompletionRequest") -> bool:
+    """True when the client asked FOR reasoning — the mirror of ``_effort_is_off``.
+
+    An ON rung (`reasoning_effort` low/medium/high/xhigh/max, `reasoning={"enabled": true}` or an
+    effort inside it, or a bare `thinking: true`) is a request for the model to think, not merely a
+    token budget for thinking that may or may not happen. Without this the ladder was one-sided: OFF
+    was honored and ON was silently dropped, so a caller asking for MORE reasoning on a checkpoint
+    whose template defaults to thinking-off got a 16384-token budget for a span the template never
+    opened — measured on Gemma-4, `reasoning_effort` xhigh, high, medium and none all returned an
+    identical answer with `reasoning_content` empty. Only `enable_thinking` worked, which is the
+    field the ladder exists to spare callers from knowing about.
+
+    `enable_thinking=false` still wins: it is checked first in `_resolve_chat_template_kwargs`, so an
+    explicit opt-out is never overridden by an effort rung that came along for the ride."""
+    if req.thinking is True:
+        return True
+    if req.reasoning_effort and _norm_effort(req.reasoning_effort) in _EFFORT_BUDGET:
+        return True
+    r = req.reasoning
+    if isinstance(r, dict):
+        if r.get("enabled") is True:
+            return True
+        eff = r.get("effort")
+        if eff and _norm_effort(eff) in _EFFORT_BUDGET:
+            return True
+    return False
+
+
 def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
     """Per-request reasoning-token budget, or None for unbounded (the server's MINISGL_THINK_BUDGET
     default still applies when nothing is set). Precedence: explicit `reasoning_max_tokens` > the same
@@ -644,12 +672,24 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None
     kwargs = dict(req.chat_template_kwargs or {})
     if req.enable_thinking is not None and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = req.enable_thinking
-    # reasoning_effort=none/minimal, reasoning={"enabled":false}, thinking=false all mean the same
-    # thing as enable_thinking=false. They were previously accepted and IGNORED — and for
-    # reasoning_effort="none" the effect was the opposite of the request (no budget -> unbounded
-    # thinking), which is how a client asking for less reasoning got the most possible.
-    if "enable_thinking" not in kwargs and _effort_is_off(req):
-        kwargs["enable_thinking"] = False
+    # The reasoning ladder maps to the template kwarg in BOTH directions. OFF first, so an explicit
+    # opt-out wins over an effort rung that rode along on the same request:
+    #
+    # * reasoning_effort=none/minimal, reasoning={"enabled":false}, thinking=false -> enable_thinking
+    #   False. Previously accepted and IGNORED — and for reasoning_effort="none" the effect was the
+    #   OPPOSITE of the request (no budget -> unbounded thinking), which is how a client asking for
+    #   less reasoning got the most possible.
+    # * reasoning_effort=low/medium/high/xhigh/max, reasoning={"enabled":true}, thinking=true ->
+    #   enable_thinking True. Same defect, other direction, and it outlived the first fix: the rung
+    #   set a token BUDGET but never opened the span, so on a checkpoint whose template defaults to
+    #   thinking-off every rung produced an identical answer with reasoning_content empty. A budget
+    #   for reasoning that cannot happen is not a knob, and `enable_thinking` — the field the ladder
+    #   exists so callers need not know about — was the only thing that worked.
+    if "enable_thinking" not in kwargs:
+        if _effort_is_off(req):
+            kwargs["enable_thinking"] = False
+        elif _effort_is_on(req):
+            kwargs["enable_thinking"] = True
     return kwargs or None
 
 
