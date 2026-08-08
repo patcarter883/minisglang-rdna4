@@ -214,6 +214,7 @@ class ReasoningStreamState:
         self.pending = ""     # held-back tail that might be a partial end token
         self._content_started = False  # have we emitted any answer text yet
         self._reasoning_started = False  # have we emitted any reasoning text yet
+        self._closed_once = False  # a close delimiter has been consumed (see _strip_stale_closers)
         # Watch the head for an opener in BOTH states (see the class docstring).
         self._probing = bool(start_token)
         self._probe = ""      # head of the stream, held while it could still become the opener
@@ -264,8 +265,45 @@ class ReasoningStreamState:
                 return self._push_active(out)
             return None, self._emit_content(out)
         if not self.active:
-            return None, self._emit_content(delta)
+            return None, self._emit_content(self._strip_stale_closers(delta))
         return self._push_active(delta)
+
+    def _strip_stale_closers(self, delta: str) -> str:
+        """Drop a close delimiter that arrives AFTER the span already closed.
+
+        A second closer is markup, never answer text, and it appears for a reason the splitter cannot
+        anticipate: the reasoning-budget backstop force-emits the close token at β tokens, the model
+        does not notice and keeps thinking, and when it finally finishes it emits its OWN closer —
+        which by then is in the content phase. Measured on gemma-4 at `reasoning_effort=low` (β=256):
+        `…pointer overhead."<channel|>Radix trees save memory by…` went out as the visible answer.
+
+        Non-streaming `parse` does not have this problem — it `rpartition`s on the LAST closer, so the
+        model's own closer is the boundary and the post-β scratch stays in reasoning_content. A stream
+        cannot look ahead, so it must commit at the FIRST closer, and the two lanes genuinely differ
+        on where the boundary falls. What they must NOT differ on is whether raw markup reaches the
+        caller.
+
+        Only ever strips a delimiter of which one has already been consumed (`_closed_once`), so a
+        completion that never opened a span is passed through byte for byte."""
+        if not self._closed_once or not self.end_token:
+            return delta
+        text = self.pending + delta
+        self.pending = ""
+        out = []
+        while True:
+            idx = text.find(self.end_token)
+            if idx == -1:
+                break
+            out.append(text[:idx])
+            text = text[idx + len(self.end_token):]
+        # Hold back a suffix that could be the head of a closer split across this chunk boundary,
+        # exactly as the reasoning phase does — otherwise a delimiter straddling two chunks survives.
+        keep = _end_overlap_len(text, self.end_token)
+        if keep:
+            self.pending = text[-keep:]
+            text = text[:-keep]
+        out.append(text)
+        return "".join(out)
 
     def _push_active(self, delta: str) -> Tuple[Optional[str], Optional[str]]:
         """Inside the reasoning span: emit reasoning until the close delimiter, then content."""
@@ -274,8 +312,10 @@ class ReasoningStreamState:
         if idx != -1:
             reasoning = self._emit_reasoning(text[:idx])
             self.active = False
+            self._closed_once = True
             self.pending = ""
-            return reasoning, self._emit_content(text[idx + len(self.end_token):])
+            return reasoning, self._emit_content(
+                self._strip_stale_closers(text[idx + len(self.end_token):]))
         keep = _end_overlap_len(text, self.end_token)
         if keep:
             self.pending = text[-keep:]
@@ -288,11 +328,16 @@ class ReasoningStreamState:
     def flush(self) -> Tuple[Optional[str], Optional[str]]:
         """Emit any buffered tail at stream end, as ``(reasoning_tail, content_tail)``. Two buffers can
         hold text: the opener probe (the whole completion was shorter than the opener and a prefix of
-        it, so it never became one) and the partial-close-tag tail (still inside reasoning). Dropping
-        either would silently truncate the reply.
+        it, so it never became one) and the partial-close-tag tail. Dropping either would silently
+        truncate the reply.
 
         The probe drains FIRST and through the same routing as ``push`` — it precedes the close-tag
-        tail chronologically, and releasing it can itself leave a partial closer pending."""
+        tail chronologically, and releasing it can itself leave a partial closer pending.
+
+        The close-tag tail goes to whichever channel is live: reasoning while the span is open, and
+        CONTENT once it has closed, because after the span closes the same buffer holds back a
+        possible stale closer (`_strip_stale_closers`). Only the reasoning half used to be drained,
+        so once that second buffer existed a reply ending in `<` would have lost its last character."""
         reasoning = content = None
         if self._probe:
             out, self._probe = self._probe, ""
@@ -300,10 +345,13 @@ class ReasoningStreamState:
             if self.active:
                 reasoning, content = self._push_active(out)
             else:
-                content = self._emit_content(out)
-        if self.active and self.pending:
-            tail, self.pending = self._emit_reasoning(self.pending), ""
-            reasoning = ((reasoning or "") + (tail or "")) or None
+                content = self._emit_content(self._strip_stale_closers(out))
+        if self.pending:
+            tail, self.pending = self.pending, ""
+            if self.active:
+                reasoning = ((reasoning or "") + (self._emit_reasoning(tail) or "")) or None
+            else:
+                content = ((content or "") + (self._emit_content(tail) or "")) or None
         self._probing = False
         return (reasoning or None), content
 
