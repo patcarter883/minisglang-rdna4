@@ -689,18 +689,78 @@ def _frontend_tokenizer():
     return _FRONTEND_TOKENIZER
 
 
-# Rendered generation prompts, keyed by the resolved chat_template_kwargs. The reasoning delimiters
-# are emitted by the template's `add_generation_prompt` branch, which keys on the THINKING KWARGS,
-# not on message text — so one render per distinct kwargs set answers every request and the whole
-# cache is a handful of entries (unset / thinking-on / thinking-off).
+# Rendered generation prompts, keyed by the resolved chat_template_kwargs AND the request's trailing
+# message SHAPE. The kwargs alone are not enough: the `add_generation_prompt` branch also keys on what
+# the conversation ends WITH. Gemma-4 skips the branch entirely when the last thing rendered was a
+# tool call/result (`chat_template.jinja`: `if ns.prev_message_type != 'tool_response' and ... !=
+# 'tool_call'`), because the model is meant to CONTINUE the already-open model turn. Keying on kwargs
+# only meant every request was classified from a `[user]`-shaped probe, so a tool-continuation turn was
+# read as "thinking off" — see `_prompt_thinking_state`. Shape has a handful of distinct values per
+# kwargs set, so the cache stays small and no conversation is re-rendered per request.
 _PROMPT_PROBE_CACHE: Dict[tuple, str | None] = {}
+
+# How many trailing messages define the shape. The generation-prompt branch looks at the tail of the
+# conversation (the last non-tool role, and whether a tool call/result is still open), never at its
+# head or at message TEXT, so a short suffix is a sound cache key.
+_SHAPE_TAIL = 4
+
+# `(span_open, reasoning_possible)` per (chat_template_kwargs, tail shape). Caching the ANSWER rather
+# than the rendered string is what keeps the extra render off the per-request path: a conversation is
+# rendered once per shape it ever ends in, and never re-rendered as it grows.
+_THINKING_STATE_CACHE: Dict[tuple, Tuple[bool, bool]] = {}
 
 # Sentinel for "omit the `usage` key entirely", which is not the same as "usage: null".
 _NO_USAGE = object()
 
 
+def _tail_shape(req: "OpenAICompletionRequest") -> tuple:
+    """Structural signature of the conversation's TAIL — the only thing `add_generation_prompt`
+    branches on. Roles plus "did this turn carry tool calls", never message TEXT, so it is a sound
+    cache key and two different conversations that end the same way share one render."""
+    msgs = req.messages or []
+    return tuple(
+        (m.role, bool(m.tool_calls), m.content is not None) for m in msgs[-_SHAPE_TAIL:]
+    )
+
+
+def _generation_prompt_tail(req: "OpenAICompletionRequest", kwargs: dict | None) -> str | None:
+    """What `add_generation_prompt` APPENDS for THIS request — rendered from the request's own
+    messages, not from a stand-in conversation.
+
+    Returns the appended text, `""` when the template appended NOTHING, or None if it cannot render.
+    The empty string is the case this function exists for: a template may decline to open a new turn
+    (Gemma-4 after a tool call/result — the model is meant to continue the model turn already open),
+    and that is invisible to a probe rendered from a `[user]` conversation, which always gets a full
+    generation prompt back.
+
+    Diffing the two renders rather than reading the whole prompt also keeps history OUT of the answer:
+    only the appended tail is inspected for delimiters, so an earlier turn carrying a stray delimiter
+    (e.g. reasoning markup that leaked into an assistant `content` and got replayed) cannot flip the
+    state of a prompt that in fact ends with a clean generation prompt."""
+    tok = _frontend_tokenizer()
+    if tok is None or not req.messages:
+        return None
+    messages = [msg.model_dump(exclude_none=True) for msg in req.messages]
+    _normalize_tool_args(messages)
+    try:
+        on = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **(kwargs or {}))
+        off = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, **(kwargs or {}))
+    except Exception as e:  # noqa: BLE001 — a template that rejects the render tells us nothing
+        logger.debug("generation-prompt render failed for %s: %s", kwargs, e)
+        return None
+    i = 0
+    while i < min(len(on), len(off)) and on[i] == off[i]:
+        i += 1
+    return on[i:]
+
+
 def _probe_generation_prompt(kwargs: dict | None) -> str | None:
-    """Render this checkpoint's generation prompt under `kwargs`, cached. None if it can't render."""
+    """Render a STAND-IN generation prompt under `kwargs`, cached. None if it can't render.
+
+    The fallback for a request with no messages of its own to render (the raw-completion lane's
+    callers). Prefer `_generation_prompt_tail`, which reads the actual request."""
     key = tuple(sorted((k, repr(v)) for k, v in (kwargs or {}).items()))
     if key not in _PROMPT_PROBE_CACHE:
         rendered = None
@@ -730,7 +790,26 @@ def _prompt_thinking_state(req: "OpenAICompletionRequest") -> Tuple[bool, bool]:
     The ground truth is the rendered prompt — a span is open iff the template injected an opener and
     did not close it. Reading it needs no model-name branch, no allow-list and no new config field.
     Falls back to the old optimistic default only when nothing renders, i.e. when we truly cannot
-    tell."""
+    tell.
+
+    THREE states, not two, because a template can also decline to start a turn at all:
+
+    * generation prompt ABSENT (`tail == ""`) — the template appended nothing, so the model is
+      CONTINUING a turn that is already open and whatever convention that turn carries is still in
+      force. Gemma-4 does this after every tool call/result, and it is why "thinking off" cannot be
+      expressed there: off is spelled by INJECTING a pre-closed empty span
+      (`<|channel>thought\\n<channel|>`) inside the very branch that got skipped. The model duly opens
+      a thought channel and the completion begins mid-span — measured, its first token is literally
+      `thought`, with no opener. Reported as `(True, True)`: treat the span as open, which is what
+      makes the streaming splitter route that scratch to `reasoning_content` instead of streaming it
+      to the user as the answer, and what arms the reasoning-budget backstop that force-closes a
+      runaway (observed unfixed: 34k characters of chain-of-thought delivered as `content`, the last
+      27k of it a single sentence repeated 676 times).
+    * generation prompt PRESENT — read the delimiters out of the appended tail, as before.
+    * nothing renders — the old optimistic default.
+
+    Cached on `(kwargs, tail shape)`: the branch keys on the conversation's trailing structure, never
+    on message text, so one render answers every request that ends the same way."""
     parser = _reasoning_parser()
     if parser is None:
         return False, False
@@ -738,10 +817,20 @@ def _prompt_thinking_state(req: "OpenAICompletionRequest") -> Tuple[bool, bool]:
     # the delimiters straight out of it (a raw prompt ending in `<think>` really is mid-reasoning).
     if req.messages is None and isinstance(req.prompt, str):
         return parser.prompt_state(req.prompt)
-    rendered = _probe_generation_prompt(_resolve_chat_template_kwargs(req))
-    if rendered is None:
-        return True, True
-    return parser.prompt_state(rendered)
+    kwargs = _resolve_chat_template_kwargs(req)
+    key = (tuple(sorted((k, repr(v)) for k, v in (kwargs or {}).items())), _tail_shape(req))
+    if key not in _THINKING_STATE_CACHE:
+        tail = _generation_prompt_tail(req, kwargs)
+        if tail is None:
+            # No messages of our own to render (or the template refused): fall back to the stand-in.
+            rendered = _probe_generation_prompt(kwargs)
+            state = (True, True) if rendered is None else parser.prompt_state(rendered)
+        elif not tail.strip():
+            state = (True, True)  # no new turn -> the model continues the one already open
+        else:
+            state = parser.prompt_state(tail)
+        _THINKING_STATE_CACHE[key] = state
+    return _THINKING_STATE_CACHE[key]
 
 
 def _thinking_open(req: "OpenAICompletionRequest") -> bool:
