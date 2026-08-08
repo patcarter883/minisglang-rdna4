@@ -108,6 +108,34 @@ ANSWER = ["Hello", " there", "."]
 r_s, c_s = stream(CHAN, ANSWER, active=False)
 check("plain answer is content", (r_s, c_s) == ("", "Hello there."), repr((r_s, c_s)))
 
+print("PURE 5: an ECHOED opener is stripped, span already open — markup never reaches the client")
+# Classifying these turns as span-open (the fix above) means the splitter now starts ACTIVE on turns
+# where the model ALSO writes the opener itself. `parse` drops such an echo; the splitter must too,
+# or every streamed reasoning_content on those turns starts with raw `<|channel>thought`.
+ECHO = ["<|channel>", "thought", "\n", "I", " think", ".", "<channel|>", "Hi", "."]
+r_s, c_s = stream(CHAN, ECHO, active=True)
+r_p, c_p = CHAN.parse("".join(ECHO), thinking_open=True)
+check("opener stripped from reasoning", "channel" not in r_s, repr(r_s))
+check("streaming == non-streaming", (r_s.strip(), c_s) == ((r_p or "").strip(), c_p),
+      f"{(r_s, c_s)!r} != {(r_p, c_p)!r}")
+check("answer still delivered", c_s == "Hi.", repr(c_s))
+
+print("PURE 6: span open, opener NOT echoed — text still routes to reasoning, not content")
+# The other half of the same branch: the probe rules out an opener, and what it was holding must go
+# to reasoning because the prompt already opened the span. Releasing it as content was the old
+# behaviour and would leak a prompt-opened chain of thought.
+NOECHO = ["The", " user", " wants", "<channel|>", "Done", "."]
+r_s, c_s = stream(CHAN, NOECHO, active=True)
+r_p, c_p = CHAN.parse("".join(NOECHO), thinking_open=True)
+check("held head goes to reasoning", r_s.strip() == "The user wants", repr(r_s))
+check("streaming == non-streaming", (r_s.strip(), c_s) == ((r_p or "").strip(), c_p),
+      f"{(r_s, c_s)!r} != {(r_p, c_p)!r}")
+
+print("PURE 7: a completion SHORTER than the opener is not swallowed")
+for active, want in ((False, ("", "<|c")), (True, ("<|c", ""))):
+    r_s, c_s = stream(CHAN, ["<|c"], active=active)
+    check(f"active={active}: flushed, not dropped", (r_s, c_s) == want, repr((r_s, c_s)))
+
 
 # ---------------------------------------------------------------------------------------------
 # ARTIFACT: the real template — does `add_generation_prompt` append anything?
