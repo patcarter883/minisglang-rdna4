@@ -172,20 +172,38 @@ class ReasoningParser:
             pre = pre.split(self.start_token, 1)[-1]
         reasoning = pre.strip()
         content = post.lstrip("\n")
+        # A span RE-OPENED after the last closer and never closed again: everything from that opener
+        # on is scratch, not answer. rpartition alone cannot see it — the tail has no closer to
+        # partition on — so the opener and the thinking behind it went out as visible content. Seen
+        # live: an answer ending `…implementation of the Delta-Schema.<|channel>thought`, which the
+        # caller then stored and replayed, leaving the NEXT turn's prompt genuinely mid-span; that
+        # turn thought for 15k characters and returned an empty answer.
+        if self.start_token and self.start_token in content:
+            content, _, tail = content.partition(self.start_token)
+            tail = tail.strip()
+            if tail:
+                reasoning = f"{reasoning}\n{tail}" if reasoning else tail
+            content = content.rstrip()
         return (reasoning or None), content
 
     def stream_state(self, active: bool) -> "ReasoningStreamState":
         return ReasoningStreamState(self.start_token, self.end_token, active)
 
 
-def _end_overlap_len(text: str, token: str) -> int:
-    """Largest k>0 such that ``text`` ends with ``token[:k]`` (a partial closing tag straddling a
-    streaming boundary). Returns 0 when no suffix of ``text`` is a prefix of ``token``."""
-    max_k = min(len(text), len(token) - 1)
-    for k in range(max_k, 0, -1):
-        if text.endswith(token[:k]):
-            return k
-    return 0
+def _end_overlap_len(text: str, *tokens: str) -> int:
+    """Largest k>0 such that ``text`` ends with ``token[:k]`` for one of ``tokens`` (a delimiter
+    straddling a streaming boundary). Returns 0 when no suffix of ``text`` is a prefix of any of
+    them. Takes several because the CONTENT phase watches for BOTH delimiters at once — a re-opened
+    span and a stale closer can each arrive split across two chunks."""
+    best = 0
+    for token in tokens:
+        if not token:
+            continue
+        for k in range(min(len(text), len(token) - 1), 0, -1):
+            if text.endswith(token[:k]):
+                best = max(best, k)
+                break
+    return best
 
 
 class ReasoningStreamState:
@@ -265,45 +283,59 @@ class ReasoningStreamState:
                 return self._push_active(out)
             return None, self._emit_content(out)
         if not self.active:
-            return None, self._emit_content(self._strip_stale_closers(delta))
+            return self._push_inactive(delta)
         return self._push_active(delta)
 
-    def _strip_stale_closers(self, delta: str) -> str:
-        """Drop a close delimiter that arrives AFTER the span already closed.
+    def _push_inactive(self, delta: str) -> Tuple[Optional[str], Optional[str]]:
+        """Outside the reasoning span: emit content, but keep watching for BOTH delimiters.
 
-        A second closer is markup, never answer text, and it appears for a reason the splitter cannot
-        anticipate: the reasoning-budget backstop force-emits the close token at β tokens, the model
-        does not notice and keeps thinking, and when it finally finishes it emits its OWN closer —
-        which by then is in the content phase. Measured on gemma-4 at `reasoning_effort=low` (β=256):
-        `…pointer overhead."<channel|>Radix trees save memory by…` went out as the visible answer.
+        A span is not a once-per-completion event, and the content phase meets each delimiter for its
+        own reason:
 
-        Non-streaming `parse` does not have this problem — it `rpartition`s on the LAST closer, so the
-        model's own closer is the boundary and the post-β scratch stays in reasoning_content. A stream
-        cannot look ahead, so it must commit at the FIRST closer, and the two lanes genuinely differ
-        on where the boundary falls. What they must NOT differ on is whether raw markup reaches the
-        caller.
+        * an OPENER means the model RE-OPENED a reasoning span after answering. Observed live: a turn
+          whose answer ended `…understand the technical implementation of the Delta-Schema.<|channel>
+          thought` — the markup shipped as the visible answer, and because the caller stores content
+          and replays it, the NEXT turn's prompt then genuinely ended mid-thought-channel. That turn
+          thought for 15,206 characters, never closed the span, and delivered an empty answer. One
+          leaked delimiter, one dead turn.
+        * a CLOSER means the span already closed once and this is a duplicate — the reasoning-budget
+          backstop force-emits the close token at β, the model does not notice, keeps thinking, and
+          emits its own closer later. Measured on gemma-4 at `reasoning_effort=low` (β=256):
+          `…pointer overhead."<channel|>Radix trees save memory by…` as the answer. Dropped, because a
+          second closer closes nothing.
 
-        Only ever strips a delimiter of which one has already been consumed (`_closed_once`), so a
-        completion that never opened a span is passed through byte for byte."""
-        if not self._closed_once or not self.end_token:
-            return delta
+        The opener is watched unconditionally; the closer only once one has been consumed
+        (`_closed_once`), so a completion that never opened a span is passed through byte for byte and
+        a model writing the delimiter as literal prose on a non-reasoning turn is not silently edited.
+        """
         text = self.pending + delta
         self.pending = ""
-        out = []
-        while True:
-            idx = text.find(self.end_token)
-            if idx == -1:
-                break
-            out.append(text[:idx])
-            text = text[idx + len(self.end_token):]
-        # Hold back a suffix that could be the head of a closer split across this chunk boundary,
-        # exactly as the reasoning phase does — otherwise a delimiter straddling two chunks survives.
-        keep = _end_overlap_len(text, self.end_token)
+        out: List[str] = []
+        while text:
+            i_open = text.find(self.start_token) if self.start_token else -1
+            i_close = text.find(self.end_token) if (self._closed_once and self.end_token) else -1
+            if i_open != -1 and (i_close == -1 or i_open < i_close):
+                # Re-entering the span: everything before the opener is answer text, everything after
+                # is scratch — hand the remainder to the reasoning half, which owns it from here.
+                out.append(text[:i_open])
+                self.active = True
+                content = self._emit_content("".join(out))
+                reasoning, more = self._push_active(text[i_open + len(self.start_token):])
+                return reasoning, ((content or "") + (more or "")) or None
+            if i_close != -1:
+                out.append(text[:i_close])
+                text = text[i_close + len(self.end_token):]
+                continue
+            break
+        # Hold back a suffix that could be the head of either delimiter split across this chunk
+        # boundary, exactly as the reasoning phase does — otherwise a delimiter straddling two chunks
+        # survives into the answer.
+        keep = _end_overlap_len(text, self.start_token, self.end_token)
         if keep:
             self.pending = text[-keep:]
             text = text[:-keep]
         out.append(text)
-        return "".join(out)
+        return None, self._emit_content("".join(out))
 
     def _push_active(self, delta: str) -> Tuple[Optional[str], Optional[str]]:
         """Inside the reasoning span: emit reasoning until the close delimiter, then content."""
@@ -314,8 +346,10 @@ class ReasoningStreamState:
             self.active = False
             self._closed_once = True
             self.pending = ""
-            return reasoning, self._emit_content(
-                self._strip_stale_closers(text[idx + len(self.end_token):]))
+            # The remainder re-enters the CONTENT phase, which keeps watching for both delimiters —
+            # the model can re-open a span, or emit a duplicate closer, in this very chunk.
+            _r, content = self._push_inactive(text[idx + len(self.end_token):])
+            return ((reasoning or "") + (_r or "")) or None, content
         keep = _end_overlap_len(text, self.end_token)
         if keep:
             self.pending = text[-keep:]
@@ -334,10 +368,10 @@ class ReasoningStreamState:
         The probe drains FIRST and through the same routing as ``push`` — it precedes the close-tag
         tail chronologically, and releasing it can itself leave a partial closer pending.
 
-        The close-tag tail goes to whichever channel is live: reasoning while the span is open, and
-        CONTENT once it has closed, because after the span closes the same buffer holds back a
-        possible stale closer (`_strip_stale_closers`). Only the reasoning half used to be drained,
-        so once that second buffer existed a reply ending in `<` would have lost its last character."""
+        The partial-delimiter tail goes to whichever channel is live: reasoning while the span is
+        open, and CONTENT once it has closed, because the content phase holds back a possible partial
+        delimiter of its own (`_push_inactive`). Only the reasoning half used to be drained, so once
+        that second buffer existed a reply ending in `<` would have lost its last character."""
         reasoning = content = None
         if self._probe:
             out, self._probe = self._probe, ""
@@ -345,7 +379,7 @@ class ReasoningStreamState:
             if self.active:
                 reasoning, content = self._push_active(out)
             else:
-                content = self._emit_content(self._strip_stale_closers(out))
+                reasoning, content = self._push_inactive(out)
         if self.pending:
             tail, self.pending = self.pending, ""
             if self.active:

@@ -164,6 +164,35 @@ r_s, c_s = stream(CHAN, ["the tag ", "<channel|>", " is literal"], active=False)
 check("untouched when no span ever closed", c_s == "the tag <channel|> is literal", repr(c_s))
 
 
+print("PURE 11: a RE-OPENED span is scratch, not answer — on BOTH lanes")
+# The model answers, then opens a new thought channel. Observed live: an answer ending
+# `…implementation of the Delta-Schema.<|channel>thought`. That markup shipped as the reply, the
+# caller stored and replayed it, and the NEXT turn's prompt genuinely ended mid-thought-channel —
+# that turn thought for 15,206 characters and delivered an empty answer. One leaked delimiter, one
+# dead turn, so this is asserted on both lanes.
+REOPEN = ["thought", "\n", "scratch", "<channel|>", "The", " answer", ".",
+          "<|channel>", "thought", "\n", "more", " scratch"]
+r_s, c_s = stream(CHAN, REOPEN, active=True)
+r_p, c_p = CHAN.parse("".join(REOPEN), thinking_open=True)
+check("streaming: answer only, no markup", c_s == "The answer.", repr(c_s))
+check("streaming: re-opened scratch is reasoning", "more scratch" in r_s and "channel" not in r_s, repr(r_s))
+check("non-streaming: answer only, no markup", c_p == "The answer.", repr(c_p))
+check("non-streaming: re-opened scratch is reasoning",
+      "more scratch" in (r_p or "") and "channel" not in (r_p or ""), repr(r_p))
+check("lanes agree on content", c_s == c_p, f"{c_s!r} != {c_p!r}")
+
+print("PURE 12: a re-opened span that CLOSES again returns to content")
+CYCLE = ["thought", "\n", "a", "<channel|>", "X", "<|channel>", "thought", "b", "<channel|>", "Y"]
+r_s, c_s = stream(CHAN, CYCLE, active=True)
+check("both answer fragments delivered", c_s == "XY", repr(c_s))
+check("both scratch fragments captured", "a" in r_s and "b" in r_s and "channel" not in r_s, repr(r_s))
+
+print("PURE 13: an opener SPLIT across chunks is caught in the content phase too")
+r_s, c_s = stream(CHAN, ["t", "<channel|>", "answer <|chan", "nel>thought hidden"], active=True)
+check("split re-opener stripped from content", c_s == "answer " and "chan" not in c_s, repr(c_s))
+check("text after it is reasoning", "hidden" in r_s, repr(r_s))
+
+
 # ---------------------------------------------------------------------------------------------
 # ARTIFACT: the real template — does `add_generation_prompt` append anything?
 # ---------------------------------------------------------------------------------------------
@@ -233,6 +262,7 @@ if tok is not None:
     # whichever shape lost the race.
     check("cache keeps the shapes apart",
           state([USER]) == (False, False) and state([USER, ASSISTANT, RESULT]) == (True, True))
+
 
 
 print()
