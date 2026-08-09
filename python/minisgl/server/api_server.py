@@ -292,8 +292,12 @@ def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
         forced_name = (choice.get("function") or {}).get("name")
     elif choice != "required":
         return None  # "auto" / "none" / None -> not forced (see _structural_tag_from_tools)
-    if _TOOL_FORMAT == "zaya_xml":
+    fmt = _resolve_tool_format()
+    if fmt == "zaya_xml":
         ebnf = _zaya_xml_grammar(tools, forced_name)  # native <zyphra_tool_call> XML, not JSON
+        return json.dumps({"__ebnf__": ebnf}) if ebnf else None
+    if fmt == "gemma_native":
+        ebnf = _gemma_native_grammar(tools, forced_name)  # native <|tool_call>call:…, not JSON
         return json.dumps({"__ebnf__": ebnf}) if ebnf else None
     variants = _tool_call_variants(tools, forced_name)
     if not variants:
@@ -336,6 +340,122 @@ def _zaya_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str 
     ])
 
 
+def _gemma_native_grammar(tools: List[dict], forced_name: str | None = None) -> str | None:
+    """EBNF constraining Gemma-4's NATIVE tool call to its trained format:
+
+        <|tool_call>call:NAME{key:value,key:value}<tool_call|>
+
+    Read off the checkpoint's own `chat_template.jinja` rather than guessed. The call is rendered by
+    `'<|tool_call>call:' + name + '{'` then `key ':' format_argument(value, escape_keys=False)` joined
+    by `,`, then `'}<tool_call|>'`. `format_argument` is the value grammar, and `escape_keys=False`
+    PROPAGATES into nested mappings, so every key at every depth is BARE:
+
+        str      -> `<|"|>text<|"|>`      bool -> `true` / `false`
+        mapping  -> `{k:v,…}`            sequence -> `[a,b]`        anything else -> raw
+
+    The body is JSON-SHAPED but is NOT JSON — bare keys, and strings delimited by the `<|"|>` special
+    token rather than `"`. That is why this needs an EBNF and cannot ride the structural-tag path,
+    which is JSON-schema-only (see `_TOOL_STRUCT_WRAPPERS`). Forcing the JSON shape here would make a
+    forced call come out in a format the checkpoint was never trained to emit AND that its own
+    template cannot render back into a prompt.
+
+    Function NAME is constrained to the allowed tools and top-level keys to those tools' declared
+    properties, so the result is guaranteed parseable by `_parse_gemma_tool_call`. Params are
+    any-order/any-subset (a fixed order would reject valid calls) and values stay permissive so the
+    model is not boxed on content — the same trade `_zaya_xml_grammar` makes.
+
+    One documented limit: a string value cannot contain the two-character sequence `<|`, because the
+    closing `<|"|>` has to be recognisable. `<` alone is fine (`ls <file`, `a < b`), which is the
+    common case a flat `[^<]*` would have broken."""
+    fns: List[str] = []
+    keys: set[str] = set()
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name or (forced_name and name != forced_name):
+            continue
+        fns.append(name)
+        keys.update((fn.get("parameters") or {}).get("properties", {}) or {})
+    if not fns:
+        return None
+    fname_alt = " | ".join(_ebnf_lit(n) for n in fns)
+    key_alt = " | ".join(_ebnf_lit(k) for k in sorted(keys)) if keys else _ebnf_lit("_")
+    q = _ebnf_lit('<|"|>')
+    return "\n".join([
+        f'root ::= "<|tool_call>call:" fname "{{" args "}}<tool_call|>"',
+        f"fname ::= {fname_alt}",
+        'args ::= (arg ("," arg)*)?',
+        'arg ::= key ":" value',
+        f"key ::= {key_alt}",
+        "value ::= str | bool | num | arr | obj",
+        f"str ::= {q} schar* {q}",
+        # Anything but the closer. `<` is allowed unless followed by `|`, so shell redirects and
+        # comparisons survive; only the literal `<|` is out of reach.
+        'schar ::= [^<] | "<" [^|]',
+        'bool ::= "true" | "false"',
+        'num ::= "-"? [0-9]+ ("." [0-9]+)?',
+        'arr ::= "[" (value ("," value)*)? "]"',
+        # Nested mappings: `escape_keys=False` propagates, so these keys are bare too. They are NOT
+        # tool property names (they are whatever the argument object holds), hence a permissive ident.
+        'obj ::= "{" (okv ("," okv)*)? "}"',
+        'okv ::= ident ":" value',
+        "ident ::= [a-zA-Z_] [a-zA-Z0-9_]*",
+    ])
+
+
+# Which native tool-call format this checkpoint speaks. DERIVED from the chat template by default
+# (see `_derive_tool_format`) rather than named: `MINISGL_TOOL_FORMAT` used to default to "json", so a
+# family whose native call is not JSON got the JSON shape unless an operator knew to set the variable
+# — which is how Gemma-4 ended up with no native grammar at all despite the template plainly rendering
+# one. An explicit value still wins, for a serve that needs to pin the format (the ZAYA compose
+# service sets zaya_xml).
+_TOOL_FORMAT = os.environ.get("MINISGL_TOOL_FORMAT", "auto")
+_DERIVED_TOOL_FORMAT: str | None = None
+_DERIVED_TOOL_FORMAT_SET = False
+
+# Probe call used to make the template SHOW its tool-call wrapper. Content is irrelevant — the wrapper
+# is emitted by the template's tool_calls branch, which keys on the message shape, not on the values.
+_TOOL_PROBE_MESSAGES = [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": {"k": "v"}}}]},
+]
+
+
+def _derive_tool_format() -> str | None:
+    """Render a tool call through the checkpoint's own template and read the format back out.
+
+    The template is the fact: it is what turns a `tool_calls` message into bytes, so whatever it emits
+    around the call IS this checkpoint's native format. Only a shape the forced path can actually
+    CONSTRAIN is reported — today that is Gemma-4's `<|tool_call>call:NAME{…}`; everything else
+    returns None and keeps the JSON default, so this can never downgrade a family it does not
+    recognise."""
+    tok = _frontend_tokenizer()
+    if tok is None:
+        return None
+    try:
+        rendered = tok.apply_chat_template(
+            _TOOL_PROBE_MESSAGES, tokenize=False, add_generation_prompt=False)
+    except Exception as e:  # noqa: BLE001 — a template that rejects the probe tells us nothing
+        logger.debug("tool-format probe render failed: %s", e)
+        return None
+    if "<|tool_call>call:" in rendered:
+        return "gemma_native"
+    return None
+
+
+def _resolve_tool_format() -> str:
+    """`MINISGL_TOOL_FORMAT` when set to anything but "auto", else the derived format, else "json"."""
+    global _DERIVED_TOOL_FORMAT, _DERIVED_TOOL_FORMAT_SET
+    if _TOOL_FORMAT and _TOOL_FORMAT != "auto":
+        return _TOOL_FORMAT
+    if not _DERIVED_TOOL_FORMAT_SET:
+        _DERIVED_TOOL_FORMAT_SET = True
+        _DERIVED_TOOL_FORMAT = _derive_tool_format()
+        logger.info("native tool-call format: %s", _DERIVED_TOOL_FORMAT or "json (no native form derived)")
+    return _DERIVED_TOOL_FORMAT or "json"
+
+
 def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> List[dict]:
     """A JSON-schema per allowed tool: {name: const, arguments: that tool's parameters}."""
     variants = []
@@ -365,16 +485,21 @@ def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> Li
 # emits valid JSON when constrained — cf. the forced path); the XML `<function=…>` parser recovers any
 # native-XML that still slips through. For a GUARANTEED native-XML forced call see `_zaya_xml_grammar`
 # (MINISGL_TOOL_FORMAT=zaya_xml).
+#
+# GEMMA-4 IS DELIBERATELY ABSENT, and it is the one family that cannot simply be added. Its wrapper
+# `<|tool_call>` … `<tool_call|>` would be a fine trigger, but a structural tag can only constrain its
+# body to a JSON SCHEMA (`grammar.py`: `xgr.StructuralTagItem(begin, schema, end)`), and Gemma's body
+# is not JSON — bare keys, and strings delimited by the `<|"|>` special token. Listing it here would
+# force the model to emit JSON inside its native wrapper: a shape it was never trained to produce and
+# that its own template cannot render back into a prompt on the next turn. So `auto` mode stays
+# UNCONSTRAINED for Gemma-4 (the model picks the format; `_parse_gemma_tool_call` reads it), and the
+# native format is guaranteed on the FORCED path instead, via `_gemma_native_grammar`. Closing this
+# properly needs per-tag EBNF support in xgrammar, which structural tags do not have today.
 _TOOL_STRUCT_WRAPPERS = (
     ("<zyphra_tool_call>", "</zyphra_tool_call>"),
     ("<tool_call>", "</tool_call>"),
     ("<tools>", "</tools>"),
 )
-# Model-native forced-tool-call format. "json" (default) -> `{"name": …, "arguments": …}`; "zaya_xml" ->
-# ZAYA's trained `<zyphra_tool_call><function=NAME><parameter=P>…</parameter></function></zyphra_tool_call>`
-# via a custom EBNF (`_zaya_xml_grammar`). Set per serve (the ZAYA compose service sets zaya_xml); JSON is
-# correct for every other family, so the default is a no-op change.
-_TOOL_FORMAT = os.environ.get("MINISGL_TOOL_FORMAT", "json")
 
 
 def _structural_tag_from_tools(req: "OpenAICompletionRequest") -> str | None:
