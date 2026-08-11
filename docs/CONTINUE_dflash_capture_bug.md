@@ -127,10 +127,31 @@ at all; measure the determinism floor per model rather than assuming it. The har
 1. **Test §3's hypothesis**: pin each rung and diff the ring verify against the materialising verify
    on identical state. If the ring is not bit-exact, that is a kernel-level correctness question for
    `rdna4-hip-kernels/gdn`, not an engine one.
-2. **Re-take everything measured through the bug** — every DFlash acceptance number taken under the
-   default ladder on a GDN hybrid was scored against a target whose recurrent state was being zeroed
-   every step. That includes the vendor comparison (we sat at 71–90% of llama.cpp on identical
-   weights) and `CONTINUANCE §11`. The 5.7× rung-3 acceptance recovery says the gap was largely this.
+2. ~~**Re-take everything measured through the bug**~~ — **DONE, and the scope was much narrower
+   than this bullet originally claimed. See `docs/measurements/DFLASH_GDN_RINGGATE_RETAKE.md`.**
+
+   The bug needs a **GDN hybrid** AND a ladder that **straddles `REPLAY_RING_LEN = 8`**, i.e.
+   DFlash at K≥8. So MTP (K=4, qlens [3,4,5]) and EAGLE3 (K=6, qlens [4,5,7]) were never affected on
+   any model, and — checked against the configs, not assumed — **Muse-Glimmer and Laguna have no GDN
+   layer at all** (`sliding_attention` + `full_attention` only), so `GDNVerifyGraphCapture` is never
+   even constructed for them.
+
+   **This bullet's original claim was therefore wrong**: the llama.cpp vendor comparison ran on
+   **Muse** and `CONTINUANCE §11` ran on **Laguna** (and eager, `--cuda-graph-max-bs 0`, so no verify
+   graph existed). Neither went through this bug. **The 71–90%-of-vendor gap is NOT explained by it
+   and remains open.**
+
+   What the retake *did* show, on Qwen3.6-27B (the actual affected surface), pre-code vs post-code
+   worktrees, adaptive default:
+
+   | class | drafts/verify | committed/verify |
+   |---|---|---|
+   | prose greedy | 0.236 → 1.918 (**8.1×**) | 1.236 → 2.918 |
+   | code greedy | 0.253 → 3.314 (**13.1×**) | 1.253 → 4.314 |
+   | code sampled | 0.174 → 3.302 (**19.0×**) | 1.174 → 4.302 |
+
+   Pre-fix, DFlash bought ~0.2 extra tokens per 16-row verify — almost certainly net-negative.
+   (Acceptance only; throughput not measured.)
 3. **Check the other GDN spec paths for the same width-scoping error** — `can_use_ddtree_verify` and
    the fused-TiDAR capture family were not audited here.
 4. Laguna greedy non-determinism (old §5) — untouched, still open.

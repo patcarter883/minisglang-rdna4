@@ -1,0 +1,62 @@
+{
+ "q27_post_code_greedy": {
+  "drafted": 2780.0,
+  "accepted": 1226.0,
+  "emitted": 1596.0,
+  "verify_batches": 370.0,
+  "req_verify_instances": 370.0,
+  "accepted_drafts_per_verify": 3.3135135135135134,
+  "committed_per_verify": 4.313513513513514,
+  "accept_rate": 0.44100719424460433
+ },
+ "q27_post_code_sampled": {
+  "drafted": 2549.0,
+  "accepted": 1225.0,
+  "emitted": 1596.0,
+  "verify_batches": 371.0,
+  "req_verify_instances": 371.0,
+  "accepted_drafts_per_verify": 3.30188679245283,
+  "committed_per_verify": 4.30188679245283,
+  "accept_rate": 0.48058061985092193
+ },
+ "q27_post_prose_greedy": {
+  "drafted": 3760.0,
+  "accepted": 1049.0,
+  "emitted": 1596.0,
+  "verify_batches": 547.0,
+  "req_verify_instances": 547.0,
+  "accepted_drafts_per_verify": 1.9177330895795246,
+  "committed_per_verify": 2.917733089579525,
+  "accept_rate": 0.2789893617021277
+ },
+ "q27_pre_code_greedy": {
+  "drafted": 803.0,
+  "accepted": 57.0,
+  "emitted": 282.0,
+  "verify_batches": 225.0,
+  "req_verify_instances": 225.0,
+  "accepted_drafts_per_verify": 0.25333333333333335,
+  "committed_per_verify": 1.2533333333333334,
+  "accept_rate": 0.07098381070983811
+ },
+ "q27_pre_code_sampled": {
+  "drafted": 1265.0,
+  "accepted": 66.0,
+  "emitted": 445.0,
+  "verify_batches": 379.0,
+  "req_verify_instances": 379.0,
+  "accepted_drafts_per_verify": 0.1741424802110818,
+  "committed_per_verify": 1.1741424802110818,
+  "accept_rate": 0.05217391304347826
+ },
+ "q27_pre_prose_greedy": {
+  "drafted": 956.0,
+  "accepted": 65.0,
+  "emitted": 341.0,
+  "verify_batches": 276.0,
+  "req_verify_instances": 276.0,
+  "accepted_drafts_per_verify": 0.23550724637681159,
+  "committed_per_verify": 1.2355072463768115,
+  "accept_rate": 0.06799163179916318
+ }
+}
