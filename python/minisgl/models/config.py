@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Collection, Dict
+from typing import Any, Collection, Dict, Tuple
 from transformers import PretrainedConfig
 
 from minisgl.quant.config import QuantConfig
@@ -135,6 +135,22 @@ class ModelConfig:
     # Gemma: embeddings are scaled by sqrt(hidden_size), CAST TO THE WEIGHT DTYPE before the
     # multiply (fp16 -> 53.0625, not 53.0660). None -> no scaling.
     embed_scale: float | None = None
+    # Muse-Glimmer: the logits are pre-scaled by this BEFORE the tanh softcap, giving
+    # `T * tanh(lm_head(h) * m / T)`. `m = 1/sqrt(hidden/head_dim... ) = 1/sqrt(26)` in the shipping
+    # checkpoint. It lands on the RETURNED logits, so it changes sampling (not just a training-time
+    # loss scale) and any spec-decode verify path has to reproduce it. None -> no pre-scale.
+    output_multiplier: float | None = None
+    # Muse-Glimmer: the two SANDWICH post-norms (post_attention / post_feedforward, which sit on the
+    # sublayer OUTPUT before the residual add) use their own, much tighter epsilon (1e-8) than the
+    # two input-side norms (rms_norm_eps, 1e-5). Two epsilons in one layer is unusual enough that
+    # collapsing them to one is a silent-quality bug. None -> reuse rms_norm_eps everywhere.
+    post_norm_eps: float | None = None
+    # Muse-Glimmer: per-layer RoPE base, where 0 means NoPE — that layer applies NO positional
+    # encoding. Stored as the RAW per-layer list so `nope_layer_ids` can key on it; the nonzero
+    # entries are all the global theta in the shipping checkpoint (the reference implementation only
+    # reads this list as a boolean, so a per-layer NONZERO theta would be silently ignored upstream
+    # too). None -> every layer ropes, which is every other model.
+    layer_rope_theta: Tuple[float, ...] | None = None
     # ---- Block diffusion (DiffusionGemma). The decoder denoises a FIXED-length canvas of this many
     # tokens per block instead of emitting one token per step, so this is not a tuning knob: it sizes
     # the per-request scratch slots, widens the SWA ring stride, and fixes the query count of every
@@ -194,6 +210,25 @@ class ModelConfig:
             and self.layer_types is not None
             and any(t == "sliding_attention" for t in self.layer_types)
         )
+
+    @property
+    def is_muse_glimmer(self) -> bool:
+        """True for the Muse-Glimmer backbone (multimodal wrapper `muse_glimmer` or its unwrapped
+        text config). Text-only here: the vision tower is skipped by the loader, as it is for every
+        other multimodal checkpoint this engine serves."""
+        return self.model_type in ("muse_glimmer", "muse_glimmer_text")
+
+    @property
+    def nope_layer_ids(self) -> Tuple[int, ...]:
+        """Layers that apply NO positional encoding — `layer_rope_theta[i] == 0`. Empty for every
+        model without a per-layer theta list, so the ordinary all-rope path is unchanged. In
+        Muse-Glimmer these coincide exactly with the FULL-attention layers (3, 7, …, 51): the global
+        layers mix context with no positional prior while the sliding layers carry RoPE. They are
+        derived independently rather than aliased to `full_attn_layer_ids`, because the coincidence
+        is a property of this checkpoint's config, not a structural invariant."""
+        if self.layer_rope_theta is None:
+            return ()
+        return tuple(i for i, t in enumerate(self.layer_rope_theta) if not t)
 
     @property
     def is_gemma4(self) -> bool:
@@ -317,6 +352,22 @@ class ModelConfig:
         top = config
         if hasattr(config, "text_config") and config.text_config is not None:
             config = config.text_config
+            # A multimodal wrapper whose `model_type` the installed transformers does NOT register
+            # comes back from the generic `PretrainedConfig.from_dict` fallback with `text_config`
+            # still a plain DICT — the class that would have promoted it does not exist. Promote it
+            # here so the rest of `from_hf` can keep reading fields with `getattr`. Without this the
+            # unwrap below dies on `'dict' object has no attribute 'architectures'`, which is what a
+            # brand-new architecture (Muse-Glimmer on transformers < 5.15) hits FIRST — before any
+            # model code runs, so it reads as "unsupported" rather than "your transformers is old".
+            if isinstance(config, dict):
+                _sub_type = config.get("model_type")
+                config = PretrainedConfig.from_dict(dict(config))
+                # `model_type` is a CLASS attribute, not an __init__ kwarg, so from_dict drops it and
+                # the sub-config would report "" — the same wart cached_load_hf_config works around
+                # for the top-level config. Restore it, or every `model_type`-gated branch below
+                # (is_muse_glimmer, is_cca, …) silently reads the wrong architecture.
+                if _sub_type:
+                    config.model_type = _sub_type
             for attr in ("architectures", "rope_theta", "rope_scaling"):
                 if not getattr(config, attr, None) and getattr(top, attr, None):
                     setattr(config, attr, getattr(top, attr))
@@ -581,6 +632,13 @@ class ModelConfig:
         _is_gemma4 = model_type in (
             "gemma4", "gemma4_text", "diffusion_gemma", "diffusion_gemma_text"
         )
+        _is_muse = model_type in ("muse_glimmer", "muse_glimmer_text")
+        # Muse-Glimmer scales Q by `qk_scale_factor` (3.87) AFTER a weightless QK-norm and BEFORE
+        # attention, ON TOP OF the ordinary head_dim**-0.5 — it replaces neither. Because both Q and
+        # K are RMS-normalised to unit RMS, that factor is what actually sets the softmax
+        # temperature. Folding it into the scale is exact (scaling Q by c then dotting is identical
+        # to scaling the logits by c) and saves a full-tensor multiply per layer.
+        _muse_qk_scale = float(getattr(config, "qk_scale_factor", 3.87)) if _is_muse else None
         # `attention_k_eq_v` decides whether the FULL-attention layers ship a v_proj at all, so
         # getting it wrong is not a tuning error — it changes the parameter set. Gemma4 declares it;
         # DiffusionGemma DELETES it (its @strict config subclass rebinds the field to an
@@ -690,10 +748,21 @@ class ModelConfig:
             # Gemma4 hard-codes scaling=1.0 in its attention (modeling_gemma4.py:1153); the
             # temperature lives in the learned k_norm instead. Every other family leaves this None
             # and keeps the standard head_dim**-0.5.
-            attn_softmax_scale=1.0 if _is_gemma4 else None,
+            attn_softmax_scale=(
+                1.0
+                if _is_gemma4
+                else (_muse_qk_scale * head_dim**-0.5 if _muse_qk_scale is not None else None)
+            ),
             attention_k_eq_v=attention_k_eq_v,
             final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
             embed_scale=(config.hidden_size**0.5) if _is_gemma4 else None,
+            output_multiplier=getattr(config, "output_multiplier", None) if _is_muse else None,
+            post_norm_eps=getattr(config, "post_norm_eps", None) if _is_muse else None,
+            layer_rope_theta=(
+                tuple(_lrt)
+                if _is_muse and isinstance((_lrt := getattr(config, "layer_rope_theta", None)), list)
+                else None
+            ),
             kv_lora_rank=kv_lora_rank,
             q_lora_rank=q_lora_rank,
             qk_nope_head_dim=qk_nope_head_dim,
