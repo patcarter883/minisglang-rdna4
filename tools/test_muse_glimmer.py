@@ -215,6 +215,37 @@ def main() -> int:
         "model.layers.0.mlp.gate_up_proj.weight_packed",
     )
 
+    print("== DFlash aux-capture wiring ==")
+    # The drafter's `fc` concatenates its aux inputs in the order it was trained on, so both the
+    # propagation AND the order are contract, not convenience.
+    CAP = [1, 13, 25, 37, 49]
+    model.set_capture_layers(CAP)
+    check("ids reach the inner model", model.model._capture_layer_ids, CAP)
+    model.set_capture_layers(None)
+    check("None disables capture", model.model._capture_layer_ids, None)
+
+    # The drafter states these at the TOP LEVEL and ships no `dflash_config` sub-dict. Asserting it
+    # here pins the one-line proposer fix: the old `dfc.get("target_layer_ids")` lookup could only
+    # ever have returned None for this checkpoint — and the GGUF's `dflash.target_layers` is the SAME
+    # list off by one (1-indexed), so a wrong-but-plausible answer was sitting right there.
+    hits = glob.glob(
+        os.path.expanduser(
+            "~/.cache/huggingface/hub/models--meta-models--Muse-Glimmer-30B-assistant/snapshots/*/"
+        )
+    )
+    if hits:
+        with open(os.path.join(hits[0], "config.json")) as f:
+            dcfg = json.load(f)
+        check("drafter has NO dflash_config sub-dict", "dflash_config" in dcfg, False)
+        check("drafter target_layer_ids is top-level", dcfg.get("target_layer_ids"), CAP)
+        check("drafter block_size", dcfg.get("block_size"), 16)
+        check("drafter hidden == target hidden", dcfg.get("hidden_size"), mc.hidden_size)
+        # num_aux drives fc's in_features (num_aux*hidden); a mismatch is a silent acceptance killer.
+        check("captured count == drafter layer count", len(CAP), dcfg.get("num_hidden_layers"))
+        check("captured ids are real target layers", all(0 <= i < mc.num_layers for i in CAP), True)
+    else:
+        print("  [skip] drafter not cached")
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}): " + ", ".join(FAILS))

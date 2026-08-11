@@ -90,7 +90,7 @@ case "$MODEL" in
                   mem_default_spec="0.93"
                   swa_hybrid=1 ;;
   # Muse-Glimmer: dense SWA hybrid (39 sliding @2048 + 13 full, the full ones NoPE), NVFP4,
-  # text-only — the vision tower is skipped by the loader. No drafter exists for it, so spec is off.
+  # text-only — the vision tower is skipped by the loader.
   # TP=2 is not a preference: text-only weights are ~19.6 GB (14.2 GB of NVFP4 layers plus an UNTIED
   # bf16 embed and lm_head at 2.69 GB each, both ignore-listed by the quantizer), so it does not fit
   # on one 16 GB card at all. serve.sh cannot enforce TP, so it is stated here and in
@@ -101,8 +101,21 @@ case "$MODEL" in
                   model_id="RedHatAI/Muse-Glimmer-30B-NVFP4";          spec_default="none"
                   tool_format="atem"; min_tp=2
                   # 0.85 mirrors Laguna, the other NVFP4 SWA hybrid: ~9.8 GB/card of weights leaves
-                  # room for a real KV pool. NOT yet validated on hardware — see the port doc.
+                  # room for a real KV pool. Validated booting + serving at TP=2 (83% VRAM).
                   mem_default="0.85"
+                  # DFlash block-diffusion drafter, block_size 16 -> at most 15 drafts per step
+                  # (the block is [anchor, 15 masks]), captured from target layers 1/13/25/37/49.
+                  dflash_draft="meta-models/Muse-Glimmer-30B-assistant"; k_dflash=15
+                  # This drafter is 2.556B / 5.11 GB bf16 — SEVEN TIMES the 737 MB one that already
+                  # forced qwen35b onto fp8, and `_PlainLinear` replicates it on EVERY rank (by
+                  # design: identical argmax per rank means drafts stay in sync with no collective).
+                  # bf16 would leave ~1.1 GB/card for KV+graphs, i.e. it cannot boot. fp8 halves it
+                  # to ~2.56 GB. Lossless in the sense that matters: the target verifies every draft
+                  # token, so weight-only quant can cost ACCEPTANCE, never correctness.
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                    mem_default_spec="0.93"
+                    : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
+                  fi
                   swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"

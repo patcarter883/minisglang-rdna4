@@ -174,7 +174,12 @@ class DFlashProposer(CapturableProposer):
             self._block_size = min(self._block_size, block_cap)
 
         # Captured target-layer ids (z-lab target_layer_ids / speculators aux_hidden_state_layer_ids).
-        ids = dfc.get("target_layer_ids") or getattr(hf, "aux_hidden_state_layer_ids", None)
+        # Read through `cfg`, not `dfc.get`: Muse-Glimmer's assistant checkpoint ships NO
+        # `dflash_config` sub-dict and states `target_layer_ids` at the TOP LEVEL, which both the
+        # sub-dict lookup and the differently-named speculators fallback miss. The assert below then
+        # fires, which is the good outcome — the bad one is capturing the WRONG layers, where
+        # nothing errors and acceptance just quietly degrades.
+        ids = cfg("target_layer_ids", "aux_hidden_state_layer_ids")
         env_ids = os.environ.get("MINISGL_DFLASH_CAPTURE_LAYERS")
         if env_ids:
             ids = [int(x) for x in env_ids.split(",") if x.strip() != ""]
@@ -899,7 +904,22 @@ class DFlashProposer(CapturableProposer):
         if quant_mode:
             logger.info_rank0(f"DFlash drafter: weight-only {quant_mode} quant of the draft linears")
 
+        # Tensor-name DIALECTS for the same trunk. Muse-Glimmer's assistant checkpoint namespaces the
+        # hidden-fusion pair under `encoder.` and spells the norm `output_norm_enc`; the tensors,
+        # their shapes and the math are identical to z-lab's. Aliasing at the key level keeps ONE
+        # loader instead of forking it per vendor — the fork is what the CCA drafter needed, and only
+        # because its LAYERS differed, not its names.
+        aliases = {
+            "fc.weight": ("encoder.fc.weight",),
+            "hidden_norm.weight": ("encoder.output_norm_enc.weight",),
+        }
+
         def assign(mod, leaf, key, quant=False):
+            if key not in sd:
+                for alt in aliases.get(key, ()):
+                    if alt in sd:
+                        key = alt
+                        break
             assert key in sd, f"DFlash ckpt missing {key}"
             t = sd[key].to(self._dtype).contiguous()
             cur = getattr(mod, leaf)
