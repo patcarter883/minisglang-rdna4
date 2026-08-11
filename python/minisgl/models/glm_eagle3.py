@@ -26,21 +26,17 @@ from __future__ import annotations
 from typing import List, Tuple
 
 import torch
-import torch.nn.functional as F
 from minisgl.layers import RMSNorm, get_rope, silu_and_mul
 from minisgl.layers.base import BaseOP
 
 
-class _PlainLinear(BaseOP):
-    """A replicated nn.Linear-shaped weight [out, in] with no bias and no TP sharding. The draft is
-    tiny (278 MB) so it is replicated on every rank; its lm_head over the 32000 draft vocab produces
-    the same argmax on each rank (drafts stay in sync, no collective needed)."""
-
-    def __init__(self, in_features: int, out_features: int) -> None:
-        self.weight = torch.empty(out_features, in_features)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight)
+# The drafter linear now lives in ONE place (models/draft_linear.py), shared by every draft trunk.
+# This was a near-identical COPY of DFlash's class that then diverged, and the divergence cost real
+# things: this copy allocated its scaffold in fp32 ON THE CARD (no device="meta"), and it carried no
+# weight-only quant path at all — so the EAGLE3 drafter could not be quantized, purely because the
+# class had been copy-pasted. Aliased rather than renamed at the 10 call sites, so at tp_size==1 this
+# is a pure consolidation with no behavioural delta.
+from .draft_linear import DraftLinear as _PlainLinear  # noqa: E402
 
 
 class GLMEagle3DraftModel(BaseOP):
