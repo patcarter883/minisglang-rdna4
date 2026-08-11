@@ -42,6 +42,11 @@ PORT="${PORT:-1919}"
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
+# Minimum TP a model's WEIGHTS require. A general knob, not a special case: some checkpoints simply
+# do not fit on one 16 GB card, and the control panel exposes TP as a free dropdown — so picking one
+# of them at TP=1 otherwise dies in a CUDA OOM minutes into weight loading, with nothing in the
+# error pointing at the actual cause.
+min_tp=1
 # Each arm matches the ALIAS *or* the checkpoint id/path, because the two ways of choosing a model
 # produce different strings: typing `MODEL=laguna` gives the alias, while the control panel's model
 # dropdown is populated from the HF cache and hands over the full id. Matching only the alias meant
@@ -94,7 +99,7 @@ case "$MODEL" in
   # the template, but pinning keeps a FORCED tool call off the JSON fallback.
   muse|muse-glimmer|RedHatAI/Muse-Glimmer-30B-NVFP4)
                   model_id="RedHatAI/Muse-Glimmer-30B-NVFP4";          spec_default="none"
-                  tool_format="atem"
+                  tool_format="atem"; min_tp=2
                   # 0.85 mirrors Laguna, the other NVFP4 SWA hybrid: ~9.8 GB/card of weights leaves
                   # room for a real KV pool. NOT yet validated on hardware — see the port doc.
                   mem_default="0.85"
@@ -106,6 +111,13 @@ case "$MODEL" in
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
+# Refuse a TP the weights cannot fit in, rather than OOM'ing several minutes into the load. Says
+# what to do, because the panel's TP dropdown is where this gets chosen wrongly.
+if [ "$TP" -lt "$min_tp" ]; then
+  echo "[serve] ERROR: $model_id needs TP>=$min_tp (its weights do not fit on $TP card(s) at 16 GB);" \
+       "got TP=$TP. Set TP=$min_tp." >&2
+  exit 2
+fi
 
 ATTN="${ATTN:-$attn}"
 # Laguna's 0.85 default leaves too little KV pool once a DFlash drafter AND the verify graphs are
