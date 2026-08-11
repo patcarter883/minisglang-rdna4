@@ -1168,6 +1168,134 @@ def _load_laguna_weight(
     )
 
 
+_MUSE_SKIP_PREFIXES = (
+    "model.vision_tower.",
+    "model.vision_adapter.",
+    "model.vision_projection",
+)
+
+
+def _muse_glimmer_remap(name: str) -> "str | None":
+    """Muse-Glimmer checkpoint key -> native key, or None to skip.
+
+    Only two rules: drop the vision stack (text-only engine), and collapse the transformers-v5
+    `model.language_model.` namespace to the `model.` the decoder is built in. `lm_head.weight` is
+    already top-level. An unrecognised namespace RAISES rather than being silently dropped — a
+    quietly ignored key is how a mis-shaped port loads cleanly and serves garbage."""
+    if name.startswith(_MUSE_SKIP_PREFIXES):
+        return None
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model.") :]
+    if name == "lm_head.weight":
+        return name
+    raise ValueError(f"unexpected Muse-Glimmer checkpoint key: {name}")
+
+
+def _muse_gate_up_merge(key: str):
+    """`mlp.gate_proj`/`mlp.up_proj` -> `mlp.gate_up_proj`. Returns (merged_key, slot) or None.
+
+    Anchored on `.mlp.` ON PURPOSE. Muse-Glimmer has a SECOND, unrelated `gate_proj` — the attention
+    output gate at `self_attn.gate_proj` — and the generic `_gate_up_merge` would sweep it into a
+    `self_attn.gate_up_proj` merge that can never complete (there is no `self_attn.up_proj`)."""
+    for sub, slot in ((".mlp.gate_proj.", "gate"), (".mlp.up_proj.", "up")):
+        if sub in key:
+            return key.replace(sub, ".mlp.gate_up_proj."), slot
+    return None
+
+
+def _shard_muse_glimmer(name: str, t: torch.Tensor, r: int, n: int) -> torch.Tensor:
+    """Rank-r plain-TP shard of a Muse-Glimmer tensor, applied BEFORE the gate/up merge.
+
+    Matching is on the MODULE infix (`.q_proj.`), not on a `.weight` suffix: every linear here is
+    NVFP4, so the leaves are `.weight_packed` / `.weight_scale`, and a suffix match would silently
+    replicate all of them. NVFP4 tensors are not `_AWQ_SUFFIXES`, so — like a bf16 weight —
+    output-parallel splits dim 0 and input-parallel splits dim 1 with no AWQ axis flip: for a
+    (N, K//2) packed weight and its (N, K//16) group scale, both axes stay in step.
+
+      * Column-parallel (dim 0): q/k/v/gate (attention) and mlp gate/up.
+      * Row-parallel (dim 1): o_proj, mlp down.
+      * Vocab-parallel (dim 0): embed_tokens, untied lm_head.
+      * Replicated: every norm.
+    n == 1 is the identity."""
+    if n == 1:
+        return t
+    if name.endswith("layernorm.weight") or name == "model.norm.weight":
+        return t
+    # `.gate_proj.` deliberately covers BOTH the attention gate and the MLP gate: both are
+    # column-parallel over dim 0, so one rule is right for both. Only the MERGE has to tell them
+    # apart, which `_muse_gate_up_merge` does.
+    if any(s in name for s in (".q_proj.", ".k_proj.", ".v_proj.", ".gate_proj.", ".up_proj.")):
+        return t.chunk(n, dim=0)[r].clone()
+    if ".o_proj." in name or ".down_proj." in name:
+        return t.chunk(n, dim=1)[r].clone()
+    if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
+        num_emb = t.shape[0]
+        per = div_ceil(num_emb, n)
+        return t[r * per : min((r + 1) * per, num_emb), :].clone()
+    return t
+
+
+def _load_muse_glimmer_weight(
+    model_folder: str, device: torch.device, config
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for Muse-Glimmer (see docs/MUSE_GLIMMER_PORT.md).
+
+    Dense, so there is no expert stack — the only buffering is the NVFP4 scale/global pair and the
+    MLP gate/up merge, both asserted empty at the end."""
+    tp_info = get_tp_info()
+    files = glob.glob(f"{model_folder}/*.safetensors")
+    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
+    merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    _is_nvfp4 = config.quant is not None and config.quant.is_nvfp4
+    nvfp4_fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for name in f.keys():
+                if name.startswith(_MUSE_SKIP_PREFIXES):
+                    continue  # vision stack: unquantized, so it never enters the fold buffer
+                # NVFP4: fold the e4m3 block scale and the per-tensor global into ONE fp16 per-group
+                # scale at the LEAF — before the rename and before the gate/up merge — so no
+                # per-tensor scalar ever has to survive a concat. weight_packed passes through still
+                # 4-bit; input_global_scale (the FP4 activation calibration) is dropped, because the
+                # e2m1 kernel quantizes activations to fp8 dynamically.
+                override = None
+                if _is_nvfp4:
+                    if name.endswith(".input_global_scale"):
+                        continue
+                    if name.endswith((".weight_scale", ".weight_global_scale")):
+                        base, field = name.rsplit(".", 1)
+                        buf = nvfp4_fold_buf.setdefault(base, {})
+                        buf[field] = f.get_tensor(name)
+                        if len(buf) < 2:
+                            continue
+                        del nvfp4_fold_buf[base]
+                        name = base + ".weight_scale"
+                        override = nvfp4.fold_nvfp4_scale(
+                            buf["weight_scale"], buf["weight_global_scale"]
+                        )
+                native = _muse_glimmer_remap(name)
+                if native is None:
+                    continue
+                tens = override if override is not None else f.get_tensor(name)
+                tens = _shard_muse_glimmer(native, tens, tp_info.rank, tp_info.size)
+                if (mm := _muse_gate_up_merge(native)) is not None:
+                    merged_key, slot = mm
+                    merge_buf.setdefault(merged_key, {})[slot] = tens
+                    if len(merge_buf[merged_key]) != 2:
+                        continue
+                    parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+                    del merge_buf[merged_key]
+                    # Both the packed weight (N, K//2) and its group scale (N, K//16) concat on
+                    # dim 0: the gate/up merge stacks OUTPUT rows, the axis neither tensor packs
+                    # along, so the scale stays row-aligned with the weight it describes.
+                    yield merged_key, torch.cat(parts, dim=0)
+                else:
+                    yield native, tens
+    assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
+    assert not nvfp4_fold_buf, f"incomplete NVFP4 scale/global pairs: {list(nvfp4_fold_buf.keys())}"
+
+
 def load_weight(
     model_path: str, device: torch.device, spec_algorithm: str = "mtp"
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -1196,6 +1324,13 @@ def load_weight(
     # routed into the Laguna loader, whose remap and TP sharding are Laguna-specific.
     if config.is_gemma4:
         yield from _load_gemma4_weight(model_folder, device, config)
+        return
+    # MUST precede the is_swa_hybrid branch, for the same reason Gemma4 does: Muse-Glimmer is also
+    # a SWA hybrid, so it would otherwise be routed into the Laguna loader, whose remap (no
+    # `model.language_model.` namespace, no vision skip) and TP sharding (suffix-matched on
+    # `.weight`, which no NVFP4 leaf ends in) are both wrong for it.
+    if config.is_muse_glimmer:
+        yield from _load_muse_glimmer_weight(model_folder, device, config)
         return
     if config.is_swa_hybrid:
         yield from _load_laguna_weight(model_folder, device, config)

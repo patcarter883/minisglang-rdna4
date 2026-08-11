@@ -20,6 +20,9 @@ _MODEL_REGISTRY = {
     "Gemma4ForConditionalGeneration": (".gemma4", "Gemma4ForConditionalGeneration"),
     "Gemma4ForCausalLM": (".gemma4", "Gemma4ForConditionalGeneration"),
     "DiffusionGemmaForBlockDiffusion": (".diffusion_gemma", "DiffusionGemmaForBlockDiffusion"),
+    # Muse-Glimmer is a vision model; like every other multimodal checkpoint served here, only its
+    # text decoder is built (the loader skips the vision tower).
+    "MuseGlimmerForConditionalGeneration": (".muse_glimmer", "MuseGlimmerForConditionalGeneration"),
 }
 
 

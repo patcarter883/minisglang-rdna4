@@ -701,7 +701,12 @@ class ModelConfig:
             hidden_size=config.hidden_size,
             vocab_size=config.vocab_size,
             intermediate_size=intermediate_size,
-            hidden_act=getattr(config, "hidden_act", "silu"),
+            # The Gemma lineage (and Muse-Glimmer, which inherits its config shape) spells this
+            # `hidden_activation`; everyone else spells it `hidden_act`. Read both rather than let
+            # the "silu" default silently paper over a checkpoint that asked for gelu.
+            hidden_act=getattr(config, "hidden_act", None)
+            or getattr(config, "hidden_activation", None)
+            or "silu",
             rms_norm_eps=rms_norm_eps,
             tie_word_embeddings=tie_word_embeddings,
             # SWA models (Laguna) override this with the FULL-attention rope (yarn); the sliding
