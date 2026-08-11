@@ -96,6 +96,12 @@ class DraftLinear(BaseOP):
         self._w4s = None  # [in/16, out] fp16 group scale, GROUP-MAJOR (nvfp4)
         self._comm = DistributedCommunicator() if shard == SHARD_ROW else None
 
+    @property
+    def full_shape(self) -> tuple:
+        """Shape of the FULL checkpoint tensor this linear consumes. Loaders must assert against
+        this, not against `weight.shape`, which is the local shard once sharding is on."""
+        return (self.full_out, self.full_in)
+
     # ---- loading -------------------------------------------------------------------------------
     def _slice(self, w: torch.Tensor) -> torch.Tensor:
         """Take this rank's slice of a FULL [out, in] checkpoint tensor."""

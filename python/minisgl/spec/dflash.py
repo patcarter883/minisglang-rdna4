@@ -840,6 +840,13 @@ class DFlashProposer(CapturableProposer):
         def put(mod, leaf, key):
             assert key in sd, f"Laguna DFlash ckpt missing {key}"
             t = sd[key].to(self._dtype).contiguous()
+            # A DraftLinear may be TP-SHARDED, so it must slice the FULL checkpoint tensor itself;
+            # a bare setattr would install the whole matrix on every rank and silently un-shard it.
+            if hasattr(mod, "full_shape") and leaf == "weight":
+                assert tuple(mod.full_shape) == tuple(t.shape), (
+                    f"shape mismatch {key}: model {tuple(mod.full_shape)} vs ckpt {tuple(t.shape)}")
+                mod.load(t, self._device)
+                return
             cur = getattr(mod, leaf)
             assert cur.shape == t.shape, (
                 f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
@@ -853,8 +860,9 @@ class DFlashProposer(CapturableProposer):
         for i, an in enumerate(d.aux_hidden_norms):
             put(an, "weight", f"aux_hidden_norms.{i}.weight")
 
-        q_dim = d.layers[0].q_dim
-        kv_dim = d.layers[0].kv_dim
+        # FULL dims: the fused checkpoint tensor is whole, and each DraftLinear shards its own slice.
+        q_dim = d.layers[0].full_q_dim
+        kv_dim = d.layers[0].full_kv_dim
         for i, layer in enumerate(d.layers):
             p = f"layers.{i}."
             put(layer.input_layernorm, "weight", p + "input_layernorm.weight")
@@ -866,9 +874,9 @@ class DFlashProposer(CapturableProposer):
             assert qkv.shape[0] == q_dim + 2 * kv_dim, (
                 f"qkv rows {qkv.shape[0]} != q{q_dim}+2*kv{kv_dim}"
             )
-            layer.q_proj.weight = qkv[:q_dim].contiguous().to(self._device)
-            layer.k_proj.weight = qkv[q_dim:q_dim + kv_dim].contiguous().to(self._device)
-            layer.v_proj.weight = qkv[q_dim + kv_dim:].contiguous().to(self._device)
+            layer.q_proj.load(qkv[:q_dim].contiguous(), self._device)
+            layer.k_proj.load(qkv[q_dim:q_dim + kv_dim].contiguous(), self._device)
+            layer.v_proj.load(qkv[q_dim + kv_dim:].contiguous(), self._device)
             put(layer.o_proj, "weight", p + "self_attn.o_proj.weight")
             put(layer.g_proj, "weight", p + "self_attn.g_proj.weight")
             put(layer.q_norm, "weight", p + "self_attn.q_norm.weight")
@@ -938,13 +946,17 @@ class DFlashProposer(CapturableProposer):
                         break
             assert key in sd, f"DFlash ckpt missing {key}"
             t = sd[key].to(self._dtype).contiguous()
-            cur = getattr(mod, leaf)
-            assert cur.shape == t.shape, (
-                f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
+            want = mod.full_shape if (hasattr(mod, "full_shape") and leaf == "weight") \
+                else getattr(mod, leaf).shape
+            assert tuple(want) == tuple(t.shape), (
+                f"shape mismatch {key}: model {tuple(want)} vs ckpt {tuple(t.shape)}"
             )
             if quant and quant_mode:
-                # t on CPU -> packed on GPU; mode is per-LEAF (see `mode_for`).
+                # t on CPU -> packed on GPU; mode is per-LEAF (see `mode_for`). load_quant slices to
+                # this rank BEFORE quantizing, so a shard's per-output-channel scales are its own.
                 mod.load_quant(t, mode_for(key), self._dtype, self._device)
+            elif hasattr(mod, "full_shape") and leaf == "weight":
+                mod.load(t, self._device)   # may be TP-sharded; it slices the full tensor itself
             else:
                 setattr(mod, leaf, t.to(self._device))
 

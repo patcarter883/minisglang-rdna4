@@ -48,7 +48,8 @@ from minisgl.layers.base import BaseOP
 # The class body that used to sit here moved there verbatim, plus a TP `shard` policy; the weight
 # FORMAT (bf16 / fp8 / int8 / nvfp4-e2m1) stays a load policy on that one core, never a subclass,
 # per KERNEL_CORE_POLICY.md. Aliased so the 12 call sites below are untouched.
-from .draft_linear import DraftLinear as _PlainLinear  # noqa: E402
+from .draft_linear import (  # noqa: E402
+    SHARD_COL, SHARD_NONE, SHARD_ROW, DraftLinear as _PlainLinear)
 
 
 class _DFlashLayer(BaseOP):
@@ -72,34 +73,53 @@ class _DFlashLayer(BaseOP):
         gated: bool = False,
         sliding_window: int = 0,
     ) -> None:
+        from minisgl.distributed import get_tp_info
+
+        tp = get_tp_info()
+        # ATTENTION sharding needs BOTH head counts to divide the TP size: the GQA group mapping
+        # (q head h reads kv head h // group) is only preserved when both split by the same factor.
+        # If either does not divide, attention stays REPLICATED and only the MLP shards — which is
+        # where most of the mass is anyway, so the fallback is degraded, not useless.
+        self._attn_sharded = (
+            tp.size > 1 and num_heads % tp.size == 0 and num_kv_heads % tp.size == 0)
+        _asplit = tp.size if self._attn_sharded else 1
+
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        # LOCAL head counts — every reshape/einsum below is expressed in these, so the attention math
+        # is per-rank by construction and needs no other edit.
+        self.num_heads = num_heads // _asplit
+        self.num_kv_heads = num_kv_heads // _asplit
         self.head_dim = head_dim
-        self.q_dim = num_heads * head_dim
-        self.kv_dim = num_kv_heads * head_dim
+        self.q_dim = self.num_heads * head_dim
+        self.kv_dim = self.num_kv_heads * head_dim
+        # FULL dims are kept for the LOADERS: a checkpoint tensor always arrives whole and
+        # DraftLinear.load()/load_quant() slice it to this rank.
+        self.full_q_dim = num_heads * head_dim
+        self.full_kv_dim = num_kv_heads * head_dim
         self.scale = head_dim ** -0.5
         self._rotary = rotary
+        _acol = SHARD_COL if self._attn_sharded else SHARD_NONE
+        _arow = SHARD_ROW if self._attn_sharded else SHARD_NONE
         # Laguna gated attention: a per-head SOFTPLUS output gate (self_attn.g_proj [num_heads, hidden])
         # applied to the attention output before o_proj — matches the base LagunaAttention. Qwen3 z-lab
         # drafters have no gate (gated=False) and this path is byte-identical to before.
         self.gated = gated
         self.sliding_window = sliding_window
-        self.g_proj = _PlainLinear(hidden_size, num_heads) if gated else None
+        self.g_proj = _PlainLinear(hidden_size, num_heads, shard=_acol) if gated else None
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.q_proj = _PlainLinear(hidden_size, self.q_dim)
-        self.k_proj = _PlainLinear(hidden_size, self.kv_dim)
-        self.v_proj = _PlainLinear(hidden_size, self.kv_dim)
-        self.o_proj = _PlainLinear(self.q_dim, hidden_size)
+        self.q_proj = _PlainLinear(hidden_size, self.full_q_dim, shard=_acol)
+        self.k_proj = _PlainLinear(hidden_size, self.full_kv_dim, shard=_acol)
+        self.v_proj = _PlainLinear(hidden_size, self.full_kv_dim, shard=_acol)
+        self.o_proj = _PlainLinear(self.full_q_dim, hidden_size, shard=_arow)
         # Per-head RMSNorm over head_dim (plain-weight; both the Qwen3 z-lab draft and the Laguna
         # draft use the plain-weight convention, NOT the (1+weight) Qwen3.5 one).
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
-        self.gate_proj = _PlainLinear(hidden_size, intermediate_size)
-        self.up_proj = _PlainLinear(hidden_size, intermediate_size)
-        self.down_proj = _PlainLinear(intermediate_size, hidden_size)
+        self.gate_proj = _PlainLinear(hidden_size, intermediate_size, shard=SHARD_COL)
+        self.up_proj = _PlainLinear(hidden_size, intermediate_size, shard=SHARD_COL)
+        self.down_proj = _PlainLinear(intermediate_size, hidden_size, shard=SHARD_ROW)
 
     def _mlp(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj.forward(x)
