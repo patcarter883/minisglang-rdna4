@@ -364,3 +364,82 @@ swept. No throughput numbers taken — this was a correctness bring-up.
 `message/`, `scheduler/`, or `core.Batch` at all, and image parts are currently dropped silently at
 the API boundary (`Message._flatten_content_parts`). Serving a *vision* model text-only should be a
 stated limitation, not a surprise.
+
+## 10. DFlash — lands, boots, and is NOT worth enabling yet
+
+The drafter is `meta-models/Muse-Glimmer-30B-assistant` (2.556B, 5 layers, block_size 16, captured
+target layers 1/13/25/37/49). Structurally it is the SAME trunk minisgl already runs for Qwen3.6 —
+2 norms/layer, learned q/k_norm, separate q/k/v/o, SwiGLU, `fc` + hidden-norm fusion — so
+`models/dflash.py` is reused wholesale; only names and dialect differ.
+
+The GGUF repo is llama.cpp-only and is NOT loadable here (Q4_K is an ASYMMETRIC super-block format;
+our e2m1 core is symmetric, so it cannot ride the shared kernel as a load policy). It was still
+useful twice: as evidence that 4-bit is the intended deployment, and as a second opinion on the
+capture-layer indexing.
+
+### It only fits at 4-bit
+
+Measured, on 2x16 GB with the target at ~11.7-12.6 GiB/card:
+
+| drafter | reserve | outcome |
+|---|---|---|
+| bf16 | ~5.5 GiB | cannot size a KV pool |
+| fp8 | 3.08 GiB | cannot size a KV pool, even at CONC=2 / ratio 0.95 |
+| **nvfp4 (down_proj fp8)** | **2.09 GiB** | **boots**: KV 23,248 tokens, VRAM 94% |
+
+So fp8 is not a viable intermediate step here, and there is no fp8 acceptance baseline to compare
+against — a confound that could not be designed away.
+
+Two engine bugs had to be fixed to get there, both general:
+- `_PlainLinear.__init__` allocated its `torch.empty` scaffold in **fp32 on the card** (the drafter
+  is built under `with torch.device(cuda)`), then had every tensor overwritten by the loader. At the
+  ~1 GB drafters the class was written for that was a wasteful ~2 GiB transient; at 2.556B it is
+  **10.2 GiB** and the drafter OOMs during construction. Now built on `meta`.
+- `_draft_model_bytes` scaled the on-disk bf16 size by a flat `//2` for ANY quant mode, which
+  over-reserves nvfp4 by ~0.8 GiB — on a 16 GB card, exactly the margin 4-bit exists to buy.
+
+Plus: `MINISGL_DRAFT_RESERVE*` and `MINISGL_DFLASH_CAPTURE_LAYERS` were not forwarded by compose, so
+setting them on the host looked like it worked and did nothing; and both reserve knobs parsed an
+unset-through-compose value (the empty string) straight into `float("")`.
+
+### The measurement, sampled and greedy
+
+| config | tok/s | mean accept-len |
+|---|---|---|
+| plain decode (sampled) | 25.6 / 25.9 | — |
+| DFlash nvfp4 (sampled) | 16.6 / 22.9 | 1.11 - 1.29 |
+| DFlash nvfp4 (greedy)  | 25.6 / 25.9 | 1.20 - 1.22 |
+
+Against K=15 an accept-len of ~1.2 is very poor; the adaptive verify width never once selects 15.
+**DFlash currently buys nothing** — a wash at greedy, a loss when sampled.
+
+### What has been ruled out
+
+- **Capture-layer indexing.** The safetensors config says `[1,13,25,37,49]`; the GGUF build of the
+  same drafter says `[2,14,26,38,50]`. A/B'd with everything else held fixed: 1.12 vs 1.11. Not it.
+- **Verify mode / draft-distribution scale.** Greedy verify is argmax-based and scale-invariant, and
+  it still gives ~1.2. So the logit-transform mismatch below is not the dominant cause.
+
+### Known defect, still unfixed
+
+The drafter's head calls `lm_head.logits_all_rows` DIRECTLY, bypassing
+`MuseGlimmerForConditionalGeneration._logits` — so draft logits carry neither `output_multiplier`
+(1/sqrt(26)) nor the tanh softcap, making the draft distribution ~5x sharper than the target's.
+Greedy verify is immune (both transforms are monotone), which is why the test above did not move,
+but **sampled rejection verify and DDTree top-K marginals both compare distributions** and are
+therefore wrong. This must be fixed before any acceptance number here is trusted as a measure of the
+drafter rather than of the mismatch.
+
+### Remaining suspects, in order
+
+1. That logit-transform mismatch (affects the sampled numbers above, not the greedy ones).
+2. 4-bit quantization of a **5-layer** drafter — a flat ~0.095 relative L2 on every tensor, with no
+   depth for errors to average out. `tools/dflash_quant_probe.py` shows every leaf quantizing
+   identically, so there is no obvious tensor to spend more bits on. Note this could NOT be A/B'd:
+   neither bf16 nor fp8 fits.
+3. A port bug in how the block is driven (anchor/mask layout, prefix-KV positions).
+
+`down_proj` is held at fp8 mirroring Meta's Q6_K choice. Stated honestly: the weight-error probe
+does NOT independently support that carve-out (down_proj measures marginally the *best* of any
+leaf); it is followed on the vendor's recipe plus the known post-SwiGLU activation-outlier mechanism,
+which a weight-norm probe cannot observe. Cost is +0.27 GiB.

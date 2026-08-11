@@ -948,8 +948,10 @@ class Engine:
         bf16 >= an fp8 runtime). Resolved from the HF cache without downloading under ``HF_HUB_OFFLINE``.
         Override with ``MINISGL_DRAFT_RESERVE_GB=<float>`` (e.g. to correct an fp8-runtime vs bf16-on-disk
         mismatch, or to reserve when the checkpoint can't be sized here)."""
-        override = os.environ.get("MINISGL_DRAFT_RESERVE_GB")
-        if override is not None:
+        # Truthiness, NOT `is not None`: compose forwards an unset variable as the empty string, so
+        # `is not None` would accept "" and crash in float(""). Empty means "not set".
+        override = (os.environ.get("MINISGL_DRAFT_RESERVE_GB") or "").strip()
+        if override:
             return int(float(override) * (1 << 30))
         sc = config.spec_config
         draft_path = getattr(sc, "draft_model_path", None) if sc is not None else None
@@ -963,14 +965,28 @@ class Engine:
             for name in os.listdir(folder):
                 if name.endswith(".safetensors"):
                     total += os.path.getsize(os.path.join(folder, name))  # follows symlink into blobs/
-            # MINISGL_DFLASH_QUANT=fp8|int8 weight-only quantizes the draft linears to ~half memory.
-            if (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip():
-                total //= 2
+            # MINISGL_DFLASH_QUANT weight-only quantizes the draft linears. On-disk is bf16, so scale
+            # by what the mode actually keeps. This MUST track the mode: a flat //2 was right while
+            # fp8/int8 were the only options, but it over-reserves an nvfp4 drafter by ~0.8 GiB —
+            # which on a 16 GB card is the whole margin a 4-bit drafter exists to buy, so the reserve
+            # alone would leave the KV pool unsizable and the boot would fail anyway.
+            _mode = (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip().lower()
+            if _mode in ("fp8", "int8"):
+                total //= 2  # 1 byte/param vs bf16's 2
+            elif _mode == "nvfp4":
+                # 4-bit codes + an fp16 per-16-element group scale = 4.5 bits/param, but the
+                # sensitive leaves stay fp8 (see `_load_draft_weights`), so budget 6 bits = 3/8 of
+                # bf16. Deliberately a slight OVER-estimate of the measured 1.61 GiB: under-reserving
+                # does not fail at boot, it fails later in the drafter's eager forward.
+                total = total * 3 // 8
             # + working-set headroom for the drafter's EAGER forward (DFlash denoise / EAGLE3 step) and
             # its spec-verify transient. This is NOT covered by the captured-graph reserve (propose runs
             # eager for DFlash/EAGLE3), and it is the ~340 MB that OOMs a tight 27B+DFlash boot at warmup
             # (past capture). Default 0.7 GB; tune via MINISGL_DRAFT_RESERVE_MARGIN_GB (0 disables).
-            margin = int(float(os.environ.get("MINISGL_DRAFT_RESERVE_MARGIN_GB", "0.7")) * (1 << 30))
+            # `or "0.7"` AFTER strip, not a get() default: compose forwards an unset variable as the
+            # EMPTY STRING, which satisfies the default and then explodes in float("").
+            _m = (os.environ.get("MINISGL_DRAFT_RESERVE_MARGIN_GB") or "").strip() or "0.7"
+            margin = int(float(_m) * (1 << 30))
             return total + margin
         except Exception as e:  # noqa: BLE001 — sizing must never block boot
             logger.warning_rank0(

@@ -897,8 +897,24 @@ class DFlashProposer(CapturableProposer):
         # a big drafter replicated on every 16 GB card). Load to CPU so the fp16 transient stays in
         # host RAM and only the 1-byte packed weight lands on GPU (the load-time OOM peak is the issue).
         quant_mode = (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip().lower() or None
-        if quant_mode not in (None, "fp8", "int8"):
-            raise ValueError(f"MINISGL_DFLASH_QUANT must be fp8|int8, got {quant_mode!r}")
+        if quant_mode not in (None, "fp8", "int8", "nvfp4"):
+            raise ValueError(f"MINISGL_DFLASH_QUANT must be fp8|int8|nvfp4, got {quant_mode!r}")
+        # MIXED precision under nvfp4. Meta's own GGUF build of the Muse-Glimmer drafter is not
+        # uniform: Q4_K everywhere except `ffn_down`, which they hold at Q6_K (and every norm at
+        # F32). Mirror that carve-out.
+        #
+        # Note honestly that a weight-error probe does NOT reproduce their choice —
+        # tools/dflash_quant_probe.py measures every leaf of this drafter at the same relative L2
+        # (~0.095 nvfp4 vs ~0.027 fp8, a flat 3.6x), with down_proj marginally the BEST. That is a
+        # limitation of the proxy, not evidence against the carve-out: down_proj's sensitivity is an
+        # ACTIVATION-outlier property (its input is post-SwiGLU), which a weight-norm probe cannot
+        # see. So this follows the vendor's recipe plus that mechanism, and costs +0.27 GiB.
+        _FP8_LEAVES = ("down_proj",)
+
+        def mode_for(key: str) -> str:
+            if quant_mode != "nvfp4":
+                return quant_mode
+            return "fp8" if any(f".{leaf}." in key for leaf in _FP8_LEAVES) else "nvfp4"
         sd = st.load_file(path, device="cpu" if quant_mode else str(self._device))
         d = self._draft
         if quant_mode:
@@ -927,7 +943,8 @@ class DFlashProposer(CapturableProposer):
                 f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
             )
             if quant and quant_mode:
-                mod.load_quant(t, quant_mode, self._dtype, self._device)  # t on CPU -> packed on GPU
+                # t on CPU -> packed on GPU; mode is per-LEAF (see `mode_for`).
+                mod.load_quant(t, mode_for(key), self._dtype, self._device)
             else:
                 setattr(mod, leaf, t.to(self._device))
 

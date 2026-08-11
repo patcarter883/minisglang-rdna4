@@ -120,8 +120,23 @@ x-lean-common: &lean-common
     # Reasoning + structured output: gate the JSON grammar until </think> (default on). Set 0 to
     # apply the schema from token 0 even with thinking on (the pre-fix behavior / A-B toggle).
     MINISGL_GRAMMAR_THINK_GATE: "${MINISGL_GRAMMAR_THINK_GATE:-1}"
-    # DFlash drafter weight-only quant (fp8|int8) — halves the replicated drafter to fit big pairs.
+    # DFlash drafter weight-only quant (fp8|int8|nvfp4) — shrinks the replicated drafter to fit big
+    # pairs. nvfp4 is 4-bit weights riding the shared W4A8 core; fp8/int8 are 1 byte/param.
     MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
+    # Draft-model VRAM RESERVE overrides. Forwarded because the engine reads them from os.environ
+    # INSIDE the container: with no passthrough entry they are silently unset there, so the only
+    # documented lever for a mis-estimated drafter reserve could not be pulled through the normal
+    # launch path at all — setting it on the host looked like it worked and did nothing.
+    # _GB replaces the whole reserve; _MARGIN_GB tunes only the eager working-set headroom (0.7 GB
+    # default), which is the generous part once the drafter is small and quantized.
+    MINISGL_DRAFT_RESERVE_GB: "${MINISGL_DRAFT_RESERVE_GB:-}"
+    MINISGL_DRAFT_RESERVE_MARGIN_GB: "${MINISGL_DRAFT_RESERVE_MARGIN_GB:-}"
+    # Override the target layers whose hidden states feed the drafter's `fc`. Forwarded so the
+    # indexing convention can be A/B'd: a drafter records these in its own config, but conventions
+    # differ between builds of the SAME drafter (Muse-Glimmer's safetensors config says
+    # [1,13,25,37,49] while its GGUF says [2,14,26,38,50]) — and capturing the wrong set does not
+    # error, it just quietly halves acceptance, which is indistinguishable from a bad drafter.
+    MINISGL_DFLASH_CAPTURE_LAYERS: "${MINISGL_DFLASH_CAPTURE_LAYERS:-}"
     # DDTree: route DFlash through the drafter-agnostic draft-TREE step (per-position top-K marginals
     # -> best-first tree -> ancestor-mask verify) for a higher accept-len than the linear K chain.
     # Forwarded so the scheduler's os.environ read sees it inside the container; topk/budget default
