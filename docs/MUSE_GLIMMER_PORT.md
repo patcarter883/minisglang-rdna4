@@ -273,18 +273,31 @@ Verified: single call with surrounding prose (content cleanly stripped, `days` c
 parallel calls with a nested-JSON argument, and an unclosed block. Hermes JSON, Qwen3 XML and plain
 prose all parse unchanged, and `tools/tool_call_reasoning_split_check.py` passes.
 
-**Not yet written:**
-1. **Strip the leading turn header from `content`.** Verified failure: a reply with *no* reasoning
-   comes back as `content=" to=user<|message|>Hello!"`. The generation prompt ends mid-header at
-   `<|start|>assistant`, so every completion opens with ` to=<recipient><|message|>`; only the
-   reasoning path currently consumes it, as part of the close delimiter.
+### The answer-turn header
 
-   This was deliberately **not** bolted onto `ReasoningParser.parse`: doing so would fix the
-   non-streaming path and leave streaming — the primary serve path — still emitting the header,
-   which is worse than a uniformly missing feature. It wants its own derivation (the header marker
-   is recoverable from the derived opener, which ends in `<|message|>`) applied in both
-   `parse` and `ReasoningStreamState`.
-2. Numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU lease.
+Muse-Glimmer's generation prompt stops MID-HEADER at `<|start|>assistant`, so the model writes the
+recipient itself. A reply with no reasoning therefore begins ` to=user<|message|>` — markup that
+would have been served as the first characters of the answer. (The reasoning path never saw it:
+there it is part of the close delimiter.)
+
+`derive_turn_header` recovers it by the same subtract-the-generation-prompt technique as the opener:
+render an assistant turn carrying only content, and whatever the model must emit before it can start
+answering is left over. Two guards, because a false positive here eats the head of an answer — the
+result must contain markup (`<`), and must not contain either reasoning delimiter (a template that
+renders an empty pre-closed think span into its assistant turns would otherwise hand back
+`<think></think>` as a "header", and stripping that would defeat the reasoning split entirely).
+
+Applied in **both** lanes: `ReasoningParser.parse`, and the streaming head-probe, which now watches
+for the header alongside the opener — they share a prefix (` to=self…` vs ` to=user…`), so giving up
+on the opener must not release a half-matched header into `content`. The opener wins when both
+match. Streamed output was verified byte-identical to non-streaming at chunk sizes 3, 7 and 1000,
+i.e. including boundaries that split the header and the opener mid-token.
+
+Across every cached checkpoint (Qwen3, Qwen3.5, GLM-4.7, Laguna, ZAYA1, Gemma-4, Instella) the
+derived header is `""` — only Muse-Glimmer has one.
+
+**Not yet written:** numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU
+lease, so both were out of scope while the cards were held by the live serve.
 
 **Deferred:** the vision tower. It is greenfield for this engine — there is no image path in
 `message/`, `scheduler/`, or `core.Batch` at all, and image parts are currently dropped silently at
