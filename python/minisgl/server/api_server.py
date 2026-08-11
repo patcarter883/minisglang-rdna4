@@ -299,6 +299,9 @@ def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
     if fmt == "gemma_native":
         ebnf = _gemma_native_grammar(tools, forced_name)  # native <|tool_call>call:…, not JSON
         return json.dumps({"__ebnf__": ebnf}) if ebnf else None
+    if fmt == "atem":
+        ebnf = _atem_xml_grammar(tools, forced_name)  # native <atem:invoke> XML, not JSON
+        return json.dumps({"__ebnf__": ebnf}) if ebnf else None
     variants = _tool_call_variants(tools, forced_name)
     if not variants:
         return None
@@ -335,6 +338,50 @@ def _zaya_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str 
         f"fname ::= {fname_alt}",
         "params ::= param*",
         'param ::= "<parameter=" pname ">\\n" pval "\\n</parameter>\\n"',
+        f"pname ::= {pname_alt}",
+        "pval ::= [^<]*",
+    ])
+
+
+def _atem_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str | None:
+    """EBNF constraining Muse-Glimmer's NATIVE tool call to its trained ATEM format:
+
+        <atem:function_calls>\\n<atem:invoke name="NAME">\\n
+        (<atem:parameter name="P">VALUE</atem:parameter>\\n)*
+        </atem:invoke>\\n</atem:function_calls>
+
+    Mirrors `_zaya_xml_grammar`: NAMES are constrained to the allowed tools and known parameters (so
+    the structure is guaranteed parseable by `_parse_tool_calls`) while VALUES stay permissive so the
+    model is not boxed in on content. Params are any-order/any-subset — a fixed order would reject
+    valid calls.
+
+    Only ONE `<atem:invoke>` is emitted under constraint even though the format admits several in a
+    block (that is how it expresses parallel calls). Forcing a call is a request for *a* call; the
+    unconstrained "auto" path still parses as many as the model emits.
+
+    `pval` excludes `<` for the same reason ZAYA's does — it is what terminates the value — so a
+    value containing a literal `<` cannot be emitted under constraint. That is a real limitation of
+    a delimiter-terminated format, shared with every other native grammar here, and it applies only
+    when a call is FORCED."""
+    fns: List[str] = []
+    pnames: set[str] = set()
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name or (forced_name and name != forced_name):
+            continue
+        fns.append(name)
+        pnames.update((fn.get("parameters") or {}).get("properties", {}) or {})
+    if not fns:
+        return None
+    fname_alt = " | ".join(_ebnf_lit(n) for n in fns)
+    pname_alt = " | ".join(_ebnf_lit(p) for p in sorted(pnames)) if pnames else _ebnf_lit("_")
+    return "\n".join([
+        'root ::= "<atem:function_calls>\\n<atem:invoke name=\\"" fname "\\">\\n" params '
+        '"</atem:invoke>\\n</atem:function_calls>"',
+        f"fname ::= {fname_alt}",
+        "params ::= param*",
+        'param ::= "<atem:parameter name=\\"" pname "\\">" pval "</atem:parameter>\\n"',
         f"pname ::= {pname_alt}",
         "pval ::= [^<]*",
     ])
@@ -427,9 +474,9 @@ def _derive_tool_format() -> str | None:
 
     The template is the fact: it is what turns a `tool_calls` message into bytes, so whatever it emits
     around the call IS this checkpoint's native format. Only a shape the forced path can actually
-    CONSTRAIN is reported — today that is Gemma-4's `<|tool_call>call:NAME{…}`; everything else
-    returns None and keeps the JSON default, so this can never downgrade a family it does not
-    recognise."""
+    CONSTRAIN is reported — today Gemma-4's `<|tool_call>call:NAME{…}` and Muse-Glimmer's ATEM XML;
+    everything else returns None and keeps the JSON default, so this can never downgrade a family it
+    does not recognise."""
     tok = _frontend_tokenizer()
     if tok is None:
         return None
@@ -441,6 +488,8 @@ def _derive_tool_format() -> str | None:
         return None
     if "<|tool_call>call:" in rendered:
         return "gemma_native"
+    if "<atem:invoke" in rendered:
+        return "atem"
     return None
 
 
@@ -495,6 +544,9 @@ def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> Li
 # UNCONSTRAINED for Gemma-4 (the model picks the format; `_parse_gemma_tool_call` reads it), and the
 # native format is guaranteed on the FORCED path instead, via `_gemma_native_grammar`. Closing this
 # properly needs per-tag EBNF support in xgrammar, which structural tags do not have today.
+# Muse-Glimmer's ATEM XML is omitted for the SAME reason: its body is `<atem:parameter name="k">v`
+# elements, not JSON. It likewise stays unconstrained under `auto` (parsed by the `_ATEM_INVOKE_RE`
+# scan) and is guaranteed on the forced path by `_atem_xml_grammar`.
 _TOOL_STRUCT_WRAPPERS = (
     ("<zyphra_tool_call>", "</zyphra_tool_call>"),
     ("<tool_call>", "</tool_call>"),
@@ -1191,6 +1243,22 @@ _XML_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", r
 # the primary path; this is a fallback. `[/?zyphra_tool_call]` square wrappers are normalized to angle
 # in `_parse_tool_calls` before the block scan.
 _INLINE_FN_RE = re.compile(r"<function\s*=\s*([A-Za-z_][\w.]*)\s*\((.*?)\)\s*/?>", re.DOTALL)
+# (F) Muse-Glimmer native ATEM XML:
+#   <atem:function_calls><atem:invoke name="NAME">
+#     <atem:parameter name="KEY">VALUE</atem:parameter>…
+#   </atem:invoke>…</atem:function_calls>
+# Scanned per-INVOKE rather than per-block, because ONE block expresses N parallel calls — which the
+# shared `_add(inner)` path (one body -> one call) cannot represent. The block regex exists only to
+# strip the wrapper out of `content` afterwards.
+_ATEM_BLOCK_RE = re.compile(r"<atem:function_calls>.*?</atem:function_calls>", re.DOTALL)
+_ATEM_INVOKE_RE = re.compile(r'<atem:invoke\s+name="([^"]*)"\s*>(.*?)</atem:invoke>', re.DOTALL)
+_ATEM_PARAM_RE = re.compile(
+    r'<atem:parameter\s+name="([^"]*)"\s*>(.*?)</atem:parameter>', re.DOTALL
+)
+# An unclosed ATEM block (model truncated mid-call). Recovered like the other unclosed wrappers.
+_ATEM_UNCLOSED_RE = re.compile(r"<atem:function_calls>(?!.*</atem:function_calls>)(.*)$", re.DOTALL)
+# Dangling ATEM wrapper tags left after the invokes are lifted out.
+_ATEM_ORPHAN_RE = re.compile(r"</?atem:function_calls>")
 _SQUARE_WRAP_RE = re.compile(r"\[(/?(?:" + "|".join(_TOOL_WRAPPERS) + r"))\]")
 # (D) Laguna native tool args: `<arg_key>NAME</arg_key><arg_value>VALUE</arg_value>` pairs (NOT the
 # Qwen3 `<parameter=…>` form). The call is `<tool_call>fname<arg_key>…</arg_key><arg_value>…` — a bare
@@ -1340,6 +1408,16 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
                 return call["name"], call.get("arguments", {})
         except json.JSONDecodeError:
             pass
+    # (F) Muse-Glimmer ATEM XML. Only the FIRST invoke, because this function's contract is one body
+    # -> one call. That is exact for the streaming path (which is where it is reached from: a block
+    # is withheld until its closer, then handed here), and the NON-streaming path never relies on it
+    # — `_parse_tool_calls` scans invokes directly, so a parallel call yields every one of them.
+    atem = _ATEM_INVOKE_RE.search(inner)
+    if atem and atem.group(1).strip():
+        return (
+            atem.group(1).strip(),
+            {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(atem.group(2))},
+        )
     fn = _XML_FN_RE.search(inner)  # (B) Qwen3 XML: <function=NAME>…<parameter=…>…</function>
     if fn:
         args = {k.strip(): _coerce(v.strip()) for k, v in _XML_PARAM_RE.findall(fn.group(2))}
@@ -1388,6 +1466,24 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     # regex catches it (a deviation from the trained `<zyphra_tool_call>`; if the model also dropped the
     # closer, the bare/inline scans below still recover the inner `<function=…>`).
     text = _SQUARE_WRAP_RE.sub(r"<\1>", text)
+    # (F) ATEM invokes, scanned FIRST and independently: one `<atem:function_calls>` block can carry
+    # several `<atem:invoke>`s (that is how the format spells parallel calls), so each invoke becomes
+    # its own tool call rather than being funnelled through the one-body-one-call `_add`.
+    for m in _ATEM_INVOKE_RE.finditer(text):
+        name = m.group(1).strip()
+        if not name:
+            continue
+        # Values are NOT stripped: the format's own instructions state that spaces in string values
+        # are significant. `_coerce` still lifts JSON/number/bool forms, and it tolerates the
+        # surrounding whitespace a multi-line value carries.
+        args = {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
+        tool_calls.append(
+            {
+                "id": f"call_{uid}_{len(tool_calls)}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }
+        )
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         _add(m.group(1))
     # (E) Gemma-4's asymmetric `<|tool_call>…<tool_call|>` block — a separate scan because its closer
@@ -1408,6 +1504,26 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
     # JSON/XML is already complete this recovers a real tool call, and when it genuinely is truncated we
     # say so in the log instead of silently passing markup off as the model's answer.
     if not tool_calls:
+        # An ATEM block that opened but whose LAST invoke never closed: the complete invokes before
+        # it were already taken above, so reaching here means none completed. Retry the tail against
+        # the invoke scanner in case only the outer `</atem:function_calls>` is missing.
+        atem_open = _ATEM_UNCLOSED_RE.search(text)
+        if atem_open:
+            for m in _ATEM_INVOKE_RE.finditer(atem_open.group(1)):
+                name = m.group(1).strip()
+                if not name:
+                    continue
+                args = {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
+                tool_calls.append(
+                    {
+                        "id": f"call_{uid}_{len(tool_calls)}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(args)},
+                    }
+                )
+            if tool_calls:
+                return (text[: atem_open.start()].strip() or None), tool_calls
+    if not tool_calls:
         unclosed = _GEMMA_TOOL_UNCLOSED_RE.search(text) or _UNCLOSED_WRAP_RE.search(text)
         if unclosed:
             before = len(tool_calls)
@@ -1421,8 +1537,11 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
             )
     if not tool_calls:
         return text, []
-    content = _GEMMA_TOOL_BLOCK_RE.sub("", text)
+    content = _ATEM_BLOCK_RE.sub("", _GEMMA_TOOL_BLOCK_RE.sub("", text))
     content = _INLINE_FN_RE.sub("", _BARE_FN_BLOCK_RE.sub("", _TOOL_CALL_BLOCK_RE.sub("", content)))
+    # Lift out any invoke that survived (an ATEM block whose wrapper was malformed) plus the
+    # wrapper tags themselves, so no `<atem:…>` markup is ever passed off as the model's prose.
+    content = _ATEM_ORPHAN_RE.sub("", _ATEM_INVOKE_RE.sub("", content))
     content = _ORPHAN_WRAP_RE.sub("", content).strip()  # drop any dangling wrapper opener/closer
     return (content or None), tool_calls
 
@@ -1436,11 +1555,22 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
 # ORDER MATTERS: `<|tool_call>` must precede `<tool_call>`. They are different strings (the pipe sits
 # INSIDE the angle bracket) so neither contains the other, but keeping the Gemma opener first makes the
 # asymmetry explicit to anyone extending this table — its closer is `<tool_call|>`, NOT `</…>`.
-_TOOL_OPENERS = ("<|tool_call>", "<tool_call>", "<zyphra_tool_call>", "<tools>", "<function=")
+_TOOL_OPENERS = (
+    "<|tool_call>",
+    "<tool_call>",
+    "<zyphra_tool_call>",
+    "<atem:function_calls>",
+    "<tools>",
+    "<function=",
+)
 _TOOL_CLOSERS = {
     "<|tool_call>": "<tool_call|>",  # Gemma-4: asymmetric, pipe-inside
     "<tool_call>": "</tool_call>",
     "<zyphra_tool_call>": "</zyphra_tool_call>",
+    # Muse-Glimmer ATEM. The closer is the BLOCK's, not the invoke's, so a parallel call (several
+    # `<atem:invoke>`s in one block) is withheld and emitted as one complete set — matching the
+    # non-streaming parser, which also scans invokes within the whole block.
+    "<atem:function_calls>": "</atem:function_calls>",
     "<tools>": "</tools>",
     "<function=": "</function>",
 }

@@ -249,15 +249,42 @@ and bad — a reasoning reply truncated at `max_tokens` was reported as a finish
 raw chain-of-thought as `content`. Now lstripped on both sides; `<think>` behaviour is byte-identical
 and `tools/tool_call_reasoning_split_check.py` passes.
 
+### ATEM tool calls
+
+`api_server.py` gained format `atem`, following the Gemma-4/ZAYA pattern exactly:
+
+- `_derive_tool_format` reports `"atem"` when the rendered probe contains `<atem:invoke`.
+- `_parse_tool_calls` scans **per-invoke**, not per-block: one `<atem:function_calls>` block carries
+  N `<atem:invoke>`s, which is how the format spells parallel calls, and the shared one-body-one-call
+  `_add` path cannot represent that. Includes unclosed-block recovery.
+- `_parse_one_tool_call` gets a first-invoke branch for the streaming path (which withholds a block
+  until its closer, then hands it over whole).
+- `_atem_xml_grammar` constrains the FORCED path to the native shape. Without it, `fmt == "atem"`
+  would have fallen through to `_tool_call_variants` and forced a JSON call this model was never
+  trained to emit.
+- ATEM is deliberately **absent** from `_TOOL_STRUCT_WRAPPERS`, for the same reason Gemma-4 is: a
+  structural tag forces the body to a JSON *schema*, and an ATEM body is `<atem:parameter>` elements.
+  `auto` therefore stays unconstrained and is read back by the parser.
+
+Parameter values are **not** stripped — the format's own instructions state that spaces in string
+values are significant.
+
+Verified: single call with surrounding prose (content cleanly stripped, `days` coerced to int),
+parallel calls with a nested-JSON argument, and an unclosed block. Hermes JSON, Qwen3 XML and plain
+prose all parse unchanged, and `tools/tool_call_reasoning_split_check.py` passes.
+
 **Not yet written:**
 1. **Strip the leading turn header from `content`.** Verified failure: a reply with *no* reasoning
    comes back as `content=" to=user<|message|>Hello!"`. The generation prompt ends mid-header at
-   `<|start|>assistant`, so every completion opens with ` to=<recipient><|message|>`. Only the
-   reasoning path currently consumes it (as part of the close delimiter).
-2. **ATEM tool calls** (§7) — parser + EBNF grammar + `_derive_tool_format` detection. Until then a
-   tool call arrives as `content=" to=get_weather<|message|><atem:function_calls>…"` rather than as
-   `tool_calls`. Follow `_zaya_xml_grammar`, whose native format is structurally near-identical.
-3. Numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU lease.
+   `<|start|>assistant`, so every completion opens with ` to=<recipient><|message|>`; only the
+   reasoning path currently consumes it, as part of the close delimiter.
+
+   This was deliberately **not** bolted onto `ReasoningParser.parse`: doing so would fix the
+   non-streaming path and leave streaming — the primary serve path — still emitting the header,
+   which is worse than a uniformly missing feature. It wants its own derivation (the header marker
+   is recoverable from the derived opener, which ends in `<|message|>`) applied in both
+   `parse` and `ReasoningStreamState`.
+2. Numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU lease.
 
 **Deferred:** the vision tower. It is greenfield for this engine — there is no image path in
 `message/`, `scheduler/`, or `core.Batch` at all, and image parts are currently dropped silently at
