@@ -122,6 +122,22 @@ case "$MODEL" in
                     : "${MINISGL_DFLASH_QUANT:=nvfp4}"; export MINISGL_DFLASH_QUANT
                   fi
                   swa_hybrid=1 ;;
+  # Qwen3.6-27B + the z-lab DFlash drafter. The drafter is the TIED-VOCAB z-lab dialect (no own
+  # embed/lm_head/d2t — it borrows the target's), non-causal and UNWINDOWED, so it attends its whole
+  # prefix bidirectionally and takes the EAGER per-uid propose path rather than the captured ring
+  # (spec/dflash.py: that is a checkpoint property, not a switch). Its config states no block_size,
+  # so block = SPEC_K + 1 and k_dflash=15 gives the block of 16 the other DFlash pairs use.
+  #
+  # NO quant default, deliberately, unlike muse/qwen35b. The drafter is ~1.73B (5L, hidden 5120,
+  # inter 17408) = ~3.5 GB bf16, which SHARDS to ~1.9 GiB/card (models/draft_linear.py) against a
+  # 27B INT4 target costing ~6.8 GiB/card at TP=2. That fits with room, so this pair does not need
+  # to trade acceptance for footprint — set MINISGL_DFLASH_QUANT explicitly to measure the arms.
+  qwen27b|cyankiwi/Qwen3.6-27B-AWQ-INT4)
+                  model_id="cyankiwi/Qwen3.6-27B-AWQ-INT4";            spec_default="none"
+                  dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
+  qwen27b-nvfp4|cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4)
+                  model_id="cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4";      spec_default="none"
+                  dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"

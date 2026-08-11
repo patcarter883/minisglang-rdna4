@@ -971,6 +971,8 @@ class Engine:
             # which on a 16 GB card is the whole margin a 4-bit drafter exists to buy, so the reserve
             # alone would leave the KV pool unsizable and the boot would fail anyway.
             _mode = (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip().lower()
+            if _mode in ("none", "bf16", "off"):
+                _mode = ""   # explicit "no quant" sentinel — reserve the full bf16 size
             if _mode in ("fp8", "int8"):
                 total //= 2  # 1 byte/param vs bf16's 2
             elif _mode == "nvfp4":
@@ -979,6 +981,20 @@ class Engine:
                 # bf16. Deliberately a slight OVER-estimate of the measured 1.61 GiB: under-reserving
                 # does not fail at boot, it fails later in the drafter's eager forward.
                 total = total * 3 // 8
+            # TP-SHARDED drafter: the decoder-layer linears (q/k/v/o, gate/up/down) are split across
+            # ranks (models/draft_linear.py), so each card holds roughly 1/tp of them. NOT everything
+            # shards — `fc` (num_aux*hidden -> hidden), every norm, and any tensor whose dimension
+            # does not divide tp stay REPLICATED — so scale only the sharded fraction and keep the
+            # rest whole. 0.20 replicated is a deliberate OVER-estimate (Muse-Glimmer's fc is ~9% of
+            # the drafter): over-reserving merely costs KV pool, while under-reserving does not fail
+            # at boot, it fails later inside the drafter's eager forward. Correct it exactly with
+            # MINISGL_DRAFT_RESERVE_GB if a checkpoint's split is known.
+            from minisgl.distributed import get_tp_info
+
+            _tp = get_tp_info().size
+            if _tp > 1:
+                _REPLICATED = 0.20
+                total = int(total * (_REPLICATED + (1.0 - _REPLICATED) / _tp))
             # + working-set headroom for the drafter's EAGER forward (DFlash denoise / EAGLE3 step) and
             # its spec-verify transient. This is NOT covered by the captured-graph reserve (propose runs
             # eager for DFlash/EAGLE3), and it is the ~340 MB that OOMs a tight 27B+DFlash boot at warmup

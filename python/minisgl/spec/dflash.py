@@ -840,6 +840,13 @@ class DFlashProposer(CapturableProposer):
         def put(mod, leaf, key):
             assert key in sd, f"Laguna DFlash ckpt missing {key}"
             t = sd[key].to(self._dtype).contiguous()
+            # A DraftLinear may be TP-SHARDED, so it must slice the FULL checkpoint tensor itself;
+            # a bare setattr would install the whole matrix on every rank and silently un-shard it.
+            if hasattr(mod, "full_shape") and leaf == "weight":
+                assert tuple(mod.full_shape) == tuple(t.shape), (
+                    f"shape mismatch {key}: model {tuple(mod.full_shape)} vs ckpt {tuple(t.shape)}")
+                mod.load(t, self._device)
+                return
             cur = getattr(mod, leaf)
             assert cur.shape == t.shape, (
                 f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
@@ -853,8 +860,9 @@ class DFlashProposer(CapturableProposer):
         for i, an in enumerate(d.aux_hidden_norms):
             put(an, "weight", f"aux_hidden_norms.{i}.weight")
 
-        q_dim = d.layers[0].q_dim
-        kv_dim = d.layers[0].kv_dim
+        # FULL dims: the fused checkpoint tensor is whole, and each DraftLinear shards its own slice.
+        q_dim = d.layers[0].full_q_dim
+        kv_dim = d.layers[0].full_kv_dim
         for i, layer in enumerate(d.layers):
             p = f"layers.{i}."
             put(layer.input_layernorm, "weight", p + "input_layernorm.weight")
@@ -866,9 +874,9 @@ class DFlashProposer(CapturableProposer):
             assert qkv.shape[0] == q_dim + 2 * kv_dim, (
                 f"qkv rows {qkv.shape[0]} != q{q_dim}+2*kv{kv_dim}"
             )
-            layer.q_proj.weight = qkv[:q_dim].contiguous().to(self._device)
-            layer.k_proj.weight = qkv[q_dim:q_dim + kv_dim].contiguous().to(self._device)
-            layer.v_proj.weight = qkv[q_dim + kv_dim:].contiguous().to(self._device)
+            layer.q_proj.load(qkv[:q_dim].contiguous(), self._device)
+            layer.k_proj.load(qkv[q_dim:q_dim + kv_dim].contiguous(), self._device)
+            layer.v_proj.load(qkv[q_dim + kv_dim:].contiguous(), self._device)
             put(layer.o_proj, "weight", p + "self_attn.o_proj.weight")
             put(layer.g_proj, "weight", p + "self_attn.g_proj.weight")
             put(layer.q_norm, "weight", p + "self_attn.q_norm.weight")
@@ -897,8 +905,17 @@ class DFlashProposer(CapturableProposer):
         # a big drafter replicated on every 16 GB card). Load to CPU so the fp16 transient stays in
         # host RAM and only the 1-byte packed weight lands on GPU (the load-time OOM peak is the issue).
         quant_mode = (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip().lower() or None
+        # EXPLICIT "do not quantize" sentinel. The empty string cannot express it: compose forwards
+        # an unset variable as "", and tools/serve.sh then does `: "${MINISGL_DFLASH_QUANT:=nvfp4}"`
+        # — and `:=` substitutes when the variable is unset OR EMPTY. So through the normal launch
+        # path an unquantized drafter was UNREACHABLE, and asking for one silently served nvfp4
+        # (caught by a reserve of 1.37 GiB where bf16 needs ~3.15, and legs byte-identical to the
+        # nvfp4 arm). A non-empty sentinel survives `:=`, so bf16 becomes expressible.
+        if quant_mode in ("none", "bf16", "off"):
+            quant_mode = None
         if quant_mode not in (None, "fp8", "int8", "nvfp4"):
-            raise ValueError(f"MINISGL_DFLASH_QUANT must be fp8|int8|nvfp4, got {quant_mode!r}")
+            raise ValueError(
+                f"MINISGL_DFLASH_QUANT must be fp8|int8|nvfp4|none, got {quant_mode!r}")
         # MIXED precision under nvfp4. Meta's own GGUF build of the Muse-Glimmer drafter is not
         # uniform: Q4_K everywhere except `ffn_down`, which they hold at Q6_K (and every norm at
         # F32). Mirror that carve-out.
@@ -915,7 +932,17 @@ class DFlashProposer(CapturableProposer):
             if quant_mode != "nvfp4":
                 return quant_mode
             return "fp8" if any(f".{leaf}." in key for leaf in _FP8_LEAVES) else "nvfp4"
-        sd = st.load_file(path, device="cpu" if quant_mode else str(self._device))
+        # ALWAYS stage in HOST RAM, never straight to the card. The old form
+        # (`device="cpu" if quant_mode else str(self._device)`) put the WHOLE checkpoint on EVERY
+        # rank whenever the drafter was unquantized, so:
+        #   * TP sharding bought nothing at load time — each rank still materialised the full
+        #     checkpoint before slicing it (this OOM'd Qwen3.6-27B's 3.45 GB bf16 drafter at 14.28
+        #     of 15.92 GiB, trying to allocate 170 MiB);
+        #   * and under expandable_segments the freed staging stays RESERVED, which is the same
+        #     failure `_load_laguna_weights` already documents and avoids.
+        # Staging on CPU and moving each FINAL (already-sliced, already-quantized) tensor to the card
+        # keeps the peak at one tensor, not one checkpoint.
+        sd = st.load_file(path, device="cpu")
         d = self._draft
         if quant_mode:
             logger.info_rank0(f"DFlash drafter: weight-only {quant_mode} quant of the draft linears")
@@ -938,13 +965,17 @@ class DFlashProposer(CapturableProposer):
                         break
             assert key in sd, f"DFlash ckpt missing {key}"
             t = sd[key].to(self._dtype).contiguous()
-            cur = getattr(mod, leaf)
-            assert cur.shape == t.shape, (
-                f"shape mismatch {key}: model {tuple(cur.shape)} vs ckpt {tuple(t.shape)}"
+            want = mod.full_shape if (hasattr(mod, "full_shape") and leaf == "weight") \
+                else getattr(mod, leaf).shape
+            assert tuple(want) == tuple(t.shape), (
+                f"shape mismatch {key}: model {tuple(want)} vs ckpt {tuple(t.shape)}"
             )
             if quant and quant_mode:
-                # t on CPU -> packed on GPU; mode is per-LEAF (see `mode_for`).
+                # t on CPU -> packed on GPU; mode is per-LEAF (see `mode_for`). load_quant slices to
+                # this rank BEFORE quantizing, so a shard's per-output-channel scales are its own.
                 mod.load_quant(t, mode_for(key), self._dtype, self._device)
+            elif hasattr(mod, "full_shape") and leaf == "weight":
+                mod.load(t, self._device)   # may be TP-sharded; it slices the full tensor itself
             else:
                 setattr(mod, leaf, t.to(self._device))
 
