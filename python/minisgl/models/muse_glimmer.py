@@ -204,12 +204,35 @@ class MuseGlimmerModel(BaseOP):
         # reference keeps it unfused from the embedding matrix on purpose, so the DFlash drafter can
         # embed without it.
         self._embed_norm = RMSNormNoScale(eps=config.rms_norm_eps)
+        # Spec-decode aux capture: decoder-layer ids whose output hidden is stashed (None = off).
+        self._capture_layer_ids: "list[int] | None" = None
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def set_capture_layers(self, ids: "list[int] | None") -> None:
+        self._capture_layer_ids = list(ids) if ids else None
+
+    def forward(
+        self, input_ids: torch.Tensor, return_hidden: bool = False
+    ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor | None]":
         h = self._embed_norm.forward(self.embed_tokens.forward(input_ids))
-        for layer in self.layers.op_list:
+        # Aux capture is OFF unless return_hidden AND layers are programmed: zero cost otherwise.
+        cap = self._capture_layer_ids if return_hidden else None
+        cap_set = set(cap) if cap else None
+        grabbed: "dict[int, torch.Tensor]" = {}
+        for lid, layer in enumerate(self.layers.op_list):
             h = layer.forward(h)
-        return self.norm.forward(h)
+            if cap_set is not None and lid in cap_set:
+                # The layer's RETURN VALUE is the output hidden, full stop — this decoder threads a
+                # plain `x` and does its residual adds internally (sandwich norms forbid the fused
+                # rmsnorm+residual-add). So there is no `x` vs `x + residual` ambiguity here, and no
+                # equivalent of EAGLE3's MINISGL_EAGLE3_AUX_MODE toggle is needed or meaningful.
+                grabbed[lid] = h.clone()
+        final = self.norm.forward(h)
+        if return_hidden:
+            # Stack in the PROGRAMMED id order, not sorted order: the drafter's `fc` concatenates its
+            # aux inputs in the order it was trained on, so this ordering is part of the contract.
+            aux_stack = torch.stack([grabbed[i] for i in cap], dim=0) if cap else None
+            return final, aux_stack
+        return final
 
 
 class MuseGlimmerForConditionalGeneration(BaseLLMModel):
@@ -244,11 +267,14 @@ class MuseGlimmerForConditionalGeneration(BaseLLMModel):
 
     def forward(self, return_hidden: bool = False):
         input_ids = get_global_ctx().batch.input_ids
-        hidden = self.model.forward(input_ids)
         if return_hidden:
-            # No aux-hidden capture: this model has no draft head wired up yet.
-            return self._logits(hidden), hidden, None
-        return self._logits(hidden)
+            # last_hidden = post-final-norm hidden (pre-lm_head); aux = stacked captured layers.
+            hidden, aux_hidden = self.model.forward(input_ids, return_hidden=True)
+            return self._logits(hidden), hidden, aux_hidden
+        return self._logits(self.model.forward(input_ids))
+
+    def set_capture_layers(self, ids: "list[int] | None") -> None:
+        self.model.set_capture_layers(ids)
 
 
 __all__ = ["MuseGlimmerForConditionalGeneration"]
