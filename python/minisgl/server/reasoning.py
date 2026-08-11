@@ -129,8 +129,15 @@ class ReasoningParser:
         """Does this COMPLETION open its own reasoning span? True when the model emitted the opener
         itself because the template did not (Gemma-4 thinking-on renders a bare ``<|turn>model\\n``
         and lets the model write ``<|channel>thought``). Without this, such an output truncated
-        before its close tag would be reported as a finished answer that is really raw scratch."""
-        return bool(self.start_token) and text.lstrip().startswith(self.start_token)
+        before its close tag would be reported as a finished answer that is really raw scratch.
+
+        Both sides are lstripped. The opener is not always a tag: a channel-routed family opens its
+        reasoning with a RECIPIENT (Muse-Glimmer's `` to=self<|message|>``, whose leading space is
+        part of the delimiter because the generation prompt ends mid-header at ``<|start|>assistant``).
+        Stripping only `text` would compare a space-led delimiter against space-stripped text and
+        never match — which is precisely the truncated-reasoning case this method exists to catch,
+        so the failure would be a full chain-of-thought served as the answer."""
+        return bool(self.start_token) and text.lstrip().startswith(self.start_token.lstrip())
 
     def parse(self, text: str, thinking_open: bool = False) -> Tuple[Optional[str], str]:
         """Split ``text`` into ``(reasoning_content, content)``.
@@ -533,6 +540,80 @@ def derive_delimiters(tokenizer) -> Optional[Tuple[str, str, str]]:
         return None
 
 
+# Probe for `derive_delimiters_from_history`. The marker strings only have to be findable in the
+# render and absent from the template's own boilerplate; they are never tokenized.
+_RSN_MARK = "ZQREASONINGZQ"
+_ANS_MARK = "ZQANSWERZQ"
+_HISTORY_PROBE = [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "reasoning_content": _RSN_MARK, "content": _ANS_MARK},
+]
+
+
+def derive_delimiters_from_history(tokenizer) -> Optional[Tuple[str, str, str]]:
+    """Derive ``(open, close, how)`` by rendering an assistant turn that CARRIES reasoning.
+
+    Complements `derive_delimiters`, which diffs the `enable_thinking` branch of the generation
+    prompt. That method sees nothing when a template has no such branch — either because the model
+    is always-thinking, or because it spells the reasoning strength some other way (Muse-Glimmer's
+    `reasoning_strength`). But such a template still has to RE-RENDER prior reasoning when it
+    appears in history, and to do that it must emit the very delimiters we are looking for. So:
+    hand it a turn with `reasoning_content` and read the markup straight off the result.
+
+    This is more direct evidence than the thinking-off diff, not less — it is the template stating
+    the pair rather than us inferring it from an absence — but it runs SECOND because it depends on
+    the `reasoning_content` history convention, which not every template implements.
+
+    It also handles a family the pair-of-tags model otherwise cannot: one where reasoning is a
+    separate TURN rather than a span inside one. Muse-Glimmer renders
+    ``<|start|>assistant to=self<|message|>R<|eom|><|start|>assistant<|message|>A<|eot|>``, which
+    yields ``open=" to=self<|message|>"`` and ``close="<|eom|><|start|>assistant<|message|>"`` —
+    delimiters that bracket the reasoning exactly as ``<think>``/``</think>`` do, even though
+    neither is a tag.
+
+    The opener has the GENERATION PROMPT stripped off its front, because the model's completion
+    starts after that prompt: Muse-Glimmer's prompt already ends ``<|start|>assistant``, so the
+    model itself only ever emits the `` to=self<|message|>`` part.
+    """
+    try:
+        rendered = tokenizer.apply_chat_template(
+            _HISTORY_PROBE, tokenize=False, add_generation_prompt=False
+        )
+    except Exception:  # noqa: BLE001 — a template that rejects the probe tells us nothing
+        return None
+    if not isinstance(rendered, str):
+        return None
+    ri, ai = rendered.find(_RSN_MARK), rendered.find(_ANS_MARK)
+    if ri < 0 or ai <= ri:
+        # No reasoning_content support (the marker never appeared), or the template emitted the
+        # answer first. Either way there is no bracketing to read.
+        return None
+    close = rendered[ri + len(_RSN_MARK) : ai]
+    head = rendered[:ri]
+    try:
+        genp = tokenizer.apply_chat_template(
+            _PROBE_MESSAGES, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:  # noqa: BLE001
+        genp = ""
+    # Strip whatever the generation prompt already supplies. The two renders share the same system
+    # block and the same user turn, so their common prefix IS the prompt the model conditions on.
+    common = 0
+    if isinstance(genp, str):
+        limit = min(len(head), len(genp))
+        while common < limit and head[common] == genp[common]:
+            common += 1
+    start = head[common:]
+    # A delimiter has to be non-empty and carry real markup. Bail rather than return something
+    # degenerate: `parse` treats an absent close tag as "no reasoning", which is the safe outcome,
+    # whereas a junk close tag would split an answer in half.
+    if not close.strip() or not start.strip():
+        return None
+    if len(close) > 200 or len(start) > 200:
+        return None
+    return start, close, "chat template (assistant turn carrying reasoning_content)"
+
+
 def resolve_reasoning_parser(
     tokenizer, requested: str = "auto", declared: Optional[str] = None
 ) -> Tuple[Optional[ReasoningParser], str]:
@@ -562,7 +643,7 @@ def resolve_reasoning_parser(
     if requested and requested != "auto":
         return get_reasoning_parser(requested), f"--reasoning-parser {requested}"
     if tokenizer is not None:
-        derived = derive_delimiters(tokenizer)
+        derived = derive_delimiters(tokenizer) or derive_delimiters_from_history(tokenizer)
         if derived is not None:
             start, end, how = derived
             return ReasoningParser(start, end), f"derived from {how}"

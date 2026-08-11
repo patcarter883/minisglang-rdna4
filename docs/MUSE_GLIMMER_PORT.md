@@ -161,8 +161,21 @@ Token ids: `<|start|>` 200022, `<|message|>` 200023, `<|eom|>` 200007, `<|eot|>`
 ends a *turn* and generation continues with a new `<|start|>assistant` header. A stop-string
 implementation truncates every reasoning reply at the end of its thinking.
 
-The existing `ReasoningParser` (open/close token pair) does map onto this cleanly:
-`start_token=" to=self<|message|>"`, `end_token="<|eom|><|start|>assistant<|message|>"`.
+The existing `ReasoningParser` (open/close token pair) does map onto this cleanly, and the pair is
+now **derived**, not tabulated — see §8. Note the answer turn renders ` to=user`, because the
+template defaults `recipient` to `user` and always emits it:
+
+```
+open  = " to=self<|message|>"
+close = "<|eom|><|start|>assistant to=user<|message|>"
+```
+
+The leading space in the opener is load-bearing: the generation prompt ends mid-header at
+`<|start|>assistant`, so the model's completion begins with ` to=…`.
+
+`minisgl`'s detokenizer calls `batch_decode` without `skip_special_tokens`, so these markers do
+survive into the text the parser sees. That is a dependency worth knowing about — turning special-
+token skipping on anywhere in that path would erase the delimiters and silently disable the split.
 
 Tool-call payload is Anthropic-style XML:
 ```
@@ -175,6 +188,7 @@ Tool-call payload is Anthropic-style XML:
 Structurally close to ZAYA's native `<zyphra_tool_call><function=…><parameter=…>` — the EBNF grammar
 in `_zaya_xml_grammar` and its parser are the template to follow, registered through
 `_derive_tool_format` (which probes the rendered template) rather than a named special case.
+
 
 ## 8. Status
 
@@ -200,12 +214,50 @@ sliding_window 2048, `attn_softmax_scale = 0.3420629053989924`, `final_logit_sof
 `output_multiplier = 0.196116…`, `post_norm_eps = 1e-8`, `is_swa_hybrid = True`,
 `nope_layer_ids == full_attn_layer_ids == (3, 7, …, 51)`, quant NVFP4 group-16.
 
+- `models/muse_glimmer.py` — the decoder, `models/weight.py::_load_muse_glimmer_weight` + its
+  dispatch (which must precede `is_swa_hybrid`, like Gemma4's), and the `register.py` entry.
+- `server/reasoning.py` — `derive_delimiters_from_history`, plus an `opens_span` fix (below).
+
+**`tools/test_muse_glimmer.py`** is the CPU-only gate: per-layer plan, meta-instantiation of all 52
+layers, TP=2 shard shapes for the NVFP4 packed/scale pair, and a full key-set diff of the model
+against the real checkpoint index — **939 keys, zero missing, zero extra**. That diff is the check
+that would otherwise only fire after a multi-minute load on a leased GPU.
+
+### Reasoning delimiters are DERIVED, not tabulated
+
+`derive_delimiters` diffs a template's `enable_thinking` branch. Muse-Glimmer has no such branch (it
+spells the knob `reasoning_strength`), so that method correctly sees nothing and the resolver would
+have fallen through to the generic `<think>`/`</think>` — delimiters this model never emits, leaving
+the raw channel markup in `content`.
+
+Rather than add a table row (which the file explicitly forbids: *"if derivation cannot see the
+model's delimiters, the fix is to make the derivation see them"*), `derive_delimiters_from_history`
+adds a second, general mechanism: **render an assistant turn carrying `reasoning_content` and read
+the bracketing straight off the result.** Any template that supports reasoning in history must
+re-emit its own delimiters to do so. It runs second only because it depends on that convention.
+
+Measured across every cached checkpoint — Qwen3, Qwen3.5, GLM-4.7, Laguna, ZAYA1, Gemma-4 — **all
+still resolve through the original path, unchanged**. Muse-Glimmer now derives:
+```
+open  = " to=self<|message|>"
+close = "<|eom|><|start|>assistant to=user<|message|>"
+```
+
+The `opens_span` fix is a genuine latent bug this exposed: it compared `text.lstrip()` against an
+**un**-stripped `start_token`, so a space-led opener could never match. The failure mode is specific
+and bad — a reasoning reply truncated at `max_tokens` was reported as a finished answer, serving the
+raw chain-of-thought as `content`. Now lstripped on both sides; `<think>` behaviour is byte-identical
+and `tools/tool_call_reasoning_split_check.py` passes.
+
 **Not yet written:**
-1. `models/muse_glimmer.py` — the decoder (§2 is the spec).
-2. `models/weight.py::_load_muse_glimmer_weight` + the `load_weight` dispatch line, and the
-   `models/register.py` entry for `MuseGlimmerForConditionalGeneration`.
-3. Serve-side chat format (§7).
-4. Numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU lease.
+1. **Strip the leading turn header from `content`.** Verified failure: a reply with *no* reasoning
+   comes back as `content=" to=user<|message|>Hello!"`. The generation prompt ends mid-header at
+   `<|start|>assistant`, so every completion opens with ` to=<recipient><|message|>`. Only the
+   reasoning path currently consumes it (as part of the close delimiter).
+2. **ATEM tool calls** (§7) — parser + EBNF grammar + `_derive_tool_format` detection. Until then a
+   tool call arrives as `content=" to=get_weather<|message|><atem:function_calls>…"` rather than as
+   `tool_calls`. Follow `_zaya_xml_grammar`, whose native format is structurally near-identical.
+3. Numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU lease.
 
 **Deferred:** the vision tower. It is greenfield for this engine — there is no image path in
 `message/`, `scheduler/`, or `core.Batch` at all, and image parts are currently dropped silently at
