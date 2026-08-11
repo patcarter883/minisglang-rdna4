@@ -84,6 +84,21 @@ case "$MODEL" in
                   dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85"
                   mem_default_spec="0.93"
                   swa_hybrid=1 ;;
+  # Muse-Glimmer: dense SWA hybrid (39 sliding @2048 + 13 full, the full ones NoPE), NVFP4,
+  # text-only — the vision tower is skipped by the loader. No drafter exists for it, so spec is off.
+  # TP=2 is not a preference: text-only weights are ~19.6 GB (14.2 GB of NVFP4 layers plus an UNTIED
+  # bf16 embed and lm_head at 2.69 GB each, both ignore-listed by the quantizer), so it does not fit
+  # on one 16 GB card at all. serve.sh cannot enforce TP, so it is stated here and in
+  # docs/MUSE_GLIMMER_PORT.md rather than left to OOM at load.
+  # tool_format=atem pins its native <atem:invoke> XML. Auto-derivation reaches the same answer from
+  # the template, but pinning keeps a FORCED tool call off the JSON fallback.
+  muse|muse-glimmer|RedHatAI/Muse-Glimmer-30B-NVFP4)
+                  model_id="RedHatAI/Muse-Glimmer-30B-NVFP4";          spec_default="none"
+                  tool_format="atem"
+                  # 0.85 mirrors Laguna, the other NVFP4 SWA hybrid: ~9.8 GB/card of weights leaves
+                  # room for a real KV pool. NOT yet validated on hardware — see the port doc.
+                  mem_default="0.85"
+                  swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"

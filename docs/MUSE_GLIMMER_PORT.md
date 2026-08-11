@@ -296,8 +296,69 @@ i.e. including boundaries that split the header and the opener mid-token.
 Across every cached checkpoint (Qwen3, Qwen3.5, GLM-4.7, Laguna, ZAYA1, Gemma-4, Instella) the
 derived header is `""` — only Muse-Glimmer has one.
 
-**Not yet written:** numeric parity vs the reference, then a TP=2 serve bring-up. Both need a GPU
-lease, so both were out of scope while the cards were held by the live serve.
+## 9. Parity and serve bring-up — both PASS
+
+### Layer parity vs the real reference
+
+`tools/muse_glimmer_layer_parity_cpu.py` compares minisgl's decoder layer against
+`transformers==5.15.0`'s own `MuseGlimmerTextDecoderLayer`, weight-for-weight, fp32, CPU-only. The
+only substitution is `AttentionLayer.forward` (its paged HIP kernel needs a GPU and the engine's
+global context); the stand-in performs the same steps in the same order, so the q/k/v/gate/o_proj
+wiring, the gate's argument and application point, the QK-norm, the scale fold and NoPE all stay
+under test. The attention kernel itself is shared with Laguna/Gemma4 and already validated.
+
+```
+L0/L1/L2 (sliding, RoPE)   max|Δ| = 2.6e-06 … 3.0e-06
+L3       (full,    NoPE)   max|Δ| = 4.1e-06
+scale fold  (q*c)@k/√d == q@k*c/√d
+logits      T*tanh(lm_head(h)*m/T)   exact
+```
+
+The reference's own `self_attn.scaling` reads **0.125 = head_dim**-0.5**, confirming `qk_scale_factor`
+multiplies Q *on top of* the standard scale rather than replacing it — which is what makes the fold
+into `attn_softmax_scale` correct.
+
+### The bug the serve caught: NoPE broke a contiguity invariant
+
+First TP=2 boot died in graph capture with `attn_decode: q must be contiguous`.
+
+`qkv.split(...)` returns **non-contiguous views** (stride = the fused row width). Every existing
+model then passes q/k through RoPE, which calls `query.contiguous()` internally and returns fresh
+tensors — so contiguity was an *incidental side effect* the HIP decode kernel silently depended on.
+Skipping RoPE on the 13 NoPE layers let a non-contiguous `q` reach the kernel. Fixed by restoring
+the invariant explicitly in the NoPE branch rather than relying on a neighbouring op to launder it.
+
+Worth noting the failure mode: it surfaced at **boot**, during capture, on a shape no CPU parity
+test exercises — neither the meta-instantiation gate nor the layer parity could have found it.
+
+### Serve
+
+`MODEL=muse TP=2 CONC=4`, mem-ratio 0.85, 83% VRAM on both cards, SWA-radix + SWA ring KV active,
+graph capture clean.
+
+| check | result |
+|---|---|
+| coherence | `17*23` → `391`, `finish_reason=stop` |
+| reasoning split | reasoning captured; `content == '391'`, no header leak |
+| streaming | 127 chunks, `content == 'Paris'`, split identical to non-streaming |
+| ATEM tool call | `finish_reason=tool_calls`, `{"city":"Melbourne","unit":"c"}`, no markup in content |
+
+Boot log confirms both derivations fire in production:
+```
+reasoning delimiters ' to=self<|message|>' … '<|eom|><|start|>assistant to=user<|message|>'
+(derived from chat template (assistant turn carrying reasoning_content);
+ answer-turn header ' to=user<|message|>' stripped)
+```
+
+### Console
+
+`tools/serve.sh` gains a `muse` alias (matching the bare alias *and* the full checkpoint id, since
+the panel's dropdown hands over the id). The panel already lists the model — it auto-discovers from
+the HF cache — so the alias is what makes a dropdown pick inherit `swa_hybrid`, `tool_format=atem`
+and the tuned memory ratio instead of falling through to the catch-all.
+
+**Still open:** `mem_default=0.85` is inherited from Laguna and boots with headroom, but has not been
+swept. No throughput numbers taken — this was a correctness bring-up.
 
 **Deferred:** the vision tower. It is greenfield for this engine — there is no image path in
 `message/`, `scheduler/`, or `core.Batch` at all, and image parts are currently dropped silently at

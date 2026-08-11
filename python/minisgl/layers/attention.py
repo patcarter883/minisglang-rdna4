@@ -71,6 +71,15 @@ class AttentionLayer(StateLessOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         if self.rotary is not None:
             q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        else:
+            # NoPE. `qkv.split` hands back NON-CONTIGUOUS views (stride = the fused row width), and
+            # every roped model is handed contiguous q/k only as a SIDE EFFECT of rope, which does
+            # `query.contiguous()` internally and returns fresh tensors. With rope skipped that
+            # invariant silently lapses, and the HIP decode kernel rejects it — `attn_decode: q must
+            # be contiguous`, raised during graph capture, i.e. at boot rather than in a way any
+            # numeric test would surface. Restore the invariant explicitly instead of relying on a
+            # neighbouring op to launder it.
+            q, k = q.contiguous(), k.contiguous()
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(
             q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
