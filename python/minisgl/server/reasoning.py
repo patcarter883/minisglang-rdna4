@@ -95,9 +95,34 @@ _PROBE_MESSAGES = [{"role": "user", "content": "hi"}]
 class ReasoningParser:
     """Splits a completion into (reasoning_content, content) on a closing think tag."""
 
-    def __init__(self, start_token: str = "<think>", end_token: str = "</think>") -> None:
+    def __init__(
+        self,
+        start_token: str = "<think>",
+        end_token: str = "</think>",
+        turn_header: str = "",
+    ) -> None:
         self.start_token = start_token
         self.end_token = end_token
+        # Literal that a completion opens with before its ANSWER, when the template's generation
+        # prompt stops MID-HEADER. Empty for every family whose prompt ends at a turn boundary
+        # (`<|im_start|>assistant\n`), which is almost all of them.
+        #
+        # Muse-Glimmer's prompt ends `<|start|>assistant` and the model itself writes the recipient,
+        # so a reply with no reasoning begins ` to=user<|message|>` — markup that would otherwise be
+        # served as the first characters of the answer. The reasoning path never sees it, because
+        # there it is part of the CLOSE delimiter (`<|eom|><|start|>assistant to=user<|message|>`);
+        # this covers the case where the model answers directly.
+        self.turn_header = turn_header
+
+    def _strip_turn_header(self, text: str) -> str:
+        """Drop a leading answer-turn header. Checked AFTER the opener, which wins: the two share a
+        prefix (` to=self…` vs ` to=user…`), and treating a reasoning opener as a header would put
+        the chain of thought into `content`."""
+        if not self.turn_header or text.startswith(self.start_token):
+            return text
+        if text.startswith(self.turn_header):
+            return text[len(self.turn_header) :]
+        return text
 
     def prompt_state(self, prompt: str) -> Tuple[bool, bool]:
         """Read the RENDERED GENERATION PROMPT and report ``(span_open, reasoning_possible)``.
@@ -129,8 +154,15 @@ class ReasoningParser:
         """Does this COMPLETION open its own reasoning span? True when the model emitted the opener
         itself because the template did not (Gemma-4 thinking-on renders a bare ``<|turn>model\\n``
         and lets the model write ``<|channel>thought``). Without this, such an output truncated
-        before its close tag would be reported as a finished answer that is really raw scratch."""
-        return bool(self.start_token) and text.lstrip().startswith(self.start_token)
+        before its close tag would be reported as a finished answer that is really raw scratch.
+
+        Both sides are lstripped. The opener is not always a tag: a channel-routed family opens its
+        reasoning with a RECIPIENT (Muse-Glimmer's `` to=self<|message|>``, whose leading space is
+        part of the delimiter because the generation prompt ends mid-header at ``<|start|>assistant``).
+        Stripping only `text` would compare a space-led delimiter against space-stripped text and
+        never match — which is precisely the truncated-reasoning case this method exists to catch,
+        so the failure would be a full chain-of-thought served as the answer."""
+        return bool(self.start_token) and text.lstrip().startswith(self.start_token.lstrip())
 
     def parse(self, text: str, thinking_open: bool = False) -> Tuple[Optional[str], str]:
         """Split ``text`` into ``(reasoning_content, content)``.
@@ -152,6 +184,7 @@ class ReasoningParser:
         """
         if not text:
             return None, text
+        text = self._strip_turn_header(text)
         if self.end_token not in text:
             if not thinking_open and not self.opens_span(text):
                 return None, text
@@ -187,7 +220,7 @@ class ReasoningParser:
         return (reasoning or None), content
 
     def stream_state(self, active: bool) -> "ReasoningStreamState":
-        return ReasoningStreamState(self.start_token, self.end_token, active)
+        return ReasoningStreamState(self.start_token, self.end_token, active, self.turn_header)
 
 
 def _end_overlap_len(text: str, *tokens: str) -> int:
@@ -225,16 +258,22 @@ class ReasoningStreamState:
     Only as many characters are held back as the opener is long, and text that turns out NOT to be an
     opener is released into whichever channel the state was already in."""
 
-    def __init__(self, start_token: str, end_token: str, active: bool) -> None:
+    def __init__(
+        self, start_token: str, end_token: str, active: bool, turn_header: str = ""
+    ) -> None:
         self.start_token = start_token
         self.end_token = end_token
+        # See `ReasoningParser.turn_header`. The head probe below watches for this AS WELL AS the
+        # opener, because the two can share a prefix (` to=self…` vs ` to=user…`) and giving up on
+        # the opener must not release a half-matched header into `content`.
+        self.turn_header = turn_header
         self.active = active  # currently inside the reasoning span
         self.pending = ""     # held-back tail that might be a partial end token
         self._content_started = False  # have we emitted any answer text yet
         self._reasoning_started = False  # have we emitted any reasoning text yet
         self._closed_once = False  # a close delimiter has been consumed (see _strip_stale_closers)
         # Watch the head for an opener in BOTH states (see the class docstring).
-        self._probing = bool(start_token)
+        self._probing = bool(start_token) or bool(turn_header)
         self._probe = ""      # head of the stream, held while it could still become the opener
 
     def _emit_content(self, text: str) -> Optional[str]:
@@ -263,14 +302,26 @@ class ReasoningStreamState:
         if self._probing:
             self._probe += delta
             head = self._probe.lstrip("\n")
-            if head.startswith(self.start_token):
+            if self.start_token and head.startswith(self.start_token):
                 # The model opened its own span: switch into reasoning mode and re-feed the rest.
                 self._probing = False
                 self.active = True
                 self._probe = ""
                 return self._push_active(head[len(self.start_token):])
-            if head and self.start_token.startswith(head):
-                return None, None    # still a viable prefix of the opener — keep holding
+            # The ANSWER-turn header (checked after the opener, which wins — they share a prefix).
+            # Consume it and carry on in whatever channel we were in; it is markup, not text.
+            if self.turn_header and head.startswith(self.turn_header):
+                self._probing = False
+                self._probe = ""
+                rest = head[len(self.turn_header):]
+                # Re-feed through the normal lane rather than emitting directly, so the delimiter
+                # watch that `_push_inactive`/`_push_active` run still sees everything after it.
+                return self._push_active(rest) if self.active else self._push_inactive(rest)
+            if head and (
+                (self.start_token and self.start_token.startswith(head))
+                or (self.turn_header and self.turn_header.startswith(head))
+            ):
+                return None, None    # still a viable prefix of the opener OR the header — hold
             if not head:
                 return None, None    # nothing but the template's leading newlines so far
             # First character that rules the opener out. It is ordinary text, and which channel it
@@ -533,6 +584,131 @@ def derive_delimiters(tokenizer) -> Optional[Tuple[str, str, str]]:
         return None
 
 
+# Probe for `derive_delimiters_from_history`. The marker strings only have to be findable in the
+# render and absent from the template's own boilerplate; they are never tokenized.
+_RSN_MARK = "ZQREASONINGZQ"
+_ANS_MARK = "ZQANSWERZQ"
+_HISTORY_PROBE = [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "reasoning_content": _RSN_MARK, "content": _ANS_MARK},
+]
+
+
+def derive_delimiters_from_history(tokenizer) -> Optional[Tuple[str, str, str]]:
+    """Derive ``(open, close, how)`` by rendering an assistant turn that CARRIES reasoning.
+
+    Complements `derive_delimiters`, which diffs the `enable_thinking` branch of the generation
+    prompt. That method sees nothing when a template has no such branch — either because the model
+    is always-thinking, or because it spells the reasoning strength some other way (Muse-Glimmer's
+    `reasoning_strength`). But such a template still has to RE-RENDER prior reasoning when it
+    appears in history, and to do that it must emit the very delimiters we are looking for. So:
+    hand it a turn with `reasoning_content` and read the markup straight off the result.
+
+    This is more direct evidence than the thinking-off diff, not less — it is the template stating
+    the pair rather than us inferring it from an absence — but it runs SECOND because it depends on
+    the `reasoning_content` history convention, which not every template implements.
+
+    It also handles a family the pair-of-tags model otherwise cannot: one where reasoning is a
+    separate TURN rather than a span inside one. Muse-Glimmer renders
+    ``<|start|>assistant to=self<|message|>R<|eom|><|start|>assistant<|message|>A<|eot|>``, which
+    yields ``open=" to=self<|message|>"`` and ``close="<|eom|><|start|>assistant<|message|>"`` —
+    delimiters that bracket the reasoning exactly as ``<think>``/``</think>`` do, even though
+    neither is a tag.
+
+    The opener has the GENERATION PROMPT stripped off its front, because the model's completion
+    starts after that prompt: Muse-Glimmer's prompt already ends ``<|start|>assistant``, so the
+    model itself only ever emits the `` to=self<|message|>`` part.
+    """
+    try:
+        rendered = tokenizer.apply_chat_template(
+            _HISTORY_PROBE, tokenize=False, add_generation_prompt=False
+        )
+    except Exception:  # noqa: BLE001 — a template that rejects the probe tells us nothing
+        return None
+    if not isinstance(rendered, str):
+        return None
+    ri, ai = rendered.find(_RSN_MARK), rendered.find(_ANS_MARK)
+    if ri < 0 or ai <= ri:
+        # No reasoning_content support (the marker never appeared), or the template emitted the
+        # answer first. Either way there is no bracketing to read.
+        return None
+    close = rendered[ri + len(_RSN_MARK) : ai]
+    head = rendered[:ri]
+    try:
+        genp = tokenizer.apply_chat_template(
+            _PROBE_MESSAGES, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:  # noqa: BLE001
+        genp = ""
+    # Strip whatever the generation prompt already supplies. The two renders share the same system
+    # block and the same user turn, so their common prefix IS the prompt the model conditions on.
+    common = 0
+    if isinstance(genp, str):
+        limit = min(len(head), len(genp))
+        while common < limit and head[common] == genp[common]:
+            common += 1
+    start = head[common:]
+    # A delimiter has to be non-empty and carry real markup. Bail rather than return something
+    # degenerate: `parse` treats an absent close tag as "no reasoning", which is the safe outcome,
+    # whereas a junk close tag would split an answer in half.
+    if not close.strip() or not start.strip():
+        return None
+    if len(close) > 200 or len(start) > 200:
+        return None
+    return start, close, "chat template (assistant turn carrying reasoning_content)"
+
+
+_ANSWER_PROBE = [
+    {"role": "user", "content": "hi"},
+    {"role": "assistant", "content": _ANS_MARK},
+]
+
+
+def derive_turn_header(tokenizer, start_token: str = "", end_token: str = "") -> str:
+    """The literal a completion opens with before its ANSWER, or "" when there is none.
+
+    Same technique as the opener derivation: render an assistant turn carrying only content, and
+    subtract the generation prompt. Whatever is left is what the model has to emit itself before it
+    can start answering.
+
+    Almost every template ends its generation prompt at a turn boundary and so yields "". A
+    channel-routed one does not: Muse-Glimmer's prompt stops at `<|start|>assistant` and the model
+    writes ` to=user<|message|>` before the answer — markup that would otherwise be served as the
+    first characters of `content`.
+
+    Guarded two ways, because a false positive here EATS the head of an answer:
+      * the result must contain markup (`<`), never bare prose;
+      * it must not contain either reasoning delimiter. A template that renders an empty pre-closed
+        think span into its assistant turns would otherwise hand back `<think></think>` as a
+        "header", and stripping that would defeat the reasoning split entirely.
+    """
+    try:
+        rendered = tokenizer.apply_chat_template(
+            _ANSWER_PROBE, tokenize=False, add_generation_prompt=False
+        )
+        genp = tokenizer.apply_chat_template(
+            _PROBE_MESSAGES, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:  # noqa: BLE001 — a template that rejects the probe tells us nothing
+        return ""
+    if not isinstance(rendered, str) or not isinstance(genp, str):
+        return ""
+    ai = rendered.find(_ANS_MARK)
+    if ai < 0:
+        return ""
+    head = rendered[:ai]
+    common = 0
+    limit = min(len(head), len(genp))
+    while common < limit and head[common] == genp[common]:
+        common += 1
+    header = head[common:]
+    if not header or "<" not in header or len(header) > 100:
+        return ""
+    if (start_token and start_token in header) or (end_token and end_token in header):
+        return ""
+    return header
+
+
 def resolve_reasoning_parser(
     tokenizer, requested: str = "auto", declared: Optional[str] = None
 ) -> Tuple[Optional[ReasoningParser], str]:
@@ -562,10 +738,13 @@ def resolve_reasoning_parser(
     if requested and requested != "auto":
         return get_reasoning_parser(requested), f"--reasoning-parser {requested}"
     if tokenizer is not None:
-        derived = derive_delimiters(tokenizer)
+        derived = derive_delimiters(tokenizer) or derive_delimiters_from_history(tokenizer)
         if derived is not None:
             start, end, how = derived
-            return ReasoningParser(start, end), f"derived from {how}"
+            header = derive_turn_header(tokenizer, start, end)
+            if header:
+                how += f"; answer-turn header {header!r} stripped"
+            return ReasoningParser(start, end, header), f"derived from {how}"
     if declared:
         parser = get_reasoning_parser(declared)
         if parser is not None:

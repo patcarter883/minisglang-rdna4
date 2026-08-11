@@ -22,7 +22,7 @@ class AttentionLayer(StateLessOP):
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        rotary_config: RotaryConfig,
+        rotary_config: RotaryConfig | None,
         q_norm: RMSNorm | None = None,
         k_norm: RMSNorm | None = None,
         sliding_window: int = 0,
@@ -40,13 +40,24 @@ class AttentionLayer(StateLessOP):
         self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
-        self.rotary = get_rope(
-            head_dim=head_dim,
-            rotary_dim=rotary_config.rotary_dim,
-            max_position=rotary_config.max_position,
-            base=rotary_config.base,
-            rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
-            interleave=rotary_config.interleave,  # GLM-style interleaved RoPE, else NeoX
+        # `rotary_config is None` == NoPE: this layer applies NO positional encoding at all. Not a
+        # zero-frequency rope (which is numerically an identity but still costs a kernel launch per
+        # layer) — the rope is simply never built and never called. Muse-Glimmer marks its 13 full-
+        # attention layers NoPE via `layer_rope_theta[i] == 0`, letting the global layers mix context
+        # without a positional prior while the 39 sliding layers carry RoPE.
+        self.rotary = (
+            None
+            if rotary_config is None
+            else get_rope(
+                head_dim=head_dim,
+                rotary_dim=rotary_config.rotary_dim,
+                max_position=rotary_config.max_position,
+                base=rotary_config.base,
+                rope_scaling=(
+                    tuple(rotary_config.scaling.items()) if rotary_config.scaling else None
+                ),
+                interleave=rotary_config.interleave,  # GLM-style interleaved RoPE, else NeoX
+            )
         )
         self.q_norm = q_norm
         self.k_norm = k_norm
@@ -58,7 +69,17 @@ class AttentionLayer(StateLessOP):
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-        q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        if self.rotary is not None:
+            q, k = self.rotary.forward(ctx.batch.positions, q, k)
+        else:
+            # NoPE. `qkv.split` hands back NON-CONTIGUOUS views (stride = the fused row width), and
+            # every roped model is handed contiguous q/k only as a SIDE EFFECT of rope, which does
+            # `query.contiguous()` internally and returns fresh tensors. With rope skipped that
+            # invariant silently lapses, and the HIP decode kernel rejects it — `attn_decode: q must
+            # be contiguous`, raised during graph capture, i.e. at boot rather than in a way any
+            # numeric test would surface. Restore the invariant explicitly instead of relying on a
+            # neighbouring op to launder it.
+            q, k = q.contiguous(), k.contiguous()
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(
             q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window

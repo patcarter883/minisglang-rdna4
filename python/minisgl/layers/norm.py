@@ -112,6 +112,12 @@ class RMSNormNoScale(StateLessOP):
         # them in torch would have kept 60 multi-launch norms per step after the weighted ones moved.
         return _rms_norm(x, None, self.eps)
 
+    def forward_inplace(self, x: torch.Tensor) -> None:
+        """In-place form, so a scaleless norm can stand in for the weighted `q_norm`/`k_norm` an
+        `AttentionLayer` applies to the split-out q/k views. Muse-Glimmer's QK-norm is exactly this:
+        `with_scale=False`, hence no `q_norm.weight`/`k_norm.weight` in its checkpoint."""
+        x.copy_(_rms_norm(x, None, self.eps))
+
 
 class RMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float, *, plus_one: bool = False) -> None:
