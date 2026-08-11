@@ -155,6 +155,13 @@ x-lean-common: &lean-common
     # Isolates verify-forward cost from accept/commit cost — a step still pays the full propose +
     # qlen=K+1 verify, so 1/tok_s is the propose+verify time with the accept path removed.
     MINISGL_SPEC_FORCE_N0: "${MINISGL_SPEC_FORCE_N0:-}"
+    # Sampled (rejection-sampling) verify. Was forwarded ONLY by the `cam` service, so on the serve
+    # profile — the path everything actually runs on — it was unreachable: tools/serve.sh defaults it
+    # to 1 inside the container and nothing outside could say otherwise. That matters because sampled
+    # verify is DISTRIBUTIONALLY lossless, not TOKEN lossless, so it is exactly the knob you must be
+    # able to turn off to test the greedy invariant (greedy+spec == greedy plain). Forwarded here, in
+    # the shared anchor, so every service inherits it.
+    MINISGL_SPEC_SAMPLED: "${MINISGL_SPEC_SAMPLED:-}"
     # Expert-divergence probe (quant/kernels.py:_route_stats): set to a path under /engine and every
     # small-M MoE call records its routing shape (distinct experts, moe_align block count, union
     # curve) to JSON. Diagnostic only — it syncs per call, so never set it on a timed run.

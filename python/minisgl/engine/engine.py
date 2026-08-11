@@ -971,6 +971,8 @@ class Engine:
             # which on a 16 GB card is the whole margin a 4-bit drafter exists to buy, so the reserve
             # alone would leave the KV pool unsizable and the boot would fail anyway.
             _mode = (os.environ.get("MINISGL_DFLASH_QUANT", "") or "").strip().lower()
+            if _mode in ("none", "bf16", "off"):
+                _mode = ""   # explicit "no quant" sentinel — reserve the full bf16 size
             if _mode in ("fp8", "int8"):
                 total //= 2  # 1 byte/param vs bf16's 2
             elif _mode == "nvfp4":
