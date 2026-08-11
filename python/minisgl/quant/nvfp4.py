@@ -98,3 +98,74 @@ def dequant_reference(
     w = lut[codes]  # (N, K)
     bs = weight_scale_e4m3.to(torch.float32).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)  # (N, K)
     return w * bs / global_scale.to(torch.float32).reshape(())
+
+
+# --- ENCODER: bf16/fp32 -> NVFP4 -----------------------------------------------------------------
+# The decoders above consume a checkpoint someone else quantized. This is the other direction, and it
+# exists because the Muse-Glimmer DFlash drafter ships bf16 ONLY: there is no NVFP4 build of it, and
+# on 2x16 GB the drafter has to be 4-bit to fit beside the target at all (bf16 reserves 5.5 GiB, fp8
+# 3.08 GiB, and neither leaves a KV pool).
+#
+# Doing this by RTN needs no calibration data, and that is not a shortcut — it is the recipe the
+# shipping Muse-Glimmer checkpoint itself declares for weights: `observer: memoryless_minmax`,
+# `dynamic: false`, i.e. scales derived from each tensor's own amax. (Its `input_activations` block
+# asks for FP4 activations, which this engine does not do and cannot: gfx1201 has no FP4 math, so
+# NVFP4 here means W4A8 — 4-bit weights decoded to fp8 e4m3 in-register at the WMMA.)
+#
+# For a DRAFT model the error budget is unusually forgiving: the target verifies every drafted token,
+# so a worse drafter costs ACCEPTANCE RATE, never correctness.
+
+# Magnitudes of the OCP E2M1 codebook, i.e. FP4_E2M1_LUT[0:8]. Midpoints between consecutive entries
+# are the round-to-nearest bucket edges.
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+FP4_E2M1_MAX = 6.0
+FP8_E4M3_MAX = 448.0
+
+
+def quantize_nvfp4_rtn(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(N, K) float weight -> (w_packed (N, K//8) int32 E2M1 codes, scales (N, K//16) fp16).
+
+    Returns the ALREADY-FOLDED per-group scale the e2m1 kernel consumes — the same thing
+    `fold_nvfp4_scale` produces for a real NVFP4 checkpoint — so the output drops straight into the
+    existing W4A8 path with no per-tensor scalar left over.
+
+    Two-level scale, matching compressed-tensors:
+        global      = FP8_E4M3_MAX * FP4_E2M1_MAX / amax(|w|)        (per tensor, a DIVISOR)
+        scale[n,g]  = e4m3( amax(|w[n,g]|) / FP4_E2M1_MAX * global ) (per 16-element group)
+        w ~= E2M1_LUT[code] * scale / global
+    The e4m3 ROUND-TRIP is applied here rather than kept in fp32, because that rounding is part of
+    the format — leaving it out would produce scales the real decode path could not reproduce.
+    """
+    assert w.ndim == 2, w.shape
+    n, k = w.shape
+    assert k % NVFP4_GROUP_SIZE == 0, f"K={k} must be a multiple of {NVFP4_GROUP_SIZE}"
+    wf = w.detach().to(torch.float32)
+    amax = wf.abs().amax().clamp_min(1e-12)
+    global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax
+
+    g = wf.reshape(n, k // NVFP4_GROUP_SIZE, NVFP4_GROUP_SIZE)
+    group_amax = g.abs().amax(dim=-1)  # (N, K//16)
+    s = (group_amax / FP4_E2M1_MAX) * global_scale
+    # Round the scale THROUGH e4m3, then read it back: this is the value a real checkpoint stores.
+    s_e4m3 = s.clamp(min=1e-12, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn).to(torch.float32)
+    eff = (s_e4m3 / global_scale).clamp_min(1e-12)  # (N, K//16) effective per-group scale
+
+    q = g / eff.unsqueeze(-1)
+    mag = q.abs().clamp(max=FP4_E2M1_MAX)
+    edges = torch.tensor(_E2M1_EDGES, dtype=torch.float32, device=wf.device)
+    idx = torch.bucketize(mag, edges)  # 0..7, round-to-nearest over the codebook magnitudes
+    codes = (idx | (q < 0).to(torch.int64) * 8).to(torch.uint8).reshape(n, k)
+    return pack_codes_to_int32(codes), eff.to(torch.float16).contiguous()
+
+
+def dequantize_nvfp4_folded(w_packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Inverse of `quantize_nvfp4_rtn`, for tests: (N,K//8) int32 + (N,K//16) fp16 -> (N,K) float32."""
+    from .mxfp4 import FP4_E2M1_LUT
+
+    n, kw = w_packed.shape
+    k = kw * 8
+    words = w_packed.to(torch.int64)
+    codes = torch.stack([(words >> (4 * j)) & 0xF for j in range(8)], dim=-1).reshape(n, k)
+    lut = torch.tensor(FP4_E2M1_LUT, dtype=torch.float32, device=w_packed.device)
+    return lut[codes] * scales.to(torch.float32).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)

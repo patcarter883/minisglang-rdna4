@@ -54,13 +54,43 @@ class _PlainLinear(BaseOP):
     Dequant to the activation dtype happens in-forward (no fp8 GEMM needed)."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
-        self.weight = torch.empty(out_features, in_features)
+        # META, not the ambient device. DFlashDraftModel is built under `with torch.device(cuda)`,
+        # so this used to allocate an fp32 scaffold ON THE CARD — 4 bytes/param for a drafter that
+        # is about to have every one of these tensors REPLACED by the loader (`setattr`, or dropped
+        # entirely by `load_quant`). At the ~1 GB drafters this class was written for that was a
+        # ~2 GiB transient and merely wasteful; at Muse-Glimmer's 2.556B it is 10.2 GiB and the boot
+        # cannot survive it — the drafter OOMs during construction, before a single weight is read.
+        # A meta tensor keeps `.shape`/`.dtype` for the loader's assertions and costs nothing.
+        self.weight = torch.empty(out_features, in_features, device="meta")
         self._wq = None   # [out, in] fp8_e4m3 / int8 quantized weight
         self._ws = None   # [out, 1] per-output-channel scale (compute dtype)
+        self._w4 = None   # [out, in/8] int32 packed E2M1 codes      (nvfp4)
+        self._w4s = None  # [out, in/16] fp16 folded per-group scale (nvfp4)
 
     def load_quant(self, w: torch.Tensor, mode: str, compute_dtype, device) -> None:
         """RTN weight-only quant of a loaded [out, in] weight (pass it on CPU so the fp16 transient
-        stays in host RAM and only the 1-byte packed weight lands on GPU). mode: 'fp8' | 'int8'."""
+        stays in host RAM and only the packed weight reaches the GPU).
+        mode: 'fp8' | 'int8' | 'nvfp4'."""
+        if mode == "nvfp4":
+            # 4-bit E2M1 + an fp16 per-16-element group scale, riding the SAME shared W4A8 core the
+            # target's NVFP4 linears use — a weight format is a load POLICY on that core, never a new
+            # kernel (KERNEL_CORE_POLICY.md).
+            #
+            # Unlike the fp8/int8 arms below this is not merely smaller: those dequantize the WHOLE
+            # matrix into the activation dtype on every forward, which for a drafter is pure overhead
+            # on the decode critical path. The e2m1 kernel decodes to fp8 e4m3 in-register at the
+            # WMMA, so nothing is ever materialized.
+            from minisgl.quant.nvfp4 import quantize_nvfp4_rtn
+
+            packed, scales = quantize_nvfp4_rtn(w)
+            self._w4 = packed.to(device)
+            # GROUP-MAJOR (K//16, N), matching NvFp4LinearMethod: the op indexes scales as
+            # `[g*N + n]`, so N has to be the contiguous axis for the read to coalesce. The encoder
+            # emits the natural (N, K//16); transposing here rather than there keeps the encoder in
+            # checkpoint layout, which is what its round-trip test and the golden decoder expect.
+            self._w4s = scales.transpose(0, 1).contiguous().to(device)
+            self.weight = None
+            return
         wf = w.float()
         amax = wf.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)  # [out,1]
         if mode == "fp8":
@@ -75,6 +105,20 @@ class _PlainLinear(BaseOP):
         self.weight = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._w4 is not None:
+            from minisgl.quant import kernels
+
+            # The kernel is 2-D and wants contiguous rows; the drafter calls this with both [T, H]
+            # (denoise) and [N, Q, H] (the captured batched twin), so flatten and restore. Being
+            # explicit about contiguity here rather than trusting the caller is deliberate — the
+            # NoPE bug in AttentionLayer was exactly a contiguity invariant that a neighbouring op
+            # had been quietly providing.
+            shp = x.shape
+            x2 = x.reshape(-1, shp[-1]).contiguous()
+            out = kernels.w4a8_linear(
+                x2, self._w4, self._w4s, None, 16, weight_is_e2m1=True
+            )
+            return out.reshape(*shp[:-1], out.shape[-1])
         if self._wq is not None:
             w = self._wq.to(x.dtype) * self._ws  # dequant [out,in] * [out,1]
             return F.linear(x, w)

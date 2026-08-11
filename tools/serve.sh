@@ -114,7 +114,12 @@ case "$MODEL" in
                   # token, so weight-only quant can cost ACCEPTANCE, never correctness.
                   if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
                     mem_default_spec="0.93"
-                    : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
+                    # nvfp4, NOT fp8. Measured: fp8 reserves 3.08 GiB and the KV pool cannot be
+                    # sized at all (num_pages assert), even at CONC=2 / ratio 0.95 — so fp8 is not a
+                    # viable step here, it simply does not boot. 4-bit weights + an fp16 per-16 group
+                    # scale bring the drafter to ~1.61 GiB (down_proj held at fp8, mirroring Meta's
+                    # own GGUF, which is Q4_K everywhere except ffn_down at Q6_K).
+                    : "${MINISGL_DFLASH_QUANT:=nvfp4}"; export MINISGL_DFLASH_QUANT
                   fi
                   swa_hybrid=1 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
