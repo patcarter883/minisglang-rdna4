@@ -92,6 +92,73 @@ _LEGACY_GENERIC = ("<think>", "</think>")
 _PROBE_MESSAGES = [{"role": "user", "content": "hi"}]
 
 
+class _EndMatcher:
+    """Finds the reasoning CLOSE delimiter in a string.
+
+    Two modes. Normally the closer is one literal (``</think>``) and this is ``str.find`` with extra
+    steps. But a channel-routed template names the RECIPIENT inside the delimiter, so the closer is a
+    FAMILY of strings: Muse-Glimmer ends reasoning with
+    ``<|eom|><|start|>assistant to=<recipient><|message|>``, where the recipient is ``user`` for an
+    answer but a TOOL NAME when the model routes to a tool. Deriving the concrete ``to=user`` form and
+    matching it literally leaves a tool-routed reply with no closer at all — ``parse`` then reads it
+    as an unterminated reasoning span and files the whole reply under ``reasoning_content``.
+
+    So when ``prefix``/``suffix`` are known the match is "``prefix``, then at most ``MAX_GAP``
+    characters, then ``suffix``". ``MAX_GAP`` is what stops the pattern spanning half a reply when the
+    model emits ``prefix`` and never follows through.
+    """
+
+    MAX_GAP = 128  # characters allowed between prefix and suffix (a recipient / tool name)
+
+    def __init__(self, end_token: str, end_prefix: str = "", end_suffix: str = "") -> None:
+        self.token = end_token or ""
+        self.prefix = end_prefix or ""
+        self.suffix = end_suffix or ""
+        self.wild = bool(self.prefix and self.suffix)
+
+    def find(self, text: str, start: int = 0) -> Optional[Tuple[int, int]]:
+        """``(begin, end)`` of the first closer at or after ``start``, or None."""
+        if not self.wild:
+            if not self.token:
+                return None
+            i = text.find(self.token, start)
+            return (i, i + len(self.token)) if i >= 0 else None
+        i = start
+        while True:
+            p = text.find(self.prefix, i)
+            if p < 0:
+                return None
+            body = p + len(self.prefix)
+            s = text.find(self.suffix, body)
+            if s >= 0 and (s - body) <= self.MAX_GAP:
+                return (p, s + len(self.suffix))
+            i = p + 1
+
+    def rfind(self, text: str) -> Optional[Tuple[int, int]]:
+        """``(begin, end)`` of the LAST closer, or None. See ``ReasoningParser.parse`` for why the
+        last one and not the first."""
+        last = None
+        m = self.find(text, 0)
+        while m is not None:
+            last = m
+            m = self.find(text, m[0] + 1)
+        return last
+
+    def hold(self, text: str) -> int:
+        """How many trailing characters the streaming splitter must hold back so a closer straddling a
+        chunk boundary is still detected. For the wildcard form that includes an already-complete
+        ``prefix`` still waiting for its ``suffix`` — otherwise the recipient name would stream out as
+        visible content before we learn it was markup."""
+        if not self.wild:
+            return _end_overlap_len(text, self.token)
+        p = text.rfind(self.prefix)
+        if p >= 0 and self.find(text, p) is None:
+            span = len(text) - p
+            if span <= len(self.prefix) + self.MAX_GAP + len(self.suffix):
+                return span
+        return _end_overlap_len(text, self.prefix)
+
+
 class ReasoningParser:
     """Splits a completion into (reasoning_content, content) on a closing think tag."""
 
@@ -100,9 +167,17 @@ class ReasoningParser:
         start_token: str = "<think>",
         end_token: str = "</think>",
         turn_header: str = "",
+        end_prefix: str = "",
+        end_suffix: str = "",
     ) -> None:
         self.start_token = start_token
         self.end_token = end_token
+        # The closer with a WILDCARD recipient, when the template varies it by recipient (see
+        # `_EndMatcher`). `end_token` stays the CONCRETE form: it is what the engine force-emits at
+        # the reasoning budget, so it has to be one emittable literal.
+        self.end_prefix = end_prefix or ""
+        self.end_suffix = end_suffix or ""
+        self._end = _EndMatcher(end_token, self.end_prefix, self.end_suffix)
         # Literal that a completion opens with before its ANSWER, when the template's generation
         # prompt stops MID-HEADER. Empty for every family whose prompt ends at a turn boundary
         # (`<|im_start|>assistant\n`), which is almost all of them.
@@ -147,7 +222,8 @@ class ReasoningParser:
         case: the kwarg reaches the template, the template closes the span, we see it closed.
         """
         open_at = prompt.rfind(self.start_token) if self.start_token else -1
-        close_at = prompt.rfind(self.end_token)
+        _close = self._end.rfind(prompt)
+        close_at = _close[0] if _close is not None else -1
         return open_at > close_at, close_at <= open_at
 
     def opens_span(self, text: str) -> bool:
@@ -185,7 +261,8 @@ class ReasoningParser:
         if not text:
             return None, text
         text = self._strip_turn_header(text)
-        if self.end_token not in text:
+        closer = self._end.rfind(text)
+        if closer is None:
             if not thinking_open and not self.opens_span(text):
                 return None, text
             # The span was open (prompt-side, or the model opened it itself) and never closed -> it's
@@ -199,7 +276,7 @@ class ReasoningParser:
         # original span plus any re-opened blocks — in reasoning_content and leaves only the final
         # answer as content, so the visible response never looks like leftover thinking. Identical to
         # partition for the normal single-</think> case.
-        pre, _, post = text.rpartition(self.end_token)
+        pre, post = text[: closer[0]], text[closer[1] :]
         # If the model echoed an opening <think> (some do), keep only what follows it.
         if self.start_token and self.start_token in pre:
             pre = pre.split(self.start_token, 1)[-1]
@@ -220,7 +297,10 @@ class ReasoningParser:
         return (reasoning or None), content
 
     def stream_state(self, active: bool) -> "ReasoningStreamState":
-        return ReasoningStreamState(self.start_token, self.end_token, active, self.turn_header)
+        return ReasoningStreamState(
+            self.start_token, self.end_token, active, self.turn_header,
+            self.end_prefix, self.end_suffix,
+        )
 
 
 def _end_overlap_len(text: str, *tokens: str) -> int:
@@ -259,10 +339,13 @@ class ReasoningStreamState:
     opener is released into whichever channel the state was already in."""
 
     def __init__(
-        self, start_token: str, end_token: str, active: bool, turn_header: str = ""
+        self, start_token: str, end_token: str, active: bool, turn_header: str = "",
+        end_prefix: str = "", end_suffix: str = "",
     ) -> None:
         self.start_token = start_token
         self.end_token = end_token
+        # Same closer matcher the non-streaming lane uses, so both agree on identical bytes.
+        self._end = _EndMatcher(end_token, end_prefix, end_suffix)
         # See `ReasoningParser.turn_header`. The head probe below watches for this AS WELL AS the
         # opener, because the two can share a prefix (` to=self…` vs ` to=user…`) and giving up on
         # the opener must not release a half-matched header into `content`.
@@ -364,7 +447,8 @@ class ReasoningStreamState:
         out: List[str] = []
         while text:
             i_open = text.find(self.start_token) if self.start_token else -1
-            i_close = text.find(self.end_token) if (self._closed_once and self.end_token) else -1
+            m_close = self._end.find(text) if self._closed_once else None
+            i_close = m_close[0] if m_close is not None else -1
             if i_open != -1 and (i_close == -1 or i_open < i_close):
                 # Re-entering the span: everything before the opener is answer text, everything after
                 # is scratch — hand the remainder to the reasoning half, which owns it from here.
@@ -375,13 +459,13 @@ class ReasoningStreamState:
                 return reasoning, ((content or "") + (more or "")) or None
             if i_close != -1:
                 out.append(text[:i_close])
-                text = text[i_close + len(self.end_token):]
+                text = text[m_close[1]:]
                 continue
             break
         # Hold back a suffix that could be the head of either delimiter split across this chunk
         # boundary, exactly as the reasoning phase does — otherwise a delimiter straddling two chunks
         # survives into the answer.
-        keep = _end_overlap_len(text, self.start_token, self.end_token)
+        keep = max(_end_overlap_len(text, self.start_token), self._end.hold(text))
         if keep:
             self.pending = text[-keep:]
             text = text[:-keep]
@@ -391,17 +475,17 @@ class ReasoningStreamState:
     def _push_active(self, delta: str) -> Tuple[Optional[str], Optional[str]]:
         """Inside the reasoning span: emit reasoning until the close delimiter, then content."""
         text = self.pending + delta
-        idx = text.find(self.end_token)
-        if idx != -1:
-            reasoning = self._emit_reasoning(text[:idx])
+        m = self._end.find(text)
+        if m is not None:
+            reasoning = self._emit_reasoning(text[:m[0]])
             self.active = False
             self._closed_once = True
             self.pending = ""
             # The remainder re-enters the CONTENT phase, which keeps watching for both delimiters —
             # the model can re-open a span, or emit a duplicate closer, in this very chunk.
-            _r, content = self._push_inactive(text[idx + len(self.end_token):])
+            _r, content = self._push_inactive(text[m[1]:])
             return ((reasoning or "") + (_r or "")) or None, content
-        keep = _end_overlap_len(text, self.end_token)
+        keep = self._end.hold(text)
         if keep:
             self.pending = text[-keep:]
             emit = text[:-keep]
@@ -658,6 +742,65 @@ def derive_delimiters_from_history(tokenizer) -> Optional[Tuple[str, str, str]]:
     return start, close, "chat template (assistant turn carrying reasoning_content)"
 
 
+_RECIPIENT_MARK = "ZQRECIPIENTZQ"
+
+
+def derive_end_wildcard(tokenizer, end_token: str) -> Optional[Tuple[str, str]]:
+    """Derive ``(prefix, suffix)`` bracketing a VARIABLE recipient inside the close delimiter, or None
+    when the template's closer is a fixed literal (which is every ``<think>`` family).
+
+    ``derive_delimiters_from_history`` renders one assistant turn and reads the closer off it — so on
+    a channel-routed template it captures whatever recipient that probe defaulted to. Muse-Glimmer
+    renders ``<|eom|><|start|>assistant to=user<|message|>``, and a reply that ends reasoning by
+    routing to a TOOL emits ``… to=<toolname><|message|>`` instead: same delimiter, different middle.
+    Matched literally, such a reply has no closer at all, so ``parse`` treats it as an unterminated
+    reasoning span and files the entire thing — the tool call included — under ``reasoning_content``.
+
+    Method: render the SAME history probe twice, once with the assistant turn's ``recipient`` left to
+    the template's default and once with a marker recipient, then diff. The common prefix and common
+    suffix bracket the recipient slot. A template that ignores ``recipient`` renders both identically
+    and yields None, so this is inert for every family whose closer really is one literal (verified
+    against every cached ``<think>`` checkpoint).
+
+    Guarded: the derived bracket must actually reconstruct the concrete closer
+    (``end_token.startswith(prefix)`` and ``endswith(suffix)``), or a template that varies something
+    OTHER than a recipient could hand back a bracket that splits answers in half.
+    """
+    if not end_token:
+        return None
+    probe = [_HISTORY_PROBE[0], dict(_HISTORY_PROBE[1], recipient=_RECIPIENT_MARK)]
+    try:
+        plain = tokenizer.apply_chat_template(
+            _HISTORY_PROBE, tokenize=False, add_generation_prompt=False
+        )
+        marked = tokenizer.apply_chat_template(probe, tokenize=False, add_generation_prompt=False)
+    except Exception:  # noqa: BLE001 — a template that rejects the probe tells us nothing
+        return None
+    if not isinstance(plain, str) or not isinstance(marked, str) or plain == marked:
+        return None
+
+    def _closer(rendered: str) -> Optional[str]:
+        ri, ai = rendered.find(_RSN_MARK), rendered.find(_ANS_MARK)
+        return rendered[ri + len(_RSN_MARK) : ai] if (ri >= 0 and ai > ri) else None
+
+    a, b = _closer(plain), _closer(marked)
+    if not a or not b or a == b or _RECIPIENT_MARK not in b:
+        # No closer, or the recipient landed somewhere other than inside it — nothing to bracket.
+        return None
+    p = 0
+    while p < min(len(a), len(b)) and a[p] == b[p]:
+        p += 1
+    s = 0
+    while s < min(len(a), len(b)) - p and a[len(a) - 1 - s] == b[len(b) - 1 - s]:
+        s += 1
+    prefix, suffix = a[:p], a[len(a) - s :]
+    if not prefix.strip() or not suffix.strip():
+        return None
+    if not (end_token.startswith(prefix) and end_token.endswith(suffix)):
+        return None
+    return prefix, suffix
+
+
 _ANSWER_PROBE = [
     {"role": "user", "content": "hi"},
     {"role": "assistant", "content": _ANS_MARK},
@@ -744,7 +887,14 @@ def resolve_reasoning_parser(
             header = derive_turn_header(tokenizer, start, end)
             if header:
                 how += f"; answer-turn header {header!r} stripped"
-            return ReasoningParser(start, end, header), f"derived from {how}"
+            wild = derive_end_wildcard(tokenizer, end)
+            prefix, suffix = wild if wild is not None else ("", "")
+            if wild is not None:
+                how += f"; closer recipient is variable ({prefix!r} … {suffix!r})"
+            return (
+                ReasoningParser(start, end, header, prefix, suffix),
+                f"derived from {how}",
+            )
     if declared:
         parser = get_reasoning_parser(declared)
         if parser is not None:
