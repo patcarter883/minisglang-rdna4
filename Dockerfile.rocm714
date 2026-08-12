@@ -1,0 +1,417 @@
+# syntax=docker/dockerfile:1
+#
+# minisgl-rdna4 — LEAN serving image, ROCm 7.14 / torch 2.13 variant.
+#
+# Same shape as the canonical `Dockerfile` (which is ROCm 7.2.1 + torch 2.14.0.dev): ONLY what
+# minisglang needs to run on gfx1201 (RDNA4) — no vllm, no sglang, no flashinfer, no sgl_kernel.
+#
+# NOTE on triton: it IS installed here (3.7.1+rocm7.14.0), because torch declares it unconditionally
+# in Requires-Dist on every ROCm build (inductor's codegen backend), alongside rocm[libraries].
+# That is NOT a difference from the 7.2.1 image — that image has triton 3.7.1 + triton-rocm 3.8.0
+# too, and the canonical Dockerfile's "no triton" comment is simply stale. The serve path uses none
+# of it; the native-HIP kernels below are what actually run.
+#
+# What differs from the canonical Dockerfile:
+#
+#   * ROCm 7.2.1 -> 7.14. The 7.2.1 toolchain is AMD clang 22; 7.14 is clang 23, which on this
+#     kernel tree improves occupancy on 112-124 of 513 kernels SPILL-FREE with zero regressions
+#     (moe_gemm_tiled_ashuffle 245->169 VGPR, occ 9->16). The measured e2e win on SERVED shapes is
+#     ~0 today, so perf is NOT the reason to build this. The reason is PROFILING PARITY: 7.2.1's
+#     `rocprofv3 --pmc` hangs on gfx1201, so counters currently force a compile-in-7.2.1 /
+#     run-in-7.14 split, and clang 23 leaves only 8 of 2074 kernels ISA-identical — i.e. every
+#     counter number today describes a binary we do not ship. On 7.14 we profile what we serve.
+#     (Counters additionally need `power_dpm_force_performance_level=profile_standard` on the
+#     discrete cards at RUNTIME — RDNA4's default `auto` gates the perfmon clock. That is a host
+#     setting, not an image setting; see tools/counter_probe/perf_level_counters.sh.)
+#
+#   * torch 2.14.0.dev (download.pytorch.org nightly, rocm7.2) -> torch 2.12.0 (repo.amd.com,
+#     rocm7.14). This is NOT a downgrade off a release: 2.14 is UNRELEASED and we currently ship a
+#     nightly of it, so this is nightly -> stable. torch.version.hip is 7.14.60850 — an exact match
+#     for this base image, so there is no torch/runtime skew.
+#     2.13.0 exists on the index and is DELIBERATELY NOT USED — its extras metadata is broken and it
+#     silently yields a gfx942 torch. See the pin comment at the torch stage; that is a correctness
+#     pin, not conservatism.
+#
+#   * The wheels come from AMD's OFFICIAL multi-arch release channel, which is a THIRD index —
+#     neither download.pytorch.org (tops out at rocm7.2) nor repo.radeon.com/rocm/manylinux (tops
+#     out at rocm-rel-7.2.4) nor the TheRock nightly index (rocm.nightlies.amd.com, whose 7.14 line
+#     carries only torch 2.9.1). Surveying only those three is what produced the long-standing and
+#     WRONG conclusion that 7.14 forces a 5-minor torch downgrade.
+#
+# Verified against the engine before writing this file: all 139 distinct torch.* symbols the engine
+# uses exist in 2.13; the engine touches NONE of the volatile namespaces (no torch.compile,
+# _dynamo, _inductor, export, accelerator); graph capture rides only on torch.cuda.CUDAGraph /
+# torch.cuda.graph(pool=, stream=); and every torch/ATen/c10 header the kernels include is present
+# (c10/util/Optional.h in 2.13 is already `using std::optional`, so the c10::optional deprecation is
+# a no-op either direction).
+#
+# BUILD (both contexts REQUIRED, both must be CLEAN worktrees):
+#   docker build -f Dockerfile.rocm714 -t minisgl-rdna4:lean714 \
+#       --build-context kernels=<CLEAN kernels worktree> \
+#       --build-context uprof=/home/pat/pkgs \
+#       --build-arg KERNELS_REF=<kernels sha> .
+# `COPY --from=kernels .` and `COPY python` copy what is ON DISK, so building from a shared tree
+# bakes another agent's mid-edit files. KERNELS_REF is only a cache-buster label — bump it or the
+# kernel layer is served from cache and you ship stale kernels. Omitting `uprof` does NOT skip the
+# stage: docker tries to resolve the name as a REGISTRY image and fails with "pull access denied
+# ... insufficient_scope", which reads like an auth problem. An empty dir is fine.
+#
+# THE KERNELS MUST BE BUILT IN THIS IMAGE (they are, below). A .so built against one image's torch
+# will not load in another — the symptom is a serve that never reaches the GPU (gpu_use=0% until the
+# readiness timeout), NOT a build error. Do not copy a 7.2.1-built kernel tree in here.
+
+FROM rocm/dev-ubuntu-24.04:7.14.0-full
+
+ENV DEBIAN_FRONTEND=noninteractive
+# libnuma1: torch 2.12 on this channel pulls rocSHMEM, which logs
+# "E-001h rocSHMEM Could not open libnuma" on every import without it. Cosmetic but noisy, and it
+# pollutes the boot logs we read to decide whether a serve came up.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-venv python3-pip git build-essential ca-certificates libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- register ROCm with the dynamic loader ---------------------------------------------------
+# ANOTHER 7.2.1 -> 7.14 BASE DIFFERENCE, and a silent one. The 7.2.1-complete base had ROCm in the
+# loader cache; 7.14.0-full does NOT — `ldconfig -p | grep libamdhip64` returns ZERO entries and
+# there is no /etc/ld.so.conf.d/*rocm*. The libs are real, just unregistered: /opt/rocm/lib is an
+# alternatives symlink to /opt/rocm/core-7.14/lib. Anything that dlopen()s the bare soname (e.g.
+# IntelliKit's kerncap/linex via ctypes) dies with
+#     OSError: libamdhip64.so: cannot open shared object file: No such file or directory
+# at IMPORT time, long after a successful compile — so it is invisible to the build until it isn't.
+#
+# Do this via ld.so.conf, NOT LD_LIBRARY_PATH. The loader searches DT_RPATH, then LD_LIBRARY_PATH,
+# then DT_RUNPATH, and the ldconfig cache LAST — so this cannot shadow torch's own bundled ROCm libs,
+# which is exactly the failure mode the rocprof-deps note below warns about (a global
+# LD_LIBRARY_PATH there aborted an unrelated dlopen during import with SIGABRT).
+RUN set -eux; \
+    echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf; \
+    ldconfig; \
+    ldconfig -p | grep -q libamdhip64 || { echo "FATAL: libamdhip64 still not on loader path"; exit 1; }; \
+    python3 -c "import ctypes; ctypes.CDLL('libamdhip64.so'); print('dlopen libamdhip64.so OK')"
+
+# Isolated venv (Ubuntu's system python is PEP-668 externally-managed). Base is Ubuntu 24.04 =>
+# python 3.12.3, which is what the cp312 wheels below require.
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/opt/rocm/bin:$PATH \
+    PIP_NO_CACHE_DIR=1
+
+# --- torch 2.13 for ROCm 7.14, gfx1201 ------------------------------------------------------------
+# AMD's multi-arch channel splits torch from its device code: the base `torch` wheel is arch-less
+# (~185 MB) and the `[device-gfx1201]` extra pulls amd-torch-device-gfx1201 (~51 MB) which carries
+# the gfx1201 fat binary. Requesting plain `torch` WITHOUT the extra installs something that imports
+# fine and then finds no GPU — so the extra is load-bearing, not cosmetic.
+#
+# A single --index-url is correct and sufficient: repo.amd.com/rocm/whl-multi-arch is a FULL PyPI
+# mirror, not an AMD-only index (verified — filelock/sympy/jinja2/networkx/fsspec resolve there,
+# while a bogus package name returns 403). So torch's own deps resolve without an --extra-index-url.
+#
+# The assert pins the two things that actually break silently: a non-ROCm torch, and torch/runtime
+# HIP skew against this base (both must be 7.14).
+#
+# *** PIN 2.12.0, NOT 2.13.0. THIS IS A CORRECTNESS PIN, NOT CONSERVATISM. ***
+# torch 2.13.0+rocm7.14.0 on this index is an MI300-ONLY publish. Its own wheel METADATA declares:
+#     Provides-Extra: device-gfx942
+#     Provides-Extra: device-all
+#     Requires-Dist: amd-torch-device-gfx942 == 2.13.0+rocm7.14.0; extra == "device-gfx942"
+#     Requires-Dist: amd-torch-device-gfx942 == 2.13.0+rocm7.14.0; extra == "device-all"
+# gfx942 is the ONLY device extra it offers, and even `device-all` maps to gfx942 alone. So:
+#     pip install "torch[device-gfx1201]==2.13.0+rocm7.14.0"
+#     -> WARNING: torch 2.13.0+rocm7.14.0 does not provide the extra 'device-gfx1201'
+# pip only WARNS and proceeds, leaving a torch with get_arch_list() == ['gfx942'] that imports
+# cleanly and passes a torch.version.hip check but has no gfx1201 code. An
+# amd_torch_device_gfx1201-2.13.0 wheel DOES exist in the index listing, but it is orphaned —
+# torch 2.13.0 never references it, and installing it by hand does not fix the arch list.
+# 2.12.0 is what AMD's ROCm install docs pin; it resolves the extra cleanly and pulls
+# amd-torch-device-gfx1201 + rocm-sdk-device-gfx1201 + rocm-sdk-core/libraries 7.14.0.
+# Before bumping to 2.13.x, check `Provides-Extra` in the new wheel's METADATA for device-gfx1201 —
+# do not assume a newer version number is better here.
+ARG TORCH_INDEX=https://repo.amd.com/rocm/whl-multi-arch/
+ARG TORCH_SPEC=torch[device-gfx1201]==2.12.0+rocm7.14.0
+RUN pip install "${TORCH_SPEC}" --index-url ${TORCH_INDEX} \
+ && python - <<'PY'
+import torch
+from importlib.metadata import version, PackageNotFoundError
+assert torch.version.hip, "not a ROCm torch"
+assert torch.version.hip.startswith("7.14"), f"torch/runtime HIP skew: {torch.version.hip} vs base 7.14"
+# Gate the SILENT failure mode above: if the extra did not resolve, this dist is simply absent.
+try:
+    dev = version("amd-torch-device-gfx1201")
+except PackageNotFoundError:
+    raise SystemExit("FATAL: amd-torch-device-gfx1201 not installed — the "
+                     "'[device-gfx1201]' extra did not resolve (pip only WARNS). "
+                     "This torch has no gfx1201 code; it would import fine and never reach the GPU.")
+# get_arch_list() is EMPTY here and that is expected: there is no GPU during a docker build, so it
+# enumerates nothing. (Verified on-card afterwards: the same image returns a full list CONTAINING
+# gfx1201 once a card is visible.) So do not assert 'gfx1201 in archs' — it would fail every build.
+# A NON-empty list that lacks gfx1201 is the real signal: that is the 2.13.0 foreign-fat-wheel mode.
+archs = torch.cuda.get_arch_list()
+assert not archs or "gfx1201" in archs, f"torch built for {archs}, not gfx1201"
+print("torch", torch.__version__, "hip", torch.version.hip,
+      "| amd-torch-device-gfx1201", dev, "| arch list", archs)
+PY
+
+# *** TOOLCHAIN SHADOWING — read before touching PATH or adding a stage that compiles HIP ***
+# torch 2.12 on this channel hard-depends on `rocm[libraries]==7.14.0`, which installs a COMPLETE pip
+# ROCm SDK into the venv, including shims on /opt/venv/bin for hipcc, amdclang, amdclang++,
+# hipify-clang, rocm_agent_enumerator, rocm-smi. Because the venv is first on PATH, `which hipcc`
+# silently changes the moment torch is installed:
+#     before torch:  /opt/rocm/bin/hipcc
+#     after  torch:  /opt/venv/bin/hipcc
+# The shim is NOT broken and is NOT a different toolchain — it reports the same HIP 7.14.60850 and
+# the same AMD clang 23 (46fcb339) as /opt/rocm. But it is a PYTHON script that imports
+# rocm_sdk_core, so it dies with "ModuleNotFoundError: No module named 'rocm_sdk_core'" in any
+# context where the venv's site-packages is not on sys.path — most importantly PIP BUILD ISOLATION.
+# That is what broke IntelliKit's kerneldb here (cmake then reports the far less obvious
+# "CMAKE_CXX_COMPILER not set, after EnableLanguage").
+# Every stage below that compiles HIP therefore prepends /opt/rocm/bin to PATH explicitly.
+# Do NOT "simplify" that away, and do not reorder this stage above the torch install.
+
+# --- engine runtime deps (only what minisglang imports on the serve path) -------------------------
+# server: fastapi/uvicorn/pydantic/starlette + openai (OpenAI-compatible API) ; message: msgpack/pyzmq ;
+# model load: transformers/tokenizers/safetensors/huggingface-hub/accelerate/modelscope/sentencepiece/
+# einops ; cli: prompt_toolkit ; util: numpy/psutil ; guided decoding: xgrammar (grammar compiler;
+# minisgl does the bitmask masking device-agnostically in torch, so no xgrammar CUDA kernel needed).
+# NB: NO apache-tvm-ffi (the tvm_ffi paths are the disabled pynccl/JIT build path — the combined image
+# never had it and serve works without it).
+# Pinned to PyPI explicitly rather than inheriting the AMD mirror above: these are not AMD packages,
+# and we do not want the long tail of engine deps to depend on that mirror staying complete.
+RUN pip install --index-url https://pypi.org/simple \
+        "transformers>=4.56" tokenizers safetensors "huggingface-hub" accelerate modelscope \
+        sentencepiece einops \
+        numpy msgpack pyzmq psutil xgrammar \
+        fastapi uvicorn pydantic starlette prompt_toolkit openai
+
+# ---- rpd_tracer (rocmProfileData): low-overhead STREAMING tracer -------------------------------
+# rocprofv3 pays twice on a long serving run: it timestamps every dispatch (overhead scales with
+# KERNEL COUNT, ~1.33x on a ~3M-dispatch run) and then serializes the buffered trace at exit on
+# essentially one thread, which on a huge trace takes longer than the run. rpd streams straight to
+# SQLite during execution, so there is no end-of-run serialization -- it is the right tool for a
+# whole-serve trace. Selected via `WHAT=stream bash opt_loop/bin/gpuprof.sh ...`.
+#
+# Build deps discovered by building it (not guessed): libsqlite3-dev, libfmt-dev, and xxd (the
+# Makefile generates tableSchema.h with `xxd -i`; without it the build dies at Error 127).
+# GOTCHA: the repo ROOT contains a Django app directory named `rocpd/` which SHADOWS the real
+# `rocpd_python/rocpd` package whenever python runs with the repo as CWD -- the import then fails with
+# "No module named rocpd.schema" and looks like a packaging bug. Install, then leave the directory.
+# rocmProfileData's default branch is **master**, not main — pinning --branch main fails the clone
+# with "Remote branch main not found" (exit 128).
+ARG RPD_REF=master
+RUN set -eux; \
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libsqlite3-dev libfmt-dev xxd; \
+    rm -rf /var/lib/apt/lists/*; \
+    git clone --depth 1 --branch "${RPD_REF}" https://github.com/ROCm/rocmProfileData /opt/rocmProfileData; \
+    cd /opt/rocmProfileData; \
+    make -C rocpd_python install; \
+    make -C rpd_tracer; \
+    make -C rpd_tracer install; \
+    cd /; \
+    python -c "import rocpd.schema, rpdTracerControl; print('rpd import OK')"; \
+    test -f /usr/local/lib/librpd_tracer.so
+
+# ---- IntelliKit (AMDResearch): kerncap + linex + accordo + metrix + nexus + MCP servers ---------
+#   linex   -> maps latency_cycles / stall_cycles to SOURCE LINES via `rocprofv3 --att` (SQTT thread
+#              trace). --att is a DIFFERENT mechanism from --pmc and worked even on 7.2.1.
+#   kerncap -> captures a live dispatch (kernarg + device memory + HSACO) at the REAL served shapes
+#              and emits a standalone reproducer.
+#   accordo -> snapshot-based correctness validation with configurable atol/rtol.
+#   metrix  -> the counter tool. On 7.2.1 it was inert because `--pmc` hung on gfx1201. ON THIS
+#              IMAGE THAT IS NO LONGER TRUE: 7.14's rocprofv3 collects counters on gfx1201 in
+#              seconds. The remaining gate is a RUNTIME host setting, not the image — the discrete
+#              cards must be at power_dpm_force_performance_level=profile_standard or RDNA4 gates
+#              the perfmon clock and every counter silently reads zero. NOTE that profile_standard
+#              pins clocks to a fixed NON-BOOST state, so timings taken under it are not comparable
+#              to auto-mode numbers; keep counter runs and timing runs separate.
+#   uprof_mcp -> an MCP WRAPPER only; it needs AMD uProf itself, installed by the stage below.
+#
+# apt deps are from IntelliKit's own docker/Dockerfile, PLUS libelf-dev, which the 7.2.1-complete
+# base happened to provide and this 7.14.0-full base does NOT: kerneldb's src/addressMap.cc includes
+# <gelf.h> and dies with "fatal error: 'gelf.h' file not found". libdwarf-dev alone is not enough.
+# (Ignore the "Failed to get device count: no ROCm-capable device is detected (error code: 100)"
+# line in this stage's output — there is no GPU during a build and it is not the failure.)
+#
+# *** PATH ORDER IS LOAD-BEARING HERE — see the toolchain-shadowing note below. ***
+# IntelliKit's `kerneldb`/`accordo` compile HIP through cmake under PIP BUILD ISOLATION, and the
+# venv's hipcc shim cannot survive that. Prepending /opt/rocm/bin puts the REAL hipcc first.
+ARG INTELLIKIT_REF=main
+RUN set -eux; \
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git wget ninja-build cmake python3-dev build-essential libdwarf-dev libzstd-dev \
+        libelf-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    . /opt/venv/bin/activate; \
+    export PATH=/opt/rocm/bin:$PATH; \
+    export CMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++; \
+    hipcc --version | head -1; \
+    git clone --depth 1 --branch "${INTELLIKIT_REF}" https://github.com/AMDResearch/intellikit /opt/intellikit; \
+    bash /opt/intellikit/install/tools/install.sh --pip-cmd "pip --no-cache-dir"; \
+    python -c "import accordo, kerncap, linex, metrix, nexus; print('intellikit import OK')"
+
+# ---- rocprofiler-sdk runtime deps: libdw / libelf ------------------------------------------------
+# CHANGED vs the 7.2.1 Dockerfile, and this is a BUILD-BREAKING difference, not a tidy-up. There, the
+# only libdw.so.1 / libelf.so.1 in the image lived inside torch/lib and were symlinked out of it.
+# torch 2.13's wheel does NOT bundle them (verified), so that symlink loop would fail here. It is
+# also unnecessary: this base ships both on the normal loader path (/lib/x86_64-linux-gnu). We still
+# populate /opt/rocprof-deps so KERNCAP_DEPS keeps its old contract for callers that set it.
+# Do NOT put this on a global LD_LIBRARY_PATH — on the 7.2.1 image that shadowed torch's own libs and
+# aborted an unrelated dlopen during import (SIGABRT inside PyImport_ImportModuleLevelObject).
+RUN set -eux; \
+    mkdir -p /opt/rocprof-deps; \
+    for d in libdw.so.1 libelf.so.1; do \
+      src="$(ldconfig -p | awk -v n="$d" '$1==n {print $NF; exit}')"; \
+      test -n "$src" || { echo "FATAL: $d not found on loader path"; exit 1; }; \
+      ln -sf "$src" "/opt/rocprof-deps/$d"; \
+    done; \
+    ls -l /opt/rocprof-deps
+
+# ---- rocprofv3 ATT trace decoder -----------------------------------------------------------------
+# CHANGED vs the 7.2.1 Dockerfile: 7.2.1 had no decoder at all, so the build downloaded one
+# (tools/fetch_att_decoder.py). This base SHIPS librocprof-trace-decoder (0.2.0) already, so we
+# resolve it out of the ROCm tree instead of fetching. The path is version-stamped
+# (/opt/rocm/core-7.14/lib), hence the find rather than a hardcoded path. The fetch script remains
+# the fallback so this stage cannot silently produce an image with no decoder.
+COPY tools/fetch_att_decoder.py /opt/fetch_att_decoder.py
+RUN set -eux; \
+    mkdir -p /opt/rocprof-decoder; \
+    src="$(find /opt/rocm -name 'librocprof-trace-decoder.so*' -type f 2>/dev/null | head -1)"; \
+    if [ -n "$src" ]; then \
+      ln -sf "$src" /opt/rocprof-decoder/librocprof-trace-decoder.so; \
+      echo "ATT decoder from base: $src"; \
+    else \
+      echo "ATT decoder not in base — falling back to fetch"; \
+      . /opt/venv/bin/activate; \
+      python /opt/fetch_att_decoder.py /opt/rocprof-decoder/librocprof-trace-decoder.so; \
+    fi; \
+    test -e /opt/rocprof-decoder/librocprof-trace-decoder.so
+
+ENV KERNCAP_DEPS=/opt/rocprof-deps \
+    ATT_DECODER_DIR=/opt/rocprof-decoder
+
+# ---- AMD uProf 5.3.521: the CPU profiler -------------------------------------------------------
+# WHY: this stack keeps turning out to be HOST-bound rather than GPU-bound. uprof_mcp from IntelliKit
+# is only an MCP wrapper and is inert without this.
+#
+# NOT FETCHABLE AT BUILD TIME. AMD serves it only behind a EULA click-through: the direct URL answers
+# 302 back to the landing page for any request that has not been through the form. So the .deb is
+# supplied as a BUILD CONTEXT rather than downloaded, which also keeps the build reproducible and
+# offline. The stage is skipped cleanly if that context has no .deb.
+#
+# THE POSTINST FAILURE IS EXPECTED AND TOLERATED (|| true): it wants to build a KERNEL MODULE against
+# the host kernel (impossible in a container, and it is for POWER profiling, not CPU hotspots), and it
+# wants debugfs/tracefs mounted (a runtime concern). The binaries unpack correctly either way, so the
+# real gate is whether the CLI RUNS, which is what is checked below.
+COPY --from=uprof . /tmp/uprof-pkg/
+RUN set -eux; \
+    if ls /tmp/uprof-pkg/amduprof_*.deb >/dev/null 2>&1; then \
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        /tmp/uprof-pkg/amduprof_*.deb || true; \
+      rm -rf /var/lib/apt/lists/*; \
+      /opt/AMDuProf_5.3-521/bin/AMDuProfCLI info --list-cpu-topology >/dev/null 2>&1 \
+        || /opt/AMDuProf_5.3-521/bin/AMDuProfCLI --version >/dev/null 2>&1 \
+        || { echo "uProf CLI does not run"; exit 1; }; \
+      echo "uProf CLI OK: $(ls -d /opt/AMDuProf_*/bin/AMDuProfCLI)"; \
+    else \
+      echo "NOTE: no amduprof_*.deb in the uprof build context — CPU profiling will be unavailable"; \
+    fi; \
+    rm -rf /tmp/uprof-pkg
+ENV INTELLIKIT_UPROF_CLI=/opt/AMDuProf_5.3-521/bin/AMDuProfCLI
+
+# py-spy: sampling profiler for the PYTHON layer. Most of this engine's host overhead is Python --
+# scheduler loop, per-step batch assembly, spec/EP orchestration -- and py-spy attributes that
+# directly, on a RUNNING process, with no instrumentation and no restart. That matters here because
+# the serve is the thing we cannot easily rebuild mid-experiment.
+RUN . /opt/venv/bin/activate && pip install --no-cache-dir --index-url https://pypi.org/simple py-spy && py-spy --version
+
+# --- build the custom HIP kernels from the CANONICAL repo (source of truth) ------------------------
+# Each subdir of rdna4-hip-kernels is an independent kernel-builder package with a no-Nix local build
+# (local/build_local.sh -> hipcc, gfx1201). We build every serve-path package and collect its
+# importable python module (torch-ext/<pyname>) under /opt/kernels, which goes on PYTHONPATH.
+#
+# This is the stage that MUST run in this image: hipcc here is 7.14 (clang 23) and torch here is
+# 2.13, so both the ISA and the C++ ABI differ from the 7.2.1 image. rocWMMA (used by
+# attn_prefill_paged / attn_hip / fp8_wmma) is present in this base at /opt/rocm/include/rocwmma.
+ARG KERNELS_REF=2fa1c38
+# Bound the compile parallelism. torch's cpp_extension honours MAX_JOBS; unbounded it saturates all
+# 16 cores, and on this SHARED box that perturbs whatever a concurrent opt_loop is timing.
+ARG MAX_JOBS=6
+COPY --from=kernels . /opt/rdna4-hip-kernels
+# PATH: /opt/rocm/bin FIRST, deliberately — see the toolchain-shadowing note. The two hipccs are the
+# same toolchain (both HIP 7.14.60850 / clang 23 46fcb339), so this is about DETERMINISM, not
+# correctness: we must be able to say exactly which compiler produced the .so we ship and profile.
+RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; export PATH=/opt/rocm/bin:$PATH; mkdir -p /opt/kernels; \
+    echo "kernel toolchain: $(which hipcc)"; hipcc --version | head -2; \
+    for pkg in \
+        gdn:gdn_hip \
+        cca:zaya_cca \
+        mla:mla_hip \
+        attn_hip:attn_hip \
+        attn_decode:attn_decode \
+        attn_prefill_paged:attn_prefill_paged \
+        dense_gemm:dense_gemm \
+        fp8_wmma:fp8_wmma \
+        moe:moe_hip \
+        custom_ar:custom_ar \
+        swiglu:swiglu_hip \
+        sampler:sampler_hip \
+        tail:tail_hip ; do \
+      dir="${pkg%%:*}"; mod="${pkg##*:}"; \
+      echo "=== building canonical kernel: ${dir} -> import ${mod} ==="; \
+      ( cd "/opt/rdna4-hip-kernels/${dir}" && GPU_ARCHS=gfx1201 bash local/build_local.sh ); \
+      ln -sfn "/opt/rdna4-hip-kernels/${dir}/torch-ext/${mod}" "/opt/kernels/${mod}"; \
+    done; \
+    python - <<'PY'
+# Import-check every collected kernel module (registers torch.ops.<mod>_C.*). No GPU needed to load.
+import sys; sys.path.insert(0, "/opt/kernels")
+for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
+          "dense_gemm","fp8_wmma","moe_hip",
+          "custom_ar","swiglu_hip","sampler_hip","tail_hip"]:
+    __import__(m); print("ok import", m)
+PY
+
+# --- bake the engine source so the image is SELF-CONTAINED (turnkey `docker compose up`) ----------
+# The internal dev compose hot-mounts the repo at /engine and prepends /engine/python to PYTHONPATH
+# (edit-and-restart). But the PUBLIC prebuilt image must run with NO source mount and NO repo clone,
+# so we also COPY the engine into the image at /opt/minisgl/python and put it on the DEFAULT
+# PYTHONPATH below. A dev mount that overrides PYTHONPATH still wins; the baked copy is the fallback.
+COPY python /opt/minisgl/python
+
+# /opt/kernels first so the canonical builds are authoritative, then the baked engine.
+# ROCm serve needs the RCCL-via-torch path.
+#
+# TORCH_BLAS_PREFER_HIPBLASLT=1 — CHANGED from the 7.2.1 image's 0. Read this before reverting.
+#
+# WHY 1 HERE: ROCm 7.14's release notes call out lower-than-expected LLM inference performance
+# (FP16 decode, batch >= 8) on torch < 2.14 unless hipBLASLt is preferred, and state that =1 becomes
+# the PyTorch 2.14 default. We are on torch 2.12, i.e. exactly the "earlier than 2.14" case, so we
+# opt in explicitly rather than inherit the slower default.
+#
+# TWO CAVEATS, both verified, so nobody re-derives them:
+#  1. That advisory names AMD Radeon RX 7900 Series / RX 7800 XT / Ryzen AI MAX+ (RDNA3 and
+#     Ryzen-AI) — it does NOT name RDNA4 / gfx1201. So the perf claim is not established for THIS
+#     card; treat the win as unmeasured until someone A/Bs it (it is an ENV, so both legs run on
+#     this same image via `-e`).
+#  2. On gfx1201 this flag does not choose the BACKEND the way it reads: rocBLAS's
+#     isDefaultHipBLASLtArch() already returns true for gfx1200/1201/1250/950, so hipBLASLt is
+#     reached either way. The flag selects WHICH layer's heuristic picks the solution.
+#
+# THE RISK WE ACCEPTED: the 7.2.1 image pinned 0 as a STABILITY workaround, not a perf choice —
+# PORT.md:214 records hipBLASLt intermittently returning INTERNAL_ERROR -> ALLOC_FAILED on the
+# in_proj GEMM under serve load. That was observed on ROCm 7.2.x with an older hipBLASLt and is
+# unverified on 7.14. IF a serve dies with ALLOC_FAILED / INTERNAL_ERROR on a GEMM under sustained
+# load, THIS LINE IS THE FIRST THING TO FLIP BACK TO 0 — the failure is intermittent and load
+# dependent, so it will not show up in a smoke test.
+# NOTE the sibling configs still pin 0 and were deliberately NOT changed with this image:
+# docker-compose.yml, docker-compose.lean.tidar.yml, tools/run_{ab_window,dflash_window,
+# seed_kv_parity,prefill_seed_window}.sh — a run through those still overrides this to 0.
+ENV PYTHONPATH=/opt/kernels:/opt/minisgl/python \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_OFFLINE=1 \
+    TORCH_BLAS_PREFER_HIPBLASLT=1
+
+EXPOSE 1919
+WORKDIR /opt/minisgl
+CMD ["python", "-m", "minisgl", "--help"]
