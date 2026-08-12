@@ -205,7 +205,11 @@ RUN set -eux; \
 #              to auto-mode numbers; keep counter runs and timing runs separate.
 #   uprof_mcp -> an MCP WRAPPER only; it needs AMD uProf itself, installed by the stage below.
 #
-# apt deps are from IntelliKit's own docker/Dockerfile.
+# apt deps are from IntelliKit's own docker/Dockerfile, PLUS libelf-dev, which the 7.2.1-complete
+# base happened to provide and this 7.14.0-full base does NOT: kerneldb's src/addressMap.cc includes
+# <gelf.h> and dies with "fatal error: 'gelf.h' file not found". libdwarf-dev alone is not enough.
+# (Ignore the "Failed to get device count: no ROCm-capable device is detected (error code: 100)"
+# line in this stage's output — there is no GPU during a build and it is not the failure.)
 #
 # *** PATH ORDER IS LOAD-BEARING HERE — see the toolchain-shadowing note below. ***
 # IntelliKit's `kerneldb`/`accordo` compile HIP through cmake under PIP BUILD ISOLATION, and the
@@ -214,7 +218,8 @@ ARG INTELLIKIT_REF=main
 RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        git wget ninja-build cmake python3-dev build-essential libdwarf-dev libzstd-dev; \
+        git wget ninja-build cmake python3-dev build-essential libdwarf-dev libzstd-dev \
+        libelf-dev; \
     rm -rf /var/lib/apt/lists/*; \
     . /opt/venv/bin/activate; \
     export PATH=/opt/rocm/bin:$PATH; \
