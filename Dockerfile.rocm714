@@ -70,6 +70,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-dev python3-venv python3-pip git build-essential ca-certificates libnuma1 \
     && rm -rf /var/lib/apt/lists/*
 
+# --- register ROCm with the dynamic loader ---------------------------------------------------
+# ANOTHER 7.2.1 -> 7.14 BASE DIFFERENCE, and a silent one. The 7.2.1-complete base had ROCm in the
+# loader cache; 7.14.0-full does NOT — `ldconfig -p | grep libamdhip64` returns ZERO entries and
+# there is no /etc/ld.so.conf.d/*rocm*. The libs are real, just unregistered: /opt/rocm/lib is an
+# alternatives symlink to /opt/rocm/core-7.14/lib. Anything that dlopen()s the bare soname (e.g.
+# IntelliKit's kerncap/linex via ctypes) dies with
+#     OSError: libamdhip64.so: cannot open shared object file: No such file or directory
+# at IMPORT time, long after a successful compile — so it is invisible to the build until it isn't.
+#
+# Do this via ld.so.conf, NOT LD_LIBRARY_PATH. The loader searches DT_RPATH, then LD_LIBRARY_PATH,
+# then DT_RUNPATH, and the ldconfig cache LAST — so this cannot shadow torch's own bundled ROCm libs,
+# which is exactly the failure mode the rocprof-deps note below warns about (a global
+# LD_LIBRARY_PATH there aborted an unrelated dlopen during import with SIGABRT).
+RUN set -eux; \
+    echo "/opt/rocm/lib" > /etc/ld.so.conf.d/rocm.conf; \
+    ldconfig; \
+    ldconfig -p | grep -q libamdhip64 || { echo "FATAL: libamdhip64 still not on loader path"; exit 1; }; \
+    python3 -c "import ctypes; ctypes.CDLL('libamdhip64.so'); print('dlopen libamdhip64.so OK')"
+
 # Isolated venv (Ubuntu's system python is PEP-668 externally-managed). Base is Ubuntu 24.04 =>
 # python 3.12.3, which is what the cp312 wheels below require.
 RUN python3 -m venv /opt/venv
@@ -360,10 +379,36 @@ COPY python /opt/minisgl/python
 
 # /opt/kernels first so the canonical builds are authoritative, then the baked engine.
 # ROCm serve needs the RCCL-via-torch path.
+#
+# TORCH_BLAS_PREFER_HIPBLASLT=1 — CHANGED from the 7.2.1 image's 0. Read this before reverting.
+#
+# WHY 1 HERE: ROCm 7.14's release notes call out lower-than-expected LLM inference performance
+# (FP16 decode, batch >= 8) on torch < 2.14 unless hipBLASLt is preferred, and state that =1 becomes
+# the PyTorch 2.14 default. We are on torch 2.12, i.e. exactly the "earlier than 2.14" case, so we
+# opt in explicitly rather than inherit the slower default.
+#
+# TWO CAVEATS, both verified, so nobody re-derives them:
+#  1. That advisory names AMD Radeon RX 7900 Series / RX 7800 XT / Ryzen AI MAX+ (RDNA3 and
+#     Ryzen-AI) — it does NOT name RDNA4 / gfx1201. So the perf claim is not established for THIS
+#     card; treat the win as unmeasured until someone A/Bs it (it is an ENV, so both legs run on
+#     this same image via `-e`).
+#  2. On gfx1201 this flag does not choose the BACKEND the way it reads: rocBLAS's
+#     isDefaultHipBLASLtArch() already returns true for gfx1200/1201/1250/950, so hipBLASLt is
+#     reached either way. The flag selects WHICH layer's heuristic picks the solution.
+#
+# THE RISK WE ACCEPTED: the 7.2.1 image pinned 0 as a STABILITY workaround, not a perf choice —
+# PORT.md:214 records hipBLASLt intermittently returning INTERNAL_ERROR -> ALLOC_FAILED on the
+# in_proj GEMM under serve load. That was observed on ROCm 7.2.x with an older hipBLASLt and is
+# unverified on 7.14. IF a serve dies with ALLOC_FAILED / INTERNAL_ERROR on a GEMM under sustained
+# load, THIS LINE IS THE FIRST THING TO FLIP BACK TO 0 — the failure is intermittent and load
+# dependent, so it will not show up in a smoke test.
+# NOTE the sibling configs still pin 0 and were deliberately NOT changed with this image:
+# docker-compose.yml, docker-compose.lean.tidar.yml, tools/run_{ab_window,dflash_window,
+# seed_kv_parity,prefill_seed_window}.sh — a run through those still overrides this to 0.
 ENV PYTHONPATH=/opt/kernels:/opt/minisgl/python \
     PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
-    TORCH_BLAS_PREFER_HIPBLASLT=0
+    TORCH_BLAS_PREFER_HIPBLASLT=1
 
 EXPOSE 1919
 WORKDIR /opt/minisgl
