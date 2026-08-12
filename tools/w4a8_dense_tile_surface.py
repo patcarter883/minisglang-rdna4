@@ -124,6 +124,19 @@ SHAPES = [
     # real group-size effect from that one shape's N. group_size is a QUANTIZATION policy, not a
     # shape property: a g=128 checkpoint carries the same linears a g=32 one does, so the honest
     # g=128 fixture is the g=32 N/K ladder re-quantised. K stays a multiple of 128 for all of these.
+    # ---- the g=16 COLUMN (NVFP4) -------------------------------------------------------------
+    # NVFP4 mandates group_size 16, so every nvfp4-pack-quantized checkpoint lands here and NOTHING
+    # in this fixture covered it: the chooser was fitted on g=32/128 and extrapolates. Measured
+    # 2026-08-12 on Muse-Glimmer-30B-NVFP4's per-card TP=2 linears -- g=16 costs ~1.9-2.1x vs the
+    # SAME (K,N) at g=32, and the chooser's pick is a further ~1.55x off the best legal tile.
+    ("muse.qkv     g16", 6656,  2304, 16, torch.bfloat16, False),
+    ("muse.o_proj  g16", 2048,  6656, 16, torch.bfloat16, False),
+    ("muse.gate_up g16", 6656, 19968, 16, torch.bfloat16, False),
+    ("muse.down    g16", 9984,  6656, 16, torch.bfloat16, False),
+    ("muse.qkv     g32", 6656,  2304, 32, torch.bfloat16, False),
+    ("muse.o_proj  g32", 2048,  6656, 32, torch.bfloat16, False),
+    ("muse.gate_up g32", 6656, 19968, 32, torch.bfloat16, False),
+    ("muse.down    g32", 9984,  6656, 32, torch.bfloat16, False),
     ("glm.q_proj   tp2", 2048, 2048, 128, torch.bfloat16, True),
     ("glm.o_proj   tp2", 2048, 2816, 128, torch.bfloat16, True),
     ("g128 N=4096", 2048, 4096, 128, torch.bfloat16, True),
@@ -158,7 +171,11 @@ def rotation(N: int, K: int, g: int, zeros: bool, M: int, outbytes: int = 2):
     ws = []
     for _ in range(R):
         wp = pack_uint4_2d(torch.randint(0, 16, (N, K), dtype=torch.int8, device=DEV))
-        sc = (torch.randn(N, K // g, device=DEV).abs() * 0.02 + 0.002).to(torch.float16)
+        # GROUP-MAJOR (K/g, N). This is the kernel ABI ("scales must be (K/group, N)") and what
+        # NvFp4LinearMethod.process_weights_after_load hands it -- it transposes so N is the
+        # contiguous axis. The tool built (N, K/g) and EVERY cell failed with a shape error;
+        # the surface predates the scale-layout transpose and was never updated.
+        sc = (torch.randn(K // g, N, device=DEV).abs() * 0.02 + 0.002).to(torch.float16).contiguous()
         wz = (
             torch.randint(0, 1 << 30, (N // 8, K // g), dtype=torch.int32, device=DEV)
             if zeros
@@ -241,6 +258,8 @@ def make_call(W, cand: str, x, e2m1: bool):
 def set_env(cand: str) -> None:
     os.environ.pop("VLLM_W4A8_V7_CFG", None)
     os.environ.pop("VLLM_W4A8_DENSE_SMALLM_OFF", None)
+    if cand == "auto":
+        return   # no override -> tile_select.h's analytic chooser: the PRODUCTION pick
     if cand == "prefill_wmma:smallm_off":
         os.environ["VLLM_W4A8_DENSE_SMALLM_OFF"] = "1"
     elif cand not in ARMS:
@@ -256,6 +275,10 @@ def main() -> int:
     ap.add_argument("--shapes", default="", help="comma list of substrings to keep")
     ap.add_argument("--no-arms", action="store_true")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--e2m1", action="store_true",
+                    help="E2M1 (MXFP4/NVFP4) weight decode instead of uniform int4. The\n                          served path for every 4-bit FLOAT checkpoint; never swept before.")
+    ap.add_argument("--auto", action="store_true",
+                    help="also time the chooser's OWN pick (tile_select.h, no override) --\n                          i.e. what production actually gets, vs the best tile available.")
     ap.add_argument("--allow-any-card", action="store_true",
                     help="time on a non-64-CU card. ONLY for deliberately measuring the\n                          price of the CU pin; never for deriving or validating the model.")
     args = ap.parse_args()
@@ -343,7 +366,7 @@ def main() -> int:
                        if legal(tile3(t)[0], tile3(t)[1], g, tile3(t)[2])]
         skipped = [tile_name(t) for t in tiles
                    if not legal(tile3(t)[0], tile3(t)[1], g, tile3(t)[2])]
-        cands = ([] if args.no_arms else list(ARMS)) + legal_tiles
+        cands = (["auto"] if args.auto else []) + ([] if args.no_arms else list(ARMS)) + legal_tiles
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} "
             f"zeros={'awq' if zeros else 'sym'} ===")
         if skipped:
@@ -366,7 +389,7 @@ def main() -> int:
             for cand in cands:
                 set_env(cand)
                 try:
-                    t[cand], rp[cand] = time_graph(make_call(W, cand, x, False), ws)
+                    t[cand], rp[cand] = time_graph(make_call(W, cand, x, args.e2m1), ws)
                 except Exception as e:  # noqa: BLE001
                     out(f"      (M={M} {cand}: {type(e).__name__}: {str(e)[:90]})")
                     torch.cuda.synchronize()
