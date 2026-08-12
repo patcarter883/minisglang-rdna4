@@ -130,6 +130,22 @@ print("torch", torch.__version__, "hip", torch.version.hip,
       "| amd-torch-device-gfx1201", dev, "| arch list", archs)
 PY
 
+# *** TOOLCHAIN SHADOWING — read before touching PATH or adding a stage that compiles HIP ***
+# torch 2.12 on this channel hard-depends on `rocm[libraries]==7.14.0`, which installs a COMPLETE pip
+# ROCm SDK into the venv, including shims on /opt/venv/bin for hipcc, amdclang, amdclang++,
+# hipify-clang, rocm_agent_enumerator, rocm-smi. Because the venv is first on PATH, `which hipcc`
+# silently changes the moment torch is installed:
+#     before torch:  /opt/rocm/bin/hipcc
+#     after  torch:  /opt/venv/bin/hipcc
+# The shim is NOT broken and is NOT a different toolchain — it reports the same HIP 7.14.60850 and
+# the same AMD clang 23 (46fcb339) as /opt/rocm. But it is a PYTHON script that imports
+# rocm_sdk_core, so it dies with "ModuleNotFoundError: No module named 'rocm_sdk_core'" in any
+# context where the venv's site-packages is not on sys.path — most importantly PIP BUILD ISOLATION.
+# That is what broke IntelliKit's kerneldb here (cmake then reports the far less obvious
+# "CMAKE_CXX_COMPILER not set, after EnableLanguage").
+# Every stage below that compiles HIP therefore prepends /opt/rocm/bin to PATH explicitly.
+# Do NOT "simplify" that away, and do not reorder this stage above the torch install.
+
 # --- engine runtime deps (only what minisglang imports on the serve path) -------------------------
 # server: fastapi/uvicorn/pydantic/starlette + openai (OpenAI-compatible API) ; message: msgpack/pyzmq ;
 # model load: transformers/tokenizers/safetensors/huggingface-hub/accelerate/modelscope/sentencepiece/
@@ -190,6 +206,10 @@ RUN set -eux; \
 #   uprof_mcp -> an MCP WRAPPER only; it needs AMD uProf itself, installed by the stage below.
 #
 # apt deps are from IntelliKit's own docker/Dockerfile.
+#
+# *** PATH ORDER IS LOAD-BEARING HERE — see the toolchain-shadowing note below. ***
+# IntelliKit's `kerneldb`/`accordo` compile HIP through cmake under PIP BUILD ISOLATION, and the
+# venv's hipcc shim cannot survive that. Prepending /opt/rocm/bin puts the REAL hipcc first.
 ARG INTELLIKIT_REF=main
 RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
@@ -197,6 +217,9 @@ RUN set -eux; \
         git wget ninja-build cmake python3-dev build-essential libdwarf-dev libzstd-dev; \
     rm -rf /var/lib/apt/lists/*; \
     . /opt/venv/bin/activate; \
+    export PATH=/opt/rocm/bin:$PATH; \
+    export CMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++; \
+    hipcc --version | head -1; \
     git clone --depth 1 --branch "${INTELLIKIT_REF}" https://github.com/AMDResearch/intellikit /opt/intellikit; \
     bash /opt/intellikit/install/tools/install.sh --pip-cmd "pip --no-cache-dir"; \
     python -c "import accordo, kerncap, linex, metrix, nexus; print('intellikit import OK')"
@@ -290,7 +313,11 @@ ARG KERNELS_REF=2fa1c38
 # 16 cores, and on this SHARED box that perturbs whatever a concurrent opt_loop is timing.
 ARG MAX_JOBS=6
 COPY --from=kernels . /opt/rdna4-hip-kernels
-RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; mkdir -p /opt/kernels; \
+# PATH: /opt/rocm/bin FIRST, deliberately — see the toolchain-shadowing note. The two hipccs are the
+# same toolchain (both HIP 7.14.60850 / clang 23 46fcb339), so this is about DETERMINISM, not
+# correctness: we must be able to say exactly which compiler produced the .so we ship and profile.
+RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; export PATH=/opt/rocm/bin:$PATH; mkdir -p /opt/kernels; \
+    echo "kernel toolchain: $(which hipcc)"; hipcc --version | head -2; \
     for pkg in \
         gdn:gdn_hip \
         cca:zaya_cca \
