@@ -141,8 +141,10 @@ except PackageNotFoundError:
     raise SystemExit("FATAL: amd-torch-device-gfx1201 not installed — the "
                      "'[device-gfx1201]' extra did not resolve (pip only WARNS). "
                      "This torch has no gfx1201 code; it would import fine and never reach the GPU.")
-# In this split design the base wheel is arch-less, so an EMPTY arch list is expected and correct.
-# A NON-empty list that lacks gfx1201 means we got a foreign fat wheel (the 2.13.0 failure mode).
+# get_arch_list() is EMPTY here and that is expected: there is no GPU during a docker build, so it
+# enumerates nothing. (Verified on-card afterwards: the same image returns a full list CONTAINING
+# gfx1201 once a card is visible.) So do not assert 'gfx1201 in archs' — it would fail every build.
+# A NON-empty list that lacks gfx1201 is the real signal: that is the 2.13.0 foreign-fat-wheel mode.
 archs = torch.cuda.get_arch_list()
 assert not archs or "gfx1201" in archs, f"torch built for {archs}, not gfx1201"
 print("torch", torch.__version__, "hip", torch.version.hip,
