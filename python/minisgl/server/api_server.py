@@ -619,6 +619,46 @@ def _reasoning_close_delim(req: "OpenAICompletionRequest") -> str | None:
     return parser.end_token if parser is not None else None
 
 
+def _reasoning_answer_delim(req: "OpenAICompletionRequest") -> str | None:
+    """The model's own ANSWER-TURN header, as an additional "reasoning ended" marker for the
+    scheduler's think gate. Never a force target — only a release trigger.
+
+    Needed by a template whose generation prompt stops MID-HEADER: Muse-Glimmer's ends
+    `<|start|>assistant`, so the model itself writes the recipient and a reply with no reasoning
+    begins ` to=user<|message|>` — it never opens a reasoning turn and so never emits the closer.
+    Without this the gate would stay shut for the whole reply and the β backstop would splice a turn
+    header into the middle of a legitimate answer. "" for every family whose generation prompt ends at
+    a turn boundary, which is the common case.
+
+    SAFETY: a header that is a SUFFIX of the reasoning opener would match at the START of the
+    reasoning turn and release the gate immediately — exactly the single-token bug this whole change
+    fixes, reintroduced one level up. (Muse: opener ` to=self<|message|>` vs header
+    ` to=user<|message|>` — no suffix relation, so the header is kept.)"""
+    if not _thinking_active(req):
+        return None
+    parser = _reasoning_parser()
+    if parser is None:
+        return None
+    header = parser.turn_header
+    if not header:
+        return None
+    if parser.start_token and parser.start_token.endswith(header):
+        return None
+    return header
+
+
+def _reasoning_close_wildcard(req: "OpenAICompletionRequest") -> tuple[str | None, str | None]:
+    """`(prefix, suffix)` bracketing a VARIABLE recipient inside the close delimiter, so the gate also
+    recognises reasoning that ends by routing to a TOOL (`…assistant to=<toolname><|message|>`) rather
+    than to the user. `(None, None)` when the checkpoint's closer is a fixed literal."""
+    if not _thinking_active(req):
+        return None, None
+    parser = _reasoning_parser()
+    if parser is None or not (parser.end_prefix and parser.end_suffix):
+        return None, None
+    return parser.end_prefix, parser.end_suffix
+
+
 # reasoning_effort -> token budget for the think-gate backstop.
 #   * OFF rungs disable thinking outright (handled in _resolve_chat_template_kwargs, not here).
 #   * "max" means UNBOUNDED: thinking on, no budget — distinct from omitting the field only in that
@@ -1096,8 +1136,11 @@ def _reasoning_parser():
         if _REASONING_PARSER is None:
             logger.info("reasoning extraction DISABLED (%s)", how)
         else:
-            logger.info("reasoning delimiters %r … %r (%s)",
-                        _REASONING_PARSER.start_token, _REASONING_PARSER.end_token, how)
+            # The answer-turn header is logged alongside the pair because it is now load-bearing for
+            # DECODING (it releases the scheduler's reasoning gate), not just for stripping text.
+            logger.info("reasoning delimiters %r … %r (answer-turn header %r) (%s)",
+                        _REASONING_PARSER.start_token, _REASONING_PARSER.end_token,
+                        _REASONING_PARSER.turn_header, how)
     return _REASONING_PARSER
 
 
@@ -2288,6 +2331,9 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
                 # grammar-free rollout, not just the structured final answer.
                 think_close_delim=_reasoning_close_delim(req),
+                think_answer_delim=_reasoning_answer_delim(req),
+                think_close_prefix=_reasoning_close_wildcard(req)[0],
+                think_close_suffix=_reasoning_close_wildcard(req)[1],
                 think_budget=_resolve_think_budget(req),
             )
         except RSAError as e:
@@ -2418,6 +2464,9 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # and truncate with no answer. For grammar requests this is the same delim (it also
                 # gates the schema until </think>); for plain thinking it's a pure backstop.
                 think_close_delim=_reasoning_close_delim(req),
+                think_answer_delim=_reasoning_answer_delim(req),
+                think_close_prefix=_reasoning_close_wildcard(req)[0],
+                think_close_suffix=_reasoning_close_wildcard(req)[1],
                 think_budget=_resolve_think_budget(req),
             ),
         )
@@ -2634,6 +2683,9 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
                 think_close_delim=_think_delim,
+                think_answer_delim=_reasoning_answer_delim(req) if _think_delim else None,
+                think_close_prefix=(_reasoning_close_wildcard(req)[0] if _think_delim else None),
+                think_close_suffix=(_reasoning_close_wildcard(req)[1] if _think_delim else None),
                 think_budget=_resolve_think_budget(req) if _think_delim else None,
             ),
         )

@@ -42,11 +42,29 @@ class SamplingParams:
     # Reasoning + structured output: when a grammar is combined with an active thinking phase, the
     # model opens `<think>…</think>` reasoning BEFORE the answer, and masking JSON from token 0 would
     # suppress that reasoning (truncated / CoT-leaked output). This carries the reasoning parser's
-    # close delimiter (e.g. "</think>"); the scheduler resolves it to a token id and does NOT
-    # advance/mask the grammar matcher until that token is emitted — reasoning is free, the schema is
-    # enforced only on the post-`</think>` answer. None => grammar applies from token 0 (non-reasoning
-    # models, thinking-off requests, or unconstrained reqs — all unchanged).
+    # close delimiter (e.g. "</think>"); the scheduler resolves it to a token SEQUENCE and does NOT
+    # advance/mask the grammar matcher until that sequence is emitted — reasoning is free, the schema
+    # is enforced only on the post-`</think>` answer. None => grammar applies from token 0
+    # (non-reasoning models, thinking-off requests, or unconstrained reqs — all unchanged).
+    # This is also the backstop's FORCE target, so it must stay one concrete, emittable literal.
     think_close_delim: str | None = None
+    # An ADDITIONAL literal whose emission also ends the reasoning phase, but which is NEVER
+    # force-emitted at the budget: the model's own ANSWER-TURN header. It exists for a template whose
+    # generation prompt stops mid-header — Muse-Glimmer's ends `<|start|>assistant`, so a reply with
+    # no reasoning at all begins ` to=user<|message|>` and never opens a reasoning turn. Without it
+    # such a reply would never release the gate and the β backstop would splice a turn header into
+    # the middle of a perfectly good answer. None for every family whose generation prompt ends at a
+    # turn boundary (`<|im_start|>assistant\n`) — Qwen3, GLM, Laguna, Gemma-4, DeepSeek — i.e. a pure
+    # no-op on the common path.
+    think_answer_delim: str | None = None
+    # The close delimiter with a WILDCARD recipient, as (prefix, suffix). A channel-routed template
+    # names the recipient INSIDE the delimiter, so `think_close_delim` above is only the concrete
+    # `to=user` form: when the model ends reasoning by routing to a TOOL it emits
+    # `<|eom|><|start|>assistant to=<toolname><|message|>`, which the literal cannot match. These two
+    # bracket it — the scheduler matches "prefix, then a bounded run of any tokens, then suffix".
+    # Both None unless the checkpoint's template actually varies the delimiter by recipient.
+    think_close_prefix: str | None = None
+    think_close_suffix: str | None = None
     # Reasoning BUDGET (backstop for the gate above): a reasoning model often rambles in long/loose
     # prose and never emits a clean `</think>`, so the gate never opens and no JSON is produced. When
     # set (or via the scheduler's MINISGL_THINK_BUDGET default), after this many reasoning tokens the
