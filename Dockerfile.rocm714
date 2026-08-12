@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# minisgl-rdna4 — LEAN serving image, ROCm 7.14 / torch 2.13 variant.
+# minisgl-rdna4 — LEAN serving image, ROCm 7.14 / torch 2.12 variant.
 #
 # Same shape as the canonical `Dockerfile` (which is ROCm 7.2.1 + torch 2.14.0.dev): ONLY what
 # minisglang needs to run on gfx1201 (RDNA4) — no vllm, no sglang, no flashinfer, no sgl_kernel.
@@ -96,7 +96,7 @@ ENV VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:/opt/rocm/bin:$PATH \
     PIP_NO_CACHE_DIR=1
 
-# --- torch 2.13 for ROCm 7.14, gfx1201 ------------------------------------------------------------
+# --- torch 2.12 for ROCm 7.14, gfx1201 ------------------------------------------------------------
 # AMD's multi-arch channel splits torch from its device code: the base `torch` wheel is arch-less
 # (~185 MB) and the `[device-gfx1201]` extra pulls amd-torch-device-gfx1201 (~51 MB) which carries
 # the gfx1201 fat binary. Requesting plain `torch` WITHOUT the extra installs something that imports
@@ -253,7 +253,8 @@ RUN set -eux; \
 # ---- rocprofiler-sdk runtime deps: libdw / libelf ------------------------------------------------
 # CHANGED vs the 7.2.1 Dockerfile, and this is a BUILD-BREAKING difference, not a tidy-up. There, the
 # only libdw.so.1 / libelf.so.1 in the image lived inside torch/lib and were symlinked out of it.
-# torch 2.13's wheel does NOT bundle them (verified), so that symlink loop would fail here. It is
+# torch's wheel here does NOT bundle them (verified on BOTH 2.12 and 2.13), so that symlink loop
+# would fail here. It is
 # also unnecessary: this base ships both on the normal loader path (/lib/x86_64-linux-gnu). We still
 # populate /opt/rocprof-deps so KERNCAP_DEPS keeps its old contract for callers that set it.
 # Do NOT put this on a global LD_LIBRARY_PATH — on the 7.2.1 image that shadowed torch's own libs and
