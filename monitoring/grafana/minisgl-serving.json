@@ -98,7 +98,7 @@
       "id": 2,
       "type": "stat",
       "title": "Requests running",
-      "description": "minisgl_running_requests gauge — in-flight decode batch.",
+      "description": "minisgl_running_requests gauge \u2014 in-flight decode batch.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -160,7 +160,7 @@
       "id": 3,
       "type": "stat",
       "title": "Requests waiting (queue)",
-      "description": "minisgl_waiting_requests gauge — queued, not yet scheduled.",
+      "description": "minisgl_waiting_requests gauge \u2014 queued, not yet scheduled.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -222,7 +222,7 @@
       "id": 4,
       "type": "stat",
       "title": "Decode speed (tok/s)",
-      "description": "Per-stream decode rate = 1 / mean TPOT, measured prefill-excluded as (completion_time - first_token_time) / (tokens - 1).\n\nThis is the speed one request's tokens arrive at, not the server's aggregate — see \"Token throughput\" for that. It records on request COMPLETION, so it lags in-flight generation and stays flat during a long request; on a low request rate it can hold a stale value for minutes.\n\nUse it to answer \"how fast does a single user's stream feel?\" — it is unaffected by prefill time and by idle gaps between requests.",
+      "description": "Per-stream decode rate = 1 / mean TPOT, measured prefill-excluded as (completion_time - first_token_time) / (tokens - 1).\n\nThis is the speed one request's tokens arrive at, not the server's aggregate \u2014 see \"Token throughput\" for that. It records on request COMPLETION, so it lags in-flight generation and stays flat during a long request; on a low request rate it can hold a stale value for minutes.\n\nUse it to answer \"how fast does a single user's stream feel?\" \u2014 it is unaffected by prefill time and by idle gaps between requests.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -280,7 +280,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prompt tok/s",
-      "description": "Prefill throughput averaged over wall time: prompt tokens computed per second, excluding any served from the prefix cache. Idle gaps count against it, so on bursty traffic it reads well below what the prefill kernel is capable of — use \"Prefill throughput (compute)\" for the kernel's own rate.",
+      "description": "Prompt tokens/s actually run through prefill; tokens served from the prefix cache are excluded. Measured over a single 1 s scrape interval (irate) and reported as the peak within each display bucket, so it shows the real burst rate at any zoom level and reads 0 when nothing is prefilling. For the prefill kernel's own rate \u2014 computed tokens per GPU-second spent in prefill \u2014 see \"Prefill throughput (compute)\".",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -330,9 +330,10 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
         }
-      ]
+      ],
+      "interval": "1s"
     },
     {
       "id": 6,
@@ -469,7 +470,7 @@
     {
       "id": 8,
       "type": "row",
-      "title": "Spec Decode (DFlash / DDTree) — headline",
+      "title": "Spec Decode (DFlash / DDTree) \u2014 headline",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -483,7 +484,7 @@
       "id": 9,
       "type": "stat",
       "title": "Mean accept-len (tok/step)",
-      "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term — matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
+      "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term \u2014 matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -615,7 +616,7 @@
       "id": 11,
       "type": "stat",
       "title": "Drafted tok/s",
-      "description": "rate(minisgl_spec_draft_tokens_total) — draft tokens proposed.",
+      "description": "Speculative draft tokens proposed per second. Measured over a single 1 s scrape interval (irate), reported as the peak within each display bucket: the rate while drafting is actually running, not an idle-inclusive average.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -665,15 +666,16 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+          "expr": "max_over_time(sum(irate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
         }
-      ]
+      ],
+      "interval": "1s"
     },
     {
       "id": 12,
       "type": "stat",
       "title": "Accepted tok/s",
-      "description": "rate(minisgl_spec_accepted_tokens_total) — draft tokens verified & kept.",
+      "description": "Speculative draft tokens accepted by verify, per second. Measured over a single 1 s scrape interval (irate), reported as the peak within each display bucket. Compare against \"Drafted tok/s\" for the acceptance fraction.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -723,15 +725,16 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[$__rate_interval]))"
+          "expr": "max_over_time(sum(irate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
         }
-      ]
+      ],
+      "interval": "1s"
     },
     {
       "id": 13,
       "type": "timeseries",
       "title": "Mean accept-len over time",
-      "description": "accepted/steps over time — watch DFlash/DDTree tuning move this.",
+      "description": "accepted/steps over time \u2014 watch DFlash/DDTree tuning move this.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -863,7 +866,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "Token throughput (incl. prefix cache)",
-      "description": "Idle-INCLUSIVE throughput: rate() over the window averages in the gaps between requests, so a bursty workload reads well below the decode speed. See \"Decode speed\" for model tok/s.",
+      "description": "Generation and prompt token rates. Each series is measured over a single 1 s scrape interval (irate) and plotted as the peak within each display bucket, so a burst keeps its true height however far you zoom out. \"prefill cached (saved)\" is prompt tokens served from the prefix cache \u2014 work skipped, not work done.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -913,7 +916,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_generation_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_generation_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "generation"
         },
         {
@@ -922,7 +925,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "prompt"
         },
         {
@@ -930,17 +933,18 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "└ prefill cached (saved)",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "legendFormat": "\u2514 prefill cached (saved)",
           "refId": "C"
         }
-      ]
+      ],
+      "interval": "1s"
     },
     {
       "id": 17,
       "type": "timeseries",
       "title": "Requests running / waiting",
-      "description": "running = requests currently decoding. queued + prefilling = requests admitted but not yet decoding: either waiting for KV capacity or with a prefill still in flight.\n\nEach point is the PEAK over that interval, not a point sample, so a request shorter than the graph's resolution still shows up when you zoom out. Heights are therefore peaks, not averages — a bucket reading 4 may have averaged 1.\n\nA long prompt sits in \"queued + prefilling\" for the whole of its prefill and only moves to \"running\" at its first generated token.\n\nRead together: the second series climbing while the first stays flat means a queue backlog (check KV-pool utilization); both moving together is healthy batching.",
+      "description": "running = requests currently decoding. queued + prefilling = requests admitted but not yet decoding: either waiting for KV capacity or with a prefill still in flight.\n\nEach point is the PEAK over that interval, not a point sample, so a request shorter than the graph's resolution still shows up when you zoom out. Heights are therefore peaks, not averages \u2014 a bucket reading 4 may have averaged 1.\n\nA long prompt sits in \"queued + prefilling\" for the whole of its prefill and only moves to \"running\" at its first generated token.\n\nRead together: the second series climbing while the first stays flat means a queue backlog (check KV-pool utilization); both moving together is healthy batching.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -1008,7 +1012,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Request rate",
-      "description": "req/s: total arrived, succeeded, aborted (minisgl_requests_total / _success_total / _aborted_total).",
+      "description": "Requests/s arrived, succeeded, and aborted. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -1058,7 +1062,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_requests_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_requests_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "arrived"
         },
         {
@@ -1067,7 +1071,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_requests_success_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_requests_success_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "success"
         },
         {
@@ -1076,10 +1080,11 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_requests_aborted_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_requests_aborted_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "aborted"
         }
-      ]
+      ],
+      "interval": "1s"
     },
     {
       "id": 19,
@@ -1601,7 +1606,7 @@
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Prompt tokens/s served from the prefix cache (not re-prefilled).",
+      "description": "Prompt tokens/s served from the prefix cache \u2014 prefill work skipped. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1638,19 +1643,20 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "refId": "A"
         }
       ],
       "title": "Cached tok/s (saved)",
-      "type": "stat"
+      "type": "stat",
+      "interval": "1s"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Prompt tokens/s actually run through prefill (cache misses).",
+      "description": "Prompt tokens/s actually run through prefill (cache misses). Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1687,19 +1693,20 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "refId": "A"
         }
       ],
       "title": "Prefill computed tok/s",
-      "type": "stat"
+      "type": "stat",
+      "interval": "1s"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "TRUE prefill throughput: computed prefill tokens / wall-seconds of prefill compute. Unlike 'Prompt tok/s' (prompt-token ARRIVAL rate), this measures the prefill kernel itself — the apples-to-apples analog of vLLM request_prompt_tokens_sum / request_prefill_time_seconds_sum.",
+      "description": "TRUE prefill throughput: computed prefill tokens / wall-seconds of prefill compute. Unlike 'Prompt tok/s' (prompt-token ARRIVAL rate), this measures the prefill kernel itself \u2014 the apples-to-apples analog of vLLM request_prompt_tokens_sum / request_prefill_time_seconds_sum.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1874,7 +1881,7 @@
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Stacked prompt-token throughput: cache-saved vs actually computed. Total height = prompt tok/s.",
+      "description": "Stacked prompt-token rate: cache-saved vs actually computed; total height is prompt tok/s. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -1920,7 +1927,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "cached (saved)",
           "refId": "A"
         },
@@ -1929,18 +1936,19 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(rate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
           "legendFormat": "computed",
           "refId": "B"
         }
       ],
       "title": "Prefill tokens: cached vs computed",
-      "type": "timeseries"
+      "type": "timeseries",
+      "interval": "1s"
     },
     {
       "id": 38,
       "type": "row",
-      "title": "GPU — hardware telemetry (amd-smi)",
+      "title": "GPU \u2014 hardware telemetry (amd-smi)",
       "collapsed": false,
       "datasource": {
         "type": "prometheus",
@@ -2013,7 +2021,7 @@
     {
       "id": 40,
       "type": "timeseries",
-      "title": "GPU load — gfx activity (%)",
+      "title": "GPU load \u2014 gfx activity (%)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2070,7 +2078,7 @@
     {
       "id": 41,
       "type": "timeseries",
-      "title": "GPU temperature (°C)",
+      "title": "GPU temperature (\u00b0C)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2390,7 +2398,7 @@
           "legendFormat": "GPU {{gpu}}"
         }
       ],
-      "description": "amdgpu_umc_activity_percent — measured fraction of time the memory controller is busy (the directly-reported BW-utilization signal the GB/s panel is derived from)."
+      "description": "amdgpu_umc_activity_percent \u2014 measured fraction of time the memory controller is busy (the directly-reported BW-utilization signal the GB/s panel is derived from)."
     },
     {
       "id": 46,
@@ -2408,7 +2416,7 @@
       "id": 47,
       "type": "stat",
       "title": "Stored facts",
-      "description": "minisgl_cam_facts — subject→object edits across all namespaces.",
+      "description": "minisgl_cam_facts \u2014 subject\u2192object edits across all namespaces.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2466,7 +2474,7 @@
       "id": 48,
       "type": "stat",
       "title": "Namespaces",
-      "description": "minisgl_cam_namespaces — per-tenant/session isolated stores.",
+      "description": "minisgl_cam_namespaces \u2014 per-tenant/session isolated stores.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2524,7 +2532,7 @@
       "id": 49,
       "type": "stat",
       "title": "Facts evicted",
-      "description": "minisgl_cam_evicted — LRU-evicted under capacity pressure (0 = uncapped).",
+      "description": "minisgl_cam_evicted \u2014 LRU-evicted under capacity pressure (0 = uncapped).",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2586,7 +2594,7 @@
       "id": 50,
       "type": "stat",
       "title": "Max bank load",
-      "description": "minisgl_cam_max_bank_load — product-key crowding; delivery-fallback degrades past ~9/bank.",
+      "description": "minisgl_cam_max_bank_load \u2014 product-key crowding; delivery-fallback degrades past ~9/bank.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2652,7 +2660,7 @@
       "id": 51,
       "type": "stat",
       "title": "Crowded banks",
-      "description": "minisgl_cam_crowded_banks — banks past the crowding knee (>9 edits).",
+      "description": "minisgl_cam_crowded_banks \u2014 banks past the crowding knee (>9 edits).",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
