@@ -1218,6 +1218,31 @@ class Engine:
     # sync; pairs are drained opportunistically once complete, so nothing blocks the scheduler.
     prefill_seconds_total: float = 0.0
 
+    # Cumulative prompt tokens actually COMPUTED, accumulated per prefill chunk as the work happens.
+    # Exported as minisgl_prefill_computed_tokens_total.
+    #
+    # This exists because the two pre-existing prompt-token counters are both attributed to an INSTANT
+    # rather than to the interval over which the work ran, which made prefill and decode look
+    # concurrent on the throughput panel:
+    #   * minisgl_prompt_tokens_total (frontend, metrics.py) credits the whole prompt on the FIRST
+    #     REPLY for a request — i.e. at TTFT, after prefill finished — so a 52k-token prompt landed as
+    #     one spike exactly on top of the first decode token, displaced by the full prefill duration
+    #     (measured: 21 s).
+    #   * minisgl_prefix_cache_prompt_tokens_total (prefill.py) credits it once at ADMISSION, before
+    #     the work runs, and deliberately counts the whole prompt (it is the hit-ratio denominator).
+    # rate() then smears either instantaneous step across the whole rate window, drawing a flat
+    # plateau that overlaps the decode ramp.
+    #
+    # Counted here rather than in the scheduler because forward_batch is the single choke point every
+    # prefill chunk passes through (including the spec-decode seeded prefill), and because it keeps
+    # this counter scope-identical to prefill_seconds_total — numerator and denominator of the prefill
+    # throughput panel then refer to the same set of forwards. extend_len is per-chunk (device_len -
+    # cached_len), so a chunked prefill contributes its chunks across the steps that ran them, and
+    # prefix-cache hits are excluded for free (cached tokens are never re-computed). Spec VERIFY
+    # batches are phase="decode", so their extend_len>1 query tokens are correctly NOT counted as
+    # prompt.
+    prefill_computed_tokens_total: int = 0
+
     def _drain_prefill_events(self) -> None:
         """Fold completed prefill event pairs into the counter. Non-blocking: an incomplete pair is
         left for a later step, so this never syncs the host onto the GPU just to keep a metric."""
@@ -1238,6 +1263,9 @@ class Engine:
         if batch.is_prefill:
             _pf_ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             _pf_ev[0].record(self.stream)
+            # Chunk-accurate prompt-token accounting: credit only what THIS chunk computes, at the
+            # step that computes it. See prefill_computed_tokens_total.
+            self.prefill_computed_tokens_total += sum(r.extend_len for r in batch.reqs)
         _pf_probe = batch.is_prefill and os.environ.get("MINISGL_PREFILL_MEM_PROBE") == "1"
         if _pf_probe:
             torch.cuda.reset_peak_memory_stats()

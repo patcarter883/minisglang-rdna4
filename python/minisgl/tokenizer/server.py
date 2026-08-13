@@ -124,6 +124,7 @@ def tokenize_worker(
                         prefill_seconds=sm.prefill_seconds,
                         prefix_cache_hit_tokens=sm.prefix_cache_hit_tokens,
                         prefix_cache_prompt_tokens=sm.prefix_cache_prompt_tokens,
+                        prefill_computed_tokens=sm.prefill_computed_tokens,
                         cam_facts=sm.cam_facts,
                         cam_namespaces=sm.cam_namespaces,
                         cam_evicted=sm.cam_evicted,

@@ -1269,6 +1269,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 waiting_requests=len(self.prefill_manager.pending_list),
                 prefix_cache_hit_tokens=self.prefill_manager.prefix_hit_tokens,
                 prefix_cache_prompt_tokens=self.prefill_manager.prefix_prompt_tokens,
+                prefill_computed_tokens=self.engine.prefill_computed_tokens_total,
                 kv_tokens_total=int(kv_total),
                 kv_tokens_used=int(kv_used),
                 gdn_slots_total=int(gdn_total),
@@ -3776,6 +3777,17 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self.send_result(reply)
 
         t_end = _tstamp()
+
+        # Metrics: mirror the two-forward path's accounting (see _spec_decode_step). This path computed
+        # n_proposed/n_accepted/n_emitted for its own debug log but never fed _m_spec_*, so with the
+        # fused TiDAR verify selected every minisgl_spec_* series read a flat ZERO — the dashboard's
+        # accept-len / acceptance-rate panels reported "spec is doing nothing" on a path that was in
+        # fact accepting drafts. Same counters, same units, same per-verify-step cadence.
+        if self._metrics_enabled:
+            self._m_spec_steps += 1
+            self._m_spec_draft_tokens += n_proposed
+            self._m_spec_accepted_tokens += n_accepted
+            self._m_spec_emitted_tokens += n_emitted
 
         # MINISGL_SPEC_DEBUG=1: fused acceptance stats (the two-forward path logs [spec] separately).
         # accept_rate = accepted drafts / proposed (B/req/step); emitted/step includes the bonus token.
