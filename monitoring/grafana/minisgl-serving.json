@@ -747,7 +747,7 @@
           "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -806,7 +806,7 @@
           "unit": "percentunit",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -879,7 +879,7 @@
           "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -940,7 +940,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "Requests running / waiting",
-      "description": "running = requests currently decoding. queued + prefilling = requests admitted but not yet decoding: either waiting for KV capacity or with a prefill still in flight.\n\nA long prompt sits in the second series for the whole of its prefill and only moves to \"running\" at its first generated token, so the throughput panels can show prefill activity while running is 0.\n\nRead them together: second series climbing while the first stays flat means a queue backlog (check KV-pool utilization); both moving together is healthy batching.",
+      "description": "running = requests currently decoding. queued + prefilling = requests admitted but not yet decoding: either waiting for KV capacity or with a prefill still in flight.\n\nEach point is the PEAK over that interval, not a point sample, so a request shorter than the graph's resolution still shows up when you zoom out. Heights are therefore peaks, not averages — a bucket reading 4 may have averaged 1.\n\nA long prompt sits in \"queued + prefilling\" for the whole of its prefill and only moves to \"running\" at its first generated token.\n\nRead together: the second series climbing while the first stays flat means a queue backlog (check KV-pool utilization); both moving together is healthy batching.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -990,7 +990,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(minisgl_running_requests{model_name=~\"$model\"})",
+          "expr": "sum(max_over_time(minisgl_running_requests{model_name=~\"$model\"}[$__interval]))",
           "legendFormat": "running"
         },
         {
@@ -999,7 +999,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})",
+          "expr": "sum(max_over_time(minisgl_waiting_requests{model_name=~\"$model\"}[$__interval]))",
           "legendFormat": "queued + prefilling"
         }
       ]
@@ -1024,7 +1024,7 @@
           "unit": "reqps",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1101,7 +1101,7 @@
           "unit": "percent",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1173,7 +1173,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1250,7 +1250,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1327,7 +1327,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1820,7 +1820,7 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 2,
             "showPoints": "never",
             "stacking": {
@@ -1880,7 +1880,7 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "lineInterpolation": "stepBefore",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 2,
             "showPoints": "never",
             "stacking": {
