@@ -222,7 +222,7 @@
       "id": 4,
       "type": "stat",
       "title": "Decode speed (tok/s)",
-      "description": "Per-stream decode rate = 1 / mean TPOT, where TPOT is measured PREFILL-EXCLUDED as (completion_time - first_token_time) / (tokens - 1) (server/metrics.py). Records on request COMPLETION, so it lags in-flight generation — that lag is the deliberate price of correctness. The previous expression, rate(generation_tokens)/running_requests, divided by WALL time and so counted prefill and idle as decode: at 65k context it read 4.3 tok/s against a true 57.5 (13x understated), because TTFT had grown to 27s inside the rate window. It also divided a window-averaged rate by an instantaneous gauge. See \"Token throughput\" for aggregate idle-inclusive throughput.",
+      "description": "Per-stream decode rate = 1 / mean TPOT, measured prefill-excluded as (completion_time - first_token_time) / (tokens - 1).\n\nThis is the speed one request's tokens arrive at, not the server's aggregate — see \"Token throughput\" for that. It records on request COMPLETION, so it lags in-flight generation and stays flat during a long request; on a low request rate it can hold a stale value for minutes.\n\nUse it to answer \"how fast does a single user's stream feel?\" — it is unaffected by prefill time and by idle gaps between requests.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -280,7 +280,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prompt tok/s",
-      "description": "rate(minisgl_prefill_computed_tokens_total) — prefill throughput, accumulated PER CHUNK as the prefill runs. Was rate(minisgl_prompt_tokens_total), which credits the whole prompt at first-token time (i.e. AFTER prefill finished), so prefill was drawn on top of the decode it actually preceded.",
+      "description": "Prefill throughput averaged over wall time: prompt tokens computed per second, excluding any served from the prefix cache. Idle gaps count against it, so on bursty traffic it reads well below what the prefill kernel is capable of — use \"Prefill throughput (compute)\" for the kernel's own rate.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -940,7 +940,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "Requests running / waiting",
-      "description": "running = requests in the DECODE set (minisgl_running_requests). It is 0 for the whole of a request's prefill, so prefill throughput legitimately appears while running=0 — the prefilling request is counted in the second series (it stays in the prefill manager's pending list until its last chunk). Both are instantaneous gauges, drawn stepAfter; the throughput panels are rate()-derived and drawn stepBefore, because a rate sample describes the window ENDING at its timestamp.",
+      "description": "running = requests currently decoding. queued + prefilling = requests admitted but not yet decoding: either waiting for KV capacity or with a prefill still in flight.\n\nA long prompt sits in the second series for the whole of its prefill and only moves to \"running\" at its first generated token, so the throughput panels can show prefill activity while running is 0.\n\nRead them together: second series climbing while the first stays flat means a queue backlog (check KV-pool utilization); both moving together is healthy batching.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
