@@ -1871,6 +1871,7 @@ class FrontendManager:
                         prefill_seconds=msg.prefill_seconds,
                         prefix_cache_hit_tokens=msg.prefix_cache_hit_tokens,
                         prefix_cache_prompt_tokens=msg.prefix_cache_prompt_tokens,
+                        prefill_computed_tokens=msg.prefill_computed_tokens,
                         cam_facts=msg.cam_facts,
                         cam_namespaces=msg.cam_namespaces,
                         cam_evicted=msg.cam_evicted,

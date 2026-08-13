@@ -98,7 +98,7 @@
       "id": 2,
       "type": "stat",
       "title": "Requests running",
-      "description": "minisgl_running_requests gauge \u2014 in-flight decode batch.",
+      "description": "minisgl_running_requests gauge — in-flight decode batch.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -160,7 +160,7 @@
       "id": 3,
       "type": "stat",
       "title": "Requests waiting (queue)",
-      "description": "minisgl_waiting_requests gauge \u2014 queued, not yet scheduled.",
+      "description": "minisgl_waiting_requests gauge — queued, not yet scheduled.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -280,7 +280,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prompt tok/s",
-      "description": "rate(minisgl_prefill_computed_tokens_total) \u2014 prefill throughput, accumulated PER CHUNK as the prefill runs. Was rate(minisgl_prompt_tokens_total), which credits the whole prompt at first-token time (i.e. AFTER prefill finished), so prefill was drawn on top of the decode it actually preceded.",
+      "description": "rate(minisgl_prefill_computed_tokens_total) — prefill throughput, accumulated PER CHUNK as the prefill runs. Was rate(minisgl_prompt_tokens_total), which credits the whole prompt at first-token time (i.e. AFTER prefill finished), so prefill was drawn on top of the decode it actually preceded.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -469,7 +469,7 @@
     {
       "id": 8,
       "type": "row",
-      "title": "Spec Decode (DFlash / DDTree) \u2014 headline",
+      "title": "Spec Decode (DFlash / DDTree) — headline",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -483,7 +483,7 @@
       "id": 9,
       "type": "stat",
       "title": "Mean accept-len (tok/step)",
-      "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term \u2014 matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
+      "description": "accepted/steps = minisgl_spec_accepted_tokens_total / minisgl_spec_steps_total. Headline lever for DFlash/DDTree speed. (No +1 bonus term — matches the repo's accept-len convention where 0.26 / 1.30 / 2.15 are reported.)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -615,7 +615,7 @@
       "id": 11,
       "type": "stat",
       "title": "Drafted tok/s",
-      "description": "rate(minisgl_spec_draft_tokens_total) \u2014 draft tokens proposed.",
+      "description": "rate(minisgl_spec_draft_tokens_total) — draft tokens proposed.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -673,7 +673,7 @@
       "id": 12,
       "type": "stat",
       "title": "Accepted tok/s",
-      "description": "rate(minisgl_spec_accepted_tokens_total) \u2014 draft tokens verified & kept.",
+      "description": "rate(minisgl_spec_accepted_tokens_total) — draft tokens verified & kept.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -731,7 +731,7 @@
       "id": 13,
       "type": "timeseries",
       "title": "Mean accept-len over time",
-      "description": "accepted/steps over time \u2014 watch DFlash/DDTree tuning move this.",
+      "description": "accepted/steps over time — watch DFlash/DDTree tuning move this.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -747,7 +747,7 @@
           "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -806,7 +806,7 @@
           "unit": "percentunit",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -879,7 +879,7 @@
           "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -931,7 +931,7 @@
             "uid": "vllm-prometheus"
           },
           "expr": "sum(rate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[$__rate_interval]))",
-          "legendFormat": "\u2514 prefill cached (saved)",
+          "legendFormat": "└ prefill cached (saved)",
           "refId": "C"
         }
       ]
@@ -940,7 +940,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "Requests running / waiting",
-      "description": "batch occupancy vs queue depth.",
+      "description": "running = requests in the DECODE set (minisgl_running_requests). It is 0 for the whole of a request's prefill, so prefill throughput legitimately appears while running=0 — the prefilling request is counted in the second series (it stays in the prefill manager's pending list until its last chunk). Both are instantaneous gauges, drawn stepAfter; the throughput panels are rate()-derived and drawn stepBefore, because a rate sample describes the window ENDING at its timestamp.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -956,7 +956,7 @@
           "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1000,7 +1000,7 @@
             "uid": "vllm-prometheus"
           },
           "expr": "sum(minisgl_waiting_requests{model_name=~\"$model\"})",
-          "legendFormat": "waiting"
+          "legendFormat": "queued + prefilling"
         }
       ]
     },
@@ -1024,7 +1024,7 @@
           "unit": "reqps",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1101,7 +1101,7 @@
           "unit": "percent",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1173,7 +1173,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1250,7 +1250,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1327,7 +1327,7 @@
           "unit": "s",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1417,7 +1417,7 @@
           "unit": "percent",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1477,7 +1477,7 @@
           "unit": "percent",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "fillOpacity": 10,
             "showPoints": "never",
             "lineWidth": 2,
@@ -1699,7 +1699,7 @@
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "TRUE prefill throughput: computed prefill tokens / wall-seconds of prefill compute. Unlike 'Prompt tok/s' (prompt-token ARRIVAL rate), this measures the prefill kernel itself \u2014 the apples-to-apples analog of vLLM request_prompt_tokens_sum / request_prefill_time_seconds_sum.",
+      "description": "TRUE prefill throughput: computed prefill tokens / wall-seconds of prefill compute. Unlike 'Prompt tok/s' (prompt-token ARRIVAL rate), this measures the prefill kernel itself — the apples-to-apples analog of vLLM request_prompt_tokens_sum / request_prefill_time_seconds_sum.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1820,7 +1820,7 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "lineWidth": 2,
             "showPoints": "never",
             "stacking": {
@@ -1880,7 +1880,7 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepBefore",
             "lineWidth": 2,
             "showPoints": "never",
             "stacking": {
@@ -1940,7 +1940,7 @@
     {
       "id": 38,
       "type": "row",
-      "title": "GPU \u2014 hardware telemetry (amd-smi)",
+      "title": "GPU — hardware telemetry (amd-smi)",
       "collapsed": false,
       "datasource": {
         "type": "prometheus",
@@ -1974,7 +1974,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2013,7 +2013,7 @@
     {
       "id": 40,
       "type": "timeseries",
-      "title": "GPU load \u2014 gfx activity (%)",
+      "title": "GPU load — gfx activity (%)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2030,7 +2030,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2070,7 +2070,7 @@
     {
       "id": 41,
       "type": "timeseries",
-      "title": "GPU temperature (\u00b0C)",
+      "title": "GPU temperature (°C)",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2087,7 +2087,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2143,7 +2143,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2265,7 +2265,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2354,7 +2354,7 @@
           "min": 0,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "linear",
+            "lineInterpolation": "stepAfter",
             "lineWidth": 1,
             "fillOpacity": 10,
             "showPoints": "never",
@@ -2390,7 +2390,7 @@
           "legendFormat": "GPU {{gpu}}"
         }
       ],
-      "description": "amdgpu_umc_activity_percent \u2014 measured fraction of time the memory controller is busy (the directly-reported BW-utilization signal the GB/s panel is derived from)."
+      "description": "amdgpu_umc_activity_percent — measured fraction of time the memory controller is busy (the directly-reported BW-utilization signal the GB/s panel is derived from)."
     },
     {
       "id": 46,
@@ -2408,7 +2408,7 @@
       "id": 47,
       "type": "stat",
       "title": "Stored facts",
-      "description": "minisgl_cam_facts \u2014 subject\u2192object edits across all namespaces.",
+      "description": "minisgl_cam_facts — subject→object edits across all namespaces.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2466,7 +2466,7 @@
       "id": 48,
       "type": "stat",
       "title": "Namespaces",
-      "description": "minisgl_cam_namespaces \u2014 per-tenant/session isolated stores.",
+      "description": "minisgl_cam_namespaces — per-tenant/session isolated stores.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2524,7 +2524,7 @@
       "id": 49,
       "type": "stat",
       "title": "Facts evicted",
-      "description": "minisgl_cam_evicted \u2014 LRU-evicted under capacity pressure (0 = uncapped).",
+      "description": "minisgl_cam_evicted — LRU-evicted under capacity pressure (0 = uncapped).",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2586,7 +2586,7 @@
       "id": 50,
       "type": "stat",
       "title": "Max bank load",
-      "description": "minisgl_cam_max_bank_load \u2014 product-key crowding; delivery-fallback degrades past ~9/bank.",
+      "description": "minisgl_cam_max_bank_load — product-key crowding; delivery-fallback degrades past ~9/bank.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -2652,7 +2652,7 @@
       "id": 51,
       "type": "stat",
       "title": "Crowded banks",
-      "description": "minisgl_cam_crowded_banks \u2014 banks past the crowding knee (>9 edits).",
+      "description": "minisgl_cam_crowded_banks — banks past the crowding knee (>9 edits).",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
