@@ -93,6 +93,10 @@ class StatsMsg(BaseTokenizerMsg):
     prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
+    # Prompt tokens actually computed, accumulated PER PREFILL CHUNK as the work happens (unlike
+    # prefix_cache_prompt_tokens, which is credited whole at admission for the hit-ratio denominator).
+    # This is the honest prefill-throughput numerator. See engine.prefill_computed_tokens_total.
+    prefill_computed_tokens: int = 0
     # CAM editable-memory store stats (0 when CAM is off), aggregated across namespaces.
     cam_facts: int = 0
     cam_namespaces: int = 0

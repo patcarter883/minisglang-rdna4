@@ -107,6 +107,7 @@ class BackendSnapshot:
     prefill_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
+    prefill_computed_tokens: int = 0
     cam_facts: int = 0
     cam_namespaces: int = 0
     cam_evicted: int = 0
@@ -192,6 +193,7 @@ class FrontendMetrics:
             total.prefill_seconds += s.prefill_seconds
             total.prefix_cache_hit_tokens += s.prefix_cache_hit_tokens
             total.prefix_cache_prompt_tokens += s.prefix_cache_prompt_tokens
+            total.prefill_computed_tokens += s.prefill_computed_tokens
             # CAM stores are per-replica (DP-pinned): sum counts (idle replicas report 0), max the load.
             total.cam_facts += s.cam_facts
             total.cam_namespaces += s.cam_namespaces
@@ -224,8 +226,14 @@ class FrontendMetrics:
         # ---- throughput -------------------------------------------------------------------------
         counter("minisgl_generation_tokens_total",
                 "Total generated (decode) tokens served.", self.generation_tokens)
+        # ATTRIBUTION: credited whole on the FIRST REPLY for a request (on_reply), i.e. at TTFT, AFTER
+        # its prefill finished. Correct as a cumulative billing total, WRONG as a throughput series:
+        # rate() of it draws the prefill on top of the decode it preceded. For prefill throughput use
+        # minisgl_prefill_computed_tokens_total, which is accumulated per chunk as the work runs.
         counter("minisgl_prompt_tokens_total",
-                "Total prompt (prefill) tokens processed.", self.prompt_tokens)
+                "Total prompt (prefill) tokens processed, credited at first-token time (see "
+                "minisgl_prefill_computed_tokens_total for a rate()-able prefill series).",
+                self.prompt_tokens)
 
         # ---- request counts ---------------------------------------------------------------------
         counter("minisgl_requests_total", "Total requests received.", self.requests_total)
@@ -295,8 +303,18 @@ class FrontendMetrics:
                 "that panel rendered nothing.", b.prefill_seconds)
         counter("minisgl_prefix_cache_hit_tokens_total",
                 "Prompt tokens served from the prefix (radix) cache.", b.prefix_cache_hit_tokens)
+        # ATTRIBUTION: credited whole at ADMISSION (once per request, before the prefill runs) so that
+        # hit/prompt is a true reuse rate. Like minisgl_prompt_tokens_total it is an instant, not an
+        # interval — do not rate() it as a throughput.
         counter("minisgl_prefix_cache_prompt_tokens_total",
-                "Total prompt tokens seen (prefix-cache denominator).", b.prefix_cache_prompt_tokens)
+                "Total prompt tokens seen, credited at admission (prefix-cache denominator; NOT a "
+                "throughput series).", b.prefix_cache_prompt_tokens)
+        # The rate()-able prefill series: prompt tokens actually computed, accumulated per prefill
+        # chunk at the step that computed them. Excludes prefix-cache hits (never re-computed), so
+        # this over minisgl_prefill_seconds_total is a true prefill throughput.
+        counter("minisgl_prefill_computed_tokens_total",
+                "Prompt tokens computed by prefill forwards, accumulated per chunk as the work runs.",
+                b.prefill_computed_tokens)
         _hit_ratio = (b.prefix_cache_hit_tokens / b.prefix_cache_prompt_tokens
                       if b.prefix_cache_prompt_tokens > 0 else 0.0)
         gauge("minisgl_prefix_cache_hit_ratio",
