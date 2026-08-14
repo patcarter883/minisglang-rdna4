@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import json
 import os
 import re
@@ -680,8 +681,71 @@ _EFFORT_BUDGET = {
 }
 
 
+# The reasoning ladder as a LEVEL NAME, for templates that take the strength as a kwarg instead of
+# the server enforcing a token budget. Muse-Glimmer's template renders `Reasoning strength: <level>.`
+# into the system block and accepts low/medium/high/xhigh — the model was TRAINED to self-regulate
+# from that line, so the level is the mechanism its author intended. `max`/`unlimited` have no level
+# to express them; clamp to the strongest the ladder defines rather than render a word the model
+# never saw (`Reasoning strength: max.` is not a trained input, and untrained is worse than clamped).
+_EFFORT_LEVEL = {
+    "low": "low", "medium": "medium", "high": "high",
+    "extra_high": "xhigh", "xhigh": "xhigh", "x_high": "xhigh", "very_high": "xhigh",
+    "max": "xhigh", "maximum": "xhigh", "unlimited": "xhigh",
+}
+# Kwarg spellings a chat template might read the level from, most specific first.
+_LEVEL_KWARGS = ("reasoning_strength", "reasoning_effort", "thinking_level", "reasoning_level")
+_LEVEL_PROBE = "__minisgl_level_probe__"
+
+
+def _served_model_path() -> str | None:
+    """The served checkpoint path, or None before global state exists. Module-level helpers cannot
+    take it as an argument (and `state` is a LOCAL in at least one of them), so read it the same way
+    `_reasoning_parser` does."""
+    try:
+        return get_global_state().config.model_path
+    except Exception:
+        return None
+
+
+@functools.cache
+def _template_level_kwarg(model_path: str) -> str | None:
+    """Which kwarg (if any) this checkpoint's chat template reads the reasoning LEVEL from.
+
+    DERIVED, not tabulated: render the template with a sentinel under each candidate spelling and
+    see which one reaches the output. Same technique as `derive_delimiters`, for the same reason — a
+    model-name table silently fails the next checkpoint that adopts the convention.
+
+    This is what connects the STANDARD `reasoning_effort` to a model-specific kwarg. Without it a
+    client using the OpenAI convention gets no variation at all on such a model: Muse's template
+    defaults to `high` and ignores `enable_thinking`, so every rung — including an explicit request
+    for LESS reasoning — rendered an identical prompt, and `xhigh` (the level its card recommends
+    for coding and agentic work) was unreachable through the standard API."""
+    try:
+        tok = load_tokenizer(model_path)
+    except Exception:
+        return None
+    msgs = [{"role": "user", "content": "x"}]
+    for name in _LEVEL_KWARGS:
+        try:
+            out = tok.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, **{name: _LEVEL_PROBE})
+        except Exception:
+            continue
+        if isinstance(out, str) and _LEVEL_PROBE in out:
+            return name
+    return None
+
+
 def _norm_effort(value: str) -> str:
     return "_".join(str(value).strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def _requested_effort(req: "OpenAICompletionRequest") -> str | None:
+    """The effort rung the client asked for, from either spelling, normalised."""
+    eff = req.reasoning_effort
+    if not eff and isinstance(req.reasoning, dict):
+        eff = req.reasoning.get("effort")
+    return _norm_effort(eff) if eff else None
 
 
 def _effort_is_off(req: "OpenAICompletionRequest") -> bool:
@@ -726,7 +790,8 @@ def _effort_is_on(req: "OpenAICompletionRequest") -> bool:
     return False
 
 
-def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
+def _resolve_think_budget(req: "OpenAICompletionRequest",
+                          model_path: str | None = None) -> int | None:
     """Per-request reasoning-token budget, or None for unbounded (the server's MINISGL_THINK_BUDGET
     default still applies when nothing is set). Precedence: explicit `reasoning_max_tokens` > the same
     key inside `chat_template_kwargs` > `reasoning_effort` > `reasoning.effort`.
@@ -740,11 +805,19 @@ def _resolve_think_budget(req: "OpenAICompletionRequest") -> int | None:
     ck_budget = ck.get("reasoning_max_tokens")
     if isinstance(ck_budget, int) and ck_budget > 0:
         return ck_budget
-    effort = req.reasoning_effort
-    if not effort and isinstance(req.reasoning, dict):
-        effort = req.reasoning.get("effort")
+    effort = _requested_effort(req)
     if effort:
-        return _EFFORT_BUDGET.get(_norm_effort(effort))
+        # When the TEMPLATE consumes the level, the model self-regulates from its own system-prompt
+        # line and the server's token cap stops being the meaning of `reasoning_effort` — it becomes
+        # a second, blunter mechanism for the same intent, and the stricter one silently wins. That
+        # is how the two defects documented above happened. Concretely: `high` caps at 4096, which
+        # would truncate exactly the coding/agentic work Muse's card says to use high/xhigh for. So
+        # leave it unbounded and let an EXPLICIT `reasoning_max_tokens` (handled above, and which
+        # takes precedence) be the way to impose a ceiling. Templates that ignore the level keep the
+        # budget, because there it is the only mechanism that exists.
+        if model_path and _template_level_kwarg(model_path):
+            return None
+        return _EFFORT_BUDGET.get(effort)
     return None
 
 
@@ -882,7 +955,8 @@ def _reject_unsupported_text_completion(req: "OpenAICompletionRequest") -> JSONR
     return None
 
 
-def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None:
+def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest",
+                                  model_path: str | None = None) -> dict | None:
     """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
     the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3 /
     Poolside, whose reasoning format is now parsed — see _reasoning_parser + _REASONING_DELIMITERS)."""
@@ -907,6 +981,19 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest") -> dict | None
             kwargs["enable_thinking"] = False
         elif _effort_is_on(req):
             kwargs["enable_thinking"] = True
+    # ALIAS the standard rung onto whatever kwarg the template actually reads the LEVEL from. A
+    # client using the OpenAI convention reasonably expects `reasoning_effort` to vary how much the
+    # model thinks; on a template that takes a level kwarg it otherwise varies NOTHING, because the
+    # template supplies its own default and never sees the request. An explicit
+    # `chat_template_kwargs` entry still wins — the caller naming the model's own kwarg is more
+    # specific than the generic ladder.
+    if model_path:
+        level_key = _template_level_kwarg(model_path)
+        if level_key and level_key not in kwargs:
+            eff = _requested_effort(req)
+            level = _EFFORT_LEVEL.get(eff) if eff else None
+            if level:
+                kwargs[level_key] = level
     return kwargs or None
 
 
@@ -1074,7 +1161,7 @@ def _prompt_thinking_state(req: "OpenAICompletionRequest") -> Tuple[bool, bool]:
     # the delimiters straight out of it (a raw prompt ending in `<think>` really is mid-reasoning).
     if req.messages is None and isinstance(req.prompt, str):
         return parser.prompt_state(req.prompt)
-    kwargs = _resolve_chat_template_kwargs(req)
+    kwargs = _resolve_chat_template_kwargs(req, _served_model_path())
     key = (tuple(sorted((k, repr(v)) for k, v in (kwargs or {}).items())), _tail_shape(req))
     if key not in _THINKING_STATE_CACHE:
         tail = _generation_prompt_tail(req, kwargs)
@@ -2326,7 +2413,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             )
             result = await run_markovian_rsa(
                 client, rsa_params, messages, req.model,
-                chat_template_kwargs=_resolve_chat_template_kwargs(req),
+                chat_template_kwargs=_resolve_chat_template_kwargs(req, state.config.model_path),
                 grammar=rf_grammar or forced_tool_grammar or auto_tool_grammar,
                 tools=_tools_for_template(req),
                 # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
@@ -2335,7 +2422,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
-                think_budget=_resolve_think_budget(req),
+                think_budget=_resolve_think_budget(req, state.config.model_path),
             )
         except RSAError as e:
             return JSONResponse(status_code=502, content={"error": f"RSA failed: {e}"})
@@ -2449,7 +2536,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             uid=uid,
             text=prompt,
             tools=_tools_for_template(req),
-            chat_template_kwargs=_resolve_chat_template_kwargs(req),
+            chat_template_kwargs=_resolve_chat_template_kwargs(req, state.config.model_path),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
                 presence_penalty=req.presence_penalty,
@@ -2468,7 +2555,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
-                think_budget=_resolve_think_budget(req),
+                think_budget=_resolve_think_budget(req, state.config.model_path),
             ),
         )
     )
@@ -2687,7 +2774,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 think_answer_delim=_reasoning_answer_delim(req) if _think_delim else None,
                 think_close_prefix=(_reasoning_close_wildcard(req)[0] if _think_delim else None),
                 think_close_suffix=(_reasoning_close_wildcard(req)[1] if _think_delim else None),
-                think_budget=_resolve_think_budget(req) if _think_delim else None,
+                think_budget=_resolve_think_budget(req, state.config.model_path) if _think_delim else None,
             ),
         )
     )
