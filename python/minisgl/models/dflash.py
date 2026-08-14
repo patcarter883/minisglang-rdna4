@@ -96,6 +96,13 @@ class _DFlashLayer(BaseOP):
         # DraftLinear.load()/load_quant() slice it to this rank.
         self.full_q_dim = num_heads * head_dim
         self.full_kv_dim = num_kv_heads * head_dim
+        # Plain 1/sqrt(d), and it stays plain even when the TARGET's family folds an extra factor
+        # into its softmax scale (Muse-Glimmer: qk_scale_factor 3.87 over a WEIGHTLESS QK-norm). A
+        # DFlash drafter is not that architecture: it carries its OWN learned q_norm/k_norm, so
+        # training sets the temperature through those weights. Both upstream engines agree —
+        # vllm/model_executor/models/qwen3_dflash.py:190 `self.scaling = self.head_dim**-0.5` with
+        # learned q_norm/k_norm at :235-236, and sglang/srt/models/dflash.py:158 identically — and
+        # neither reads any family scale factor for a drafter. Do not "inherit" the target's scale.
         self.scale = head_dim ** -0.5
         self._rotary = rotary
         _acol = SHARD_COL if self._attn_sharded else SHARD_NONE
@@ -320,6 +327,8 @@ class DFlashDraftModel(BaseOP):
         sliding_window: int = 0,
         causal: bool = False,
         per_aux_norm: bool = False,
+        layer_causal: Optional[List[bool]] = None,
+        layer_window: Optional[List[int]] = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_aux_layers = num_aux_layers
@@ -328,8 +337,40 @@ class DFlashDraftModel(BaseOP):
         # and a per-captured-layer RMSNorm on each aux BEFORE fc (aux_hidden_norms). z-lab Qwen3
         # (default): ungated, bidirectional, single hidden_norm after fc.
         gated = decoder_layer_type == "laguna_xs"
+        # THE MASK IS PER LAYER, and this is not a minisgl invention — it is the convention both
+        # merged upstream engines implement, independently and identically:
+        #
+        #   vllm/model_executor/models/qwen3_dflash.py::_dflash_layer_causal
+        #       "``dflash_config.causal`` overrides all layers; else only SWA layers causal."
+        #   sglang/srt/models/dflash.py
+        #       full_attention  -> AttentionType.ENCODER_ONLY (non-causal), window -1
+        #       sliding_attention -> AttentionType.DECODER (causal), window sliding_window-1
+        #
+        # i.e. a `sliding_attention` layer is CAUSAL with a left-only window, and a `full_attention`
+        # layer is BIDIRECTIONAL and unbounded. A single global (causal, sliding_window) pair cannot
+        # express a checkpoint that mixes the two — which every z-lab DFlash drafter except the
+        # all-full one does. `causal`/`sliding_window` remain the UNIFORM fallback for a drafter that
+        # declares no `layer_types`; when the caller derives the per-layer lists they win.
+        self.layer_causal = list(layer_causal) if layer_causal else [causal] * num_layers
+        self.layer_window = list(layer_window) if layer_window else [sliding_window] * num_layers
+        assert len(self.layer_causal) == len(self.layer_window) == num_layers, (
+            f"per-layer mask lists must cover all {num_layers} layers, got "
+            f"{len(self.layer_causal)}/{len(self.layer_window)}")
+        # Uniform view, kept for the callers that legitimately need ONE answer for the whole model:
+        # `window_prefix` (how many prefix rows are worth projecting at all) and the proposer's
+        # decision on whether a fixed-capacity ring can hold this drafter's prefix. A drafter is
+        # BOUNDED only if EVERY layer is windowed — one full_attention layer reads the whole prefix
+        # and makes the model unbounded no matter what the other layers do.
+        self.bounded = all(w > 0 for w in self.layer_window)
+        # Every layer masks identically. The CAPTURED propose body (`denoise_batched`) records ONE
+        # mask tensor for the whole trunk, so a drafter whose layers disagree cannot ride it; the
+        # proposer gates capture on this rather than silently applying layer 0's mask to all of them.
+        # Uniform is the common case: it holds for every all-`sliding_attention` and every
+        # all-`full_attention` checkpoint, and fails only for the mixed z-lab drafters.
+        self.uniform_mask = (
+            len(set(zip(self.layer_causal, self.layer_window))) <= 1)
         self.causal = causal
-        self.sliding_window = sliding_window
+        self.sliding_window = max(self.layer_window) if self.bounded else 0
 
         # fc fuses the N captured target aux layers (N*hidden) -> hidden; hidden_norm norms it.
         self.fc = _PlainLinear(num_aux_layers * hidden_size, hidden_size)
@@ -358,9 +399,9 @@ class DFlashDraftModel(BaseOP):
                 rms_norm_eps=rms_norm_eps,
                 rotary=rotary,
                 gated=gated,
-                sliding_window=sliding_window,
+                sliding_window=self.layer_window[i],
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ]
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -418,23 +459,47 @@ class DFlashDraftModel(BaseOP):
             flat = aux.reshape(aux.shape[0], -1)  # [P, N_aux*hidden]
         return self.hidden_norm.forward(self.fc.forward(flat))
 
-    def _block_mask(self, P: int, B: int, device: torch.device) -> Optional[torch.Tensor]:
-        """Additive [B, P+B] mask (0 keep / -inf drop) for the Laguna causal + sliding-window block.
+    def _block_mask(
+        self, P: int, B: int, device: torch.device, causal: bool, window: int
+    ) -> Optional[torch.Tensor]:
+        """Additive [B, P+B] mask (0 keep / -inf drop) for ONE layer's block attention.
+
         The keys are the P prefix positions followed by the B block positions, all contiguous in
         absolute position (prefix at [base-P .. base-1], block at [base .. base+B-1]); so a query at
         block index i sits at concatenated position i+P and, causally + FlashAttention moving-query
-        SWA, attends to keys j with (i+P-window) < j <= (i+P). Returns None when not causal (z-lab
-        bidirectional path -> byte-identical to before)."""
-        if not self.causal:
+        SWA, attends to keys j with (i+P-window) < j <= (i+P).
+
+        `(qpos - kpos) < window` is exactly SGLang's `window_left = sliding_window - 1` convention
+        (`speculative/dflash_utils.py`: "HF sliding windows include the current token; SGLang stores
+        window_left"), so a declared 4096 keeps distances 0..4095. Returns None only for a layer that
+        is BOTH non-causal and unwindowed — a `full_attention` layer — which attends the whole prefix
+        bidirectionally and needs no mask at all."""
+        if not causal and window <= 0:
             return None
         qpos = torch.arange(B, device=device).view(B, 1) + P  # [B,1] concat position of each query
         kpos = torch.arange(P + B, device=device).view(1, P + B)  # [1,P+B]
-        keep = kpos <= qpos
-        if self.sliding_window > 0:
-            keep = keep & ((qpos - kpos) < self.sliding_window)
+        keep = kpos <= qpos if causal else torch.ones_like(kpos, dtype=torch.bool).expand(B, P + B)
+        if window > 0:
+            keep = keep & ((qpos - kpos) < window)
         return torch.where(
             keep, torch.zeros((), device=device), torch.full((), float("-inf"), device=device)
         ).float()
+
+    def layer_masks(self, P: int, B: int, device: torch.device) -> List[Optional[torch.Tensor]]:
+        """One additive mask per layer, built once per distinct (causal, window) pair.
+
+        A uniform drafter (every layer `sliding_attention`, or every layer `full_attention` — which
+        is every DFlash checkpoint except the mixed z-lab ones) therefore still materialises exactly
+        ONE mask and hands the same tensor to every layer, so this costs nothing where the old single
+        global mask was already correct."""
+        cache: dict = {}
+        out: List[Optional[torch.Tensor]] = []
+        for c, w in zip(self.layer_causal, self.layer_window):
+            key = (bool(c), int(w))
+            if key not in cache:
+                cache[key] = self._block_mask(P, B, device, bool(c), int(w))
+            out.append(cache[key])
+        return out
 
     def window_prefix(self, P: int) -> int:
         """How many TRAILING prefix rows the block can actually attend to. 0-cost, host-only.
@@ -456,10 +521,15 @@ class DFlashDraftModel(BaseOP):
         (`project_ctx`), so a row carries its phase with it and slicing moves no phase.
 
         (Row P - W itself is also always masked — for query i, qpos - kpos = i + W >= W — so W - 1
-        rows would suffice; W is kept as the conservative, easier-to-reason-about bound.)"""
-        if not self.causal or self.sliding_window <= 0:
-            return P  # z-lab bidirectional drafter: NO mask at all, every key is live. Never slice.
-        return min(P, self.sliding_window)
+        rows would suffice; W is kept as the conservative, easier-to-reason-about bound.)
+
+        MIXED drafters may not slice. The bound is a property of the WHOLE model, not of the widest
+        layer: a single `full_attention` layer reads every prefix row, so dropping rows that the
+        windowed layers discard would change ITS output rather than skip dead work. Hence `bounded`
+        (all layers windowed), not `max(layer_window)`."""
+        if not self.bounded:
+            return P  # an unwindowed layer is present: every key is live somewhere. Never slice.
+        return min(P, max(self.layer_window))
 
     @torch.inference_mode()
     def denoise(
@@ -469,16 +539,17 @@ class DFlashDraftModel(BaseOP):
         block_pos: torch.Tensor,      # [B]
         ctx_pos: torch.Tensor,        # [P]
     ) -> torch.Tensor:
-        """One denoising forward -> [B, hidden] (pre-head-normed block hidden). Bidirectional (z-lab)
-        or causal+SWA-masked (Laguna) per self.causal."""
+        """One denoising forward -> [B, hidden] (pre-head-normed block hidden). Each layer gets its
+        OWN mask: causal+SWA for a `sliding_attention` layer, none (bidirectional, unbounded) for a
+        `full_attention` one — see `layer_masks`."""
         hidden = noise_embed
         P_full = target_hidden.shape[0]
         P = self.window_prefix(P_full)
         if P < P_full:  # windowed: drop the prefix rows the mask discards BEFORE projecting them
             target_hidden = target_hidden[P_full - P :]
             ctx_pos = ctx_pos[P_full - P :]
-        mask = self._block_mask(P, noise_embed.shape[0], noise_embed.device)
-        for layer in self.layers:
+        masks = self.layer_masks(P, noise_embed.shape[0], noise_embed.device)
+        for layer, mask in zip(self.layers, masks):
             hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos, mask)
         return self.norm.forward(hidden)
 
@@ -513,8 +584,8 @@ class DFlashDraftModel(BaseOP):
             # torch.cat + einsums see [W + B] keys instead of [P + B]. Constant-shaped once P >= W.
             d = P_full - P
             prefix_kv = [(k[d:], v[d:]) for (k, v) in prefix_kv]
-        mask = self._block_mask(P, noise_embed.shape[0], noise_embed.device)
-        for layer, (k_ctx, v_ctx) in zip(self.layers, prefix_kv):
+        masks = self.layer_masks(P, noise_embed.shape[0], noise_embed.device)
+        for layer, (k_ctx, v_ctx), mask in zip(self.layers, prefix_kv, masks):
             hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask)
         return self.norm.forward(hidden)
 
@@ -526,7 +597,8 @@ class DFlashDraftModel(BaseOP):
         k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd] persistent ring
         v_pool: List[torch.Tensor],
         wslot: torch.Tensor,        # [m] destination slot per row (NULL slot = discard)
-        wcol: torch.Tensor,         # [m] destination ring column per row
+        wcol,                       # [m] ring column per row, or a PER-LAYER list of them
+        layer_ids=None,             # restrict to these layer indices (rings of one capacity)
     ) -> None:
         """fc+hidden_norm the captured aux of m committed positions and SCATTER each layer's prefix
         K/V straight into the persistent ring. Fixed-shape and sync-free, so it runs INSIDE the
@@ -539,11 +611,24 @@ class DFlashDraftModel(BaseOP):
         step and discarding the overhang is idempotent — the scheduler only ever APPENDS accepted
         positions to the aux buffer, so re-projecting an already-projected position reproduces the
         identical K/V, bit for bit."""
+        # `wcol` may be per-layer: a mixed drafter's rings have DIFFERENT capacities (a windowed
+        # layer needs window+slack rows, a `full_attention` layer needs a max-context-capped ring),
+        # so `pos % C` differs per layer. One shared column vector only works when every layer's ring
+        # is the same size. `fuse_aux` still runs ONCE for all layers either way.
+        # `layer_ids` exists for the REBUILD path, which must feed a different number of rows to
+        # rings of different capacity: a ring of capacity c can only hold its newest c rows, and
+        # scattering more than that writes several positions to the same column. That is not merely
+        # wasteful — `_pk`/`_pv` and `_ppos` are SEPARATE scatters, so with duplicate indices they
+        # can disagree about which position a column holds, and the mask would then admit a key
+        # believing it is at a position it is not (wrong RoPE phase, wrong content).
+        per_layer_col = isinstance(wcol, (list, tuple))
         target_hidden = self.fuse_aux(aux)  # [m, hidden]
-        for l, layer in enumerate(self.layers):
+        for l in (range(len(self.layers)) if layer_ids is None else layer_ids):
+            layer = self.layers[l]
             k, v = layer.project_ctx(target_hidden, rope_pos)
-            k_pool[l][wslot, wcol] = k
-            v_pool[l][wslot, wcol] = v
+            c = wcol[l] if per_layer_col else wcol
+            k_pool[l][wslot, c] = k
+            v_pool[l][wslot, c] = v
 
     def denoise_batched(
         self,
@@ -552,17 +637,19 @@ class DFlashDraftModel(BaseOP):
         k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd]
         v_pool: List[torch.Tensor],
         slots: torch.Tensor,         # [N] which ring slot each request reads
-        mask: torch.Tensor,          # [N, Q, C+Q] additive 0/-inf
+        mask,                        # [N, Q, C+Q] additive 0/-inf, or a PER-LAYER list of them
     ) -> torch.Tensor:
         """One BATCHED denoising forward over the persistent ring -> [N, Q, hidden].
 
         The per-layer gather ``k_pool[l][slots]`` is issued INSIDE the layer loop, not hoisted: the
         caching allocator then reuses one layer's [N, C, Hkv, hd] transient for the next, so the
         graph's private pool holds one layer's worth rather than all of them."""
+        per_layer_mask = isinstance(mask, (list, tuple))
         hidden = noise_embed
         for l, layer in enumerate(self.layers):
             hidden = layer.attend_block_batched(
-                hidden, block_pos, k_pool[l][slots], v_pool[l][slots], mask)
+                hidden, block_pos, k_pool[l][slots], v_pool[l][slots],
+                mask[l] if per_layer_mask else mask)
         return self.norm.forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
 
 

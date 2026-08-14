@@ -267,6 +267,34 @@ x-lean-common: &lean-common
     # that long prompts at concurrency also need. Forwarded so that competition can be measured
     # rather than argued about; a slot outside the pool simply skips propose, which is lossless.
     MINISGL_DFLASH_KV_FRAC: "${MINISGL_DFLASH_KV_FRAC:-}"
+    # Propose-ring sizing. All three MUST be declared here or they are SILENTLY INERT: compose passes
+    # only the variables it lists, so setting them on the host looks like it worked and does nothing
+    # — the same trap MINISGL_DRAFT_RESERVE* and MINISGL_DFLASH_CAPTURE_LAYERS already hit.
+    #   RING_SLOTS       cap on ring slots. The ring costs slots x sum(per-layer capacity); on a 16 GB
+    #                    card a 4096-window drafter at 5 slots is ~360 MB, which is enough to starve a
+    #                    long generation's workspace. A request whose slot is outside the pool decodes
+    #                    plain, so this trades drafted-concurrency for memory and never correctness.
+    #   RING_HEADROOM_GB free memory to leave unspent when sizing the ring at boot.
+    #   FULL_CAP         max-context cap for a `full_attention` layer's ring (it has no window).
+    MINISGL_DFLASH_RING_SLOTS: "${MINISGL_DFLASH_RING_SLOTS:-}"
+    MINISGL_DFLASH_RING_HEADROOM_GB: "${MINISGL_DFLASH_RING_HEADROOM_GB:-}"
+    MINISGL_DFLASH_FULL_CAP: "${MINISGL_DFLASH_FULL_CAP:-}"
+    MINISGL_DFLASH_REBUILD_CHUNK: "${MINISGL_DFLASH_REBUILD_CHUNK:-}"
+    # Force the drafter's block mask causal (1) or bidirectional (0), overriding the per-layer rule
+    # derived from `layer_types`. For a checkpoint that declares neither `dflash_config.causal` nor
+    # `sliding_window_non_causal` this is the only way to measure the axis: vLLM/SGLang make
+    # sliding-window layers causal, while z-lab's own reference is non-causal on every layer, and a
+    # block-diffusion drafter is bidirectional within its block by construction.
+    MINISGL_DFLASH_CAUSAL: "${MINISGL_DFLASH_CAUSAL:-}"
+    # ---- GPU fault localisation (empty = off; these are DIAGNOSTIC, not serving knobs) ----------
+    # An HSA_STATUS_ERROR_EXCEPTION 0x1016 is an in-kernel memory fault reported asynchronously, so
+    # by default the traceback points at whatever host call happened to sync next, not at the kernel
+    # that faulted. AMD_SERIALIZE_KERNEL=3 + HIP_LAUNCH_BLOCKING=1 make the abort land ON the guilty
+    # launch. This is how the previous 0x1016 on this box was localised (it turned out to be an
+    # embedding lookup on a -1 token id), and it reproduced deterministically under serialisation.
+    AMD_SERIALIZE_KERNEL: "${AMD_SERIALIZE_KERNEL:-}"
+    HIP_LAUNCH_BLOCKING: "${HIP_LAUNCH_BLOCKING:-}"
+    TORCH_USE_HIP_DSA: "${TORCH_USE_HIP_DSA:-}"
     # TiDAR logit-mixing "Trust-Diffusion" verify (fused-TiDAR path only): verify each draft position
     # against argmax(beta*p_ar + (1-beta)*R_i[0]). 1.0 (default) = the lossless-vs-AR-greedy path
     # (bit-identical); beta<1.0 leans on the diffusion self-draft for higher acceptance but is NOT

@@ -48,6 +48,114 @@ _SEED_TAIL_DEFAULT = 64
 # steps (~30 at a 4-token accept) and costs 128 extra rows/layer = ~0.26 MB/uid over the window.
 _KV_SLACK = 128
 
+_SLIDING_ATTENTION = "sliding_attention"
+
+# Rows projected per call on the cold ring-rebuild path. 2048 is under the largest capacity measured
+# working (6160) with margin, and well under the one measured faulting (8208). Override with
+# MINISGL_DFLASH_REBUILD_CHUNK to re-characterise the boundary rather than to tune throughput — this
+# path runs once per request, not per step.
+_REBUILD_CHUNK = int(os.environ.get("MINISGL_DFLASH_REBUILD_CHUNK") or 2048)
+
+
+def dflash_layer_masks(cfg, num_layers: int):
+    """Per-layer (causal, window) for a DFlash drafter, from DECLARED config fields only.
+
+    Transcribed from the two merged upstream implementations, which were written independently and
+    agree exactly:
+
+      vllm/model_executor/models/qwen3_dflash.py
+        `_dflash_layer_causal`: "``dflash_config.causal`` overrides all layers; else only SWA layers
+        causal."; `use_swa` "forces SWA on every layer, even an all-full ``layer_types``";
+        window = `dflash_config.swa_window_size` else top-level `sliding_window`, and a sliding layer
+        with no window is an ERROR rather than a silent full-attention layer.
+      sglang/srt/models/dflash.py
+        full_attention -> AttentionType.ENCODER_ONLY (non-causal), window -1
+        sliding_attention -> AttentionType.DECODER (causal), window `sliding_window - 1`
+
+    (The `-1` is a representation difference, not a semantic one: SGLang stores `window_left` while
+    this engine's mask tests `(qpos - kpos) < window`, which keeps exactly the same distances.)
+
+    Reading these rather than sniffing `model_type`/`architectures` is the whole point. The previous
+    dispatch gated the windowed+causal build on the checkpoint being NAMED laguna, so four of the
+    seven DFlash drafters on this box — every one that declares a window but is not called Laguna —
+    silently got `causal=False, sliding_window=0`: the wrong mask, and (because an unbounded prefix
+    has no fixed-capacity ring) a permanently eager propose. That outcome was then written up as a
+    property of those checkpoints. It is a property of the dispatch.
+    """
+    dfc = getattr(cfg, "dflash_config", None) or {}
+    if not isinstance(dfc, dict):
+        dfc = dict(dfc)
+    tlc = getattr(cfg, "transformer_layer_config", None) or {}
+
+    def declared(key, default=None):
+        for src in (dfc, tlc, cfg.__dict__ if hasattr(cfg, "__dict__") else {}):
+            if isinstance(src, dict):
+                if key in src:
+                    return src[key]
+            elif hasattr(src, key):
+                return getattr(src, key)
+        return default
+
+    layer_types = declared("layer_types")
+    use_swa = bool(dfc.get("use_swa", False))
+    override = dfc.get("causal")  # declared global override; None = derive per layer
+    if override is None and "sliding_window_non_causal" in dfc:
+        # The upstream `speculators` DFlashSpeculatorConfig spells the same axis inverted:
+        # `sliding_window_non_causal: bool = False` ("Use non-causal synthetic block attention for
+        # sliding-window layers"). Read it where it is declared rather than only its vLLM alias.
+        override = not bool(dfc["sliding_window_non_causal"])
+    # MEASUREMENT/OPERATOR override for a checkpoint that declares NEITHER. The per-layer rule below
+    # is vLLM/SGLang's, and it was written for the z-lab Qwen DFlash drafters; it is NOT established
+    # for every block-diffusion drafter. Muse-Glimmer's card describes its drafter as predicting
+    # "entire blocks of 16 tokens in a single forward pass" — block diffusion, i.e. bidirectional
+    # WITHIN the block — and z-lab's own HF reference sets is_causal=False on every layer, while
+    # vLLM/SGLang make sliding layers causal. Those genuinely disagree, and no Muse config field
+    # settles it, so expose the axis and let acceptance decide instead of guessing in code.
+    _env = (os.environ.get("MINISGL_DFLASH_CAUSAL") or "").strip().lower()
+    if _env in ("0", "false", "no"):
+        override = False
+    elif _env in ("1", "true", "yes"):
+        override = True
+
+    any_sliding = False
+    if layer_types is not None:
+        any_sliding = any(lt == _SLIDING_ATTENTION for lt in layer_types)
+
+    window_decl = dfc.get("swa_window_size", declared("sliding_window"))
+    causal, window = [], []
+    for i in range(num_layers):
+        if layer_types is None or (use_swa and not any_sliding):
+            is_sliding = use_swa
+        else:
+            is_sliding = i < len(layer_types) and layer_types[i] == _SLIDING_ATTENTION
+        if is_sliding and not window_decl:
+            raise ValueError(
+                f"DFlash layer {i} is `{_SLIDING_ATTENTION}` but no window is declared "
+                "(dflash_config.swa_window_size or a top-level sliding_window)")
+        causal.append(bool(override) if override is not None else bool(is_sliding))
+        window.append(int(window_decl) if is_sliding else 0)
+    return causal, window
+
+
+def dflash_trunk_probe(names):
+    """What KIND of trunk this drafter is, from the CHECKPOINT'S OWN TENSORS — never its name.
+
+    `names` is `models.weight.checkpoint_tensor_names(folder)`, which reads only safetensors headers.
+    Each signal is the presence of a weight that only that variant has, so a checkpoint that ships
+    the structure gets the code path whether or not anybody has taught minisgl its vendor string:
+
+      conv_qk            -> the CCA-recurrent drafter (a different architecture, its own builder)
+      self_attn.g_proj   -> gated attention (the `laguna_xs` decoder layer's softplus output gate)
+      aux_hidden_norms.* -> a per-captured-layer RMSNorm on each aux BEFORE fc
+      self_attn.qkv_proj -> fused QKV, rather than separate q/k/v projections
+    """
+    return {
+        "cca": any(".conv_qk." in n or n.startswith("conv_qk.") for n in names),
+        "gated": any(".g_proj." in n for n in names),
+        "per_aux_norm": any(n.startswith("aux_hidden_norms.") for n in names),
+        "fused_qkv": any(".qkv_proj." in n for n in names),
+    }
+
 
 class DFlashProposer(CapturableProposer):
     """DFlash block-diffusion draft proposer.
@@ -118,19 +226,40 @@ class DFlashProposer(CapturableProposer):
 
         hidden = int(cfg("hidden_size"))
         num_layers = int(cfg("num_hidden_layers"))
-        # CCA-recurrent drafter (the trained ZAYA DFlashCCADraftModel) has no attention/rope/block_size
-        # — a fundamentally different arch from the z-lab Qwen3-GQA drafter. Build it on its own path.
-        architectures = getattr(hf, "architectures", []) or []
-        self._is_cca = "DFlashCCADraftModel" in architectures or bool(getattr(hf, "cca_config", None))
+
+        # WHICH BUILDER — decided by the checkpoint's own TENSORS, not its model_type/architectures.
+        #
+        # The dispatch this replaces asked `model_type == "laguna" or "Laguna" in architectures`, so
+        # the windowed+causal build (and with it the prefix ring, and with it a capturable propose)
+        # was reachable only by a checkpoint carrying that vendor string. Measured consequence on
+        # this box: of seven DFlash drafters, ONE was captured — the one literally named laguna —
+        # while Muse-Glimmer (`sliding_window: 2048`, 5x sliding_attention) and all three windowed
+        # z-lab drafters ran eager, on a mask they were never trained with, and the engine reported
+        # the reason as "the z-lab DFlash drafter is non-causal and unwindowed", which is a statement
+        # about this dispatch and not about those checkpoints.
+        #
+        # `conv_qk` is the CCA-recurrent drafter's convolution and `self_attn.g_proj` is the gated
+        # (laguna_xs) decoder layer's per-head softplus gate. Both are weights only that variant has,
+        # so a checkpoint that ships the structure gets the right builder whether or not anyone has
+        # taught minisgl its name. `cca_config` stays as an OR because the CCA trunk is a genuinely
+        # different architecture and a declared marker for it is legitimate.
+        from minisgl.models.weight import checkpoint_tensor_names
+
+        self._ckpt_names = checkpoint_tensor_names(draft_model_path)
+        self._probe = dflash_trunk_probe(self._ckpt_names)
+        # Per-layer (causal, window), from the declared fields, upstream's rule. Both builders below
+        # consume these — so the mask a drafter gets is a function of what it DECLARES, in one place.
+        self._layer_causal, self._layer_window = dflash_layer_masks(hf, num_layers)
+
+        self._is_cca = self._probe["cca"] or bool(getattr(hf, "cca_config", None))
         if self._is_cca:
             self._build_cca(engine, hf, cfg, dfc, folder, hidden, num_layers)
             return
         self._is_cca = False
-        # Laguna DFlash drafter (poolside/Laguna-XS-2.1-DFlash): a Laguna-XS gated GQA trunk (fused
-        # qkv, per-head softplus g_proj gate, per-aux hidden norms, causal + sliding-window block
-        # attention). Same fc->KV-prefix mechanism as the z-lab Qwen path, different decoder layer.
-        model_type = str(getattr(hf, "model_type", "") or "").lower()
-        self._is_laguna = model_type == "laguna" or any("Laguna" in a for a in architectures)
+        # Gated (laguna_xs) GQA trunk: fused qkv, per-head softplus g_proj gate, per-aux hidden
+        # norms. Same fc->KV-prefix mechanism as the ungated Qwen3 trunk, different decoder layer —
+        # which is why this is a LOADER/layer-type difference, not a separate mask policy.
+        self._is_laguna = self._probe["gated"]
         if self._is_laguna:
             self._build_laguna(engine, hf, cfg, dfc, folder, hidden, num_layers)
             return
@@ -212,6 +341,12 @@ class DFlashProposer(CapturableProposer):
                 max_position=max_pos,
                 draft_vocab_size=draft_vocab if self._compressed else None,
                 own_embed=self._compressed,
+                # The mask this checkpoint DECLARES, per layer. Previously omitted entirely, so the
+                # model took its defaults (causal=False, sliding_window=0) and every windowed
+                # drafter that reached this path silently attended its whole prefix bidirectionally.
+                layer_causal=self._layer_causal,
+                layer_window=self._layer_window,
+                per_aux_norm=self._probe["per_aux_norm"],
             )
         self._load_draft_weights(folder)
 
@@ -243,10 +378,35 @@ class DFlashProposer(CapturableProposer):
         # cap on the accumulated aux (and it used to silently revert this whole fast path).
         self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
-        self._init_prefix_kv(0)  # z-lab drafter is bidirectional/unwindowed -> unbounded append
+        # Size the ring from what the drafter DECLARES, not from a family assumption. A drafter whose
+        # every layer is windowed has a bounded prefix and therefore a fixed-capacity ring and a
+        # capturable propose; anything else records the real reason.
+        self._finish_prefix_kv(engine)
+
+    def _finish_prefix_kv(self, engine) -> None:
+        """Size the prefix K/V and decide capture from the DECLARED per-layer mask. One policy, used
+        by every attention-trunk drafter, so "can this be captured?" is asked of the checkpoint's
+        structure instead of its name.
+
+        A group is one distinct (causal, window) pair — the same partition vLLM makes when it splits
+        a mixed drafter into multiple KV cache groups (`_group_causal: dict[gid, bool]`, baked into
+        the captured metadata). One group whose window is bounded is the case the existing single
+        ring already expresses, so it captures today. Mixed/unbounded groups need one ring PER GROUP
+        (an unbounded group sized by a max-context cap, as vLLM's FullAttentionSpec is bounded by
+        max_model_len); until those are allocated the reason recorded below states the actual
+        structural fact and its cost, and never claims the checkpoint is something it is not."""
+        bounded = all(w > 0 for w in self._layer_window)
+        # EVERY attention-trunk drafter is capturable, mixed included: the ring is sized per layer
+        # (window+slack for a windowed layer, a max-context cap for a `full_attention` one) and the
+        # captured body builds one mask per distinct (causal, window, capacity). The only thing that
+        # can stop it now is memory or an explicit opt-out, and both say so.
+        if self._persist:
+            self._init_prefix_kv(int(max(self._layer_window)) if bounded else 0)
+            self.init_propose_capture(engine)
+            return
+        self._init_prefix_kv(int(max(self._layer_window)) if bounded else 0)
         self.propose_uncapturable_reason = (
-            "the z-lab DFlash drafter is non-causal and unwindowed — it attends its ENTIRE prefix "
-            "bidirectionally, so there is no fixed-capacity shape to capture")
+            "MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off")
 
     # ---- persistent prefix K/V (ring) ------------------------------------------------------------
     def _init_prefix_kv(self, window: int) -> None:
@@ -357,11 +517,28 @@ class DFlashProposer(CapturableProposer):
         dev, dt = self._device, self._dtype
         L = len(d.layers)
         Hkv, hd = d.layers[0].num_kv_heads, d.layers[0].head_dim
-        C = self._kv_cap                      # window + _KV_SLACK, from _init_prefix_kv
         A = self._block_size                  # positions committed per step is at most one block
         self._pc_A = A
-        self._pc_C = C
+        # PER-LAYER ring capacity — this is what lets a MIXED drafter be captured at all.
+        # A `sliding_attention` layer only ever reads `window` rows back, so window + slack is
+        # sufficient. A `full_attention` layer reads the WHOLE prefix, which has no natural bound —
+        # so it gets a max-context CAP, exactly as vLLM bounds its FullAttentionSpec by
+        # max_model_len. Sizing every layer at the largest capacity would work and is what a single
+        # ring forces, but it is wasteful precisely where it hurts: on a 6-layer drafter with one
+        # full layer that is 6x the max-context ring instead of 1x plus five small ones.
+        full_cap = int(os.environ.get("MINISGL_DFLASH_FULL_CAP") or 0) or min(
+            int(getattr(engine, "max_seq_len", 0) or 8192), 8192)
+        self._layer_cap = [(w + _KV_SLACK) if w > 0 else (full_cap + A)
+                           for w in self._layer_window]
+        self._layer_win = list(self._layer_window)
+        self._layer_cau = list(self._layer_causal)
+        self._pc_C = max(self._layer_cap)
         self._window = self._kv_window
+        # How much aux the SCHEDULER must retain for us. `_init_prefix_kv` derives this from a single
+        # window and answers "all of it" (0) when unbounded — which, now that an unbounded layer has
+        # a max-context-capped ring, would have the scheduler grow a buffer larger than anything the
+        # ring can hold. Bound it by the widest ring plus one block.
+        self.aux_ctx_cap = max(self._layer_cap) + A
         self._num_aux = len(self.capture_layer_ids or [])
         self._hidden = int(d.hidden_size)
         vocab = int(engine.model.model.embed_tokens.num_embeddings)
@@ -373,21 +550,64 @@ class DFlashProposer(CapturableProposer):
         # simply skips propose and decodes plain, which is lossless.
         from minisgl.engine.graph import get_free_memory
 
-        per_slot = L * C * Hkv * hd * dt.itemsize * 2
+        per_slot = sum(self._layer_cap) * Hkv * hd * dt.itemsize * 2
         want = int(engine.page_table.shape[0])
         # `or "0.30"` not a dict default: docker-compose's `VAR: "${VAR:-}"` sets the variable to the
         # EMPTY STRING, so the key IS present and `os.environ.get(k, default)` returns "" — which
         # float() raises on and which kills the serve at boot, not at the call site. Every other env
         # reader in this file already uses the `or` form; these three KV_FRAC readers did not, so
         # forwarding any of them through compose (the only way this repo serves) was fatal.
-        budget = int(get_free_memory(dev)
-                     * float(os.environ.get("MINISGL_DFLASH_KV_FRAC") or "0.30"))
-        self._pool_slots = max(1, min(want, budget // max(per_slot, 1)))
+        # RESERVE RUNTIME HEADROOM FIRST. `KV_FRAC * free` alone is not a budget: it spends a share of
+        # what is free at BUILD time and leaves the rest to be consumed by the KV pool's own growth,
+        # activations and graph pools. Measured failure — qwen35b-awq, MEM_RATIO=0.86, a 360 MB ring
+        # for a 6-layer drafter with one full_attention layer: free went 1.31 -> 0.32 GiB at boot and
+        # the serve then died mid-generation on a 146 MiB allocation. It did NOT die under a short
+        # benchmark, only under long generations, so the cost is invisible to a probe that stops at a
+        # few hundred tokens. Subtract the headroom before taking the fraction.
+        # The floor is a RUNTIME floor, and KV_FRAC is deliberately NOT applied on top of it: taking a
+        # fraction of "free minus floor" double-discounts and still left 360 MB spent here on the pair
+        # that could least afford it. What must hold is simply `free - ring >= floor`, because the
+        # thing that OOMs is a long generation's transient workspace, which scales with context and
+        # is invisible to any boot-time measurement. 1.0 GiB is not a guess: the measured failure
+        # allocated 146 MiB with 0 bytes free after the ring had taken free from ~1.3 to ~0.3 GiB.
+        _head = float(os.environ.get("MINISGL_DFLASH_RING_HEADROOM_GB") or "1.0") * (1 << 30)
+        _free = get_free_memory(dev)
+        budget = int(max(0.0, _free - _head))
+        fits = budget // max(per_slot, 1)
+        self._ring_budget_note = (
+            f"free={_free / 1e9:.2f}GB floor={_head / 1e9:.2f}GB "
+            f"budget={budget / 1e6:.0f}MB per_slot={per_slot / 1e6:.0f}MB fits={fits}")
+        if fits < 1:
+            # Honest refusal: this is a MEMORY fact about this box and this operating point, measured
+            # here, not a claim about the checkpoint. Say what it would have cost so the operator can
+            # trade KV pool for it deliberately (lower --memory-ratio, or raise KV_FRAC).
+            self.propose_capturable = False
+            self.propose_uncapturable_reason = (
+                f"the prefix ring needs {per_slot / 1e6:.0f} MB/slot but only "
+                f"{budget / 1e6:.0f} MB is budgetable ({_free / 1e9:.2f} GiB free minus "
+                f"{_head / 1e9:.2f} GiB runtime headroom, x KV_FRAC) — lower --memory-ratio to buy "
+                f"room, or raise MINISGL_DFLASH_KV_FRAC / lower MINISGL_DFLASH_RING_HEADROOM_GB")
+            logger.warning_rank0(f"spec-decode: DFlash propose stays EAGER — "
+                                 f"{self.propose_uncapturable_reason}")
+            return
+        # An explicit CAP, because the automatic budget cannot see the future. Everything allocated
+        # after this point (spec-verify graphs, and then a long generation's context-scaled
+        # workspace) competes for the same memory, so "free right now" over-states what the ring can
+        # afford: measured on qwen35b-awq, free was 2.82 GB here and 0.32 GB by the time serving
+        # started. Slots are the only lever that does not change numerics — a request whose
+        # table_idx falls outside the pool simply decodes plain, which is lossless — so expose them
+        # and let the operator trade concurrency-with-drafting against KV pool.
+        _cap = int(os.environ.get("MINISGL_DFLASH_RING_SLOTS") or 0)
+        self._pool_slots = max(1, min(want, fits, _cap or want))
         self._null_slot = self._pool_slots
         S = self._pool_slots + 1
-        self._pk = [torch.zeros(S, C, Hkv, hd, device=dev, dtype=dt) for _ in range(L)]
-        self._pv = [torch.zeros(S, C, Hkv, hd, device=dev, dtype=dt) for _ in range(L)]
-        self._ppos = torch.full((S, C), _NO_POS, dtype=torch.int64, device=dev)
+        self._pk = [torch.zeros(S, c, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
+        self._pv = [torch.zeros(S, c, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
+        # One position map PER DISTINCT CAPACITY (usually one; two for a mixed drafter). The ring is
+        # modulo, so a column means nothing without the absolute position it currently holds, and
+        # rings of different capacity map the same position to different columns.
+        self._ppos = {c: torch.full((S, c), _NO_POS, dtype=torch.int64, device=dev)
+                      for c in sorted(set(self._layer_cap))}
 
         G = S  # static I/O rows: one per pool slot (+NULL), which bounds the captured bucket too
         Q = self._block_size
@@ -407,6 +627,10 @@ class DFlashProposer(CapturableProposer):
         # `block_size` wide and the window is far larger), so it is a constant, not per-step data.
         tri = torch.arange(Q, device=dev).view(Q, 1) >= torch.arange(Q, device=dev).view(1, Q)
         self._blk_tri = torch.where(tri, 0.0, float("-inf")).to(torch.float32)
+        # ...and its BIDIRECTIONAL twin, for a `full_attention` layer: within the block it sees every
+        # position, not just the ones behind it. Both are constants, so a mixed drafter costs one
+        # extra [Q, Q] tensor and no per-step work.
+        self._blk_open = torch.zeros(Q, Q, device=dev, dtype=torch.float32)
         # Pinned host staging -> three H2D copies per step for the whole batch.
         self._h_slots = torch.zeros(G, dtype=torch.int64, pin_memory=True)
         self._h_pre = torch.zeros(4, G, A, dtype=torch.int64, pin_memory=True)
@@ -415,14 +639,22 @@ class DFlashProposer(CapturableProposer):
         self._ar_Q = torch.arange(Q, dtype=torch.int64)
         self._slot_uid: dict[int, int] = {}   # pool slot -> owning uid (reset the ring on reuse)
         self._ring_end: dict[int, int] = {}   # pool slot -> ABSOLUTE end position already projected
+        # uid -> ring slot, plus the free list. The ring is its OWN slot space, sized by memory;
+        # `free(uid)` returns the slot so a finished request's ring row is reused rather than lost.
+        self._slot_of_uid: dict[int, int] = {}
+        self._free_slots: list = list(range(self._pool_slots))
         self._rebuilds = 0                    # cold/gap eager rebuilds (evidence, not a knob)
         self.propose_capturable = True
         self.init_propose_capture_state(engine, tag="DFlash")
+        # Report the per-layer geometry, not one number: on a mixed drafter the interesting fact is
+        # that the windowed layers are small and only the full_attention one pays a max-context ring.
+        _bytes = 2 * S * sum(self._layer_cap) * Hkv * hd * dt.itemsize
+        _grp = sorted(set(zip(self._layer_cau, self._layer_win, self._layer_cap)))
         logger.info_rank0(
-            f"spec-decode: DFlash propose ring (slots={self._pool_slots}+NULL of {want}, C={C}, "
-            f"block={Q}, window={self._window}, prefix-KV "
-            f"{2 * L * S * C * Hkv * hd * dt.itemsize / 1e6:.0f} MB, "
-            f"logits buf {self._g_logits.numel() * 4 / 1e6:.0f} MB)")
+            f"spec-decode: DFlash propose ring (slots={self._pool_slots}+NULL of {want}, "
+            f"block={Q}, {L} layers in {len(_grp)} group(s) "
+            f"(causal,window,cap)={_grp}, prefix-KV {_bytes / 1e6:.0f} MB, "
+            f"logits buf {self._g_logits.numel() * 4 / 1e6:.0f} MB) [{self._ring_budget_note}]")
 
     @torch.inference_mode()
     def _rebuild_ring(self, slot: int, aux: torch.Tensor, end: int, m: int) -> None:
@@ -432,13 +664,34 @@ class DFlashProposer(CapturableProposer):
         reported so "captured" can't quietly mean "rebuilding every step"."""
         dev = self._device
         P = int(aux.shape[1])
-        rows = aux[:, P - m : P].permute(1, 0, 2).contiguous().to(self._dtype)  # [m, num_aux, hidden]
-        pos = torch.arange(end - m, end, dtype=torch.int64, device=dev)
-        col = pos % self._pc_C
-        ws = torch.full((m,), slot, dtype=torch.int64, device=dev)
-        self._draft.project_prefix_into(rows, pos.to(torch.int32), self._pk, self._pv, ws, col)
-        self._ppos[slot].fill_(_NO_POS)
-        self._ppos[slot, col] = pos
+        # ONE PASS PER RING CAPACITY, each fed only as many rows as that ring can hold. Feeding the
+        # same `m` to every layer scatters m rows into a c-column ring whenever c < m — duplicate
+        # columns, and `_pk`/`_ppos` are separate scatters that can then resolve the duplicates
+        # DIFFERENTLY, leaving the mask certain a column holds position p while the K/V there is
+        # p'. `m` comes in as min(P, max capacity), so this only ever narrows it.
+        # CHUNKED. The projection is one GEMM per layer with M = the row count, and this path is the
+        # only place M is unbounded — it grows with the ring capacity, i.e. with context. Measured:
+        # a full-attention ring of 8208 rows faults the queue (HSA_STATUS_ERROR_EXCEPTION 0x1016)
+        # while 6160 and 4112 are clean, and the fault survives every mask/capture variation, so the
+        # one-shot large-M projection through the drafter's quantised linears is what changed across
+        # that boundary. Chunking also stops a cold rebuild from becoming a single multi-thousand-row
+        # stall on the decode path. The result is identical: each row's K/V depends only on its own
+        # aux and position, so the split is arithmetically inert.
+        for c in sorted(set(self._layer_cap)):
+            ids = [l for l, cc in enumerate(self._layer_cap) if cc == c]
+            mc = min(m, c)
+            ppos = self._ppos[c]
+            ppos[slot].fill_(_NO_POS)
+            for lo in range(0, mc, _REBUILD_CHUNK):
+                hi = min(lo + _REBUILD_CHUNK, mc)
+                # rows [P-mc+lo, P-mc+hi) carry absolute positions [end-mc+lo, end-mc+hi)
+                rows = aux[:, P - mc + lo : P - mc + hi].permute(1, 0, 2).contiguous().to(self._dtype)
+                pos = torch.arange(end - mc + lo, end - mc + hi, dtype=torch.int64, device=dev)
+                col = pos % c                  # unique for mc <= c, which the min above guarantees
+                ws = torch.full((hi - lo,), slot, dtype=torch.int64, device=dev)
+                self._draft.project_prefix_into(
+                    rows, pos.to(torch.int32), self._pk, self._pv, ws, col, layer_ids=ids)
+                ppos[slot, col] = pos
         self._rebuilds += 1
 
     def stage_propose(
@@ -454,17 +707,26 @@ class DFlashProposer(CapturableProposer):
             aux = ctx.aux_hidden.get(req.uid)
             if k_i <= 0 or aux is None or aux.dim() != 3 or aux.shape[1] < 1:
                 continue
-            slot = int(req.table_idx)
-            if slot >= self._pool_slots:
-                self._pc_warn_once(
-                    "slot", f"req slot {slot} is outside the {self._pool_slots}-slot prefix ring "
-                            "(memory-capped) — this request decodes plain")
-                continue
-            end = int(req.cached_len)
-            P = int(aux.shape[1])
-            if self._slot_uid.get(slot) != req.uid:      # slot reused by a new request
+            # RING SLOT, ALLOCATED — not `req.table_idx` reused as one. `table_idx` indexes the
+            # page_table, whose row count is max_running_req+1 and is INDEPENDENT of how many ring
+            # slots memory allowed. Using it directly means a pool smaller than the page table drops
+            # every request whose row happens to sit above the cut, and it is not "the excess few":
+            # measured with a 2-slot ring against a 5-row page table, 100% of steps came back
+            # width 0 (`accept-len 0.00, replay=0`) — spec silently OFF, at half the eager
+            # throughput. A pool of N must serve N requests, whichever rows they landed on.
+            slot = self._slot_of_uid.get(req.uid)
+            if slot is None:
+                if not self._free_slots:
+                    self._pc_warn_once(
+                        "slot", f"all {self._pool_slots} prefix-ring slots are in use (memory-capped)"
+                                " — further concurrent requests decode plain, which is lossless")
+                    continue
+                slot = self._free_slots.pop()
+                self._slot_of_uid[req.uid] = slot
                 self._slot_uid[slot] = req.uid
                 self._ring_end.pop(slot, None)
+            end = int(req.cached_len)
+            P = int(aux.shape[1])
             covered = self._ring_end.get(slot)
             if covered is None or end < covered or end - covered > A:
                 self._rebuild_ring(slot, aux, end, min(P, C))
@@ -517,29 +779,55 @@ class DFlashProposer(CapturableProposer):
         batched denoising forward -> head. Reads only the static buffers' first `bs` rows; writes the
         ring, `_g_out` and `_g_logits`. No host sync, no data-dependent shape, one fixed trip count."""
         d = self._draft
-        A, C, Q = self._pc_A, self._pc_C, self._block_size
+        A, Q = self._pc_A, self._block_size
         m = bs * A
         # 1) Re-project the newest A committed positions into the ring. Idempotent for the ones
         #    already there (the aux of a committed position never changes), so a fixed row count can
         #    stand in for the step's variable number of newly accepted positions.
+        #    Columns are derived ON DEVICE from the staged ABSOLUTE position (`pos % capacity`) rather
+        #    than staged from the host: with per-layer capacities there is no single column to stage,
+        #    and a modulo is cheaper than the extra H2D anyway. Pure tensor ops, so still capturable.
         pre = self._g_pre[:, :bs]
-        ws, wc, wp = pre[0].reshape(m), pre[1].reshape(m), pre[2].reshape(m)
+        ws, wp = pre[0].reshape(m), pre[2].reshape(m)
+        cols = [torch.remainder(wp, c) for c in self._layer_cap]
         d.project_prefix_into(
             self._aux_stage[:bs].reshape(m, self._num_aux, self._hidden),
-            pre[3].reshape(m).to(torch.int32), self._pk, self._pv, ws, wc)
-        self._ppos[ws, wc] = wp
-        # 2) Additive mask from ABSOLUTE positions (see init_propose_capture for why not concat idx).
+            pre[3].reshape(m).to(torch.int32), self._pk, self._pv, ws, cols)
+        for c, ppos in self._ppos.items():
+            ppos[ws, torch.remainder(wp, c)] = wp
+        # 2) Additive mask PER LAYER from ABSOLUTE positions (see init_propose_capture for why not
+        #    concat idx). Built once per distinct (causal, window, capacity), so a uniform drafter
+        #    still materialises exactly one mask and hands the same tensor to every layer.
         slots = self._g_slots[:bs]
-        pa = self._ppos[slots].unsqueeze(1)              # [bs, 1, C]
         qa = self._g_blk[2, :bs].unsqueeze(2)            # [bs, Q, 1]
-        keep = (pa <= qa) & ((qa - pa) < self._window)
-        mask = torch.cat(
-            [torch.where(keep, 0.0, float("-inf")).to(torch.float32),
-             self._blk_tri.expand(bs, Q, Q)], dim=2)     # [bs, Q, C+Q]
+        cache, masks = {}, []
+        for l in range(len(d.layers)):
+            key = (self._layer_cau[l], self._layer_win[l], self._layer_cap[l])
+            if key not in cache:
+                causal_l, win_l, cap_l = key
+                pa = self._ppos[cap_l][slots].unsqueeze(1)   # [bs, 1, C]
+                # A column that has never been written (or belongs to a previous owner) carries
+                # _NO_POS. The window test used to kill those implicitly — _NO_POS is so negative
+                # that `qa - pa` exceeds any window — but an UNBOUNDED layer applies no window test,
+                # so liveness has to be explicit or a full_attention layer would attend garbage.
+                # EXPAND to the query axis up front. `pa` is [bs, 1, C] and only the causal / window
+                # terms carry a Q axis, so a layer with NEITHER (a full_attention layer: bidirectional
+                # AND unbounded) would leave `keep` at [bs, 1, C] and the concat with the [bs, Q, Q]
+                # block mask fails. Broadcasting here makes the mask well-formed for every group.
+                keep = (pa != _NO_POS).expand(bs, Q, cap_l)
+                if causal_l:
+                    keep = keep & (pa <= qa)
+                if win_l > 0:
+                    keep = keep & ((qa - pa) < win_l)
+                blk = self._blk_tri if causal_l else self._blk_open
+                cache[key] = torch.cat(
+                    [torch.where(keep, 0.0, float("-inf")).to(torch.float32),
+                     blk.expand(bs, Q, Q)], dim=2)          # [bs, Q, C+Q]
+            masks.append(cache[key])
         # 3) One batched denoising forward over [anchor, mask, mask, ...].
         noise = d.embed(self._g_blk[0, :bs].reshape(-1)).to(self._dtype).view(bs, Q, -1)
         hidden = d.denoise_batched(
-            noise, self._g_blk[1, :bs].to(torch.int32), self._pk, self._pv, slots, mask)
+            noise, self._g_blk[1, :bs].to(torch.int32), self._pk, self._pv, slots, masks)
         # 4) Head over block rows 1..Q-1 only (row 0 is the known anchor and is never read).
         n = bs * (Q - 1)
         logits = d.head(hidden[:, 1:].reshape(n, -1))
@@ -576,9 +864,12 @@ class DFlashProposer(CapturableProposer):
     def reset_propose_state(self) -> None:
         """Undo what the warmup/capture dummy batch wrote. It ran entirely on the NULL slot, so only
         that row's position vector needs clearing; no live request can have observed anything."""
-        self._ppos[self._null_slot].fill_(_NO_POS)
+        for _ppos in self._ppos.values():
+            _ppos[self._null_slot].fill_(_NO_POS)
         self._slot_uid.clear()
         self._ring_end.clear()
+        self._slot_of_uid.clear()
+        self._free_slots = list(range(self._pool_slots))
         self._rebuilds = 0
 
     def _build_cca(self, engine, hf, cfg, dfc, folder, hidden, num_layers) -> None:
@@ -684,8 +975,13 @@ class DFlashProposer(CapturableProposer):
         eps = float(cfg("rms_norm_eps", default=1e-6))
         rope_theta = float(cfg("rope_theta", default=500000.0))
         max_pos = int(cfg("max_position_embeddings", default=262144))
-        sliding_window = int(getattr(hf, "sliding_window", 0) or 0)
-        causal = bool(dfc.get("causal", True))
+        # Derived, not re-read. The old form was `causal = bool(dfc.get("causal", True))` — a key the
+        # upstream `speculators` schema never writes (it declares `sliding_window_non_causal`, and
+        # vLLM treats `dflash_config.causal` as an OVERRIDE, not the source). It landed on the right
+        # answer for this checkpoint only because its default happened to match. `dflash_layer_masks`
+        # applies the real rule, override included, for every drafter.
+        sliding_window = max(self._layer_window)
+        causal = all(self._layer_causal)
 
         self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 16)
         block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
@@ -736,9 +1032,9 @@ class DFlashProposer(CapturableProposer):
                     draft_vocab_size=None,
                     own_embed=False,
                     decoder_layer_type="laguna_xs",
-                    sliding_window=sliding_window,
-                    causal=causal,
-                    per_aux_norm=True,
+                    layer_causal=self._layer_causal,
+                    layer_window=self._layer_window,
+                    per_aux_norm=self._probe["per_aux_norm"],
                 )
         finally:
             torch.set_default_dtype(_prev_default_dtype)
@@ -751,23 +1047,10 @@ class DFlashProposer(CapturableProposer):
         self._ctx_pos_env = os.environ.get("MINISGL_DFLASH_CTX_POS")
         self._persist = os.environ.get("MINISGL_DFLASH_PERSIST_KV", "1") not in ("0", "false", "no")
         self._ctx_window = int(os.environ.get("MINISGL_DFLASH_CTX_WINDOW", "0") or 0)
-        # O(window), not O(context): gated on the drafter's OWN mask being windowed+causal. Without
-        # both, `_block_mask` returns None and the block attends the full prefix bidirectionally, so
-        # dropping rows would change results rather than skip discarded work.
-        self._init_prefix_kv(sliding_window if (causal and sliding_window > 0) else 0)
-        if self._kv_window > 0 and self._persist:
-            # Bounded prefix => a fixed-capacity ring => a capturable propose. Allocating the ring
-            # here REPLACES the per-uid compacting buffers for this drafter (nothing reads them on
-            # the captured path); the unwindowed z-lab drafter keeps them.
-            self.init_propose_capture(engine)
-        else:
-            # Record WHY, so the engagement readout says ALWAYS-EAGER(never: <reason>) instead of a
-            # `replay=0 eager=0` that reads like "no fallbacks". `propose_capturable` stays False, so
-            # `propose` keeps the eager per-uid path and nothing here touches the capture state.
-            self.propose_uncapturable_reason = (
-                f"this drafter has no bounded prefix (causal={causal}, "
-                f"sliding_window={sliding_window})" if self._kv_window <= 0 else
-                "MINISGL_DFLASH_PERSIST_KV=0 — the persistent prefix ring is off")
+        # SAME policy as every other attention-trunk drafter — the ring and the capture decision are
+        # a function of the declared per-layer mask, not of which builder ran. This is the line that
+        # used to be reachable only for a checkpoint named laguna.
+        self._finish_prefix_kv(engine)
 
         # PROMPT-PREFILL SEED (full-context path only). Without it the drafter's aux prefix is built
         # append-only from ACCEPTED GENERATED positions (scheduler.py:_spec_aux_hidden), so its context
@@ -1226,6 +1509,11 @@ class DFlashProposer(CapturableProposer):
             # Release the ring slot. Stale K/V need not be zeroed — clearing the slot's ownership is
             # enough, because the next owner's first propose rebuilds the ring and resets every
             # column's ABSOLUTE POSITION to _NO_POS, which is what the mask actually consults.
+            # Return it to the FREE LIST too, or a capped ring leaks a slot per finished request and
+            # degrades to "no drafting at all" after `_pool_slots` completions.
+            s = self._slot_of_uid.pop(uid, None)
+            if s is not None and s not in self._free_slots:
+                self._free_slots.append(s)
             for s, u in list(self._slot_uid.items()):
                 if u == uid:
                     del self._slot_uid[s]
