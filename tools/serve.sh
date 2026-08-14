@@ -120,6 +120,28 @@ case "$MODEL" in
                     # scale bring the drafter to ~1.61 GiB (down_proj held at fp8, mirroring Meta's
                     # own GGUF, which is Q4_K everywhere except ffn_down at Q6_K).
                     : "${MINISGL_DFLASH_QUANT:=nvfp4}"; export MINISGL_DFLASH_QUANT
+                    # BIDIRECTIONAL block mask, and this MUST be stated here because the derived
+                    # default is the opposite. The per-layer rule (vllm qwen3_dflash.py /
+                    # sglang models/dflash.py: `sliding_attention` -> causal) is right for the z-lab
+                    # Qwen drafters it was written for and for Laguna, but WRONG for this one, and
+                    # nothing in the checkpoint distinguishes them — Laguna and Muse are both
+                    # all-`sliding_attention`, and neither declares `dflash_config.causal` or
+                    # `sliding_window_non_causal`. So it is a MEASURED per-checkpoint fact, and it
+                    # belongs in the table rather than as a code branch or a global default.
+                    #
+                    # Measured 2026-08-14, TP=2, long code/math probe, card sampling
+                    # (temp 1.0 / top_p 0.95 / top_k 64), fixtures in
+                    # /home/pat/fixtures/minisgl-dflash-matrix/museab-*:
+                    #   bidirectional + window 2048 (captured)  39.40 tok/s  accept-len 3.01
+                    #   baseline: bidirectional + UNBOUNDED (eager) 37.50 tok/s  accept-len 2.70
+                    #   causal + window 2048 (captured)         36.06 tok/s  accept-len 2.56
+                    # The model card agrees with the measurement: the drafter "predicts entire
+                    # blocks of 16 tokens in a single forward pass" — block diffusion is
+                    # bidirectional WITHIN the block by construction.
+                    #
+                    # Without this line the drafter runs the causal mask and reads as a ~5% tok/s
+                    # and ~16% accept-len REGRESSION against today's serve, with nothing to point at.
+                    : "${MINISGL_DFLASH_CAUSAL:=0}"; export MINISGL_DFLASH_CAUSAL
                   fi
                   swa_hybrid=1 ;;
   # Qwen3.6-27B + the z-lab DFlash drafter. The drafter is the TIED-VOCAB z-lab dialect (no own
@@ -292,6 +314,13 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
 [[ "$SPEC" != "none" && -n "$SPEC" ]] && printf '[serve] spec sampled=%s\n' "$MINISGL_SPEC_SAMPLED" >&2
+# The DFlash drafter's block mask and weight format, ON THE BANNER. Both change acceptance
+# materially and neither appears on the python command line, so without this the only way to tell
+# which mask a run used is to read the engine's ring log — and a table entry that silently stopped
+# applying reads as a model regression rather than a launch difference. `causal=` is empty when the
+# table says nothing, i.e. the per-layer rule derived from `layer_types` is in force.
+[[ "$SPEC" == "dflash" ]] && printf '[serve] dflash: quant=%s causal=%s (empty causal = derived from layer_types)\n' \
+  "${MINISGL_DFLASH_QUANT:-<derived>}" "${MINISGL_DFLASH_CAUSAL:-<derived>}" >&2
 printf '[serve] %s\n' "${cmd[*]}" >&2
 [[ -n "${DRY_RUN:-}" ]] && exit 0
 exec "${cmd[@]}"

@@ -69,7 +69,26 @@ def _resolve_repo_file(model_path: str, filename: str) -> str | None:
     try:
         return hf_hub_download(repo_id=model_path, filename=filename)
     except Exception:
-        return None
+        pass
+    # FALL BACK TO THE LOCAL CACHE, any snapshot. `hf_hub_download` does not merely read — it wants
+    # to materialise the file into the current ref's snapshot dir, which fails with PermissionError
+    # when that dir is ROOT-OWNED. That is the normal state on this box: the serve containers run as
+    # root over the bind-mounted HF cache, so a snapshot fetched inside a container is unwritable by
+    # the host user afterwards (observed on RedHatAI/Muse-Glimmer-30B-NVFP4, where the current
+    # root-owned snapshot lacks README.md while an older pat-owned one has it). Without this, an
+    # optional side file reads as ABSENT rather than unreadable, and a caller silently loses a
+    # declared default. Also covers plain offline operation.
+    root = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
+    repo_dir = os.path.join(root, "models--" + model_path.replace("/", "--"), "snapshots")
+    try:
+        for snap in sorted(os.listdir(repo_dir), reverse=True):
+            p = os.path.join(repo_dir, snap, filename)
+            if os.path.isfile(p):
+                return p
+    except Exception:
+        pass
+    return None
 
 
 def _load_side_chat_template(model_path: str) -> str | None:
@@ -90,6 +109,67 @@ def _load_side_chat_template(model_path: str) -> str | None:
     return None
 
 
+# The sampling triple, and the ONLY keys inherited from a declared base model. Deliberately not
+# eos/pad/max_length: a derivative may legitimately change those, whereas losing the author's
+# recommended sampling in a repack is a packaging accident, not a decision.
+_SAMPLING_KEYS = ("temperature", "top_p", "top_k")
+
+
+@functools.cache
+def declared_base_model(model_path: str) -> str | None:
+    """The checkpoint this one DECLARES it was derived from, or None.
+
+    Two declaration sites, both standard, checked in order of specificity: `config.json`
+    (`base_model` / `base_model_name_or_path` / `_name_or_path`), then the HF model-card front
+    matter, which is where `base_model` actually lives for most quantized repacks. The front-matter
+    list mixes the base with method tags — `base_model: [meta-models/Muse-Glimmer-30B, nvfp4,
+    llm-compressor]` — so take the first entry shaped like a repo id."""
+    p = _resolve_repo_file(model_path, "config.json")
+    if p is not None:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            for k in ("base_model", "base_model_name_or_path", "_name_or_path"):
+                v = cfg.get(k)
+                if isinstance(v, str) and "/" in v and v != model_path:
+                    return v
+        except Exception:
+            pass
+    p = _resolve_repo_file(model_path, "README.md")
+    if p is None:
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    front = text[3 : end if end > 0 else len(text)]
+    in_key = False
+    for raw in front.splitlines():
+        if not raw.strip():
+            continue
+        if raw.startswith("base_model:"):
+            rest = raw.split(":", 1)[1].strip().strip("[]")
+            for cand in (c.strip().strip("'\"") for c in rest.split(",")):
+                if "/" in cand and cand != model_path:
+                    return cand
+            in_key = True
+            continue
+        if in_key:
+            stripped = raw.strip()
+            if stripped.startswith("- "):
+                cand = stripped[2:].strip().strip("'\"")
+                if "/" in cand and cand != model_path:
+                    return cand
+                continue
+            if not raw.startswith((" ", "\t")):
+                in_key = False               # next top-level key: the list is over
+    return None
+
+
 @functools.cache
 def load_generation_config(model_path: str) -> dict:
     """Load the model's `generation_config.json` as a plain dict (cached; {} if absent/unreadable).
@@ -98,14 +178,39 @@ def load_generation_config(model_path: str) -> dict:
     ignored this file, so multi-EOS models (e.g. GLM-4.x: [154820,154827,154829]) never stopped on
     their secondary end-of-turn tokens and the recommended sampling was not applied."""
     p = _resolve_repo_file(model_path, "generation_config.json")
-    if p is None:
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data: dict = {}
+    if p is not None:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            data = {}
+    # INHERIT the author's sampling from the DECLARED base model when this checkpoint has none.
+    # A quantized repack routinely drops `temperature`/`top_p`/`top_k` while the base declares them,
+    # and the result is not a neutral default — it is full-distribution sampling (top_p 1.0,
+    # top_k -1), the case `_resolve_sampling` was written to prevent. Verified on
+    # RedHatAI/Muse-Glimmer-30B-NVFP4 (none of the three) vs meta-models/Muse-Glimmer-30B
+    # (1.0 / 0.95 / 64). ONE hop, sampling keys only, and only ones this file does not already set,
+    # so a repack that deliberately retunes sampling still wins. Best-effort: fetching the base's
+    # config needs the hub (or a warm cache), and if it is unavailable we return what we have rather
+    # than fail a boot over a default.
+    if not any(k in data for k in _SAMPLING_KEYS):
+        base = declared_base_model(model_path)
+        if base:
+            bp = _resolve_repo_file(base, "generation_config.json")
+            if bp is not None:
+                try:
+                    with open(bp, "r", encoding="utf-8") as f:
+                        bdata = json.load(f)
+                    if isinstance(bdata, dict):
+                        inherited = {k: bdata[k] for k in _SAMPLING_KEYS if k in bdata}
+                        if inherited:
+                            data = {**data, **inherited}
+                            data["_sampling_inherited_from"] = base
+                except Exception:
+                    pass
+    return data
 
 
 def resolve_stop_token_ids(model_path: str, tokenizer: PreTrainedTokenizerBase) -> list[int]:
