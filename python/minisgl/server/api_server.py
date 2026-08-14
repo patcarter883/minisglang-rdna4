@@ -666,8 +666,13 @@ def _reasoning_close_wildcard(req: "OpenAICompletionRequest") -> tuple[str | Non
 #     it is an explicit choice rather than a default.
 # Spellings are normalised (case, spaces, hyphens -> underscores) because clients disagree:
 # "extra high" / "extra-high" / "xhigh" all mean the same thing.
-_EFFORT_OFF = frozenset({"none", "off", "minimal", "no", "false", "disabled"})
+# OFF means NO reasoning. `minimal` is deliberately NOT here: OpenAI defines
+# `reasoning_effort: "minimal"` as the LOWEST tier of reasoning, not the absence of it, and treating
+# it as an off-switch is how a request for a little reasoning became a request for none — which on a
+# template that reasons regardless disarmed the grammar think-gate and hung constrained JSON.
+_EFFORT_OFF = frozenset({"none", "off", "no", "false", "disabled"})
 _EFFORT_BUDGET = {
+    "minimal": 128,   # lowest RUNG, not off — see _EFFORT_OFF
     "low": 256,
     "medium": 1024,
     "high": 4096,
@@ -688,6 +693,7 @@ _EFFORT_BUDGET = {
 # to express them; clamp to the strongest the ladder defines rather than render a word the model
 # never saw (`Reasoning strength: max.` is not a trained input, and untrained is worse than clamped).
 _EFFORT_LEVEL = {
+    "minimal": "low",   # nearest level a low/medium/high/xhigh ladder can express
     "low": "low", "medium": "medium", "high": "high",
     "extra_high": "xhigh", "xhigh": "xhigh", "x_high": "xhigh", "very_high": "xhigh",
     "max": "xhigh", "maximum": "xhigh", "unlimited": "xhigh",
@@ -992,20 +998,74 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest",
         if level_key and level_key not in kwargs:
             eff = _requested_effort(req)
             level = _EFFORT_LEVEL.get(eff) if eff else None
+            if level is None and (eff in _EFFORT_OFF or kwargs.get("enable_thinking") is False):
+                # OFF, on a ladder with no off rung. Passing NO level is the worst option: the
+                # template then supplies its OWN default, which for Muse-Glimmer is `high` — so a
+                # request for NO reasoning would render the MOST reasoning, the same inversion this
+                # file already documents twice. Clamp to the weakest level the template can express.
+                # The engine cannot make a model that always reasons stop reasoning; it can only ask
+                # for as little as the ladder allows.
+                level = _EFFORT_LEVEL.get("minimal")
             if level:
                 kwargs[level_key] = level
     return kwargs or None
 
 
+@functools.cache
+def _template_honours_thinking_off(model_path: str) -> bool:
+    """Can this template actually express "no reasoning"? Rendered with and without
+    `enable_thinking=False`; if the output is IDENTICAL the kwarg is ignored and the answer is no.
+
+    The old code asserted the opt-out "ahead of the prompt derivation so the opt-out holds even for
+    a template that silently ignores the kwarg" — but holding an opt-out the template ignored is the
+    bug, not the feature. Downstream, `_thinking_active` False disarms the grammar think-gate, so a
+    JSON schema is enforced from token 0; on a template that reasons anyway the schema then masks
+    every token of the model's prose and it loops inside a string until the budget is gone.
+
+    MEASURED on Muse-Glimmer, whose template reads only `reasoning_strength` and ignores
+    `enable_thinking` entirely: constrained-JSON at `reasoning_effort=minimal` and at
+    `enable_thinking=false` produced byte-identical prompts and both hung at the SAME character
+    offset, while medium/high parsed — because those kept the gate armed. The rendered prompt is the
+    ground truth (see `_prompt_thinking_state`); this makes the opt-out defer to it."""
+    try:
+        tok = load_tokenizer(model_path)
+        msgs = [{"role": "user", "content": "x"}]
+        on = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        off = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                      enable_thinking=False)
+        return on != off
+    except Exception:
+        return True          # cannot tell -> keep the historical behaviour
+
+
 def _thinking_opted_out(req: "OpenAICompletionRequest") -> bool:
-    """The request explicitly asked for no reasoning: `enable_thinking=false` (top-level or inside
-    chat_template_kwargs) or an OFF reasoning-effort rung. Checked ahead of the prompt derivation so
-    the opt-out holds even for a template that silently ignores the kwarg."""
-    if req.enable_thinking is False:
+    """The request explicitly asked for no reasoning AND the template can honour it.
+
+    The second half is load-bearing: an opt-out the template ignores must not be believed, or we
+    disarm the grammar think-gate for a model that is about to reason (see
+    `_template_honours_thinking_off`)."""
+    asked_off = (
+        req.enable_thinking is False
+        or (req.chat_template_kwargs or {}).get("enable_thinking") is False
+        or _effort_is_off(req)
+    )
+    if not asked_off:
+        return False
+    mp = _served_model_path()
+    if not mp:
         return True
-    if (req.chat_template_kwargs or {}).get("enable_thinking") is False:
+    # Disbelieve the opt-out ONLY where the model demonstrably reasons regardless: the template
+    # ignores `enable_thinking` AND consumes a reasoning-LEVEL kwarg, i.e. it always renders a
+    # reasoning instruction and the model self-regulates from it (Muse-Glimmer).
+    #
+    # NARROW ON PURPOSE. Gemma-4's template also ignores `enable_thinking` at a bare render, but it
+    # does NOT always reason — measured, `reasoning_effort=none` yields 0 reasoning characters. If
+    # the opt-out were disbelieved there too, the grammar think-gate would stay armed waiting for a
+    # reasoning-close that never comes, and a JSON-schema request would go UNCONSTRAINED — a worse
+    # failure than the one this fixes. A template with no level kwarg keeps the historical behaviour.
+    if _template_honours_thinking_off(mp):
         return True
-    return _effort_is_off(req)
+    return _template_level_kwarg(mp) is None
 
 
 _FRONTEND_TOKENIZER = None
