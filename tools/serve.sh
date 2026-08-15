@@ -232,8 +232,21 @@ case "$MODEL" in
   # Its ignore list carries the `...linear_attn` CONTAINER while shipping in_proj_qkv quantized, so
   # it depends on the structural quant oracle (QuantConfig.ckpt_quantized) — under the old substring
   # matching it died in the GDN concat with KeyError in_proj_qkvz.weight.
-  qwen38-27b-int4|cyankiwi/Qwen3.8-27B-AWQ-INT4)
-                  model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4";            spec_default="mtp"; k_mtp=4
+  # THROUGHPUT, measured single-stream 400-token decode, TP=2, 2026-08-15 (median of 3-4):
+  #   Qwen3.6-27B INT4        31.9 tok/s
+  #   Qwen3.8 INT4 (this)     31.8 tok/s   <- default
+  #   Qwen3.8 INT4 + MTP      31.3 tok/s
+  #   Qwen3.8 all-NVFP4       24.4 tok/s   (-23%: the e2m1 decode path costs more than
+  #                                         int4 W4A8 on this card; repeatable to 0.1s)
+  # So Qwen3.8 is NOT inherently slower than 3.6 — the all-NVFP4 build is, and it had been
+  # the default because it was chosen on footprint + quality without measuring tok/s.
+  # spec_default=none: MTP is a WASH here (31.3 vs 31.8) despite ~0.55 accept / 3.3 tok-step,
+  # i.e. the per-step cost eats the accept-length win — the same result the repo already
+  # recorded for MTP under sampling. Still selectable with SPEC=mtp; it works, it just does
+  # not pay. NOTE: spec is also auto-disabled whenever batch>1, so any concurrent traffic
+  # turns it off regardless.
+  qwen38-27b|cyankiwi/Qwen3.8-27B-AWQ-INT4)
+                  model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4";            spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.47 GiB/card, the LIGHTEST of the three
                   # Qwen3.8 builds. 0.92, NOT the 0.97 the other two carry: because this model is so
                   # light the pool grows to fill whatever the ratio allows, and at 0.97 it took
@@ -264,8 +277,8 @@ case "$MODEL" in
                   # is what the lower spec ratio pays for.
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
                   if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
-  qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
-                  model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="mtp"; k_mtp=4
+  qwen38-27b-nvfp4|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
+                  model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
                   # leaves 3.27 GiB = 214,016 KV tokens, 4.2x the unsloth serve. Validated: 20/20 on
                   # the sampled quality probe with ZERO degeneration, a 5.4k-token prefill, and MTP
@@ -300,7 +313,7 @@ case "$MODEL" in
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
                   # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
-                  model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="mtp"; k_mtp=4
+                  model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="none"; k_mtp=4
                   mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
                   # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
                   # that decodes the block semi-autoregressively, which is what fixes DFlash's
