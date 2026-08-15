@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 import os
 import re
 from dataclasses import dataclass
@@ -349,6 +350,28 @@ class ModelConfig:
         ckpt_tensor_names: "Collection[str] | None" = None,
     ) -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
+        if quant is not None and ckpt_tensor_names:
+            # Which modules does the checkpoint ACTUALLY ship quantized? A quantized module carries a
+            # packing/scale tensor (`weight_packed`/`qweight`/`weight_scale`/`scales`/...); a
+            # full-precision one carries only a bare `.weight`. Names are de-wrapped to the loader's
+            # native space (the `language_model.` infix stripped) so they match what the model asks
+            # with. See QuantConfig.ckpt_quantized for why the ignore list alone cannot decide this.
+            _QSUFFIX = (".weight_packed", ".qweight", ".weight_scale", ".scales",
+                        ".weight_global_scale", ".weight_scale_2", ".qzeros", ".weight_zero_point")
+
+            def _native(n: str) -> str:
+                # Mirror the loader's de-wrapping EXACTLY (same rewrites as quant _norm_ignore):
+                # strip the multimodal `language_model.` infix, and collapse DiffusionGemma's
+                # `model.decoder.` nesting to `model.`. Miss either and this set is keyed in a
+                # different namespace than the names the model asks with — every lookup misses and
+                # a fully-quantized model silently builds bf16.
+                n = n.replace("language_model.", "")
+                return "model." + n.removeprefix("model.decoder.") if n.startswith("model.decoder.") else n
+
+            quant = dataclasses.replace(quant, ckpt_quantized=frozenset(
+                _native(name[: -len(sfx)])
+                for name in ckpt_tensor_names for sfx in _QSUFFIX if name.endswith(sfx)
+            ))
         top = config
         if hasattr(config, "text_config") and config.text_config is not None:
             config = config.text_config

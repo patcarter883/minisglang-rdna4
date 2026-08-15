@@ -213,8 +213,29 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+        def _mem_probe(tag: str) -> None:
+            """Localize where DEVICE memory goes that torch does not account for. `used` is the true
+            device-wide draw (what the KV sizing bills as `model`); `reserved` is everything torch
+            holds. used-minus-reserved is the non-torch remainder — bisecting it across load vs
+            post_load says whether it is the weight stream or the quant layout conversion."""
+            torch.cuda.synchronize(self.device)
+            free = torch.cuda.mem_get_info(self.device)[0]
+            used, res = init_free_memory - free, torch.cuda.memory_reserved()
+            logger.info_rank0(
+                f"[mem] {tag}: used={mem_GB(used)} allocated={mem_GB(torch.cuda.memory_allocated())} "
+                f"reserved={mem_GB(res)} non-torch={mem_GB(used - res)} "
+                # PEAKS separate the two explanations for reserved >> allocated: a transient spike
+                # during load (peak allocated near reserved -> reduce the loading pattern) versus
+                # fragmentation (peak allocated near final -> the segments are simply unusable).
+                f"| peak_alloc={mem_GB(torch.cuda.max_memory_allocated())} "
+                f"peak_reserved={mem_GB(torch.cuda.max_memory_reserved())}"
+            )
+
+        _mem_probe("after build (meta)")
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        _mem_probe("after load_state_dict")
         self.model.post_load()  # finalize weights (e.g. quantized layout conversion)
+        _mem_probe("after post_load")
 
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -1108,7 +1129,20 @@ class Engine:
             )
         num_pages = config.num_page_override
         if num_pages is None:
-            model_memory = old_free_memory - new_free_memory
+            # Bill the model for its RESIDENT tensors plus whatever is genuinely outside torch — NOT
+            # the raw free-memory delta. Weight loading peaks well above the final weight size
+            # (measured on Qwen3.8-27B-NVFP4, TP=2: peak allocated 14.11 GiB vs 11.67 GiB resident),
+            # torch sizes its segment pool to that PEAK, and empty_cache does not hand it back to the
+            # driver. So the delta charges the model ~2.7 GiB of allocator segments that are FREE —
+            # and that the KV pool, which allocates through the SAME torch allocator, reuses. Charging
+            # them shrank this model's pool from ~186k tokens to 25k, and at the shipped 0.80 ratio
+            # sized it NEGATIVE and refused to boot. `used - reserved` keeps the part that really is
+            # non-torch (HIP context, kernel code objects). Unquantized models barely notice — their
+            # load has almost no transient (qwen27b: reserved 9.09 vs allocated 9.00).
+            device_used = old_free_memory - new_free_memory
+            model_memory = torch.cuda.memory_allocated() + max(
+                0, device_used - torch.cuda.memory_reserved()
+            )
             # Reserve the fixed GDN/CCA recurrent-state cache, which is allocated AFTER the KV pool
             # and scales with max_running_req. Without this the KV pool takes the whole budget and the
             # state alloc OOMs — the reason GDN 35B on 16 GB needed a manual --max-running-requests cap
@@ -1129,6 +1163,25 @@ class Engine:
                 - draft_memory
                 - graph_memory
                 - snap_memory
+            )
+            # Per-term breakdown. Without it the "Not enough memory for KV cache" assert below names
+            # five candidate causes and gives no way to tell which one actually ate the budget —
+            # every diagnosis starts by re-deriving these numbers by hand.
+            logger.info(
+                f"KV sizing: free={mem_GB(old_free_memory)} x ratio={config.memory_ratio} = "
+                f"{mem_GB(int(config.memory_ratio * old_free_memory))} budget; "
+                f"model={mem_GB(model_memory)} state={mem_GB(state_memory)} "
+                f"draft={mem_GB(draft_memory)} graph={mem_GB(graph_memory)} "
+                f"snap={mem_GB(snap_memory)} -> available={mem_GB(available_memory)} "
+                f"@ {cache_per_page} B/page; "
+                # `model` is a free-memory DELTA, so it also carries allocator slack, fragmentation
+                # and the HIP context. `allocated` is the exact resident tensor total — when the two
+                # diverge the gap is overhead, not weights, and the fix is not a higher memory-ratio.
+                f"resident tensors={mem_GB(torch.cuda.memory_allocated())} "
+                # reserved-minus-allocated is torch's own segment overhead (kept after empty_cache
+                # because those segments still hold a live block); whatever `model` exceeds RESERVED
+                # by is not torch at all — HIP context, kernel code objects, comms buffers.
+                f"torch reserved={mem_GB(torch.cuda.memory_reserved())}"
             )
             num_pages = available_memory // cache_per_page
             if snap_memory:

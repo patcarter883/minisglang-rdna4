@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -64,6 +65,24 @@ class QuantConfig:
     # (group-16, FP8-E4M3 block scale + per-tensor FP32 global scale, W4A4). Only compressed-tensors
     # sets it; None for every other method.
     ct_format: str | None = None
+    # MIXED-PRECISION (compressed-tensors `format: mixed-precision`): one entry per `config_groups`
+    # group, as (targets, scheme) — `targets` is the group's regex/substring module selector and
+    # `scheme` is that group's own fully-parsed QuantConfig. EMPTY for every single-format checkpoint
+    # (AWQ/GPTQ/RXF and single-group compressed-tensors), where the scalar fields above ARE the whole
+    # story and `for_module` degenerates to "self, unless ignored" — i.e. behaviour is unchanged.
+    # Populated only when a checkpoint genuinely mixes schemes across modules, e.g. Qwen3.8-27B-NVFP4:
+    # NVFP4 for the bulk MLP, fp8 W8A8 for attention / GDN in_proj / lm_head / the last 8 MLP layers.
+    ct_groups: tuple[tuple[tuple[str, ...], "QuantConfig"], ...] = ()
+    # Modules the CHECKPOINT actually ships in quantized form (native/de-wrapped names), derived from
+    # its tensor index. None = unknown, fall back to matching the `ignore` list.
+    #
+    # This exists because a container entry in `ignore` is ambiguous, and the two conventions in the
+    # wild contradict each other. GLM-4.7-Flash-AWQ ignores `model.layers.0` meaning "all of dense
+    # layer 0 stays bf16" (prefix semantics — 341 modules depend on it), while Qwen3.8-NVFP4 ignores
+    # `...layers.N.linear_attn` meaning ONLY the container, with its children in_proj_qkv/z/out_proj
+    # quantized. No string rule satisfies both; the checkpoint's own tensors do, unambiguously — so
+    # the ignore list becomes advisory and the shipped tensors decide.
+    ckpt_quantized: frozenset[str] | None = None
 
     @property
     def is_awq(self) -> bool:
@@ -117,22 +136,72 @@ class QuantConfig:
         expert/linear kernel (int4 weight x per-token fp8 act, or true W4A16 where flagged)."""
         return self.bits == 4 and self.weight_type == "int" and not self.is_rxf
 
-    def is_module_quantized(self, name: str) -> bool:
+    def is_module_quantized(self, name: str, *, exact: bool = False) -> bool:
         """Is the weight module `name` (e.g. 'model.layers.47.mlp.experts.0.gate_proj') quantized
         under this config? False if `name` matches any `ignore` entry — a `re:`-prefixed regex
         (compressed-tensors / RXF) or a plain substring (AWQ/GPTQ `modules_to_not_convert`). This lets
         a checkpoint keep specific modules at full precision (bf16/fp16) on an otherwise-quantized
         backbone — an MTP / draft head, the router gate, dense early layers — and the model build it
-        unquantized accordingly (universal: not tied to any one model or quant method)."""
+        unquantized accordingly (universal: not tied to any one model or quant method).
+
+        `exact` selects how a PLAIN (non-`re:`) entry matches. The historical default is a bare
+        substring test, which is right for the suffix-shaped entries these lists usually carry
+        ('lm_head', 'mlp.gate_proj') but WRONG for an entry naming a container module: the ignore
+        entry 'model.layers.0.linear_attn' is the GDN module itself, yet as a substring it also
+        swallows its children 'model.layers.0.linear_attn.in_proj_qkv'/'.in_proj_z'/'.out_proj' —
+        which a mixed-precision config_group explicitly TARGETS as fp8. `exact=True` requires the
+        pattern to align to a dotted path boundary and run to the END of the name, so a container
+        entry matches only itself. Used by `for_module` for mixed-precision checkpoints (where the
+        positive `targets` selector makes the distinction load-bearing); the substring default is
+        kept everywhere else so no existing checkpoint changes behaviour."""
         for pat in self.ignore:
             if not pat:
                 continue
             if pat.startswith("re:"):
                 if re.search(pat[3:], name):
                     return False
-            elif pat in name:
+            elif (name == pat or name.endswith("." + pat)) if exact else (pat in name):
                 return False
         return True
+
+    def for_module(self, name: str) -> "QuantConfig | None":
+        """The EFFECTIVE scheme for weight module `name`, or None if it is unquantized.
+
+        This is the single place a caller should ask "how is this module quantized?" — it folds the
+        two independent reasons a module may differ from the checkpoint's headline scheme:
+
+          1. the `ignore` list (module kept at full precision)          -> None
+          2. MIXED-PRECISION `config_groups` (module in a different     -> that group's QuantConfig
+             group than its neighbours, selected by the group `targets`)
+
+        Single-format checkpoints have no `ct_groups`, so this returns `self` for every non-ignored
+        module — byte-identical to the previous `is_module_quantized(name) -> create_linear_method(q)`
+        pattern it replaces. Under mixed-precision a module matching NO group is unquantized (None):
+        compressed-tensors only quantizes what a group's `targets` selects.
+
+        Groups are tried in declaration order and the FIRST match wins, which is what the specific-
+        before-general layout these checkpoints ship requires: Qwen3.8-27B lists the 8 fp8 MLP layers
+        (`layers.(56|...|63).mlp.(gate|up|down)_proj`) in group_0 and the catch-all NVFP4 MLP
+        (`.*mlp.(gate|up|down)_proj`) in group_1, so the narrow rule must be consulted first."""
+        if self.ckpt_quantized is not None:
+            # STRUCTURAL and authoritative: the checkpoint either ships this module quantized or it
+            # does not. Immune to the container-entry ambiguity the ignore list cannot express.
+            if name not in self.ckpt_quantized:
+                return None
+        elif not self.is_module_quantized(name, exact=bool(self.ct_groups)):
+            return None
+        if not self.ct_groups:
+            return self
+        for targets, scheme in self.ct_groups:
+            for pat in targets:
+                if not pat:
+                    continue
+                if pat.startswith("re:"):
+                    if re.search(pat[3:], name):
+                        return scheme
+                elif pat in name:
+                    return scheme
+        return None
 
     @staticmethod
     def _as_dict(qc: Any) -> dict:
@@ -196,32 +265,48 @@ class QuantConfig:
             # constant zero-point 8). Config-driven, not model-specific.
             ignore = tuple(d.get("ignore", ()) or ())
             fmt = str(d.get("format", "")).lower() or None
-            gs, bits, sym = 32, 4, True
-            wtype, atype = "int", None
             groups = d.get("config_groups") or {}
-            for g in groups.values():
+            norm_ignore = _norm_ignore(ignore)
+
+            def _scheme(g: dict, group_fmt: str | None) -> "QuantConfig":
+                """One config_groups entry -> a fully-parsed scheme. `group_fmt` is the group's own
+                `format` when it declares one (mixed-precision), else the top-level format."""
                 w = (g or {}).get("weights") or {}
-                if not w:
-                    continue
-                if w.get("group_size"):
-                    gs = int(w["group_size"])
-                if w.get("num_bits"):
-                    bits = int(w["num_bits"])
-                if "symmetric" in w and w["symmetric"] is not None:
-                    sym = bool(w["symmetric"])
-                # WEIGHT element type: "float" (fp8 e4m3 W8A8, e.g. ZAYA — `format:float-quantized`)
-                # vs "int" (int4/int8). Drives the fp8-vs-int4 kernel selection downstream.
-                if w.get("type"):
-                    wtype = str(w["type"]).lower()
                 # ACTIVATION scheme the checkpoint declares (per-token fp8 -> W8A8). Honor it: an env
                 # var never substitutes a different act scheme than declared (W8A16 is only an OPT-IN
                 # perf override, never the default). Present + float type -> "fp8"; else weight-only.
                 ia = (g or {}).get("input_activations") or {}
-                if ia and str(ia.get("type", "")).lower() == "float":
-                    atype = "fp8"
-                break
-            return cls(
-                method="compressed-tensors", bits=bits, group_size=gs, sym=sym,
-                ignore=_norm_ignore(ignore), weight_type=wtype, act_type=atype, ct_format=fmt,
+                return cls(
+                    method="compressed-tensors",
+                    # WEIGHT element type: "float" (fp8 e4m3 W8A8, e.g. ZAYA — `float-quantized`) vs
+                    # "int" (int4/int8). Drives the fp8-vs-int4 kernel selection downstream.
+                    bits=int(w["num_bits"]) if w.get("num_bits") else 4,
+                    group_size=int(w["group_size"]) if w.get("group_size") else 32,
+                    sym=bool(w["symmetric"]) if w.get("symmetric") is not None else True,
+                    ignore=norm_ignore,
+                    weight_type=str(w["type"]).lower() if w.get("type") else "int",
+                    act_type="fp8" if ia and str(ia.get("type", "")).lower() == "float" else None,
+                    # A mixed-precision group carries its OWN format ("float-quantized" /
+                    # "nvfp4-pack-quantized"); single-format checkpoints declare it top-level only.
+                    ct_format=(str((g or {}).get("format", "")).lower() or None) or group_fmt,
+                )
+
+            # Groups in DECLARATION order (dict order == the JSON's, which these checkpoints author
+            # specific-before-general; see for_module). Skip entries with no `weights` block.
+            ordered = [(k, g) for k, g in groups.items() if (g or {}).get("weights")]
+            # MIXED-PRECISION: modules are split across groups by regex `targets`, so no single scalar
+            # scheme describes the checkpoint — record every group and let `for_module` resolve. A
+            # single-group checkpoint keeps ct_groups empty (the scalars below are the whole story).
+            ct_groups: tuple[tuple[tuple[str, ...], "QuantConfig"], ...] = ()
+            if len(ordered) > 1 or fmt == "mixed-precision":
+                ct_groups = tuple(
+                    (_norm_ignore(tuple(g.get("targets") or ())), _scheme(g, fmt))
+                    for _, g in ordered
+                )
+            # Headline scalars stay the FIRST group's, so `quant.bits`/`group_size`/... keep meaning
+            # for the single-format checkpoints (and for callers that only want a rough descriptor).
+            head = _scheme(ordered[0][1], fmt) if ordered else cls(
+                method="compressed-tensors", bits=4, group_size=32, sym=True, ignore=norm_ignore
             )
+            return dataclasses.replace(head, ct_format=fmt, ct_groups=ct_groups)
         return None  # unsupported scheme -> treat as unquantized (will likely fail to load)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import struct
 from typing import Dict, Tuple
 
@@ -30,7 +31,7 @@ from minisgl.models.config import ModelConfig
 from minisgl.models.weight import qwen3_5_remap
 from minisgl.utils import cached_load_hf_config, download_hf_weight, torch_dtype
 
-MODEL_PATH = "Qwen/Qwen3.5-4B"
+MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3.5-4B")
 
 # safetensors dtype string -> torch dtype (only the ones this checkpoint uses + common siblings)
 _ST_DTYPE = {
@@ -42,6 +43,8 @@ _ST_DTYPE = {
     "I32": torch.int32,
     "I8": torch.int8,
     "U8": torch.uint8,
+    "F8_E4M3": torch.float8_e4m3fn,  # compressed-tensors float-quantized (fp8 W8A8)
+    "F8_E5M2": torch.float8_e5m2,
     "BOOL": torch.bool,
 }
 

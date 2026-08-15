@@ -41,6 +41,8 @@ PORT="${PORT:-1919}"
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
+# Per-model torch allocator config (exported just before exec). Empty = torch default.
+alloc_conf=""
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 # Minimum TP a model's WEIGHTS require. A general knob, not a special case: some checkpoints simply
 # do not fit on one 16 GB card, and the control panel exposes TP as a free dropdown — so picking one
@@ -160,6 +162,62 @@ case "$MODEL" in
   qwen27b-nvfp4|cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4)
                   model_id="cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4";      spec_default="none"
                   dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
+  # Qwen3.8-27B, unsloth's MIXED-PRECISION quant: NVFP4 (group-16 e2m1) for the bulk MLP, fp8 W8A8
+  # for attention / GDN in_proj / lm_head / the last 8 MLP layers. Same backbone as the 3.6-27B above
+  # (64L, hidden 5120, head_dim 256, 24q/4kv, GDN hybrid at full_attention_interval=4), so it rides
+  # the existing Qwen3_5 model; what it needed was per-MODULE quant resolution (quant/config.py
+  # `for_module`) — one config-wide scheme cannot describe it.
+  #
+  # The MIXED NVFP4+fp8 build. NOT the default: qwen38-27b (sakamakismile, all-NVFP4) is 1.65
+  # GiB/card lighter for the same probe score, so this is kept only as the higher-precision
+  # alternative — its GDN/attention stay fp8, and it drafts BETTER under MTP (0.616 vs 0.551
+  # accept), so prefer it when spec throughput matters more than KV pool.
+  # Settings follow the qwen27b defaults above (attn=hip, TP=2, conc 4, page 16, chunk 2048) —
+  # same backbone — EXCEPT mem_default, which 0.80 cannot satisfy. MEASURED at boot, TP=2, 2026-08-15:
+  #     resident weights 11.62 GiB/card  (vs the INT4 27B's ~6.8: NVFP4+fp8 on a bigger effective
+  #                                       footprint, plus a bf16 lm_head and the 0.85 GB MTP head)
+  #     + ~2.37 GiB/card consumed OUTSIDE torch (torch's own reserved-minus-allocated is just
+  #       0.19 GiB, so it is not slack the loader or an empty_cache can recover). It is NOT a fixed
+  #       per-process cost: qwen27b on the same box/image pays only 0.06 GiB. It is also NOT spec —
+  #       measured at 2.39 GiB with SPEC=none. It tracks this checkpoint's KERNEL SET, which pulls in
+  #       BOTH the fp8 W8A8 and the NVFP4/e2m1 paths where the INT4 27B only uses AWQ int4; the
+  #       suspect is HIP code objects / kernel workspaces. Unreduced — if someone shrinks it, this
+  #       ratio should come back down and the KV pool grows with it.
+  #     => the free-memory delta the engine bills as `model` is 14.18 of 15.67 GiB free.
+  # At 0.80 the KV pool sizes NEGATIVE (-2.18 GiB) and boot dies in _determine_num_pages. 0.95 leaves
+  # 0.39 GiB => 25,296 KV tokens, which is the practical context ceiling here (NOT the checkpoint's
+  # 262144) and is why conc stays at 4. Raise TP or drop conc before raising this further.
+  #
+  # min_tp=2 is a GUARD, not a default change (TP already defaults to 2): 22.6 GB of weights plus the
+  # MTP head cannot fit one 16 GB card at any memory ratio, and the panel exposes TP as a free dropdown.
+  #
+  # SPEC=mtp: the checkpoint ships a full bf16 MTP head as a SEPARATE model_mtp.safetensors, listed
+  # in the index under canonical `mtp.*` keys, so the normal loader picks it up with no sidecar path.
+  # Same Qwen3.8-27B, quantized ALL-NVFP4 rather than unsloth's NVFP4+fp8 mix: the GDN in_proj /
+  # out_proj and attention q/k/v/o are 4-bit here where unsloth keeps them fp8, and lm_head ships
+  # plain bf16 (no dequant needed — and bf16 is what the M-invariant LM-head GEMV wants anyway).
+  # 20.59 GB on disk vs 23.44, i.e. ~9.8 GiB/card vs 11.62, which is a much larger KV pool.
+  # The MTP head is a separate bf16 file (model-mtp-bf16.safetensors), canonical `mtp.*` keys.
+  # ACCURACY CAVEAT: 4-bit GDN input projections are exactly what unsloth declined to do, and the
+  # int4-GDN Qwen3.6-AWQ is the one that degenerated in the quality probe. Treat as UNPROVEN until
+  # A/B'd against qwen38-27b on the same prompts.
+  qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
+                  model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="mtp"; k_mtp=4
+                  # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
+                  # leaves 3.27 GiB = 214,016 KV tokens, 4.2x the unsloth serve. Validated: 20/20 on
+                  # the sampled quality probe with ZERO degeneration, a 5.4k-token prefill, and MTP
+                  # engaged. The feared 4-bit-GDN quality loss did NOT appear.
+                  # TRADE: MTP acceptance is consistently LOWER than unsloth's — 0.551 vs 0.616
+                  # (same prompt), 2.72 vs 3.03 tok/step. A more heavily quantized target agrees
+                  # with its own draft head less often, so some of the memory win is paid back in
+                  # spec throughput. Single-sample measurements; re-measure before relying on it.
+                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
+  qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
+                  # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
+                  # target's embed/lm_head), so pairing it across a model generation is only valid if
+                  # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
+                  model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="mtp"; k_mtp=4
+                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"
@@ -322,5 +380,14 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
 [[ "$SPEC" == "dflash" ]] && printf '[serve] dflash: quant=%s causal=%s (empty causal = derived from layer_types)\n' \
   "${MINISGL_DFLASH_QUANT:-<derived>}" "${MINISGL_DFLASH_CAUSAL:-<derived>}" >&2
 printf '[serve] %s\n' "${cmd[*]}" >&2
+# Per-model torch allocator config, exported for the python we exec below (a fresh process, so the
+# allocator reads it at ITS import). ON THE BANNER because it changes the KV pool size materially and
+# never appears on the command line — a table entry that silently stopped applying would read as a
+# model regression. An explicit PYTORCH_HIP_ALLOC_CONF from the environment always wins.
+if [[ -n "$alloc_conf" ]]; then
+  export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-$alloc_conf}"
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-$alloc_conf}"
+  printf '[serve] alloc_conf=%s\n' "$PYTORCH_HIP_ALLOC_CONF" >&2
+fi
 [[ -n "${DRY_RUN:-}" ]] && exit 0
 exec "${cmd[@]}"

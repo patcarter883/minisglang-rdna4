@@ -237,12 +237,23 @@ def qwen3_5_remap(ckpt_key: str, load_mtp: bool = False):
     """
     if ckpt_key.endswith(".weight_shape"):
         return None  # compressed-tensors metadata (the original [N,K]); not a model param
+    if ckpt_key.endswith((".k_scale", ".v_scale")):
+        # fp8 KV-cache scales (quantization_config.kv_cache_scheme, e.g. Qwen3.8-27B-NVFP4 ships one
+        # pair per FULL-attention layer). NOT model params: the cache reads them straight out of the
+        # checkpoint files via kvcache/fp8_scales.py, and only when the engine is actually running an
+        # fp8 KV cache. Skipped here so they do not land as unexpected keys in load_state_dict.
+        return None
     if ckpt_key.startswith("mtp."):
         return _qwen3_5_mtp_remap(ckpt_key) if load_mtp else None
     if ckpt_key.startswith(_QWEN35_SKIP_PREFIXES):
         return None
     if ckpt_key == "lm_head.weight":
         return ("direct", "lm_head.weight")  # untied (qwen3_5_moe); top-level, no LM prefix
+    if ckpt_key == "lm_head.weight_scale":
+        # fp8 lm_head (mixed-precision checkpoints put lm_head in the fp8 W8A8 group). The loader
+        # folds this channel scale INTO `lm_head.weight` before the remap runs, so it is never a
+        # param of its own. Skipped rather than raised — it is a legitimate key, not an unknown one.
+        return None
     if not ckpt_key.startswith(_QWEN35_LM_PREFIX):
         raise ValueError(f"unexpected Qwen3.5 checkpoint key (not under {_QWEN35_LM_PREFIX!r}): {ckpt_key}")
     native = "model." + ckpt_key[len(_QWEN35_LM_PREFIX) :]
@@ -279,6 +290,16 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
         return t
     key_dim = config.linear_key_head_dim * config.linear_num_key_heads
     value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+
+    # fp8 W8A8 (compressed-tensors `float-quantized`, strategy:channel) ships a PER-OUTPUT-CHANNEL
+    # weight_scale of shape (N,1). On a ROW-parallel linear (o_proj / down_proj / GDN out_proj) the
+    # OUTPUT dim is not sharded — only the input is — so that scale must REPLICATE. It shares the
+    # `.weight_scale` suffix with the NVFP4/int4 per-GROUP scale (N, K//g), which DOES split on dim 1,
+    # so the two are told apart by the singleton group axis. Without this the row-parallel rules below
+    # chunk a size-1 dim and rank 1 gets an EMPTY (N,0) scale.
+    if (name.endswith((".o_proj.weight_scale", ".down_proj.weight_scale", ".out_proj.weight_scale"))
+            and t.dim() == 2 and t.shape[1] == 1):
+        return t
 
     # ---- GDN linear-attention (head-parallel) ----
     if name.endswith((".linear_attn.in_proj_qkv.weight", ".linear_attn.conv1d.weight")):
@@ -402,7 +423,8 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
         return t.chunk(n, dim=1)[r].clone()
 
     # ---- vocab-parallel embedding + untied lm_head ----
-    if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
+    # (a fp8 lm_head's channel scale is per-VOCAB-row, so it rides the same split as its weight)
+    if name.endswith("embed_tokens.weight") or name in ("lm_head.weight", "lm_head.weight_scale"):
         num = t.shape[0]
         per = div_ceil(num, n)
         return t[r * per : min((r + 1) * per, num)].clone()
@@ -447,8 +469,14 @@ def _load_qwen3_5_weight(
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # MoE per-expert -> stacked over E
     # NVFP4: pair each proj's e4m3 block scale + per-tensor global to fold them into one fp16 per-group
     # scale at the LEAF (before remap/concat/merge/stack) — see below.
-    _is_nvfp4 = config.quant is not None and config.quant.is_nvfp4
+    # NVFP4 is identified STRUCTURALLY, PER MODULE: a proj is NVFP4 iff the checkpoint ships it a
+    # `.weight_global_scale`. A MIXED-PRECISION checkpoint (Qwen3.8-27B-NVFP4) carries NVFP4 and fp8
+    # W8A8 side by side and BOTH spell their scale `.weight_scale`, so the config-wide `quant.is_nvfp4`
+    # flag this replaces cannot separate them — it would buffer every fp8 CHANNEL scale waiting for a
+    # global that never arrives, then trip the completeness assert below. Keying on the global's
+    # presence is exact for single-format and mixed checkpoints alike.
     nvfp4_fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}
+    lm_head_buf: Dict[str, torch.Tensor] = {}  # fp8 lm_head weight + channel scale -> dequantized
     # EP: this replica keeps only its expert shard; skip the rest and stack at local ids. Off => full.
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
 
@@ -490,8 +518,17 @@ def _load_qwen3_5_weight(
             yield native_key, tensor
 
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
+        # Read on the HOST and move only the RANK-LOCAL shard to the GPU. Reading straight to device
+        # materialised every FULL tensor in VRAM, sliced this rank's shard out of it and freed the
+        # rest — so at TP=2 the peak was ~2x the resident weights and, far worse, it left the heap
+        # badly FRAGMENTED. empty_cache() cannot recover that (it only returns segments with NO live
+        # block), so the engine's free-memory delta billed 14.40 GiB for 11.67 GiB of real tensors
+        # and the KV pool sized NEGATIVE. Slicing host-side keeps GPU peak == GPU resident.
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+            nvfp4_bases = {k.rsplit(".", 1)[0] for k in keys if k.endswith(".weight_global_scale")}
+            _fp8_lm_head = "lm_head.weight_scale" in keys
+            for name in keys:
                 # NVFP4: fold the e4m3 block scale / per-tensor global into ONE fp16 per-group scale at
                 # the LEAF — before remap / GDN in_proj concat / gate-up merge / expert stack. That makes
                 # NVFP4 MXFP4-shaped (E2M1 weights + fp16 per-group scale), so every downstream fusion
@@ -499,7 +536,7 @@ def _load_qwen3_5_weight(
                 # no per-tensor scalar ever reaches a merge. weight_packed passes through unchanged (4-bit);
                 # input_global_scale (FP4 act calib) is dropped — the e2m1 kernel quantizes acts to fp8.
                 override = None
-                if _is_nvfp4:
+                if name.rsplit(".", 1)[0] in nvfp4_bases:
                     if name.endswith(".input_global_scale"):
                         continue
                     if name.endswith((".weight_scale", ".weight_global_scale")):
@@ -510,14 +547,62 @@ def _load_qwen3_5_weight(
                             continue
                         del nvfp4_fold_buf[base]
                         name = base + ".weight_scale"
-                        override = nvfp4.fold_nvfp4_scale(buf["weight_scale"], buf["weight_global_scale"])
+                        # to(device) FIRST: the fold is arithmetic on an e4m3 block scale and torch
+                        # has no CPU float8 math. Both operands are small per-group scales, so this
+                        # is not the bulk transfer the host-side slicing above exists to avoid.
+                        override = nvfp4.fold_nvfp4_scale(
+                            buf["weight_scale"].to(device), buf["weight_global_scale"].to(device)
+                        )
+                # fp8 lm_head -> DEQUANTIZE to the compute dtype at load: weight (V,H) e4m3 times its
+                # per-output-channel scale (V,1). Both split on the VOCAB dim, so each rank folds only
+                # ITS OWN rows and the full bf16 head is never materialised.
+                #
+                # Serving it AS fp8 would be smaller and cheaper to stream, and is tempting on a 248k
+                # vocab — but it is WRONG here, and not merely because ParallelLMHead has no quant
+                # plumbing. The LM head must stay M-INVARIANT: quant/kernels.py dispatches between
+                # kernel arms as a function of M and those arms disagree numerically (dense decode_gemv
+                # vs wmma_tiled by up to ~1.95e-3), so a quantized head is only M-invariant WITHIN an
+                # arm band. Spec-decode verify runs M=K+1 while decode runs M=1 — straddling bands —
+                # and verify logits that do not match decode logits silently destroy draft acceptance
+                # (see layers/minv.py, which names spec-decode VERIFY as a protected pathway). bf16
+                # keeps `_lm_head_linear` on dense_bf16_gemv, which is M-invariant by construction.
+                # This matches the repo-wide stance that lm_head is never quantized (create_linear_
+                # method's `quantized=False`; qwen3_5_moe and glm4_moe_lite both keep it full-precision).
+                #
+                # Handled before the remap because `lm_head.weight_scale` is not a key qwen3_5_remap
+                # knows. A bf16 lm_head ships no scale, so _fp8_lm_head is False and nothing changes.
+                if _fp8_lm_head and name.startswith("lm_head."):
+                    field = name.rsplit(".", 1)[1]
+                    if field not in ("weight", "weight_scale"):
+                        continue
+                    lm_head_buf[field] = _shard_qwen3_5(
+                        name, f.get_tensor(name), tp_info.rank, tp_info.size, config
+                    )
+                    if len(lm_head_buf) < 2:
+                        continue
+                    w = lm_head_buf.pop("weight").to(device)
+                    sc = lm_head_buf.pop("weight_scale").to(device).to(torch.float32)
+                    out = torch.empty(w.shape, dtype=torch.get_default_dtype(), device=device)
+                    # CHUNKED over vocab rows. A whole-tensor `w.to(f32) * sc` would allocate two
+                    # ~2.5 GiB fp32 temporaries for a 248k-row head; the caching allocator does not
+                    # return those to the driver, so they inflate the engine's `model_memory =
+                    # free_before - free_after` measurement and silently starve the KV pool (it sized
+                    # to ZERO pages). One chunk is ~160 MiB and is reused every iteration.
+                    for i in range(0, w.shape[0], 8192):
+                        blk = slice(i, i + 8192)
+                        out[blk] = (w[blk].to(torch.float32) * sc[blk]).to(out.dtype)
+                    del w, sc
+                    yield from emit("lm_head.weight", out)
+                    continue
                 plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
                 if plan is None:
                     continue
                 # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
                 # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
                 tens = override if override is not None else f.get_tensor(name)
-                raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config)
+                # .to(device) AFTER the shard: everything downstream (GDN concat, gate/up merge,
+                # expert stack) then composes rank-local tensors already in VRAM, as before.
+                raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config).to(device)
                 if plan[0] == "direct":
                     yield from emit(plan[1], raw)
                     continue
@@ -534,6 +619,10 @@ def _load_qwen3_5_weight(
     assert not nvfp4_fold_buf, (
         f"incomplete NVFP4 scale/global pairs (a proj missing its weight_scale or weight_global_scale): "
         f"{list(nvfp4_fold_buf.keys())}"
+    )
+    assert not lm_head_buf, (
+        f"fp8 lm_head missing its counterpart tensor (have {list(lm_head_buf.keys())}; "
+        f"need both weight and weight_scale)"
     )
 
 

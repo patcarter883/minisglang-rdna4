@@ -95,8 +95,23 @@ def mlp_accepts_producer_actquant(mlp) -> bool:
 
 
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig):
-        qm = create_linear_method(config.quant)
+    def __init__(self, config: ModelConfig, name_prefix: str | None = None):
+        # `name_prefix` is this MLP's CHECKPOINT namespace (e.g. 'model.layers.7'). Passing it makes
+        # the precision per-MODULE rather than per-model, which a MIXED-PRECISION checkpoint requires:
+        # Qwen3.8-27B-NVFP4 ships layers 0-55 mlp as NVFP4 and layers 56-63 as fp8 W8A8, so a single
+        # config-wide method would build 8 layers against tensors the checkpoint does not ship. Left
+        # None (uniform checkpoints) it resolves once from config.quant, exactly as before.
+        q = config.quant
+        if q is not None and name_prefix is not None:
+            gate_q, up_q = (q.for_module(f"{name_prefix}.mlp.{p}_proj") for p in ("gate", "up"))
+            assert gate_q == up_q, (
+                f"{name_prefix}.mlp gate_proj and up_proj resolve to DIFFERENT quant schemes "
+                f"({gate_q} vs {up_q}); they merge into one gate_up_proj and must agree"
+            )
+            qm = create_linear_method(gate_q)
+            down_qm = create_linear_method(q.for_module(f"{name_prefix}.mlp.down_proj"))
+        else:
+            qm = down_qm = create_linear_method(q)
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
@@ -113,7 +128,7 @@ class GatedMLP(BaseOP):
             config.intermediate_size,
             config.hidden_size,
             has_bias=False,
-            quant_method=qm,
+            quant_method=down_qm,
         )
 
     @nvtx_annotate("MLP")

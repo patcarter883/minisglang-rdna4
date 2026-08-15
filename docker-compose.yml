@@ -599,6 +599,14 @@ services:
       # and OOM'd with devfree at 0. Overridable per launch (MAX_PREFILL_LENGTH=8192) for a model
       # with the headroom to want bigger chunks.
       MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-2048}"
+      # torch allocator config. Loading streams each checkpoint tensor, slices the rank shard and
+      # frees the rest, which leaves the heap fragmented: on Qwen3.8-27B-NVFP4 torch reserved 14.13
+      # GiB for 11.62 GiB of tensors, and the empty_cache() before KV sizing dropped `reserved` to
+      # 11.81 WITHOUT the device taking the memory back — so the engine billed 14.18 GiB of `model`
+      # and the KV pool shrank to 25k tokens. expandable_segments grows/returns one virtual range
+      # instead of many fixed segments, which is the documented fix for exactly that shape.
+      PYTORCH_HIP_ALLOC_CONF: "${PYTORCH_HIP_ALLOC_CONF:-}"
+      PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-}"
       EXTRA_ARGS: "${EXTRA_ARGS:-}"
     entrypoint: ["bash", "-lc"]
     command: ["exec /engine/tools/serve.sh"]

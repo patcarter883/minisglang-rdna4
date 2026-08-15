@@ -184,7 +184,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         expert_quant = config.quant
         backbone_cfg = config
 
-        def mlp_factory(cfg: "ModelConfig") -> BaseOP:
+        def mlp_factory(cfg: "ModelConfig", name_prefix: str | None = None) -> BaseOP:
             return Qwen3_5MoeSparseBlock(cfg, expert_quant)
 
         # The MTP head follows the checkpoint's precision: quantized only if mtp.* is NOT in the quant
@@ -196,7 +196,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         ):
             mtp_quant = None
 
-        def mtp_mlp_factory(cfg: "ModelConfig") -> BaseOP:
+        def mtp_mlp_factory(cfg: "ModelConfig", name_prefix: str | None = None) -> BaseOP:
             return Qwen3_5MoeSparseBlock(cfg, mtp_quant, force_no_ep=True)
 
         super().__init__(backbone_cfg, mlp_factory=mlp_factory, mtp_mlp_factory=mtp_mlp_factory)

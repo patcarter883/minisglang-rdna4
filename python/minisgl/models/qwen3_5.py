@@ -122,8 +122,7 @@ class Qwen3_5Attn(BaseOP):
 
         def _attn_method(module: str) -> "object":
             name = f"{prefix}.self_attn.{module}"
-            quantized = q is not None and q.is_module_quantized(name)
-            return create_linear_method(q, quantized=quantized)
+            return create_linear_method(q.for_module(name) if q is not None else None)
 
         # q_proj emits q + gate (2x), interleaved per head: [head_h q | head_h gate].
         self.q_proj = LinearColParallelMerged(
@@ -276,7 +275,7 @@ class Qwen3_5DecoderLayer(BaseOP):
         is_gdn: bool,
         gdn_layer_id: int | None,
         attn_kv_id: int | None = None,
-        mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP,
+        mlp_factory: Callable[..., BaseOP] = Qwen3MLP,
     ):
         if is_gdn:
             assert gdn_layer_id is not None
@@ -291,8 +290,7 @@ class Qwen3_5DecoderLayer(BaseOP):
 
             def _gdn_method(module: str) -> "object":
                 name = f"model.layers.{layer_id}.linear_attn.{module}"
-                quantized = q is not None and q.is_module_quantized(name)
-                return create_linear_method(q, quantized=quantized)
+                return create_linear_method(q.for_module(name) if q is not None else None)
 
             gdn = QwenGatedDeltaNet(
                 hidden_size=config.hidden_size,
@@ -317,7 +315,7 @@ class Qwen3_5DecoderLayer(BaseOP):
             self._attn_op = self.self_attn
         # Dense SwiGLU for the 4B; the MoE variants pass a sparse-block factory (the MLP is the
         # ONLY structural difference between qwen3_5 and qwen3_5_moe decoder layers).
-        self.mlp = mlp_factory(config)
+        self.mlp = mlp_factory(config, f"model.layers.{layer_id}")
         self.input_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps, plus_one=True
         )
@@ -347,7 +345,7 @@ class Qwen3_5DecoderLayer(BaseOP):
 
 class Qwen3_5Model(BaseOP):
     def __init__(
-        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP
+        self, config: ModelConfig, *, mlp_factory: Callable[..., BaseOP] = Qwen3MLP
     ):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
@@ -632,7 +630,7 @@ class Qwen3_5MTPHead(BaseOP):
 
     def __init__(self, config: ModelConfig, layer_id: int, embed: VocabParallelEmbedding,
                  lm_head: ParallelLMHead,
-                 mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP):
+                 mlp_factory: Callable[..., BaseOP] = Qwen3MLP):
         eps = config.rms_norm_eps
         self.pre_fc_norm_embedding = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
         self.pre_fc_norm_hidden = RMSNorm(config.hidden_size, eps=eps, plus_one=True)
@@ -644,7 +642,7 @@ class Qwen3_5MTPHead(BaseOP):
         self.self_attn = Qwen3_5MTPAttn(config, layer_id)
         # MoE models (qwen3_5_moe, e.g. the 35B) ship a MoE MTP block (mtp.layers.0.mlp.experts.*);
         # dense models a plain MLP. The same mlp_factory the backbone uses builds the right one.
-        self.mlp = mlp_factory(config)
+        self.mlp = mlp_factory(config, "mtp.layers.0")
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
         self.norm = RMSNormFused(size=config.hidden_size, eps=eps, plus_one=True)
@@ -716,8 +714,8 @@ class Qwen3_5MTPHead(BaseOP):
 
 class Qwen3_5ForConditionalGeneration(BaseLLMModel):
     def __init__(
-        self, config: ModelConfig, *, mlp_factory: Callable[[ModelConfig], BaseOP] = Qwen3MLP,
-        mtp_mlp_factory: "Callable[[ModelConfig], BaseOP] | None" = None,
+        self, config: ModelConfig, *, mlp_factory: Callable[..., BaseOP] = Qwen3MLP,
+        mtp_mlp_factory: "Callable[..., BaseOP] | None" = None,
     ):
         self.model = Qwen3_5Model(config, mlp_factory=mlp_factory)
         self.lm_head = ParallelLMHead(

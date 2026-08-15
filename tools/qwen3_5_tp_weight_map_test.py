@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import struct
 from typing import Dict, Tuple
 
@@ -47,7 +48,9 @@ _CAT_DIM1 = (".qweight", ".qzeros", ".scales")
 _ST_DTYPE = {
     "BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16, "F64": torch.float64,
     "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8,
-    "U8": torch.uint8, "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "F8_E4M3": torch.float8_e4m3fn,  # compressed-tensors float-quantized (fp8 W8A8)
+    "F8_E5M2": torch.float8_e5m2, "BOOL": torch.bool,
 }
 
 
