@@ -843,7 +843,11 @@ class DFlashProposer(CapturableProposer):
             noise, self._g_blk[1, :bs].to(torch.int32), self._pk, self._pv, slots, masks)
         # 4) Head over block rows 1..Q-1 only (row 0 is the known anchor and is never read).
         n = bs * (Q - 1)
-        logits = d.head(hidden[:, 1:].reshape(n, -1))
+        # Same row-alignment split as the eager path. Kept at Q-1 rows either way so the static
+        # `_g_out` / `_g_logits` buffers keep their captured shapes; a shifted drafter therefore
+        # forfeits its last block position rather than resizing the ring (drafts Q-1, not Q).
+        rows = hidden[:, :-1] if d.has_markov else hidden[:, 1:]
+        logits = d.head(rows.reshape(n, -1))
         self._g_logits[:n] = logits
         if d.has_markov:
             # DSpark, batched: same semi-autoregressive walk, anchors are block column 0.
@@ -1450,7 +1454,16 @@ class DFlashProposer(CapturableProposer):
             # M-INVARIANT BY CONSTRUCTION (layers/embedding.py:16-21 — per-(row,col) independent fp32
             # dot in a fixed K-order), and B=16 -> k_i=15 rows stays inside the same
             # `dense_bf16_gemv` band (_LMHEAD_GEMV_MMAX = 16), so no kernel-family switch either.
-            block_logits = draft.head(hidden[1 : 1 + k_i])  # [k_i, vocab]
+            # ROW ALIGNMENT differs by drafter dialect, and getting it wrong is silent:
+            #   in-place (z-lab DFlash): row j DENOISES the mask AT position j -> rows 1..k.
+            #   shifted  (DSpark):       row j predicts the token AFTER position j, so row 0 (the
+            #                            anchor's own row) yields the FIRST draft -> rows 0..k-1.
+            # Confirmed from sglang dspark_draft.py: the block is [bonus_token, mask*(gamma-1)] and
+            # the sampler consumes ALL gamma rows seeded with that anchor. Reading rows 1..k against
+            # a shifted drafter takes every draft off by one position — it still runs, and acceptance
+            # just collapses (measured 0.078 accept before this).
+            rows = hidden[0:k_i] if draft.has_markov else hidden[1 : 1 + k_i]
+            block_logits = draft.head(rows)  # [k_i, vocab]
             if draft.has_markov:
                 # DSpark: bias each position by the token chosen at the previous one (anchor first).
                 anchor_dev = torch.as_tensor(anchor_tok, dtype=torch.int64, device=device)
