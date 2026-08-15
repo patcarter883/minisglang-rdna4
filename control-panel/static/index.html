@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Serving Control</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#2b333f; --text:#e6edf3;
+    --muted:#8b949e; --accent:#2f81f7; --green:#3fb950; --red:#f85149; --amber:#d29922;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{position:sticky;top:0;z-index:5;background:linear-gradient(#161b22,#12161d);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+  .grow{flex:1}
+  .gpu-pills{display:flex;gap:8px}
+  .pill{font:12px var(--mono);padding:3px 9px;border-radius:20px;border:1px solid var(--border);background:var(--panel2)}
+  .pill.free{color:var(--green);border-color:#1c3a25}
+  .pill.busy{color:var(--amber);border-color:#3a2f18}
+  button{font:inherit;cursor:pointer;border:1px solid var(--border);background:var(--panel2);color:var(--text);border-radius:7px;padding:6px 12px;transition:.12s}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.primary:hover{filter:brightness(1.1)}
+  button.danger{background:#2a1315;border-color:#5c2327;color:#ff8b82}
+  button.danger:hover{border-color:var(--red)}
+  button.ghost{background:transparent}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  main{max-width:1200px;margin:0 auto;padding:20px;display:flex;flex-direction:column;gap:22px}
+  .section-title{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 4px 2px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .card-h{padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);background:var(--panel2)}
+  .card-h .name{font-weight:600}
+  .card-b{padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+  .tag{font:11px var(--mono);padding:2px 7px;border-radius:5px;background:#20293a;color:var(--muted);border:1px solid var(--border)}
+  .tag.gpu{color:#d2a8ff;border-color:#3a2d4d;background:#211a2e}
+  .tag.cpu{color:#7ee787;border-color:#1c3a25;background:#12261a}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .env-grid{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:6px 10px;align-items:center}
+  .env-grid label{font:12px var(--mono);color:var(--muted);text-align:right;overflow:hidden;text-overflow:ellipsis}
+  input,textarea,select{font:13px var(--mono);background:#0b0f16;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;width:100%}
+  input:focus,textarea:focus{outline:none;border-color:var(--accent)}
+  textarea{resize:vertical;min-height:220px;line-height:1.45;white-space:pre;tab-size:2}
+  .muted{color:var(--muted)}
+  .small{font-size:12px}
+  details summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
+  details[open] summary{margin-bottom:8px}
+  .repo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+  .status-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot-up{background:var(--green);box-shadow:0 0 6px #3fb95088}
+  .dot-down{background:#484f58}
+  .dot-wait{background:var(--amber);animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.4}}
+  .ports{font:11px var(--mono);color:var(--accent)}
+  #drawer{position:fixed;bottom:0;left:0;right:0;height:0;background:#0b0f16;border-top:1px solid var(--border);transition:height .18s;z-index:20;display:flex;flex-direction:column}
+  #drawer.open{height:min(52vh,520px)}
+  .drawer-h{display:flex;align-items:center;gap:10px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--panel2)}
+  #drawer pre{margin:0;padding:12px 16px;overflow:auto;flex:1;font:12px/1.5 var(--mono);white-space:pre-wrap;color:#c9d1d9}
+  .banner{background:#2a1f0a;border:1px solid #4d3c14;color:#e3b341;padding:8px 14px;border-radius:8px;font-size:12.5px}
+  .link{color:var(--accent);text-decoration:none}
+  .toast{position:fixed;top:16px;right:16px;z-index:40;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;box-shadow:0 8px 24px #0008;max-width:360px}
+  .toast.err{border-color:var(--red);color:#ffb4ac}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎛️ GPU Serving Control</h1>
+  <div class="gpu-pills" id="gpuPills"></div>
+  <div class="grow"></div>
+  <span class="muted small" id="clock"></span>
+  <button class="ghost" onclick="refresh(true)"><span id="refreshIcon">⟳</span> Refresh</button>
+</header>
+
+<main>
+  <div id="warnBanner"></div>
+
+  <section>
+    <p class="section-title">Running services</p>
+    <div id="running"></div>
+  </section>
+
+  <section>
+    <p class="section-title">Predefined profiles</p>
+    <div id="predefined"></div>
+  </section>
+
+  <section>
+    <p class="section-title">Custom compose service</p>
+    <div class="card">
+      <div class="card-h"><span class="name">➕ New custom service</span>
+        <div class="grow"></div>
+        <select id="tplSelect" style="width:auto" onchange="loadTemplate()"><option value="">load template…</option></select>
+      </div>
+      <div class="card-b">
+        <div class="row">
+          <div style="flex:1"><label class="muted small">Name</label><input id="cName" placeholder="my-service"></div>
+          <div style="width:130px"><label class="muted small">Profile (optional)</label><input id="cProfile" placeholder=""></div>
+          <div style="width:120px"><label class="muted small">Working dir</label><input id="cWorkdir" placeholder="(custom dir)"></div>
+        </div>
+        <div>
+          <label class="muted small">docker-compose YAML</label>
+          <textarea id="cYaml" spellcheck="false" placeholder="services:&#10;  my-service:&#10;    image: ..."></textarea>
+        </div>
+        <div class="row">
+          <label class="small"><input type="checkbox" id="cGpu" style="width:auto" onchange="syncCardsField()"> lease GPU</label>
+          <span id="cCardsWrap" style="display:none">cards <select id="cCards" style="width:auto"><option>1</option><option>2</option></select></span>
+          <div class="grow"></div>
+          <button class="ghost" onclick="validateCustom()">Validate</button>
+          <button class="primary" onclick="launchCustom()">Create & start</button>
+        </div>
+        <p class="muted small">Custom files are saved to <code id="customDirHint">control-panel/custom/</code>. GPU services are auto-wrapped in <code>gpu-lease</code>. Use absolute paths for volumes unless you set a working dir.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="drawer">
+  <div class="drawer-h">
+    <strong id="drawerTitle">Output</strong>
+    <span id="drawerStatus" class="muted small"></span>
+    <div class="grow"></div>
+    <button class="ghost" onclick="if(logKey){openLogs(logKey,logTitle)}">Reload</button>
+    <button class="ghost" onclick="closeDrawer()">✕ Close</button>
+  </div>
+  <pre id="drawerBody"></pre>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let STATE = null, MODELS = [], logKey=null, logTitle='', pollTimer=null, jobTimer=null;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(msg, err){
+  const t=document.createElement('div'); t.className='toast'+(err?' err':''); t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(), err?6000:3000);
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const ct = r.headers.get('content-type')||'';
+  const data = ct.includes('json') ? await r.json() : await r.text();
+  if(!r.ok){ const m=(data&&data.error)||data||('HTTP '+r.status); throw new Error(m); }
+  return data;
+}
+function fmtAgo(ts){ if(!ts)return''; const s=Math.max(0,(Date.now()/1000-ts)); if(s<60)return Math.floor(s)+'s'; if(s<3600)return Math.floor(s/60)+'m'; return Math.floor(s/3600)+'h'; }
+
+// ---------- render ----------
+function renderGpu(txt){
+  const pills=$('#gpuPills'); pills.innerHTML='';
+  (txt||'').split('\n').forEach(line=>{
+    const m=line.match(/^(\d+)\s+(\w+)\s+(.*)$/);
+    if(m){ const free=m[2].toUpperCase()==='FREE';
+      const p=document.createElement('span'); p.className='pill '+(free?'free':'busy');
+      p.textContent='GPU'+m[1]+' '+m[2]+(free?'':' · '+m[3].trim()); pills.appendChild(p); }
+  });
+}
+  function controlsRow(controls, idPrefix, defaults, env){
+    if(!controls || !controls.length) return '';
+    defaults=defaults||{}; env=env||{};
+    let h='<div class="row" style="flex-wrap:wrap;gap:8px;margin:6px 0">';
+    controls.forEach(c=>{
+      const cur = (c.key in defaults) ? defaults[c.key] : '';
+      const ph  = c.placeholder || env[c.key] || '';
+      if(c.type==='select'){
+        const opts=(c.options||[]).map(o=>`<option value="${esc(o)}"${String(o)===String(cur)?' selected':''}>${esc(o===''?'(default)':o)}</option>`).join('');
+        h+=`<label class="small" title="${esc(c.key)}">${esc(c.label||c.key)} <select data-env="${idPrefix}" data-k="${esc(c.key)}" style="width:auto">${opts}</select></label>`;
+      } else {
+        h+=`<label class="small" title="${esc(c.key)}">${esc(c.label||c.key)} <input data-env="${idPrefix}" data-k="${esc(c.key)}" value="${esc(cur)}" placeholder="${esc(ph)}" style="width:88px"></label>`;
+      }
+    });
+    return h+'</div>';
+  }
+function envGrid(env, idPrefix, skip, defaults, collapsed){
+  defaults=defaults||{};
+  const keys=Object.keys(env||{}).filter(k=>!(skip||[]).includes(k));
+  if(!keys.length) return '';
+  const hasDef=Object.keys(defaults).length>0;
+  let h='<details'+((hasDef&&!collapsed)?' open':'')+'><summary>'+keys.length+' overridable env var'+(keys.length>1?'s':'')+(hasDef?' · <span style="color:var(--accent)">'+Object.keys(defaults).length+' panel default</span>':'')+'</summary><div class="env-grid">';
+  keys.forEach(k=>{
+    const isDef = k in defaults;
+    const val = isDef ? esc(defaults[k]) : '';
+    const style = isDef ? ' style="border-color:var(--accent);background:#0e1726"' : '';
+    const tip = isDef ? ' title="panel default — edit or clear as needed"' : ` title="${esc(k)}"`;
+    h+=`<label${tip}>${esc(k)}${isDef?' <span style="color:var(--accent)">◆</span>':''}</label><input data-env="${idPrefix}" data-k="${esc(k)}" value="${val}" placeholder="${esc(env[k]??'')}"${style}>`;
+  });
+  h+='</div></details>'; return h;
+}
+function modelSelect(idPrefix, modelVar, def){
+  if(!modelVar) return '';
+  let opts=`<option value="${esc(def)}">${esc(def||'(unset)')} — default</option>`;
+  MODELS.forEach(m=>{ if(m!==def) opts+=`<option value="${esc(m)}">${esc(m)}</option>`; });
+  opts+='<option value="__custom__">custom…</option>';
+  return `<div>
+    <label class="muted small">Model <span class="muted" style="opacity:.6">(${esc(modelVar)})</span></label>
+    <div class="row" style="flex-wrap:nowrap;gap:6px">
+      <select data-modelsel="${idPrefix}" data-k="${esc(modelVar)}" onchange="onModelChange('${idPrefix}')" style="flex:1">${opts}</select>
+    </div>
+    <input data-modelcustom="${idPrefix}" placeholder="org/name or /path/in/container" style="display:none;margin-top:6px">
+  </div>`;
+}
+function onModelChange(idPrefix){
+  const sel=document.querySelector(`select[data-modelsel="${idPrefix}"]`);
+  const ci=document.querySelector(`input[data-modelcustom="${idPrefix}"]`);
+  if(!sel||!ci) return;
+  const custom = sel.value==='__custom__';
+  ci.style.display = custom?'block':'none';
+  if(custom) ci.focus();
+}
+function collectEnv(idPrefix){
+  const out={};
+  document.querySelectorAll(`input[data-env="${idPrefix}"],select[data-env="${idPrefix}"]`).forEach(i=>{ if(i.value.trim())out[i.dataset.k]=i.value.trim(); });
+  const sel=document.querySelector(`select[data-modelsel="${idPrefix}"]`);
+  if(sel){
+    let v=sel.value;
+    if(v==='__custom__'){ const ci=document.querySelector(`input[data-modelcustom="${idPrefix}"]`); v=ci?ci.value.trim():''; }
+    if(v) out[sel.dataset.k]=v;
+  }
+  return out;
+}
+
+function renderRunning(){
+  const el=$('#running'); const t=STATE.tracked||[];
+  if(!t.length){ el.innerHTML='<div class="card"><div class="card-b muted">Nothing started through the panel yet. Start a profile below.</div></div>'; return; }
+  el.innerHTML='';
+  t.forEach(s=>{
+    const dot = s.up?'dot-up':(s.containers.length?'dot-wait':'dot-down');
+    const cont = s.containers.map(c=>`<span class="tag">${c.name||'?'} · ${c.state||c.status||''}</span>`).join(' ')||'<span class="muted small">no container yet — check output</span>';
+    const ports = s.containers.map(c=>c.ports).filter(Boolean).join(' ');
+    const card=document.createElement('div'); card.className='card';
+    card.innerHTML=`<div class="card-h">
+        <span class="status-dot ${dot}"></span>
+        <span class="name">${s.repo} / ${s.profile||'(custom)'}</span>
+        <span class="tag ${s.needs_gpu?'gpu':'cpu'}">${s.needs_gpu?('GPU ×'+s.cards):'CPU'}</span>
+        <span class="tag">${s.name}</span>
+        <span class="muted small">${fmtAgo(s.started)} ago</span>
+        <div class="grow"></div>
+        <button class="ghost" onclick='openLogs(${JSON.stringify(s.key)},${JSON.stringify(s.repo+"/"+ (s.profile||"custom"))})'>Logs</button>
+        <button class="danger" onclick='stopService(${JSON.stringify(s.key)})'>Stop</button>
+      </div>
+      <div class="card-b">
+        <div class="row">${cont}</div>
+        ${ports?`<div class="ports">↳ ${ports}</div>`:''}
+      </div>`;
+    el.appendChild(card);
+  });
+}
+
+let predefSig='';
+function updateDots(){
+  (STATE.repos||[]).forEach(repo=>(repo.profiles||[]).forEach(p=>{
+    const dot=document.getElementById('pdot-'+repo.id+'__'+p.profile); if(!dot) return;
+    const running=(STATE.tracked||[]).some(t=>t.key===repo.id+'::'+p.profile && t.up);
+    dot.className='status-dot '+(running?'dot-up':'dot-down');
+  }));
+}
+function renderPredefined(){
+  // Rebuild only when the structure (repos/profiles/model list) changes, so a poll never
+  // wipes out a model choice or env value the user is editing. Live status → updateDots().
+  const sig=JSON.stringify((STATE.repos||[]).map(r=>[r.id,(r.profiles||[]).map(p=>p.profile),r.error]))+'|m'+MODELS.length;
+  if(sig===predefSig && $('#predefined').children.length){ updateDots(); return; }
+  predefSig=sig;
+  const el=$('#predefined'); el.innerHTML='';
+  (STATE.repos||[]).forEach(repo=>{
+    const wrap=document.createElement('div'); wrap.style.marginBottom='14px';
+    let h=`<p class="muted small" style="margin:6px 2px"><strong>${repo.name}</strong> <span class="muted">· ${repo.compose}</span>${repo.error?` · <span style="color:var(--red)">${repo.error}</span>`:''}</p><div class="repo-grid">`;
+    (repo.profiles||[]).forEach(p=>{
+      const id=repo.id+'__'+p.profile;
+      const running=(STATE.tracked||[]).some(t=>t.key===repo.id+'::'+p.profile && t.up);
+      h+=`<div class="card">
+        <div class="card-h">
+          <span class="status-dot ${running?'dot-up':'dot-down'}" id="pdot-${id}"></span>
+          <span class="name">${p.profile}</span>
+          <span class="tag ${p.needs_gpu?'gpu':'cpu'}">${p.needs_gpu?('GPU ×'+p.cards):'CPU'}</span>
+          <div class="grow"></div>
+          ${p.ports.length?`<span class="ports">${p.ports.join(' ')}</span>`:''}
+        </div>
+        <div class="card-b">
+          <div class="row small muted">services: ${p.services.join(', ')}</div>
+          ${p.images.length?`<div class="small muted">image: ${p.images.join(', ')}</div>`:''}
+          ${modelSelect(id, p.model_var, p.model_default)}
+          ${controlsRow(p.controls, id, p.defaults, p.env)}
+          ${p.defaults&&Object.keys(p.defaults).length?`<div class="small" style="color:var(--accent)">◆ panel defaults: ${Object.entries(p.defaults).map(([k,v])=>`${esc(k)}=<code>${esc(v)}</code>`).join(', ')}</div>`:''}
+          ${envGrid(p.env, id, (p.model_var?[p.model_var]:[]).concat((p.controls||[]).map(c=>c.key)), p.defaults, (p.controls||[]).length>0)}
+          <div class="row">
+            ${p.needs_gpu?`<label class="small">cards <select data-cards="${id}" style="width:auto">
+                <option ${p.cards==1?'selected':''}>1</option><option ${p.cards==2?'selected':''}>2</option></select></label>`:'<span class="tag cpu">no lease</span>'}
+            <div class="grow"></div>
+            <button class="primary" onclick='startProfile(${JSON.stringify(repo.id)},${JSON.stringify(p.profile)},${p.needs_gpu},"${id}")'>Start</button>
+          </div>
+        </div>
+      </div>`;
+    });
+    h+='</div>';
+    wrap.innerHTML=h; el.appendChild(wrap);
+  });
+}
+
+function renderTemplates(){
+  const sel=$('#tplSelect');
+  const cur=sel.value; sel.innerHTML='<option value="">load template…</option>';
+  (STATE.repos||[]).forEach(repo=>(repo.profiles||[]).forEach(p=>{
+    const o=document.createElement('option'); o.value=repo.id+'::'+p.profile; o.textContent=`from ${repo.id}/${p.profile}`; sel.appendChild(o);
+  }));
+  (STATE.customs||[]).forEach(c=>{ const o=document.createElement('option'); o.value='custom::'+c.name; o.textContent=`custom/${c.name}`; sel.appendChild(o); });
+  sel.value=cur;
+}
+
+// ---------- actions ----------
+async function startProfile(repo, profile, needsGpu, id){
+  const cards = needsGpu ? parseInt(document.querySelector(`select[data-cards="${id}"]`).value) : 0;
+  const env = collectEnv(id);
+  try{
+    const r=await api('/api/up',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo,profile,needs_gpu:needsGpu,cards,env})});
+    toast('Starting '+repo+'/'+profile+(needsGpu?` (leasing ${cards} card${cards>1?'s':''})`:''));
+    watchJob(r.job, repo+'/'+profile);
+  }catch(e){ toast(e.message,true); }
+}
+async function stopService(key){
+  if(!confirm('Stop '+key+'?')) return;
+  try{ const r=await api('/api/down',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+    toast('Stopping '+key); watchJob(r.job, 'down '+key);
+  }catch(e){ toast(e.message,true); }
+}
+async function launchCustom(){
+  const name=$('#cName').value.trim(); const yaml=$('#cYaml').value;
+  if(!name||!yaml.trim()){ toast('name and YAML required',true); return; }
+  const body={name, yaml, profile:$('#cProfile').value.trim(), needs_gpu:$('#cGpu').checked,
+    cards:parseInt($('#cCards').value||'1'), workdir:$('#cWorkdir').value.trim()};
+  try{ const r=await api('/api/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Created & starting '+name); watchJob(r.job,'custom '+name);
+  }catch(e){ toast(e.message,true); }
+}
+async function validateCustom(){
+  // dry: reuse custom endpoint would launch; instead just check YAML client-side + inform
+  try{ const y=$('#cYaml').value; if(!y.trim())throw new Error('empty'); toast('Looks non-empty — full validation runs on Create'); }
+  catch(e){ toast('YAML: '+e.message,true); }
+}
+function loadTemplate(){
+  const v=$('#tplSelect').value; if(!v)return;
+  if(v.startsWith('custom::')){ const name=v.slice(8); const c=(STATE.customs||[]).find(x=>x.name===name); if(c){ $('#cYaml').value=c.text; $('#cName').value=name; } return; }
+  // build a minimal compose stub referencing the source file so the user can edit
+  const [rid,prof]=v.split('::'); const repo=(STATE.repos||[]).find(r=>r.id===rid);
+  const p=repo && (repo.profiles||[]).find(x=>x.profile===prof);
+  if(!p)return;
+  $('#cName').value=rid+'-'+prof+'-custom'; $('#cProfile').value='';
+  $('#cGpu').checked=p.needs_gpu; syncCardsField(); $('#cCards').value=String(p.cards);
+  $('#cYaml').value=
+`# Derived from ${rid}/${prof}. Edit freely. Volumes: use ABSOLUTE paths (or set a working dir).\n`+
+`# Original compose: ${repo.compose}\n`+
+`services:\n  ${rid}-${prof}-custom:\n    image: ${(p.images[0]||'IMAGE:TAG')}\n`+
+`    # devices/env/command below — copy what you need from the original service.\n`+
+(p.needs_gpu?
+`    devices: ["/dev/kfd:/dev/kfd","/dev/dri:/dev/dri"]\n    group_add: [video]\n    security_opt: [seccomp=unconfined, label=disable]\n    cap_add: [SYS_PTRACE]\n    ipc: host\n    shm_size: "16gb"\n`:'')+
+`    ports: ["${(p.ports[0]||'PORT:PORT')}"]\n    # command: [ ... ]\n`;
+}
+function syncCardsField(){ $('#cCardsWrap').style.display=$('#cGpu').checked?'inline':'none'; }
+
+// ---------- jobs / logs ----------
+function watchJob(jid, title){
+  openDrawer('▶ '+title); $('#drawerStatus').innerHTML='<span class="spin"></span> running…'; logKey=null;
+  clearInterval(jobTimer);
+  const poll=async()=>{
+    try{ const j=await api('/api/job?id='+encodeURIComponent(jid));
+      $('#drawerBody').textContent=j.log||'(no output yet)';
+      $('#drawerBody').scrollTop=$('#drawerBody').scrollHeight;
+      if(j.status!=='running'){ clearInterval(jobTimer);
+        $('#drawerStatus').innerHTML = j.status==='done'?'<span style="color:var(--green)">✔ done</span>':'<span style="color:var(--red)">✖ exit '+j.returncode+'</span>';
+        refresh(); }
+    }catch(e){ clearInterval(jobTimer); $('#drawerStatus').textContent='error: '+e.message; }
+  };
+  poll(); jobTimer=setInterval(poll, 1200);
+}
+async function openLogs(key,title){
+  logKey=key; logTitle=title; openDrawer('📜 logs · '+title); $('#drawerStatus').innerHTML='<span class="spin"></span> loading…';
+  clearInterval(jobTimer);
+  try{ const txt=await api('/api/logs?tail=300&key='+encodeURIComponent(key));
+    $('#drawerBody').textContent=txt||'(no logs)'; $('#drawerStatus').textContent='';
+    $('#drawerBody').scrollTop=$('#drawerBody').scrollHeight;
+  }catch(e){ $('#drawerBody').textContent=e.message; $('#drawerStatus').textContent=''; }
+}
+function openDrawer(t){ $('#drawerTitle').textContent=t; $('#drawer').classList.add('open'); }
+function closeDrawer(){ $('#drawer').classList.remove('open'); clearInterval(jobTimer); logKey=null; }
+
+// ---------- loop ----------
+async function refresh(manual){
+  if(manual)$('#refreshIcon').innerHTML='<span class="spin"></span>';
+  try{
+    if(manual || !MODELS.length){ try{ MODELS=(await api('/api/models')).models||[]; }catch(e){} }
+    STATE=await api('/api/state'); renderGpu(STATE.gpu_status); renderRunning(); renderPredefined(); renderTemplates();
+  }
+  catch(e){ toast('state: '+e.message,true); }
+  finally{ if(manual)$('#refreshIcon').textContent='⟳'; }
+}
+function tick(){ $('#clock').textContent=new Date().toLocaleTimeString(); }
+function showWarn(){
+  const loc=location.hostname;
+  $('#warnBanner').innerHTML='<div class="banner">⚠ This panel executes docker &amp; gpu-lease commands with no authentication. It is reachable on your LAN at <strong>http://'+loc+':'+location.port+'</strong>. Only expose it on a trusted network. Set <code>"token"</code> in config.json to require one.</div>';
+}
+showWarn(); tick(); setInterval(tick,1000); refresh(); setInterval(()=>refresh(),5000); syncCardsField();
+</script>
+</body>
+</html>

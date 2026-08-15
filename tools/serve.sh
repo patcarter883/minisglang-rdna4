@@ -242,7 +242,28 @@ case "$MODEL" in
                   # needs a LOWER ratio, not a higher one. 0.92 => 290,576 tokens, captured with
                   # 0.71 GiB spare. Validated: 20/20 sampled probe, 0 degeneration, 5.4k prefill,
                   # MTP 0.550 accept / 3.29 tok-step (the best per-step of the three).
-                  mem_default="0.92"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
+                  mem_default="0.92"; alloc_conf="expandable_segments:True"; min_tp=2 
+                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
+                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
+                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
+                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
+                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
+                  # hence the lower spec ratio.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
+                  # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
+                  # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
+                  # token chosen at the previous one. That is the whole point: DFlash scores a block
+                  # in one forward, so its positions are conditionally independent and acceptance
+                  # decays toward the back of the block; one-step dependency restores it.
+                  # config block_size=7 and this path drafts B-1, hence k=6.
+                  # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
+                  # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
+                  # is what the lower spec ratio pays for.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
   qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
                   model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="mtp"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
@@ -253,13 +274,55 @@ case "$MODEL" in
                   # (same prompt), 2.72 vs 3.03 tok/step. A more heavily quantized target agrees
                   # with its own draft head less often, so some of the memory win is paid back in
                   # spec throughput. Single-sample measurements; re-measure before relying on it.
-                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
+                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
+                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
+                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
+                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
+                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
+                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
+                  # hence the lower spec ratio.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
+                  # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
+                  # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
+                  # token chosen at the previous one. That is the whole point: DFlash scores a block
+                  # in one forward, so its positions are conditionally independent and acceptance
+                  # decays toward the back of the block; one-step dependency restores it.
+                  # config block_size=7 and this path drafts B-1, hence k=6.
+                  # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
+                  # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
+                  # is what the lower spec ratio pays for.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
   qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
                   # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
                   model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="mtp"; k_mtp=4
-                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
+                  mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
+                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
+                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
+                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
+                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
+                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
+                  # hence the lower spec ratio.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
+                  # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
+                  # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
+                  # token chosen at the previous one. That is the whole point: DFlash scores a block
+                  # in one forward, so its positions are conditionally independent and acceptance
+                  # decays toward the back of the block; one-step dependency restores it.
+                  # config block_size=7 and this path drafts B-1, hence k=6.
+                  # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
+                  # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
+                  # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
+                  # is what the lower spec ratio pays for.
+                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"

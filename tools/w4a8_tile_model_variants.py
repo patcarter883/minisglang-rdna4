@@ -33,7 +33,10 @@ import csv
 import math
 from collections import defaultdict
 
-ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off")
+# "auto" is the CHOOSER'S OWN PICK (--auto), not a tile: it has no "BMxBN" to parse and it is
+# not an arm either. Treat it as a non-tile candidate everywhere, or `parse_tile` raises on it
+# and the whole analysis refuses to run against any surface swept with --auto.
+ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off", "auto")
 LDS_BUDGET = 65536
 LINE = 128            # gfx1201 cache line, bytes
 WAVES_PER_CU = 32

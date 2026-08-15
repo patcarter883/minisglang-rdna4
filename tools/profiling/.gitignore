@@ -1,0 +1,8 @@
+# Profiler output: *.pt.trace.json.gz runs to ~30 MB per rank per run. Regenerate with
+# run_profile.sh / the VHIP_CMD offline_profile.py recipe in docs/CONTINUE_rdna4_vllm_wiring.md.
+prof_out/
+prof_out_eager/
+prof_w4a16/
+prof_bylane/
+prof_*/
+*.pt.trace.json*

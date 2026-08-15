@@ -2247,3 +2247,91 @@ width), so this is expected — what moved is the eager path, onto the same kern
 decode and verify run `mla_hip.mla_decode_fp8` / `mla_verify`, and `attn_prefill_paged` never appears.
 Qwen's ledger carries both `gdn_hip.gdn_verify_replay` (the verify graph IS replaying) and
 `attn_prefill_paged.flash_prefill_paged_fp8`, which is the exposure, live, on its default config.
+
+
+---
+
+## Part D13 — the step is NOT host-bound: the sampler's D2H syncs are FALSIFIED as a lever, and §D10's "25% inter-kernel gap" is void
+
+### D13.1 The hypothesis, and where it came from
+
+Upstream review (SGLang `srt/dllm/`, vLLM `models/diffusion_gemma.py`, both at 2026-08-06 HEAD) found
+that vLLM's entire denoising step is one `@torch.compile` region with **zero GPU→CPU syncs**, while
+this engine's `CanvasState.step` did two per request per step:
+
+```python
+stable = all(bool(torch.equal(h, argmax)) for h in self._history)   # D2H
+mean_entropy = float(entropy.mean())                                 # D2H
+```
+
+Against §D10.2's **"25% inter-kernel gap (24.8 ms/step idle under capture)"** the inference was
+obvious: the host drains the pipe every step, the GPU idles until the host comes back and issues the
+next forward, and the fix is to make the stopping criterion device-resident and issue the next
+forward BEFORE reading it back.
+
+**It is wrong, and the reasoning had a hole that §D11.4 had already opened.** The 25% gap comes from
+the same D10 profile whose attention rows §D11.4 voided — taken while the captured path ran
+`flash_prefill_paged_fp8_split_kernel` + `flash_prefill_reduce_kernel` on all 30 layers instead of
+the single-pass kernel. That is 60 extra dispatches per step, and an inter-kernel GAP is a property
+of the dispatch sequence above all else. §D11.4 said the *shares* were void; the gap row is not a
+share, it is the dispatch sequence itself, and it should have been voided first.
+
+### D13.2 Three arms, matched k
+
+`tools/diffusiongemma_generate.sh`, `AR=0`, TP=2, bs=1, image `minisgl-rdna4:splitctx`, one boot per
+arm. The run is deterministic — every arm realised the SAME k (17 / 23 / 19), so wall time is
+directly comparable and none of this is a convergence-luck artifact.
+
+| arm | change | 106 tok (k=17) | 256 tok (k=23) | 256 tok (k=19) |
+|---|---|---|---|---|
+| 0 | unmodified (`356bfdaa`) | 4.66 s | **2.36 s** | **1.97 s** |
+| A | sampler de-sync: `done` device-resident, ONE batched D2H per step instead of two per request | — | 2.37 s (+0.4%) | 1.98 s (+0.5%) |
+| B | A + speculative issue of the next forward before the readback | 4.83 s | 2.46 s (+4.2%) | 2.07 s (+5.1%) |
+
+And the measurement that closes it — **ms per model forward**, where arm B does `k+2` per block
+(k denoise + 1 causal re-encode + 1 speculative) against arm 0's `k+1`:
+
+| arm | fwd/block | 256 tok (k=23) | 256 tok (k=19) |
+|---|---|---|---|
+| 0 | k+1 | 98.3 ms | 98.5 ms |
+| B | k+2 | 98.4 ms | 98.6 ms |
+
+**Per-forward cost is identical to within 0.2%.** The pipeline made no forward cheaper; it added one.
+Arm B's regression is exactly the extra forward (+1 on k+1 ≈ +5.6% predicted, +4.2/+5.1% measured)
+with no offsetting gain, which is only possible if the GPU was never waiting on that readback.
+
+### D13.3 What this establishes
+
+* **The canvas step is ~98 ms of GPU work at bs=1 and is NOT host-bound.** The host is off the
+  critical path; `fwd_issue` at 0.6–0.8 ms under capture was already telling us this and the gap row
+  was the only thing arguing otherwise.
+* **§D10.2's 25% inter-kernel gap is VOID**, on the same grounds as its attention rows. Nothing
+  should be planned against it until the profile is re-taken on the fixed (§D12) path.
+* **Neither change is merged.** Arm A is +0.4/+0.5% — noise, no measured benefit — and shipping
+  `resolve()`, tensor-backed `DiffusionStep` properties and a `MINISGL_CANVAS_PIPELINE` env knob for
+  that is exactly the env-gated dead weight this repo does not carry. The branch
+  `feat/canvas-desync` is retained as the record, not as a candidate.
+* **What upstream does here does not transfer.** vLLM needs its sync-free sampler because its
+  denoise loop IS the scheduler loop — one full engine step (scheduler → prepare_inputs → forward →
+  sampler → post_update) per denoising iteration. This engine already runs the loop worker-resident,
+  which is the thing vLLM's own source names as the way to beat it. Same for SGLang's
+  `mark_forward_metadata_ready` (plan attention once per block, NPU-only there): it targets a
+  per-step FlashInfer `plan()` this engine does not have, and the equivalent host work here is
+  inside the 0.6–0.8 ms `fwd_issue`.
+
+### D13.4 Where the levers actually are
+
+Everything left is inside the kernels, and the ranking in §D10.7 survives in MECHANISM only — every
+share is a share of a step that was 12% too long, so the first task is re-taking that profile. The
+mechanisms that do survive: the MoE grouped GEMM at 40.6% of roofline with every expert touched
+every step (256 rows × top-8 over 128 experts), 107.6 all-reduces per step where the lever is FEWER
+collectives rather than a faster one, and the dense W4A8 under-occupancy §D11.5 traced to the
+occupancy TERM rather than the tie-break.
+
+One transferable kernel observation from the vLLM read, still unmeasured here:
+`vllm/v1/attention/ops/triton_unified_attention.py:941-955` retunes for exactly this shape —
+*"head_size 256 with many query rows per sequence (diffusion-gemma bidirectional canvas passes) is
+prefill-shaped, but the decode-oriented defaults under-tile it … ~2x faster"*. The canvas batch here
+is built `phase="decode"` at M=256, and §D10.7 already reports the dense path picking a tile that
+launches 64 workgroups on 64 CUs at 12/16 waves. Whether the dispatch keys off phase rather than
+actual M is the open question, and it is a measurement, not an argument.

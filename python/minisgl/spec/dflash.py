@@ -285,6 +285,18 @@ class DFlashProposer(CapturableProposer):
                 "rope_theta"
             ) or 1e6
         rope_theta = float(rope_theta)
+        # The drafter's rope SCHEME, not just its theta. Only a real scheme becomes scaling (mirrors
+        # models/config.py); "default"/absent stays None so every existing drafter is unchanged.
+        # Passed as a hashable tuple because the rope builder is cached. Non-scalar entries (e.g. an
+        # mrope_section list) are dropped — they are multimodal-only and would break the cache key.
+        rope_scaling = None
+        if isinstance(rp, dict) and str(rp.get("rope_type", "default")) not in ("default", "None"):
+            rope_scaling = tuple(
+                sorted((k, v) for k, v in rp.items() if isinstance(v, (str, int, float, bool)))
+            )
+            logger.info_rank0(
+                f"spec-decode: DFlash drafter rope scheme={rp.get('rope_type')} "
+                f"({dict(rope_scaling)}) — applied, not defaulted")
         max_pos = int(cfg("max_position_embeddings", default=262144))
 
         self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 0)
@@ -338,6 +350,7 @@ class DFlashProposer(CapturableProposer):
                 num_aux_layers=num_aux,
                 rms_norm_eps=eps,
                 rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
                 max_position=max_pos,
                 draft_vocab_size=draft_vocab if self._compressed else None,
                 own_embed=self._compressed,
@@ -832,7 +845,13 @@ class DFlashProposer(CapturableProposer):
         n = bs * (Q - 1)
         logits = d.head(hidden[:, 1:].reshape(n, -1))
         self._g_logits[:n] = logits
-        ids = logits.argmax(dim=-1)
+        if d.has_markov:
+            # DSpark, batched: same semi-autoregressive walk, anchors are block column 0.
+            ids = d.markov_block_argmax(
+                logits.view(bs, Q - 1, -1), self._g_blk[0, :bs, 0].to(torch.int64)
+            ).reshape(-1)
+        else:
+            ids = logits.argmax(dim=-1)
         if self._compressed:
             ids = ids + self._d2t[ids]                   # draft vocab -> target vocab (on device)
         self._g_out[:bs] = ids.view(bs, Q - 1)
@@ -1279,6 +1298,23 @@ class DFlashProposer(CapturableProposer):
             assign(layer.up_proj, "weight", p + "mlp.up_proj.weight", quant=True)
             assign(layer.down_proj, "weight", p + "mlp.down_proj.weight", quant=True)
 
+        # DSpark: the Markov bigram logit-bias head, when the checkpoint ships one. Detected by
+        # TENSOR PRESENCE, matching this file's builder dispatch — a plain DFlash checkpoint has
+        # neither key and the drafter behaves exactly as before. `confidence_head.*` is loaded by
+        # nothing yet: it drives DSpark's VARIABLE verify length, which needs a dynamic draft budget
+        # and so cannot ride the fixed-shape captured propose. Deliberately deferred, not forgotten.
+        # MINISGL_DSPARK_MARKOV=0 loads the checkpoint but SKIPS the head, so the same drafter runs
+        # as plain DFlash. Diagnostic: it separates "the Markov application is wrong" from "the
+        # drafter/backbone is mismatched", which acceptance alone cannot.
+        if "markov_head.markov_w1.weight" in sd and os.environ.get("MINISGL_DSPARK_MARKOV") != "0":
+            d.set_markov(
+                sd["markov_head.markov_w1.weight"].to(self._dtype).contiguous().to(self._device),
+                sd["markov_head.markov_w2.weight"].to(self._dtype).contiguous().to(self._device),
+            )
+            print(f"[dflash] DSpark Markov head loaded (rank="
+                  f"{sd['markov_head.markov_w1.weight'].shape[1]}); block positions decode "
+                  f"semi-autoregressively", flush=True)
+
         if self._compressed:
             assert "embed_tokens.weight" in sd, "compressed DFlash ckpt missing embed_tokens"
             d.set_own_embed(sd["embed_tokens.weight"].to(self._dtype).contiguous().to(self._device))
@@ -1415,7 +1451,12 @@ class DFlashProposer(CapturableProposer):
             # dot in a fixed K-order), and B=16 -> k_i=15 rows stays inside the same
             # `dense_bf16_gemv` band (_LMHEAD_GEMV_MMAX = 16), so no kernel-family switch either.
             block_logits = draft.head(hidden[1 : 1 + k_i])  # [k_i, vocab]
-            ids = block_logits.argmax(dim=-1)  # [k_i] draft-vocab ids
+            if draft.has_markov:
+                # DSpark: bias each position by the token chosen at the previous one (anchor first).
+                anchor_dev = torch.as_tensor(anchor_tok, dtype=torch.int64, device=device)
+                ids = draft.markov_block_argmax(block_logits, anchor_dev)  # [k_i]
+            else:
+                ids = block_logits.argmax(dim=-1)  # [k_i] draft-vocab ids
             if self._compressed:
                 ids = ids + self._d2t[ids]  # draft id -> target id (delta map)
             pend.append((i, req, anchor_tok, base_pos, k_i, ids))

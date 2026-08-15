@@ -1,0 +1,56 @@
+# Profiling image: the kernels we SHIP, under a ROCm runtime whose rocprofv3 can actually collect.
+#
+# THE PROBLEM. gfx1201 hardware counters need ROCm 7.14 — on 7.2.1 `rocprofv3 --pmc` hangs >90 s and
+# needs SIGKILL, with the perfmon clock ungated or not. But rebuilding the kernels inside a 7.14
+# image is not an option: it ships AMD clang 23, and this repo has already measured that compiler
+# changing scratch spills enough to move kernels 1.35-1.83x. Counters collected on a binary we do not
+# ship explain nothing about the binary we do.
+#
+# THE SPLIT. A kernel's ISA is fixed at COMPILE time; the profiler attaches at RUN time. So build the
+# package normally (minisgl-rdna4:lean, ROCm 7.2.1 hipcc — the same toolchain as the serve image and
+# the wall-clock bench) and change only the runtime underneath it.
+#
+#   build:   local/build_local.sh inside minisgl-rdna4:lean     <- 7.2.1 hipcc, the shipped ISA
+#   profile: this image                                         <- 7.14 runtime + rocprofiler
+#
+# WHY IT NEEDS A DOCKERFILE AT ALL. The torch ROCm wheel VENDORS its own ROCm: torch/lib carries
+# libamdhip64.so, libhsa-runtime64.so, libhiprtc.so AND librocprofiler-sdk.so / librocprofiler-
+# register.so. Those win over the system ones by RPATH, so simply running the lean venv inside a 7.14
+# container still loads the 7.2 runtime and the 1.1.0 profiler sdk — i.e. it still hangs, while
+# looking like it should have worked. They have to be moved aside explicitly.
+#
+# VERIFY, DO NOT ASSUME (counter_probe/verify_runtime_split.py does both):
+#   * the loaded libamdhip64/libhsa-runtime64 resolve to /opt/rocm-7.14*, not to torch/lib
+#   * the fp8_wmma kernel ISA is byte-identical to the .so built in the lean image
+#
+#   docker build -t rdna4-prof714:latest \
+#     --build-context lean=docker-image://minisgl-rdna4:lean \
+#     -f tools/counter_probe/Dockerfile.profile714 tools/counter_probe
+FROM rdna4-rocm7.14:latest
+
+# torch 2.14+rocm7.2 and the engine's deps, taken WHOLE so nothing is recompiled here.
+COPY --from=lean /opt/venv /opt/venv
+
+# Move torch's vendored ROCm 7.2 runtime + rocprofiler-sdk 1.1.0 aside, so the process resolves the
+# 7.14 system copies by soname. Kept rather than deleted: if torch turns out to need a symbol 7.14
+# dropped, the shadow directory is the evidence and the way back.
+RUN set -eux; \
+    d=$(echo /opt/venv/lib/python3.*/site-packages/torch/lib); \
+    mkdir -p "$d/_rocm72_shadow"; \
+    for f in libamdhip64.so libhsa-runtime64.so libhiprtc.so \
+             librocprofiler-register.so librocprofiler-sdk.so; do \
+      for g in "$d/$f"*; do [ -e "$g" ] && mv "$g" "$d/_rocm72_shadow/" || true; done; \
+    done; \
+    ls "$d/_rocm72_shadow"
+
+# The copied venv is a REAL venv: /opt/venv/bin/python is a symlink to /usr/bin/python3.12, which
+# the lean image has (Ubuntu 24.04 system python) and this one does NOT — it uses a uv-managed
+# interpreter under /root/.local/share/uv. Without this the symlink dangles and every command
+# silently falls through to /app/.venv's torch 2.11, i.e. you profile the wrong torch and the wrong
+# kernels while everything appears to run. Same 24.04 base, so apt's python3 is the matching 3.12.3.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && /opt/venv/bin/python -c "import sys; print('venv python', sys.version)"
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:/opt/rocm/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin

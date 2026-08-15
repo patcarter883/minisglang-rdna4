@@ -1,0 +1,225 @@
+# Static per-kernel GPU resource comparison, ROCm 7.2.1/clang22 vs ROCm 7.14/clang23
+# date=2026-08-12  kernels_commit=86fed3a (both sides), arch=gfx1201
+# A: minisgl-rdna4:lean    ROCm 7.2.1, AMD clang 22.0.0git, torch 2.14.0.dev+rocm7.2
+# B: minisgl-rdna4:lean714 ROCm 7.14,  AMD clang 23.0.0git, torch 2.12.0+rocm7.14.0
+# Both built from the SAME worktree commit by local/build_local.sh GPU_ARCHS=gfx1201, so the
+# only variable is the toolchain. Produced by tools/kernel_static_resources.py.
+# occ = waves/SIMD bound by VGPR alone: min(16, 1536 // (ceil(vgpr/24)*24)).
+
+################################################################ attn_decode
+396 kernels in both  (396 in r72, 396 in r714)
+386 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::flash_decode_paged_split_kerne   210    10     0       0       0   +2: vgpr 122->120, occ 10->12
+_GLOBAL__N_1::flash_decode_paged_fp8_split_k    90     4     0       0       0   +2: vgpr 122->120, occ 10->12
+_GLOBAL__N_1::flash_decode_kernel                8     0     0       0       0   
+_GLOBAL__N_1::flash_decode_paged_kernel         56     0     0       0       0   
+_GLOBAL__N_1::flash_decode_reduce_kernel         8     0     0       0       0   
+_GLOBAL__N_1::flash_decode_paged_fp8_kernel     24     0     0       0       0   
+
+TOTAL: 14 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ attn_hip
+8 kernels in both  (8 in r72, 8 in r714)
+8 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::flash_prefill_kernel               8     0     0       0       2   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 2
+
+################################################################ attn_prefill_paged
+128 kernels in both  (128 in r72, 128 in r714)
+124 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::flash_prefill_reduce_kernel        8     0     0       0       0   
+_GLOBAL__N_1::flash_prefill_paged_split_kern    20     2     8       0       0   +2: vgpr 122->120, occ 10->12
+_GLOBAL__N_1::flash_prefill_paged_fp8_split_    20     2     8       0       1   +2: vgpr 123->120, occ 10->12
+_GLOBAL__N_1::flash_prefill_paged_fp8_kernel    40     2    14       0       4   +1: vgpr 250->238, occ 5->6
+_GLOBAL__N_1::flash_prefill_paged_kernel        40     0    16       0       4   -2: vgpr 165->197, occ 9->7
+
+TOTAL: 6 kernels gain an occupancy step under r714, 46 lose one; spill worse in 0, better in 9
+
+################################################################ cca
+78 kernels in both  (78 in r72, 78 in r714)
+69 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+cca_decode_qk_kernel                             3     0     0       0       0   
+cca_prefill_qk_kernel                            3     0     0       0       0   
+zaya_merge_norm_kernel                           2     0     0       0       0   
+cca_decode_fused_kernel                          6     0     0       0       0   
+cca_decode_qk_fp4_kernel                         3     0     0       0       0   
+cca_decode_qk_wide_kernel                        6     0     0       0       0   
+cca_conv_state_decode_kernel                     1     0     0       0       0   
+gemv_decode::gemv_decode_core                   54     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ custom_ar
+11 kernels in both  (11 in r72, 11 in r714)
+10 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+custom_ar::all_gather_kernel                     3     0     0       0       0   
+custom_ar::flag_probe_kernel                     1     0     0       0       0   
+custom_ar::one_shot_ar_kernel                    3     0     0       0       0   
+custom_ar::all_gather_vec_kernel                 1     0     0       0       0   
+custom_ar::one_shot_ar_vec_kernel                3     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ dense_gemm
+156 kernels in both  (156 in r72, 156 in r714)
+136 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+dense_gemm::dense_gemm_pipe_kernel             106    32     2      14      48   +8: vgpr 187->95, occ 8->16
+dense_gemm::dense_gemm_rd_kernel                20     2     2       0       0   +4: vgpr 108->85, occ 12->16
+dense_gemm::dense_gemm_rd_kernel_cu             20     2     2       0       0   +4: vgpr 108->85, occ 12->16
+dense_gemm::dense_gemm_reduce_kernel             2     0     0       0       0   
+dense_gemm::dense_gemm_kernel                    8     0     2       0       0   -4: vgpr 89->101, occ 16->12
+
+TOTAL: 36 kernels gain an occupancy step under r714, 8 lose one; spill worse in 14, better in 48
+
+################################################################ fp8_wmma
+5984 kernels in both  (5984 in r72, 5984 in r714)
+5382 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+w4a8_tile::moe_gemm_tiled_ashuffle_kernel      341   136     4       7      32   +7: vgpr 165->96, occ 9->16
+w4a8_fp8_wmma::mmq_regdirect_w4a16_moe_kerne   168    88     0       0       8   +11: vgpr 256->84, occ 5->16
+w4a8_fp8_wmma::gemm_tiled_ashuffle_kernel      256   116    38      20      36   +3: vgpr 256->190, occ 5->8
+w4a8_fp8_wmma::mmq_fp8_gemm_prefill_wmma_ash   256   116    38      20      36   +3: vgpr 256->190, occ 5->8
+gemv_decode::gemv_decode_core                 1532    72     0       0       0   +4: vgpr 116->96, occ 12->16
+w4a8_tile::moe_gemm_tiled_kernel               342    46     4       0      22   +4: vgpr 97->95, occ 12->16
+w4a8_fp8_wmma::mmq_regdirect_w4a16_wide_kern    84    41     0       0       4   +11: vgpr 256->84, occ 5->16
+w4a8_tile::moe_bf16act_regdirect_kernel        144    26     4       0       0   +4: vgpr 118->58, occ 12->16
+w4a8_fp8_moe::moe_gemm1_silu_alds_kernel        28     8     0       1      11   +4: vgpr 97->89, occ 12->16
+w4a8_fp8_moe::moe_gemm1_silu_ashuffle_kernel    28     8     0       0      14   +4: vgpr 99->92, occ 12->16
+w4a8_tile::moe_gemm_flag_kernel                  8     4     0       0       6   +1: vgpr 247->234, occ 5->6
+rxf_fold::moe_gemm_regdirect_kernel             10     3     0       0       0   +4: vgpr 106->84, occ 12->16
+w8a8_dense::dense_gemm_tiled_kernel              2     2     0       0       0   +1: vgpr 247->231, occ 5->6
+w8a8_dense::dense_act_quant_kernel               2     0     0       0       0   
+w4a8_fp8_moe::mmq_regdirect_w8a8_moe_kernel     84     0     0       0       0   
+w4a8_fp8_moe::moe_gemm_scalar_kernel             8     0     0       0       0   
+w4a8_fp8_moe::moe_gather_reduce_kernel           2     0     0       0       0   
+w4a8_fp8_moe::moe_compute_act_fp8_kernel         2     0     0       0       0   
+w4a8_fp8_moe::moe_build_inverse_map_kernel       2     0     0       0       0   
+w4a8_fp8_moe::moe_gemm2_gather_reduce_core      10     0     0       0       0   
+w4a8_fp8_wmma::gemm_tiled_kernel                 4     0     0       0       0   
+w4a8_fp8_wmma::cvt_f32_f16_kernel                2     0     0       0       0   
+w4a8_fp8_wmma::mmq_fp8_gemm_scalar_kernel        2     0     0       0       0   
+w4a8_fp8_wmma::mmq_regdirect_w4a16_kernel       28     0     0       0       0   
+w4a8_fp8_wmma::mmq_fp8_gemm_prefill_wmma_ker     2     0     0       0       0   
+w4a8_fp8_wmma::compute_act_fp8_and_scales_ke     2     0     0       0       0   
+rxf_fold::moe_gemv_kernel                        1     0     0       0       0   
+rxf_fold::linear_gemv_kernel                     1     0     0       0       0   
+rxf_fold::rotate_quant_kernel                    4     0     0       0       0   
+rxf_fold::moe_gather_reduce_kernel               1     0     0       0       0   
+w4a8_tile::moe_gemm_flag_w4_kernel               2     0     0       0       0   
+w4a8_tile::moe_bf16act_tiled_kernel             72     0     0       0       0   
+w4a8_tile::moe_gemm1_silu_flag_w4_kernel         4     0     0       0       0   
+w4a8_tile::moe_gemm1_silu_flag_fp8_kernel        4     0     0       0       0   
+rxf_fold::linear_tiled_kernel                    2     0     2       1       0   -2: vgpr 110->140, occ 12->10
+w4a8_fp8_wmma::mmq_fp8_gemm_wmma_tiled_tuned  2544   312   356      46      24   +4: vgpr 112->95, occ 12->16
+
+TOTAL: 978 kernels gain an occupancy step under r714, 446 lose one; spill worse in 95, better in 193
+
+################################################################ gdn
+339 kernels in both  (339 in r72, 339 in r714)
+320 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+gdn_prefill_wmma_kernel                         24    12     0       0       0   +2: vgpr 122->120, occ 10->12
+gdn_prefill_kernel                              24     0     0       0       0   
+rmsnorm_gated_kernel                             4     0     0       0       0   
+causal_conv1d_bwd_kernel                         4     0     0       0       0   
+causal_conv1d_fwd_kernel                         4     0     0       0       0   
+rmsnorm_gated_bwd_kernel                         4     0     0       0       0   
+gdn_prefill_verify_kernel                       72     0     0       0       0   
+gdn_prefill_chunked_kernel                      12     0     0       0       0   
+gdn_replay_rollback_kernel                       1     0     0       0       0   
+causal_conv1d_update_kernel                      4     0     0       0       0   
+gdn_decode_conv_gated_kernel                    48     7     7      20       0   +4: vgpr 104->96, occ 12->16
+causal_conv1d_fwd_verify_kernel                 12     0     0       0       0   
+gdn_replay_flush_kernel                          6     0     6       0       0   -1: vgpr 142->166, occ 10->9
+gdn_decode_gated_kernel                         24     4    16       0       0   +4: vgpr 109->93, occ 12->16
+gdn_decode_replay_kernel                        24     0    22       0       0   -2: vgpr 144->171, occ 10->8
+gdn_decode_kernel                               24     0    24      14       0   -4: vgpr 114->179, occ 12->8
+gdn_decode_conv_kernel                          24     0    24       0       0   -2: vgpr 139->183, occ 10->8
+gdn_verify_replay_kernel                        24     0    24      20       0   -2: vgpr 139->189, occ 10->8
+
+TOTAL: 23 kernels gain an occupancy step under r714, 123 lose one; spill worse in 54, better in 0
+
+################################################################ mla
+40 kernels in both  (40 in r72, 40 in r714)
+40 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::mla_prefill_kernel                 6     4     0       0       0   +4: vgpr 105->96, occ 12->16
+mla_attend::mla_split_kernel                    32     0     0       0       0   
+mla_attend::mla_combine_kernel                   2     0     0       0       0   
+
+TOTAL: 4 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ moe
+385 kernels in both  (385 in r72, 385 in r714)
+379 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::moe_align_kernel                   1     0     0       0       0   
+_GLOBAL__N_1::moe_route_align_kernel            72     0     0       0       0   
+_GLOBAL__N_1::moe_topk_softmax_kernel          312     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ sampler
+3 kernels in both  (3 in r72, 3 in r714)
+3 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::topk_partial_kernel                1     0     0       0       0   
+_GLOBAL__N_1::topk_finalize_kernel               1     0     0       0       0   
+_GLOBAL__N_1::topk_topp_sampling_kernel          1     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ swiglu
+4 kernels in both  (4 in r72, 4 in r714)
+0 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::down_kernel                        2     0     0       0       0   
+_GLOBAL__N_1::gate_up_silu_kernel                2     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+
+################################################################ tail
+33 kernels in both  (33 in r72, 33 in r714)
+24 changed resources under r714
+
+kernel family                                    n  occ+  occ-  spill+  spill-   biggest occupancy move (vgpr, waves/SIMD)   
+----------------------------------------------------------------------------------------------------------------------------
+_GLOBAL__N_1::rope_kernel                        3     0     0       0       0   
+_GLOBAL__N_1::rms_norm_kernel                    6     0     0       0       0   
+_GLOBAL__N_1::store_kv_kernel                    9     0     0       0       0   
+_GLOBAL__N_1::gated_mul_kernel                   9     0     0       0       0   
+_GLOBAL__N_1::rms_norm_add_kernel                6     0     0       0       0   
+
+TOTAL: 0 kernels gain an occupancy step under r714, 0 lose one; spill worse in 0, better in 0
+

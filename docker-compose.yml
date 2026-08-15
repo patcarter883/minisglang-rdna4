@@ -123,6 +123,9 @@ x-lean-common: &lean-common
     # DFlash drafter weight-only quant (fp8|int8|nvfp4) — shrinks the replicated drafter to fit big
     # pairs. nvfp4 is 4-bit weights riding the shared W4A8 core; fp8/int8 are 1 byte/param.
     MINISGL_DFLASH_QUANT: "${MINISGL_DFLASH_QUANT:-}"
+    # DSpark diagnostic: 0 loads the checkpoint but skips its Markov head, so the SAME drafter runs
+    # as plain DFlash. Separates "the Markov application is wrong" from "the backbone is mismatched".
+    MINISGL_DSPARK_MARKOV: "${MINISGL_DSPARK_MARKOV:-}"
     # Draft-model VRAM RESERVE overrides. Forwarded because the engine reads them from os.environ
     # INSIDE the container: with no passthrough entry they are silently unset there, so the only
     # documented lever for a mis-estimated drafter reserve could not be pulled through the normal

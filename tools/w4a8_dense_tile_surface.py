@@ -231,8 +231,18 @@ def time_graph(fn, ws, budget_us: float = CELL_BUDGET_US, max_reps: int = 20, mi
 
 def legal(bm: int, bn: int, g: int, wn: int = 1) -> bool:
     """LDS fit, plus WARPS_N legality: the workgroup is (BM/16)*WN warps and the hardware caps it at
-    1024 threads, and WN must split NFRAG = BN/16 evenly."""
-    if (bm + bn) * (g + 8) > LDS_MAX:
+    1024 threads, and WN must split NFRAG = BN/16 evenly.
+
+    The LDS half is ASKED OF THE PACKAGE, not recomputed here. This function used to carry
+    `(bm + bn) * (g + 8) > LDS_MAX`, which is what the launcher used to compute too -- and when the
+    kernel's staging round stopped being one quant group deep, this copy kept answering for the old
+    kernel. At g=16 it claims a 256x256 tile needs 12 KB when the real footprint is 70 KB: the sweep
+    would schedule a tile that cannot launch, and skip nothing it should have skipped. There is one
+    definition of this (tile_select.h) and `dense_tile_lds` is how Python reaches it.
+    """
+    import fp8_wmma  # late, like the main import: --help must work without the package built
+
+    if not fp8_wmma.dense_tile_lds(bm, bn, g)[1]:
         return False
     return (bm // 16) * wn <= 32 and (bn // 16) % wn == 0 and (bn // 16) >= wn
 
@@ -320,6 +330,13 @@ def main() -> int:
     # physical cards are visible and their ORDER is not guaranteed, so "cuda:0 is the XT" is exactly
     # the assumption that produced a whole WARPS_N surface on the 56-CU card.
     global DEV
+    # INITIALISE BEFORE ENUMERATING. On the ROCm 7.14 / torch 2.12 image `torch.cuda.device_count()`
+    # returns 0 until CUDA is initialised — `is_available()` is True, `hipGetDeviceCount` reports 3,
+    # and a plain `torch.zeros(4, device="cuda")` works, but the count is 0 until something forces
+    # init. On the ROCm 7.2.1 / torch 2.14 image it returns 2 either way, so a tool written against
+    # that image gates on device_count() and reports "no 64-CU card visible" on the new one, which
+    # reads as a lease or permissions problem and is neither.
+    torch.cuda.init()
     want = None
     for i in range(torch.cuda.device_count()):
         p = torch.cuda.get_device_properties(i)
@@ -370,7 +387,8 @@ def main() -> int:
         out(f"=== {name}  K={K} N={N} g={g} {str(dt).split('.')[-1]} "
             f"zeros={'awq' if zeros else 'sym'} ===")
         if skipped:
-            out(f"    LDS-illegal at g={g} (>{LDS_MAX} B): " + " ".join(skipped))
+            out(f"    LDS-illegal at g={g} (>{LDS_MAX} B, per the package's own tile_lds): "
+                + " ".join(skipped))
         prev_M = None
         ws = R = wbytes = None
         for M in ms:

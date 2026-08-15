@@ -1,0 +1,6 @@
+[cost] stage-1 bind (M=8, 1500 steps, batch 4): 43s | peak GPU 12.95 GiB
+[cost] stage-2 tap fit L=12 (200 steps, batch 4): 174s | peak GPU 13.44 GiB
+[indist] relations: {'P103': 37, 'P364': 33, 'P37': 31} | tap delivers in-dist (unlike OOD MQuAKE) — testing whether that delivery RIPPLES through a language 2-hop (base as oracle)
+[indist]   confound-controlled FILTERED set (base-composes ∩ tap-delivers): n=48
+[indist]   HEADLINE: TAP 0.250 vs RAG 0.500 (Δ = -0.250)
+[cost] in-distribution language-pivot ripple L=12: 385s | peak GPU 13.24 GiB

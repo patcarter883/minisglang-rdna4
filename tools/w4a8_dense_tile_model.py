@@ -38,7 +38,12 @@ import csv
 import math
 from collections import defaultdict
 
-ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off")
+import _w4a8_tile_policy as _policy
+
+# "auto" is the CHOOSER'S OWN PICK (--auto), not a tile: it has no "BMxBN" to parse and it is
+# not an arm either. Treat it as a non-tile candidate everywhere, or `parse_tile` raises on it
+# and the whole analysis refuses to run against any surface swept with --auto.
+ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off", "auto")
 LDS_BUDGET = 65536
 # gfx1201: 2 SIMD32 per CU, 16 wave32 slots per SIMD -> 32 waves/CU; 1536 VGPRs per SIMD in wave32.
 WAVES_PER_CU = 32
@@ -71,7 +76,9 @@ def vgprs(bn: int) -> int:
 
 def blocks_per_cu(bm, bn, g):
     nwarps = bm // 16
-    lds = (bm + bn) * (g + 8) + 4 * bn + 4 * bm
+    # Staging tiles at the real STAGE depth + the static scale array. Was
+    # `(bm + bn) * (g + 8) + 4 * bn + 4 * bm`, which is the pre-decoupling footprint.
+    lds = _policy.tile_lds(bm, bn, g) + 4 * bm
     by_lds = LDS_BUDGET // max(lds, 1)
     waves_simd = min(WAVES_PER_SIMD_MAX, VGPR_PER_SIMD // max(vgprs(bn), 1))
     by_waves = (waves_simd * 2) // max(nwarps, 1)
@@ -98,7 +105,7 @@ def model_cost(M, N, K, g, bm, bn, cu, cA, cB, cW, LAT, bw=0.0):
     enters through UNDERFILL and LATENCY only, never as a divisor of WORK. (Getting that wrong is
     what made the first version of this model prefer BN=32 at M=2048, where it loses 1.6x.)
     """
-    if (bm + bn) * (g + 8) > LDS_BUDGET:
+    if _policy.tile_lds(bm, bn, g) > LDS_BUDGET:
         return None
     bpc = blocks_per_cu(bm, bn, g)
     if bpc <= 0:

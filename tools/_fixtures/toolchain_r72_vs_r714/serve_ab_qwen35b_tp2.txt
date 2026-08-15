@@ -1,0 +1,195 @@
+# toolchain serve A/B — ROCm 7.2.1/clang22 vs ROCm 7.14/clang23
+# model=qwen35b-awq tp=2 conc=6 reps=2  worktree=/home/pat/code/minisgl-rdna4-gdnab
+# kernels: both legs built from rdna4-hip-kernels 86fed3a, each by its own image's compiler
+
+################################################################
+########## LEG 72 — ROCm 7.2.1 / clang 22 (minisgl-rdna4:lean)
+################################################################
+  provenance:
+    gdn_hip=/engine/_kern72/gdn_hip sha=f6507eefae32
+    attn_prefill_paged=/engine/_kern72/attn_prefill_paged sha=d6cef0853e4a
+    fp8_wmma=/engine/_kern72/fp8_wmma sha=4d2981fecd8f
+    moe_hip=/engine/_kern72/moe_hip sha=4d64d10eee8e
+
+  ---- serve_perf rep 1 ----
+    model: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+    conc:  6   max_tokens: 512
+    ============================================================================
+    
+    1. SINGLE-STREAM (bs=1) — the latency-sensitive case
+       tokens=512  wall=5.42s
+       tok/s  median=94.5  min=84.2  max=94.5  spread=10.9%
+    
+    2. TTFT / TPOT (streaming; TTFT counts the first reasoning OR content delta)
+       TTFT median=27 ms   TPOT median=10.57 ms/token (94.6 tok/s decode-only)
+       [512 tokens arrived in 511 SSE chunks = 1.00 tok/chunk — chunk-counting would have reported 94.4 tok/s]
+    
+    3. THROUGHPUT SCALING (distinct prompts — no radix sharing)
+       bs=1    512 tok /   5.54s =    92.3 tok/s   (1.00x vs bs=1,    92.3 tok/s per stream)
+       bs=2   1024 tok /   7.21s =   142.0 tok/s   (1.54x vs bs=1,    71.0 tok/s per stream)
+       bs=6   3072 tok /   9.11s =   337.2 tok/s   (3.65x vs bs=1,    56.2 tok/s per stream)
+    
+    4. PREFILL vs PROMPT LENGTH (prefill tok/s = prompt_tokens / TTFT)
+           17 prompt tok -> TTFT      47 ms =      359 prefill tok/s
+         3375 prompt tok -> TTFT     895 ms =     3772 prefill tok/s
+        10533 prompt tok -> TTFT    2036 ms =     5173 prefill tok/s
+        21671 prompt tok -> TTFT    4353 ms =     4979 prefill tok/s
+    
+    5. DECODE vs CONTEXT DEPTH (same output budget, deeper context)
+       ctx~    37 tok ->  512 out in   5.43s =    94.3 tok/s
+       ctx~  6975 tok ->  512 out in   6.59s =    77.7 tok/s
+       ctx~ 17711 tok ->  512 out in   6.72s =    76.2 tok/s
+    
+    6. PREFIX CACHE (radix): same long prefix, different suffix
+       cold   14112 prompt tok    2.33s
+       warm  median   1.10s  -> +53% wall vs cold
+    
+    7. LATENCY PERCENTILES UNDER SUSTAINED LOAD
+       n=18  p50=3.37s  p90=3.46s  p99=3.46s  max=3.46s
+    
+    8. SPEC-DECODE EFFECTIVENESS (DELTA over a controlled workload)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+    
+    ============================================================================
+
+  ---- serve_perf rep 2 ----
+    model: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+    conc:  6   max_tokens: 512
+    ============================================================================
+    
+    1. SINGLE-STREAM (bs=1) — the latency-sensitive case
+       tokens=512  wall=5.42s
+       tok/s  median=94.4  min=94.2  max=94.5  spread=0.4%
+    
+    2. TTFT / TPOT (streaming; TTFT counts the first reasoning OR content delta)
+       TTFT median=23 ms   TPOT median=10.56 ms/token (94.7 tok/s decode-only)
+       [512 tokens arrived in 511 SSE chunks = 1.00 tok/chunk — chunk-counting would have reported 94.5 tok/s]
+    
+    3. THROUGHPUT SCALING (distinct prompts — no radix sharing)
+       bs=1    512 tok /   5.42s =    94.4 tok/s   (1.00x vs bs=1,    94.4 tok/s per stream)
+       bs=2   1024 tok /   7.17s =   142.9 tok/s   (1.51x vs bs=1,    71.5 tok/s per stream)
+       bs=6   3072 tok /   9.01s =   340.9 tok/s   (3.61x vs bs=1,    56.8 tok/s per stream)
+    
+    4. PREFILL vs PROMPT LENGTH (prefill tok/s = prompt_tokens / TTFT)
+           17 prompt tok -> TTFT      20 ms =      846 prefill tok/s
+         3375 prompt tok -> TTFT      41 ms =    83204 prefill tok/s
+        10533 prompt tok -> TTFT      38 ms =   280851 prefill tok/s
+        21671 prompt tok -> TTFT      50 ms =   432047 prefill tok/s
+    
+    5. DECODE vs CONTEXT DEPTH (same output budget, deeper context)
+       ctx~    37 tok ->  512 out in   5.42s =    94.4 tok/s
+       ctx~  6975 tok ->  512 out in   6.00s =    85.3 tok/s
+       ctx~ 17711 tok ->  512 out in   6.01s =    85.2 tok/s
+    
+    6. PREFIX CACHE (radix): same long prefix, different suffix
+       cold   14112 prompt tok    1.10s
+       warm  median   1.10s  -> -0% wall vs cold
+    
+    7. LATENCY PERCENTILES UNDER SUSTAINED LOAD
+       n=18  p50=3.36s  p90=3.36s  p99=3.36s  max=3.36s
+    
+    8. SPEC-DECODE EFFECTIVENESS (DELTA over a controlled workload)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+    
+    ============================================================================
+
+################################################################
+########## LEG 714 — ROCm 7.14  / clang 23 (minisgl-rdna4:lean714)
+################################################################
+  provenance:
+    gdn_hip=/engine/_kern714/gdn_hip sha=ff5e0194ac94
+    attn_prefill_paged=/engine/_kern714/attn_prefill_paged sha=370603ceec20
+    fp8_wmma=/engine/_kern714/fp8_wmma sha=9e0b13238901
+    moe_hip=/engine/_kern714/moe_hip sha=c986e9d46f18
+
+  ---- serve_perf rep 1 ----
+    model: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+    conc:  6   max_tokens: 512
+    ============================================================================
+    
+    1. SINGLE-STREAM (bs=1) — the latency-sensitive case
+       tokens=512  wall=5.45s
+       tok/s  median=94.0  min=82.7  max=94.1  spread=12.1%
+    
+    2. TTFT / TPOT (streaming; TTFT counts the first reasoning OR content delta)
+       TTFT median=22 ms   TPOT median=10.62 ms/token (94.2 tok/s decode-only)
+       [512 tokens arrived in 511 SSE chunks = 1.00 tok/chunk — chunk-counting would have reported 94.0 tok/s]
+    
+    3. THROUGHPUT SCALING (distinct prompts — no radix sharing)
+       bs=1    512 tok /   5.60s =    91.4 tok/s   (1.00x vs bs=1,    91.4 tok/s per stream)
+       bs=2   1024 tok /   9.29s =   110.2 tok/s   (1.20x vs bs=1,    55.1 tok/s per stream)
+       bs=6   3072 tok /  11.32s =   271.4 tok/s   (2.97x vs bs=1,    45.2 tok/s per stream)
+    
+    4. PREFILL vs PROMPT LENGTH (prefill tok/s = prompt_tokens / TTFT)
+           17 prompt tok -> TTFT      45 ms =      377 prefill tok/s
+         3375 prompt tok -> TTFT     828 ms =     4076 prefill tok/s
+        10533 prompt tok -> TTFT    1987 ms =     5300 prefill tok/s
+        21671 prompt tok -> TTFT    4489 ms =     4827 prefill tok/s
+    
+    5. DECODE vs CONTEXT DEPTH (same output budget, deeper context)
+       ctx~    37 tok ->  512 out in   5.47s =    93.6 tok/s
+       ctx~  6975 tok ->  512 out in   7.35s =    69.7 tok/s
+       ctx~ 17711 tok ->  512 out in   7.56s =    67.8 tok/s
+    
+    6. PREFIX CACHE (radix): same long prefix, different suffix
+       cold   14112 prompt tok    2.42s
+       warm  median   1.17s  -> +52% wall vs cold
+    
+    7. LATENCY PERCENTILES UNDER SUSTAINED LOAD
+       n=18  p50=4.16s  p90=4.28s  p99=4.28s  max=4.28s
+    
+    8. SPEC-DECODE EFFECTIVENESS (DELTA over a controlled workload)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+    
+    ============================================================================
+
+  ---- serve_perf rep 2 ----
+    model: cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+    conc:  6   max_tokens: 512
+    ============================================================================
+    
+    1. SINGLE-STREAM (bs=1) — the latency-sensitive case
+       tokens=512  wall=5.45s
+       tok/s  median=93.9  min=93.8  max=94.0  spread=0.2%
+    
+    2. TTFT / TPOT (streaming; TTFT counts the first reasoning OR content delta)
+       TTFT median=24 ms   TPOT median=10.62 ms/token (94.1 tok/s decode-only)
+       [512 tokens arrived in 511 SSE chunks = 1.00 tok/chunk — chunk-counting would have reported 94.0 tok/s]
+    
+    3. THROUGHPUT SCALING (distinct prompts — no radix sharing)
+       bs=1    512 tok /   5.46s =    93.8 tok/s   (1.00x vs bs=1,    93.8 tok/s per stream)
+       bs=2   1024 tok /   9.31s =   110.0 tok/s   (1.17x vs bs=1,    55.0 tok/s per stream)
+       bs=6   3072 tok /  11.23s =   273.6 tok/s   (2.92x vs bs=1,    45.6 tok/s per stream)
+    
+    4. PREFILL vs PROMPT LENGTH (prefill tok/s = prompt_tokens / TTFT)
+           17 prompt tok -> TTFT      19 ms =      877 prefill tok/s
+         3375 prompt tok -> TTFT      44 ms =    75855 prefill tok/s
+        10533 prompt tok -> TTFT      44 ms =   240759 prefill tok/s
+        21671 prompt tok -> TTFT      58 ms =   376642 prefill tok/s
+    
+    5. DECODE vs CONTEXT DEPTH (same output budget, deeper context)
+       ctx~    37 tok ->  512 out in   5.47s =    93.6 tok/s
+       ctx~  6975 tok ->  512 out in   6.81s =    75.2 tok/s
+       ctx~ 17711 tok ->  512 out in   6.81s =    75.2 tok/s
+    
+    6. PREFIX CACHE (radix): same long prefix, different suffix
+       cold   14112 prompt tok    1.16s
+       warm  median   1.17s  -> -0% wall vs cold
+    
+    7. LATENCY PERCENTILES UNDER SUSTAINED LOAD
+       n=18  p50=4.17s  p90=4.20s  p99=4.20s  max=4.20s
+    
+    8. SPEC-DECODE EFFECTIVENESS (DELTA over a controlled workload)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+       (no [spec] counters in the log — MINISGL_SPEC_DEBUG not enabled?)
+    
+    ============================================================================
+
+
+########## READ THIS AS ##########
+section 5 (decode tok/s vs context depth) is the GDN decode path — the kernel whose occupancy
+fell 12 -> 8. Section 4 (prefill tok/s) is attn_prefill_paged. Section 1/3 also carry GDN decode.
+If 4 and 5 are both flat, the static regression does not reach the serve.

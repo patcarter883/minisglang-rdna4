@@ -321,6 +321,7 @@ class DFlashDraftModel(BaseOP):
         rope_theta: float,
         max_position: int,
         *,
+        rope_scaling: "tuple | None" = None,
         draft_vocab_size: Optional[int] = None,
         own_embed: bool = False,
         decoder_layer_type: str = "qwen3",
@@ -382,12 +383,17 @@ class DFlashDraftModel(BaseOP):
             else None
         )
 
+        # rope_scaling was hardcoded None, so a drafter declaring a real scheme silently ran PLAIN
+        # rope. That is not a long-context-only concern: YaRN's frequency ramp reshapes inv_freq at
+        # EVERY position, so a YaRN-trained drafter fed default rope mis-encodes position from token
+        # one and drafts badly with nothing in the logs to say so. Measured on Qwen3.8-27B-DSpark
+        # (rope_type=yarn, factor=32, original_max_position_embeddings=8192).
         rotary = get_rope(
             head_dim=head_dim,
             rotary_dim=head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=None,
+            rope_scaling=rope_scaling,
         )
         self.layers = [
             _DFlashLayer(
@@ -421,6 +427,12 @@ class DFlashDraftModel(BaseOP):
         self._embed = None
         self._lm_head = None
 
+        # DSpark: optional low-rank bigram ("Markov") logit-bias head. None for plain DFlash; the
+        # proposer installs it at load when the checkpoint ships `markov_head.*` — detected from
+        # TENSORS, like every other variant decision on this path.
+        self._markov_w1 = None  # [vocab, rank]  latent for the PREVIOUS token
+        self._markov_w2 = None  # [vocab, rank]  Linear(rank -> vocab).weight, projects back
+
     # ---- binding to the target (tied-vocab variant) ----
     def bind_embed(self, embed) -> None:
         self._embed = embed
@@ -431,6 +443,40 @@ class DFlashDraftModel(BaseOP):
     def set_own_embed(self, embed_weight: torch.Tensor) -> None:
         self._own_embed = _PlainLinear(0, 0)
         self._own_embed.weight = embed_weight  # [target_vocab, hidden]
+
+    # ---- DSpark Markov (bigram) head ----
+    def set_markov(self, w1: torch.Tensor, w2: torch.Tensor) -> None:
+        self._markov_w1, self._markov_w2 = w1, w2
+
+    @property
+    def has_markov(self) -> bool:
+        return self._markov_w1 is not None
+
+    def markov_bias(self, prev_ids: torch.Tensor) -> torch.Tensor:
+        """Logit bias for the token FOLLOWING `prev_ids`: w2 @ w1[prev] -> [*, vocab].
+
+        Rank-256 factorization, so it is two skinny matmuls rather than a [vocab, vocab] bigram
+        table (which at this vocab would be 61 G params)."""
+        return F.linear(F.embedding(prev_ids, self._markov_w1), self._markov_w2)
+
+    def markov_block_argmax(
+        self, block_logits: torch.Tensor, prev: torch.Tensor
+    ) -> torch.Tensor:
+        """Semi-autoregressive block decode: bias each position by the token chosen at the previous
+        one, then argmax. `block_logits` is [..., k, vocab]; `prev` is the anchor id, shaped [...].
+
+        WHY: DFlash scores every block position in ONE forward, so given the block hidden states its
+        positions are conditionally INDEPENDENT — which is precisely why its acceptance decays toward
+        the back of a block ("suffix decay"). Restoring one-step dependency is the whole DSpark idea.
+        The loop is a FIXED trip count over k with static shapes and `prev` never leaves the device,
+        so it adds no host sync and stays capture-safe."""
+        k = block_logits.shape[-2]
+        ids = []
+        for j in range(k):
+            tok = (block_logits[..., j, :] + self.markov_bias(prev)).argmax(dim=-1)
+            ids.append(tok)
+            prev = tok
+        return torch.stack(ids, dim=-1) if ids else prev.new_empty(prev.shape + (0,))
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         if self._own_embed is not None:

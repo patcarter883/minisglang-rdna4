@@ -31,7 +31,12 @@ import csv
 import math
 from collections import defaultdict
 
-ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off")
+import _w4a8_tile_policy as _policy
+
+# "auto" is the CHOOSER'S OWN PICK (--auto), not a tile: it has no "BMxBN" to parse and it is
+# not an arm either. Treat it as a non-tile candidate everywhere, or `parse_tile` raises on it
+# and the whole analysis refuses to run against any surface swept with --auto.
+ARMS = ("prefill_wmma", "prefill_wmma_ashuffle", "prefill_wmma:smallm_off", "auto")
 LDS_MAX = 65536
 SHIPPED = {
     (64, 64), (64, 128), (80, 128), (96, 128), (112, 128), (128, 64),
@@ -45,7 +50,8 @@ def parse_tile(c):
 
 
 def legal(bm, bn, g):
-    return (bm + bn) * (g + 8) <= LDS_MAX
+    """LDS fit, from the shared policy — see _w4a8_tile_policy on why the inline formula is wrong."""
+    return _policy.tile_lds(bm, bn, g) <= _policy.LDS_BUDGET
 
 
 def ceildiv(a, b):
