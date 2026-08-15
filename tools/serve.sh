@@ -115,7 +115,18 @@ case "$MODEL" in
                   # to ~2.56 GB. Lossless in the sense that matters: the target verifies every draft
                   # token, so weight-only quant can cost ACCEPTANCE, never correctness.
                   if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
-                    mem_default_spec="0.93"
+                    # 0.96, NOT the 0.93 this line used to carry. 0.93 was Laguna's validated spec
+                    # ratio, copied across with the 0.85 above it; it was never measured on Muse and
+                    # it does not boot. This target is far heavier: the load delta is 12.58 GiB/card
+                    # (measured 2026-08-13, TP=2), and the four reserves below it — 0.02 snapshot +
+                    # 0.12 SWA ring (4 slots) + 1.77 drafter + 0.07 graphs = 1.98 GiB — are ALL
+                    # subtracted from `memory_ratio * free`, so 0.93 leaves 14.56 - 12.58 - 1.98 =
+                    # 0.00 GiB and dies in engine.py's `num_pages > 1` assert. It misses by single
+                    # -digit MiB, which is why it reads as a plausible number that simply crashes.
+                    # 0.96 leaves 0.47 GiB = 151,200 KV tokens, and boots: graph capture at
+                    # avail_mem 3.06 GiB, verify graphs at free 1.78 GiB, VRAM 90%/89%, generation
+                    # verified. Do not lower this without re-measuring the load delta.
+                    mem_default_spec="0.96"
                     # nvfp4, NOT fp8. Measured: fp8 reserves 3.08 GiB and the KV pool cannot be
                     # sized at all (num_pages assert), even at CONC=2 / ratio 0.95 — so fp8 is not a
                     # viable step here, it simply does not boot. 4-bit weights + an fp16 per-16 group
@@ -152,13 +163,28 @@ case "$MODEL" in
   # (spec/dflash.py: that is a checkpoint property, not a switch). Its config states no block_size,
   # so block = SPEC_K + 1 and k_dflash=15 gives the block of 16 the other DFlash pairs use.
   #
-  # NO quant default, deliberately, unlike muse/qwen35b. The drafter is ~1.73B (5L, hidden 5120,
-  # inter 17408) = ~3.5 GB bf16, which SHARDS to ~1.9 GiB/card (models/draft_linear.py) against a
-  # 27B INT4 target costing ~6.8 GiB/card at TP=2. That fits with room, so this pair does not need
-  # to trade acceptance for footprint — set MINISGL_DFLASH_QUANT explicitly to measure the arms.
+  # This arm carried NO spec defaults, on the claim that the 27B INT4 target costs "~6.8 GiB/card at
+  # TP=2" and so a bf16 drafter "fits with room". That arithmetic was wrong: the checkpoint is
+  # 19.1 GiB of safetensors, i.e. >=9.5 GiB/card BEFORE the replicated embed/lm_head and the vision
+  # tower — so `MODEL=qwen27b SPEC=dflash` at the global 0.80 default dies in engine.py's
+  # `num_pages > 1` assert, having reserved 0.17 (GDN state) + 1.67 (drafter) + 0.04 (graphs) +
+  # 0.04 (snapshot store) GiB with nothing left to page. The pair HAS a validated operating point —
+  # docs/measurements/DFLASH_GDN_RINGGATE_RETAKE.md §3 measured it at fp8 + CONC=2 + MEM_RATIO=0.90
+  # — but that lived only in the doc, so every launch that did not retype the magic numbers failed.
+  # Encode them here, like qwen35b-awq (0.86) and laguna (0.93) already do.
   qwen27b|cyankiwi/Qwen3.6-27B-AWQ-INT4)
                   model_id="cyankiwi/Qwen3.6-27B-AWQ-INT4";            spec_default="none"
-                  dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
+                  dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15
+                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                    mem_default_spec="0.90"
+                    # fp8 is not optional here either: it halves the 3.07 GiB bf16 drafter to a
+                    # 1.67 GiB reserve. Bf16 would add ~0.9 GiB, which is more than 0.90 leaves.
+                    : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
+                    # A CAP, not a default (CONC is already assigned above the case block). 2 is the
+                    # only concurrency this pair was measured booting at; GRAPH_BS follows CONC, so
+                    # capping admission keeps capture coverage equal to what is admitted.
+                    if [ "$CONC" -gt 2 ]; then CONC=2; fi
+                  fi ;;
   qwen27b-nvfp4|cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4)
                   model_id="cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4";      spec_default="none"
                   dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
@@ -201,6 +227,22 @@ case "$MODEL" in
   # ACCURACY CAVEAT: 4-bit GDN input projections are exactly what unsloth declined to do, and the
   # int4-GDN Qwen3.6-AWQ is the one that degenerated in the quality probe. Treat as UNPROVEN until
   # A/B'd against qwen38-27b on the same prompts.
+  # Qwen3.8-27B quantized INT4 (compressed-tensors pack-quantized, group-32, asymmetric) by the same
+  # publisher as the 3.6-27B INT4. Same backbone; lm_head ships bf16 so nothing is dequantized.
+  # Its ignore list carries the `...linear_attn` CONTAINER while shipping in_proj_qkv quantized, so
+  # it depends on the structural quant oracle (QuantConfig.ckpt_quantized) — under the old substring
+  # matching it died in the GDN concat with KeyError in_proj_qkvz.weight.
+  qwen38-27b-int4|cyankiwi/Qwen3.8-27B-AWQ-INT4)
+                  model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4";            spec_default="mtp"; k_mtp=4
+                  # MEASURED TP=2 2026-08-15: resident 9.47 GiB/card, the LIGHTEST of the three
+                  # Qwen3.8 builds. 0.92, NOT the 0.97 the other two carry: because this model is so
+                  # light the pool grows to fill whatever the ratio allows, and at 0.97 it took
+                  # 341,936 tokens and left 42 MiB — graph capture then OOM'd. The `graph` reserve
+                  # (0.03 GiB) badly under-counts what capture actually needs, so a LIGHTER model
+                  # needs a LOWER ratio, not a higher one. 0.92 => 290,576 tokens, captured with
+                  # 0.71 GiB spare. Validated: 20/20 sampled probe, 0 degeneration, 5.4k prefill,
+                  # MTP 0.550 accept / 3.29 tok-step (the best per-step of the three).
+                  mem_default="0.92"; alloc_conf="expandable_segments:True"; min_tp=2 ;;
   qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
                   model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="mtp"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
