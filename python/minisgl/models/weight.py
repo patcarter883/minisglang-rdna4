@@ -517,6 +517,25 @@ def _load_qwen3_5_weight(
         else:
             yield native_key, tensor
 
+    # NVFP4 bases and the fp8 lm_head flag are resolved across ALL shard files BEFORE streaming.
+    # They used to be recomputed per file, which silently required a proj's weight_scale and
+    # weight_global_scale to be CO-LOCATED in one shard: in the shard holding only weight_scale the
+    # base was absent from the per-file set, so that tensor fell through to the generic remap and
+    # was dropped while its partner waited in the fold buffer forever — every quantized proj
+    # "incomplete" at the end of the load. The layout is repack luck, not a convention:
+    # sakamakismile/Qwen3.8-27B-MTP-NVFP4 co-locates all 496 pairs (which is how the per-file set
+    # passed validation), cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4 splits all 256 across its 6 shards
+    # (which is how it failed to boot). Metadata-only pass — safe_open reads headers, no tensors.
+    nvfp4_bases: set = set()
+    _fp8_lm_head = False
+    for file in files:
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k.endswith(".weight_global_scale"):
+                    nvfp4_bases.add(k.rsplit(".", 1)[0])
+                elif k == "lm_head.weight_scale":
+                    _fp8_lm_head = True
+
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         # Read on the HOST and move only the RANK-LOCAL shard to the GPU. Reading straight to device
         # materialised every FULL tensor in VRAM, sliced this rank's shard out of it and freed the
@@ -526,8 +545,6 @@ def _load_qwen3_5_weight(
         # and the KV pool sized NEGATIVE. Slicing host-side keeps GPU peak == GPU resident.
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
             keys = list(f.keys())
-            nvfp4_bases = {k.rsplit(".", 1)[0] for k in keys if k.endswith(".weight_global_scale")}
-            _fp8_lm_head = "lm_head.weight_scale" in keys
             for name in keys:
                 # NVFP4: fold the e4m3 block scale / per-tensor global into ONE fp16 per-group scale at
                 # the LEAF — before remap / GDN in_proj concat / gate-up merge / expert stack. That makes
