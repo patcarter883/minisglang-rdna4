@@ -496,7 +496,8 @@ class Engine:
         except Exception:
             pass
         self.sampler = Sampler(self.device, config.model_config.vocab_size,
-                               real_vocab_size=_real_vocab)
+                               real_vocab_size=_real_vocab,
+                               logit_softcap=getattr(config.model_config, "final_logit_softcapping", None))
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")

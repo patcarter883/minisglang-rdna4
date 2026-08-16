@@ -80,6 +80,7 @@ class GenerateRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    min_p: float | None = None
     # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
     # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
     cam_write: bool | None = None
@@ -172,6 +173,9 @@ class OpenAICompletionRequest(BaseModel):
     # not an obviously broken reply.
     top_k: int | None = None
     top_p: float | None = None
+    # min-p relative probability floor (vLLM-compatible extension; not OpenAI wire spec). Unset
+    # inherits the checkpoint's generation_config `min_p` when present, else 0.0 (off).
+    min_p: float | None = None
     n: int = 1
     stream: bool = False
     # OpenAI stream_options, e.g. {"include_usage": true}. When include_usage is set, a spec-compliant
@@ -961,7 +965,8 @@ def _resolve_sampling(req: "OpenAICompletionRequest | GenerateRequest", model_pa
     temperature = req.temperature if req.temperature is not None else float(gen.get("temperature", 1.0))
     top_p = req.top_p if req.top_p is not None else float(gen.get("top_p", 1.0))
     top_k = req.top_k if req.top_k is not None else int(gen.get("top_k", -1) or -1)
-    return temperature, top_p, top_k
+    min_p = req.min_p if getattr(req, "min_p", None) is not None else float(gen.get("min_p", 0.0) or 0.0)
+    return temperature, top_p, top_k, min_p
 
 
 def _resolve_penalties(req: "OpenAICompletionRequest | GenerateRequest") -> tuple:
@@ -2805,7 +2810,7 @@ async def generate(req: GenerateRequest, request: Request):
                 seed=req.seed,
                 # unset -> the checkpoint's generation_config default (same resolution the OpenAI
                 # endpoints use), NOT the greedy SamplingParams default.
-                **dict(zip(("temperature", "top_p", "top_k"),
+                **dict(zip(("temperature", "top_p", "top_k", "min_p"),
                            _resolve_sampling(req, state.config.model_path))),
             ),
         )
@@ -2999,7 +3004,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 seed=req.seed,
-                **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
+                **dict(zip(("temperature", "top_p", "top_k", "min_p"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 stop_keep=_tool_stop_keep(req),
                 grammar=_pl_rf_grammar or _pl_forced_tool_grammar or _pl_auto_tool_grammar,
@@ -3225,7 +3230,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 seed=req.seed,
-                **dict(zip(("temperature", "top_p", "top_k"),
+                **dict(zip(("temperature", "top_p", "top_k", "min_p"),
                            _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
@@ -3340,7 +3345,7 @@ async def shell_completion(req: OpenAICompletionRequest):
                 ignore_eos=req.ignore_eos,
                 **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
-                **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
+                **dict(zip(("temperature", "top_p", "top_k", "min_p"), _resolve_sampling(req, state.config.model_path))),
             ),
         )
     )

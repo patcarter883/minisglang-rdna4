@@ -19,6 +19,9 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    # min-p relative probability floor [bs] fp32, or None when no row asked (the overwhelmingly
+    # common case — None keeps the fused HIP sampler eligible).
+    min_p: torch.Tensor | None = None
     # Structured output: packed xgrammar token bitmask [bs, ceil(vocab/32)] (constrained rows carry
     # the grammar's allowed set; unconstrained rows are all-ones). Applied to logits before sampling.
     grammar_bitmask: torch.Tensor | None = None
@@ -63,6 +66,7 @@ def sample_impl(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Fused native HIP sampler (temperature+softmax+top-k+top-p+multinomial in one kernel, no sort)
     # when available; otherwise the torch reference below. Only tensor top_k/top_p route to the op
@@ -73,10 +77,18 @@ def sample_impl(
         and logits.dtype == torch.float32
         and not isinstance(top_k, int)
         and not isinstance(top_p, float)
+        and min_p is None
     ):
         return _sampler_hip.sample(logits, temperatures, top_k, top_p)
     # torch port of the former flashinfer.sampling path (greedy goes through argmax in Sampler).
     probs = torch.softmax(logits / temperatures.unsqueeze(-1).clamp_min(1e-6), dim=-1)
+    if min_p is not None:
+        # min-p: drop tokens below min_p * max_prob for the row — a RELATIVE floor that adapts to
+        # how peaked the distribution is (a guard top_p cannot express). Before top-k/top-p,
+        # matching vLLM's processor order. Any row asking for it routes the batch here (the fused
+        # HIP kernel has no min_p in its contract) — correctness over the fused win.
+        floor = probs.max(dim=-1, keepdim=True).values * min_p.unsqueeze(-1)
+        probs = probs.masked_fill(probs < floor, 0.0)
     if top_k is not None:
         probs = _apply_top_k(probs, top_k)
     if top_p is not None:
@@ -97,6 +109,10 @@ class Sampler:
     # logits_processor.py:103; SGLang slices to vocab_size, logits_processor.py:865). None/equal ->
     # no mask (a tokenizer that could not be loaded must not silently disable sampling).
     real_vocab_size: int | None = None
+    # Gemma2-style final-logit soft cap (config `final_logit_softcapping`): logits are squashed to
+    # (-cap, cap) via cap*tanh(l/cap) before any masking/sampling — an outlier-logit clamp both
+    # reference engines apply at the head. None (every current checkpoint) = no-op.
+    logit_softcap: float | None = None
     # uid -> [vocab] float32 count of tokens that request has generated. Created lazily for penalised
     # requests only (~1 MB each at a 248k vocab) and updated incrementally by one index_add per step,
     # so the cost does not grow with output length. Released by `free_penalty_state` on finish.
@@ -172,7 +188,11 @@ class Sampler:
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, **pen)
+        min_p = None
+        min_ps = [max(getattr(p, "min_p", 0.0) or 0.0, 0.0) for p in params]
+        if any(mp > 0.0 for mp in min_ps):
+            min_p = make_device_tensor(min_ps, torch.float32, self.device)
+        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, min_p=min_p, **pen)
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
@@ -186,6 +206,8 @@ class Sampler:
             # In-place is safe even on a captured graph's output buffer: replay overwrites it fully.
             if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
                 torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+            if self.logit_softcap:
+                logits = torch.tanh(logits.float() / self.logit_softcap) * self.logit_softcap
             # Padded-vocab fence: the untrained tail can never be sampled (see real_vocab_size).
             if self.real_vocab_size is not None and self.real_vocab_size < logits.shape[-1]:
                 logits[:, self.real_vocab_size:] = float("-inf")
@@ -216,4 +238,5 @@ class Sampler:
                 # entire point of asking for them at temperature 0.
                 return self._commit_penalty(torch.argmax(logits, dim=-1), args)
             return self._commit_penalty(
-                sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p), args)
+                sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p,
+                            args.min_p), args)

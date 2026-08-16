@@ -20,6 +20,10 @@ class SamplingParams:
     temperature: float = 0.0
     top_k: int = -1
     top_p: float = 1.0
+    # min-p relative probability floor (arXiv:2407.01082): tokens below min_p * max_prob are
+    # dropped, BEFORE top-k/top-p. 0.0 (default) skips the path and keeps the fused HIP sampler
+    # eligible; any positive value routes the batch through the torch reference sampler.
+    min_p: float = 0.0
     ignore_eos: bool = False
     max_tokens: int = 1024
     # Stop strings: generation finishes (and the output is truncated) at the first occurrence of any

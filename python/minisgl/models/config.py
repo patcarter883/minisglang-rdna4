@@ -124,6 +124,8 @@ class ModelConfig:
     # HF default). An unknown value raises in from_hf: better a loud load failure than 48 layers of
     # grammatical-but-degenerate output through the wrong gate. Was hardcoded SiLU end to end.
     gdn_output_gate: str = "silu"
+    # Gemma2-style final-logit soft cap; None for models that don't declare it.
+    final_logit_softcapping: float | None = None
     # ---- Sliding-window attention (SWA) hybrid (Laguna: repeating [full, sliding×3]). None for a
     # non-SWA model. `layer_types[i]` is "sliding_attention" (windowed) or "full_attention" (global);
     # a SWA layer keeps paged KV but capped at `sliding_window` tokens (its own ring pool), NOT full
@@ -782,6 +784,7 @@ class ModelConfig:
             canvas_length=getattr(top, "canvas_length", None) or None,
             linear_num_key_heads=linear_num_key_heads,
             gdn_output_gate=_norm_output_gate(getattr(config, "output_gate_type", None)),
+            final_logit_softcapping=getattr(config, "final_logit_softcapping", None) or None,
             linear_num_value_heads=getattr(config, "linear_num_value_heads", None),
             linear_key_head_dim=getattr(config, "linear_key_head_dim", None),
             linear_value_head_dim=getattr(config, "linear_value_head_dim", None),
@@ -806,7 +809,6 @@ class ModelConfig:
                 else (_muse_qk_scale * head_dim**-0.5 if _muse_qk_scale is not None else None)
             ),
             attention_k_eq_v=attention_k_eq_v,
-            final_logit_softcapping=getattr(config, "final_logit_softcapping", None),
             embed_scale=(config.hidden_size**0.5) if _is_gemma4 else None,
             output_multiplier=getattr(config, "output_multiplier", None) if _is_muse else None,
             post_norm_eps=getattr(config, "post_norm_eps", None) if _is_muse else None,
