@@ -1977,13 +1977,20 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             if p_ids and s_ids:
                 releases.append((p_ids, s_ids, _THINK_RECIPIENT_MAX_TOKENS))
         budget = getattr(sp, "think_budget", None)
-        # A grammar-constrained request may NOT go unbounded. The schema engages only once this gate
-        # RELEASES (see the matcher advance in the decode loop) — so with no backstop, a model that
-        # never closes its reasoning span is never constrained at all and the JSON silently stops
-        # being enforced. Unbounded is a free-form choice; here the backstop is a correctness
-        # mechanism, so fall back to the server default. `sp.grammar` is the DECLARATION, available
-        # at arm time — the matcher itself is created lazily and would not exist yet.
-        if isinstance(budget, int) and budget < 0 and getattr(sp, "grammar", None):
+        # A request whose grammar is REQUIRED may not go unbounded. The schema engages only once this
+        # gate RELEASES (see the matcher advance in the decode loop) — so with no backstop, a model
+        # that never closes its reasoning span is never constrained at all and the JSON silently
+        # stops being enforced. There the backstop is a correctness mechanism, so fall back to the
+        # server default.
+        #
+        # `grammar_required`, NOT merely `grammar`: gating on the latter also caught the permissive
+        # structural tag that gets attached whenever tools are OFFERED with `tool_choice: auto`,
+        # which is every turn a typical agent client sends. That silently re-capped the unbounded
+        # path at the default budget and reproduced the exact mid-word `</think>` splice it was
+        # meant to fix. An auto tag constrains a tool call IF one is emitted and requires nothing, so
+        # it has no guarantee to protect.
+        if isinstance(budget, int) and budget < 0 \
+                and getattr(sp, "grammar", None) and getattr(sp, "grammar_required", False):
             budget = None
         self._think_gate.arm(
             uid,

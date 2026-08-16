@@ -2705,6 +2705,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 stop=_norm_stop(req.stop),
                 stop_keep=_tool_stop_keep(req),
                 grammar=_pl_rf_grammar or _pl_forced_tool_grammar or _pl_auto_tool_grammar,
+                # The auto structural tag is NOT a requirement — see SamplingParams.grammar_required.
+                grammar_required=bool(_pl_rf_grammar or _pl_forced_tool_grammar),
                 # UNCONDITIONAL close delim (was grammar-only): β-bounds reasoning on the PLAIN lane
                 # too, so a thinking request without response_format can't run reasoning to max_tokens
                 # and truncate with no answer. For grammar requests this is the same delim (it also
@@ -2928,6 +2930,8 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                            _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 grammar=_grammar_from_response_format(req.response_format),
+                # response_format only on this lane: if there is a grammar, the caller required it.
+                grammar_required=bool(_grammar_from_response_format(req.response_format)),
                 think_close_delim=_think_delim,
                 think_answer_delim=_reasoning_answer_delim(req) if _think_delim else None,
                 think_close_prefix=(_reasoning_close_wildcard(req)[0] if _think_delim else None),

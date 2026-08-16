@@ -39,6 +39,18 @@ class SamplingParams:
     # A constrained request is masked per-token by a grammar matcher (drafts propose unconstrained and
     # the grammar is enforced at the spec verify argmax).
     grammar: str | None = None
+    # Is `grammar` a caller REQUIREMENT, or was it attached automatically?
+    #
+    # Required: `response_format` (the caller demands valid JSON) or a FORCED tool choice (it demands
+    # a call). Automatic: the permissive structural tag attached whenever tools are merely OFFERED
+    # with `tool_choice: auto` — it shapes a call IF one is emitted and requires nothing.
+    #
+    # The distinction exists because the schema only engages once the think gate RELEASES, so a
+    # request that asked for an UNBOUNDED reasoning budget keeps the β backstop when its grammar is
+    # required (else the constraint might never apply) and stays unbounded when it is automatic.
+    # Treating the two alike re-capped every tool-bearing turn at the default budget — i.e. every
+    # turn a typical agent client sends, so the unbounded path was dead on arrival.
+    grammar_required: bool = False
     # Reasoning + structured output: when a grammar is combined with an active thinking phase, the
     # model opens `<think>…</think>` reasoning BEFORE the answer, and masking JSON from token 0 would
     # suppress that reasoning (truncated / CoT-leaked output). This carries the reasoning parser's
