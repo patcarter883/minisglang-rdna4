@@ -112,6 +112,10 @@ x-lean-common: &lean-common
     # launch silently did nothing (the five-hops trap): the A/B would have run the kernel on both
     # arms and reported the kernel clean. Empty forward is safe for this parse ("" != "0" -> ON).
     MINISGL_FUSED_SAMPLER: "${MINISGL_FUSED_SAMPLER:-}"
+    # Native HIP attention within the rdna4 backend (attention/rdna4.py). Default ON; 0 falls back
+    # to the pure-Triton unified_attention — the attention-numerics A/B arm (only read when
+    # ATTN=rdna4). Same five-hops trap as above: read by the engine, previously never forwarded.
+    MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
     MINISGL_KV_FP8_SCALES: "${MINISGL_KV_FP8_SCALES:-}"
