@@ -24,6 +24,15 @@ class ServerArgs(SchedulerConfig):
     # `<|channel>thought` … `<channel|>`) works with no code change; a named family FORCES that pair;
     # "none" disables extraction. See server/reasoning.py for the cascade.
     reasoning_parser: str = "auto"
+    # Chat-template OVERRIDE: a path to a .jinja file, or a literal jinja string. Replaces the
+    # checkpoint's baked-in template for the SERVED model everywhere it renders (frontend probes,
+    # tokenizer workers) — the escape hatch for a checkpoint that ships a broken or thinking-less
+    # template. Both reference engines have this (--chat-template); we did not.
+    chat_template: str | None = None
+    # Server-level DEFAULT chat_template_kwargs, as a JSON object string. Merged UNDER each
+    # request's own chat_template_kwargs (the request wins). NOT applied to the reasoning-delimiter
+    # derivation probes, which need the template's own defaults to diff against.
+    chat_template_kwargs: str | None = None
     # Server-side DEFAULT Markovian-RSA parameters (set by the --rsa-* flags). A per-request `rsa`
     # field on /v1/chat/completions patches these; RSA runs ONLY when a request opts in (rsa present
     # and enabled), so a normal call is an ordinary single completion. See
@@ -273,6 +282,23 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        dest="chat_template",
+        default=ServerArgs.chat_template,
+        help="Override the served checkpoint's chat template: a path to a .jinja file or a literal "
+        "jinja string. Applies to every render of the SERVED model (frontend + tokenizer workers); "
+        "other tokenizers (drafters, calibrators) are untouched.",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=str,
+        dest="chat_template_kwargs",
+        default=ServerArgs.chat_template_kwargs,
+        help="Server-level default chat_template_kwargs as a JSON object (e.g. "
+        "'{\"enable_thinking\": false}'). Merged under each request's own kwargs; the request wins.",
+    )
     parser.add_argument(
         "--reasoning-parser",
         type=str,

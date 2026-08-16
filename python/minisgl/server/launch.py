@@ -49,6 +49,16 @@ def launch_server(run_shell: bool = False) -> None:
     server_args, run_shell = parse_args(sys.argv[1:], run_shell)
     logger = init_logger(__name__, "initializer")
 
+    # --chat-template propagates by ENV so every process that loads the SERVED tokenizer (frontend,
+    # tokenizer workers — all inherit this env) applies the same override, scoped to the served
+    # model_path so other tokenizers (drafters, calibrators) are untouched. See
+    # utils/hf._chat_template_override.
+    if getattr(server_args, "chat_template", None):
+        os.environ["MINISGL_CHAT_TEMPLATE"] = server_args.chat_template
+        os.environ["MINISGL_CHAT_TEMPLATE_MODEL"] = server_args.model_path
+        logger.info("chat template OVERRIDDEN via --chat-template (%s)",
+                    "file" if os.path.isfile(server_args.chat_template) else "inline string")
+
     # Worker processes are watched by a crash-watchdog (see below). If any dies unexpectedly (OOM,
     # segfault, CUDA error) the parent frontend would otherwise survive as a zombie and HOLD THE GPU
     # LEASE until the caller's timeout — a wedged bench then blocks the whole lease queue for ~40 min.

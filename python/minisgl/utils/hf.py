@@ -42,6 +42,20 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def _chat_template_override(model_path: str) -> "str | None":
+    """The --chat-template override for the SERVED model, propagated by env so every process that
+    loads the served tokenizer (frontend, tokenizer workers — both inherit the launch env) applies
+    the same template, while other tokenizers loaded in the same processes (drafters, calibrators)
+    are untouched. A path is read here; anything else is treated as a literal jinja string."""
+    spec = os.environ.get("MINISGL_CHAT_TEMPLATE")
+    if not spec or os.environ.get("MINISGL_CHAT_TEMPLATE_MODEL") != model_path:
+        return None
+    if os.path.isfile(spec):
+        with open(spec, "r", encoding="utf-8") as f:
+            return f.read()
+    return spec
+
+
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -58,6 +72,10 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     # then raw Jinja), local dir or hub.
     if not getattr(tokenizer, "chat_template", None):
         tokenizer.chat_template = _load_side_chat_template(model_path)
+    # Operator override LAST (it must beat both the baked template and any side file).
+    override = _chat_template_override(model_path)
+    if override is not None:
+        tokenizer.chat_template = override
     return tokenizer
 
 

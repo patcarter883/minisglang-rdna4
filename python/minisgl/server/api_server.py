@@ -1132,12 +1132,31 @@ def _reject_unsupported_text_completion(req: "OpenAICompletionRequest") -> JSONR
     return None
 
 
+@functools.cache
+def _server_default_template_kwargs() -> dict:
+    """--chat-template-kwargs parsed once. {} when unset; raises at first use when malformed (a
+    typo'd launch default silently vanishing is exactly the five-hops class of bug)."""
+    raw = getattr(get_global_state().config, "chat_template_kwargs", None)
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"--chat-template-kwargs must be a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
 def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest",
                                   model_path: str | None = None) -> dict | None:
     """Merge the request's `chat_template_kwargs` with the `enable_thinking` convenience alias into
     the kwargs forwarded to `apply_chat_template`. None -> template defaults (thinking ON for Qwen3 /
     Poolside, whose reasoning format is now parsed — see _reasoning_parser + _REASONING_DELIMITERS)."""
     kwargs = dict(req.chat_template_kwargs or {})
+    # Server-level defaults (--chat-template-kwargs) merge UNDER everything request-side: the
+    # request's own kwargs, its enable_thinking alias, and the effort-ladder aliasing below all
+    # win over a launch default. Parsed once; a malformed JSON default is a LOUD boot-time
+    # misconfiguration, not a silent no-op.
+    for k, v in _server_default_template_kwargs().items():
+        kwargs.setdefault(k, v)
     if req.enable_thinking is not None and "enable_thinking" not in kwargs:
         kwargs["enable_thinking"] = req.enable_thinking
     # The reasoning ladder maps to the template kwarg in BOTH directions. OFF first, so an explicit
