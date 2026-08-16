@@ -1978,6 +1978,99 @@ def _opener_partial_len(text: str) -> int:
     return best
 
 
+class _JsonArgStreamer:
+    """Incremental argument streaming for the HERMES-JSON tool form
+    (``<tool_call>{"name": "X", "arguments": {...}}</tool_call>``) — the form the Qwen3-family
+    templates emit natively. The reference engines stream argument DIFFS as they arrive (vLLM
+    hermes_tool_parser via partial_json_parser; SGLang base_format_detector); the whole-block
+    design here withheld multi-KB arguments until the closer, leaving the wire dead for the entire
+    call (the trapped-block behaviour observed live: only a 10s SSE keepalive for minutes).
+
+    This streams the RAW bytes of the ``"arguments"`` value as they arrive, exactly as emitted by
+    the model — OpenAI streaming semantics require only that the client's concatenation of
+    ``function.arguments`` fragments equals the final JSON string, which the model's own bytes
+    satisfy by construction. A string-aware scanner (in_string/escape/brace-depth) finds the value's
+    END; everything after it (the wrapper's closing ``}`` + ``</tool_call>``) is withheld.
+
+    Engages ONLY on the clean common shape — ``{"name": "..."`` seen before ``"arguments"``, value
+    an object/array — and signals fallback (``dead=True``) on anything else, returning the block to
+    the existing whole-block path. MINISGL_TOOL_ARG_STREAM=0 disables it entirely."""
+
+    _NAME_RE = re.compile(r'"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    _ARGS_KEY_RE = re.compile(r'"arguments"\s*:\s*')
+
+    def __init__(self) -> None:
+        self.dead = False          # fall back to whole-block handling
+        self.name: str | None = None
+        self.name_sent = False
+        self.args_open = False     # inside the arguments value
+        self.args_done = False
+        self.streamed = 0          # chars of the value already emitted
+        self._depth = 0
+        self._in_str = False
+        self._esc = False
+        self._vstart = -1          # index (in the block body) where the value starts
+
+    def scan(self, body: str) -> Tuple[str | None, str | None]:
+        """Given the FULL accumulated block body (opener stripped), return
+        ``(name_if_newly_found, new_args_fragment)``. Idempotent per growth of ``body``."""
+        if self.dead or self.args_done:
+            return None, None
+        if self.name is None:
+            m = self._NAME_RE.search(body)
+            if m is None:
+                # A body that already contains "arguments" before any name is not the clean shape.
+                if self._ARGS_KEY_RE.search(body):
+                    self.dead = True
+                return None, None
+            self.name = m.group(1)
+        new_name = None
+        if self._vstart < 0:
+            m = self._ARGS_KEY_RE.search(body)
+            if m is None:
+                return None, None
+            if m.end() >= len(body):
+                return None, None      # value char not arrived yet — cannot confirm streamability
+            if body[m.end()] not in "{[":
+                self.dead = True       # scalar/string arguments: rare; whole-block path handles it
+                return None, None
+            self._vstart = m.end()
+            # Value confirmed an object/array: NOW the name is safe to surface (no fallback can
+            # re-emit this call once fragments start flowing).
+            if not self.name_sent:
+                self.name_sent = True
+                new_name = self.name
+        # advance the scanner over the unseen part of the value
+        i = self._vstart + self.streamed
+        end = -1
+        while i < len(body):
+            ch = body[i]
+            if self._in_str:
+                if self._esc:
+                    self._esc = False
+                elif ch == "\\":
+                    self._esc = True
+                elif ch == '"':
+                    self._in_str = False
+            else:
+                if ch == '"':
+                    self._in_str = True
+                elif ch in "{[":
+                    self._depth += 1
+                elif ch in "}]":
+                    self._depth -= 1
+                    if self._depth == 0:
+                        end = i + 1
+                        i += 1
+                        break
+            i += 1
+        frag = body[self._vstart + self.streamed : (end if end != -1 else i)]
+        self.streamed += len(frag)
+        if end != -1:
+            self.args_done = True
+        return new_name, (frag or None)
+
+
 class ToolCallStreamState:
     """Incremental tool-call splitter for the streaming path — the tool-call analogue of
     ``ReasoningStreamState``. Feed each *content* chunk (post reasoning-split); get back
@@ -2005,6 +2098,9 @@ class ToolCallStreamState:
         self.unparsed_tail = False
         # One-shot latch for the oversize-block warning (see `held_chars`).
         self._warned_oversize = False
+        # Incremental JSON-argument streaming for the current block (None = whole-block mode).
+        self._jstream: _JsonArgStreamer | None = None
+        self._jstream_index: int | None = None
 
     @property
     def held_chars(self) -> int:
@@ -2049,6 +2145,26 @@ class ToolCallStreamState:
             return _parse_one_tool_call(buf)
         return _parse_one_tool_call(buf[len(self.opener):])
 
+    def _jstream_advance(self) -> List[dict]:
+        """Feed the accumulated block body to the JSON-arg streamer; emit name/argument deltas for
+        whatever newly cleared the scanner. No-op in whole-block mode or after fallback."""
+        js = self._jstream
+        if js is None or js.dead:
+            return []
+        body = self.buf[len(self.opener or ""):]
+        name, frag = js.scan(body)
+        out: List[dict] = []
+        if name is not None:
+            i = self.next_index
+            self.next_index += 1
+            self._jstream_index = i
+            self.emitted = True
+            out.append({"index": i, "id": f"call_{self.uid}_{i}", "type": "function",
+                        "function": {"name": name, "arguments": ""}})
+        if frag is not None and self._jstream_index is not None:
+            out.append({"index": self._jstream_index, "function": {"arguments": frag}})
+        return out
+
     def _emit_parsed(self, name: str, args) -> List[dict]:
         args_str = args if isinstance(args, str) else json.dumps(args)
         i = self.next_index
@@ -2086,16 +2202,37 @@ class ToolCallStreamState:
                     content_parts.append(text[:idx])
                 self.in_tool = True
                 self.opener = opener
+                # Incremental JSON-argument streaming: only for the plain <tool_call> wrapper whose
+                # body is the Hermes JSON object (Qwen3-family native form), and only when enabled.
+                self._jstream = (
+                    _JsonArgStreamer()
+                    if opener == "<tool_call>"
+                    and os.environ.get("MINISGL_TOOL_ARG_STREAM", "1") != "0"
+                    else None
+                )
+                self._jstream_index = None
                 text = text[idx:]  # keep the opener token as the head of the block buffer
             else:
                 closer = _TOOL_CLOSERS[self.opener]  # type: ignore[index]
                 cidx = text.find(closer)
                 if cidx == -1:
                     self.buf = text  # block still open; hold the whole body
+                    tool_deltas.extend(self._jstream_advance())
                     break
                 block = text[: cidx + len(closer)]
                 text = text[cidx + len(closer):]
-                tool_deltas.extend(self._emit_call(block))
+                if self._jstream is not None and self._jstream_index is not None and not self._jstream.dead:
+                    # Name (and possibly some argument bytes) already streamed incrementally: emit
+                    # the REMAINING argument bytes and close out this index — never re-emit through
+                    # _emit_call, which would duplicate the call.
+                    self.buf = block  # let the streamer see the final body
+                    tool_deltas.extend(self._jstream_advance())
+                    self.buf = ""
+                    self.emitted = True
+                else:
+                    tool_deltas.extend(self._emit_call(block))
+                self._jstream = None
+                self._jstream_index = None
                 self.in_tool = False
                 self.opener = None
                 self._warned_oversize = False  # re-arm: a LATER block can go oversize too
@@ -2111,6 +2248,20 @@ class ToolCallStreamState:
         the bytes reach the caller and the truncation is visible. A buffered partial opener turned out
         to be literal ``content`` and is emitted."""
         if self.in_tool:
+            if self._jstream is not None and self._jstream_index is not None and not self._jstream.dead:
+                # Fragments already streamed for this call: emit whatever else cleared the scanner
+                # and report the truncation — re-parsing through _emit_parsed would duplicate the
+                # call under a new index.
+                out = self._jstream_advance()
+                truncated = not self._jstream.args_done
+                self.buf, self.in_tool, self.opener = "", False, None
+                self._jstream, self._jstream_index = None, None
+                self.unparsed_tail = truncated
+                if truncated:
+                    logger.warning(
+                        "stream ended mid-tool-call after incremental argument streaming; the client "
+                        "holds a partial arguments string — reporting the turn as truncated")
+                return None, out
             buf = self.buf
             parsed = self._parse_unclosed(buf)
             self.buf, self.in_tool, self.opener = "", False, None
