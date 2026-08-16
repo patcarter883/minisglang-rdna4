@@ -74,6 +74,10 @@ Ids = Tuple[int, ...]
 # with tail, and head ends at most max_gap tokens before tail starts".
 Pattern = Tuple[Ids, Ids, int]
 
+# Budget value meaning "never force" — large enough that `count < budget` is always true for any
+# reachable token count, so the backstop is disarmed without making `budget` Optional everywhere.
+_UNBOUNDED = 1 << 62
+
 
 def _as_pattern(p) -> Optional[Pattern]:
     """Normalise a caller-supplied release spec. Accepts a bare id sequence (exact match) or an
@@ -166,12 +170,31 @@ class ThinkGate:
                 pats.append(p)
         patterns = tuple(pats)
 
-        eff = int(budget) if (isinstance(budget, int) and budget > 0) else self._default_budget
+        # Three-way, because "no cap requested" and "cap explicitly disabled" are different asks:
+        #   budget > 0  -> that many reasoning tokens
+        #   budget < 0  -> UNBOUNDED: the caller has another mechanism and does not want the
+        #                  backstop. Used when the chat template consumes the reasoning LEVEL
+        #                  (Qwen3.8's `reasoning_effort`), where the model self-regulates from its
+        #                  own system-prompt line and a token cap just guillotines it mid-thought.
+        #   None / 0    -> nothing requested; the server default applies.
+        # `_UNBOUNDED` rather than a None budget so every `count < budget` comparison below stays a
+        # plain int compare and no call site needs an Optional guard.
+        if isinstance(budget, int) and budget < 0:
+            eff = _UNBOUNDED
+        elif isinstance(budget, int) and budget > 0:
+            eff = int(budget)
+        else:
+            eff = self._default_budget
         # Reserve room for the ANSWER *and* for the force run itself. Forcing a 6-token delimiter
         # needs 6 decode steps of headroom; without subtracting them a long delimiter can run into
         # `not req.can_decode` and finish `length` mid-delimiter, leaving a half-written turn header
         # that the reasoning parser reads as an unterminated span — the very symptom this fixes.
-        if max_tokens > 0 and eff + len(force) >= max_tokens:
+        # Skipped when unbounded: re-deriving a cap from max_tokens there would be the same bug this
+        # sentinel exists to fix — a caller asking for no backstop, silently getting one at 3/4 of
+        # max_tokens. The cost is that a model which never closes its span runs to max_tokens and the
+        # reply arrives entirely as reasoning_content; that is the caller's trade to make, and it is
+        # what upstream engines do by default.
+        if eff != _UNBOUNDED and max_tokens > 0 and eff + len(force) >= max_tokens:
             eff = max(1, (max_tokens * 3) // 4 - len(force))
 
         # If an EOS id sits INSIDE a delimiter, suppressing EOS while gated would make that delimiter

@@ -314,6 +314,25 @@ def purity() -> None:
     g5.arm(4, force_seq=MUSE_CLOSE, budget=1024, max_tokens=64)
     check("budget capped with force headroom", g5.budget_of(4) == 42, f"{g5.budget_of(4)}")
 
+    # UNBOUNDED (budget < 0): the caller has another mechanism — a chat template that consumes the
+    # reasoning LEVEL, e.g. Qwen3.8's `reasoning_effort` — and wants no backstop at all. Distinct
+    # from budget=None, which means "nothing requested" and takes the server default. Regression:
+    # this used to be expressed as None, which fell through to the default and capped at 1024 anyway,
+    # splicing `</think>` mid-word; the model kept thinking and the rest was served as the ANSWER.
+    g6 = TG(default_budget=1024)
+    g6.arm(5, force_seq=MUSE_CLOSE, budget=-1, max_tokens=64)
+    check("unbounded budget is not the default", g6.budget_of(5) != 1024, f"{g6.budget_of(5)}")
+    check("unbounded budget survives the max_tokens clamp", g6.budget_of(5) > 10**6,
+          f"{g6.budget_of(5)}")
+    for _ in range(5000):
+        g6.commit(5, 7)                      # 7 is in no delimiter: plain reasoning tokens
+    check("unbounded never forces", g6.forced_next(5) is None, f"{g6.forced_next(5)}")
+
+    g7 = TG(default_budget=1024)
+    g7.arm(6, force_seq=MUSE_CLOSE, budget=None)
+    check("None budget still takes the server default", g7.budget_of(6) == 1024,
+          f"{g7.budget_of(6)}")
+
 
 if __name__ == "__main__":
     muse()

@@ -718,6 +718,12 @@ _EFFORT_LEVEL = {
 # Kwarg spellings a chat template might read the level from, most specific first.
 _LEVEL_KWARGS = ("reasoning_strength", "reasoning_effort", "thinking_level", "reasoning_level")
 _LEVEL_PROBE = "__minisgl_level_probe__"
+# Real rung names, weakest first. Used for two things the sentinel probe cannot do on a template
+# that VALIDATES its level: detect that the kwarg is read at all, and learn which values it accepts.
+_LEVEL_LADDER = ("low", "medium", "high", "xhigh")
+# Per-request "no β backstop at all", distinct from None ("nothing asked for" -> server default).
+# Negative because the budget is a token count; `ThinkGate.arm` reads any negative as unbounded.
+THINK_BUDGET_UNBOUNDED = -1
 
 
 def _served_model_path() -> str | None:
@@ -742,21 +748,81 @@ def _template_level_kwarg(model_path: str) -> str | None:
     client using the OpenAI convention gets no variation at all on such a model: Muse's template
     defaults to `high` and ignores `enable_thinking`, so every rung — including an explicit request
     for LESS reasoning — rendered an identical prompt, and `xhigh` (the level its card recommends
-    for coding and agentic work) was unreachable through the standard API."""
-    try:
-        tok = load_tokenizer(model_path)
-    except Exception:
-        return None
-    msgs = [{"role": "user", "content": "x"}]
+    for coding and agentic work) was unreachable through the standard API.
+
+    A sentinel ALONE is not enough. Qwen3.8's template validates the rung and calls
+    `raise_exception('Unexpected reasoning effort ...')` for anything outside
+    ('xhigh', 'medium', 'low') — so the sentinel raised, the `except` swallowed it, this returned
+    None, and the whole level-aliasing path below went dead on the one checkpoint that ships the
+    convention officially. The visible symptom was NOT a template error: `_resolve_think_budget`
+    then fell through to `_EFFORT_BUDGET`, turning `reasoning_effort: medium` into a HARD 1024-token
+    cap, and the β backstop spliced `</think>` mid-word. The model kept thinking and the remainder
+    was served as the ANSWER. So: sentinel first (permissive templates), then fall back to rendering
+    REAL rungs and looking for VARIATION — a template that changes its output across rungs is
+    reading the kwarg, whether or not it tolerates a made-up value."""
     for name in _LEVEL_KWARGS:
-        try:
-            out = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True, **{name: _LEVEL_PROBE})
-        except Exception:
-            continue
+        out = _render_with_level(model_path, name, _LEVEL_PROBE)
         if isinstance(out, str) and _LEVEL_PROBE in out:
             return name
+        rendered = {_render_with_level(model_path, name, v) for v in _LEVEL_LADDER}
+        rendered.discard(None)
+        if len(rendered) > 1:
+            return name
     return None
+
+
+@functools.cache
+def _level_probe_tokenizer(model_path: str):
+    """Tokenizer for the probes below, or None if it will not load. Cached because `load_tokenizer`
+    is NOT — the probes render up to 4 kwargs x 5 values twice over, and paying an
+    `AutoTokenizer.from_pretrained` for each would put ~20 cold loads on the first request."""
+    try:
+        return load_tokenizer(model_path)
+    except Exception:
+        return None
+
+
+def _render_with_level(model_path: str, kwarg: str, value: str) -> str | None:
+    """Render the chat template with one level kwarg, or None if it raised / is unavailable.
+    A raise is a real answer here — it is how a validating template says "not that value"."""
+    tok = _level_probe_tokenizer(model_path)
+    if tok is None:
+        return None
+    try:
+        out = tok.apply_chat_template(
+            [{"role": "user", "content": "x"}],
+            tokenize=False, add_generation_prompt=True, **{kwarg: value})
+    except Exception:
+        return None
+    return out if isinstance(out, str) else None
+
+
+@functools.cache
+def _template_level_values(model_path: str, kwarg: str) -> tuple:
+    """The rungs this template actually ACCEPTS, weakest first — those that render without raising.
+
+    Needed because the standard ladder and a checkpoint's ladder are not the same set. Qwen3.8 takes
+    ('low', 'medium', 'xhigh') and RAISES on 'high', which `_EFFORT_LEVEL` maps `reasoning_effort:
+    high` straight onto. Forwarding it unclamped would turn a routine request into a template
+    exception — trading a silent truncation for a loud 500."""
+    return tuple(v for v in _LEVEL_LADDER if _render_with_level(model_path, kwarg, v) is not None)
+
+
+def _clamp_level(level: str, accepted: tuple) -> str | None:
+    """Nearest rung the template can express, preferring MORE reasoning on a tie.
+
+    Rounding up is the safer miss: `high` on a ladder of ('low','medium','xhigh') becomes `xhigh`,
+    which over-thinks slightly, where rounding down to `medium` would silently serve LESS reasoning
+    than a client explicitly asked for."""
+    if not accepted:
+        return None
+    if level in accepted:
+        return level
+    if level not in _LEVEL_LADDER:
+        return None
+    want = _LEVEL_LADDER.index(level)
+    return min(accepted, key=lambda v: (abs(_LEVEL_LADDER.index(v) - want),
+                                        -_LEVEL_LADDER.index(v)))
 
 
 def _norm_effort(value: str) -> str:
@@ -828,18 +894,28 @@ def _resolve_think_budget(req: "OpenAICompletionRequest",
     ck_budget = ck.get("reasoning_max_tokens")
     if isinstance(ck_budget, int) and ck_budget > 0:
         return ck_budget
+    # When the TEMPLATE consumes the reasoning LEVEL, the model self-regulates from its own
+    # system-prompt line and a server-side token cap stops being the meaning of `reasoning_effort` —
+    # it becomes a second, blunter mechanism for the same intent, and the stricter one silently wins.
+    # Concretely: `high` caps at 4096, which would truncate exactly the coding/agentic work Muse's
+    # card says to use high/xhigh for; and on Qwen3.8 `medium` capped at 1024 and guillotined the
+    # chain of thought mid-word, after which the model kept thinking and the remainder was served as
+    # the ANSWER. So leave it unbounded and let an EXPLICIT `reasoning_max_tokens` (handled above,
+    # which takes precedence) be the way to impose a ceiling. Templates that ignore the level keep
+    # the budget, because there it is the only mechanism that exists.
+    #
+    # Asked independently of whether THIS request named a rung: such a template supplies its own
+    # default when the client names none (Qwen3.8 renders `xhigh` for an unset `reasoning_effort`),
+    # so the model self-regulates either way. Gating it on `if effort` left a bare request back on
+    # the 1024 default — the same guillotine, reached by the other door.
+    #
+    # And it must be an EXPLICIT sentinel, not None: None means "nothing requested" and falls through
+    # to the scheduler's MINISGL_THINK_BUDGET default (1024), so returning it here asked for no cap
+    # and got the same 1024 as everyone else — the comment said "unbounded", the code delivered a cap.
+    if model_path and _template_level_kwarg(model_path):
+        return THINK_BUDGET_UNBOUNDED
     effort = _requested_effort(req)
     if effort:
-        # When the TEMPLATE consumes the level, the model self-regulates from its own system-prompt
-        # line and the server's token cap stops being the meaning of `reasoning_effort` — it becomes
-        # a second, blunter mechanism for the same intent, and the stricter one silently wins. That
-        # is how the two defects documented above happened. Concretely: `high` caps at 4096, which
-        # would truncate exactly the coding/agentic work Muse's card says to use high/xhigh for. So
-        # leave it unbounded and let an EXPLICIT `reasoning_max_tokens` (handled above, and which
-        # takes precedence) be the way to impose a ceiling. Templates that ignore the level keep the
-        # budget, because there it is the only mechanism that exists.
-        if model_path and _template_level_kwarg(model_path):
-            return None
         return _EFFORT_BUDGET.get(effort)
     return None
 
@@ -1023,6 +1099,11 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest",
                 # The engine cannot make a model that always reasons stop reasoning; it can only ask
                 # for as little as the ladder allows.
                 level = _EFFORT_LEVEL.get("minimal")
+            if level:
+                # Clamp to the rungs this template accepts. `_EFFORT_LEVEL` speaks the STANDARD
+                # ladder; a checkpoint's own may be a subset (Qwen3.8: low/medium/xhigh, and it
+                # RAISES on `high`), so an unclamped forward is a template exception.
+                level = _clamp_level(level, _template_level_values(model_path, level_key))
             if level:
                 kwargs[level_key] = level
     return kwargs or None
