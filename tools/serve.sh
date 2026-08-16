@@ -232,7 +232,8 @@ case "$MODEL" in
   # Its ignore list carries the `...linear_attn` CONTAINER while shipping in_proj_qkv quantized, so
   # it depends on the structural quant oracle (QuantConfig.ckpt_quantized) — under the old substring
   # matching it died in the GDN concat with KeyError in_proj_qkvz.weight.
-  # THROUGHPUT, measured single-stream 400-token decode, TP=2, 2026-08-15 (median of 3-4):
+  # NOT THE DEFAULT, despite being the fastest — see the corruption note on the qwen38-27b
+  # arm below. THROUGHPUT, single-stream 400-token decode, TP=2, 2026-08-15 (median of 3-4):
   #   Qwen3.6-27B INT4        31.9 tok/s
   #   Qwen3.8 INT4 (this)     31.8 tok/s   <- default
   #   Qwen3.8 INT4 + MTP      31.3 tok/s
@@ -245,7 +246,7 @@ case "$MODEL" in
   # recorded for MTP under sampling. Still selectable with SPEC=mtp; it works, it just does
   # not pay. NOTE: spec is also auto-disabled whenever batch>1, so any concurrent traffic
   # turns it off regardless.
-  qwen38-27b|cyankiwi/Qwen3.8-27B-AWQ-INT4)
+  qwen38-27b-int4|cyankiwi/Qwen3.8-27B-AWQ-INT4)
                   model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4";            spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.47 GiB/card, the LIGHTEST of the three
                   # Qwen3.8 builds. 0.92, NOT the 0.97 the other two carry: because this model is so
@@ -277,7 +278,22 @@ case "$MODEL" in
                   # is what the lower spec ratio pays for.
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
                   if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
-  qwen38-27b-nvfp4|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
+  # DEFAULT ON CORRECTNESS, NOT SPEED. The INT4 arm is ~23% faster (31.8 vs 24.4 tok/s) and was
+  # briefly the default for that reason, until a Hermes agent session surfaced token-level
+  # CORRUPTION on it: foreign script fused mid-word ("neutral<cyrillic>", "<hangul>"), repeated
+  # fragments ("st collidingding"), a spurious injected token, a stray "</".
+  # Scanning ~120 archived Hermes sessions for that exact signature (non-Latin script FUSED to a
+  # Latin letter, which legitimate foreign text never produces):
+  #     locally-served cyankiwi *-AWQ-INT4 :  6 corrupted / 19 sessions  (~32%)
+  #     everything else                    :  0 corrupted / ~100 sessions
+  # Zero on 60+ HOSTED-model sessions through the same client (so not Hermes), and zero on local
+  # NVFP4 (Laguna, Muse) and GGUF (so not local serving generally). Recurring 08-03 -> 08-16, i.e.
+  # it predates this table entry. NOT explained by the missing kv_cache_scheme those checkpoints
+  # share — Muse and Qwen3.6-35B have the same gap and stay clean. Root cause still OPEN, and it
+  # did NOT reproduce from plain requests (short, 15k-token prompt, 3.5k-token generation,
+  # streamed and not): it appears to need agent-shaped context and to be stochastic.
+  # Until that is understood, the default takes the slower quant family with no such history.
+  qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
                   model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
                   # leaves 3.27 GiB = 214,016 KV tokens, 4.2x the unsloth serve. Validated: 20/20 on
