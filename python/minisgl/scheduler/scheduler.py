@@ -1976,11 +1976,20 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             p_ids, s_ids = self._resolve_delim_ids(pre), self._resolve_delim_ids(suf)
             if p_ids and s_ids:
                 releases.append((p_ids, s_ids, _THINK_RECIPIENT_MAX_TOKENS))
+        budget = getattr(sp, "think_budget", None)
+        # A grammar-constrained request may NOT go unbounded. The schema engages only once this gate
+        # RELEASES (see the matcher advance in the decode loop) — so with no backstop, a model that
+        # never closes its reasoning span is never constrained at all and the JSON silently stops
+        # being enforced. Unbounded is a free-form choice; here the backstop is a correctness
+        # mechanism, so fall back to the server default. `sp.grammar` is the DECLARATION, available
+        # at arm time — the matcher itself is created lazily and would not exist yet.
+        if isinstance(budget, int) and budget < 0 and getattr(sp, "grammar", None):
+            budget = None
         self._think_gate.arm(
             uid,
             force_seq=force,
             release_seqs=tuple(releases),
-            budget=getattr(sp, "think_budget", None),
+            budget=budget,
             max_tokens=int(getattr(sp, "max_tokens", 0) or 0),
             eos_ids=self.eos_token_ids,
         )

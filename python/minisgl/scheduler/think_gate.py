@@ -267,9 +267,19 @@ class ThinkGate:
     def suppress_eos(self, uid) -> bool:
         """Should this request's EOS logits be masked this step? Only while genuinely mid-reasoning:
         gated, under budget, and with no EOS id buried in its delimiters. Once the backstop starts
-        forcing, the row is masked to the forced token anyway and EOS suppression is redundant."""
+        forcing, the row is masked to the forced token anyway and EOS suppression is redundant.
+
+        NEVER under an unbounded budget. Holding EOS is only legitimate because the β backstop is
+        guaranteed to release it — the request is stopped from ending its turn mid-thought, and a
+        few hundred tokens later the closer is forced and it can stop. Take the backstop away and the
+        two halves of that bargain come apart: `count < budget` is true forever, EOS stays masked
+        forever, `forced_next` never fires, and the request CANNOT terminate. It runs to max_tokens
+        sampling ever-less-probable tokens — observed as an answer decaying into `. . . . .` and
+        mojibake. Unbounded thinking has to mean the model may also stop on its own."""
         st = self._st.get(uid)
         if st is None or not st.may_suppress_eos:
+            return False
+        if st.budget >= _UNBOUNDED:
             return False
         return st.count < st.budget
 

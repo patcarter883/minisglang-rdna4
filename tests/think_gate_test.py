@@ -327,6 +327,13 @@ def purity() -> None:
     for _ in range(5000):
         g6.commit(5, 7)                      # 7 is in no delimiter: plain reasoning tokens
     check("unbounded never forces", g6.forced_next(5) is None, f"{g6.forced_next(5)}")
+    # And therefore must NOT hold EOS. Suppression is only safe when the backstop will release it;
+    # unbounded + suppressed EOS is a request that can never terminate, which shipped once and
+    # decayed answers into `. . . . .` and mojibake at max_tokens.
+    check("unbounded does not suppress EOS", g6.suppress_eos(5) is False)
+    g5b = TG(default_budget=1024)
+    g5b.arm(7, force_seq=MUSE_CLOSE, budget=1024)
+    check("bounded still suppresses EOS mid-reasoning", g5b.suppress_eos(7) is True)
 
     g7 = TG(default_budget=1024)
     g7.arm(6, force_seq=MUSE_CLOSE, budget=None)
