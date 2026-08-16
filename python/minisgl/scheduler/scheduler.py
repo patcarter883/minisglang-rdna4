@@ -1976,6 +1976,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             p_ids, s_ids = self._resolve_delim_ids(pre), self._resolve_delim_ids(suf)
             if p_ids and s_ids:
                 releases.append((p_ids, s_ids, _THINK_RECIPIENT_MAX_TOKENS))
+        # Tool-call openers implicitly end reasoning (see SamplingParams.think_tool_release):
+        # release-only patterns, mirroring the parser-side rule so the gate and the splitter agree
+        # on where the span ended.
+        for opener in getattr(sp, "think_tool_release", None) or ():
+            o_ids = self._resolve_delim_ids(opener)
+            if o_ids:
+                releases.append(o_ids)
         budget = getattr(sp, "think_budget", None)
         # A request whose grammar is REQUIRED may not go unbounded. The schema engages only once this
         # gate RELEASES (see the matcher advance in the decode loop) — so with no backstop, a model

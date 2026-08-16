@@ -188,6 +188,15 @@ class ReasoningParser:
         # there it is part of the CLOSE delimiter (`<|eom|><|start|>assistant to=user<|message|>`);
         # this covers the case where the model answers directly.
         self.turn_header = turn_header
+        # Tool-call block openers (assigned by the server at resolve time — the table lives with the
+        # tool parser and this module must not import it). A model that opens a tool call while
+        # still inside its reasoning span, WITHOUT emitting the close delimiter, has implicitly
+        # finished thinking: both reference engines encode this rule for the Qwen3-family (vLLM
+        # qwen3_reasoning_parser `<tool_call>` = implicit reasoning end; SGLang `tool_start_token`).
+        # Without it the whole call stays trapped in reasoning_content — the tool subsystem only
+        # sees the CONTENT channel — and the client receives an empty answer with no tool_calls.
+        # The opener is PRESERVED into content (SGLang behaviour) so the tool parser consumes it.
+        self.tool_openers: tuple = ()
 
     def _strip_turn_header(self, text: str) -> str:
         """Drop a leading answer-turn header. Checked AFTER the opener, which wins: the two share a
@@ -265,11 +274,20 @@ class ReasoningParser:
         if closer is None:
             if not thinking_open and not self.opens_span(text):
                 return None, text
-            # The span was open (prompt-side, or the model opened it itself) and never closed -> it's
-            # all reasoning.
+            # The span was open (prompt-side, or the model opened it itself) and never closed. If a
+            # tool-call opener appears in the body, the model implicitly ended its reasoning there
+            # (see `tool_openers`): reasoning is everything before it, and the opener plus the rest
+            # is CONTENT so the tool parser can consume the call. Otherwise it's all reasoning.
             pre = text
             if self.start_token and self.start_token in pre:
                 pre = pre.split(self.start_token, 1)[-1]
+            t_idx = -1
+            for tok in self.tool_openers:
+                j = pre.find(tok)
+                if j != -1 and (t_idx == -1 or j < t_idx):
+                    t_idx = j
+            if t_idx != -1:
+                return (pre[:t_idx].strip() or None), pre[t_idx:].lstrip("\n")
             return (pre.strip() or None), ""
         # Split on the LAST close tag, not the first: a model (esp. after a β-forced </think> in RSA)
         # may RE-OPEN <think>…</think> before its final answer. rpartition keeps ALL reasoning — the
@@ -299,7 +317,7 @@ class ReasoningParser:
     def stream_state(self, active: bool) -> "ReasoningStreamState":
         return ReasoningStreamState(
             self.start_token, self.end_token, active, self.turn_header,
-            self.end_prefix, self.end_suffix,
+            self.end_prefix, self.end_suffix, tool_openers=self.tool_openers,
         )
 
 
@@ -340,8 +358,11 @@ class ReasoningStreamState:
 
     def __init__(
         self, start_token: str, end_token: str, active: bool, turn_header: str = "",
-        end_prefix: str = "", end_suffix: str = "",
+        end_prefix: str = "", end_suffix: str = "", tool_openers: tuple = (),
     ) -> None:
+        # See ReasoningParser.tool_openers: inside the span, one of these ends reasoning implicitly
+        # and is PRESERVED into content for the tool parser.
+        self.tool_openers = tuple(tool_openers)
         self.start_token = start_token
         self.end_token = end_token
         # Same closer matcher the non-streaming lane uses, so both agree on identical bytes.
@@ -473,9 +494,24 @@ class ReasoningStreamState:
         return None, self._emit_content("".join(out))
 
     def _push_active(self, delta: str) -> Tuple[Optional[str], Optional[str]]:
-        """Inside the reasoning span: emit reasoning until the close delimiter, then content."""
+        """Inside the reasoning span: emit reasoning until the close delimiter, then content. A
+        tool-call opener also ends the span (implicitly — see ReasoningParser.tool_openers), with
+        the opener itself routed to CONTENT; whichever of closer/opener appears first wins."""
         text = self.pending + delta
+        t_idx, t_tok = -1, None
+        for tok in self.tool_openers:
+            j = text.find(tok)
+            if j != -1 and (t_idx == -1 or j < t_idx):
+                t_idx, t_tok = j, tok
         m = self._end.find(text)
+        if t_idx != -1 and (m is None or t_idx < m[0]):
+            reasoning = self._emit_reasoning(text[:t_idx])
+            self.active = False
+            self._closed_once = True
+            self.pending = ""
+            # Opener PRESERVED: content phase re-consumes it so the tool splitter sees the block.
+            _r, content = self._push_inactive(text[t_idx:])
+            return ((reasoning or "") + (_r or "")) or None, content
         if m is not None:
             reasoning = self._emit_reasoning(text[:m[0]])
             self.active = False
@@ -486,6 +522,7 @@ class ReasoningStreamState:
             _r, content = self._push_inactive(text[m[1]:])
             return ((reasoning or "") + (_r or "")) or None, content
         keep = self._end.hold(text)
+        keep = max(keep, _end_overlap_len(text, *self.tool_openers))
         if keep:
             self.pending = text[-keep:]
             emit = text[:-keep]

@@ -76,6 +76,12 @@ class SamplingParams:
     # bracket it — the scheduler matches "prefix, then a bounded run of any tokens, then suffix".
     # Both None unless the checkpoint's template actually varies the delimiter by recipient.
     think_close_prefix: str | None = None
+    # Tool-call block openers that implicitly END the reasoning span (Qwen3-family convention; the
+    # reasoning parser routes the call to content — see api_server._TOOL_OPENERS, which populates
+    # this). Registered with the think gate as RELEASE patterns only, never forced: a model that
+    # opens a tool call mid-think has finished thinking, so the budget stops counting and a held
+    # grammar engages, exactly as if it had emitted the close delimiter.
+    think_tool_release: List[str] = field(default_factory=list)
     think_close_suffix: str | None = None
     # Reasoning BUDGET (backstop for the gate above): a reasoning model often rambles in long/loose
     # prose and never emits a clean `</think>`, so the gate never opens and no JSON is produced. When

@@ -1456,6 +1456,12 @@ def _reasoning_parser():
             requested=getattr(cfg, "reasoning_parser", "auto"),
             declared=declared,
         )
+        if _REASONING_PARSER is not None:
+            # Qwen3-family rule both reference engines implement: an unpaired tool-call opener
+            # inside the think span implicitly ENDS reasoning (the opener + call route to content,
+            # where the tool splitter consumes them). The opener table lives with the tool parser;
+            # inject it here rather than have reasoning.py import this module.
+            _REASONING_PARSER.tool_openers = _TOOL_OPENERS
         _REASONING_PARSER_SET = True
         if _REASONING_PARSER is None:
             logger.info("reasoning extraction DISABLED (%s)", how)
@@ -2656,6 +2662,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
                 # grammar-free rollout, not just the structured final answer.
                 think_close_delim=_reasoning_close_delim(req),
+                think_tool_release=list(_TOOL_OPENERS),
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
@@ -2791,6 +2798,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # and truncate with no answer. For grammar requests this is the same delim (it also
                 # gates the schema until </think>); for plain thinking it's a pure backstop.
                 think_close_delim=_reasoning_close_delim(req),
+                think_tool_release=list(_TOOL_OPENERS),
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
@@ -3011,6 +3019,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 # response_format only on this lane: if there is a grammar, the caller required it.
                 grammar_required=bool(_grammar_from_response_format(req.response_format)),
                 think_close_delim=_think_delim,
+                think_tool_release=list(_TOOL_OPENERS) if _think_delim else [],
                 think_answer_delim=_reasoning_answer_delim(req) if _think_delim else None,
                 think_close_prefix=(_reasoning_close_wildcard(req)[0] if _think_delim else None),
                 think_close_suffix=(_reasoning_close_wildcard(req)[1] if _think_delim else None),
