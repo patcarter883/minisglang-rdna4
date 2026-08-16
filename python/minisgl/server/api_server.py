@@ -29,6 +29,7 @@ from minisgl.message import (
     TokenizeMsg,
     UserReply,
 )
+from minisgl.kvcache._envutil import env_int
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
 from .metrics import BackendSnapshot, FrontendMetrics
@@ -1089,6 +1090,44 @@ def _reject_unsupported(req: "OpenAICompletionRequest") -> JSONResponse | None:
                 "none/off/minimal (no reasoning), low, medium, high, extra_high, max.",
                 "reasoning_effort", "invalid_value")
     return None
+
+
+def _reject_unclosed_toolcall_continuation(req: "OpenAICompletionRequest") -> JSONResponse | None:
+    """400 for a continuation whose final assistant turn ends inside an OVERSIZED unclosed tool-call
+    block — the request shape that turns one runaway tool call into an infinite retry loop.
+
+    The loop, observed live (Hermes session 620a3c33becc, Qwen3.6-35B, 2026-08-17): a completion hits
+    max_tokens mid-tool-call, the client appends the partial block to the assistant turn and re-sends,
+    the model resumes the runaway and burns another full max_tokens — measured 8 legs x 8192 tokens,
+    every leg ending inside the same never-closing block, ending only at a 65,510-char body the parser
+    could not salvage. A replayed assistant turn that ends inside an unclosed block is never a
+    well-formed conversation (a finished turn carries parsed tool_calls, or no opener at all), but two
+    benign shapes must pass: re-sending a briefly-truncated call so the model can CLOSE it is a
+    legitimate recovery, and prose that merely QUOTES an opener is not a block. The size threshold
+    splits all three: a body already past MINISGL_TOOLCALL_CONT_LIMIT chars (default 49152, well past
+    both any real tool argument seen served and one full 8192-token leg of the measured runaway)
+    cannot converge by continuation — every retry is pure loss. 0 disables the guard."""
+    limit = env_int("MINISGL_TOOLCALL_CONT_LIMIT", 49152)
+    if limit <= 0 or not req.messages:
+        return None
+    last = req.messages[-1]
+    # held_chars can never exceed len(content): skip the scan for anything plausibly sized.
+    if last.role != "assistant" or not isinstance(last.content, str) or len(last.content) < limit:
+        return None
+    scan = ToolCallStreamState(uid=0)
+    scan.push(last.content)
+    if not scan.in_tool or scan.held_chars < limit:
+        return None
+    return JSONResponse(status_code=400, content={"error": {
+        "message": (
+            f"The final assistant message ends inside an unclosed tool-call block: {scan.held_chars} "
+            f"chars follow the last {scan.opener!r} opener with no closer. This is the signature of "
+            "re-submitting a length-truncated tool call for continuation; a block this large cannot "
+            "be completed by continuing, and every retry burns max_tokens extending it. Drop or "
+            "truncate that assistant turn and re-issue the request."
+        ),
+        "type": "invalid_request_error", "param": "messages",
+        "code": "unclosed_tool_call_continuation"}})
 
 
 def _reject_unsupported_text_completion(req: "OpenAICompletionRequest") -> JSONResponse | None:
@@ -2833,7 +2872,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # registration was (and is) `/v1/chat/completions`, so `/v1/completions` was a bare FastAPI 404
     # and the misleading symbol is what made the hole look filled on a read of the file. The real
     # `/v1/completions` is now its own handler below — this one is chat, and answers `chat.completion`.
-    _bad = _reject_unsupported(req)
+    _bad = _reject_unsupported(req) or _reject_unclosed_toolcall_continuation(req)
     if _bad is not None:
         return _bad
     state = get_global_state()
