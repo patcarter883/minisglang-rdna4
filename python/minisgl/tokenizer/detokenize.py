@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional
 
 from minisgl.message import DetokenizeMsg
+from minisgl.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+logger = init_logger(__name__)
 
 
 class DetokResult(NamedTuple):
@@ -74,6 +77,11 @@ class DetokenizeManager:
         # uid -> DecodeStatus
         self.decode_map: Dict[int, DecodeStatus] = {}
         self.tokenizer = tokenizer
+        # Tokenizer length for the OOV fence below; 0 disables (unsized tokenizer stub in tests).
+        try:
+            self._tok_len = len(tokenizer)
+        except Exception:
+            self._tok_len = 0
         # The FULL end-of-generation set (generation_config eos_token_id list ∪ tokenizer ∪ config),
         # so a trailing end-of-turn token from a multi-EOS model (GLM-4.x) isn't rendered. Falls back
         # to the tokenizer's single EOS when the resolved set isn't supplied.
@@ -107,6 +115,19 @@ class DetokenizeManager:
             toks = [] if msg.error is not None else [msg.next_token, *msg.extra_tokens]
             if msg.finished and toks and toks[-1] in self.eos_token_ids:
                 toks = toks[:-1]
+            # Last-line OOV fence: an id at/above the tokenizer's length (the model's padded-vocab
+            # tail, or garbage from an upstream numerics fault) has no defined decoding — HF decode
+            # yields '', a stray added-token string, or a replacement char depending on tokenizer.
+            # The sampler now masks the padded tail, so this should never fire; if it does, drop the
+            # id and say so LOUDLY rather than surface an undefined glyph mid-stream.
+            bad = [t for t in toks if t >= self._tok_len] if self._tok_len else []
+            if bad:
+                logger.warning(
+                    "detokenizer: dropped %d out-of-vocab token id(s) %s for uid=%s — the sampler "
+                    "emitted past the tokenizer's %d entries (upstream numerics fault?)",
+                    len(bad), bad[:4], msg.uid, self._tok_len,
+                )
+                toks = [t for t in toks if t < self._tok_len]
             s.decoded_ids.extend(toks)
             s.num_tokens += len(toks)
             read_ids.append(s.decoded_ids[s.surr_offset :])

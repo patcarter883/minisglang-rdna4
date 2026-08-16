@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
+import os
+
 import torch
 from minisgl.utils import nvtx_annotate
 
@@ -87,6 +89,14 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
+    # The TOKENIZER's vocab length, when it is smaller than the model's (padded) vocab_size. The
+    # trailing `vocab_size - real_vocab_size` lm_head rows are UNTRAINED padding (Qwen3.5-family:
+    # 248320 config vs 248077 tokenizer = 243 pad ids); their logits are checkpoint noise — or live
+    # dequant artifacts on the fp8 lm_head path — and are fully eligible for top-k selection unless
+    # masked. Both reference engines make them unreachable (vLLM slices logits to org_vocab_size,
+    # logits_processor.py:103; SGLang slices to vocab_size, logits_processor.py:865). None/equal ->
+    # no mask (a tokenizer that could not be loaded must not silently disable sampling).
+    real_vocab_size: int | None = None
     # uid -> [vocab] float32 count of tokens that request has generated. Created lazily for penalised
     # requests only (~1 MB each at a 248k vocab) and updated incrementally by one index_add per step,
     # so the cost does not grow with output length. Released by `free_penalty_state` on finish.
@@ -167,6 +177,18 @@ class Sampler:
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            # NaN/Inf scrub BEFORE anything reads the row. A transient NaN from any upstream kernel
+            # makes sampling undefined — SGLang's sanitizer documents the exact consequence ("can
+            # come back as out-of-vocab token ids", srt/utils/async_probe.py) and runs on every
+            # sample; vLLM leans on masking alone. Unconditional nan_to_num_ is one elementwise op
+            # (no host sync — an isnan().any() check would cost more than the scrub); NaN -> -1e30
+            # removes the token from contention rather than crowning it argmax-of-garbage.
+            # In-place is safe even on a captured graph's output buffer: replay overwrites it fully.
+            if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
+                torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+            # Padded-vocab fence: the untrained tail can never be sampled (see real_vocab_size).
+            if self.real_vocab_size is not None and self.real_vocab_size < logits.shape[-1]:
+                logits[:, self.real_vocab_size:] = float("-inf")
             if args.grammar_bitmask is not None:  # structured output: mask disallowed tokens to -inf
                 from .grammar import apply_token_bitmask
 

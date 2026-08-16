@@ -478,7 +478,25 @@ class Engine:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
-        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        # real_vocab_size fences the untrained padded lm_head tail off from sampling (see Sampler).
+        # Best-effort: the tokenizer is cached (the frontend already loaded it), and an unloadable
+        # tokenizer must not take the engine down over a defence-in-depth mask.
+        _real_vocab = None
+        try:
+            from minisgl.utils import load_tokenizer
+
+            _tok_len = len(load_tokenizer(config.model_path))
+            if 0 < _tok_len < config.model_config.vocab_size:
+                _real_vocab = _tok_len
+                logger.info_rank0(
+                    f"sampler: masking padded vocab tail [{_tok_len}, "
+                    f"{config.model_config.vocab_size}) — {config.model_config.vocab_size - _tok_len} "
+                    "untrained ids fenced off"
+                )
+        except Exception:
+            pass
+        self.sampler = Sampler(self.device, config.model_config.vocab_size,
+                               real_vocab_size=_real_vocab)
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
