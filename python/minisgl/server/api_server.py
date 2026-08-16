@@ -134,7 +134,10 @@ class OpenAICompletionRequest(BaseModel):
     # coalesced int `max_tokens`.
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
-    temperature: float = 1.0
+    # Sampling. Unset (None) inherits the checkpoint's generation_config.json via `_resolve_sampling`
+    # — see `top_k`/`top_p` below, and keep all three `| None`: a non-None default here is
+    # indistinguishable from a client that set the value, which silently disables that inheritance.
+    temperature: float | None = None
 
     # TRANSPARENT CAM per-request override: True/False forces ambient auto-write on/off for THIS call,
     # overriding MINISGL_CAM_AUTO_WRITE (None = server default). Suppress learning on a read-only turn.
@@ -143,8 +146,22 @@ class OpenAICompletionRequest(BaseModel):
     # it on/off for THIS call, overriding MINISGL_CAM_AUTO (None = server default).
     cam_read: bool | None = None
 
-    top_k: int = -1
-    top_p: float = 1.0
+    # These were `top_k: int = -1` / `top_p: float = 1.0` / `temperature: float = 1.0`, which made
+    # `_resolve_sampling`'s generation_config inheritance DEAD CODE on this lane: it tests
+    # `req.top_k is not None`, and a non-None default is never not-None. Only `GenerateRequest` was
+    # converted when that inheritance landed, and its comment claimed the OpenAI endpoints "already
+    # do" this — they did not. `top_k` is not in the OpenAI wire spec, so essentially no client sends
+    # one, and every bare /v1/chat/completions request was served at the FULL distribution
+    # (t=1.0, top_p=1.0, top_k=-1) instead of the checkpoint's own t=1.0/0.95/20.
+    #
+    # That is not a cosmetic default. Measured on Qwen3.8-27B-NVFP4, asking for a 140-char string
+    # echoed verbatim into a tool-call argument, N=10 per arm: bare request 8/10 corrupted, explicit
+    # t=1.0/p=0.95/k=20 0/10, t=1.0 + k=20 alone 0/10, p=0.95 without top_k 6/10. So top_k is the
+    # load-bearing one, and the damage is silent token drop/substitution mid-argument
+    # (`5000; do` -> `500Q:`, `--max-time` -> `--max"time`) — a corrupt shell command or file body,
+    # not an obviously broken reply.
+    top_k: int | None = None
+    top_p: float | None = None
     n: int = 1
     stream: bool = False
     # OpenAI stream_options, e.g. {"include_usage": true}. When include_usage is set, a spec-compliant
