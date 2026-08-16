@@ -67,9 +67,10 @@ class GenerateRequest(BaseModel):
     max_tokens: int
     ignore_eos: bool = False
     # Mirror the OpenAI lane so /generate is not a second-class citizen (it already mirrors
-    # temperature/top_p/top_k). Neutral 0.0 default = penalty path skipped entirely.
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    # temperature/top_p/top_k). Unset (None) -> the serve-level default (_resolve_penalties);
+    # explicit 0.0 still means "no penalty" and wins over it.
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     # Sampling. Unset (None) inherits the checkpoint's generation_config.json via _resolve_sampling,
     # exactly as the OpenAI endpoints already do. /generate previously built a bare SamplingParams()
     # and so served GREEDY (SamplingParams defaults temperature=0.0 / top_k=-1 / top_p=1.0) even
@@ -169,8 +170,11 @@ class OpenAICompletionRequest(BaseModel):
     # (before [DONE]) — the shape strict clients (langchain usage_metadata, budget guards) parse.
     stream_options: dict | None = None
     stop: List[str] | str = []
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    # Unset (None) -> the serve-level default (_resolve_penalties). `| None` for the same reason as
+    # temperature/top_p/top_k above: a plain 0.0 default is indistinguishable from a client that
+    # explicitly asked for no penalty, which would make any server-side default unreachable.
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
 
     # Structured output. {"type": "json_object"} -> any valid JSON; {"type": "json_schema",
     # "json_schema": {"schema": {...}}} -> conform to the schema. None -> unconstrained.
@@ -949,6 +953,32 @@ def _resolve_sampling(req: "OpenAICompletionRequest | GenerateRequest", model_pa
     top_p = req.top_p if req.top_p is not None else float(gen.get("top_p", 1.0))
     top_k = req.top_k if req.top_k is not None else int(gen.get("top_k", -1) or -1)
     return temperature, top_p, top_k
+
+
+def _resolve_penalties(req: "OpenAICompletionRequest | GenerateRequest") -> tuple:
+    """Effective (presence_penalty, frequency_penalty): the request value when the client set it,
+    else the serve-level default, else 0.0 (penalty path skipped entirely).
+
+    The serve default exists because a model author's repetition guidance does not FIT in
+    generation_config.json — that file carries temperature/top_p/top_k only, while the guidance
+    lives in the model card as prose. Qwen3.8's card documents "endless repetition" and names
+    `presence_penalty` 0..2 as the remedy (its non-thinking preset ships 1.5); measured here
+    (2026-08-16, 4x ~4k-token thinking generations per arm on the NVFP4 serve): defaults looped
+    1/4 with a 1540-char repeat, presence=1.0 looped 0/4. The VALUE is per-model and belongs in
+    tools/serve.sh's table (exported as the env below), not hardcoded here.
+
+    An explicit client value — including an explicit 0.0 — always wins, which is why the request
+    fields are `float | None` rather than defaulting to 0.0."""
+    def _env(name: str) -> float:
+        try:
+            return float(os.environ.get(name, "") or 0.0)
+        except ValueError:
+            return 0.0
+    presence = req.presence_penalty if req.presence_penalty is not None \
+        else _env("MINISGL_DEFAULT_PRESENCE_PENALTY")
+    frequency = req.frequency_penalty if req.frequency_penalty is not None \
+        else _env("MINISGL_DEFAULT_FREQUENCY_PENALTY")
+    return presence, frequency
 
 
 def _normalize_tool_args(messages: List[dict]) -> None:
@@ -2503,8 +2533,7 @@ async def generate(req: GenerateRequest, request: Request):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                presence_penalty=req.presence_penalty,
-                frequency_penalty=req.frequency_penalty,
+                **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 seed=req.seed,
                 # unset -> the checkpoint's generation_config default (same resolution the OpenAI
@@ -2697,8 +2726,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             chat_template_kwargs=_resolve_chat_template_kwargs(req, state.config.model_path),
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                presence_penalty=req.presence_penalty,
-                frequency_penalty=req.frequency_penalty,
+                **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 seed=req.seed,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
@@ -2922,8 +2950,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                presence_penalty=req.presence_penalty,
-                frequency_penalty=req.frequency_penalty,
+                **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 seed=req.seed,
                 **dict(zip(("temperature", "top_p", "top_k"),
@@ -3038,8 +3065,7 @@ async def shell_completion(req: OpenAICompletionRequest):
             text=prompt,
             sampling_params=SamplingParams(
                 ignore_eos=req.ignore_eos,
-                presence_penalty=req.presence_penalty,
-                frequency_penalty=req.frequency_penalty,
+                **dict(zip(("presence_penalty", "frequency_penalty"), _resolve_penalties(req))),
                 max_tokens=req.max_tokens,
                 **dict(zip(("temperature", "top_p", "top_k"), _resolve_sampling(req, state.config.model_path))),
             ),

@@ -41,6 +41,9 @@ PORT="${PORT:-1919}"
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
+# Per-model default presence penalty (server-side, request-unset only; explicit client values —
+# including 0.0 — win). Empty = no default, penalty path skipped.
+presence_default=""
 # Per-model torch allocator config (exported just before exec). Empty = torch default.
 alloc_conf=""
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
@@ -314,6 +317,18 @@ case "$MODEL" in
   # KV moves both sides together. It is an OUTPUT-QUALITY fix, not a spec-acceptance one.
   qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
                   model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="none"; k_mtp=4
+                  # MEASURED 2026-08-16: long THINKING (>1024 reasoning tokens, newly reachable now
+                  # the think budget honours the template's reasoning_effort) hits the card's
+                  # documented "endless repetition" at the card's own thinking sampling
+                  # (t=1.0/p=0.95/k=20): 1/4 probe runs looped (1540-char repeat), plus a live
+                  # agent session (4000-char `**ai**ai**` loop; prose after it degraded — dropped
+                  # sentence-final periods). With presence_penalty=1.0 (card remedy range 0..2;
+                  # its non-thinking preset ships 1.5): 0/4 loops, longer coherent outputs.
+                  # DELIBERATE deviation from the card's thinking preset (presence 0.0), on that
+                  # measurement. Card caveat: high values risk language mixing / slight quality
+                  # loss — 1.0 is mid-range, n=4/arm; re-measure before tuning. Applies to
+                  # request-UNSET only: an explicit client value, including 0.0, wins.
+                  presence_default="1.0"
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
                   # leaves 3.27 GiB = 214,016 KV tokens, 4.2x the unsloth serve. Validated: 20/20 on
                   # the sampled quality probe with ZERO degeneration, a 5.4k-token prefill, and MTP
@@ -349,6 +364,9 @@ case "$MODEL" in
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
                   # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
                   model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="none"; k_mtp=4
+                  # Same base model + card as qwen38-27b above; inherits its measured anti-loop
+                  # default (see that entry for the 2026-08-16 measurement + caveats).
+                  presence_default="1.0"
                   mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
                   # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
                   # that decodes the block semi-autoregressively, which is what fixes DFlash's
@@ -464,6 +482,8 @@ if [[ "$SPEC" != "none" && -n "$SPEC" ]]; then
 fi
 # Per-model engine env that used to live in the deleted per-model services.
 [[ -n "$tool_format" ]] && export MINISGL_TOOL_FORMAT="${MINISGL_TOOL_FORMAT:-$tool_format}"
+[[ -n "$presence_default" ]] && \
+  export MINISGL_DEFAULT_PRESENCE_PENALTY="${MINISGL_DEFAULT_PRESENCE_PENALTY:-$presence_default}"
 
 # --- SWA-hybrid prefix caching ------------------------------------------------------------------
 # A sliding-window model downgrades `--cache-type radix` to `naive` unless MINISGL_SWA_RADIX is on
@@ -525,6 +545,8 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
 [[ "$SPEC" != "none" && -n "$SPEC" ]] && printf '[serve] spec sampled=%s\n' "$MINISGL_SPEC_SAMPLED" >&2
+[[ -n "${MINISGL_DEFAULT_PRESENCE_PENALTY:-}" ]] && \
+  printf '[serve] default presence_penalty=%s (request-unset only)\n' "$MINISGL_DEFAULT_PRESENCE_PENALTY" >&2
 # The DFlash drafter's block mask and weight format, ON THE BANNER. Both change acceptance
 # materially and neither appears on the python command line, so without this the only way to tell
 # which mask a run used is to read the engine's ring log — and a table entry that silently stopped
