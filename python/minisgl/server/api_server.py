@@ -1815,7 +1815,38 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     return None
 
 
-def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
+_UNKNOWN_TOOL_WARNED: set = set()
+
+
+def _known_tool_names(tools) -> "frozenset[str] | None":
+    """Names offered in the request, or None when validation cannot apply (no tools offered)."""
+    if not tools:
+        return None
+    names = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+    names.discard(None)
+    return frozenset(names) or None
+
+
+def _tool_name_allowed(name: str, allowed: "frozenset[str] | None") -> bool:
+    """Reject a call whose function name is NOT among the request's tools. A hallucinated name used
+    to stream to the client as a real call (the agent then errors or, worse, dispatches it); SGLang
+    skips undefined functions for the same reason. MINISGL_FORWARD_UNKNOWN_TOOLS=1 restores the old
+    forward-everything behaviour. One warning per name per process — degeneration can hallucinate
+    the same name thousands of times."""
+    if allowed is None or name in allowed:
+        return True
+    if os.environ.get("MINISGL_FORWARD_UNKNOWN_TOOLS") == "1":
+        return True
+    if name not in _UNKNOWN_TOOL_WARNED:
+        _UNKNOWN_TOOL_WARNED.add(name)
+        logger.warning(
+            "dropped tool call to %r — not among the %d tool(s) offered in the request "
+            "(MINISGL_FORWARD_UNKNOWN_TOOLS=1 to forward unknown names)", name, len(allowed))
+    return False
+
+
+def _parse_tool_calls(text: str, uid: int,
+                      allowed: "frozenset[str] | None" = None) -> Tuple[str | None, List[dict]]:
     """Extract tool calls from a completion. Returns (content, tool_calls): `content` is the text with
     the <tool_call> blocks stripped (None if nothing but calls remain), `tool_calls` is the
     OpenAI-shaped list ([] when the model didn't call a tool)."""
@@ -1826,6 +1857,8 @@ def _parse_tool_calls(text: str, uid: int) -> Tuple[str | None, List[dict]]:
         if parsed is None:
             return  # malformed block -> ignore, leave it in the text
         name, args = parsed
+        if not _tool_name_allowed(name, allowed):
+            return  # markup is still stripped from content; the call itself is dropped
         tool_calls.append(
             {
                 "id": f"call_{uid}_{len(tool_calls)}",
@@ -2084,8 +2117,10 @@ class ToolCallStreamState:
     well-formed JSON object once the whole block is parsed; a single complete fragment reassembles
     identically on any OpenAI client. Sequential blocks increment ``index``."""
 
-    def __init__(self, uid: int) -> None:
+    def __init__(self, uid: int, allowed: "frozenset[str] | None" = None) -> None:
         self.uid = uid
+        # Names offered in the request; calls to any other name are dropped (see _tool_name_allowed).
+        self.allowed = allowed
         self.buf = ""            # partial opener (outside a block) OR accumulating block body (inside)
         self.in_tool = False
         self.opener: str | None = None
@@ -2155,6 +2190,11 @@ class ToolCallStreamState:
         name, frag = js.scan(body)
         out: List[dict] = []
         if name is not None:
+            if not _tool_name_allowed(name, self.allowed):
+                # Kill incremental streaming for this block; the closer path parses whole-block and
+                # _emit_parsed drops it again (idempotent — one warning per name per process).
+                js.dead = True
+                return []
             i = self.next_index
             self.next_index += 1
             self._jstream_index = i
@@ -2166,6 +2206,8 @@ class ToolCallStreamState:
         return out
 
     def _emit_parsed(self, name: str, args) -> List[dict]:
+        if not _tool_name_allowed(name, self.allowed):
+            return []
         args_str = args if isinstance(args, str) else json.dumps(args)
         i = self.next_index
         self.next_index += 1
@@ -2844,7 +2886,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             # Forced tool call: grammar constrained `body` to a complete call. zaya_xml -> native XML
             # (<function=…><parameter=…>), parsed by the wrapper parser; else JSON {"name","arguments"}.
             if '"__ebnf__"' in forced_tool_grammar:
-                _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
+                _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools))
                 if tool_calls:
                     message["content"] = _tc_content
                     message["tool_calls"] = tool_calls
@@ -2857,7 +2899,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                     finish_reason = "tool_calls"
         elif req.tools and req.tool_choice != "none":
             # auto: the model chose; if it opened a wrapper its args were structural-tag-constrained.
-            _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter)
+            _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools))
             if tool_calls:
                 message["content"] = _tc_content
                 message["tool_calls"] = tool_calls
@@ -2969,7 +3011,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # Stateful tool-call parser: only when tools are actually offered to the model (mirrors the
         # non-streaming path's `if req.tools`). `tool_choice:"none"` withholds the tools from the
         # template, so no blocks are emitted and this stays a no-op even when constructed.
-        tool_stream = ToolCallStreamState(uid) if req.tools and req.tool_choice != "none" else None
+        tool_stream = (ToolCallStreamState(uid, allowed=_known_tool_names(req.tools))
+                       if req.tools and req.tool_choice != "none" else None)
         include_usage = bool((req.stream_options or {}).get("include_usage"))
         return StreamingResponse(
             state.stream_with_cancellation(
@@ -3021,7 +3064,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     if _pl_forced_tool_grammar is not None:
         # Forced tool call: zaya_xml -> native XML (wrapper parser); else JSON {"name","arguments"}.
         if '"__ebnf__"' in _pl_forced_tool_grammar:
-            _c, _tc = _parse_tool_calls(full_content, uid)
+            _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools))
             if _tc:
                 tool_calls, remainder = _tc, (_c or "")
         else:
@@ -3045,7 +3088,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # Parsed even when finish_reason == "length": skipping truncated output guaranteed that any
         # markup already emitted leaked into `content` as prose. `_parse_tool_calls` recovers complete
         # blocks and logs the genuinely-truncated ones, so attempting it is strictly better than not.
-        _c, _tc = _parse_tool_calls(full_content, uid)
+        _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools))
         if _tc:
             tool_calls, remainder = _tc, (_c or "")
 
