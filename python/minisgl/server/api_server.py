@@ -107,6 +107,15 @@ class Message(BaseModel):
     tool_calls: List[dict] | None = None  # on a prior assistant turn
     tool_call_id: str | None = None  # on a "tool" turn — which call this result answers
     name: str | None = None  # tool/function name on a "tool" turn
+    # Chain-of-thought on a REPLAYED assistant turn (DeepSeek-style field, what our own responses
+    # emit). Undeclared until now, so pydantic silently DROPPED it at the boundary and the chat
+    # template never saw it — which broke the piece of the Qwen convention that matters most for
+    # agent loops: both Qwen3.6 and Qwen3.8 templates re-render thinking for every assistant turn
+    # AFTER the last user query (`loop.index0 > ns.last_query_index`), i.e. across tool-call rounds
+    # within one task, so the model continues its own chain of thought instead of re-deriving from
+    # scratch at every tool result. Qwen3.8 additionally replays ALL history thinking by default
+    # (`preserve_thinking` true when undefined). Templates that don't read the key ignore it.
+    reasoning_content: str | None = None
 
     @model_validator(mode="after")
     def _flatten_content_parts(self) -> "Message":
