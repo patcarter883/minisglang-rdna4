@@ -51,6 +51,24 @@ def _rotary_from_subdict(
     )
 
 
+def _norm_output_gate(value) -> str:
+    """Normalize the checkpoint's GDN `output_gate_type` to the two activations the kernels
+    implement. swish IS silu (upstream maps it identically); absent means the HF default (silu).
+    Anything else raises HERE, at config load: the gate multiplies every GDN layer's output, and
+    running the wrong one produces degenerate-but-grammatical text with no error anywhere else."""
+    if value is None:
+        return "silu"
+    v = str(value).strip().lower()
+    if v in ("silu", "swish"):
+        return "silu"
+    if v == "sigmoid":
+        return "sigmoid"
+    raise ValueError(
+        f"unsupported GDN output_gate_type {value!r}: the gated-norm kernels implement "
+        "silu/swish and sigmoid"
+    )
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
@@ -101,6 +119,11 @@ class ModelConfig:
     linear_value_head_dim: int | None = None
     linear_conv_kernel_dim: int | None = None
     layer_types: tuple[str, ...] | None = None
+    # GDN output-gate activation, NORMALIZED: "silu" (covers the checkpoint spellings silu/swish —
+    # upstream maps swish->silu) or "sigmoid". Read from `output_gate_type`; absent -> "silu" (the
+    # HF default). An unknown value raises in from_hf: better a loud load failure than 48 layers of
+    # grammatical-but-degenerate output through the wrong gate. Was hardcoded SiLU end to end.
+    gdn_output_gate: str = "silu"
     # ---- Sliding-window attention (SWA) hybrid (Laguna: repeating [full, sliding×3]). None for a
     # non-SWA model. `layer_types[i]` is "sliding_attention" (windowed) or "full_attention" (global);
     # a SWA layer keeps paged KV but capped at `sliding_window` tokens (its own ring pool), NOT full
@@ -758,6 +781,7 @@ class ModelConfig:
             # -> is_block_diffusion False, and every canvas branch downstream stays dead.
             canvas_length=getattr(top, "canvas_length", None) or None,
             linear_num_key_heads=linear_num_key_heads,
+            gdn_output_gate=_norm_output_gate(getattr(config, "output_gate_type", None)),
             linear_num_value_heads=getattr(config, "linear_num_value_heads", None),
             linear_key_head_dim=getattr(config, "linear_key_head_dim", None),
             linear_value_head_dim=getattr(config, "linear_value_head_dim", None),

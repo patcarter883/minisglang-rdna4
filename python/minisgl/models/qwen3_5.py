@@ -301,6 +301,9 @@ class Qwen3_5DecoderLayer(BaseOP):
                 conv_kernel_size=config.linear_conv_kernel_dim,
                 tp_size=get_tp_info().size,  # head-parallel: local heads + out_proj all-reduce
                 eps=config.rms_norm_eps,
+                # The checkpoint's output_gate_type, normalized by _norm_output_gate. Was a dead
+                # parameter (SiLU hardcoded end to end); Qwen3.8 made it load-bearing.
+                activation=config.gdn_output_gate,
                 dtype=torch.get_default_dtype(),  # bf16/fp16 under the engine's build context
                 device=torch.device("meta"),  # built on meta; real tensors via load(assign=True)
                 qkvz_method=_gdn_method("in_proj_qkv"),

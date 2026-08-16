@@ -220,6 +220,18 @@ class QwenGatedDeltaNet(nn.Module):
         self.head_v_dim = head_v_dim
         self.conv_kernel_size = conv_kernel_size
         self.activation = activation
+        # OUTPUT-GATE activation id for the gated-RMSNorm epilogues (kernel `gate_act` policy:
+        # 0=silu, 1=sigmoid). Distinct from the CONV activation, which stays SiLU. Was hardcoded
+        # SiLU in every kernel while this parameter sat dead — the exact silent-quality-poison
+        # shape: a sigmoid checkpoint would have produced grammatical-but-degenerate output through
+        # all 48 GDN layers with no error anywhere. Unknown spellings raise HERE, at build time.
+        _GATE_IDS = {"silu": 0, "swish": 0, "sigmoid": 1}
+        if activation not in _GATE_IDS:
+            raise ValueError(
+                f"unsupported GDN output-gate activation {activation!r} "
+                f"(kernels implement {sorted(_GATE_IDS)})"
+            )
+        self._gate_act = _GATE_IDS[activation]
         self._proj_dtype = dtype  # output dtype of the projections (== model dtype)
 
         self.key_dim = head_k_dim * self.num_k_heads
@@ -296,6 +308,16 @@ class QwenGatedDeltaNet(nn.Module):
         v = v.reshape(n, self.num_v_heads, self.head_v_dim).contiguous()
         return q, k, v
 
+    def _gate_args(self) -> tuple:
+        """Trailing `gate_activation` arg for the gated-norm ops, as a splat.
+
+        Empty for SiLU so the call is BYTE-IDENTICAL to the pre-policy form — which is also what
+        keeps an OLD gdn_hip .so (schema without the arg, e.g. the serve image's baked build)
+        working for every silu/swish checkpoint. A sigmoid checkpoint on an old .so fails the op's
+        schema match with an argument-count error at first forward: loud, and the fix is a kernel
+        rebuild, not a silent SiLU."""
+        return (self._gate_act,) if self._gate_act else ()
+
     # ---- output projection: rmsnorm_gated(core, z) -> flatten -> out_proj ----
     def _output_projection(self, core_attn_out: torch.Tensor, z: torch.Tensor, n: int) -> torch.Tensor:
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
@@ -307,7 +329,8 @@ class QwenGatedDeltaNet(nn.Module):
         core = core_attn_out.reshape(-1, core_attn_out.shape[-1]).contiguous()  # [n*HV, head_v_dim]
         z_flat = z.reshape(-1, z.shape[-1]).contiguous()
         engaged("gdn_hip.rmsnorm_gated")
-        normed = gdn.rmsnorm_gated(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
+        normed = gdn.rmsnorm_gated(core, z_flat, self._norm_weight_fp32(), self.norm.eps,
+                                   *self._gate_args())
         normed = normed.reshape(n, self.value_dim)  # (n, num_v_heads, head_v_dim) -> (n, value_dim)
         return self.out_proj(normed.to(out_dtype))
 
@@ -337,7 +360,8 @@ class QwenGatedDeltaNet(nn.Module):
         out_dtype = self._proj_dtype
         core = core.reshape(-1, core.shape[-1]).contiguous()          # [T*num_v_heads, head_v_dim]
         z_flat = z.reshape(-1, z.shape[-1]).contiguous()
-        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
+        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps,
+                                             *self._gate_args())
         return self.out_proj(normed.reshape(n, self.value_dim).to(out_dtype))
 
     def _prefill_train_batch(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -366,7 +390,8 @@ class QwenGatedDeltaNet(nn.Module):
         out_dtype = self._proj_dtype
         core = core.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
         z_flat = z.reshape(n * self.num_v_heads, self.head_v_dim).contiguous()
-        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps)
+        normed = gdn_bwd.rmsnorm_gated_train(core, z_flat, self._norm_weight_fp32(), self.norm.eps,
+                                             *self._gate_args())
         return self.out_proj(normed.reshape(B, T, self.value_dim).to(out_dtype))
 
     def _forward_prefill_train(self, hidden_states: torch.Tensor,
@@ -590,7 +615,7 @@ class QwenGatedDeltaNet(nn.Module):
                 a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
                 ssm_state, state_idx, ring["k"], ring["vr"], ring["g"], ring["vn"], ring["len"],
                 ring["s0n"], z_flat, self._norm_weight_fp32(), self.norm.eps,
-                1, self.head_k_dim ** -0.5, 1,
+                1, self.head_k_dim ** -0.5, 1, *self._gate_args(),
             )  # [B, num_v_heads, head_v_dim], conv+replay-recurrence+gated-RMS-norm in one
             return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
 
@@ -604,7 +629,7 @@ class QwenGatedDeltaNet(nn.Module):
                 mixed_qkv.contiguous(), self._conv_weights_fp32(), None, conv_state,
                 a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
                 ssm_state, state_idx, z_flat, self._norm_weight_fp32(), self.norm.eps,
-                1, self.head_k_dim ** -0.5, 1,
+                1, self.head_k_dim ** -0.5, 1, *self._gate_args(),
             )  # [B, num_v_heads, head_v_dim], conv+recurrence+gated-RMS-norm in one
             return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
 
@@ -629,7 +654,7 @@ class QwenGatedDeltaNet(nn.Module):
             normed = gdn.gdn_decode_gated(
                 q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
                 ssm_state, state_idx, z_flat, self._norm_weight_fp32(), self.norm.eps,
-                self.head_k_dim ** -0.5, 1,
+                self.head_k_dim ** -0.5, 1, *self._gate_args(),
             )  # [B, num_v_heads, head_v_dim], already gated-RMS-normed
             return self.out_proj(normed.reshape(n, self.value_dim).to(self._proj_dtype))
         engaged("gdn_hip.gdn_decode")
