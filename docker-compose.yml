@@ -116,6 +116,12 @@ x-lean-common: &lean-common
     # to the pure-Triton unified_attention — the attention-numerics A/B arm (only read when
     # ATTN=rdna4). Same five-hops trap as above: read by the engine, previously never forwarded.
     MINISGL_ATTN_HIP: "${MINISGL_ATTN_HIP:-}"
+    # Server default think budget (scheduler β backstop; scheduler.py reads it, default 1024).
+    # Needed at launch for models whose template has NO reasoning level (e.g. Qwen3.6): there the
+    # 1024 cap still applies to every thinking request, so a long-thinking comparison against a
+    # level-capable model (Qwen3.8, uncapped) is unfair unless this is raised. Third instance of
+    # the five-hops trap: read by the engine, was never forwarded.
+    MINISGL_THINK_BUDGET: "${MINISGL_THINK_BUDGET:-}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
     MINISGL_KV_FP8_SCALES: "${MINISGL_KV_FP8_SCALES:-}"
