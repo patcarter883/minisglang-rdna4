@@ -324,11 +324,18 @@ case "$MODEL" in
                   # agent session (4000-char `**ai**ai**` loop; prose after it degraded — dropped
                   # sentence-final periods). With presence_penalty=1.0 (card remedy range 0..2;
                   # its non-thinking preset ships 1.5): 0/4 loops, longer coherent outputs.
-                  # DELIBERATE deviation from the card's thinking preset (presence 0.0), on that
-                  # measurement. Card caveat: high values risk language mixing / slight quality
-                  # loss — 1.0 is mid-range, n=4/arm; re-measure before tuning. Applies to
-                  # request-UNSET only: an explicit client value, including 0.0, wins.
-                  presence_default="1.0"
+                  # REVERTED same day: presence=1.0 replaced the loop with a WORSE failure —
+                  # presence penalty is one-shot per token IDENTITY over the whole output, so a
+                  # long thinking turn saturates the common-token space and the model degenerates
+                  # into letter-by-letter spelling ("T\nh\ne\nm\na\ni\n n", live session
+                  # 78cd9d018610 at ~5k chars). The 0/4-loops validation was BLIND: its metrics
+                  # (repeat-run + missing-period regex) cannot see letter-spelling, and the arm-B
+                  # text was never read. The card's own presets encode the constraint — presence
+                  # 1.5 for SHORT non-thinking answers, 0.0 for thinking — penalties of this form
+                  # do not mix with long generations. Loop root cause still open (top-k sampler
+                  # kernel under test; fp8-KV A/B pending); do NOT re-apply an unbounded-window
+                  # penalty here.
+                  presence_default=""
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
                   # leaves 3.27 GiB = 214,016 KV tokens, 4.2x the unsloth serve. Validated: 20/20 on
                   # the sampled quality probe with ZERO degeneration, a 5.4k-token prefill, and MTP
@@ -364,9 +371,9 @@ case "$MODEL" in
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
                   # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
                   model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="none"; k_mtp=4
-                  # Same base model + card as qwen38-27b above; inherits its measured anti-loop
-                  # default (see that entry for the 2026-08-16 measurement + caveats).
-                  presence_default="1.0"
+                  # Same base model + card as qwen38-27b above — see that entry: the presence
+                  # default was applied and REVERTED same day (long-generation starvation).
+                  presence_default=""
                   mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
                   # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
                   # that decodes the block semi-autoregressively, which is what fixes DFlash's
