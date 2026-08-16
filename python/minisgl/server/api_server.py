@@ -981,6 +981,45 @@ def _resolve_penalties(req: "OpenAICompletionRequest | GenerateRequest") -> tupl
     return presence, frequency
 
 
+def _strip_replayed_think_spans(messages: List[dict]) -> None:
+    """Remove BALANCED reasoning spans from HISTORICAL assistant `content`, in place.
+
+    A client that replays an assistant turn whose content carries leaked reasoning markup (our own
+    parser documents the re-opened-span edge case that puts it there) meets templates that disagree
+    about whose job the cleanup is: Qwen3.6's template splits `content` on the closer itself, but
+    Qwen3.8's expects the markup in `reasoning_content` and renders content VERBATIM — after its own
+    empty `<think>\\n\\n</think>` block. The result is a double-think turn no model was trained on,
+    replayed into every subsequent prompt of the session: one degenerate turn poisons the rest.
+
+    Deliberately conservative, in two ways. Only BALANCED `open…close` spans are removed — an
+    unterminated opener is left alone, because deleting from an unclosed tag to end-of-string is a
+    known data-loss bug in at least one agent framework's history sanitizer, and silently truncating
+    a real answer is worse than rendering stray markup. And the delimiters are the pair DERIVED from
+    this checkpoint's own template (the reasoning parser's), never a hardcoded `<think>`."""
+    try:
+        parser = _reasoning_parser()
+    except Exception:  # noqa: BLE001 — no parser context (early boot / tests): nothing to strip by
+        return
+    if parser is None or not parser.start_token or not parser.end_token:
+        return
+    start, end = parser.start_token, parser.end_token
+    for msg in messages:
+        c = msg.get("content")
+        if msg.get("role") != "assistant" or not isinstance(c, str) or start not in c:
+            continue
+        out = c
+        while True:
+            i = out.find(start)
+            if i < 0:
+                break
+            j = out.find(end, i + len(start))
+            if j < 0:
+                break  # unterminated: leave it (see docstring)
+            out = out[:i] + out[j + len(end):]
+        if out != c:
+            msg["content"] = out.lstrip("\n")
+
+
 def _normalize_tool_args(messages: List[dict]) -> None:
     """Chat templates expect a tool call's `function.arguments` to be a *mapping* (they call
     `.items()` on it), but the OpenAI wire format carries it as a JSON *string*. When tool-call
@@ -1274,6 +1313,7 @@ def _generation_prompt_tail(req: "OpenAICompletionRequest", kwargs: dict | None)
         return None
     messages = [msg.model_dump(exclude_none=True) for msg in req.messages]
     _normalize_tool_args(messages)
+    _strip_replayed_think_spans(messages)
     try:
         on = tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **(kwargs or {}))
@@ -2583,6 +2623,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # the template (exclude_none + JSON-string tool args -> dict).
         messages = [msg.model_dump(exclude_none=True) for msg in req.messages]
         _normalize_tool_args(messages)
+        _strip_replayed_think_spans(messages)
         client = InProcessBackendClient(state, state.config.model_path)
         try:
             # Thread the SAME structured transports the plain lane uses: thinking-mode applies to every
@@ -2693,6 +2734,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # "tool" result turn) — the chat template checks for absent keys, not explicit nulls.
         prompt = [msg.model_dump(exclude_none=True) for msg in req.messages]
         _normalize_tool_args(prompt)  # tool_call arguments: JSON string -> dict for the template
+        _strip_replayed_think_spans(prompt)
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
