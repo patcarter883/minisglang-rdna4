@@ -293,6 +293,25 @@ case "$MODEL" in
   # did NOT reproduce from plain requests (short, 15k-token prompt, 3.5k-token generation,
   # streamed and not): it appears to need agent-shaped context and to be stochastic.
   # Until that is understood, the default takes the slower quant family with no such history.
+  # fp8-KV: this checkpoint ships NO kv_cache_scheme, so without a sidecar the cache stores k/v
+  # at e4m3 with 1.0 scales (the engine warns). CALIBRATED per-head scales were generated and
+  # installed at <snapshot>/kv_scales.safetensors, which fp8_scales auto-discovers — the boot
+  # log then says "installed PER-HEAD scales from sidecar" instead of the uncalibrated warning.
+  # It earns its keep here: measured V amax ranges 6.844 -> 133 ACROSS LAYERS and the per-head
+  # spread is up to 2.36x, none of which a single 1.0 scale can represent.
+  #
+  # THE SIDECAR IS NOT IN THIS REPO and lives in the HF snapshot dir, so a re-download SILENTLY
+  # reverts to uncalibrated (a warning in the log, not an error). Durable copy + report:
+  #   /home/pat/fixtures/minisgl-kv-calib/sidecars/qwen38-27b-nvfp4_tp2.{safetensors,report.json}
+  # Restore:  cp <that>.safetensors <snapshot>/kv_scales.safetensors
+  # Regenerate (under a 2-card lease, in the lean image, with MINISGL_KV_FP8=0 so the amax is
+  # measured through a bf16 cache — see the calibrator docstring):
+  #   python tools/kv_fp8_calibrate.py --model sakamakismile/Qwen3.8-27B-MTP-NVFP4 --tp 2 \
+  #     --text /home/pat/fixtures/minisgl-kv-calib/kv_calib_v1.txt --out <sidecar> --report <json>
+  # Costs NOTHING in context: pool is unchanged at 247,264 tokens with the sidecar installed.
+  # Does NOT measurably change MTP acceptance (0.563 median calibrated vs 0.551 uncalibrated,
+  # inside a 0.490-0.599 spread) — the draft head reads the same KV as the target, so cleaner
+  # KV moves both sides together. It is an OUTPUT-QUALITY fix, not a spec-acceptance one.
   qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
                   model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.97 GiB/card (vs unsloth's 11.62) -> 0.97
