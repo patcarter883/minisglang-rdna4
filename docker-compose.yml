@@ -76,6 +76,12 @@ x-lean-common: &lean-common
     # SAME binary, _DEBUG makes the launcher print the count it chose (the A/B's provenance).
     MINISGL_MOE_G2_SPLIT_K: "${MINISGL_MOE_G2_SPLIT_K:-}"
     MINISGL_MOE_G2_SPLIT_DEBUG: "${MINISGL_MOE_G2_SPLIT_DEBUG:-}"
+    # Tool-call runaway defenses (api_server; empty-safe via env_int, defaults live in code):
+    # _CONT_LIMIT rejects a continuation replaying an unclosed block past N chars (default 49152);
+    # _RUNAWAY_LIMIT force-finishes an in-flight generation once a single unclosed block passes N
+    # chars (default 65536). 0 disables either.
+    MINISGL_TOOLCALL_CONT_LIMIT: "${MINISGL_TOOLCALL_CONT_LIMIT:-}"
+    MINISGL_TOOLCALL_RUNAWAY_LIMIT: "${MINISGL_TOOLCALL_RUNAWAY_LIMIT:-}"
     # Twin handle for the SCATTER arm's K carve (M<=2). "legacy" reproduces the retired
     # `4 if M == 1 else 1` so a control leg can measure what that constant cost e2e.
     MINISGL_MOE_SPLITK_SCATTER: "${MINISGL_MOE_SPLITK_SCATTER:-}"

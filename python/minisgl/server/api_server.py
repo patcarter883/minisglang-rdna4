@@ -2563,7 +2563,11 @@ class FrontendManager:
             }
             return f"data: {json.dumps(payload)}\n\n".encode()
 
-        async for ack in self.wait_for_ack(uid):
+        # In-flight runaway budget: the largest unclosed tool-call body worth continuing to decode.
+        # See the trip site below; 0 disables.
+        _runaway_limit = env_int("MINISGL_TOOLCALL_RUNAWAY_LIMIT", 65536)
+        _acks = self.wait_for_ack(uid)
+        async for ack in _acks:
             if getattr(ack, "error", None):
                 # Headers are already sent, so this cannot become a 4xx — emit an explicit error
                 # event so the client sees a REASON instead of an empty stream that just stops.
@@ -2627,6 +2631,28 @@ class FrontendManager:
                         "never close; the turn will only surface when max_tokens is hit.",
                         uid, tool_stream.held_chars, tool_stream.opener, completion_tokens,
                     )
+
+            # Runaway killer: a single unclosed tool-call body past the budget cannot be a real
+            # call any more (the largest legitimate argument served is ~15KB; the measured runaway
+            # ran to 65,510 chars and would have continued to max_tokens — 35-45k tokens of garbage
+            # per leg). Force-finish NOW: closing the ack generator is what aborts the backend
+            # generation (wait_for_ack's finally), and the flush below delivers the partial block
+            # with the truthful finish_reason="length" so an agent harness treats it as truncation,
+            # not success. `held_chars` covers BOTH block modes — it keeps accumulating even while
+            # incremental argument fragments are streaming out.
+            if (tool_stream is not None and _runaway_limit > 0
+                    and tool_stream.held_chars > _runaway_limit):
+                logger.warning(
+                    "uid=%s force-finished: unclosed %s tool-call block reached %d chars "
+                    "(MINISGL_TOOLCALL_RUNAWAY_LIMIT=%d) after %d completion tokens — runaway "
+                    "generation inside a tool call. Aborting the generation; the partial block "
+                    "goes to the client with finish_reason=length.",
+                    uid, tool_stream.opener, tool_stream.held_chars, _runaway_limit,
+                    completion_tokens,
+                )
+                finish_reason = "length"
+                await _acks.aclose()
+                break
 
             if ack.finished:
                 break
@@ -2777,6 +2803,33 @@ class FrontendManager:
         except asyncio.CancelledError:
             asyncio.create_task(self.abort_user(uid))
             raise
+
+    async def acks_with_cancellation(self, uid: int, request: Request):
+        """`wait_for_ack` for the NON-streaming lanes, with the disconnect handling the streaming
+        lanes get from `stream_with_cancellation`. Without it, a non-streaming caller that gives up
+        (agent-gateway timeouts are the norm — a Hermes subagent caps one call at 600s) left the
+        engine decoding to max_tokens with nobody to receive the result: measured 2026-08-17, a
+        12.5-minute ~45k-token zombie after a 600s client timeout, evicting the live session's radix
+        pages the whole time. Same throttled `is_disconnected` poll as the streaming path; on
+        disconnect the iteration simply ends — closing the inner generator is what aborts the
+        backend generation (wait_for_ack's finally: finished=False -> AbortMsg + map/metrics
+        cleanup), and the caller's already-collected partial state goes to a dead socket."""
+        _DISCONNECT_POLL_INTERVAL = 0.5
+        last_check = 0.0
+        inner = self.wait_for_ack(uid)
+        try:
+            async for ack in inner:
+                yield ack
+                now = time.monotonic()
+                if now - last_check >= _DISCONNECT_POLL_INTERVAL:
+                    last_check = now
+                    if await request.is_disconnected():
+                        logger.info(
+                            "client disconnected mid-generation for user %s — aborting the "
+                            "backend generation instead of decoding to max_tokens", uid)
+                        break
+        finally:
+            await inner.aclose()
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
@@ -3092,7 +3145,16 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
     rejected: str | None = None
-    async for ack in state.wait_for_ack(uid):
+    # In-flight runaway watchdog, mirroring the streaming lane: scan the accumulating output with
+    # the SAME block grammar the streaming parser uses, and force-finish once an unclosed tool-call
+    # body passes the budget. This is the lane the measured zombie ran on (a non-streaming Hermes
+    # subagent call), so it needs the guard MOST: nothing else bounds a runaway here before
+    # max_tokens. Scan only when tools were offered — with tools withheld no block can be emitted.
+    _rw_limit = env_int("MINISGL_TOOLCALL_RUNAWAY_LIMIT", 65536)
+    _rw_scan = (ToolCallStreamState(uid) if _rw_limit > 0 and req.tools
+                and req.tool_choice != "none" else None)
+    _acks = state.acks_with_cancellation(uid, request)
+    async for ack in _acks:
         if getattr(ack, "error", None):
             rejected = ack.error
             break
@@ -3103,6 +3165,19 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             finish_reason = ack.finish_reason
         if ack.finished:
             break
+        if _rw_scan is not None and ack.incremental_output:
+            _rw_scan.push(ack.incremental_output)
+            if _rw_scan.held_chars > _rw_limit:
+                logger.warning(
+                    "uid=%s force-finished: unclosed %s tool-call block reached %d chars "
+                    "(MINISGL_TOOLCALL_RUNAWAY_LIMIT=%d) after %d completion tokens — runaway "
+                    "generation inside a tool call. Aborting the generation; the partial output "
+                    "is returned with finish_reason=length.",
+                    uid, _rw_scan.opener, _rw_scan.held_chars, _rw_limit, completion_tokens,
+                )
+                finish_reason = "length"
+                await _acks.aclose()
+                break
     if rejected is not None:
         # The engine refused this request (e.g. prompt longer than the KV pool). Answer with a real
         # 4xx: returning an empty 200 would look like the model chose to say nothing, and the old
@@ -3301,7 +3376,9 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
     rejected: str | None = None
-    async for ack in state.wait_for_ack(uid):
+    # No tool-call runaway scan here — tools are a 400 on this lane — but the disconnect abort
+    # matters just the same: an abandoned non-streaming request must not decode to max_tokens.
+    async for ack in state.acks_with_cancellation(uid, request):
         if getattr(ack, "error", None):
             rejected = ack.error
             break
