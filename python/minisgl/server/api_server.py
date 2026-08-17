@@ -2508,11 +2508,20 @@ class FrontendManager:
 
                 pending = self.ack_map[uid]
                 self.ack_map[uid] = []
-                ack = None
                 for ack in pending:
+                    # `finished` is set BEFORE the yield: every consumer breaks its async-for at
+                    # the yield of the finished ack, so setting it after the loop meant a normal
+                    # completion looked abandoned to the finally below, which then fired a spurious
+                    # AbortMsg for the just-finished uid. Harmless when cleanup ran lazily at GC
+                    # time, but acks_with_cancellation closes this generator PROMPTLY — the abort
+                    # then races the scheduler's own deferred finish processing (resource free +
+                    # recurrent-state snapshot) for the same request. Observed 2026-08-17 as
+                    # cross-request response contamination under concurrent load; see
+                    # fixtures/minisgl-crossing-20260817.
+                    if ack.finished:
+                        finished = True
                     yield ack
-                if ack and ack.finished:
-                    finished = True
+                if finished:
                     break
         finally:
             # GUARANTEED terminal cleanup on ANY exit — normal finish, client disconnect (GeneratorExit
