@@ -338,10 +338,13 @@ def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
     if fmt == "atem":
         ebnf = _atem_xml_grammar(tools, forced_name)  # native <atem:invoke> XML, not JSON
         return json.dumps({"__ebnf__": ebnf}) if ebnf else None
-    variants = _tool_call_variants(tools, forced_name)
+    variants, defs = _tool_call_variants(tools, forced_name)
     if not variants:
         return None
-    return json.dumps(variants[0] if len(variants) == 1 else {"anyOf": variants})
+    schema = variants[0] if len(variants) == 1 else {"anyOf": variants}
+    if defs:
+        schema = {**schema, "$defs": defs}
+    return json.dumps(schema)
 
 
 def _ebnf_lit(s: str) -> str:
@@ -541,24 +544,108 @@ def _resolve_tool_format() -> str:
     return _DERIVED_TOOL_FORMAT or "json"
 
 
-def _tool_call_variants(tools: List[dict], forced_name: str | None = None) -> List[dict]:
-    """A JSON-schema per allowed tool: {name: const, arguments: that tool's parameters}."""
+def _jp_escape(seg: str) -> str:
+    """JSON-pointer-escape one path segment (RFC 6901: ~ -> ~0, / -> ~1)."""
+    return seg.replace("~", "~0").replace("/", "~1")
+
+
+def _jp_unescape(seg: str) -> str:
+    return seg.replace("~1", "/").replace("~0", "~")
+
+
+def _rehome_refs(node, ns: str):
+    """Deep-copy ``node`` rewriting document-root ``$ref`` pointers — ``#``, ``#/$defs/X…``,
+    ``#/definitions/X…`` — to the hoisted root-level names (``<ns>`` / ``<ns>.X``, see
+    _hoist_tool_defs). Anything else (external URIs, other in-document pointers) passes through
+    untouched: if it can't compile, the scheduler downgrades that request to unconstrained
+    decoding rather than crashing."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "$ref" and isinstance(v, str):
+                if v == "#":
+                    v = "#/$defs/" + _jp_escape(ns)
+                else:
+                    for base in ("#/$defs/", "#/definitions/"):
+                        if v.startswith(base):
+                            name, sep, rest = v[len(base):].partition("/")
+                            v = ("#/$defs/" + _jp_escape(f"{ns}.{_jp_unescape(name)}")
+                                 + (("/" + rest) if sep else ""))
+                            break
+                out[k] = v
+            else:
+                out[k] = _rehome_refs(v, ns)
+        return out
+    if isinstance(node, list):
+        return [_rehome_refs(v, ns) for v in node]
+    return node
+
+
+def _contains_self_ref(node) -> bool:
+    """True if ``node`` anywhere carries ``{"$ref": "#"}`` (a self-recursive root schema)."""
+    if isinstance(node, dict):
+        return any(
+            (k == "$ref" and v == "#") or _contains_self_ref(v) for k, v in node.items()
+        )
+    if isinstance(node, list):
+        return any(_contains_self_ref(v) for v in node)
+    return False
+
+
+def _hoist_tool_defs(params: dict, ns: str, defs_out: dict) -> dict:
+    """Prepare a tool's ``parameters`` schema for embedding as a SUBSCHEMA of the composed
+    tool-call grammar. JSON-pointer refs resolve from the root of whatever document xgrammar is
+    handed, so a schema whose refs point at its own root — ``$defs``/``definitions``, what every
+    pydantic-generated tool schema carries — breaks the moment it is nested under
+    ``properties.arguments``: ``#/$defs/X`` then points into the wrapper and xgrammar's compile
+    raises (which used to kill the scheduler and, via the crash-watchdog, the whole serve).
+    Hoist those defs into ``defs_out`` under a per-tool namespace for the caller to attach at
+    the COMPOSED schema's root, rewriting the refs to match. Nothing is inlined, so recursive
+    schemas keep working."""
+    local: dict = {}
+    for key in ("$defs", "definitions"):
+        d = params.get(key)
+        if isinstance(d, dict):
+            local.update(d)
+    self_ref = _contains_self_ref(params)
+    if not local and not self_ref:
+        return params  # nothing root-anchored to rehome; embed as-is
+    body = _rehome_refs(
+        {k: v for k, v in params.items() if k not in ("$defs", "definitions")}, ns
+    )
+    for name, sub in local.items():
+        defs_out[f"{ns}.{name}"] = _rehome_refs(sub, ns)
+    if self_ref:
+        defs_out[ns] = body  # `{"$ref": "#"}` now targets this hoisted copy of the whole schema
+    return body
+
+
+def _tool_call_variants(
+    tools: List[dict], forced_name: str | None = None
+) -> tuple[List[dict], dict]:
+    """A JSON-schema per allowed tool — {name: const, arguments: that tool's parameters} — plus
+    the hoisted ``$defs`` the caller MUST attach at the composed schema's root (refs resolve from
+    the document root, i.e. above any ``anyOf``, not from the variant they appear in)."""
     variants = []
-    for t in tools:
+    defs: dict = {}
+    for i, t in enumerate(tools):
         fn = t.get("function") or {}
         name = fn.get("name")
         if not name or (forced_name and name != forced_name):
             continue
+        params = fn.get("parameters") or {"type": "object"}
+        if isinstance(params, dict):
+            params = _hoist_tool_defs(params, f"tool{i}", defs)
         variants.append({
             "type": "object",
             "properties": {
                 "name": {"const": name},
-                "arguments": fn.get("parameters") or {"type": "object"},
+                "arguments": params,
             },
             "required": ["name", "arguments"],
             "additionalProperties": False,
         })
-    return variants
+    return variants, defs
 
 
 # Tool-call wrappers we constrain in `auto` mode: a trigger opener -> JSON call -> closer. The model
@@ -598,10 +685,12 @@ def _structural_tag_from_tools(req: "OpenAICompletionRequest") -> str | None:
     tools = req.tools
     if not tools or (req.tool_choice not in (None, "auto")):
         return None
-    variants = _tool_call_variants(tools)
+    variants, defs = _tool_call_variants(tools)
     if not variants:
         return None
     call_schema = variants[0] if len(variants) == 1 else {"anyOf": variants}
+    if defs:
+        call_schema = {**call_schema, "$defs": defs}
     tags = [{"begin": b, "schema": call_schema, "end": e} for b, e in _TOOL_STRUCT_WRAPPERS]
     triggers = [b for b, _ in _TOOL_STRUCT_WRAPPERS]
     return json.dumps({"__structural_tag__": {"tags": tags, "triggers": triggers}})

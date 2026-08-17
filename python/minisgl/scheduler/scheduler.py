@@ -2052,7 +2052,24 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 continue
             m = self._grammar_matchers.get(r.uid)
             if m is None:
-                m = self._grammar_matchers[r.uid] = backend.make_matcher(r.sampling_params.grammar)
+                try:
+                    m = self._grammar_matchers[r.uid] = backend.make_matcher(
+                        r.sampling_params.grammar
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # A grammar that fails to COMPILE (malformed client schema, unresolvable
+                    # $ref, an xgrammar limitation) must degrade THIS request to unconstrained
+                    # decoding, never propagate — an uncaught error here kills the scheduler and
+                    # the crash-watchdog then takes the whole serve down (one bad tool schema in
+                    # a /v1/chat/completions request == total outage). Clearing the grammar
+                    # flips is_constrained off for every later consumer (bitmask, spec routing,
+                    # matcher advance), so the row stays all-ones from here on.
+                    r.sampling_params.grammar = None
+                    logger.warning_rank0(
+                        "grammar compile failed for req %d (%r); serving it UNCONSTRAINED.",
+                        r.uid, e,
+                    )
+                    continue
                 self._maybe_arm_think_gate(r)  # gate the schema until </think> if thinking is active
             # Reasoning gate: while still inside <think>…</think>, leave this row all-ones (free
             # reasoning) and do NOT advance the matcher — the schema starts fresh on the answer.
