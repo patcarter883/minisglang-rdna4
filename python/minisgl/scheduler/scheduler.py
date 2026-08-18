@@ -2611,6 +2611,28 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
+        # FEEDBACK-INTEGRITY CHECK (MINISGL_FEEDBACK_CHECK=1, debug-only: one D2H sync per step).
+        # The invariant that keeps the emitted stream and the model's context the SAME text: a
+        # decode row's input token (read from the token pool) must equal the token the scheduler
+        # COMMITTED for that req last step (host seq position device_len-1). Any mismatch means the
+        # client saw one token and the model another — the silent divergence class behind the
+        # token-pool override bug (76b9164d). Loud log, no crash: the point is to catch it in the
+        # act on a live serve.
+        if os.environ.get("MINISGL_FEEDBACK_CHECK") == "1" and not batch.is_prefill:
+            ids_cpu = batch.input_ids.to("cpu")
+            real = {id(r) for r in batch.reqs}
+            off = 0
+            for r in batch.padded_reqs:
+                n = r.extend_len
+                if n == 1 and id(r) in real and off < ids_cpu.shape[0]:
+                    pos = r.device_len - 1
+                    if 0 <= pos < r.input_ids.shape[0]:
+                        exp, got = int(r.input_ids[pos]), int(ids_cpu[off])
+                        if exp != got:
+                            logger.warning_rank0(
+                                f"[feedback-integrity] uid={r.uid} pos={pos}: model input {got} "
+                                f"!= committed {exp} — context/emission DIVERGENCE")
+                off += n
         if self.engine.cam is not None:
             self._stage_cam(batch)
         # DFlash training-data capture: run the forward WITH aux (eager, no graph) whenever the batch has
