@@ -864,8 +864,8 @@ def w4a16_moe(
 def w4a16_linear(
     x: torch.Tensor,  # (M, K) fp16 activations — DIRECT (no act-quant)
     w_rep_wide: torch.Tensor,  # register-direct wide weights (built in process_weights_after_load)
-    scales: torch.Tensor,  # (N, K//g) fp16
-    w_zeros: torch.Tensor | None,  # (N//8, K//g) int32 (AWQ) or None (symmetric)
+    scales: torch.Tensor,  # (K//g, N) fp16 GROUP-MAJOR
+    w_zeros: torch.Tensor | None,  # (K//g, N//8) int32 (AWQ) or None (symmetric)
     group_size: int,
     N: int,
 ) -> torch.Tensor:
@@ -1572,8 +1572,8 @@ _W4A8_GEMV_K_MULTIPLE = 32
 def w4a8_linear(
     x: torch.Tensor,
     w_packed: torch.Tensor,  # (N, K/8) int32, op layout
-    scales: torch.Tensor,  # (N, K/group) fp16
-    w_zeros: torch.Tensor | None,  # (N/8, K/group) int32 (AWQ asym) or None (sym)
+    scales: torch.Tensor,  # (K/group, N) fp16 GROUP-MAJOR — N contiguous (binding asserts size(1)==N)
+    w_zeros: torch.Tensor | None,  # (K/group, N/8) int32 (AWQ asym) or None (sym)
     group_size: int,
     kernel: str | None = None,
     weight_is_e2m1: bool = False,  # True -> decode nibbles as MXFP4 (OCP E2M1); w_zeros must be None
@@ -1623,8 +1623,8 @@ def w4a8_linear(
 def w4a8_linear_silu(
     x: torch.Tensor,
     w_packed: torch.Tensor,  # (2*inter, K/8) int32 [gate|up], op layout
-    scales: torch.Tensor,  # (2*inter, K/group) fp16
-    w_zeros: torch.Tensor | None,  # ((2*inter)/8, K/group) int32 (AWQ) or None (sym)
+    scales: torch.Tensor,  # (K/group, 2*inter) fp16 GROUP-MAJOR
+    w_zeros: torch.Tensor | None,  # (K/group, (2*inter)/8) int32 (AWQ) or None (sym)
     group_size: int,
     weight_is_e2m1: bool = False,
 ) -> torch.Tensor:
