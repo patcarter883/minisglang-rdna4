@@ -220,6 +220,8 @@ x-lean-common: &lean-common
     # SSM recurrent-state STORAGE dtype: 1 (default) = bf16, 0 = fp32. Passed through for the
     # Qwen3.8 corruption bisection — the bf16 bounded-rounding claim is horizon/model-dependent.
     MINISGL_SSM_BF16: "${MINISGL_SSM_BF16:-1}"
+    # ReplaySSM ring: 1 (default) = deferred-fold decode, 0 = bit-exact per-step path (bisection).
+    MINISGL_GDN_REPLAY: "${MINISGL_GDN_REPLAY:-1}"
     # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
     # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
     MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"

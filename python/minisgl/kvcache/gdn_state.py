@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .host_arena import (
@@ -91,7 +93,9 @@ class GDNStateCache:
         # never drift from the kernel's own allocator.
         self._ring: list | None = None
         self.ring_len = 0
-        if device.type == "cuda":   # the replay kernels are HIP-only; a CPU cache keeps the old path
+        # MINISGL_GDN_REPLAY=0 disables the ReplaySSM ring entirely (decode falls back to the
+        # bit-exact per-step gdn_decode_conv_gated path) — corruption-bisection knob.
+        if device.type == "cuda" and os.environ.get("MINISGL_GDN_REPLAY", "1") != "0":
             try:
                 import gdn_hip as _gdn
                 if hasattr(_gdn, "gdn_decode_conv_gated_replay"):
