@@ -39,23 +39,21 @@ def _get_lmhead_gemv():
 
 def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
                     bias: torch.Tensor | None) -> torch.Tensor:
-    """EXPERIMENT (this worktree only): full-vocab logits in fp32 end-to-end.
+    """Full-vocab logits x @ weight^T (+bias). Uses the M-invariant bf16 decode GEMV when it applies
+    (bf16/fp16 weight, rows <= MMAX), else the minv GEMM. Both are M-invariant, so the choice never
+    breaks spec-verify == decode bit-identity."""
+    from minisgl.layers.minv import minv_linear
 
-    The production path (bf16 GEMV / minv below) accumulates each dot in fp32 but STORES bf16 —
-    at logit magnitude 16..32 that is a 0.125-granular grid, which collapses every distinction
-    finer than 0.125 nats into an EXACT tie (measured: 19/19 top-20 gaps on the grid, both AWQ
-    and NVFP4 arms; llama.cpp on the same weights is continuous). This chunked torch fallback
-    keeps the store fp32 to test whether the grid (and its tie-collapse) is the corruption
-    contributor. ~2.5 GB of transient weight casts per step — a probe, not a production kernel;
-    the real fix is an fp32-out store policy on the shared GEMV core."""
-    xf = x.float()
-    out = torch.empty(x.shape[0], weight.shape[0], dtype=torch.float32, device=x.device)
-    CH = 8192
-    for i in range(0, weight.shape[0], CH):
-        out[:, i : i + CH] = xf @ weight[i : i + CH].float().t()
-    if bias is not None:
-        out += bias
-    return out
+    gemv = _get_lmhead_gemv()
+    if (gemv is not None
+            and weight.dtype in (torch.bfloat16, torch.float16)
+            and x.dtype == weight.dtype
+            and x.dim() == 2 and x.shape[0] <= _LMHEAD_GEMV_MMAX):
+        out = gemv(x.contiguous(), weight)
+        if bias is not None:
+            out = out + bias
+        return out
+    return minv_linear(x, weight, bias)
 
 
 class VocabParallelEmbedding(BaseOP):
