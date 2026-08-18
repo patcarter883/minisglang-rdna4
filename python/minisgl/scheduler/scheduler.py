@@ -1313,6 +1313,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                         self._stash_swa_state(req)
                     continue
                 next_token = next_tokens_cpu[i]
+                _sampled_token = int(next_token.item())
                 # #100 POINTER delivery: for the first len(obj) steps, OVERRIDE the sampled token with the
                 # exact object token from engine.cam (deliver_object_ids, computed in _prepare_cam). The
                 # forced token is what's committed to the KV history (append_host) AND emitted, so the base
@@ -1331,6 +1332,18 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 _forced = self._think_gate.forced_next(req.uid)
                 if _forced is not None and int(next_token.item()) != _forced:
                     next_token = next_token.new_tensor(_forced)
+                # OVERRIDE FIXUP: the forward already committed the SAMPLED token to the token pool
+                # (token_pool[output_mapping] = next_tokens_gpu, _forward), so an override that only
+                # touched the host sequence would leave the NEXT step's embedding input reading the
+                # pre-override token — the emitted stream and the model's context silently diverge,
+                # and everything after a think-gate force-close (or CAM delivery) is conditioned on a
+                # context the client never saw. Demonstrated live 2026-08-18: a budget-forced close
+                # collapsed into token noise at exactly the forced boundary. Write the override into
+                # the same cell the forward wrote: complete_one already ran, so the sampled token's
+                # cell is (table_idx, cached_len). Spec path is unaffected (it scatters committed
+                # tokens itself). One tiny H2D per FORCED token only.
+                if int(next_token.item()) != _sampled_token:
+                    self.token_pool[req.table_idx, req.cached_len] = int(next_token.item())
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # CAM seed-once: the object's first token has landed -> stop injecting this req's bank
