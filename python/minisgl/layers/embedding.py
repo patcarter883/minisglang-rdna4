@@ -39,21 +39,38 @@ def _get_lmhead_gemv():
 
 def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
                     bias: torch.Tensor | None) -> torch.Tensor:
-    """Full-vocab logits x @ weight^T (+bias). Uses the M-invariant bf16 decode GEMV when it applies
-    (bf16/fp16 weight, rows <= MMAX), else the minv GEMM. Both are M-invariant, so the choice never
-    breaks spec-verify == decode bit-identity."""
-    from minisgl.layers.minv import minv_linear
+    """Full-vocab logits x @ weight^T (+bias), stored fp32.
 
+    The GEMV core always accumulated each dot in fp32; storing the result in bf16 quantized the
+    finished logits to the bf16 ULP — an exact 0.125 grid at |logit| 16..32, with bit-identical
+    TIES between unrelated tokens (measured on the served LM-head top-20; llama.cpp on the same
+    weights is continuous). Ties collapse <0.125-nat distinctions at sampling time, so the store
+    is now fp32 end-to-end: the M-invariant decode GEMV takes fp32_out (a store POLICY on the
+    shared core), and the rare rows > MMAX fall back to a chunked fp32 torch matmul (prefill
+    last-token batches; once per request, so the cast traffic is irrelevant there). minv stays
+    out of this path — its bf16 store is the exact grid this removes."""
     gemv = _get_lmhead_gemv()
     if (gemv is not None
             and weight.dtype in (torch.bfloat16, torch.float16)
             and x.dtype == weight.dtype
             and x.dim() == 2 and x.shape[0] <= _LMHEAD_GEMV_MMAX):
-        out = gemv(x.contiguous(), weight)
+        try:
+            out = gemv(x.contiguous(), weight, True)
+        except TypeError:
+            # Older kernel package without the fp32_out policy: keep serving (bf16 store) rather
+            # than dying — the grid is a fidelity deficit, not an outage.
+            out = gemv(x.contiguous(), weight)
         if bias is not None:
             out = out + bias
         return out
-    return minv_linear(x, weight, bias)
+    xf = x.float()
+    out = torch.empty(x.shape[0], weight.shape[0], dtype=torch.float32, device=x.device)
+    CH = 8192
+    for i in range(0, weight.shape[0], CH):
+        out[:, i : i + CH] = xf @ weight[i : i + CH].float().t()
+    if bias is not None:
+        out += bias
+    return out
 
 
 class VocabParallelEmbedding(BaseOP):
