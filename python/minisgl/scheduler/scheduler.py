@@ -1291,7 +1291,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
 
         hp = self._hp
         _t0 = time.perf_counter() if hp is not None else 0.0
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, (_, next_tokens_cpu, copy_done, *_fo_rest) = last_data[0].batch, last_data[1]
+        # Per-token logprob capture (probe traffic only): batch-row -> (top_ids, top_lps, tok_lp).
+        _lp_cap = last_data[1].logprobs
         copy_done.synchronize()
         if hp is not None:
             _t0 = self._hp_add("gpu_wait", time.perf_counter() - _t0) or time.perf_counter()
@@ -1372,8 +1374,19 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     elif m is not None and not m.is_terminated():
                         m.accept_token(next_token)
                 fr = ("stop" if eos_hit else "length") if finished else None
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token,
-                                           finished=finished, finish_reason=fr))
+                _lp = _lp_cap.get(i) if (_lp_cap is not None
+                                         and req.sampling_params.logprobs > 0) else None
+                if _lp is None:
+                    reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token,
+                                               finished=finished, finish_reason=fr))
+                else:
+                    # NOTE: tok_lp is the logprob of the SAMPLED token; a think-gate/CAM override
+                    # that replaced it leaves top_ids/top_logprobs valid but tok_lp describing the
+                    # pre-override draw. Probe requests never carry those overrides.
+                    reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token,
+                                               finished=finished, finish_reason=fr,
+                                               logprob=_lp[2], top_ids=list(_lp[0]),
+                                               top_logprobs=[float(v) for v in _lp[1]]))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:

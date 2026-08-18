@@ -26,6 +26,12 @@ class SamplingParams:
     min_p: float = 0.0
     ignore_eos: bool = False
     max_tokens: int = 1024
+    # Top-N per-token logprobs for GENERATED tokens (0 = off). Captured from the model's
+    # distribution after the softcap and padded-vocab fence but BEFORE grammar masks, EOS
+    # suppression and repetition penalties — the raw model distribution, which is what an
+    # engine-numerics probe wants. Plain decode path only (spec decode commits several tokens per
+    # step through a different lane and does not carry these).
+    logprobs: int = 0
     # Stop strings: generation finishes (and the output is truncated) at the first occurrence of any
     # of these in the decoded text. Matched on the detokenized string, scheduler-agnostic.
     # OpenAI repetition controls, applied to the tokens THIS REQUEST HAS GENERATED (not the prompt —

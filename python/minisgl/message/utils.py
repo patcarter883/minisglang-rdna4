@@ -17,7 +17,8 @@ import torch
 # fallback and composes inside a `Batch*.data` list exactly as before. Field order mirrors each
 # dataclass's declaration so the emitted dict is identical to what the generic walk produced.
 _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
-    "DetokenizeMsg": ("uid", "next_token", "finished", "extra_tokens", "finish_reason", "error"),
+    "DetokenizeMsg": ("uid", "next_token", "finished", "extra_tokens", "finish_reason", "error",
+                      "logprob", "top_ids", "top_logprobs"),
     "UserReply": (
         "uid",
         "incremental_output",
@@ -26,6 +27,10 @@ _FAST_SCALAR_FIELDS: Dict[str, tuple] = {
         "prompt_tokens",
         "finish_reason",
         "error",
+        # logprobs is a nested-but-plain container (dict of scalars + list of dicts of scalars);
+        # the fast lane passes values verbatim, so msgpack packs it directly. None on non-probe
+        # traffic keeps the hot path byte-identical.
+        "logprobs",
     ),
     "StatsMsg": (
         "dp_rank",

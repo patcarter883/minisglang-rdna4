@@ -234,10 +234,11 @@ class OpenAICompletionRequest(BaseModel):
     metadata: dict | None = None
     service_tier: str | None = None
     parallel_tool_calls: bool | None = None
-    # Declared ONLY so the request can be REJECTED with a clear reason. The engine has no support for
-    # these; accepting them silently (the old behaviour) means answering a different question than the
-    # one asked. See _reject_unsupported.
-    logprobs: bool | None = None
+    # logprobs IS honoured on the non-streaming /v1/completions lane (classic int form: top-N per
+    # generated token, capped at 20 — see v1_text_completions). Everywhere else — chat, streaming —
+    # it is still a clear 400, not a silently-ignored field. top_logprobs alone remains chat-only
+    # vocabulary and is rejected with it.
+    logprobs: int | bool | None = None
     top_logprobs: int | None = None
     logit_bias: dict | None = None
     # TEXT-completions-only parameters (/v1/completions). Declared for the SAME reason as the block
@@ -1150,7 +1151,8 @@ def _tools_for_template(req: "OpenAICompletionRequest") -> List[dict] | None:
     return req.tools
 
 
-def _reject_unsupported(req: "OpenAICompletionRequest") -> JSONResponse | None:
+def _reject_unsupported(req: "OpenAICompletionRequest",
+                        allow_logprobs: bool = False) -> JSONResponse | None:
     """400 for parameters this engine cannot honour, instead of accepting and ignoring them.
 
     Silently ignoring is the worse failure: the caller gets a 200 and a confidently wrong answer to a
@@ -1161,10 +1163,10 @@ def _reject_unsupported(req: "OpenAICompletionRequest") -> JSONResponse | None:
         return JSONResponse(status_code=400, content={"error": {
             "message": msg, "type": "invalid_request_error", "param": param, "code": code}})
 
-    if req.logprobs or req.top_logprobs is not None:
-        return bad("logprobs / top_logprobs are not supported by this server: returning per-token "
-                   "logprobs would require carrying them through the sampler, scheduler and "
-                   "detokenizer on every token. Omit the field.", "logprobs")
+    if (req.logprobs or req.top_logprobs is not None) and not allow_logprobs:
+        return bad("logprobs / top_logprobs are not supported on this endpoint. Per-token logprobs "
+                   "are available on NON-STREAMING /v1/completions only (classic int form, "
+                   "capped at 20).", "logprobs")
     if req.logit_bias:
         return bad("logit_bias is not supported by this server.", "logit_bias")
     if req.n is not None and req.n != 1:
@@ -1235,7 +1237,9 @@ def _reject_unsupported_text_completion(req: "OpenAICompletionRequest") -> JSONR
       for the same reason.
     * `echo` / `suffix` / `best_of` — see the request-model comment.
     """
-    bad = _reject_unsupported(req)
+    # logprobs are legal on this lane when non-streaming (the SSE wire shape has no logprobs
+    # field); the int form is validated in the handler.
+    bad = _reject_unsupported(req, allow_logprobs=not req.stream)
     if bad is not None:
         return bad
 
@@ -3417,6 +3421,15 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
     _bad = _reject_unsupported_text_completion(req)
     if _bad is not None:
         return _bad
+    # Classic completions logprobs: an INT top-N (bool True is tolerated as 5, the OpenAI default
+    # cap era; 0/False/None = off), hard-capped at 20 like the reference implementations.
+    lp_n = 0
+    if req.logprobs:
+        lp_n = 5 if req.logprobs is True else min(int(req.logprobs), 20)
+        if lp_n < 0:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "logprobs must be a non-negative integer (top-N, capped at 20).",
+                "type": "invalid_request_error", "param": "logprobs", "code": "invalid_value"}})
     state = get_global_state()
     prompt: str = req.prompt  # type: ignore[assignment]  # guaranteed a non-empty str by the reject above
 
@@ -3445,6 +3458,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 **dict(zip(("temperature", "top_p", "top_k", "min_p"),
                            _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
+                logprobs=lp_n,
                 grammar=_grammar_from_response_format(req.response_format),
                 # response_format only on this lane: if there is a grammar, the caller required it.
                 grammar_required=bool(_grammar_from_response_format(req.response_format)),
@@ -3471,6 +3485,7 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
     # Non-streaming: accumulate into a list and "".join once — `+=` in the loop is O(n^2) in the
     # output length (same reason as the chat lane).
     chunks: List[str] = []
+    lp_entries: List[Dict] = []
     prompt_tokens = completion_tokens = 0
     finish_reason = "stop"
     rejected: str | None = None
@@ -3481,6 +3496,8 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
             rejected = ack.error
             break
         chunks.append(ack.incremental_output)
+        if getattr(ack, "logprobs", None):
+            lp_entries.append(ack.logprobs)
         completion_tokens = max(completion_tokens, ack.completion_tokens)
         prompt_tokens = ack.prompt_tokens or prompt_tokens
         if ack.finish_reason:
@@ -3504,7 +3521,18 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "text": "".join(chunks),
-                "logprobs": None,
+                # Classic text-completions logprobs object, plus a "detail" extension carrying
+                # token IDS (the classic shape keys top_logprobs by token STRING, which collides
+                # for byte-identical detokenizations — a numerics probe wants the ids).
+                "logprobs": None if not lp_n else {
+                    "tokens": [e["token"] for e in lp_entries],
+                    "token_logprobs": [e["logprob"] for e in lp_entries],
+                    "top_logprobs": [
+                        {t["token"]: t["logprob"] for t in e["top"]} for e in lp_entries
+                    ],
+                    "text_offset": [],
+                    "detail": lp_entries,
+                },
                 "finish_reason": finish_reason,
             }
         ],

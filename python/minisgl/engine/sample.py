@@ -39,6 +39,12 @@ class BatchSamplingArgs:
     pen_presence: torch.Tensor | None = None
     pen_frequency: torch.Tensor | None = None
     pen_uids: list | None = None
+    # Rows (batch indices, host list) whose request asked for per-token logprobs, and the largest N
+    # asked. None/0 on the overwhelmingly common no-logprobs path — zero cost there. The capture
+    # itself happens inside Sampler.sample (see _capture_logprobs) so it reads the SAME processed
+    # logits (post-softcap, post-vocab-fence) that sampling reads.
+    logprob_rows: list | None = None
+    logprob_topn: int = 0
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -173,6 +179,10 @@ class Sampler:
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         pen = self._penalty_plan(batch)
+        lp_rows = [i for i, p in enumerate(params) if getattr(p, "logprobs", 0) > 0]
+        if lp_rows:
+            pen = dict(pen, logprob_rows=lp_rows,
+                       logprob_topn=max(params[i].logprobs for i in lp_rows))
         if all(p.is_greedy for p in params):
             # Greedy still needs penalties applied — they change which token is the argmax, which is
             # the entire point of asking for them at temperature 0.
@@ -211,6 +221,16 @@ class Sampler:
             # Padded-vocab fence: the untrained tail can never be sampled (see real_vocab_size).
             if self.real_vocab_size is not None and self.real_vocab_size < logits.shape[-1]:
                 logits[:, self.real_vocab_size:] = float("-inf")
+            # Per-token logprob capture, for the rows that asked (SamplingParams.logprobs > 0).
+            # Taken HERE — after the scrub / softcap / padded-vocab fence, before grammar masks,
+            # EOS suppression and penalties — so it reports the raw model distribution rather than
+            # the served one (the difference matters to an engine-numerics probe; probe requests
+            # carry none of those masks anyway). The log_softmax stays on-device; the sampled
+            # token's own logprob is gathered at return time (_finish_logprob_capture).
+            _lp_full = None
+            if args.logprob_rows:
+                _lp_full = torch.log_softmax(
+                    logits[torch.tensor(args.logprob_rows, device=logits.device)].float(), dim=-1)
             if args.grammar_bitmask is not None:  # structured output: mask disallowed tokens to -inf
                 from .grammar import apply_token_bitmask
 
@@ -236,7 +256,31 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 # Penalties apply to greedy too: they change which token is the argmax, which is the
                 # entire point of asking for them at temperature 0.
-                return self._commit_penalty(torch.argmax(logits, dim=-1), args)
-            return self._commit_penalty(
-                sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p,
-                            args.min_p), args)
+                tokens = self._commit_penalty(torch.argmax(logits, dim=-1), args)
+            else:
+                tokens = self._commit_penalty(
+                    sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p,
+                                args.min_p), args)
+            if _lp_full is not None:
+                self._finish_logprob_capture(_lp_full, tokens, args)
+            return tokens
+
+    def _finish_logprob_capture(self, lp_full: torch.Tensor, tokens: torch.Tensor,
+                                args: BatchSamplingArgs) -> None:
+        """Stash top-N (ids, logprobs) + the sampled token's logprob for the flagged rows. One small
+        D2H copy per step, probe traffic only. The engine pops this right after sample() and rides
+        it back on ForwardOutput.logprobs; keying is by BATCH ROW index (the scheduler maps rows to
+        reqs by position)."""
+        n = min(args.logprob_topn, lp_full.shape[-1])
+        topv, topi = lp_full.topk(n, dim=-1)
+        rows_t = torch.tensor(args.logprob_rows, device=tokens.device)
+        tok_lp = lp_full.gather(-1, tokens[rows_t].long().unsqueeze(-1)).squeeze(-1)
+        self._captured_logprobs = {
+            int(r): (topi[j].tolist(), topv[j].tolist(), float(tok_lp[j]))
+            for j, r in enumerate(args.logprob_rows)
+        }
+
+    def pop_captured_logprobs(self) -> dict | None:
+        cap = getattr(self, "_captured_logprobs", None)
+        self._captured_logprobs = None
+        return cap

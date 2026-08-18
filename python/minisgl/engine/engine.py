@@ -152,6 +152,10 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Per-token logprob capture for rows that asked (SamplingParams.logprobs > 0): batch-row ->
+    # (top_ids, top_logprobs, sampled_token_logprob). None on the common no-logprobs path. NOTE:
+    # positional destructures of this tuple must use starred unpacking or field access.
+    logprobs: dict | None = None
 
 
 class Engine:
@@ -1381,7 +1385,8 @@ class Engine:
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        out = ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event,
+                            self.sampler.pop_captured_logprobs())
         if _pf_ev is not None:
             _pf_ev[1].record(self.stream)
             self._pf_events.append(_pf_ev)

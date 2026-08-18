@@ -158,6 +158,20 @@ def tokenize_worker(
                         finish_reason = "stop"
                     else:
                         finish_reason = msg.finish_reason or "stop"
+                    # Per-token logprobs (probe traffic only): decode ids to token strings here,
+                    # where the tokenizer lives — the HTTP frontend has none.
+                    _lp_rec = None
+                    if msg.top_ids is not None:
+                        _tok = detokenize_manager.tokenizer
+                        _lp_rec = {
+                            "token_id": msg.next_token,
+                            "token": _tok.decode([msg.next_token]),
+                            "logprob": msg.logprob,
+                            "top": [
+                                {"id": tid, "token": _tok.decode([tid]), "logprob": tlp}
+                                for tid, tlp in zip(msg.top_ids, msg.top_logprobs or [])
+                            ],
+                        }
                     replies.append(
                         UserReply(
                             uid=msg.uid,
@@ -167,6 +181,7 @@ def tokenize_worker(
                             prompt_tokens=prompt_tokens_map.get(msg.uid, 0),
                             finish_reason=finish_reason,
                             error=msg.error,
+                            logprobs=_lp_rec,
                         )
                     )
                     if finished:

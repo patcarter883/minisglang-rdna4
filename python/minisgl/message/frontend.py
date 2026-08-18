@@ -37,6 +37,10 @@ class UserReply(BaseFrontendMsg):
     # Set when the engine REFUSED the request (see DetokenizeMsg.error). The reply is terminal and
     # carries no text; the HTTP layer turns it into a 4xx instead of ending the stream silently.
     error: str | None = None
+    # Per-token logprob record for THIS reply's token (requests with SamplingParams.logprobs > 0
+    # only): {"token_id", "token", "logprob", "top": [{"id", "token", "logprob"}, ...]}. The HTTP
+    # layer accumulates one per generated token into the OpenAI `logprobs` response object.
+    logprobs: Dict | None = None
 
 
 @dataclass

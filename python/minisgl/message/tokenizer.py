@@ -45,6 +45,12 @@ class DetokenizeMsg(BaseTokenizerMsg):
     # never saw a `finished` ack, and the caller blocked until its own timeout: a rejected request
     # was indistinguishable from a hung server.
     error: str | None = None
+    # Per-token logprobs for this step's token, present only when the request asked
+    # (SamplingParams.logprobs > 0) and the plain decode path committed the token: the sampled
+    # token's logprob plus the top-N (ids, logprobs) of the raw model distribution at this step.
+    logprob: float | None = None
+    top_ids: List[int] | None = None
+    top_logprobs: List[float] | None = None
 
 
 @dataclass
