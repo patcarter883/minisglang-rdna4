@@ -166,6 +166,11 @@ x-lean-common: &lean-common
     # [1,13,25,37,49] while its GGUF says [2,14,26,38,50]) — and capturing the wrong set does not
     # error, it just quietly halves acceptance, which is indistinguishable from a bad drafter.
     MINISGL_DFLASH_CAPTURE_LAYERS: "${MINISGL_DFLASH_CAPTURE_LAYERS:-}"
+    # Cap the drafter's block size below the checkpoint's (block = min(ckpt, this); drafts = block-1).
+    # The propose cost lever for a drafter whose late positions never accept: head rows, markov walk
+    # length and the block forward all shrink with it. Forwarded for the same reason as every other
+    # MINISGL_* knob here — the engine reads it INSIDE the container.
+    MINISGL_DFLASH_BLOCK: "${MINISGL_DFLASH_BLOCK:-}"
     # DDTree: route DFlash through the drafter-agnostic draft-TREE step (per-position top-K marginals
     # -> best-first tree -> ancestor-mask verify) for a higher accept-len than the linear K chain.
     # Forwarded so the scheduler's os.environ read sees it inside the container; topk/budget default

@@ -276,6 +276,16 @@ case "$MODEL" in
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
+                  # MEASURED 2026-08-19 (coding prompts, SAMPLED seeds 101/202/303, M=1, 1200-tok,
+                  # TP=2, graphs on, ledger-verified markov+confidence engaged): NET-NEGATIVE at
+                  # M=1 on the INT4 arm — plain 38.85 tok/s vs dspark k=3/block-4 34.81 (0.93
+                  # drafts/step), k=6 33.80 (0.95), k=6+tau0.5 ~30, MTP 34.25 (1.08). The FP8-
+                  # trained drafter accepts ~1 draft/step against 4-bit target hidden, and the
+                  # ~5 GB/step propose weight-stream eats the win. So spec_default stays none;
+                  # SPEC=dspark remains selectable and correct (12-probe degen pass clean).
+                  # MINISGL_DFLASH_QUANT=fp8 on this drafter is WORSE (27.0 tok/s) — never use.
+                  # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
+                  # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
                   if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   # DEFAULT ON CORRECTNESS, NOT SPEED. The INT4 arm is ~23% faster (31.8 vs 24.4 tok/s) and was
@@ -356,6 +366,16 @@ case "$MODEL" in
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
+                  # MEASURED 2026-08-19 (coding prompts, SAMPLED seeds 101/202/303, M=1, 1200-tok,
+                  # TP=2, graphs on, ledger-verified markov+confidence engaged): NET-NEGATIVE at
+                  # M=1 on the INT4 arm — plain 38.85 tok/s vs dspark k=3/block-4 34.81 (0.93
+                  # drafts/step), k=6 33.80 (0.95), k=6+tau0.5 ~30, MTP 34.25 (1.08). The FP8-
+                  # trained drafter accepts ~1 draft/step against 4-bit target hidden, and the
+                  # ~5 GB/step propose weight-stream eats the win. So spec_default stays none;
+                  # SPEC=dspark remains selectable and correct (12-probe degen pass clean).
+                  # MINISGL_DFLASH_QUANT=fp8 on this drafter is WORSE (27.0 tok/s) — never use.
+                  # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
+                  # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
                   if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
@@ -381,6 +401,16 @@ case "$MODEL" in
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
+                  # MEASURED 2026-08-19 (coding prompts, SAMPLED seeds 101/202/303, M=1, 1200-tok,
+                  # TP=2, graphs on, ledger-verified markov+confidence engaged): NET-NEGATIVE at
+                  # M=1 on the INT4 arm — plain 38.85 tok/s vs dspark k=3/block-4 34.81 (0.93
+                  # drafts/step), k=6 33.80 (0.95), k=6+tau0.5 ~30, MTP 34.25 (1.08). The FP8-
+                  # trained drafter accepts ~1 draft/step against 4-bit target hidden, and the
+                  # ~5 GB/step propose weight-stream eats the win. So spec_default stays none;
+                  # SPEC=dspark remains selectable and correct (12-probe degen pass clean).
+                  # MINISGL_DFLASH_QUANT=fp8 on this drafter is WORSE (27.0 tok/s) — never use.
+                  # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
+                  # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
                   if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)

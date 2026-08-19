@@ -315,7 +315,10 @@ class DFlashProposer(CapturableProposer):
         )
         block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
         if block_cap:
-            self._block_size = min(self._block_size, block_cap)
+            # An EXPLICIT override wins in BOTH directions: it can also RAISE the block past the
+            # checkpoint's declared block_size (positions past the trained block are then
+            # out-of-distribution — verify gates them, so it is an empirical lever, not a hazard).
+            self._block_size = block_cap
 
         # Captured target-layer ids (z-lab target_layer_ids / speculators aux_hidden_state_layer_ids).
         # Read through `cfg`, not `dfc.get`: Muse-Glimmer's assistant checkpoint ships NO
@@ -1042,7 +1045,10 @@ class DFlashProposer(CapturableProposer):
         self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 16)
         block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
         if block_cap:
-            self._block_size = min(self._block_size, block_cap)
+            # An EXPLICIT override wins in BOTH directions: it can also RAISE the block past the
+            # checkpoint's declared block_size (positions past the trained block are then
+            # out-of-distribution — verify gates them, so it is an empirical lever, not a hazard).
+            self._block_size = block_cap
         assert self._block_size >= 2, f"DFlash block_size must be >= 2, got {self._block_size}"
         self._mask_token_id = int(dfc.get("mask_token_id", 12))
 
