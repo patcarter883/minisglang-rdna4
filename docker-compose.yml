@@ -231,6 +231,8 @@ x-lean-common: &lean-common
     # Debug: =1 serves every dense quant linear through the tiled/prefill kernel (decode GEMVs
     # bypassed) — corruption-bisection knob.
     MINISGL_FORCE_TILED_LINEARS: "${MINISGL_FORCE_TILED_LINEARS:-}"
+    # Debug: every Nth GDN decode call logs max/median per-head ||S||_F vs the kernel's 1000 cap.
+    MINISGL_SSM_NORM_LOG: "${MINISGL_SSM_NORM_LOG:-}"
     # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
     # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
     MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"
