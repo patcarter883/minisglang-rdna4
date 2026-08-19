@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import get_global_ctx
+from minisgl.utils import init_logger
 
 from .rdna4 import _HIP_HEAD_DIMS, RDNA4Backend, RDNA4Metadata
 
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from minisgl.core import Batch
     from minisgl.models import ModelConfig
 
+
+
+logger = init_logger(__name__)
 
 class HIPAttnBackend(RDNA4Backend):
     def __init__(self, config: "ModelConfig") -> None:
@@ -146,9 +150,61 @@ class HIPAttnBackend(RDNA4Backend):
             # (0-dim views) the canonical op now requires — stable address, graph-safe.
             ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]
             engaged("attn_decode.flash_decode_paged_fp8")
-            return self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, scale, ks, vs, 0)
-        engaged("attn_decode.flash_decode_paged")
-        return self._decode(q, k_cache, v_cache, block_table, ctx_lens, scale, 0)
+            ret = self._decode_fp8(q, k_cache, v_cache, block_table, ctx_lens, scale, ks, vs, 0)
+        else:
+            engaged("attn_decode.flash_decode_paged")
+            ret = self._decode(q, k_cache, v_cache, block_table, ctx_lens, scale, 0)
+        # ATTENTION PARITY TAP (MINISGL_ATTN_PARITY_N=N, debug; eager decode only — a python tap
+        # cannot run inside a captured graph). Every Nth decode-attention call, recompute this
+        # layer's decode attention in torch fp32 from the SAME paged KV (incl. the fp8 descale) and
+        # log the worst per-row rel error. There is no second attention backend on RDNA4 to A/B
+        # against, so the reference IS torch — this is how the HIP decode-attention kernel gets
+        # checked in real serving conditions (real page tables, real lengths, real KV contents).
+        n = getattr(self, "_parity_n", None)
+        if n is None:
+            n = self._parity_n = int(os.environ.get("MINISGL_ATTN_PARITY_N", "0") or 0)
+            self._parity_calls = 0
+        if n and not torch.cuda.is_current_stream_capturing():
+            self._parity_calls += 1
+            if self._parity_calls % n == 0:
+                self._attn_parity_check(q, ret, layer_id, metadata, scale)
+        return ret
+
+    def _attn_parity_check(self, q, out, layer_id, metadata, scale) -> None:
+        try:
+            k_cache = self.kvcache.k_cache(layer_id)
+            v_cache = self.kvcache.v_cache(layer_id)
+            ps = k_cache.shape[1]
+            worst, worst_row, worst_len = 0.0, -1, 0
+            for i in range(q.shape[0]):
+                L = int(metadata.cache_seqlens[i])
+                if L <= 0:
+                    continue
+                pages = metadata.page_table[i, : (L + ps - 1) // ps].long()
+                k = k_cache[pages].reshape(-1, k_cache.shape[-2], k_cache.shape[-1])[:L]
+                v = v_cache[pages].reshape(-1, v_cache.shape[-2], v_cache.shape[-1])[:L]
+                if self.kv_is_fp8:
+                    k = k.float() * float(self.kvcache.k_descale[layer_id])
+                    v = v.float() * float(self.kvcache.v_descale[layer_id])
+                else:
+                    k, v = k.float(), v.float()
+                qi = q[i].float()
+                Hq, D = qi.shape
+                G = Hq // k.shape[1]
+                k = k.repeat_interleave(G, dim=1)   # kv head h//G serves query head h
+                v = v.repeat_interleave(G, dim=1)
+                p = torch.softmax(torch.einsum("hd,lhd->hl", qi, k) * scale, dim=-1)
+                ref = torch.einsum("hl,lhd->hd", p, v)
+                r = ((out[i].float().reshape(Hq, D) - ref).norm()
+                     / ref.norm().clamp_min(1e-9)).item()
+                if r > worst:
+                    worst, worst_row, worst_len = r, i, L
+            lvl = logger.warning_rank0 if worst > 2e-2 else logger.info_rank0
+            lvl(f"[attn-parity] layer={layer_id} call={self._parity_calls} "
+                f"worst_rel={worst:.3e} row={worst_row} kv_len={worst_len}"
+                + (" — DIVERGENT" if worst > 2e-2 else ""))
+        except Exception as e:  # a broken tap must never take down the serve
+            logger.warning_rank0(f"[attn-parity] check failed: {e}")
 
     # ---- cudagraph capture (DECODE only) -----------------------------------------------------
     # Decode is one token/seq, so the only per-step varying metadata the kernel reads is
