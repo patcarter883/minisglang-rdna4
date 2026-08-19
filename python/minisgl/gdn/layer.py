@@ -450,28 +450,6 @@ class QwenGatedDeltaNet(nn.Module):
 
         import gdn_hip as gdn  # lazy: only the engine forward needs the HIP .so (canonical callables)
 
-        # SSM-NORM PROBE (MINISGL_SSM_NORM_LOG=N, debug): every Nth decode call on layer 0, log the
-        # max per-head ||S||_F across active slots. The gdn_hip decode kernels Frobenius-clamp the
-        # state at SSM_STATE_MAX_NORM (1000, compile-time) — a nonlinear intervention llama.cpp does
-        # not perform — so if a model's real rumination-era states brush the cap, minisgl distorts
-        # them where llama.cpp lets them ride. This logger answers whether the clamp ENGAGES in vivo.
-        import os as _os
-        _nl = int(_os.environ.get("MINISGL_SSM_NORM_LOG", "0") or 0)
-        if _nl:
-            self._norm_calls = getattr(self, "_norm_calls", 0) + 1
-            if self._norm_calls % _nl == 0 and not torch.cuda.is_current_stream_capturing():
-                try:
-                    idx = state_indices.long()
-                    st = ssm_state[idx].float()          # [B, HV, V, K]
-                    nrm = st.reshape(st.shape[0], st.shape[1], -1).norm(dim=-1)
-                    from minisgl.utils import init_logger
-                    init_logger(__name__).info_rank0(
-                        f"[ssm-norm] call={self._norm_calls} max={nrm.max().item():.1f} "
-                        f"p50={nrm.median().item():.1f} (cap 1000)")
-                except Exception as e:
-                    from minisgl.utils import init_logger
-                    init_logger(__name__).warning_rank0(f"[ssm-norm] probe failed: {e!r}")
-
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
@@ -619,6 +597,28 @@ class QwenGatedDeltaNet(nn.Module):
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
         mixed_qkv, z, b, a = self._split_qkvz_ba(qkvz, ba, n)
+        # SSM-NORM PROBE (MINISGL_SSM_NORM_LOG=N, debug): every Nth decode call on layer 0, log the
+        # max per-head ||S||_F across active slots. The gdn_hip decode kernels Frobenius-clamp the
+        # state at SSM_STATE_MAX_NORM (1000, compile-time) — a nonlinear intervention llama.cpp does
+        # not perform — so if a model's real rumination-era states brush the cap, minisgl distorts
+        # them where llama.cpp lets them ride. This logger answers whether the clamp ENGAGES in vivo.
+        import os as _os
+        _nl = int(_os.environ.get("MINISGL_SSM_NORM_LOG", "0") or 0)
+        if _nl:
+            self._norm_calls = getattr(self, "_norm_calls", 0) + 1
+            if self._norm_calls % _nl == 0 and not torch.cuda.is_current_stream_capturing():
+                try:
+                    idx = state_indices.long()
+                    st = ssm_state[idx].float()          # [B, HV, V, K]
+                    nrm = st.reshape(st.shape[0], st.shape[1], -1).norm(dim=-1)
+                    from minisgl.utils import init_logger
+                    init_logger(__name__).info_rank0(
+                        f"[ssm-norm] call={self._norm_calls} max={nrm.max().item():.1f} "
+                        f"p50={nrm.median().item():.1f} (cap 1000)")
+                except Exception as e:
+                    from minisgl.utils import init_logger
+                    init_logger(__name__).warning_rank0(f"[ssm-norm] probe failed: {e!r}")
+
         state_idx = state_indices.long()  # int32->int64 once, reused by both kernels below
 
         if ring is not None and hasattr(gdn, "gdn_decode_conv_gated_replay"):
