@@ -190,6 +190,9 @@ class DFlashProposer(CapturableProposer):
 
     needs_last_hidden = False
     capture_layer_ids: Optional[List[int]] = None  # set in __init__ from the ckpt config
+    # DSpark confidence-head survival threshold; class default so the builders that can never load
+    # a confidence head (CCA, Laguna) need no per-path init. 0.0 = never truncate.
+    _conf_tau = 0.0
     # Set True in _build_laguna when the drafter is CAUSAL + SLIDING-WINDOW. It is a property of the
     # checkpoint, not a switch: the z-lab DFlash drafters are constructed non-causal with
     # sliding_window=0, so `_block_mask` returns None and the block attends the ENTIRE prefix
@@ -631,6 +634,9 @@ class DFlashProposer(CapturableProposer):
         self._g_blk = torch.zeros(3, G, Q, dtype=torch.int64, device=dev)
         self._aux_stage = torch.zeros(G, A, self._num_aux, self._hidden, device=dev, dtype=dt)
         self._g_out = torch.zeros(G, Q - 1, dtype=torch.int64, device=dev)
+        # DSpark confidence per drafted position (fp32, static so the captured body can write it);
+        # read_drafts cuts each request's draft list where cumulative survival crosses _conf_tau.
+        self._g_conf = torch.zeros(G, Q - 1, dtype=torch.float32, device=dev)
         # Block logits live in a static buffer because DDTree reads the per-position top-K marginals
         # of the SAME forward; a graph's internal tensors are not addressable from Python afterwards.
         # fp32 so it is lossless whatever kernel family the LM head dispatched to (the bf16 decode
@@ -859,6 +865,13 @@ class DFlashProposer(CapturableProposer):
         if self._compressed:
             ids = ids + self._d2t[ids]                   # draft vocab -> target vocab (on device)
         self._g_out[:bs] = ids.view(bs, Q - 1)
+        if d.has_confidence:
+            # Per-position acceptance probability over the SAME rows the head scored, conditioned
+            # one step back exactly like the Markov walk ([anchor, draft_0, ..]). Fixed shapes and
+            # no host sync, so it lives inside the captured body; the CUT happens in read_drafts.
+            idv = self._g_out[:bs]
+            prev = torch.cat([self._g_blk[0, :bs, :1], idv[:, :-1]], dim=1)
+            self._g_conf[:bs] = d.confidence(rows, prev)
 
     def read_drafts(
         self, reqs: List["Req"], staged: StagedPropose, topk: int = 0, **kw
@@ -866,10 +879,16 @@ class DFlashProposer(CapturableProposer):
         out: List[List[int]] = [[] for _ in reqs]
         Q = self._block_size
         drafts = self._g_out[: staged.bs].cpu().tolist()      # ONE D2H for the whole step
-        for i, k_i, row in zip(staged.rows, staged.budget, drafts):
+        conf = (self._g_conf[: staged.bs].cpu().tolist()
+                if self._draft.has_confidence and self._conf_tau > 0.0 else None)
+        for j, (i, k_i, row) in enumerate(zip(staged.rows, staged.budget, drafts)):
+            if conf is not None:
+                k_i = self._conf_cut(conf[j], k_i)
             out[i] = row[:k_i]
             if self._dbg:
-                print(f"[dflash-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}", flush=True)
+                print(f"[dflash-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}"
+                      + (f" conf={[round(c, 3) for c in conf[j][:k_i]]}" if conf else ""),
+                      flush=True)
         if topk > 0:
             # DDTree: per-position top-K marginals of the SAME forward, read off the static logits
             # buffer. Two batched D2H copies for the step, not two per request.
@@ -883,6 +902,20 @@ class DFlashProposer(CapturableProposer):
                 b = j * (Q - 1)
                 self._ddtree_topk[id(reqs[i])] = (ti_all[b : b + k_i], tv_all[b : b + k_i])
         return out
+
+    def _conf_cut(self, conf_row: List[float], k_i: int) -> int:
+        """DSpark adaptive draft length: keep draft j while the predicted cumulative survival
+        prod(conf[0..j]) stays >= tau. Host-side on the already-transferred floats — the drafted
+        block is fixed-shape on device; only the LIST the verify consumes shortens, which the
+        scheduler already treats as a per-request budget. k=0 is a legal outcome (plain decode
+        for that request this step, lossless)."""
+        s, k = 1.0, 0
+        for c in conf_row[:k_i]:
+            s *= c
+            if s < self._conf_tau:
+                break
+            k += 1
+        return k
 
     def reset_propose_state(self) -> None:
         """Undo what the warmup/capture dummy batch wrote. It ran entirely on the NULL slot, so only
@@ -1304,9 +1337,7 @@ class DFlashProposer(CapturableProposer):
 
         # DSpark: the Markov bigram logit-bias head, when the checkpoint ships one. Detected by
         # TENSOR PRESENCE, matching this file's builder dispatch — a plain DFlash checkpoint has
-        # neither key and the drafter behaves exactly as before. `confidence_head.*` is loaded by
-        # nothing yet: it drives DSpark's VARIABLE verify length, which needs a dynamic draft budget
-        # and so cannot ride the fixed-shape captured propose. Deliberately deferred, not forgotten.
+        # neither key and the drafter behaves exactly as before.
         # MINISGL_DSPARK_MARKOV=0 loads the checkpoint but SKIPS the head, so the same drafter runs
         # as plain DFlash. Diagnostic: it separates "the Markov application is wrong" from "the
         # drafter/backbone is mismatched", which acceptance alone cannot.
@@ -1318,6 +1349,30 @@ class DFlashProposer(CapturableProposer):
             print(f"[dflash] DSpark Markov head loaded (rank="
                   f"{sd['markov_head.markov_w1.weight'].shape[1]}); block positions decode "
                   f"semi-autoregressively", flush=True)
+
+        # DSpark: the confidence head (AcceptRatePredictor) — sigmoid(Linear([row | markov_w1[prev]]))
+        # predicts each draft position's acceptance probability, and the proposer TRUNCATES the block
+        # where the cumulative survival prod(conf[0..j]) falls below MINISGL_DSPARK_CONF_TAU. This is
+        # the per-request degenerate case of sglang's ragged-verify budget scheduler
+        # (dspark_planner.py ScheduleVerifyLensTopk over cumprod survival): at the M=1 operating
+        # point a global token budget reduces to a survival threshold, so the fixed-shape captured
+        # propose is untouched — the forward always scores block-1 positions and the CUT is applied
+        # host-side to the draft list, which is already variable-length per request. tau=0 keeps the
+        # head loaded-and-reported but never cutting; MINISGL_DSPARK_CONF=0 skips it entirely.
+        # The with_markov feature layout needs markov_w1, so the head rides only when the Markov
+        # head is also installed.
+        self._conf_tau = 0.0
+        if ("confidence_head.proj.weight" in sd and d.has_markov
+                and os.environ.get("MINISGL_DSPARK_CONF") != "0"):
+            d.set_confidence(
+                sd["confidence_head.proj.weight"].float().contiguous().to(self._device),
+                sd["confidence_head.proj.bias"].float().contiguous().to(self._device)
+                if "confidence_head.proj.bias" in sd else None,
+            )
+            self._conf_tau = float(os.environ.get("MINISGL_DSPARK_CONF_TAU") or "0.5")
+            print(f"[dflash] DSpark confidence head loaded (in_dim="
+                  f"{sd['confidence_head.proj.weight'].shape[1]}); adaptive draft length at "
+                  f"survival tau={self._conf_tau}", flush=True)
 
         if self._compressed:
             assert "embed_tokens.weight" in sd, "compressed DFlash ckpt missing embed_tokens"
@@ -1470,9 +1525,14 @@ class DFlashProposer(CapturableProposer):
                 ids = draft.markov_block_argmax(block_logits, anchor_dev)  # [k_i]
             else:
                 ids = block_logits.argmax(dim=-1)  # [k_i] draft-vocab ids
+            conf_i = None
+            if draft.has_confidence and self._conf_tau > 0.0 and k_i > 0:
+                # Same features as the captured body: the scored rows + one-step-back token ids.
+                prev = torch.cat([anchor_dev.view(1), ids[:-1]])
+                conf_i = draft.confidence(rows, prev)  # [k_i] fp32, stays on device
             if self._compressed:
                 ids = ids + self._d2t[ids]  # draft id -> target id (delta map)
-            pend.append((i, req, anchor_tok, base_pos, k_i, ids))
+            pend.append((i, req, anchor_tok, base_pos, k_i, ids, conf_i))
             if topk > 0 and k_i > 0:
                 lp = torch.log_softmax(block_logits.float(), dim=-1)  # [k_i, vocab]
                 tv, ti = lp.topk(topk, dim=-1)  # [k_i, topk], descending
@@ -1483,13 +1543,19 @@ class DFlashProposer(CapturableProposer):
         # --- the ONE host sync of the step -------------------------------------------------------
         if pend:
             flat = torch.cat([p[5] for p in pend]).tolist()  # single D2H for the whole batch
+            # Confidence (DSpark, all-or-none per proposer): a second batched D2H, still one sync
+            # point — the first .tolist() already drained the queue.
+            cflat = (torch.cat([p[6] for p in pend]).tolist()
+                     if pend[0][6] is not None else None)
             off = 0
-            for (i, req, anchor_tok, base_pos, k_i, _ids) in pend:
-                out[i] = flat[off : off + k_i]
+            for (i, req, anchor_tok, base_pos, k_i, _ids, _c) in pend:
+                k_eff = (self._conf_cut(cflat[off : off + k_i], k_i)
+                         if cflat is not None else k_i)
+                out[i] = flat[off : off + k_eff]
                 off += k_i
                 if self._dbg:
                     print(f"[dflash-dbg] uid={req.uid} anchor={anchor_tok} base_pos={base_pos} "
-                          f"B={B} k={k_i} draft={out[i]}", flush=True)
+                          f"B={B} k={k_i}->{k_eff} draft={out[i]}", flush=True)
         if pend_topk:
             # DDTree only. Two batched D2H copies for the whole step instead of two PER REQUEST.
             ti_all = torch.cat([p[1] for p in pend_topk]).cpu().tolist()

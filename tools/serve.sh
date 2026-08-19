@@ -13,7 +13,9 @@
 #
 # THE CHOICES (all optional; every one has a default)
 #   MODEL   alias below, or any HF id / local path      (default qwen35b-awq)
-#   SPEC    none|mtp|dflash|eagle3|ngram|tidar          (default: the model's own default)
+#   SPEC    none|mtp|dflash|dspark|eagle3|ngram|tidar   (default: the model's own default)
+#           dspark = the dflash engine path with a DSpark draft (Markov + confidence heads,
+#           detected from the checkpoint's tensors); canonical for the qwen38-27b* arms.
 #   DRAFT   draft checkpoint for dflash/eagle3          (default: per model; required if none)
 #   SPEC_K  draft length                                (default: per model+algorithm, tuned)
 #   TP      tensor-parallel size, 1 or 2                (default 2)
@@ -260,27 +262,22 @@ case "$MODEL" in
                   # 0.71 GiB spare. Validated: 20/20 sampled probe, 0 degeneration, 5.4k prefill,
                   # MTP 0.550 accept / 3.29 tok-step (the best per-step of the three).
                   mem_default="0.92"; alloc_conf="expandable_segments:True"; min_tp=2 
-                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
-                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
-                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
-                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
-                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
-                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
-                  # hence the lower spec ratio.
-                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
                   # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
                   # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
                   # token chosen at the previous one. That is the whole point: DFlash scores a block
                   # in one forward, so its positions are conditionally independent and acceptance
                   # decays toward the back of the block; one-step dependency restores it.
                   # config block_size=7 and this path drafts B-1, hence k=6.
+                  # SPEC=dspark is the canonical way to pick it (an alias of the dflash engine
+                  # path — the proposer detects the Markov + confidence heads from the checkpoint's
+                  # own tensors); the confidence head then truncates each block where predicted
+                  # survival crosses MINISGL_DSPARK_CONF_TAU (adaptive draft length).
                   # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   # DEFAULT ON CORRECTNESS, NOT SPEED. The INT4 arm is ~23% faster (31.8 vs 24.4 tok/s) and was
   # briefly the default for that reason, until a Hermes agent session surfaced token-level
   # CORRUPTION on it: foreign script fused mid-word ("neutral<cyrillic>", "<hangul>"), repeated
@@ -345,27 +342,22 @@ case "$MODEL" in
                   # with its own draft head less often, so some of the memory win is paid back in
                   # spec throughput. Single-sample measurements; re-measure before relying on it.
                   mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
-                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
-                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
-                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
-                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
-                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
-                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
-                  # hence the lower spec ratio.
-                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
                   # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
                   # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
                   # token chosen at the previous one. That is the whole point: DFlash scores a block
                   # in one forward, so its positions are conditionally independent and acceptance
                   # decays toward the back of the block; one-step dependency restores it.
                   # config block_size=7 and this path drafts B-1, hence k=6.
+                  # SPEC=dspark is the canonical way to pick it (an alias of the dflash engine
+                  # path — the proposer detects the Markov + confidence heads from the checkpoint's
+                  # own tensors); the confidence head then truncates each block where predicted
+                  # survival crosses MINISGL_DSPARK_CONF_TAU (adaptive draft length).
                   # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
@@ -375,27 +367,22 @@ case "$MODEL" in
                   # default was applied and REVERTED same day (long-generation starvation).
                   presence_default=""
                   mem_default="0.97"; alloc_conf="expandable_segments:True"; min_tp=2 
-                  # DSpark drafter: DFlash backbone + a rank-256 Markov (bigram) logit bias
-                  # that decodes the block semi-autoregressively, which is what fixes DFlash's
-                  # suffix decay. Its config block_size=7, and this path drafts B-1, so k=6.
-                  # Trained against Qwen3.8-27B-FP8; every target here is 4-bit, and the draft
-                  # consumes TARGET hidden states (layers 4/16/28/40/52), so expect acceptance
-                  # below its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank,
-                  # hence the lower spec ratio.
-                  dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi 
                   # DSpark drafter: the DFlash backbone plus a rank-256 Markov (bigram) logit bias
                   # that decodes the block SEMI-AUTOREGRESSIVELY — each position is biased by the
                   # token chosen at the previous one. That is the whole point: DFlash scores a block
                   # in one forward, so its positions are conditionally independent and acceptance
                   # decays toward the back of the block; one-step dependency restores it.
                   # config block_size=7 and this path drafts B-1, hence k=6.
+                  # SPEC=dspark is the canonical way to pick it (an alias of the dflash engine
+                  # path — the proposer detects the Markov + confidence heads from the checkpoint's
+                  # own tensors); the confidence head then truncates each block where predicted
+                  # survival crosses MINISGL_DSPARK_CONF_TAU (adaptive draft length).
                   # Trained against Qwen3.8-27B-FP8 while every target here is 4-bit, and the draft
                   # consumes TARGET hidden states (layers 4/16/28/40/52) — so expect acceptance
                   # BELOW its published 3.35. The 2.7 GB bf16 drafter is REPLICATED per rank, which
                   # is what the lower spec ratio pays for.
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"
@@ -455,8 +442,8 @@ spec_args=()
 # no model at all. DRAFT= overrides whatever the table resolved.
 need_draft=""; resolved_draft=""
 case "$SPEC" in
-  dflash) need_draft=1; resolved_draft="${DRAFT:-$dflash_draft}" ;;
-  eagle3) need_draft=1; resolved_draft="${DRAFT:-$eagle3_draft}" ;;
+  dflash|dspark) need_draft=1; resolved_draft="${DRAFT:-$dflash_draft}" ;;
+  eagle3)        need_draft=1; resolved_draft="${DRAFT:-$eagle3_draft}" ;;
 esac
 if [[ -n "$need_draft" && -z "$resolved_draft" ]]; then
   echo "serve.sh: SPEC=$SPEC needs a draft checkpoint and MODEL=$MODEL has no default for it." >&2
@@ -472,9 +459,13 @@ case "$SPEC" in
   tidar)   spec_args=(--spec-algorithm tidar  --spec-num-draft "${SPEC_K:-$k_tidar}") ;;
   eagle3)  spec_args=(--spec-algorithm eagle3 --spec-draft-model-path "$resolved_draft"
                       --spec-num-draft "${SPEC_K:-$k_eagle3}") ;;
-  dflash)  spec_args=(--spec-algorithm dflash --spec-draft-model-path "$resolved_draft"
+  # dspark IS the dflash engine algorithm — the DFlashProposer detects the DSpark Markov +
+  # confidence heads from the draft checkpoint's own tensors, so the engine flag stays `dflash`.
+  # The separate SPEC name exists so the launch line SAYS which drafter family was asked for and
+  # so the qwen38 arms' tuned defaults key on it.
+  dflash|dspark)  spec_args=(--spec-algorithm dflash --spec-draft-model-path "$resolved_draft"
                       --spec-num-draft "${SPEC_K:-$k_dflash}") ;;
-  *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|eagle3|ngram|tidar)" >&2; exit 2 ;;
+  *) echo "serve.sh: unknown SPEC='$SPEC' (none|mtp|dflash|dspark|eagle3|ngram|tidar)" >&2; exit 2 ;;
 esac
 
 # --- sampled speculative verify ------------------------------------------------------------------
@@ -559,8 +550,12 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
 # which mask a run used is to read the engine's ring log — and a table entry that silently stopped
 # applying reads as a model regression rather than a launch difference. `causal=` is empty when the
 # table says nothing, i.e. the per-layer rule derived from `layer_types` is in force.
-[[ "$SPEC" == "dflash" ]] && printf '[serve] dflash: quant=%s causal=%s (empty causal = derived from layer_types)\n' \
-  "${MINISGL_DFLASH_QUANT:-<derived>}" "${MINISGL_DFLASH_CAUSAL:-<derived>}" >&2
+[[ "$SPEC" =~ ^(dflash|dspark)$ ]] && printf '[serve] %s: quant=%s causal=%s (empty causal = derived from layer_types)\n' \
+  "$SPEC" "${MINISGL_DFLASH_QUANT:-<derived>}" "${MINISGL_DFLASH_CAUSAL:-<derived>}" >&2
+# DSpark's adaptive draft length on the banner: tau changes accept-len and tok/s materially and
+# never appears on the python command line.
+[[ "$SPEC" == "dspark" ]] && printf '[serve] dspark: conf=%s tau=%s markov=%s\n' \
+  "${MINISGL_DSPARK_CONF:-1}" "${MINISGL_DSPARK_CONF_TAU:-0.5}" "${MINISGL_DSPARK_MARKOV:-1}" >&2
 printf '[serve] %s\n' "${cmd[*]}" >&2
 # Per-model torch allocator config, exported for the python we exec below (a fresh process, so the
 # allocator reads it at ITS import). ON THE BANNER because it changes the KV pool size materially and

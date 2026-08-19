@@ -147,6 +147,11 @@ x-lean-common: &lean-common
     # DSpark diagnostic: 0 loads the checkpoint but skips its Markov head, so the SAME drafter runs
     # as plain DFlash. Separates "the Markov application is wrong" from "the backbone is mismatched".
     MINISGL_DSPARK_MARKOV: "${MINISGL_DSPARK_MARKOV:-}"
+    # DSpark confidence head: 0 skips loading it (no adaptive draft length). TAU is the cumulative
+    # survival threshold the drafted block is truncated at (engine default 0.5; 0 = never truncate).
+    # Forwarded because the engine reads them INSIDE the container — no entry means silently unset.
+    MINISGL_DSPARK_CONF: "${MINISGL_DSPARK_CONF:-}"
+    MINISGL_DSPARK_CONF_TAU: "${MINISGL_DSPARK_CONF_TAU:-}"
     # Draft-model VRAM RESERVE overrides. Forwarded because the engine reads them from os.environ
     # INSIDE the container: with no passthrough entry they are silently unset there, so the only
     # documented lever for a mis-estimated drafter reserve could not be pulled through the normal

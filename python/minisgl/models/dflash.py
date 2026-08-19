@@ -432,6 +432,12 @@ class DFlashDraftModel(BaseOP):
         # TENSORS, like every other variant decision on this path.
         self._markov_w1 = None  # [vocab, rank]  latent for the PREVIOUS token
         self._markov_w2 = None  # [vocab, rank]  Linear(rank -> vocab).weight, projects back
+        # DSpark: optional confidence head (AcceptRatePredictor) — a single Linear over
+        # [block hidden | markov latent of the previous token] predicting the per-position
+        # acceptance probability. Consumed by the proposer to TRUNCATE the drafted block where
+        # the predicted cumulative survival drops below threshold (adaptive draft length).
+        self._conf_w = None  # [1, hidden (+ markov_rank when trained with_markov)]  fp32
+        self._conf_b = None  # [1] fp32
 
     # ---- binding to the target (tied-vocab variant) ----
     def bind_embed(self, embed) -> None:
@@ -459,6 +465,34 @@ class DFlashDraftModel(BaseOP):
         table (which at this vocab would be 61 G params)."""
         return F.linear(F.embedding(prev_ids, self._markov_w1), self._markov_w2)
 
+    # ---- DSpark confidence head (AcceptRatePredictor) ----
+    def set_confidence(self, weight: torch.Tensor, bias: Optional[torch.Tensor]) -> None:
+        self._conf_w, self._conf_b = weight, bias
+
+    @property
+    def has_confidence(self) -> bool:
+        return self._conf_w is not None
+
+    def confidence(self, rows: torch.Tensor, prev_ids: torch.Tensor) -> torch.Tensor:
+        """Per-position predicted acceptance probability, sigmoid(Linear(features)) in fp32.
+
+        `rows` [..., k, hidden] are the SAME post-norm block hidden states the head scores (the
+        reference feeds the logits' input to the confidence head — sglang dspark_planner.py
+        `compute_confidence(draft_hidden=...)` where draft_hidden is the sampler's hidden_states).
+        `prev_ids` [..., k] is the teacher-forcing sequence [anchor, draft_0, .., draft_{k-2}] —
+        the same one-step-back conditioning the Markov walk uses. When the head was trained
+        with_markov (our checkpoint: in_dim = hidden + rank), the feature is the concat of the row
+        with markov_w1[prev]; a head trained without it is just the row. fp32 throughout: the
+        weight is [1, in_dim], so this costs one skinny GEMV per block."""
+        from minisgl._hip_engage import engaged
+        engaged("spec_dflash.dspark_confidence")
+        feat = rows.float()
+        if self._conf_w.shape[1] > rows.shape[-1]:
+            assert self._markov_w1 is not None, "with_markov confidence head needs the Markov head"
+            feat = torch.cat([feat, F.embedding(prev_ids, self._markov_w1).float()], dim=-1)
+        raw = F.linear(feat, self._conf_w, self._conf_b).squeeze(-1)
+        return torch.sigmoid(raw)
+
     def markov_block_argmax(
         self, block_logits: torch.Tensor, prev: torch.Tensor
     ) -> torch.Tensor:
@@ -470,6 +504,8 @@ class DFlashDraftModel(BaseOP):
         the back of a block ("suffix decay"). Restoring one-step dependency is the whole DSpark idea.
         The loop is a FIXED trip count over k with static shapes and `prev` never leaves the device,
         so it adds no host sync and stays capture-safe."""
+        from minisgl._hip_engage import engaged
+        engaged("spec_dflash.dspark_markov")
         k = block_logits.shape[-2]
         ids = []
         for j in range(k):
