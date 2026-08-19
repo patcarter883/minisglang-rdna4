@@ -1355,6 +1355,11 @@ def _pick_dense_kernel(
 ) -> str:
     """Per-M dense-linear kernel selection, at the MEASURED crossovers (gfx1201).
 
+    MINISGL_FORCE_TILED_LINEARS=1 (debug, corruption bisection): return wmma_tiled_tuned at EVERY M,
+    bypassing the decode_gemv family entirely — the prefill-proven kernels serve M=1. Slower; the
+    point is that teacher-forced probes only ever exercise the tiled arm, so this is how the decode
+    GEMVs get isolated on a live generation workload.
+
     - m <= gemv_max -> decode_gemv: a streaming GEMV that reads each weight once and dots it against
       all M rows (amortizing the weight read), writing straight to `out`. Serves the decode/decode-
       batch band; measured crossover int4 M<=8, e2m1 M<=16 (also the only e2m1-capable small-M kernel;
@@ -1428,6 +1433,8 @@ def _pick_dense_kernel(
     WMMA at `gemv_max` -- and it sits inside the spec-verify band (verify M = bs*(K+1)). That is why
     _W4A8_GEMV_MAX_INT4 is 16 and not 8; see its comment.
     """
+    if os.environ.get("MINISGL_FORCE_TILED_LINEARS") == "1":
+        return "wmma_tiled_tuned"
     # NVFP4 (group-16) e2m1 now rides decode_gemv in the decode band: the unified Int4Fp8GemvLoader
     # folds a per-16-K-half scale (group<32 branch), so the streaming GEMV serves group-16 at M<=gemv_max
     # just like group-32 MXFP4/int4. Above the band, prefill_wmma/ashuffle STILL hard-require
@@ -1653,5 +1660,7 @@ def w8a8_dense_linear(
     `kernel=None` auto-dispatches (M<=8 -> decode_gemv, else prefill_tiled)."""
     import fp8_wmma
 
+    if kernel is None and os.environ.get("MINISGL_FORCE_TILED_LINEARS") == "1":
+        kernel = "prefill_tiled"  # bisection: bypass the fp8 decode gemv (see _pick_dense_kernel)
     engaged(f"fp8_wmma.mmq_w8a8_gemm({kernel or 'auto'})")
     return fp8_wmma.mmq_w8a8_gemm(x, w_fp8, scales, kernel)
