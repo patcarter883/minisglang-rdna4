@@ -468,8 +468,9 @@ class QwenGatedDeltaNet(nn.Module):
                     init_logger(__name__).info_rank0(
                         f"[ssm-norm] call={self._norm_calls} max={nrm.max().item():.1f} "
                         f"p50={nrm.median().item():.1f} (cap 1000)")
-                except Exception:
-                    pass
+                except Exception as e:
+                    from minisgl.utils import init_logger
+                    init_logger(__name__).warning_rank0(f"[ssm-norm] probe failed: {e!r}")
 
         n = hidden_states.shape[0]
         qkvz = self.in_proj_qkvz(hidden_states)
