@@ -225,6 +225,9 @@ x-lean-common: &lean-common
     # Debug: =1 checks every decode row's input token against the last committed token (one D2H
     # sync per step) and logs any context/emission divergence loudly. Off by default.
     MINISGL_FEEDBACK_CHECK: "${MINISGL_FEEDBACK_CHECK:-}"
+    # Debug: every Nth eager decode-attention call recomputes the layer in torch fp32 from the same
+    # paged KV and logs the worst rel error (attn parity tap). Empty = off.
+    MINISGL_ATTN_PARITY_N: "${MINISGL_ATTN_PARITY_N:-}"
     # Spec acceptance diagnostics: MINISGL_SPEC_DEBUG=1 logs [spec] accept_rate / emitted-per-step /
     # mean accept-len (every 50 steps + at request end). Default empty (off). Zero serve-path cost.
     MINISGL_SPEC_DEBUG: "${MINISGL_SPEC_DEBUG:-}"
