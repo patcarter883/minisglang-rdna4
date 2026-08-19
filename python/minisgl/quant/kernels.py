@@ -12,6 +12,7 @@ vllm-gfx1201/w4a8_fp8_wmma/{vllm_adapter.py,moe_experts.py} — TODO Phase 2c.
 """
 from __future__ import annotations
 
+import os
 import torch
 
 from minisgl._hip_engage import engaged
