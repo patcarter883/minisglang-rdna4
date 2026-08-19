@@ -287,7 +287,17 @@ case "$MODEL" in
                   # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
                   # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
+                    # 0.84 + FULL_CAP=2048 is the DEGEN-VALIDATED point (2026-08-19, 12/12 clean,
+                    # 20.7k spec steps, zero restarts, MINISGL_SPEC_MAX_BS=4). Uncapped, this
+                    # all-full_attention drafter accumulates aux to 8206 rows = 420 MB PER REQUEST
+                    # (torch.cat per step, scheduler.py _spec_decode_step) — measured killing the
+                    # serve at 0.88 AND at 0.84 under 4 concurrent 12k-token generations (OOM at
+                    # 0 bytes free). The cap bounds aux at ~105 MB/uid and shrinks the propose ring
+                    # 504->126 MB; drafting conditions on the newest 2048 committed positions.
+                    mem_default_spec="0.84"
+                    : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                  fi ;;
   # DEFAULT ON CORRECTNESS, NOT SPEED. The INT4 arm is ~23% faster (31.8 vs 24.4 tok/s) and was
   # briefly the default for that reason, until a Hermes agent session surfaced token-level
   # CORRUPTION on it: foreign script fused mid-word ("neutral<cyrillic>", "<hangul>"), repeated
@@ -377,7 +387,17 @@ case "$MODEL" in
                   # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
                   # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
+                    # 0.84 + FULL_CAP=2048 is the DEGEN-VALIDATED point (2026-08-19, 12/12 clean,
+                    # 20.7k spec steps, zero restarts, MINISGL_SPEC_MAX_BS=4). Uncapped, this
+                    # all-full_attention drafter accumulates aux to 8206 rows = 420 MB PER REQUEST
+                    # (torch.cat per step, scheduler.py _spec_decode_step) — measured killing the
+                    # serve at 0.88 AND at 0.84 under 4 concurrent 12k-token generations (OOM at
+                    # 0 bytes free). The cap bounds aux at ~105 MB/uid and shrinks the propose ring
+                    # 504->126 MB; drafting conditions on the newest 2048 committed positions.
+                    mem_default_spec="0.84"
+                    : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                  fi ;;
   qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
@@ -412,7 +432,17 @@ case "$MODEL" in
                   # tau=0 (head computed, never cutting) is fastest at M=1; the default tau=0.5
                   # only pays where verify width costs, i.e. batched spec (MINISGL_SPEC_MAX_BS>1).
                   dflash_draft="RadixArk/Qwen3.8-27B-DSpark"; k_dflash=6
-                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then mem_default_spec="0.88"; fi ;;
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
+                    # 0.84 + FULL_CAP=2048 is the DEGEN-VALIDATED point (2026-08-19, 12/12 clean,
+                    # 20.7k spec steps, zero restarts, MINISGL_SPEC_MAX_BS=4). Uncapped, this
+                    # all-full_attention drafter accumulates aux to 8206 rows = 420 MB PER REQUEST
+                    # (torch.cat per step, scheduler.py _spec_decode_step) — measured killing the
+                    # serve at 0.88 AND at 0.84 under 4 concurrent 12k-token generations (OOM at
+                    # 0 bytes free). The cap bounds aux at ~105 MB/uid and shrinks the propose ring
+                    # 504->126 MB; drafting conditions on the newest 2048 committed positions.
+                    mem_default_spec="0.84"
+                    : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                  fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"
