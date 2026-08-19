@@ -184,8 +184,11 @@ class HIPAttnBackend(RDNA4Backend):
                 k = k_cache[pages].reshape(-1, k_cache.shape[-2], k_cache.shape[-1])[:L]
                 v = v_cache[pages].reshape(-1, v_cache.shape[-2], v_cache.shape[-1])[:L]
                 if self.kv_is_fp8:
-                    k = k.float() * float(self.kvcache.k_descale[layer_id])
-                    v = v.float() * float(self.kvcache.v_descale[layer_id])
+                    # descale may be a per-layer scalar OR per-head vector — broadcast either.
+                    kd = self.kvcache.k_descale[layer_id].float()
+                    vd = self.kvcache.v_descale[layer_id].float()
+                    k = k.float() * kd.reshape(1, -1, 1)
+                    v = v.float() * vd.reshape(1, -1, 1)
                 else:
                     k, v = k.float(), v.float()
                 qi = q[i].float()
