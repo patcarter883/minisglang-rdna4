@@ -35,7 +35,7 @@ class MTPProposer(CapturableProposer):
     **Persistent draft KV.** The MTP decoder layer is a real transformer layer, so its self-attention
     needs the full causal context, not just the K draft tokens (restricting it to the chain collapses
     the head to ~40% single-token accuracy). The KV lives in ONE GLOBAL fixed-shape buffer
-    ``[max_slots, max_ctx, nkv, hd]`` keyed by ``req.table_idx`` — the same stable slot index the
+    ``[max_slots, ring, nkv, hd]`` keyed by ``req.table_idx`` — the same stable slot index the
     paged ``page_table`` and the GDN/CCA recurrent state use — plus a per-slot cursor. A growing
     per-uid Python list would be both a dynamic shape and a host-side mutation, i.e. uncapturable;
     the fixed window + additive ``-inf`` mask beyond the cursor is byte-exact against it
@@ -90,22 +90,6 @@ class MTPProposer(CapturableProposer):
         self._max_slots = self._live_slots + 1
         dt = engine.dtype
         dev = self._device
-        # Cap the draft-KV window to bound VRAM: the buffer is slots*max_ctx*(nkh*kdim+nvh*vdim)*dt,
-        # AND every propose gathers k_buf[slot_rows]/v_buf[slot_rows] over the WHOLE window as a
-        # transient of comparable size — a naive 8192 window OOMs a heavy head (GLM MLA: 96
-        # materialized heads => ~1.4 GB buffer + ~0.3 GB/step transient). Size it from the memory
-        # actually free at build time and budget for both.
-        from minisgl.engine.graph import get_free_memory
-
-        per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize
-        # `or` form, not a dict default — compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY
-        # and float("") raises at boot. See the same note in spec/dflash.py.
-        _budget = int(get_free_memory(dev)
-                      * float(os.environ.get("MINISGL_MTP_KV_FRAC") or "0.33"))
-        _mem_cap = max(512, _budget // max(per_col * 2, 1))
-        self._max_ctx = min(int(engine.max_seq_len),
-                            int(os.environ.get("MINISGL_MTP_MAX_CTX") or "8192"),
-                            int(_mem_cap))
         # Long-context spec gate: past this committed length a request skips propose and decodes
         # plain. Above the window the seed fell back to cold, so the drafts are context-BLIND
         # (near-zero accept) while still paying propose + verify(K+1) — net-negative.
@@ -132,8 +116,9 @@ class MTPProposer(CapturableProposer):
         # capture/transient path, which is exactly where this stack runs out (see _spec_seed_fits).
         # Raise it if a model's drafter turns out to be more context-sensitive than MTP's.
         self._ring = max(64, int(os.environ.get("MINISGL_MTP_KV_WINDOW") or 512))
-        # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to _max_ctx and was the
-        # silent cliff; the ring makes any length drafts-capable, so there is nothing to gate.
+        # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to the full-context
+        # buffer length and was the silent cliff; the ring makes any length drafts-capable, so there
+        # is nothing to gate.
         _gate_env = os.environ.get("MINISGL_SPEC_MAX_CONTEXT")
         self._ctx_gate = int(_gate_env) if _gate_env else (1 << 62)
         self._k_buf = torch.zeros(self._max_slots, self._ring, _nkh, _kdim, device=dev, dtype=dt)
@@ -161,7 +146,7 @@ class MTPProposer(CapturableProposer):
         self.init_propose_capture_state(engine, tag="MTP")
         logger.info_rank0(
             f"spec-decode: MTP propose buffers (slots={self._live_slots}+NULL, "
-            f"max_ctx={self._max_ctx}, ring={self._ring} (unbounded context), draft-KV "
+            f"ring={self._ring} (unbounded context), draft-KV "
             f"{(self._k_buf.numel() + self._v_buf.numel()) * dt.itemsize / 1e6:.0f} MB)")
 
     # ----------------------------------------------------------------------- hook: HOST staging
@@ -265,28 +250,35 @@ class MTPProposer(CapturableProposer):
     # ------------------------------------------------------------------------------ seeding etc.
     @torch.inference_mode()
     def seed_prefill(self, req: "Req", last_hidden, aux_hidden=None) -> None:
-        """Seed the persistent MTP KV from the prompt prefill so the FIRST draft already sees full
+        """Seed the persistent MTP KV from the prompt prefill so the FIRST draft already sees the
         prompt context. Mirrors the decode-time convention exactly: propose processes the pair
-        (embed(token_p), h_{p-1}) at RoPE position p, so we run the MTP layer's k/v over the prompt
-        pairs p=1..P-1 and mark them committed; the first decode propose then appends position P.
-        Slot/cursor convention matches ``stage_propose`` exactly (columns 0..S-1 hold positions
-        1..P-1, ``_cur[slot] = S``), and ``_slot_uid`` is registered so that first propose does not
+        (embed(token_p), h_{p-1}) at RoPE position p, writing at ring column p % ring with absolute
+        label p. ``last_hidden`` holds the rows for absolute positions [cached_len-P, cached_len) —
+        on a radix prefix-cache hit that origin is > 0 and the rows are the prompt SUFFIX, not its
+        start (complete_one has already advanced cached_len to the full prompt length; same
+        ``ctx_start = cached_len - P`` convention as DFlash). ``_cur[slot]`` is the ABSOLUTE index
+        of the next pair to write, so it is set to cached_len and the first decode propose APPENDS
+        the bonus pair (token_{cached_len}, RoPE cached_len) at column cached_len % ring instead of
+        clobbering the last seeded pair. ``_slot_uid`` is registered so that first propose does not
         treat the slot as cold and reset the cursor."""
         if last_hidden is None:
             return
         P = last_hidden.shape[0]
         if P < 2:
             return  # nothing to seed (P==1: only the bonus, handled by the first propose)
-        S = P - 1
         device = self._device
         slot = int(req.table_idx)
-        # Seed the ring TAIL. The old code REFUSED when S > buffer and left the cache cold, which is
-        # what made long prompts draft blind. With col = pos % ring the tail is always representable;
-        # it just may WRAP, so write it as up to two contiguous runs.
-        p_lo = max(1, P - self._ring)                    # first prompt position kept in the ring
-        tokens = req.input_ids[p_lo:P].to(device=device, dtype=torch.int64)
-        prev_hidden = last_hidden[p_lo - 1 : P - 1].to(self._engine.dtype)
-        positions = torch.arange(p_lo, P, dtype=torch.int32, device=device)
+        end = int(req.cached_len)                        # one past the last seeded pair
+        origin = end - P                                 # absolute position of last_hidden[0]
+        assert origin >= 0, f"seed_prefill: {P} hidden rows exceed cached_len {end}"
+        # Seed the ring TAIL. The old code REFUSED when the prompt exceeded the buffer and left the
+        # cache cold, which is what made long prompts draft blind. With col = pos % ring the tail is
+        # always representable; it just may WRAP, so write it as up to two contiguous runs. Pair
+        # `origin` itself is unseedable on a cache hit (h_{origin-1} was never recomputed).
+        p_lo = max(origin + 1, end - self._ring)         # first prompt position kept in the ring
+        tokens = req.input_ids[p_lo:end].to(device=device, dtype=torch.int64)
+        prev_hidden = last_hidden[p_lo - 1 - origin : end - 1 - origin].to(self._engine.dtype)
+        positions = torch.arange(p_lo, end, dtype=torch.int32, device=device)
         n = int(positions.numel())
         if n > 0:
             c0 = p_lo % self._ring
@@ -296,10 +288,10 @@ class MTPProposer(CapturableProposer):
             if first < n:
                 self._head.seed_buffered(tokens[first:], prev_hidden[first:], positions[first:],
                                          self._k_buf, self._v_buf, slot, 0)
-            abs_pos = torch.arange(p_lo, P, dtype=torch.int64, device=device)
+            abs_pos = torch.arange(p_lo, end, dtype=torch.int64, device=device)
             self._pos_buf[slot, torch.remainder(abs_pos, self._ring)] = abs_pos
         self._slot_uid[slot] = req.uid
-        self._cur[slot] = S
+        self._cur[slot] = end
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         # Advance each drafted slot's committed cursor by min(1+n, K) — the FULL-ACCEPT CAP: propose

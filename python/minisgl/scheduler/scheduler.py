@@ -544,6 +544,18 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 if self._dflash_ddtree:
                     logger.info_rank0("spec-decode: DFlash DDTree draft-tree path ENABLED")
                     self._ddtree_budget = int(os.environ.get("MINISGL_DDTREE_BUDGET") or "32")
+            # A GDN backbone has no tree/replica-shaped verify: the GDN verify kernels scan the packed
+            # query rows strictly SEQUENTIALLY (the custom_mask only shapes attention), so fused
+            # replica rows / tree sibling rows would fold into every node's conv+SSM state — and the
+            # fused step builds no gdn_metadata at all. Route to the linear propose→verify step, which
+            # snapshots/installs GDN state correctly.
+            if self.gdn_slots is not None and (
+                self._tidar_fused or self._tidar_ddtree or self._dflash_ddtree
+            ):
+                logger.info_rank0(
+                    "spec-decode: GDN backbone — fused/DDTree paths DISABLED; using the linear "
+                    "propose→verify step (no parent-indexed GDN verify kernel)")
+                self._tidar_fused = self._tidar_ddtree = self._dflash_ddtree = False
             # ON whenever the proposer wants it. It used to ALSO require MINISGL_SPEC_PREFILL_SEED=1,
             # which nothing ever set — not tools/serve.sh, not docker-compose.yml — so a measured win
             # (+8.5% on EAGLE3) shipped switched off; and for DFlash the flag was doubly dead, because
@@ -591,8 +603,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             # max_running_req.
             needs_hidden = self._spec_needs_last_hidden or bool(self._spec_capture_layer_ids)
             num_aux = len(self._spec_capture_layer_ids) if self._spec_capture_layer_ids else 0
+            # ...and at _spec_max_bs: _spec_batch_ok forces plain decode past the spec batch gate, so
+            # a verify/propose graph (and the max_bs-sized capture buffers — fp32 full-vocab logits
+            # per verify row) at a larger bs can never be replayed. Gate 0 = no cap (mtp/ngram/tidar).
+            _spec_bs_cap = config.max_running_req
+            if self._spec_max_bs > 0:
+                _spec_bs_cap = min(_spec_bs_cap, self._spec_max_bs)
             verify_bs = [b for b in self.engine.graph_runner.graph_bs_list
-                         if b <= config.max_running_req]
+                         if b <= _spec_bs_cap]
             # ADAPTIVE VERIFY WIDTH. Capture a small LADDER of widths instead of the single
             # `num_draft` (spec/width.py `verify_width_ladder`), so the step can size the verify block
             # from recent acceptance and still land on a captured graph. The ladder's max is clamped
@@ -696,8 +714,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 self._ddtree_seg_layout = None
                 self._ddtree_seg_block = None
                 # FUSE implies SEG (the fused replicas are appended to the segmented tree layout).
-                _seg = (os.environ.get("MINISGL_DDTREE_SEG") == "1"
+                # On a CCA backbone SEG defaults ON: the packed (non-seg) layout feeds each node's
+                # conv window its packed neighbours instead of its ancestors (spec/ddtree.py) — the
+                # acceptance-degrading layout the segmented mode exists to fix. Explicit
+                # MINISGL_DDTREE_SEG=0 still forces the packed layout (compose substitutes "" for an
+                # unset var, so "" counts as unset).
+                _seg_env = os.environ.get("MINISGL_DDTREE_SEG") or None
+                if _seg_env is None and self.cca_slots is not None:
+                    _seg_env = "1"
+                _seg = (_seg_env == "1"
                         or os.environ.get("MINISGL_DDTREE_FUSE") == "1")
+                if not _seg and self.cca_slots is not None:
+                    logger.warning_rank0(
+                        "spec-decode: DDTree PACKED tree layout on a CCA backbone "
+                        "(MINISGL_DDTREE_SEG=0) — each node's conv reads packed neighbours, not its "
+                        "ancestors; tree acceptance will trail the segmented layout.")
                 if os.environ.get("MINISGL_DDTREE_STATIC") == "1" or _seg:
                     from minisgl.spec.ddtree import (build_static_template, template_ancestor_block,
                                                      fill_static_template, ddtree_paged_layout_segmented)
@@ -732,7 +763,15 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                         # top path (brief #2) — append R_0..R_L replicas to the captured verify. On-path
                         # steps reuse R_{k+1} as the next tree's marginals (skip block_predict); off-path
                         # steps fall back to block_predict. Fixed shape (rank-0 path) -> still capturable.
-                        if os.environ.get("MINISGL_DDTREE_FUSE") == "1":
+                        # TP>1: the on-path bit is walked from each rank's OWN verify logits, which are
+                        # not bit-identical across TP ranks (see _bcast_drafts_tp) — need_f1 would
+                        # partition differently per rank on a near-tie flip and desync the block_predict
+                        # collectives, so FUSE stays off until the bit is rank0-broadcast.
+                        if os.environ.get("MINISGL_DDTREE_FUSE") == "1" and self.engine.tp_size > 1:
+                            logger.warning_rank0(
+                                "spec-decode: DDTree FUSE ignored under TP>1 (rank-local on-path walk "
+                                "would desync the need_f1 collectives)")
+                        elif os.environ.get("MINISGL_DDTREE_FUSE") == "1":
                             from minisgl.spec.ddtree import (template_rank0_path,
                                                              ddtree_fused_paged_layout_segmented)
                             self._ddtree_rank0 = template_rank0_path(self._ddtree_template)
@@ -1520,6 +1559,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # would leak one float per completed request for the process lifetime.
         if self._verify_width is not None:
             self._verify_width.free(req.uid)
+        # Drop this uid's target hidden seeds (draft-head proposers). The spec commit pops them each
+        # step, but a req that finishes OFF the spec path (abort, plain-decode fallback past
+        # spec_max_bs, non-greedy without sampled spec) never reaches that pop, and the cloned GPU
+        # buffers — tens of MB per uid with fullctx aux — would persist for the process lifetime.
+        self._spec_last_hidden.pop(req.uid, None)
+        self._spec_aux_hidden.pop(req.uid, None)
         # Release the structured-output grammar matcher + reasoning gate/budget (idempotent).
         self._grammar_matchers.pop(req.uid, None)
         # `free`, not `clear`: the request is gone, so the "already released" marker goes with it.
@@ -2180,19 +2225,23 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         emitted: List[int] = []
         n_acc = 0
         K = len(draft)
+        lblock = logits_block.float()  # hoisted once; each row is masked/consumed exactly once below
+        # Pre-draw the K accept u's in one batch (fixed generator order, mirroring verify_sampled) and
+        # pull them in ONE sync instead of a .item() per position.
+        us = torch.rand(K, generator=gen, device=lblock.device).cpu().tolist() if K else []
 
-        def _reject_sample(p: torch.Tensor, di):
+        def _reject_sample(p: torch.Tensor, di, u):
             # accept draft di w.p. p[di] (q=onehot); else residual = renorm(relu(p - onehot(di))).
             # di is None at the bonus position -> straight sample from p. Returns (token, accepted).
+            # The residual draw runs on device either way so the accept flag + fallback token reach
+            # host in ONE packed sync — the matcher's serial advance already forces one per position.
             if di is not None:
-                u = float(torch.rand(1, generator=gen, device=p.device).item())
-                if u < float(p[di]):
-                    return di, True
                 resid = p.clone()
                 resid[di] = 0.0
-                s = resid.sum()
-                dist = resid / s if float(s) > 0.0 else p
-                return int(torch.multinomial(dist, 1, generator=gen).item()), False
+                dist = torch.where(resid.sum() > 0.0, resid, p)  # degenerate p==onehot -> fall back to p
+                alt = torch.multinomial(dist, 1, generator=gen)  # multinomial normalizes internally
+                accepted, tok = torch.cat([(p[di] > u).reshape(1).long(), alt]).cpu().tolist()
+                return (di, True) if accepted else (int(tok), False)
             return int(torch.multinomial(p, 1, generator=gen).item()), False
 
         for i in range(K + 1):
@@ -2202,9 +2251,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             terminated = matcher.is_terminated()
             if not terminated:
                 matcher.fill_next_token_bitmask(bitmask, 0)
-            masked = apply_token_bitmask(logits_block[i : i + 1].float(), bitmask)  # disallowed -> -inf
-            p = probs_from_logits(masked, sp.temperature, sp.top_k, sp.top_p)[0]  # grammar-masked dist
-            t_i, acc = _reject_sample(p, di)
+            masked = apply_token_bitmask(lblock[i : i + 1], bitmask)  # disallowed -> -inf
+            p = probs_from_logits(
+                masked, sp.temperature, sp.top_k, sp.top_p, min_p=sp.min_p
+            )[0]  # grammar-masked dist
+            t_i, acc = _reject_sample(p, di, us[i] if i < K else None)
             emitted.append(t_i)
             is_eos = (not sp.ignore_eos) and t_i in self.eos_token_ids
             if not is_eos and not terminated:
@@ -2753,7 +2804,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     reqs, self._proposer.block_size, self._proposer.mask_token_id)
             elif getattr(self, "_dflash_ddtree", False):
                 self._spec_decode_step_dflash_ddtree(reqs)
-            elif getattr(self, "_tidar_fused", False):
+            elif getattr(self, "_tidar_fused", False) and self._fused_route_ok(reqs):
                 self._spec_decode_step_tidar_fused(
                     reqs, self._proposer.block_size, self._proposer.mask_token_id)
             else:
@@ -2820,9 +2871,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # veto. Agreed via MAX over (1 - all_spec_ok): any 1 -> some replica must fall back.
         # ...and the batch gate votes through the SAME veto: a replica whose batch is too large for
         # spec to pay asks everyone to fall back, so the decision stays replica-identical.
+        # Fused TiDAR votes through it too: its accept path enforces neither grammar nor the reasoning
+        # gate, and a busy-replica-only fallback to the linear step would change the forward count the
+        # idle replica mirrors — so a constrained/gated batch asks every replica for plain decode.
         local_nongreedy = (
             1 if (local_reqs and (not all(self._req_spec_ok(r) for r in local_reqs)
-                                  or not self._spec_batch_ok(len(local_reqs)))) else 0
+                                  or not self._spec_batch_ok(len(local_reqs))
+                                  or (getattr(self, "_tidar_fused", False)
+                                      and not self._fused_route_ok(local_reqs)))) else 0
         )
         t = torch.tensor(
             [local_prefill_tokens, local_decode_bs, local_nongreedy], dtype=torch.int64
@@ -2841,11 +2897,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             dr = engine.dummy_req
             saved_lens = None if is_real else (dr.cached_len, dr.device_len)
             try:
-                forward_input = (
-                    self._prepare_batch(prefill_batch)
-                    if is_real
-                    else self._ep_prepare_dummy_prefill()
-                )
+                if is_real:
+                    # Mirror _spec_loop's seed branch: the hidden-capturing seeded prefill is the
+                    # SAME single forward (return_hidden adds no MoE collectives), so the idle
+                    # replica's dummy prefill still lines up 1:1. Constrained reqs keep the plain
+                    # path — the seed forward bypasses the sampler's grammar bitmask.
+                    constrained = any(
+                        r.sampling_params.is_constrained for r in prefill_batch.reqs
+                    )
+                    if (self._spec_seed_enabled and not constrained
+                            and self._spec_seed_fits(prefill_batch)):
+                        self._spec_prefill_seeded(prefill_batch)
+                        return
+                    forward_input = self._prepare_batch(prefill_batch)
+                else:
+                    forward_input = self._ep_prepare_dummy_prefill()
                 data = (forward_input, self._forward(forward_input, track_reqs=is_real))
             finally:
                 ep.pad_tokens = None
@@ -3160,6 +3226,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             self.engine.graph_runner.pad_verify(batch, ep_bs)
         else:
             batch.padded_reqs = reqs
+            # The veto must BIND: forward_verify re-checks the bare graph gate, which knows nothing of
+            # the EP/skip_alloc conditions above and would replay the fixed-N graph on the eager batch.
+            batch.spec_verify_no_graph = True
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = page_table[input_mapping]
@@ -3270,6 +3339,18 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             tree_qlen = seg_lay["n_query"]
         else:
             tree_qlen = (budget + 1) if budget else max(trees[id(r)].n_nodes for r in reqs)
+        # A req within tree_qlen columns of the page-table width cannot stage the fixed tree block —
+        # the c0..c0+tree_qlen-1 scatter would run off its row into the NEXT request's page-table
+        # entries. Degrade it to plain decode (empty accepted path; F3 commits just the bonus).
+        out = {}
+        table_w = page_table.shape[1]
+        if any(r.cached_len + tree_qlen > table_w for r in reqs):
+            for r in reqs:
+                if r.cached_len + tree_qlen > table_w:
+                    out[id(r)] = ([], None)
+            reqs = [r for r in reqs if id(r) not in out]
+            if not reqs:
+                return out
         saved_lens = [(r.device_len, r.cached_len) for r in reqs]
         store_rows, store_cols, tok_vals, pos_list = [], [], [], []
         per_req = []  # (req, c0, tree, n)
@@ -3365,7 +3446,6 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             gdn_snap = self.engine.gdn_state.snapshot(gdn_idx)
         logits = self.engine.forward_verify(batch)
         argmax = logits.argmax(dim=-1).to(torch.int32).cpu().tolist()
-        out = {}
         off = 0
         r0 = getattr(self, "_ddtree_rank0", None)
         replica_rows = self._ddtree_fused_layout["replica_rows"] if fuse else None
@@ -3486,9 +3566,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if st["n"] % 100 == 0:
             logger.info_rank0(f"[ddtree] mean tree accept-len={st['tree']/st['n']:.2f} over {st['n']} reqs "
                               f"(B={budget} K={K} block={B})")
-        # forward 3: commit the accepted path per req via the linear verify (drafts = tree path)
+        # forward 3: commit the accepted path per req via the linear verify (drafts = tree path).
+        # Clamped to remain_len-1 like every linear proposer — the path + bonus must fit the
+        # request's output budget.
         for req in reqs:
-            req._tidar_drafts = accepted[id(req)][0]  # the accepted tokens as the drafts to commit
+            req._tidar_drafts = accepted[id(req)][0][: max(0, req.remain_len - 1)]
         self._spec_decode_step(reqs, ddtree_drafts=True)
 
     @torch.inference_mode()
@@ -3553,8 +3635,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             logger.info_rank0(f"[ddtree] mean tree accept-len={st['tree']/st['n']:.2f} over {st['n']} reqs "
                               f"(B={budget} K={K} block={self._proposer._block_size})")
         # forward 3: commit the accepted path per req via the linear verify (drafts = tree path).
+        # Clamped to remain_len-1 like every linear proposer — the path + bonus must fit the
+        # request's output budget.
         for req in reqs:
-            req._tidar_drafts = accepted[id(req)][0]
+            req._tidar_drafts = accepted[id(req)][0][: max(0, req.remain_len - 1)]
         self._spec_decode_step(reqs, ddtree_drafts=True)
 
     @torch.inference_mode()
@@ -3628,12 +3712,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if seg:
             from minisgl.spec.tidar_mask import fused_paged_layout_segmented
 
-        # --- bootstrap: first step has no carried drafts -> one block_predict per fresh req --------
-        fresh = [r for r in reqs if getattr(r, "_tidar_drafts", None) is None]
-        if fresh:
-            boot = self._tidar_block_predict(fresh, B, mask_id)
-            for r, d in zip(fresh, boot):
-                r._tidar_drafts = d
+        # --- bootstrap: first step has no carried drafts -> seed B mask tokens, NO forward ---------
+        # A block_predict here would be a SECOND full-target forward in this step, which the EP
+        # lockstep never accounts for (_spec_num_ep_forwards: fused = 1) — the idle replica's
+        # per-layer MoE collectives would pair off-by-one and wedge. Mask drafts are simply all
+        # rejected by verify (lossless); the first block costs one step of acceptance, not a forward.
+        for r in reqs:
+            if getattr(r, "_tidar_drafts", None) is None:
+                r._tidar_drafts = [mask_id] * B
 
         # DUMP fidelity gate: block_predict on the CURRENT (pre-step) committed == the IDEAL R_0 (both
         # condition on [committed|confirmed] and predict positions c0+1..c0+B). Captured here, before
@@ -3650,7 +3736,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         store_cols: List[int] = []
         tok_vals: List[int] = []
         pos_list: List[int] = []
-        per_req = []  # (req, c0, n_query, drafts, layout_or_None)
+        per_req = []  # (req, c0, n_query, drafts, layout_or_None, mask_blk)
         for req in reqs:
             c0 = req.cached_len
             drafts = list(req._tidar_drafts)
@@ -3658,6 +3744,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             if seg:
                 layout = fused_paged_layout_segmented(c0, B, tp, device=device)
                 fpos = layout["positions"]; n_query = layout["n_query"]
+                mask_blk = layout["mask"]
                 toks = []
                 for (kind, _r, loc, abs_pos) in layout["rows"]:
                     if kind == "confirmed":
@@ -3670,7 +3757,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     else:  # R
                         toks.append(mask_id)
             else:
-                fpos, _mask, n_query_full, _ = fused_paged_layout(c0, B, device=device)
+                fpos, mask_blk, n_query_full, _ = fused_paged_layout(c0, B, device=device)
                 if norep:
                     n_query = 1 + B                                   # [confirmed | S] only
                     toks = [int(req.input_ids[c0])] + drafts
@@ -3685,7 +3772,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 tok_vals.append(toks[i])
             pos_list += fpos
             req.device_len = c0 + n_query  # extend_len = n_query -> cache_seqlens = context_len
-            per_req.append((req, c0, n_query, drafts, layout))
+            per_req.append((req, c0, n_query, drafts, layout, mask_blk))
         rows_t = torch.tensor(store_rows, dtype=torch.int64, device=device)
         cols_t = torch.tensor(store_cols, dtype=torch.int64, device=device)
         self.token_pool[rows_t, cols_t] = torch.tensor(tok_vals, dtype=self.token_pool.dtype, device=device)
@@ -3708,11 +3795,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         total_q = len(store_rows)
         custom_mask = torch.zeros(total_q, max_kv, dtype=torch.float32, device=device)
         off = 0
-        for (req, c0, n_query, _drafts, layout) in per_req:
-            if layout is not None:
-                mask_blk = layout["mask"]                                   # segmented [n_query, c0+n_query]
-            else:
-                _, mask_blk, _, _ = fused_paged_layout(c0, B, device=device)  # [nq_full, c0+nq_full]
+        for (req, c0, n_query, _drafts, _layout, mask_blk) in per_req:
+            # mask built ONCE at staging (seg [n_query, c0+n_query]; flat [nq_full, c0+nq_full],
+            # sliced for norep) — rebuilding it here doubled ~20 tiny device launches per req.
             custom_mask[off:off + n_query, : c0 + n_query] = mask_blk[:n_query, : c0 + n_query]
             off += n_query
         batch.attn_metadata.custom_mask = custom_mask
@@ -3725,52 +3810,49 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             cca_state_indices = self.cca_slots.state_indices(batch)
             batch.cca_metadata = build_cca_metadata(batch, cca_state_indices, device)
             batch.cca_metadata.capture_verify_state = True
-            batch.cca_metadata.verify_max_qlen = max(nq for (_, _, nq, _, _) in per_req)
+            batch.cca_metadata.verify_max_qlen = max(nq for (_, _, nq, _, _, _) in per_req)
 
         t_stage = _tstamp()
         logits = self.engine.forward_verify(batch)  # [total_q, vocab]
         t_fwd = _tstamp()
         vocab = logits.shape[-1]
 
-        # --- verify S rows + select replica R_k; commit + carry ------------------------------------
-        dump_cap: List[dict] = []
-        bykacc: List[tuple] = []   # STEP-0a: (prev_k, n_drafts, n_accepted) to bucket accept by prior k
-        reply: List[DetokenizeMsg] = []
-        new_finished_reqs: Set[Req] = set()
-        c_rows: List[int] = []
-        c_cols: List[int] = []
-        c_vals: List[int] = []
-        free_chunks: List[torch.Tensor] = []
-        install_batch_idx: List[int] = []
-        install_t_index: List[int] = []
-        ps = self.cache_manager.page_size
-        n_proposed = n_accepted = n_emitted = 0
-        off = 0
-        for i, (req, c0, n_query, drafts, layout) in enumerate(per_req):
-            lg = logits[off:off + n_query]
-            off += n_query
-            p_ar = lg[0:B + 1]                       # confirmed row + S rows -> predict positions c0..c0+B
-            if mix_beta < 1.0:
-                # Diffusion prediction of draft position i (conditioned on S[:i]) = R_i[0], the first
-                # token of replica R_i — same conditioning AND predicted position as p_ar[i] (§4.4.3,
-                # the "E->E''" case). Mix only the B draft rows; the bonus row (B) stays pure-AR.
+        # --- verify S rows + select replica R_k (outcome pass, host) -------------------------------
+        # ONE batched argmax over every scored row + ONE D2H copy replaces the per-req pair of
+        # blocking syncs the commit loop used to pay (target .cpu() + next_drafts .cpu()) — 2 per
+        # req per step, each a full stream drain at bs>1.
+        all_argmax = logits.argmax(dim=-1).cpu().tolist()   # [total_q]; the single stream sync
+        mix_targets = None
+        if mix_beta < 1.0:
+            # Diffusion prediction of draft position i (conditioned on S[:i]) = R_i[0], the first
+            # token of replica R_i — same conditioning AND predicted position as p_ar[i] (§4.4.3,
+            # the "E->E''" case). Mix only the B draft rows; the bonus row (B) stays pure-AR.
+            mixed_rows: List[torch.Tensor] = []
+            off = 0
+            for (req, c0, n_query, drafts, layout, _mask) in per_req:
+                lg = logits[off:off + n_query]
+                off += n_query
                 if layout is not None:                                                  # segmented
                     diff0 = lg[[layout["replica_rows"][r][1][0] for r in range(B)]]     # [B,V] = R_r[0]
                 else:                                                                   # flat
                     diff0 = lg[B + 1:].reshape(B, B, vocab)[:, 0, :]                     # [B,V] = R_r[0]
-                p_ar = p_ar.clone()  # lg is a view into logits — don't write the forward output in place
-                p_ar[:B] = mix_beta * p_ar[:B] + (1.0 - mix_beta) * diff0
-            target = p_ar.argmax(dim=-1).to(torch.int32).cpu().tolist()
+                mixed_rows.append((mix_beta * lg[:B] + (1.0 - mix_beta) * diff0).argmax(dim=-1))
+            mix_targets = torch.cat(mixed_rows).cpu().tolist()  # [n_reqs*B]; one batched extra sync
+
+        dump_cap: List[dict] = []
+        outcomes: List[Tuple[int, List[int], bool, List[int] | None]] = []  # (k, keep, eos, next)
+        off = 0
+        for i, (req, c0, n_query, drafts, layout, _mask) in enumerate(per_req):
+            blk = all_argmax[off:off + n_query]
+            off += n_query
+            # confirmed row + S rows -> predict positions c0..c0+B; under MIX the B draft rows read
+            # the mixed argmax, the bonus row stays pure-AR.
+            if mix_targets is not None:
+                target = mix_targets[i * B:(i + 1) * B] + [blk[B]]
+            else:
+                target = blk[:B + 1]
             result = verify_greedy(drafts, target)  # emitted = drafts[:k] + bonus; num_accepted = k
             k = result.num_accepted
-            n_proposed += len(drafts); n_accepted += k
-            # STEP-0a de-risk: attribute THIS step's acceptance to the prior step's k (which selected the
-            # replica that produced these carried drafts). If accept-after-k>=1 >> accept-after-k=0, the
-            # fused cap is the k=0 bonus-conditioning effect and dissolves as diff_acc rises (see
-            # docs/TRAINING_PLAN_ACCEPTANCE.md §"Step 0"). None on the very first (bootstrap) block.
-            prev_k = getattr(req, "_tidar_drafts_from_k", None)
-            if prev_k is not None and not norep:
-                bykacc.append((prev_k, len(drafts), k))
             # next block starts AFTER the bonus (committed += drafts[:k]+bonus). R_r[0] sits at
             # position c0+1+r, so the replica drafting the post-bonus block is R_{k+1}, not R_k.
             r_sel = max(0, min(B - 1, k + 1))
@@ -3778,20 +3860,17 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 # probe: next drafts from a fresh block_predict (extra fwd) — isolates the verify path
                 next_drafts = None  # filled after the commit (needs updated cached_len); see below
             elif layout is not None:                    # segmented: R_{r_sel} lives at these packed rows
-                rrows = layout["replica_rows"][r_sel][1]
-                next_drafts = [int(x) for x in lg[rrows].argmax(dim=-1).cpu().tolist()]
+                next_drafts = [blk[j] for j in layout["replica_rows"][r_sel][1]]
             else:                                       # flat: replicas are the contiguous tail rows
-                rep_rows = lg[B + 1:].reshape(B, B, vocab)  # [replica r, token m, V]
-                next_drafts = [int(x) for x in rep_rows[r_sel].argmax(dim=-1).cpu().tolist()]
+                next_drafts = blk[B + 1 + r_sel * B: B + 1 + (r_sel + 1) * B]
 
             if dump and getattr(self, "_tidar_dump_count", 0) < 8:
                 # capture ALL replicas' argmax [B][B] (not just the selected one) so the dump can tell
                 # a selection/shift bug (some R_r matches gt) from a conditioning/fidelity bug (none do).
                 if layout is not None:
-                    reps_all = [[int(x) for x in lg[rr].argmax(dim=-1).cpu().tolist()]
-                                for (_r, rr) in layout["replica_rows"]]
+                    reps_all = [[blk[j] for j in rr] for (_r, rr) in layout["replica_rows"]]
                 else:
-                    reps_all = lg[B + 1:].reshape(B, B, vocab).argmax(dim=-1).cpu().tolist()
+                    reps_all = [blk[B + 1 + r * B: B + 1 + (r + 1) * B] for r in range(B)]
                 dump_cap.append(dict(req=req, c0=c0, drafts=list(drafts), target=list(target),
                                      k=k, r_sel=r_sel, reps=reps_all, next_drafts=list(next_drafts),
                                      bp0=bp0_map.get(id(req))))
@@ -3804,6 +3883,36 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 if (not req.sampling_params.ignore_eos) and tok in self.eos_token_ids:
                     eos = True
                     break
+            outcomes.append((k, keep, eos, next_drafts))
+
+        # TP LOCKSTEP: the verify logits are NOT bit-identical across TP ranks (see _bcast_accept_tp),
+        # so commit rank0's outcome — INCLUDING next_drafts, which stage the NEXT step's tokens — on
+        # every rank, or an argmax near-tie flip drifts the ranks' committed tokens/finish steps and
+        # desyncs the collective sequence. No-op at TP=1.
+        outcomes = self._bcast_fused_accept_tp(outcomes, B)
+
+        # --- commit + carry (rank0-authoritative outcome) ------------------------------------------
+        bykacc: List[tuple] = []   # STEP-0a: (prev_k, n_drafts, n_accepted) to bucket accept by prior k
+        reply: List[DetokenizeMsg] = []
+        new_finished_reqs: Set[Req] = set()
+        c_rows: List[int] = []
+        c_cols: List[int] = []
+        c_vals: List[int] = []
+        free_chunks: List[torch.Tensor] = []
+        install_batch_idx: List[int] = []
+        install_t_index: List[int] = []
+        ps = self.cache_manager.page_size
+        n_proposed = n_accepted = n_emitted = 0
+        for i, (req, c0, n_query, drafts, layout, _mask) in enumerate(per_req):
+            k, keep, eos, next_drafts = outcomes[i]
+            n_proposed += len(drafts); n_accepted += k
+            # STEP-0a de-risk: attribute THIS step's acceptance to the prior step's k (which selected the
+            # replica that produced these carried drafts). If accept-after-k>=1 >> accept-after-k=0, the
+            # fused cap is the k=0 bonus-conditioning effect and dissolves as diff_acc rises (see
+            # docs/TRAINING_PLAN_ACCEPTANCE.md §"Step 0"). None on the very first (bootstrap) block.
+            prev_k = getattr(req, "_tidar_drafts_from_k", None)
+            if prev_k is not None and not norep:
+                bykacc.append((prev_k, len(drafts), k))
             n_emitted += len(keep)
             # confirmed@c0 already in pool + its KV computed this step; drafts[:k] already staged at
             # c0+1..c0+k (their KV computed this step); write only the bonus (emitted[-1]) at c0+len(keep).
@@ -3852,7 +3961,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if norep:
             # probe: next drafts from a fresh block_predict on the committed prefix (snapshot/restores
             # the just-installed CCA state internally). Correctness-only — this makes the step 2-forward.
-            still = [req for (req, _, _, _, _) in per_req if req not in new_finished_reqs]
+            still = [req for (req, _, _, _, _, _) in per_req if req not in new_finished_reqs]
             if still:
                 boot = self._tidar_block_predict(still, B, mask_id)
                 for r, d in zip(still, boot):
@@ -3961,11 +4070,26 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         A non-greedy req can when sampled spec is enabled — unconstrained via verify_sampled, constrained
         via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md.
         Thinking (reasoning-gate) requests DO speculate — the gate is enforced on the verify logits
-        (EOS-suppression + budget force-</think>) in _spec_decode_step, see _apply_think_gate_spec."""
+        (EOS-suppression + budget force-</think>) in _spec_decode_step, see _apply_think_gate_spec.
+        Penalised reqs (presence/frequency) take plain decode: every spec accept path consumes raw
+        verify logits, so the penalties Sampler.sample applies — even at temperature 0 — would be
+        silently inert on the spec lane."""
         sp = req.sampling_params
-        return sp.is_greedy or self._spec_sampled
+        return (sp.is_greedy or self._spec_sampled) and not req.has_penalty
 
-    def _bcast_drafts_tp(self, reqs: List[Req], drafts: List[List[int]]) -> List[List[int]]:
+    def _fused_route_ok(self, reqs: List[Req]) -> bool:
+        """Whether a batch may take the fused-TiDAR single-forward step. Its accept path commits raw
+        verify-argmax tokens (no grammar bitmask / matcher advance, no think-gate mask or commit_many —
+        those live only in _spec_decode_step), so constrained and reasoning-gated reqs must take the
+        linear step — the same shape as the sampled-spec exclusion (_spec_sampled forces fused off)."""
+        if any(r.sampling_params.is_constrained for r in reqs):
+            return False
+        return not (self._think_gate.any_armed()
+                    and any(self._think_gate.is_armed(r.uid) for r in reqs))
+
+    def _bcast_drafts_tp(
+        self, reqs: List[Req], drafts: List[List[int]], cap: int | None = None
+    ) -> List[List[int]]:
         """TP>1 lockstep: force every TP rank to verify rank0's drafts.
 
         The eager spec-verify's vocab-parallel lm-head all_gather (embedding.py `forward`/
@@ -3977,11 +4101,29 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         Broadcasting rank0's drafts makes every rank build the byte-identical verify batch → identical
         collectives forever. LOSSLESS: ``verify_greedy`` corrects any draft, so the committed tokens
         are the target's greedy tokens regardless of which rank's drafts were verified — only the
-        (already-nondeterministic) acceptance rate can move, never the output."""
+        (already-nondeterministic) acceptance rate can move, never the output.
+
+        ``cap`` — a rank-invariant upper bound on every draft length (the proposer's num_draft).
+        When given, lens + padded flat travel in ONE fixed-size gloo broadcast (size known on every
+        rank without a lens exchange); None (the DDTree commit, whose accepted-path length is bounded
+        by the tree config, not num_draft) keeps the two-op lens-then-flat sequence."""
         if self._tp_size <= 1:
             return drafts
         g = self.tp_cpu_group
         n = len(reqs)
+        if cap is not None:
+            # payload = [len_0..len_{n-1} | draft_0 padded to cap | ... | draft_{n-1} padded to cap]
+            if self._tp_is_primary:
+                assert all(len(d) <= cap for d in drafts), (cap, [len(d) for d in drafts])
+                pl = [len(d) for d in drafts]
+                for d in drafts:
+                    pl += [int(t) for t in d] + [0] * (cap - len(d))
+                payload = torch.tensor(pl, dtype=torch.int64)
+            else:
+                payload = torch.zeros(n * (1 + cap), dtype=torch.int64)
+            g.broadcast(payload, root=0).wait()
+            h = payload.tolist()
+            return [h[n + i * cap: n + i * cap + h[i]] for i in range(n)]
         lens = torch.tensor(
             [len(d) for d in drafts] if self._tp_is_primary else [0] * n, dtype=torch.int64
         )
@@ -4003,7 +4145,8 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         return out
 
     def _bcast_accept_tp(
-        self, reqs: List[Req], results: List[Tuple[int, List[int], bool]]
+        self, reqs: List[Req], results: List[Tuple[int, List[int], bool]],
+        drafts: List[List[int]],
     ) -> List[Tuple[int, List[int], bool]]:
         """TP>1 lockstep: force every rank to COMMIT rank0's accept outcome.
 
@@ -4021,37 +4164,72 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         LOSSLESS: only rank0 streams replies to the frontend (see run path), and no collective depends
         on the per-rank grammar matcher (its bitmask is applied host-side), so a non-primary rank's
         matcher drifting to rank0's tokens is invisible — its local verify decision is simply overwritten
-        by rank0's. The committed sequence is always rank0's grammar-valid, greedy-correct output."""
+        by rank0's. The committed sequence is always rank0's grammar-valid, greedy-correct output.
+
+        ``drafts`` (the post-_bcast_drafts_tp, rank-invariant lists) bound each req's keep at
+        len(draft)+1, so the padded payload size is known on every rank and header + keep tokens
+        travel in ONE gloo broadcast instead of a header-then-flat pair."""
         if self._tp_size <= 1:
             return results
         g = self.tp_cpu_group
         n = len(reqs)
-        # header = [num_accepted*n | eos(0/1)*n | keep_len*n]; then the flat keep tokens.
+        # payload = [num_accepted*n | eos(0/1)*n | keep_len*n | keep_0 padded to len(d_0)+1 | ...]
+        bounds = [len(d) + 1 for d in drafts]
         if self._tp_is_primary:
             na = [int(r[0]) for r in results]
             eos = [1 if r[2] else 0 for r in results]
             klen = [len(r[1]) for r in results]
-            flat_keep = [int(t) for r in results for t in r[1]]
+            keep_pad: List[int] = []
+            for b, r in zip(bounds, results):
+                keep_pad += [int(t) for t in r[1]] + [0] * (b - len(r[1]))
+            payload = torch.tensor(na + eos + klen + keep_pad, dtype=torch.int64)
         else:
-            na = [0] * n; eos = [0] * n; klen = [0] * n; flat_keep = []
-        header = torch.tensor(na + eos + klen, dtype=torch.int64)
-        g.broadcast(header, root=0).wait()
-        h = [int(x) for x in header.tolist()]
+            payload = torch.zeros(3 * n + sum(bounds), dtype=torch.int64)
+        g.broadcast(payload, root=0).wait()
+        h = payload.tolist()
         na, eos, klen = h[:n], h[n:2 * n], h[2 * n:3 * n]
-        total = sum(klen)
-        flat = (
-            torch.tensor(flat_keep, dtype=torch.int64)
-            if self._tp_is_primary else torch.zeros(total, dtype=torch.int64)
-        )
-        if total > 0:
-            g.broadcast(flat, root=0).wait()
-        fl = [int(x) for x in flat.tolist()]
         out: List[Tuple[int, List[int], bool]] = []
-        off = 0
+        off = 3 * n
         for i in range(n):
-            L = klen[i]
-            out.append((na[i], fl[off:off + L], bool(eos[i])))
-            off += L
+            out.append((na[i], h[off:off + klen[i]], bool(eos[i])))
+            off += bounds[i]
+        return out
+
+    def _bcast_fused_accept_tp(
+        self, outcomes: List[Tuple[int, List[int], bool, List[int] | None]], B: int
+    ) -> List[Tuple[int, List[int], bool, List[int] | None]]:
+        """TP>1 lockstep for the fused-TiDAR step: commit rank0's (k, keep, eos, next_drafts) on
+        every rank — the same failure class _bcast_accept_tp documents (verify logits are not
+        bit-identical across ranks, so an argmax near-tie flip drifts the committed tokens and the
+        ranks' decode sets/collective sequences). next_drafts must ride along because the carried
+        drafts stage the NEXT step's tokens. keep <= B+1 and next_drafts is exactly B when present
+        (absent only on the NOREP probe, which refills per rank after the commit), so the payload is
+        fixed-size and ONE gloo broadcast suffices."""
+        if self._tp_size <= 1:
+            return outcomes
+        g = self.tp_cpu_group
+        n = len(outcomes)
+        W = B + 1
+        # payload = per-req [k, eos, keep_len, nd_present]*n | keep padded to W | nd padded to B
+        if self._tp_is_primary:
+            head: List[int] = []
+            keep_pad: List[int] = []
+            nd_pad: List[int] = []
+            for (k, keep, eos, nd) in outcomes:
+                head += [k, 1 if eos else 0, len(keep), 0 if nd is None else 1]
+                keep_pad += keep + [0] * (W - len(keep))
+                nd_pad += nd if nd is not None else [0] * B
+            payload = torch.tensor(head + keep_pad + nd_pad, dtype=torch.int64)
+        else:
+            payload = torch.zeros(n * (4 + W + B), dtype=torch.int64)
+        g.broadcast(payload, root=0).wait()
+        h = payload.tolist()
+        out: List[Tuple[int, List[int], bool, List[int] | None]] = []
+        for i in range(n):
+            k, eos, klen, ndp = h[4 * i:4 * (i + 1)]
+            keep = h[4 * n + i * W: 4 * n + i * W + klen]
+            nd = h[4 * n + n * W + i * B: 4 * n + n * W + (i + 1) * B] if ndp else None
+            out.append((k, keep, bool(eos), nd))
         return out
 
     def _adaptive_width_ok(self) -> bool:
@@ -4137,7 +4315,36 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 drafts = [d[:_w] for d in drafts]
         # TP>1 lockstep: every rank verifies rank0's drafts so the eager lm-head all_gather sees an
         # identical row count on all ranks (else the verify batch desyncs → illegal-address fault).
-        drafts = self._bcast_drafts_tp(reqs, drafts)
+        drafts = self._bcast_drafts_tp(reqs, drafts, None if ddtree_drafts else spec.num_draft)
+
+        # An ALL-EMPTY draft step (every req proposed nothing — an n-gram all-miss) IS a plain
+        # decode: each req stages only its confirmed token, and qlen=1 is never a captured verify
+        # width (the ladder starts at 2), so the spec path could only run it EAGER. Route it through
+        # the normal decode step (captured decode graph), keeping the spec accounting. Stays on the
+        # verify path when:
+        #   * a draft-head proposer captures hidden (`capture`) — the verify forward is what seeds
+        #     the NEXT propose, and the padded step below still lands on a captured graph;
+        #   * DP+EP — the idle replica mirrors verify-shaped forwards, so this replica must stage
+        #     the padded verify below (captured-vs-captured or eager-vs-eager, never mixed — a
+        #     decode-graph forward here would desync the fixed-N MoE all_gather and wedge).
+        from minisgl.distributed import is_ep_over_tp
+        if (not ddtree_drafts and not capture
+                and not (self.engine.enable_ep and not is_ep_over_tp())
+                and all(len(d) == 0 for d in drafts)):
+            self._cur_verify_width = 0
+            ast = getattr(self, "_spec_accept_stat", None) or {"acc": 0.0, "n": 0}
+            ast["n"] += len(reqs)
+            self._spec_accept_stat = ast
+            if self._verify_width is not None:
+                self._verify_width.record([r.uid for r in reqs], [0] * len(reqs), 0)
+            if self._metrics_enabled:
+                self._m_spec_steps += 1
+            if _rtx:
+                _roctx.pop(); _roctx.pop()  # propose, spec_step
+            batch = self.decode_manager.schedule_next_batch()
+            forward_input = self._prepare_batch(batch)
+            self._process_last_data((forward_input, self._forward(forward_input)))
+            return
 
         # Ragged → uniform padding for the verify GRAPH. `can_use_verify_graph` needs every req to have
         # the SAME number of drafts, and that count to be a CAPTURED width; a ragged step (a req clamped
@@ -4158,22 +4365,27 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # Note the common case needs NO padding at all: when the proposer emits a full block and the
         # chosen width matches it, the lengths are already uniform-and-captured, which also keeps the
         # fast on-device accept path enabled (it is skipped when pad_active).
+        # The DDTree commit (F3) pads too: its accepted-path length varies per step (0..L), so an
+        # unpadded commit almost never equals a captured qlen and the DOMINANT forward of every
+        # DDTree step would run eager. Padding is the same lossless argument as above; the nearest
+        # rung (adaptive target) keeps the filler rows minimal. An all-empty step that stayed here
+        # (draft-head seed capture / DP+EP lockstep) also pads — up to the smallest rung, or the
+        # DP+EP-pinned width, so the step still replays a captured graph.
         staged_drafts = drafts
         pad_active = False
-        if not ddtree_drafts:
-            from minisgl.spec.width import pad_to_captured_width
+        from minisgl.spec.width import pad_to_captured_width
 
-            vbs = self.engine.graph_runner.verify_bs_list
-            cw = self.engine.graph_runner.verify_widths
-            lens = [len(d) for d in drafts]
-            # What the histogram attributes this step to, even if none of the padding below applies
-            # (no captured widths / batch past the captured bs → eager verify at the ragged width).
-            self._cur_verify_width = max(lens, default=0)
-            if vbs and cw and len(reqs) <= vbs[-1] and any(L >= 1 for L in lens):
-                drafts, staged_drafts, w_pad, pad_active = pad_to_captured_width(
-                    drafts, cw, self._adaptive_width_ok()
-                )
-                self._cur_verify_width = w_pad
+        vbs = self.engine.graph_runner.verify_bs_list
+        cw = self.engine.graph_runner.verify_widths
+        lens = [len(d) for d in drafts]
+        # What the histogram attributes this step to, even if none of the padding below applies
+        # (no captured widths / batch past the captured bs → eager verify at the ragged width).
+        self._cur_verify_width = max(lens, default=0)
+        if vbs and cw and len(reqs) <= vbs[-1]:
+            drafts, staged_drafts, w_pad, pad_active = pad_to_captured_width(
+                drafts, cw, True if ddtree_drafts else self._adaptive_width_ok()
+            )
+            self._cur_verify_width = w_pad
         if _timing:
             torch.cuda.synchronize(device); _t1 = _time.perf_counter()
         if _rtx:
@@ -4230,6 +4442,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             self.engine.graph_runner.pad_verify(batch, ep_bs)
         else:
             batch.padded_reqs = reqs
+            batch.spec_verify_no_graph = True  # bind the EP eager gate inside forward_verify too
         batch.positions = _make_positions(batch, device)
         input_mapping = _make_input_tuple(batch, device)
         batch.out_loc = page_table[input_mapping]
@@ -4280,6 +4493,20 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
         else:
             logits = self.engine.forward_verify(batch)
+
+        # Head-side processing, mirroring what Sampler.sample does exactly once on the plain path
+        # (engine/sample.py): scrub transient NaNs, softcap when the checkpoint asks, and fence off
+        # the untrained padded-vocab tail. Without this a dequant-artifact logit in a pad row can win
+        # the verify argmax (or enter the sampled nucleus) and commit an out-of-tokenizer token id —
+        # every accept branch below (host greedy, on-device, sampled, constrained) reads `logits`.
+        # In-place is safe on a captured graph's output buffer: replay overwrites it fully.
+        _smp = self.engine.sampler
+        if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
+            torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+        if _smp.logit_softcap:
+            logits = torch.tanh(logits.float() / _smp.logit_softcap) * _smp.logit_softcap
+        if _smp.real_vocab_size is not None and _smp.real_vocab_size < logits.shape[-1]:
+            logits[:, _smp.real_vocab_size:] = float("-inf")
 
         # Reasoning gate on the spec path: mask the verify logits IN PLACE for any req still inside <think>
         # (EOS-suppress under budget / force-</think> over budget) BEFORE the argmax/accept below, so a
@@ -4340,16 +4567,26 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 acc.committed_flat, acc.committed_offsets, acc.committed_lens,
                 eos_id, ignore_mask, device,
             )
-            # The one batched sync: small [num_reqs] / [sum kept] host copies (vs the old per-position
-            # preds + per-req Python). Replaces verify_greedy + the EOS keep-loop for every req.
-            od_accepts = acc.num_accepted.cpu().tolist()
-            kept_lens_host = trunc.kept_lens.cpu().tolist()
-            kept_offsets_host = trunc.kept_offsets.cpu().tolist()
-            kept_flat_host = trunc.kept_flat.cpu().tolist()
-            od_eos = [bool(x) for x in trunc.kept_finished_eos.cpu().tolist()]
-            od_keeps = [
-                kept_flat_host[o : o + L] for o, L in zip(kept_offsets_host, kept_lens_host)
-            ]
+            # The one batched sync — literally one: the small per-req results + the flat kept ids are
+            # packed into a single device tensor and pulled with ONE D2H copy (each extra .cpu() is
+            # its own blocking round-trip). kept_offsets is just the exclusive cumsum of kept_lens,
+            # recomputed on host rather than transferred. Replaces verify_greedy + the EOS keep-loop.
+            n_od = len(reqs)
+            packed = torch.cat([
+                acc.num_accepted.to(torch.int32),
+                trunc.kept_lens.to(torch.int32),
+                trunc.kept_finished_eos.to(torch.int32),
+                trunc.kept_flat.to(torch.int32),
+            ]).cpu().tolist()
+            od_accepts = packed[:n_od]
+            kept_lens_host = packed[n_od : 2 * n_od]
+            od_eos = [bool(x) for x in packed[2 * n_od : 3 * n_od]]
+            kept_flat_host = packed[3 * n_od :]
+            od_keeps = []
+            o = 0
+            for L in kept_lens_host:
+                od_keeps.append(kept_flat_host[o : o + L])
+                o += L
         else:
             preds = logits.argmax(dim=-1).to(torch.int32).cpu()  # [sum(K_i+1)]; this syncs
         if _timing:
@@ -4397,7 +4634,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 if gen is not None and not sp.is_greedy:
                     lblock = logits[block_start : block_start + q_len]
                     result = verify_sampled(
-                        d, probs_from_logits(lblock, sp.temperature, sp.top_k, sp.top_p), gen
+                        d,
+                        probs_from_logits(
+                            lblock, sp.temperature, sp.top_k, sp.top_p, min_p=sp.min_p
+                        ),
+                        gen,
                     )
                 else:
                     result = verify_greedy(d, preds[block_start : block_start + q_len].tolist())
@@ -4407,7 +4648,24 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 if j is not None:                    # reasoning ends inside this chain
                     keep = keep[: j + 1]
                     num_accepted_i = min(num_accepted_i, j)
-                eos = False                          # EOS was masked out during the reasoning phase
+                # EOS is only masked while suppress_eos() holds — an UNBOUNDED think budget (and a
+                # template whose close delimiter contains an EOS id) deliberately leaves it live so
+                # the model can stop on its own. Honor a surviving EOS exactly like the ungated path
+                # (the plain path's eos_hit is gate-independent), or the request runs conditioned on
+                # post-EOS context all the way to max_tokens. Scanned AFTER the release truncation:
+                # an EOS past the release point is not committed this step, so it must not finish
+                # the request here — like the plain path, the model re-emits it after the release
+                # and the request finishes then.
+                eos = False
+                if (self._think_gate.forced_next(req.uid) is None
+                        and not self._think_gate.suppress_eos(req.uid)
+                        and not sp.ignore_eos):
+                    for jj, tok in enumerate(keep):
+                        if tok in self.eos_token_ids:
+                            keep = keep[: jj + 1]
+                            num_accepted_i = min(num_accepted_i, jj)
+                            eos = True
+                            break
                 accept_results.append((num_accepted_i, list(keep), eos))
                 continue
             if use_ondevice:
@@ -4430,7 +4688,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     # advance). A grammar-violating draft has masked p=0 -> always rejected.
                     result = self._verify_sampled_constrained(matcher, d, lblock, sp, gen, req.uid)
                 else:
-                    pblock = probs_from_logits(lblock, sp.temperature, sp.top_k, sp.top_p)
+                    pblock = probs_from_logits(
+                        lblock, sp.temperature, sp.top_k, sp.top_p, min_p=sp.min_p
+                    )
                     result = verify_sampled(d, pblock, gen)
             else:
                 matcher = (
@@ -4473,7 +4733,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # TP LOCKSTEP: commit rank0's accept outcome on EVERY rank so the ranks never drift on committed
         # tokens -> req finishes -> the spec-vs-plain branch in _spec_loop -> the collective sequence.
         # (No-op at TP=1.) See _bcast_accept_tp for why the per-rank verify can otherwise disagree.
-        accept_results = self._bcast_accept_tp(reqs, accept_results)
+        accept_results = self._bcast_accept_tp(reqs, accept_results, drafts)
 
         # PASS 2: commit + rollback per req using the rank0-authoritative outcome. Everything here is a
         # deterministic function of (num_accepted, keep, eos) + the already-synced drafts/reqs, so all
@@ -4491,7 +4751,8 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             # _process_last_data). keep was truncated at the release point in pass 1, so it is either all
             # reasoning (count all) or ends on the last token of a delimiter (count the prefix, then
             # release the gate → schema/answer next step).
-            if self._think_gate.is_armed(req.uid):
+            gate_armed = self._think_gate.is_armed(req.uid)
+            if gate_armed:
                 self._think_gate.commit_many(req.uid, keep)
             c0 = req.cached_len
 
@@ -4501,8 +4762,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             # the confirmed token (input_ids[cached_len]), plus the drafter's block, its acceptance,
             # the target's correction, and the target top-K logits (soft-KL teacher). This matches the
             # train_drafter.py seed-fold recipe 1:1. See dflash-drafter/docs/CAPTURE_CONTRACT.md.
+            # gate_armed (snapshotted BEFORE commit_many above could release the gate): an armed
+            # req's verify logits were mutated in place by _gate_mask_spec_logits (fill_(-inf) +
+            # forced token, or EOS-masked), so its top-K rows are a degenerate one-hot "teacher".
             if (self._opd_dir is not None and self._spec_capture_layer_ids and not use_ondevice
-                    and req.sampling_params.is_greedy
+                    and req.sampling_params.is_greedy and not gate_armed
                     and self._grammar_matchers.get(req.uid) is None):
                 ax = self._spec_aux_hidden.get(req.uid)
                 if ax is not None and 0 <= c0 < req.input_ids.shape[0]:
@@ -4720,6 +4984,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 self._verify_width.record(
                     [r.uid for r in reqs], accepted_counts,
                     getattr(self, "_cur_verify_width", self._verify_width.max_width),
+                    offered=[len(d) for d in drafts],
                 )
             if ast["n"] % 100 == 0:
                 _wd = (f" verify-width[{self._verify_width.hist_str()}]"

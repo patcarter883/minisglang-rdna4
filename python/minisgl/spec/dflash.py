@@ -599,15 +599,22 @@ class DFlashProposer(CapturableProposer):
         if fits < 1:
             # Honest refusal: this is a MEMORY fact about this box and this operating point, measured
             # here, not a claim about the checkpoint. Say what it would have cost so the operator can
-            # trade KV pool for it deliberately (lower --memory-ratio, or raise KV_FRAC).
+            # trade KV pool for it deliberately (lower --memory-ratio, or lower the headroom floor).
             self.propose_capturable = False
             self.propose_uncapturable_reason = (
                 f"the prefix ring needs {per_slot / 1e6:.0f} MB/slot but only "
                 f"{budget / 1e6:.0f} MB is budgetable ({_free / 1e9:.2f} GiB free minus "
-                f"{_head / 1e9:.2f} GiB runtime headroom, x KV_FRAC) — lower --memory-ratio to buy "
-                f"room, or raise MINISGL_DFLASH_KV_FRAC / lower MINISGL_DFLASH_RING_HEADROOM_GB")
+                f"{_head / 1e9:.2f} GiB runtime headroom) — lower --memory-ratio to buy "
+                f"room, or lower MINISGL_DFLASH_RING_HEADROOM_GB")
             logger.warning_rank0(f"spec-decode: DFlash propose stays EAGER — "
                                  f"{self.propose_uncapturable_reason}")
+            if self._kv_cap == 0:
+                # An unbounded drafter's eager persist cache is a per-uid torch.cat append with
+                # no ring to bound it — O(context) draft KV on the box that just proved it lacked
+                # headroom for the fixed-size ring. Take the recompute path instead: the
+                # scheduler caps the aux at aux_ctx_cap (set above), so every step re-fuses a
+                # bounded prefix and holds no per-uid state.
+                self._persist = False
             return
         # An explicit CAP, because the automatic budget cannot see the future. Everything allocated
         # after this point (spec-verify graphs, and then a long generation's context-scaled
@@ -865,15 +872,17 @@ class DFlashProposer(CapturableProposer):
             ).reshape(-1)
         else:
             ids = logits.argmax(dim=-1)
+        draft_ids = ids.view(bs, Q - 1)
         if self._compressed:
             ids = ids + self._d2t[ids]                   # draft vocab -> target vocab (on device)
         self._g_out[:bs] = ids.view(bs, Q - 1)
         if d.has_confidence:
             # Per-position acceptance probability over the SAME rows the head scored, conditioned
-            # one step back exactly like the Markov walk ([anchor, draft_0, ..]). Fixed shapes and
-            # no host sync, so it lives inside the captured body; the CUT happens in read_drafts.
-            idv = self._g_out[:bs]
-            prev = torch.cat([self._g_blk[0, :bs, :1], idv[:, :-1]], dim=1)
+            # one step back exactly like the Markov walk ([anchor, draft_0, ..]). PRE-d2t
+            # draft-vocab ids, matching the eager path — markov_w1 is indexed in draft space.
+            # Fixed shapes and no host sync, so it lives inside the captured body; the CUT
+            # happens in read_drafts.
+            prev = torch.cat([self._g_blk[0, :bs, :1], draft_ids[:, :-1]], dim=1)
             self._g_conf[:bs] = d.confidence(rows, prev)
 
     def read_drafts(
@@ -1348,6 +1357,14 @@ class DFlashProposer(CapturableProposer):
         # as plain DFlash. Diagnostic: it separates "the Markov application is wrong" from "the
         # drafter/backbone is mismatched", which acceptance alone cannot.
         if "markov_head.markov_w1.weight" in sd and os.environ.get("MINISGL_DSPARK_MARKOV") != "0":
+            # The Markov/confidence embeds index markov_w1 in DRAFT-vocab space, but the anchor id
+            # comes from req.input_ids in TARGET-vocab space — under a compressed (d2t) drafter
+            # those spaces differ and the anchor can index past markov_w1's rows. Refuse rather
+            # than gather garbage; a t2d remap of the anchor would be needed to support it.
+            assert not self._compressed, (
+                "DSpark Markov/confidence heads are unsupported on a compressed-vocab (d2t) "
+                "drafter — the target-vocab anchor cannot index the draft-vocab markov_w1; "
+                "run with MINISGL_DSPARK_MARKOV=0")
             d.set_markov(
                 sd["markov_head.markov_w1.weight"].to(self._dtype).contiguous().to(self._device),
                 sd["markov_head.markov_w2.weight"].to(self._dtype).contiguous().to(self._device),
@@ -1375,7 +1392,17 @@ class DFlashProposer(CapturableProposer):
                 sd["confidence_head.proj.bias"].float().contiguous().to(self._device)
                 if "confidence_head.proj.bias" in sd else None,
             )
-            self._conf_tau = float(os.environ.get("MINISGL_DSPARK_CONF_TAU") or "0.5")
+            _tau_env = os.environ.get("MINISGL_DSPARK_CONF_TAU")
+            if _tau_env not in (None, ""):
+                self._conf_tau = float(_tau_env)
+            else:
+                # The cut only pays where verify WIDTH costs, i.e. when speculation batches. At
+                # the dflash gate's default bs=1 (scheduler _SPEC_MAX_BS_BY_ALGO) tau=0 measured
+                # fastest — serve.sh qwen38 block, k=6: tau=0 33.80 tok/s vs tau=0.5 ~30, every
+                # truncated draft a lost acceptance for a near-zero width saving. Mirror the
+                # scheduler's gate resolution (env override, else 1; 0 = ungated, any bs).
+                _bs_gate = int(os.environ.get("MINISGL_SPEC_MAX_BS") or 1)
+                self._conf_tau = 0.5 if _bs_gate != 1 else 0.0
             print(f"[dflash] DSpark confidence head loaded (in_dim="
                   f"{sd['confidence_head.proj.weight'].shape[1]}); adaptive draft length at "
                   f"survival tau={self._conf_tau}", flush=True)

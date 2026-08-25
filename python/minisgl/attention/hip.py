@@ -456,38 +456,42 @@ class HIPAttnBackend(RDNA4Backend):
         Wp = min(c0, W). Builds, per seq:
             out_loc (bs*qlen)   ring slot per NEW token = table_idx*R + (c0+j) % R
             page_table[i]       [ window slots  base+(p%R) for p in [c0-Wp, c0)  |  the qlen new slots ]
-                                (ascending absolute position; tail past Wp+qlen padded with 0)
-            cache_seqlens[i]    Wp + qlen         (bounds the paged read; padded tail ignored)
+                                (ascending absolute position; ONE closed form over the whole row,
+                                base + ((c0-Wp)+k) % R — the new slots are its k in [Wp, Wp+qlen))
+            cache_seqlens[i]    Wp + qlen         (bounds the paged read; tail past it ignored)
         These are the SAME ring slots the eager `_build_swa_metadata` / `_gather_swa_windows` (verify)
         and `_build_swa_canvas_metadata` (canvas) address — store slots identical, window read = the
         last Wp positions at their ring slots p%R — so a captured replay is bit-identical to the eager
         forward it replaces. `page_table`'s ROW STRIDE is W+qlen and the kernel reads it as a dense
         block, so it must be an allocation of exactly that width, never a narrow view of a wider one.
-        bs is tiny (<= the captured max), so the O(bs*(W+qlen)) python build is negligible against the
-        forward it feeds; one pinned H2D per buffer."""
+        VECTORIZED like `_fill_swa_decode_static`: O(bs) host reads + on-device arithmetic instead of
+        a per-step O(bs*(W+qlen)) python ring loop with fresh pinned tensors (this runs on EVERY
+        verify replay). Row columns k >= Wp+qlen carry the formula's value rather than a 0-pad but
+        are NEVER read — the kernel bounds key reads by cache_seqlens, the same equivalence the
+        decode fill relies on for its own j >= cnt columns."""
         bs = len(reqs)
         dev = out_loc.device
         W = self.swa_window
         R = self.swa_ring_stride
         row_w = page_table.shape[1]
-        out_slots: list[int] = []
-        pt_rows: list[list[int]] = []
-        ctx: list[int] = []
-        for req in reqs:
-            base = req.table_idx * R
-            c0 = req.device_len - qlen  # cached prefix before the qlen new tokens
-            Wp = min(c0, W) if c0 > 0 else 0
-            new_slots = [base + ((c0 + j) % R) for j in range(qlen)]
-            out_slots.extend(new_slots)
-            win_slots = [base + (p % R) for p in range(c0 - Wp, c0)]  # ascending absolute pos
-            row = win_slots + new_slots
-            row += [0] * (row_w - len(row))  # pad tail (never read; ctx bounds it)
-            pt_rows.append(row)
-            ctx.append(Wp + qlen)
-        CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-        out_loc[: bs * qlen].copy_(torch.tensor(out_slots, **CPU).to(dev, non_blocking=True))
-        page_table[:bs].copy_(torch.tensor(pt_rows, **CPU).to(dev, non_blocking=True))
-        cache_seqlens[:bs].copy_(torch.tensor(ctx, **CPU).to(dev, non_blocking=True))
+        # Cached device arange, grown to the widest row seen (row_w = W + qlen varies per rung/canvas).
+        cols = getattr(self, "_swa_mq_cols", None)
+        if cols is None or cols.numel() < row_w:
+            cols = torch.arange(row_w, dtype=torch.int64, device=dev)
+            self._swa_mq_cols = cols
+        # O(bs) host reads -> one pinned H2D each (bs is tiny: <= the captured max).
+        tbl = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64, pin_memory=True).to(
+            dev, non_blocking=True)
+        S = torch.tensor([r.device_len for r in reqs], dtype=torch.int64, pin_memory=True).to(
+            dev, non_blocking=True)
+        base = tbl * R                                   # [bs] ring block start
+        c0 = S - qlen                                    # [bs] cached prefix before the new tokens
+        Wp = torch.clamp(c0, min=0, max=W)               # [bs] live-window length
+        new_slots = base[:, None] + torch.remainder(c0[:, None] + cols[None, :qlen], R)  # [bs, qlen]
+        rows = base[:, None] + torch.remainder((c0 - Wp)[:, None] + cols[None, :row_w], R)
+        out_loc[: bs * qlen].copy_(new_slots.reshape(-1).to(torch.int32))
+        page_table[:bs].copy_(rows.to(torch.int32))
+        cache_seqlens[:bs].copy_((Wp + qlen).to(torch.int32))
 
     def _fill_swa_verify_static(self, batch: "Batch") -> None:
         self._fill_swa_multiquery_static(

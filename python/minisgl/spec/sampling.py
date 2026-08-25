@@ -23,11 +23,12 @@ __all__ = ["probs_from_logits", "verify_sampled"]
 
 
 def probs_from_logits(
-    logits: torch.Tensor, temperature: float, top_k: int, top_p: float
+    logits: torch.Tensor, temperature: float, top_k: int, top_p: float, min_p: float = 0.0
 ) -> torch.Tensor:
-    """Build the target sampling distribution from logits, applying the request's temp/top_k/top_p the
-    same way the fused sampler does (temperature scale -> top-k mask -> softmax -> top-p renormalize).
-    ``logits`` [.., V] (any float); returns probs [.., V] fp32. temperature<=0 -> onehot(argmax)."""
+    """Build the target sampling distribution from logits, applying the request's temp/min_p/top_k/top_p
+    the same way the fused sampler does (temperature scale -> min-p floor -> top-k mask -> softmax ->
+    top-p renormalize). ``logits`` [.., V] (any float); returns probs [.., V] fp32.
+    temperature<=0 -> onehot(argmax)."""
     logits = logits.float()
     if temperature <= 0.0:
         out = torch.zeros_like(logits)
@@ -35,10 +36,16 @@ def probs_from_logits(
         return out
     V = logits.shape[-1]
     # Mirror engine/sample.py::sample_impl EXACTLY (the torch reference the fused HIP sampler matches):
-    # softmax(logits/T) -> top_k (rank mask, NO renorm) -> top_p (nucleus on the un-renormalized probs)
-    # -> normalize. Applying top_p to un-renormalized top_k probs is load-bearing: renormalizing between
-    # top_k and top_p shifts the nucleus and skews the distribution (caught by validate_sampled_spec).
+    # softmax(logits/T) -> min_p (relative floor) -> top_k (rank mask, NO renorm) -> top_p (nucleus on
+    # the un-renormalized probs) -> normalize. Applying top_p to un-renormalized top_k probs is
+    # load-bearing: renormalizing between top_k and top_p shifts the nucleus and skews the distribution
+    # (caught by validate_sampled_spec).
     probs = torch.softmax(logits / temperature, dim=-1)
+    if min_p and min_p > 0.0:
+        # min-p: drop tokens below min_p * max_prob for the row, BEFORE top-k/top-p (sample_impl's
+        # processor order). The max-prob token itself always survives, so the row never zeroes out.
+        floor = probs.max(dim=-1, keepdim=True).values * min_p
+        probs = probs.masked_fill(probs < floor, 0.0)
     if top_k and 0 < top_k < V:
         sp, si = torch.sort(probs, descending=True, dim=-1)
         ranks = torch.arange(V, device=probs.device).expand_as(sp)
@@ -62,26 +69,37 @@ def verify_sampled(
     (== min(1, p/q) with q_i(draft_i)=1); on the first reject at n, emit a residual sample from
     ``normalize(relu(p[n] - onehot(draft[n])))`` (= p[n] with draft[n] zeroed, renormalized); if all K
     accept, emit a bonus sample from ``p[K]``. Output tokens are distributed exactly as the target's
-    sampler. All randomness draws from ``gen`` in a fixed order so TP ranks (identical drafts + p +
-    seed) stay in lockstep without an outcome broadcast.
+    sampler. All randomness draws from ``gen`` in a fixed order (rand(K), then ONE batched multinomial
+    over all K+1 rows) so TP ranks (identical drafts + p + seed) stay in lockstep without an outcome
+    broadcast.
+
+    Everything runs on device and the outcome (first-reject index + the sample at every row) reaches
+    host in ONE packed sync — a .item() per intermediate would serialize 3-4 stream stalls per req per
+    spec step. Sampling every row's residual and selecting row n afterward leaves the emitted
+    distribution unchanged: each row's draw uses disjoint generator output, so the sample at row n is
+    exactly multinomial(resid_n) regardless of the other rows.
     """
     K = len(draft)
     assert p.shape[0] == K + 1, (p.shape, K)
     device = p.device
-    n = K
-    if K > 0:
-        idx = torch.tensor(draft, dtype=torch.long, device=device)
-        p_at = p[torch.arange(K, device=device), idx]          # [K] = p_i(draft_i)
-        u = torch.rand(K, device=device, generator=gen)        # [K] accept draws (fixed order)
-        rejected = u >= p_at                                    # accept iff u < p_i(draft_i)
-        if bool(rejected.any()):
-            n = int(rejected.float().argmax().item())           # first reject index
-    if n < K:
-        resid = p[n].clone()
-        resid[int(draft[n])] = 0.0                              # relu(p - onehot) zeroes the draft
-        s = resid.sum()
-        dist = resid / s if float(s) > 0.0 else p[n]            # degenerate p==onehot -> fall back to p
-        tok = int(torch.multinomial(dist, 1, generator=gen).item())
-        return AcceptResult(emitted=list(draft[:n]) + [tok], num_accepted=n)
-    tok = int(torch.multinomial(p[K], 1, generator=gen).item())  # all accepted -> bonus ~ p[K]
-    return AcceptResult(emitted=list(draft[:K]) + [tok], num_accepted=K)
+    if K == 0:
+        tok = int(torch.multinomial(p[0], 1, generator=gen).item())  # bonus ~ p[0]
+        return AcceptResult(emitted=[tok], num_accepted=0)
+    rows = torch.arange(K, device=device)
+    idx = torch.tensor(draft, dtype=torch.long, device=device)
+    p_at = p[rows, idx]                                        # [K] = p_i(draft_i)
+    u = torch.rand(K, device=device, generator=gen)            # [K] accept draws (fixed order)
+    rejected = u >= p_at                                        # accept iff u < p_i(draft_i)
+    # first reject index (argmax of all-False is 0, so gate it on any()); K == all accepted
+    n_t = torch.where(
+        rejected.any(), rejected.int().argmax(), torch.tensor(K, device=device, dtype=torch.long)
+    )
+    resid = p.clone()
+    resid[rows, idx] = 0.0                                      # relu(p - onehot) zeroes the draft
+    # degenerate p==onehot -> fall back to p; row K stays p[K] (the bonus dist)
+    dist = torch.where(resid.sum(dim=-1, keepdim=True) > 0.0, resid, p)
+    toks = torch.multinomial(dist, 1, generator=gen).squeeze(-1)  # [K+1] per-row samples (normalizes)
+    packed = torch.cat([n_t.reshape(1), toks]).cpu().tolist()   # the ONE sync
+    n = int(packed[0])
+    tok = int(packed[1 + n])                                    # residual at row n, or bonus at row K
+    return AcceptResult(emitted=list(draft[:n]) + [tok], num_accepted=n)

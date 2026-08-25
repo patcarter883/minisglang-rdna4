@@ -72,7 +72,7 @@ case "$MODEL" in
                   # quant halves the drafter (lossless: the target verifies every draft), and the
                   # graph buckets have to shrink with it. Measured booting and serving at
                   # 0.86 + fp8 + GRAPH_BS<=4. MTP needs none of this (no separate draft model).
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
                     mem_default_spec="0.86"
                     : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
                     # Cap ADMISSION, not just capture. GRAPH_BS now follows CONC, so capping only the
@@ -85,7 +85,18 @@ case "$MODEL" in
                   fi ;;
   qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
                   model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
-                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15 ;;
+                  dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
+                  # Same 737 MB bf16 drafter beside a same-size 4-bit 35B target as the AWQ twin
+                  # above, so the same footprint arithmetic applies: at the global 0.80 default a
+                  # bf16 drafter does not boot (see that arm's bracketing). Mirrors the AWQ twin's
+                  # measured point; not independently re-measured on this quant.
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
+                    mem_default_spec="0.86"
+                    : "${MINISGL_DFLASH_QUANT:=fp8}"; export MINISGL_DFLASH_QUANT
+                    # A CAP, not a default (CONC is already assigned above the case block): GRAPH_BS
+                    # follows CONC, so capping admission keeps capture coverage equal to admission.
+                    if [ "$CONC" -gt 4 ]; then CONC=4; fi
+                  fi ;;
   # GLM's MTP head is a measured NET LOSS on this box, so its default is EAGLE3 (K=6 from the
   # spec-len sweep). MTP remains selectable — it is just not the default.
   glm|QuantTrio/GLM-4.7-Flash-AWQ)
@@ -119,7 +130,7 @@ case "$MODEL" in
                   # bf16 would leave ~1.1 GB/card for KV+graphs, i.e. it cannot boot. fp8 halves it
                   # to ~2.56 GB. Lossless in the sense that matters: the target verifies every draft
                   # token, so weight-only quant can cost ACCEPTANCE, never correctness.
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
                     # 0.96, NOT the 0.93 this line used to carry. 0.93 was Laguna's validated spec
                     # ratio, copied across with the 0.85 above it; it was never measured on Muse and
                     # it does not boot. This target is far heavier: the load delta is 12.58 GiB/card
@@ -180,7 +191,7 @@ case "$MODEL" in
   qwen27b|cyankiwi/Qwen3.6-27B-AWQ-INT4)
                   model_id="cyankiwi/Qwen3.6-27B-AWQ-INT4";            spec_default="none"
                   dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15
-                  if [[ "${SPEC:-$spec_default}" == "dflash" ]]; then
+                  if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
                     mem_default_spec="0.90"
                     # fp8 is not optional here either: it halves the 3.07 GiB bf16 drafter to a
                     # 1.67 GiB reserve. Bf16 would add ~0.9 GiB, which is more than 0.90 leaves.
@@ -297,6 +308,15 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
+                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
+                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
+                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
+                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
+                      : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
+                    fi
                   fi ;;
   # DEFAULT ON CORRECTNESS, NOT SPEED. The INT4 arm is ~23% faster (31.8 vs 24.4 tok/s) and was
   # briefly the default for that reason, until a Hermes agent session surfaced token-level
@@ -397,6 +417,15 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
+                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
+                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
+                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
+                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
+                      : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
+                    fi
                   fi ;;
   qwen38-27b-mixed|unsloth/Qwen3.8-27B-NVFP4)
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
@@ -442,6 +471,15 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
+                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
+                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
+                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
+                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
+                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
+                      : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
+                    fi
                   fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
@@ -552,13 +590,15 @@ fi
 # shared prefix, ps=1 gave 0 hits (a SILENT miss) and ps=16 gave 2 hits with warm TTFT dropping.
 # Both were set per-service on the old laguna services; they belong to the MODEL, so they live here.
 # An explicit value from the caller/panel always wins, and both are inert on non-SWA models.
+# Compose forwards MINISGL_SPEC_MHA_PAGED as the EMPTY STRING when unset on the host, and the
+# engine's gate is `!= "0"`, so "" would silently opt every spec serve into paged MHA. Empty =
+# unset: the engine's shipped default (page_size->1) applies, and the SWA block below opts in.
+[[ -z "${MINISGL_SPEC_MHA_PAGED:-}" ]] && unset MINISGL_SPEC_MHA_PAGED
 if [[ -n "$swa_hybrid" ]]; then
   export MINISGL_SWA_RADIX="${MINISGL_SWA_RADIX:-1}"
   export MINISGL_SPEC_MHA_PAGED="${MINISGL_SPEC_MHA_PAGED:-1}"
   # Both are REQUIRED here, and a 0 in either fails SILENTLY — the cache is downgraded, or it is
   # "enabled" and never hits. Say so loudly rather than let the serve look healthy.
-  # NOTE the compose lean-env anchor SETS MINISGL_SPEC_MHA_PAGED, so `${VAR:-1}` above cannot
-  # default it: an inherited value always wins. Its compose default is therefore 1, not 0.
   [[ "$MINISGL_SWA_RADIX" == "0" ]] && echo \
     "[serve] WARNING: MINISGL_SWA_RADIX=0 on an SWA-hybrid model — prefix cache falls back to naive." >&2
   [[ "$MINISGL_SPEC_MHA_PAGED" == "0" ]] && echo \
