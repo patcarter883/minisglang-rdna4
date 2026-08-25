@@ -308,12 +308,14 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
-                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
-                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
-                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
-                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
-                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
-                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    # MEASURED 2026-08-25 (same protocol as the 08-19 row: sampled seeds
+                    # 101/202/303, M=1, 1200 tok): MAX_BS=1 -> tau=0 serves 36.71 tok/s median vs
+                    # 27.78 with MAX_BS=4 -> tau=0.5 — the batched default is the slowest M=1
+                    # combination, so the M=1-validated point is the default. MAX_BS=4 (+ tau=0.5)
+                    # remains the degen-validated BATCHED override for concurrent spec traffic.
+                    : "${MINISGL_SPEC_MAX_BS:=1}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 tau=0 wins
+                    # (36.71 vs ~30 tok/s), so a bs=1 gate defaults tau to 0.
                     if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
                       : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
                     fi
@@ -417,12 +419,14 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
-                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
-                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
-                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
-                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
-                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
-                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    # MEASURED 2026-08-25 (same protocol as the 08-19 row: sampled seeds
+                    # 101/202/303, M=1, 1200 tok): MAX_BS=1 -> tau=0 serves 36.71 tok/s median vs
+                    # 27.78 with MAX_BS=4 -> tau=0.5 — the batched default is the slowest M=1
+                    # combination, so the M=1-validated point is the default. MAX_BS=4 (+ tau=0.5)
+                    # remains the degen-validated BATCHED override for concurrent spec traffic.
+                    : "${MINISGL_SPEC_MAX_BS:=1}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 tau=0 wins
+                    # (36.71 vs ~30 tok/s), so a bs=1 gate defaults tau to 0.
                     if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
                       : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
                     fi
@@ -471,12 +475,14 @@ case "$MODEL" in
                     # 504->126 MB; drafting conditions on the newest 2048 committed positions.
                     mem_default_spec="0.84"
                     : "${MINISGL_DFLASH_FULL_CAP:=2048}"; export MINISGL_DFLASH_FULL_CAP
-                    # MAX_BS=4 is part of that validated point, not a tweak: unset, the dflash algo
-                    # gate (scheduler.py _SPEC_MAX_BS_BY_ALGO) is 1, so spec never engages above
-                    # bs=1 and the tau=0.5 head default runs the slowest measured M=1 combination.
-                    : "${MINISGL_SPEC_MAX_BS:=4}"; export MINISGL_SPEC_MAX_BS
-                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 it measured
-                    # ~30 vs 33.80 tok/s with tau=0, so a bs=1 pin defaults tau to 0.
+                    # MEASURED 2026-08-25 (same protocol as the 08-19 row: sampled seeds
+                    # 101/202/303, M=1, 1200 tok): MAX_BS=1 -> tau=0 serves 36.71 tok/s median vs
+                    # 27.78 with MAX_BS=4 -> tau=0.5 — the batched default is the slowest M=1
+                    # combination, so the M=1-validated point is the default. MAX_BS=4 (+ tau=0.5)
+                    # remains the degen-validated BATCHED override for concurrent spec traffic.
+                    : "${MINISGL_SPEC_MAX_BS:=1}"; export MINISGL_SPEC_MAX_BS
+                    # tau=0.5 only pays where verify width costs (MAX_BS>1); at bs=1 tau=0 wins
+                    # (36.71 vs ~30 tok/s), so a bs=1 gate defaults tau to 0.
                     if [ "$MINISGL_SPEC_MAX_BS" = "1" ]; then
                       : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
                     fi

@@ -4368,9 +4368,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # The DDTree commit (F3) pads too: its accepted-path length varies per step (0..L), so an
         # unpadded commit almost never equals a captured qlen and the DOMINANT forward of every
         # DDTree step would run eager. Padding is the same lossless argument as above; the nearest
-        # rung (adaptive target) keeps the filler rows minimal. An all-empty step that stayed here
-        # (draft-head seed capture / DP+EP lockstep) also pads — up to the smallest rung, or the
-        # DP+EP-pinned width, so the step still replays a captured graph.
+        # rung (adaptive target) keeps the filler rows minimal. Under DP+EP an all-empty step that
+        # stayed here also pads — the idle replica mirrors verify-shaped forwards, so the busy
+        # replica must land on the same captured graph.
         staged_drafts = drafts
         pad_active = False
         from minisgl.spec.width import pad_to_captured_width
@@ -4381,7 +4381,15 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # What the histogram attributes this step to, even if none of the padding below applies
         # (no captured widths / batch past the captured bs → eager verify at the ragged width).
         self._cur_verify_width = max(lens, default=0)
-        if vbs and cw and len(reqs) <= vbs[-1]:
+        # An all-empty step kept on the verify path only for aux capture stages EAGER at qlen=1
+        # rather than padding to the smallest rung: on a recurrent-hybrid target every filler row
+        # re-runs the GDN/CCA scan, and the padded captured step measured SLOWER serve-wide than
+        # the eager qlen-1 forward (qwen38 dspark tau=0.5, 48% empty steps: 27.8 vs 31.6 tok/s,
+        # 2026-08-25). DP+EP still pads — the lockstep needs the captured shape on both replicas.
+        _empty_aux_eager = (capture and not ddtree_drafts
+                            and all(L == 0 for L in lens)
+                            and not (self.engine.enable_ep and not is_ep_over_tp()))
+        if vbs and cw and len(reqs) <= vbs[-1] and not _empty_aux_eager:
             drafts, staged_drafts, w_pad, pad_active = pad_to_captured_width(
                 drafts, cw, True if ddtree_drafts else self._adaptive_width_ok()
             )
