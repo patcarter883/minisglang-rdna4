@@ -35,6 +35,7 @@ linear verify_greedy (DFlash is a linear block, not a tree).
 """
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import torch
@@ -50,6 +51,15 @@ from minisgl.layers.base import BaseOP
 # per KERNEL_CORE_POLICY.md. Aliased so the 12 call sites below are untouched.
 from .draft_linear import (  # noqa: E402
     SHARD_COL, SHARD_NONE, SHARD_ROW, DraftLinear as _PlainLinear)
+
+# DSpark Markov walk: how many unbiased top candidates each block position re-scores. The bias is a
+# low-rank ADDITIVE term, so the biased argmax can only move within tokens whose unbiased logit is
+# within max|bias| of the top — re-scoring the full vocab streams the whole [vocab, rank] w2 matrix
+# once per position, sequentially, for a result the candidate set already contains. A fixed C keeps
+# the shapes static (capture-safe). MINISGL_DSPARK_MARKOV_FULL=1 restores the exact full-vocab walk
+# for parity checks.
+_MARKOV_TOPC = int(os.environ.get("MINISGL_DSPARK_MARKOV_TOPC") or 64)
+_MARKOV_FULL = os.environ.get("MINISGL_DSPARK_MARKOV_FULL") == "1"
 
 
 class _DFlashLayer(BaseOP):
@@ -503,13 +513,30 @@ class DFlashDraftModel(BaseOP):
         positions are conditionally INDEPENDENT — which is precisely why its acceptance decays toward
         the back of a block ("suffix decay"). Restoring one-step dependency is the whole DSpark idea.
         The loop is a FIXED trip count over k with static shapes and `prev` never leaves the device,
-        so it adds no host sync and stays capture-safe."""
+        so it adds no host sync and stays capture-safe. The candidate set per position is the top
+        `_MARKOV_TOPC` UNBIASED tokens, computed in one batched topk; the walk then re-scores only
+        those — a [C, rank] gather of w2 per position instead of the full [vocab, rank] stream and
+        a full-vocab argmax, which is almost entirely wasted bandwidth for a low-rank additive bias
+        (see `_MARKOV_TOPC`)."""
         from minisgl._hip_engage import engaged
         engaged("spec_dflash.dspark_markov")
         k = block_logits.shape[-2]
+        if _MARKOV_FULL:
+            ids = []
+            for j in range(k):
+                tok = (block_logits[..., j, :] + self.markov_bias(prev)).argmax(dim=-1)
+                ids.append(tok)
+                prev = tok
+            return torch.stack(ids, dim=-1) if ids else prev.new_empty(prev.shape + (0,))
+        C = min(_MARKOV_TOPC, block_logits.shape[-1])
+        top_v, top_i = block_logits.topk(C, dim=-1)      # [..., k, C], one pass over the logits
+        cand_w2 = F.embedding(top_i, self._markov_w2)    # [..., k, C, rank]
         ids = []
         for j in range(k):
-            tok = (block_logits[..., j, :] + self.markov_bias(prev)).argmax(dim=-1)
+            lat = F.embedding(prev, self._markov_w1)     # [..., rank]
+            bias = (cand_w2[..., j, :, :] * lat.unsqueeze(-2)).sum(dim=-1)  # [..., C]
+            sel = (top_v[..., j, :] + bias).argmax(dim=-1)
+            tok = top_i[..., j, :].gather(-1, sel.unsqueeze(-1)).squeeze(-1)
             ids.append(tok)
             prev = tok
         return torch.stack(ids, dim=-1) if ids else prev.new_empty(prev.shape + (0,))

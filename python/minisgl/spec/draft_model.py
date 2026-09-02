@@ -19,19 +19,6 @@ __all__ = ["DraftModelProposer"]
 logger = init_logger(__name__)
 
 
-# Target GLM-4.7-Flash decoder layers to capture for EAGLE3 aux fusion.
-#
-# SGLang's target-side default set_eagle3_layers_to_capture() = [2, N//2, N-3] for
-# N=num_hidden_layers; GLM-4.7-Flash N=47 -> SGLang ids [2, 23, 44]. BUT SGLang captures the residual
-# stream at the INPUT of layer i (`aux.append(hidden_states + residual)` BEFORE running layer i),
-# whereas minisgl's GLMModel.forward grabs `residual` AFTER layer `lid` runs (= the input to layer
-# lid+1). So SGLang's "input to layer i" == minisgl's "output of layer i-1" -> the equivalent minisgl
-# capture ids are [1, 22, 43]. Override via env for GPU iteration.
-_GLM47_CAPTURE_LAYER_IDS = [
-    int(x) for x in os.environ.get("MINISGL_EAGLE3_CAPTURE_LAYERS", "1,22,43").split(",")
-]
-
-
 class DraftModelProposer(CapturableProposer):
     """EAGLE3 draft-model speculative proposer.
 
@@ -50,7 +37,7 @@ class DraftModelProposer(CapturableProposer):
     **Persistent draft KV.** The single draft layer's self-attention needs the full causal context,
     not just the K-token chain — restricting attention to the chain collapses the head to ~2% accept
     (near random). So this proposer keeps a PERSISTENT per-request draft KV (one layer, like the GLM
-    MTP head). It lives in ONE GLOBAL fixed-shape buffer `[max_slots, max_ctx, Hkv, hd]` keyed by
+    MTP head). It lives in ONE GLOBAL fixed-shape buffer `[max_slots, ring, Hkv, hd]` keyed by
     `req.table_idx` plus a per-slot cursor, NOT a per-uid Python list: a growing list is both a
     dynamic contraction dim and a host-side mutation, i.e. two capture blockers, and it made propose
     O(prompt) in interpreted Python per draft step (the prompt seed pushed P-1 one-row tuples into
@@ -59,19 +46,22 @@ class DraftModelProposer(CapturableProposer):
 
     **This is a WINDOWED buffer over an UNWINDOWED drafter, and that is a real semantic.** Unlike
     DFlash, the EAGLE3 draft layer attends every cached key with no sliding window, so capping the
-    buffer at `max_ctx` is not a pure traffic reduction: past the window the drafts genuinely differ.
+    buffer at the ring window is not a pure traffic reduction: past it the drafts genuinely differ.
     It stays end-to-end LOSSLESS because verify gates every emitted token — but an EAGLE3 A/B must be
     read as accept-len at a stated window, never as byte-equality of drafts.
     """
 
     needs_last_hidden = False
-    capture_layer_ids = _GLM47_CAPTURE_LAYER_IDS
     supports_prefill_seed = True
     # EAGLE3's per-step seed is fc(aux) at the LAST confirmed position — one column, not a history.
     # The scheduler's aux accumulator is a global (`MINISGL_DFLASH_FULLCTX`, default on) that is NOT
     # gated on the proposer, so without this cap it grows a [num_aux, P, hidden] buffer with a
     # torch.cat per step per request for a consumer that reads exactly one column of it.
     aux_ctx_cap = 1
+    # Same reasoning for the seeded-prefill store: `seed_prefill` receives the raw prompt-suffix
+    # slice directly, so the per-uid buffer only ever feeds stage_propose's aux[:, -1] — keep one
+    # column instead of cloning up to [num_aux, 512, hidden] per seeded request.
+    prefill_aux_tail = 1
 
     def __init__(self, engine, num_draft: int, draft_model_path: str) -> None:
         from minisgl.models.glm_eagle3 import GLMEagle3DraftModel
@@ -102,6 +92,32 @@ class DraftModelProposer(CapturableProposer):
         rp = getattr(hf, "rope_parameters", None) or getattr(hf, "rope_scaling", None) or {}
         rope_theta = float(rp.get("rope_theta", getattr(hf, "rope_theta", 1e6)))
         max_pos = int(hf.max_position_embeddings)
+
+        # Target decoder layers to capture for the EAGLE3 aux fusion. Checkpoint/SGLang ids count
+        # the residual stream at the INPUT of layer i (`aux.append(hidden_states + residual)` BEFORE
+        # running layer i), whereas minisgl's model.forward grabs `residual` AFTER layer `lid` runs
+        # (= the input to layer lid+1) — so SGLang's "input to layer i" == minisgl's "output of
+        # layer i-1" and every declared id maps to a minisgl capture id MINUS 1. Prefer the ids the
+        # draft checkpoint was trained against; fall back to SGLang's target-side default
+        # set_eagle3_layers_to_capture() = [2, N//2, N-3] for N target layers (GLM-4.7-Flash N=47
+        # -> minisgl ids [1, 22, 43]). MINISGL_EAGLE3_CAPTURE_LAYERS overrides with minisgl-
+        # convention ids for GPU iteration.
+        target_layers = int(cached_load_hf_config(engine.model_path).num_hidden_layers)
+        ckpt_ids = (getattr(hf, "eagle_aux_hidden_state_layer_ids", None)
+                    or getattr(hf, "aux_hidden_state_layer_ids", None))
+        if ckpt_ids:
+            ids = [int(x) - 1 for x in ckpt_ids]
+        else:
+            ids = [i - 1 for i in (2, target_layers // 2, target_layers - 3)]
+        env_ids = os.environ.get("MINISGL_EAGLE3_CAPTURE_LAYERS")
+        if env_ids:
+            ids = [int(x) for x in env_ids.split(",") if x.strip()]
+        assert all(0 <= i < target_layers for i in ids), (
+            f"EAGLE3 capture layer ids {ids} out of range for the {target_layers}-layer target — "
+            "a never-captured id fails only at the first return_hidden forward, and a wrong-depth "
+            "id silently collapses accept."
+        )
+        self.capture_layer_ids = ids
         num_aux = len(self.capture_layer_ids)
 
         # Build the draft on the engine device (materialized, not meta — it is tiny).
@@ -143,19 +159,6 @@ class DraftModelProposer(CapturableProposer):
         self._null_slot = self._live_slots
         self._max_slots = self._live_slots + 1
         dev, dt = self._device, self._dtype
-        from minisgl.engine.graph import get_free_memory
-
-        per_col = self._max_slots * (_nkh * _kdim + _nvh * _vdim) * dt.itemsize
-        # Budget the persistent buffer AND the per-step k_buf[slot_rows] gather (a second transient
-        # of comparable size at full batch) — the same sizing MTP arrived at after a bs>=4 OOM.
-        # `or` form, not a dict default — compose's `VAR: "${VAR:-}"` makes the key present-but-EMPTY
-        # and float("") raises at boot. See the same note in spec/dflash.py.
-        _budget = int(get_free_memory(dev)
-                      * float(os.environ.get("MINISGL_EAGLE3_KV_FRAC") or "0.33"))
-        _mem_cap = max(512, _budget // max(per_col * 2, 1))
-        self._max_ctx = min(int(engine.max_seq_len),
-                            int(os.environ.get("MINISGL_EAGLE3_MAX_CTX") or "8192"),
-                            int(_mem_cap))
         # RING, not a linear absolute-indexed buffer — the same fix MTP already carries (spec/mtp.py).
         # Column WAS the absolute position, so the buffer capped context at its allocation and
         # `_ctx_gate` skipped propose entirely past it: EAGLE3 became a SILENT no-op on long prompts.
@@ -172,8 +175,9 @@ class DraftModelProposer(CapturableProposer):
         # floor) for 3 MB instead of 50 MB. EAGLE3's drafter is a different model, so if it turns out
         # to be more context-sensitive than MTP's, raise MINISGL_EAGLE3_KV_WINDOW.
         self._ring = max(64, int(os.environ.get("MINISGL_EAGLE3_KV_WINDOW") or 512))
-        # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to _max_ctx and was the
-        # silent cliff; the ring makes any length drafts-capable, so there is nothing to gate.
+        # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to the full-context
+        # buffer length and was the silent cliff; the ring makes any length drafts-capable, so there
+        # is nothing to gate.
         _gate_env = os.environ.get("MINISGL_SPEC_MAX_CONTEXT")
         self._ctx_gate = int(_gate_env) if _gate_env else (1 << 62)
         self._k_buf = torch.zeros(self._max_slots, self._ring, _nkh, _kdim, device=dev, dtype=dt)
@@ -197,7 +201,7 @@ class DraftModelProposer(CapturableProposer):
         self.init_propose_capture_state(engine, tag="EAGLE3")
         logger.info_rank0(
             f"spec-decode: EAGLE3 propose buffers (slots={self._live_slots}+NULL, "
-            f"max_ctx={self._max_ctx}, ring={self._ring} (unbounded context), draft-KV "
+            f"ring={self._ring} (unbounded context), draft-KV "
             f"{(self._k_buf.numel() + self._v_buf.numel()) * dt.itemsize / 1e6:.0f} MB)")
 
     def _load_draft_weights(self, folder: str) -> None:
@@ -352,30 +356,38 @@ class DraftModelProposer(CapturableProposer):
 
     @torch.inference_mode()
     def seed_prefill(self, req: "Req", last_hidden=None, aux_hidden=None) -> None:
-        """Seed the persistent draft KV from the prompt prefill so the FIRST draft already sees full
+        """Seed the persistent draft KV from the prompt prefill so the FIRST draft already sees the
         prompt context (otherwise the cache starts empty -> cold early tokens, the ~2% floor's milder
         cousin). Same convention as the decode-time chain: the pair (embed(token_p), fc(aux_{p-1}))
-        lives at RoPE position p, so we write the draft layer's k/v for prompt pairs p=1..P-1 into
-        columns 0..S-1 of this req's slot and set the cursor to S; the first decode propose then
-        appends position P (the bonus) at column S."""
+        lives at RoPE position p, writing at ring column p % ring with absolute label p.
+        ``aux_hidden`` holds the rows for absolute positions [cached_len-P, cached_len) — on a radix
+        prefix-cache hit that origin is > 0 and the rows are the prompt SUFFIX, not its start
+        (complete_one has already advanced cached_len to the full prompt length; same
+        ``ctx_start = cached_len - P`` convention as DFlash). ``_cur[slot]`` is the ABSOLUTE index
+        of the next pair to write, so it is set to cached_len and the first decode propose APPENDS
+        the bonus pair (token_{cached_len}, RoPE cached_len) at column cached_len % ring instead of
+        clobbering the last seeded pair."""
         if aux_hidden is None:
             return
         P = aux_hidden.shape[1]  # aux_hidden: [num_aux, P, hidden]
         if P < 2:
             return
-        S = P - 1
         device = self._device
         slot = int(req.table_idx)
-        # Seed the ring TAIL. The old code REFUSED when S > buffer and left the cache cold, which —
-        # together with the _ctx_gate that has now gone — is what made long prompts draft blind.
-        # With col = pos % ring the tail is always representable; it just may WRAP, so write it as up
-        # to two contiguous runs.
-        p_lo = max(1, P - self._ring)                    # first prompt position kept in the ring
-        tokens = req.input_ids[p_lo:P].to(device=device, dtype=torch.int64)  # token_p, p=p_lo..P-1
-        aux_prev = (aux_hidden[:, p_lo - 1 : P - 1]
+        end = int(req.cached_len)                        # one past the last seeded pair
+        origin = end - P                                 # absolute position of aux_hidden[:, 0]
+        assert origin >= 0, f"seed_prefill: {P} aux rows exceed cached_len {end}"
+        # Seed the ring TAIL. The old code REFUSED when the prompt exceeded the buffer and left the
+        # cache cold, which — together with the _ctx_gate that has now gone — is what made long
+        # prompts draft blind. With col = pos % ring the tail is always representable; it just may
+        # WRAP, so write it as up to two contiguous runs. Pair `origin` itself is unseedable on a
+        # cache hit (aux_{origin-1} was never recomputed).
+        p_lo = max(origin + 1, end - self._ring)         # first prompt position kept in the ring
+        tokens = req.input_ids[p_lo:end].to(device=device, dtype=torch.int64)  # token_p
+        aux_prev = (aux_hidden[:, p_lo - 1 - origin : end - 1 - origin]
                     .to(self._dtype).permute(1, 0, 2).contiguous())
-        fused = self._draft.fuse_aux(aux_prev)           # [P-p_lo, hidden]
-        positions = torch.arange(p_lo, P, dtype=torch.int32, device=device)
+        fused = self._draft.fuse_aux(aux_prev)           # [end-p_lo, hidden]
+        positions = torch.arange(p_lo, end, dtype=torch.int32, device=device)
         n = int(positions.numel())
         if n > 0:
             c0 = p_lo % self._ring
@@ -387,10 +399,10 @@ class DraftModelProposer(CapturableProposer):
                 self._draft.seed_buffered(
                     self._draft.embed(tokens[first:]), fused[first:], positions[first:],
                     self._k_buf, self._v_buf, slot, 0)
-            abs_pos = torch.arange(p_lo, P, dtype=torch.int64, device=device)
+            abs_pos = torch.arange(p_lo, end, dtype=torch.int64, device=device)
             self._pos_buf[slot, torch.remainder(abs_pos, self._ring)] = abs_pos
         self._slot_uid[slot] = req.uid
-        self._cur[slot] = S
+        self._cur[slot] = end
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
         # The confirmed token (always committed) plus the n accepted drafts become permanent draft

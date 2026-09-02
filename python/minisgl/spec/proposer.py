@@ -11,6 +11,11 @@ if TYPE_CHECKING:
 
 __all__ = ["propose_ngram", "NgramProposer"]
 
+# Only the trailing window is scanned for matches. The heuristic already prefers the most
+# recent occurrence, so bounding the lookback keeps per-step host cost O(window) instead of
+# growing with the full context length.
+_MAX_LOOKBACK = 4096
+
 
 def propose_ngram(
     token_ids: Sequence[int] | torch.Tensor,
@@ -30,7 +35,8 @@ def propose_ngram(
     shrink to ``min_ngram``, returning on the first window size that hits. Longer matches are
     rarer but far more likely to be accepted, so they're preferred. Among occurrences of a given
     window we take the **most recent** (largest start index) — in repetitive/structured output
-    the nearest prior copy is the best continuation predictor.
+    the nearest prior copy is the best continuation predictor. Matching only scans the last
+    ``_MAX_LOOKBACK`` tokens, so the host cost per step is bounded regardless of context length.
 
     Args:
         token_ids: the full token sequence so far (prompt + generated), 1-D.
@@ -45,9 +51,12 @@ def propose_ngram(
     if num_draft <= 0:
         return []
     if isinstance(token_ids, torch.Tensor):
-        t = token_ids.detach().to(device="cpu", dtype=torch.long).flatten()
+        # Native dtype: input_ids is already a CPU int buffer, so this is a zero-copy view.
+        t = token_ids.detach().to(device="cpu").flatten()
     else:
-        t = torch.as_tensor(token_ids, dtype=torch.long)
+        t = torch.as_tensor(token_ids)
+    if t.numel() > _MAX_LOOKBACK:
+        t = t[-_MAX_LOOKBACK:]
     L = int(t.numel())
     # Need at least one token before the needle to ever match, and one after to propose.
     if L < 2:

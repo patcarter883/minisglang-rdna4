@@ -468,6 +468,14 @@ class Engine:
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
         aligned_max_seq_len = _align_up_32(self.max_seq_len)
+        if config.spec_config is not None:
+            # Verify-width padding (spec/width.pad_to_captured_width) stages up to the max captured
+            # width of filler drafts with no per-req budget clamp, so a request clamped to the exact
+            # context limit can stage columns past max_seq_len; give every row that much slack or the
+            # staged scatter runs off it into the next request's page-table entries. token_pool
+            # (zeros_like this table) inherits the slack. GraphRunner sees the widened value below,
+            # so capture and replay agree on the table width.
+            aligned_max_seq_len += _align_up_32(config.spec_config.num_draft + 1)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -1437,7 +1445,12 @@ class Engine:
         # v2 S4: the FUSED-TiDAR custom-mask verify forward has its own captured graph (distinct qlen +
         # a static dense mask). Check it first — its batch carries `fused_verify=True` and fused_qlen
         # query tokens, so it never collides with the K+1 two-forward verify graph below. Logits-only.
-        if self.graph_runner.can_use_fused_verify(batch):
+        # Under DP+EP the in-graph MoE all_gather bakes the captured N while the idle replica's dummy
+        # self-agrees N eagerly (moe.py case 3) → keep the fused verify eager there. EP-over-TP has no
+        # idle replica (the TP ranks run the same bs in lockstep), so replay stays safe.
+        if self.graph_runner.can_use_fused_verify(batch) and (
+            not self.enable_ep or self._ep_over_tp
+        ):
             return self.graph_runner.replay_fused_verify(batch)
         # DDTree draft-TREE verify: its own captured graph (fixed tree_qlen + a static ancestor mask +
         # state-neutral recurrent scratch). Batch carries `ddtree_verify=True`; logits-only. Under EP the
@@ -1681,7 +1694,9 @@ def _adjust_config(config: EngineConfig):
             # (better decode/prefill gather coalescing). GATED default-off pending GPU validation:
             # MINISGL_SPEC_MHA_PAGED=1 keeps the configured page_size (already snapped to a %16 multiple
             # by the HIP backend rule above); unset restores the shipped byte-identical page_size=1.
-            _mha_paged = os.environ.get("MINISGL_SPEC_MHA_PAGED", "0") != "0"
+            # `or "0"`: compose forwards unset host vars as the EMPTY string, which must read as the
+            # shipped default for launchers that bypass serve.sh's unset-normalization (cam, run).
+            _mha_paged = (os.environ.get("MINISGL_SPEC_MHA_PAGED") or "0") != "0"
             if _mha_paged and config.page_size > 1:
                 logger.warning_rank0(
                     f"spec-decode (MHA): keeping page_size={config.page_size} (page-aware rollback; "

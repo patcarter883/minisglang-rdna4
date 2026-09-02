@@ -34,6 +34,13 @@ class SpecConfig:
             )
         if self.num_draft < 1:
             raise ValueError(f"spec_num_draft must be >= 1, got {self.num_draft}")
+        # Fail at config build, not in make_proposer: by then the target's weights are loaded and
+        # the KV pool is sized (with a zero draft reserve), so a missing path wastes a whole boot.
+        if self.algorithm in ("eagle3", "dflash") and not self.draft_model_path:
+            raise ValueError(
+                f"spec algorithm {self.algorithm!r} requires a separate draft checkpoint — "
+                "set --spec-draft-model-path"
+            )
         if not (1 <= self.ngram_min <= self.ngram_max):
             raise ValueError(
                 f"require 1 <= ngram_min <= ngram_max, got "

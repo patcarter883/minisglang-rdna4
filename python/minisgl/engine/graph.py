@@ -585,6 +585,10 @@ class GraphRunner:
         # step) falls back to eager. spec_verify is set by the scheduler.
         if self._verify is None or not getattr(batch, "spec_verify", False):
             return False
+        # Scheduler veto (EP eager gate / skip_alloc dummy): pad_verify was skipped, so a replay here
+        # would desync the EP MoE collectives or index an uncaptured padded_size.
+        if getattr(batch, "spec_verify_no_graph", False):
+            return False
         if batch.size > self._verify["bs_list"][-1] or batch.size == 0:
             return False
         ql = batch.reqs[0].extend_len

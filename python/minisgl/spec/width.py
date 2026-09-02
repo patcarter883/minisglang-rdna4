@@ -375,17 +375,28 @@ class AdaptiveVerifyWidth:
                 break
         return min(w_acc, self.width_cap(n))
 
-    def record(self, uids: Sequence[int], accepted: Sequence[int], width: int) -> None:
+    def record(
+        self, uids: Sequence[int], accepted: Sequence[int], width: int,
+        offered: "Optional[Sequence[int]]" = None,
+    ) -> None:
         """Fold this step's outcome into the per-uid EMA and count the width that was actually run.
 
         `accepted[i]` must be the RANK0-AUTHORITATIVE accepted-draft count for `uids[i]` (i.e. taken
-        after `_bcast_accept_tp`), or the ranks' EMAs — and hence their next chosen widths — drift."""
+        after `_bcast_accept_tp`), or the ranks' EMAs — and hence their next chosen widths — drift.
+
+        `offered[i]` is the number of rows `uids[i]`'s REAL draft list put up this step (its length
+        before padding, i.e. what accept actually sliced). The staged `width` is only the GRAPH
+        shape: a ragged batch (n-gram misses, remain_len clamps, a confidence cut) pads every req up
+        to it, but a req whose real list was shorter was never offered the deeper rows. None means
+        every req really drafted `width` rows."""
         a = self._alpha
         for uid, n in zip(uids, accepted):
             prev = self._ema.get(uid)
             self._ema[uid] = float(n) if prev is None else (1.0 - a) * prev + a * float(n)
-        # Censored survival counts. `width` is the number of rows OFFERED, so this step observes
-        # "did the run reach j" for j = 1..width and observes NOTHING beyond it. Decayed so the
+        # Censored survival counts. A req observes "did the run reach j" only for j up to the rows it
+        # was actually OFFERED and observes NOTHING beyond — crediting the staged width to a shorter
+        # req would record failures at depths it never ran, re-creating exactly the downward latch
+        # the censoring correction exists to remove (survival()'s docstring). Decayed so the
         # estimate tracks a drafter whose acceptance changes over a request rather than averaging
         # the whole run; DECAY**-1 ~ 200 steps. Deterministic across ranks: same inputs, same
         # arithmetic, no wall-clock.
@@ -394,8 +405,13 @@ class AdaptiveVerifyWidth:
             for j in range(1, self._max + 1):
                 self._st[j] *= _DECAY
                 self._sh[j] *= _DECAY
-            for j in range(1, w + 1):
-                self._st[j] += len(accepted)
+            if offered is None:
+                for j in range(1, w + 1):
+                    self._st[j] += len(accepted)
+            else:
+                for o in offered:
+                    for j in range(1, min(int(o), w) + 1):
+                        self._st[j] += 1.0
             for n in accepted:
                 for j in range(1, min(int(n), w) + 1):
                     self._sh[j] += 1.0
