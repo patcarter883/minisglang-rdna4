@@ -1,0 +1,43 @@
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_decode.flash_decode_paged_fp8
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv[gdn_proj]
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_gemm(decode_gemv)
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_decode_conv_gated_replay
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm_add
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rope
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.silu_and_mul
+[1m[2026-08-25|11:41:45|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.store_kv
+[1m[2026-08-25|11:42:10|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_gemm(wmma_tiled_tuned)
+[1m[2026-08-25|11:42:11|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_prefill_paged.flash_prefill_paged_fp8
+[1m[2026-08-25|11:42:11|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd_verify
+[1m[2026-08-25|11:42:11|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_verify_replay
+[1m[2026-08-25|11:42:11|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.rmsnorm_gated
+[1m[2026-08-25|11:42:13|core|rank=0][0m [32mINFO    [0m [hip-engage] spec_dflash.dspark_markov
+[1m[2026-08-25|11:42:14|core|rank=0][0m [32mINFO    [0m [hip-engage] spec_dflash.dspark_confidence
+[1m[2026-08-25|11:42:27|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd
+[1m[2026-08-25|11:42:27|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_prefill_wmma
+[1m[2026-08-25|11:42:27|core|rank=0][0m [32mINFO    [0m [hip-engage] sampler_hip.top_k_top_p_sampling_from_logits_
+[1m[2026-08-25|11:42:36|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.91 over 100 reqs [accepted-drafts/verify; committed/verify=1.91] verify-width[0:23(23%) 3:72(72%) 4:5(5%) 6:0(0%)] verify-graph replay=77 eager=23
+[1m[2026-08-25|11:42:41|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.89 over 200 reqs [accepted-drafts/verify; committed/verify=1.89] verify-width[0:58(29%) 3:137(68%) 4:5(2%) 6:0(0%)] verify-graph replay=142 eager=58
+[1m[2026-08-25|11:42:46|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.84 over 300 reqs [accepted-drafts/verify; committed/verify=1.84] verify-width[0:93(31%) 3:202(67%) 4:5(2%) 6:0(0%)] verify-graph replay=207 eager=93
+[1m[2026-08-25|11:42:51|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.76 over 400 reqs [accepted-drafts/verify; committed/verify=1.75] verify-width[0:145(36%) 3:250(62%) 4:5(1%) 6:0(0%)] verify-graph replay=255 eager=145
+[1m[2026-08-25|11:42:55|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.65 over 500 reqs [accepted-drafts/verify; committed/verify=1.65] verify-width[0:209(42%) 3:286(57%) 4:5(1%) 6:0(0%)] verify-graph replay=291 eager=209
+[1m[2026-08-25|11:43:00|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.69 over 600 reqs [accepted-drafts/verify; committed/verify=1.69] verify-width[0:244(41%) 3:351(58%) 4:5(1%) 6:0(0%)] verify-graph replay=356 eager=244
+[1m[2026-08-25|11:43:05|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.65 over 700 reqs [accepted-drafts/verify; committed/verify=1.65] verify-width[0:302(43%) 3:393(56%) 4:5(1%) 6:0(0%)] verify-graph replay=398 eager=302
+[1m[2026-08-25|11:43:10|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.67 over 800 reqs [accepted-drafts/verify; committed/verify=1.67] verify-width[0:322(40%) 3:473(59%) 4:5(1%) 6:0(0%)] verify-graph replay=478 eager=322
+[1m[2026-08-25|11:43:15|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.65 over 900 reqs [accepted-drafts/verify; committed/verify=1.65] verify-width[0:373(41%) 3:522(58%) 4:5(1%) 6:0(0%)] verify-graph replay=527 eager=373
+[1m[2026-08-25|11:43:19|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.62 over 1000 reqs [accepted-drafts/verify; committed/verify=1.62] verify-width[0:433(43%) 3:562(56%) 4:5(0%) 6:0(0%)] verify-graph replay=567 eager=433
+[1m[2026-08-25|11:43:24|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.61 over 1100 reqs [accepted-drafts/verify; committed/verify=1.61] verify-width[0:488(44%) 3:607(55%) 4:5(0%) 6:0(0%)] verify-graph replay=612 eager=488
+[1m[2026-08-25|11:43:28|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.58 over 1200 reqs [accepted-drafts/verify; committed/verify=1.58] verify-width[0:554(46%) 3:641(53%) 4:5(0%) 6:0(0%)] verify-graph replay=646 eager=554
+[1m[2026-08-25|11:43:33|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.55 over 1300 reqs [accepted-drafts/verify; committed/verify=1.55] verify-width[0:614(47%) 3:681(52%) 4:5(0%) 6:0(0%)] verify-graph replay=686 eager=614
+[1m[2026-08-25|11:43:37|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.54 over 1400 reqs [accepted-drafts/verify; committed/verify=1.54] verify-width[0:665(48%) 3:730(52%) 4:5(0%) 6:0(0%)] verify-graph replay=735 eager=665
+[1m[2026-08-25|11:43:42|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.55 over 1500 reqs [accepted-drafts/verify; committed/verify=1.55] verify-width[0:709(47%) 3:786(52%) 4:5(0%) 6:0(0%)] verify-graph replay=791 eager=709
+[1m[2026-08-25|11:43:47|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.57 over 1600 reqs [accepted-drafts/verify; committed/verify=1.57] verify-width[0:735(46%) 3:860(54%) 4:5(0%) 6:0(0%)] verify-graph replay=865 eager=735
+[1m[2026-08-25|11:43:52|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.56 over 1700 reqs [accepted-drafts/verify; committed/verify=1.56] verify-width[0:780(46%) 3:915(54%) 4:5(0%) 6:0(0%)] verify-graph replay=920 eager=780
+[1m[2026-08-25|11:43:57|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.55 over 1800 reqs [accepted-drafts/verify; committed/verify=1.55] verify-width[0:833(46%) 3:962(53%) 4:5(0%) 6:0(0%)] verify-graph replay=967 eager=833
+[1m[2026-08-25|11:44:01|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.54 over 1900 reqs [accepted-drafts/verify; committed/verify=1.54] verify-width[0:890(47%) 3:1005(53%) 4:5(0%) 6:0(0%)] verify-graph replay=1010 eager=890
+[1m[2026-08-25|11:44:06|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.53 over 2000 reqs [accepted-drafts/verify; committed/verify=1.53] verify-width[0:944(47%) 3:1051(53%) 4:5(0%) 6:0(0%)] verify-graph replay=1056 eager=944
+[1m[2026-08-25|11:44:10|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.53 over 2100 reqs [accepted-drafts/verify; committed/verify=1.53] verify-width[0:992(47%) 3:1103(53%) 4:5(0%) 6:0(0%)] verify-graph replay=1108 eager=992
+[1m[2026-08-25|11:44:15|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.52 over 2200 reqs [accepted-drafts/verify; committed/verify=1.52] verify-width[0:1050(48%) 3:1145(52%) 4:5(0%) 6:0(0%)] verify-graph replay=1150 eager=1050
+[1m[2026-08-25|11:44:20|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.51 over 2300 reqs [accepted-drafts/verify; committed/verify=1.51] verify-width[0:1099(48%) 3:1196(52%) 4:5(0%) 6:0(0%)] verify-graph replay=1201 eager=1099
+[1m[2026-08-25|11:44:25|core|rank=0][0m [32mINFO    [0m [spec] mean accept-len=0.52 over 2400 reqs [accepted-drafts/verify; committed/verify=1.52] verify-width[0:1144(48%) 3:1251(52%) 4:5(0%) 6:0(0%)] verify-graph replay=1256 eager=1144
