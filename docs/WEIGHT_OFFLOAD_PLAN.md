@@ -332,6 +332,26 @@ Policy-independent: cold-set size, per-layer Gini / top-C mass, inter-reference 
   > becomes exact, `verify_matches_plan()` stops being vacuous, and `carve_digest()` gains real coverage.
   > Secondary lever: nothing above **2 GiB** has ever been pinned on this box, and a 4 GiB chunk would
   > save 0.65 GiB/rank of tier — worth a 0.5 d probe (**P3d**), not a default change.
+
+  > **[M1B-2026-09-03] DONE, and the ≈ 3.90 GiB/rank estimate above was OPTIMISTIC — the computed
+  > answer is 5.85.** `OffloadPlan.host_row_requests()` emits the per-component rows as
+  > `RegionRequest(forecast=True)` and `StageARuntime.attach_host_arena` reserves those, so
+  > `plan_regions` runs the real next-fit allocator over the real list. Target shape, computed by the
+  > landed code: rows are **384/48/12 MiB (w13) + 192/24/6 MiB (w2) = 666 MiB/layer**; three whole
+  > layers fit one 2 GiB chunk (1998 MiB, 50 MiB abandoned), so all-host is **16 chunks =
+  > 32.00 GiB/rank · 64.00 GiB/node**, not 20 / 40.00 / 80.00. The required device tier falls from
+  > **11.06 → 5.85 GiB/rank** (17 → 9 of 48 layers); at that tier the 39 host layers pin 13 chunks =
+  > **52.00 GiB/node ≤ 55.80 → FEASIBLE**. The 3.90 figure assumed the *payload* (54.63 GiB/node) was
+  > the charge; 42 host layers actually pin 14 chunks = 56.00 GiB/node, 0.20 GiB over the ceiling.
+  > **5.2 GiB/rank of VRAM recovered, not 7.2.**
+  > Three things the fix had to carry that this bullet did not anticipate: (a) torch's caching
+  > allocator asks for a rounded SEGMENT, not for the tensor, so rows are reserved at
+  > `chunk_plan.torch_allocation_bytes` (`round_up(max(n, 2 MiB), 2 MiB)`) — **modelled, never
+  > measured**, and the first thing a GPU run must check; (b) the `MemPool` C ABI carries a size and
+  > no identity, so a forecast region is reconciled by *envelope + attribution*, never by name —
+  > `verify_matches_plan()` now refuses a VACUOUS pass and is called from `seal()`, its first
+  > production caller; (c) the observed (meta-model) path was not applying `post_load_delta_bytes` at
+  > all, which the old +28 % slop had been hiding — `placement.PostLoadCorrection` closes it.
   > P5b confirmed the `MemPool` plumbing over a **host** pointer, so this bullet's precondition is met:
   > `data_ptr() == hipHostGetDevicePointer(...)`, 0 fallbacks, free callback fires zero times, arena
   > survives `empty_cache` and `graph.__enter__`, 24/24 replays one sha256.

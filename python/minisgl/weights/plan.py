@@ -50,7 +50,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .chunk_plan import CHUNK_GRANULE, DEFAULT_CHUNK_BYTES, headroom_chunks, round_up
+from .chunk_plan import (
+    ALIGN,
+    CHUNK_GRANULE,
+    DEFAULT_CHUNK_BYTES,
+    RegionRequest,
+    headroom_chunks,
+    plan_regions,
+    round_up,
+    suggest_chunk_bytes,
+    torch_allocation_bytes,
+)
 from .host_capacity import (
     DEFAULT_FLOOR_BYTES,
     P3B_NOTE,
@@ -60,6 +70,7 @@ from .placement import (
     LayerWeights,
     OffloadPlan,
     PlacementError,
+    PostLoadCorrection,
     ep_local_top_k,
     format_sweep,
     plan_layer_granular,
@@ -67,7 +78,13 @@ from .placement import (
     sweep_device_fraction,
 )
 from .prior import PHASE0_PRIOR, GiB, OffloadPrior, Projection  # NOTE: prior.GB is NOT imported
-from .sizing import expert_stack_bytes, scheme_supports_ep
+from .sizing import (
+    SCHEME_MXFP4,
+    expert_stack_bytes,
+    post_load_delta_bytes,
+    scheme_from_quant,
+    scheme_supports_ep,
+)
 from .stacks import StackKind
 
 __all__ = [
@@ -75,12 +92,14 @@ __all__ = [
     "WeightPlanResolution",
     "arena_reservation_bytes",
     "effective_chunk_bytes",
+    "exact_arena_reservation_bytes",
     "build_planned_layers",
     "host_arena_ceiling_bytes",
     "is_mtp_path",
     "moe_layer_indices",
     "moe_layer_shapes",
     "observed_planned_layers",
+    "plan_arena_reservation_bytes",
     "required_device_bytes",
     "resolve_expert_parallel",
     "resolve_weight_plan",
@@ -457,6 +476,51 @@ def observed_planned_layers(
     from .granule import offload_refusal
     from .moe_interpose import discover_moe_layers, ep_size_of
 
+    def _meta_corrections(layer: Any, e_local: int) -> Dict[str, PostLoadCorrection]:
+        """What `post_load()` will add to this layer's two containers. See `PostLoadCorrection`.
+
+        ONLY for a spec derived on META. `engine.py` builds the model on meta and resolves the plan
+        there — which is the whole reason the capacity abort can land before `load_state_dict` — so
+        the specs this path reads are `__init__` shapes and `post_load()` has not run. Two of the
+        nine shipped containers grow across it (`sizing.PostLoadDelta`): compressed-tensors
+        SYMMETRIC materialises a real `_zeros_op` (+18 MiB/layer, ~2.7%, on the target shape) and
+        MXFP4 widens its E8M0 scale to fp16 (+6.25% at g=32). The config path
+        (`expert_stack_bytes`) has charged both since 2026-09-03; this path did not, and the
+        anonymous-headroom reservation's +28% slop was hiding it. With the reservation exact those
+        bytes are rows with nowhere to go, i.e. `hipMalloc` VRAM booked as host RAM.
+
+        Shapes are read off `MoELayer`, which stores every term (`hidden_size`,
+        `intermediate_size`, `tp_size`, `enable_ep`) — no transcription, and the EP branch is the
+        layer's own answer rather than a re-derivation of it. Anything unreadable yields a zero
+        correction, which is exactly today's behaviour.
+        """
+        try:
+            hidden = int(layer.hidden_size)
+            inter = int(layer.intermediate_size)
+            i_part = inter if bool(layer.enable_ep) else inter // int(layer.tp_size)
+            scheme = scheme_from_quant(
+                getattr(layer, "quant", None),
+                fp8_experts=bool(getattr(layer, "fp8_experts", False)),
+                strict=False,
+            )
+            out = {}
+            for attr, (n, k) in (
+                ("gate_up_proj", (2 * i_part, hidden)),
+                ("down_proj", (hidden, i_part)),
+            ):
+                d = post_load_delta_bytes(scheme, e_local, n, k)
+                # MXFP4 grows the EXISTING u8 group-scale row in place; everything else that grows
+                # does so by allocating a tensor `__init__` never made, which is a row of its own.
+                widen = (
+                    e_local * n * (k // scheme.group_size)
+                    if scheme.kind == SCHEME_MXFP4 and scheme.group_size
+                    else 0
+                )
+                out[attr] = PostLoadCorrection(d.resident, d.granule, widen)
+            return out
+        except Exception:  # pragma: no cover - an unreadable layer keeps today's behaviour
+            return {}
+
     prio = priorities or {}
     layers: List[LayerWeights] = []
     skipped: List[str] = []
@@ -478,7 +542,11 @@ def observed_planned_layers(
             skipped.append(f"{path} (container refuses host residency: {refusal})")
             continue
         specs = layer.granule_specs(allow_meta=allow_meta)
-        saw_meta = saw_meta or any(getattr(s, "meta", False) for s in specs.values())
+        is_meta = any(getattr(s, "meta", False) for s in specs.values())
+        saw_meta = saw_meta or is_meta
+        # Applied ONLY on meta. Off a live post-load container the tensors are already there and
+        # adding the delta again would double-charge the arena.
+        corrections = _meta_corrections(layer, int(layer.local_num_experts)) if is_meta else {}
         kinds.append(next(iter(specs.values())).kind)
         e_local = int(layer.local_num_experts)
         # ceil, and for the same reason as the config path: the step waits for the SLOWEST rank.
@@ -501,6 +569,8 @@ def observed_planned_layers(
                 w13=specs["gate_up_proj"],
                 w2=specs["down_proj"],
                 priority=int(p),
+                w13_post_load=corrections.get("gate_up_proj"),
+                w2_post_load=corrections.get("down_proj"),
             )
         )
 
@@ -584,6 +654,13 @@ def build_planned_layers(
                 # this the reservation assumes perfect next-fit packing and comes up ~25-30% short
                 # on this shape; see `arena_reservation_bytes`.
                 max_row_bytes=max(int(sized.w13), int(sized.w2)),
+                # And the ROWS themselves when either byte model could break the containers down.
+                # With them the arena is reserved by enumeration (`exact_arena_reservation_bytes`)
+                # instead of against `max_row_bytes`' worst-case packing bound; without them nothing
+                # changes and the bound still applies. Note the bound above stays as the container
+                # total even when rows are known -- it is the FALLBACK, and a fallback that quietly
+                # got tighter would hide a lost enumeration.
+                rows=tuple(sized.rows),
             )
         )
         sources.append(sized.source)
@@ -671,6 +748,59 @@ def arena_reservation_bytes(
     return headroom_chunks(int(host_payload_bytes), chunk, int(max_row_bytes)) * chunk
 
 
+def exact_arena_reservation_bytes(
+    rows: Sequence[Any],
+    chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    *,
+    align: int = ALIGN,
+) -> int:
+    """Host RAM one rank's arena will pin for an ENUMERATED row list. The exact answer, not a bound.
+
+    THIS IS THE FIX `arena_reservation_bytes`' docstring could not make. That function is a
+    GUARANTEE derived from one number (`max_row_bytes`): next-fit may abandon up to `m` bytes at
+    every chunk boundary, so only `chunk - m` per chunk is provably placeable. It has to assume the
+    worst row lands at the worst offset in EVERY chunk because it has nothing else to go on. On the
+    target shape -- 48 layers of six rows (384/48/12 MiB for w13, 192/24/6 MiB for w2), 666 MiB per
+    layer, 2 GiB chunks -- that charges 20 chunks (40.00 GiB/rank, 80.00 GiB/node) where the real
+    allocator fits three whole layers per chunk and uses 16 (32.00 GiB/rank). The +28% is not a
+    rounding artefact: at a 55.80 GiB node budget it is the difference between needing 11.06 GiB/rank
+    of device tier on a 16 GiB card and needing far less, i.e. ~1.4M KV tokens per rank.
+
+    `sizing.meta_gemm_spec` builds the real container under `torch.device("meta")` before
+    `load_state_dict`, so the row sizes ARE knowable at reserve() time; there was never a reason to
+    reserve anonymously. This runs the SAME `chunk_plan.plan_regions` / `BumpAllocator` that
+    `PinnedWeightArena.reserve` and `allocate_raw` use, so the planner cannot drift from the arena.
+
+    `suggest_chunk_bytes` (not `effective_chunk_bytes`) mirrors `reserve()`'s growth rule for NAMED
+    regions: a named region only needs a chunk it fits in, while the anonymous-headroom bound needs
+    one strictly larger than any row or `chunk - m` is zero.
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+    if chunk_bytes <= 0:
+        raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}")
+    chunk = suggest_chunk_bytes(rows, int(chunk_bytes))
+    return plan_regions(rows, chunk, align=align).reserved_bytes
+
+
+def plan_arena_reservation_bytes(plan: OffloadPlan, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
+    """Host RAM ONE rank's arena pins for `plan`. THE definition — every caller goes through here.
+
+    Exact when the plan enumerated its rows, the `arena_reservation_bytes` bound when it did not.
+    Deliberately one function and not two call sites: `resolve_weight_plan` computes the feasibility
+    verdict from this and `WeightPlanResolution.host_reservation_bytes_per_rank` reports it, and the
+    two disagreeing produces the worst available outcome — a resolution that says FEASIBLE while its
+    own printed reservation exceeds the ceiling, or vice versa.
+    """
+    rows = plan.host_row_requests()
+    if rows:
+        return exact_arena_reservation_bytes(rows, chunk_bytes)
+    return arena_reservation_bytes(
+        plan.host_resident_bytes, chunk_bytes, plan.max_host_row_bytes
+    )
+
+
 def effective_chunk_bytes(chunk_bytes: int, max_row_bytes: int = 0) -> int:
     """The chunk size `PinnedWeightArena.reserve()` will actually use, given a row bound.
 
@@ -721,10 +851,16 @@ def required_device_bytes(
     is the plan the operator would actually get if they granted that many bytes -- not an abstract
     byte count they cannot act on. Returns 0 when the all-host plan already fits.
 
-    The inequality is over `arena_reservation_bytes(host)`, i.e. what the arena will PIN, not over
-    the payload. Comparing the payload here is how the "raise the device tier to >= X" message came
-    to name a tier that still aborts mid-pin: the number an operator is told to grant has to be a
-    number that boots, or the message sends them round a loop with the box in swap each time.
+    The inequality is over what the arena will PIN, not over the payload. Comparing the payload here
+    is how the "raise the device tier to >= X" message came to name a tier that still aborts
+    mid-pin: the number an operator is told to grant has to be a number that boots, or the message
+    sends them round a loop with the box in swap each time.
+
+    PINNED IS `exact_arena_reservation_bytes` WHENEVER THE ROWS ARE ENUMERATED, and only
+    `arena_reservation_bytes`' worst-case bound when they are not. The bound over-charges by the
+    tail next-fit *might* abandon at every boundary; the enumeration charges the tails it *does*
+    abandon. Since this function answers "how much VRAM must the operator surrender", the difference
+    lands directly on a 16 GiB card.
 
     This is the arithmetic the whole feature turns on. Phase 0 3.4: all-host is 68.8 GB against a
     62 GiB two-rank ceiling, so on the target checkpoint this returns a non-zero number and the
@@ -745,10 +881,30 @@ def required_device_bytes(
         a bigger device tier than they need."""
         return max((layers[i].row_bound for i in host_idx), default=0)
 
+    def _rows(host_idx: Sequence[int]) -> Optional[List[Any]]:
+        """The host rows in CARVE order, or None when any host layer could not enumerate.
+
+        Sorted by DECLARATION index, not by the priority order this walk iterates in: the bake
+        binds seams in declaration order (`discover_moe_layers`), and the arena's allocator is
+        order-sensitive by construction, so a reservation laid out in priority order would not be
+        the reservation the bake consumes.
+        """
+        idx = sorted(host_idx)
+        if not idx or any(not layers[i].rows for i in idx):
+            return None
+        return [
+            RegionRequest(f"{layers[i].path}.{name}", torch_allocation_bytes(nb), forecast=True)
+            for i in idx
+            for name, nb in layers[i].rows
+        ]
+
     def _fits(host_payload: int, host_idx: Sequence[int]) -> bool:
-        return arena_reservation_bytes(
-            host_payload, chunk_bytes, _row_bound(host_idx)
-        ) * local_ranks <= ceiling_total_bytes
+        rows = _rows(host_idx)
+        if rows is not None:
+            pinned = exact_arena_reservation_bytes(rows, chunk_bytes)
+        else:
+            pinned = arena_reservation_bytes(host_payload, chunk_bytes, _row_bound(host_idx))
+        return pinned * local_ranks <= ceiling_total_bytes
 
     host = sum(lw.resident_bytes for lw in layers)
     remaining = list(order)
@@ -820,15 +976,15 @@ class WeightPlanResolution:
         """What one rank's arena will PIN -- the payload rounded up to a whole arena chunk.
 
         This, not `host_bytes_per_rank`, is the number that has to clear the ceiling: `attach()`
-        `hipHostMalloc`s and first-touches every chunk at full size. Charged against the plan's
-        packing bound (`max_host_row_bytes`) as well as its payload, because a row may never
-        straddle a chunk and next-fit abandons the tail -- see `arena_reservation_bytes`.
+        `hipHostMalloc`s and first-touches every chunk at full size.
+
+        EXACT when the plan enumerated its rows (`OffloadPlan.host_row_requests`) -- the same
+        `plan_regions` call `PinnedWeightArena.reserve` will make, so the feasibility answer and the
+        reservation cannot disagree. Only when the rows are unknown does this fall back to
+        `arena_reservation_bytes`' worst-case packing BOUND, which over-charges +28% on the target
+        shape (20 chunks against a real 16) and buys that with device tier the card does not have.
         """
-        return arena_reservation_bytes(
-            self.plan.host_resident_bytes,
-            self.arena_chunk_bytes,
-            self.plan.max_host_row_bytes,
-        )
+        return plan_arena_reservation_bytes(self.plan, self.arena_chunk_bytes)
 
     @property
     def host_reservation_bytes_per_node(self) -> int:
@@ -1247,12 +1403,11 @@ def resolve_weight_plan(
     # ~1 GiB w13 row in a 2 GiB chunk) that under-reserved the arena by ~25-30% -- the overflow rows
     # then land in `hipMalloc` VRAM at bind time, which `seal()` refuses AFTER the arena is pinned
     # and the checkpoint is loaded. See `arena_reservation_bytes`.
-    reserved_node = (
-        arena_reservation_bytes(
-            plan.host_resident_bytes, arena_chunk_bytes, plan.max_host_row_bytes
-        )
-        * ranks
-    )
+    # ...and against the ENUMERATED rows whenever the sizing model could produce them, which turns
+    # that bound into the answer: `plan_arena_reservation_bytes` runs the real next-fit allocator
+    # over the real row list instead of assuming the worst row lands at the worst offset in every
+    # chunk. On the target shape that is 16 chunks rather than 20 (32.00 vs 40.00 GiB/rank).
+    reserved_node = plan_arena_reservation_bytes(plan, arena_chunk_bytes) * ranks
     feasible = reserved_node <= ceiling
     if not feasible:
         reason = (

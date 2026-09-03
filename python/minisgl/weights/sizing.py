@@ -426,6 +426,72 @@ def _checkpoint_gemm_bytes(
     raise ValueError(f"no analytic byte model for scheme {kind!r}")
 
 
+def analytic_gemm_rows(gb: GemmBytes, prefix: str) -> Tuple[Tuple[str, int], ...]:
+    """One container's arena ROWS from the closed-form model: `((name, nbytes), ...)`, summing to
+    `gb.total`.
+
+    A row is ONE COMPONENT's stacked slab (`moe_interpose._plan_items` calls `alloc_like` per
+    storage, never per expert), so the closed form's three terms are three rows and the `post_load`
+    delta is a fourth -- except for MXFP4, whose delta WIDENS the existing scale row rather than
+    adding one. That distinction is not cosmetic: two 24 MiB rows pack into a chunk tail that one
+    48 MiB row does not, so modelling a widened row as a separate row would make the reservation
+    optimistic in exactly the place the never-straddle rule bites.
+    """
+    rows = [(f"{prefix}.weight", gb.weight), (f"{prefix}.scale", gb.scale),
+            (f"{prefix}.zero", gb.zero)]
+    delta = gb.post_load_resident
+    if delta:
+        if gb.scheme == SCHEME_MXFP4:
+            # E8M0 u8 -> fp16 on the SAME buffer: the scale row grows, it does not gain a sibling.
+            rows[1] = (rows[1][0], rows[1][1] + delta)
+        else:
+            # CT-symmetric's `_zeros_op` is a real `torch.empty` post_load allocates from nothing,
+            # so it is a row of its own, carved like any other.
+            rows.append((f"{prefix}.post_load", delta))
+    return tuple((n, b) for n, b in rows if b > 0)
+
+
+def _meta_spec_rows(spec: Any, prefix: str) -> Tuple[Tuple[str, int], ...]:
+    """The meta-built container's rows, straight off the walker's component/replicated lists."""
+    comps = getattr(spec, "components", None)
+    if comps is None:
+        return ()
+    n = int(getattr(spec, "num_granules", 0) or 0) or 1
+    rows = [(f"{prefix}.{c.name}", int(getattr(c, "nbytes", 0) or 0) * n) for c in comps]
+    rows += [
+        (f"{prefix}.{r.name}", int(getattr(r, "nbytes", 0) or 0))
+        for r in (getattr(spec, "replicated", ()) or ())
+    ]
+    return tuple((name, nb) for name, nb in rows if nb > 0)
+
+
+def _apply_post_load_to_rows(
+    rows: Tuple[Tuple[str, int], ...], scheme: ExpertScheme, delta: "PostLoadDelta",
+    num_experts: int, out_features: int, in_features: int, prefix: str,
+) -> Tuple[Tuple[str, int], ...]:
+    """Correct meta-derived rows (which are `__init__` shapes) for what `post_load()` does.
+
+    The meta model builds the real container and therefore cannot drift on SHAPES, but it can never
+    run `post_load()` -- so it is blind to the two shipped containers that are not byte-invariant
+    across it. `expert_stack_bytes` already corrects the TOTAL; the rows have to be corrected the
+    same way or the reservation is enumerated against tensors that will not exist.
+    """
+    if not rows or not delta.resident:
+        return rows
+    if scheme.kind == SCHEME_MXFP4 and scheme.group_size:
+        target = num_experts * out_features * (in_features // scheme.group_size)
+        out = list(rows)
+        for i, (name, nb) in enumerate(out):
+            if nb == target:
+                out[i] = (name, nb + delta.resident)
+                return tuple(out)
+        # The u8 scale row was not where the closed form says it is -- do not guess which row grew;
+        # charge it as its own row, which is the conservative reading for the TOTAL and only ever
+        # optimistic about packing by one row's worth.
+        return tuple(out) + ((f"{prefix}.post_load", delta.resident),)
+    return rows + ((f"{prefix}.post_load", delta.resident),)
+
+
 def _require_div(value: int, divisor: int, what: str) -> None:
     if divisor <= 0 or value % divisor:
         raise ValueError(f"{what}={value} must be divisible by {divisor}")
@@ -504,6 +570,11 @@ class ExpertStackBytes:
     agreement: Optional[float]  # meta/analytic ratio when both ran, else None
     granule: int = 0
     detail: Tuple[str, ...] = ()
+    # Every arena ROW this layer will ask for, in carve order, as `((name, nbytes), ...)`. Sums to
+    # `total`. This is what lets the pinned arena be reserved by ENUMERATION instead of by
+    # `chunk_plan.headroom_chunks`' worst-case bound (+28% on the target shape) -- see
+    # `placement.LayerWeights.rows`. `()` when neither model could break the container down.
+    rows: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def total(self) -> int:
@@ -586,6 +657,8 @@ def expert_stack_bytes(
     meta: Dict[str, Any] = {}
     meta_granule = 0
     meta_delta_note = ""
+    meta_rows: Tuple[Tuple[str, int], ...] = ()
+    meta_rows_complete = True
     if prefer_meta:
         for name, out_f, in_f in shapes:
             spec = meta_gemm_spec(quant, num_local_experts, out_f, in_f,
@@ -593,6 +666,7 @@ def expert_stack_bytes(
             if spec is None:
                 meta = {}
                 meta_granule = 0
+                meta_rows = ()
                 break
             d = post_load_delta_bytes(scheme, num_local_experts, out_f, in_f)
             meta[name] = int(spec.total_bytes) + d.resident
@@ -600,6 +674,15 @@ def expert_stack_bytes(
             # `granule.total_granule_bytes` over the pair, inlined to avoid importing torch here.
             meta_granule += int(spec.granule_bytes) + d.granule
             meta_delta_note = meta_delta_note or d.note
+            r = _apply_post_load_to_rows(
+                _meta_spec_rows(spec, name), scheme, d, num_local_experts, out_f, in_f, name
+            )
+            meta_rows_complete = meta_rows_complete and bool(r)
+            meta_rows += r
+        # All or nothing: half a row list reserves exactly for the components it can see and nothing
+        # for the rest, which is short in the silent direction.
+        if not meta_rows_complete or sum(nb for _, nb in meta_rows) != sum(meta.values()):
+            meta_rows = ()
 
     if meta and analytic:
         # Compare CHECKPOINT totals, not resident ones: the meta model's subject is `__init__`, and
@@ -613,11 +696,21 @@ def expert_stack_bytes(
         return ExpertStackBytes(
             meta["w13"], meta["w2"], num_local_experts, scheme.kind, "meta", agreement,
             meta_granule, (analytic["w13"].formula, analytic["w2"].formula),
+            # The analytic breakdown is the fallback ONLY when it totals the same bytes the meta
+            # model priced. Rows that do not sum to `total` would reserve the arena for a different
+            # weight set than the capacity budget was spent on.
+            rows=meta_rows or (
+                (analytic_gemm_rows(analytic["w13"], "w13")
+                 + analytic_gemm_rows(analytic["w2"], "w2"))
+                if analytic["w13"].total + analytic["w2"].total == meta["w13"] + meta["w2"]
+                else ()
+            ),
         )
     if meta:
         return ExpertStackBytes(
             meta["w13"], meta["w2"], num_local_experts, scheme.kind, "meta", None, meta_granule,
             (meta_delta_note,) if meta_delta_note else (),
+            rows=meta_rows,
         )
     if analytic:
         # The analytic granule is the CHECKPOINT flat share plus only the PER-EXPERT part of the
@@ -636,6 +729,8 @@ def expert_stack_bytes(
             analytic["w13"].total, analytic["w2"].total, num_local_experts, scheme.kind,
             "analytic", None, a_granule,
             (analytic["w13"].formula, analytic["w2"].formula),
+            rows=analytic_gemm_rows(analytic["w13"], "w13")
+            + analytic_gemm_rows(analytic["w2"], "w2"),
         )
     raise ValueError(
         f"cannot size a {scheme.kind} expert stack "

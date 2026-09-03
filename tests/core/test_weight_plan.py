@@ -41,6 +41,7 @@ from minisgl.weights.plan import (
     local_arena_count,
     moe_layer_indices,
     moe_layer_shapes,
+    plan_arena_reservation_bytes,
     required_device_bytes,
     resolve_expert_parallel,
     resolve_weight_plan,
@@ -461,9 +462,9 @@ def test_device_budget_falls_back_to_the_config_field_in_GiB_not_decimal_GB():
 
 def test_capacity_is_charged_in_whole_arena_chunks_not_payload_bytes():
     """`PinnedWeightArena.attach` hipHostMallocs and first-touches every chunk at FULL chunk_bytes,
-    and `chunk_plan.plan_regions` reserves `ceil(payload / chunk_bytes)` whole chunks. So the pinned
-    footprint is the payload rounded UP -- up to one chunk per rank of host RAM the old inequality
-    ignored."""
+    so the pinned footprint is the payload rounded UP -- up to one chunk per rank of host RAM the
+    old inequality ignored. The unit assertions below pin `arena_reservation_bytes`, which remains
+    the reservation on any plan whose rows cannot be enumerated."""
     chunk = 2 * GiB
     assert arena_reservation_bytes(0, chunk) == 0
     assert arena_reservation_bytes(1, chunk) == chunk
@@ -471,30 +472,39 @@ def test_capacity_is_charged_in_whole_arena_chunks_not_payload_bytes():
     assert arena_reservation_bytes(2 * GiB + 1, chunk) == 4 * GiB
     # And the resolution reports it, per rank and per node, so a boot log can explain a mid-pin abort.
     r = resolve(device_budget_bytes=8 * GiB)
-    assert r.host_reservation_bytes_per_rank == arena_reservation_bytes(
-        r.host_bytes_per_rank, r.arena_chunk_bytes, r.plan.max_host_row_bytes
+    assert r.host_reservation_bytes_per_rank == plan_arena_reservation_bytes(
+        r.plan, r.arena_chunk_bytes
     )
     assert r.host_reservation_bytes_per_rank >= r.host_bytes_per_rank
     assert r.host_reservation_bytes_per_node == r.host_reservation_bytes_per_rank * r.local_ranks
+    # ...and on this fixture the rows ARE enumerated, so the charge is the EXACT packing and is
+    # strictly cheaper than the worst-case bound. That gap is the M1-B headline: it is device tier.
+    assert r.plan.host_rows_known
+    assert r.host_reservation_bytes_per_rank < arena_reservation_bytes(
+        r.host_bytes_per_rank, r.arena_chunk_bytes, r.plan.max_host_row_bytes
+    )
 
 
 def test_the_plan_charge_equals_what_chunk_plan_will_actually_reserve():
     """Cross-check against the real allocator planner rather than re-deriving the rounding here: the
-    two must not be able to drift, because a drift is invisible until a boot dies mid-pin."""
+    two must not be able to drift, because a drift is invisible until a boot dies mid-pin.
+
+    `plan_regions` is fed the SAME `RegionRequest` list `StageARuntime.attach_host_arena` hands to
+    `reserve()`, so this compares the resolver against literally the code that reserves -- a
+    stronger statement than the old form, which compared it against the anonymous-headroom bound.
+    """
     from minisgl.weights.chunk_plan import plan_regions
 
     r = resolve(device_budget_bytes=8 * GiB)
-    # SAME bound on both sides. `plan_regions` without `extra_max_region_bytes` reserves
-    # `ceil(payload/chunk)` chunks, i.e. it assumes next-fit packs perfectly; the resolver charges
-    # `headroom_chunks(payload, chunk, max_row)`. Comparing the two forms was comparing the planner
-    # against the very assumption the planner exists to stop making.
-    real = plan_regions(
-        [],
-        r.arena_chunk_bytes,
-        extra_bytes=r.host_bytes_per_rank,
-        extra_max_region_bytes=r.plan.max_host_row_bytes,
-    )
+    rows = r.plan.host_row_requests()
+    assert rows, "the fixture must enumerate its rows, or this proves nothing"
+    real = plan_regions(rows, r.arena_chunk_bytes)
     assert real.reserved_bytes == r.host_reservation_bytes_per_rank
+    # Every reserved region is a FORECAST of an anonymous MemPool carve, never a named one.
+    assert all(p.forecast for p in real.placements)
+    # And the plan digest is no longer blind: it hashes every row's name/chunk/offset/size, so two
+    # ranks that laid the arena out differently cannot print the same string.
+    assert real.digest() != plan_regions(rows[:-1], r.arena_chunk_bytes).digest()
 
 
 def test_required_device_tier_produces_a_plan_whose_PINNED_arena_fits():
@@ -512,12 +522,7 @@ def test_required_device_tier_produces_a_plan_whose_PINNED_arena_fits():
     ok.raise_if_infeasible()
     # The pinned figure, not the payload figure, is what has to clear the budget.
     assert ok.host_reservation_bytes_per_node <= ok.host_ceiling_bytes
-    real = plan_regions(
-        [],
-        ok.arena_chunk_bytes,
-        extra_bytes=ok.host_bytes_per_rank,
-        extra_max_region_bytes=ok.plan.max_host_row_bytes,
-    )
+    real = plan_regions(ok.plan.host_row_requests(), ok.arena_chunk_bytes)
     assert real.reserved_bytes * ok.local_ranks <= ok.host_ceiling_bytes
     # Still minimal: one layer less of device tier must NOT fit.
     layer_bytes = infeasible.layers[0].resident_bytes
@@ -1027,15 +1032,21 @@ def test_reserve_with_a_row_bound_larger_than_the_chunk_does_not_raise():
 
 
 def test_the_resolver_and_the_arena_charge_the_same_bound():
-    """One property, one definition. If `StageARuntime.host_row_bound_bytes()` and
-    `arena_reservation_bytes` disagree, the resolver prints FEASIBLE plus a "raise the device tier
-    to >= X" figure and then `reserve()`'s capacity gate refuses the boot anyway — handing the
+    """One property, one definition. If what `StageARuntime.attach_host_arena` hands `reserve()`
+    and what the resolver charged disagree, the resolver prints FEASIBLE plus a "raise the device
+    tier to >= X" figure and then `reserve()`'s capacity gate refuses the boot anyway — handing the
     operator a tier that still does not work."""
     from minisgl.weights.bake import StageARuntime
+    from minisgl.weights.chunk_plan import plan_regions
 
     r = resolve(device_budget_bytes=8 * GiB)
-    bound = StageARuntime.host_row_bound_bytes(SimpleNamespace(plan=r.plan))
+    stub = SimpleNamespace(plan=r.plan)
+    # The FALLBACK bound (used when the rows cannot be enumerated) is still one definition...
+    bound = StageARuntime.host_row_bound_bytes(stub)
     assert bound == r.plan.max_host_row_bytes
-    assert r.host_reservation_bytes_per_rank == arena_reservation_bytes(
-        r.host_bytes_per_rank, r.arena_chunk_bytes, bound
+    # ...and so is the enumeration the driver actually passes to reserve().
+    rows = StageARuntime.host_row_requests(stub)
+    assert rows == r.plan.host_row_requests()
+    assert plan_regions(rows, r.arena_chunk_bytes).reserved_bytes == (
+        r.host_reservation_bytes_per_rank
     )

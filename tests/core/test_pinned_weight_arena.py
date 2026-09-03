@@ -585,11 +585,26 @@ class TestCarveDigest:
         a.close()
         b.close()
 
-    def test_verify_matches_plan_passes_vacuously_on_the_headroom_shape(self, no_capacity_limit):
-        """Documents WHY carve_digest exists: the plan-vs-carve check has nothing to compare."""
+    def test_verify_matches_plan_REFUSES_the_vacuous_headroom_shape(self, no_capacity_limit):
+        """M1-B. The anonymous-headroom reservation makes `verify_matches_plan()` a check with
+        nothing to check, and a green result from it used to be indistinguishable from a real pass.
+
+        THIS IS THE REGRESSION GUARD ON VACUITY. If the shipping reservation is reverted to
+        `reserve([], extra_bytes=...)`, or `require_coverage` is relaxed, this stops raising and the
+        M1-B fix is gone — silently, because nothing else would fail. The `carve_digest` tests above
+        remain the reason a *bounded* headroom reservation is survivable at all.
+        """
         a = self._headroom_arena(FakeHip())
         a.allocate_raw(4096)
-        a.verify_matches_plan()  # no named regions planned -> passes with zero coverage
+        cov = a.verification_coverage()
+        assert cov.vacuous and cov.named_planned == 0 and cov.forecast_planned == 0
+        with pytest.raises(ArenaStateError) as exc:
+            a.verify_matches_plan()
+        assert "NOTHING WAS VERIFIED" in str(exc.value)
+        assert "host_row_requests" in str(exc.value)
+        # ...and the escape hatch REPORTS the vacuity rather than hiding it, so a caller that
+        # already knows the shape is unverifiable still cannot mistake it for a pass.
+        assert a.verify_matches_plan(require_coverage=False).vacuous
         assert a.plan.placements == ()
         a.close()
 
@@ -900,6 +915,152 @@ class TestAllocateRawContract:
             a.allocate(r.name, r.nbytes)
         assert a.allocate_raw(4096) is not None
         a.verify_matches_plan()                     # must not complain about the raw carve
+        a.close()
+
+
+# =================================================================================================
+# M1-B — FORECAST regions: the reservation the shipping path actually makes
+#
+# `bake.StageARuntime.attach_host_arena` used to reserve the whole host tier as anonymous headroom,
+# which cost `headroom_chunks`' worst-case packing bound (+28% on the target shape) AND left
+# `verify_matches_plan()` with an empty planned table. It now passes the enumerated rows as forecast
+# `RegionRequest`s: laid out by the same allocator that carves them, reconciled by envelope and by
+# attribution rather than by name (the torch `MemPool` C ABI carries a size and no identity).
+# =================================================================================================
+class TestForecastRegions:
+    """One layer's worth of rows, sized so three of them fill a CHUNK and abandon a tail."""
+
+    ROWS = (("w13.weight", CHUNK // 2), ("w13.scale", CHUNK // 8), ("w2.weight", CHUNK // 8))
+
+    def _forecast_arena(self, hip=None, *, layers: int = 6):
+        a = PinnedWeightArena(0, hip=FakeHip() if hip is None else hip,
+                              chunk_bytes=CHUNK, floor_bytes=0)
+        reqs = [
+            RegionRequest(f"L{i}.{n}", nb, forecast=True)
+            for i in range(layers)
+            for n, nb in self.ROWS
+        ]
+        a.reserve(reqs)
+        a.attach()
+        return a, reqs
+
+    def _carve_all(self, a, reqs):
+        for r in reqs:
+            assert a.allocate_raw(r.nbytes) is not None
+
+    def test_the_reservation_is_the_exact_packing_not_the_bound(self, no_capacity_limit):
+        """The headline. 6 layers x (1/2 + 1/8 + 1/8) of a chunk = 4.5 chunks of payload; next-fit
+        fits one whole layer per chunk (0.75) and abandons the rest, so 6 chunks. The
+        `headroom_chunks` bound would charge `ceil(payload / (chunk - max_row))` = 9."""
+        from minisgl.weights.chunk_plan import headroom_chunks
+
+        a, reqs = self._forecast_arena()
+        payload = sum(r.nbytes for r in reqs)
+        assert a.plan.n_chunks == 6
+        assert a.plan.n_chunks < headroom_chunks(payload, CHUNK, CHUNK // 2)
+        assert a.plan.payload_bytes == payload
+        assert a.plan.extra_chunks == 0          # nothing anonymous is left
+        self._carve_all(a, reqs)
+        a.close()
+
+    def test_the_plan_digest_stops_being_blind(self, no_capacity_limit):
+        """With anonymous headroom the digest hashed the chunk COUNT, so two ranks with different
+        layouts printed the same string. Forecast regions give it the layout to hash."""
+        a, reqs = self._forecast_arena()
+        b, _ = self._forecast_arena()
+        assert a.plan.digest() == b.plan.digest()
+        c = PinnedWeightArena(0, hip=FakeHip(), chunk_bytes=CHUNK, floor_bytes=0)
+        c.reserve(list(reversed(reqs)))          # a peer rank that enumerated the other way
+        assert c.plan.digest() != a.plan.digest()
+        for x in (a, b):
+            x.close()
+
+    def test_a_raw_carve_adopts_the_forecast_name_so_carve_digest_covers_real_rows(
+        self, no_capacity_limit
+    ):
+        a, reqs = self._forecast_arena()
+        self._carve_all(a, reqs)
+        assert set(a.regions) == {r.name for r in reqs}
+        assert "torch:" not in a.carve_digest()
+        assert all(a.regions[r.name].nbytes == r.nbytes for r in reqs)
+        # Same rows, same digest; a divergent walk order, a different digest.
+        b, breqs = self._forecast_arena()
+        self._carve_all(b, breqs)
+        assert a.carve_digest() == b.carve_digest()
+        a.close()
+        b.close()
+
+    def test_verify_is_no_longer_vacuous_once_the_rows_are_forecast(self, no_capacity_limit):
+        a, reqs = self._forecast_arena()
+        self._carve_all(a, reqs)
+        cov = a.verify_matches_plan()
+        assert not cov.vacuous
+        assert cov.forecast_planned == len(reqs) == cov.forecast_matched
+        assert cov.forecast_coverage == 1.0
+        assert cov.carved_footprint == cov.planned_footprint
+        assert "forecast" in cov.describe()
+        a.close()
+
+    def test_a_carve_that_needs_more_arena_than_was_reserved_is_refused(self, no_capacity_limit):
+        """The row list was wrong — a component the sizing model does not know about, or torch
+        asking for a bigger segment than `torch_allocation_bytes` models. The overflow would land in
+        hipMalloc VRAM while the capacity plan still called it host-resident."""
+        a, reqs = self._forecast_arena()
+        for r in reqs[:-1]:
+            a.allocate_raw(r.nbytes)
+        a.allocate_raw(reqs[-1].nbytes + CHUNK // 4)   # one row fatter than forecast
+        with pytest.raises(ArenaStateError) as exc:
+            a.verify_matches_plan()
+        assert "reserved" in str(exc.value) and "hipMalloc" in str(exc.value)
+        a.close()
+
+    def test_a_carve_that_follows_no_forecast_row_at_all_is_refused(self, no_capacity_limit):
+        """A walk that enumerated in a different order than the plan: nothing lines up, so every
+        offset from the first divergence on is a different address than was reserved."""
+        a, reqs = self._forecast_arena()
+        a.allocate_raw(reqs[0].nbytes // 3)            # first carve already off-plan
+        a.allocate_raw(reqs[1].nbytes)
+        with pytest.raises(ArenaStateError) as exc:
+            a.verify_matches_plan()
+        assert "forecast row" in str(exc.value)
+        a.close()
+
+    def test_a_refused_carve_is_reported_by_verify_not_only_by_mark_populated(
+        self, no_capacity_limit
+    ):
+        a, reqs = self._forecast_arena()
+        self._carve_all(a, reqs)
+        assert a.allocate_raw(CHUNK * 4) is None       # bigger than a chunk: refused, counted
+        with pytest.raises(ArenaStateError) as exc:
+            a.verify_matches_plan()
+        assert "REFUSED" in str(exc.value)
+        a.close()
+
+    def test_forecast_regions_are_not_reported_as_planned_but_never_carved(self, no_capacity_limit):
+        """They are carved anonymously by construction, so a by-name check must skip them — or the
+        first thing the new reservation would do is refuse every boot."""
+        a, reqs = self._forecast_arena()
+        for r in reqs[:3]:                             # torch split a block; fewer callbacks
+            a.allocate_raw(r.nbytes)
+        cov = a.verify_matches_plan()                  # must NOT raise
+        assert cov.forecast_matched == 3 < cov.forecast_planned
+        assert cov.carved_footprint <= cov.planned_footprint
+        a.close()
+
+    def test_a_named_region_still_gets_the_exact_by_name_check(self, no_capacity_limit):
+        """Forecast reconciliation is weaker than name equality, so it must not be able to weaken
+        the named path: `allocate(name, ...)` is still checked offset-for-offset."""
+        a = PinnedWeightArena(0, hip=FakeHip(), chunk_bytes=CHUNK, floor_bytes=0)
+        a.reserve([
+            RegionRequest("named", 4096),
+            RegionRequest("fc", 8192, forecast=True),
+        ])
+        a.attach()
+        a.allocate("named", 4096)
+        a.allocate_raw(8192)
+        cov = a.verify_matches_plan()
+        assert cov.named_planned == cov.named_carved == 1
+        assert cov.forecast_matched == 1
         a.close()
 
 

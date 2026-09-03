@@ -262,6 +262,48 @@ class SelfTestResult:
         )
 
 
+@dataclass(frozen=True)
+class PlanVerification:
+    """What `PinnedWeightArena.verify_matches_plan()` actually compared.
+
+    A boolean pass is not enough for this check and never was: the failure it exists to catch is a
+    layout drift, and the way it FAILED was not by returning False but by having nothing to compare
+    — the shipping caller reserved anonymous headroom, so the planned table was empty and a green
+    result carried zero information. `vacuous` is therefore part of the result, and
+    `verify_matches_plan` treats it as an error rather than as a pass.
+    """
+
+    named_planned: int
+    named_carved: int
+    forecast_planned: int
+    forecast_matched: int
+    raw_carves: int
+    planned_footprint: int
+    carved_footprint: int
+    planned_payload: int
+    carved_bytes: int
+    headroom_bytes: int = 0
+
+    @property
+    def vacuous(self) -> bool:
+        """Nothing was checked. Never a pass."""
+        return self.named_carved == 0 and self.forecast_matched == 0
+
+    @property
+    def forecast_coverage(self) -> float:
+        return self.forecast_matched / self.forecast_planned if self.forecast_planned else 0.0
+
+    def describe(self) -> str:
+        return (
+            f"named {self.named_carved}/{self.named_planned} checked, forecast "
+            f"{self.forecast_matched}/{self.forecast_planned} attributed, {self.raw_carves} "
+            f"anonymous carve(s), footprint {fmt_bytes(self.carved_footprint)} of "
+            f"{fmt_bytes(self.planned_footprint)} planned"
+            + (f", {fmt_bytes(self.headroom_bytes)} anonymous headroom" if self.headroom_bytes
+               else "")
+        )
+
+
 class PinnedWeightArena:
     """The host tier. Build it, reserve it, attach it, carve it, populate it, freeze it.
 
@@ -341,6 +383,14 @@ class PinnedWeightArena:
         # not just the symptom (`torch_fallbacks`).
         self.headroom_denied_bytes = 0
         self.headroom_denied_max = 0
+        # How many raw (`allocate_raw`) carves landed exactly on a FORECAST placement and adopted
+        # its name. See `RegionRequest.forecast`: the torch `MemPool` C ABI carries a size and
+        # nothing else, so a forecast row cannot be carved BY NAME — attribution by coinciding
+        # (chunk, offset) is what makes `carve_digest()` cover real weight rows instead of a run of
+        # `torch:<n>` counters, and what makes `verify_matches_plan()` able to say the carve
+        # followed the plan.
+        self._forecast_cursor = 0
+        self._forecast_matched = 0
 
     # -- phase plumbing -------------------------------------------------------
 
@@ -851,18 +901,61 @@ class PinnedWeightArena:
             p = None
         if p is None:
             # Record the DIAGNOSIS, not just the symptom. The caller (`ArenaMemPool._fallback`) can
-            # only report "a hipMalloc happened"; the reason is almost always that the anonymous
-            # headroom was sized as ceil(bytes/chunk) with no bound on the region size, so next-fit
-            # abandoned a tail per chunk and ran out early. `stats()` prints the shortfall and the
-            # largest refusal, which together name the `extra_max_region_bytes` that should have
-            # been passed to reserve().
+            # only report "a hipMalloc happened". There are two reasons and `stats()` distinguishes
+            # them: on the enumerated path the row list did not describe what the bake asked for
+            # (a component the sizing model does not know about, or torch asking for a bigger
+            # segment than `chunk_plan.torch_allocation_bytes` models); on the anonymous-headroom
+            # fallback the reservation was sized as ceil(bytes/chunk) with no bound on the region
+            # size, so next-fit abandoned a tail per chunk and ran out early. The shortfall and the
+            # largest refusal together name either the missing row or the missing
+            # `extra_max_region_bytes`.
             self.headroom_denied_bytes += int(nbytes)
             self.headroom_denied_max = max(self.headroom_denied_max, int(nbytes))
             return None
+        p = self._attribute_to_forecast(p)
         region = self._region_from_placement(p)
         self._regions[region.name] = region
         self._raw_names.append(region.name)
         return region
+
+    def _attribute_to_forecast(self, p: Placement) -> Placement:
+        """Give an anonymous carve the name of the FORECAST row it landed on, when it landed on one.
+
+        The rows of the host tier are reserved by `reserve()` as forecast regions and then carved
+        through torch's `MemPool` C ABI, which passes a size and no identity. Matching on the
+        coinciding `(chunk_index, offset)` is exact and unspoofable — the forward-only allocator
+        produced both numbers from the same request sequence, so they coincide iff the carve is
+        following the plan — and it costs one comparison per carve.
+
+        Two things depend on it. `carve_digest()` (the cross-rank layout proof, per its own
+        docstring the only digest that is diagnostic at TP=2) starts naming real components instead
+        of `torch:0, torch:1, ...`, so two ranks whose walks diverged print different digests for a
+        reason an operator can read. And `verify_matches_plan()` gets a coverage number: "the carve
+        followed N of the M rows the plan reserved" is a checkable statement where "the plan had
+        nothing to compare" was not.
+
+        On a mismatch the carve keeps its `torch:<n>` name and the cursor stops advancing, so a
+        drifted carve is reported as zero further attribution rather than being silently re-aligned
+        against a row it is not.
+        """
+        if self.plan is None:
+            return p
+        forecasts = self.plan.forecast_placements
+        if self._forecast_cursor >= len(forecasts):
+            return p
+        f = forecasts[self._forecast_cursor]
+        # Offset AND size. Offset alone is not attribution: the first carve of a run always lands at
+        # chunk 0 offset 0 whatever its size, so a walk that enumerated something else entirely
+        # would adopt the first row's name and then be reported as "1 of N followed the plan".
+        if (f.chunk_index, f.offset, f.nbytes) != (
+            p.chunk_index,
+            p.offset,
+            p.nbytes,
+        ) or f.name in self._regions:
+            return p
+        self._forecast_cursor += 1
+        self._forecast_matched += 1
+        return Placement(f.name, p.chunk_index, p.offset, p.nbytes, p.align, forecast=True)
 
     def _region_from_placement(self, p: Placement) -> ArenaRegion:
         c = self.chunks[p.chunk_index]
@@ -927,16 +1020,64 @@ class PinnedWeightArena:
             h.update(f"{r.name}\x00{r.chunk_index}\x00{r.offset}\x00{r.nbytes}\n".encode())
         return h.hexdigest()[:16]
 
-    def verify_matches_plan(self) -> None:
-        """Every carved region landed exactly where `reserve()` said it would.
+    def verification_coverage(self) -> "PlanVerification":
+        """What `verify_matches_plan()` is in a position to check. See `PlanVerification`."""
+        plan = self.plan
+        raw = set(self._raw_names)
+        named_planned = 0 if plan is None else len(plan.named_placements)
+        named_carved = sum(
+            1
+            for name in self._regions
+            if name not in raw and plan is not None and name in plan.by_name()
+        )
+        return PlanVerification(
+            named_planned=named_planned,
+            named_carved=named_carved,
+            forecast_planned=0 if plan is None else len(plan.forecast_placements),
+            forecast_matched=self._forecast_matched,
+            raw_carves=len(self._raw_names),
+            planned_footprint=0 if plan is None else plan.footprint_bytes,
+            carved_footprint=0 if self._bump is None else self._bump.footprint_bytes,
+            planned_payload=0 if plan is None else plan.payload_bytes,
+            carved_bytes=sum(r.nbytes for r in self._regions.values()),
+            headroom_bytes=0 if plan is None else plan.headroom_bytes,
+        )
+
+    def verify_matches_plan(self, *, require_coverage: bool = True) -> "PlanVerification":
+        """Every carved region landed where `reserve()` said it would — and SOMETHING was checked.
 
         Cheap, and it closes a real drift path: if the walker enumerates regions in one order for
         the plan and another for the carve, the arena still "works" and every offset is wrong, which
         on a quantized checkpoint means dequantizing one expert against another's scale — plausible
         text, no crash.
+
+        THIS USED TO PASS OVER THE SHIPPING SHAPE WITHOUT CHECKING ANYTHING, and that is the whole
+        reason it had no production caller worth having. `bake.StageARuntime.attach_host_arena`
+        reserved the host tier as anonymous headroom (`reserve([], extra_bytes=...)`), so
+        `plan.placements` was empty, this method iterated an empty table, and a green result meant
+        "no regions were planned" rather than "the layout is right". Now the tier is reserved as
+        enumerated FORECAST rows, and there are three real checks:
+
+          1. NAMED regions (`allocate(name, ...)`) must match the plan exactly, and every planned
+             one must have been carved — unchanged, and still the strongest check available.
+          2. FORECAST regions are checked by ENVELOPE and by ATTRIBUTION, never by name: the carve
+             is anonymous (torch's `MemPool` C ABI passes a size and no identity), so the questions
+             that can honestly be asked are "did the carve need more arena than was pinned for it"
+             (`carved_footprint <= planned_footprint`, monotone in the request sequence, so a carve
+             that turns out smaller or fewer — torch splitting a block, a component the walker
+             deduped — passes) and "did any of it follow the plan at all"
+             (`_attribute_to_forecast`).
+          3. `require_coverage` refuses a VACUOUS pass. If the arena carved bytes but this method
+             found nothing to compare them against, that is not a pass; it is the absence of a
+             check, and reporting it as a pass is what let the defect above survive a green suite.
+             Pass `require_coverage=False` only to inspect the coverage of a shape you already know
+             is unverifiable.
+
+        Returns the `PlanVerification` so a caller (or a test) can assert on WHAT was checked rather
+        than only on the absence of an exception.
         """
         assert self.plan is not None
-        planned = self.plan.by_name()
+        planned = {n: p for n, p in self.plan.by_name().items() if not p.forecast}
         raw = set(self._raw_names)
         bad = []
         for name, r in self._regions.items():
@@ -948,7 +1089,7 @@ class PinnedWeightArena:
                 # string can spoof is not an exemption, and the thing being skipped is the check
                 # that stops one expert's bytes landing on another's.
                 if name in raw:
-                    continue  # MemPool allocations are headroom by construction, never planned
+                    continue  # MemPool allocations are anonymous by construction, never planned
                 bad.append(f"{name}: carved but not in the plan")
             elif (p.chunk_index, p.offset, p.nbytes) != (r.chunk_index, r.offset, r.nbytes):
                 bad.append(
@@ -956,13 +1097,47 @@ class PinnedWeightArena:
                     f"chunk {r.chunk_index}+{r.offset} ({r.nbytes} B)"
                 )
         missing = [n for n in planned if n not in self._regions]
+
+        cov = self.verification_coverage()
+        if cov.carved_footprint > cov.planned_footprint and cov.forecast_planned:
+            bad.append(
+                f"the carve consumed {fmt_bytes(cov.carved_footprint)} of arena but the plan "
+                f"reserved {fmt_bytes(cov.planned_footprint)} for it "
+                f"(+{fmt_bytes(cov.carved_footprint - cov.planned_footprint)}). The enumerated rows "
+                f"are not the rows the bake asked for — either a component the sizing model does "
+                f"not know about, or torch asking for a larger segment than "
+                f"chunk_plan.torch_allocation_bytes models. The overflow lands in hipMalloc VRAM "
+                f"while the capacity plan still calls it host-resident."
+            )
+        if self.headroom_denied_bytes:
+            bad.append(
+                f"the arena REFUSED {fmt_bytes(self.headroom_denied_bytes)} of carves (largest "
+                f"single refusal {fmt_bytes(self.headroom_denied_max)}); those bytes went to "
+                f"hipMalloc VRAM"
+            )
+        if cov.forecast_planned and cov.forecast_matched == 0 and cov.raw_carves:
+            bad.append(
+                f"none of the {cov.raw_carves} anonymous carve(s) landed on any of the "
+                f"{cov.forecast_planned} forecast row(s). The carve order or the row sizes have "
+                f"drifted from the plan, so every offset from the first divergence on is a "
+                f"different address than was reserved."
+            )
+        if require_coverage and cov.vacuous and (cov.carved_bytes or cov.planned_payload):
+            bad.append(
+                f"NOTHING WAS VERIFIED. {cov.describe()}. A plan with no named and no forecast "
+                f"regions cannot be compared against anything, so this call is not evidence the "
+                f"layout is right — it is the absence of a check. Reserve the host rows as "
+                f"RegionRequests (OffloadPlan.host_row_requests) instead of as anonymous "
+                f"`extra_bytes` headroom."
+            )
         if bad or missing:
             raise ArenaStateError(
                 "WEIGHT OFFLOAD: carved layout does not match the reserved plan "
-                f"(digest {self.plan.digest()}).\n"
+                f"(digest {self.plan.digest()}, carve {self.carve_digest()}).\n"
                 + "\n".join(f"  {b}" for b in bad)
                 + (f"\n  planned but never carved: {missing[:16]}" if missing else "")
             )
+        return cov
 
     # -- step 5: lock down ----------------------------------------------------
 
@@ -991,9 +1166,12 @@ class PinnedWeightArena:
         if self.torch_fallbacks and not allow_fallbacks:
             denied = (
                 f" The arena refused {fmt_bytes(self.headroom_denied_bytes)} of carves (largest "
-                f"single refusal {fmt_bytes(self.headroom_denied_max)}), so reserve()'s headroom "
-                f"was too small — most likely because `extra_bytes` was sized as the payload total "
-                f"with no allowance for the tails next-fit abandons at every chunk boundary."
+                f"single refusal {fmt_bytes(self.headroom_denied_max)}), so reserve() was too "
+                f"small: either the enumerated rows "
+                f"({len(self.plan.forecast_placements) if self.plan else 0} forecast) do not "
+                f"describe what the bake asked for, or the anonymous-headroom fallback was sized "
+                f"as the payload total with no allowance for the tails next-fit abandons at every "
+                f"chunk boundary."
                 if self.headroom_denied_bytes
                 else ""
             )
@@ -1087,6 +1265,10 @@ class PinnedWeightArena:
             "chunk_growth_advisory": self.chunk_growth_advisory,
             "headroom_denied_bytes": self.headroom_denied_bytes,
             "headroom_denied_max": self.headroom_denied_max,
+            # What `verify_matches_plan()` is in a position to check. Printed because a reservation
+            # that fell back to anonymous headroom verifies NOTHING, and that has to be visible in
+            # the boot log rather than discovered by reading the reserve() call site.
+            "verification": self.verification_coverage().describe() if self.plan else None,
             "selftest": self._selftest.summary() if self._selftest else None,
             "torch_hipmalloc_fallbacks": self.torch_fallbacks,
             "frozen": hipmem.is_frozen(),

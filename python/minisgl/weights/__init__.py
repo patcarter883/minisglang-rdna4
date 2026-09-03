@@ -40,6 +40,7 @@ from .chunk_plan import (
     headroom_chunks,
     plan_regions,
     suggest_chunk_bytes,
+    torch_allocation_bytes,
 )
 from .config import ArenaSettings, create_pinned_weight_arena, resolve_arena_settings
 from .host_capacity import (
@@ -60,6 +61,7 @@ from .pinned_arena import (
     ArenaSelfTestError,
     ArenaStateError,
     PinnedWeightArena,
+    PlanVerification,
     SelfTestResult,
     chunk_fingerprint,
     decode_fingerprint,
@@ -81,6 +83,7 @@ __all__ = [
     "headroom_chunks",
     "plan_regions",
     "suggest_chunk_bytes",
+    "torch_allocation_bytes",
     # capacity
     "CapacityVerdict",
     "HostArenaCapacityError",
@@ -98,6 +101,7 @@ __all__ = [
     "ArenaSelfTestError",
     "ArenaStateError",
     "PinnedWeightArena",
+    "PlanVerification",
     "SelfTestResult",
     "chunk_fingerprint",
     "decode_fingerprint",

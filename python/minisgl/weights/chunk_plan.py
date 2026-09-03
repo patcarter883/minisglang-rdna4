@@ -36,7 +36,7 @@ three timing-dependent inputs that would make two ranks plan differently.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Sequence, Tuple
 
 KIB = 1 << 10
@@ -59,6 +59,41 @@ CHUNK_GRANULE = 2 * MIB
 # no progress. Do not raise this default without re-running P3b at the new size.
 DEFAULT_CHUNK_BYTES = 2 * GIB
 MIN_CHUNK_BYTES = CHUNK_GRANULE
+
+# torch's caching allocator does NOT ask the arena for a tensor's byte count. `MemPool` allocations
+# go through `CUDACachingAllocator::malloc`, which rounds the request (`round_size`, 512 B) and then
+# asks the backing allocator for a whole SEGMENT sized by `get_allocation_size`: `kSmallBuffer`
+# (2 MiB) for requests <= 1 MiB, `kLargeBuffer` (20 MiB) for requests < 10 MiB, and
+# `round_up(size, kRoundLarge = 2 MiB)` above that. So a planned row of `n` bytes costs the arena at
+# least `round_up(max(n, 2 MiB), 2 MiB)`, and a reservation enumerated in tensor bytes is short by
+# the rounding.
+TORCH_ALLOC_GRANULE = 2 * MIB
+
+
+def torch_allocation_bytes(nbytes: int) -> int:
+    """Arena bytes ONE torch `MemPool` allocation of `nbytes` consumes. See `TORCH_ALLOC_GRANULE`.
+
+    MODELLED, NEVER MEASURED — this is the single largest assumption in the exact-packing
+    reservation and a GPU run must replace it (compare `ArenaMemPool.stats()`'s served sizes with
+    `OffloadPlan.host_row_requests()`). Two deliberate choices:
+
+      * `round_up(max(n, 2 MiB), 2 MiB)` mirrors `kRoundLarge`/`kSmallBuffer` exactly for every row
+        this feature actually reserves (a component's stacked slab is tens to hundreds of MiB).
+      * the `kLargeBuffer` bucket — a 6 MiB row costing a 20 MiB segment — is deliberately NOT
+        modelled. torch SPLITS a large block, so a run of such rows shares one buffer, and charging
+        every one of them 20 MiB over-reserves ~3x on a small-row shape. Over-reserving is not the
+        polite failure here: it is charged against the live `MemAvailable` gate and refuses boots
+        that would have fitted. The residual exposure is bounded by
+        `sum(kLargeBuffer - modelled)` over rows in the (1 MiB, 10 MiB) band and, on the target
+        shape, is absorbed by the tail next-fit already abandons in each chunk; a shape where it is
+        not absorbed fails LOUDLY at the carve (`allocate_raw` refuses, `mark_populated` raises)
+        rather than silently in VRAM, which is why the optimistic direction is affordable here and
+        was not affordable for `headroom_chunks`.
+    """
+    n = int(nbytes)
+    if n <= 0:
+        return 0
+    return round_up(max(n, TORCH_ALLOC_GRANULE), TORCH_ALLOC_GRANULE)
 
 
 class ArenaLayoutError(RuntimeError):
@@ -110,6 +145,23 @@ class RegionRequest:
     name: str
     nbytes: int
     align: int = ALIGN
+    # True == "this region is a FORECAST of an allocation somebody else will make ANONYMOUSLY".
+    #
+    # The weight rows are carved by torch's `MemPool` callback (`PinnedWeightArena.allocate_raw`),
+    # which is a C ABI that carries a size and nothing else — it cannot name the region it is
+    # serving. Before this flag the only way to reserve for it was `extra_bytes` (anonymous
+    # headroom), which reserves `headroom_chunks(payload, chunk, max_row)` = a GUARANTEE bound that
+    # costs +28% on the target shape because it assumes the worst row lands at the worst offset in
+    # every chunk. A forecast region says instead "here is the row list, in carve order": the layout
+    # is planned exactly with the same next-fit allocator that will carve it, so the reservation is
+    # the real chunk count rather than a bound, and `ChunkPlan.digest()` stops collapsing to a hash
+    # of the chunk COUNT.
+    #
+    # What it does NOT claim is that the carve will use this name. `verify_matches_plan()` therefore
+    # checks a forecast region by ENVELOPE (the carve must not need more arena than was planned)
+    # and by attribution (a raw carve landing exactly on a forecast placement adopts its name, so
+    # `carve_digest()` covers real rows), never by name equality — see `PinnedWeightArena`.
+    forecast: bool = False
 
     def __post_init__(self) -> None:
         if self.nbytes < 0:
@@ -136,6 +188,9 @@ class Placement:
     offset: int
     nbytes: int
     align: int = ALIGN
+    # Carried from `RegionRequest.forecast`. A forecast placement is never carved by name, so every
+    # by-name check must skip it or it reports every row as "planned but never carved".
+    forecast: bool = False
 
     @property
     def end(self) -> int:
@@ -198,6 +253,22 @@ class BumpAllocator:
         request larger than the current tail can still be served from a later chunk, so this is an
         upper bound on what a *single* allocation can get, not a promise."""
         return self.reserved_bytes - self.consumed_bytes - self.abandoned_bytes
+
+    @property
+    def footprint_bytes(self) -> int:
+        """High-water mark: every byte of arena this allocator has consumed OR abandoned.
+
+        `consumed_bytes` alone is not comparable between two runs of a forward-only next-fit
+        allocator, because an abandoned tail is arena that is gone even though no cursor counts it.
+        This is the number `verify_matches_plan()` compares carve-against-plan on: it is monotone in
+        the request sequence, so "the carve stayed inside the reservation" is exactly
+        `carved.footprint_bytes <= planned.footprint_bytes` — a check that passes when the real
+        allocations turn out SMALLER or fewer than forecast (torch splitting a block, a component
+        the walker deduped) and fails whenever they need more room than was pinned for them.
+        """
+        if not self._cursors:
+            return 0
+        return self._cur * self.chunk_bytes + self._cursors[self._cur]
 
     @property
     def largest_free_run(self) -> int:
@@ -323,6 +394,27 @@ class ChunkPlan:
         return sum(self.chunk_bytes - c for c in self.cursors[: self.last_used_chunk])
 
     @property
+    def footprint_bytes(self) -> int:
+        """Arena consumed OR abandoned by the placements. See `BumpAllocator.footprint_bytes`."""
+        if not self.placements:
+            return 0
+        last = max(p.chunk_index for p in self.placements)
+        return last * self.chunk_bytes + self.cursors[last]
+
+    @property
+    def forecast_placements(self) -> Tuple[Placement, ...]:
+        """Placements reserved for anonymous carves. See `RegionRequest.forecast`."""
+        return tuple(p for p in self.placements if p.forecast)
+
+    @property
+    def named_placements(self) -> Tuple[Placement, ...]:
+        return tuple(p for p in self.placements if not p.forecast)
+
+    @property
+    def forecast_bytes(self) -> int:
+        return sum(p.nbytes for p in self.placements if p.forecast)
+
+    @property
     def headroom_bytes(self) -> int:
         return self.extra_chunks * self.chunk_bytes
 
@@ -393,7 +485,8 @@ class ChunkPlan:
             f"reserved={fmt_bytes(self.reserved_bytes)} payload={fmt_bytes(self.payload_bytes)} "
             f"pad={fmt_bytes(self.padding_bytes)} abandoned={fmt_bytes(self.abandoned_bytes)} "
             f"headroom={fmt_bytes(self.headroom_bytes)} "
-            f"fill={self.fill_frac * 100:.1f}% regions={len(self.placements)} "
+            f"fill={self.fill_frac * 100:.1f}% regions={len(self.placements)}"
+            f"(forecast={len(self.forecast_placements)}) "
             f"digest={self.digest()}"
         )
 
@@ -481,7 +574,12 @@ def plan_regions(
             f"silently overwrites the earlier entry and one granule ends up reading another's bytes"
         )
     b = BumpAllocator(chunk_bytes, n_chunks=None, align=align)
-    placements = [b.allocate(r.nbytes, name=r.name, align=r.align) for r in requests]
+    placements = [
+        replace(b.allocate(r.nbytes, name=r.name, align=r.align), forecast=r.forecast)
+        if r.forecast
+        else b.allocate(r.nbytes, name=r.name, align=r.align)
+        for r in requests
+    ]
     extra_chunks = headroom_chunks(extra_bytes, chunk_bytes, extra_max_region_bytes)
     # An empty plan must reserve ZERO chunks, not one. §6.2's design has the plan *derived*: when
     # everything fits in VRAM the plan is empty and the whole path must cost nothing, or the "it is

@@ -59,6 +59,7 @@ __all__ = [
     "LayerPlacement",
     "OffloadPlan",
     "PlacementError",
+    "PostLoadCorrection",
     "distinct_experts",
     "ep_local_top_k",
     "plan_layer_granular",
@@ -121,6 +122,37 @@ def distinct_experts(num_experts: int, top_k: int, batch: int) -> float:
     return num_experts * (1.0 - (1.0 - k / num_experts) ** batch)
 
 
+def _spec_rows(spec: Any, prefix: str) -> tuple:
+    """The ordered list of arena ROWS one `granule.GranuleSpec` will ask for: `((name, nbytes), ...)`.
+
+    ORDER IS `moe_interpose._plan_items`' ORDER — every component (the whole stacked slab, `E` x the
+    per-expert slice, because the kernels index `base + e*row_bytes`) and then every replicated
+    tensor. That order is what the arena's forward-only next-fit allocator sees, so a reservation
+    laid out in any other order is not the reservation the bake will consume.
+
+    THE NAMES ARE DESCRIPTIVE, NOT A CONTRACT. `_plan_items` names its copies
+    `{layer}.{container_attr}.{component}` and this prefix is `w13`/`w2`, so the two do not match —
+    deliberately. The rows are reserved as FORECAST regions (`chunk_plan.RegionRequest.forecast`),
+    carved anonymously through the torch `MemPool` C ABI, and reconciled by ENVELOPE rather than by
+    name. Making the reservation depend on two independently-derived name strings agreeing would
+    turn a cosmetic rename into a boot failure and buy nothing.
+
+    Returns `()` when the spec does not expose the component lists (a test double, a future
+    descriptor); every consumer then falls back to the old `headroom_chunks` bound, which is a
+    guarantee rather than an enumeration.
+    """
+    comps = getattr(spec, "components", None)
+    if comps is None:
+        return ()
+    n = int(getattr(spec, "num_granules", 0) or 0) or 1
+    rows = [(f"{prefix}.{c.name}", int(getattr(c, "nbytes", 0) or 0) * n) for c in comps]
+    rows += [
+        (f"{prefix}.{r.name}", int(getattr(r, "nbytes", 0) or 0))
+        for r in (getattr(spec, "replicated", ()) or ())
+    ]
+    return tuple((name, nb) for name, nb in rows if nb > 0)
+
+
 def _spec_max_row_bytes(spec: Any) -> int:
     """Largest single arena row a `granule.GranuleSpec` will ask for. Duck-typed, torch-free.
 
@@ -141,6 +173,46 @@ def _spec_max_row_bytes(spec: Any) -> int:
     n = int(getattr(spec, "num_granules", 0) or 0) or 1
     rows += [int(getattr(c, "nbytes", 0) or 0) * n for c in comps]
     return max(rows, default=int(getattr(spec, "total_bytes", 0) or 0))
+
+
+@dataclass(frozen=True)
+class PostLoadCorrection:
+    """What `post_load()` will add to a container that has only been built, not loaded.
+
+    `granule.derive_granule_spec` on a META model reports `__init__` shapes, because `post_load()`
+    cannot run on meta tensors — and two of the nine shipped containers are not byte-invariant
+    across it (`sizing.PostLoadDelta`). The engine resolves its plan on exactly that model
+    (`engine.py` builds on meta, then `StageASession.begin(model=...)`), so without this correction
+    the observed path under-counts the arena by the whole synthesised `_zeros_op`. That used to be
+    absorbed by the anonymous-headroom reservation's +28% slop; with the reservation exact it is a
+    row that has nowhere to go, i.e. `hipMalloc` VRAM.
+
+    Deliberately an instruction set and not a byte model: `sizing` knows which formats do what,
+    `placement` knows what to do with the numbers, and neither grows an arm for the other. Three
+    fields because the three consequences are different:
+      * `resident` — capacity, always charged;
+      * `granule` — traffic, charged only when the added bytes are per-expert;
+      * `widen_row_bytes` — PACKING. 0 means the delta is a NEW row (CT-symmetric's `_zeros_op` is a
+        real `torch.empty`); non-zero names the size of the existing row that GROWS instead (MXFP4's
+        E8M0 u8 scale becoming fp16 in place). Two half-size rows pack into a chunk tail that one
+        full-size row does not, so getting this wrong makes the reservation optimistic exactly where
+        the never-straddle rule bites.
+    """
+
+    resident: int = 0
+    granule: int = 0
+    widen_row_bytes: int = 0
+
+    def apply_rows(self, rows: tuple, prefix: str) -> tuple:
+        if not rows or not self.resident:
+            return rows
+        if self.widen_row_bytes:
+            out = list(rows)
+            for i, (name, nb) in enumerate(out):
+                if nb == self.widen_row_bytes:
+                    out[i] = (name, nb + self.resident)
+                    return tuple(out)
+        return rows + ((f"{prefix}.post_load", self.resident),)
 
 
 @dataclass(frozen=True)
@@ -200,6 +272,20 @@ class LayerWeights:
     priority: int = 0
     # Largest single arena row this layer allocates. See the class docstring. 0 == not derived.
     max_row_bytes: int = 0
+    # And the FOURTH byte count, which subsumes the third: every arena row this layer will ask for,
+    # in carve order, as `((name, nbytes), ...)`.
+    #
+    # WHY IT EXISTS. `max_row_bytes` feeds `chunk_plan.headroom_chunks`, whose guarantee is
+    # `chunk - max_row` placeable bytes per chunk — it prices the reservation as if the worst row
+    # landed at the worst offset in EVERY chunk. On the target shape (rows of 384/192/48/24/12/6 MiB
+    # summing to 666 MiB per layer, in 2 GiB chunks) that charges 20 chunks where next-fit actually
+    # uses 16: +28% of the pinned host tier, which is 7.2 GiB/rank of device tier the operator has to
+    # surrender to compensate. Enumerating the rows replaces the bound with the answer.
+    #
+    # `()` means "not derived" and every consumer falls back to `row_bound` — the bound is still
+    # sound, just loose, and a caller that cannot enumerate must never silently get the optimistic
+    # `ceil(payload/chunk)` instead.
+    rows: tuple = ()
 
     @property
     def row_bound(self) -> int:
@@ -207,7 +293,9 @@ class LayerWeights:
 
         Never 0: a caller that used 0 as "no bound" would go straight back to the `ceil(payload /
         chunk)` reservation this field exists to replace, and would do it silently."""
-        return self.max_row_bytes or self.resident_bytes
+        return self.max_row_bytes or (
+            max((n for _, n in self.rows), default=0) or self.resident_bytes
+        )
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0:
@@ -236,6 +324,35 @@ class LayerWeights:
                 f"set, and the arena would be reserved against a packing bound for weights this "
                 f"rank is not holding."
             )
+        if self.rows:
+            names = [n for n, _ in self.rows]
+            if len(set(names)) != len(names):
+                raise PlacementError(
+                    f"{self.path}: duplicate arena row names {sorted({n for n in names if names.count(n) > 1})}. "
+                    f"The reservation is keyed by name, so a duplicate silently overwrites the "
+                    f"earlier row and one component ends up reading another's bytes."
+                )
+            if any(nb <= 0 for _, nb in self.rows):
+                raise PlacementError(f"{self.path}: every arena row must be > 0 bytes: {self.rows}")
+            total = sum(nb for _, nb in self.rows)
+            if total != self.resident_bytes:
+                # NOT a tolerance. `resident_bytes` is what the capacity budget is spent in and the
+                # rows are what the arena is reserved for; if they disagree the plan is charging one
+                # number and pinning another, which is precisely the class of drift the exact
+                # reservation exists to remove. A component the walker dropped (a scale) shows up
+                # here as a byte count, at boot, instead of as plausible text at inference.
+                raise PlacementError(
+                    f"{self.path}: the enumerated arena rows sum to {total} B but the layer is "
+                    f"priced at resident_bytes={self.resident_bytes} B (difference "
+                    f"{total - self.resident_bytes:+d} B). The capacity arithmetic and the arena "
+                    f"reservation would be computed from two different weight sets."
+                )
+            if self.max_row_bytes and self.max_row_bytes < max(nb for _, nb in self.rows):
+                raise PlacementError(
+                    f"{self.path}: max_row_bytes={self.max_row_bytes} is smaller than the largest "
+                    f"enumerated row {max(nb for _, nb in self.rows)}. The packing bound would be "
+                    f"optimistic, which under-reserves the arena and pushes the overflow into VRAM."
+                )
 
     @classmethod
     def from_specs(
@@ -247,8 +364,14 @@ class LayerWeights:
         w13: Any,
         w2: Any,
         priority: int = 0,
+        w13_post_load: "PostLoadCorrection | None" = None,
+        w2_post_load: "PostLoadCorrection | None" = None,
     ) -> "LayerWeights":
-        """Adapt a `granule.GranuleSpec` pair. The only place placement touches the tensor layer."""
+        """Adapt a `granule.GranuleSpec` pair. The only place placement touches the tensor layer.
+
+        `*_post_load` corrects a spec derived from a META model, where `post_load()` has not run and
+        cannot. Omit them for a spec taken off live post-load containers, or the delta is counted
+        twice. See `PostLoadCorrection`."""
         if w13.num_experts != num_experts:
             raise PlacementError(
                 f"{path}: granule spec says n={w13.num_experts} but the layer reports "
@@ -258,15 +381,28 @@ class LayerWeights:
             )
         h = hashlib.sha256()
         h.update(f"{path}|{w13.fingerprint()}|{w2.fingerprint()}".encode())
+        d13 = w13_post_load or PostLoadCorrection()
+        d2 = w2_post_load or PostLoadCorrection()
+        # w13 first, then w2 — `MoELayer.expert_containers()` yields `gate_up_proj` before
+        # `down_proj` and `_plan_items` walks that dict in order, so this is the order the arena's
+        # forward-only allocator will actually see.
+        r13, r2 = _spec_rows(w13, "w13"), _spec_rows(w2, "w2")
+        # An all-or-nothing enumeration: a half-enumerated layer would reserve exactly for the rows
+        # it knows about and nothing for the rest.
+        rows = (d13.apply_rows(r13, "w13") + d2.apply_rows(r2, "w2")) if (r13 and r2) else ()
         return cls(
             path=path,
             num_experts=num_experts,
             top_k=top_k,
-            granule_bytes=w13.granule_bytes + w2.granule_bytes,
-            resident_bytes=w13.total_bytes + w2.total_bytes,
+            granule_bytes=w13.granule_bytes + w2.granule_bytes + d13.granule + d2.granule,
+            resident_bytes=w13.total_bytes + w2.total_bytes + d13.resident + d2.resident,
             fingerprint=h.hexdigest()[:16],
             priority=priority,
-            max_row_bytes=max(_spec_max_row_bytes(w13), _spec_max_row_bytes(w2)),
+            max_row_bytes=max(
+                _spec_max_row_bytes(w13) + (d13.resident if d13.widen_row_bytes else 0),
+                _spec_max_row_bytes(w2) + (d2.resident if d2.widen_row_bytes else 0),
+            ),
+            rows=rows,
         )
 
     def active_bytes(self, batch: int = 1) -> int:
@@ -286,10 +422,15 @@ class LayerPlacement:
     # reservation needs. See `LayerWeights.max_row_bytes`. 0 == not derived; `row_bound` falls back
     # to the whole layer, which is sound but loose.
     max_row_bytes: int = 0
+    # Every arena row this layer asks for, in carve order. See `LayerWeights.rows`; `()` == not
+    # derived, and the reservation then falls back to the `row_bound` guarantee.
+    rows: tuple = ()
 
     @property
     def row_bound(self) -> int:
-        return self.max_row_bytes or self.resident_bytes
+        return self.max_row_bytes or (
+            max((n for _, n in self.rows), default=0) or self.resident_bytes
+        )
 
     def table(self) -> ExpertStackTable:
         """The layer's residency ledger. Uniform by construction under layer-granular placement.
@@ -334,6 +475,45 @@ class OffloadPlan:
         return max(
             (p.row_bound for p in self.placements if p.kind is StackKind.HOST), default=0
         )
+
+    @property
+    def host_rows_known(self) -> bool:
+        """Can the host arena be reserved by ENUMERATION rather than by the packing bound?
+
+        True only when every host-resident layer enumerated its rows. A partial enumeration is not
+        usable: the reservation would be exact for the layers it can see and nothing at all for the
+        rest, which is the one way to be short in the silent direction.
+        """
+        host = [p for p in self.placements if p.kind is StackKind.HOST]
+        return bool(host) and all(p.rows for p in host)
+
+    def host_row_requests(self) -> tuple:
+        """The host arena's reservation, as ordered `chunk_plan.RegionRequest`s. `()` when unknown.
+
+        THIS IS THE FIX FOR THE +28% RESERVATION. `PinnedWeightArena.reserve` lays these out with
+        the same forward-only next-fit allocator that carves them, so `ChunkPlan.reserved_bytes`
+        becomes the chunk count the arena will really pin instead of `headroom_chunks`' worst-case
+        bound. Sizes are inflated to `chunk_plan.torch_allocation_bytes` because the rows are carved
+        through torch's caching allocator, which asks for a rounded SEGMENT and not for the tensor.
+
+        Emitted in placement order (= `moe_interpose.bind_plan`'s seam order = the walk order), and
+        within a layer in `_plan_items` order. Flagged `forecast=True`: these regions are carved
+        anonymously by the `MemPool` C ABI, so they fix the LAYOUT without claiming the carve will
+        use these names. See `RegionRequest.forecast`.
+        """
+        from .chunk_plan import RegionRequest, torch_allocation_bytes
+
+        if not self.host_rows_known:
+            return ()
+        out = []
+        for p in self.placements:
+            if p.kind is not StackKind.HOST:
+                continue
+            for name, nbytes in p.rows:
+                out.append(
+                    RegionRequest(f"{p.path}.{name}", torch_allocation_bytes(nbytes), forecast=True)
+                )
+        return tuple(out)
 
     @property
     def unused_device_bytes(self) -> int:
@@ -464,6 +644,7 @@ def plan_layer_granular(
             num_experts=lw.num_experts,
             top_k=lw.top_k,
             max_row_bytes=lw.max_row_bytes,
+            rows=lw.rows,
         )
         for i, lw in enumerate(layers)
     )

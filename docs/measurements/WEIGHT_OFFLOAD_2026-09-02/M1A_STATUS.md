@@ -293,6 +293,39 @@ host tier as anonymous headroom therefore needs `headroom_chunks(payload, chunk,
 | same at a 4 GiB chunk | 10.41 GiB/rank (nothing > 2 GiB has ever been pinned on this box) |
 | **required device tier if rows were NAMED regions (exact packing)** | **≈ 3.90 GiB/rank** (6 layers on device, 54.63 GiB/node host) |
 
+> **[M1B-2026-09-03] FIXED. The computed answer is 5.85 GiB/rank, not the ≈ 3.90 estimated below.**
+> The rows are now emitted as `RegionRequest(forecast=True)` by `OffloadPlan.host_row_requests()` and
+> reserved by `StageARuntime.attach_host_arena`, so the reservation is the real next-fit packing:
+>
+> | | as landed in M1-A | **M1-B, named regions** |
+> |---|---|---|
+> | pinned reservation, all-host | 20 chunks · 40.00 GiB/rank · 80.00 GiB/node | **16 chunks · 32.00 GiB/rank · 64.00 GiB/node** |
+> | required device tier | 11.06 GiB/rank (17 of 48 layers) | **5.85 GiB/rank (9 of 48 layers)** |
+> | at that tier | 26 chunks · 52.00 GiB/node — but the tier is unaffordable | **13 chunks · 52.00 GiB/node ≤ 55.80 → FEASIBLE** |
+> | VRAM recovered | — | **5.20 GiB/rank** (~1.0 M KV tokens) |
+>
+> The ≈ 3.90 estimate charged the *payload* (54.63 GiB/node) rather than the reservation: 42 host
+> layers pin 14 chunks = 56.00 GiB/node, 0.20 GiB over the ceiling, so 39 host layers / 9 device is
+> the real minimum. Per-layer rows are 384/48/12 MiB (w13) + 192/24/6 MiB (w2) = 666 MiB, and three
+> whole layers fit a 2 GiB chunk (1998 MiB used, 50 MiB abandoned).
+>
+> **The one assumption a GPU run must replace:** torch's caching allocator asks the arena for a
+> rounded SEGMENT, not for the tensor, so rows are reserved at `chunk_plan.torch_allocation_bytes`
+> = `round_up(max(n, 2 MiB), 2 MiB)`. That mirrors `kRoundLarge`/`kSmallBuffer`, but the
+> `kLargeBuffer` bucket (a 6 MiB row costing a 20 MiB segment) is deliberately NOT modelled because
+> torch splits such blocks and charging every one 20 MiB over-reserves ~3× on a small-row shape. On
+> this shape the exposure is 48 × 14 MiB and is absorbed by the 50 MiB tail each chunk already
+> abandons; on another shape it would fail loudly at the carve, not silently in VRAM. Measure it:
+> compare `ArenaMemPool.stats()`'s served sizes against `OffloadPlan.host_row_requests()`.
+>
+> Two adjacent defects the fix had to close. `verify_matches_plan()` now REFUSES a vacuous pass and
+> is called from `seal()` — it had no production caller, and on the shipping shape it had nothing to
+> compare. And `observed_planned_layers` (the path `engine.py` actually uses, on the meta model) was
+> not applying `sizing.post_load_delta_bytes` at all, so the CT-symmetric `_zeros_op` and the MXFP4
+> scale widening were uncounted; the old +28 % slop was hiding it. `placement.PostLoadCorrection`
+> closes that, gated on the spec being meta-derived so a post-`post_load()` re-plan is not
+> double-charged.
+
 **This is the headline number of the report.** 11.06 GiB of a 16 GiB card, with the device tier billed
 *inside* `model_memory` (the plan's correct "no sixth subtrahend" rule), leaves ~3.3 GiB at
 `--memory-ratio 0.9` for the dense weights, the KV pool, recurrent state, the draft model and the graph
@@ -320,12 +353,11 @@ Estimates assume one engineer, a free card when needed, and the GPU-lease waiver
 1. **Fix the image/source skew first** (0.25 d). `tail_hip has no attribute silu_and_mul` blocks every
    import-level verification of `engine.py`. Rebuild the serve image against the current kernels tree
    (per CLAUDE.md: clean worktrees for both contexts, bump `KERNELS_REF`).
-2. **Enumerate the arena rows as NAMED regions instead of anonymous headroom** (1 d). This is the
-   7.2 GiB/rank item above. `sizing.meta_gemm_spec` already builds the real container under
-   `torch.device("meta")` pre-load, so the per-component row sizes *are* knowable at `reserve()` time;
-   emit them as `RegionRequest`s and the reservation becomes exact, `verify_matches_plan()` stops being
-   vacuous, and `carve_digest()` gains real coverage. **Do this before any GPU work** — it changes the
-   feasibility answer and therefore what you would measure.
+2. ~~**Enumerate the arena rows as NAMED regions instead of anonymous headroom** (1 d).~~
+   **DONE [M1B-2026-09-03].** Required device tier **11.06 → 5.85 GiB/rank**, all-host reservation
+   **80.00 → 64.00 GiB/node**, and the target shape is FEASIBLE at 52.00 GiB/node. See the correction
+   block in §5. Residual for the first GPU run: confirm torch's real `MemPool` request sizes against
+   `chunk_plan.torch_allocation_bytes`, which is modelled and unmeasured.
 3. **First GPU run** (0.5 d): `pytest -m gpu tests/core/test_pinned_weight_arena.py` and
    `test_granule_regdirect_gpu.py`, **serially on BOTH cards**. This box has burned people twice on
    cross-card assumptions and P2′/P5/P6 only ever ran on card 0. Confirm real `hipHostMalloc` bases are

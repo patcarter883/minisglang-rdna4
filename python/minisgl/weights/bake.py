@@ -177,6 +177,13 @@ class StageADriver(Protocol):
     def assert_arena_clean(self) -> None:
         """Raise if any arena row silently landed in VRAM (`ArenaMemPool` hipMalloc fallback)."""
 
+    def verify_arena_layout(self) -> Any:
+        """Raise if the carved layout is not the reserved one. Optional; reached by `getattr`.
+
+        Distinct from `assert_arena_clean`, which answers "did anything escape to VRAM". This
+        answers "did what stayed in the arena land where the plan put it" — the drift that produces
+        plausible text with no crash, and the one the reservation's exactness now makes checkable."""
+
     def freeze(self) -> None:
         """`arena.mark_populated()` + `arena.freeze()`; rule R1 closes here."""
 
@@ -488,6 +495,15 @@ class StageASession:
         clean = getattr(self.driver, "assert_arena_clean", None)
         if callable(clean):
             clean()
+        # Then the LAYOUT. `assert_arena_clean` answers "did anything escape to VRAM"; this answers
+        # "did what stayed land where it was reserved". Both before the KV pool is sized, because a
+        # drifted layout dequantizes one expert against another's scale — plausible text, no crash,
+        # and nothing downstream can see it.
+        layout = getattr(self.driver, "verify_arena_layout", None)
+        if callable(layout):
+            v = layout()
+            what = getattr(v, "describe", None)
+            self.log(f"weight offload: arena layout verified — {what() if callable(what) else v}")
         self._assert_device_accounting()
         self._require_complete_ledger()
         self.driver.freeze()  # arena.mark_populated() + arena.freeze() -> hipmem.freeze() (rule R1)
@@ -708,6 +724,11 @@ class StageARuntime:
     def host_row_bound_bytes(self) -> int:
         """Proven upper bound on ONE allocation the torch `MemPool` will ask the arena for.
 
+        SINCE M1-B THIS IS THE FALLBACK, not the reservation: `host_row_requests()` enumerates the
+        rows and `attach_host_arena` reserves those, which is exact rather than bounded. This is
+        what a plan that could not break its containers down still gets, and it must stay a
+        GUARANTEE — see `chunk_plan.headroom_chunks`.
+
         The arena's bump allocator refuses to straddle a chunk, so `headroom_chunks` can only
         guarantee placement for `chunk - m` bytes per chunk, where `m` bounds a single region. With
         `m` unknown it falls back to `ceil(extra/chunk)`, which under-reserves by the abandoned tails
@@ -760,44 +781,65 @@ class StageARuntime:
             notes.append(f"arena reservation: {plan.describe()}")
         return tuple(notes)
 
+    def host_row_requests(self) -> Tuple[Any, ...]:
+        """The host tier as ENUMERATED, ordered arena rows. `()` when the plan could not break the
+        containers down and the anonymous-headroom bound has to be used instead.
+
+        Delegated to `OffloadPlan.host_row_requests` for the same reason `host_row_bound_bytes` is
+        delegated: `WeightPlanResolution.host_reservation_bytes_per_rank` — the number
+        `raise_if_infeasible()` gates on, two lines above the `reserve()` this feeds — is computed
+        from the identical list. Two derivations of the same row set can differ, and a reservation
+        larger than the one the resolver called feasible refuses the boot AFTER telling the operator
+        the tier they granted was enough."""
+        return self.plan.host_row_requests()
+
     def attach_host_arena(self) -> None:
-        """Reserve headroom, pin, self-test, then stand up the torch pool over the arena.
+        """Reserve the rows, pin, self-test, then stand up the torch pool over the arena.
 
-        The regions are reserved as anonymous HEADROOM (`extra_bytes`) rather than as named
-        `RegionRequest`s, because the rows are carved by the torch `MemPool` callback
-        (`PinnedWeightArena.allocate_raw`) at bind time and their exact sizes are a property of the
-        post_load() containers, which do not exist yet. `raise_if_infeasible()` runs FIRST so an
-        impossible plan fails before a single page is pinned.
+        `raise_if_infeasible()` runs FIRST so an impossible plan fails before a single page is
+        pinned.
 
-        THE HEADROOM IS BOUNDED, AND THE BOUND IS THE WHOLE RESERVATION. `chunk_plan.headroom_chunks`
-        states outright that `ceil(extra/chunk)` — reserving exactly `host_resident_bytes` with no
-        bound on any one row — is WRONG and wrong in the direction that costs a boot: the bump
-        allocator may never straddle a chunk, so next-fit abandons the tail whenever the next row does
-        not fit, and a 34 GiB reservation of 17 x 2 GiB chunks comes up ~800 MiB short. The rows that
-        fall out do not fail loudly; `PinnedWeightArena.allocate_raw` returns None, `ArenaMemPool`
-        falls back to `hipMalloc`, and weights the capacity plan booked against HOST RAM land in
-        VRAM — which is then subtracted from `model_memory` as though it were host memory, so the KV
-        pool is oversized by twice the shortfall. `allocate_raw`'s own comment names the missing
-        `extra_max_region_bytes` as the cause. This is the caller that has to supply it.
+        THE ROWS ARE ENUMERATED, NOT GUESSED, AND THAT IS WORTH ~5 GiB/rank OF VRAM. This used to
+        reserve the whole tier as anonymous HEADROOM — `reserve([], extra_bytes=host_resident_bytes,
+        extra_max_region_bytes=max_host_row_bytes)` — on the reasoning that the rows are carved by
+        the torch `MemPool` callback at bind time and their sizes are a property of the `post_load()`
+        containers, which do not exist yet. The second half of that is false: `sizing.meta_gemm_spec`
+        builds the real container under `torch.device("meta")` before `load_state_dict` and
+        `sizing.post_load_delta_bytes` carries the two shipped containers that are not byte-invariant
+        across `post_load`, so the row SIZES are knowable here even though the row IDENTITIES are
+        not.
 
-        The bound is `max(LayerPlacement.resident_bytes)` over the HOST placements. A row is one
-        tensor of one container of one layer (`MoEWeightSeam._bake_item` calls `alloc_like` per
-        storage), and a layer's containers sum to its `resident_bytes`, so the layer figure is a
-        proven upper bound rather than an estimate — which is what `headroom_chunks` needs, since it
-        guarantees `chunk - m` placeable bytes per chunk. It is loose (it over-reserves whenever a
-        layer splits into several tensors) and that is the correct direction: over-reserving is
-        charged against the live `MemAvailable` gate inside `reserve()` and aborts in milliseconds
-        with a capacity message, while under-reserving is silent VRAM."""
+        The difference is not marginal. `chunk_plan.headroom_chunks` can only guarantee `chunk - m`
+        placeable bytes per chunk, i.e. it prices the worst row landing at the worst offset in EVERY
+        chunk; on the target shape (six rows per layer summing to 666 MiB, 2 GiB chunks) that is 20
+        chunks where the real next-fit allocator fits three whole layers per chunk and uses 16 —
+        +28% of the pinned tier, which at a 55.80 GiB node ceiling is 5+ GiB/rank of device tier the
+        operator has to surrender to compensate, on a 16 GiB card.
+
+        So the rows go in as FORECAST `RegionRequest`s (`chunk_plan.RegionRequest.forecast`): they
+        are laid out by the same allocator that will carve them, which makes `reserve()`'s chunk
+        count the real one, gives `ChunkPlan.digest()` something to hash besides the chunk count, and
+        gives `verify_matches_plan()` something to compare. They do NOT claim the carve will use
+        their names — the `MemPool` C ABI passes a size and no identity — so reconciliation is by
+        envelope and by attribution; see `PinnedWeightArena.verify_matches_plan`.
+
+        `extra_bytes` / `extra_max_region_bytes` stay on the call and are the FALLBACK, not
+        vestigial: a plan whose containers could not be broken down (a test double, a future
+        descriptor, a format whose spec exposes no component list) still gets the bounded
+        anonymous reservation rather than a silent `ceil(payload/chunk)`. Dropping the bound is a
+        one-line edit that imports, boots, and puts the tail of the host tier in VRAM.
+        """
         import torch
 
         from .stacks import TorchStackAllocator
         from .torch_pool import ArenaMemPool
 
         self.resolution.raise_if_infeasible()
+        rows = self.host_row_requests()
         self.arena.reserve(
-            [],
-            extra_bytes=self.plan.host_resident_bytes,
-            extra_max_region_bytes=self.host_row_bound_bytes(),
+            rows,
+            extra_bytes=0 if rows else self.plan.host_resident_bytes,
+            extra_max_region_bytes=0 if rows else self.host_row_bound_bytes(),
         )
         self.arena.attach(selftest=self.settings.selftest, first_touch=self.settings.first_touch)
         self.pool = ArenaMemPool(self.arena)
@@ -897,6 +939,21 @@ class StageARuntime:
         """
         if self.pool is not None:
             self.pool.assert_clean(expect_served_bytes=self.moved_bytes())
+
+    def verify_arena_layout(self) -> Any:
+        """The carve followed the reservation. THE FIRST PRODUCTION CALLER of this check.
+
+        `PinnedWeightArena.verify_matches_plan()` has existed since M1-A with no caller worth
+        having, because on the shipping shape it had nothing to compare: the tier was reserved as
+        anonymous headroom, so the planned table was empty and it passed vacuously. Now the rows go
+        in enumerated, so the call is evidence — and `require_coverage` makes a reservation that
+        somehow reverted to headroom fail HERE, loudly, instead of being reported as a pass.
+
+        Runs inside `seal()`, before the byte ledger and before `_determine_num_pages`: a layout
+        drift means one expert's bytes are at another's address, which produces plausible text with
+        no crash and is undetectable from any later vantage point.
+        """
+        return self.arena.verify_matches_plan()
 
     def freeze(self) -> None:
         """One moment closes the whole mapping window: the seams, the arena, and the HIP binding.
