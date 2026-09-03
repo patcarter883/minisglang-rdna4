@@ -78,7 +78,17 @@ def dequant_f8_e4m3(raw: np.ndarray, scale: float) -> np.ndarray:
     return _E4M3_LUT[raw] * np.float32(scale)
 
 
-#: safetensors dtype -> (bytes per value, decoder). Only what a lookup table plausibly ships as.
+#: Width of every safetensors dtype this module may have to size — including the small I64 metadata
+#: tensors, which are NOT valid row-table element types.
+DTYPE_BYTES: Dict[str, int] = {
+    "F8_E4M3": 1, "F8_E5M2": 1, "U8": 1, "I8": 1,
+    "BF16": 2, "F16": 2, "I16": 2, "U16": 2,
+    "F32": 4, "I32": 4, "U32": 4,
+    "F64": 8, "I64": 8, "U64": 8,
+}
+
+#: The subset a row table may be built from — a dtype is only safe here if one value is one
+#: independently addressable unit, so a row can be sliced without decoding its neighbours.
 CODECS: Dict[str, int] = {"F8_E4M3": 1, "F8_E5M2": 1, "BF16": 2, "F16": 2, "F32": 4}
 
 
@@ -96,7 +106,10 @@ class TensorLoc:
 
     @property
     def nbytes(self) -> int:
-        n = CODECS[self.dtype]
+        try:
+            n = DTYPE_BYTES[self.dtype]
+        except KeyError:
+            raise ValueError(f"unknown safetensors dtype {self.dtype!r} for {self.path}") from None
         for d in self.shape:
             n *= d
         return n
@@ -159,7 +172,8 @@ class ShardedRowTable:
     """
 
     def __init__(self, shards: Sequence[TensorLoc], *, scale: float = 1.0,
-                 advise_random: bool = True, shard_ids: Sequence[int] | None = None) -> None:
+                 advise_random: bool = True, shard_ids: Sequence[int] | None = None,
+                 workers: int = 0, auto_prefetch: bool = True) -> None:
         if not shards:
             raise ValueError("no shards")
         row_elems = shards[0].shape[1]
@@ -182,6 +196,13 @@ class ShardedRowTable:
         self.rows_per_shard = int(height)
         self.row_bytes = self.row_elems * CODECS[self.dtype]
         self.scale = float(scale)
+        self.workers = int(workers)
+        #: Below this many rows the thread pool costs more than the faults it overlaps — a decode
+        #: step asks for 16 rows and is better served by prefetch + mmap (609 us vs 802 us).
+        self.threaded_min_rows = 256
+        #: Issue MADV_WILLNEED before a non-threaded gather. Advisory, so it can never return wrong
+        #: data; on an already-resident range it is a cheap no-op syscall with no I/O.
+        self.auto_prefetch = bool(auto_prefetch)
 
         # Global row ids are defined by the shard's INDEX IN THE CHECKPOINT, not its position in
         # this list. The checkpoint assigns shards to files in string order — `model-plefp8-00000`
@@ -217,6 +238,14 @@ class ShardedRowTable:
                 self._fds[s.path] = fd
                 self._maps[s.path] = mm
             mm = self._maps[s.path]
+            need = s.offset + self.rows_per_shard * self.row_bytes
+            if need > len(mm):
+                raise ValueError(
+                    f"{os.path.basename(s.path)} is too short for its own header: shard needs bytes "
+                    f"up to {need:,} but the file is {len(mm):,} ({need - len(mm):,} missing). "
+                    f"The usual cause is a partial or in-progress download — the safetensors header "
+                    f"is written first, so an incomplete file still advertises every tensor."
+                )
             view = np.frombuffer(mm, dtype=np.uint8, count=self.rows_per_shard * self.row_bytes,
                                  offset=s.offset)
             self._views.append(view.reshape(self.rows_per_shard, self.row_bytes))
@@ -224,15 +253,8 @@ class ShardedRowTable:
 
     # -- gather ------------------------------------------------------------
 
-    def gather_raw(self, row_ids) -> np.ndarray:
-        """(n,) global row ids -> (n, row_bytes) uint8. Faults in only the pages actually touched."""
-        ids = np.asarray(row_ids, dtype=np.int64)
-        if ids.size == 0:
-            return np.empty((0, self.row_bytes), dtype=np.uint8)
-        if ids.min() < 0 or ids.max() >= self.n_rows:
-            raise IndexError(
-                f"row id outside [0, {self.n_rows}): min={ids.min()} max={ids.max()}"
-            )
+    def _locate(self, ids: np.ndarray):
+        """(n,) global row ids -> (slots, absolute file offsets). Raises if a shard is absent."""
         shard_of = ids // self.rows_per_shard
         local = ids - shard_of * self.rows_per_shard
         slots = self._slot_of_id[shard_of]
@@ -243,6 +265,100 @@ class ShardedRowTable:
                 f"({len(self.shards)} of {self.n_shards_total} shards present). "
                 f"Pass the full `model-plefp8-*.safetensors` set for a complete table."
             )
+        base = np.array([s.offset for s in self.shards], dtype=np.int64)[slots]
+        return slots, base + local * self.row_bytes
+
+    def prefetch(self, row_ids) -> None:
+        """Ask the kernel to start reading these rows, without waiting.
+
+        `MADV_WILLNEED` is asynchronous, so issuing it for a whole batch lets the device queue many
+        reads at once; a subsequent `gather` then finds the pages resident instead of taking one
+        serialised major fault per row. This is the cheap half of fixing the latency bound — no
+        threads, one syscall per row, and it is advisory so it can never return wrong data.
+
+        Offsets are sorted first: the kernel merges adjacent requests, and the NVMe queue is happier
+        with ascending LBAs than with the random order the hash produces.
+        """
+        ids = np.asarray(row_ids, dtype=np.int64)
+        if ids.size == 0:
+            return
+        if ids.min() < 0 or ids.max() >= self.n_rows:
+            raise IndexError(f"row id outside [0, {self.n_rows})")
+        slots, offs = self._locate(ids)
+        page = mmap.PAGESIZE
+        for slot in np.unique(slots):
+            sel = slots == slot
+            mm = self._maps[self.shards[int(slot)].path]
+            o = np.sort(offs[sel])
+            starts = (o // page) * page
+            ends = ((o + self.row_bytes + page - 1) // page) * page
+            # Coalesce overlapping/adjacent page ranges so hot regions cost one call, not many.
+            keep = np.empty(starts.size, dtype=bool)
+            keep[0] = True
+            np.greater(starts[1:], ends[:-1], out=keep[1:])
+            grp = np.cumsum(keep) - 1
+            g_start = starts[keep]
+            g_end = np.maximum.reduceat(ends, np.flatnonzero(keep))
+            for a, b in zip(g_start.tolist(), g_end.tolist()):
+                try:
+                    mm.madvise(mmap.MADV_WILLNEED, a, b - a)
+                except (OSError, ValueError):
+                    return  # advisory only — never let a hint failure break a gather
+            del grp
+
+    def _gather_raw_threaded(self, ids: np.ndarray) -> np.ndarray:
+        """Fetch rows with `os.pread` from a thread pool.
+
+        `os.pread` releases the GIL, so N threads give N genuinely concurrent NVMe requests — which
+        is the whole game here, because a single-threaded gather is bound by ~15 us of page-fault
+        latency per row and reaches only ~10 MB/s regardless of what the drive can do. This is what
+        the DGX recipe's `WORKERS=32` is buying.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        slots, offs = self._locate(ids)
+        paths = [self.shards[int(s)].path for s in slots]
+        out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
+        rb = self.row_bytes
+        n_workers = min(self.workers, max(1, ids.size))
+        bounds = np.linspace(0, ids.size, n_workers + 1).astype(np.int64)
+
+        def work(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                fd = self._fds[paths[i]]
+                out[i] = np.frombuffer(os.pread(fd, rb, int(offs[i])), dtype=np.uint8)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            list(ex.map(lambda b: work(*b), list(zip(bounds[:-1], bounds[1:]))))
+        return out
+
+    def gather_raw(self, row_ids) -> np.ndarray:
+        """(n,) global row ids -> (n, row_bytes) uint8. Faults in only the pages actually touched."""
+        ids = np.asarray(row_ids, dtype=np.int64)
+        if ids.size == 0:
+            return np.empty((0, self.row_bytes), dtype=np.uint8)
+        if ids.min() < 0 or ids.max() >= self.n_rows:
+            raise IndexError(
+                f"row id outside [0, {self.n_rows}): min={ids.min()} max={ids.max()}"
+            )
+        # Two mechanisms, and which one wins INVERTS with request size (measured on the full 51.2 GB
+        # table, cold cache, idle box):
+        #
+        #   rows        baseline    prefetch    workers=16/32
+        #   16 (decode)  2320 us      609 us       802 us     <- prefetch wins; pool setup dominates
+        #   8192         906 ms       177 ms        66 ms     <- threads win, 13.8x vs 5.1x
+        #   65536       6199 ms      1326 ms       497 ms     <- threads win, 12.5x vs 4.7x
+        #
+        # So pick per call rather than committing to one. Threads give real I/O concurrency because
+        # os.pread drops the GIL; MADV_WILLNEED gives async readahead with no threads at all, which
+        # is what a 16-row decode step actually wants.
+        if self.workers > 1 and ids.size >= self.threaded_min_rows:
+            return self._gather_raw_threaded(ids)
+        if self.auto_prefetch:
+            self.prefetch(ids)
+        shard_of = ids // self.rows_per_shard
+        local = ids - shard_of * self.rows_per_shard
+        slots = self._slot_of_id[shard_of]
         out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
         # Group by shard so each mmap view is fancy-indexed once, not once per row.
         for slot in np.unique(slots):
@@ -356,6 +472,8 @@ def open_qwen4exp_ngram_table(
     *,
     layer_prefix: str = PLE_PREFIX,
     scale_override: float | None = None,
+    workers: int = 0,
+    auto_prefetch: bool = True,
 ):
     """Open the n-gram table from a Qwen4-Exp checkpoint's `model-plefp8-*.safetensors` set.
 
@@ -400,7 +518,8 @@ def open_qwen4exp_ngram_table(
         scale = float(scale_override)
 
     table = ShardedRowTable(
-        [idx[n] for _, n in found], scale=scale, shard_ids=shard_ids
+        [idx[n] for _, n in found], scale=scale, shard_ids=shard_ids, workers=workers,
+        auto_prefetch=auto_prefetch
     )
 
     heads = None
