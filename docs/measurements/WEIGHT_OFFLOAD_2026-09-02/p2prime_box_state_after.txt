@@ -1,0 +1,36 @@
+=== date ===
+2026-09-03T08:55:56+10:00
+=== rocm-smi ===
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+Exception caught: map::at
+
+
+======================================== ROCm System Management Interface ========================================
+================================================== Concise Info ==================================================
+Device  Node  IDs              Temp    Power   Partitions          SCLK  MCLK     Fan  Perf  PwrCap  VRAM%  GPU%  
+[3m              (DID,     GUID)  (Edge)  (Avg)   (Mem, Compute, ID)                                                 [0m
+==================================================================================================================
+0       1     0x7550,   28946  33.0°C  7.0W    N/A, N/A, 0         0Mhz  96Mhz    0%   auto  320.0W  0%     0%    
+1       2     0x7550,   5255   27.0°C  7.0W    N/A, N/A, 0         0Mhz  96Mhz    0%   auto  260.0W  0%     0%    
+2       3     0x164e,   32869  32.0°C  33.21W  N/A, N/A, 0         N/A   2600Mhz  0%   auto  N/A     52%    84%   
+==================================================================================================================
+============================================== End of ROCm SMI Log ===============================================
+=== showpids ===
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+=== gpu-status ===
+GPU    STATE  HOLDER
+0      FREE   -
+1      FREE   -
+=== free -g ===
+               total        used        free      shared  buff/cache   available
+Mem:              91          21          67           0           4          70
+Swap:             53          18          34

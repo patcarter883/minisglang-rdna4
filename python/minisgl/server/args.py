@@ -158,6 +158,37 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The fraction of GPU memory to use for KV cache.",
     )
 
+    # Weight offload (weights/plan.py). Neither flag is an on/off switch — plan §6.2 forbids one —
+    # they CLAMP a decision the resolver makes from config on every serve. Left at their 0.0
+    # defaults the engine derives the device tier from the card's total memory, so a model that fits
+    # stays entirely VRAM-resident and the offload path costs nothing.
+    #
+    # BOTH ARE GiB (2**30), not decimal GB, because that is what consumes them: `plan.GIB_PER_UNIT`
+    # scales both fields, `Engine._weight_offload_device_budget` converts with the same constant, and
+    # `WeightPlanResolution.summary_line()` renders every figure it prints back in GiB. Saying "GB"
+    # here would be a 7.4% lie in the help text of a knob whose whole job is to be an exact byte
+    # budget — and 7.4% of a tier is enough to move a layer across the greedy fill boundary.
+    parser.add_argument(
+        "--weight-offload-device-gb",
+        type=float,
+        default=ServerArgs.weight_offload_device_gb,
+        help=(
+            "VRAM per rank (GiB) the MoE expert tier may occupy. 0 = derive it from the card's "
+            "total memory. Lowering it moves whole MoE layers to the pinned host arena; each GiB "
+            "surrendered is roughly 200k KV tokens. Applies to MoE expert stacks only — a dense "
+            "model has nothing for this build to offload and the flag is reported as a no-op."
+        ),
+    )
+    parser.add_argument(
+        "--weight-offload-gb",
+        type=float,
+        default=ServerArgs.weight_offload_gb,
+        help=(
+            "Per-rank pinned host weight arena budget (GiB), replacing the measured P3b default in "
+            "BOTH directions. 0 = keep the default. Never an enable switch."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",

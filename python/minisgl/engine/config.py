@@ -146,6 +146,22 @@ class EngineConfig:
     use_pynccl: bool = field(default_factory=lambda: not is_rocm())
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # --- weight offload (weights/plan.py::resolve_weight_plan) ----------------------------------
+    # These two fields are READ BY NAME by `resolve_weight_plan` through a defensive `getattr`.
+    # Until they existed here that `getattr` fell through to 0.0 on every real serve, and the
+    # resolver reads 0.0 as "the expert tier may occupy ZERO bytes of VRAM" — i.e. an ALL-HOST plan
+    # for every MoE model, including ones that fit the card several times over. A missing field is
+    # not a neutral default here; it is a decision, and it was the wrong one.
+    #
+    # `weight_offload_device_gb`: VRAM PER RANK the MoE expert tier may occupy. 0.0 means "not
+    # configured", and `Engine._weight_offload_device_budget` derives it from the card's TOTAL
+    # memory — a stable, rank-identical hardware constant, never a live `mem_get_info` delta (two
+    # ranks measuring different deltas resolve different plans and stream different layers, with no
+    # error anywhere).
+    # `weight_offload_gb`: an upper CLAMP on the pinned host arena per rank; 0.0 means no clamp. It
+    # is never an on/off switch (plan §6.2) — the placement decision is derived either way.
+    weight_offload_device_gb: float = 0.0
+    weight_offload_gb: float = 0.0
     # --- speculative decoding (off by default; see SPEC_DECODE.md) ------------------------------
     # "none" disables every spec path (byte-for-byte unchanged serve). "ngram" enables the
     # prompt-lookup MVP. These flat fields mirror the argparse dests; spec_config assembles them.

@@ -1,0 +1,60 @@
+=== date ===
+2026-09-03T08:42:58+10:00
+=== uname ===
+Linux blue 7.0.10-1-cachyos-custom #1 SMP PREEMPT_DYNAMIC Sun, 24 May 2026 11:52:26 +0000 x86_64 GNU/Linux
+=== rocm-smi ===
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+Exception caught: map::at
+
+
+========================================= ROCm System Management Interface =========================================
+=================================================== Concise Info ===================================================
+Device  Node  IDs              Temp    Power    Partitions          SCLK  MCLK     Fan  Perf  PwrCap  VRAM%  GPU%  
+[3m              (DID,     GUID)  (Edge)  (Avg)    (Mem, Compute, ID)                                                 [0m
+====================================================================================================================
+0       1     0x7550,   28946  33.0°C  6.0W     N/A, N/A, 0         0Mhz  96Mhz    0%   auto  320.0W  0%     0%    
+1       2     0x7550,   5255   27.0°C  8.0W     N/A, N/A, 0         0Mhz  96Mhz    0%   auto  260.0W  0%     0%    
+2       3     0x164e,   32869  31.0°C  25.004W  N/A, N/A, 0         N/A   2600Mhz  0%   auto  N/A     52%    0%    
+====================================================================================================================
+=============================================== End of ROCm SMI Log ================================================
+=== rocm-smi --showpids ===
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+=== gpu-status ===
+GPU    STATE  HOLDER
+0      FREE   -
+1      FREE   -
+=== free -g ===
+               total        used        free      shared  buff/cache   available
+Mem:              91          21          67           0           4          70
+Swap:             53          18          34
+=== /proc/meminfo head ===
+MemTotal:       96304676 kB
+MemFree:        70607588 kB
+MemAvailable:   74225952 kB
+SwapTotal:      56540664 kB
+SwapFree:       36645244 kB
+HugePages_Total:       0
+=== GPU-touching procs ===
+pat      2098287  0.0  0.0   9280  1716 ?        Ss   Aug12   0:04 /bin/zsh -c source /home/pat/.claude/shell-snapshots/snapshot-zsh-1785565268108-dtvlan.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && eval 'until [ -s /tmp/claude-1000/-home-pat-code-minisgl-rdna4/75404185-c434-48c7-990f-b43957ee11f5/tasks/b7qxwy7gi.output ]; do sleep 90; done; echo REPORT_READY' < /dev/null && pwd -P >| /tmp/claude-4dd3-cwd
+pat      3891652  0.0  0.0   9280  1788 ?        Ss   Aug11   0:10 /bin/zsh -c source /home/pat/.claude/shell-snapshots/snapshot-zsh-1785565268108-dtvlan.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && eval 'until [ -s /tmp/claude-1000/-home-pat-code-minisgl-rdna4/75404185-c434-48c7-990f-b43957ee11f5/tasks/bp28apcd0.output ]; do sleep 45; done; echo OK' < /dev/null && pwd -P >| /tmp/claude-3982-cwd
+(none above = clean)
+=== docker ps ===
+CONTAINER ID   IMAGE                                   COMMAND                  CREATED       STATUS                 PORTS                                                                                            NAMES
+de95f9da76fd   cloudflare/cloudflared:latest           "cloudflared --no-au…"   2 weeks ago   Up 2 weeks                                                                                                              minisgl-cloudflared
+c18e50edc274   grafana/grafana:latest                  "/run.sh"                2 weeks ago   Up 2 weeks             0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp                                                      vllm-gfx1201-grafana
+210fa5b9a75f   firecrawl-api                           "docker-entrypoint.s…"   4 weeks ago   Up 4 weeks             127.0.0.1:3002->3002/tcp, 8080/tcp                                                               firecrawl-api-1
+83f36afe1461   rabbitmq:3-management                   "docker-entrypoint.s…"   4 weeks ago   Up 4 weeks (healthy)   4369/tcp, 5671-5672/tcp, 15671-15672/tcp, 15691-15692/tcp, 25672/tcp                             firecrawl-rabbitmq-1
+b0a91ef90737   firecrawl-nuq-postgres                  "docker-entrypoint.s…"   4 weeks ago   Up 4 weeks             5432/tcp                                                                                         firecrawl-nuq-postgres-1
+a0ce893d8702   redis:alpine                            "docker-entrypoint.s…"   4 weeks ago   Up 4 weeks             6379/tcp                                                                                         firecrawl-redis-1
+77c18403f99f   firecrawl-playwright-service            "docker-entrypoint.s…"   4 weeks ago   Up 4 weeks                                                                                                              firecrawl-playwright-service-1
+43f2f386ec4f   turnstone:local                         "entrypoint.sh sh -c…"   5 weeks ago   Up 4 weeks (healthy)                                                                                                    turnstone-node-2-1
+7ec4974ee65b   turnstone:local                         "entrypoint.sh sh -c…"   5 weeks ago   Up 4 weeks (healthy)                                                                                                    turnstone-node-10-1

@@ -1,0 +1,18 @@
+{"stress": "A_dev_uniform1p5M#0", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "B_host_uniform1p5M#0", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "C_alt_w13rows#0", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "D_alt_mixedsize#0", "n": 256, "n_fail": 111, "rate": 0.4336, "first_fail": {"i": 1, "call": "setaccess", "rc": 1, "size": 1572864, "media": "host", "va": "0x7f5a6a2c0000"}, "fail_calls": {"setaccess": 111}, "fail_media": {"host": 55, "dev": 56}}
+{"stress": "A_dev_uniform1p5M#1", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "B_host_uniform1p5M#1", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "C_alt_w13rows#1", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "D_alt_mixedsize#1", "n": 256, "n_fail": 88, "rate": 0.3438, "first_fail": {"i": 1, "call": "setaccess", "rc": 1, "size": 1572864, "media": "host", "va": "0x7f5a6a2c0000"}, "fail_calls": {"setaccess": 88}, "fail_media": {"host": 44, "dev": 44}}
+{"stress": "A_dev_uniform1p5M#2", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "B_host_uniform1p5M#2", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "C_alt_w13rows#2", "n": 256, "n_fail": 0, "rate": 0.0, "first_fail": null, "fail_calls": {}, "fail_media": {}}
+{"stress": "D_alt_mixedsize#2", "n": 256, "n_fail": 88, "rate": 0.3438, "first_fail": {"i": 1, "call": "setaccess", "rc": 1, "size": 1572864, "media": "host", "va": "0x7f5a6a2c0000"}, "fail_calls": {"setaccess": 88}, "fail_media": {"host": 45, "dev": 43}}
+{"stress": "E_minimal_pair_fresh_reservations", "n": 100, "n_fail": 75, "rate": 0.75, "fail_kinds": {"setaccess/host": 75}}
+{
+ "AGGREGATE_chunks": 3072,
+ "AGGREGATE_fails": 287,
+ "AGGREGATE_rate": 0.09342
+}

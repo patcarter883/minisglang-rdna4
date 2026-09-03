@@ -31,6 +31,7 @@ from minisgl.kvcache._envutil import env_int
 from minisgl.kvcache.ghost_cache import ghost_oracle_path
 from minisgl.spec.accept_gpu import accept_greedy_ondevice, truncate_at_eos_ondevice
 from minisgl.utils import div_ceil, init_logger, load_tokenizer, resolve_stop_token_ids
+from minisgl.weights.bake import weight_arena_torch_slack_bytes
 
 from .cache import CacheManager
 from .cca_slots import CCASlotManager
@@ -790,6 +791,17 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 elif self._ddtree_seg:
                     tree_qlen = self._ddtree_seg_layout["n_query"]
                 self.engine.capture_spec_ddtree_verify_graphs(tree_qlen, ddtree_bs, max_ctx)
+        # WEIGHT OFFLOAD: the LAST capture site in the process. `Engine.__init__` gates the arena
+        # after ITS captures (decode + canvas), but three of the five capture families —
+        # spec-verify, propose, fused-TiDAR and DDTree — are captured HERE, after the engine's
+        # constructor has returned, because they need the proposer. An arena allocation made inside
+        # any of them is never freed (the arena is a forward-only bump allocator with a no-op free)
+        # and its address is baked into a graph that replays for the life of the process; one that
+        # MISSES the arena cannot fall back at all, because hipMalloc is illegal mid-capture, and
+        # returns NULL for torch to dereference. Idempotent, inert on every serve that does not
+        # offload, and run unconditionally (not under `if self.spec_config`) so the path is
+        # exercised on every serve rather than only on spec ones.
+        self.engine.verify_weight_arena_after_capture()
         # uid -> last_hidden / aux_hidden of the verified position carried to the NEXT propose. Empty
         # unless a draft-head proposer requested capture (so n-gram serve allocates nothing).
         self._spec_last_hidden: dict[int, torch.Tensor] = {}
@@ -2287,6 +2299,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             # there is ~2.5 GiB of headroom, and collapse the budget. Available = device-free + the
             # allocator's own free cache.
             free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            # ...minus whatever of that cache is the WEIGHT ARENA. Arena segments are reserved but
+            # not allocated, and unlike ordinary allocator slack they are NOT reusable: a host-backed
+            # segment is not device memory at all, and a device-tier segment holds frozen weights.
+            # Counting them would inflate this guard's idea of free VRAM by up to the whole arena and
+            # turn a protective clamp into an OOM. Exactly 0 on every serve that does not offload
+            # (see weights/accounting.py::torch_slack_bytes), so the guard is unchanged today.
+            free -= weight_arena_torch_slack_bytes()
         except Exception:  # noqa: BLE001 - the guard must never break scheduling
             return base
         affordable = (free - self._act_safety_bytes) // self._act_bytes_per_token

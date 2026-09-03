@@ -6,6 +6,7 @@ import torch
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.quant.method import UnquantizedLinearMethod
 from minisgl.utils import div_even
+from minisgl.weights.granule import ExpertContainer
 
 from .base import BaseOP
 
@@ -13,12 +14,36 @@ if TYPE_CHECKING:
     from minisgl.quant.method import LinearMethod
 
 
-class _LinearTPImpl(BaseOP):
+class _LinearTPImpl(ExpertContainer, BaseOP):
     """Real implementation of a linear layer with tensor parallelism.
 
     Weight layout + the matmul are delegated to a LinearMethod (default unquantized
     `F.linear`); a W4A8 method swaps in quantized buffers + the WMMA kernel without
     changing the sharding/collective logic here."""
+
+    # ── granule descriptor ──────────────────────────────────────────────────────────────────────
+    # DENSE IS THE SAME MECHANISM, and — load-bearing — the same CLASS: `ExpertContainer` with the
+    # granule axis declared as "the whole container is ONE granule". Not a parallel pair of
+    # look-alike methods on this class, because a look-alike drifts: it silently lacked
+    # `expert_slice` and `offload_refusal`, so the one surface a residency consumer would write
+    # against worked for a 512-expert MoE stack and raised `AttributeError` on a bf16 QKV
+    # projection. Sharing the mixin is "MoE and dense land together" discharged in code.
+    #
+    # The quant methods build the same repack-and-delete shape the MoE containers do
+    # (`_w_packed_op` / `_scales_op` / `_zeros_op` / `_w_rep_wide`, checkpoint names deleted), so
+    # the same underscore-inclusive walk finds them and the same fail-closed rule applies — which
+    # is what makes dense offload a merge gate rather than a follow-on. And the BIAS is in the
+    # granule: a moved weight with a left-behind bias is the same silent-corruption family as a
+    # left-behind scale.
+    _granule_dense = True
+
+    # The dense compressed-tensors path makes the same undetectable-by-walk decode decision the MoE
+    # one does (`W4A8LinearMethod.process_weights_after_load` -> `ct_packed_sign_convention` ->
+    # `layer._ct_sign`), so it declares the same policy path. There is no w13/w2 pair to cross-check
+    # here, but it still lands in `fingerprint()`, which is what two TP ranks compare: a rank that
+    # resolved the nibble histogram the other way decodes every int4 weight of this linear off by 8
+    # quanta, and nothing else in the descriptor would move.
+    _granule_policy = ("_ct_sign.uint4b8",)
 
     def __init__(
         self,
