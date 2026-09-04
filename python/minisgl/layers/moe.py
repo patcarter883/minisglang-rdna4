@@ -1143,10 +1143,26 @@ class MoELayer(BaseOP):
         topk_ids: "torch.Tensor | None",
     ):
         """Return (topk_weights f32, topk_ids i32) for the EP dispatch. EP must all_gather a route, so
-        it can't defer to the kernel's fused softmax+topk — precompute it here (matching the kernel's
-        own torch route: softmax -> top_k -> optional renorm, kernels.py w4a8_moe._route). A model that
-        already provides a route (GLM/DeepSeek noaux_tc) passes it through unchanged; renormalize must
-        happen over ALL top_k here, BEFORE the per-rank local-expert masking in _ep_dispatch."""
+        it can't defer to the kernel's fused softmax+topk — precompute it here. A model that already
+        provides a route (GLM/DeepSeek noaux_tc) passes it through unchanged; renormalize must happen
+        over ALL top_k here, BEFORE the per-rank local-expert masking in _ep_dispatch.
+
+        NOT bit-identical to the non-EP route, and it must NOT be used to PREDICT which experts the
+        kernel will read. This used to claim it matched "the kernel's own torch route (kernels.py
+        w4a8_moe._route)". That function no longer exists — the served route is
+        `moe_hip.moe_route_align`, which does softmax + top-k INSIDE the kernel — and the two break
+        EXACT TIES at the k-th boundary opposite ways. Ties are common, not exotic: the gate logits are
+        bf16 (8 mantissa bits) spread over hundreds of experts. MEASURED on Qwen3.8-Flash-Next
+        (E=512, top_k=10), layer 0 of an 8-token prefill: experts 324 and 366 both scored exactly
+        -5.09375 at ranks 9 and 10, straddling the cut; the kernel kept the LOWER index (324) and
+        `torch.topk` kept the higher (366). Two of the eight MoE calls in that one forward diverged by
+        exactly one expert this way.
+
+        This is self-consistent for EP — `_ep_dispatch` hands these ids to the kernel, so an EP serve
+        uses this route end to end — but it does mean an EP and a non-EP serve of the same model can
+        select a different expert on a tie row. Anything that needs the set of experts the GEMM will
+        actually dereference (a routed weight gather, an offload prefetch) must call
+        `quant.kernels._route_align` and read its `topk_ids`/`expert_ids`, not re-derive it here."""
         if topk_ids is not None:
             assert topk_weights is not None, "topk_weights required when topk_ids is given"
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)

@@ -5,13 +5,16 @@ and decodes each E2M1 code -> fp8 e4m3 IN-REGISTER at the WMMA (fp8xfp8). NVFP4 
 E2M1 weight codes as MXFP4; the only difference is the SCALE:
 
   * MXFP4 : E8M0 uint8 per-32-element block exponent (2^(s-127)).
-  * NVFP4 : e4m3 fp8 per-16-element block scale  x  a per-tensor fp32 `weight_global_scale`
-            (= FP8_E4M3_MAX(448) * FP4_E2M1_MAX(6) / amax, a quantization scale you DIVIDE by).
+  * NVFP4 : e4m3 fp8 per-16-element block scale  x  a per-tensor fp32 global scale. TWO PRODUCERS
+            SPELL THAT GLOBAL DIFFERENTLY AND RECIPROCALLY: compressed-tensors
+            `weight_global_scale` = 448*6/amax (DIVIDE by it), modelopt `weight_scale_2` =
+            amax/(448*6) (MULTIPLY by it). See NVFP4_GLOBAL_SCALE_IS_RECIPROCAL.
 
 So NVFP4 is served WITHOUT any weight upconvert (4-bit stays 4-bit) by FOLDING its two-level scale into
 the one per-group fp16 scale the kernel already consumes:
 
     fp16_group_scale[n, g] = weight_scale_e4m3[n, g].to(fp16) / weight_global_scale        (group_size 16)
+    fp16_group_scale[n, g] = weight_scale_e4m3[n, g].to(fp16) * weight_scale_2             (modelopt)
 
 This fold is exact (fp16 easily holds e4m3/global; E2M1->e4m3 decode is lossless), so NVFP4 lands at
 native-NVFP4 fidelity AND native-NVFP4 memory — strictly better than upconverting to fp8 W8A8 (which
@@ -34,18 +37,64 @@ from .mxfp4 import pack_codes_to_int32, unpack_e2m1_nibbles
 
 NVFP4_GROUP_SIZE = 16  # NVFP4 block scale spans 16 elements (vs MXFP4's 32)
 
+# THE TWO PRODUCERS OF NVFP4 SHIP RECIPROCAL PER-TENSOR GLOBALS, AND THE NAME IS THE ONLY TELL.
+#
+#   compressed-tensors  `.weight_global_scale` = 448*6/amax   -> a LARGE number you DIVIDE by
+#   modelopt            `.weight_scale_2`      = amax/(448*6) -> a SMALL number you MULTIPLY by
+#
+# Measured on RadixArk/Qwen3.8-Flash-Next-NVFP4 (modelopt 0.46.0), layer 0 routed experts:
+# weight_scale_2 = 2.078e-4, e4m3 block scales 7..256. Multiplying gives |w| mean 0.0105 / max 0.18,
+# which matches the same layer's UNQUANTIZED bf16 shared expert (|w| mean 0.0071) — the anchor that
+# settles the direction by measurement. Dividing gives |w| mean 242,377, and folded scales up to
+# 4.2e6 that OVERFLOW the fp16 the kernel consumes -> inf -> NaN logits from the first MoE block.
+#
+# `global_field` is therefore REQUIRED, and it is the literal checkpoint suffix the caller read the
+# global out of — not a bool and not a producer name. A new NVFP4 loader cannot call this without
+# stating which spelling it found, and a spelling that is not listed here raises instead of guessing.
+NVFP4_GLOBAL_SCALE_IS_RECIPROCAL = {
+    "weight_global_scale": True,  # compressed-tensors: divide
+    "weight_scale_2": False,  # modelopt: multiply
+}
+
 
 def fold_nvfp4_scale(
-    weight_scale: torch.Tensor, global_scale: torch.Tensor
+    weight_scale: torch.Tensor, global_scale: torch.Tensor, *, global_field: str
 ) -> torch.Tensor:
     """(N, K//16) e4m3 block scale + per-tensor f32 global -> (N, K//16) fp16 per-group scale.
 
-    fp16 = e4m3.to(fp16) / global. Model-agnostic and layout-agnostic (operates per element, so it
-    composes with the loader's later concat/merge/stack). Run at the LEAF, before any weight fusion,
-    so the per-tensor global is absorbed into the per-group scale and never has to survive a merge."""
-    return (weight_scale.to(torch.float32) / global_scale.to(torch.float32).reshape(())).to(
-        torch.float16
-    )
+    Model-agnostic and layout-agnostic (operates per element, so it composes with the loader's later
+    concat/merge/stack). Run at the LEAF, before any weight fusion, so the per-tensor global is
+    absorbed into the per-group scale and never has to survive a merge.
+
+    `global_field` names the CHECKPOINT tensor suffix `global_scale` came from and selects the
+    convention — see `NVFP4_GLOBAL_SCALE_IS_RECIPROCAL`.
+    """
+    try:
+        reciprocal = NVFP4_GLOBAL_SCALE_IS_RECIPROCAL[global_field]
+    except KeyError:
+        raise ValueError(
+            f"unknown NVFP4 global-scale field {global_field!r}. The per-tensor global is a DIVISOR "
+            f"in compressed-tensors ('weight_global_scale') and a MULTIPLIER in modelopt "
+            f"('weight_scale_2'); the two are reciprocals and picking wrong is a ~7-orders-of-"
+            f"magnitude error that shows up as NaN, not as a load failure. Add the new spelling to "
+            f"NVFP4_GLOBAL_SCALE_IS_RECIPROCAL with its measured direction."
+        ) from None
+    ws = weight_scale.to(torch.float32)
+    g = global_scale.to(torch.float32).reshape(())
+    folded = (ws / g if reciprocal else ws * g).to(torch.float16)
+    # The fp16 store is the kernel's scale dtype, and it is exactly where a wrong convention stops
+    # being an arithmetic error and becomes an inf. Checking here makes that class of mistake a loud
+    # load-time failure instead of NaN logits 48 layers later, which is the failure mode this repo
+    # has been burned by before.
+    if not bool(folded.isfinite().all()):
+        raise ValueError(
+            f"NVFP4 scale fold overflowed fp16 for global_field={global_field!r}: "
+            f"{int((~folded.isfinite()).sum())}/{folded.numel()} folded scales are inf/nan "
+            f"(e4m3 block scale max {float(ws.max()):.4g}, global {float(g):.6e}). The kernel's "
+            f"per-group scale is fp16 (max 65504), so this is a real dequant error and not a "
+            f"precision nit — most likely the global-scale convention is inverted for this producer."
+        )
+    return folded
 
 
 def convert_nvfp4_weight(weight_packed: torch.Tensor, weight_scale: torch.Tensor) -> dict:
@@ -87,17 +136,30 @@ def convert_nvfp4_moe(weight_packed: torch.Tensor, weight_scale: torch.Tensor) -
 
 
 def dequant_reference(
-    weight_packed: torch.Tensor, weight_scale_e4m3: torch.Tensor, global_scale: torch.Tensor
+    weight_packed: torch.Tensor,
+    weight_scale_e4m3: torch.Tensor,
+    global_scale: torch.Tensor,
+    *,
+    global_field: str = "weight_global_scale",
 ) -> torch.Tensor:
     """Golden dequant from the RAW NVFP4 checkpoint tensors (pre-fold): E2M1_LUT[code] *
-    (e4m3_block_scale / global_scale). (N, K) f32 — what the folded e2m1 kernel path must reproduce."""
+    fold(e4m3_block_scale, global). (N, K) f32 — what the folded e2m1 kernel path must reproduce.
+
+    Takes the same `global_field` convention selector as `fold_nvfp4_scale` and reads the SAME
+    `NVFP4_GLOBAL_SCALE_IS_RECIPROCAL` table, so the golden and the served path cannot disagree about
+    the direction — but it stays in fp32 rather than calling the fold, because the fold's fp16 store
+    is precisely the kernel-side rounding this reference exists to measure. It keeps a default
+    (unlike the fold) because it is a diagnostic and every current caller is compressed-tensors."""
     from .mxfp4 import FP4_E2M1_LUT
 
+    if global_field not in NVFP4_GLOBAL_SCALE_IS_RECIPROCAL:
+        raise ValueError(f"unknown NVFP4 global-scale field {global_field!r}")
     codes = unpack_e2m1_nibbles(weight_packed).to(torch.int64)
     lut = torch.tensor(FP4_E2M1_LUT, dtype=torch.float32, device=weight_packed.device)
     w = lut[codes]  # (N, K)
     bs = weight_scale_e4m3.to(torch.float32).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)  # (N, K)
-    return w * bs / global_scale.to(torch.float32).reshape(())
+    g = global_scale.to(torch.float32).reshape(())
+    return w * bs / g if NVFP4_GLOBAL_SCALE_IS_RECIPROCAL[global_field] else w * bs * g
 
 
 # --- ENCODER: bf16/fp32 -> NVFP4 -----------------------------------------------------------------

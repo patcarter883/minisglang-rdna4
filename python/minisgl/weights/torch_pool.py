@@ -36,6 +36,7 @@ assert it is zero, do not merely log it.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import sys
 from contextlib import contextmanager
@@ -45,6 +46,60 @@ from .pinned_arena import PinnedWeightArena
 
 # Module-level, permanent, never cleared. See note 1 above.
 _KEEP: List[Any] = []
+
+# The live `ArenaMemPool`s. Held separately from `_KEEP` so `_release_pools_at_exit` can drop the
+# `torch.cuda.MemPool` each one owns WITHOUT dropping the trampolines that pool calls. See that
+# function for why the two lifetimes must part ways.
+_POOLS: List[Any] = []
+_ATEXIT_REGISTERED = False
+
+
+def _release_pools_at_exit() -> None:
+    """Destroy every arena `MemPool` while the interpreter is still alive.
+
+    THE BUG THIS FIXES (measured 2026-09-04, and it predates TP): every qwen4_exp offload run this
+    repo has ever done ended in `SIGSEGV`, at exit, after a clean PASS. `faulthandler` put the last
+    frame at `torch_pool.py::_free`.
+
+    The sequence is: torch's C++ `MemPool` destructor runs during interpreter FINALIZATION and calls
+    the raw free function pointer for each block it still holds. That pointer is a ctypes
+    `CFUNCTYPE` trampoline, and entering it means acquiring the GIL and building a Python frame — in
+    an interpreter that no longer has one. The crash is therefore INSIDE the trampoline, before
+    `_free`'s body, which is why `_free` being a `try/except`-wrapped no-op did not and could not
+    prevent it (module note 3's "an exception here becomes a NULL return" reasoning only covers
+    callbacks that actually reach Python).
+
+    Nothing is freed by this. `_free` is a no-op, the arena's chunks are released only by an explicit
+    `PinnedWeightArena.close()`, and every device pointer torch handed out stays mapped — so
+    dropping the pool cannot invalidate a live tensor's `data_ptr()`. What it does is move the
+    callback torch was always going to make from "after finalization" to "here, now", where the
+    interpreter can service it. `free_events` counts them, so a run can report how many fired rather
+    than assuming P5b's measured zero still holds at teardown.
+
+    The trampolines in `_KEEP` are deliberately NOT dropped, here or ever: once the pools are gone
+    nothing should call them again, but note 1's rule is that a collected trampoline is a dangling
+    function pointer, and an atexit handler is exactly the wrong place to start testing that claim.
+
+    Never raises. An `atexit` handler that throws prints a traceback over the run's real output and
+    changes the exit code, which is the same failure this exists to remove.
+    """
+    if not _POOLS:
+        return
+    try:
+        import gc
+
+        # Drop the OWNER's reference too. `ArenaMemPool` is reachable from the arena -> the offload
+        # driver -> the engine, all of which outlive this handler, so clearing the list alone leaves
+        # the `MemPool` refcount at one and the dtor still lands in finalization.
+        for inst in _POOLS:
+            inst.pool = None
+        _POOLS.clear()
+        # Refcount-driven, and the pool may sit in a cycle with its allocator, so collect: the free
+        # callbacks must land inside THIS function, not at some later and less alive moment.
+        gc.collect()
+    except BaseException as exc:  # pragma: no cover - teardown, reported not raised
+        _shout(f"pool release at exit failed ({type(exc).__name__}: {exc}); "
+               f"a segfault after this line is that failure, not the arena")
 
 _ALLOC_T = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)
 _FREE_T = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)
@@ -114,7 +169,13 @@ class ArenaMemPool:
             pool = torch.cuda.MemPool(allocator)
         except TypeError:  # older signature
             pool = torch.cuda.MemPool(allocator=allocator)
-        _KEEP.append(pool)
+        # NOT in `_KEEP`: the pool must be droppable at exit while the trampolines it calls stay
+        # alive forever. `_release_pools_at_exit` is the whole reason those two lifetimes differ.
+        _POOLS.append(self)
+        global _ATEXIT_REGISTERED
+        if not _ATEXIT_REGISTERED:
+            atexit.register(_release_pools_at_exit)
+            _ATEXIT_REGISTERED = True
         self.allocator = allocator
         self.pool = pool
 

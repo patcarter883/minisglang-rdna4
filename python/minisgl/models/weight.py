@@ -2,15 +2,85 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import re
-from typing import Collection, Dict, FrozenSet, Iterator, Tuple
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import safetensors
 import torch
 from minisgl.distributed import get_dp_info, get_ep_rank, get_ep_size, get_tp_info, is_ep_enabled
 from minisgl.quant import nvfp4
-from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
+from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight, init_logger
 from tqdm import tqdm
+
+logger = init_logger(__name__)
+
+
+def cast_checkpoint_tensor(key: str, v: torch.Tensor, model_dtype: torch.dtype) -> torch.Tensor:
+    """The dtype normalization every `load_weight` consumer MUST apply. Part of loading, not of the
+    engine.
+
+    A checkpoint's stored dtype is not the dtype the layer runs in, and the rules are per-tensor-KIND
+    rather than global: packed quant blobs and scales keep their encoding, the GDN gating params and
+    the fp32 residual affines are upcast, everything else follows the model dtype.
+
+    THIS LIVED AS A CLOSURE INSIDE `Engine._load_weight_state_dict`, which made it invisible to every
+    other caller of `load_weight` — and that is not hypothetical. The `qwen4_exp` bring-up harness
+    fed the loader's raw output straight into `load_state_dict` and died in `gdn_prefill_wmma` with
+    "expected scalar type Float but found BFloat16", because `RadixArk/Qwen3.8-Flash-Next-NVFP4`
+    ships BOTH `A_log` and `dt_bias` as bf16 while the kernels and the module's `nn.Parameter` are
+    fp32. `GDNLinearAttn` loads its wrapped module with `assign=True`, so a checkpoint dtype survives
+    into the parameter and nothing downstream would have caught it.
+
+    `model_dtype` is passed rather than read from a global because it is the ENGINE's activation
+    dtype, which a bring-up harness or an offline repack picks for itself.
+    """
+    if not v.is_floating_point() or key.endswith(".scales"):
+        return v
+    # ZAYA experts stay fp8: the F8_E4M3 weight must NOT be upcast (that re-inflates ~8 GB fp8 ->
+    # ~16 GB bf16 and OOMs the 16 GB card), and its per-channel fp32 weight_scale must keep fp32.
+    # Dequant is deferred to compute (_GroupedFP8Experts).
+    if v.dtype == torch.float8_e4m3fn:
+        return v
+    if key.endswith(".weight_scale"):
+        # fp8 (ZAYA) per-channel scales are fp32 and MUST stay fp32; compressed-tensors int4 scales
+        # ship fp16 OR bf16 -> normalize to fp16 (the op's + the linear buffer's declared scale
+        # dtype) so a bf16-scale head and an fp16-scale backbone both load against the same float16
+        # buffer.
+        return v if v.dtype == torch.float32 else v.to(torch.float16)
+    # GDN gating params stay fp32. The kernels and the model's nn.Parameter require fp32 whatever the
+    # checkpoint stores, so the upcast is unconditional: A_log ships fp32 in the Qwen3.5 line and
+    # BF16 in Qwen3.8-Flash-Next, dt_bias ships bf16 in both.
+    if key.endswith((".A_log", ".dt_bias")):
+        return v.to(torch.float32)
+    # ZAYA router balancing_biases is an fp32 buffer (added to the fp32 router softmax; ships bf16,
+    # upcast to keep the buffer fp32 and the choice numerics faithful). The ResidualScaling affines
+    # run in fp32 on the fp32 residual stream (scale_residual_merge ships bf16 -> upcast so the merge
+    # stays fp32). CCA conv/temp can stay bf16 (post_load upcasts them to fp32 once for the
+    # kernel-weight cache).
+    if key.endswith(
+        (
+            ".balancing_biases",
+            ".hidden_states_scale",
+            ".hidden_states_bias",
+            ".residual_scale",
+            ".residual_bias",
+        )
+    ):
+        return v.to(torch.float32)
+    return v.to(model_dtype)
+
 
 _SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".q_b_proj", ".kv_b_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
@@ -144,6 +214,100 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     if packed_name.endswith(".weight"):
         packed_name = packed_name.removesuffix(".weight")
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
+
+
+class _ExpertStacker:
+    """Accumulate an MoE layer's per-expert tensors INTO a preallocated ``[E, ...]`` output.
+
+    WHY THIS IS NOT ``torch.stack`` OVER A DICT, which is what both loaders used to do.
+
+    ``torch.stack`` must have every source alive at the moment it allocates its result, so buffering
+    all ``E`` experts and stacking at the end holds the layer's expert row TWICE on the card at once.
+    On this checkpoint the largest row is 400 MiB, so that one line peaked at 800 MiB of VRAM for a
+    400 MiB tensor — and it did so INSIDE ``ChunkedWeightLoader.apply_chunk``, whose whole contract
+    is "the live set is one chunk, by construction". It was not: the peak was one chunk plus a
+    doubled expert row, and the gap is invisible in the ledger because both allocations retire
+    before the next sample.
+
+    That gap is a CAPACITY bug, not an efficiency nit. The 48-layer TP=2 offload serve is bounded by
+    host RAM, the only lever against that is moving layers to the device tier, and the device tier
+    was pinned at 11 layers because 12 OOM'd here — asking for 400 MiB with 224 MiB free while torch
+    held 486 MiB reserved-but-unallocated. Removing the double-buffer frees ~400 MiB of device peak,
+    which is what lets the 12th layer be device-resident and drops the node's pinned host arena from
+    54.20 GiB to 52.73 GiB.
+
+    BIT-IDENTICAL to the old form: ``out[i].copy_(expert_i)`` for ``i in 0..E-1`` writes exactly the
+    rows ``torch.stack(experts, dim=0)`` writes, in the same dim-0 order, with no arithmetic. The
+    output is allocated on the FIRST expert's device/dtype, so a source that disagrees on dtype,
+    shape or device raises in ``copy_`` here instead of silently broadcasting.
+
+    Held per packed key because experts arrive interleaved across shard files; the completeness
+    asserts at the end of each loader read :attr:`pending`.
+    """
+
+    __slots__ = ("_out", "_filled", "_width")
+
+    def __init__(self) -> None:
+        self._out: Dict[str, torch.Tensor] = {}
+        self._filled: Dict[str, set] = {}
+        self._width: Dict[str, int] = {}
+
+    def add(
+        self, packed_key: str, idx: int, tensor: torch.Tensor, num_experts: int
+    ) -> "torch.Tensor | None":
+        """Place expert ``idx``. Returns the finished ``[E, ...]`` tensor once all ``E`` landed."""
+        out = self._out.get(packed_key)
+        if out is None:
+            out = torch.empty(
+                (num_experts, *tensor.shape), dtype=tensor.dtype, device=tensor.device
+            )
+            self._out[packed_key] = out
+            self._filled[packed_key] = set()
+            self._width[packed_key] = num_experts
+        elif self._width[packed_key] != num_experts:
+            # The expert count for one packed key changed mid-stream (an EP-shard/replication
+            # decision applied inconsistently). Say so: the alternative is a partially-filled
+            # output that loads without complaint.
+            raise AssertionError(
+                f"{packed_key}: expert count changed mid-stack "
+                f"({self._width[packed_key]} -> {num_experts})"
+            )
+        filled = self._filled[packed_key]
+        if idx in filled:
+            raise AssertionError(
+                f"{packed_key}: expert {idx} delivered twice; the second write would silently win"
+            )
+        if not (0 <= idx < num_experts):
+            raise AssertionError(
+                f"{packed_key}: expert index {idx} outside [0, {num_experts}) — an EP shard offset "
+                f"was applied twice or not at all"
+            )
+        # EXACT shape/dtype, because `Tensor.copy_` BROADCASTS and `torch.stack` does not. Without
+        # this, a checkpoint whose experts disagree on shape — a mis-sharded rank, a mixed-width MoE
+        # — would have RAISED under `torch.stack` and would now silently fan one expert's row across
+        # the slot. That is the one way this rewrite could be less safe than the code it replaces,
+        # so it is checked rather than argued.
+        if tuple(tensor.shape) != tuple(out.shape[1:]) or tensor.dtype != out.dtype:
+            raise AssertionError(
+                f"{packed_key}: expert {idx} is {tuple(tensor.shape)}/{tensor.dtype}, but the stack "
+                f"was opened as {tuple(out.shape[1:])}/{out.dtype} by its first expert"
+            )
+        out[idx].copy_(tensor)
+        filled.add(idx)
+        if len(filled) != num_experts:
+            return None
+        del self._filled[packed_key], self._width[packed_key]
+        return self._out.pop(packed_key)
+
+    @property
+    def pending(self) -> "List[str]":
+        return sorted(self._out)
+
+    def __bool__(self) -> bool:
+        return bool(self._out)
+
+    def __len__(self) -> int:
+        return len(self._out)
 
 
 # ---- Qwen3.5 GDN-hybrid weight-name remap (Phase 3d-3) ----
@@ -433,6 +597,121 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     return t
 
 
+# Qwen3.8-Flash-Next submodules that are REPLICATED ON EVERY RANK, by construction of the model:
+# each one is built from `LinearReplicated` / a plain `RMSNorm` / a bare buffer, so its parameter is
+# full-width on every rank and a shard would leave rank r holding a slice the layer will never index.
+#
+# This set is spelled out rather than left to `_shard_qwen4_exp`'s fall-through, even though the
+# fall-through IS "replicate" and would produce the same tensors today. The reason is the direction
+# each mistake fails in. A missing shard rule for something that SHOULD shard fails loudly at
+# `load_state_dict` on a shape mismatch; a rule that shards something that should NOT is what this
+# list prevents, and that one is silent when the shapes happen to divide — `input_mix_weight_up` is
+# [10240, 320] and `key_proj` is [10240, 2560], both evenly splittable at TP=2 by any rule that grew
+# a matching suffix later. Naming them here means a future rule that would capture one of these has
+# to delete an entry that says why it exists.
+#
+#   * `*_hyper_connection.*` / `hyper_connection_mixer.*` — the hyper-connection MIXES across the
+#     hc_count residual streams of the WHOLE hidden state. A column split would give each rank a
+#     partial mix with no all-reduce to complete it: right shapes, plausible text, wrong model. The
+#     checkpoint's quant `ignore` list carries `*hyper_connection*` so these stay bf16, and "not
+#     quantized" is not "not sharded" — the two are easy to conflate and only this list separates them.
+#   * `self_attn.indexer.*` — `QSAIndexer` is parameters-only (bring-up plan T5); `index_qk_proj` is
+#     `LinearReplicated` and both layernorms are per-head-dim.
+#   * `.ple.*` — the PLE block's `key_proj`/`value_proj` are `LinearReplicated`, its conv1d is a flat
+#     depthwise buffer over the wide stream, and its three `GroupedRMSNorm`s are grouped by
+#     hidden_size. The block consumes and produces the WIDE stream, which is not sharded.
+#   * `.mlp.gate.weight` (router logits over all 512 experts) and `.mlp.shared_expert_gate.weight`
+#     (a single sigmoid row) — `LinearReplicated`. The router MUST be replicated: every rank routes
+#     the same tokens to the same experts, and a rank that disagreed would compute a different
+#     top-k and the all-reduce would sum two different models' outputs.
+_QWEN4EXP_REPLICATED_SUBSTRINGS = (
+    "_hyper_connection.",
+    "hyper_connection_mixer.",
+    ".self_attn.indexer.",
+    ".ple.",
+)
+_QWEN4EXP_REPLICATED_SUFFIXES = (
+    ".mlp.gate.weight",
+    ".mlp.shared_expert_gate.weight",
+)
+
+# The routed experts, in modelopt's NVFP4 spelling. `qwen4_exp_remap` renames these leaves to the
+# repo-native `.weight_packed` / `.weight_scale` AFTER this function runs, so the rules here are
+# keyed on the CHECKPOINT spelling: a bare `.weight` (the packed E2M1 blob) and `.weight_scale` (the
+# per-group scale, already folded with `.weight_scale_2` by the loader before the shard is applied).
+_Q4_EXPERT_COL = (
+    ".gate_proj.weight", ".gate_proj.weight_scale",
+    ".up_proj.weight", ".up_proj.weight_scale",
+)
+_Q4_EXPERT_ROW = (".down_proj.weight", ".down_proj.weight_scale")
+
+
+def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Extract rank r's TP shard of a Qwen3.8-Flash-Next (`qwen4_exp`) CHECKPOINT tensor.
+
+    Applied at READ time on the checkpoint name, BEFORE the loader's GDN `in_proj_qkv`+`in_proj_z`
+    concat, its gate/up merge and its per-expert stack — so all three compose rank-local parts into
+    the rank-local fused buffers the TP-aware model declares. `n == 1` is the identity, so the TP=1
+    path is byte-for-byte what it was before this function existed.
+
+    MOST OF THIS MODEL SHARDS EXACTLY LIKE QWEN3.5 AND IS DELEGATED, not copied: the GDN
+    head-parallel splits (qkv/conv1d by [key|key|value] head block, z/b/a/A_log/dt_bias per v-head,
+    out_proj row-parallel), the gated-attention splits (q_proj carries q interleaved with its
+    per-head sigmoid gate, so an output-dim chunk keeps whole heads on a rank; o_proj row-parallel),
+    the shared expert (col gate/up, row down) and the vocab-parallel embedding/lm_head are all
+    `_shard_qwen3_5`'s rules and stay there. Two things are qwen4_exp's own and are handled here
+    first:
+
+      1. **The replicated submodules** — hyper-connections, the QSA indexer, the PLE block, both
+         gates. See `_QWEN4EXP_REPLICATED_SUBSTRINGS` for why they are enumerated rather than left
+         to fall through.
+      2. **The routed experts in modelopt's NVFP4 spelling.** This is the rule that does not exist
+         anywhere else. The checkpoint spells the packed blob `.weight` (U8 [N, K/2]) and its
+         per-group scale `.weight_scale` (F8_E4M3 [N, K/16]) — where compressed-tensors would say
+         `.weight_packed` / `.weight_scale`. NVFP4 packs along the INPUT K, so:
+            gate/up  (column-parallel, output N)  -> split dim 0: [640,1280]->[320,1280],
+                                                    scale [640,160]->[320,160]
+            down     (row-parallel,    input  K)  -> split dim 1: [2560,320]->[2560,160],
+                                                    scale [2560,40]->[2560,20]
+         The down_proj scale split is the one worth checking by hand: K=640 elements is 320 packed
+         bytes and 40 scale groups, so at TP=2 a rank gets 320 elements = 160 bytes = 20 groups, and
+         the three stay consistent only because 640/n stays a multiple of the group size 16. Below
+         that the packed byte axis and the group axis would round differently and the dequant would
+         read another rank's groups — so it is asserted, not assumed.
+
+    A `.weight_scale` that fell through to `_shard_qwen3_5` would REPLICATE (that function has no
+    NVFP4-scale rule; its `.weight_scale` cases are compressed-tensors-shaped), which is why these
+    are matched here and not left to the delegate.
+    """
+    if n == 1:
+        return t
+    if any(s in name for s in _QWEN4EXP_REPLICATED_SUBSTRINGS):
+        return t
+    if name.endswith(_QWEN4EXP_REPLICATED_SUFFIXES):
+        return t
+
+    if ".mlp.experts." in name:
+        # Under EP the experts are sharded by expert INDEX at full intermediate width, exactly as
+        # `_shard_qwen3_5` documents — no tensor split here. (EP is off for this model today; the
+        # branch is kept so enabling it later does not silently double-shard.)
+        if is_ep_enabled():
+            return t
+        if name.endswith(_Q4_EXPERT_COL):
+            return t.chunk(n, dim=0)[r].clone()
+        if name.endswith(_Q4_EXPERT_ROW):
+            gs = config.quant.group_size if config.quant is not None else 16
+            if name.endswith(".weight_scale") and t.shape[1] % n:
+                raise ValueError(
+                    f"{name}: NVFP4 down_proj scale has {t.shape[1]} groups, which tp={n} does not "
+                    f"divide. The packed-byte axis and the group axis would round differently and "
+                    f"each rank would dequantize its columns with another rank's group scales — "
+                    f"silent, and fluent. moe_intermediate_size/{n} must stay a multiple of {gs}."
+                )
+            return t.chunk(n, dim=1)[r].clone()
+
+    return _shard_qwen3_5(name, t, r, n, config)
+
+
 def _ep_expert_shard(config) -> Tuple[bool, int, int]:
     """EP expert-shard params for the QUANTIZED MoE loaders, mirroring MoELayer's gate exactly (moe.py:
     `is_ep_enabled() and (fp8 or W4A8/W4A16 quant)`). Returns (should_shard, ep_local, ep_offset): when
@@ -466,7 +745,7 @@ def _load_qwen3_5_weight(
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN/dense in_proj concat (qwen3_5_remap)
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}   # MoE gate/up -> gate_up
-    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # MoE per-expert -> stacked over E
+    expert_buf = _ExpertStacker()  # MoE per-expert -> filled into a preallocated [E, ...]
     # NVFP4: pair each proj's e4m3 block scale + per-tensor global to fold them into one fp16 per-group
     # scale at the LEAF (before remap/concat/merge/stack) — see below.
     # NVFP4 is identified STRUCTURALLY, PER MODULE: a proj is NVFP4 iff the checkpoint ships it a
@@ -507,13 +786,10 @@ def _load_qwen3_5_weight(
             if e_shard and not (e_offset <= idx < e_offset + e_local):
                 return  # not this replica's expert
             local_idx = idx - e_offset
-            slots = expert_buf.setdefault(packed_key, {})
-            slots[local_idx] = tensor
-            if len(slots) != e_local:
+            stacked = expert_buf.add(packed_key, local_idx, tensor, e_local)
+            if stacked is None:
                 return
-            experts = [slots[i] for i in range(e_local)]
-            del expert_buf[packed_key]
-            yield packed_key, torch.stack(experts, dim=0)
+            yield packed_key, stacked
         else:
             yield native_key, tensor
 
@@ -568,7 +844,9 @@ def _load_qwen3_5_weight(
                         # has no CPU float8 math. Both operands are small per-group scales, so this
                         # is not the bulk transfer the host-side slicing above exists to avoid.
                         override = nvfp4.fold_nvfp4_scale(
-                            buf["weight_scale"].to(device), buf["weight_global_scale"].to(device)
+                            buf["weight_scale"].to(device),
+                            buf["weight_global_scale"].to(device),
+                            global_field="weight_global_scale",
                         )
                 # fp8 lm_head -> DEQUANTIZE to the compute dtype at load: weight (V,H) e4m3 times its
                 # per-output-channel scale (V,1). Both split on the VOCAB dim, so each rank folds only
@@ -632,7 +910,7 @@ def _load_qwen3_5_weight(
                 yield from emit(merged, torch.cat(parts, dim=cat_dim))
     assert not concat_buf, f"incomplete concat groups in checkpoint: {list(concat_buf.keys())}"
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
-    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
     assert not nvfp4_fold_buf, (
         f"incomplete NVFP4 scale/global pairs (a proj missing its weight_scale or weight_global_scale): "
         f"{list(nvfp4_fold_buf.keys())}"
@@ -641,6 +919,665 @@ def _load_qwen3_5_weight(
         f"fp8 lm_head missing its counterpart tensor (have {list(lm_head_buf.keys())}; "
         f"need both weight and weight_scale)"
     )
+
+
+# ---- Qwen3.8-Flash-Next (`qwen4_exp`) weight-name remap — bring-up tranche 1a ----
+#
+# The checkpoint (`RadixArk/Qwen3.8-Flash-Next-NVFP4`, 296,475 tensors over 206 files) is a
+# multimodal wrapper laid out like Qwen3.5's — `model.language_model.*` for the text decoder,
+# `model.visual.*` for the vision tower, top-level `mtp.*` for the speculative head — but it is NOT
+# the Qwen3.5 key set, so it gets its own remap:
+#
+#   * hyper-connections: `layers.<L>.{attn,mlp}_hyper_connection.*` (4 tensors each) and a top-level
+#     `hyper_connection_mixer.*` (3 tensors, no block_inject_weight). The mixer REPLACES the final
+#     norm — this checkpoint ships no `model.language_model.norm.weight` at all.
+#   * PLE: `layers.1.ple.*`, including a 51.2 GB n-gram table split into 128 F8_E4M3 shards. That
+#     table is NOT a model parameter: it is NVMe-resident and served by `weights/row_table.py`, so
+#     every `ple_embedding.ngram_embedding.*` key (and the two head-metadata tensors `NgramHeads`
+#     reads directly from the files) is SKIPPED here rather than loaded.
+#   * QSA indexer: `layers.<L>.self_attn.indexer.*` on the 12 full-attention layers.
+#   * routed experts are modelopt-NVFP4 and spell their leaves `.weight` / `.weight_scale` /
+#     `.weight_scale_2` / `.input_scale`, where this repo's NVFP4 path expects `.weight_packed` /
+#     `.weight_scale` / `.weight_global_scale`. The rename happens HERE, i.e. before any loader's
+#     `nvfp4_bases` pre-pass (which keys on `.weight_global_scale`) — do it later and the two-level
+#     scale fold silently no-ops.
+#
+# Everything shared with Qwen3.5 is reused unchanged: the GDN `in_proj_qkv`+`in_proj_z` ->
+# `in_proj_qkvz` / `in_proj_b`+`in_proj_a` -> `in_proj_ba` concats, the `conv1d.weight` ->
+# `conv1d_weight` flattening, and the MoE gate/up merge + expert stack (`_gate_up_merge`,
+# `_get_expert_stack_info`) which the caller applies to this function's output.
+#
+# NOTHING IS DROPPED SILENTLY. Every checkpoint key resolves to a plan or to an explicit
+# ("skip", reason) — there is no `None` return — and an unrecognised `model.language_model.*` key
+# RAISES. `qwen4_exp_ignored_summary` turns the skips into a per-reason count a loader can log.
+
+_QWEN4EXP_LM_PREFIX = "model.language_model."
+_QWEN4EXP_SKIP_PREFIXES = ("model.visual.", "visual.")
+
+# skip reason -> what it means, for the loader's ignore ledger.
+QWEN4EXP_SKIP_REASONS: Dict[str, str] = {
+    "vision": "model.visual.* — vision tower; this engine serves the text decoder only",
+    "mtp-head": "mtp.* — the MTP speculative head is not implemented (bring-up plan T8.1)",
+    "ple-ngram-table": (
+        "ple_embedding.ngram_embedding.* + ngram head metadata — the 51.2 GB n-gram table stays "
+        "NVMe-resident and is served by weights/row_table.py, never streamed into VRAM"
+    ),
+    "act-calibration": (
+        "*.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 "
+        "math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused "
+        "(the served scheme is W4A8, not the declared W4A4)"
+    ),
+    "quant-metadata": "*.weight_shape — compressed-tensors bookkeeping, not a model parameter",
+    "fp8-kv-scale": "*.k_scale / *.v_scale — read from the files by kvcache/fp8_scales.py",
+    "beyond-decoder": (
+        "layers.<n> with n >= num_hidden_layers — the model-bf16-* shards carry every layer the "
+        "CHECKPOINT has, and a config that serves fewer (a layer-subset bring-up config) declares "
+        "fewer. Same rule `load_weight` applies for every other family"
+    ),
+}
+
+#: The reason key above, as a constant, because it is recorded in one place and rendered in another.
+_Q4_BEYOND_DECODER = "beyond-decoder"
+
+# rename-only leaves (checkpoint suffix -> native suffix). Both conv1ds are stored FLAT by the
+# model (a plain Parameter, not an nn.Conv1d), matching the Qwen3.5 GDN convention.
+_QWEN4EXP_RENAME = {
+    ".linear_attn.conv1d.weight": ".linear_attn.conv1d_weight",
+    ".ple.conv1d.weight": ".ple.conv1d_weight",
+}
+_Q4_QKVZ = (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_z.weight")
+_Q4_BA = (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight")
+_QWEN4EXP_CONCAT = {
+    _Q4_QKVZ[0]: (".linear_attn.in_proj_qkvz.weight", _Q4_QKVZ, 0),
+    _Q4_QKVZ[1]: (".linear_attn.in_proj_qkvz.weight", _Q4_QKVZ, 0),
+    _Q4_BA[0]: (".linear_attn.in_proj_ba.weight", _Q4_BA, 0),
+    _Q4_BA[1]: (".linear_attn.in_proj_ba.weight", _Q4_BA, 0),
+}
+
+# modelopt NVFP4 leaf spellings -> this repo's compressed-tensors NVFP4 spellings.
+_MODELOPT_GLOBAL_SCALE = ".weight_scale_2"
+_MODELOPT_ACT_CALIB = (".input_scale", ".input_global_scale")
+
+# Every native key this remap is allowed to produce. A checkpoint key that lands anywhere else is a
+# key we have not thought about, and it RAISES instead of being passed through — a pass-through
+# would reach `load_state_dict` as an "unexpected key", which is loud, but a name that happens to
+# collide with a real parameter would not be.
+_QWEN4EXP_NATIVE_OK = tuple(
+    re.compile(p)
+    for p in (
+        r"^lm_head\.weight$",
+        r"^model\.embed_tokens\.weight$",
+        r"^model\.hyper_connection_mixer\."
+        r"(hc_norm|input_mix_weight_down|input_mix_weight_up)\.weight$",
+        r"^model\.layers\.\d+\.(attn|mlp)_hyper_connection\."
+        r"(hc_norm|input_mix_weight_down|input_mix_weight_up|block_inject_weight)\.weight$",
+        r"^model\.layers\.\d+\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj|norm)\.weight$",
+        r"^model\.layers\.\d+\.linear_attn\.(conv1d_weight|A_log|dt_bias)$",
+        r"^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj|q_norm|k_norm)\.weight$",
+        r"^model\.layers\.\d+\.self_attn\.indexer\."
+        r"(index_qk_proj|q_layernorm|k_layernorm)\.weight$",
+        r"^model\.layers\.\d+\.mlp\.(gate|shared_expert_gate)\.weight$",
+        r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\.weight$",
+        r"^model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\."
+        r"(weight|weight_packed|weight_scale|weight_global_scale)$",
+        r"^model\.layers\.\d+\.ple\."
+        r"(key_proj|value_proj|norm_key|norm_query|norm_conv)\.weight$",
+        r"^model\.layers\.\d+\.ple\.conv1d_weight$",
+        r"^model\.layers\.\d+\.ple\.ple_embedding\.layer_multipliers$",
+    )
+)
+
+
+def _q4_check_native(ckpt_key: str, native: str) -> str:
+    for pat in _QWEN4EXP_NATIVE_OK:
+        if pat.match(native):
+            return native
+    raise ValueError(
+        f"unrecognised qwen4_exp checkpoint key {ckpt_key!r} (would map to {native!r}). Add it to "
+        f"_QWEN4EXP_NATIVE_OK (and to the model) or give it an explicit skip reason — a silent "
+        f"pass-through is how a tensor goes missing."
+    )
+
+
+def qwen4_exp_nvfp4_modules(ckpt_names: "Collection[str]") -> FrozenSet[str]:
+    """Module base names the checkpoint actually ships NVFP4-quantized, keyed STRUCTURALLY on the
+    presence of a two-level global scale (`.weight_scale_2`) rather than on the config's ignore list.
+
+    This is the same "the tensors are the fact, the config is a claim" rule
+    `_load_qwen3_5_weight`'s `nvfp4_bases` pre-pass already uses, and it is what tells
+    `qwen4_exp_remap` that a bare `.weight` on this module is a packed E2M1 blob rather than a bf16
+    matrix. In `RadixArk/Qwen3.8-Flash-Next-NVFP4` that is exactly the 73,728 routed-expert
+    projections; the shared expert, both gates, the GDN, self_attn, the hyper-connections, the PLE
+    block and lm_head are all bf16.
+
+    Takes CHECKPOINT names and returns NATIVE (de-wrapped, `model.language_model.` -> `model.`)
+    module names — the namespace `qwen4_exp_remap` compares in, and the same namespace
+    `QuantConfig.ckpt_quantized` is keyed in (see `ModelConfig.from_hf`'s `_native`). Returning the
+    wrapped spelling instead is a silent no-op: every membership test misses and the whole MoE quietly
+    builds full precision."""
+    return frozenset(
+        n[: -len(_MODELOPT_GLOBAL_SCALE)].replace(_QWEN4EXP_LM_PREFIX, "model.", 1)
+        for n in ckpt_names
+        if n.endswith(_MODELOPT_GLOBAL_SCALE)
+    )
+
+
+def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = ()):
+    """Map a Qwen3.8-Flash-Next checkpoint key to a minisgl-native key plan. Pure (no tensors), so
+    it is CPU-testable against the checkpoint index vs. the model's `state_dict()`.
+
+    `nvfp4_modules`: module base names known to be NVFP4 (see `qwen4_exp_nvfp4_modules`). A bare
+    `.weight` on one of those is the packed E2M1 blob and is renamed to `.weight_packed`; on any
+    other module `.weight` is an ordinary bf16 matrix and is left alone. This has to be told to the
+    function because the two are indistinguishable from the key string, and guessing either way is a
+    silent-wrong: guess "packed" and a bf16 matrix lands in a uint8 buffer, guess "bf16" and the MoE
+    silently builds full precision.
+
+    Returns one of:
+      ``("skip",   reason)``                          -> not a model parameter; `reason` is a key of
+                                                         QWEN4EXP_SKIP_REASONS
+      ``("direct", native_key)``                      -> rename only
+      ``("concat", merged_key, slot, n_slots, dim)``  -> one member of an ordered concat group
+
+    Never returns None, and raises on an unrecognised `model.language_model.*` key.
+    """
+    # Namespace first, so a skipped tensor is attributed to the reason a reader would expect
+    # (`mtp.<...>.input_scale` is skipped because the MTP head is not built, not because of FP4
+    # activation calibration).
+    if ckpt_key.startswith("mtp."):
+        # The MTP head is a different animal here (fused expert tensors, its own hyper-connections,
+        # a 10240-wide pre-mixer seed) and is not implemented — ModelConfig.from_hf refuses
+        # --spec-algorithm mtp for this architecture rather than letting it half-build.
+        return ("skip", "mtp-head")
+    if ckpt_key.startswith(_QWEN4EXP_SKIP_PREFIXES):
+        return ("skip", "vision")
+    if ckpt_key.endswith(".weight_shape"):
+        return ("skip", "quant-metadata")
+    if ckpt_key.endswith((".k_scale", ".v_scale")):
+        return ("skip", "fp8-kv-scale")
+    if ckpt_key.endswith(_MODELOPT_ACT_CALIB):
+        return ("skip", "act-calibration")
+    if ckpt_key == "lm_head.weight":
+        return ("direct", "lm_head.weight")  # untied; top-level, no LM prefix
+    if not ckpt_key.startswith(_QWEN4EXP_LM_PREFIX):
+        raise ValueError(
+            f"unexpected qwen4_exp checkpoint key (not under {_QWEN4EXP_LM_PREFIX!r}, "
+            f"'mtp.' or 'lm_head.'): {ckpt_key}"
+        )
+    native = "model." + ckpt_key[len(_QWEN4EXP_LM_PREFIX) :]
+
+    # The n-gram table and its head metadata are read straight off disk by weights/row_table.py.
+    # `layer_multipliers` is NOT part of that — it is the hash multiplier and stays a model buffer.
+    if ".ple.ple_embedding." in native and not native.endswith(".layer_multipliers"):
+        return ("skip", "ple-ngram-table")
+
+    for suffix, renamed in _QWEN4EXP_RENAME.items():
+        if native.endswith(suffix):
+            return ("direct", _q4_check_native(ckpt_key, native[: -len(suffix)] + renamed))
+    for suffix, (merged_suffix, members, cat_dim) in _QWEN4EXP_CONCAT.items():
+        if native.endswith(suffix):
+            merged = _q4_check_native(ckpt_key, native[: -len(suffix)] + merged_suffix)
+            return ("concat", merged, members.index(suffix), len(members), cat_dim)
+
+    # modelopt NVFP4 leaf spellings -> the repo's.
+    base, _, field = native.rpartition(".")
+    if field == "weight_scale_2":
+        native = base + ".weight_global_scale"
+    elif field == "weight" and base in nvfp4_modules:
+        native = base + ".weight_packed"
+    return ("direct", _q4_check_native(ckpt_key, native))
+
+
+def qwen4_exp_ignored_summary(
+    ckpt_names: "Collection[str]", *, nvfp4_modules: "Collection[str]" = ()
+) -> "Dict[str, int]":
+    """Per-reason count of the checkpoint tensors `qwen4_exp_remap` deliberately does not load.
+
+    A loader should log this AFTER streaming, so "we ignored 296,344 tensors" is a stated fact with
+    a stated reason rather than an unnoticed hole. (Of this checkpoint's 296,475 tensors, the vast
+    majority are the 128 n-gram shards' siblings and the vision tower.)"""
+    counts: Dict[str, int] = {}
+    for name in ckpt_names:
+        plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+        if plan[0] == "skip":
+            counts[plan[1]] = counts.get(plan[1], 0) + 1
+    return counts
+
+
+def log_qwen4_exp_ignored(counts: "Dict[str, int]", log) -> None:
+    """Emit the ignore ledger. `log` is a callable (e.g. `logger.info_rank0`)."""
+    if not counts:
+        return
+    total = sum(counts.values())
+    log(f"qwen4_exp loader ignored {total} checkpoint tensors, by reason:")
+    for reason, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        log(f"  {n:>7}  {reason}: {QWEN4EXP_SKIP_REASONS.get(reason, '?')}")
+
+
+#: The 51.2 GB NVMe-resident n-gram table shards. They are named in the checkpoint index but are NOT
+#: model parameters (`weights/row_table.py` mmaps them directly), which is why they are normally kept
+#: in a separate directory. Skipped by FILE name as well as by key, so a deployment that does
+#: colocate them does not spend 51 GB of read bandwidth proving they are skipped.
+_QWEN4EXP_PLE_FILE_MARK = "model-plefp8-"
+
+#: `layer-<LLLLL>-experts-<lo>-<hi>.safetensors` — the per-layer, per-expert-range routed-expert
+#: shards. This naming IS the chunk boundary Stage B streams on, so the pattern lives next to the
+#: loader that consumes it rather than in the driver.
+_QWEN4EXP_EXPERT_FILE = re.compile(r"^layer-(?P<layer>\d+)-experts-(?P<lo>\d+)-(?P<hi>\d+)\.safetensors$")
+
+
+def qwen4_exp_shard_files(model_folder: str) -> "list[str]":
+    """Every non-PLE safetensors shard of a qwen4_exp checkpoint, sorted. One definition, because the
+    n-gram-table exclusion is a correctness rule (51.2 GB of read bandwidth spent proving those keys
+    are skipped) and both the whole-checkpoint loader and the chunked one must apply it."""
+    files = sorted(
+        f
+        for f in glob.glob(f"{model_folder}/*.safetensors")
+        if _QWEN4EXP_PLE_FILE_MARK not in os.path.basename(f)
+    )
+    if not files:
+        raise FileNotFoundError(f"no non-PLE *.safetensors under {model_folder}")
+    return files
+
+
+def qwen4_exp_expert_file_layer(path: str) -> "int | None":
+    """The decoder-layer index a routed-expert shard belongs to, or None for a non-expert shard."""
+    m = _QWEN4EXP_EXPERT_FILE.match(os.path.basename(path))
+    return None if m is None else int(m.group("layer"))
+
+
+def qwen4_exp_chunk_files(model_folder: str, num_layers: int) -> "tuple[list[str], dict[int, list[str]]]":
+    """Split the checkpoint into `(body_files, {layer_index: expert_files})` — the STAGE B chunks.
+
+    The 84 GB checkpoint cannot be materialized as one `state_dict` (70.31 GiB of it is routed
+    experts, on a 15.92 GiB card), and this layout is what makes chunking natural rather than
+    surgical: every routed expert of layer L, and nothing else, lives in exactly four
+    `layer-LLLLL-experts-*.safetensors` files, and the entire non-expert body lives in the
+    `model-bf16-*` shards. So a chunk is a FILE SET, not a key filter — no key has to be classified,
+    and a file that matches neither pattern lands in the body chunk where the ordinary remap decides
+    its fate. That is deliberately the fail-safe direction: an unrecognised shard is loaded and
+    accounted for, never silently dropped.
+
+    Raises when a layer in `range(num_layers)` has no expert shards at all. A missing layer would
+    otherwise surface as `_load_qwen4_exp_weight`'s "incomplete expert stacks" assert at the END of a
+    multi-minute load, or — far worse, if the model happens to have fewer layers than the checkpoint
+    — as a silently truncated model.
+    """
+    body: "list[str]" = []
+    per_layer: "dict[int, list[str]]" = {}
+    for path in qwen4_exp_shard_files(model_folder):
+        lid = qwen4_exp_expert_file_layer(path)
+        if lid is None:
+            body.append(path)
+        else:
+            per_layer.setdefault(lid, []).append(path)
+    for files in per_layer.values():
+        files.sort()
+    missing = [i for i in range(num_layers) if not per_layer.get(i)]
+    if missing:
+        raise FileNotFoundError(
+            f"qwen4_exp chunked load: {model_folder} has no `layer-LLLLL-experts-*.safetensors` "
+            f"shards for decoder layers {missing[:8]}{'...' if len(missing) > 8 else ''} "
+            f"(model declares {num_layers} layers)."
+        )
+    return body, per_layer
+
+
+def qwen4_exp_nvfp4_prepass(files: "Sequence[str]") -> "tuple[set[str], FrozenSet[str]]":
+    """`(nvfp4_ckpt_bases, nvfp4_modules)` read from the shard HEADERS only — no tensor is read.
+
+    Hoisted out of `_load_qwen4_exp_weight` because the chunked loader must run it ONCE over the
+    whole checkpoint and then reuse the answer for every chunk. Re-deriving it per chunk would be
+    both wasteful (196 header opens x 49 chunks) and WRONG in the general case: the rule is
+    structural ("this module ships a `.weight_scale_2`"), and a chunk that happens to contain a
+    module's `weight_scale` but not its global would classify that module as non-NVFP4 and pass its
+    packed E2M1 blob through as a bf16 matrix. On this checkpoint the pair is always co-located, but
+    that is a property of one file layout, not of the format.
+    """
+    ckpt_names: "set[str]" = set()
+    for file in files:
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            ckpt_names.update(f.keys())
+    bases = {
+        n[: -len(_MODELOPT_GLOBAL_SCALE)] for n in ckpt_names if n.endswith(_MODELOPT_GLOBAL_SCALE)
+    }
+    return bases, qwen4_exp_nvfp4_modules(ckpt_names)
+
+
+def _load_qwen4_exp_weight(
+    model_folder: str,
+    device: torch.device,
+    config,
+    *,
+    files: "Sequence[str] | None" = None,
+    nvfp4_sets: "tuple[set[str], FrozenSet[str]] | None" = None,
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Streaming loader for `RadixArk/Qwen3.8-Flash-Next-NVFP4` (`qwen4_exp`). TP=1 only.
+
+    Same skeleton as `_load_qwen3_5_weight`, deliberately: the two share the GDN in_proj concat, the
+    MoE gate/up merge, the per-expert stack over E, and the NVFP4 leaf fold. Everything that differs
+    lives in `qwen4_exp_remap` (hyper-connections, PLE, the QSA indexer, modelopt's spelling of
+    NVFP4) except three things worth naming here:
+
+      1. **The fold keys on `.weight_scale_2`, the CHECKPOINT's spelling** — not on the repo-native
+         `.weight_global_scale` the qwen3_5 loader searches for, which here would match nothing and
+         silently leave every routed expert scaled by its block scale alone (a ~2^k error per group,
+         i.e. fluent garbage). It happens at the LEAF, before the merge and the stack, so the
+         per-tensor global is absorbed into the per-group scale and no scalar survives a concat.
+      2. **The n-gram table is never read**, by key AND by file name.
+      3. **The ignore ledger is emitted** per reason after the stream: ~296k tensors in, ~1.1k
+         parameters out, and the difference is a stated fact with a stated reason rather than a hole.
+
+    TP > 1 shards through `_shard_qwen4_exp`, applied at READ on the checkpoint name so the GDN
+    concat, the gate/up merge and the per-expert stack below all compose rank-local parts. It was
+    TP=1-only until 2026-09-04 and the refusal was correct while it stood: the fall-through
+    behaviour of the generic sharders is "replicate", which loads the whole 84 GB on every rank and
+    then fails somewhere else entirely.
+    """
+    tp_info = get_tp_info()
+    # `files=None` is the whole checkpoint (the one-shot path). Stage B passes ONE CHUNK's shards and
+    # the checkpoint-wide NVFP4 pre-pass result, so the fold decision is identical to the one-shot
+    # load's — see `qwen4_exp_nvfp4_prepass` for why the pre-pass may not be re-derived per chunk.
+    files = qwen4_exp_shard_files(model_folder) if files is None else sorted(files)
+    if not files:
+        raise FileNotFoundError(f"no shards to load under {model_folder}")
+    num_layers = int(config.num_layers)
+
+    # Which modules does the checkpoint ACTUALLY ship NVFP4? Keyed STRUCTURALLY on the presence of a
+    # two-level global scale, across ALL shards, before streaming — the same rule and the same reason
+    # as the qwen3_5 loader's `nvfp4_bases` pre-pass: a module's `weight_scale` and its global
+    # routinely land in DIFFERENT shards, so a per-file set drops one half of the pair and the fold
+    # never completes. Two spellings of the same set are needed: CHECKPOINT bases to drive the fold,
+    # NATIVE bases (`model.language_model.` -> `model.`) to tell `qwen4_exp_remap` that a bare
+    # `.weight` on that module is a packed E2M1 blob and not a bf16 matrix.
+    nvfp4_ckpt_bases, nvfp4_modules = (
+        qwen4_exp_nvfp4_prepass(files) if nvfp4_sets is None else nvfp4_sets
+    )
+    logger.info_rank0(
+        f"qwen4_exp: {len(files)} shards, {len(nvfp4_modules)} NVFP4 "
+        f"modules (structural: they ship a '{_MODELOPT_GLOBAL_SCALE}')"
+    )
+
+    concat_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # GDN in_proj qkv+z / b+a
+    merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # MoE gate/up -> gate_up
+    expert_buf = _ExpertStacker()  # per-expert -> filled into a preallocated [E, ...]
+    fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # NVFP4 weight_scale + weight_scale_2
+    skips: Dict[str, int] = {}
+
+    def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        if (mm := _gate_up_merge(native_key)) is not None:
+            merged_key, slot = mm
+            merge_buf.setdefault(merged_key, {})[slot] = tensor
+            if len(merge_buf[merged_key]) != 2:
+                return
+            parts = [merge_buf[merged_key][s] for s in ("gate", "up")]
+            del merge_buf[merged_key]
+            # NVFP4 packs along the INPUT K (weight_packed [N, K//2], folded weight_scale [N, K//16])
+            # and the gate/up merge concatenates the OUTPUT N — so dim 0 for every leaf here, unlike
+            # AWQ's K-major qweight/qzeros/scales, which merge on dim 1.
+            native_key, tensor = merged_key, torch.cat(parts, dim=0)
+        if (einfo := _get_expert_stack_info(native_key)) is not None:
+            packed_key, idx = einfo
+            stacked = expert_buf.add(packed_key, idx, tensor, config.num_experts)
+            if stacked is None:
+                return
+            yield packed_key, stacked
+        else:
+            yield native_key, tensor
+
+    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+            for name in list(f.keys()):
+                override = None
+                base, _, field = name.rpartition(".")
+                if base in nvfp4_ckpt_bases and field in ("weight_scale", "weight_scale_2"):
+                    buf = fold_buf.setdefault(base, {})
+                    buf[field] = f.get_tensor(name)
+                    if len(buf) < 2:
+                        continue
+                    del fold_buf[base]
+                    # e4m3 -> fp32 is a CAST (defined on CPU as well as on device); the fold is
+                    # ordinary fp32 arithmetic. Both operands are tiny per-group scales, so this is
+                    # not the bulk traffic the host-side read exists to avoid.
+                    #
+                    # `global_field` is modelopt's `weight_scale_2`, the RECIPROCAL of
+                    # compressed-tensors' `weight_global_scale`: a MULTIPLIER, not a divisor. This
+                    # call originally passed no convention and inherited the compressed-tensors
+                    # divide, which folded to per-group scales up to 4.2e6, overflowed the kernel's
+                    # fp16 scale to inf, and made every logit NaN from the first MoE block onward.
+                    override = nvfp4.fold_nvfp4_scale(
+                        buf["weight_scale"].to(device),
+                        buf["weight_scale_2"].to(device),
+                        global_field="weight_scale_2",
+                    )
+                    name = base + ".weight_scale"  # the repo-native spelling of the folded scale
+                plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+                if plan[0] == "skip":
+                    skips[plan[1]] = skips.get(plan[1], 0) + 1
+                    continue
+                # `layers.<n>` with n >= num_layers is not this model's. The `model-bf16-*` shards
+                # carry every layer the CHECKPOINT has, so a config that serves fewer — a layer
+                # subset, the only way this checkpoint is bootable on one card — is handed ~44
+                # layers' worth of body tensors it has no home for, and `load_state_dict` refuses
+                # with "Unexpected keys". Every other family gets this filter from `load_weight`;
+                # the qwen4_exp remap did not carry it, so it lived in `qwen4_exp_chunked_source`'s
+                # `stream` wrapper — i.e. the CHUNKED path could load a subset and the ONE-SHOT path
+                # could not, for the same checkpoint and the same config. It belongs here, once, on
+                # the code path both share.
+                #
+                # AFTER the remap's own skip branch, so the ignore ledger still attributes a vision
+                # or MTP tensor to the reason a reader would expect; BEFORE `f.get_tensor`, so the
+                # dropped layers are never read and never touch the device.
+                if _is_beyond_decoder(name, num_layers):
+                    skips[_Q4_BEYOND_DECODER] = skips.get(_Q4_BEYOND_DECODER, 0) + 1
+                    continue
+                # Shard at READ (on the CHECKPOINT name), so the GDN in_proj concat, the gate/up
+                # merge and the per-expert stack below all compose rank-local parts. `.to(device)`
+                # comes AFTER the shard: everything downstream then composes rank-local tensors
+                # already in VRAM, and a rank never materializes the full-width tensor on its card.
+                # `override` (the NVFP4 two-level scale fold) is already on device and already
+                # full-width — the fold reads both levels whole and the shard applies to its result,
+                # so no scale is folded twice and none is folded from a partial.
+                tens = override if override is not None else f.get_tensor(name)
+                raw = _shard_qwen4_exp(
+                    name, tens, tp_info.rank, tp_info.size, config
+                ).to(device)
+                if plan[0] == "direct":
+                    yield from emit(plan[1], raw)
+                    continue
+                _, merged, slot, n_slots, cat_dim = plan
+                concat_buf.setdefault(merged, {})[slot] = raw
+                if len(concat_buf[merged]) != n_slots:
+                    continue
+                parts = [concat_buf[merged][i] for i in range(n_slots)]
+                del concat_buf[merged]
+                yield from emit(merged, torch.cat(parts, dim=cat_dim))
+
+    # Only shards that were actually opened contribute to this ledger; when the n-gram table lives in
+    # its own directory (the normal deployment) its 129 keys are never seen at all, which is why the
+    # ledger is printed rather than asserted against a fixed count.
+    log_qwen4_exp_ignored(skips, logger.info_rank0)
+    assert not concat_buf, f"incomplete GDN in_proj concat groups: {sorted(concat_buf)}"
+    assert not merge_buf, f"incomplete gate/up merges: {sorted(merge_buf)}"
+    assert not expert_buf, (
+        f"incomplete expert stacks ({len(expert_buf)} groups, e.g. {expert_buf.pending[:3]}): a "
+        f"layer's expert shards are missing from {model_folder}"
+    )
+    assert not fold_buf, (
+        f"incomplete NVFP4 scale pairs (a module with a '{_MODELOPT_GLOBAL_SCALE}' but no "
+        f"weight_scale, or the reverse): {sorted(fold_buf)[:3]}"
+    )
+
+
+class Qwen4ExpExpertRowSource:
+    """`weights.stream_tier.ExpertRowSource` for qwen4_exp's per-expert NVFP4 shards.
+
+    The checkpoint stores each expert as its own set of leaves inside one of four
+    `layer-{L:05d}-experts-{lo:04d}-{lo+127:04d}.safetensors` files, so reading 10 of 512 experts is
+    a `safe_open` plus six `get_tensor` calls, not a 1.465 GiB stack. That per-expert granularity is
+    the entire reason the stream tier is viable on this checkpoint.
+
+    THE LEAF ARITHMETIC IS `_load_qwen4_exp_weight`'S, NOT A SECOND COPY OF IT — same order, same
+    convention: fold the modelopt `weight_scale_2` global into the e4m3 block scale AT THE LEAF, then
+    merge gate/up on dim 0 (NVFP4 packs along the input axis K, so the gate/up concat is the OUTPUT
+    dim for every leaf), then hand the pair to `nvfp4.convert_nvfp4_moe` — which is
+    `_GroupedNvFp4Experts.post_load`'s own conversion, run over `len(ids)` experts instead of E.
+    `convert_nvfp4_moe` is per-expert internally, so a subset stack is bit-identical to the same
+    experts inside a full one. Getting the fold direction or the merge axis wrong here is silent
+    (right shapes, plausible magnitudes), which is why nothing about either is re-derived.
+    """
+
+    def __init__(self, model_path: str, device: torch.device) -> None:
+        self.model_folder = download_hf_weight(model_path)
+        self.device = device
+        self.bytes_read = 0
+        self._handles: "Dict[Tuple[int, int], Any]" = {}
+
+    def _handle(self, layer: int, lo: int):
+        key = (layer, lo)
+        h = self._handles.get(key)
+        if h is None:
+            import safetensors
+
+            path = (
+                f"{self.model_folder}/layer-{layer:05d}-experts-{lo:04d}-{lo + 127:04d}.safetensors"
+            )
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"layer {layer}, experts {lo}..{lo + 127}: missing {path}. The layer->shard "
+                    f"mapping is the one place a streamed run goes silently wrong, so it is "
+                    f"asserted rather than skipped."
+                )
+            h = safetensors.safe_open(path, framework="pt", device="cpu")
+            h.__enter__()
+            self._handles[key] = h
+        return h
+
+    def _leaf(self, layer: int, eid: int, projs: "Tuple[str, ...]"):
+        from minisgl.quant import nvfp4
+
+        f = self._handle(layer, (eid // 128) * 128)
+        pre = f"model.language_model.layers.{layer}.mlp.experts.{eid}."
+        packed, scales = [], []
+        for p in projs:
+            w = f.get_tensor(pre + p + ".weight")
+            s = f.get_tensor(pre + p + ".weight_scale")
+            # `_MODELOPT_GLOBAL_SCALE` already carries its leading dot (it is a SUFFIX matched
+            # against full tensor names elsewhere in this file), while `fold_nvfp4_scale` keys its
+            # convention table on the bare field name. Two spellings of one thing, so both are
+            # derived from the constant rather than written out.
+            g = f.get_tensor(pre + p + _MODELOPT_GLOBAL_SCALE)
+            self.bytes_read += w.numel() * w.element_size() + s.numel() * s.element_size() + 4
+            packed.append(w.to(self.device, non_blocking=True))
+            scales.append(
+                nvfp4.fold_nvfp4_scale(
+                    s.to(self.device),
+                    g.to(self.device),
+                    global_field=_MODELOPT_GLOBAL_SCALE.lstrip("."),
+                )
+            )
+        if len(projs) == 1:
+            return packed[0], scales[0]
+        return torch.cat(packed, dim=0), torch.cat(scales, dim=0)
+
+    def gather(self, layer: int, expert_ids) -> "Dict[str, Dict[str, torch.Tensor]]":
+        from minisgl.quant import nvfp4
+
+        p13, s13, p2, s2 = [], [], [], []
+        for e in expert_ids:
+            a, b = self._leaf(layer, int(e), ("gate_proj", "up_proj"))
+            c, d = self._leaf(layer, int(e), ("down_proj",))
+            p13.append(a)
+            s13.append(b)
+            p2.append(c)
+            s2.append(d)
+        out: "Dict[str, Dict[str, torch.Tensor]]" = {}
+        for attr, packed, scale in (("gate_up_proj", p13, s13), ("down_proj", p2, s2)):
+            conv = nvfp4.convert_nvfp4_moe(torch.stack(packed), torch.stack(scale))
+            out[attr] = {
+                "_w_op": conv["w_packed"],
+                # GROUP-MAJOR, exactly as `_GroupedNvFp4Experts.post_load` leaves it.
+                "_scales_op": conv["scales"].transpose(1, 2).contiguous(),
+            }
+        return out
+
+    def close(self) -> None:
+        for h in self._handles.values():
+            try:
+                h.__exit__(None, None, None)
+            except Exception:
+                pass
+        self._handles.clear()
+
+
+def expert_row_source(model_path: str, device: torch.device, spec_algorithm: str = "mtp"):
+    """`weights.stream_tier.ExpertRowSource` for this family, or None if it has none.
+
+    The third dispatch twin of `load_weight` / `chunked_weight_source`. A family whose checkpoint has
+    no per-expert granularity returns None and the stream tier is simply unavailable — a capacity
+    limit, not a degradation: every other model this repo serves fits {device, pinned host}.
+    """
+    from .config import ModelConfig
+
+    config = ModelConfig.from_hf(
+        cached_load_hf_config(model_path),
+        spec_algorithm=spec_algorithm,
+        ckpt_tensor_names=checkpoint_tensor_names(model_path),
+    )
+    if config.is_qwen4_exp:
+        return Qwen4ExpExpertRowSource(model_path, device)
+    return None
+
+
+def qwen4_exp_chunked_source(
+    model_path: str, device: torch.device, config
+) -> "Tuple[List, Callable]":
+    """`(chunks, stream)` for `weights.stage_b.ChunkedWeightLoader` — the STAGE B entry point.
+
+    One `LoadChunk` for the whole non-expert body, then one per decoder layer carrying that layer's
+    512 routed experts and finalizing `model.layers.{L}.mlp.experts`. Body first, deliberately: the
+    body is resident for the whole serve whatever the plan says, so loading it first means every
+    per-layer chunk is measured against the real steady-state device occupancy rather than against an
+    empty card — a chunk that only fits because the body has not arrived yet is a boot that fails at
+    layer 47.
+
+    `stream` re-enters `_load_qwen4_exp_weight` with that chunk's shards and the checkpoint-wide
+    NVFP4 pre-pass, so the fold, the gate/up merge, the per-expert stack over E and the ignore ledger
+    are the SAME code the one-shot loader runs — Stage B changes when tensors are read, never how
+    they are interpreted. In particular the expert stack is still asserted complete per layer: four
+    shards x 128 experts, and a missing shard is `_load_qwen4_exp_weight`'s own "incomplete expert
+    stacks" assert, raised at that layer instead of at the end of an 84 GB read.
+    """
+    from minisgl.weights.stage_b import LoadChunk
+
+    model_folder = download_hf_weight(model_path)
+    num_layers = int(config.num_layers)
+    body_files, per_layer = qwen4_exp_chunk_files(model_folder, num_layers)
+    # ONE pre-pass over the whole checkpoint's headers, reused by every chunk. See
+    # `qwen4_exp_nvfp4_prepass` for why it may not be re-derived per chunk.
+    nvfp4_sets = qwen4_exp_nvfp4_prepass(body_files + [f for fs in per_layer.values() for f in fs])
+
+    chunks = [LoadChunk(name="body", files=tuple(body_files))]
+    for lid in range(num_layers):
+        chunks.append(
+            LoadChunk(
+                name=f"layer-{lid:05d}-experts",
+                files=tuple(per_layer[lid]),
+                finalize_paths=(f"model.layers.{lid}.mlp.experts",),
+            )
+        )
+
+    def stream(chunk) -> Iterator[Tuple[str, torch.Tensor]]:
+        # No key filtering here. `_load_qwen4_exp_weight` drops `layers.<n>` with n >= num_layers
+        # itself, before it reads the tensor — this wrapper used to do it after, which meant the
+        # CHUNKED path could load a layer-subset config and the ONE-SHOT path (the engine's) could
+        # not. `ChunkedWeightLoader` stays strict: an unhomed key is still an error, because for a
+        # key that is not beyond the decoder it means the remap dropped something real.
+        yield from _load_qwen4_exp_weight(
+            model_folder, device, config, files=chunk.files, nvfp4_sets=nvfp4_sets
+        )
+
+    return chunks, stream
 
 
 # ---- ZAYA1-8B CCA-hybrid weight-name remap (Step 3) ----
@@ -1068,7 +2005,7 @@ def _load_gemma4_weight(
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
-    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    expert_buf = _ExpertStacker()
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -1086,13 +2023,10 @@ def _load_gemma4_weight(
             packed_key, idx = einfo
             if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
                 return
-            slots = expert_buf.setdefault(packed_key, {})
-            slots[idx - _ep_offset] = tensor
-            if len(slots) != _ep_local:
+            stacked = expert_buf.add(packed_key, idx - _ep_offset, tensor, _ep_local)
+            if stacked is None:
                 return
-            experts = [slots[i] for i in range(_ep_local)]
-            del expert_buf[packed_key]
-            yield packed_key, torch.stack(experts, dim=0)
+            yield packed_key, stacked
         else:
             yield native_key, tensor
 
@@ -1119,7 +2053,7 @@ def _load_gemma4_weight(
                 yield from emit(native, raw)
 
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
-    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
     for key, enc in tie_encoder.items():
         dec = tie_decoder.get(key)
         # Bit-equality, not a tolerance: these are the same trained scalar exported twice, so any
@@ -1211,7 +2145,7 @@ def _load_laguna_weight(
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # gate/up -> gate_up
-    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}  # per-expert -> stacked over E
+    expert_buf = _ExpertStacker()  # per-expert -> filled into a preallocated [E, ...]
     _is_nvfp4 = config.quant is not None and config.quant.is_nvfp4
     nvfp4_fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
@@ -1230,14 +2164,10 @@ def _load_laguna_weight(
             packed_key, idx = einfo
             if _ep_shard and not (_ep_offset <= idx < _ep_offset + _ep_local):
                 return  # not this replica's expert
-            local_idx = idx - _ep_offset
-            slots = expert_buf.setdefault(packed_key, {})
-            slots[local_idx] = tensor
-            if len(slots) != _ep_local:
+            stacked = expert_buf.add(packed_key, idx - _ep_offset, tensor, _ep_local)
+            if stacked is None:
                 return
-            experts = [slots[i] for i in range(_ep_local)]
-            del expert_buf[packed_key]
-            yield packed_key, torch.stack(experts, dim=0)
+            yield packed_key, stacked
         else:
             yield native_key, tensor
 
@@ -1259,7 +2189,11 @@ def _load_laguna_weight(
                             continue
                         del nvfp4_fold_buf[base]
                         name = base + ".weight_scale"
-                        override = nvfp4.fold_nvfp4_scale(buf["weight_scale"], buf["weight_global_scale"])
+                        override = nvfp4.fold_nvfp4_scale(
+                            buf["weight_scale"],
+                            buf["weight_global_scale"],
+                            global_field="weight_global_scale",
+                        )
                 plan = _laguna_remap(name)
                 if plan is None:
                     continue
@@ -1268,7 +2202,7 @@ def _load_laguna_weight(
                 raw = _shard_laguna(native, tens, tp_info.rank, tp_info.size, config)
                 yield from emit(native, raw)
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
-    assert not expert_buf, f"incomplete expert stacks in checkpoint: {list(expert_buf.keys())}"
+    assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
     assert not nvfp4_fold_buf, (
         f"incomplete NVFP4 scale/global pairs: {list(nvfp4_fold_buf.keys())}"
     )
@@ -1378,7 +2312,9 @@ def _load_muse_glimmer_weight(
                         del nvfp4_fold_buf[base]
                         name = base + ".weight_scale"
                         override = nvfp4.fold_nvfp4_scale(
-                            buf["weight_scale"], buf["weight_global_scale"]
+                            buf["weight_scale"],
+                            buf["weight_global_scale"],
+                            global_field="weight_global_scale",
                         )
                 native = _muse_glimmer_remap(name)
                 if native is None:
@@ -1402,6 +2338,34 @@ def _load_muse_glimmer_weight(
     assert not nvfp4_fold_buf, f"incomplete NVFP4 scale/global pairs: {list(nvfp4_fold_buf.keys())}"
 
 
+def chunked_weight_source(
+    model_path: str, device: torch.device, spec_algorithm: str = "mtp"
+) -> "Optional[Tuple[List, Callable]]":
+    """`(chunks, stream)` for `weights.stage_b.ChunkedWeightLoader`, or None if this family has none.
+
+    THE DISPATCH TWIN OF `load_weight`, and deliberately shaped like it. `load_weight` answers "give
+    me every tensor"; this answers "give them to me in units small enough to place as they arrive".
+    A family that has not implemented a chunk enumeration returns None and the caller falls back to
+    the one-shot load — which is the correct default, not a degraded one: chunking only buys anything
+    for a checkpoint that does not fit at once, and every other model this repo serves does.
+
+    It re-derives `ModelConfig` from the same three inputs `load_weight` does rather than taking the
+    engine's, because the chunk enumeration is keyed on `num_layers` and a config built from a
+    different `spec_algorithm` has a different decoder depth. Two derivations of the layer count that
+    can disagree is exactly how a chunk list ends up naming a layer the model does not have.
+    """
+    from .config import ModelConfig
+
+    config = ModelConfig.from_hf(
+        cached_load_hf_config(model_path),
+        spec_algorithm=spec_algorithm,
+        ckpt_tensor_names=checkpoint_tensor_names(model_path),
+    )
+    if config.is_qwen4_exp:
+        return qwen4_exp_chunked_source(model_path, device, config)
+    return None
+
+
 def load_weight(
     model_path: str, device: torch.device, spec_algorithm: str = "mtp"
 ) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -1420,6 +2384,15 @@ def load_weight(
         # with what was built (that disagreement is exactly how an unfillable head reaches the loader).
         ckpt_tensor_names=checkpoint_tensor_names(model_path),
     )
+    # MUST precede the is_gdn_hybrid branch: qwen4_exp IS a GDN hybrid (36 of its 48 layers are
+    # linear-attention), so without this it silently routes into the Qwen3.5 loader — whose remap
+    # happily passes `hyper_connection_mixer.*` / `ple.*` / `indexer.*` through as "direct" and then
+    # dies in load_state_dict with a 296k-key unexpected-keys dump that names no cause. Its streaming
+    # loader is bring-up plan T1.3; the NAME mapping it will use (`qwen4_exp_remap`) already exists
+    # above and is tested against the full checkpoint index.
+    if config.is_qwen4_exp:
+        yield from _load_qwen4_exp_weight(model_folder, device, config)
+        return
     if config.is_gdn_hybrid:
         yield from _load_qwen3_5_weight(model_folder, device, config)
         return
@@ -1447,7 +2420,7 @@ def load_weight(
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
-    expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    expert_buf = _ExpertStacker()
     # EP: keep only this replica's expert shard, re-indexed to 0..ep_local-1. Off => full stack.
     _ep_shard, _ep_local, _ep_offset = _ep_expert_shard(config)
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
@@ -1502,15 +2475,14 @@ def load_weight(
                     packed_key, expert_idx = expert_info
                     if _ep_shard and not (_ep_offset <= expert_idx < _ep_offset + _ep_local):
                         continue  # not this replica's expert
-                    slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx - _ep_offset] = out[1]
-                    if len(slots) != _ep_local:
+                    stacked = expert_buf.add(
+                        packed_key, expert_idx - _ep_offset, out[1], _ep_local
+                    )
+                    if stacked is None:
                         continue
-                    experts = [slots[idx] for idx in range(_ep_local)]
-                    del expert_buf[packed_key]
-                    yield packed_key, torch.stack(experts, dim=0)
+                    yield packed_key, stacked
                 else:  # Normal dense model
                     yield out[0], out[1]
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
-    assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+    assert not expert_buf, f"Incomplete expert tensors in checkpoint: {expert_buf.pending}"

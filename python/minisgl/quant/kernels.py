@@ -661,7 +661,16 @@ def w4a8_moe(
     # contention-free gather_reduce (the (P,K) out2 reuse amortizes better at larger M).
     # NOT bit-exact vs gather_reduce: the atomic reduction order varies, so this is a tolerance-gated
     # path, never a bit-exact one.
-    if M <= 2:
+    #
+    # AND THAT IS WHY `MINISGL_MOE_G2FUSE=0` GATES IT TOO (plan §5.4 A1.0). The knob's stated job is
+    # "revert to the bit-exact WMMA gemm2 + gather_reduce", and it did not cover this branch — so at
+    # bs<=2, which is every decode step of a bs=1 serve, there was NO deterministic reference in the
+    # binary at all: two runs of the same weights on the same input differ, and every weight-offload
+    # numerics gate had to be scored against a measured noise floor with no way to check that the
+    # floor was not hiding a real difference. With the knob off, M<=2 falls through to the
+    # gather_reduce path below (its own `_MOE_G2FUSE` test also fails), which is the bit-exact one.
+    # Default is unchanged: the fused scatter is still ON for every serve.
+    if _MOE_G2FUSE and M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         # split_k is an AXIS on the shared scatter core (workload-derived), not a second kernel and
         # not a second package: same op, same weights, same epilogue, one extra grid dimension.

@@ -166,3 +166,49 @@ class RMSNormFused(BaseOP):
             out, res = self.forward(x, residual)
             return out, res, None, None
         return r[0], residual, r[1], r[2]
+
+
+class GroupedRMSNorm(BaseOP):
+    """`groups` independent RMSNorms packed into one `hidden_size` vector, with the Gemma `(1 + w)`
+    gain.
+
+    Qwen3.8-Flash-Next (`qwen4_exp`) carries a `hc_count * hidden_size` residual stream, and every
+    norm that touches that WIDE vector normalizes each of the `hc_count` branches on its own:
+    the hyper-connections' `hc_norm` and the PLE block's `norm_key`/`norm_query`/`norm_conv`. One
+    class serves all four — the width and the group size are the only things that differ.
+
+    Transcribed from the reference implementations rather than a paraphrase of them; both agree:
+      * `transformers/models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextRMSNorm` with `group_size`
+      * `sglang/srt/layers/hyperconnection.py::GroupedGemmaRMSNorm` with `group_size`
+
+        x   = x.reshape(*x.shape[:-1], -1, group_size)
+        out = x * rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)      # fp32 internally
+        return (out.flatten(-2) * (1.0 + weight)).type_as(x)
+
+    The variance is per group of `group_size` channels, NOT over the full width. A full-width
+    `RMSNorm` here is a different function that produces plausible garbage, which is why the reshape
+    is explicit and the divisibility is checked in `__init__`.
+
+    Reuses the shared `_rms_norm` core with a NULL gain (`weight=None` — the same entry point
+    `RMSNormNoScale` uses) on the reshaped view, then applies the `(1 + w)` gain on the flat view.
+    The gain is per channel of the WIDE vector, so it cannot be handed to a kernel whose gain has
+    the group's width; a `group_size` policy on the tail_hip rms_norm core would fold it in and drop
+    the second pass — a policy on the existing core, never a forked kernel. The only numeric
+    difference from the references is that the shared core rounds the normalized value back to
+    `x.dtype` before the gain, one rounding earlier than their fp32-until-the-end.
+    """
+
+    def __init__(self, hidden_size: int, group_size: int, eps: float) -> None:
+        if hidden_size % group_size:
+            raise ValueError(
+                f"GroupedRMSNorm hidden_size {hidden_size} not divisible by group_size {group_size}"
+            )
+        self.weight = torch.empty(hidden_size)
+        self._group_size = group_size
+        self._groups = hidden_size // group_size
+        self._eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        grouped = x.reshape(*x.shape[:-1], self._groups, self._group_size)
+        normed = _rms_norm(grouped, None, self._eps).flatten(-2)
+        return normed * (self.weight + 1.0)

@@ -10,6 +10,11 @@ _MODEL_REGISTRY = {
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "Qwen3_5ForConditionalGeneration": (".qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "Qwen3_5MoeForConditionalGeneration": (".qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+    # Qwen3.8-Flash-Next (`qwen4_exp`). Text decoder only, like every other multimodal checkpoint
+    # here. It is a GDN hybrid *and* a hyper-connection model, so it gets its own entry rather than
+    # reusing the Qwen3.5 class — that class has no hyper-connections and would build a final `norm`
+    # this checkpoint does not ship.
+    "Qwen4ExpForConditionalGeneration": (".qwen4exp", "Qwen4ExpForConditionalGeneration"),
     "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
     "ZayaForCausalLM": (".zaya", "ZayaForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),

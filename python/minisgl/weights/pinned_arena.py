@@ -583,7 +583,9 @@ class PinnedWeightArena:
         # check=False and therefore recorded nothing.
         if self.capacity is None:
             self.capacity = self.capacity_at_attach
-        swap = SwapTripwire()
+        # Scaled to THIS arena's reservation: a flat page count is a fraction of a percent of a
+        # 30 GiB pin and aborts on ambient co-tenant swap traffic. See `SwapTripwire`.
+        swap = SwapTripwire(pin_bytes=self.plan.reserved_bytes)
 
         for i in range(self.plan.n_chunks):
             # "Can I take the NEXT chunk and still be above the floor?" — P3b's incremental check,
@@ -603,7 +605,12 @@ class PinnedWeightArena:
                     f"rank 1 stopped at 28.0 of 34.0 GiB. Raise the device-tier fraction or free "
                     f"host RAM; see the reserve()-time message for the quantified table."
                 )
-            swap.check(f"at chunk {i}/{self.plan.n_chunks}")
+            # `avail` is the reading taken one line above, so the arming decision and the floor
+            # decision are made from the SAME sample — two /proc reads could straddle a co-tenant's
+            # allocation and disagree about whether the box is short of memory.
+            swap.check(
+                f"at chunk {i}/{self.plan.n_chunks}", available=avail, floor=self.floor_bytes
+            )
 
             t0 = time.perf_counter()
             try:

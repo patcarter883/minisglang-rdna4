@@ -200,6 +200,53 @@ class ModelConfig:
     zaya_use_mod: bool = False  # mixture-of-depths: extra "skip" expert at index num_experts
     scale_residual_merge: bool = False  # affine on the fp32 residual stream before each input_norm
     residual_in_fp32: bool = False  # carry the residual stream in fp32 across all layers
+    # ---- Qwen4-Exp (Qwen3.8-Flash-Next) — hyper-connections, PLE n-gram block, QSA indexer ----
+    # Populated ONLY when model_type is qwen4_exp / qwen4_exp_text, so every other family keeps the
+    # None/() defaults and `is_qwen4_exp` stays False.
+    #
+    # HYPER-CONNECTIONS. The residual stream is `hc_count` copies wide (4 x 2560 = 10240) for the
+    # WHOLE decoder: each block reads a mixed 2560-wide view and writes back into the wide stream.
+    # `hc_lowrank` (320) is the rank of the mix gate's down/up pair. There is NO final `norm` tensor
+    # in this checkpoint — the top-level `hyper_connection_mixer` plays that role.
+    hc_count: int | None = None
+    hc_lowrank: int | None = None
+    # PLE (per-layer n-gram embedding). `ple_layer_ids` is stored 0-BASED here; the checkpoint's
+    # config.json field is 1-BASED ([2] -> decoder index 1, which is where `layers.1.ple.*` lives).
+    # Converting on the way in is load-bearing: attaching the block one layer late loads cleanly and
+    # only degrades quality (see the bring-up plan, T4.3).
+    ple_layer_ids: Tuple[int, ...] = ()
+    ple_embed_dim: int | None = None      # 2560 = 16 n-gram heads x 160 (the row-table row width)
+    ple_conv_kernel_size: int | None = None  # 4 (depthwise short conv over the WIDE stream)
+    ngram_size: int | None = None            # 3
+    heads_per_ngram: int | None = None       # 8 -> (ngram_size-1)*heads_per_ngram = 16 hash heads
+    ngram_vocab_size_base: int | None = None            # 20_000_000
+    make_ngram_vocab_size_divisible_by: int | None = None  # 128
+    split_ngram_parts: int | None = None                # 128 table shards on disk
+    # Two inputs to the n-gram HASH that the shipping config.json does not spell out, and that are
+    # silent-wrong if guessed (a wrong value still yields a valid row id in the right head's band —
+    # a real embedding from the wrong row, for every token, with no error anywhere):
+    #   `ngram_seed`          `Qwen4ExpTextConfig.seed`, default 1234. It seeds `layer_multipliers`.
+    #                         The checkpoint SHIPS those multipliers, and ple/hashing.py asserts the
+    #                         derivation from this seed reproduces them exactly — the two check each
+    #                         other rather than either being trusted.
+    #   `ngram_eos_token_id`  the reference's `_shift_right_ignore_eos` fill and the initial 2-token
+    #                         context. `config.eos_token_id` (first entry if it is a list).
+    ngram_seed: int | None = None
+    ngram_eos_token_id: int | None = None
+    # QSA sparse-attention indexer (the 12 full-attention layers). Unimplemented (bring-up T5); the
+    # dims are carried so the indexer's checkpoint tensors have somewhere to land and so the
+    # <= indexer_budget "dense is bit-equivalent" argument can be asserted rather than assumed.
+    indexer_budget: int | None = None
+    indexer_compress_ratio: int | None = None
+    indexer_head_dim: int | None = None
+    indexer_kv_heads: int | None = None
+    indexer_n_heads: int | None = None
+    # The checkpoint declared a `quantization_config` that `QuantConfig.from_hf` did NOT parse, so
+    # `quant` is None and every module will build FULL PRECISION. That is a silent-wrong condition
+    # for any family (the loader then hands packed tensors to bf16 buffers, or the shapes simply
+    # miss), so record the method name rather than let "unquantized" be indistinguishable from
+    # "quantization we failed to read". None = nothing was declared, or it parsed fine.
+    unparsed_quant_method: str | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -236,6 +283,25 @@ class ModelConfig:
             and self.layer_types is not None
             and any(t == "sliding_attention" for t in self.layer_types)
         )
+
+    @property
+    def is_qwen4_exp(self) -> bool:
+        """True for the Qwen3.8-Flash-Next backbone (`qwen4_exp` multimodal wrapper or its unwrapped
+        `qwen4_exp_text` config). Text-only here: the vision tower is skipped by the loader, as it is
+        for every other multimodal checkpoint this engine serves.
+
+        NOTE this model is ALSO a GDN hybrid (`is_gdn_hybrid` is True: 36 of its 48 layers are
+        linear-attention). Every dispatch that branches on `is_gdn_hybrid` must therefore test
+        `is_qwen4_exp` FIRST, or a qwen4_exp checkpoint silently routes into the Qwen3.5 path — which
+        has no hyper-connections, no PLE and a different key namespace."""
+        return self.model_type in ("qwen4_exp", "qwen4_exp_text")
+
+    @property
+    def hc_hidden_size(self) -> int:
+        """Width of the hyper-connection residual stream = hc_count * hidden_size (10240 for
+        Qwen3.8-Flash-Next). Equals `hidden_size` for every model without hyper-connections, so a
+        buffer sized by this is correct everywhere."""
+        return self.hidden_size * (self.hc_count or 1)
 
     @property
     def is_muse_glimmer(self) -> bool:
@@ -375,6 +441,21 @@ class ModelConfig:
         ckpt_tensor_names: "Collection[str] | None" = None,
     ) -> ModelConfig:
         quant = QuantConfig.from_hf(config)  # quantization_config is top-level
+        # A declared-but-unparsed quantization_config is the worst kind of silent failure: `quant`
+        # comes back None, every module builds full precision, and the only symptom is a shape/key
+        # mismatch deep in the loader (or, worse, a checkpoint whose packed tensors happen to fit).
+        # Record WHICH method we could not read so a model builder can say so at boot.
+        # (Qwen3.8-Flash-Next-NVFP4 hits this today: `quant_method: "modelopt"` has no arm in
+        # QuantConfig.from_hf — bring-up plan T1.1.)
+        # Same lookup QuantConfig.from_hf does (top-level, then text_config) — asking only the
+        # top level would miss a wrapper that nests it and report "nothing declared".
+        _decl_quant = getattr(config, "quantization_config", None)
+        if _decl_quant is None and getattr(config, "text_config", None) is not None:
+            _decl_quant = getattr(config.text_config, "quantization_config", None)
+        unparsed_quant_method = None
+        if quant is None and _decl_quant:
+            _m = _decl_quant.get("quant_method") if isinstance(_decl_quant, dict) else None
+            unparsed_quant_method = str(_m or "unknown")
         if quant is not None and ckpt_tensor_names:
             # Which modules does the checkpoint ACTUALLY ship quantized? A quantized module carries a
             # packing/scale tensor (`weight_packed`/`qweight`/`weight_scale`/`scales`/...); a
@@ -421,6 +502,9 @@ class ModelConfig:
                     setattr(config, attr, getattr(top, attr))
 
         model_type = getattr(config, "model_type", "llama")
+        # Qwen3.8-Flash-Next. Detected on model_type alone: `qwen4_exp` (the multimodal wrapper) and
+        # `qwen4_exp_text` (what the text_config unwrap above leaves behind).
+        _is_qwen4_exp = model_type in ("qwen4_exp", "qwen4_exp_text")
         # PORT_PLAN §detection: a Zaya CCA hybrid is identified by model_type=="zaya" OR an explicit
         # top-level `cca` flag — NOT the conjunction. AND silently disabled the entire CCA port for a
         # `zaya` checkpoint that omits `cca` (no error, garbage output); OR matches the spec and the
@@ -493,6 +577,15 @@ class ModelConfig:
             if ffn_hidden_size:
                 moe_intermediate_size = ffn_hidden_size // 2
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
+        if _is_qwen4_exp and not hasattr(config, "norm_topk_prob"):
+            # The shipping config.json omits `norm_topk_prob`, so the False default above would
+            # silently leave the top-10 router weights summing to < 1 — mis-scaled experts, i.e.
+            # degenerate text with no error anywhere. The architecture's default is True, read out of
+            # the reference rather than guessed: `Qwen4ExpTextConfig(Qwen3NextConfig)`
+            # (sglang/srt/configs/qwen4_exp.py:15) inherits `norm_topk_prob=True`
+            # (sglang/srt/configs/qwen3_next.py:214), and the MoE block consumes it as
+            # `renormalize=config.norm_topk_prob` (sglang/srt/models/qwen2_moe.py:322).
+            norm_topk_prob = True
         shared_expert_intermediate_size = getattr(config, "shared_expert_intermediate_size", 0)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
@@ -554,6 +647,24 @@ class ModelConfig:
         # unless an explicit env override forced it on. Applied inside from_hf so the model builder
         # AND the streaming weight loader (both go through from_hf) agree on load_mtp.
         if spec_algorithm != "mtp" and not _mtp_forced:
+            mtp_num_hidden_layers = 0
+            num_nextn_predict_layers = 0
+        if _is_qwen4_exp and (mtp_num_hidden_layers or num_nextn_predict_layers):
+            # Qwen3.8-Flash-Next ships an MTP head (`mtp.*`, mtp_num_hidden_layers: 1) that this
+            # engine does NOT implement (bring-up plan T8.1). It is not the Qwen3.5 head with a new
+            # prefix: its experts are FUSED single tensors (`mtp.layers.0.mlp.experts.gate_up_proj`)
+            # in a different quant group, it carries its own hyper-connections, and it seeds from the
+            # 10240-wide PRE-mixer stream rather than a post-final-norm hidden. Building the Qwen3.5
+            # head against those tensors would be wrong in shape and in seed. Refuse loudly when it
+            # was explicitly asked for; otherwise just do not build it.
+            if _mtp_forced or spec_algorithm == "mtp":
+                raise NotImplementedError(
+                    "qwen4_exp (Qwen3.8-Flash-Next) speculative decoding via its `mtp.*` head is NOT "
+                    "implemented (bring-up plan T8.1): the head's experts are fused single tensors, "
+                    "it carries its own hyper-connections, and it seeds from the hc_count-wide "
+                    "pre-mixer stream. Serve with --spec-algorithm none (or ngram), which needs no "
+                    "MTP head."
+                )
             mtp_num_hidden_layers = 0
             num_nextn_predict_layers = 0
 
@@ -741,6 +852,52 @@ class ModelConfig:
                         _maxpos,
                     )
 
+        # ---- Qwen4-Exp: hyper-connection / PLE / QSA-indexer dims ----
+        # `ple_layer_ids` in config.json is 1-BASED (the shipping value [2] names decoder index 1,
+        # which is exactly where the checkpoint's `layers.1.ple.*` tensors live). Convert here, once,
+        # and range-check: attaching the PLE block to index 2 instead of 1 loads without a single
+        # error and only degrades quality (bring-up plan T4.3).
+        ple_layer_ids: Tuple[int, ...] = ()
+        if _is_qwen4_exp:
+            _raw_ple = list(getattr(config, "ple_layer_ids", None) or [])
+            ple_layer_ids = tuple(sorted({int(i) - 1 for i in _raw_ple}))
+            for _p in ple_layer_ids:
+                if not 0 <= _p < num_layers:
+                    raise ValueError(
+                        f"qwen4_exp ple_layer_ids={_raw_ple} (1-based) maps to decoder index {_p}, "
+                        f"outside [0, {num_layers}). Either the field is already 0-based in this "
+                        f"checkpoint or num_hidden_layers disagrees with it."
+                    )
+            if not getattr(config, "hc_count", None):
+                raise ValueError(
+                    "qwen4_exp config is missing `hc_count`: the whole decoder carries an "
+                    "hc_count-times-wide residual stream, so there is no safe default."
+                )
+
+        # The two hash inputs config.json leaves implicit. `seed` is absent from the shipping file,
+        # so the architecture default (1234) is what every row id depends on — carried explicitly so
+        # ple/hashing.py can assert it reproduces the checkpoint's own `layer_multipliers` instead of
+        # assuming it. `eos_token_id` may be an int or a list; the reference takes `[0]` of a list
+        # (`Qwen4ExpTextNGramEmbedding.__init__`), and it is the fill for positions whose n-gram
+        # context would cross a segment boundary.
+        ngram_seed = None
+        ngram_eos_token_id = None
+        if _is_qwen4_exp:
+            from minisgl.ple.hashing import DEFAULT_NGRAM_SEED
+
+            ngram_seed = int(getattr(config, "seed", None) or DEFAULT_NGRAM_SEED)
+            _eos = getattr(config, "eos_token_id", None)
+            if isinstance(_eos, (list, tuple)):
+                _eos = _eos[0] if _eos else None
+            if _eos is None:
+                raise ValueError(
+                    "qwen4_exp config has no `eos_token_id`, which the n-gram hash needs: it is the "
+                    "fill for positions whose n-gram context would reach across a segment boundary, "
+                    "and the seed of every sequence's initial 2-token context. Defaulting it would "
+                    "hash the first tokens of every request against the wrong n-gram, silently."
+                )
+            ngram_eos_token_id = int(_eos)
+
         return cls(
             num_layers=num_layers,
             num_qo_heads=config.num_attention_heads,
@@ -856,4 +1013,46 @@ class ModelConfig:
             zaya_use_mod=bool(getattr(config, "zaya_use_mod", True)) if is_cca else False,
             scale_residual_merge=bool(getattr(config, "scale_residual_merge", is_cca)),
             residual_in_fp32=bool(getattr(config, "residual_in_fp32", False)),
+            unparsed_quant_method=unparsed_quant_method,
+            # Qwen4-Exp. All gated on _is_qwen4_exp so no other family can pick these up from a
+            # coincidentally-named config key.
+            hc_count=getattr(config, "hc_count", None) if _is_qwen4_exp else None,
+            hc_lowrank=getattr(config, "hc_lowrank", None) if _is_qwen4_exp else None,
+            ple_layer_ids=ple_layer_ids,
+            ple_embed_dim=(
+                (getattr(config, "ple_embed_dim", None) or config.hidden_size)
+                if _is_qwen4_exp
+                else None
+            ),
+            ple_conv_kernel_size=(
+                getattr(config, "ple_conv_kernel_size", None) if _is_qwen4_exp else None
+            ),
+            ngram_size=getattr(config, "ngram_size", None) if _is_qwen4_exp else None,
+            heads_per_ngram=getattr(config, "heads_per_ngram", None) if _is_qwen4_exp else None,
+            ngram_vocab_size_base=(
+                getattr(config, "ngram_vocab_size_base", None) if _is_qwen4_exp else None
+            ),
+            make_ngram_vocab_size_divisible_by=(
+                getattr(config, "make_ngram_vocab_size_divisible_by", None)
+                if _is_qwen4_exp
+                else None
+            ),
+            split_ngram_parts=(
+                getattr(config, "split_ngram_parts", None) if _is_qwen4_exp else None
+            ),
+            ngram_seed=ngram_seed,
+            ngram_eos_token_id=ngram_eos_token_id,
+            indexer_budget=getattr(config, "indexer_budget", None) if _is_qwen4_exp else None,
+            indexer_compress_ratio=(
+                getattr(config, "indexer_compress_ratio", None) if _is_qwen4_exp else None
+            ),
+            indexer_head_dim=(
+                getattr(config, "indexer_head_dim", None) if _is_qwen4_exp else None
+            ),
+            indexer_kv_heads=(
+                getattr(config, "indexer_kv_heads", None) if _is_qwen4_exp else None
+            ),
+            indexer_n_heads=(
+                getattr(config, "indexer_n_heads", None) if _is_qwen4_exp else None
+            ),
         )

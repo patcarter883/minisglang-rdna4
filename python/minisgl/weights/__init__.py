@@ -17,6 +17,11 @@ Import layering — deliberate, and load-bearing for the tests:
 Nothing above `torch_pool` imports torch at module scope, so the planning and capacity logic is
 unit-testable on a machine where `import torch` fails outright.
 
+`stream_tier` is deliberately NOT re-exported here either, and for the same reason as `granule`: it
+imports torch and `moe_interpose` at module scope. Import it by path
+(`from minisgl.weights.stream_tier import ExpertStreamTier`); `stage_b` and `bake` already do, from
+inside the methods that need it, so the torch-free planning tests stay torch-free.
+
 `granule` is therefore deliberately NOT re-exported here: it imports torch and
 `minisgl.kvcache.host_arena` (for `FrameComponent`/`FrameLayout`) at module scope, and
 `minisgl.layers.moe` / `minisgl.layers.linear` import it eagerly, so pulling it into this
@@ -44,6 +49,9 @@ from .chunk_plan import (
 )
 from .config import ArenaSettings, create_pinned_weight_arena, resolve_arena_settings
 from .host_capacity import (
+    DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE,
+    DEFAULT_SWAP_TRIPWIRE_FRACTION,
+    DEFAULT_SWAP_TRIPWIRE_PAGES,
     CapacityVerdict,
     HostArenaCapacityError,
     HostArenaSwapThrashError,
@@ -85,6 +93,9 @@ __all__ = [
     "suggest_chunk_bytes",
     "torch_allocation_bytes",
     # capacity
+    "DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE",
+    "DEFAULT_SWAP_TRIPWIRE_FRACTION",
+    "DEFAULT_SWAP_TRIPWIRE_PAGES",
     "CapacityVerdict",
     "HostArenaCapacityError",
     "HostArenaSwapThrashError",

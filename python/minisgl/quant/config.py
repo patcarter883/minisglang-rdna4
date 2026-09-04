@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,118 @@ def _norm_ignore(patterns: tuple[str, ...]) -> tuple[str, ...]:
                 p = "model." + p.removeprefix("model.decoder.")
         out.append(p)
     return tuple(out)
+
+
+# ---- modelopt (NVIDIA TensorRT-ModelOpt) -> compressed-tensors normalization ------------------
+#
+# `quant_method: "modelopt"` describes the SAME on-disk formats compressed-tensors does; it only
+# spells the header differently. Rather than grow a second parallel arm through every consumer
+# (`is_nvfp4`, `weight_is_e2m1`, `for_module`, the linear/MoE method factories), a modelopt header is
+# rewritten INTO the compressed-tensors shape at parse time and falls through the existing branch.
+# Downstream sees `method="compressed-tensors"` and is untouched.
+#
+# Three things differ and each is silent-wrong if left alone:
+#   1. the format lives in `quant_algo` ("NVFP4"), not in `format` — without the translation
+#      `ct_format` is None, `is_nvfp4` is False, and the NVFP4 experts route into the MXFP4 W4A8
+#      kernel (group-32 vs the real group-16, and an orphaned `weight_scale_2`);
+#   2. `ignore` entries are fnmatch GLOBS ("*.self_attn.*", "*hyper_connection*"), not the plain
+#      substrings compressed-tensors uses. Left as substrings, `"*.self_attn.*" in name` is False for
+#      EVERY name (no literal asterisk in a module path), so the whole ignore list evaporates and the
+#      bf16 attention / GDN / hyper-connection / shared-expert / PLE modules all build quantized
+#      against tensors the checkpoint ships unpacked;
+#   3. `targets` names a torch CLASS ("Linear"), not a module-path selector.
+_MODELOPT_METHODS = ("modelopt", "modelopt_fp8", "modelopt_fp4")
+
+# `quant_algo` -> the compressed-tensors `format` that denotes the identical on-disk layout.
+# Deliberately a closed table: an algo that is not here is a packing this repo has no reader for, and
+# returning None (-> `ModelConfig.unparsed_quant_method`) says so instead of guessing a format.
+_MODELOPT_ALGO_FORMAT = {
+    "NVFP4": "nvfp4-pack-quantized",  # E2M1 + per-16 e4m3 block scale + per-tensor fp32 global
+    "NVFP4_AWQ": "nvfp4-pack-quantized",
+    "FP8": "float-quantized",  # e4m3 weights (W8A8 when input_activations are declared)
+    "FP8_PER_TENSOR": "float-quantized",
+    "FP8_PER_CHANNEL_PER_TOKEN": "float-quantized",
+}
+
+# The weights/input_activations block `config_groups` would carry, per algo, for the headers that
+# ship `quant_algo` ALONE (modelopt does this for whole-model schemes). Only used when there is no
+# `config_groups` at all — otherwise the file's own numbers win. Without it the compressed-tensors
+# branch would fall back to its group_size=32 default, which for NVFP4 is the WRONG block size and
+# mis-strides every scale.
+_MODELOPT_ALGO_SCHEME = {
+    "nvfp4-pack-quantized": {
+        "weights": {"num_bits": 4, "group_size": 16, "type": "float", "symmetric": True},
+        "input_activations": {"num_bits": 4, "type": "float"},
+    },
+    "float-quantized": {
+        "weights": {"num_bits": 8, "type": "float", "symmetric": True},
+        "input_activations": {"num_bits": 8, "type": "float"},
+    },
+}
+
+_GLOB_META = ("*", "?", "[")
+
+
+def _glob_to_ignore(pattern: str) -> str:
+    """One modelopt `ignore` glob -> an entry `is_module_quantized` matches correctly.
+
+    A pattern with no glob metacharacter ("lm_head", "model.embed_tokens") is left as a plain entry
+    so it keeps the historical substring semantics every other checkpoint relies on. A pattern that
+    DOES glob is translated to a fully anchored `re:` regex — anchored because a glob is a whole-name
+    match, and an unanchored `mtp\\..*` would also swallow a hypothetical `model.mtp_proj.*`.
+    """
+    if pattern.startswith("re:") or not any(c in pattern for c in _GLOB_META):
+        return pattern
+    # fnmatch.translate already appends \Z; \A closes the front.
+    return "re:" + r"\A" + fnmatch.translate(pattern)
+
+
+def _modelopt_targets(targets: tuple) -> tuple:
+    """modelopt `targets` are torch CLASS names ("Linear"), compressed-tensors' are module-path
+    selectors. A class name reaches `for_module` as a substring test that matches nothing, so a
+    MULTI-group modelopt header would resolve every module to "unquantized" — the whole model built
+    full precision with no error. Map a bare class-like token to the catch-all it means; leave
+    anything that looks like a path (has a dot or a glob) to the normal selector logic."""
+    out = []
+    for t in targets:
+        t = str(t)
+        if t and "." not in t and not any(c in t for c in _GLOB_META):
+            out.append("re:.*")  # a class-name target selects every Linear, i.e. everything
+        else:
+            out.append(_glob_to_ignore(t))
+    return tuple(out)
+
+
+def _modelopt_to_compressed_tensors(d: dict) -> "dict | None":
+    """Rewrite a modelopt `quantization_config` dict into the compressed-tensors shape, or None if
+    its `quant_algo` names a packing this repo cannot read."""
+    algo = str(d.get("quant_algo") or "").upper()
+    fmt = _MODELOPT_ALGO_FORMAT.get(algo)
+    if fmt is None:
+        return None
+    groups = d.get("config_groups") or {}
+    if not any((g or {}).get("weights") for g in groups.values()):
+        groups = {"group_0": dict(_MODELOPT_ALGO_SCHEME[fmt], targets=("re:.*",))}
+    else:
+        groups = {
+            k: dict(g, targets=_modelopt_targets(tuple(g.get("targets") or ())))
+            for k, g in groups.items()
+        }
+    return {
+        "quant_method": "compressed-tensors",
+        "format": fmt,
+        "config_groups": groups,
+        # ORDER MATTERS: `_norm_ignore` (the `language_model.` / `model.decoder.` de-wrap, so an
+        # entry written in the checkpoint's wrapped key space matches the loader's de-wrapped module
+        # names) skips anything already `re:`-prefixed. Run it on the raw GLOB text first, then
+        # translate. Doing it the other way round leaves `model.language_model.embed_tokens`
+        # un-de-wrapped and it silently matches nothing. `_norm_ignore` runs again inside the
+        # compressed-tensors branch; it is a no-op on the `re:` entries this produces.
+        "ignore": tuple(_glob_to_ignore(p) for p in _norm_ignore(tuple(d.get("ignore") or ()))),
+        # Carried through untouched for any consumer that reads them off the raw dict.
+        "kv_cache_scheme": d.get("kv_cache_quant_algo"),
+        "modelopt_quant_algo": algo,
+    }
 
 
 @dataclass(frozen=True)
@@ -221,6 +334,16 @@ class QuantConfig:
             return None
         d = cls._as_dict(qc)
         method = str(d.get("quant_method", "")).lower()
+
+        # modelopt is compressed-tensors wearing a different header (see the module notes above):
+        # normalize and fall through, so `is_nvfp4`/`weight_is_e2m1`/`for_module` and every method
+        # factory keep exactly one code path. An algo we cannot read normalizes to None and the
+        # function returns None, which `ModelConfig.unparsed_quant_method` reports by name.
+        if method in _MODELOPT_METHODS:
+            normalized = _modelopt_to_compressed_tensors(d)
+            if normalized is None:
+                return None
+            d, method = normalized, "compressed-tensors"
 
         # modules_to_not_convert (AWQ/GPTQ): plain module-name substrings kept at full precision
         # (attn, router gate, an unquantized MTP/draft head). Folded into `ignore` so is_module_quantized

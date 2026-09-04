@@ -37,6 +37,7 @@ from minisgl.layers import (
     RMSNorm,
     RMSNormFused,
     VocabParallelEmbedding,
+    load_nn_bridge_state,
 )
 from minisgl.quant import create_linear_method
 from minisgl.utils import div_even, init_logger, nvtx_annotate
@@ -255,10 +256,10 @@ class GDNLinearAttn(BaseOP):
             result[_concat(prefix, name)] = tensor
         return result
 
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        sub = {name: state_dict.pop(_concat(prefix, name)) for name in self._gdn.state_dict()}
-        missing, unexpected = self._gdn.load_state_dict(sub, strict=True, assign=True)
-        assert not missing and not unexpected, (missing, unexpected)
+    def load_state_dict(
+        self, state_dict, *, prefix: str = "", _internal: bool = False, missing_ok: bool = False
+    ) -> None:
+        load_nn_bridge_state(self._gdn, state_dict, prefix, missing_ok=missing_ok)
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 

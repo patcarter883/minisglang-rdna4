@@ -65,18 +65,76 @@ CGROUP_UNLIMITED_MIN = 1 << 53
 # P3b's floor, so the ceilings quoted below were measured under this policy.
 DEFAULT_FLOOR_BYTES = 12 * GIB
 
-# What P3b actually reached, on an IDLE box with NO ENGINE LOADED. Advisory only — never a gate,
-# because it is a property of that box on that day, while `MemAvailable` is the live truth. Used to
-# warn when a plan is technically inside `MemAvailable` but outside anything ever demonstrated.
-P3B_PINNED_CEILING_BYTES: Dict[int, int] = {1: 34 * GIB, 2: 62 * GIB}
+# The largest pinned arena ever DEMONSTRATED on this box, per local-rank count. Advisory only —
+# never a gate, because it is a property of this box on a given day while `MemAvailable` is the live
+# truth. Used to warn when a plan is technically inside `MemAvailable` but outside anything anyone
+# has actually reached.
+#
+# THE 1-RANK ENTRY IS NOW MEASURED ON THE SHIPPING PATH, not inherited from P3b. P3b's 34.0 GiB came
+# from `hipMemCreate(location=Host)` in a standalone probe; the arena uses `hipHostMalloc` through
+# `pinned_arena.attach()`, behind this module's floor and tripwire, and nobody had ever swept THAT.
+# `tools/offload/pin_ceiling_sweep.py` did, one rank, card 0, 3 GiB chunks, 12 GiB floor, 2026-09-04:
+# clean at 8/16/20/24/26/28/30/32/34/36/38/40/44/48/52 GiB targets, topping out at **51.0 GiB
+# actually pinned**, with the per-chunk pin time flat throughout (median 6.4-9.3 s per 3 GiB chunk;
+# max/median never above 2.0x, i.e. no rate collapse). 56 GiB is the first failure and it is not a
+# `hipHostMalloc` refusal: at chunk 17/18 `MemAvailable` had fallen to 21.97 GiB — inside 2x the
+# floor, so the swap tripwire ARMED — and 20,003,608 pages of swap-out tripped the 1 % rate
+# threshold. The arena rolled back to 0 bytes and the box was fine.
+#
+# So the failure mode past the ceiling is a CLEAN, EARLY REFUSAL by this module, which is the whole
+# design intent, and the real limit is node `MemAvailable` rather than anything in the allocator.
+#
+# THE 2-RANK ENTRY IS STILL P3b's AND IS NOW SUSPECT. 62.0 GiB across two ranks exceeds what ONE
+# rank reached on this box today (51.0), and the ceiling is a node MemAvailable floor that does not
+# grow with ranks (`plan.host_arena_ceiling_bytes` says exactly this). P3b measured it on an idle
+# box; this box now idles with tens of GiB in zram. It is left unchanged because it has NOT been
+# re-measured — sweeping two concurrent ranks is the obvious next probe — but a plan that leans on
+# it is leaning on the older, more optimistic of two numbers.
+PINNED_CEILING_BYTES: Dict[int, int] = {1: 51 * GIB, 2: 62 * GIB}
+#: Back-compat alias. The name said P3B when only P3b's figures were in it; the 1-rank entry no
+#: longer comes from P3b. Kept so existing importers (`weights/plan.py`, `tests/core/test_weight_plan
+#: .py`) do not have to move in the same change that re-measured the number.
+P3B_PINNED_CEILING_BYTES: Dict[int, int] = PINNED_CEILING_BYTES
 P3B_NOTE = (
-    "P3b (idle box, no engine loaded): 34.0 GiB pinned for 1 rank, 62.0 GiB across 2 ranks "
-    "(34.0 + 28.0), rank 1 stopped on the MemAvailable floor with 114,813 pages swapped"
+    "measured 2026-09-04 (tools/offload/pin_ceiling_sweep.py, card 0, 1 rank, 3 GiB chunks, 12 GiB "
+    "floor): 51.0 GiB pinned clean with a flat per-chunk rate; 56.0 GiB aborted at chunk 17/18 on "
+    "the swap tripwire with MemAvailable down to 21.97 GiB. 2-rank figure is still P3b's (idle box, "
+    "no engine loaded): 62.0 GiB across two ranks (34.0 + 28.0), rank 1 stopped on the MemAvailable "
+    "floor with 114,813 pages swapped — NOT re-measured, and above today's 1-rank result"
 )
 
 # Swap-out pages observed while pinning before we call it thrash. P3b saw 114,813 at the ceiling;
 # 16,384 pages = 64 MiB is far below that and still far above idle noise on this box.
+#
+# THIS IS A FLOOR, NOT THE THRESHOLD — see `SwapTripwire`. As a flat constant it is a boot failure
+# for any large arena: 30 GiB is 7.9 M pages, so 64 MiB is 0.2 % of the pin, a figure any co-tenant
+# of a shared box crosses without the pinning being responsible for a single page of it (this box
+# runs zram and idles with tens of GiB already swapped). Every 48-layer boot died on it.
 DEFAULT_SWAP_TRIPWIRE_PAGES = 16 * 1024
+
+# The RATE the tripwire gates on: pages evicted per page pinned. Above this the kernel is
+# systematically making room for us rather than incidentally reclaiming, which is the box-destroying
+# regime — pinned pages are themselves unevictable, so the eviction is one-way. 1 % of a 30 GiB pin
+# is 78,643 pages, still below the 114,813 P3b measured AT the ceiling, so the fault P3b hit is
+# still caught while a co-tenant's steady-state swap traffic is not.
+DEFAULT_SWAP_TRIPWIRE_FRACTION = 0.01
+
+# The tripwire is ARMED only once MemAvailable has fallen within this multiple of the floor.
+#
+# `pswpout` is box-wide and carries no attribution, so on a shared box a co-tenant's eviction storm
+# reads as ours. Measured here, 2026-09-03: pinning 10 GiB with 71 GiB free and MemAvailable at
+# 58 GiB coincided with 432,173 pages of swap-out — 1.65 GiB, 16 % of the pin — none of which our
+# pinning could have caused, because the box was nowhere near short of memory (this box runs zram
+# and its cumulative `pswpout` is in the hundreds of millions of pages). A threshold low enough to
+# catch real thrash is far below that ambient traffic, so a swap-count-only tripwire on this box
+# refuses every large arena for a reason that has nothing to do with the arena.
+#
+# Headroom is the discriminator that needs no attribution: swap-out matters only when memory is
+# actually scarce. The tripwire exists because `MemAvailable` is an ESTIMATE that P3b proved
+# optimistic — but P3b's rank 1 was AT its floor when it drove 114,813 pages out, which this arming
+# condition catches, while "60 GiB available and the box is swapping anyway" is somebody else's
+# problem and not a reason to refuse a boot.
+DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE = 2.0
 
 
 class HostArenaCapacityError(RuntimeError):
@@ -396,18 +454,86 @@ def check_capacity(
 
 
 class SwapTripwire:
-    """Watches `pswpout` across the pinning loop.
+    """Watches `pswpout` across the pinning loop. The threshold is a RATE, not a constant.
 
     `MemAvailable` is checked before every chunk, but it is an *estimate*: P3b drove 114,813 pages
     to swap while still nominally above its floor. Swap-out during pinning means the kernel is
     evicting to make room for pages that can never themselves be evicted — the box is being
     destroyed one chunk at a time. Abort while it is still recoverable.
+
+    WHY A FLAT THRESHOLD WAS WRONG, AND HOW. `DEFAULT_SWAP_TRIPWIRE_PAGES` alone (64 MiB) is a
+    fraction of a percent of the pins this feature exists to make: the target checkpoint asks for
+    ~29.3 GiB per rank, so a flat 64 MiB aborts on 0.2 % of the payload's worth of swap-out — which a
+    box that swaps at all crosses from ambient co-tenant traffic long before the pinning has done
+    anything wrong. Every 48-layer boot died there. But raising the constant is not the fix either:
+    it would make the tripwire progressively blinder as arenas grow, and the *small*-arena case (a
+    64 MiB pin that drives 64 MiB of eviction) is genuinely pathological and must still fire.
+
+    So `pin_bytes` turns it into a rate: abort when the eviction we caused exceeds
+    `DEFAULT_SWAP_TRIPWIRE_FRACTION` of what we are pinning, never below the flat floor. Passing no
+    `pin_bytes` reproduces the old flat behaviour exactly, which is what every existing caller and
+    test gets.
+
+    It cannot ATTRIBUTE the swap-out — `pswpout` is box-wide — which is why `check()` takes the live
+    `available`/`floor` and arms only when memory is actually scarce. See
+    `DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE` for the measurement that forced that. Passing no headroom
+    keeps the tripwire permanently armed, which is the old behaviour and the right default for a
+    caller that has no `MemAvailable` reading to offer.
+
+    ARMING GATES *WHEN* THE COMPARISON RUNS; IT MUST ALSO GATE *WHICH* SWAP IS COUNTED. Until the
+    re-baseline below, it did not, and the two halves contradicted each other. `delta_pages()`
+    counted from construction — the start of the pin — while `armed()` only decided whether to look.
+    On a long pin the box is nowhere near its floor for most of the loop, so the tripwire sits
+    disarmed while box-wide `pswpout` accumulates from co-tenants; then, near the END of the pin,
+    `MemAvailable` finally falls inside `arm_multiple x floor`, the tripwire arms, and the FIRST
+    armed comparison is charged the entire disarmed window. That is precisely the ambient traffic
+    `DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE` exists to exclude, billed a few chunks later.
+
+    MEASURED, 2026-09-04, qwen4_exp 48 layers TP=2, 27.10 GiB/rank: aborted at chunk 33/37 claiming
+    **21,660,130 pages = 82.63 GiB "swapped out while pinning"** a 27.10 GiB arena. The number
+    refutes its own attribution — no 27.10 GiB pin evicts 82.63 GiB — and the run was killed by it
+    after ten minutes of successful pinning. The identical configuration booted, generated coherent
+    text and pinned all 37 chunks when the floor was lowered, which did not add capacity: it lowered
+    the ARMING threshold enough that the pin finished before the window opened. A tripwire whose
+    verdict depends on how late it happens to arm is not measuring anything.
+
+    So the delta is re-baselined ONCE, on the disarmed -> armed transition, and the count that
+    matters becomes the swap-out observed WHILE memory was scarce. Deliberately once and not per
+    transition: `MemAvailable` oscillates around the arming threshold as chunks are pinned and page
+    cache is reclaimed, and re-baselining on every re-arm would reset the count forever and blind the
+    tripwire completely. And deliberately only when a disarmed check was actually seen
+    (`disarmed_checks`), so a caller that is armed from its first check — every caller that passes no
+    `available`, plus every existing test — keeps the construction baseline and behaves exactly as
+    before.
     """
 
-    __slots__ = ("threshold_pages", "baseline_pages", "enabled")
+    __slots__ = (
+        "threshold_pages",
+        "baseline_pages",
+        "enabled",
+        "pin_bytes",
+        "fraction",
+        "arm_multiple",
+        "disarmed_checks",
+        "armed_baseline_taken",
+    )
 
-    def __init__(self, threshold_pages: int = DEFAULT_SWAP_TRIPWIRE_PAGES) -> None:
-        self.threshold_pages = int(threshold_pages)
+    def __init__(
+        self,
+        threshold_pages: int = DEFAULT_SWAP_TRIPWIRE_PAGES,
+        *,
+        pin_bytes: int = 0,
+        fraction: float = DEFAULT_SWAP_TRIPWIRE_FRACTION,
+        arm_multiple: float = DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE,
+        page_bytes: int = 4096,
+    ) -> None:
+        self.pin_bytes = max(0, int(pin_bytes))
+        self.fraction = float(fraction)
+        self.arm_multiple = float(arm_multiple)
+        self.disarmed_checks = 0
+        self.armed_baseline_taken = False
+        scaled = int(self.pin_bytes / max(1, page_bytes) * self.fraction)
+        self.threshold_pages = max(int(threshold_pages), scaled)
         self.baseline_pages = read_pswpout_pages()
         # A box with no swap configured cannot thrash; do not spend a /proc read per chunk on it.
         self.enabled = bool(read_meminfo().get("SwapTotal") or 0) and self.threshold_pages > 0
@@ -415,14 +541,41 @@ class SwapTripwire:
     def delta_pages(self) -> int:
         return max(0, read_pswpout_pages() - self.baseline_pages)
 
-    def check(self, context: str = "") -> None:
+    def armed(self, available: int | None, floor: int) -> bool:
+        """Is memory scarce enough that swap-out could plausibly be OUR fault?"""
+        if available is None or floor <= 0 or self.arm_multiple <= 0:
+            return True
+        return available < floor * self.arm_multiple
+
+    def check(
+        self, context: str = "", *, available: int | None = None, floor: int = 0
+    ) -> None:
         if not self.enabled:
             return
+        if not self.armed(available, floor):
+            self.disarmed_checks += 1
+            return
+        # The disarmed -> armed transition, once. See the class docstring: without this the first
+        # armed comparison is charged every page a co-tenant evicted while the box had tens of GiB
+        # free, which on a long pin is the whole pin. `disarmed_checks` guards it so an
+        # always-armed caller keeps the construction baseline byte-for-byte.
+        if self.disarmed_checks and not self.armed_baseline_taken:
+            self.armed_baseline_taken = True
+            self.baseline_pages = read_pswpout_pages()
         d = self.delta_pages()
         if d >= self.threshold_pages:
+            scale = (
+                f" (threshold is {self.fraction:.1%} of the {fmt_bytes(self.pin_bytes)} being "
+                f"pinned, floored at {DEFAULT_SWAP_TRIPWIRE_PAGES} pages; armed because "
+                f"MemAvailable {fmt_bytes(available or 0)} is within {self.arm_multiple:g}x the "
+                f"{fmt_bytes(floor)} floor)"
+                if self.pin_bytes
+                else ""
+            )
             raise HostArenaSwapThrashError(
                 f"WEIGHT OFFLOAD: aborting the pinned host arena — {d} pages ({fmt_bytes(d * 4096)} "
-                f"at 4 KiB) were swapped out while pinning{(' ' + context) if context else ''}. "
+                f"at 4 KiB) were swapped out while pinning{(' ' + context) if context else ''}"
+                f"{scale}. "
                 f"Pinned pages are unevictable, so continuing trades the whole box for a boot that "
                 f"will not finish. Same fixes as a capacity failure: raise the device-tier fraction, "
                 f"free host RAM, or use a smaller checkpoint."

@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Sequence
 
 import torch
+from minisgl._hip_engage import engaged
 from minisgl.utils import init_logger
 
 from .granule import (
@@ -78,8 +79,10 @@ from .stacks import ExpertStackTable, StackAllocator, StackKind
 __all__ = [
     "MoEWeightSeam",
     "SeamBindReport",
+    "SeamResidencyProof",
     "BindOutcome",
     "InterpositionError",
+    "prove_seam_residency",
     "discover_moe_layers",
     "build_layer_weights",
     "attach_seams",
@@ -92,6 +95,21 @@ __all__ = [
 ]
 
 _logger = init_logger("weight-offload")
+
+# How many times each placement arm has been RESOLVED, keyed by the same name the ledger uses.
+#
+# The `engaged()` ledger is a SET: it records that an arm fired once, ever. That is the right shape
+# for "did the seam ever engage" and the wrong shape for a per-leg A/B, where both legs run after the
+# ledger is already saturated and a set-diff is empty by construction for BOTH of them. This counter
+# is what makes the per-leg question answerable, and it answers it in a direction that is easy to
+# misread, so: under CUDAGRAPH REPLAY these counts DO NOT MOVE. `resolve()` is host Python inside
+# `MoELayer.forward`; a replay re-executes the recorded kernel launches and never re-enters Python,
+# so the captured leg reads its host-resident experts through pointers the graph baked at capture
+# time. Counts frozen across a captured leg and climbing by (num MoE layers) per step across an eager
+# leg is therefore the positive signal that the two legs took different paths — not evidence that the
+# offload arm stopped working. (`bake.verify_after_capture()` is the separate gate that those baked
+# pointers still address the arena.) One dict update per MoE layer per eager forward.
+RESOLVE_COUNTS: dict[str, int] = {}
 
 # The container attributes `MoELayer.forward` selects, in the order it selects them. Read off
 # `MoELayer.expert_containers()` when available so the seam and the layer can never disagree about
@@ -295,6 +313,9 @@ class MoEWeightSeam:
         "_bound",
         "_frozen",
         "_report",
+        # The `engaged()` name for this seam's placement, precomputed at bind(). Not derived in
+        # `resolve()`: that is once per MoE layer per forward step.
+        "_engage",
     )
 
     def __init__(
@@ -337,6 +358,10 @@ class MoEWeightSeam:
         self._bound = False
         self._frozen = False
         self._report = SeamBindReport(path=path, kind=StackKind.DEVICE)
+        # "unbound" until bind() decides — a seam that reaches a forward without being bound is a
+        # binder bug, and it has to be visible in the ledger as its own name rather than silently
+        # reading as the device arm.
+        self._engage = "weight_offload.moe_resolve[unbound]"
 
     # -- hot path ------------------------------------------------------------------------------
     def resolve(self, w13: Any, w2: Any) -> tuple[Any, Any]:
@@ -346,6 +371,29 @@ class MoEWeightSeam:
         already happened at `bind()`. The checks are not decoration: they are the only thing that
         turns a seam-bound-to-the-wrong-layer bug (identical container shapes, plausible logits, no
         crash) into a loud failure. See the module docstring.
+
+        THE `engaged()` LINE. Boot-time logs prove the arena was PINNED and the bake COPIED; neither
+        proves the forward ever goes through the seam. `MoELayer._weight_offload` is a class
+        attribute defaulting to None, so any regression that leaves it unset — a detach, a layer
+        rebuilt after bind, a model whose sparse block stopped being a `MoELayer` — makes the whole
+        offload arm vanish with the boot banner unchanged and the serve merely reading device
+        weights (or, at 48 layers, OOMing later for reasons that look unrelated). This repo requires
+        diffing the engaged ledger per leg precisely because that class of dispatch regression is
+        invisible to a bench. Fires once per (kind), from the first real forward AND from inside HIP
+        graph capture; the name is precomputed at bind so the hot path is one set lookup.
+        """
+        engaged(self._engage)
+        RESOLVE_COUNTS[self._engage] = RESOLVE_COUNTS.get(self._engage, 0) + 1
+        return self.assert_identity(w13, w2)
+
+    def assert_identity(self, w13: Any, w2: Any) -> tuple[Any, Any]:
+        """`resolve()` WITHOUT the ledger line. The check, on its own.
+
+        Split out for `prove_seam_residency`, which has to make exactly the call the forward makes
+        (that is the whole point of it) but MUST NOT publish `weight_offload.moe_resolve[host]` while
+        doing so. That line's only value is that it distinguishes "the bake ran" from "a forward read
+        the arena"; a boot-time proof that emitted it would make the two indistinguishable again and
+        quietly destroy the evidence the ledger exists to provide.
         """
         if w13 is not self._w13 or w2 is not self._w2:
             raise InterpositionError(
@@ -479,24 +527,25 @@ class MoEWeightSeam:
         self._w13 = getattr(self._layer, self._attrs[0])
         self._w2 = getattr(self._layer, self._attrs[1])
         self._bound = True
+        # One name per PLACEMENT, not per layer: 48 per-layer lines would drown the boot log and,
+        # worse, would make "the host arm is present" a thing you have to count rather than read.
+        # Two names, so a run where every layer silently landed on the device still differs from a
+        # run where the host arm engaged.
+        self._engage = f"weight_offload.moe_resolve[{kind.name.lower()}]"
         self._report = report
         return report
 
-    def _plan_items(self, allocator: StackAllocator) -> list["_BakeItem"]:
-        """Enumerate this layer's copies: every component AND every replicated tensor.
+    def _enumerate_named_tensors(self) -> list[tuple[str, Any, tuple[str, ...], Any]]:
+        """`(owner_attr, container, alias_names, canonical_tensor)` for every tensor the layer's
+        expert containers CURRENTLY hold — components first, then replicated, in bake order.
 
-        COMPONENT-granular, not expert-granular. A GRANULE is one expert's slice of every tensor in
-        the container — scales and zero-points travel with their weights or expert `e` gets
-        dequantized against expert `f`'s scale, which is plausible numbers with no crash — but under
-        layer-granular placement the whole container moves at once and each COMPONENT is one
-        contiguous slab whose row stride is its own `e * row_bytes`. Copying component-wise
-        therefore preserves exactly the addressing the kernels already do, in one `copy_` per
-        component instead of one per expert.
-
-        The REPLICATED tensors move too. They are excluded from `granule_bytes` because every expert
-        reads the same row of them (one read per layer, not one per routed expert), but they are
-        still resident bytes that `LayerWeights.resident_bytes` prices — leaving them behind would
-        make the arena's occupancy disagree with the plan's capacity arithmetic by ~3% of w13.
+        ONE enumeration, two consumers: `_plan_items` (which turns each entry into a copy) and
+        `live_tensors` (which turns each entry into a residency claim). They MUST see the same set:
+        `live_tensors` exists to prove that what the kernels read is in the arena, and a proof that
+        walked a different tensor set from the bake would be a proof about weights the forward does
+        not use — vacuous in exactly the direction that reads as a pass. The tensors are re-read off
+        `self._layer` on every call, never cached, because after `bind()` the containers hold the
+        ARENA tensors and that is precisely the state the proof is about.
         """
         attrs = _container_attrs(self._layer)
         if len(attrs) != 2:
@@ -519,21 +568,52 @@ class MoEWeightSeam:
                 f"granule specs for {tuple(specs)}. The specs describe different tensors than the "
                 f"layer is holding."
             )
-        items: list[_BakeItem] = []
+        out: list[tuple[str, Any, tuple[str, ...], Any]] = []
         for owner_attr in attrs:
             spec = specs[owner_attr]
             container = getattr(self._layer, owner_attr)
             stacked = spec.stacked_tensors(container)
             for c in spec.components:
-                items.append(
-                    self._item(owner_attr, container, c.names, stacked[c.name], allocator)
-                )
+                out.append((owner_attr, container, tuple(c.names), stacked[c.name]))
             for r in spec.replicated:
                 names = (r.name,) + tuple(getattr(r, "aliases", ()) or ())
-                items.append(
-                    self._item(owner_attr, container, names, _lookup(container, r.name), allocator)
-                )
-        return items
+                out.append((owner_attr, container, names, _lookup(container, r.name)))
+        return out
+
+    def live_tensors(self) -> list[tuple[str, Any]]:
+        """`(name, tensor)` for every tensor this layer's kernels will actually read, RIGHT NOW.
+
+        Public because the residency PROOF needs it (`prove_seam_residency`): after `bind()` these
+        are the arena rows for a HOST layer and the untouched originals for a DEVICE one, so asking
+        the arena whether it owns each pointer is a direct answer to "is this layer really streaming
+        from host RAM". Only the canonical tensor per alias group is yielded — the aliases are views
+        of the same storage, so a second claim about them would double-count the bytes.
+        """
+        return [
+            (f"{self.path}.{owner}.{names[0]}", t)
+            for owner, _c, names, t in self._enumerate_named_tensors()
+        ]
+
+    def _plan_items(self, allocator: StackAllocator) -> list["_BakeItem"]:
+        """Enumerate this layer's copies: every component AND every replicated tensor.
+
+        COMPONENT-granular, not expert-granular. A GRANULE is one expert's slice of every tensor in
+        the container — scales and zero-points travel with their weights or expert `e` gets
+        dequantized against expert `f`'s scale, which is plausible numbers with no crash — but under
+        layer-granular placement the whole container moves at once and each COMPONENT is one
+        contiguous slab whose row stride is its own `e * row_bytes`. Copying component-wise
+        therefore preserves exactly the addressing the kernels already do, in one `copy_` per
+        component instead of one per expert.
+
+        The REPLICATED tensors move too. They are excluded from `granule_bytes` because every expert
+        reads the same row of them (one read per layer, not one per routed expert), but they are
+        still resident bytes that `LayerWeights.resident_bytes` prices — leaving them behind would
+        make the arena's occupancy disagree with the plan's capacity arithmetic by ~3% of w13.
+        """
+        return [
+            self._item(owner_attr, container, names, src, allocator)
+            for owner_attr, container, names, src in self._enumerate_named_tensors()
+        ]
 
     def _item(self, owner_attr, container, names, src, allocator) -> "_BakeItem":
         """Build one copy item, resolving EVERY alias to its own live tensor.
@@ -1073,39 +1153,85 @@ def attach_seams(root: Any, *, allow_meta: bool = False) -> list[MoEWeightSeam]:
     the walk exists to prevent. `allow_meta=True` is for a shapes-only sizing estimate before the
     load and must never be used for a bind.
     """
-    seams: list[MoEWeightSeam] = []
-    for path, layer in discover_moe_layers(root):
-        n = int(layer.local_num_experts)
-        # Which attribute holds which GEMM comes from ONE place — the layer — and the specs are
-        # keyed by it here and again in `_plan_items`. Reading `specs['gate_up_proj']` while the
-        # bake enumerated containers in `expert_containers()` order would pair each spec with the
-        # OTHER container the day those two orders differ, and a swap is undetectable downstream
-        # because `assert_granule_pair_consistent` forces the two specs to share a component set.
-        attrs = _container_attrs(layer)
-        try:
-            # Prefer the layer's own derivation (`MoELayer.granule_specs`) — it already passes the
-            # LOCAL expert count and cross-checks the pair, so the seam cannot drift from it.
-            fn = getattr(layer, "granule_specs", None)
-            if callable(fn):
-                specs = fn(allow_meta=allow_meta)
-            else:
-                specs = {
-                    a: spec_for_container(getattr(layer, a), n, allow_meta=allow_meta)
-                    for a in attrs
-                }
-            missing = [a for a in attrs if a not in specs]
-            if missing:
-                raise InterpositionError(
-                    f"MoE layer {path!r}: granule_specs() is missing {missing}; it must key its "
-                    f"specs by the same attribute names expert_containers() yields ({attrs})."
-                )
-            w13, w2 = specs[attrs[0]], specs[attrs[1]]
-        except GranuleError as exc:
-            raise InterpositionError(f"MoE layer {path!r}: {exc}") from exc
-        seam = MoEWeightSeam(path, layer, w13_spec=w13, w2_spec=w2)
-        seam.attach()
-        seams.append(seam)
-    return seams
+    return [
+        attach_seam(path, layer, allow_meta=allow_meta) for path, layer in discover_moe_layers(root)
+    ]
+
+
+def attach_seam(path: str, layer: Any, *, allow_meta: bool = False) -> MoEWeightSeam:
+    """Derive ONE layer's seam and install it. The per-layer half of `attach_seams`.
+
+    Split out for `stage_b.SeamLayerSink`, which attaches a seam the moment the chunked load
+    finalizes that layer. It cannot use `attach_seams`: the other layers' containers do not hold
+    real tensors yet at that point, and `derive_granule_spec` would (correctly) refuse them.
+    """
+    n = int(layer.local_num_experts)
+    # Which attribute holds which GEMM comes from ONE place — the layer — and the specs are
+    # keyed by it here and again in `_plan_items`. Reading `specs['gate_up_proj']` while the
+    # bake enumerated containers in `expert_containers()` order would pair each spec with the
+    # OTHER container the day those two orders differ, and a swap is undetectable downstream
+    # because `assert_granule_pair_consistent` forces the two specs to share a component set.
+    attrs = _container_attrs(layer)
+    try:
+        # Prefer the layer's own derivation (`MoELayer.granule_specs`) — it already passes the
+        # LOCAL expert count and cross-checks the pair, so the seam cannot drift from it.
+        fn = getattr(layer, "granule_specs", None)
+        if callable(fn):
+            specs = fn(allow_meta=allow_meta)
+        else:
+            specs = {
+                a: spec_for_container(getattr(layer, a), n, allow_meta=allow_meta) for a in attrs
+            }
+        missing = [a for a in attrs if a not in specs]
+        if missing:
+            raise InterpositionError(
+                f"MoE layer {path!r}: granule_specs() is missing {missing}; it must key its "
+                f"specs by the same attribute names expert_containers() yields ({attrs})."
+            )
+        w13, w2 = specs[attrs[0]], specs[attrs[1]]
+    except GranuleError as exc:
+        raise InterpositionError(f"MoE layer {path!r}: {exc}") from exc
+    seam = MoEWeightSeam(path, layer, w13_spec=w13, w2_spec=w2)
+    seam.attach()
+    return seam
+
+
+def bind_seam(
+    seam: MoEWeightSeam,
+    kind: StackKind,
+    allocator: StackAllocator | None,
+    *,
+    selftest: int = SELFTEST_SAMPLE,
+    out: "BindOutcome",
+    count_device_bytes: bool = True,
+) -> SeamBindReport:
+    """Bind ONE seam and fold its result into `out`. The unit of work `bind_plan` iterates.
+
+    `count_device_bytes=False` for a layer the PLAN does not name (the policy-excluded MTP draft
+    head). Its bytes are absent from `plan.device_resident_bytes` too, and
+    `WeightPlanResolution.assert_device_accounting` compares the two — so counting them here would
+    make every MTP-capable checkpoint fail a boot assertion about a layer neither side planned.
+
+    Extracted so Stage B's per-layer sink and the one-shot `bind_plan` share one implementation of
+    the move AND one implementation of its accounting. The `device_resident_bytes` term in
+    particular is the only INDEPENDENT measurement of the device tier that exists (see
+    `BindOutcome`), and a second copy of it in the chunked path is exactly the drift that would make
+    two boot modes disagree about how much VRAM the model took.
+    """
+    rep = seam.bind(kind, allocator, selftest=selftest)
+    out.reports = out.reports + (rep,)
+    out.moved_bytes += rep.moved_bytes
+    if kind is StackKind.HOST:
+        out.host_layers += 1
+    else:
+        out.device_layers += 1
+        if count_device_bytes:
+            # Measured off the live containers this seam is holding, so a plan whose byte model
+            # disagrees with what post_load() actually produced (sizing.py under-counts MXFP4's
+            # E8M0 -> fp16 scale widening by 2x, for one known case) is caught here rather than by
+            # a KV pool sized against a fiction.
+            out.device_resident_bytes += seam.w13_spec.total_bytes + seam.w2_spec.total_bytes
+    return rep
 
 
 def detach_seams(seams: Sequence[MoEWeightSeam]) -> None:
@@ -1164,23 +1290,10 @@ def bind_plan(
         )
 
     out = BindOutcome(plan_digest=plan.digest())
-    reports: list[SeamBindReport] = []
     for placement in plan.placements:
-        seam = by_path[placement.path]
-        rep = seam.bind(placement.kind, allocator, selftest=selftest)
-        reports.append(rep)
-        out.moved_bytes += rep.moved_bytes
-        if placement.kind is StackKind.HOST:
-            out.host_layers += 1
-        else:
-            out.device_layers += 1
-            # Measured off the live containers this seam is holding, so a plan whose byte model
-            # disagrees with what post_load() actually produced (sizing.py under-counts MXFP4's
-            # E8M0 -> fp16 scale widening by 2x, for one known case) is caught here rather than by
-            # a KV pool sized against a fiction.
-            out.device_resident_bytes += (
-                seam.w13_spec.total_bytes + seam.w2_spec.total_bytes
-            )
+        bind_seam(
+            by_path[placement.path], placement.kind, allocator, selftest=selftest, out=out
+        )
 
     # A discovered layer the plan does NOT name is DEVICE-resident, explicitly and by name. It is
     # not an error, because the resolver excludes layers BY POLICY: `plan.OFFLOAD_MTP_HEAD = False`
@@ -1191,9 +1304,14 @@ def bind_plan(
     # guarding them: an unbound seam would still be attached and still be consulted, but with no
     # ledger and no `kind`.
     for path in sorted(set(by_path) - planned):
-        seam = by_path[path]
-        reports.append(seam.bind(StackKind.DEVICE, None, selftest=selftest))
-        out.device_layers += 1
+        bind_seam(
+            by_path[path],
+            StackKind.DEVICE,
+            None,
+            selftest=selftest,
+            out=out,
+            count_device_bytes=False,
+        )
         out.notes.append(f"{path}: not in the plan (excluded by policy) -> DEVICE, 0 bytes moved")
 
     # No `torch.cuda.synchronize()` here: `_bake` already issues exactly one per layer, keyed off
@@ -1203,7 +1321,6 @@ def bind_plan(
         for seam in seams:
             seam.freeze()
     out.seams = tuple(seams)
-    out.reports = tuple(reports)
     if log:
         # Plain `info`, not `info_rank0`: `_hip_engage`-style rank-0-only logging would hide a rank
         # whose plan diverged, which is the single most important thing to see here.
@@ -1223,6 +1340,191 @@ def bind_plan(
 # `bake._resolve_driver`, before its `if not resolution.enabled` early return. `bind_plan` records
 # `plan.digest()` in `BindOutcome.plan_digest` and logs it on every rank (plain `info`, not
 # `info_rank0`) so a divergence that somehow got past the gate is still visible in the two logs.
+
+
+@dataclass(frozen=True)
+class SeamResidencyProof:
+    """What `prove_seam_residency` MEASURED off the live model. Every field is a count of tensors
+    or bytes it actually walked; none is read from the plan."""
+
+    moe_layers: int = 0
+    host_layers: int = 0
+    device_layers: int = 0
+    host_tensors: int = 0
+    host_bytes: int = 0
+    device_tensors: int = 0
+    device_bytes: int = 0
+    #: Tensors that were skipped in the byte totals because another layer had already contributed
+    #: the SAME allocation. Non-zero only under the stream tier, whose whole mechanism is that N
+    #: layers' expert containers alias ONE buffer set (`weights/stream_tier.py`). Without the dedup
+    #: this proof reported 46.9 GiB "device-resident" on a 15.9 GiB card — an obviously impossible
+    #: number in a boot banner, which is worse than a missing one because it reads as authoritative.
+    aliased_tensors: int = 0
+    #: True when the arena was consulted, i.e. every host byte above was proven to live inside a
+    #: pinned chunk. False means the walk ran without an `owns_pointer` and the host figures are
+    #: only "what the seam claims", which is NOT a residency proof.
+    pointer_checked: bool = False
+
+    def describe(self) -> str:
+        g = 1 << 30
+        return (
+            f"seam proof: {self.moe_layers} MoE layers reachable from the LIVE model, "
+            f"{self.host_layers} host ({self.host_tensors} tensors, {self.host_bytes / g:.3f} GiB "
+            f"{'INSIDE the pinned arena' if self.pointer_checked else 'UNVERIFIED'}), "
+            f"{self.device_layers} device ({self.device_tensors} tensors, "
+            f"{self.device_bytes / g:.3f} GiB)"
+            + (
+                f", {self.aliased_tensors} tensor(s) aliased onto an allocation already counted "
+                f"(stream tier)"
+                if self.aliased_tensors
+                else ""
+            )
+        )
+
+
+def prove_seam_residency(
+    root: Any,
+    seams: Sequence[MoEWeightSeam],
+    *,
+    owns_pointer: Any = None,
+    require_host_layers: bool = True,
+) -> SeamResidencyProof:
+    """Walk the LIVE model and prove the offload seam is actually in the serving path.
+
+    WHY THIS EXISTS AND WHY IT IS NOT REDUNDANT WITH `seal()`. Every gate `seal()` runs asks the
+    ARENA and the PLAN questions: did a row fall back to `hipMalloc`, does the carve match the
+    reservation, do the copied bytes match the ledger. All of them can pass over a model the engine
+    is not going to run. The failure this repo has already paid for once — the PLE runtime, where
+    every component was green and the seam between the engine and them did not exist, so the served
+    path was 0% functional — is exactly that shape. So this asks the MODEL instead, and asks it the
+    two questions the arena cannot answer:
+
+      1. **Is the seam reachable from the object the engine will call `forward()` on?**
+         `discover_moe_layers(root)` is re-run against the live model (NOT against the seam list the
+         binder returned), and every discovered layer must carry the corresponding seam as
+         `_weight_offload`. A layer with no seam is a layer whose forward never consults the
+         placement at all; a seam bound to a layer that is no longer in the tree is a ledger about
+         weights nothing reads.
+      2. **Do the tensors the kernels will read live where the plan says they do?** For every HOST
+         layer this calls `seam.resolve(...)` with the containers read off the layer — byte for byte
+         the call `MoELayer.forward` makes — and then asks the arena whether it owns each resulting
+         tensor's `data_ptr()`. That is the only direct evidence that a host-placed layer streams
+         from pinned host RAM rather than from a VRAM copy, and it is the one claim the whole
+         feature rests on.
+
+    `owns_pointer(ptr, nbytes) -> bool` is `PinnedWeightArena.owns_pointer`. Omitting it downgrades
+    the proof to a structural one and says so in `pointer_checked`, which the caller must gate on —
+    a "proof" that silently skipped its own evidence is worse than none.
+
+    `require_host_layers` refuses a VACUOUS pass: on an enabled session, a walk that found zero
+    host-resident layers means the offload arm is not in the serving path, however clean the boot
+    log looked. Pass False only where an all-device bind is the expected outcome.
+    """
+    live = dict(discover_moe_layers(root))
+    by_path = {s.path: s for s in seams}
+    orphan_seams = sorted(set(by_path) - set(live))
+    if orphan_seams:
+        raise InterpositionError(
+            f"weight-offload seams are bound to MoE layers that are NOT reachable from the model "
+            f"the engine will serve: {orphan_seams}. Those seams' placement, byte accounting and "
+            f"host residency are all about tensors no forward will read — the arena is populated "
+            f"and the serving path is unchanged. Discovered live paths: {sorted(live)[:6]}..."
+        )
+    unseamed = sorted(p for p, layer in live.items() if getattr(layer, "_weight_offload", None) is None)
+    if unseamed:
+        raise InterpositionError(
+            f"{len(unseamed)} MoE layer(s) on the live model carry no weight-offload seam, e.g. "
+            f"{unseamed[:4]}. `MoELayer._weight_offload` is a CLASS attribute defaulting to None, "
+            f"so an unseamed layer does not fail — it silently reads its device containers while "
+            f"the plan, the arena reservation and the KV budget were all computed as though it had "
+            f"been placed. Every discovered layer must be bound, even the ones the plan leaves on "
+            f"the device (bind_plan binds those explicitly for this reason)."
+        )
+
+    moe = host_layers = device_layers = 0
+    host_tensors = host_bytes = device_tensors = device_bytes = aliased = 0
+    # Bytes are attributed to an ALLOCATION, once. The stream tier points every one of its layers'
+    # containers at a single buffer set, so a per-layer sum counts the same VRAM N times and the
+    # totals stop being physical. Keyed on `data_ptr()` because that is what the kernel
+    # dereferences and therefore what "resident" means here.
+    seen_ptrs: set = set()
+    for path, layer in sorted(live.items()):
+        seam = layer._weight_offload
+        moe += 1
+        if by_path.get(path) is not seam:
+            raise InterpositionError(
+                f"MoE layer {path!r} carries a seam the binder did not produce. Two binders ran, or "
+                f"a stale seam survived a rebuild; either way the residency ledger consulted by "
+                f"`seal()` is not the one the forward consults."
+            )
+        if not seam.bound:
+            raise InterpositionError(
+                f"seam {path!r} was attached but never bound. `resolve()` would run with no "
+                f"placement behind it and the layer's bytes are unaccounted on both tiers."
+            )
+        attrs = _container_attrs(layer)
+        # EXACTLY the check `MoELayer.forward` makes — `resolve()` minus its ledger line. Not a
+        # re-implementation of it: if the seam and the layer have drifted, this raises here, at boot,
+        # instead of on the first request. `assert_identity` rather than `resolve` because emitting
+        # `weight_offload.moe_resolve[host]` from a boot-time proof would make that ledger line stop
+        # meaning "a forward read the arena", which is the only thing it is for.
+        seam.assert_identity(*(getattr(layer, a) for a in attrs))
+        is_host = seam.kind is StackKind.HOST
+        host_layers += is_host
+        device_layers += not is_host
+        for name, t in seam.live_tensors():
+            nbytes = t.numel() * t.element_size()
+            # The residency CHECKS below still run for every tensor of every layer — an aliased
+            # tensor in the wrong tier is exactly as wrong as an unaliased one. Only the byte and
+            # tensor COUNTS are deduped.
+            first = t.data_ptr() not in seen_ptrs
+            seen_ptrs.add(t.data_ptr())
+            aliased += not first
+            # Counted bytes, which is 0 for an alias. `nbytes` itself stays the TRUE size, because
+            # `owns_pointer(ptr, nbytes)` is a range containment test and handing it 0 would ask a
+            # different, weaker question of exactly the tensors the stream tier introduced.
+            billed = nbytes if first else 0
+            if is_host:
+                host_tensors += first
+                host_bytes += billed
+                if owns_pointer is not None and not owns_pointer(t.data_ptr(), nbytes):
+                    raise InterpositionError(
+                        f"{name}: this layer is HOST-placed, but the tensor its kernels will read "
+                        f"at 0x{t.data_ptr():x} ({nbytes} B) is NOT inside the pinned arena. The "
+                        f"bytes are in VRAM the capacity plan counts as free, AND "
+                        f"`model_memory_correction()` will subtract them from the model term as "
+                        f"though they were host RAM — so the KV pool is oversized by twice this "
+                        f"tensor and the failure surfaces later as an unrelated OOM."
+                    )
+            else:
+                device_tensors += first
+                device_bytes += billed
+                if owns_pointer is not None and owns_pointer(t.data_ptr(), nbytes):
+                    raise InterpositionError(
+                        f"{name}: this layer is DEVICE-placed but its tensor lives INSIDE the host "
+                        f"arena. It is being streamed over PCIe on every step while the plan bills "
+                        f"it against the device tier — the device tier and the KV pool are both "
+                        f"sized wrong, and the layer is silently ~10x slower."
+                    )
+    proof = SeamResidencyProof(
+        moe_layers=moe,
+        host_layers=host_layers,
+        device_layers=device_layers,
+        host_tensors=host_tensors,
+        host_bytes=host_bytes,
+        device_tensors=device_tensors,
+        device_bytes=device_bytes,
+        aliased_tensors=aliased,
+        pointer_checked=owns_pointer is not None,
+    )
+    if require_host_layers and host_layers == 0:
+        raise InterpositionError(
+            "weight offload is ENABLED but not one MoE layer on the live model is host-resident: "
+            f"{proof.describe()}. The arena was pinned and the boot banner reported a plan, and the "
+            "serving path is byte-for-byte the non-offloaded one. This is the dispatch regression "
+            "an engaged() ledger exists to make visible; refusing rather than serving it."
+        )
+    return proof
 
 
 def seam_summary(seams: Sequence[MoEWeightSeam]) -> str:

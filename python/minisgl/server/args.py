@@ -189,6 +189,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         ),
     )
 
+    parser.add_argument(
+        "--weight-offload-stream-layers",
+        type=int,
+        default=ServerArgs.weight_offload_stream_layers,
+        help=(
+            "How many of the LAST MoE layers stream their routed experts off the checkpoint every "
+            "forward instead of occupying VRAM or the pinned host arena. 0 = off. This is the "
+            "capacity tier of last resort: it costs a disk read per layer per step, so use it only "
+            "when the plan refuses. Requires --cuda-graph-max-bs 0 (the gather is not capturable) "
+            "and a checkpoint with per-expert granularity."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",

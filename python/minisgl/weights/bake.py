@@ -69,7 +69,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Callable, Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 
 from .accounting import WeightArenaAccounting, gib
 
@@ -146,6 +146,14 @@ class StageADriver(Protocol):
     def bind(self, model: Any) -> Any:
         """Discover the seams and execute the plan over them. Returns a `BindOutcome`."""
 
+    def prove_seam(self, model: Any) -> Any:
+        """Prove the offload arm is in the serving path of `model`. Returns a `SeamResidencyProof`.
+
+        Optional — reached through `getattr`, so a test double that implements only the byte ledger
+        keeps working. Every OTHER method on this protocol reports on the arena or the plan, and all
+        of them can answer correctly about a model the engine will not run; this is the only one
+        that asks the live module tree."""
+
     def moved_bytes(self) -> int:
         """Bytes actually copied into the arena by `bind()`."""
 
@@ -190,6 +198,22 @@ class StageADriver(Protocol):
     def describe(self) -> str: ...
 
 
+def _engaged(name: str) -> None:
+    """One line in the process-wide engagement ledger (`minisgl._hip_engage`).
+
+    LAZY, and it swallows ImportError, for the layering reason this package's `__init__` documents:
+    `minisgl._hip_engage` reaches `minisgl.utils`, which imports torch through `utils.arch`, and
+    `bake` must stay importable (and unit-testable) on a machine where `import torch` fails. The
+    ledger is diagnostic, so losing it on such a machine is correct; losing the ability to plan is
+    not.
+    """
+    try:
+        from minisgl._hip_engage import engaged
+    except Exception:  # pragma: no cover - torch-free host
+        return
+    engaged(name)
+
+
 def _noop_log(msg: str) -> None:
     """Default sink for a session built without a logger (tests, and the disabled path)."""
 
@@ -224,6 +248,24 @@ class StageASession:
     # compares against it: an arena allocation served DURING graph capture moves these, and its
     # address is by then baked into a graph that will replay for the life of the process.
     _sealed_arena_activity: Tuple[int, int] = (0, 0)
+    # The model `bind()` was executed over, kept so `seal()` and `verify_after_capture()` can ASSERT
+    # THE SEAM against the object the engine actually serves rather than against the seam list the
+    # binder handed back. The engine holds this model for the life of the process anyway, so the
+    # reference costs nothing; what it buys is that the two gates cannot be pointed at a different
+    # tree from the forward. `None` on a disabled session and on every `bind()` that never ran.
+    _model: Any = None
+    #: The last `SeamResidencyProof`. Read by the engine's boot banner and by the harness.
+    seam_proof: Any = None
+    #: How many times `verify_after_capture()` reached its BODY with the session enabled. 0 on every
+    #: non-offloading serve, and 0 is also what a silently-disabled offload looks like — which is
+    #: why the harness asserts on this rather than on the fact that the call site exists.
+    verify_after_capture_fired: int = 0
+    #: The `stream_tier.ExpertStreamTier` this window adopted layers into, or None. The THIRD tier:
+    #: layers whose experts are re-read from the checkpoint per forward instead of living in VRAM or
+    #: in the pinned arena. Held here because `install_stream_hooks()` must run after `seal()` — the
+    #: hook is a forward-path mutation and the window's rule is that nothing about residency changes
+    #: until the mapping window has closed.
+    stream: Any = None
 
     # -- construction -------------------------------------------------------------------------
 
@@ -240,6 +282,8 @@ class StageASession:
         agreement_group: Any = None,
         gather: Any = None,
         model: Any = None,
+        stream: Any = None,
+        stream_layers: "Sequence[int] | None" = None,
     ) -> "StageASession":
         """Resolve the plan — call on the META-BUILT model, before `load_state_dict`.
 
@@ -270,6 +314,14 @@ class StageASession:
         and the checkpoint is loaded. Passing the flag is what turns that into a refusal from
         integers. See `_refuse_derived_budget_that_leaves_no_kv`.
 
+        `stream` / `stream_layers` hand this window the THIRD tier. The named layers are EXCLUDED
+        from the plan — `resolve_weight_plan(layer_indices=...)` never sees them — so the arena is
+        reserved, the capacity gate is asked, and the KV pool is sized for the layers that actually
+        occupy a tier. That exclusion is the whole point: on the target checkpoint {device, pinned
+        host} is short by ~15.5 GiB and `HostArenaCapacityError` refuses correctly; the stream tier
+        is what removes bytes from the question rather than what waves it through. See
+        `weights/stream_tier.py`.
+
         `agreement_group` is the TP CPU (gloo) group. Pass it whenever tp_size > 1: the plan is only
         rank-identical because it is a pure integer function of config, and `device_budget_bytes` is
         an input this module cannot vet. See `WeightPlanResolution.assert_rank_agreement`. It is also
@@ -285,6 +337,8 @@ class StageASession:
                 agreement_group,
                 gather=gather,
                 model=model,
+                stream=stream,
+                stream_layers=stream_layers,
                 log=log or _noop_log,
                 # Whether the number above was CHOSEN by the operator or derived from the card. The
                 # resolver cannot tell, and the two have opposite meanings: a chosen tier is a
@@ -305,9 +359,19 @@ class StageASession:
             log=log or _noop_log,
             agreement_group=agreement_group,
             gather=gather,
+            stream=stream if drv is not None else None,
         )
         if s.enabled:
             s.log(f"weight offload: {drv.describe()}")
+        elif stream is not None:
+            # A stream tier with no host tier means the plan came back empty AFTER the stream layers
+            # were excluded — i.e. everything left fits VRAM. Saying so is not cosmetic: the caller
+            # built a tier, and an inert session would never adopt a layer into it, so the boot would
+            # try to keep all of them resident and OOM with no line explaining why.
+            (log or _noop_log)(
+                "weight offload: a stream tier was supplied but the plan is empty (the non-streamed "
+                "layers fit the device budget). Nothing will be streamed."
+            )
         return s
 
     @classmethod
@@ -436,6 +500,34 @@ class StageASession:
         for note in (notes() if callable(notes) else ()):
             self.log(f"weight offload: {note}")
 
+    def chunked_sink(self) -> Any:
+        """The Stage-B sink for this window, or None when there is nothing to offload.
+
+        Call BETWEEN `attach()` and `note_loaded()` — i.e. inside the load — and hand the result to
+        `stage_b.ChunkedWeightLoader(sink=...)`. Returning None (disabled session) is not an error
+        and the caller must handle it: a serve with no host tier still wants the chunked loader's
+        raised LOAD ceiling, it just has nothing to bake, and `ChunkedWeightLoader` defaults to
+        `DeviceLayerSink` in exactly that case.
+
+        The phase is asserted rather than assumed because the sink closes over the arena allocator:
+        asked before `attach()` there is no arena, and asked after `bind()` the seams it would create
+        are ones no gate will ever look at.
+        """
+        if self.phase is not StageAPhase.ATTACHED:
+            raise RuntimeError(
+                f"weight offload: chunked_sink() must be called between attach() and note_loaded(); "
+                f"the session is in {self.phase.name}."
+            )
+        if not self.enabled:
+            return None
+        factory = getattr(self.driver, "chunked_sink", None)
+        if not callable(factory):
+            raise RuntimeError(
+                "weight offload: this Stage-A driver has no chunked_sink(), so a chunked load would "
+                "leave every host-placed layer in VRAM while the plan claims it is host-resident."
+            )
+        return factory()
+
     def note_loaded(self) -> None:
         """Call immediately after `post_load()` (`engine.py:241`)."""
         self._advance(StageAPhase.ATTACHED, StageAPhase.LOADED)
@@ -450,6 +542,7 @@ class StageASession:
     def _bind_body(self, model: Any) -> Any:
         if not self.enabled:
             return None
+        self._model = model
         self._sample("pre_bake")
         self.outcome = self.driver.bind(model)
         self.accounting.copied_bytes = int(self.driver.moved_bytes())
@@ -507,6 +600,18 @@ class StageASession:
         self._assert_device_accounting()
         self._require_complete_ledger()
         self.driver.freeze()  # arena.mark_populated() + arena.freeze() -> hipmem.freeze() (rule R1)
+        # THEN assert the SEAM — after freeze, so what is proved is the final, capture-ready state
+        # the engine is about to serve, and against the live model rather than the binder's own
+        # return value. Every gate above this line interrogates the arena or the plan; all of them
+        # pass just as happily over a model whose MoE layers the forward never routes through the
+        # seam. See `moe_interpose.prove_seam_residency`.
+        self._prove_seam("seal")
+        # THE BOOT HALF OF THE ENGAGED LEDGER. `moe_interpose.resolve` publishes the FORWARD half
+        # (`weight_offload.moe_resolve[host|device]`); this publishes that a Stage-A window actually
+        # ran to completion on this rank. Diffing the two legs of an A/B then shows the difference
+        # between "offload was configured" and "offload sealed and the forward used it" — which are
+        # the two things a serve-level bench cannot tell apart.
+        _engaged("weight_offload.stage_a_sealed")
         _TORCH_SLACK = self.accounting.torch_slack_bytes
         self._sealed_arena_activity = self._arena_activity()
         rep = self.accounting.report()
@@ -516,6 +621,32 @@ class StageASession:
                 "against a number that is not true.\n" + rep.render()
             )
         self.log(rep.render())
+
+    def install_stream_hooks(self) -> None:
+        """Arm the THIRD tier's per-forward gather. Call AFTER `seal()`, once, from the engine.
+
+        After seal, and that ordering is the same rule the rest of this window follows: seal is the
+        single moment residency stops changing, and a hook installed before it would be a forward-path
+        mutation inside the window the gates are still measuring. The hook itself moves no weights and
+        touches no arena page — it wraps `MoELayer.forward` so the layer's routed rows are read from
+        the checkpoint immediately before its kernel runs.
+
+        NOT CAPTURE-SAFE. The hook body does file I/O, allocates and syncs, all of which are illegal
+        under HIP graph capture. `verify_after_capture()` would not catch it (it watches the ARENA,
+        and this tier does not touch the arena), so it is stated here and in `stream_tier.py` rather
+        than left to be discovered: serve with `--cuda-graph-max-bs 0` until a capturable design
+        exists. This is the one undischarged merge requirement the third tier adds.
+        """
+        if self.phase is not StageAPhase.SEALED:
+            raise RuntimeError(
+                f"weight offload: install_stream_hooks() must be called after seal(); the session is "
+                f"in {self.phase.name}."
+            )
+        if self.stream is None:
+            return
+        self.stream.install_hooks()
+        self.log(f"weight offload: {self.stream.describe()}")
+        _engaged("weight_offload.stream_tier")
 
     def verify_after_capture(self) -> None:
         """Re-gate the arena AFTER every HIP graph has been captured. Call once, from the engine.
@@ -555,7 +686,26 @@ class StageASession:
                 "weight offload: verify_after_capture() ran before seal(); it is the POST-capture "
                 f"gate and the session is in {self.phase.name}."
             )
+        # COUNTED, not merely called. This gate has never fired in this repo's history: until the
+        # engine booted with a non-empty plan, `enabled` was False on every serve and the body
+        # returned immediately, so "we call verify_after_capture()" and "verify_after_capture() ran"
+        # were different statements with no way to tell them apart from a log. The counter is what a
+        # harness asserts on, and it counts only the calls that reached the body with the gate live.
         self._run_staged("post_capture", self._verify_after_capture_body)
+
+    def _prove_seam(self, where: str) -> None:
+        """Run the driver's seam proof, if it has one, and publish the result.
+
+        `getattr` rather than a hard call because `StageADriver` is an injection point: the tests'
+        doubles implement the byte-ledger half of the protocol and have no model walk. A driver that
+        cannot prove its seam simply does not, and `seam_proof` stays None — which the engine's
+        banner renders as "unproven" rather than as a pass.
+        """
+        fn = getattr(self.driver, "prove_seam", None)
+        if not callable(fn) or self._model is None:
+            return
+        self.seam_proof = fn(self._model)
+        self.log(f"weight offload [{where}]: {self.seam_proof.describe()}")
 
     def _arena_activity(self) -> Tuple[int, int]:
         """`(alloc_events, served_bytes)` off the arena's own MemPool, or `(0, 0)` without one."""
@@ -568,6 +718,8 @@ class StageASession:
     def _verify_after_capture_body(self) -> None:
         if not self.enabled:
             return
+        self.verify_after_capture_fired += 1
+        _engaged("weight_offload.verify_after_capture")
         now = self._arena_activity()
         if now != self._sealed_arena_activity:
             raise RuntimeError(
@@ -582,6 +734,14 @@ class StageASession:
         clean = getattr(self.driver, "assert_arena_clean", None)
         if callable(clean):
             clean()
+        # Re-prove the seam on the far side of capture. `assert_clean()` above answers "did anything
+        # allocate from the arena during capture"; this answers the other half — "is the seam the
+        # captured graphs were built over still the one the model holds". A container rebound
+        # between seal() and here (a late post_load, a second bake, a reload path) leaves every
+        # captured graph replaying against an address no seam describes, and `resolve()`'s identity
+        # check would only report it from inside a replay, i.e. after the pointer is already baked
+        # in. Cheap: it is a module walk plus two pointer-range tests per tensor, once per boot.
+        self._prove_seam("post-capture")
         self.log("weight offload: arena clean after graph capture")
 
     def _require_complete_ledger(self) -> None:
@@ -697,9 +857,13 @@ class StageARuntime:
         rank: int = 0,
         local_ranks: int = 1,
         label: str = "weights",
+        stream: Any = None,
+        stream_layers: "Sequence[int] | None" = None,
     ) -> None:
         from .config import create_pinned_weight_arena, resolve_arena_settings
 
+        self.stream = stream
+        self.stream_layers = tuple(sorted(int(i) for i in (stream_layers or ())))
         self.resolution = resolution
         self.settings = resolve_arena_settings()
         self.device_index = int(device_index)
@@ -710,6 +874,9 @@ class StageARuntime:
         self.allocator = None
         self.outcome = None
         self.seams: Tuple[Any, ...] = ()
+        #: Set by `chunked_sink()` when the caller loads via Stage B. Its presence is what makes
+        #: `bind()` ADOPT rather than execute — see there.
+        self.sink = None
 
     # -- StageADriver ---------------------------------------------------------------------------
 
@@ -848,17 +1015,92 @@ class StageARuntime:
             host_alloc=lambda shape, dtype: self.pool.empty(*shape, dtype=dtype),
         )
 
+    def chunked_sink(self) -> Any:
+        """A `stage_b.LayerSink` that bakes each MoE layer AS THE CHUNKED LOAD FINALIZES IT.
+
+        This is the Stage-B entry point into the Stage-A window, and it exists because the two paths
+        disagree about *when* a layer is bakeable, not about *how*. The one-shot path can only bake
+        after `post_load()` has finished the whole model, which requires the whole checkpoint to be
+        resident at once — the thing the target checkpoint cannot do. The chunked path knows a layer
+        is final the moment its own chunk closes, so it bakes there and the live set stays one chunk.
+
+        `SeamLayerSink` calls `moe_interpose.bind_seam` — the same function `bind_plan` calls per
+        layer — so the validate-before-copy order, the bitwise read-back, the weakref leak proof and
+        the byte accounting are shared code and cannot drift between the two paths.
+
+        Requires `attach_host_arena()` to have run: the allocator it hands the sink IS the arena. A
+        sink built before attach would silently take `allocator=None` and `bind_seam(HOST, None)`
+        would place the "host" tier in VRAM.
+        """
+        from .stage_b import SeamLayerSink
+
+        if self.allocator is None:
+            raise RuntimeError(
+                "weight offload: chunked_sink() was asked for before attach_host_arena(), so there "
+                "is no arena allocator to hand it. The host tier would be bound with a None "
+                "allocator, which places it in VRAM under a host budget."
+            )
+        # `selftest=` is deliberately NOT passed: `settings.selftest` is the ARENA's per-chunk word
+        # probe count, while `SeamLayerSink`'s is `moe_interpose.SELFTEST_SAMPLE`, the bake's
+        # read-back row sample. They are different quantities with the same name, and crossing them
+        # silently weakens the bake's own verification.
+        self.sink = SeamLayerSink(
+            self.plan, self.allocator, stream=self.stream, stream_layers=self.stream_layers
+        )
+        return self.sink
+
     def bind(self, model: Any) -> Any:
         """Attach a seam to every `MoELayer`, then execute the plan over them.
 
         `freeze=False`: the seams are frozen by `StageASession.seal()`, together with the arena and
         the process-wide `hipmem` latch, so there is exactly one moment at which the mapping window
-        closes rather than three."""
+        closes rather than three.
+
+        WHEN THE LOAD WAS CHUNKED THIS ADOPTS INSTEAD OF EXECUTING. `SeamLayerSink` already attached
+        and bound every layer's seam during the load, and re-running `attach_seams`/`bind_plan` over
+        them would attach a SECOND seam to containers whose device originals have already been
+        released — i.e. it would try to copy freed memory into arena rows that are already carved.
+        The session's phase machine is unchanged: `bind()` is still the step that produces the
+        outcome and the seam list every later gate reads, it just reads them off the sink."""
         from .moe_interpose import attach_seams, bind_plan
 
+        if self.stream is not None and self.sink is None:
+            raise RuntimeError(
+                "weight offload: a stream tier was configured but the load was ONE-SHOT, so no layer "
+                "was ever adopted into it. Every streamed layer is still a full 1.465 GiB expert "
+                "stack in VRAM under a plan that does not bill it. The stream tier requires Stage B "
+                "(`Engine._load_weight_chunked`), because adoption has to happen as each layer is "
+                "finalized or the peak is the whole tier."
+            )
+        if self.sink is not None:
+            self.seams = tuple(self.sink.seams)
+            self.outcome = self.sink.outcome
+            if not self.seams:
+                raise RuntimeError(
+                    "weight offload: the chunked load's sink bound no seams at all. Every MoE layer "
+                    "the plan named was supposed to pass through it; an empty seam list means the "
+                    "chunk enumeration finalized nothing and the arena holds no weights."
+                )
+            return self.outcome
         self.seams = attach_seams(model)
         self.outcome = bind_plan(self.seams, self.plan, self.allocator, freeze=False)
         return self.outcome
+
+    def prove_seam(self, model: Any) -> Any:
+        """ASSERT THE SEAM: the offload arm is in the path of the model the engine will serve.
+
+        The arena is asked for `owns_pointer`, which is what turns "the seam says host" into "the
+        tensor the kernel will read is inside a pinned chunk". Everything else `seal()` checks is a
+        question about the arena or the plan and can pass over a model nobody runs — see
+        `moe_interpose.prove_seam_residency` for the failure mode this repo has already paid for.
+        """
+        from .moe_interpose import prove_seam_residency
+
+        return prove_seam_residency(
+            model,
+            self.seams,
+            owns_pointer=None if self.arena is None else self.arena.owns_pointer,
+        )
 
     def moved_bytes(self) -> int:
         return int(getattr(self.outcome, "moved_bytes", 0) or 0)
@@ -1083,6 +1325,8 @@ def _resolve_driver(
     *,
     gather: Any = None,
     model: Any = None,
+    stream: Any = None,
+    stream_layers: "Sequence[int] | None" = None,
     log: Callable[[str], None] = _noop_log,
     budget_is_derived: bool = False,
 ) -> Optional[StageADriver]:
@@ -1123,9 +1367,36 @@ def _resolve_driver(
     # MINISGL_WEIGHT_ARENA_CHUNK_MIB gets a plan that says FITS and an arena that aborts mid-pin.
     from .config import resolve_arena_settings
 
+    # The STREAM tier's layers are removed from the question entirely. `layer_indices` is the
+    # resolver's own restriction knob and it names what IS planned, so the complement is passed.
+    # Derived from the model's own MoE walk, never from a layer count: the MTP draft head owns a
+    # `MoELayer` too, and an index-arithmetic complement would silently plan or unplan it.
+    layer_indices = None
+    if stream_layers:
+        from .plan import _path_layer_index
+        from .moe_interpose import discover_moe_layers
+
+        streamed = {int(i) for i in stream_layers}
+        if model is None:
+            raise ValueError(
+                "weight offload: a stream tier was configured with no model to enumerate. The "
+                "complement of the streamed layers cannot be derived from a layer count without "
+                "guessing whether the MTP draft head is one of them."
+            )
+        all_idx = [_path_layer_index(p) for p, _ in discover_moe_layers(model)]
+        unknown = streamed - {i for i in all_idx if i is not None}
+        if unknown:
+            raise ValueError(
+                f"weight offload: stream layers {sorted(unknown)} are not MoE layers of this model "
+                f"(it has {sorted(i for i in all_idx if i is not None)}). A stream tier pointed at "
+                f"a layer that does not exist would leave the real one device-resident."
+            )
+        layer_indices = sorted(i for i in all_idx if i is not None and i not in streamed)
+
     resolution = resolve_weight_plan(
         config,
         device_budget_bytes=device_budget_bytes,
+        layer_indices=layer_indices,
         arena_chunk_bytes=resolve_arena_settings().chunk_bytes,
         # THE GENERALITY HINGE. With a model the resolver reads the layer set, this rank's EP/TP
         # sharding and the per-expert byte count off the live objects (`observed_planned_layers`);
@@ -1150,4 +1421,6 @@ def _resolve_driver(
         device_index=int(getattr(config, "device_index", 0) or 0),
         rank=int(getattr(getattr(config, "tp_info", None), "rank", 0) or 0),
         local_ranks=int(getattr(resolution, "local_ranks", 1) or 1),
+        stream=stream,
+        stream_layers=stream_layers,
     )

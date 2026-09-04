@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, NamedTuple, Protocol, Tuple, runtime_checkable
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Protocol, Tuple, runtime_checkable
 
 import torch
 import torch.nn.functional as F
@@ -217,6 +217,105 @@ def apply_ct_sign(t: torch.Tensor, conv: CtSignConvention) -> torch.Tensor:
 def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
     """Boolean form of `ct_packed_sign_convention`, for call sites that need nothing else."""
     return ct_packed_sign_convention(packed).uint4b8
+
+
+class CtSignRankDivergence(RuntimeError):
+    """Two TP ranks put the SAME logical weights in different int4 sign domains."""
+
+
+def collect_ct_sign_decisions(model) -> Dict[str, bool]:
+    """`{op path: conv.uint4b8}` for every container that made a packed-int4 sign decision.
+
+    Uses `weights.moe_interpose._iter_ops`, which is the repo's ONE op-tree walk and produces the
+    same dotted paths `BaseOP.state_dict` emits. That matters twice over: `BaseOP` is not an
+    `nn.Module`, so `named_modules()` does not exist on most of this tree; and the paths are the
+    strings the two ranks compare, so they have to be a pure function of the module tree rather than
+    of a construction order that an MTP head or a differing shard count could renumber.
+
+    The VALUE is the boolean and nothing else. `margin`, `sampled_words`, `stride` and `blocks` are
+    properties of the SHARD each rank happened to sample and legitimately differ between ranks —
+    comparing them would fail every healthy TP=2 boot on a perfectly uniform checkpoint. `uint4b8`
+    is the only field that has to agree, because it is the only one that changes bytes.
+    """
+    # local: quant <- weights <- layers would be an import cycle at module load.
+    from minisgl.weights.moe_interpose import _iter_ops
+
+    out: Dict[str, bool] = {}
+    for path, mod in _iter_ops(model, "", set()):
+        conv = getattr(mod, "_ct_sign", None)
+        if conv is not None and hasattr(conv, "uint4b8"):
+            out[path] = bool(conv.uint4b8)
+    return out
+
+
+def verify_ct_sign_across_ranks(model, group, tp_size: int, tp_rank: int) -> Dict[str, bool]:
+    """CLOSE the cross-rank hazard `ct_packed_sign_convention` documents. Call at post_load.
+
+    THE HAZARD, restated because the failure has no symptom. The sign convention is decided from a
+    SAMPLE of the packed nibbles, and under TP no two ranks hold the same bytes: plain TP gives rank
+    r a `w13` of shape (E, 2*I/tp, H), EP-over-TP gives it experts [r*E/ep, (r+1)*E/ep). Each rank
+    runs `post_load` on its own container and decides independently. On a homogeneously packed
+    checkpoint — every real one — both land on the same answer, because the convention is a property
+    of the PRODUCER rather than of a slice. On a mixed-packing stack they diverge, and then one
+    rank's half of a TP-split GEMM is dequantized in the uint4b8 domain and the other's in
+    two's-complement. The shapes are right, no kernel errors, and the model produces fluent text
+    that is wrong. Nothing downstream can see it.
+
+    `ct_packed_sign_convention` itself REFUSES a tie (it raises below `_CT_SIGN_MIN_MARGIN`) — but
+    that refusal is evaluated per shard, and a mixed stack is only a tie when you can see all of it.
+    Neither rank ever does, so the refusal cannot fire. A collective is the only place the whole
+    stack is observable, which is why this lives here and not inside the detector.
+
+    Cheap enough to be unconditional: one `all_gather_object` of a dict of bools at boot, on the
+    gloo CPU group the engine already builds for its control messages. `tp_size == 1` returns
+    immediately — there is nothing to disagree with — and so does any model with no CT containers
+    (the NVFP4 / MXFP4 / RXF MoE paths declare no `_ct_sign` at all, so qwen4_exp's NVFP4 body walks
+    straight through this and only its AWQ sibling is actually gated).
+
+    Raises rather than warns. A warning here is a serve that answers questions wrongly for as long
+    as it is up.
+    """
+    local = collect_ct_sign_decisions(model)
+    if tp_size <= 1 or group is None:
+        return local
+    import torch.distributed as dist
+
+    gathered: List[Dict[str, bool] | None] = [None] * tp_size
+    dist.all_gather_object(gathered, local, group=group)
+    ref = gathered[0] or {}
+    bad_keys: List[str] = []
+    missing: List[str] = []
+    for d in gathered:
+        d = d or {}
+        # A path present on one rank and absent on another is ALSO a divergence: it means one rank
+        # built a CT container where its peer built something else, so the two are not running the
+        # same model. Reported separately because the fix differs (a build/config skew, not a
+        # mixed-packing checkpoint).
+        if set(d) != set(ref):
+            missing.extend(sorted(set(d) ^ set(ref)))
+        for k in sorted(set(d) & set(ref)):
+            if d[k] != ref[k] and k not in bad_keys:
+                bad_keys.append(k)
+    if bad_keys or missing:
+        detail = "\n".join(
+            f"    {k}: " + ", ".join(f"rank{r}={(g or {}).get(k)}" for r, g in enumerate(gathered))
+            for k in (bad_keys + sorted(set(missing)))[:20]
+        )
+        raise CtSignRankDivergence(
+            f"compressed-tensors int4 SIGN CONVENTION DIVERGED ACROSS TP RANKS "
+            f"(tp_size={tp_size}, this rank={tp_rank}). Each rank samples only its own shard, so a "
+            f"mixed-packing stack is decided independently and one rank dequantizes in the uint4b8 "
+            f"domain while the other uses two's-complement. Every weight in the disagreeing stack "
+            f"is then off by 8 quanta on one rank: right shapes, no kernel error, fluent and wrong "
+            f"text.\n"
+            f"  {len(bad_keys)} container(s) disagreed"
+            + (f", {len(set(missing))} present on some ranks only" if missing else "")
+            + f":\n{detail}\n"
+            f"  This is a CHECKPOINT property, not a runtime one — inspect its quantization_config "
+            f"and repack it with a single convention, or serve it at TP=1, where one rank sees the "
+            f"whole stack and the detector's own tie-refusal can fire."
+        )
+    return local
 
 
 @runtime_checkable

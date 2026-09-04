@@ -145,6 +145,147 @@ class TestSwapTripwire:
         t.check()
 
 
+class TestSwapTripwireScalesWithThePin:
+    """A FLAT page count is a boot failure at the sizes this feature exists for.
+
+    64 MiB is 0.2 % of a 30 GiB pin, i.e. below the ambient swap traffic of any box that swaps at
+    all — every 48-layer boot died there. But raising the constant would make the tripwire blinder
+    the bigger the arena gets, and a 64 MiB pin that drives 64 MiB of eviction is genuinely
+    pathological. Hence a rate, floored at the old constant.
+    """
+
+    def _wire(self, monkeypatch, pages):
+        monkeypatch.setattr(hc, "read_meminfo", lambda: {"SwapTotal": 10 * GIB})
+        monkeypatch.setattr(hc, "read_pswpout_pages", lambda: pages["n"])
+
+    def test_a_small_pin_keeps_the_old_flat_floor(self, monkeypatch):
+        self._wire(monkeypatch, {"n": 0})
+        assert SwapTripwire(pin_bytes=64 << 20).threshold_pages == hc.DEFAULT_SWAP_TRIPWIRE_PAGES
+
+    def test_a_large_pin_scales_the_threshold(self, monkeypatch):
+        self._wire(monkeypatch, {"n": 0})
+        t = SwapTripwire(pin_bytes=30 * GIB)
+        # 1 % of 30 GiB at 4 KiB pages, and still under the 114,813 pages P3b measured AT the
+        # ceiling — so the fault P3b hit is caught while ambient traffic is not.
+        assert t.threshold_pages == int(30 * GIB / 4096 * hc.DEFAULT_SWAP_TRIPWIRE_FRACTION)
+        assert t.threshold_pages < 114_813
+
+    def test_the_scaled_threshold_really_gates(self, monkeypatch):
+        pages = {"n": 0}
+        self._wire(monkeypatch, pages)
+        t = SwapTripwire(pin_bytes=30 * GIB)
+        pages["n"] = hc.DEFAULT_SWAP_TRIPWIRE_PAGES * 2  # would have fired on the flat constant
+        t.check(available=0, floor=1)
+        pages["n"] = t.threshold_pages
+        with pytest.raises(HostArenaSwapThrashError):
+            t.check(available=0, floor=1)
+
+
+class TestSwapTripwireArmsOnHeadroom:
+    """`pswpout` is box-wide and carries no attribution, so scarcity is the discriminator.
+
+    Measured 2026-09-03 on this box: pinning 10 GiB with 71 GiB free coincided with 432,173 pages of
+    swap-out (16 % of the pin) that our pinning provably did not cause — a count-only tripwire
+    refuses every large arena there. P3b's real thrash, by contrast, happened with rank 1 AT its
+    floor, which this arming condition still catches.
+    """
+
+    def _wire(self, monkeypatch, n):
+        monkeypatch.setattr(hc, "read_meminfo", lambda: {"SwapTotal": 10 * GIB})
+        monkeypatch.setattr(hc, "read_pswpout_pages", lambda: n)
+
+    def test_disarmed_when_memory_is_plentiful(self, monkeypatch):
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 1_000_000)
+        t.check("plenty of room", available=60 * GIB, floor=12 * GIB)  # must not raise
+        assert t.disarmed_checks == 1
+
+    def test_armed_when_close_to_the_floor(self, monkeypatch):
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 1_000_000)
+        with pytest.raises(HostArenaSwapThrashError) as exc:
+            t.check("near the floor", available=20 * GIB, floor=12 * GIB)
+        assert "near the floor" in str(exc.value)
+
+    def test_no_headroom_reading_means_permanently_armed(self, monkeypatch):
+        # A caller with no MemAvailable sample gets the old, unconditional behaviour rather than a
+        # silently disabled gate.
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 1_000_000)
+        with pytest.raises(HostArenaSwapThrashError):
+            t.check()
+
+
+class TestSwapTripwireCountsOnlyTheArmedWindow:
+    """Arming must gate WHICH swap is counted, not only WHEN the comparison runs.
+
+    THE BUG THIS PINS, measured 2026-09-04 on the real path: qwen4_exp 48 layers at TP=2 pinning
+    27.10 GiB/rank aborted at chunk 33/37 with "21,660,130 pages (82.63 GiB) were swapped out while
+    pinning". A 27.10 GiB pin cannot evict 82.63 GiB — the count was box-wide `pswpout` accumulated
+    across the ~10 minutes the tripwire spent DISARMED with tens of GiB free, and it was billed in
+    full the instant `MemAvailable` first fell inside `2x floor`. That is exactly the ambient
+    co-tenant traffic `TestSwapTripwireArmsOnHeadroom` exists to ignore, arriving one chunk late.
+
+    The tell that it was an artifact and not a real refusal: the same plan, same box, same binary
+    booted and generated coherent text with a LOWER floor — which adds no capacity at all, it just
+    moves the arming threshold down far enough that the pin finishes before the window opens.
+    """
+
+    def _wire(self, monkeypatch, n):
+        monkeypatch.setattr(hc, "read_meminfo", lambda: {"SwapTotal": 10 * GIB})
+        monkeypatch.setattr(hc, "read_pswpout_pages", lambda: n)
+
+    def test_swap_from_the_disarmed_window_is_not_billed_on_arming(self, monkeypatch):
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        # A long, comfortable stretch of the pin during which a co-tenant evicts 1M pages.
+        self._wire(monkeypatch, 1_000_000)
+        t.check("chunk 5/37", available=60 * GIB, floor=12 * GIB)
+        t.check("chunk 20/37", available=40 * GIB, floor=12 * GIB)
+        assert t.disarmed_checks == 2
+        # Now memory gets scarce. Nothing new has been evicted since, so nothing is our fault.
+        t.check("chunk 33/37", available=20 * GIB, floor=12 * GIB)  # must not raise
+        assert t.armed_baseline_taken
+
+    def test_swap_DURING_the_armed_window_still_aborts(self, monkeypatch):
+        # The re-baseline must not blind the gate: real thrash after arming still fires.
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 1_000_000)
+        t.check("chunk 5/37", available=60 * GIB, floor=12 * GIB)
+        t.check("chunk 33/37", available=20 * GIB, floor=12 * GIB)  # arms, re-baselines at 1M
+        self._wire(monkeypatch, 1_000_050)  # 50 more pages, threshold is 10
+        with pytest.raises(HostArenaSwapThrashError) as exc:
+            t.check("chunk 34/37", available=18 * GIB, floor=12 * GIB)
+        assert "50 pages" in str(exc.value)
+
+    def test_rebaseline_happens_once_so_oscillation_cannot_blind_it(self, monkeypatch):
+        # MemAvailable flaps across the arming threshold as chunks are pinned and page cache is
+        # reclaimed. Re-baselining on every re-arm would reset the count forever.
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 1_000_000)
+        t.check("disarmed", available=60 * GIB, floor=12 * GIB)
+        t.check("armed", available=20 * GIB, floor=12 * GIB)  # re-baselines at 1M
+        t.check("disarmed again", available=60 * GIB, floor=12 * GIB)
+        self._wire(monkeypatch, 1_000_099)
+        with pytest.raises(HostArenaSwapThrashError):
+            t.check("armed again", available=20 * GIB, floor=12 * GIB)
+
+    def test_always_armed_caller_keeps_the_construction_baseline(self, monkeypatch):
+        # No `available` ever passed => armed from the first check => no disarmed window => the
+        # construction baseline stands, byte-for-byte the pre-fix behaviour.
+        self._wire(monkeypatch, 0)
+        t = SwapTripwire(threshold_pages=10)
+        self._wire(monkeypatch, 500)
+        with pytest.raises(HostArenaSwapThrashError):
+            t.check("no headroom reading")
+        assert not t.armed_baseline_taken
+
+
 class TestRankSkewCaveat:
     """A multi-rank shortfall and a benign boot skew produce IDENTICAL arithmetic.
 

@@ -24,6 +24,12 @@ from minisgl.quant.method import (  # noqa: E402
     apply_ct_sign,
     ct_packed_sign_convention,
 )
+from minisgl.layers.base import BaseOP  # noqa: E402
+from minisgl.quant.method import (  # noqa: E402
+    CtSignRankDivergence,
+    collect_ct_sign_decisions,
+    verify_ct_sign_across_ranks,
+)
 
 
 def _stack(e: int, words_per_expert: int, nibble: int) -> torch.Tensor:
@@ -290,3 +296,112 @@ class TestContainerDtypeGenerality:
         narrow = ct_packed_sign_convention(self._u8_stack(4, 4 * _CT_SIGN_SAMPLE_WORDS, 8))
         assert wide.stride > 1 and narrow.stride > 1
         assert wide.uint4b8 and narrow.uint4b8
+
+
+class _Leaf(BaseOP):
+    """A minimal real `BaseOP`. Real, not a stand-in with a `named_modules` method: `BaseOP` is not
+    an `nn.Module`, and `collect_ct_sign_decisions` walks the repo's own op tree (`_iter_ops`). A
+    duck-typed fake would let the collector pass this test and find nothing on a live model."""
+
+    def __init__(self, uint4b8=None):
+        if uint4b8 is not None:
+            self._ct_sign = CtSignConvention(
+                uint4b8=uint4b8, margin=0.1, sampled_words=1, stride=1, blocks=1
+            )
+
+    def forward(self, *a, **k):  # pragma: no cover - storage only
+        raise RuntimeError
+
+
+class _Tree(BaseOP):
+    """`{"a.b": True}` -> a nested op tree whose `_iter_ops` paths are exactly those keys."""
+
+    def __init__(self, decisions):
+        for path, uint4b8 in decisions.items():
+            node = self
+            parts = path.split(".")
+            for part in parts[:-1]:
+                nxt = getattr(node, part, None)
+                if not isinstance(nxt, BaseOP):
+                    nxt = _Leaf()
+                    setattr(node, part, nxt)
+                node = nxt
+            setattr(node, parts[-1], _Leaf(uint4b8))
+
+    def forward(self, *a, **k):  # pragma: no cover
+        raise RuntimeError
+
+
+def _FakeModule(decisions):
+    return _Tree(decisions)
+
+
+class _FakeGroup:
+    """A gloo group stand-in. `verify_ct_sign_across_ranks` calls exactly one collective, so the
+    whole distributed dependency is that one function — patched, not mocked at the C level."""
+
+
+class TestCrossRankVerification:
+    """The CLOSE for `TestCrossRankHazard`. The detector cannot catch a mixed-packing stack alone:
+    its tie-refusal is evaluated per shard, and a mixed stack is only a tie when you can see all of
+    it, which no rank ever does. So the check has to be a collective."""
+
+    def _patch(self, monkeypatch, per_rank):
+        import torch.distributed as dist
+
+        def _fake_all_gather(out_list, obj, group=None):
+            for i, d in enumerate(per_rank):
+                out_list[i] = d
+
+        monkeypatch.setattr(dist, "all_gather_object", _fake_all_gather)
+
+    def test_tp1_is_a_noop_and_needs_no_group(self):
+        m = _FakeModule({"layers.0.mlp.experts.w13": True})
+        assert verify_ct_sign_across_ranks(m, None, 1, 0) == {"layers.0.mlp.experts.w13": True}
+
+    def test_a_model_with_no_ct_containers_collects_nothing(self):
+        m = _FakeModule({"layers.0.mlp.experts.w13": None})
+        assert verify_ct_sign_across_ranks(m, None, 2, 0) == {}
+
+    def test_agreeing_ranks_pass(self, monkeypatch):
+        agree = {"layers.0.mlp.experts.w13": True, "layers.0.mlp.experts.w2": True}
+        self._patch(monkeypatch, [agree, agree])
+        assert verify_ct_sign_across_ranks(_FakeModule(agree), _FakeGroup(), 2, 1) == agree
+
+    def test_diverging_ranks_RAISE(self, monkeypatch):
+        """The exact shape `TestCrossRankHazard::test_ep_shards_of_a_mixed_stack_decide_differently`
+        produces: two ranks, same path, opposite answers, and previously nothing anywhere noticed."""
+        r0 = {"layers.0.mlp.experts.w13": True}
+        r1 = {"layers.0.mlp.experts.w13": False}
+        self._patch(monkeypatch, [r0, r1])
+        with pytest.raises(CtSignRankDivergence) as exc:
+            verify_ct_sign_across_ranks(_FakeModule(r0), _FakeGroup(), 2, 0)
+        assert "layers.0.mlp.experts.w13" in str(exc.value)
+        assert "rank0=True" in str(exc.value) and "rank1=False" in str(exc.value)
+
+    def test_a_path_on_only_one_rank_also_raises(self, monkeypatch):
+        """Not a mixed checkpoint but a BUILD skew — one rank made a CT container where its peer
+        made something else. Same silent-wrong-answer class, different fix, so it must not be
+        waved through just because the shared keys agree."""
+        r0 = {"layers.0.mlp.experts.w13": True, "layers.1.mlp.experts.w13": True}
+        r1 = {"layers.0.mlp.experts.w13": True}
+        self._patch(monkeypatch, [r0, r1])
+        with pytest.raises(CtSignRankDivergence) as exc:
+            verify_ct_sign_across_ranks(_FakeModule(r0), _FakeGroup(), 2, 0)
+        assert "layers.1.mlp.experts.w13" in str(exc.value)
+
+    def test_margin_and_sample_fields_are_NOT_compared(self, monkeypatch):
+        """They are properties of the SHARD each rank sampled and legitimately differ. Comparing
+        them would fail every healthy TP=2 boot on a perfectly uniform checkpoint."""
+        import torch.distributed as dist
+
+        captured = {}
+
+        def _fake(out_list, obj, group=None):
+            captured["obj"] = obj
+            out_list[0] = out_list[1] = obj
+
+        monkeypatch.setattr(dist, "all_gather_object", _fake)
+        m = _FakeModule({"a": True})
+        verify_ct_sign_across_ranks(m, _FakeGroup(), 2, 0)
+        assert captured["obj"] == {"a": True}  # a dict of BOOLS, not of CtSignConvention

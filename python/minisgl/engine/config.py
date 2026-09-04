@@ -86,6 +86,19 @@ def resolve_prefix_cache(config: "EngineConfig") -> PrefixCachePlan:
     mc = config.model_config
     cache_type = getattr(config, "cache_type", "radix")
 
+    # A PLE layer (Qwen4-Exp) carries per-sequence recurrent state of its OWN — a 9-column dilated
+    # conv window and a 2-token n-gram history — that the recurrent-radix snapshot store does not
+    # capture: `GDNStateCache.clone_slot` clones the GDN buffers and nothing else. A radix hit would
+    # restore the GDN state at a prefix boundary and leave the PLE state at zero/EOS, which is
+    # exactly the silent-garbage case the snapshot store exists to prevent, one block deeper.
+    # Extending the snapshot to cover PLE is a real feature (it also has to reach the host-side token
+    # history); refusing the snapshot radix is the honest interim and costs only prefix reuse.
+    # Checked BEFORE the GDN arm because qwen4_exp is ALSO a GDN hybrid and would match it.
+    if getattr(mc, "ple_layer_ids", ()):
+        return PrefixCachePlan(
+            "naive", "", "PLE recurrent state is not covered by the recurrent-radix snapshot store"
+        )
+
     # GDN (Qwen3.5/3.6) and CCA (ZAYA) recurrent state is not prefix-cacheable UNLESS it is
     # snapshotted: a plain radix hit would report cached_len>0 with no state behind it (silent
     # garbage). --gdn-radix (default on) opts into the snapshot-capable radix; --no-gdn-radix forces
@@ -162,6 +175,16 @@ class EngineConfig:
     # is never an on/off switch (plan §6.2) — the placement decision is derived either way.
     weight_offload_device_gb: float = 0.0
     weight_offload_gb: float = 0.0
+    # `weight_offload_stream_layers`: how many of the LAST MoE layers are served by the THIRD tier —
+    # experts re-read from the checkpoint per forward instead of living in VRAM or in the pinned
+    # arena (`weights/stream_tier.py`). 0 = off, and off is right for every model that fits
+    # {device, pinned host}. It exists because the target checkpoint does not: 70.31 GiB of routed
+    # experts against a 15.92 GiB card and ~53 GiB of usable RAM is short by ~15.5 GiB at 48 layers,
+    # and no chunk size, device tier or arena budget closes that. A COUNT and not a byte budget,
+    # because the tier's cost is per LAYER PER FORWARD (a streamed layer reads ~29 MiB per decode
+    # step) and an operator trading throughput for capacity is choosing how many layers to slow
+    # down, not how many bytes to house. NOT CAPTURE-SAFE: requires --cuda-graph-max-bs 0.
+    weight_offload_stream_layers: int = 0
     # --- speculative decoding (off by default; see SPEC_DECODE.md) ------------------------------
     # "none" disables every spec path (byte-for-byte unchanged serve). "ngram" enables the
     # prompt-lookup MVP. These flat fields mirror the argparse dests; spec_config assembles them.

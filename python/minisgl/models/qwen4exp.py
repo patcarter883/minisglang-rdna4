@@ -1,0 +1,786 @@
+"""Qwen3.8-Flash-Next (`qwen4_exp`) — text-only decoder SKELETON. Bring-up tranche 1a.
+
+WHAT THIS FILE IS
+-----------------
+The parameter/structure definition of the 48-layer text decoder of
+`Qwen4ExpForConditionalGeneration`, verified against the real checkpoint headers of
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` (not against docs):
+
+  * 48 layers, schedule `layer_types[i]`: `idx % 4 == 3` (3, 7, ..., 47) is FULL attention with
+    `self_attn.*`; the other 36 are linear attention with `linear_attn.*`. A layer never has both.
+  * EVERY layer has the MoE `mlp.*` block (512 routed experts, top-10, inter 640, plus an always-on
+    bf16 shared expert + sigmoid gate) AND two hyper-connection blocks
+    (`attn_hyper_connection`, `mlp_hyper_connection`).
+  * ONLY decoder index 1 carries the PLE n-gram block (`ple.*`). config.json's `ple_layer_ids: [2]`
+    is 1-BASED; `ModelConfig` converts it.
+  * `lm_head` is UNTIED, and there is **no** `model.language_model.norm.weight` — the top-level
+    `hyper_connection_mixer` (3 tensors, no `block_inject_weight`) plays the final-norm role and is
+    what feeds `lm_head`.
+  * The residual stream is `hc_count * hidden_size` = 4 * 2560 = **10240** wide for the whole
+    decoder. Each block reads a mixed 2560-wide view and writes back into the wide stream.
+
+WHAT IS IMPLEMENTED
+-------------------
+The whole `Qwen4ExpPLE` n-gram block (tranche 1b), a transcription of
+`transformers/models/qwen4_exp/modeling_qwen4_exp.py` (`main`, fetched 2026-09-03) — the reference
+implementation of this architecture — checked against it numerically in `tests/qwen4exp_ple_test.py`,
+not merely read. The host half of the PLE block (hash -> NVMe row gather -> one H2D into a static
+buffer) lives in `minisgl/ple/`; the table itself was already done in `minisgl/weights/row_table.py`
+and is NOT re-implemented.
+
+The hyper-connections (tranche T0.3 / GATE-2) are `minisgl.layers.HyperConnection` — they are
+architecture-level plumbing, not a qwen4_exp detail, so they live under `layers/` next to the norms
+and linears they are made of, and `_make_hc` below is the only place this config's field names are
+read. Their `hc_norm` is `minisgl.layers.GroupedRMSNorm`, the same grouped (1+w) norm the PLE block
+uses. `tests/qwen4exp_hc_parity_test.py` pins `mix` and `combine` SEPARATELY against the sglang
+reference source itself (fp32 bit-exact, bf16 within 2 ULP on the real layer-10 tensors).
+
+THE FORWARD RUNS. WHAT IS BOUNDED, AND HOW IT REFUSES
+-----------------------------------------------------
+`Qwen4ExpForConditionalGeneration.forward()` computes logits. Three things are deliberately NOT
+implemented, and each raises rather than approximating:
+
+  * **QSA indexer** (T5) — the sparse-attention selection on the 12 full-attention layers.
+    `QSAIndexer` is declared (its checkpoint tensors need somewhere to land and the loader key set
+    must stay exact) but computes nothing. What runs instead is DENSE causal attention, which is not
+    an approximation: below `indexer_budget` (2048) the selection picks `min(topk, visible)` keys —
+    every visible one — so dense IS the sparse result, bit for bit. `Qwen4ExpAttn.forward` asserts
+    that inequality against the live batch on every call and raises the moment any request's context
+    crosses 2048. It does not clamp, truncate or fall back.
+  * **Aux-hidden capture / draft heads** — refused: the per-layer residual here is the 4x-wide
+    hyper-connection stream, not the hidden-size feature a drafter's fc was trained on.
+
+`UNIMPLEMENTED` below is the machine-readable version of that list; it is logged once per build.
+
+TENSOR PARALLELISM (added 2026-09-04; was a blanket refusal until then)
+----------------------------------------------------------------------
+TP>1 is legal wherever the counts divide — `_assert_tp_divides` checks them at build and names the
+one that failed. `num_key_value_heads = 2`, so TP=2 is the last legal degree on the GQA side, which
+is also all this box has. The shard rules are `models/weight._shard_qwen4_exp`, applied at READ on
+the checkpoint name so the GDN in_proj concat, the gate/up merge and the per-expert stack compose
+rank-local parts; most of them delegate to `_shard_qwen3_5` because these are the Qwen3.5 shapes.
+
+WHAT DOES NOT SHARD, and it is not an oversight: the hyper-connections. `HyperConnection` mixes
+across the hc_count residual streams of the WHOLE hidden state, so a column split would leave each
+rank with a partial mix and no all-reduce to complete it — right shapes, plausible text, wrong
+model. They are `LinearReplicated`, the quant `ignore` list keeps them bf16, and
+`qwen4exp_offload_serve_test.py` digests their BYTES on every rank and compares over the gloo group
+rather than trusting either fact. The cost is real and worth stating: at 48 layers they are
+1.193 GiB, identical at TP=1 and TP=2, i.e. 22.5% of the 5.312 GiB per-rank TP=2 body (measured).
+The QSA indexer and the PLE block are replicated for the same construction reason.
+
+MEASURED at TP=2, 2026-09-04 (cards 0+1, meta build for the byte counts): routed experts
+35.156 GiB/rank (0.7324/layer, exactly half of TP=1's 70.312), body 5.312 GiB/rank (from 9.216).
+
+REUSED VERBATIM (do not fork)
+-----------------------------
+`QwenGatedDeltaNet` + the `GDNLinearAttn` bridge (`gdn/layer.py`, `models/qwen3_5.py`), the gated
+partial-rotary attention `Qwen3_5Attn`, and the sparse block `Qwen3_5MoeSparseBlock` — the Qwen3.5
+shapes are identical here. The differences are the hyper-connections, the PLE block, the QSA
+indexer, and the absence of the per-layer input/post norms and the final norm.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING, List, Tuple
+
+import torch
+import torch.nn.functional as F
+from minisgl.core import get_global_ctx
+from minisgl.distributed import get_tp_info
+from minisgl.gdn.layer import QwenGatedDeltaNet
+from minisgl.layers import (
+    BaseOP,
+    GroupedRMSNorm,
+    HyperConnection,
+    LinearReplicated,
+    OPList,
+    ParallelLMHead,
+    RMSNorm,
+    VocabParallelEmbedding,
+)
+from minisgl.ple import PLEBatch
+from minisgl.quant import create_linear_method
+from minisgl.utils import init_logger, nvtx_annotate
+
+from .base import BaseLLMModel
+from .qwen3_5 import GDNLinearAttn, Qwen3_5Attn
+from .qwen3_5_moe import Qwen3_5MoeSparseBlock
+
+if TYPE_CHECKING:
+    from .config import ModelConfig
+
+logger = init_logger(__name__)
+
+# Every piece of this architecture that is NOT implemented yet, with the bring-up-plan step that
+# owns it and the EXACT condition under which the gap becomes observable. Logged once per build by
+# `Qwen4ExpForConditionalGeneration.__init__`. Deleting an entry here is the last step of landing
+# that piece — keep it honest. Every one of these also raises at the point of use; the list is the
+# summary, never the enforcement.
+UNIMPLEMENTED: Tuple[Tuple[str, str], ...] = (
+    (
+        "QSA sparse-attention indexer on the 12 full-attention layers",
+        "plan T5: needs a second KV pool for the index keys and a BaseAttnBackend ABI that can "
+        "carry a per-query selected-page set. Below indexer_budget (2048) the selection is the "
+        "identity, so the DENSE attention that runs is bit-equivalent; Qwen4ExpAttn.forward raises "
+        "the moment a request's context exceeds the budget",
+    ),
+    (
+        "vision tower (model.visual.*)",
+        "text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 "
+        "skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/"
+        "front-end concern and never reaches this model",
+    ),
+    (
+        "MTP speculative head (mtp.*)",
+        "plan T8.1: fused expert tensors, its own hyper-connections, and it seeds from the "
+        "hc_count-wide PRE-mixer stream. ModelConfig.from_hf REFUSES --spec-algorithm mtp for this "
+        "architecture rather than half-building the Qwen3.5 head against those tensors",
+    ),
+    (
+        "cudagraph capture of the PREFILL / spec-VERIFY forwards",
+        "DECODE capture is implemented and exercised (2026-09-04): boot with the `hip` attention "
+        "backend and --cuda-graph-max-bs > 0, and `PLEGraphCapture` stages the n-gram batch the "
+        "capture-time warmup forward needs. Prefill stays eager everywhere in this engine, and "
+        "spec-verify capture is moot while --spec-algorithm mtp is refused for this architecture. "
+        "The `rdna4` attention backend still raises on capture (its Phase-4 gap, not this model's); "
+        "the capture-capable subclass is `hip`, which is what every production serve here uses",
+    ),
+)
+
+
+def _make_hc(config: "ModelConfig", *, use_combine: bool) -> HyperConnection:
+    """`minisgl.layers.HyperConnection` from this config. The layer takes plain scalars (it is
+    architecture-agnostic and lives under `layers/`); this is the one place the qwen4_exp config
+    field names are read."""
+    return HyperConnection(
+        hidden_size=config.hidden_size,
+        hc_count=config.hc_count,
+        hc_lowrank=config.hc_lowrank,
+        eps=config.rms_norm_eps,
+        use_combine=use_combine,
+    )
+
+
+class QSAIndexer(BaseOP):
+    """Query-sparse-attention indexer for a full-attention layer. Parameters only (T5).
+
+    Checkpoint tensors, verified from the shard header:
+        index_qk_proj.weight  [n_heads*head_dim + kv_heads*head_dim, hidden]  = [640, 2560]
+        q_layernorm.weight    [head_dim] = [128]
+        k_layernorm.weight    [head_dim] = [128]
+
+    The two layernorms are Gemma-style `(1 + w)` (`sglang/srt/layers/attention/qsa/qsa_indexer.py`
+    imports `GemmaRMSNorm`), which is why they are built with `plus_one=True`.
+
+    Not called by anything. At `seq_len <= indexer_budget` (2048) the upstream selection kernel
+    clamps `row_topk = min(topk, visible)` and therefore selects every visible token, i.e. it is
+    bit-equivalent to dense causal attention — which is why a short-context forward can legitimately
+    run the DENSE path and still be exact. `Qwen4ExpAttn.forward` checks that inequality against the
+    live batch on EVERY call (`assert_dense_is_exact`) and raises the moment a request crosses the
+    budget, so nothing can quietly run a wrong attention believing it is sparse.
+    """
+
+    def __init__(self, config: "ModelConfig") -> None:
+        d = config.indexer_head_dim
+        assert d and config.indexer_n_heads and config.indexer_kv_heads, (
+            "qwen4_exp full-attention layers need indexer_head_dim / _n_heads / _kv_heads"
+        )
+        qk_out = (config.indexer_n_heads + config.indexer_kv_heads) * d
+        self.index_qk_proj = LinearReplicated(config.hidden_size, qk_out, has_bias=False)
+        self.q_layernorm = RMSNorm(d, eps=config.rms_norm_eps, plus_one=True)
+        self.k_layernorm = RMSNorm(d, eps=config.rms_norm_eps, plus_one=True)
+        self._budget = int(config.indexer_budget or 0)
+        assert self._budget > 0, "qwen4_exp needs a positive indexer_budget"
+
+    @property
+    def budget(self) -> int:
+        return self._budget
+
+    def assert_dense_is_exact(self, max_ctx_len: int) -> None:
+        """Raise unless dense causal attention is BIT-EQUIVALENT to this layer's sparse selection.
+
+        The equivalence is not an approximation argument: at `seq_len <= budget` the selection picks
+        `min(topk, visible) == visible` keys, i.e. all of them, so the sparse and dense attentions
+        are the same computation. Above the budget they diverge and there is no defensible fallback
+        — running dense anyway would be a DIFFERENT model (denser, so not obviously worse output, and
+        therefore not detectable from the text), and truncating context would be worse. So: refuse.
+        """
+        if max_ctx_len > self._budget:
+            raise NotImplementedError(
+                f"qwen4_exp: a request reached context length {max_ctx_len}, past the QSA indexer "
+                f"budget of {self._budget}. Below the budget the indexer selects every visible "
+                f"token, so this engine's DENSE causal attention is bit-equivalent and is what runs; "
+                f"beyond it the checkpoint's attention is genuinely sparse and this engine does not "
+                f"implement it (bring-up plan T5: a second KV pool for the index keys plus a "
+                f"BaseAttnBackend ABI that can carry a per-query selected-page set). Cap "
+                f"max_total_tokens / the request length at {self._budget}, or implement T5 — do not "
+                f"raise this bound, it would silently serve a different model."
+            )
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "qwen4_exp QSA indexer is not implemented (bring-up plan T5): it needs a second KV pool "
+            "for index keys and a BaseAttnBackend ABI that can carry a per-query selected-page set. "
+            f"Selection is bit-equivalent to dense causal attention at seq_len <= {self._budget}, "
+            f"which is the regime Qwen4ExpAttn.forward enforces and runs densely."
+        )
+
+
+class Qwen4ExpAttn(Qwen3_5Attn):
+    """`Qwen3_5Attn` (gated q_proj, partial rotary, per-head q/k norm) plus the QSA indexer.
+
+    Every shape was confirmed against the checkpoint: q_proj [12288, 2560] = 2 * 24 heads * 256
+    (q interleaved with its per-head sigmoid output gate), k/v_proj [512, 2560] = 2 kv heads * 256,
+    o_proj [2560, 6144], q_norm/k_norm [256]. So the Qwen3.5 class is reused unchanged and only the
+    `indexer` submodule is added.
+
+    The forward is the Qwen3.5 dense one, GATED on the budget check above. That is the whole sparse
+    story for now and it is exact where it runs: below `indexer_budget` the indexer's selection is
+    the identity, above it this raises.
+    """
+
+    def __init__(self, config: "ModelConfig", layer_id: int, *, attn_kv_id: int) -> None:
+        super().__init__(config, layer_id, attn_kv_id=attn_kv_id)
+        self.indexer = QSAIndexer(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `device_len` is prompt + committed tokens, i.e. the KV length this forward attends over —
+        # the quantity the budget bounds. Checked per FORWARD rather than per request admission
+        # because a request crosses the budget mid-generation: admitted at 2000 tokens it is fine, at
+        # 2049 it is not, and only the forward sees that moment. `default=0` covers the empty-batch
+        # cases the engine legitimately issues (an idle EP replica's dummy step), which attend over
+        # nothing and so cannot exceed anything.
+        batch = get_global_ctx().batch
+        self.indexer.assert_dense_is_exact(max((r.device_len for r in batch.reqs), default=0))
+        return super().forward(x)
+
+
+class Qwen4ExpNGramEmbedding(BaseOP):
+    """The learned scalars of the n-gram embedding. The 51.2 GB TABLE itself is NOT a model
+    parameter: it stays NVMe-resident and is served by `minisgl/weights/row_table.py`
+    (`open_qwen4exp_ngram_table`), which mmaps `model-plefp8-*.safetensors` and gathers rows. The
+    weight loader must therefore skip `ple_embedding.ngram_embedding.*`, and it does — see
+    `qwen4_exp_remap`'s `ple-ngram-table` skip reason.
+
+    `ngram_heads_offsets` / `ngram_heads_vocab_sizes` are likewise skipped: `row_table.NgramHeads`
+    reads them straight out of the checkpoint files, and duplicating them here would create two
+    sources of truth for an arithmetic that fails silently (an off-by-one reads another head's
+    embeddings).
+
+    `layer_multipliers` (int64 [ngram_size]) IS kept: it is the multiplier set the n-gram key is
+    mixed with, and `minisgl/ple/hashing.py` is its only reader. That module also DERIVES the same
+    three values from (vocab_size, ngram_size, ple_layer_index, seed=1234) and refuses to run if the
+    two disagree — the derivation and the checkpoint tensor check each other, because a wrong
+    multiplier reads a real embedding from the wrong row and errors nowhere.
+    """
+
+    def __init__(self, config: "ModelConfig") -> None:
+        assert config.ngram_size, "qwen4_exp PLE needs ngram_size"
+        self.layer_multipliers = torch.empty(config.ngram_size, dtype=torch.int64)
+
+
+class Qwen4ExpPLE(BaseOP):
+    """The per-layer n-gram (PLE) block. Present on ONE decoder layer only. IMPLEMENTED (tranche 1b).
+
+    Shapes verified from the checkpoint shard headers:
+        conv1d_weight        [hc*H, 1, ple_conv_kernel_size] = [10240, 1, 4]  (depthwise, dilated
+                             by ngram_size; stored FLAT like the GDN conv1d, not as an nn.Conv1d)
+        key_proj.weight      [hc*H, ple_embed_dim]  = [10240, 2560]
+        value_proj.weight    [H, ple_embed_dim]     = [ 2560, 2560]
+        norm_conv/key/query  [hc*H]                 = [10240]  grouped (1+w), group = hidden_size
+        ple_embedding.layer_multipliers [ngram_size] int64
+
+    `ple_embed_dim` (2560) is the width of one gathered n-gram embedding = 16 hash heads x 160,
+    which is exactly the row width `row_table.py` already validated on the real table.
+
+    THE MATH, transcribed from `modeling_qwen4_exp.py::Qwen4ExpTextPLELayer.forward`:
+
+        key   = norm_key(key_proj(e)).unflatten(-1, (hc, H))       # e = n-gram embedding (T, 2560)
+        value = value_proj(e)                                      # (T, H)
+        query = norm_query(hidden_wide).unflatten(-1, (hc, H))
+        gate  = (key * query).sum(-1, keepdim=True) / sqrt(H)      # (T, hc, 1)
+        gate  = sign(gate) * sqrt(clamp_min(|gate|, 1e-6))         # signed sqrt "soft" gate
+        gv    = sigmoid(gate) * value.unsqueeze(-2)                # (T, hc, H) -> flatten to wide
+        out   = gv + silu(dilated_depthwise_conv(norm_conv(gv)))
+
+    Note the asymmetry in the last line, and that it is silent if got wrong: the conv is fed the
+    NORMED gated value while the residual adds the UNNORMED one. The conv is depthwise over all
+    10240 channels with kernel 4 and dilation `ngram_size` = 3, i.e. a receptive field of 10 tokens
+    reading positions t, t-3, t-6, t-9 — hence a 9-column state per sequence.
+
+    The block returns a wide (10240) delta the decoder layer ADDS to the stream; it does not
+    consume or produce the 2560-wide mixed view.
+
+    GRAPH CAPTURE. The decode path is shape-static: an `index_select` from the persistent
+    `PLEStateCache.conv_state`, one concat of the single new column, four scaled adds (the four
+    dilated taps), and an `index_copy_` back. No host sync, no allocation keyed on the batch, and
+    the n-gram embeddings arrive in a static staging buffer filled before replay (`ple/runtime.py`).
+    The prefill path loops over sequences with `F.conv1d`; prefill is not captured in this engine.
+    """
+
+    def __init__(self, config: "ModelConfig") -> None:
+        hs = config.hidden_size
+        wide = config.hc_hidden_size
+        embed = config.ple_embed_dim
+        k = config.ple_conv_kernel_size
+        assert embed and k, "qwen4_exp PLE needs ple_embed_dim and ple_conv_kernel_size"
+        self.ple_embedding = Qwen4ExpNGramEmbedding(config)
+        self.conv1d_weight = torch.empty(wide, 1, k)
+        self.key_proj = LinearReplicated(embed, wide, has_bias=False)
+        self.value_proj = LinearReplicated(embed, hs, has_bias=False)
+        self.norm_key = GroupedRMSNorm(wide, group_size=hs, eps=config.rms_norm_eps)
+        self.norm_query = GroupedRMSNorm(wide, group_size=hs, eps=config.rms_norm_eps)
+        self.norm_conv = GroupedRMSNorm(wide, group_size=hs, eps=config.rms_norm_eps)
+        self._hc = config.hc_count
+        self._hs = hs
+        self._wide = wide
+        # Dilation is `ngram_size`, NOT the conv kernel size — the conv strides the same n-gram
+        # spacing the hash does. `state_len = (k - 1) * dilation` = 9 for (4, 3); a state sized
+        # `k - 1` = 3 (the GDN convention) would silently truncate the receptive field to 4 tokens.
+        self._dilation = int(config.ngram_size)
+        self._state_len = (int(k) - 1) * self._dilation
+
+    # -- state geometry, for whoever allocates the cache -------------------
+
+    @property
+    def conv_state_len(self) -> int:
+        return self._state_len
+
+    def make_state_cache(self, *, num_slots: int, eos_token_id: int, device, dtype):
+        """Allocate the `PLEStateCache` this block's geometry implies. Keeping the constructor here
+        is what stops the 9 from being re-derived (or mis-derived) at the allocation site."""
+        from minisgl.ple import PLEStateCache
+
+        return PLEStateCache(
+            num_slots=num_slots,
+            wide=self._wide,
+            state_len=self._state_len,
+            context_len=self._dilation - 1,
+            eos_token_id=eos_token_id,
+            dtype=dtype,
+            device=device,
+        )
+
+    # -- compute -----------------------------------------------------------
+
+    def _short_conv(self, x: torch.Tensor, batch: "PLEBatch", conv_state: torch.Tensor):
+        """`x` is the NORMED gated value, flat (T, wide). Returns silu(conv(x)) as (T, wide) and
+        updates `conv_state` in place for every sequence in the batch."""
+        w = self.conv1d_weight  # (wide, 1, k)
+        d, s = self._dilation, self._state_len
+        idx = batch.state_indices
+
+        if batch.is_decode:
+            # One token per sequence -> the conv degenerates to k scaled adds over a 10-wide window
+            # (9 cached + 1 new). Fully static: no F.conv1d, no per-sequence Python, capturable.
+            # Padding rows all carry slot 0, so the `index_copy_` writes several times to the NULL
+            # slot; the duplicate-index order is unspecified but every writer targets the slot no
+            # sequence owns, so nothing real is disturbed.
+            st = conv_state.index_select(0, idx)  # (N, wide, s)
+            full = torch.cat([st, x.unsqueeze(-1)], dim=-1)  # (N, wide, s+1)
+            taps = w.shape[-1]
+            out = full[..., 0] * w[:, 0, 0]
+            for j in range(1, taps):
+                out = out + full[..., j * d] * w[:, 0, j]
+            conv_state.index_copy_(0, idx, full[..., 1:])
+            return F.silu(out)
+
+        # Prefill / chunked prefill: varlen. One F.conv1d per sequence over its own
+        # [state | chunk] window; the last `s` columns of that window become the new state. The slot
+        # ids come from the HOST list, not `idx.tolist()` — the latter is a device->host sync in the
+        # middle of a forward.
+        outs: List[torch.Tensor] = []
+        start = 0
+        if not batch.seq_lens:
+            return x[:0]
+        for slot, n in zip(batch.slots, batch.seq_lens):
+            xs = x[start : start + n].t().unsqueeze(0)  # (1, wide, n)
+            full = torch.cat([conv_state[slot].unsqueeze(0), xs], dim=-1)  # (1, wide, s+n)
+            y = F.conv1d(full, w, groups=self._wide, dilation=d)  # (1, wide, n)
+            conv_state[slot].copy_(full[0, :, -s:])
+            outs.append(y[0].t())
+            start += n
+        return F.silu(torch.cat(outs, dim=0) if len(outs) > 1 else outs[0])
+
+    def compute(
+        self,
+        hidden: torch.Tensor,
+        embeddings: torch.Tensor,
+        batch: "PLEBatch",
+        conv_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """The block, with every runtime input passed explicitly. `forward` is the thin wrapper that
+        reads them out of the global context; tests drive THIS, so the numerics can be checked
+        without an engine."""
+        hc, hs = self._hc, self._hs
+        t = hidden.shape[0]
+        key = self.norm_key.forward(self.key_proj.forward(embeddings)).view(t, hc, hs)
+        value = self.value_proj.forward(embeddings)  # (T, hs)
+        query = self.norm_query.forward(hidden).view(t, hc, hs)
+        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(hs)
+        # Signed sqrt. `clamp_min` BEFORE the sqrt (on |gate|, not on gate) — it is a gradient guard
+        # upstream, and moving it changes the value for |gate| < 1e-6.
+        gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+        gated = torch.sigmoid(gate) * value.unsqueeze(-2)  # (T, hc, hs)
+        gated = gated.reshape(t, hc * hs)
+        # The conv sees the NORMED gated value; the residual adds the UNNORMED one.
+        return gated + self._short_conv(self.norm_conv.forward(gated), batch, conv_state)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """`hidden` is the wide (hc*H) stream. Returns the wide delta the layer adds to it.
+
+        Everything host-side — the n-gram hash, the NVMe row gather, the H2D — happened in
+        `PLERuntime.prepare` before this forward; see `minisgl/ple/runtime.py` for why that split is
+        what makes the decode step capturable.
+        """
+        rt = getattr(get_global_ctx(), "ple", None)
+        if rt is None or rt.batch is None:
+            raise RuntimeError(
+                "qwen4_exp PLE: no staged batch. `PLERuntime.prepare(slots, token_lists)` must run "
+                "on the host BEFORE the model forward — it hashes the recent tokens, gathers the "
+                "16 rows/token from the NVMe-resident n-gram table and copies them into the static "
+                "device buffer this layer reads. There is no fallback: skipping the block would "
+                "drop the n-gram features silently, which costs quality and errors nowhere."
+            )
+        batch = rt.batch
+        if batch.embeddings.shape[0] != hidden.shape[0]:
+            raise ValueError(
+                f"PLE staged {batch.embeddings.shape[0]} token embeddings but the forward carries "
+                f"{hidden.shape[0]} tokens — the staging ran against a different batch."
+            )
+        return self.compute(hidden, batch.embeddings, batch, rt.state.conv_state)
+
+
+class Qwen4ExpDecoderLayer(BaseOP):
+    """One decoder block. NOTE what is ABSENT: there is no `input_layernorm` and no
+    `post_attention_layernorm`. The hyper-connection's own `hc_norm` is the pre-block norm, and the
+    checkpoint ships no such tensors (upstream literally `delattr`s them —
+    `sglang/srt/models/qwen4_exp.py::_init_qwen4_exp_layer_extensions`). Adding either would be an
+    unfillable key at load.
+    """
+
+    def __init__(
+        self,
+        config: "ModelConfig",
+        layer_id: int,
+        *,
+        is_gdn: bool,
+        gdn_layer_id: int | None,
+        attn_kv_id: int | None,
+        expert_quant,
+    ) -> None:
+        if is_gdn:
+            assert gdn_layer_id is not None
+            q = config.quant
+
+            def _gdn_method(module: str):
+                name = f"model.layers.{layer_id}.linear_attn.{module}"
+                return create_linear_method(q.for_module(name) if q is not None else None)
+
+            gdn = QwenGatedDeltaNet(
+                hidden_size=config.hidden_size,
+                num_k_heads=config.linear_num_key_heads,
+                num_v_heads=config.linear_num_value_heads,
+                head_k_dim=config.linear_key_head_dim,
+                head_v_dim=config.linear_value_head_dim,
+                conv_kernel_size=config.linear_conv_kernel_dim,
+                tp_size=get_tp_info().size,
+                eps=config.rms_norm_eps,
+                # "sigmoid" for this checkpoint (`output_gate_type`), NOT the silu default. The gate
+                # multiplies every one of the 36 GDN layers' outputs; the wrong one is degenerate
+                # text with no error (GATE-5 asks the .so to confirm it consumed the argument).
+                activation=config.gdn_output_gate,
+                dtype=torch.get_default_dtype(),
+                device=torch.device("meta"),
+                qkvz_method=_gdn_method("in_proj_qkv"),
+                ba_method=_gdn_method("in_proj_b"),
+                out_proj_method=_gdn_method("out_proj"),
+            )
+            self.linear_attn = GDNLinearAttn(gdn, gdn_layer_id)
+            self._attn_op: BaseOP = self.linear_attn
+        else:
+            assert attn_kv_id is not None
+            self.self_attn = Qwen4ExpAttn(config, layer_id, attn_kv_id=attn_kv_id)
+            self._attn_op = self.self_attn
+        # PLE sits on exactly one layer, as a SIBLING of the mixer (not inside it).
+        if layer_id in config.ple_layer_ids:
+            self.ple = Qwen4ExpPLE(config)
+        self.mlp = Qwen3_5MoeSparseBlock(config, expert_quant)
+        self.attn_hyper_connection = _make_hc(config, use_combine=True)
+        self.mlp_hyper_connection = _make_hc(config, use_combine=True)
+        self._layer_id = layer_id
+        self._has_ple = layer_id in config.ple_layer_ids
+
+    @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        """`hidden` is the hc_count-WIDE stream in and out. Dataflow transcribed from
+        `sglang/srt/models/qwen4_exp.py` (`_prepare_qwen4_exp_attn` / `_prepare_qwen4_exp_mlp` /
+        `_postprocess_qwen4_exp_layer`).
+
+        There is no separate `residual` carried between layers the way the Qwen3.5 fused-norm path
+        does — the WIDE stream IS the residual, and `hc_norm` inside `mix` is the pre-block norm this
+        checkpoint ships instead of an input_layernorm. Two orderings here are load-bearing and
+        silent if swapped: the PLE delta is added to the wide stream BEFORE the attention mix (it is
+        a sibling of the mixer, not a term inside it), and each `combine` consumes the residual pair
+        from ITS OWN `mix` — the mlp block's gate must read the post-attention stream, not the
+        pre-attention one."""
+        if self._has_ple:
+            hidden = hidden + self.ple.forward(hidden)
+        x, res = self.attn_hyper_connection.mix(hidden)
+        x = self._attn_op.forward(x)
+        hidden = self.attn_hyper_connection.combine(x, res)
+        x, res = self.mlp_hyper_connection.mix(hidden)
+        x = self.mlp.forward(x)
+        return self.mlp_hyper_connection.combine(x, res)
+
+
+class Qwen4ExpModel(BaseOP):
+    def __init__(self, config: "ModelConfig") -> None:
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
+        )
+        gdn_pos = {gid: pos for pos, gid in enumerate(config.gdn_layer_ids)}
+        attn_pos = {aid: pos for pos, aid in enumerate(config.full_attn_layer_ids)}
+        expert_quant = config.quant
+        self.layers = OPList(
+            [
+                Qwen4ExpDecoderLayer(
+                    config,
+                    lid,
+                    is_gdn=lid in gdn_pos,
+                    gdn_layer_id=gdn_pos.get(lid),
+                    attn_kv_id=attn_pos.get(lid),
+                    expert_quant=expert_quant,
+                )
+                for lid in range(config.num_layers)
+            ]
+        )
+        # THE FINAL NORM. There is deliberately no `self.norm`: this checkpoint ships no
+        # `model.language_model.norm.weight`, and the top-level `hyper_connection_mixer` — the same
+        # hyper-connection block with use_combine=False, hence 3 tensors and no block_inject_weight —
+        # is what folds the 10240-wide stream down to the 2560 hidden `lm_head` consumes.
+        self.hyper_connection_mixer = _make_hc(config, use_combine=False)
+        self._hc_count = config.hc_count
+        self._capture_layer_ids: List[int] | None = None
+
+    def set_capture_layers(self, ids: List[int] | None) -> None:
+        if ids:
+            # Aux capture exists to feed a draft head (EAGLE3/DFlash/MTP) the exact feature it was
+            # trained on. Here the per-layer stream is the hc_count-WIDE residual (10240), not the
+            # 2560 hidden every drafter in this engine consumes, and there is no defensible way to
+            # pick one of the 4 branches or to fold them (the mixer's fold is trained for the LM
+            # head, not for a drafter). Handing back the wide tensor would be a silent shape error
+            # in the drafter's fc, and handing back a folded one would be silently OOD. Refuse.
+            raise NotImplementedError(
+                "qwen4_exp does not support aux-hidden capture: its per-layer residual stream is "
+                f"the {self._hc_count}x-wide hyper-connection stream, not the hidden-size feature a "
+                "draft head expects. Serve with --spec-algorithm none/ngram (the checkpoint's own "
+                "mtp.* head is bring-up plan T8.1)."
+            )
+        self._capture_layer_ids = None
+
+    def forward(
+        self, input_ids: torch.Tensor, return_hidden: bool = False
+    ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]":
+        x = self.embed_tokens.forward(input_ids)
+        # The stream starts as hc_count copies of the embedding (upstream `_prepare_qwen4_exp_attn`
+        # does this lazily on the first layer; doing it once here is identical and cheaper).
+        hidden = torch.cat([x] * self._hc_count, dim=-1)
+        for layer in self.layers.op_list:
+            hidden = layer.forward(hidden)
+        # `hyper_connection_mixer.mix` REPLACES the final norm: this checkpoint ships no
+        # `model.norm.weight`. Its `.mix` folds hc_count*hidden -> hidden for the lm_head; its second
+        # return value (the residual pair) is the mixer's own business and is discarded, exactly as
+        # upstream does (`hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)`).
+        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if return_hidden:
+            # The WIDE pre-mixer stream is what upstream hands its MTP head (`hc_hidden_states`), so
+            # it is the honest second return here — but nothing in this engine consumes a wide seed
+            # yet, and `aux_hidden` is None because capture is refused above.
+            return mixed, hidden, None
+        return mixed
+
+
+def _assert_tp_divides(config: "ModelConfig", tp: int) -> None:
+    """Refuse a TP degree this checkpoint's head/width counts do not divide, naming the count.
+
+    This REPLACED a blanket `tp > 1` refusal (2026-09-04). That refusal was correct while there was
+    no `_shard_qwen4_exp` — the generic sharders fall through to "replicate", which would have
+    loaded the whole 84 GB on every rank and failed somewhere unrelated. Now the shard rules exist,
+    and what is left is the real constraint: TP is legal exactly where every partitioned count
+    divides. Checked HERE, at build, so an indivisible degree is a named refusal at second zero
+    rather than a shape mismatch several minutes into a 38-shard load.
+
+    Note `num_kv_heads = 2` for this checkpoint: TP=2 is the LAST legal degree on the GQA side, and
+    TP=4 is refused by this function rather than by an unhelpful assert inside AttentionLayer. The
+    box has two cards, so that bound is not currently reachable in practice.
+    """
+    if tp <= 1:
+        return
+    counts = {
+        "num_attention_heads": config.num_qo_heads,
+        "num_key_value_heads": config.num_kv_heads,
+        "linear_num_key_heads": config.linear_num_key_heads,
+        "linear_num_value_heads": config.linear_num_value_heads,
+        "moe_intermediate_size": config.moe_intermediate_size,
+        "shared_expert_intermediate_size": config.shared_expert_intermediate_size,
+    }
+    bad = {k: v for k, v in counts.items() if v and int(v) % tp}
+    if bad:
+        raise NotImplementedError(
+            f"qwen4_exp cannot serve at tp_size={tp}: "
+            + ", ".join(f"{k}={v} is not divisible by {tp}" for k, v in sorted(bad.items()))
+            + ". Every one of these is a per-rank partition (attention heads, GDN key/value heads, "
+            "the routed- and shared-expert intermediate width); an uneven split would give one rank "
+            "a differently-shaped partial for its all-reduce. Serve at a tp that divides them."
+        )
+    # NVFP4 packs the routed experts along the INPUT K in 2-per-byte units with a group scale every
+    # 16 elements, so the ROW-parallel down_proj needs its per-rank K to stay a whole number of both.
+    # `_shard_qwen4_exp` raises on the scale axis at load; saying it here as well means the operator
+    # learns it before paying for a load, and the two checks are the same arithmetic stated twice on
+    # purpose — this one is reachable with no checkpoint on disk.
+    inter = int(config.moe_intermediate_size or 0)
+    gs = int(getattr(config.quant, "group_size", 0) or 16) if config.quant is not None else 16
+    if inter and (inter // tp) % gs:
+        raise NotImplementedError(
+            f"qwen4_exp at tp_size={tp}: moe_intermediate_size/{tp} = {inter // tp} is not a "
+            f"multiple of the NVFP4 group size {gs}. The routed down_proj is row-parallel over K, "
+            f"so its packed bytes (K/2) and its group scales (K/{gs}) would round to different rank "
+            f"boundaries and each rank would dequantize its columns with another rank's scales."
+        )
+
+
+class Qwen4ExpForConditionalGeneration(BaseLLMModel):
+    def __init__(self, config: "ModelConfig") -> None:
+        if not config.is_qwen4_exp:
+            raise ValueError(
+                f"Qwen4ExpForConditionalGeneration built from a {config.model_type!r} config"
+            )
+        tp = get_tp_info().size
+        _assert_tp_divides(config, tp)
+        if config.quant is None and config.unparsed_quant_method:
+            # Do not let "we could not read the quantization_config" look like "this checkpoint is
+            # bf16". The NVFP4 body is ~63 GB packed; built unquantized it is neither loadable nor
+            # servable, and the first symptom would be a key/shape miss deep in the loader.
+            logger.warning_rank0(
+                f"qwen4_exp: config declares quantization_config quant_method="
+                f"{config.unparsed_quant_method!r}, which QuantConfig.from_hf does NOT parse — every "
+                f"module is being built FULL PRECISION. For RadixArk/Qwen3.8-Flash-Next-NVFP4 that "
+                f"is wrong (routed experts are NVFP4 E2M1 + a two-level scale). Bring-up plan T1.1 "
+                f"adds the modelopt arm; until then this model builds but cannot load that "
+                f"checkpoint's experts."
+            )
+        self.model = Qwen4ExpModel(config)
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            # UNTIED in this checkpoint (`lm_head.weight` is a top-level tensor of its own).
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+        )
+        super().__init__()
+        # Say what this build does NOT do, once, at boot — where an operator reads it — rather than
+        # only at the moment something raises deep in a forward.
+        # Counts come from the CONFIG, not from the shipping checkpoint's 48/36/12: a layer-subset
+        # bring-up config (or any future variant) built the numbers into this line as a literal and
+        # the boot log then stated a depth the engine was not running.
+        logger.info_rank0(
+            f"qwen4_exp built: {config.num_layers} layers ({len(config.gdn_layer_ids)} GDN + "
+            f"{len(config.full_attn_layer_ids)} full-attn), PLE on decoder index "
+            f"{sorted(config.ple_layer_ids)}, {config.hc_count}x{config.hidden_size}-wide "
+            f"hyper-connection residual. NOT implemented in this build:"
+        )
+        for what, why in UNIMPLEMENTED:
+            logger.info_rank0(f"  * {what}\n      ({why})")
+
+    def forward(self, return_hidden: bool = False):
+        input_ids = get_global_ctx().batch.input_ids
+        if return_hidden:
+            # (post-mixer for lm_head, the WIDE pre-mixer stream, aux=None). Nothing consumes the
+            # wide seed yet — the only caller of return_hidden is a draft head, and `set_capture_
+            # layers` refuses — but returning the right tensor is cheaper than returning a lie.
+            mixed, wide, aux = self.model.forward(input_ids, return_hidden=True)
+            return self.lm_head.forward(mixed), wide, aux
+        return self.lm_head.forward(self.model.forward(input_ids))
+
+    def iter_gdn_layers(self) -> List[GDNLinearAttn]:
+        """GDN bridge ops in gdn_layer_id order (the engine sizes gdn_state + warms up from this)."""
+        return [
+            layer.linear_attn
+            for layer in self.model.layers.op_list
+            if isinstance(getattr(layer, "linear_attn", None), GDNLinearAttn)
+        ]
+
+    def set_capture_layers(self, ids: List[int] | None) -> None:
+        self.model.set_capture_layers(ids)  # refuses a non-empty set — see Qwen4ExpModel
+
+    def indexers(self) -> List[QSAIndexer]:
+        """Every full-attention layer's QSA indexer, in layer order. Empty on a GDN-only subset."""
+        cached = getattr(self, "_indexer_cache", None)
+        if cached is None:
+            cached = self._indexer_cache = [
+                layer.self_attn.indexer
+                for layer in self.model.layers.op_list
+                if getattr(layer, "self_attn", None) is not None
+            ]
+        return cached
+
+    def prepare_for_replay(self, batch) -> None:
+        """Restate the QSA indexer-budget refusal on the CAPTURED decode path.
+
+        `Qwen4ExpAttn.forward` asks `assert_dense_is_exact(max device_len)` once per forward, and
+        that check is the only thing standing between this engine and serving a DIFFERENT model:
+        below `indexer_budget` the checkpoint's sparse selection picks every visible key, so this
+        engine's dense causal attention is bit-equivalent; above it the two genuinely diverge, and
+        dense is not "slightly wrong" — it attends MORE, so the output stays fluent and the
+        substitution is undetectable from the text.
+
+        That check is Python inside `forward()`, so under cudagraph capture it runs exactly once —
+        at capture, over `dummy_req` rows whose `device_len` is 1 — and never again for the life of
+        the process. Restating it in this `GraphRunner.replay` pre-hook is what keeps a request that
+        crosses the budget mid-generation raising, instead of quietly switching models at token
+        2049. Deliberately NOT removed from `Qwen4ExpAttn.forward`: prefill and any uncaptured
+        decode never reach this hook, and that path is where the check has always lived.
+
+        No-op when the build has no full-attention layer at all (a GDN-only layer subset, which the
+        bring-up harness routinely runs): nothing dense executes, so there is nothing to bound. The
+        bound is a property of the config's `indexer_budget` and is identical on every indexer, so
+        the first one answers for all of them.
+        """
+        idx = self.indexers()
+        if not idx:
+            return
+        idx[0].assert_dense_is_exact(max((r.device_len for r in batch.reqs), default=0))
+
+    def ple_block(self) -> "Qwen4ExpPLE":
+        """The single PLE block, for whoever allocates its state cache and stages its batches.
+
+        Returned rather than re-derived at the allocation site: the block owns its conv geometry
+        (`conv_state_len` = 9, not the kernel-size-minus-one an ordinary short conv would imply) and
+        `make_state_cache` builds the matching `PLEStateCache`. Raises if the model was built with no
+        PLE layer at all, which for this checkpoint means `ple_layer_ids` was mis-parsed."""
+        blocks = [
+            layer.ple for layer in self.model.layers.op_list if getattr(layer, "ple", None) is not None
+        ]
+        if len(blocks) != 1:
+            raise RuntimeError(
+                f"expected exactly one qwen4_exp PLE block, found {len(blocks)}. The checkpoint "
+                f"ships `layers.1.ple.*` only; `ple_layer_ids` in config.json is 1-BASED and "
+                f"ModelConfig converts it."
+            )
+        return blocks[0]
+
+
+__all__ = [
+    "GroupedRMSNorm",
+    "HyperConnection",
+    "QSAIndexer",
+    "Qwen4ExpAttn",
+    "Qwen4ExpPLE",
+    "Qwen4ExpDecoderLayer",
+    "Qwen4ExpModel",
+    "Qwen4ExpForConditionalGeneration",
+    "UNIMPLEMENTED",
+]

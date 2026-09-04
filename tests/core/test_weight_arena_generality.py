@@ -360,7 +360,9 @@ class TestAttachSideEffects:
             def __init__(self, *a, **kw):
                 self.n = 0
 
-            def check(self, context: str = "") -> None:
+            def check(self, context: str = "", *, available=None, floor: int = 0) -> None:
+                # Same signature as the real one: `attach()` hands over the MemAvailable sample it
+                # already took, so the arming decision and the floor decision come from ONE reading.
                 self.n += 1
                 if self.n > 2:
                     raise hc.HostArenaSwapThrashError("synthetic thrash")

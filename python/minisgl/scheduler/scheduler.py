@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.profiler
@@ -96,6 +98,25 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+# Per-forward wall times, most recent last: (phase, batch_size, seconds).
+#
+# WHY A PER-STEP LOG AT ALL. A tok/s taken as `len(tokens) / wall(generate)` folds the PREFILL into
+# the per-token cost, and on this box's offloaded serve step 0 is not a rounding error — it reads the
+# whole prompt through the same host-resident experts every decode step touches, at a different batch
+# shape. This repo already has a standing note that the decode panel measures WALL time and must not
+# be quoted as a decode number; this log is how a decode number gets quoted instead. Reading the
+# MEDIAN over steps 1..N (step 0 dropped) also makes the statistic robust to the one-off first-replay
+# and allocator costs that a mean would smear across the run.
+#
+# `phase` is "prefill", "decode_graph" or "decode_eager", classified at the step that ran — which
+# doubles as the finest-grained provenance there is: an A/B leg's own steps say which path they took,
+# so a leg cannot be mislabelled by the switch that was supposed to select it.
+#
+# Bounded and ALWAYS ON: a ring buffer costs a `perf_counter` pair and a deque append per forward
+# (microseconds against a ~50 ms step) and cannot be accidentally left disabled on the run whose
+# number gets published, which an env gate can. The cap keeps a long-lived serve's memory flat.
+STEP_LOG: "deque[Tuple[str, int, float]]" = deque(maxlen=8192)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -324,6 +345,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             if self.engine.cca_state is not None
             else None
         )
+        # Qwen4-Exp PLE n-gram runtime — non-None ONLY when the engine built one (a checkpoint with
+        # `ple_layer_ids`). None for every other model, so the two call sites added below
+        # (`_finish_prepare` staging, `_forward` commit) are byte-identical for them. Held as an
+        # attribute, like `gdn_slots`, because `run_forever` keys its loop choice on it and `config`
+        # is not retained past __init__.
+        self._ple = getattr(self.engine, "ple_runtime", None)
         # Block-diffusion canvas lifecycle — active ONLY for a checkpoint that declares a
         # `canvas_length` (DiffusionGemma). None for every autoregressive model, which is also what
         # `run_forever` keys the loop selection on: `config` is not retained past __init__, so the
@@ -1229,7 +1256,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # `_rtx` is read ONCE: roctx.enabled() is a module-global test, but reading it per iteration
         # on the hottest loop in the server buys nothing.
         _rtx = _roctx.enabled()
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix:
+        # Qwen4-Exp PLE forces the synchronous loop for a different reason than the two above, and a
+        # sharper one: `_stage_ple` hashes `req.input_ids[cached_len:device_len]` on the HOST before
+        # the forward, and under the overlap order (schedule -> forward -> process-last) the previous
+        # step's sampled token has NOT yet been committed to that host buffer. The n-gram context
+        # would silently lag one token — no crash, just subtly wrong features on every decode step.
+        if (ENV.DISABLE_OVERLAP_SCHEDULING or self._rec_radix or self._swa_radix
+                or self._ple is not None):
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -1917,6 +1950,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # RDNA4Metadata); swa_prefix is a post-hoc field.
         elif self._swa_radix and batch.is_prefill and not batch.spec_verify:
             self._restore_swa_states(batch)
+        # Qwen4-Exp PLE: hash this pass's tokens, gather their n-gram rows off NVMe and copy them
+        # into the layer's static device buffer. HERE, after the GDN slots exist (the PLE state is
+        # indexed by the same slot id) and before the forward, because none of it — mmap reads, a
+        # numpy hash, an H2D — can happen inside the model, let alone inside a captured graph.
+        # Inert (`_ple is None`) for every other model.
+        if self._ple is not None:
+            self._stage_ple(batch)
         # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
         # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
         # inside a graph — read here, reuse across decode). Inert when CAM is not built.
@@ -2678,8 +2718,81 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 conf_chunks.append(torch.zeros(nt, device=dev))
         inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
 
+    def _stage_ple(self, batch: Batch) -> None:
+        """Stage the Qwen4-Exp PLE n-gram embeddings for `batch` (host work, before the forward).
+
+        Row order matches `_make_positions` — `padded_reqs`, each contributing `extend_len` tokens —
+        because the PLE layer consumes one embedding per token of `batch.input_ids` and checks the
+        two counts agree. A cudagraph PADDING row is given the reserved NULL slot 0, whose state is
+        zero and whose output is discarded.
+
+        Two things here are load-bearing and silent if wrong:
+
+        * The tokens come from the HOST buffer, `req.input_ids[cached_len:device_len]`, not from the
+          device token pool: the n-gram hash is numpy over an mmap'd table and must run before the
+          forward. That is only valid under the SYNCHRONOUS loop, where the previous step's sampled
+          token has already been committed to the host buffer — which is why `run_forever` refuses
+          the overlap loop for a PLE model.
+        * A freshly-allocated slot is RESET first. `GDNSlotManager.state_indices` (called just above)
+          zeroes the GDN buffers of a new slot but knows nothing about the PLE cache, so without this
+          a recycled slot would start with the previous request's conv window and 2-token history —
+          i.e. one request's lexical context bleeding into the start of the next, with no error.
+          `cached_len == 0` is the fresh-sequence test under the naive prefix cache this model forces
+          (`resolve_prefix_cache`); a chunked continuation has `cached_len > 0` and must NOT be reset.
+        """
+        if self.gdn_slots is None:
+            raise RuntimeError(
+                "a PLE model reached _stage_ple with no recurrent slot manager. PLE state is indexed "
+                "by the GDN slot id (ple/state.py); without GDNSlotManager there is no per-sequence "
+                "identity to key it on."
+            )
+        reqs = batch.padded_reqs if batch.padded_reqs is not None else batch.reqs
+        real = {id(r) for r in batch.reqs}
+        slots: List[int] = []
+        tokens: List[np.ndarray] = []
+        for req in reqs:
+            if id(req) not in real:
+                slot = 0  # padding / dummy row -> the reserved NULL slot
+            else:
+                slot = self.gdn_slots.slot_for(req.uid)
+                if slot is None:
+                    # NOT slot 0: a real sequence on the NULL slot would share one conv window and
+                    # one n-gram history with every padding row and with any other slotless request
+                    # — cross-request contamination that produces perfectly finite output.
+                    raise RuntimeError(
+                        f"uid={req.uid} reached _stage_ple with no recurrent slot. "
+                        f"GDNSlotManager.state_indices runs first and allocates one for every "
+                        f"prefill req, so this means the batch was assembled off that path."
+                    )
+                if batch.is_prefill and req.cached_len == 0:
+                    self._ple.reset_slot(slot)
+            ids = req.input_ids[req.cached_len : req.device_len]
+            if ids.numel() != req.extend_len:
+                # The host token buffer is short of this pass's span — the overlap-scheduling hazard,
+                # or a path that advanced device_len without committing the token. Say so here: the
+                # symptom otherwise surfaces as a token-count mismatch inside the PLE layer, three
+                # frames away from the cause.
+                raise RuntimeError(
+                    f"uid={req.uid}: host token buffer holds {ids.numel()} of the {req.extend_len} "
+                    f"tokens in [{req.cached_len}, {req.device_len}). The PLE n-gram hash reads host "
+                    f"ids BEFORE the forward, so every token of this pass must already be committed."
+                )
+            slots.append(slot)
+            tokens.append(ids.to(torch.int64).numpy())
+        self._ple.prepare(slots, tokens)
+
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        # STEP_LOG bookkeeping (see the module-level comment). Both fields are read BEFORE the
+        # forward on purpose: `forward_batch` calls `complete_one()`, which sets cached_len=device_len
+        # and collapses extend_len, so `batch.is_prefill` asked afterwards describes a batch that no
+        # longer exists. The graph/eager split is taken from the replay counter MOVING across this
+        # step rather than by re-asking `can_use_cuda_graph` — that is the dispatch that actually
+        # happened, not a second opinion about what should have.
+        _step_t0 = time.perf_counter()
+        _step_is_pf = bool(batch.is_prefill)
+        _step_bs = int(batch.size)
+        _step_r0 = self.engine.graph_runner.replays
         batch.input_ids = self.token_pool[input_mapping]
         # FEEDBACK-INTEGRITY CHECK (MINISGL_FEEDBACK_CHECK=1, debug-only: one D2H sync per step).
         # The invariant that keeps the emitted stream and the model's context the SAME text: a
@@ -2724,6 +2837,19 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             forward_output = out
         else:
             forward_output = self.engine.forward_batch(batch, sample_args)
+        # Qwen4-Exp PLE: advance each slot's n-gram token history now that the forward has actually
+        # run. Deliberately AFTER, and deliberately not merged into `_stage_ple`: a batch that raises
+        # in the forward must not leave its slots' history one pass ahead of their conv state, and
+        # the spans cannot be re-derived here anyway (`forward_batch` has already called
+        # `complete_one`). Inert for every non-PLE model. See PLERuntime.commit_staged.
+        if self._ple is not None:
+            self._ple.commit_staged()
+        STEP_LOG.append((
+            "prefill" if _step_is_pf else
+            ("decode_graph" if self.engine.graph_runner.replays > _step_r0 else "decode_eager"),
+            _step_bs,
+            time.perf_counter() - _step_t0,
+        ))
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # track_reqs=False for an EP lockstep DUMMY batch (no real reqs): its dummy_req must NOT be
         # promoted into the decode running set (it would pollute every subsequent decode step).

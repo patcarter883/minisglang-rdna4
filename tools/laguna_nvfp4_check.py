@@ -38,7 +38,7 @@ def check(snap, base, dev):
     # golden bf16 weight from the RAW checkpoint tensors
     golden = nvfp4.dequant_reference(wp, ws, wg).to(torch.float32)  # [N,K]
     # folded -> op layout (what the served kernel consumes)
-    folded = nvfp4.fold_nvfp4_scale(ws, wg)  # [N,K//16] fp16
+    folded = nvfp4.fold_nvfp4_scale(ws, wg, global_field="weight_global_scale")  # [N,K//16] fp16
     conv = nvfp4.convert_nvfp4_weight(wp, folded)
     w_op, scales_op, g = conv["w_packed"], conv["scales"], conv["group_size"]
     print(f"  fold: group_size={g}  w_op {tuple(w_op.shape)} {w_op.dtype}  scales_op {tuple(scales_op.shape)} {scales_op.dtype}")

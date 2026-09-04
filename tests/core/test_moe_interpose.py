@@ -1192,3 +1192,120 @@ class TestSelftestCompareIsBounded:
         empty = torch.zeros(0, dtype=torch.uint8)
         assert moe_interpose._bitwise_equal(empty, empty.clone())
         assert seen == []
+
+
+# ==================================================================================================
+# The seam PROOF — is the offload arm in the serving path?
+# ==================================================================================================
+
+
+class TestProveSeamResidency:
+    """`prove_seam_residency` asks the LIVE MODEL what every other gate asks the arena or the plan.
+
+    The gap it closes is not hypothetical for this repo: the PLE bring-up shipped a set of
+    individually-green components whose seam to the engine did not exist, so the served path was 0%
+    functional and every test passed. Each case below is one way that shape can recur in the offload
+    path — and every one of them is silent without this check, because `MoELayer._weight_offload`
+    defaults to None at the CLASS, so an unbound layer runs happily off its device containers while
+    the plan, the arena reservation and the KV budget were all computed as though it had not.
+    """
+
+    def _bound_model(self, budget=0):
+        model = _Model([_Block(_real_moe()) for _ in range(3)])
+        _quantize(model)
+        seams = attach_seams(model)
+        plan = plan_layer_granular(build_layer_weights(seams), device_budget_bytes=budget)
+        alloc, handed = _cpu_allocator()
+        bind_plan(seams, plan, alloc, log=False)
+        return model, seams, handed
+
+    def test_a_fully_bound_model_proves_and_counts_what_it_walked(self, tp1):
+        model, seams, handed = self._bound_model()
+        owned = {t.data_ptr() for t in handed}
+        proof = moe_interpose.prove_seam_residency(
+            model, seams, owns_pointer=lambda p, n=0: p in owned
+        )
+        assert (proof.moe_layers, proof.host_layers, proof.device_layers) == (3, 3, 0)
+        # 3 layers x 2 containers (w13, w2) x 3 components (packed weight, scales, zeros).
+        assert proof.pointer_checked and proof.host_tensors == 18
+        assert proof.host_bytes == sum(t.numel() * t.element_size() for t in handed)
+
+    def test_the_proof_is_downgraded_not_faked_without_an_owns_pointer(self, tp1):
+        """`pointer_checked=False` is the honest report of a walk that skipped its own evidence.
+        A caller that gates on the object rather than on this flag gets a structural claim believing
+        it has a residency one."""
+        model, seams, _ = self._bound_model()
+        assert not moe_interpose.prove_seam_residency(model, seams).pointer_checked
+
+    def test_a_layer_whose_seam_was_detached_is_caught(self, tp1):
+        """THE DISPATCH REGRESSION. A detached layer reads its device containers and produces
+        perfectly finite output; nothing in the arena, the plan or the byte ledger can see it."""
+        model, seams, _ = self._bound_model()
+        for s in seams:
+            s._frozen = False  # detach() correctly refuses a frozen seam; simulate the pre-freeze slip
+        seams[1].detach()
+        with pytest.raises(InterpositionError, match="carry no weight-offload seam"):
+            moe_interpose.prove_seam_residency(model, seams)
+
+    def test_a_seam_bound_to_a_layer_that_left_the_tree_is_caught(self, tp1):
+        """The arena is populated, the ledger balances, and the layer the seam describes is not the
+        one the engine will call forward() on."""
+        model, seams, _ = self._bound_model()
+        seams.append(
+            moe_interpose.attach_seam("layers.99.mlp", _Block(_real_moe()).mlp)
+        )
+        with pytest.raises(InterpositionError, match="NOT reachable from the model"):
+            moe_interpose.prove_seam_residency(model, seams)
+
+    def test_a_host_tensor_outside_the_arena_is_caught(self, tp1):
+        """The `hipMalloc` fallback, seen from the model side: the layer says HOST, the tensor its
+        kernels will read is in VRAM. Double error against the KV budget — the bytes are resident
+        AND `model_memory_correction` removes them as though they were not."""
+        model, seams, _ = self._bound_model()
+        with pytest.raises(InterpositionError, match="NOT inside the pinned arena"):
+            moe_interpose.prove_seam_residency(model, seams, owns_pointer=lambda p, n=0: False)
+
+    def test_a_device_tensor_inside_the_arena_is_caught(self, tp1):
+        """The mirror case, and it is what makes the host claim non-vacuous: an `owns_pointer` that
+        answers True for everything would otherwise 'prove' any model at all."""
+        model, seams, _ = self._bound_model(budget=1 << 40)  # everything stays on the device
+        assert all(s.kind is StackKind.DEVICE for s in seams)
+        with pytest.raises(InterpositionError, match="lives INSIDE the host arena"):
+            moe_interpose.prove_seam_residency(
+                model, seams, owns_pointer=lambda p, n=0: True, require_host_layers=False
+            )
+
+    def test_an_all_device_bind_refuses_by_default_on_an_enabled_session(self, tp1):
+        """`require_host_layers` exists because "the arena pinned and nothing is host-resident" is
+        exactly what a vanished offload arm looks like, and it is otherwise indistinguishable from a
+        correct all-device serve."""
+        model, seams, _ = self._bound_model(budget=1 << 40)
+        with pytest.raises(InterpositionError, match="not one MoE layer .* is host-resident"):
+            moe_interpose.prove_seam_residency(model, seams)
+        assert moe_interpose.prove_seam_residency(
+            model, seams, require_host_layers=False
+        ).device_layers == 3
+
+    def test_resolve_publishes_the_ledger_line_and_assert_identity_does_not(self, tp1):
+        """The ledger line's ONLY value is that it separates "the bake ran" from "a forward read the
+        arena". The boot-time proof therefore has to use `assert_identity`, or it would emit the
+        line itself and destroy the distinction."""
+        from minisgl import _hip_engage
+
+        model, seams, _ = self._bound_model()
+        seam = seams[0]
+        layer = dict(discover_moe_layers(model))[seam.path]
+        pair = (layer.gate_up_proj, layer.down_proj)
+        _hip_engage._seen.discard(seam._engage)
+        seam.assert_identity(*pair)
+        assert seam._engage not in _hip_engage._seen
+        seam.resolve(*pair)
+        assert seam._engage in _hip_engage._seen
+
+    def test_live_tensors_walks_the_same_set_the_bake_moved(self, tp1):
+        """One enumeration, two consumers. A proof that walked a different tensor set from the bake
+        would be a proof about weights the forward does not read — vacuous in the direction that
+        reads as a pass."""
+        model, seams, handed = self._bound_model()
+        walked = [t for s in seams for _n, t in s.live_tensors()]
+        assert {t.data_ptr() for t in walked} == {t.data_ptr() for t in handed}

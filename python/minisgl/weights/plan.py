@@ -435,11 +435,26 @@ def is_mtp_path(path: str) -> bool:
     return "mtp" in path.split(".")
 
 
+def _path_layer_index(path: str) -> Optional[int]:
+    """`"model.layers.31.mlp.experts"` -> 31; None when the path carries no decoder index.
+
+    Structural, never a construction counter — the same rule `moe_interpose.discover_moe_layers`
+    keys on. A path with no index (a bare MoE head) is never excluded by index: it cannot be named
+    by one.
+    """
+    parts = path.split(".")
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return int(parts[i + 1])
+    return None
+
+
 def observed_planned_layers(
     model: Any,
     *,
     priorities: Optional[Dict[Any, int]] = None,
     allow_meta: bool = True,
+    layer_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[Tuple[LayerWeights, ...], Dict[str, Any]]:
     """Size every offloadable MoE layer by WALKING THE BUILT MODEL. Returns (layers, diagnostics).
 
@@ -522,11 +537,22 @@ def observed_planned_layers(
             return {}
 
     prio = priorities or {}
+    want = None if layer_indices is None else {int(i) for i in layer_indices}
     layers: List[LayerWeights] = []
     skipped: List[str] = []
     kinds: List[str] = []
     saw_meta = False
     for path, layer in discover_moe_layers(model):
+        # `layer_indices` RESTRICTS the plan, on this path exactly as it does on the config path.
+        # It used to be accepted by `resolve_weight_plan`, forwarded to `build_planned_layers`, and
+        # then silently dropped the moment a model was passed — i.e. every production call, since
+        # `engine.py` always has one. A caller that excludes layers (the weight-offload STREAM tier
+        # excludes the ones it will re-read from the checkpoint per forward) would have got a plan
+        # naming layers it never intended to place, an arena reserved for them, and a KV pool sized
+        # against that reservation.
+        if want is not None and _path_layer_index(path) not in want:
+            skipped.append(f"{path} (excluded by layer_indices)")
+            continue
         if is_mtp_path(path) and not OFFLOAD_MTP_HEAD:
             skipped.append(f"{path} (MTP draft head: re-read every draft step, never offloaded)")
             continue
@@ -608,7 +634,7 @@ def build_planned_layers(
     fallback that answers the capacity question before anything is constructed.
     """
     if model is not None:
-        return observed_planned_layers(model, priorities=priorities)
+        return observed_planned_layers(model, priorities=priorities, layer_indices=layer_indices)
     mc = getattr(config, "model_config", config)
     if compute_dtype_bytes is None:
         compute_dtype_bytes = int(getattr(getattr(config, "dtype", None), "itemsize", 2) or 2)

@@ -42,8 +42,18 @@
 >    not the −14 % the GGUF figure suggested — §11 unknown #12). All-host T1 projects
 >    **19.42 tok/s** (was 18.7), so **A1.7 re-instantiates at 14.57** and K4 (3.178) is cleared by
 >    **6.1×** — on a projection, not a measurement.
-> 5. **Still not discharged: graph capture.** No GPU work of any kind has run. Under the repo's
->    mandatory rule this feature is **unfinished**, and dense linears are still not planned (A1.5).
+> 5. ~~**Still not discharged: graph capture.** No GPU work of any kind has run.~~
+>    `[CAPTURE-2026-09-04]` **BOTH HALVES ARE NOW FALSE.** Graph capture is **discharged** on the
+>    offloaded 48-layer TP=2 serve, and the whole path has been measured end-to-end on both cards.
+>    The offload seam needed **no change** for capture: the arena's addresses are constants by the
+>    time capture runs, `bake.verify_after_capture()` fired (count 2) on every captured boot, and
+>    `arena_torch_fallbacks` stayed 0. Capture is worth **+2.5%** (81.87 → 79.86 ms/decode step) —
+>    small, and the reason is the offload itself: 37 of 48 layers stream 568.32 MB/token/rank over
+>    PCIe, which at card 1's measured Gen4 x8 (14.48 GB/s) is 39.25 ms = **49% of the step**. See
+>    [`docs/measurements/QWEN4EXP_GRAPH_CAPTURE.md`](measurements/QWEN4EXP_GRAPH_CAPTURE.md), and
+>    note §2.3's honest open item: the engine's own banner projects 47.0 ms/step against a measured
+>    79.86, and that 32.9 ms is **unattributed** — it, not launch overhead, is the next perf target.
+>    **Dense linears are still not planned (A1.5)** — that part of the line stands.
 
 ---
 

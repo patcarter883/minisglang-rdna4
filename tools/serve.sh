@@ -29,6 +29,21 @@
 #   MAX_PREFILL_LENGTH (chunked-prefill chunk, default 2048 — see the note at its assignment).
 #   EXTRA_ARGS is appended verbatim and wins — the escape hatch for anything not modelled here.
 #
+# WEIGHT OFFLOAD (weights/plan.py). Both empty by default, which puts NO flag on the line and is the
+# shipped behaviour for every model in the table below.
+#   WOFF_DEVICE_GB  VRAM per rank (GiB) the MoE expert tier may occupy. Every layer above it is
+#                   pinned in host RAM and streamed over PCIe. ~200k KV tokens per GiB surrendered.
+#   WOFF_HOST_GB    per-rank pinned host arena clamp (GiB). Empty = the measured P3b default.
+#   WOFF_CHUNK_MIB  pinned-arena chunk size (MiB). Empty = the 2048 default. Worth 25% of the host
+#                   tier when a layer's rows are just over half a chunk — see the block below.
+#
+#   NOT OPTIONAL ONCE OFFLOAD ENGAGES, which is why it is a table column and not just an EXTRA_ARG.
+#   With no --weight-offload-device-gb the engine DERIVES the tier as `total_memory * memory_ratio`
+#   — the whole KV budget — and since the tier is billed inside `model` in _determine_num_pages, a
+#   non-empty plan under it can never leave a KV pool. `bake.UnconfiguredDeviceTierError` refuses
+#   that boot from integers before a page is pinned, so a model that needs offload and has no
+#   WOFF_DEVICE_GB does not serve slowly, it does not serve at all.
+#
 # Print the composed line without running it:  DRY_RUN=1 tools/serve.sh
 set -uo pipefail
 
@@ -491,6 +506,97 @@ case "$MODEL" in
                   model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
                   tool_format="zaya_xml"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
+  # Qwen4-Exp (`qwen4_exp`), NVFP4, 48 layers (36 GDN + 12 full-attn), 512 experts/layer, a PLE
+  # n-gram block on decoder index 1, and a 4x-wide (10240) hyper-connection residual. The ONLY model
+  # in this table that does not fit its expert tier in VRAM at any TP this box has: 37 of its 48
+  # layers are pinned in HOST RAM and streamed over PCIe every step. So every term below is
+  # load-bearing and none of them has a safe default — a launch that drops one either does not boot
+  # or boots as a different, slower serve.
+  #
+  # `[CAPTURE-2026-09-04]` GRAPH CAPTURE IS DISCHARGED ON THIS PATH and this arm is the captured
+  # operating point. Full write-up + raw artifacts:
+  # docs/measurements/QWEN4EXP_GRAPH_CAPTURE.md. The headline: capture is worth +2.5%
+  # (81.87 -> 79.86 ms per decode step, x1.0253, 5 interleaved repeats/leg, non-overlapping ranges,
+  # identical on both ranks), because this decode is PCIe-BOUND, not launch-bound — 37 host layers
+  # x 10 routed experts x 1.536 MB = 568.32 MB/token/rank, which at card 1's measured Gen4 x8
+  # (14.48 GB/s vs card 0's 28.93) is 39.25 ms = 49% of the step. Capture is kept because it is a
+  # repo merge requirement and it is free, NOT because it is a throughput lever.
+  qwen4exp|qwen4-exp|q4e)
+                  # A local checkpoint, not an HF id: the expert stacks ship as per-layer shard
+                  # files and the n-gram table is a separate 49 GiB sidecar. The measured runs
+                  # mounted /home/pat/.cache/hf-q4e at /model and /home/pat/.cache/hf-ple at /ple.
+                  model_id="${Q4E_MODEL:-/model}";                     spec_default="none"
+                  # min_tp=2 is a HARD requirement, not a preference: at TP=1 the per-rank expert
+                  # rows double to 1.465 GiB/layer and the host arena needed is ~54 GiB in ONE
+                  # process, which this box cannot pin. TP=2 is the only configuration the 48-layer
+                  # serve has ever booted in.
+                  min_tp=2
+                  # attn=hip is REQUIRED FOR CAPTURE, and it is not a kernel change. `rdna4`'s
+                  # init_capture_graph/prepare_for_capture/prepare_for_replay all raise
+                  # NotImplementedError ("rdna4 cudagraph capture lands in Phase 4"); the
+                  # capture-capable implementation is its SUBCLASS `hip`, which dispatches decode to
+                  # the same attn_decode.flash_decode_paged op and prefill to the same
+                  # attn_hip.flash_prefill. Every qwen4_exp run before 2026-09-04 booted rdna4,
+                  # which is the only reason capture had never been attempted here.
+                  attn="hip"
+                  # 0.96, MEASURED: model=13.49 GiB of a 15.71 GiB card leaves available=1.47 GiB =
+                  # 8,010 KV pages @ 196,608 B. At the 0.80 global default (or even 0.90) the pool
+                  # is ~0 and boot dies in _determine_num_pages. NOTE the capture A/B itself ran at
+                  # 0.90 (the harness default, 2,850 pages) — 0.96 WITH graphs live is the one term
+                  # on this line that is arithmetic rather than a measurement, and the graphs are
+                  # small (bs<=2 x vocab fp32 logits ~2 MB + one shared pool). First boot of this
+                  # arm is its confirmation; if it dies in num_pages, that is why.
+                  mem_default="0.96"
+                  # A CAP, not a default (CONC is already assigned above this case block, so
+                  # `${CONC:=2}` would be a silent no-op). GRAPH_BS follows CONC, so this is also
+                  # the capture coverage: buckets [1,2] are what was captured and measured, and a
+                  # batch above the captured max runs FULLY EAGER. 2 is the only concurrency this
+                  # operating point has been booted at; raising it raises coverage but is unmeasured
+                  # and eats VRAM at exactly the moment VRAM is tightest.
+                  if [ "$CONC" -gt 2 ]; then CONC=2; fi
+                  # THE OFFLOAD TIER. 8.1 GiB/rank = 11 of 48 layers device-side; the other 37 are
+                  # host-pinned at 27.10 GiB/rank (54.20 GiB across the node).
+                  # * 8.1 not 9.0: 12 device layers OOMs in STAGE B, not at rest. Stage B's peak is
+                  #   the tier plus ONE layer in flight (~1.46 GiB), which at 12 layers is 14.96 GiB
+                  #   allocated with 224 MiB free and dies asking for a 400 MiB row. At 11 the same
+                  #   run leaves min_device_free 0.66 GiB. Size the device tier against the LOAD
+                  #   peak, not the resting footprint.
+                  # * chunk 750 MiB, not the 2048 default and NOT rounded to a 256 MiB granule: the
+                  #   arena packs next-fit over ROWS and a region may never straddle a chunk. This
+                  #   checkpoint's rows are 400/200/100/50 MiB = exactly 750 MiB per layer per rank
+                  #   at TP=2, so 750 wastes ZERO (27.100 GiB/rank) while 768 costs +0.650 and 1024
+                  #   costs +9.900 (one layer per chunk). The curve is NOT monotone in chunk size —
+                  #   sweep it with tools/offload/plan_chunk_sweep.py, never extrapolate.
+                  woff_device_gb="8.1"; woff_host_gb="28"; woff_chunk_mib="750"
+                  # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
+                  # that must NOT be carried to another machine. 27.10 x 2 = 54.20 GiB pinned, and
+                  # the rank processes see ~62-65 GiB of MemAvailable (2-3 GiB less than the host
+                  # reads, because both engines are already up), so 54.20 + the 12 GiB default floor
+                  # = 66.20 does not fit and 54.20 + 9 = 63.20 does. Four 48-layer boots died in
+                  # HostArenaCapacityError / HostArenaSwapThrashError purely because ~10 GiB of
+                  # tmpfs was squatting under /tmp. Free ~3 GiB on this box and the default floor
+                  # works unchanged.
+                  : "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:=9}"; export MINISGL_WEIGHT_ARENA_FLOOR_GIB
+                  # THE PLE N-GRAM SIDECAR. Qwen4ExpPLE reads its embeddings out of a separate
+                  # ~49 GiB shard set that is NOT part of the model directory, and the head metadata
+                  # (ngram_heads_offsets / ngram_heads_vocab_sizes) lives in a bf16 shard that is
+                  # NOT in the plefp8 set, so the two are named separately. Composed here rather
+                  # than left to the operator because the failure without them is a KeyError three
+                  # minutes into a ten-minute boot.
+                  Q4E_PLE_DIR="${Q4E_PLE_DIR:-/ple}"
+                  if [[ -z "${MINISGL_PLE_FILES:-}" ]]; then
+                    MINISGL_PLE_FILES="$(ls "$Q4E_PLE_DIR"/model-plefp8-*.safetensors 2>/dev/null | paste -sd:)"
+                  fi
+                  : "${MINISGL_PLE_META_FILES:=$Q4E_PLE_DIR/model-bf16-00010.safetensors}"
+                  # Refuse from integers rather than boot a model whose n-gram block cannot be fed.
+                  if [[ -z "$MINISGL_PLE_FILES" ]]; then
+                    echo "[serve] ERROR: qwen4_exp needs the PLE n-gram shards, and none matched" \
+                         "$Q4E_PLE_DIR/model-plefp8-*.safetensors. Mount the sidecar (the measured" \
+                         "runs used -v /home/pat/.cache/hf-ple:/ple:ro) or set Q4E_PLE_DIR /" \
+                         "MINISGL_PLE_FILES explicitly." >&2
+                    exit 2
+                  fi
+                  export MINISGL_PLE_FILES MINISGL_PLE_META_FILES ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
@@ -626,6 +732,81 @@ par_args=(--tp "$TP")
 ctx_args=()
 [[ -n "${CTX:-}" ]] && ctx_args=(--max-seq-len-override "$CTX")
 
+# --- weight offload ------------------------------------------------------------------------------
+# Per-model default from the table (`woff_device_gb`), overridable by the environment. Empty stays
+# empty: no flag on the line, byte-identical to every serve that has ever run. Non-empty is the ONE
+# lever that decides how much of the MoE expert tier stays in VRAM — see the header. Both values are
+# GiB (2**30), matching plan.GIB_PER_UNIT and every figure the engine logs back.
+WOFF_DEVICE_GB="${WOFF_DEVICE_GB:-${woff_device_gb:-}}"
+WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
+# Arena chunk size, in MiB. MEASURED 2026-09-03, card 0, qwen4_exp (1.465 GiB of experts per layer):
+# a layer's rows may never straddle a chunk, so a 2 GiB chunk holds ONE layer and abandons 0.535 GiB
+# — 2.00 GiB of pinned RAM per host layer (24-layer offload serve: 32.23 GiB carved, 44.00 GiB
+# pinned, 73% efficient). A 3 GiB chunk holds TWO (2.93 GiB) — 1.50 GiB per host layer, a 25% cut
+# (32-layer offload serve: 43.95 GiB carved, 45.00 GiB pinned, 97.7%), and that 45.00 GiB is the
+# largest arena ever pinned on this box WITH an engine loaded (the previous record, which
+# `host_capacity`'s advisory still quotes, is 34.00 GiB with none). Nothing above 2 GiB had ever been
+# pinned here before that run, which is why this is a knob with its measurement attached rather than
+# a new default. Raw: docs/measurements/WEIGHT_OFFLOAD_2026-09-02/stage_b_serve/.
+#
+# THE RIGHT CHUNK IS A FUNCTION OF THE PER-RANK LAYER SIZE, SO IT MOVES WITH TP. MEASURED
+# 2026-09-04, cards 0+1, qwen4_exp at TP=2: a layer's expert rows halve to 0.7324 GiB, so the 3 GiB
+# chunk that was optimal at TP=1 holds FOUR of them (2.93 GiB, 0.07 abandoned) — still a good fill,
+# but the RESERVATION is quantised in 3 GiB steps, and at 30 host layers that rounds 21.97 GiB of
+# payload up to 24.00 GiB. A 768 MiB chunk holds exactly ONE 0.7324 GiB layer and reserves
+# 22.50 GiB for the same payload: 97.7% fill, 1.50 GiB/rank (3.00 GiB across the node) recovered,
+# which on this box is the difference between booting and a HostArenaCapacityError.
+#
+# THE "ROUND UP TO A 256 MiB GRANULE" RULE WAS WRONG, and it cost 0.633 GiB/rank. The arena packs
+# next-fit over ROWS, not over layers, and this checkpoint's rows are 400/200/100/50 MiB — exactly
+# 750 MiB per layer per rank at TP=2, with nothing left over. So a chunk that is an EXACT MULTIPLE
+# of the row set wastes ZERO, while any rounding up wastes the remainder of every chunk. Measured
+# 2026-09-04 with `tools/offload/plan_chunk_sweep.py` (48 layers, 37 host layers, TP=2), pinned per
+# rank: 750 MiB -> 27.100 GiB (0 waste), 752 -> 27.172, 768 -> 27.750 (+0.650), 1536/3072 -> 28.500
+# (+1.400), 1024 -> 37.000 (+9.900 — one layer per chunk, the worst case). The curve is NOT monotone
+# in chunk size, so it must be swept, not extrapolated. THE RULE: chunk = k x (sum of one layer's
+# per-rank row bytes), smallest k that the box's `MemAvailable` allows.
+#
+#   | tp | per-rank layer | chunk       | per chunk | fill | measured serve                          |
+#   |----|----------------|-------------|-----------|------|-----------------------------------------|
+#   | 1  | 1.465 GiB      | 3072 MiB    | 2 layers  | 97.7%| 32 layers, 45.00 GiB pinned             |
+#   | 2  | 0.7324 GiB     |  768 MiB    | 1 layer   | 97.7%| 40 layers, 22.50 GiB/rank, 14.5 tok/s   |
+#   | 2  | 0.7324 GiB     |  750 MiB    | 1 layer   | 100% | 48 layers, 27.10 GiB/rank, 11.85 tok/s  |
+#
+# THE 48-LAYER ROW IS THE FULL MODEL AND IT IS COHERENT (Rayleigh-scattering answer at the
+# checkpoint's own sampler, temp 1.0 / top_k 20 / top_p 0.95), so it is the operating point to serve
+# qwen4_exp from. Its full configuration, all four terms load-bearing:
+#
+#   tp=2, WOFF_CHUNK_MIB=750, --weight-offload-device-gb 8.1 (=11/48 layers device, 8.06 GiB/rank),
+#   --weight-offload-gb 28, --memory-ratio 0.96, MINISGL_WEIGHT_ARENA_FLOOR_GIB=9
+#
+# `[CAPTURE-2026-09-04]` THE 11.85 IN THAT TABLE IS AN **EAGER** WALL FIGURE (attention_backend=rdna4,
+# --cuda-graph-max-bs 0, 115 tokens including prefill). It is not the number to compare a captured
+# serve against, and it is not a decode number at all. The like-for-like A/B is one boot with the
+# graphs switched on and off: 81.87 -> 79.86 ms PER DECODE STEP, x1.0253. See the `qwen4exp` arm
+# above and docs/measurements/QWEN4EXP_GRAPH_CAPTURE.md. That arm is now the launch line; these
+# numbers stay here because the chunk arithmetic is what they measure.
+#
+# * device-gb 8.1 not 9.0: 12 device layers OOMs in STAGE B, not at rest. Stage B's peak is the tier
+#   plus ONE layer in flight (staged checkpoint tensors + post_load's repack, ~1.46 GiB), and at 12
+#   layers that is 14.96 GiB allocated with 224 MiB free — it dies asking for a 400 MiB row. At 11
+#   the same run leaves min_device_free 0.66 GiB. Size the device tier against the LOAD peak.
+# * memory-ratio 0.96 not 0.90: model=13.49 GiB of a 15.71 GiB card leaves available=1.47 GiB
+#   (8,010 KV pages @ 196,608 B). At 0.90 the budget is 14.14 GiB and the pool is ~0.
+# * FLOOR_GIB=9 is BELOW the 12 GiB default and is the one term that is a box property rather than a
+#   model property: 27.10 GiB/rank x 2 = 54.20 GiB, and the rank processes see ~62-65 GiB of
+#   `MemAvailable` (2-3 GiB less than the host reads, because both engines are already up), so
+#   54.20 + 12 = 66.20 does not fit and 54.20 + 9 = 63.20 does. Free ~3 GiB on this box and the
+#   default floor works unchanged. Do not carry the 9 to a box with more RAM.
+#
+# Raw: docs/measurements/WEIGHT_OFFLOAD_2026-09-02/offload_serve_tp2/L40_tp2.json (40-layer row),
+# L48_tp2_chunk750_dev11.json (48-layer row), chunk_sweep_tp2_L48.json (the sweep).
+WOFF_CHUNK_MIB="${WOFF_CHUNK_MIB:-${woff_chunk_mib:-}}"
+[[ -n "$WOFF_CHUNK_MIB" ]] && export MINISGL_WEIGHT_ARENA_CHUNK_MIB="$WOFF_CHUNK_MIB"
+woff_args=()
+[[ -n "$WOFF_DEVICE_GB" ]] && woff_args+=(--weight-offload-device-gb "$WOFF_DEVICE_GB")
+[[ -n "$WOFF_HOST_GB" ]] && woff_args+=(--weight-offload-gb "$WOFF_HOST_GB")
+
 cmd=(python -m minisgl
   --model "$model_id"
   --host 0.0.0.0 --port "$PORT"
@@ -639,6 +820,7 @@ cmd=(python -m minisgl
   --max-prefill-length "$MAX_PREFILL_LENGTH"
   "${ctx_args[@]}"
   "${spec_args[@]}"
+  "${woff_args[@]}"
 )
 # EXTRA_ARGS last so it can override anything above.
 [[ -n "${EXTRA_ARGS:-}" ]] && read -r -a _extra <<< "$EXTRA_ARGS" && cmd+=("${_extra[@]}")
@@ -648,6 +830,17 @@ printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
+# The offload tier ON THE BANNER, because it is invisible in every other observable: a serve with
+# the flag and a serve without it differ only in a `weight offload:` line buried in the engine log,
+# and the one with it holds several GiB less KV pool. Diff the LAUNCH LINE first.
+[[ -n "$WOFF_DEVICE_GB" ]] && printf '[serve] weight offload: device tier=%s GiB/rank host arena=%s chunk=%s MiB floor=%s GiB\n' \
+  "$WOFF_DEVICE_GB" "${WOFF_HOST_GB:-<default>}" "${WOFF_CHUNK_MIB:-<default 2048>}" \
+  "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:-<default 12>}" >&2
+# The PLE n-gram sidecar ON THE BANNER, same reasoning as the offload tier: it is a separate ~49 GiB
+# shard set that appears nowhere on the python command line, and a serve that silently picked up a
+# different (or partial) shard list produces plausible text from the wrong embeddings.
+[[ -n "${MINISGL_PLE_FILES:-}" ]] && printf '[serve] PLE n-gram: %s shard(s) meta=%s\n' \
+  "$(awk -F: '{print NF}' <<< "$MINISGL_PLE_FILES")" "${MINISGL_PLE_META_FILES:-<unset>}" >&2
 [[ "$SPEC" != "none" && -n "$SPEC" ]] && printf '[serve] spec sampled=%s\n' "$MINISGL_SPEC_SAMPLED" >&2
 [[ -n "${MINISGL_DEFAULT_PRESENCE_PENALTY:-}" ]] && \
   printf '[serve] default presence_penalty=%s (request-unset only)\n' "$MINISGL_DEFAULT_PRESENCE_PENALTY" >&2
