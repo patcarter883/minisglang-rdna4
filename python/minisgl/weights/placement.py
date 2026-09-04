@@ -286,6 +286,32 @@ class LayerWeights:
     # sound, just loose, and a caller that cannot enumerate must never silently get the optimistic
     # `ceil(payload/chunk)` instead.
     rows: tuple = ()
+    # And a FIFTH, which only the CPU tier (`StackKind.CPU`) ever uses: the ratio
+    # `cpu-layout bytes : device-layout bytes` for this layer's expert stack.
+    #
+    # 1.0 — the default and the only value a plan may assume — means "the CPU tier holds exactly
+    # the bytes the GPU tier would have held". On this checkpoint a REPACKED CPU stack is 0.9,
+    # because the CPU core reads the checkpoint's own e4m3 group-scale byte (2,764,800 B/expert)
+    # where the GPU path holds an fp16-folded scale (3,072,000 B/expert) — and, measured, the
+    # smaller layout is also the more accurate one (rel_rms 2.0e-07 vs 3.6e-04 on the same
+    # tensors, tools/cpu_moe/RESULTS_KERNEL_2026-09-04.txt).
+    #
+    # It is a field and not a constant because it is a property of a REPACK THAT ACTUALLY RAN.
+    # `cpu_tier.CpuTierPrior.layout_fraction_for(policy, repacked=False)` returns 1.0
+    # unconditionally, so a bake that copies the device-layout tensors verbatim into pageable
+    # memory is charged for the bytes it really holds. Claiming 0.9 on the strength of the format
+    # alone is how a capacity number becomes fiction.
+    cpu_layout_fraction: float = 1.0
+
+    @property
+    def cpu_resident_bytes(self) -> int:
+        """Resident bytes if this layer is placed on the CPU tier. Pageable host, never pinned."""
+        return int(round(self.resident_bytes * self.cpu_layout_fraction))
+
+    @property
+    def cpu_granule_bytes(self) -> int:
+        """One expert's CPU-tier traffic — what the DDR bus moves per routed expert."""
+        return int(round(self.granule_bytes * self.cpu_layout_fraction))
 
     @property
     def row_bound(self) -> int:
@@ -298,6 +324,13 @@ class LayerWeights:
         )
 
     def __post_init__(self) -> None:
+        if not (0.0 < self.cpu_layout_fraction <= 1.0):
+            raise PlacementError(
+                f"{self.path}: cpu_layout_fraction={self.cpu_layout_fraction} must be in (0, 1]. "
+                f"A CPU-tier layout that is LARGER than the device layout is not a repack, it is a "
+                f"bug in the byte model, and > 1.0 would under-charge nothing while silently "
+                f"inflating the reported capacity win."
+            )
         if self.num_experts <= 0:
             raise PlacementError(f"{self.path}: num_experts must be positive")
         if self.top_k <= 0 or self.top_k > self.num_experts:
@@ -425,12 +458,36 @@ class LayerPlacement:
     # Every arena row this layer asks for, in carve order. See `LayerWeights.rows`; `()` == not
     # derived, and the reservation then falls back to the `row_bound` guarantee.
     rows: tuple = ()
+    # See `LayerWeights.cpu_layout_fraction`. Only consulted when `kind is StackKind.CPU`.
+    cpu_layout_fraction: float = 1.0
 
     @property
     def row_bound(self) -> int:
         return self.max_row_bytes or (
             max((n for _, n in self.rows), default=0) or self.resident_bytes
         )
+
+    @property
+    def effective_resident_bytes(self) -> int:
+        """Bytes this layer really occupies, ON THE TIER IT WAS PLACED ON.
+
+        `resident_bytes` is the DEVICE-LAYOUT figure and stays the comparable unit everywhere else
+        (it is what the budget, the digest and the sweep are denominated in). A CPU-tier layer,
+        once repacked, holds fewer bytes than that — so this is the number that goes into "how much
+        host RAM does this process need", and `resident_bytes` is the number that goes into "how
+        much device budget did this layer decline to spend". Confusing them under-reports host RAM
+        by 10%, in the silent direction.
+        """
+        if self.kind is StackKind.CPU:
+            return int(round(self.resident_bytes * self.cpu_layout_fraction))
+        return self.resident_bytes
+
+    @property
+    def effective_granule_bytes(self) -> int:
+        """One routed expert's traffic on the tier this layer was placed on."""
+        if self.kind is StackKind.CPU:
+            return int(round(self.granule_bytes * self.cpu_layout_fraction))
+        return self.granule_bytes
 
     def table(self) -> ExpertStackTable:
         """The layer's residency ledger. Uniform by construction under layer-granular placement.
@@ -456,7 +513,55 @@ class OffloadPlan:
 
     @property
     def host_resident_bytes(self) -> int:
+        """PINNED-ARENA bytes. CPU-tier layers are excluded and that exclusion is the whole point.
+
+        `kind is StackKind.HOST` — not `is not StackKind.DEVICE` — so adding the CPU tier removed
+        its layers from every pinned-arena number (this, `max_host_row_bytes`, `host_row_requests`,
+        `WeightPlanResolution.host_reservation_bytes_per_rank`, and therefore the feasibility gate)
+        by construction rather than by a new special case in each. A CPU layer needs no
+        `hipHostMalloc`, no device-visible mapping and no pinned page; it is ordinary pageable
+        memory, which is not subject to `OffloadPrior.host_arena_ceiling_bytes`.
+        """
         return sum(p.resident_bytes for p in self.placements if p.kind is StackKind.HOST)
+
+    @property
+    def cpu_resident_bytes(self) -> int:
+        """PAGEABLE host bytes the CPU-computed tier occupies, in its own (possibly repacked) layout.
+
+        Not charged against the pinned ceiling; still real RAM, so `host_capacity` must see it —
+        see `total_host_bytes`.
+        """
+        return sum(
+            p.effective_resident_bytes for p in self.placements if p.kind is StackKind.CPU
+        )
+
+    @property
+    def cpu_resident_bytes_device_layout(self) -> int:
+        """The same layers priced in the DEVICE layout — what they would have cost on the host tier.
+
+        `cpu_resident_bytes` minus this is the LAYOUT half of the capacity win; the whole of
+        `cpu_resident_bytes_device_layout` is the PINNED-ARENA half. Reported separately because
+        they are relieved against different ceilings and only one of them is the binding one.
+        """
+        return sum(p.resident_bytes for p in self.placements if p.kind is StackKind.CPU)
+
+    @property
+    def total_host_bytes(self) -> int:
+        """All host RAM this rank's expert weights occupy — pinned arena PLUS pageable CPU tier.
+
+        `host_capacity.check_capacity` gates on MemAvailable, which does not care whether a page is
+        pinned; only the `hipHostMalloc` ceiling does. So the pinned figure gates FEASIBILITY and
+        this figure gates the box not swapping.
+        """
+        return self.host_resident_bytes + self.cpu_resident_bytes
+
+    @property
+    def pinned_arena_bytes_saved_vs_host(self) -> int:
+        """Pinned-arena bytes this plan does NOT need because layers went to the CPU tier.
+
+        Exactly the capacity win, per rank, against the same plan with `num_cpu_layers=0`.
+        """
+        return self.cpu_resident_bytes_device_layout
 
     @property
     def max_host_row_bytes(self) -> int:
@@ -542,6 +647,24 @@ class OffloadPlan:
         return sum(1 for p in self.placements if p.kind is StackKind.HOST)
 
     @property
+    def num_cpu_layers(self) -> int:
+        return sum(1 for p in self.placements if p.kind is StackKind.CPU)
+
+    @property
+    def cpu_layer_indices(self) -> tuple:
+        """Positions of the CPU-tier layers in `placements` order (= the walk/forward order).
+
+        This is what `cpu_tier.graph_segments` needs and what the capture planner has to be handed:
+        every GPU/CPU boundary is a cut in the captured region.
+        """
+        return tuple(i for i, p in enumerate(self.placements) if p.kind is StackKind.CPU)
+
+    @property
+    def cpu_block_is_contiguous(self) -> bool:
+        idx = self.cpu_layer_indices
+        return all(b - a == 1 for a, b in zip(idx, idx[1:]))
+
+    @property
     def is_empty(self) -> bool:
         """No layer is host-resident — the plan is a no-op and the code path costs nothing.
 
@@ -550,7 +673,7 @@ class OffloadPlan:
         no bytes. See plan §6.2: the flag CLAMPS an automatic decision, it is never "is my feature
         enabled".
         """
-        return self.num_host_layers == 0
+        return self.num_host_layers == 0 and self.num_cpu_layers == 0
 
     # -- traffic -------------------------------------------------------------------------------
     def host_active_bytes(self, batch: int = 1) -> int:
@@ -559,13 +682,22 @@ class OffloadPlan:
     def device_active_bytes(self, batch: int = 1) -> int:
         return self._active(StackKind.DEVICE, batch)
 
+    def cpu_active_bytes(self, batch: int = 1) -> int:
+        """Expert weight bytes the CPU cores read per FORWARD. DDR traffic, not PCIe traffic.
+
+        The unit is deliberately identical to `host_active_bytes` (bytes of weights consumed) so
+        `cpu_tier.project_cpu_tier` can divide one by a DDR bandwidth and the other by a PCIe
+        bandwidth with no conversion, and so the two are directly comparable in a report.
+        """
+        return self._active(StackKind.CPU, batch)
+
     def _active(self, kind: StackKind, batch: int) -> int:
         total = 0
         for p in self.placements:
             if p.kind is not kind:
                 continue
             total += int(
-                round(distinct_experts(p.num_experts, p.top_k, batch) * p.granule_bytes)
+                round(distinct_experts(p.num_experts, p.top_k, batch) * p.effective_granule_bytes)
             )
         return total
 
@@ -580,6 +712,13 @@ class OffloadPlan:
                 f"{p.path}:{int(p.kind)}:{p.resident_bytes}:{p.granule_bytes}:"
                 f"{p.num_experts}:{p.top_k}|".encode()
             )
+            # The CPU tier's layout ratio is part of the DECISION, not of the sizing: two ranks
+            # that placed the same layer on the CPU but disagree about whether it was repacked hold
+            # different numbers of bytes and would size different KV pools. `int(p.kind)` alone
+            # does not catch it, and a 1.0 fraction hashes identically to the old two-tier string
+            # so every pre-existing digest in the tests is unchanged.
+            if p.cpu_layout_fraction != 1.0:
+                h.update(f"cpuf={p.cpu_layout_fraction!r}|".encode())
         return h.hexdigest()[:16]
 
     def kind_of(self, path: str) -> StackKind:
@@ -590,10 +729,18 @@ class OffloadPlan:
 
     def describe(self) -> str:
         gib = 1 << 30
+        cpu = ""
+        if self.num_cpu_layers:
+            cpu = (
+                f", {self.num_cpu_layers} on CPU-COMPUTE "
+                f"({self.cpu_resident_bytes / gib:.2f} GiB pageable, "
+                f"{self.pinned_arena_bytes_saved_vs_host / gib:.2f} GiB of pinned arena NOT "
+                f"needed, contiguous={self.cpu_block_is_contiguous})"
+            )
         return (
             f"weight-offload plan: {self.num_device_layers} MoE layers on DEVICE "
             f"({self.device_resident_bytes / gib:.2f} GiB), {self.num_host_layers} on HOST "
-            f"({self.host_resident_bytes / gib:.2f} GiB), f={self.device_fraction:.3f}, "
+            f"({self.host_resident_bytes / gib:.2f} GiB){cpu}, f={self.device_fraction:.3f}, "
             f"unused device budget {self.unused_device_bytes / gib:.2f} GiB, "
             f"digest={self.digest()}"
         )
@@ -626,7 +773,87 @@ def plan_layer_granular(
             )
         seen.add(lw.path)
 
-    order = sorted(range(len(layers)), key=lambda i: (-layers[i].priority, i))
+    return plan_three_tier(layers, device_budget_bytes=device_budget_bytes, num_cpu_layers=0)
+
+
+def plan_three_tier(
+    layers: Sequence[LayerWeights],
+    *,
+    device_budget_bytes: int,
+    num_cpu_layers: int = 0,
+    cpu_mode: "Any" = None,
+    cpu_layout_fraction: float = 1.0,
+    cpu_from_end: bool = True,
+    cpu_eligible: Sequence[int] | None = None,
+) -> OffloadPlan:
+    """Three-tier placement: DEVICE (VRAM) / HOST (pinned, streamed over PCIe) / CPU (computed).
+
+    THE ORDER OF THE TWO DECISIONS IS LOAD-BEARING AND IT IS: CPU FIRST, THEN DEVICE.
+
+    The CPU assignment is a STRUCTURAL constraint, not an economic one, and it must be made BEFORE
+    any per-rank byte budget is consulted. Running the greedy device fill first and taking
+    "whatever is left" would make the CPU set — and therefore the number of eager host callbacks in
+    the forward, and therefore the capture shape — a function of a per-rank memory figure, which is
+    exactly the class of per-rank divergence `agreement_digest` exists to catch.
+
+    CONTIGUITY IS *NOT* A CAPTURE ARGUMENT. An earlier version of this docstring claimed "21
+    scattered CPU layers cost 22 graph segments where 21 contiguous ones cost 2"; that is wrong.
+    The cut a CPU layer makes is INSIDE the layer — its attention, norms, router and residual adds
+    are all still GPU work — so K CPU layers cost K+1 device segments whether they are contiguous
+    or scattered (`cpu_tier.graph_segments`, rewritten against that). What contiguity still buys is
+    one `HandoffLedger` epoch instead of K interleaved ones and a single entry/exit of the native
+    thread pool; see `cpu_tier.assign_cpu_block`.
+
+    So:
+      1. `cpu_tier.assign_cpu_block` takes `num_cpu_layers` from the deep end of `cpu_eligible`
+         (default: every layer). Deterministic, integer-only, no budget input.
+      2. The remaining layers get the existing greedy `(-priority, index)` device fill, unchanged,
+         against the same `device_budget_bytes`. A CPU layer is simply not a candidate — it needs
+         no device bytes, so spending budget on it would be spending it twice.
+      3. Everything else is HOST, as before.
+
+    A CPU layer is charged `cpu_layout_fraction x resident_bytes` of PAGEABLE host memory and ZERO
+    pinned-arena bytes. Pass `cpu_layout_fraction` from
+    `cpu_tier.CpuTierPrior.layout_fraction_for(policy, repacked=<did a repacker actually run>)`;
+    the default 1.0 charges the device-layout bytes, which is the sound answer when the bake copies
+    the tensors verbatim.
+
+    `cpu_mode` is accepted and recorded for the caller's benefit but does not change the
+    ASSIGNMENT — `CpuTierMode.SPLIT` places the same layers, it only schedules them differently
+    (and, being per-expert rather than per-layer, does not relieve the pinned arena at all; see
+    `cpu_tier`). Callers that want SPLIT's accounting must ask `cpu_tier.project_cpu_tier` for it
+    with `mode=SPLIT` and must NOT expect `cpu_resident_bytes` to move.
+    """
+    from .cpu_tier import CpuTierMode, assign_cpu_block
+
+    if device_budget_bytes < 0:
+        raise PlacementError(f"device_budget_bytes must be >= 0, got {device_budget_bytes}")
+    seen: set[str] = set()
+    for lw in layers:
+        if lw.path in seen:
+            raise PlacementError(
+                f"duplicate layer path {lw.path!r}. Paths must be STRUCTURAL and unique — a "
+                f"construction counter renumbers every layer after the MTP draft head builds its "
+                f"own MoELayer, which would silently place the wrong layers on the wrong stack."
+            )
+        seen.add(lw.path)
+
+    mode = CpuTierMode.BLOCK if cpu_mode is None else cpu_mode
+    eligible = tuple(range(len(layers))) if cpu_eligible is None else tuple(cpu_eligible)
+    if num_cpu_layers and any(i < 0 or i >= len(layers) for i in eligible):
+        raise PlacementError(
+            f"cpu_eligible contains an index outside [0, {len(layers)}): {sorted(eligible)}"
+        )
+    assignment = assign_cpu_block(
+        eligible, num_cpu_layers, mode=mode, from_end=cpu_from_end
+    )
+    on_cpu = set(assignment.indices)
+
+    # Step 2 — the SHIPPED greedy fill, unchanged, over the non-CPU layers only.
+    order = sorted(
+        (i for i in range(len(layers)) if i not in on_cpu),
+        key=lambda i: (-layers[i].priority, i),
+    )
     on_device: set[int] = set()
     used = 0
     for i in order:
@@ -635,16 +862,22 @@ def plan_layer_granular(
             on_device.add(i)
             used += need
 
+    def _kind(i: int) -> StackKind:
+        if i in on_cpu:
+            return StackKind.CPU
+        return StackKind.DEVICE if i in on_device else StackKind.HOST
+
     placements = tuple(
         LayerPlacement(
             path=lw.path,
-            kind=StackKind.DEVICE if i in on_device else StackKind.HOST,
+            kind=_kind(i),
             resident_bytes=lw.resident_bytes,
             granule_bytes=lw.granule_bytes,
             num_experts=lw.num_experts,
             top_k=lw.top_k,
             max_row_bytes=lw.max_row_bytes,
             rows=lw.rows,
+            cpu_layout_fraction=(cpu_layout_fraction if i in on_cpu else 1.0),
         )
         for i, lw in enumerate(layers)
     )

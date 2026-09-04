@@ -1,0 +1,32 @@
+CPU-side MoE ceiling measurement — Ryzen 7 7800X3D, DDR5-4800 dual channel, 2026-09-04
+Build: gcc -O3 -march=znver4 -o bench cpu_moe_ceiling_bench.c -lpthread -lm
+Box was NOT idle: a TP=2 minisgl serve (2 x python, ~94% CPU, ~20 GB RSS each) ran throughout;
+load avg 6.7-10.9. So every number below is already "under realistic host load".
+THP=madvise (MADV_HUGEPAGE used), governor=performance, 8 physical cores pinned 0..7 then SMT 8..15.
+
+--- kernel correctness (mode=verify), AVX512-VNNI E2M1 dequant GEMV vs double-precision scalar ref
+{"verify":{"max_abs":2.6226e-06,"max_rel":0.000523107,"ref_rms":1.94042}}
+
+--- (1) DDR gather, random 3.072 MB expert slabs out of a 6 GB table (mode=gather)
+ 1T 40.244  2T 44.036  4T 50.373  8T 50.096  16T 54.114   GB/s
+    repeats 8T: 51.003 / 53.610 / 54.668 / 56.583
+ 12 GB table:  1T 31.676   8T 49.841   16T 49.298
+ L3-resident control (64 MB table): 1T 52.109  8T 596.097   <- proves the big-table runs are DDR-bound
+ sequential stream reference (6 GB): 1T 23.584  4T 43.985  8T 52.015  16T 51.900
+ slab-size sensitivity (6 GB, 8T): 16 KB 41.649 | 64 KB 50.258 | 256 KB 54.435 | 1 MB 54.963 | 3 MB 51.003
+
+--- (2) interference: MoE gather + rate-limited "PCIe DMA" emulator threads (mode=interf)
+ baseline gather 4T 49.442 | 6T 54.693 (no DMA)
+ 6T MoE + 2 DMA @12.4 target: moe 45.436  dma 12.398  TOTAL 57.834
+ 6T MoE + 2 DMA @25.0 target: moe 38.133  dma 14.480  TOTAL 52.613
+ 6T MoE + 2 DMA unlimited   : moe 40.417  dma 16.056  TOTAL 56.473
+ 4T MoE + 1 DMA @12.4       : moe 38.716  dma 10.691  TOTAL 49.406
+ => aggregate DDR pinned at ~53-58 GB/s regardless of split. Zero-sum, ~1:1 trade.
+
+--- (3) NVFP4 (E2M1 + fp16 group-16 scale) dequant + GEMV, GB/s of WEIGHTS consumed (mode=gemv)
+ COMPUTE CEILING (16 MB cache-resident): 1T 57.157  2T 106.021  4T 193.250  8T 374.086  16T 370.567
+ REAL (6 GB DDR-resident):               1T 32.222  2T  47.112  4T  55.657  8T  55.022  16T  55.271
+ REAL (12 GB DDR-resident):              4T 43.097  6T  51.924  8T  51.793
+ repeats 6 GB 6T: 47.868 / 51.321 / 45.691
+ => dequant+GEMV costs ~nothing: 55.0 GB/s vs 51-56 GB/s for a pure read of the same bytes.
+    BANDWIDTH-BOUND with 6.8x compute headroom (374 / 55).

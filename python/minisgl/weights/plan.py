@@ -74,12 +74,14 @@ from .placement import (
     ep_local_top_k,
     format_sweep,
     plan_layer_granular,
+    plan_three_tier,
     project_plan,
     sweep_device_fraction,
 )
 from .prior import PHASE0_PRIOR, GiB, OffloadPrior, Projection  # NOTE: prior.GB is NOT imported
 from .sizing import (
     SCHEME_MXFP4,
+    cpu_wload_policy,
     expert_stack_bytes,
     post_load_delta_bytes,
     scheme_from_quant,
@@ -103,6 +105,10 @@ __all__ = [
     "required_device_bytes",
     "resolve_expert_parallel",
     "resolve_weight_plan",
+    "CpuTierGate",
+    "cpu_tier_gate",
+    "cpu_tier_sweep",
+    "format_cpu_tier_sweep",
 ]
 
 # `prior.GB` (decimal 1e9, the unit BANDWIDTHS are quoted in) is deliberately not imported above:
@@ -525,6 +531,7 @@ def observed_planned_layers(
     layers: List[LayerWeights] = []
     skipped: List[str] = []
     kinds: List[str] = []
+    ep_sizes: List[int] = []
     saw_meta = False
     for path, layer in discover_moe_layers(model):
         if is_mtp_path(path) and not OFFLOAD_MTP_HEAD:
@@ -554,6 +561,7 @@ def observed_planned_layers(
         # path and the standalone `build_layer_weights(attach_seams(model))` path cannot produce
         # different `top_k` — and therefore cannot produce different `OffloadPlan.digest()`es — for
         # one model. They did: this site did the EP correction and the seam did not.
+        ep_sizes.append(ep_size_of(layer))
         top_k_local = ep_local_top_k(int(layer.top_k), ep_size_of(layer), e_local)
         # Priorities may be keyed by path (structural, what M2's --weight-prior file will use) or by
         # decoder index (what the config path uses). Accept both; never invent one from a counter.
@@ -582,6 +590,12 @@ def observed_planned_layers(
         "sizing_agreement_min": None,
         "sizing_agreement_max": None,
         "compute_dtype_bytes": None,
+        # Same two keys the config path emits, read off the LIVE layers rather than re-derived.
+        # `ep_size_of` asks all three conjuncts `MoELayer.__init__` collapses into `enable_ep`,
+        # so a checkpoint whose quant method vetoed EP reports 1 here even under `--enable-ep`.
+        # The CPU-COMPUTE tier is refused when this is True; see `cpu_tier_gate`.
+        "expert_parallel": max(ep_sizes, default=1) > 1,
+        "ep_size": max(ep_sizes, default=1),
     }
     return tuple(layers), diagnostics
 
@@ -619,7 +633,8 @@ def build_planned_layers(
     sources: List[str] = []
     schemes: List[str] = []
     agreements: List[float] = []
-    for shape in moe_layer_shapes(config, layer_indices=layer_indices):
+    shapes = list(moe_layer_shapes(config, layer_indices=layer_indices))
+    for shape in shapes:
         if not shape.offloadable:
             skipped.append(f"{shape.path} ({shape.note})")
             continue
@@ -682,8 +697,216 @@ def build_planned_layers(
         "sizing_agreement_min": min(agreements) if agreements else None,
         "sizing_agreement_max": max(agreements) if agreements else None,
         "compute_dtype_bytes": compute_dtype_bytes,
+        # Recorded because the CPU-COMPUTE tier is REFUSED under EP: `MoELayer._ep_dispatch`
+        # all_gathers and re-orders rows across ranks, so a CPU partial computed from pre-gather
+        # rows would be added to the wrong tokens (`layers/moe.py` asserts this). `cpu_tier_gate`
+        # reads it rather than re-deriving "did EP apply", which is a three-conjunct question the
+        # engine-level toggle alone cannot answer.
+        "expert_parallel": any(sh.expert_parallel for sh in shapes if sh.offloadable),
+        "ep_size": max((sh.ep_size for sh in shapes if sh.offloadable), default=1),
     }
     return tuple(layers), diagnostics
+
+
+# =================================================================================================
+# The CPU-COMPUTE tier gate and sweep
+#
+# Everything here answers "MAY this plan put layers on the CPU, and what would it buy?" -- never
+# "turn the feature on". The tier is opt-in at the call site (`resolve_weight_plan(num_cpu_layers=)`)
+# because a CPU layer needs a NATIVE EXECUTOR that does not exist as a loadable `.so` yet
+# (`cpu_worker.NativeBackend` declares its ABI and refuses to guess). The sweep runs on every boot
+# regardless, so the lever is visible in the banner rather than discovered by reading this file.
+# =================================================================================================
+
+
+@dataclass(frozen=True)
+class CpuTierGate:
+    """May the CPU tier be used for this model on this box, and with which WLoad policy."""
+
+    allowed: bool
+    reason: str
+    wload: Optional[str]
+    layout_fraction: float
+    max_layers: int
+    threads_per_rank: int
+    total_threads: int
+
+    def describe(self) -> str:
+        head = "ALLOWED" if self.allowed else "REFUSED"
+        return (
+            f"cpu-compute tier {head}: {self.reason}"
+            + (
+                f" [wload={self.wload}, layout x{self.layout_fraction:.2f}, "
+                f"{self.threads_per_rank}T/rank = {self.total_threads} physical cores]"
+                if self.allowed
+                else ""
+            )
+        )
+
+
+def cpu_tier_gate(
+    diagnostics: Dict[str, Any],
+    *,
+    local_ranks: int,
+    n_offloadable: int,
+    repacked: bool = False,
+    threads_per_rank: Optional[int] = None,
+    cpu_prior: Any = None,
+) -> CpuTierGate:
+    """Four independent refusals, each of which is a real failure mode rather than a policy.
+
+    1. NO CPU CORE FOR THIS FORMAT. `sizing.cpu_wload_policy` returns None for a scheme no
+       `tools/cpu_moe/wload.hpp` policy can decode. Placing such a layer would bake valid tensors
+       into pageable memory that nothing is able to read -- a dead layer at the first token rather
+       than a boot error. A mixed-scheme checkpoint is refused unless EVERY scheme has a core.
+    2. EXPERT PARALLEL IS ON. `MoELayer._ep_dispatch` all_gathers and re-orders rows across ranks,
+       so a CPU partial computed from PRE-gather rows lands on the wrong tokens -- fluent, plausible
+       and wrong. `layers/moe.py` asserts this at the seam; refusing here means the operator sees it
+       at plan time with the reason, instead of at the first forward with an assert.
+    3. THE CORE BUDGET DOES NOT FIT. `threads_per_rank x local_ranks` physical cores must be free
+       after the engine and the OS. This is a refusal and not a clamp because the native pool's spin
+       barrier does not degrade gracefully when starved -- see `cpu_tier.CoreBudget`.
+    4. NOTHING TO PLACE.
+    """
+    from .cpu_tier import CPU_TIER_PRIOR, CpuTierError
+
+    cp = cpu_prior or CPU_TIER_PRIOR
+    tpr = int(threads_per_rank or cp.default_threads_per_rank)
+    total = tpr * max(1, int(local_ranks))
+    schemes = [str(k) for k in diagnostics.get("schemes", ())]
+    wloads = {sc: cpu_wload_policy(sc) for sc in schemes}
+    missing = sorted(sc for sc, w in wloads.items() if w is None)
+    if not n_offloadable:
+        return CpuTierGate(False, "no offloadable MoE layers", None, 1.0, 0, tpr, total)
+    if missing:
+        return CpuTierGate(
+            False,
+            f"no CPU expert core reads {', '.join(missing)} -- sizing.cpu_wload_policy has no "
+            f"wload.hpp policy for it. Adding one is a table row in sizing.py plus the policy in "
+            f"tools/cpu_moe/wload.hpp (KERNEL_CORE_POLICY: a weight format is a WLoad policy, "
+            f"never a new kernel and never a new tier)",
+            None, 1.0, 0, tpr, total,
+        )
+    if bool(diagnostics.get("expert_parallel")):
+        return CpuTierGate(
+            False,
+            f"expert parallel is active (ep_size={diagnostics.get('ep_size')}). "
+            f"MoELayer._ep_dispatch re-orders rows across ranks, so a CPU partial computed from "
+            f"pre-gather rows would be added to the WRONG TOKENS. Serve without --enable-ep to use "
+            f"the CPU tier, or pack the CPU partial into the gather first",
+            None, 1.0, 0, tpr, total,
+        )
+    try:
+        cp.cores.assert_fits(total, what="the CPU MoE tier")
+    except CpuTierError as e:
+        return CpuTierGate(False, str(e), None, 1.0, 0, tpr, total)
+    wload = next(iter(wloads.values()))
+    return CpuTierGate(
+        True,
+        f"{n_offloadable} layer(s) eligible",
+        wload,
+        cp.layout_fraction_for(wload, repacked=repacked),
+        int(n_offloadable),
+        tpr,
+        total,
+    )
+
+
+def cpu_tier_sweep(
+    layers: Sequence[LayerWeights],
+    *,
+    device_budget_bytes: int,
+    gate: CpuTierGate,
+    prior: OffloadPrior = PHASE0_PRIOR,
+    local_ranks: int = 1,
+    arena_chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    batch: int = 1,
+    loaded: bool = True,
+    handoff_us: Optional[float] = None,
+    cpu_prior: Any = None,
+) -> List[Dict[str, Any]]:
+    """Project the plan at every K in {0, 25%, 50%, 75%, 100%} of the offloadable layers.
+
+    Both the CAPACITY answer (pinned arena bytes relieved) and the THROUGHPUT answer, because they
+    are different levers and on this box only one of them has ever been the binding constraint.
+    Every row carries the RAW projection and the same figure multiplied by
+    `CpuTierPrior.projection_fidelity` -- the one measured-vs-projected ratio this model has, and
+    the reason no row here may be quoted as a prediction.
+
+    `handoff_us` defaults to the PESSIMISTIC end of the unmeasured bracket. That direction is
+    deliberate: the optimistic end would make a sweep row look better than anything that has been
+    run, and the whole point of the bracket is that it has not been measured on a card.
+    """
+    from .cpu_tier import CPU_TIER_PRIOR, CpuTierMode, project_cpu_tier
+
+    cp = cpu_prior or CPU_TIER_PRIOR
+    hus = cp.handoff_us_bracket[1] if handoff_us is None else float(handoff_us)
+    n = len(layers)
+    if not n:
+        return []
+    ks = sorted({0, n // 4, n // 2, (3 * n) // 4, n})
+    if not gate.allowed:
+        ks = [0]
+    rows: List[Dict[str, Any]] = []
+    for k in ks:
+        plan = plan_three_tier(
+            layers,
+            device_budget_bytes=device_budget_bytes,
+            num_cpu_layers=k,
+            cpu_layout_fraction=gate.layout_fraction if k else 1.0,
+        )
+        proj = project_cpu_tier(
+            host_bytes_per_rank=plan.host_active_bytes(batch),
+            device_bytes_per_rank=plan.device_active_bytes(batch),
+            cpu_bytes_per_rank=plan.cpu_active_bytes(batch),
+            num_cpu_layers=plan.num_cpu_layers,
+            mode=CpuTierMode.BLOCK if k else CpuTierMode.OFF,
+            handoff_us_per_layer=hus if k else 0.0,
+            threads_per_rank=gate.threads_per_rank,
+            prior=prior,
+            cpu_prior=cp,
+            num_ranks=local_ranks,
+            loaded=loaded,
+            num_layers=n,
+            check_cores=bool(k),
+        )
+        rows.append(
+            {
+                "cpu_layers": k,
+                "device_layers": plan.num_device_layers,
+                "host_layers": plan.num_host_layers,
+                "pinned_node_bytes": plan_arena_reservation_bytes(plan, arena_chunk_bytes)
+                * local_ranks,
+                "pageable_node_bytes": plan.cpu_resident_bytes * local_ranks,
+                "pinned_saved_node_bytes": plan.pinned_arena_bytes_saved_vs_host * local_ranks,
+                "step_ms": proj.step_ms,
+                "tok_s": proj.tok_s,
+                "calibrated_tok_s": proj.calibrated_tok_s,
+                "graph_segments": proj.graph_segments,
+                "rel_rms": proj.rel_rms if k else 0.0,
+            }
+        )
+    return rows
+
+
+def format_cpu_tier_sweep(rows: Sequence[Dict[str, Any]], gate: CpuTierGate) -> str:
+    if not rows:
+        return "cpu-compute tier sweep: n/a (no offloadable layers)"
+    out = [gate.describe(),
+           "  cpuL  devL  hostL   pinned/node  pageable/node    step ms   tok/s   tok/s*  segs"]
+    for r in rows:
+        out.append(
+            f"  {r['cpu_layers']:>4}  {r['device_layers']:>4}  {r['host_layers']:>5}  "
+            f"{_gb(r['pinned_node_bytes']):>12}  {_gb(r['pageable_node_bytes']):>13}  "
+            f"{r['step_ms']:>9.2f}  {r['tok_s']:>6.2f}  {r['calibrated_tok_s']:>6.2f}  "
+            f"{r['graph_segments']:>4}"
+        )
+    out.append(
+        "  tok/s is the RAW projection; tok/s* is that figure x the ONE measured "
+        "model-fidelity ratio (0.637). segs = separately-captured device segments this placement "
+        "forces; anything above 1 means today's whole-forward CUDAGraph capture cannot be used."
+    )
+    return "\n".join(out)
 
 
 # =================================================================================================
@@ -956,6 +1179,14 @@ class WeightPlanResolution:
     # under another is a silent under-charge, which is why the engine passes ArenaSettings.chunk_bytes
     # rather than letting this default drift away from the arena's.
     arena_chunk_bytes: int = DEFAULT_CHUNK_BYTES
+    # -- CPU-COMPUTE tier ------------------------------------------------------------------------
+    # Always populated, even on a two-tier plan: `cpu_gate` says WHY the tier is or is not usable
+    # and `cpu_sweep_text` prices it at every K. That is deliberate — a lever that only appears in
+    # the log once somebody has already enabled it is a lever nobody finds.
+    cpu_gate: Optional[CpuTierGate] = None
+    cpu_sweep: Tuple[Dict[str, Any], ...] = ()
+    cpu_sweep_text: str = ""
+    cpu_projection: Optional[Any] = None
 
     # -- the numbers other subsystems bill against ----------------------------------------------
     @property
@@ -989,6 +1220,32 @@ class WeightPlanResolution:
     @property
     def host_reservation_bytes_per_node(self) -> int:
         return self.host_reservation_bytes_per_rank * self.local_ranks
+
+    @property
+    def cpu_bytes_per_rank(self) -> int:
+        """PAGEABLE host bytes the CPU tier holds. Not pinned, so not against the arena ceiling."""
+        return self.plan.cpu_resident_bytes
+
+    @property
+    def pinned_bytes_saved_per_node(self) -> int:
+        """THE CAPACITY WIN. Pinned-arena bytes this plan does not need because layers went to CPU.
+
+        Priced in the DEVICE layout on purpose: it is what those same layers WOULD have cost on the
+        host tier, which is the counterfactual an operator is comparing against. The extra 10% the
+        repack removes shows up separately, as `total_host_bytes` being smaller than the two-tier
+        plan's `host_bytes_per_node` by more than this.
+        """
+        return self.plan.pinned_arena_bytes_saved_vs_host * self.local_ranks
+
+    @property
+    def total_host_bytes_per_node(self) -> int:
+        """All host RAM the expert weights occupy: pinned arena + pageable CPU tier.
+
+        `host_capacity.check_capacity` gates on MemAvailable, which does not care whether a page is
+        pinned; only the `hipHostMalloc` ceiling does. So `host_reservation_bytes_per_node` gates
+        FEASIBILITY and this gates the box not swapping.
+        """
+        return self.plan.total_host_bytes * self.local_ranks
 
     @property
     def shortfall_bytes(self) -> int:
@@ -1221,6 +1478,18 @@ class WeightPlanResolution:
         for w in self.warnings:
             out.append(f"[weight-offload] WARNING: {w}")
         out.extend(f"[weight-offload] {line}" for line in self.sweep_text.splitlines())
+        if self.cpu_sweep_text:
+            out.extend(f"[weight-offload] {line}" for line in self.cpu_sweep_text.splitlines())
+        if self.plan.num_cpu_layers:
+            out.append(
+                f"[weight-offload] cpu-tier capacity: "
+                f"{_gb(self.pinned_bytes_saved_per_node)} of pinned arena RELIEVED, "
+                f"{_gb(self.cpu_bytes_per_rank * self.local_ranks)} held as pageable instead "
+                f"(total host {_gb(self.total_host_bytes_per_node)} against MemAvailable, not "
+                f"against the {_gb(self.host_ceiling_bytes)} pinned ceiling)"
+            )
+        if self.cpu_projection is not None:
+            out.append(f"[weight-offload] {self.cpu_projection.describe()}")
         out.append(
             f"[weight-offload] gates: projected {self.projection.tok_s:.2f} tok/s vs K4 "
             f"{self.prior.kill_tok_s:.3f} -> {'PASS' if self.clears_kill_gate() else 'KILL'}; "
@@ -1255,6 +1524,31 @@ class WeightPlanResolution:
             "num_host_layers": self.plan.num_host_layers,
             "device_layers": [p.path for p in self.plan.placements if p.kind is StackKind.DEVICE],
             "host_layers": [p.path for p in self.plan.placements if p.kind is StackKind.HOST],
+            # CPU-COMPUTE tier. Reported alongside rather than folded into `host_layers`: those
+            # bytes are PAGEABLE, so they are relieved against MemAvailable and NOT against the
+            # pinned `hipHostMalloc` ceiling that `host_ceiling_bytes` above is about. Zero and []
+            # on every two-tier plan, so the diagnostics shape is a superset of the old one.
+            "num_cpu_layers": self.plan.num_cpu_layers,
+            "cpu_layers": [p.path for p in self.plan.placements if p.kind is StackKind.CPU],
+            "cpu_resident_bytes": self.plan.cpu_resident_bytes,
+            "cpu_pinned_arena_bytes_saved": self.plan.pinned_arena_bytes_saved_vs_host,
+            "cpu_pinned_arena_bytes_saved_per_node": self.pinned_bytes_saved_per_node,
+            "total_host_bytes_per_node": self.total_host_bytes_per_node,
+            "cpu_block_contiguous": self.plan.cpu_block_is_contiguous,
+            "cpu_tier_allowed": bool(self.cpu_gate and self.cpu_gate.allowed),
+            "cpu_tier_reason": self.cpu_gate.reason if self.cpu_gate else "",
+            "cpu_tier_wload": self.cpu_gate.wload if self.cpu_gate else None,
+            "cpu_tier_threads_per_rank": self.cpu_gate.threads_per_rank if self.cpu_gate else 0,
+            "cpu_tier_sweep": list(self.cpu_sweep),
+            "cpu_projected_tok_s": (
+                self.cpu_projection.tok_s if self.cpu_projection is not None else None
+            ),
+            "cpu_calibrated_tok_s": (
+                self.cpu_projection.calibrated_tok_s if self.cpu_projection is not None else None
+            ),
+            "cpu_graph_segments": (
+                self.cpu_projection.graph_segments if self.cpu_projection is not None else None
+            ),
             "projected_step_ms": self.projection.step_ms,
             "projected_tok_s": self.projection.tok_s,
             "all_host_tok_s": self.all_host_projection.tok_s,
@@ -1284,6 +1578,9 @@ def resolve_weight_plan(
     project_loaded: bool = False,
     arena_chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     model: Any = None,
+    num_cpu_layers: int = 0,
+    cpu_repacked: bool = False,
+    cpu_threads_per_rank: Optional[int] = None,
 ) -> WeightPlanResolution:
     """Decide, once, which MoE layers keep their expert stack in VRAM. Pure function of config.
 
@@ -1319,6 +1616,22 @@ def resolve_weight_plan(
 
     `arena_chunk_bytes` is the granularity capacity is charged in -- pass `ArenaSettings.chunk_bytes`
     so the plan charges the same chunks `PinnedWeightArena` will pin. See `arena_reservation_bytes`.
+
+    `num_cpu_layers` places that many of the DEEPEST offloadable layers on the CPU-COMPUTE tier
+    (`StackKind.CPU`): computed by AVX-512 cores on the host instead of streamed to the GPU. It
+    defaults to 0 and it is EXPLICIT rather than derived, for one reason: the tier needs a native
+    executor that is not a loadable `.so` yet (`cpu_worker.NativeBackend` declares its ABI and
+    refuses to guess), so a planner that switched itself on would place layers on a tier with
+    nothing able to run them. `cpu_tier_gate` still runs on every boot and `cpu_sweep_text` still
+    prices every K, so the lever is in the banner rather than in this docstring. A request the gate
+    refuses (no CPU core for the format, EP active, core budget exceeded) RAISES here rather than
+    being silently downgraded to 0 -- a silent downgrade is how a capacity plan comes to describe a
+    residency the process does not have.
+
+    `cpu_repacked` asserts that a repacker will actually run, which is what lets the CPU tier be
+    charged 0.9x the device-layout bytes (the checkpoint's own e4m3 group-scale byte against the
+    fp16-folded one). Default False charges the full device-layout bytes. See
+    `cpu_tier.CpuTierPrior.layout_fraction_for`.
 
     The returned resolution is not self-enforcing. Call `raise_if_infeasible()` before allocating.
     """
@@ -1360,6 +1673,37 @@ def resolve_weight_plan(
 
     total = sum(lw.resident_bytes for lw in layers)
 
+    # ---- CPU-COMPUTE tier: gate first, then place. -------------------------------------------
+    gate = cpu_tier_gate(
+        diag,
+        local_ranks=ranks,
+        n_offloadable=len(layers),
+        repacked=cpu_repacked,
+        threads_per_rank=cpu_threads_per_rank,
+    )
+    num_cpu_layers = max(0, int(num_cpu_layers))
+    if num_cpu_layers and not gate.allowed:
+        raise PlacementError(
+            f"--weight-offload-cpu-layers={num_cpu_layers} was asked for but the CPU-COMPUTE tier "
+            f"is not usable here. {gate.reason}. This raises instead of falling back to 0 because "
+            f"a silent downgrade would leave every capacity number in this resolution describing a "
+            f"residency the process does not have."
+        )
+    if num_cpu_layers > len(layers):
+        raise PlacementError(
+            f"--weight-offload-cpu-layers={num_cpu_layers} exceeds the {len(layers)} offloadable "
+            f"MoE layer(s) this model has"
+        )
+    cpu_fraction = gate.layout_fraction if num_cpu_layers else 1.0
+
+    def _plan_for(budget: int) -> OffloadPlan:
+        return plan_three_tier(
+            layers,
+            device_budget_bytes=budget,
+            num_cpu_layers=num_cpu_layers,
+            cpu_layout_fraction=cpu_fraction,
+        )
+
     if not layers:
         plan = plan_layer_granular((), device_budget_bytes=device_budget_bytes)
         reason = "no offloadable expert stacks (dense model, or every MoE layer excluded)"
@@ -1377,18 +1721,25 @@ def resolve_weight_plan(
                 "a property of the mechanism: granule.GranuleSpec already describes a dense "
                 "container (num_experts=None). Do not read 'OFF' here as 'dense cannot benefit'."
             )
-    elif total <= device_budget_bytes:
-        plan = plan_layer_granular(layers, device_budget_bytes=device_budget_bytes)
+    elif total <= device_budget_bytes and not num_cpu_layers:
+        plan = _plan_for(device_budget_bytes)
         reason = (
             f"whole expert stack ({_gb(total)}/rank) fits the device budget "
             f"({_gb(device_budget_bytes)}) -- offload is a no-op"
         )
     else:
-        plan = plan_layer_granular(layers, device_budget_bytes=device_budget_bytes)
+        plan = _plan_for(device_budget_bytes)
+        cpu_note = (
+            f", {plan.num_cpu_layers} CPU-computed "
+            f"({_gb(plan.cpu_resident_bytes)}/rank PAGEABLE, "
+            f"{_gb(plan.pinned_arena_bytes_saved_vs_host * ranks)} of pinned arena NOT needed)"
+            if plan.num_cpu_layers
+            else ""
+        )
         reason = (
             f"expert stack {_gb(total)}/rank exceeds the {_gb(device_budget_bytes)} device budget; "
             f"{plan.num_device_layers} of {len(layers)} layers placed on device, "
-            f"{_gb(plan.host_resident_bytes)}/rank streams from pinned host"
+            f"{_gb(plan.host_resident_bytes)}/rank streams from pinned host{cpu_note}"
         )
 
     needed = required_device_bytes(layers, ceiling, ranks, arena_chunk_bytes)
@@ -1480,6 +1831,77 @@ def resolve_weight_plan(
             "excluded from offload by policy: " + ", ".join(diag["skipped"])
         )
 
+    # ---- CPU-COMPUTE tier: the sweep runs whether or not the tier is in use ------------------
+    cpu_rows = cpu_tier_sweep(
+        layers,
+        device_budget_bytes=device_budget_bytes,
+        gate=gate,
+        prior=prior,
+        local_ranks=ranks,
+        arena_chunk_bytes=arena_chunk_bytes,
+        batch=batch,
+        loaded=True,  # a serving box, not an idle one -- see OffloadPrior.host_read_gbps_loaded
+    )
+    cpu_projection = None
+    if num_cpu_layers:
+        from .cpu_tier import CPU_TIER_PRIOR, CpuTierMode, project_cpu_tier
+
+        cpu_projection = project_cpu_tier(
+            host_bytes_per_rank=plan.host_active_bytes(batch),
+            device_bytes_per_rank=plan.device_active_bytes(batch),
+            cpu_bytes_per_rank=plan.cpu_active_bytes(batch),
+            num_cpu_layers=plan.num_cpu_layers,
+            mode=CpuTierMode.BLOCK,
+            handoff_us_per_layer=CPU_TIER_PRIOR.handoff_us_bracket[1],
+            threads_per_rank=gate.threads_per_rank,
+            prior=prior,
+            num_ranks=bandwidth_ranks,
+            loaded=True,
+            num_layers=len(layers),
+        )
+        warnings.append(
+            f"the CPU-COMPUTE tier is ACTIVE on {plan.num_cpu_layers} layer(s). Three things this "
+            f"buys and one it costs, all measured: (a) {_gb(plan.pinned_arena_bytes_saved_vs_host * ranks)} "
+            f"of pinned arena is no longer needed; (b) the same layers cost "
+            f"{_gb(plan.cpu_resident_bytes * ranks)} of PAGEABLE host RAM instead, which is not "
+            f"against the hipHostMalloc ceiling; (c) projected {cpu_projection.tok_s:.2f} tok/s raw "
+            f"/ {cpu_projection.calibrated_tok_s:.2f} at the one measured model-fidelity ratio. "
+            f"COST: the expert MLP runs with int8 activations at rel_rms "
+            f"{cpu_projection.rel_rms:.2e} (against the fp32 CPU core's 2.4e-07 -- but against the "
+            f"4.09e-02 the GPU's per-token fp8 path already serves, so it is ~4.9x MORE accurate "
+            f"than what ships today), and the forward needs "
+            f"{cpu_projection.graph_segments} separately-captured device segments, which today's "
+            f"whole-forward CUDAGraph capture cannot express AT ALL."
+        )
+        # THE HEADLINE `projection` MUST BECOME THE THREE-TIER ONE. `project_plan` sums only the
+        # HOST and DEVICE terms, so on a plan with CPU layers it silently drops the largest term in
+        # the step and reports a tok/s the box cannot reach — at 48 CPU layers it read 133 tok/s,
+        # because every byte had left both of the tiers it knows about. Every downstream consumer
+        # (the K4 kill gate, the A1.7 acceptance threshold, `summary_line`, the engine banner and
+        # the accounting) reads `projection`, so the substitution happens HERE, once, rather than
+        # by teaching each of them about a third tier.
+        projection = Projection(
+            step_ms=cpu_projection.step_ms,
+            tok_s=cpu_projection.tok_s,
+            host_ms=cpu_projection.host_ms + cpu_projection.cpu_ms + cpu_projection.handoff_ms,
+            device_ms=cpu_projection.device_ms,
+            compute_ms=cpu_projection.compute_ms,
+            host_gbps=cpu_projection.host_gbps,
+            active_bytes_per_rank=(
+                plan.host_active_bytes(batch)
+                + plan.device_active_bytes(batch)
+                + plan.cpu_active_bytes(batch)
+            ),
+        )
+        if not cpu_projection.handoff_measured:
+            warnings.append(
+                "the CPU tier's per-layer activation round trip (D2H hidden + H2D partial + the "
+                "fence) is UNMEASURED -- no card was available when it was designed. The "
+                "projection above used the PESSIMISTIC end of the 10-40 us bracket "
+                f"({cpu_projection.handoff_ms:.2f} ms total). It is the one term a GPU run must "
+                "close before any tok/s figure here is quoted."
+            )
+
     return WeightPlanResolution(
         plan=plan,
         layers=layers,
@@ -1499,6 +1921,10 @@ def resolve_weight_plan(
         diagnostics=diag,
         warnings=tuple(warnings),
         arena_chunk_bytes=int(arena_chunk_bytes),
+        cpu_gate=gate,
+        cpu_sweep=tuple(cpu_rows),
+        cpu_sweep_text=format_cpu_tier_sweep(cpu_rows, gate),
+        cpu_projection=cpu_projection,
     )
 
 

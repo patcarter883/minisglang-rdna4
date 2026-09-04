@@ -1,0 +1,225 @@
+INT8-ACTIVATION (AVX-512 VNNI) CPU MoE KERNEL -- Ryzen 7 7800X3D, DDR5 dual channel
+Follow-up to RESULTS_2026-09-04 (ceiling), RESULTS_KERNEL (fp32 kernel), RESULTS_PERCORE (budget).
+Question: can an int8-activation VNNI variant reach useful bandwidth on 1-2 PHYSICAL cores, so
+that CPU MoE offload ADDS to the GPU path instead of substituting for it?
+
+ANSWER: yes.  27.4 GB/s on one core (3.12x the fp32 core), 44.6 on two.  The 23.8 GB/s the
+23.3 tok/s target needs is met by ONE core.  The cost is activation-quantization error of
+8.3e-03 rel_rms -- 8x the ~1e-03 line, ~34,000x the fp32 core -- but 4.4-4.9x BETTER than the
+per-token fp8 activations the GPU path already serves (quant/method.py:440).
+
+Build: host g++ 16.2.1 -O3 -march=znver4 -std=c++17.  NO GPU, NO container.
+  g++ -O3 -march=znver4 -std=c++17 -o cpu_moe_layer_vnni cpu_moe_layer.cpp -lpthread
+
+================================================================================
+0. BOX CONDITIONS -- a graph-capture workflow ran throughout; every table says which
+================================================================================
+  QUIET  : 0.43-2.25 busy hw threads of 16, loadavg 4.3-5.9 (loadavg is D-state-inflated;
+           the CPU-busy figure is the real one).  Swap si 80-1500 kB/s, so 0.
+  LOADED : 4.8-14.1 busy hw threads, loadavg 8-15, the capture workflow mid-run.
+  Absolute numbers move ~15-25% between these.  Every A/B below is PAIRED and INTERLEAVED
+  (policies alternate within a rep) so the comparison survives the drift even where the
+  absolute level does not.  Pinned physical cores 0..T-1; core 0 boosts to 4.95 GHz and
+  cores 1-7 to ~4.07, so T=1 flatters a clock-bound kernel and not a memory-bound one.
+
+================================================================================
+1. HEADLINE -- per-core throughput, QUIET box, 4 paired reps
+================================================================================
+Table 5.27 GiB DDR-resident (2048 experts, 56x the 96 MB V-cache), top-10, real checkpoint
+bytes.  GB/s = weight bytes consumed (0.5625 B/weight, e4m3 layout, 2,764,800 B/expert).
+
+   T   fp32 GB/s   VNNI GB/s   VNNI GB/s   VNNI ms/layer   speedup
+       med / p5    med / p5    PER CORE    med / p5        per core
+   1   8.78/9.09   27.38/32.04   27.38     1.0096/0.8628    3.12x
+   2  17.02/18.02  44.64/51.19   22.32     0.6211/0.5401    2.62x
+   3  24.96/26.77  54.00/60.04   18.00     0.5121/0.4605    2.16x
+   4  33.64/35.51  53.50/63.23   13.38     0.5174/0.4373    1.59x
+   6  46.39/51.94  56.16/64.55    9.36     0.4929/0.4283    1.21x
+   8  42.71/58.94  56.72/64.20    7.09     0.4880/0.4307    1.33x
+  16  55.29/60.09  53.32/63.99    3.33     0.5196/0.4321    0.96x
+
+  * VNNI SATURATES DDR AT 3 THREADS (54.0 GB/s).  fp32 needs 8-16 to reach the same place.
+    That is the whole finding: it is a CORE-OCCUPANCY win, not a bandwidth win -- both cores
+    end at the same ~56 GB/s DDR wall.
+  * The synthetic ceiling probe's DDR-resident 1T figure was 34.1 GB/s.  A real full layer
+    reaches 27.4 = 80% of it; the 20% is the layer tax (gate/up -> SiLU -> requantize -> down,
+    three barriers, the top-10 loop).  The fp32 core pays a 33% tax by the same comparison.
+  * The "57.2 GB/s @ 1T" that motivated this work was NOT reproduced as a DDR number and was
+    never claimed to be one here: RESULTS_PERCORE already pinned it as the 16 MB CACHE-RESIDENT
+    line of the same probe.  27.4 is the honest DDR-resident single-core figure.
+
+================================================================================
+2. CORRECTNESS -- the part that is NOT free
+================================================================================
+Reference: float64 dequant-and-GEMM over the RAW safetensors bytes (make_fixture.py), full
+layer, 10 experts x (gate, up, SiLU-mul, down), real routing weights.
+
+  layer   fp32 core    VNNI int8 core   ratio
+  L0      2.416e-07    8.279e-03        3.4e4
+  L1      2.367e-07    9.077e-03        3.8e4
+  L2      2.188e-07    7.637e-03        3.5e4
+  L3      2.557e-07    8.645e-03        3.4e4
+
+  READ THIS BEFORE READING THE SPEED NUMBERS.  int8 activations cost ~8.3e-03 rel_rms on a
+  full layer.  That is 8x the ~1e-03 threshold and it is IRREDUCIBLE for int8: a group of 16
+  roughly-Gaussian activations has amax ~ 2 sigma, so the step is 2 sigma/127 and the relative
+  RMS error is ~1/220 = 4.5e-03 per GEMV, and a layer quantizes twice (x, then h).  Predicted
+  sqrt(2)*4.5e-03 = 6.4e-03 before SiLU amplification; measured 8.3e-03.  It is not a bug and
+  it will not be tuned away.
+
+  Cross-validated: act_format_error.py recomputes the same layer in numpy with float64 WEIGHTS
+  and only the ACTIVATION format varied, and reproduces the kernel to five digits
+  (8.2786e-03 numpy vs 8.279e-03 kernel).  Two independent implementations, same answer.
+
+  BUT the comparison that decides it is not fp32.  The GPU path this would offload FROM serves
+  these experts through the W4A8 fp8-WMMA kernel with PER-TOKEN FP8 E4M3 activations
+  (quant/method.py:440).  Measured on the same fixture, weights exact:
+
+    activation format                          L0 rel_rms   L1 rel_rms
+    fp32 (the CPU fp32 core)                    0.0          0.0
+    int8, group of 16   (THIS KERNEL)           8.279e-03    9.077e-03
+    int8, per token                             2.009e-02    2.243e-02
+    fp8 e4m3, group of 16                       3.253e-02    3.201e-02
+    fp8 e4m3, per token (WHAT THE GPU SERVES)   4.094e-02    4.026e-02
+
+  So moving a layer from the GPU to this kernel makes it 4.4-4.9x MORE accurate, not less.
+  The outlier in the system is the fp32 CPU core, which is more accurate than anything else
+  anywhere in the serving path.  The quality decision is therefore NOT "8e-03 vs 2e-07"; it is
+  "8e-03 vs the 4e-02 already being served".  Still a decision, and this model is a reasoning
+  model where quality loss shows late -- but it is a decision in the SAFE direction.
+
+  Core self-tests (mode=selftest), each policy vs its own scalar-double twin on identical
+  inputs, which isolates layout/bias-correction/scale-folding from quantization error:
+    nvfp4_e4m3_g16 8.8e-08 | nvfp4_fp16_g16 7.7e-08 | mxfp4_e8m0_g32 9.5e-08
+    vnni_nvfp4_e4m3_g16 1.2e-07 | vnni_nvfp4_fp16_g16 1.2e-07
+    e2m1 int8 codebook == kE2M1*2 : PASS  (checked, not trusted)
+
+  fp32 path unchanged by this work: the pre-existing binary and the new one both give
+  2.416e-07 on L0, bit-identical at T=1/2/4/8.
+  UNEXPLAINED: RESULTS_KERNEL records 1.988e-07 for L0 with the same fixture and the same
+  on-disk binary; today it reproduces at 2.416e-07 (~20% higher) across all four layers.  Both
+  are pure fp32 accumulation rounding and nothing downstream depends on the difference, but the
+  recorded table did not reproduce and I could not account for it.  Flagging, not papering over.
+
+================================================================================
+3. WHY IT IS A SECOND CORE AND NOT A FOURTH WLoad
+================================================================================
+KERNEL_CORE_POLICY allows exactly one exemption -- "a genuinely different algorithm or tiling".
+This is it, and the reason is arithmetic, not convenience:
+
+  fp32 core : lane = a k index, one row at a time, row-major bytes, vector activation.
+  VNNI core : lane = a ROW.  VPDPBUSD reduces 4 k values into each int32 lane, so k CANNOT be
+              the lane index; rows must be, and the resident bytes must be tiled 16 rows x 16 k.
+              Rows-in-lanes is also what makes the group scale a plain 16-lane multiply and
+              removes every horizontal reduction.
+
+Every line of the inner loop differs (vpshufb vs vpermps, u8xs8 vs fp32 FMA, broadcast vs vector
+activation, no reduction vs one per row).  What IS shared and stays shared: the E2M1 codebook
+(kE2M1I8 is derived from and checked against kE2M1), the WLoad scale semantics, ExpertSlab,
+silu_mul, the row-range partition contract, the accumulate/store output convention, the plan
+reader, the table builder, the thread pool and the verify/bench harness.
+The int8 core is itself format-parameterised in the same way the fp32 one is: TWO policies
+(D e4m3, E fp16) share one body whose only policy-dependent line is WL::tile_scale().
+
+E2M1 -> int8 is EXACT: the magnitudes {0,.5,1,1.5,2,3,4,6} doubled are the integers
+{0,1,2,3,4,6,8,12}, so the codebook maps losslessly and the implicit /2 folds into the group
+scale.  +16 makes them unsigned for VPDPBUSD's (u8 x s8) form; the bias comes off with a
+per-group 16*sum(xq[g]) correction shared by all 16 rows of the tile.  The WEIGHTS are never
+requantized and never leave their own format.
+
+================================================================================
+4. SCALE WIDTH: keep the checkpoint's e4m3 byte (measured, and it was initially WRONG)
+================================================================================
+Policy D holds the checkpoint's native e4m3 group scale (0.5625 B/weight, 2,764,800 B/expert).
+Policy E pre-folds the global into an fp16 scale (0.625 B/weight, 3,072,000) -- the GPU-resident
+layout, and what the ceiling probe measured.  Paired, interleaved, ms/layer (bytes differ, so
+GB/s is NOT comparable between them):
+
+   T   e4m3 med   fp16 med   e4m3 advantage   ...with the FIRST decoder (19 ops)
+   1    1.3010     1.1774        -9.5%              -29.7%
+   2    0.6732     0.7317        +8.7%               -5.6%
+   3    0.5818     0.6136        +5.5%               -4.3%
+   4    0.6050     0.6101        +0.8%              +10.2%
+   6    0.5766     0.5831        +1.1%              +10.0%
+
+  The first e4m3 decoder was a fully general e4m3->fp32 bit-surgery with a subnormal blend and
+  a NaN mask, 19 vector ops per tile.  At 1-3 threads the loop is ALU-bound, not DDR-bound, so
+  those ops cost more than the 11% byte saving was worth and the layout decision INVERTED --
+  e4m3 lost by 29.7% at 1 thread and by 5.6% at the 2-thread operating point.
+  Fix: a scale-byte census over the real checkpoint (629,145,600 weight_scale bytes, layers
+  0-3) found the exponent field spans 8..15 and the byte range 64..126 -- ZERO subnormals, zero
+  NaN slots, zero negatives, zero zeros.  A block scale is an amax over a positive constant, so
+  none of those can occur in a well-formed NVFP4 tensor.  Specialising to positive-normal e4m3
+  makes the decode cvtepu8 -> shift -> add, THREE ops, and hoisting the per-tensor global out of
+  the tile loop into the per-group scalar removes one more zmm multiply.
+  That lifted 1-core throughput 21.3 -> 27.4 GB/s (+29%) and flipped the 2-thread point from
+  -5.6% to +8.7%.  Emit<WLoadVnniE4m3> re-checks the precondition on every scale byte at LOAD
+  time and dies loudly if a checkpoint ever violates it; the general decode still exists in
+  build_e4m3_lut and is what the scalar reference uses.
+  => keep e4m3.  Smaller in RAM, ~1800x more accurate on the weight scale (RESULTS_KERNEL),
+     and now faster wherever DDR binds.
+
+  Prefetch (CPU_MOE_VNNI_PF = 0/2/4/8 tiles ahead): measured NO-WIN, like RB in the fp32 core.
+  T1 21.8/21.4/22.2/20.9, T4 58.5/48.2/52.1/54.4.  The HW streamer already covers the
+  sequential ~900 KB per-projection runs.  Default stays 0.
+
+================================================================================
+5. ADDITIVITY -- measured, both channels, MoE on cores 0-1 and co-load on cores 6-7
+================================================================================
+   co-load (cores 6-7)              fp32 T2 GB/s   VNNI T2 GB/s   co-load achieved
+   none                                17.61          41.98        --
+   2x AVX-512 FMA (compute)            17.23 (-2%)    41.33 (-2%)  505.6 GFLOP/s
+   2x sequential DDR stream            10.36 (-41%)   20.60 (-51%)  52.7 GB/s
+
+  CORE isolation is free -- half a TFLOP of AVX-512 next door costs 2%.  DDR isolation does not
+  exist -- a co-load that takes 52.7 GB/s halves everything.  Same conclusion RESULTS_PERCORE
+  section 5 reached, now with the VNNI kernel in it.
+  The stream co-load is a deliberate WORST case (it takes ~93% of DDR); the real PCIe path is
+  capped at 12.4-14.5 GB/s.
+
+  So the hybrid is additive in the resource that was blocking it (CORES) and remains zero-sum
+  in the one that was always zero-sum (DDR).  That was already the known constraint, not a new
+  one -- CPU compute never added bandwidth, it removes the PCIe cap on the share it takes.
+
+================================================================================
+6. THE BUDGET, RESTATED WITH MEASURED VNNI NUMBERS
+================================================================================
+  Per token, 37 offloaded layers, top-10, 2,764,800 B/expert: 1.023 GB/token.
+    11.85 tok/s (today) = 12.1 GB/s     23.3 tok/s (target) = 23.8 GB/s
+
+    cores   VNNI GB/s   MoE ms/token (37L)   share of a 42.9 ms token budget
+      1       27.38          37.4                87%   -- meets the 23.8 GB/s, too tight
+      2       44.64          23.0                54%   -- fits, 19.9 ms left for the rest
+      3       54.00          18.9                44%   -- DDR-saturated, diminishing
+    fp32 6    46.39          22.1                51%   -- same place, 3x the cores
+
+  Of 8 physical cores: 8 - 1.88 (the TP=2 engine, one measured observation) - ~0.5 (OS, the
+  offload driver's copy/dispatch threads) = ~5.6 usable.
+    fp32 needed 6 -> did not fit, and RESULTS_PERCORE section 4 showed it does not degrade
+    gracefully when it cannot get them (the spin barrier loses a whole timeslice; T=16 pinned
+    at a FIXED 6.0 ms in two independent runs).
+    VNNI needs 2-3 -> fits with 2.6-3.6 physical cores to spare.
+
+  At 2 cores VNNI takes 44.6 of the ~57 GB/s DDR wall, leaving ~12 GB/s -- which is almost
+  exactly the 12.4-14.5 GB/s PCIe cap for streaming the device-resident layers.  The two
+  halves of the hybrid land balanced, which is a coincidence worth not disturbing.
+
+  NOT MEASURED, and it gates the tok/s claim: none of this has been run against a live serve.
+  Every figure here is the MoE expert path in isolation.  The 23.3 tok/s target depends on
+  attention, the dense layers, the router, and the host<->device handoff, none of which this
+  harness touches.  Treat 2 cores / 0.62 ms per layer as an input to that integration, not as
+  a prediction of it.
+
+FILES
+  wload.hpp            + policies D (vnni e4m3) and E (vnni fp16), the specialised e4m3 decode
+                         and its load-time precondition, the int8 E2M1 codebook + its check
+  moe_core.hpp         + gemv_e2m1_vnni (the int8 core), its scalar-double twin,
+                         quantize_act_g16{,_range}, QAct
+  cpu_moe_layer.cpp    + Emit<> loader policies incl. the 16x16 tile repack, the threaded table
+                         fill, the TILED branch of run_slice, run_policy<> dispatch,
+                         --policy vnni|vnni16, selftest_vnni
+  act_format_error.py  NEW -- activation-format error with weights held exact (section 2)
+  coload.c             NEW -- compute/stream co-load generator (section 5)
+  run_percore_ab.sh    NEW -- paired interleaved bench driver with load capture
+  raw logs: percore_ab_quiet.txt, percore_ab_main.txt, coload_ab.txt, scalewidth{,2}.txt,
+            headline5.txt   (session scratchpad)

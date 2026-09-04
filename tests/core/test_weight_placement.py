@@ -402,8 +402,12 @@ class TestExpertStackTable:
         assert not t2.is_uniform
 
     def test_rejects_bad_ids_and_empty(self):
+        # 2 is `StackKind.CPU` since the CPU-compute tier landed, and is now LEGAL in the ledger; 3
+        # is still not a StackKind. See `test_cpu_tier_placement.py` for the CPU tier's own rules —
+        # above all that a table containing CPU may not be materialised as a DEVICE SELECTOR, which
+        # is the invariant that used to be enforced by this constructor rejecting the value.
         with pytest.raises(ValueError):
-            ExpertStackTable([0, 2])
+            ExpertStackTable([0, 3])
         with pytest.raises(ValueError):
             ExpertStackTable([])
 

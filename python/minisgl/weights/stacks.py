@@ -100,14 +100,50 @@ __all__ = [
 
 
 class StackKind(IntEnum):
-    """Which of the two contiguous stacks a weight lives on.
+    """Which stack — and, for ``CPU``, which *processor* — a weight lives on.
 
     The integer values are the on-device selector encoding: a future ``c_*_tab`` upload indexes
     ``[DEVICE, HOST]``, so DEVICE must stay 0 (the "no offload" default fills a zeroed table).
+
+    ``CPU`` is a THIRD tier and it is not like the other two. DEVICE and HOST both describe where
+    the GPU kernel READS the weights from; CPU says the GPU does not read them at all, because the
+    expert MLP for that layer is executed by AVX-512 cores on the host, where the bytes already
+    are. Three consequences, all load-bearing for the accounting:
+
+      * a CPU layer consumes ZERO device bytes (like HOST) **and zero pinned-arena bytes** (unlike
+        HOST). Ordinary pageable host memory is enough — nothing needs
+        ``hipHostMalloc(...Mapped)``, a device-visible mapping or a pinned page — so a CPU layer is
+        not charged against ``OffloadPrior.host_arena_ceiling_bytes``, which is the binding
+        constraint on the shipped plan.
+      * a CPU layer's PCIe traffic is the ACTIVATION (2560 bf16 down, 2560 f32 up ≈ 15 KB per
+        layer-token), not the weights (30.7 MB per layer-token). Four orders of magnitude.
+      * CPU **must never appear in a device-side selector table.** The value 2 exists so a ledger
+        can record the tier; ``ExpertStackTable.as_tensor`` refuses to materialise a table
+        containing it, because a ``c_*_tab`` indexed by it would read off the end of a two-entry
+        constant array and dequantize one expert against another's scale — plausible numbers, no
+        crash.
+
+    See ``weights/cpu_tier.py`` for the measured prior, the two scheduling modes and the handoff
+    ordering rules.
     """
 
     DEVICE = 0
     HOST = 1
+    CPU = 2
+
+    @property
+    def uses_pinned_arena(self) -> bool:
+        """Does this tier consume bytes from the pinned host arena? HOST only."""
+        return self is StackKind.HOST
+
+    @property
+    def uses_device_memory(self) -> bool:
+        return self is StackKind.DEVICE
+
+    @property
+    def gpu_reads_weights(self) -> bool:
+        """Does the GPU MoE kernel read this layer's expert weights? False for CPU-computed."""
+        return self is not StackKind.CPU
 
 
 # NOTE: the measured per-card bandwidths, the pinned-host ceiling and the compute floor deliberately
@@ -169,13 +205,21 @@ class TorchStackAllocator(StackAllocator):
 
         self.device = torch.device(device)
         self._host_alloc = host_alloc
-        self._bytes = {StackKind.DEVICE: 0, StackKind.HOST: 0}
+        self._bytes = {StackKind.DEVICE: 0, StackKind.HOST: 0, StackKind.CPU: 0}
 
     def alloc_like(self, kind: StackKind, t: "torch.Tensor") -> "torch.Tensor":
         import torch
 
         shape = tuple(t.shape)
-        if kind is StackKind.HOST:
+        if kind is StackKind.CPU:
+            # PAGEABLE, deliberately: `pin_memory=True` here would put the CPU tier back on the
+            # `hipHostMalloc` ceiling it exists to escape (P3b: 62 GiB node-wide, reached only by
+            # swapping 114,813 pages), and buy nothing — the consumer is AVX-512 cores issuing
+            # ordinary loads, which do not care whether the page is pinned. It also needs no arena
+            # and no HIP at all, which is what makes the whole CPU tier constructible and testable
+            # on a box with no card. See `weights/cpu_tier.py`.
+            out = torch.empty(shape, dtype=t.dtype, device="cpu")
+        elif kind is StackKind.HOST:
             if self._host_alloc is None:
                 raise HostStackUnavailable(
                     "no host stack: TorchStackAllocator was built without `host_alloc`, so it can "
@@ -217,8 +261,9 @@ class ExpertStackTable:
 
     def __init__(self, kinds: Sequence[int]) -> None:
         vals = tuple(int(k) for k in kinds)
+        legal = {int(StackKind.DEVICE), int(StackKind.HOST), int(StackKind.CPU)}
         for v in vals:
-            if v not in (int(StackKind.DEVICE), int(StackKind.HOST)):
+            if v not in legal:
                 raise ValueError(f"stack id {v} is not a StackKind")
         if not vals:
             raise ValueError("ExpertStackTable needs at least one expert")
@@ -333,7 +378,22 @@ class ExpertStackTable:
         freshly allocated table on the second capture would be read from a dead address. Nothing in
         the shipped path calls this today (every layer-granular table is uniform); it exists so the
         A/B and the future kernel policy have one canonical materialisation.
+
+        REFUSES a table containing ``StackKind.CPU``. The device-side ``c_*_tab`` has exactly two
+        entries; an expert tagged CPU would index past the end of it and be dequantized against
+        whatever follows in constant memory. CPU-computed experts are removed from the GPU's route
+        (weight 0, id aliased to a kept slot — the convention ``MoELayer``'s adaptive-K path
+        already uses) and never reach a selector at all.
         """
+        # BEFORE `import torch`, deliberately: this is a placement error, not a runtime one, and
+        # it must be raised identically on a box with no torch (where the whole planning layer is
+        # unit-tested) and inside the serve image.
+        if int(StackKind.CPU) in self._kinds:
+            raise ValueError(
+                "cannot materialise a device selector for a table containing StackKind.CPU: the "
+                "device table indexes [DEVICE, HOST] only. A CPU-computed expert is masked OUT of "
+                "the GPU route, not selected by it."
+            )
         import torch
 
         dt = torch.int32 if dtype is None else dtype

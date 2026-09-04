@@ -1254,6 +1254,34 @@ class MoELayer(BaseOP):
         # draft head builds its own MoELayer, so a seam bound to the wrong layer would read
         # identically-shaped containers and produce plausible logits with no crash.
         if self._weight_offload is not None:
+            # THIRD TIER: CPU-COMPUTE. The experts of this layer are executed by AVX-512 cores on
+            # the host, where the weights already are, instead of being streamed to the GPU over
+            # PCIe. Only the activation crosses the bus (~5 KB down, ~10 KB up, against 30.7 MB of
+            # weights), which is the whole thesis — see weights/cpu_tier.py.
+            #
+            # Tested BEFORE resolve(), not after: a CPU-tier seam's containers are PAGEABLE host
+            # memory with no device mapping, so `resolve()` deliberately refuses on one rather than
+            # handing the grouped kernel a pointer the device cannot dereference.
+            #
+            # The route has to be materialised here — the non-EP path normally defers softmax+topk
+            # into the kernel, and there is no kernel on this path. This is BLOCK mode: submit and
+            # join in one call, GPU idle for the duration. It is still 3.6-4.3x cheaper per layer
+            # than streaming the same layer (0.583 ms at the measured 6-thread knee vs 2.12-2.49 ms
+            # over card 1's Gen4 x8 link). The concurrent composition — submit, run GPU work, join
+            # — is `seam.cpu_submit`/`cpu_join` and needs SPLIT mode to have any GPU work to hide
+            # behind, because the residual stream is sequential.
+            if self._weight_offload.computes_on_cpu:
+                assert not self.enable_ep, (
+                    "the CPU-compute tier is not wired through the EP all_gather: _ep_dispatch "
+                    "re-orders rows across ranks, so a CPU partial computed from pre-gather rows "
+                    "would be added to the wrong tokens. Plan CPU layers only on an EP-free rank, "
+                    "or pack the CPU partial into the gather first."
+                )
+                tw, ti = self._ep_route(router_logits, topk_weights, topk_ids)
+                out = self._weight_offload.cpu_forward(hidden_states, tw, ti)
+                if self.tp_size > 1 and reduce:
+                    out = self._comm.all_reduce(out)
+                return out
             w13, w2 = self._weight_offload.resolve(w13, w2)
         # PRODUCER-SIDE act quant: the pair describes `hidden_states` ROW FOR ROW. Under EP the rows
         # are all_gather'd and re-ordered before the local kernel sees them (see _ep_dispatch), so a

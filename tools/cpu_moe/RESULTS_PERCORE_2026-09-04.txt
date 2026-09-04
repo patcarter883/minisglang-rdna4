@@ -1,0 +1,164 @@
+PER-CORE BUDGET for the CPU MoE expert path -- Ryzen 7 7800X3D, DDR5 dual channel
+Follow-up to RESULTS_2026-09-04.txt (ceiling) and RESULTS_KERNEL_2026-09-04.txt (fp32 kernel).
+Question: can an int8-activation VNNI variant reach useful bandwidth on 1-2 cores, and was the
+"57.2 GB/s @ 1T" figure that motivated the hybrid real?
+Binaries: host g++/gcc 16.2.1 -O3 -march=znver4.  NO GPU, NO container.
+
+================================================================================
+0. BOX CONDITIONS -- they changed mid-session and every table says which
+================================================================================
+  LOADED   : concurrent graph-capture workflow, TP=2 minisgl serve (2 python, 25-26 threads
+             each), load avg 6.2-10.9, 4.4-4.9 of 16 hw threads busy, AND heavy swap thrash
+             (vmstat si/so 100-1000 MB/s, 25-26 GB swap in use, bi ~1 GB/s).
+  QUIET    : that workflow exited ~mid-session; 0.29-0.32 cores busy total, si/so < 10 MB/s.
+             All headline numbers below are QUIET unless labelled otherwise.
+  Tctl 43.5 C, governor=performance, THP=madvise.
+
+  PER-CORE CLOCK IS NOT UNIFORM (measured, inline-asm dependent-add chain, freq2.c):
+      core0 4.95-5.01 GHz | cores1-7 3.95-4.07 GHz
+  Only the CPPC preferred core boosts.  Anything pinned to core 0 is a ~22% best case for a
+  compute-bound kernel.  This was not accounted for in the earlier tables.
+
+================================================================================
+1. THE "57.2 GB/s @ 1 THREAD" CLAIM -- REPRODUCED, BUT IT IS NOT A DDR NUMBER
+================================================================================
+Source found: RESULTS_2026-09-04.txt section (3), cpu_moe_ceiling_bench.c mode=gemv:
+    COMPUTE CEILING (16 MB cache-resident): 1T 57.157 ...
+    REAL (6 GB DDR-resident):               1T 32.222 ...
+The 57.2 is the *16 MB cache-resident* line.  16 MB sits inside the 96 MB V-cache.  The
+DDR-resident figure from the same probe, same thread count, is 32.2.
+
+  Reproduced (quiet, taskset -c 0):  16 MB -> 57.97 / 58.06 / 58.05 / 58.01 GB/s.  Confirmed.
+
+The probe is NOT a fake streaming loop.  Its inner loop does real work: vpshufb through an
+E2M1->u8 LUT, VPDPBUSD against broadcast int8 activations, a  -16*sum(xq[g])  bias correction,
+per-16 fp16 group scale, cvtdq2ps, fp32 accumulate.  mode=verify checks it against a scalar
+double reference (max_rel 5.2e-04).  What is wrong is only the label.
+
+  Table-size knee, 1 thread, core 0 (QUIET):
+     2 MB 56.8 | 4 MB 58.2 | 8 MB 57.1 | 16 MB 58.0 | 32 MB 57.8 | 64 MB 56.5
+    96 MB 47.1 | 128 MB 45.2 | 256 MB 36.7-38.1 | 1 GB 33.4-34.5 | 2.7 GB 34.1 | 6 GB 34.1
+
+  ... and the 2-64 MB plateau is NOT an arithmetic ceiling either.  It is clock-INSENSITIVE:
+      core0 @4.95 GHz  58.06 / 58.05 / 58.01     core4 @4.07 GHz  57.19 / 57.67 / 57.87
+  A 22% clock difference moves it 1%.  ~58 GB/s/core is a cache/fill-bandwidth wall.
+
+================================================================================
+2. HEADLINE -- fp32 vs VNNI per core, DDR-resident, QUIET box
+================================================================================
+  Both DDR-resident on a table 27-63x the V-cache.  GB/s = weight bytes consumed.
+  fp32 = cpu_moe_layer (real checkpoint bytes, full gate/up/SiLU/down layer, top-10, e4m3
+  scales 0.5625 B/weight).  VNNI = ceilbench gemv (synthetic, one 1280x2560 shape, fp16
+  scales 0.625 B/weight).
+
+    threads   fp32 GB/s (med / p5)    VNNI GB/s        ratio (p5)
+      1        8.95 / 10.76            34.1 +- 0.6       3.2x
+      2       17.04 / 17.29            52.8              3.1x
+      3       25.03 / 26.60            57.0              2.1x
+      4       34.38 / 35.51            56.6-56.8         1.6x
+      6       47.22 / 51.87            57.4              1.1x
+      8       33.46 / 45.25 (SMT)      55.5              1.2x
+     16       56.33 / 60.13            56.5              0.9x
+
+  1-thread pinned, quiet, 3-4 reps each:
+      fp32  core0 (4.95 GHz)  10.32 med / 10.46 p5      core4 (4.07 GHz)  8.54 / 8.89
+      VNNI  core0             33.9-34.8                 core4             34.7
+      pure-read gather 1T     46.5 / 46.3 / 45.9 / 46.2 GB/s   <-- single-core DDR hard cap
+
+  fp32 is CLOCK-bound (core0 is 21% faster, exactly the clock ratio).
+  VNNI at 1T is MEMORY-bound (clock makes no difference) and sits at 34.1/46.4 = 74% of the
+  single-core pure-read ceiling.  There is no 3rd core's worth of headroom hiding there.
+
+  => 2 VNNI cores (52.8) buy what the fp32 core needs 6-8 threads for.  That is the finding.
+     It is a CORE-OCCUPANCY win, not a bandwidth win: both saturate at ~57 GB/s.
+
+================================================================================
+3. PER-CORE ARITHMETIC LIMIT (decode_microbench, L1-resident, core0 @4.95 GHz, 3 reps)
+================================================================================
+    A  cvtepu8_epi32 + vpermps  (this core)   24.8-25.1 Gw/s   5.0 w/cyc   14.1 GB/s @5GHz*
+    C  vpshufb -> int8 -> vpdpbusd            148-152   Gw/s  30.3 w/cyc   85.0 GB/s @5GHz*
+    E  fp32 vfmadd roofline, decode DELETED   35.9      Gw/s   7.3 w/cyc   20.4 GB/s @5GHz*
+    (* GB/s restated at the checkpoint-native 0.5625 B/weight, not the bench's 0.625.)
+
+  * E = the hard architectural ceiling of ANY fp32-ACTIVATION formulation here: 20.4 GB/s per
+    core at 5 GHz, 16.6 at 4.07.  The full layer kernel reaches 10.46 = 51% of it, and 74% of
+    its own decode sequence (A).  So at most ~1.35x is left in this formulation.
+  * C is optimistic (activation is a hoisted broadcast constant, no group scale applied), so
+    treat 85 GB/s as an upper bound.  The COMPLETE VNNI kernel measured 58 GB/s cache-resident
+    -- and that 58 is a cache wall, not compute.  Either way arithmetic is not what binds VNNI.
+  * Analytic cross-check for VNNI: >=3.5 zmm uops per 64 weights (0.5 load, ~1 and/shift,
+    1 vpshufb, 1 vpdpbusd) at ~2 zmm ops/cyc -> ~36 w/cyc -> ~103 GB/s.  Measured C is 84% of
+    that.  VPDPBUSD retires 64 weights/instruction vs VFMADD's 16, and needs no int->float.
+  * Earlier LOADED-box readings of this same bench (A 18-19, C 108-115, E 24-26 Gw/s) were
+    30-40% low across the board.  Do not compare them to these.
+
+================================================================================
+4. WHAT PINNING DOES (taskset)
+================================================================================
+  * Physical-core pin tightens the distribution to near-zero spread: fp32 T1 p5 = 10.30,
+    10.33, 10.36, 10.46 across reps vs 8.20-10.41 unpinned.  Medians stop collapsing.
+  * Pinning onto an SMT SIBLING of a busy core costs ~50%: fp32 T1 on cpu9 (sibling of a
+    loaded core1) = 4.06 med / 6.2 p5 vs 8.4 / 8.6 on a physical core.  "Cores" must mean
+    PHYSICAL cores in any budget.
+  * Unpinned, oversubscribed, LOADED: T=16 collapses to a FIXED 6.0013 / 6.0018 ms per layer
+    (4.61 GB/s) in two independent runs, and T=12 median to 3.12 ms with p5 0.647.  That is
+    the sense-reversing spin barrier losing a scheduler timeslice when a worker is descheduled,
+    not a bandwidth result.  The 55 GB/s @16T headline only exists on an otherwise idle box.
+
+================================================================================
+5. ADDITIVITY -- pinned cores are isolated from COMPUTE, not from DDR
+================================================================================
+  2 MoE threads on cores 0-1, co-load on cores 6-7:
+     co-load            VNNI T2       fp32 T2 (p5)
+     none               48.97         16.88
+     2x AVX-512 compute 51.10         16.91      <- zero interference
+     2x DDR stream      24.05         (n/m)      <- -51%;  VNNI T1 fell 34.1 -> 11.3
+  Confirms the ceiling task's zero-sum finding from the other side.  Core isolation is free;
+  DDR isolation does not exist.  A 2-thread stream is a worst case (it takes ~30 of the 57
+  GB/s); the real PCIe path is capped at 12.4-14.5 GB/s.
+
+================================================================================
+6. THE CORE BUDGET, AS A NUMBER
+================================================================================
+  Per token, 37 offloaded layers, top-10, 2,764,800 B/expert:  1.023 GB/token.
+    11.85 tok/s (today)  = 12.1 GB/s      23.3 tok/s (target) = 23.8 GB/s
+    Absolute ceiling if MoE weight traffic got 100% of the token period at the 57 GB/s DDR
+    wall: 55.7 tok/s.  At 23.3 tok/s the MoE traffic alone is 17.9 ms of a 42.9 ms budget = 42%.
+
+  Engine: the TP=2 serve measured 0.962 + 0.922 = 1.88 cores at steady state (20 s window,
+  /proc/PID/stat delta).  Whole-system busy including kswapd/kworkers/monitoring was 4.4-4.9
+  of 16 hw threads.  (Caveat: that workflow exited before I could re-measure it under a known
+  decode load; 1.88 is one observation, not a distribution.)
+
+  Of 8 physical cores: 8 - 1.9 (engine) - ~0.5 (OS, kworkers, the offload driver's own copy
+  and dispatch threads) = ~5.6, call it 5 usable for MoE.
+
+    if MoE is allowed 50% of the token period (47.7 GB/s):  fp32 needs 6 cores, VNNI needs 2
+    if MoE is allowed 100% (23.8 GB/s):                     fp32 needs 3 cores, VNNI needs <1
+
+  fp32 at 6 cores does not fit inside 5, and measurement (4) shows it does not degrade
+  gracefully when it cannot get them.  VNNI at 2 fits with 3 cores to spare.
+
+================================================================================
+7. WHAT IS NOT YET MEASURED -- the VNNI number is an UPPER BOUND for a real layer
+================================================================================
+  The 34.1 GB/s is from a synthetic probe.  A real layer must still pay:
+   1. gate/up -> SiLU -> down serialization, deinterleave, top-10 loop, thread barriers.  The
+      fp32 core loses 33% between its L1 decode ceiling (15.6) and the full layer (10.46);
+      applying the same tax to VNNI projects ~23 GB/s/core, ~46 GB/s at 2 cores.  PROJECTION.
+   2. A load-time repack into the RB=16 / 4-row x 4-K interleaved tile layout the VNNI kernel
+      needs (our bytes are row-major).  One-time, but it is real work.
+   3. Scale bytes.  The probe uses fp16 group scales = 0.625 B/weight = 3.072 MB/expert, 11%
+      MORE DDR traffic per token than the 2.7648 MB e4m3 layout the fp32 core holds.  Note
+      e4m3 -> fp16 is LOSSLESS (3 mantissa bits into 10) -- the 3.58e-04 the fp16 POLICY shows
+      is from folding the global scale in, not from the scale byte width.  So either keep e4m3
+      bytes and pay a LUT permute in-loop, or accept +11% bytes.
+   4. ACCURACY.  int8 per-group-16 activation quantization has not been validated against this
+      checkpoint's float64 reference.  The fp32 core is 1.76e-07; expect ~1e-03 from int8
+      activations.  The fp32 core must stay as the oracle.
+  Also unmeasured: VNNI under a real co-running serve (the serve exited).  The only co-load
+  data is the synthetic one in section 5.
+
+FILES: raw logs in the session scratchpad --
+  paired_quiet.txt, vnni_threadcurve.txt, vnni_1t_sweep.txt, taskset_T1.txt, taskset_multi.txt,
+  fp32_quiet_full.txt, fp32_curve_run{1,2}.txt, paired_1t.txt, vmstat_watch.txt, load_*.txt
