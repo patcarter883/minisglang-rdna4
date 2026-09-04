@@ -895,6 +895,13 @@ class TestForwardSeamIsWired:
         calls = []
 
         class _SpySeam:
+            # `computes_on_cpu` is part of the seam interface `MoELayer.forward` consults, and it
+            # is deliberately NOT read with a `getattr(..., False)` default at the call site: a
+            # seam-shaped object missing it would silently take the GPU path with its weights in
+            # pageable host memory. So a test double has to declare it, exactly as the real seam
+            # does. See `weights/cpu_tier.py` for the third tier.
+            computes_on_cpu = False
+
             def resolve(self, w13, w2):
                 calls.append((w13, w2))
                 return w13, w2

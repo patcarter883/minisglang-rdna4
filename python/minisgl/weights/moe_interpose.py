@@ -47,6 +47,30 @@ WHY `resolve()` STILL EXISTS IF IT IS AN IDENTITY
        NOT built: P2prime measured the per-expert gain at 1.013x at the reachable operating point.
        `stacks.ExpertStackTable` carries the exact HIP-side change that would be required.
 
+THE THIRD TIER, AND THE ONE PLACE IT BREAKS THE PARAGRAPH ABOVE
+    `StackKind.CPU` is a layer whose expert MLP is executed by AVX-512 cores on the host instead of
+    by a GPU kernel. Almost all of the design above carries over unchanged — it is still a
+    bind-time reallocation, still the same `_bake` with the same bitwise read-back, still frozen
+    before the first forward — and the destination is simply pageable `torch.empty(device="cpu")`
+    instead of an arena row, which is the whole capacity argument (no `hipHostMalloc`, no
+    device-visible mapping, no pinned page, nothing charged against
+    `OffloadPrior.host_arena_ceiling_bytes`).
+
+    What does NOT carry over is the capture claim. A CPU-tier layer's forward contains a HOST CALL,
+    and a host call is not a capturable node — so "graph-capture legality is vacuous" is true of the
+    DEVICE and HOST tiers and false of this one. `engine/graph.py` captures the whole model forward
+    into one `CUDAGraph` per batch-size bucket; a plan with K CPU layers needs K+1 separately
+    captured device segments (the cut is INSIDE the layer: attention, norms and the router are all
+    still GPU work) and there is no segmented-replay path today. `cpu_tier.graph_segments` counts
+    them and `CpuTierMode.is_capturable` is False for every mode that has a CPU layer in it. That
+    is stated here, at the seam, because this docstring is where the capture argument is made.
+
+    `resolve()` REFUSES a CPU seam rather than returning its containers: they are pageable host
+    memory with no device mapping, and handing them to the grouped kernel is the one way this tier
+    could produce a fault instead of a number. `MoELayer.forward` must branch on `computes_on_cpu`
+    first. The worker is attached inside `bind_plan` (before `freeze()`, which is rule R1), never
+    by the caller afterwards.
+
 WHAT THIS MODULE DOES NOT DO
     It does not allocate host pages (that is the arena behind `StackAllocator`), it does not size
     the device tier (`placement.plan_layer_granular`), it does not do VRAM accounting
@@ -314,8 +338,14 @@ class MoEWeightSeam:
         "_frozen",
         "_report",
         # The `engaged()` name for this seam's placement, precomputed at bind(). Not derived in
-        # `resolve()`: that is once per MoE layer per forward step.
+        # `resolve()`/`cpu_forward()`: those are once per MoE layer per forward step.
         "_engage",
+        # CPU-COMPUTE TIER (StackKind.CPU). None on every device/host seam, so a two-tier serve
+        # stores one extra None per layer and pays one extra `is not None` per CPU forward — and
+        # nothing at all per device/host forward, because `MoELayer.forward` reaches
+        # `computes_on_cpu` only inside the existing `_weight_offload is not None` branch.
+        "_cpu_worker",
+        "_cpu_expert_offset",
     )
 
     def __init__(
@@ -362,6 +392,8 @@ class MoEWeightSeam:
         # binder bug, and it has to be visible in the ledger as its own name rather than silently
         # reading as the device arm.
         self._engage = "weight_offload.moe_resolve[unbound]"
+        self._cpu_worker = None
+        self._cpu_expert_offset = 0
 
     # -- hot path ------------------------------------------------------------------------------
     def resolve(self, w13: Any, w2: Any) -> tuple[Any, Any]:
@@ -371,6 +403,15 @@ class MoEWeightSeam:
         already happened at `bind()`. The checks are not decoration: they are the only thing that
         turns a seam-bound-to-the-wrong-layer bug (identical container shapes, plausible logits, no
         crash) into a loud failure. See the module docstring.
+
+        REFUSES a CPU-tier seam. A `StackKind.CPU` layer's expert weights are consumed by AVX-512
+        cores on the host and are never read by a GPU kernel; a `resolve()` that handed them back
+        would let the grouped kernel read pageable, un-mapped host memory. The caller
+        (`MoELayer.forward`) must branch on `computes_on_cpu` BEFORE resolving. The refusal lives
+        HERE and not in `assert_identity` because `assert_identity` is also the boot proof's call
+        (`prove_seam_residency`), and a CPU layer's containers still have to pass the
+        seam-bound-to-the-wrong-layer check — refusing there would delete that check for the tier
+        that holds the most bytes, which is the opposite of what either branch wanted.
 
         THE `engaged()` LINE. Boot-time logs prove the arena was PINNED and the bake COPIED; neither
         proves the forward ever goes through the seam. `MoELayer._weight_offload` is a class
@@ -382,6 +423,14 @@ class MoEWeightSeam:
         invisible to a bench. Fires once per (kind), from the first real forward AND from inside HIP
         graph capture; the name is precomputed at bind so the hot path is one set lookup.
         """
+        if self._table.is_uniform and self._table.uniform_kind is StackKind.CPU:
+            raise InterpositionError(
+                f"seam {self.path!r} is CPU-COMPUTE tier: its expert weights live in PAGEABLE host "
+                f"memory with no device mapping, so no GPU kernel may read them. `MoELayer.forward` "
+                f"must test `seam.computes_on_cpu` before calling `resolve()`. Reaching here means "
+                f"the forward has a two-tier assumption baked in and would hand the grouped kernel "
+                f"a host pointer the device cannot dereference."
+            )
         engaged(self._engage)
         RESOLVE_COUNTS[self._engage] = RESOLVE_COUNTS.get(self._engage, 0) + 1
         return self.assert_identity(w13, w2)
@@ -394,6 +443,11 @@ class MoEWeightSeam:
         doing so. That line's only value is that it distinguishes "the bake ran" from "a forward read
         the arena"; a boot-time proof that emitted it would make the two indistinguishable again and
         quietly destroy the evidence the ledger exists to provide.
+
+        Deliberately does NOT refuse a CPU-tier seam, unlike `resolve()`. The identity check is
+        exactly as load-bearing for a CPU layer as for any other — more so, since a CPU layer's
+        containers are pageable host tensors that no device fault would ever catch — and this is
+        the only place it runs at boot.
         """
         if w13 is not self._w13 or w2 is not self._w2:
             raise InterpositionError(
@@ -422,6 +476,114 @@ class MoEWeightSeam:
     @property
     def kind(self) -> StackKind:
         return self._table.uniform_kind
+
+    @property
+    def computes_on_cpu(self) -> bool:
+        """Is this layer's expert MLP executed by host CPU cores instead of a GPU kernel?
+
+        The ONE test `MoELayer.forward` makes before `resolve()`. A property rather than a
+        `kind is StackKind.CPU` comparison at the call site so the hot path has a single
+        attribute load and so the two-tier assumption cannot be re-introduced by a caller that
+        compares against `StackKind.HOST` and treats "not HOST" as "device".
+        """
+        return self._cpu_worker is not None
+
+    @property
+    def cpu_worker(self):
+        """The `cpu_worker.CpuMoEWorker` this layer submits to, or None."""
+        return self._cpu_worker
+
+    def attach_cpu_worker(self, worker: Any, *, backend_expert_offset: int = 0) -> None:
+        """Wire the CPU executor for a CPU-tier seam. Boot-time only, like every other placement act.
+
+        Separate from `bind()` because the worker is PROCESS-wide (one thread pool serves all CPU
+        layers — the parallelism lives inside the native call, and a pool per layer would be 21
+        competing schedulers) while `bind()` is per-layer. `backend_expert_offset` is this layer's
+        base index into the worker's packed table.
+        """
+        if self._frozen:
+            raise InterpositionError(
+                f"seam {self.path!r} is frozen: the CPU worker must be attached before boot ends"
+            )
+        if not (self._table.is_uniform and self._table.uniform_kind is StackKind.CPU):
+            raise InterpositionError(
+                f"seam {self.path!r} is {self.kind.name}, not CPU: attaching a CPU worker to it "
+                f"would create a layer that is computed on the host AND streamed to the device, "
+                f"i.e. double-counted in the residual."
+            )
+        self._cpu_worker = worker
+        self._cpu_expert_offset = int(backend_expert_offset)
+
+    # -- CPU-tier hot path ----------------------------------------------------------------------
+    def cpu_submit(self, hidden_states: Any, topk_weights: Any, topk_ids: Any):
+        """Start this layer's expert MLP on the host. NON-BLOCKING — the GPU proceeds meanwhile.
+
+        Copies the activation and the route to the host, waits for THAT copy (not for the compute),
+        and hands the buffers to the worker. Returns a `cpu_tier.CpuHandoff`; the caller must
+        `cpu_join` it before the layer's output enters the residual stream.
+
+        WHAT CROSSES PCIe HERE: (M, 2560) bf16 down + (M, top_k) int32 and f32 down, ~5 KB at M=1.
+        The 30.7 MB of expert weights a streamed layer would have moved do not move at all — that
+        is the entire point of the tier.
+
+        `.cpu()` on a CUDA tensor is a SYNCHRONISING copy, and that synchronisation is required
+        rather than incidental: the worker thread reads the resulting host buffer immediately, so
+        an async copy whose completion had only been *enqueued* would be read while the DMA was
+        still in flight. That is a silent wrong-numbers race, not a crash. It is also the cost that
+        makes this a per-layer round trip and therefore the thing a GPU run has to measure — see
+        `cpu_tier.CpuTierPrior.handoff_us_bracket`, which is explicitly NOT measured.
+        """
+        if self._cpu_worker is None:
+            raise InterpositionError(
+                f"seam {self.path!r}: cpu_submit with no worker attached. Call "
+                f"`attach_cpu_worker` at boot; a missing worker must not silently fall through to "
+                f"a GPU path that would read pageable host memory."
+            )
+        x = hidden_states.detach().to("cpu", copy=True)
+        w = topk_weights.detach().to("cpu", copy=True)
+        i = topk_ids.detach().to("cpu", copy=True)
+        return self._cpu_worker.submit(self._cpu_expert_offset, x, i, w)
+
+    def cpu_join(self, handoff, *, like: Any = None):
+        """Take the CPU partial back and return it as a device tensor shaped like `like`.
+
+        FIFO and exactly-once — enforced by `cpu_tier.HandoffLedger`, not by this method. A failure
+        in the worker is RE-RAISED here; it is never turned into a zero partial, because a MoE
+        layer that silently contributed zero produces fluent, plausible, wrong text.
+        """
+        if self._cpu_worker is None:
+            raise InterpositionError(f"seam {self.path!r}: cpu_join with no worker attached")
+        out = self._cpu_worker.join(handoff)
+        if like is None:
+            return out
+        import torch
+
+        t = out if isinstance(out, torch.Tensor) else torch.as_tensor(out)
+        return t.to(device=like.device, dtype=like.dtype).reshape(like.shape)
+
+    def cpu_forward(self, hidden_states: Any, topk_weights: Any, topk_ids: Any):
+        """BLOCK mode: submit and immediately join. The GPU idles for the duration.
+
+        This is the SERIAL composition, and it is the default, because it is the one whose win does
+        not depend on the unmeasured handoff latency: a CPU layer at the measured 47.45 GB/s (6
+        threads, the knee under a live serve) is 0.583 ms against 2.12-2.49 ms for the same layer
+        streamed over card 1's Gen4 x8 link. 3.6x-4.3x per layer with no concurrency required.
+
+        The genuinely concurrent composition is `cpu_submit(...)` -> GPU work -> `cpu_join(...)`,
+        which only has GPU work to hide behind in SPLIT mode (see `cpu_worker.split_route_for_cpu`
+        and `cpu_tier`'s module docstring): the residual stream is sequential, so at BLOCK
+        granularity there is no independent GPU work available to overlap with.
+
+        THE `engaged()` LINE for this tier — the CPU arm's equivalent of `resolve()`'s, and it has
+        to be here because `resolve()` refuses a CPU seam. Without it the third tier would be the
+        one arm of three with no evidence that a forward ever reached it, which is precisely the
+        dispatch regression the per-leg ledger diff is meant to expose: a plan that placed 21
+        layers on the CPU and a forward that never called them look identical in the boot banner.
+        """
+        engaged(self._engage)
+        RESOLVE_COUNTS[self._engage] = RESOLVE_COUNTS.get(self._engage, 0) + 1
+        return self.cpu_join(self.cpu_submit(hidden_states, topk_weights, topk_ids),
+                             like=hidden_states)
 
     @property
     def report(self) -> SeamBindReport:
@@ -505,13 +667,22 @@ class MoEWeightSeam:
         if self._bound:
             raise InterpositionError(f"seam {self.path!r} is already bound")
         report = SeamBindReport(path=self.path, kind=kind)
-        if kind is StackKind.HOST:
+        if kind in (StackKind.HOST, StackKind.CPU):
             if allocator is None:
                 raise InterpositionError(
-                    f"seam {self.path!r}: host placement needs a StackAllocator with a host arena"
+                    f"seam {self.path!r}: {kind.name} placement needs a StackAllocator"
+                    + (" with a host arena" if kind is StackKind.HOST else "")
                 )
+            # The CPU tier runs the SAME bake — same refusal gate, same component enumeration, same
+            # bitwise read-back verification, same weakref leak proof. Only the destination differs
+            # (`allocator.alloc_like(CPU, ...)` is plain pageable `torch.empty(device="cpu")`, no
+            # `hipHostMalloc`, no mapping, no arena). Reusing the path rather than writing a second
+            # one is deliberate: Phase 0 produced four separate cases of this driver reporting
+            # success over wrong state, and the read-back-and-compare in `_bake` is what catches
+            # them. A "the CPU tier is just a torch copy, it cannot fail" shortcut would drop
+            # exactly that check on the tier that holds the most bytes.
             self._refuse_before_any_byte_moves()
-            items = self._plan_items(allocator)
+            items = self._plan_items(allocator, kind=kind)
             # Drop the seam's own handles on the containers first. For a bare stacked tensor the
             # container IS the weight, so `_w13`/`_w2` are live references to the very sources the
             # bake is about to replace — keeping them would pin the device originals and make the
@@ -529,9 +700,18 @@ class MoEWeightSeam:
         self._bound = True
         # One name per PLACEMENT, not per layer: 48 per-layer lines would drown the boot log and,
         # worse, would make "the host arm is present" a thing you have to count rather than read.
-        # Two names, so a run where every layer silently landed on the device still differs from a
-        # run where the host arm engaged.
-        self._engage = f"weight_offload.moe_resolve[{kind.name.lower()}]"
+        # Three names, so a run where every layer silently landed on the device still differs from a
+        # run where the host arm engaged, and from one where the CPU tier did.
+        #
+        # The CPU arm gets a DIFFERENT call site in its name, because it has a different call site:
+        # `resolve()` REFUSES a CPU seam, so `moe_resolve[cpu]` could never fire and would sit in
+        # the ledger as a permanently-absent arm — indistinguishable from the dispatch regression
+        # the ledger exists to catch. `MoELayer.forward` reaches this tier through `cpu_forward`.
+        self._engage = (
+            "weight_offload.moe_cpu_forward[cpu]"
+            if kind is StackKind.CPU
+            else f"weight_offload.moe_resolve[{kind.name.lower()}]"
+        )
         self._report = report
         return report
 
@@ -594,7 +774,9 @@ class MoEWeightSeam:
             for owner, _c, names, t in self._enumerate_named_tensors()
         ]
 
-    def _plan_items(self, allocator: StackAllocator) -> list["_BakeItem"]:
+    def _plan_items(
+        self, allocator: StackAllocator, *, kind: StackKind = StackKind.HOST
+    ) -> list["_BakeItem"]:
         """Enumerate this layer's copies: every component AND every replicated tensor.
 
         COMPONENT-granular, not expert-granular. A GRANULE is one expert's slice of every tensor in
@@ -609,13 +791,21 @@ class MoEWeightSeam:
         reads the same row of them (one read per layer, not one per routed expert), but they are
         still resident bytes that `LayerWeights.resident_bytes` prices — leaving them behind would
         make the arena's occupancy disagree with the plan's capacity arithmetic by ~3% of w13.
+
+        `kind` selects the DESTINATION stack — `StackKind.HOST` for the pinned arena,
+        `StackKind.CPU` for plain pageable `torch.empty`. It is the only thing that differs
+        between the two bakes; the enumeration, the refusal gate, the read-back verification and
+        the leak proof are shared, which is what keeps the CPU tier under the same evidence
+        regime as the host tier.
         """
         return [
-            self._item(owner_attr, container, names, src, allocator)
+            self._item(owner_attr, container, names, src, allocator, kind)
             for owner_attr, container, names, src in self._enumerate_named_tensors()
         ]
 
-    def _item(self, owner_attr, container, names, src, allocator) -> "_BakeItem":
+    def _item(
+        self, owner_attr, container, names, src, allocator, kind: StackKind = StackKind.HOST
+    ) -> "_BakeItem":
         """Build one copy item, resolving EVERY alias to its own live tensor.
 
         The alias's own dtype and shape are load-bearing and are NOT recoverable from the granule
@@ -639,7 +829,7 @@ class MoEWeightSeam:
             attrs=tuple(aliases),
             src=src,
             alias_srcs=srcs,
-            dst=allocator.alloc_like(StackKind.HOST, src),
+            dst=allocator.alloc_like(kind, src),
             nbytes=src.numel() * src.element_size(),
         )
 
@@ -1097,12 +1287,42 @@ class BindOutcome:
     device_resident_bytes: int = 0
     plan_digest: str = ""
     notes: list[str] = field(default_factory=list)
+    # CPU-COMPUTE tier. Counted separately from `host_layers` throughout, because the two relieve
+    # different ceilings: host layers are PINNED (charged against `OffloadPrior`'s 62 GiB
+    # `hipHostMalloc` ceiling, the binding constraint) and CPU layers are PAGEABLE (charged only
+    # against MemAvailable). Folding them into one counter is what would make the boot banner claim
+    # a pinned arena that was never reserved.
+    cpu_layers: int = 0
+    cpu_resident_bytes: int = 0
+
+    @property
+    def arena_moved_bytes(self) -> int:
+        """Bytes copied into the PINNED ARENA — `moved_bytes` minus the CPU tier's pageable copies.
+
+        The number every arena-side gate means when it says "moved". `moved_bytes` is the total over
+        all non-device placements, and once a third tier exists the two stop being the same thing:
+        `StageAAccounting` compares the copied figure against `plan.host_resident_bytes`, caps
+        `model_memory_correction()` with it, and `TorchStackPool.assert_clean` expects the pinned
+        pool to have SERVED exactly that many bytes. A CPU layer's copy goes to plain
+        `torch.empty(device="cpu")` — it never touches the arena, the pool or `memory_allocated()` —
+        so feeding the total into any of those three states a claim about the arena that is wrong by
+        the whole CPU tier (~0.6 GiB at 21 layers), in the direction that over-corrects the model
+        term and over-sizes the KV pool. Equal to `moved_bytes` on every two-tier plan, which is why
+        this can be derived rather than counted separately.
+        """
+        return self.moved_bytes - self.cpu_resident_bytes
 
     def describe(self) -> str:
+        cpu = (
+            f", {self.cpu_layers} cpu-compute "
+            f"({self.cpu_resident_bytes / (1 << 30):.2f} GiB PAGEABLE, not pinned)"
+            if self.cpu_layers
+            else ""
+        )
         return (
             f"weight-offload bound: {self.host_layers} MoE layers host-resident "
             f"({self.moved_bytes / (1 << 30):.2f} GiB moved), {self.device_layers} device-resident "
-            f"({self.device_resident_bytes / (1 << 30):.2f} GiB measured), "
+            f"({self.device_resident_bytes / (1 << 30):.2f} GiB measured){cpu}, "
             f"plan={self.plan_digest}"
         )
 
@@ -1223,6 +1443,14 @@ def bind_seam(
     out.moved_bytes += rep.moved_bytes
     if kind is StackKind.HOST:
         out.host_layers += 1
+    elif kind is StackKind.CPU:
+        # NOT the `else` arm. Three tiers now exist, and an `if HOST / else DEVICE` shape would bill
+        # every CPU layer's ~30 MB against `device_resident_bytes` — the one INDEPENDENT measurement
+        # of the device tier, which `assert_device_accounting` compares against the plan at boot. On
+        # a 21-CPU-layer plan that is ~0.6 GiB of phantom VRAM in the term the KV pool is sized
+        # from, and it would surface as an unrelated OOM rather than as an accounting failure.
+        out.cpu_layers += 1
+        out.cpu_resident_bytes += rep.moved_bytes
     else:
         out.device_layers += 1
         if count_device_bytes:
@@ -1254,8 +1482,18 @@ def bind_plan(
     selftest: int = SELFTEST_SAMPLE,
     freeze: bool = True,
     log: bool = True,
+    cpu_worker: Any = None,
 ) -> BindOutcome:
     """Execute `plan` over `seams`: move the host-resident layers, then freeze.
+
+    `cpu_worker` MUST be passed whenever the plan has CPU-tier layers, and it is attached HERE
+    rather than by the caller afterwards. That is a lifetime fact, not a convenience: `freeze()`
+    is rule R1 ("after this, every placement entry point raises") and `attach_cpu_worker` is a
+    placement entry point, so a caller that binds-then-attaches is attaching to a frozen seam and
+    gets an `InterpositionError`. Binding a CPU layer and leaving it worker-less is not a
+    recoverable state either — `MoELayer.forward` would reach `cpu_forward` with nothing to submit
+    to — so this function REFUSES a CPU plan with no worker instead of producing a model that
+    boots and then dies on its first token.
 
     Order is the PLAN order, which is the seam/discovery order, which is structural — so both ranks
     populate their arenas in the identical sequence and any chunked arena lays out identically.
@@ -1289,11 +1527,28 @@ def bind_plan(
             f"`_iter_ops`), which is what `weights/plan.py::moe_layer_shapes` mirrors."
         )
 
-    out = BindOutcome(plan_digest=plan.digest())
-    for placement in plan.placements:
-        bind_seam(
-            by_path[placement.path], placement.kind, allocator, selftest=selftest, out=out
+    n_cpu = sum(1 for p in plan.placements if p.kind is StackKind.CPU)
+    if n_cpu and cpu_worker is None:
+        raise InterpositionError(
+            f"the plan places {n_cpu} layer(s) on the CPU-COMPUTE tier but no `cpu_worker` was "
+            f"passed to bind_plan(). The worker has to be attached BEFORE freeze() (rule R1 makes "
+            f"`attach_cpu_worker` unreachable afterwards), and a CPU seam without one is not a "
+            f"degraded mode: `MoELayer.forward` would reach `cpu_forward` with nothing to submit "
+            f"to and the serve would die on its first token instead of at boot."
         )
+
+    out = BindOutcome(plan_digest=plan.digest())
+    cpu_expert_offset = 0
+    for placement in plan.placements:
+        seam = by_path[placement.path]
+        bind_seam(seam, placement.kind, allocator, selftest=selftest, out=out)
+        if placement.kind is StackKind.CPU:
+            # Attached inside the bind loop, in PLAN order, so `backend_expert_offset` is derived
+            # from the same walk on every rank rather than from the caller's enumeration. The
+            # offset counts EXPERTS, not layers: the worker holds one packed table and each CPU
+            # layer occupies `num_experts` consecutive slots in it.
+            seam.attach_cpu_worker(cpu_worker, backend_expert_offset=cpu_expert_offset)
+            cpu_expert_offset += int(placement.num_experts)
 
     # A discovered layer the plan does NOT name is DEVICE-resident, explicitly and by name. It is
     # not an error, because the resolver excludes layers BY POLICY: `plan.OFFLOAD_MTP_HEAD = False`
@@ -1354,6 +1609,14 @@ class SeamResidencyProof:
     host_bytes: int = 0
     device_tensors: int = 0
     device_bytes: int = 0
+    #: CPU-COMPUTE tier (`StackKind.CPU`). Separate counters, never folded into the host ones: a
+    #: host layer is PINNED and streams over PCIe, a CPU layer is PAGEABLE and never crosses the
+    #: bus at all. `owns_pointer` answers OPPOSITELY for the two, so a merged counter would make
+    #: the pointer check unstateable — which is how a "not HOST means DEVICE" walk would come to
+    #: bill 21 pageable layers against VRAM and still print a clean banner.
+    cpu_layers: int = 0
+    cpu_tensors: int = 0
+    cpu_bytes: int = 0
     #: Tensors that were skipped in the byte totals because another layer had already contributed
     #: the SAME allocation. Non-zero only under the stream tier, whose whole mechanism is that N
     #: layers' expert containers alias ONE buffer set (`weights/stream_tier.py`). Without the dedup
@@ -1373,6 +1636,12 @@ class SeamResidencyProof:
             f"{'INSIDE the pinned arena' if self.pointer_checked else 'UNVERIFIED'}), "
             f"{self.device_layers} device ({self.device_tensors} tensors, "
             f"{self.device_bytes / g:.3f} GiB)"
+            + (
+                f", {self.cpu_layers} cpu-compute ({self.cpu_tensors} tensors, "
+                f"{self.cpu_bytes / g:.3f} GiB PAGEABLE, proven off-device)"
+                if self.cpu_layers
+                else ""
+            )
             + (
                 f", {self.aliased_tensors} tensor(s) aliased onto an allocation already counted "
                 f"(stream tier)"
@@ -1441,8 +1710,9 @@ def prove_seam_residency(
             f"the device (bind_plan binds those explicitly for this reason)."
         )
 
-    moe = host_layers = device_layers = 0
+    moe = host_layers = device_layers = cpu_layers = 0
     host_tensors = host_bytes = device_tensors = device_bytes = aliased = 0
+    cpu_tensors = cpu_bytes = 0
     # Bytes are attributed to an ALLOCATION, once. The stream tier points every one of its layers'
     # containers at a single buffer set, so a per-layer sum counts the same VRAM N times and the
     # totals stop being physical. Keyed on `data_ptr()` because that is what the kernel
@@ -1469,9 +1739,26 @@ def prove_seam_residency(
         # `weight_offload.moe_resolve[host]` from a boot-time proof would make that ledger line stop
         # meaning "a forward read the arena", which is the only thing it is for.
         seam.assert_identity(*(getattr(layer, a) for a in attrs))
-        is_host = seam.kind is StackKind.HOST
+        # THREE tiers, tested by name. The two-tier shape this replaced (`is_host` / `not is_host`)
+        # would classify every CPU-compute layer as DEVICE-resident and then run the DEVICE pointer
+        # assertion on it. That assertion passes vacuously — a pageable host tensor is not inside
+        # the pinned arena either — so a 21-layer CPU plan would have produced a green proof that
+        # reported ~0.6 GiB of VRAM which does not exist, in the same banner the KV budget is read
+        # from. `computes_on_cpu` is not used here: this asks about WHERE THE BYTES ARE, and an
+        # unattached worker must not silently reclassify a CPU-placed layer as device.
+        kind = seam.kind
+        is_host = kind is StackKind.HOST
+        is_cpu = kind is StackKind.CPU
         host_layers += is_host
-        device_layers += not is_host
+        cpu_layers += is_cpu
+        device_layers += not (is_host or is_cpu)
+        if is_cpu and not seam.computes_on_cpu:
+            raise InterpositionError(
+                f"seam {path!r} is CPU-placed but carries no CPU worker. `MoELayer.forward` tests "
+                f"`computes_on_cpu`, so this layer would fall through to `resolve()` — which "
+                f"refuses — and the serve would die on its first token. bind_plan attaches the "
+                f"worker in the bind loop; reaching here means the seam was bound by another path."
+            )
         for name, t in seam.live_tensors():
             nbytes = t.numel() * t.element_size()
             # The residency CHECKS below still run for every tensor of every layer — an aliased
@@ -1496,6 +1783,30 @@ def prove_seam_residency(
                         f"though they were host RAM — so the KV pool is oversized by twice this "
                         f"tensor and the failure surfaces later as an unrelated OOM."
                     )
+            elif is_cpu:
+                cpu_tensors += first
+                cpu_bytes += billed
+                # The DIRECT claim for this tier, and it needs no arena: a CPU-compute layer's
+                # weights are read by AVX-512 cores, so they must be on the CPU device. If one is
+                # still a HIP tensor the bake silently did not move it, the bytes are on the card
+                # the plan believes it freed, and `cpu_worker.submit` would hand the native kernel
+                # a device pointer — a fault or, worse, garbage read through a stale mapping.
+                if getattr(t, "device", None) is not None and t.device.type != "cpu":
+                    raise InterpositionError(
+                        f"{name}: this layer is CPU-COMPUTE placed but its tensor is on "
+                        f"{t.device}, not host RAM. The CPU tier's entire claim is that these "
+                        f"{nbytes} B never occupy VRAM and never cross PCIe; here they still do, "
+                        f"and both the device budget and the pinned-arena reservation were "
+                        f"computed as though they had moved."
+                    )
+                if owns_pointer is not None and owns_pointer(t.data_ptr(), nbytes):
+                    raise InterpositionError(
+                        f"{name}: this layer is CPU-COMPUTE placed but its tensor lives inside the "
+                        f"PINNED arena. CPU-tier bytes are meant to be pageable and charged only "
+                        f"against MemAvailable; sitting in the arena means they are also charged "
+                        f"against the hipHostMalloc ceiling that the host tier's capacity is "
+                        f"planned from, so the arena is over-subscribed by this tensor."
+                    )
             else:
                 device_tensors += first
                 device_bytes += billed
@@ -1516,13 +1827,22 @@ def prove_seam_residency(
         device_bytes=device_bytes,
         aliased_tensors=aliased,
         pointer_checked=owns_pointer is not None,
+        cpu_layers=cpu_layers,
+        cpu_tensors=cpu_tensors,
+        cpu_bytes=cpu_bytes,
     )
-    if require_host_layers and host_layers == 0:
+    # HOST **or** CPU. The guard's question is "did anything actually leave the card", and under
+    # three-tier planning a CPU-only plan answers yes with `host_layers == 0` — it is the strongest
+    # form of the feature, not a vacuous pass. Keeping the old `host_layers == 0` test would have
+    # made an all-CPU plan unbootable while an all-DEVICE plan (the regression this exists to catch)
+    # stayed just as detectable, because that one has zero on both counters.
+    if require_host_layers and (host_layers + cpu_layers) == 0:
         raise InterpositionError(
-            "weight offload is ENABLED but not one MoE layer on the live model is host-resident: "
-            f"{proof.describe()}. The arena was pinned and the boot banner reported a plan, and the "
-            "serving path is byte-for-byte the non-offloaded one. This is the dispatch regression "
-            "an engaged() ledger exists to make visible; refusing rather than serving it."
+            "weight offload is ENABLED but not one MoE layer on the live model is host-resident or "
+            f"CPU-computed — every one of them stayed on the device: {proof.describe()}. The arena "
+            "was pinned and the boot banner reported a plan, and the serving path is byte-for-byte "
+            "the non-offloaded one. This is the dispatch regression an engaged() ledger exists to "
+            "make visible; refusing rather than serving it."
         )
     return proof
 
@@ -1530,12 +1850,24 @@ def prove_seam_residency(
 def seam_summary(seams: Sequence[MoEWeightSeam]) -> str:
     host = [s for s in seams if s.bound and s.kind is StackKind.HOST]
     dev = [s for s in seams if s.bound and s.kind is StackKind.DEVICE]
+    # Counted separately, never folded into `host`: those bytes are PINNED and these are PAGEABLE,
+    # and only the first kind is charged against the hipHostMalloc ceiling. A summary that merged
+    # them would report an arena that was never reserved.
+    cpu = [s for s in seams if s.bound and s.kind is StackKind.CPU]
     gib = 1 << 30
     host_b = sum(s.w13_spec.total_bytes + s.w2_spec.total_bytes for s in host)
     dev_b = sum(s.w13_spec.total_bytes + s.w2_spec.total_bytes for s in dev)
+    cpu_b = sum(s.w13_spec.total_bytes + s.w2_spec.total_bytes for s in cpu)
     granule = seams[0].w13_spec.granule_bytes + seams[0].w2_spec.granule_bytes if seams else 0
+    cpu_txt = (
+        f", {len(cpu)} cpu-compute ({cpu_b / gib:.2f} GiB pageable, "
+        f"workers={sum(1 for s in cpu if s.computes_on_cpu)}/{len(cpu)})"
+        if cpu
+        else ""
+    )
     return (
         f"MoE seams: {len(seams)} layers, {len(host)} host ({host_b / gib:.2f} GiB), "
-        f"{len(dev)} device ({dev_b / gib:.2f} GiB), granule={granule / (1 << 20):.3f} MiB, "
+        f"{len(dev)} device ({dev_b / gib:.2f} GiB){cpu_txt}, "
+        f"granule={granule / (1 << 20):.3f} MiB, "
         f"frozen={all(s.frozen for s in seams) if seams else False}"
     )

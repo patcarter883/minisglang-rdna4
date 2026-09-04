@@ -90,6 +90,46 @@ SCHEME_SUPPORTS_EP: Dict[str, bool] = {
     SCHEME_CT_INT4: True,
 }
 
+# Which `tools/cpu_moe/wload.hpp` policy — if any — can read this scheme's bytes on the CPU tier.
+# A scheme absent from this table has NO CPU expert core, and `cpu_wload_policy` returning None is
+# what stops `plan.resolve_weight_plan` from placing its layers on `StackKind.CPU`.
+#
+# THIS IS A SIZING FACT AND THAT IS WHY IT LIVES HERE. The CPU tier's resident bytes are NOT the
+# device tier's: the AVX-512 cores read the checkpoint's own e4m3 group-scale BYTE where the GPU
+# path holds an fp16-folded scale, so a CPU-placed NVFP4 layer is 0.9x the bytes (2,764,800 vs
+# 3,072,000 per expert on the target shape). The ratio is a property of the SCALE ENCODING, which
+# is exactly the quantity this module models, and putting it anywhere else would let the capacity
+# arithmetic and the byte model drift apart.
+#
+# The value is the WLoad policy NAME, deliberately, not a bytes-per-weight number:
+# `cpu_tier.CpuTierPrior.layout_fraction_for(policy, repacked=...)` owns the ratio and refuses to
+# grant it unless a repacker actually ran. Adding a weight format here is the WLoad-policy edit
+# `KERNEL_CORE_POLICY.md` describes — a table row, never a new kernel and never a new tier.
+_CPU_WLOAD_BY_SCHEME: Dict[str, str] = {
+    SCHEME_NVFP4: "vnni_nvfp4_e4m3_g16",
+    SCHEME_MXFP4: "mxfp4_e8m0_g32",
+}
+
+
+def cpu_wload_policy(scheme: Any) -> Optional[str]:
+    """The CPU expert core's WLoad policy for `scheme`, or None if there is no CPU core for it.
+
+    `scheme` may be an `ExpertScheme` or a bare scheme-kind string. Returning None is a REFUSAL
+    the planner must honour: a CPU-tier layer whose bytes no CPU core can decode would bake
+    perfectly-valid tensors into pageable memory and then have nothing able to read them, which
+    surfaces as a dead layer at the first token rather than as a boot error.
+
+    NVFP4 maps to the VNNI (int8-activation) policy because that is the one that fits the core
+    budget — see `weights/cpu_tier.py`. The fp32 policy `nvfp4_e4m3_g16` reads the same bytes and
+    remains the correctness ORACLE; it is reachable by passing `policy=ACT_FP32` to
+    `cpu_tier.project_cpu_tier`, and it is not a serving option on an 8-core box because it needs
+    six of them.
+    """
+    kind = getattr(scheme, "kind", scheme)
+    if not isinstance(kind, str):
+        return None
+    return _CPU_WLOAD_BY_SCHEME.get(kind)
+
 
 def scheme_supports_ep(quant: Any, *, fp8_experts: bool = False) -> bool:
     """Would `MoELayer` actually EP-shard experts built from this quant config?

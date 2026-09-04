@@ -1103,7 +1103,19 @@ class StageARuntime:
         )
 
     def moved_bytes(self) -> int:
-        return int(getattr(self.outcome, "moved_bytes", 0) or 0)
+        """ARENA bytes, per the protocol contract — NOT `outcome.moved_bytes` verbatim.
+
+        `BindOutcome.moved_bytes` totals every non-device placement, and since the CPU-COMPUTE tier
+        that includes copies into pageable `torch.empty(device="cpu")` which never reach the arena,
+        the torch pool, or `memory_allocated()`. All three consumers of this method are arena
+        claims — `StageAAccounting.copied_bytes` (compared against `plan.host_resident_bytes`), the
+        `model_memory_correction()` cap, and `TorchStackPool.assert_clean(expect_served_bytes=)` —
+        so the CPU tier's bytes come off first or each one is wrong by the whole CPU tier, in the
+        direction that over-corrects the model term and over-sizes the KV pool. Identical to
+        `outcome.moved_bytes` on any plan with no CPU layers.
+        """
+        moved = int(getattr(self.outcome, "moved_bytes", 0) or 0)
+        return moved - int(getattr(self.outcome, "cpu_resident_bytes", 0) or 0)
 
     def arena_torch_bytes(self) -> int:
         """Arena bytes that ACTUALLY went through torch's allocator — the pool's own counter.
