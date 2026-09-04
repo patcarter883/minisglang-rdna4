@@ -104,6 +104,10 @@ class ChunkedLoadLedger:
     staged_bytes: int = 0
     placed_host_layers: int = 0
     placed_device_layers: int = 0
+    # A CPU-COMPUTE layer is its own tier and is counted as one. Folding it into `device` (the
+    # `else` branch this used to fall into) would say the card holds bytes it does not, which is
+    # the one number `assert_device_accounting` independently checks the plan against.
+    placed_cpu_layers: int = 0
     seconds: float = 0.0
     #: Peak `torch.cuda.memory_allocated()` observed at a chunk boundary, and the peak torch itself
     #: reports for the whole window. The second is the one that matters for "did it fit"; the first
@@ -123,7 +127,9 @@ class ChunkedLoadLedger:
         return (
             f"stage-B chunked load: {self.chunks} chunks, {self.keys_filled} keys, "
             f"{self.staged_bytes / _GIB:.2f} GiB staged, "
-            f"{self.placed_host_layers} host / {self.placed_device_layers} device layers, "
+            f"{self.placed_host_layers} host / {self.placed_device_layers} device"
+            f"{f' / {self.placed_cpu_layers} cpu-compute' if self.placed_cpu_layers else ''} "
+            f"layers, "
             f"peak device alloc {self.peak_device_allocated_torch / _GIB:.2f} GiB "
             f"(reserved {self.peak_device_reserved / _GIB:.2f}), "
             f"peak host RSS {self.peak_host_rss / _GIB:.2f} GiB, {self.seconds:.1f} s"
@@ -197,6 +203,8 @@ class SeamLayerSink:
         selftest: int | None = None,
         stream: Any = None,
         stream_layers: "Sequence[int] | None" = None,
+        cpu_worker: Any = None,
+        cpu_worker_factory: Any = None,
     ) -> None:
         from .moe_interpose import SELFTEST_SAMPLE, BindOutcome
         from .stacks import StackKind
@@ -206,11 +214,40 @@ class SeamLayerSink:
         self.selftest = SELFTEST_SAMPLE if selftest is None else int(selftest)
         self._kinds = {p.path: p.kind for p in plan.placements}
         self._host = StackKind.HOST
+        self._cpu = StackKind.CPU
         self.outcome = BindOutcome(plan_digest=plan.digest())
         self.seams: list[Any] = []
         self._seen: set[str] = set()
         self.stream = stream
         self.stream_layers = frozenset(int(i) for i in (stream_layers or ()))
+        # THE CPU-COMPUTE TIER, on the chunked path. `bind_plan` carries the same argument and the
+        # same refusal; this class is the OTHER implementation of "bind a planned layer", and the
+        # tier has to exist in both or a chunked load silently binds CPU layers as DEVICE.
+        self.cpu_worker = cpu_worker
+        # A FACTORY, not just an instance, because the worker's shapes are not in the plan.
+        # `NativeVnniBackend` is opened for ONE (hidden, inter, top_k) and the plan carries bytes
+        # and expert counts, not dimensions. The first CPU layer to arrive HAS the live containers,
+        # so the shapes are read off them rather than transcribed from config — the same generality
+        # argument `resolve_weight_plan(model=)` makes one layer up.
+        self.cpu_worker_factory = cpu_worker_factory
+        #: Running expert count over CPU layers IN PLAN ORDER — the seam's `backend_expert_offset`.
+        #: `bind_plan` derives it by iterating `plan.placements`; here layers arrive in LOAD order,
+        #: so it is taken from the plan up front rather than from arrival, or the two paths would
+        #: assign different offsets to the same layer and the backend lookup would cross layers.
+        self._cpu_offset: "dict[str, int]" = {}
+        off = 0
+        for p in plan.placements:
+            if p.kind is self._cpu:
+                self._cpu_offset[p.path] = off
+                off += int(p.num_experts)
+        if self._cpu_offset and cpu_worker is None and cpu_worker_factory is None:
+            raise ValueError(
+                f"the plan places {len(self._cpu_offset)} layer(s) on the CPU-COMPUTE tier but the "
+                f"chunked load's sink got no `cpu_worker`/`cpu_worker_factory`. A CPU seam without "
+                f"one is not a degraded mode: `MoELayer.forward` reaches `cpu_forward` with "
+                f"nothing to submit to and the "
+                f"serve dies on its first token instead of at boot."
+            )
         #: path -> the tier it actually landed in. Read by the harnesses; a placement that
         #: disagrees with the plan is a boot failure, never a log line.
         self.placed: "dict[str, str]" = {}
@@ -239,7 +276,11 @@ class SeamLayerSink:
         bind_seam(
             seam,
             kind,
-            self.allocator if kind is self._host else None,
+            # The CPU tier needs the allocator too. `TorchStackAllocator.alloc_like(CPU)` returns
+            # plain PAGEABLE `torch.empty` — no arena, no `hipHostMalloc`, no HIP at all — but it
+            # is still the allocator that hands it out, and passing None here would make a CPU
+            # placement raise `HostStackUnavailable` on the chunked path only.
+            self.allocator if kind in (self._host, self._cpu) else None,
             selftest=self.selftest,
             out=self.outcome,
             # A streamed layer's bytes are NOT the plan's device tier: all of them alias one shared
@@ -247,7 +288,28 @@ class SeamLayerSink:
             # `assert_device_accounting` would fail against a plan that never named them.
             count_device_bytes=planned and not streamed,
         )
-        if streamed:
+        if kind is self._cpu:
+            # Attach the worker and TILE this layer's bytes here, one layer after its own bake,
+            # for two reasons that are both about this being the chunked path:
+            #   * `attach_cpu_worker` is a placement entry point and `seal()` freezes every seam, so
+            #     a caller that waits until the load finishes is attaching to a frozen seam.
+            #   * the tiling is a permutation over ~750 MiB/layer that has just been written, so
+            #     doing it now is the only point at which those bytes are cache-warm.
+            offset = self._cpu_offset[path]
+            if self.cpu_worker is None:
+                # Shapes off the LIVE containers: w13 is (E, 2I, H/8) int32 after post_load, so the
+                # hidden size and the (TP-sharded) intermediate size are both readable here and
+                # neither has to be transcribed from config.
+                e, n13, k8 = op.gate_up_proj._w_op.shape
+                self.cpu_worker = self.cpu_worker_factory(
+                    hidden=int(k8) * 8, inter=int(n13) // 2, top_k=int(op.top_k)
+                )
+            seam.attach_cpu_worker(self.cpu_worker, backend_expert_offset=offset)
+            self.cpu_worker.backend.pack_layer(
+                offset, op.gate_up_proj, op.down_proj, int(op.local_num_experts)
+            )
+            name = "cpu(compute)"
+        elif streamed:
             name = self.stream.adopt(path, op, op.granule_specs(allow_meta=False))
         elif not planned:
             self.outcome.notes.append(
@@ -258,6 +320,8 @@ class SeamLayerSink:
             name = "host(arena)" if kind is self._host else "device"
         self._seen.add(path)
         self.placed[path] = name
+        if kind is self._cpu:
+            return "cpu"
         return "host" if kind is self._host else "device"
 
     def finish(self) -> None:
@@ -400,6 +464,8 @@ class ChunkedWeightLoader:
             where = self.sink.place(path, op)
             if where == "host":
                 self.ledger.placed_host_layers += 1
+            elif where == "cpu":
+                self.ledger.placed_cpu_layers += 1
             else:
                 self.ledger.placed_device_layers += 1
 

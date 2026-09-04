@@ -174,6 +174,22 @@ class EngineConfig:
     # `weight_offload_gb`: an upper CLAMP on the pinned host arena per rank; 0.0 means no clamp. It
     # is never an on/off switch (plan §6.2) — the placement decision is derived either way.
     weight_offload_device_gb: float = 0.0
+
+    # `weight_offload_cpu_layers`: how many of the DEEPEST offloadable MoE layers are computed by
+    # host AVX-512 cores instead of being streamed to the card. A THIRD placement tier, not a
+    # variation on the host tier: a CPU layer's weights are read by CPU cores with ordinary loads,
+    # so they need neither VRAM nor PINNED host memory, and nothing about them crosses PCIe except
+    # the ~15 KB of activation and route per layer per token.
+    #
+    # 0 means the tier is off, and that is the default because it is not free: it costs physical
+    # cores (`cpu_tier.CoreBudget` REFUSES an over-budget request rather than clamping), it costs
+    # int8-activation accuracy (8.3e-03 rel_rms, against the 4.1e-02 the GPU's per-token fp8 costs
+    # today), and its core is a GEMV — correct at any batch, economic only at M=1, so a prefill
+    # chunk pays M times the decode cost.
+    #
+    # `resolve_weight_plan` RAISES on a request it cannot honour (no CPU core for the quant format,
+    # EP active, core budget exceeded, nothing to place) instead of downgrading to 0.
+    weight_offload_cpu_layers: int = 0
     weight_offload_gb: float = 0.0
     # `weight_offload_stream_layers`: how many of the LAST MoE layers are served by the THIRD tier —
     # experts re-read from the checkpoint per forward instead of living in VRAM or in the pinned

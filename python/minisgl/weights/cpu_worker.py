@@ -361,6 +361,13 @@ class CpuMoEWorker:
     def ledger(self) -> HandoffLedger:
         return self._ledger
 
+    @property
+    def backend(self):
+        """The executor. Public because BOOT has to reach it: the placement path registers each
+        CPU layer's tiled tensors with the backend as that layer is baked, and the counters the
+        serve reports (`NativeVnniBackend.counters`) live on it, not on the ledger."""
+        return self._backend
+
     def submit(self, layer_index: int, x, ids, weights) -> CpuHandoff:
         """Hand one CPU layer's work to the worker. NON-BLOCKING; the GPU proceeds meanwhile.
 
@@ -403,7 +410,21 @@ class CpuMoEWorker:
             try:
                 x, ids, weights = item.payload  # type: ignore[misc]
                 item.start()
-                out = self._backend.compute(x, ids, weights)
+                # WHICH LAYER, for a backend that is a TABLE of them.
+                #
+                # The declared single-slab ABI encoded the layer in the expert ids (each CPU layer
+                # occupied `num_experts` consecutive slots of one packed table). The engine's real
+                # layout cannot: it holds each layer as its own pair of stacked tensors, so the
+                # backend has to be told. `item.layer_index` is the seam's `backend_expert_offset`,
+                # i.e. exactly the plan-order running expert count the single-slab design used as
+                # its base index — the same key, passed explicitly instead of by arithmetic.
+                #
+                # Opt-in ON THE BACKEND rather than a signature change, because `ReferenceBackend`
+                # is the float64 correctness oracle every seam/handoff test drives and it genuinely
+                # holds one layer's experts.
+                out = (self._backend.compute(x, ids, weights, layer=item.layer_index)
+                       if getattr(self._backend, "per_layer", False)
+                       else self._backend.compute(x, ids, weights))
                 item.finish(out)
                 self.layers_computed += 1
             except BaseException as exc:  # noqa: BLE001 - re-raised at join()

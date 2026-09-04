@@ -831,6 +831,7 @@ class MoEWeightSeam:
             alias_srcs=srcs,
             dst=allocator.alloc_like(kind, src),
             nbytes=src.numel() * src.element_size(),
+            kind=kind,
         )
 
     def freeze(self) -> None:
@@ -967,6 +968,13 @@ class _BakeItem:
     dst: Any
     alias_srcs: list = field(default_factory=list)
     nbytes: int = 0
+    #: WHICH TIER this row is being baked into. Carried on the item because `_validate` has to
+    #: apply a DIFFERENT device rule per tier and cannot infer which from the tensors: a
+    #: HOST(arena) row and a CPU row are both `torch.Tensor`s, and the host row's `device` reads
+    #: `cuda` (it is pinned pages addressed through `hipHostGetDevicePointer`) while the CPU row's
+    #: reads `cpu`. Inferring the tier from that would be circular — it is exactly what is being
+    #: checked.
+    kind: Any = None
 
     def rebind(self) -> None:
         """Point every alias at the arena row, then drop this item's references to the sources.
@@ -1127,14 +1135,35 @@ def _validate(item: _BakeItem) -> int:
         )
     if not dst.is_contiguous():
         raise InterpositionError(f"weight bake {item.name}: arena row is not contiguous")
-    if dst.device.type != src.device.type:
+    # THE DEVICE RULE IS PER TIER, because the two tiers want opposite things.
+    #
+    # For a HOST(arena) row the destination MUST be device-addressable: the row is pinned host
+    # memory reached through `hipHostGetDevicePointer`, the copy is device-issued, and a `cpu`
+    # destination would mean the arena handed out something that is not a mapped row — a host-side
+    # store on a path whose bandwidth and coherence were never measured that way.
+    #
+    # For a CPU-COMPUTE row the destination is PLAIN PAGEABLE `torch.empty(device="cpu")` and a
+    # host-side store is the correct and only path: the consumer is an AVX-512 core issuing
+    # ordinary loads, there is no mapping, and demanding a device pointer here would refuse the one
+    # tier that exists precisely to have none. What still has to be true is that the SOURCE is the
+    # device original — a CPU->CPU copy would mean the bake ran twice, or ran after the rebind.
+    if item.kind is StackKind.CPU:
+        if dst.device.type != "cpu":
+            raise InterpositionError(
+                f"weight bake {item.name}: a CPU-COMPUTE row must be plain pageable host memory, "
+                f"but the destination is on {dst.device}. A CPU-tier layer whose bytes sit in VRAM "
+                f"(or in the pinned arena) costs the capacity the tier exists to free, and the "
+                f"plan has already been billed as if it did not."
+            )
+    elif dst.device.type != src.device.type:
         raise InterpositionError(
             f"weight bake {item.name}: source is on {src.device} but the arena row is on "
             f"{dst.device}. The row must be addressed through hipHostGetDevicePointer so the GPU "
             f"writes the host pages; a device-type mismatch means the copy is a host-side store, "
             f"which is not the path the arena was measured on."
         )
-    if dst.device.type == "cuda" and dst.device.index != src.device.index:
+    if (item.kind is not StackKind.CPU and dst.device.type == "cuda"
+            and dst.device.index != src.device.index):
         # THE INDEX, not just the type. `hipHostGetDevicePointer` returns a mapping registered for
         # ONE device; a row carved from an arena pinned for `cuda:0` and written from a weight on
         # `cuda:1` is a peer access this arena never established and never measured, and on this box
@@ -1187,10 +1216,24 @@ def _bitwise_equal(dst: Any, src: Any) -> bool:
     s = src.reshape(-1).view(torch.uint8)
     n = int(d.numel())
     step = max(1, int(SELFTEST_COMPARE_CHUNK_BYTES))
+    # CROSS-DEVICE, for the CPU-COMPUTE tier only. A HOST(arena) row reads as `cuda` (pinned pages
+    # behind `hipHostGetDevicePointer`), so dst and src are already co-located and `torch.equal`
+    # runs on the card. A CPU-tier row is genuinely `cpu` while the source is still the device
+    # original, and `torch.equal` refuses a mixed pair outright — so the DEVICE slice is pulled
+    # down, one bounded chunk at a time.
+    #
+    # The direction matters. Pulling the source DOWN keeps the scratch on the host, where this tier
+    # has room by construction. Pushing the destination UP would put a `chunk_bytes` allocation back
+    # on the card at the boot's tightest moment — the un-offloaded model's peak VRAM — which is the
+    # OOM the slicing above exists to prevent.
+    cross = d.device.type != s.device.type
     for off in range(0, n, step):
         # Slices of a contiguous 1-D uint8 view are themselves contiguous views, so this allocates
         # no source-side copy; only the comparison scratch, which is what is being bounded.
-        if not bool(torch.equal(d[off : off + step], s[off : off + step])):
+        ds, ss = d[off : off + step], s[off : off + step]
+        if cross:
+            ss = ss.to(ds.device)
+        if not bool(torch.equal(ds, ss)):
             return False
     return True
 

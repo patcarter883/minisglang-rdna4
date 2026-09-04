@@ -874,6 +874,13 @@ class StageARuntime:
         self.allocator = None
         self.outcome = None
         self.seams: Tuple[Any, ...] = ()
+        #: The CPU-COMPUTE tier's executor, created lazily by `chunked_sink()`'s factory when the
+        #: first CPU-placed layer arrives (its shapes are read off the live containers, not the
+        #: plan). None on every serve with `--weight-offload-cpu-layers 0`, which is all of them
+        #: unless it was asked for.
+        self.cpu_worker = None
+        self.rank = int(rank)
+        self.local_ranks = int(local_ranks)
         #: Set by `chunked_sink()` when the caller loads via Stage B. Its presence is what makes
         #: `bind()` ADOPT rather than execute — see there.
         self.sink = None
@@ -1045,9 +1052,40 @@ class StageARuntime:
         # read-back row sample. They are different quantities with the same name, and crossing them
         # silently weakens the bake's own verification.
         self.sink = SeamLayerSink(
-            self.plan, self.allocator, stream=self.stream, stream_layers=self.stream_layers
+            self.plan,
+            self.allocator,
+            stream=self.stream,
+            stream_layers=self.stream_layers,
+            cpu_worker_factory=self._make_cpu_worker,
         )
         return self.sink
+
+    def _make_cpu_worker(self, *, hidden: int, inter: int, top_k: int) -> Any:
+        """Open the AVX-512 pool for this rank and start its dispatcher. Called ONCE, by the sink.
+
+        The core list is PHYSICAL and node-wide disjoint across ranks — `cpu_native.
+        default_core_list` carries the two measurements that force that (an SMT sibling of a busy
+        core costs ~50%; only core 0 boosts, so it is left to the engine). The thread count is a
+        REFUSAL, not a clamp: `cpu_tier.CoreBudget.assert_fits` raises when the node-wide total
+        exceeds what a live TP=2 serve leaves free, because §1.5 measured the pool falling off a
+        cliff (a fixed 6.0 ms/layer, ~12x its budget) rather than degrading in proportion when
+        starved.
+        """
+        import os
+
+        from .cpu_native import NativeVnniBackend, default_core_list
+        from .cpu_tier import CORE_BUDGET
+        from .cpu_worker import CpuMoEWorker
+
+        threads = int(os.environ.get("MINISGL_CPU_MOE_THREADS", "2"))
+        CORE_BUDGET.assert_fits(
+            threads * self.local_ranks,
+            what=f"the CPU MoE tier at {threads} thread(s)/rank x {self.local_ranks} rank(s)",
+        )
+        cores = default_core_list(self.rank, self.local_ranks, threads)
+        backend = NativeVnniBackend(hidden, inter, top_k, threads, cores)
+        self.cpu_worker = CpuMoEWorker(backend, name=f"cpu-moe-r{self.rank}").start()
+        return self.cpu_worker
 
     def bind(self, model: Any) -> Any:
         """Attach a seam to every `MoELayer`, then execute the plan over them.
@@ -1083,7 +1121,8 @@ class StageARuntime:
                 )
             return self.outcome
         self.seams = attach_seams(model)
-        self.outcome = bind_plan(self.seams, self.plan, self.allocator, freeze=False)
+        self.outcome = bind_plan(self.seams, self.plan, self.allocator, freeze=False,
+                                 cpu_worker=self.cpu_worker)
         return self.outcome
 
     def prove_seam(self, model: Any) -> Any:
@@ -1410,6 +1449,17 @@ def _resolve_driver(
         device_budget_bytes=device_budget_bytes,
         layer_indices=layer_indices,
         arena_chunk_bytes=resolve_arena_settings().chunk_bytes,
+        # THE CPU-COMPUTE TIER, opt-in from the engine config. `resolve_weight_plan` RAISES on a
+        # refused request rather than silently downgrading to 0, which is what makes
+        # `--weight-offload-cpu-layers` a statement about the served configuration instead of a
+        # hint. Read by `getattr` for the same reason the two byte budgets are: a config object
+        # from an older serve, or a test double, does not carry the field.
+        num_cpu_layers=int(getattr(config, "weight_offload_cpu_layers", 0) or 0),
+        # `cpu_repacked=False` is a FACT about this build, not a conservatism. The e4m3 layout
+        # (0.9x the bytes) needs a bake-time re-read of the raw checkpoint scales; `cpu_native`
+        # serves the fp16-folded scales the engine already holds, so the plan may not claim the
+        # 10%. See `weights/cpu_native.py`.
+        cpu_repacked=False,
         # THE GENERALITY HINGE. With a model the resolver reads the layer set, this rank's EP/TP
         # sharding and the per-expert byte count off the live objects (`observed_planned_layers`);
         # without one it falls back to `build_planned_layers`, which transcribes seven builder files

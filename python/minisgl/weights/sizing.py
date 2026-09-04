@@ -110,6 +110,44 @@ _CPU_WLOAD_BY_SCHEME: Dict[str, str] = {
     SCHEME_MXFP4: "mxfp4_e8m0_g32",
 }
 
+# THE SECOND SPELLING OF THE SAME FACT, and it is not a duplicate table -- it answers a DIFFERENT
+# question, from a different namespace, with a different (and more truthful) answer.
+#
+# WHY IT HAS TO EXIST. `plan.cpu_tier_gate` reads `diagnostics["schemes"]`, and the two planner
+# paths fill that key from two namespaces:
+#   * `build_planned_layers` (the CONFIG fallback) puts SCHEME KINDS in it -- "nvfp4", "fp8".
+#   * `observed_planned_layers` (the MODEL path, which is what every real serve takes) puts
+#     `GranuleSpec.kind` in it, and that is `type(container).__name__` -- "_GroupedNvFp4Experts".
+# Keying the gate on scheme kinds alone therefore refused the CPU tier on 100% of real serves while
+# passing every unit test, because the tests drive the config path. That was a live defect: the
+# refusal message even named the container class as if it were a scheme.
+#
+# WHY THE VALUES DIFFER FROM THE TABLE ABOVE. A scheme names what the CHECKPOINT holds; a container
+# names what is RESIDENT after `post_load`. For NVFP4 those are different layouts:
+# `_GroupedNvFp4Experts.post_load` folds the e4m3 block scale and the per-tensor global into ONE
+# fp16 per-group scale and deletes the checkpoint copies (layers/moe.py:405-412). So the bytes a
+# CPU tier can actually read today are policy E (`vnni_nvfp4_fp16_g16`, 0.625 B/weight), not
+# policy D (`vnni_nvfp4_e4m3_g16`, 0.5625 B/weight and ~1800x more accurate). D is what a plan gets
+# once a bake-time repacker re-reads the raw scales -- which is exactly what
+# `resolve_weight_plan(cpu_repacked=True)` is the gate for, and which nothing implements. Reporting
+# D here would claim a 10% capacity win the resident bytes do not have.
+_CPU_WLOAD_BY_CONTAINER: Dict[str, str] = {
+    "_GroupedNvFp4Experts": "vnni_nvfp4_fp16_g16",
+}
+
+
+def cpu_wload_policy_for_kind(kind: Any) -> Optional[str]:
+    """The CPU core's WLoad policy for either spelling of a layer's format, or None.
+
+    Accepts a scheme kind ("nvfp4"), an `ExpertScheme`, or a container class name
+    ("_GroupedNvFp4Experts"), because `diagnostics["schemes"]` carries the first from the config
+    path and the last from the model path. Returning None is still a REFUSAL the planner honours.
+    """
+    k = getattr(kind, "kind", kind)
+    if not isinstance(k, str):
+        return None
+    return _CPU_WLOAD_BY_CONTAINER.get(k) or _CPU_WLOAD_BY_SCHEME.get(k)
+
 
 def cpu_wload_policy(scheme: Any) -> Optional[str]:
     """The CPU expert core's WLoad policy for `scheme`, or None if there is no CPU core for it.

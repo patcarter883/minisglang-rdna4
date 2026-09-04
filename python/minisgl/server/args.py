@@ -190,6 +190,22 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--weight-offload-cpu-layers",
+        type=int,
+        default=ServerArgs.weight_offload_cpu_layers,
+        help=(
+            "How many of the DEEPEST offloadable MoE layers are COMPUTED by host AVX-512 cores "
+            "instead of being streamed to the card. 0 = off. A third placement tier: these layers "
+            "need neither VRAM nor PINNED host memory (ordinary pageable pages suffice, because "
+            "the reader is a CPU core), and nothing but the ~15 KB activation/route per layer per "
+            "token crosses PCIe. Costs physical cores (an over-budget request is REFUSED, not "
+            "clamped) and int8 activations (8.3e-03 rel_rms, against the 4.1e-02 the GPU's "
+            "per-token fp8 costs today). The core is a GEMV: correct at any batch, economic only "
+            "at batch 1, so a prefill chunk pays its token count times the decode cost."
+        ),
+    )
+
+    parser.add_argument(
         "--weight-offload-stream-layers",
         type=int,
         default=ServerArgs.weight_offload_stream_layers,

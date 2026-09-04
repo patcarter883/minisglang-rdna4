@@ -82,6 +82,7 @@ from .prior import PHASE0_PRIOR, GiB, OffloadPrior, Projection  # NOTE: prior.GB
 from .sizing import (
     SCHEME_MXFP4,
     cpu_wload_policy,
+    cpu_wload_policy_for_kind,
     expert_stack_bytes,
     post_load_delta_bytes,
     scheme_from_quant,
@@ -800,7 +801,10 @@ def cpu_tier_gate(
     tpr = int(threads_per_rank or cp.default_threads_per_rank)
     total = tpr * max(1, int(local_ranks))
     schemes = [str(k) for k in diagnostics.get("schemes", ())]
-    wloads = {sc: cpu_wload_policy(sc) for sc in schemes}
+    # BOTH SPELLINGS. `diagnostics["schemes"]` is scheme kinds from the config path and container
+    # class names from the model path (`observed_planned_layers` fills it from `GranuleSpec.kind`),
+    # and the model path is the one every real serve takes. See `sizing._CPU_WLOAD_BY_CONTAINER`.
+    wloads = {sc: cpu_wload_policy_for_kind(sc) for sc in schemes}
     missing = sorted(sc for sc, w in wloads.items() if w is None)
     if not n_offloadable:
         return CpuTierGate(False, "no offloadable MoE layers", None, 1.0, 0, tpr, total)

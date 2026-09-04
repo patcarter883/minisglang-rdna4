@@ -1209,6 +1209,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # The THIRD tier. >0 hands the LAST N MoE layers to `weights/stream_tier.py` and removes them
     # from the placement plan — the only configuration in which 48 layers boots at TP=1 on this box.
     ap.add_argument("--stream-layers", type=int, default=0)
+    # THE THIRD TIER. N deepest offloadable MoE layers computed by host AVX-512 cores instead of
+    # streamed over PCIe. Costs physical cores and int8 activations; see weights/cpu_native.py.
+    ap.add_argument("--cpu-layers", type=int, default=0)
+    ap.add_argument("--cpu-threads", type=int, default=2, help="PHYSICAL cores per rank")
     # QUALITY leg. A full-depth model SHOULD produce coherent text, and a quality verdict from a
     # bare temperature multinomial over this checkpoint's 248,320-token vocabulary measures the
     # harness, not the model — it manufactures the "token noise" degeneration signature out of the
@@ -1310,11 +1314,18 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
             weight_offload_device_gb=args.device_gb,
             weight_offload_gb=args.host_gb,
             weight_offload_stream_layers=args.stream_layers,
+            weight_offload_cpu_layers=args.cpu_layers,
         )
         if offload
         else {}
     )
     out["stream_layers_requested"] = int(args.stream_layers)
+    out["cpu_layers_requested"] = int(args.cpu_layers)
+    out["cpu_threads_per_rank"] = int(args.cpu_threads)
+    if args.cpu_layers:
+        # Set BEFORE the boot: `StageARuntime._make_cpu_worker` reads it when the sink opens the
+        # pool, which happens inside `LLM(...)`.
+        os.environ["MINISGL_CPU_MOE_THREADS"] = str(args.cpu_threads)
     t0 = time.perf_counter()
     llm = LLM(
         model_path=model_dir,
@@ -1434,7 +1445,10 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
         # missing tensors, but the count is what says in WHICH direction.
         check("chunks == 1 body + 1/layer", led.chunks, args.layers + 1)
         check("layers placed == model layers",
-              led.placed_host_layers + led.placed_device_layers, args.layers)
+              led.placed_host_layers + led.placed_device_layers + led.placed_cpu_layers,
+              args.layers)
+        check("cpu-compute layers placed == asked for",
+              led.placed_cpu_layers, int(args.cpu_layers))
         out.update(
             stage_b_chunks=int(led.chunks),
             stage_b_keys_filled=int(led.keys_filled),
@@ -1445,7 +1459,22 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
             stage_b_seconds=round(float(led.seconds), 1),
             stage_b_host_layers=int(led.placed_host_layers),
             stage_b_device_layers=int(led.placed_device_layers),
+            stage_b_cpu_layers=int(led.placed_cpu_layers),
         )
+
+    # [2b] THE CPU TIER'S COUNTERS. Deliberately NOT the `engaged()` ledger: that is a SET and
+    # saturates at one, so it cannot tell a tier that bound 21 layers and executed ONE from one
+    # that executed all 21. These are monotone, and they are read from BOTH sides of the ctypes
+    # boundary — the Python wrapper's count and the `.so`'s own atomic — so "the forward never
+    # reached the tier" is distinguishable from "the tier ran and returned nothing".
+    if args.cpu_layers:
+        cw = getattr(woff.driver, "cpu_worker", None)
+        check_true("a CPU-tier worker exists", cw is not None)
+        if cw is not None:
+            out["cpu_tier_boot_counters"] = cw.backend.counters()
+            print(f"  cpu tier: {out['cpu_tier_boot_counters']}", flush=True)
+            check("cpu layers registered with the backend",
+                  cw.backend.num_layers, int(args.cpu_layers))
 
     # [2] the bake actually moved bytes, and the arena served every one of them.
     check_true("bake copied bytes into the arena", woff.accounting.copied_bytes > 0,
@@ -1585,6 +1614,46 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
     check_true("weight_offload.moe_resolve[host] engaged",
                "weight_offload.moe_resolve[host]" in woff_marks,
                "a forward resolved a HOST-placed MoE layer through the seam")
+    # THE CPU TIER'S PROOF, AND WHY IT IS NOT THE LEDGER LINE ABOVE.
+    #
+    # `weight_offload.moe_cpu_forward[cpu]` appears in `woff_marks` after ONE forward touches ONE
+    # CPU layer, and never changes again — `engaged()` is a SET. So it cannot distinguish a tier
+    # that bound 21 layers and executed 1 from one that executed all 21, which is exactly the
+    # dispatch regression the per-leg diff is supposed to catch.
+    #
+    # The counters can, and they are read from BOTH sides of the ctypes boundary: `python_*` counts
+    # calls that entered the wrapper, `native_*` counts calls the `.so` completed. Equal and nonzero
+    # is the only healthy state — python > native means calls are dying inside the native call,
+    # native > python is impossible and would mean a second caller.
+    if args.cpu_layers:
+        cw = getattr(woff.driver, "cpu_worker", None)
+        if cw is not None:
+            c = cw.backend.counters()
+            # SPLIT THE SEAM FROM THE CORE. `compute_seconds` is wall time inside the worker
+            # thread's `backend.compute` call; `native_layer_calls` divides it into a per-layer
+            # figure that is directly comparable to the 0.517 ms/layer the standalone kernel bench
+            # measured. Anything the STEP spends beyond that is handoff — the D2H sync, the queue
+            # round trip, the GIL, the H2D of the partial — and that is the term no bench can see.
+            c["worker_compute_seconds"] = round(float(cw.compute_seconds), 4)
+            c["worker_layers_computed"] = int(cw.layers_computed)
+            if c["native_layer_calls"]:
+                c["ms_per_layer_in_backend"] = round(
+                    1000.0 * cw.compute_seconds / c["native_layer_calls"], 4)
+            out["cpu_tier_counters"] = c
+            print(f"  cpu tier AFTER forward: {c}", flush=True)
+            check_true("the CPU tier actually executed layers (COUNTER, not the engaged set)",
+                       c["native_layer_calls"] > 0,
+                       f"native_layer_calls={c['native_layer_calls']} "
+                       f"python_layer_calls={c['python_layer_calls']}")
+            check("native and python layer-call counts agree",
+                  c["native_layer_calls"], c["python_layer_calls"])
+            check_true("moe_cpu_forward engaged",
+                       "weight_offload.moe_cpu_forward[cpu]" in woff_marks)
+            # Every CPU layer must have run, not just the first one the ledger saw.
+            out["cpu_tier_layer_calls_per_layer"] = (
+                c["native_layer_calls"] / max(1, int(args.cpu_layers))
+            )
+
     check_true("weight_offload.stage_a_sealed engaged",
                "weight_offload.stage_a_sealed" in woff_marks)
     check_true("weight_offload.verify_after_capture engaged",
