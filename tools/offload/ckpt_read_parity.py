@@ -27,6 +27,7 @@ sys.path.insert(0, "/engine/python")
 import safetensors  # noqa: E402
 import torch  # noqa: E402
 
+from minisgl.weights import ckpt_read  # noqa: E402
 from minisgl.weights.ckpt_read import WHOLE_FILE_CAP, ReadSafeOpen  # noqa: E402
 
 MODEL = os.environ.get("PARITY_MODEL", "/model")
@@ -70,7 +71,11 @@ for fn in pick:
     ref_h = [raw(v).sum(dtype=torch.int64) for v in ref_t.values()]
     t1 = time.perf_counter()
 
-    got = ReadSafeOpen(path)
+    # Through the POLICY, not the class: `safe_open` is what the loader calls, and for a shard
+    # over WHOLE_FILE_CAP the correct answer is 'safetensors' mmap, unchanged'. Asserting that
+    # here is half the gate -- a cap regression that silently pushed 10 GiB body shards onto
+    # the O_DIRECT reader is precisely the defect that cost the 2026-09-06 after-leg.
+    got = ckpt_read.safe_open(path)
     got_keys = got.keys()
     got_t = {k: got.get_tensor(k) for k in got_keys}
     got_h = [raw(v).sum(dtype=torch.int64) for v in got_t.values()]
@@ -109,9 +114,12 @@ for fn in pick:
     # `pick` deliberately spans both -- expert shards are 337 MiB, the `model-bf16-*` body shards
     # are 3.4-10.0 GiB -- so a green run that exercised only one would be half a gate. `direct`
     # records whether O_DIRECT was actually granted on this mount.
-    mode = "whole" if size <= WHOLE_FILE_CAP else "per-tensor"
+    mode = "O_DIRECT" if size <= WHOLE_FILE_CAP else "mmap(policy)"
+    if (size <= WHOLE_FILE_CAP) != isinstance(got, ReadSafeOpen):
+        failures.append(f"{fn}: safe_open routed a {size} B shard to the wrong reader "
+                        f"({type(got).__name__})")
     print(f"  {fn:<46} {size / MIB:8.1f} MiB  keys={len(ref_keys):>5}  {mode:<10} "
-          f"direct={str(got.direct):<5} "
+          f"direct={str(getattr(got, 'direct', 'n/a')):<5} "
           f"mmap {size / MIB / (t1 - t0):7.1f} MiB/s   O_DIRECT {size / MIB / (t2 - t1):7.1f} MiB/s  "
           f"sha {ha.hexdigest()[:16]}", flush=True)
     del ref_t, got_t, ref, got, ref_h, got_h
