@@ -69,6 +69,20 @@ class OffloadPrior:
     # Non-expert per-step time (attention, norms, router, dense linears, launch overhead) at bs=1.
     # Phase 0 3.2 uses a 5-10 ms bracket and quotes the 7.5 ms midpoint in every published table;
     # matching it is what lets test_matches_phase0_table lock this arithmetic to the report.
+    #
+    # `[ENDGAME-2026-09-04]` THIS VALUE IS MEASURED-WRONG BY 3.6x FOR qwen4_exp, AND IT IS THE
+    # SINGLE LARGEST ERROR IN THIS FILE. GPU-event attribution of the live 48-layer TP=2 serve
+    # (docs/measurements/QWEN4EXP_ENDGAME.md §3, two boots) puts the non-expert on-device work at
+    # **26.7 ms/step**, not 7.5: hyper-connections 10.15 (a 4x-wide residual this bracket predates),
+    # GDN mixers 5.54, full-attn 2.27, shared expert + gate 1.82, all-reduce 1.26, lm_head 1.00,
+    # router 0.65, PLE 0.29, embed 0.12, plus 3.56 of block arithmetic and inter-kernel gaps. That
+    # ~19 ms of missing floor is TWO-THIRDS of the "32.9 ms unattributed gap" the capture write-up
+    # opened — i.e. the banner was wrong, not the serve.
+    # It is deliberately NOT changed here: this constant is the Phase-0 report's published prior and
+    # `test_matches_phase0_table` locks it to that report. The floor is also model-shaped (a 4x
+    # hyper-connection residual is not a general feature), so the fix is a per-model measured floor,
+    # not a new global midpoint. Until then, treat every tok/s the banner projects for qwen4_exp as
+    # optimistic by ~19 ms/step and quote the measurement instead.
     compute_floor_ms: float = 7.5
 
     # --- gates ----------------------------------------------------------------------------------

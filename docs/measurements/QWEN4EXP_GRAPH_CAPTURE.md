@@ -22,6 +22,20 @@ Gen4 x8 rate of 14.48 GB/s that read alone is 39.25 ms — 49% of the step. Capt
 overhead; there was ~2 ms/step of it to remove. A second, independent run at 44 layers with the same
 interleaved method measured 2.293 ms/token saved, so the *magnitude* of the saving replicates.
 
+> **`[ENDGAME-2026-09-04]` CORRECTION — the ABSOLUTES above are retired; the DELTA stands.**
+> Two later boots of this exact operating point, instrumented with GPU events instead of a
+> wall-derived divide, measure the captured decode step at **62.36 / 62.57 ms**, not 79.86, and the
+> capture saving at **2.80 / 3.78 ms/step** rather than 2.02. The 79.86 figure divides a run that
+> contains 8 prefill forwards by 119 decode steps; this document's own §2.4 records the same
+> instrument producing **41 / 59 / 80 ms** for one config across three boots, which is why the
+> conclusion here was correctly stated as a *delta* and only the absolute is wrong.
+> The 39.25 ms PCIe arithmetic is also superseded by measurement: the host-expert read is
+> **41.72 ms** on rank 1 (card 1, 13.53-13.62 GB/s achieved = 94% of its 14.48 GB/s ceiling) and
+> only **21.78 ms** on rank 0 (card 0, 26.0 GB/s) — the step is gated by the slower link, exactly as
+> predicted, but the two ranks are 1.92x apart and rank 0 pays the difference as **20.6 ms/step of
+> idle inside the MoE all-reduce**, which nobody had costed. Full attribution:
+> `docs/measurements/QWEN4EXP_ENDGAME.md` §3. Raw: `attrib/decode_attrib_run{1,2}.json`.
+
 Three earlier speedup figures produced by this harness are **retracted** — see §2.4. Nothing in this
 document quotes them.
 
@@ -179,6 +193,21 @@ device = 47.0 ms/step → 21.3 tok/s. Measured is 79.86 ms/step. The 32.9 ms dif
 synchronous inside the layer with no prefetch overlap; DMA below link peak; the per-expert Python
 route on the critical path) are named in `WEIGHT_OFFLOAD_PLAN.md` §T8.3(ii) and none of them has a
 trace behind it. **That gap, not launch overhead, is where the next throughput work is.**
+
+> **`[ENDGAME-2026-09-04]` CLOSED. The 32.9 ms was never one thing, and most of it was the banner,
+> not the engine.** Attributed in `QWEN4EXP_ENDGAME.md` §3, two boots, GPU events:
+> * **~19 ms of it is `prior.compute_floor_ms = 7.5`**, a documented Phase-0 GUESS (the midpoint of
+>   an unmeasured 5-10 ms bracket) standing in for a MEASURED **26.7 ms** of non-expert on-device
+>   work. The projection was wrong, not the serve.
+> * **~17 ms of it never existed**: the step is 62.36 ms, not 79.86. See the correction at the head
+>   of this document.
+> * The rest is real and newly named: **20.6 ms/step of rank-0 all-reduce idle** from the 1.92x link
+>   asymmetry, and **10.15 ms/step of hyper-connection traffic** (of which only 2.64 ms is
+>   bandwidth; the other 7.9 ms is ~1000 launch-bound kernels on 20 KB tensors).
+> * Only **3.56 ms/step** of the 62.36 remains unattributed — MoE block arithmetic plus inter-kernel
+>   gaps. Every named suspect above (no prefetch overlap; DMA below peak; Python route) is either
+>   REFUTED or reclassified in ENDGAME §3.2: within a layer the transfer *is* the kernel (there is no
+>   separate H2D copy at all) and card 1 runs the read at 94% of its link ceiling.
 
 ### 2.4 RETRACTED speedup figures from this harness
 
@@ -376,7 +405,7 @@ own accounting (`failures` per rank, aggregated at the top level) — read `fail
 | **Capture above bs=2** | Buckets `[1,2]` only, because CONC=2 is the measured admission point. `GRAPH_BS` follows `CONC` in serve.sh, so raising concurrency raises capture coverage — but neither has been measured at this operating point, and a batch above the captured max runs FULLY EAGER. |
 | **Prefill / spec-VERIFY capture** | Not done. Prefill is eager everywhere in this engine; spec-verify capture is moot while `--spec-algorithm mtp` is refused for this architecture. |
 | **The 1-token accounting asymmetry** | Open, `failures=1`, left raising (§2.5). |
-| **The 32.9 ms/step unattributed gap** | Open (§2.3). This — not launch overhead — is where throughput work should go: prefetch/overlap of the synchronous host gather, and getting the per-expert Python route off the critical path. |
+| **The 32.9 ms/step unattributed gap** | ~~Open (§2.3)~~ **`[ENDGAME-2026-09-04]` CLOSED** — attributed in `QWEN4EXP_ENDGAME.md` §3. Two-thirds of it was the banner's own `compute_floor_ms = 7.5` guess against 26.7 ms of measured non-expert work; the step is 62.36 ms, not 79.86. Residual after attribution: **3.56 ms/step**. Both suspects named here are refuted: within a layer the transfer *is* the kernel (no separate H2D copy exists) and card 1 reads at 94% of its link ceiling. |
 
 **Model features, unchanged by this work** (all four still in the `UNIMPLEMENTED` banner the build
 logs once, and all four still raise at the point of use):

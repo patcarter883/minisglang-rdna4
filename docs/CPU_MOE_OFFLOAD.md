@@ -300,6 +300,18 @@ this box's own numbers** [D from M]:
 **4.1-4.8x cheaper with zero concurrency required.** The pessimistic end of the *unmeasured* handoff
 (40 µs x 37 layers = 1.48 ms) does not change the sign.
 
+> **`[ENDGAME-2026-09-04]` The two "streamed" rows are ~2x too high and this table's conclusion is
+> REVERSED by measurement.** GPU-event timed on the live serve, same shape, same kernel, only the
+> medium differing: a host-resident routed-expert layer costs **1.135 ms on card 1** (the 14.48 GB/s
+> link) and **0.589 ms on card 0**; a device-resident one costs 0.114 ms
+> (`attrib/decode_attrib_run2.json`, `isolate`). The streamed rows above were computed from bytes ÷
+> link rate and never measured against the engine, which reads the pinned arena *inside* the grouped
+> NVFP4 kernel — there is no separate H2D copy to pay for, so the compute is absorbed into the read.
+> The CPU row survives as a kernel figure but not as a *layer* figure: on the live serve the same
+> tier measures 1.64-1.83 ms/layer in-backend at 2 threads and the end-to-end serve goes 12.61 →
+> 11.19 tok/s at 36 CPU layers. The handoff was the thing that was never measured, and it is what
+> decided it. See §6.2's correction and `QWEN4EXP_ENDGAME.md` §5.
+
 **REJECTED, with the arithmetic:**
 
 - **SPLIT** (partition each layer's top-k between GPU and CPU) is the only genuine bs=1 concurrency
@@ -506,6 +518,38 @@ both ends of the *unmeasured* 10-40 µs/layer handoff bracket:
 
 "Calibrated" applies **x0.637**, the single measured-vs-projected fidelity ratio this model has ever
 been checked against (11.85 measured / 18.6 projected on the shipped two-tier plan). **One point.**
+
+> ### `[ENDGAME-2026-09-04]` §6.2 IS WRONG. MEASURED: the tier is a REGRESSION, not a 2x.
+>
+> The tier is now wired end to end and has run on the live 48-layer TP=2 serve (commit `e9dd1d7d`;
+> raw `docs/measurements/WEIGHT_OFFLOAD_2026-09-02/r3_cpu{0,12,36}t2.json`). One harness, one boot
+> procedure, the checkpoint's own sampler, graphs OFF on every leg because **the tier cannot be
+> captured at all**, differing only in `--cpu-moe-layers`:
+>
+> | CPU layers | tier split | measured tok/s (rank 0 / rank 1) |
+> |---:|---|---:|
+> | 0 | 11 dev / 37 host | **12.61 / 12.59** |
+> | 12 | 11 dev / 25 host / 12 cpu | 12.39 / 12.36 |
+> | 36 | 11 dev / 1 host / 36 cpu | **11.19 / 11.18** |
+>
+> **11.19 tok/s measured against 22.47-23.39 projected — the projection over-promised by 2.0x**, and
+> it was wrong in *sign*, not merely in magnitude: every layer moved to the CPU costs decode. The
+> `x0.637` calibration did not save it; one point was never enough, and it was the wrong shape.
+>
+> The refuted premise is §4.2's table. Its 2.12-2.49 ms/layer "streamed" prior is what the 4.1-4.8x
+> advantage was computed from, and it is **~2x too high**: a host-resident routed-expert layer
+> measures **1.135 ms** on card 1 (the slow link) and **0.589 ms** on card 0, GPU-event timed on the
+> live serve (`attrib/decode_attrib_run2.json`, `isolate` block). The CPU core's own 0.517 ms is
+> *not* the error — the kernel is as fast and as accurate as claimed (1.64-1.83 ms/layer in-backend
+> at 2 threads with the seam included; 8.379e-03 rel_rms vs a float64-activation oracle). The error
+> is that it was scored against a stream cost nobody had measured, and that the seam around it
+> (D2H/H2D of the hidden state, a Python per-layer handoff, and the loss of every captured graph)
+> costs more than the layer does. §6.4's item 1 — "nothing here has run against a live serve" — is
+> precisely what went wrong.
+>
+> **What survives, uncontested:** the capacity win. The pinned arena drops 27.10 → 0.732 GiB/rank,
+> **52.73 GiB freed node-wide**, proven off-device by the seam proof. The tier is a capacity feature
+> that costs 11% decode. Full write-up: `docs/measurements/QWEN4EXP_ENDGAME.md` §5.
 
 ### 6.3 The honest reading
 

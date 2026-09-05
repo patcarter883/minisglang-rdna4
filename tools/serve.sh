@@ -513,14 +513,32 @@ case "$MODEL" in
   # load-bearing and none of them has a safe default — a launch that drops one either does not boot
   # or boots as a different, slower serve.
   #
-  # `[CAPTURE-2026-09-04]` GRAPH CAPTURE IS DISCHARGED ON THIS PATH and this arm is the captured
-  # operating point. Full write-up + raw artifacts:
-  # docs/measurements/QWEN4EXP_GRAPH_CAPTURE.md. The headline: capture is worth +2.5%
-  # (81.87 -> 79.86 ms per decode step, x1.0253, 5 interleaved repeats/leg, non-overlapping ranges,
-  # identical on both ranks), because this decode is PCIe-BOUND, not launch-bound — 37 host layers
-  # x 10 routed experts x 1.536 MB = 568.32 MB/token/rank, which at card 1's measured Gen4 x8
-  # (14.48 GB/s vs card 0's 28.93) is 39.25 ms = 49% of the step. Capture is kept because it is a
-  # repo merge requirement and it is free, NOT because it is a throughput lever.
+  # `[ENDGAME-2026-09-04]` THE MEASURED OPERATING POINT. Replaces the earlier `[CAPTURE-2026-09-04]`
+  # block, which quoted 79.86 ms/step from a wall-derived instrument that does not reproduce across
+  # boots (41 / 59 / 80 ms for the same config, by its own doc). Write-up + every raw artifact:
+  # docs/measurements/QWEN4EXP_ENDGAME.md.
+  #
+  #   MEASURED, sampled at the checkpoint's own settings (temp 1.0 / top_k 20 / top_p 0.95 — never
+  #   greedy), 200 tokens in-process, both ranks agreeing to 0.3%, graphs LIVE
+  #   (cuda_graph_bs_captured [1,2], 126 replays, 0 harness failures):
+  #        12.93 / 12.96 tok/s   raw: docs/measurements/WEIGHT_OFFLOAD_2026-09-02/r2_cpu0.json
+  #   identical config, graphs OFF:
+  #        12.59 / 12.61 tok/s   raw: .../r3_cpu0t2.json
+  #   device decode step, GPU-event instrumented, min-of-3 interleaved, two independent boots:
+  #        62.36 / 62.57 ms/step raw: .../attrib/decode_attrib_run{1,2}.json
+  #   Tier split 11 device / 37 host / 0 cpu = 8.1 GiB device + 27.10 GiB pinned host PER RANK
+  #   (54.20 GiB node-wide). TP=2, card 0 (RX 9070 XT) + card 1 (RX 9070), NVFP4 experts, page 16.
+  #
+  # Capture is worth 2.80-3.78 ms/step (x1.024 on the client wall) and is kept because it is free
+  # and a merge requirement, NOT as a throughput lever: 41.7 ms of the 62.4 ms step is rank 1
+  # reading host experts over PCIe (568.32 MB/token/rank; card 1 achieves 13.53-13.62 GB/s = 94% of
+  # its measured 14.48 GB/s Gen4 x8 ceiling, so the read itself has nothing left to give), and rank 0
+  # then burns 20.6 ms/step idling in the MoE all-reduce waiting for it.
+  #
+  # THE CPU EXPERT TIER IS OFF ON PURPOSE (`--cpu-moe-layers` unset). Measured same-boot-procedure
+  # A/B, graphs off on BOTH legs because the tier cannot be captured at all: 36 CPU layers =
+  # 11.19 tok/s vs 12.61 with the tier off. It buys 52.7 GiB of pinned host RAM and costs 11%
+  # decode. Turn it on only for CAPACITY. See ENDGAME §5.
   qwen4exp|qwen4-exp|q4e)
                   # A local checkpoint, not an HF id: the expert stacks ship as per-layer shard
                   # files and the n-gram table is a separate 49 GiB sidecar. The measured runs
@@ -539,14 +557,16 @@ case "$MODEL" in
                   # attn_hip.flash_prefill. Every qwen4_exp run before 2026-09-04 booted rdna4,
                   # which is the only reason capture had never been attempted here.
                   attn="hip"
-                  # 0.96, MEASURED: model=13.49 GiB of a 15.71 GiB card leaves available=1.47 GiB =
-                  # 8,010 KV pages @ 196,608 B. At the 0.80 global default (or even 0.90) the pool
-                  # is ~0 and boot dies in _determine_num_pages. NOTE the capture A/B itself ran at
-                  # 0.90 (the harness default, 2,850 pages) — 0.96 WITH graphs live is the one term
-                  # on this line that is arithmetic rather than a measurement, and the graphs are
-                  # small (bs<=2 x vocab fp32 logits ~2 MB + one shared pool). First boot of this
-                  # arm is its confirmation; if it dies in num_pages, that is why.
-                  mem_default="0.96"
+                  # `[ENDGAME-2026-09-04]` 0.90, and this is now the MEASURED value: every 48-layer
+                  # boot that has ever run — the two capture A/Bs, the two attribution boots and all
+                  # four CPU-tier legs — ran at 0.90 and sized a healthy pool (2,850-2,862 KV pages
+                  # @ 196,608 B). The previous line said 0.96 and claimed "at 0.90 the pool is ~0";
+                  # that was written against a ~14 GiB device tier and is FALSE at the 8.1 GiB tier
+                  # this arm actually ships (3.4 GiB less model on the card). 0.96 remains UNMEASURED
+                  # with graphs live and is left as an override, not a default: raising it buys KV
+                  # pages the operating point has never needed at CONC=2 and spends the headroom
+                  # capture allocates its pool out of. MEM_RATIO=0.96 to try it.
+                  mem_default="0.90"
                   # A CAP, not a default (CONC is already assigned above this case block, so
                   # `${CONC:=2}` would be a silent no-op). GRAPH_BS follows CONC, so this is also
                   # the capture coverage: buckets [1,2] are what was captured and measured, and a
@@ -778,21 +798,25 @@ WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
 # qwen4_exp from. Its full configuration, all four terms load-bearing:
 #
 #   tp=2, WOFF_CHUNK_MIB=750, --weight-offload-device-gb 8.1 (=11/48 layers device, 8.06 GiB/rank),
-#   --weight-offload-gb 28, --memory-ratio 0.96, MINISGL_WEIGHT_ARENA_FLOOR_GIB=9
+#   --weight-offload-gb 28, --memory-ratio 0.90, MINISGL_WEIGHT_ARENA_FLOOR_GIB=9
 #
-# `[CAPTURE-2026-09-04]` THE 11.85 IN THAT TABLE IS AN **EAGER** WALL FIGURE (attention_backend=rdna4,
-# --cuda-graph-max-bs 0, 115 tokens including prefill). It is not the number to compare a captured
-# serve against, and it is not a decode number at all. The like-for-like A/B is one boot with the
-# graphs switched on and off: 81.87 -> 79.86 ms PER DECODE STEP, x1.0253. See the `qwen4exp` arm
-# above and docs/measurements/QWEN4EXP_GRAPH_CAPTURE.md. That arm is now the launch line; these
-# numbers stay here because the chunk arithmetic is what they measure.
+# `[ENDGAME-2026-09-04]` THE 11.85 IN THAT TABLE IS AN **EAGER** WALL FIGURE (attention_backend=rdna4,
+# --cuda-graph-max-bs 0, 115 tokens including prefill) and it is superseded. The measured serve at
+# this operating point is 12.93 / 12.96 tok/s with graphs live and 12.59 / 12.61 without, 200
+# sampled tokens, both ranks; the device decode step is 62.36 / 62.57 ms across two boots. The
+# earlier "81.87 -> 79.86 ms/step" pair is RETIRED as an absolute (that instrument spread 41/59/80
+# ms across three boots of one config); the ~2.8-3.8 ms/step capture DELTA it measured stands. See
+# the `qwen4exp` arm above and docs/measurements/QWEN4EXP_ENDGAME.md. That arm is the launch line;
+# these numbers stay here because the chunk arithmetic is what they measure.
 #
 # * device-gb 8.1 not 9.0: 12 device layers OOMs in STAGE B, not at rest. Stage B's peak is the tier
 #   plus ONE layer in flight (staged checkpoint tensors + post_load's repack, ~1.46 GiB), and at 12
 #   layers that is 14.96 GiB allocated with 224 MiB free — it dies asking for a 400 MiB row. At 11
 #   the same run leaves min_device_free 0.66 GiB. Size the device tier against the LOAD peak.
-# * memory-ratio 0.96 not 0.90: model=13.49 GiB of a 15.71 GiB card leaves available=1.47 GiB
-#   (8,010 KV pages @ 196,608 B). At 0.90 the budget is 14.14 GiB and the pool is ~0.
+# * `[ENDGAME-2026-09-04]` memory-ratio 0.90, not 0.96. The old line here said "at 0.90 the pool is
+#   ~0"; that was computed for a ~14 GiB device tier and is FALSE at the 8.1 GiB tier this arm
+#   ships — every 48-layer boot on record ran at 0.90 and got 2,850-2,862 KV pages. 0.96 is
+#   UNMEASURED with graphs live and is an override (MEM_RATIO=0.96), not the default.
 # * FLOOR_GIB=9 is BELOW the 12 GiB default and is the one term that is a box property rather than a
 #   model property: 27.10 GiB/rank x 2 = 54.20 GiB, and the rank processes see ~62-65 GiB of
 #   `MemAvailable` (2-3 GiB less than the host reads, because both engines are already up), so
