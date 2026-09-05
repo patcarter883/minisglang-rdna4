@@ -577,14 +577,14 @@ case "$MODEL" in
                   # THE OFFLOAD TIER. `[E4M3-2026-09-05]` 8.1 GiB/rank now buys **12** of 48 layers
                   # device-side, not 11, and the other 36 are host-pinned at 24.12 GiB/rank
                   # (48.23 GiB across the node — MEASURED: 18 chunks, payload 24.00 GiB, 120 MiB
-                  # abandoned, fill 99.5%, torch_fallbacks 0, min_device_free 1.11 GiB, 14.55 tok/s).
+                  # abandoned, fill 99.5%, torch_fallbacks 0, min_device_free 1.04 GiB, 14.55 tok/s).
                   # The NVFP4 two-level scale moved both numbers: an e4m3 block scale is 1 B per 16
                   # weights where the fp16 fold was 2, so a layer's expert rows fell 0.7324 ->
                   # 0.6680 GiB/rank. Same 8.1 GiB budget, one MORE layer on the card, and 5.97 GiB
                   # LESS pinned host RAM than the 54.20 this arm used to need.
                   # * 8.1 still not 9.0, and the old reason has not expired — it has been re-priced.
                   #   Stage B's peak is the tier plus one layer in flight; at 12 e4m3 layers that is
-                  #   a MEASURED 40.91 GiB allocated leaving min_device_free 1.11 GiB, i.e. healthier
+                  #   a MEASURED 38.10 GiB allocated leaving min_device_free 1.04 GiB, i.e. healthier
                   #   than the 0.66 GiB the 11-layer fp16-fold point left. 13 layers (device-gb 9.0)
                   #   is 8.57 GiB of tier against a 14.14 GiB budget and leaves the KV pool at
                   #   ~0.16 GiB — UNMEASURED, and on the wrong side of a load peak. Size the device
