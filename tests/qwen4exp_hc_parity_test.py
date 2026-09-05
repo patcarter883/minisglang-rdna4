@@ -204,7 +204,14 @@ def _weights(dtype: torch.dtype):
     return _random_weights(dtype), "random"
 
 
-def _build(dtype: torch.dtype, *, use_combine: bool = True):
+def _build(dtype: torch.dtype, *, use_combine: bool = True, post_load: bool = True):
+    """`post_load=True` is the DEFAULT because it is what the serve runs.
+
+    `HyperConnection.post_load` folds `/hc` into the weights and packs the down/inject projections
+    into one buffer (see that method). Both are exact, but "exact" is a claim, and a parity test that
+    only ever ran the un-finalized layer would be pinning a path production never takes. Every test
+    below therefore drives the FINALIZED layer against the reference, and
+    `test_post_load_is_exact_and_idempotent` pins the un-finalized one against it."""
     w, source = _weights(dtype)
     torch.set_default_dtype(dtype)
     try:
@@ -222,6 +229,8 @@ def _build(dtype: torch.dtype, *, use_combine: bool = True):
     hc.input_mix_weight_up.weight = w["input_mix_weight_up.weight"].clone()
     if use_combine:
         hc.block_inject_weight.weight = w["block_inject_weight.weight"].clone()
+    if post_load:
+        hc.post_load()
     return hc, w, source
 
 
@@ -271,7 +280,10 @@ def test_mix_matches_reference(ref, dtype, atol, max_ulps, weight_source):
     hc, w, source = _build(dtype)
     x, _ = _inputs(dtype)
 
-    got, (res_raw, res_normed) = hc.mix(x)
+    got, residuals = hc.mix(x)
+    # (unnormed stream, normed stream, inject logits) — the third element is the inject gate's
+    # pre-sigmoid, produced by the same GEMV as the low-rank down-projection (see HCResidual).
+    res_raw, res_normed = residuals[0], residuals[1]
 
     n = ref_norm(ref, x, w["hc_norm.weight"])
     want = ref["_mix_compute"](
@@ -439,7 +451,7 @@ def test_mixer_variant_has_three_tensors_and_refuses_to_combine(ref):
     )
     torch.testing.assert_close(out, want, rtol=2e-6, atol=2e-6)
     with pytest.raises(RuntimeError, match="use_combine=False"):
-        mixer.combine(y, (x, n))
+        mixer.combine(y, (x, n, None))
 
 
 def test_state_dict_keys_and_shapes_match_the_checkpoint():
@@ -451,6 +463,95 @@ def test_state_dict_keys_and_shapes_match_the_checkpoint():
         "input_mix_weight_up.weight": (WIDE, LOWRANK),
         "block_inject_weight.weight": (HC_COUNT, WIDE),
     }
+
+
+def test_post_load_is_exact_and_idempotent(ref):
+    """`post_load` folds `/hc` into the weights and packs down+inject into one GEMV. Both are
+    launch-count changes that must not move a single bit, and the second one must not happen twice.
+
+    Three separate claims, because each fails differently:
+      * EXACT — the finalized layer and the un-finalized one agree to the LAST BIT, not to a
+        tolerance. A `/hc` fold is only exact because 4 is a power of two; if someone changes
+        `hc_count` to 3 the fold must refuse, and this comparison is what would catch it silently
+        succeeding instead.
+      * IDEMPOTENT — a second `post_load()` must not divide by `hc` again. That failure is
+        invisible: right shapes, right keys, a uniformly 4x-small pre-activation in all 48 layers.
+      * PACKED — `input_mix_weight_down.weight` / `block_inject_weight.weight` keep their checkpoint
+        shapes and become disjoint views of one buffer, so byte accounting is unchanged.
+    """
+    plain, w, _ = _build(torch.float32, post_load=False)
+    fused, _, _ = _build(torch.float32)
+    x, y = _inputs(torch.float32)
+
+    # the fold happened, and it is the exact power-of-two one
+    assert fused._scale_folded is True
+    torch.testing.assert_close(
+        fused.input_mix_weight_down.weight * HC_COUNT,
+        plain.input_mix_weight_down.weight,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        fused.block_inject_weight.weight * HC_COUNT,
+        plain.block_inject_weight.weight,
+        rtol=0,
+        atol=0,
+    )
+
+    # packed: same shapes, one storage, disjoint and contiguous
+    down, inj = fused.input_mix_weight_down.weight, fused.block_inject_weight.weight
+    assert tuple(down.shape) == (LOWRANK, WIDE) and tuple(inj.shape) == (HC_COUNT, WIDE)
+    assert down.is_contiguous() and inj.is_contiguous()
+    assert down.data_ptr() == fused._fused_w.data_ptr()
+    assert inj.data_ptr() == down.data_ptr() + down.numel() * down.element_size()
+
+    # The packed GEMV is DECLINED here, and that is the documented rule, not an accident: the pack
+    # is only legal under a row-invariant kernel, and this oracle is fp32-on-CPU, i.e. `F.linear` ->
+    # BLAS, whose accumulation blocking depends on N. See `HyperConnection._fused_ok`.
+    assert fused._fused_ok(x) is False
+
+    # EXACT, both halves, against the un-finalized layer
+    a_mix, a_res = plain.mix(x)
+    b_mix, b_res = fused.mix(x)
+    torch.testing.assert_close(b_mix, a_mix, rtol=0, atol=0)
+    torch.testing.assert_close(fused.combine(y, b_res), plain.combine(y, a_res), rtol=0, atol=0)
+
+    # IDEMPOTENT
+    before = fused.input_mix_weight_down.weight.clone()
+    fused.post_load()
+    torch.testing.assert_close(fused.input_mix_weight_down.weight, before, rtol=0, atol=0)
+    torch.testing.assert_close(fused.mix(x)[0], b_mix, rtol=0, atol=0)
+
+    # and the un-finalized layer is still the reference's arithmetic, so neither path is untested
+    n = ref_norm(ref, x, w["hc_norm.weight"])
+    torch.testing.assert_close(
+        a_mix,
+        ref["_mix_compute"](
+            n, w["input_mix_weight_down.weight"], w["input_mix_weight_up.weight"],
+            HC_COUNT, HIDDEN,
+        ),
+        rtol=2e-6,
+        atol=2e-6,
+    )
+
+
+def test_grouped_rms_norm_gain_cache_follows_the_weight():
+    """`GroupedRMSNorm` memoizes `1 + weight`. The cache must die when the weight is REBOUND (what
+    `BaseOP.load_state_dict` does) and when it is mutated IN PLACE (`copy_`), or a layer would keep
+    normalizing with the gain of the checkpoint it was loaded from before."""
+    norm = GroupedRMSNorm(WIDE, group_size=HIDDEN, eps=EPS)
+    x, _ = _inputs(torch.float32)
+
+    norm.weight = torch.zeros(WIDE)
+    first = norm.forward(x).clone()
+    torch.testing.assert_close(first, norm.forward(x), rtol=0, atol=0)  # cache hit is exact
+
+    norm.weight.copy_(torch.full((WIDE,), 1.0))  # in-place mutation
+    after_inplace = norm.forward(x)
+    torch.testing.assert_close(after_inplace, first * 2.0, rtol=1e-6, atol=1e-6)
+
+    norm.weight = torch.full((WIDE,), 3.0)  # rebind, as the loader does
+    torch.testing.assert_close(norm.forward(x), first * 4.0, rtol=1e-6, atol=1e-6)
 
 
 def test_real_checkpoint_shapes_when_present():
