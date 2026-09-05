@@ -411,11 +411,29 @@ class ChunkedWeightLoader:
         is driven by the MODEL's structure and consumes keys in model order, not stream order. That
         dict is the peak: one chunk, by construction.
         """
+        from .boot_timeline import tick
+
         staged: dict = {}
         nbytes = 0
-        for key, value in tensors:
+        # SPLIT, not one span: `tensors` is a GENERATOR that does the whole read/remap/shard/H2D/
+        # stack pipeline lazily, so the time spent inside `next()` is Stage B's I/O+conversion and
+        # the time outside it is this driver's own dict bookkeeping + the dtype cast. Timing the
+        # `for` statement as a whole attributes the generator's seconds to the loop body and makes
+        # the driver look like the cost.
+        it = iter(tensors)
+        while True:
+            _t = time.perf_counter()
+            try:
+                item = next(it)
+            except StopIteration:
+                tick("stageb.stream_next", time.perf_counter() - _t)
+                break
+            tick("stageb.stream_next", time.perf_counter() - _t)
+            key, value = item
             if self.cast is not None:
+                _t = time.perf_counter()
                 value = self.cast(key, value)
+                tick("stageb.cast", time.perf_counter() - _t)
             if key in staged:
                 raise ChunkedLoadError(
                     f"chunk {chunk.name!r} yielded {key!r} twice; the second value would silently "
@@ -434,7 +452,9 @@ class ChunkedWeightLoader:
         # `_internal=True` hands the unconsumed-keys verdict to this driver rather than to
         # `load_state_dict`'s generic "Unexpected keys" — the message has to name the CHUNK, because
         # with 49 of them "somewhere in the load there was a stray key" is not a diagnosis.
+        _t = time.perf_counter()
         self.model.load_state_dict(staged, missing_ok=True, _internal=True)
+        tick("stageb.load_state_dict", time.perf_counter() - _t)
         if staged:
             raise ChunkedLoadError(
                 f"chunk {chunk.name!r} carried {len(staged)} keys the model has no home for, e.g. "
@@ -445,9 +465,15 @@ class ChunkedWeightLoader:
 
     def finalize_chunk(self, chunk: LoadChunk) -> None:
         """`post_load()` and place every op this chunk completed."""
+        from .boot_timeline import tick
+
         if not chunk.finalize_paths:
             return
+        # The op index is rebuilt PER CHUNK by re-walking the whole module tree. Timed separately
+        # because that is O(chunks x module tree) work that has nothing to do with the bytes.
+        _t = time.perf_counter()
         by_path = self._ops_by_path()
+        tick("stageb.discover_moe_layers", time.perf_counter() - _t)
         for path in chunk.finalize_paths:
             op = by_path.get(path)
             if op is None:
@@ -459,9 +485,13 @@ class ChunkedWeightLoader:
                 )
             if op._post_load_done:
                 raise ChunkedLoadError(f"{path!r} was already finalized by an earlier chunk")
+            _t = time.perf_counter()
             op.post_load()
+            tick("stageb.post_load", time.perf_counter() - _t)
             op._post_load_done = True
+            _t = time.perf_counter()
             where = self.sink.place(path, op)
+            tick("stageb.sink_place", time.perf_counter() - _t)
             if where == "host":
                 self.ledger.placed_host_layers += 1
             elif where == "cpu":
@@ -478,31 +508,52 @@ class ChunkedWeightLoader:
     ) -> ChunkedLoadLedger:
         import torch
 
+        from .boot_timeline import rss_bytes, tick, timeline
+
+        tl = timeline()
         t0 = time.perf_counter()
         led = self.ledger
         led.min_device_free = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
         for chunk in chunks:
             t_chunk = time.perf_counter()
+            # Snapshot the accumulators so each chunk's row carries ITS OWN split, not the running
+            # total. Chunk 0 is the dense body and every other chunk is one layer's 512 experts;
+            # folding them into one average hides which of the two the seconds belong to.
+            b0 = dict(tl.buckets)
             nbytes = self.apply_chunk(chunk, stream(chunk))
             self.finalize_chunk(chunk)
             # The staging tensors of this chunk are unreachable from here on (the containers hold
             # either their own repacked buffers or arena rows). Return them to the caching allocator
             # NOW rather than at the next GC: the whole point of chunking is that the live set is one
             # chunk, and a chunk still held by a cycle is a chunk that did not shrink the peak.
+            _t = time.perf_counter()
             gc.collect()
+            tick("stageb.gc_collect", time.perf_counter() - _t)
             led.chunks += 1
             led.staged_bytes += nbytes
             self._sample(torch)
-            led.per_chunk.append(
-                {
-                    "name": chunk.name,
-                    "bytes": nbytes,
-                    "seconds": round(time.perf_counter() - t_chunk, 3),
-                    "device_allocated": int(torch.cuda.memory_allocated()),
-                    "device_free": int(torch.cuda.mem_get_info()[0]),
-                    "host_rss": _rss_hwm_bytes(),
-                }
-            )
+            rss = rss_bytes()
+            row = {
+                "name": chunk.name,
+                "bytes": nbytes,
+                "seconds": round(time.perf_counter() - t_chunk, 3),
+                "device_allocated": int(torch.cuda.memory_allocated()),
+                "device_free": int(torch.cuda.mem_get_info()[0]),
+                "host_rss": _rss_hwm_bytes(),
+                # THE ANON/FILE SPLIT, per chunk. `host_rss` above is VmHWM, a high-water mark that
+                # can only go up and therefore cannot show a chunk giving memory back. These two are
+                # CURRENT, so a flat `rss_anon` across chunks is positive evidence that the live set
+                # really is one chunk and that VmHWM's growth is page cache.
+                "rss_anon": rss["RssAnon"],
+                "rss_file": rss["RssFile"],
+            }
+            row["split"] = {
+                k: round(tl.buckets[k] - b0.get(k, 0.0), 3)
+                for k in tl.buckets
+                if tl.buckets[k] - b0.get(k, 0.0) > 0.0005
+            }
+            led.per_chunk.append(row)
+            tl.row(row)
             self.log(
                 f"[stage-b] {chunk.describe()}: {nbytes / _GIB:.3f} GiB in "
                 f"{led.per_chunk[-1]['seconds']:.2f}s, device alloc "

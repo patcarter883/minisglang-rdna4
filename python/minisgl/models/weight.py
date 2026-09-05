@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import re
+import time
 from typing import (
     Any,
     Callable,
@@ -22,6 +23,7 @@ import torch
 from minisgl.distributed import get_dp_info, get_ep_rank, get_ep_size, get_tp_info, is_ep_enabled
 from minisgl.quant import nvfp4
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight, init_logger
+from minisgl.weights import ckpt_read
 from tqdm import tqdm
 
 logger = init_logger(__name__)
@@ -1284,10 +1286,16 @@ def qwen4_exp_nvfp4_prepass(files: "Sequence[str]") -> "tuple[set[str], FrozenSe
     packed E2M1 blob through as a bf16 matrix. On this checkpoint the pair is always co-located, but
     that is a property of one file layout, not of the format.
     """
+    from minisgl.weights.boot_timeline import timeline as _bt_timeline
+
+    _tl = _bt_timeline()
+    _t0 = time.perf_counter()
     ckpt_names: "set[str]" = set()
     for file in files:
+        _tl.note_file(file, "header")
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
             ckpt_names.update(f.keys())
+    _tl.tick("ckpt.nvfp4_prepass", time.perf_counter() - _t0)
     bases = {
         n[: -len(_MODELOPT_GLOBAL_SCALE)] for n in ckpt_names if n.endswith(_MODELOPT_GLOBAL_SCALE)
     }
@@ -1355,6 +1363,8 @@ def _load_qwen4_exp_weight(
     skips: Dict[str, int] = {}
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        from minisgl.weights.boot_timeline import tick as _tk
+
         if (mm := _gate_up_merge(native_key)) is not None:
             merged_key, slot = mm
             merge_buf.setdefault(merged_key, {})[slot] = tensor
@@ -1365,18 +1375,79 @@ def _load_qwen4_exp_weight(
             # NVFP4 packs along the INPUT K (weight_packed [N, K//2], folded weight_scale [N, K//16])
             # and the gate/up merge concatenates the OUTPUT N — so dim 0 for every leaf here, unlike
             # AWQ's K-major qweight/qzeros/scales, which merge on dim 1.
+            _t = time.perf_counter()
             native_key, tensor = merged_key, torch.cat(parts, dim=0)
+            _tk("ckpt.gate_up_cat", time.perf_counter() - _t)
         if (einfo := _get_expert_stack_info(native_key)) is not None:
             packed_key, idx = einfo
+            _t = time.perf_counter()
             stacked = expert_buf.add(packed_key, idx, tensor, config.num_experts)
+            _tk("ckpt.expert_stack_add", time.perf_counter() - _t)
             if stacked is None:
                 return
             yield packed_key, stacked
         else:
             yield native_key, tensor
 
+    # BOOT ATTRIBUTION. These are bare dict adds against a `perf_counter()` delta (see
+    # `weights/boot_timeline.py`): this loop runs ~2.2e5 times on a 48-layer boot, so a context
+    # manager or a formatted log per tensor would itself be a measurable term. The buckets partition
+    # the per-tensor pipeline — header read, tensor read, NVFP4 scale fold, remap, TP shard, H2D,
+    # concat/merge, expert stack — which is the split that says where 105-174 MB/s goes against a
+    # 4.9 GB/s drive.
+    from minisgl.weights.boot_timeline import count as _bt_count
+    from minisgl.weights.boot_timeline import tick as _bt_tick
+    from minisgl.weights.boot_timeline import timeline as _bt_timeline
+
+    # THE READ. `ckpt_read.safe_open` is a routing POLICY, not a second reader: expert shards
+    # (<= WHOLE_FILE_CAP — 64.8 GiB of this checkpoint's 72.6) are read with one O_DIRECT `preadv`
+    # into ONE process-wide REUSED buffer, and the four 3.4-10.0 GiB `model-bf16-*` body shards stay
+    # on safetensors' mmap, byte-for-byte the reader they always had.
+    #
+    # MEASURED [BOOT-2026-09-05], 48-layer TP=2, FOUR boots (n=2 per arm), two worktrees, strictly
+    # sequential, one job on the box (docs/measurements/BOOT_DEFECT.md): boot 506.6 -> 300.1 s
+    # (1.69x), weight_load 355.5 -> 140.6 s, ckpt.h2d 243.5 -> 33.2 s, ckpt.shard 42.2 -> 8.1 s,
+    # major faults 56-60 M -> 24 M. Identical weights, proven byte-exactly: blake2b over 1990
+    # tensors / 70.44 GiB per rank read through the device pointer, same digest on all four boots.
+    #
+    # IT IS THE READ. The single-leg r3 verdict claimed otherwise ("the two largest wins are not
+    # reads: post_load 106.1 -> 7.0, graph_capture 84.1 -> 33.6") and n=2 refutes it: post_load is
+    # 6.67 and 6.72 s on BOTH before legs, and graph_capture does not improve (68.79/53.62 before vs
+    # 68.65/70.45 after). What actually happens is that `ckpt.h2d` is a COPY whose mmap'd source
+    # pages used to be faulted in DURING the copy, so the read was billed to it; O_DIRECT moves the
+    # same work into `ckpt.safe_open` (0.5 -> 19.0 s) and the faults disappear.
+    #
+    # On this pool, one cold 337.7 MiB shard per leg: mmap 4 KiB walk 621.7-627.0 MiB/s costing
+    # +0.33 GiB of page cache AND +0.33 GiB of ARC, O_DIRECT into the reused buffer 5122.9 MiB/s
+    # costing NOTHING.
+    #
+    # REAL COSTS, not netted out: `ckpt.nvfp4_prepass` 2.2 -> 21.1 s and `ct_sign_verify` 0.1 ->
+    # 8.4 s. Both still read through mmap and were cheap only while something else left the ARC warm.
+    #
+    # WHAT ROUND 2'S 3.5x LOSS TAUGHT (docs/measurements/BOOT_TIMELINE_2026-09-06/r2/): a FRESH
+    # buffer per shard is NOT this change. It made the read 5x faster and the boot 3.5x slower,
+    # because 64.8 GiB of anonymous churn is reclaimed by COMPRESSION where file-backed pages are
+    # reclaimed by being dropped. REUSE is what makes O_DIRECT viable — and reuse is a correctness
+    # hazard, because `get_tensor` hands out zero-copy views of the shared buffer, so a view that
+    # outlives its shard would read the NEXT shard's bytes under this shard's name: an expert
+    # dequantized against another expert's scale, which is plausible text and no crash. The two
+    # halves of the contract are marked below, and `_SharedReadBuffer.acquire` proves the first one
+    # mechanically at every refill rather than trusting this comment.
+    _bt_tl = _bt_timeline()
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+        # CONTRACT, HALF 1 — no host view of the PREVIOUS shard may be alive when this one is read.
+        # These are the loop's only host-side tensor locals (`raw`, `_cat`, and everything in
+        # `concat_buf`/`merge_buf`/`expert_buf` is already on the device), and a generator frame
+        # keeps its locals bound across the `for file` boundary, so without this the last tensor of
+        # the previous shard is still exported when the next `acquire()` runs.
+        _sc = tens = sharded = leaves = override = None
+        _t = time.perf_counter()
+        _fh = ckpt_read.safe_open(file, framework="pt", device="cpu")
+        _bt_tick("ckpt.safe_open", time.perf_counter() - _t)
+        _bt_count("ckpt.file_bytes", os.path.getsize(file))
+        _bt_count("ckpt.files_opened")
+        _bt_tl.note_file(file, "tensors")
+        with _fh as f:
             for ckpt_name in list(f.keys()):
                 # ONE checkpoint key can produce TWO leaves. An NVFP4 routed expert now keeps its
                 # scale in the checkpoint's own TWO levels — the e4m3 block scale byte-verbatim plus
@@ -1396,10 +1467,25 @@ def _load_qwen4_exp_weight(
                 base, _, field = ckpt_name.rpartition(".")
                 if base in nvfp4_ckpt_bases and field in ("weight_scale", "weight_scale_2"):
                     buf = fold_buf.setdefault(base, {})
-                    buf[field] = f.get_tensor(ckpt_name)
+                    _t = time.perf_counter()
+                    _sc = f.get_tensor(ckpt_name)
+                    _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
+                    _bt_count("ckpt.get_tensor_calls")
+                    _bt_count("ckpt.get_tensor_bytes", _sc.numel() * _sc.element_size())
+                    # CONTRACT, HALF 2 — `fold_buf` is the ONE place a `get_tensor` result is
+                    # retained past the call that produced it: it parks a `weight_scale` until its
+                    # `weight_scale_2` arrives. On this checkpoint the pair is always co-located in
+                    # one shard, but that is a property of one repack (see `qwen4_exp_nvfp4_prepass`,
+                    # which exists because another Qwen NVFP4 repack splits every pair across
+                    # shards), so the retention is made SAFE rather than assumed-not-to-happen: the
+                    # clone costs ~1/8 of the packed bytes and buys a fold that cannot read the next
+                    # shard's buffer.
+                    buf[field] = _sc.clone()
+                    _sc = None
                     if len(buf) < 2:
                         continue
                     del fold_buf[base]
+                    _t = time.perf_counter()
                     leaves = list(
                         nvfp4.nvfp4_leaf_scales(
                             base,
@@ -1409,8 +1495,11 @@ def _load_qwen4_exp_weight(
                             device=device,
                         )
                     )
+                    _bt_tick("ckpt.nvfp4_leaf_scales", time.perf_counter() - _t)
                 for name, override in leaves:
+                    _t = time.perf_counter()
                     plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+                    _bt_tick("ckpt.remap", time.perf_counter() - _t)
                     if plan[0] == "skip":
                         skips[plan[1]] = skips.get(plan[1], 0) + 1
                         continue
@@ -1437,10 +1526,27 @@ def _load_qwen4_exp_weight(
                     # full-width tensor on its card. An `override` (an NVFP4 leaf scale) is already
                     # full-width — both levels are read whole and the shard applies to the result,
                     # so no scale is folded/split twice and none from a partial.
-                    tens = override if override is not None else f.get_tensor(name)
-                    raw = _shard_qwen4_exp(
-                        name, tens, tp_info.rank, tp_info.size, config
-                    ).to(device)
+                    if override is not None:
+                        tens = override
+                    else:
+                        _t = time.perf_counter()
+                        tens = f.get_tensor(name)
+                        _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
+                        _bt_count("ckpt.get_tensor_calls")
+                        _bt_count("ckpt.get_tensor_bytes", tens.numel() * tens.element_size())
+                    _t = time.perf_counter()
+                    sharded = _shard_qwen4_exp(name, tens, tp_info.rank, tp_info.size, config)
+                    _t2 = time.perf_counter()
+                    _bt_tick("ckpt.shard", _t2 - _t)
+                    # THE H2D. One `.to(device)` per LEAF — ~2.2e5 of them on a 48-layer boot, each a
+                    # pageable copy of a few hundred KiB. Timed on its own because "the checkpoint is
+                    # read slowly" and "the checkpoint is copied to the card in 200k pieces" are
+                    # different defects with different fixes, and the byte counter next to it prices
+                    # the transfer against PCIe.
+                    raw = sharded.to(device)
+                    _bt_tick("ckpt.h2d", time.perf_counter() - _t2)
+                    _bt_count("ckpt.h2d_calls")
+                    _bt_count("ckpt.h2d_bytes", raw.numel() * raw.element_size())
                     if plan[0] == "direct":
                         yield from emit(plan[1], raw)
                         continue
@@ -1450,7 +1556,10 @@ def _load_qwen4_exp_weight(
                         continue
                     parts = [concat_buf[merged][i] for i in range(n_slots)]
                     del concat_buf[merged]
-                    yield from emit(merged, torch.cat(parts, dim=cat_dim))
+                    _t = time.perf_counter()
+                    _cat = torch.cat(parts, dim=cat_dim)
+                    _bt_tick("ckpt.gdn_concat", time.perf_counter() - _t)
+                    yield from emit(merged, _cat)
 
     # Only shards that were actually opened contribute to this ledger; when the n-gram table lives in
     # its own directory (the normal deployment) its 129 keys are never seen at all, which is why the

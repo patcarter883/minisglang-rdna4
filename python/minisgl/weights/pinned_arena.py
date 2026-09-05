@@ -177,18 +177,38 @@ class ArenaRegion:
         return t if shape is None else t.view(*shape)
 
 
-def verify_offsets(chunk_bytes: int) -> Tuple[int, ...]:
-    """Head, tail and page-aligned interior sample points.
+#: Page-aligned 4-byte probes per chunk, written and re-read THROUGH THE DEVICE POINTER.
+#
+# Was 8. It is 512 because the whole-chunk device fill that used to sit alongside it has been
+# retired (see `attach()`), and the honest way to retire an exhaustive check is to spend a fraction
+# of what it cost on making the sampled one much less sampled — not to pocket the whole saving.
+#
+# THE PRICE, measured on this box: a probe is one 4-byte `hipMemcpy` through the device pointer,
+# ~15-30 us. 512 probes x 18 chunks x 2 (the stamp and the resweep) is ~0.6-1.1 s against the
+# 171.8 s the full fill cost. Coverage per chunk goes from 40 B to 2 KiB and — the part that
+# matters — from one probe per 172 MiB to one per 2.7 MiB, so a mis-mapped span now has to be
+# smaller than 2.7 MiB to hide from the resweep.
+VERIFY_PROBES = 512
+
+
+def verify_offsets(chunk_bytes: int, probes: int = VERIFY_PROBES) -> Tuple[int, ...]:
+    """Head, tail and evenly spread page-aligned interior sample points.
 
     Head+tail alone cannot see a chunk whose middle landed on someone else's physical pages — the
-    exact P6 failure shape — so the interior is sampled too. Ten 4-byte probes cost ~0.1 ms/chunk.
+    exact P6 failure shape — so the interior is sampled too, and densely: see `VERIFY_PROBES`.
+
+    Page-aligned on purpose. Physical-page aliasing is a PAGE-granular event, so probing at page
+    boundaries is the granularity the failure actually has. The head (0) and tail
+    (`chunk_bytes - 4`) are added unconditionally: a mapping that is short or long at either end is
+    the other shape this catches, and neither lands on the even spread.
     """
+    n = max(1, int(probes))
     offs = {0}
-    for k in range(1, 8):
-        o = (chunk_bytes * k // 8) & ~(PAGE - 1)
+    for k in range(1, n):
+        o = (chunk_bytes * k // n) & ~(PAGE - 1)
         if 0 < o <= chunk_bytes - 4:
             offs.add(o)
-    offs.add(chunk_bytes - 4)
+    offs.add(max(0, chunk_bytes - 4))
     return tuple(sorted(offs))
 
 
@@ -330,7 +350,10 @@ class PinnedWeightArena:
         hip: Any = None,
         label: str = "weights",
         selftest_default: bool = True,
-        first_touch_default: bool = True,
+        # OFF. See attach(): the "drivers commit lazily" premise is refuted on this box (measured —
+        # hipHostMalloc commits eagerly), and the fill cost 171.8 s of the 618.3 s 48-layer TP=2
+        # boot to write bytes Stage B immediately overwrites.
+        first_touch_default: bool = False,
     ) -> None:
         # attach()'s defaults, so the resolved settings survive the trip from
         # `resolve_arena_settings()` through `create_pinned_weight_arena()` to the one function that
@@ -493,11 +516,43 @@ class PinnedWeightArena:
     def attach(self, *, selftest: bool | None = None, first_touch: bool | None = None) -> None:
         """Pin every chunk, prove each one stores what was written, then resweep them all.
 
-        `first_touch=True` fills each whole chunk through the DEVICE pointer. Two reasons, both
-        load-bearing: drivers commit pages lazily, so a `MemAvailable` delta sampled at allocation
-        time can be ~0 and prove nothing; and the fill is device-issued, so it exercises the page
-        table the kernels will walk rather than the CPU mapping. Cost is ~1 chunk-size of PCIe per
-        chunk (~70 ms per 2 GiB on card 0, ~145 ms on card 1).
+        `first_touch=True` fills each whole chunk through the DEVICE pointer. **It now defaults OFF,
+        because the premise it was built on was measured and is false on this box.**
+
+        The two stated reasons were: (1) drivers commit pages lazily, so a `MemAvailable` delta
+        sampled at allocation time can be ~0 and prove nothing; and (2) the fill is device-issued, so
+        it exercises the page table the kernels will walk. The quoted price was "~70 ms per 2 GiB on
+        card 0". In the 48-layer TP=2 boot it cost **171.8 s on rank 0 and 175.7 s on rank 1** —
+        24.12 GiB per rank at 143 MiB/s, 190x off the quoted figure and the single largest
+        attributed cost in the entire 618.3 s boot, ahead of `ckpt.h2d` (116.7 s) and
+        `graph_capture` (103.0 s).
+
+        REASON (1) IS REFUTED, MEASURED (`tools/offload/attach_touch_probe.py`, 36 chunks / 48.23
+        GiB, the same total this box pins at TP=2). Arm B allocated each chunk and then memset it
+        FROM THE CPU before the device fill: the CPU memset ran in **0.03 s per 1.372 GiB chunk =
+        ~45 GB/s**, i.e. every page was already resident and not one fault was taken, and
+        `MemAvailable` fell by a full chunk at `hipHostMalloc` time, before anything touched the
+        memory. `hipHostMalloc` commits eagerly here. There is nothing for a first touch to commit,
+        and the capacity gate's `MemAvailable` reading was never blind.
+
+        The same probe also shows the fill is not the thing being timed. Arm A (what shipped) ran
+        the fill at 27,000 MiB/s — PCIe speed, exactly the "~70 ms per 2 GiB" the old comment
+        promised — on every chunk taken while the box had memory, and collapsed to 50-250 MiB/s on
+        precisely the chunks whose row also shows GiB of `pswpout`. The 171.8 s was the arena
+        waiting out the box's reclaim of 48.24 GiB, with 24 GiB of PCIe writes layered on top that
+        Stage B then overwrites with weights. Pre-faulting does not help: arm B, which did strictly
+        more work, came out 33% WORSE (333.7 s vs 252.7 s) because it ran second, on a box arm A had
+        already driven deeper into zram.
+
+        REASON (2) SURVIVES AND IS KEPT, at 1/170th of the cost. With `first_touch=False`,
+        `_write_fingerprints` stamps and `selftest_light` re-reads every probe offset THROUGH THE
+        DEVICE POINTER — same device-issued write, same resweep-after-all-chunks ordering that is
+        what actually detects aliasing (see `selftest_light`) — and `VERIFY_PROBES` was raised 8 ->
+        512 so that path now covers one probe per 2.7 MiB instead of one per 172 MiB. The exact,
+        unsampled `_verify_chunk_structure` overlap/alignment check runs unconditionally either way.
+
+        Left switchable (`MINISGL_WEIGHT_ARENA_FIRST_TOUCH=1`) as a DIAGNOSTIC, not as a gate: the
+        default is the shipped behaviour on every path, so nothing here is env-gated on merge.
 
         `None` (the default for both) means "use what the constructor was given", which is what
         `create_pinned_weight_arena()` resolved from the environment. Before that, the factory read
@@ -545,6 +600,9 @@ class PinnedWeightArena:
     def _attach_pinning(self, hip: Any, *, selftest: bool, first_touch: bool) -> None:
         """The body of `attach()`. Split out only so `attach()` can own the `finally` that restores
         the HIP device and guarantees rollback; every invariant lives here."""
+        from .boot_timeline import count as _bt_count
+        from .boot_timeline import tick as _bt_tick
+
         assert self.plan is not None
         t_start = time.perf_counter()
         hip.set_device(self.device_index)
@@ -619,6 +677,13 @@ class PinnedWeightArena:
                 self._rollback(hip)
                 raise
             t1 = time.perf_counter()
+            # SPLIT, into the boot timeline. `pin_seconds`/`touch_seconds` have always been recorded
+            # per chunk and never surfaced anywhere a boot report could read them, so "the arena pin
+            # took 63 s" has never been separable into `hipHostMalloc` (kernel page pinning, which
+            # under memory pressure means reclaim and swap) and the device-issued first-touch fill
+            # (PCIe). They are different problems: one is a box-state problem, the other is a
+            # ~70 ms/2 GiB cost this code chose to pay.
+            _bt_tick("arena.host_alloc", t1 - t0)
 
             fp = chunk_fingerprint(self.rank, self.device_index, i)
             t2 = t1
@@ -631,6 +696,7 @@ class PinnedWeightArena:
                     self._rollback(hip)
                     raise
                 t2 = time.perf_counter()
+                _bt_tick("arena.first_touch", t2 - t1)
             self.chunks.append(
                 ArenaChunk(
                     index=i,
@@ -650,10 +716,15 @@ class PinnedWeightArena:
         # `n_chunks == 0` is the legitimate empty arena (§6.2: an all-device plan must cost nothing).
         # It is skipped explicitly rather than allowed to "pass" a self-test over zero chunks — those
         # are different statements and only one of them is evidence.
+        _bt_count("arena.pinned_bytes", self.plan.n_chunks * self.chunk_bytes)
+        _bt_count("arena.chunks", self.plan.n_chunks)
+
         if selftest and self.plan.n_chunks > 0:
+            _t = time.perf_counter()
             if not first_touch:
                 self._write_fingerprints(hip)
             res = self.selftest_light()
+            _bt_tick("arena.selftest", time.perf_counter() - _t)
             if not res.passed:
                 self._rollback(hip)
                 raise ArenaSelfTestError(

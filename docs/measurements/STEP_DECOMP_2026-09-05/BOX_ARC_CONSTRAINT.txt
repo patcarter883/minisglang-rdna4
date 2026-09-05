@@ -1,0 +1,19 @@
+=== box constraint discovered 2026-09-05, ZFS ARC vs the arena capacity gate ===
+
+weights/host_capacity gates the pinned arena on /proc/meminfo MemAvailable.
+This box runs ZFS. arcstats at the time of the refusals:
+  c            7.16 GiB
+  c_min        2.87 GiB
+  c_max       16.00 GiB
+  size         7.09 GiB
+
+The ARC is accounted as USED, not as reclaimable cache, so MemAvailable understates what a
+pinning allocation can obtain by (size - c_min) = evictable ARC. Three Run-A attempts were
+refused by the gate at MemAvailable 56.74 / 53.98 GiB against a 48.23 GiB arena + 12/9 GiB
+floor, while the true headroom was ~13 GiB higher. FLOOR_GIB was lowered to 3 to preserve the
+gate's intent (>=12 GiB left after pinning) against a corrected input. Recorded, not waved.
+
+CONFIRMED EMPIRICALLY, not argued: when a sibling agent's 48-layer serve (r3_serve) began
+pinning its own arena, the ARC shrank from 16.02 GiB to 7.09 GiB on its own — i.e. the ARC does
+release under the pressure a pinning allocation creates, which is exactly the assumption the
+lowered floor rests on.

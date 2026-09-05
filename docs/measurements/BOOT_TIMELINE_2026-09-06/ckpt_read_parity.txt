@@ -1,0 +1,12 @@
+model=/model  196 shards, checking 4
+  layer-00000-experts-0000-0127.safetensors         337.7 MiB  keys= 1536  mmap  1907.0 MiB/s   read()  1560.2 MiB/s  sha 740a7598b54cfb9f
+  layer-00000-experts-0128-0255.safetensors         337.7 MiB  keys= 1536  mmap  1335.6 MiB/s   read()  1719.5 MiB/s  sha 22d04254788b0ecd
+  model-bf16-00011.safetensors                    10230.4 MiB  keys=  821  mmap   761.7 MiB/s   read()   647.3 MiB/s  sha b998c6343ef341f5
+  model-bf16-00012.safetensors                     3513.0 MiB  keys=  170  mmap   722.1 MiB/s   read()   636.5 MiB/s  sha 93b56cab430ecb5d
+
+4063 tensors compared byte-for-byte over 14.08 GiB
+mmap  (safe_open + touch):   18.73 s =    770.0 MiB/s
+read() (ReadSafeOpen)    :   21.74 s =    663.3 MiB/s
+speedup 0.86x
+
+PARITY PASS: identical keys(), order, dtypes, shapes and bytes

@@ -1,0 +1,16 @@
+model=/model  192 expert shards, 6 cold shards per leg
+raw read() of one untouched shard, for reference:
+  layer-00047-experts-0384-0511.safetensors  337.7 MiB in 0.240 s = 1407.2 MiB/s (no tensors built, no touch)
+  A_mmap_lazy              2025.0 MiB in   1.205 s =   1680.5 MiB/s
+  B_read_into_anon         2025.0 MiB in   1.831 s =   1105.8 MiB/s
+Traceback (most recent call last):
+  File "/engine/tools/offload/ckpt_read_rate.py", line 119, in <module>
+    tot += fn(os.path.join(MODEL, s))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/tools/offload/ckpt_read_rate.py", line 89, in <lambda>
+    ("C_mmap_WILLNEED      ", lambda p: leg_mmap(p, MADV_WILLNEED)),
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/engine/tools/offload/ckpt_read_rate.py", line 70, in leg_mmap
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: underlying buffer is not writable

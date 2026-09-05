@@ -227,14 +227,22 @@ class Engine:
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
+        # BOOT ATTRIBUTION (`weights/boot_timeline.py`). Every `with _bt.phase(...)` below is two
+        # `perf_counter()` calls plus four small reads, against phases measured in seconds — so it
+        # runs unconditionally rather than behind a flag. Boot on this model takes 519-871 s and,
+        # before this, only the Stage-B slice of it had ever been timed; the other 352-593 s was dark.
+        from minisgl.weights import boot_timeline as _bt
+
+        with _bt.phase("init_communication"):
+            self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
+        with _bt.phase("model_construct_meta"):
+            with torch.device("meta"), torch_dtype(config.dtype):
+                self.model = create_model(config.model_config)
         # Weight offload, step 1 of 4: resolve the plan from the META-BUILT model — after the build
         # (which allocates ZERO bytes on the card) and before anything is loaded, so an unsatisfiable
         # plan is still a config error in seconds rather than a 90-second OOM. Inert, at zero device
@@ -251,7 +259,10 @@ class Engine:
         # under-reserves the arena ~4x, in the direction that makes an infeasible plan look feasible.
         # The THIRD tier, built BEFORE the plan is resolved because the plan must not see the layers
         # it takes. Returns (None, ()) unless --weight-offload-stream-layers asked for it.
-        self._woff_stream, stream_layers = self._build_weight_stream_tier(config)
+        with _bt.phase("weight_stream_tier_build"):
+            self._woff_stream, stream_layers = self._build_weight_stream_tier(config)
+        _bt_plan = _bt.phase("weight_plan_resolve")
+        _bt_plan.__enter__()
         self._woff = StageASession.begin(
             config,
             probe=self._woff_mem_probe,
@@ -282,6 +293,8 @@ class Engine:
             # tiny gloo all_gather_object at boot, over the TP CPU group built at :213.
             agreement_group=self.tp_cpu_group,
         )
+        _bt_plan.__exit__()
+
         def _mem_probe(tag: str) -> None:
             """Localize where DEVICE memory goes that torch does not account for. `used` is the true
             device-wide draw (what the KV sizing bills as `model`); `reserved` is everything torch
@@ -307,7 +320,8 @@ class Engine:
         # failure in seconds instead of after a full load. It takes ZERO device bytes — asserted at
         # seal(), never assumed, because Phase 0 caught the driver reporting host memory that was
         # actually VRAM.
-        self._woff.attach()
+        with _bt.phase("arena_pin_attach"):
+            self._woff.attach()
         #: `stage_b.ChunkedLoadLedger` when the load was chunked, None when it was one-shot. Always
         #: present so "was this serve chunked?" is a readable fact rather than a `hasattr`.
         self.stage_b_ledger = None
@@ -315,10 +329,13 @@ class Engine:
         # into: read-fill-finalize-PLACE one chunk at a time, so the peak live set is one chunk
         # instead of one checkpoint. Falls back to the one-shot load for every other model, and for
         # this one when offload is not configured — the fallback is the shipped path, unchanged.
-        if not self._load_weight_chunked(config):
-            self.model.load_state_dict(self._load_weight_state_dict(config))
-            _mem_probe("after load_state_dict")
-            self.model.post_load()  # finalize weights (e.g. quantized layout conversion)
+        with _bt.phase("weight_load"):
+            if not self._load_weight_chunked(config):
+                with _bt.phase("oneshot_read_and_fill"):
+                    self.model.load_state_dict(self._load_weight_state_dict(config))
+                _mem_probe("after load_state_dict")
+                with _bt.phase("oneshot_post_load"):
+                    self.model.post_load()  # finalize weights (quantized layout conversion)
         _mem_probe("after post_load")
         # THE ONE DECISION post_load MAKES THAT NO TENSOR RECORDS, checked across the ranks that made
         # it independently. A compressed-tensors int4 container decides its packed sign convention
@@ -334,9 +351,10 @@ class Engine:
         from minisgl._hip_engage import engaged
         from minisgl.quant.method import verify_ct_sign_across_ranks
 
-        self.ct_sign_decisions = verify_ct_sign_across_ranks(
-            self.model, self.tp_cpu_group, config.tp_info.size, config.tp_info.rank
-        )
+        with _bt.phase("ct_sign_verify"):
+            self.ct_sign_decisions = verify_ct_sign_across_ranks(
+                self.model, self.tp_cpu_group, config.tp_info.size, config.tp_info.rank
+            )
         if self.ct_sign_decisions:
             engaged(f"quant.ct_sign_cross_rank[tp{config.tp_info.size}]")
         # Weight offload, steps 3-4: host-placed containers are copied into the arena and their
@@ -348,9 +366,10 @@ class Engine:
         # already where they belong, and reallocating them would hold two copies live at once.
         # seal() closes the mapping window (rule R1); a later mapping would be invisible both to
         # this sizing and to Scheduler._prefill_budget_now.
-        self._woff.note_loaded()
-        self._woff.bind(self.model)
-        self._woff.seal()
+        with _bt.phase("weight_offload_bind_seal"):
+            self._woff.note_loaded()
+            self._woff.bind(self.model)
+            self._woff.seal()
         # AFTER seal, which is the moment residency stops changing. The hook is a forward-path
         # wrapper, not a residency change, but installing it inside the window would put file I/O in
         # the middle of the gates that are still measuring the window's device cost.
@@ -359,15 +378,17 @@ class Engine:
             _mem_probe("after weight offload")
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        with _bt.phase("kv_sizing"):
+            self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.kv_dtype,
-        )
+        with _bt.phase("kv_pool_alloc"):
+            self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                page_size=config.page_size,
+                device=self.device,
+                dtype=self.kv_dtype,
+            )
 
         # ======================= SWA (sliding-window) ring KV pool ========================
         # A SWA-hybrid model (Laguna) keeps its FULL-attention layers in the main pool above (sized by
@@ -465,8 +486,9 @@ class Engine:
             # Settle causal_conv1d's per-process in-place batch_ptr autotune on a private
             # scratch BEFORE the first real batch (3c-3) — an unwarmed first prefill is
             # op-sequence-sensitive (NaN/0/OOM). Writes no real state.
-            for gdn in self.model.iter_gdn_layers():
-                gdn.warmup_conv(_GDN_WARMUP_TOKENS)
+            with _bt.phase("gdn_conv_warmup"):
+                for gdn in self.model.iter_gdn_layers():
+                    gdn.warmup_conv(_GDN_WARMUP_TOKENS)
             logger.info_rank0(
                 f"GDN state: {mc.num_gdn_layers} layers x {config.max_running_req + 2} slots "
                 f"(conv_dim={mc.gdn_conv_dim}); conv warmup done"
@@ -522,15 +544,16 @@ class Engine:
         if getattr(mc, "ple_layer_ids", ()) and hasattr(self.model, "ple_block"):
             from minisgl.ple import build_ple_runtime
 
-            self.ctx.ple = self.ple_runtime = build_ple_runtime(
-                model=self.model,
-                config=mc,
-                model_path=config.model_path,
-                num_slots=config.max_running_req + 2,  # == the GDNStateCache slot count above
-                max_tokens=_ple_stage_tokens(config),
-                device=self.device,
-                dtype=self.dtype,
-            )
+            with _bt.phase("ple_runtime_build"):
+                self.ctx.ple = self.ple_runtime = build_ple_runtime(
+                    model=self.model,
+                    config=mc,
+                    model_path=config.model_path,
+                    num_slots=config.max_running_req + 2,  # == the GDNStateCache slot count above
+                    max_tokens=_ple_stage_tokens(config),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
             logger.info_rank0(
                 f"PLE runtime: n-gram table open, {config.max_running_req + 2} state slots, "
                 f"staging {_ple_stage_tokens(config)} tokens x {mc.ple_embed_dim} "
@@ -544,7 +567,8 @@ class Engine:
         # arena is HOST memory and does not come out of the device budget; the only device cost is
         # the staging ring, which each state cache allocates in its own ctor and which
         # _rec_snapshot_store_bytes already reserved.
-        self._build_snapshot_host_arena(config)
+        with _bt.phase("snapshot_host_arena"):
+            self._build_snapshot_host_arena(config)
 
         # ======================= CAM editable-memory (Option B, Phase 0) ========================
         # Build the CAM store+tap+router IN THE BACKEND, reusing the SERVED model's weights (no
@@ -628,11 +652,12 @@ class Engine:
         )
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
-        )
-        if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+        with _bt.phase("backends_init"):
+            self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+                config.attention_backend, config.model_config
+            )
+            if config.model_config.is_moe:
+                self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
         # real_vocab_size fences the untrained padded lm_head tail off from sampling (see Sampler).
@@ -676,6 +701,8 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         # GDN-hybrid models capture too: per-seq recurrent-state slots are threaded through static
         # buffers (GDNGraphCapture), so the decode graph replays against the live conv/ssm state.
+        _bt_cap = _bt.phase("graph_capture")
+        _bt_cap.__enter__()
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -697,10 +724,12 @@ class Engine:
             # attn/GDN/CCA/CAM metadata and nothing else. None for every other model.
             ple=self.ple_runtime,
         )
+        _bt_cap.__exit__()
         # Block-diffusion canvas graphs. Unlike the spec-verify families this needs nothing from the
         # scheduler (no proposer, no aux-capture layers) — the shape is fixed by the checkpoint's
         # canvas_length — so it is captured here, beside the decode graphs, on the engine stream.
-        self._capture_canvas_graphs(config)
+        with _bt.phase("canvas_capture"):
+            self._capture_canvas_graphs(config)
         # Weight offload, POST-capture gate. `seal()` above ran at :284, before a single graph was
         # captured, so the one thing `ArenaMemPool.assert_clean()` cannot have seen there is its own
         # `alloc_during_capture` branch — the counter only moves while a HIP capture is in flight,
@@ -710,7 +739,16 @@ class Engine:
         # because hipMalloc is illegal during capture, and returns NULL for torch to dereference.
         # Re-gating here is what turns both into a boot error. Inert on every serve that does not
         # offload. NOT the last capture in the process — see the method's docstring.
-        self.verify_weight_arena_after_capture()
+        with _bt.phase("verify_arena_after_capture"):
+            self.verify_weight_arena_after_capture()
+        # THE REPORT. Emitted at the end of every boot, not behind a flag: it is ~30 log lines once
+        # per process, and an instrument that has to be switched on is never on for the run that
+        # turned out to matter. `MINISGL_BOOT_TIMELINE_JSON` additionally writes the machine-readable
+        # form (rank-suffixed) for a harness to diff across configurations.
+        for _line in _bt.timeline().describe().splitlines():
+            logger.info_rank0(_line)
+        if (_p := _bt.timeline().dump()) is not None:
+            logger.info_rank0(f"[boot-timeline] wrote {_p}")
 
     def verify_weight_arena_after_capture(self) -> None:
         """Re-gate the weight arena on the far side of graph capture. Idempotent, any rank.
@@ -1010,9 +1048,15 @@ class Engine:
         from minisgl.models import chunked_weight_source
         from minisgl.weights.stage_b import ChunkedWeightLoader
 
-        source = chunked_weight_source(
-            config.model_path, self.device, spec_algorithm=config.spec_algorithm
-        )
+        from minisgl.weights import boot_timeline as _bt
+
+        # SEPARATE from `stage_b_run`: this enumerates the 196 shards and runs the checkpoint-wide
+        # NVFP4 header pre-pass (196 `safe_open`s). That is real seconds before a single tensor is
+        # read, and it is charged to the wrong phase if it is folded into the chunk loop.
+        with _bt.phase("stage_b_enumerate_prepass"):
+            source = chunked_weight_source(
+                config.model_path, self.device, spec_algorithm=config.spec_algorithm
+            )
         if source is None:
             return False
         chunks, stream = source
@@ -1022,8 +1066,10 @@ class Engine:
             sink=self._woff.chunked_sink(),
             log=logger.debug_rank0,
         )
-        ledger = loader.run(chunks, stream)
-        self.model.post_load()
+        with _bt.phase("stage_b_run"):
+            ledger = loader.run(chunks, stream)
+        with _bt.phase("stage_b_trailing_post_load"):
+            self.model.post_load()
         # KEPT, and MARKED. A boot log proves nothing an A/B can diff, and this repo's rule is that a
         # vanished arm shows up as a missing `engaged()` line rather than as a number nobody notices.
         # The ledger is what a harness asserts on: chunks, keys filled, and the peak device

@@ -1,0 +1,27 @@
+=== box BEFORE L48_r3_after 2026-09-06T03:04:51+10:00 chunk=1372MiB floor=4GiB args='--tp 2 --layers 48 --device-gb 8.1 --host-gb 28.0 --cuda-graph-max-bs 2' ===
+ 03:04:51 up 35 days, 10:53,  1 user,  load average: 2.13, 5.77, 5.07
+               total        used        free      shared  buff/cache   available
+Mem:              91          18          72           0           2          73
+Swap:             53          27          26
+MemFree:        75807776 kB
+MemAvailable:   77110904 kB
+SwapFree:       27874752 kB
+ARC 1.54 GiB
+--- non-infra containers (must be none) ---
+GPU    STATE  HOLDER
+0      FREE   -
+1      FREE   -
+=== box AFTER L48_r3_after 2026-09-06T03:09:29+10:00 chunk=1372MiB floor=4GiB args='--tp 2 --layers 48 --device-gb 8.1 --host-gb 28.0 --cuda-graph-max-bs 2' ===
+ 03:09:29 up 35 days, 10:58,  1 user,  load average: 7.25, 6.98, 5.75
+               total        used        free      shared  buff/cache   available
+Mem:              91          17          72           0           1          73
+Swap:             53          27          26
+MemFree:        76537240 kB
+MemAvailable:   77450364 kB
+SwapFree:       27351144 kB
+ARC 1.74 GiB
+--- non-infra containers (must be none) ---
+GPU    STATE  HOLDER
+0      FREE   -
+1      FREE   -
+exit=0

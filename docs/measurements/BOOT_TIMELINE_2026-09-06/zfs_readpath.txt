@@ -1,0 +1,7 @@
+=== ZFS read-path legs, one cold shard each ===
+read() 4MiB buffered            337.7 MiB in   0.153 s =   2209.4 MiB/s   arc demand hits    1,272 misses       64   layer-00040-experts-0000-0127.safetensors
+O_DIRECT preadv 4MiB            337.7 MiB in   0.113 s =   2978.8 MiB/s   arc demand hits        5 misses        2   layer-00041-experts-0000-0127.safetensors
+mmap bulk 16MiB slices          337.7 MiB in   0.613 s =    550.9 MiB/s   arc demand hits   91,855 misses      128   layer-00042-experts-0000-0127.safetensors
+mmap byte-walk 4K stride        337.7 MiB in   0.566 s =    596.9 MiB/s   arc demand hits   86,654 misses        2   layer-00043-experts-0000-0127.safetensors
+=== WARM repeat of leg 1's shard (ARC now holds it) ===
+read() 4MiB WARM                337.7 MiB in   0.053 s =   6380.8 MiB/s   arc demand hits    2,880 misses        0   layer-00040-experts-0000-0127.safetensors
