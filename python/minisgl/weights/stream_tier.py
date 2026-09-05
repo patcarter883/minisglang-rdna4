@@ -233,6 +233,32 @@ class ExpertStreamTier:
             return "stream(donor)"
         return "stream"
 
+    @staticmethod
+    def _poison(t: torch.Tensor, idx: "torch.Tensor | None" = None) -> None:
+        """Write NaN into `t` (or into rows `idx` of dim 0), for any float dtype torch supports.
+
+        WHY THIS IS NOT JUST `fill_(nan)` / `index_fill_(0, idx, nan)`. `float8_e4m3fn` — which the
+        NVFP4 containers now hold their block scale in — has `fill_` but NOT `index_fill_`
+        ("index_fill_cpu not implemented for 'Float8_e4m3fn'"). The per-expert poison in `stage()` is
+        the one that matters: it is what makes reading an UNSTAGED expert produce NaN instead of the
+        previous layer's weights, i.e. loud instead of fluent. Losing it to a dtype gap would be a
+        silent downgrade of the tier's only correctness guard, so the poison goes through the BYTES:
+        0x7F is e4m3's NaN encoding, and a uint8 view supports `index_fill_` on every backend.
+        """
+        if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # 0x7F is NaN in BOTH: e4m3fn (exp 1111, mantissa 111 — its only NaN) and e5m2
+            # (exp 11111, mantissa 11). One constant, no per-dtype table to get wrong.
+            b = t.view(torch.uint8)
+            if idx is None:
+                b.fill_(0x7F)
+            else:
+                b.index_fill_(0, idx, 0x7F)
+            return
+        if idx is None:
+            t.fill_(float("nan"))
+        else:
+            t.index_fill_(0, idx, float("nan"))
+
     def arm(self) -> None:
         """Poison every row. Call once, after the load and before the first forward."""
         if not self.shared:
@@ -240,7 +266,7 @@ class ExpertStreamTier:
         for attr, comps in self.shared.items():
             for name, t in comps.items():
                 if self._poisonable[attr][name]:
-                    t.fill_(float("nan"))
+                    self._poison(t)
         if not any(any(v.values()) for v in self._poisonable.values()):
             raise StreamTierError(
                 "no floating-point component in any streamed container, so an unstaged expert "
@@ -268,7 +294,7 @@ class ExpertStreamTier:
             for attr, comps in self.shared.items():
                 for name, t in comps.items():
                     if self._poisonable[attr][name]:
-                        t.index_fill_(0, idx, float("nan"))
+                        self._poison(t, idx)
         # Cleared BEFORE the read, so a source that raises mid-gather leaves the tier claiming
         # nothing is live rather than claiming rows it never wrote.
         self._live = set()

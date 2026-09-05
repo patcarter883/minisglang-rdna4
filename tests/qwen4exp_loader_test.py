@@ -142,10 +142,15 @@ def main() -> int:
     _VALUE_KEYS = (
         "model.layers.0.mlp.experts.gate_up_proj.weight_scale",
         "model.layers.0.mlp.experts.gate_up_proj.weight_packed",
+        # The NVFP4 global is the SECOND half of a two-level scale, so [3b] cannot check magnitude
+        # without it — dequantizing from the block scale alone is exactly the ~4.8e3x error the
+        # `w_zeros`-slot plumbing exists to prevent, and would silently pass a looser check.
+        "model.layers.0.mlp.experts.gate_up_proj.weight_global",
         "model.layers.0.mlp.shared_expert.gate_up_proj.weight",
         "model.layers.0.linear_attn.A_log",
         "model.layers.0.linear_attn.dt_bias",
     )
+    _STACKED_VALUE_KEYS = ("weight_scale", "weight_packed", "weight_global")
     kept: "dict[str, torch.Tensor]" = {}
     for name, tensor in load_weight(load_from, torch.device("cpu"), spec_algorithm="none"):
         if name in emitted:
@@ -153,8 +158,8 @@ def main() -> int:
         emitted[name] = (tuple(tensor.shape), tensor.dtype)
         n_bytes += tensor.numel() * tensor.element_size()
         if name in _VALUE_KEYS:
-            # Expert 0 only for the two stacked tensors — one 640x2560 matrix, not 512 of them.
-            kept[name] = tensor[0].clone() if name.endswith(("weight_scale", "weight_packed")) \
+            # Expert 0 only for the stacked tensors — one 640x2560 matrix, not 512 of them.
+            kept[name] = tensor[0].clone() if name.endswith(_STACKED_VALUE_KEYS) \
                 else tensor.clone()
         del tensor
     print(f"[loader] emitted {len(emitted)} parameters, {n_bytes / 2**30:.2f} GiB")
@@ -197,9 +202,10 @@ def main() -> int:
     for label, key in fams.items():
         check(label, emitted.get(key, "MISSING"), declared.get(key, "NOT-DECLARED"))
 
-    print("\n[3] the modelopt NVFP4 fold produced the repo-native form")
+    print("\n[3] the modelopt NVFP4 scale reached the repo-native TWO-LEVEL form")
     wp = emitted.get("model.layers.0.mlp.experts.gate_up_proj.weight_packed")
     ws = emitted.get("model.layers.0.mlp.experts.gate_up_proj.weight_scale")
+    wg = emitted.get("model.layers.0.mlp.experts.gate_up_proj.weight_global")
     if wp and ws:
         e, n, k_half = wp[0]
         check("packed dtype is uint8 E2M1", str(wp[1]), "torch.uint8")
@@ -207,39 +213,70 @@ def main() -> int:
         check("merged gate_up rows = 2 * moe_inter", n, 2 * mc.moe_intermediate_size)
         check("packed cols = hidden/2 (2 nibbles/byte)", k_half, mc.hidden_size // 2)
         check("scale shape (E, N, K/16) — group 16, NOT 32", ws[0], (e, n, mc.hidden_size // 16))
-        # The fold is `e4m3_block / f32_global -> fp16`. If the global had been dropped the dtype
-        # would still be fp16 but the values would be ~2^k off, so dtype alone is not the check —
-        # the shape being K/16 rather than K/32 is what pins the NVFP4 (not MXFP4) interpretation,
-        # and `weight_global_scale` being absent from the emitted set is what pins the fold ran.
-        check("scale dtype is fp16 (folded)", str(ws[1]), "torch.float16")
+        # The block scale is now the checkpoint's OWN e4m3 tensor, byte-verbatim: no fold, no
+        # rounding, nothing to get wrong except the direction of the global, which is checked by
+        # MAGNITUDE in [3b]. The shape being K/16 rather than K/32 is what pins the NVFP4 (not
+        # MXFP4) interpretation. The dtype being float8_e4m3fn rather than fp16 is what pins that
+        # the LOSSY fold (measured 4.37e-04 max rel-err) is no longer on this path.
+        check("block-scale dtype is e4m3 (NOT the lossy fp16 fold)", str(ws[1]),
+              "torch.float8_e4m3fn")
         check(
-            "no un-folded global scales survive",
+            "no raw per-tensor globals survive",
             [k for k in emitted if k.endswith(".weight_global_scale")][:2],
             [],
         )
     else:
         check("expert stack present", False, True)
 
-    print("\n[3b] the folded NVFP4 scale has the right MAGNITUDE, not just the right shape")
+    print("\n[3a] the per-output-channel global SURVIVED the gate|up merge and the expert stack")
+    # This is the shape claim the whole design rests on. The global is emitted at the LEAF as an (N,)
+    # vector per projection; `emit` concatenates gate|up on dim 0 and `_ExpertStacker` stacks over E.
+    # If the vector shape were wrong — a scalar, or an (N,1) — the merge would produce something that
+    # still loads (E, something) and the kernel would stride it wrong. So the assertion is that the
+    # merged, stacked global is EXACTLY (E, 2*moe_inter): one f32 per expert per OUTPUT CHANNEL of
+    # the merged matrix, which is the `w_zeros`-slot layout `E4m3GroupScaleGlobal::wz_base` indexes.
+    if wg:
+        check("global shape (E, 2*moe_inter) after merge+stack", wg[0],
+              (mc.num_experts, 2 * mc.moe_intermediate_size))
+        check("global dtype is f32", str(wg[1]), "torch.float32")
+    else:
+        check("gate_up global emitted", False, True)
+    wg2 = emitted.get("model.layers.0.mlp.experts.down_proj.weight_global")
+    if wg2:
+        # down_proj is NOT merged, so its global is the plain (E, hidden) vector — a different N
+        # from gate_up's, which is exactly why the contract is a VECTOR and not one number.
+        check("down_proj global shape (E, hidden)", wg2[0], (mc.num_experts, mc.hidden_size))
+    else:
+        check("down_proj global emitted", False, True)
+
+    print("\n[3b] the two-level NVFP4 scale has the right MAGNITUDE, not just the right shape")
     # Section [3] checks shape and dtype. Both were already correct on the day this loader produced
     # inf: modelopt's `weight_scale_2` is the RECIPROCAL of compressed-tensors' `weight_global_scale`
-    # (2.078e-4 vs ~4812 here), the fold divided where it should have multiplied, and the folded fp16
-    # scales overflowed to inf -> NaN logits from the first MoE block. Nothing structural was wrong.
+    # (2.078e-4 vs ~4812 here), the code divided where it should have multiplied, and the result
+    # overflowed to inf -> NaN logits from the first MoE block. Nothing structural was wrong.
     #
     # The anchor is the SAME LAYER's shared expert, which this checkpoint ships UNQUANTIZED in bf16.
     # It is the same kind of matrix, trained in the same model, so its coefficient magnitude is the
-    # measurement that settles the fold direction — no formula is taken on faith.
+    # measurement that settles the direction — no formula is taken on faith.
     ws_v = kept.get("model.layers.0.mlp.experts.gate_up_proj.weight_scale")
     wp_v = kept.get("model.layers.0.mlp.experts.gate_up_proj.weight_packed")
+    wg_v = kept.get("model.layers.0.mlp.experts.gate_up_proj.weight_global")
     anchor_v = kept.get("model.layers.0.mlp.shared_expert.gate_up_proj.weight")
-    if ws_v is not None and wp_v is not None and anchor_v is not None:
+    if ws_v is not None and wp_v is not None and wg_v is not None and anchor_v is not None:
         from minisgl.quant.mxfp4 import FP4_E2M1_LUT
         from minisgl.quant.nvfp4 import NVFP4_GROUP_SIZE, unpack_e2m1_nibbles
 
-        check("folded scale is finite", bool(ws_v.isfinite().all()), True)
+        # `isfinite` has no float8 kernel, so finiteness is asserted on the f32 the dequant uses —
+        # which is the value that actually reaches the kernel anyway.
+        ws_f32 = ws_v.to(torch.float32)
+        check("block scale is finite", bool(ws_f32.isfinite().all()), True)
+        check("global is finite and strictly positive",
+              bool(wg_v.isfinite().all()) and bool((wg_v > 0).all()), True)
         lut = torch.tensor(FP4_E2M1_LUT, dtype=torch.float32)
         codes = unpack_e2m1_nibbles(wp_v).to(torch.int64)
-        w = lut[codes] * ws_v.to(torch.float32).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)
+        # Kernel order: group fold first, per-output-channel epilogue second.
+        w = lut[codes] * ws_f32.repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)
+        w = w * wg_v.to(torch.float32).unsqueeze(-1)
         got_mean = float(w.abs().mean())
         want_mean = float(anchor_v.to(torch.float32).abs().mean())
         ratio = got_mean / want_mean if want_mean else float("inf")
@@ -252,9 +289,34 @@ def main() -> int:
             f"expert |w|mean={got_mean:.6f}  bf16 anchor |w|mean={want_mean:.6f}  ratio={ratio:.3f}",
         )
         check_true(
-            "dequantized expert |w| is bounded (fp16 scale did not overflow)",
+            "dequantized expert |w| is bounded (the global direction is the MULTIPLIER)",
             bool(w.isfinite().all()) and float(w.abs().max()) < 10.0,
             f"|w|max={float(w.abs().max()):.6f}",
+        )
+        # THE ACCURACY CLAIM, MEASURED ON THESE BYTES rather than quoted. The fp16 fold this
+        # replaced is recomputed here from the SAME two levels and compared against the same fp64
+        # golden, so the two arms differ only in where the rounding happens.
+        gold = (
+            lut[codes].to(torch.float64)
+            * ws_f32.to(torch.float64).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)
+            * wg_v.to(torch.float64).unsqueeze(-1)
+        )
+        folded = (ws_f32 * wg_v.to(torch.float32).unsqueeze(-1)).to(torch.float16)
+        w_fold = lut[codes] * folded.to(torch.float32).repeat_interleave(NVFP4_GROUP_SIZE, dim=-1)
+        nz = gold != 0
+        rel_split = ((w.to(torch.float64) - gold).abs() / gold.abs().clamp_min(1e-30))[nz]
+        rel_fold = ((w_fold.to(torch.float64) - gold).abs() / gold.abs().clamp_min(1e-30))[nz]
+        split_max, fold_max = float(rel_split.max()), float(rel_fold.max())
+        check_true(
+            "the fp16 fold this replaced IS lossy (the docstring used to claim it was exact)",
+            fold_max > 1e-4,
+            f"fp16-fold rel-err max={fold_max:.3e} mean={float(rel_fold.mean()):.3e}",
+        )
+        check_true(
+            "the two-level split is exact to f32 round-off, and beats the fold by >1000x",
+            split_max < 1e-6 and split_max * 1000.0 < fold_max,
+            f"split rel-err max={split_max:.3e}  vs  fold max={fold_max:.3e}  "
+            f"({(fold_max / split_max) if split_max else float('inf'):.0f}x)",
         )
     else:
         check("layer-0 expert stack + bf16 shared-expert anchor present", False, True)

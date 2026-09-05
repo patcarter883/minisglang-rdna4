@@ -104,11 +104,17 @@ def _gib(nbytes: float) -> str:
 # Checkpoint layout
 # --------------------------------------------------------------------------------------------
 
+# NVFP4 keeps the checkpoint's TWO scale levels (2026-09-05): the e4m3 block scale byte-verbatim
+# plus a per-OUTPUT-CHANNEL f32 global. `weight_global` is a leaf like any other and MUST be listed
+# here -- a layer staged without it would dequantize against whatever global the previous layer left
+# in the shared buffer, which is finite, fluent and wrong.
 _EXPERT_LEAVES = (
     "mlp.experts.gate_up_proj.weight_packed",
     "mlp.experts.gate_up_proj.weight_scale",
+    "mlp.experts.gate_up_proj.weight_global",
     "mlp.experts.down_proj.weight_packed",
     "mlp.experts.down_proj.weight_scale",
+    "mlp.experts.down_proj.weight_global",
 )
 
 
@@ -218,7 +224,8 @@ class ExpertStreamer:
     """Alias all layers' expert containers onto one shared pair of op buffers; refill per layer.
 
     The substitution is at the CONTAINER level, not inside any kernel: after `post_load` a
-    `_GroupedNvFp4Experts` is exactly `_w_op` (E,N,K//8 int32) + `_scales_op` (E,K//16,N fp16), and
+    `_GroupedNvFp4Experts` is exactly `_w_op` (E,N,K//8 int32) + `_scales_op` (E,K//16,N e4m3)
+    + `_global_op` (E,N int32-typed f32 bits), and
     `kernels.w4a8_moe` reads those two. Every layer's container is pointed at the SAME two tensors,
     and `stage(L)` copies layer L's converted weights into them in place, so the MoE path,the kernel
     selection and the op layout are untouched and identical to the resident build.
@@ -247,11 +254,12 @@ class ExpertStreamer:
             for dst, src in ((c13, s13), (c2, s2)):
                 dst._w_op = src._w_op
                 dst._scales_op = src._scales_op
+                dst._global_op = src._global_op
                 # Drop the checkpoint-shaped copies these containers were loaded with. They are the
                 # SAME aliased tensors on every layer, so the last delete is what actually frees the
                 # 1.56 GiB — and leaving them would also let a stale `weight_packed` be mistaken for
                 # live state by anything walking the container.
-                for attr in ("weight_packed", "weight_scale"):
+                for attr in ("weight_packed", "weight_scale", "weight_global"):
                     if hasattr(dst, attr):
                         delattr(dst, attr)
 
@@ -263,10 +271,12 @@ class ExpertStreamer:
         c13, c2 = self.pairs[layer]
         for cont, base in ((c13, "mlp.experts.gate_up_proj"), (c2, "mlp.experts.down_proj")):
             conv = nvfp4.convert_nvfp4_moe(got[f"{base}.weight_packed"], got[f"{base}.weight_scale"])
-            # Exactly `_GroupedNvFp4Experts.post_load`'s layout: packed int32 codes, and the scale
-            # transposed to GROUP-MAJOR (E, K//16, N) for the op's coalesced scale read.
+            # Exactly `_GroupedNvFp4Experts.post_load`'s layout: packed int32 codes, the block scale
+            # transposed to GROUP-MAJOR (E, K//16, N) for the op's coalesced scale read, and the
+            # (E, N) f32 global BITCAST to int32 for the `w_zeros` pointer slot.
             cont._w_op.copy_(conv["w_packed"])
             cont._scales_op.copy_(conv["scales"].transpose(1, 2))
+            cont._global_op.copy_(got[f"{base}.weight_global"].contiguous().view(torch.int32))
             del conv
         self.bytes_staged += sum(v.numel() * v.element_size() for v in got.values())
         del got
@@ -310,7 +320,8 @@ class RoutedExpertGather:
     HOW IT STAYS INSIDE THE EXISTING OP LAYOUT
     ------------------------------------------
     Nothing about the MoE dispatch, the kernel, the expert ids or the op buffers changes. The shared
-    `_w_op` (E,N,K//8) / `_scales_op` (E,K//16,N) pair is still E=512 wide and still indexed by the
+    `_w_op` (E,N,K//8) / `_scales_op` (E,K//16,N) / `_global_op` (E,N) triple is still E=512 wide and
+    still indexed by the
     GLOBAL expert id; this only declines to FILL the 502 rows the kernel will not read. So there is no
     id remap, no compaction, and no second code path for the grouped GEMM to get wrong.
 
@@ -378,11 +389,14 @@ class RoutedExpertGather:
                     f"routed gather requires the streamed build, which is what makes ONE 512-row "
                     f"buffer pair serve all {len(self.layer_ids)} streaming layers."
                 )
-        self.w13, self.sc13 = c13._w_op, c13._scales_op
-        self.w2, self.sc2 = c2._w_op, c2._scales_op
+        self.w13, self.sc13, self.gl13 = c13._w_op, c13._scales_op, c13._global_op
+        self.w2, self.sc2, self.gl2 = c2._w_op, c2._scales_op, c2._global_op
         # Nothing is valid until a layer stages: start fully poisoned.
-        self.sc13.fill_(float("nan"))
-        self.sc2.fill_(float("nan"))
+        # The block scale is float8_e4m3fn, whose NaN is byte 0x7F; `fill_(nan)` works on it but
+        # `index_fill_` does not, so BOTH poison paths go through the uint8 view for one text.
+        # (The global is int32-typed bytes and has no NaN -- the block scale is the poison carrier.)
+        self.sc13.view(torch.uint8).fill_(0x7F)
+        self.sc2.view(torch.uint8).fill_(0x7F)
 
     def _containers(self, lid: int):
         mlp = self.layers[lid].mlp
@@ -441,8 +455,8 @@ class RoutedExpertGather:
         stale = self._live - set(want)
         if stale:
             idx = torch.tensor(sorted(stale), dtype=torch.long, device=self.dev)
-            self.sc13.index_fill_(0, idx, float("nan"))
-            self.sc2.index_fill_(0, idx, float("nan"))
+            self.sc13.view(torch.uint8).index_fill_(0, idx, 0x7F)
+            self.sc2.view(torch.uint8).index_fill_(0, idx, 0x7F)
         self._live = set()
 
         p13, s13, p2, s2 = [], [], [], []

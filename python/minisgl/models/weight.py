@@ -546,9 +546,20 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
         # the whole packed N and splits the input group dim 1. Identical to the dense CT rules below.
         # Without this the expert zero-points would REPLICATE while their weights shard, and the load
         # would fail on shape (loudly — never a silent half-sharded dequant).
+        # NVFP4 split arm: `.weight_global` is the per-OUTPUT-CHANNEL f32 global MULTIPLIER, an (N,)
+        # vector. down_proj is row-parallel — it splits the INPUT K, so its output N is full width on
+        # every rank and its global REPLICATES. That is the one leaf whose axis differs from its own
+        # weight's, so it is matched FIRST and explicitly; letting it reach the `.down_proj.*` rule
+        # below would chunk a 1-D tensor on dim 1 and raise, and letting it fall all the way through
+        # to "replicate" would be right for the wrong reason and would break the moment somebody
+        # added a `.down_proj.weight_global`-matching suffix.
+        if name.endswith(".down_proj.weight_global"):
+            return t
         if name.endswith(
             (".gate_proj.weight_packed", ".gate_proj.weight_scale", ".gate_proj.weight_zero_point",
-             ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point")
+             ".gate_proj.weight_global",
+             ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point",
+             ".up_proj.weight_global")
         ):
             return t.chunk(n, dim=0)[r].clone()
         if name.endswith((".down_proj.weight_packed", ".down_proj.weight_scale",
@@ -638,12 +649,23 @@ _QWEN4EXP_REPLICATED_SUFFIXES = (
 # The routed experts, in modelopt's NVFP4 spelling. `qwen4_exp_remap` renames these leaves to the
 # repo-native `.weight_packed` / `.weight_scale` AFTER this function runs, so the rules here are
 # keyed on the CHECKPOINT spelling: a bare `.weight` (the packed E2M1 blob) and `.weight_scale` (the
-# per-group scale, already folded with `.weight_scale_2` by the loader before the shard is applied).
+# e4m3 per-group block scale, emitted verbatim by `nvfp4.nvfp4_leaf_scales` before the shard runs).
 _Q4_EXPERT_COL = (
     ".gate_proj.weight", ".gate_proj.weight_scale",
     ".up_proj.weight", ".up_proj.weight_scale",
+    # `.weight_global` is the NVFP4 per-OUTPUT-CHANNEL global, an (N,) f32 vector. gate/up are
+    # column-parallel, so their output N splits — dim 0 of a 1-D vector, which is the same rule and
+    # the same axis as their weight and block scale. Named explicitly rather than left to the
+    # fall-through, per this file's rule that a shard decision is stated, not inherited.
+    ".gate_proj.weight_global", ".up_proj.weight_global",
 )
 _Q4_EXPERT_ROW = (".down_proj.weight", ".down_proj.weight_scale")
+# down_proj is ROW-parallel: it splits the INPUT K, so its OUTPUT N is full width on every rank and
+# its per-output-channel global is REPLICATED, not split. This is the one place where the global's
+# axis differs from its weight's, which is exactly why it is a separate tuple with its own comment
+# instead of an entry in `_Q4_EXPERT_ROW` — chunking it on dim 1 would fail (it is 1-D) and chunking
+# it on dim 0 would hand each rank a quarter of the output channels it actually computes.
+_Q4_EXPERT_REPLICATED = (".down_proj.weight_global",)
 
 
 def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
@@ -695,6 +717,8 @@ def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torc
         # `_shard_qwen3_5` documents — no tensor split here. (EP is off for this model today; the
         # branch is kept so enabling it later does not silently double-shard.)
         if is_ep_enabled():
+            return t
+        if name.endswith(_Q4_EXPERT_REPLICATED):
             return t
         if name.endswith(_Q4_EXPERT_COL):
             return t.chunk(n, dim=0)[r].clone()
@@ -793,6 +817,79 @@ def _load_qwen3_5_weight(
         else:
             yield native_key, tensor
 
+    def leaf(f, name: str, override: "torch.Tensor | None"):
+        """ONE resolved leaf -> zero or more (native_key, tensor) pairs.
+
+        Extracted from the read loop because ONE checkpoint key can now produce TWO leaves: an NVFP4
+        routed expert emits its e4m3 block scale AND its per-output-channel global, and both must
+        take the IDENTICAL remap -> TP shard -> GDN concat -> gate|up merge -> expert stack path.
+        Duplicating that path for the second leaf is how the global would end up sharded on the wrong
+        axis or skipping a merge — silently, since every shape still works out.
+
+        `override` is a tensor the caller already materialized (an NVFP4 leaf scale); None means
+        "read `name` from this shard".
+        """
+        # fp8 lm_head -> DEQUANTIZE to the compute dtype at load: weight (V,H) e4m3 times its
+        # per-output-channel scale (V,1). Both split on the VOCAB dim, so each rank folds only
+        # ITS OWN rows and the full bf16 head is never materialised.
+        #
+        # Serving it AS fp8 would be smaller and cheaper to stream, and is tempting on a 248k
+        # vocab — but it is WRONG here, and not merely because ParallelLMHead has no quant
+        # plumbing. The LM head must stay M-INVARIANT: quant/kernels.py dispatches between
+        # kernel arms as a function of M and those arms disagree numerically (dense decode_gemv
+        # vs wmma_tiled by up to ~1.95e-3), so a quantized head is only M-invariant WITHIN an
+        # arm band. Spec-decode verify runs M=K+1 while decode runs M=1 — straddling bands —
+        # and verify logits that do not match decode logits silently destroy draft acceptance
+        # (see layers/minv.py, which names spec-decode VERIFY as a protected pathway). bf16
+        # keeps `_lm_head_linear` on dense_bf16_gemv, which is M-invariant by construction.
+        # This matches the repo-wide stance that lm_head is never quantized (create_linear_
+        # method's `quantized=False`; qwen3_5_moe and glm4_moe_lite both keep it full-precision).
+        #
+        # Handled before the remap because `lm_head.weight_scale` is not a key qwen3_5_remap
+        # knows. A bf16 lm_head ships no scale, so _fp8_lm_head is False and nothing changes.
+        if _fp8_lm_head and name.startswith("lm_head."):
+            field = name.rsplit(".", 1)[1]
+            if field not in ("weight", "weight_scale"):
+                return
+            lm_head_buf[field] = _shard_qwen3_5(
+                name, f.get_tensor(name), tp_info.rank, tp_info.size, config
+            )
+            if len(lm_head_buf) < 2:
+                return
+            w = lm_head_buf.pop("weight").to(device)
+            sc = lm_head_buf.pop("weight_scale").to(device).to(torch.float32)
+            out = torch.empty(w.shape, dtype=torch.get_default_dtype(), device=device)
+            # CHUNKED over vocab rows. A whole-tensor `w.to(f32) * sc` would allocate two
+            # ~2.5 GiB fp32 temporaries for a 248k-row head; the caching allocator does not
+            # return those to the driver, so they inflate the engine's `model_memory =
+            # free_before - free_after` measurement and silently starve the KV pool (it sized
+            # to ZERO pages). One chunk is ~160 MiB and is reused every iteration.
+            for i in range(0, w.shape[0], 8192):
+                blk = slice(i, i + 8192)
+                out[blk] = (w[blk].to(torch.float32) * sc[blk]).to(out.dtype)
+            del w, sc
+            yield from emit("lm_head.weight", out)
+            return
+        plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
+        if plan is None:
+            return
+        # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
+        # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
+        tens = override if override is not None else f.get_tensor(name)
+        # .to(device) AFTER the shard: everything downstream (GDN concat, gate/up merge,
+        # expert stack) then composes rank-local tensors already in VRAM, as before.
+        raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config).to(device)
+        if plan[0] == "direct":
+            yield from emit(plan[1], raw)
+            return
+        _, merged, slot, n_slots, cat_dim = plan
+        concat_buf.setdefault(merged, {})[slot] = raw
+        if len(concat_buf[merged]) != n_slots:
+            return
+        parts = [concat_buf[merged][i] for i in range(n_slots)]
+        del concat_buf[merged]
+        yield from emit(merged, torch.cat(parts, dim=cat_dim))
+
     # NVFP4 bases and the fp8 lm_head flag are resolved across ALL shard files BEFORE streaming.
     # They used to be recomputed per file, which silently required a proj's weight_scale and
     # weight_global_scale to be CO-LOCATED in one shard: in the shard holding only weight_scale the
@@ -821,93 +918,42 @@ def _load_qwen3_5_weight(
         # and the KV pool sized NEGATIVE. Slicing host-side keeps GPU peak == GPU resident.
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
             keys = list(f.keys())
-            for name in keys:
-                # NVFP4: fold the e4m3 block scale / per-tensor global into ONE fp16 per-group scale at
-                # the LEAF — before remap / GDN in_proj concat / gate-up merge / expert stack. That makes
-                # NVFP4 MXFP4-shaped (E2M1 weights + fp16 per-group scale), so every downstream fusion
-                # (each combining differently-scaled matrices) composes exactly as it does for MXFP4, and
-                # no per-tensor scalar ever reaches a merge. weight_packed passes through unchanged (4-bit);
-                # input_global_scale (FP4 act calib) is dropped — the e2m1 kernel quantizes acts to fp8.
-                override = None
-                if name.rsplit(".", 1)[0] in nvfp4_bases:
-                    if name.endswith(".input_global_scale"):
+            for ckpt_name in keys:
+                # NVFP4 SCALE RESOLUTION AT THE LEAF — before remap / GDN in_proj concat / gate-up
+                # merge / expert stack, so every downstream fusion (each combining differently-scaled
+                # matrices) composes without a special case. ROUTED EXPERTS keep the checkpoint's TWO
+                # levels and emit TWO leaves (`.weight_scale` e4m3 byte-verbatim + `.weight_global`,
+                # the per-output-channel f32 MULTIPLIER); everything else still folds to one fp16
+                # per-group scale, because the DENSE e2m1 kernel hardcodes a `const __half*` scale
+                # pointer. `nvfp4.nvfp4_leaf_scales` owns that decision — see `nvfp4_leaf_splits`.
+                # weight_packed passes through unchanged (4-bit); input_global_scale (FP4 act calib)
+                # is dropped — the e2m1 kernel quantizes acts to fp8.
+                leaves: "list[Tuple[str, torch.Tensor | None]]" = [(ckpt_name, None)]
+                if ckpt_name.rsplit(".", 1)[0] in nvfp4_bases:
+                    if ckpt_name.endswith(".input_global_scale"):
                         continue
-                    if name.endswith((".weight_scale", ".weight_global_scale")):
-                        base, field = name.rsplit(".", 1)
+                    if ckpt_name.endswith((".weight_scale", ".weight_global_scale")):
+                        base, field = ckpt_name.rsplit(".", 1)
                         buf = nvfp4_fold_buf.setdefault(base, {})
-                        buf[field] = f.get_tensor(name)
+                        buf[field] = f.get_tensor(ckpt_name)
                         if len(buf) < 2:
                             continue
                         del nvfp4_fold_buf[base]
-                        name = base + ".weight_scale"
-                        # to(device) FIRST: the fold is arithmetic on an e4m3 block scale and torch
-                        # has no CPU float8 math. Both operands are small per-group scales, so this
-                        # is not the bulk transfer the host-side slicing above exists to avoid.
-                        override = nvfp4.fold_nvfp4_scale(
-                            buf["weight_scale"].to(device),
-                            buf["weight_global_scale"].to(device),
-                            global_field="weight_global_scale",
+                        # `device=` is consumed by the FOLD arm only: the fold is fp32 arithmetic on
+                        # an e4m3 input and torch has no CPU float8 math. The split arm is a dtype
+                        # passthrough and stays host-side, like every other tensor read here.
+                        leaves = list(
+                            nvfp4.nvfp4_leaf_scales(
+                                base,
+                                buf["weight_scale"],
+                                buf["weight_global_scale"],
+                                global_field="weight_global_scale",
+                                device=device,
+                            )
                         )
-                # fp8 lm_head -> DEQUANTIZE to the compute dtype at load: weight (V,H) e4m3 times its
-                # per-output-channel scale (V,1). Both split on the VOCAB dim, so each rank folds only
-                # ITS OWN rows and the full bf16 head is never materialised.
-                #
-                # Serving it AS fp8 would be smaller and cheaper to stream, and is tempting on a 248k
-                # vocab — but it is WRONG here, and not merely because ParallelLMHead has no quant
-                # plumbing. The LM head must stay M-INVARIANT: quant/kernels.py dispatches between
-                # kernel arms as a function of M and those arms disagree numerically (dense decode_gemv
-                # vs wmma_tiled by up to ~1.95e-3), so a quantized head is only M-invariant WITHIN an
-                # arm band. Spec-decode verify runs M=K+1 while decode runs M=1 — straddling bands —
-                # and verify logits that do not match decode logits silently destroy draft acceptance
-                # (see layers/minv.py, which names spec-decode VERIFY as a protected pathway). bf16
-                # keeps `_lm_head_linear` on dense_bf16_gemv, which is M-invariant by construction.
-                # This matches the repo-wide stance that lm_head is never quantized (create_linear_
-                # method's `quantized=False`; qwen3_5_moe and glm4_moe_lite both keep it full-precision).
-                #
-                # Handled before the remap because `lm_head.weight_scale` is not a key qwen3_5_remap
-                # knows. A bf16 lm_head ships no scale, so _fp8_lm_head is False and nothing changes.
-                if _fp8_lm_head and name.startswith("lm_head."):
-                    field = name.rsplit(".", 1)[1]
-                    if field not in ("weight", "weight_scale"):
-                        continue
-                    lm_head_buf[field] = _shard_qwen3_5(
-                        name, f.get_tensor(name), tp_info.rank, tp_info.size, config
-                    )
-                    if len(lm_head_buf) < 2:
-                        continue
-                    w = lm_head_buf.pop("weight").to(device)
-                    sc = lm_head_buf.pop("weight_scale").to(device).to(torch.float32)
-                    out = torch.empty(w.shape, dtype=torch.get_default_dtype(), device=device)
-                    # CHUNKED over vocab rows. A whole-tensor `w.to(f32) * sc` would allocate two
-                    # ~2.5 GiB fp32 temporaries for a 248k-row head; the caching allocator does not
-                    # return those to the driver, so they inflate the engine's `model_memory =
-                    # free_before - free_after` measurement and silently starve the KV pool (it sized
-                    # to ZERO pages). One chunk is ~160 MiB and is reused every iteration.
-                    for i in range(0, w.shape[0], 8192):
-                        blk = slice(i, i + 8192)
-                        out[blk] = (w[blk].to(torch.float32) * sc[blk]).to(out.dtype)
-                    del w, sc
-                    yield from emit("lm_head.weight", out)
-                    continue
-                plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
-                if plan is None:
-                    continue
-                # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
-                # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
-                tens = override if override is not None else f.get_tensor(name)
-                # .to(device) AFTER the shard: everything downstream (GDN concat, gate/up merge,
-                # expert stack) then composes rank-local tensors already in VRAM, as before.
-                raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config).to(device)
-                if plan[0] == "direct":
-                    yield from emit(plan[1], raw)
-                    continue
-                _, merged, slot, n_slots, cat_dim = plan
-                concat_buf.setdefault(merged, {})[slot] = raw
-                if len(concat_buf[merged]) != n_slots:
-                    continue
-                parts = [concat_buf[merged][i] for i in range(n_slots)]
-                del concat_buf[merged]
-                yield from emit(merged, torch.cat(parts, dim=cat_dim))
+                for name, override in leaves:
+                    yield from leaf(f, name, override)
+
     assert not concat_buf, f"incomplete concat groups in checkpoint: {list(concat_buf.keys())}"
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
@@ -1018,8 +1064,12 @@ _QWEN4EXP_NATIVE_OK = tuple(
         r"(index_qk_proj|q_layernorm|k_layernorm)\.weight$",
         r"^model\.layers\.\d+\.mlp\.(gate|shared_expert_gate)\.weight$",
         r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\.weight$",
+        # `weight_global` is the NVFP4 split arm's second leaf: the per-output-channel f32 global
+        # MULTIPLIER (see quant/nvfp4.py). `weight_global_scale` is the OLD repo-native spelling of
+        # the raw per-TENSOR global, which the fold arm consumed and dropped; both are listed because
+        # a mixed checkpoint can still hit the fold path on a non-expert module.
         r"^model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\."
-        r"(weight|weight_packed|weight_scale|weight_global_scale)$",
+        r"(weight|weight_packed|weight_scale|weight_global|weight_global_scale)$",
         r"^model\.layers\.\d+\.ple\."
         r"(key_proj|value_proj|norm_key|norm_query|norm_conv)\.weight$",
         r"^model\.layers\.\d+\.ple\.conv1d_weight$",
@@ -1327,71 +1377,80 @@ def _load_qwen4_exp_weight(
 
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-            for name in list(f.keys()):
-                override = None
-                base, _, field = name.rpartition(".")
+            for ckpt_name in list(f.keys()):
+                # ONE checkpoint key can produce TWO leaves. An NVFP4 routed expert now keeps its
+                # scale in the checkpoint's own TWO levels — the e4m3 block scale byte-verbatim plus
+                # a per-output-channel f32 global — so the pair `(weight_scale, weight_scale_2)`
+                # resolves to `(.weight_scale, .weight_global)` and BOTH ride the identical
+                # remap -> shard -> GDN concat -> gate|up merge -> expert stack path below. Nothing
+                # downstream special-cases the global; that is what the N-vector shape buys.
+                #
+                # `global_field` is modelopt's `weight_scale_2`, the RECIPROCAL of
+                # compressed-tensors' `weight_global_scale`: a MULTIPLIER, not a divisor. The fold
+                # call this replaced originally passed no convention and inherited the
+                # compressed-tensors divide, which produced per-group scales up to 4.2e6, overflowed
+                # the kernel's fp16 scale to inf, and made every logit NaN from the first MoE block
+                # onward. `nvfp4_global_multiplier` now normalises direction ONCE, host-side, so the
+                # kernel only ever multiplies.
+                leaves: "list[Tuple[str, torch.Tensor | None]]" = [(ckpt_name, None)]
+                base, _, field = ckpt_name.rpartition(".")
                 if base in nvfp4_ckpt_bases and field in ("weight_scale", "weight_scale_2"):
                     buf = fold_buf.setdefault(base, {})
-                    buf[field] = f.get_tensor(name)
+                    buf[field] = f.get_tensor(ckpt_name)
                     if len(buf) < 2:
                         continue
                     del fold_buf[base]
-                    # e4m3 -> fp32 is a CAST (defined on CPU as well as on device); the fold is
-                    # ordinary fp32 arithmetic. Both operands are tiny per-group scales, so this is
-                    # not the bulk traffic the host-side read exists to avoid.
-                    #
-                    # `global_field` is modelopt's `weight_scale_2`, the RECIPROCAL of
-                    # compressed-tensors' `weight_global_scale`: a MULTIPLIER, not a divisor. This
-                    # call originally passed no convention and inherited the compressed-tensors
-                    # divide, which folded to per-group scales up to 4.2e6, overflowed the kernel's
-                    # fp16 scale to inf, and made every logit NaN from the first MoE block onward.
-                    override = nvfp4.fold_nvfp4_scale(
-                        buf["weight_scale"].to(device),
-                        buf["weight_scale_2"].to(device),
-                        global_field="weight_scale_2",
+                    leaves = list(
+                        nvfp4.nvfp4_leaf_scales(
+                            base,
+                            buf["weight_scale"],
+                            buf["weight_scale_2"],
+                            global_field="weight_scale_2",
+                            device=device,
+                        )
                     )
-                    name = base + ".weight_scale"  # the repo-native spelling of the folded scale
-                plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
-                if plan[0] == "skip":
-                    skips[plan[1]] = skips.get(plan[1], 0) + 1
-                    continue
-                # `layers.<n>` with n >= num_layers is not this model's. The `model-bf16-*` shards
-                # carry every layer the CHECKPOINT has, so a config that serves fewer — a layer
-                # subset, the only way this checkpoint is bootable on one card — is handed ~44
-                # layers' worth of body tensors it has no home for, and `load_state_dict` refuses
-                # with "Unexpected keys". Every other family gets this filter from `load_weight`;
-                # the qwen4_exp remap did not carry it, so it lived in `qwen4_exp_chunked_source`'s
-                # `stream` wrapper — i.e. the CHUNKED path could load a subset and the ONE-SHOT path
-                # could not, for the same checkpoint and the same config. It belongs here, once, on
-                # the code path both share.
-                #
-                # AFTER the remap's own skip branch, so the ignore ledger still attributes a vision
-                # or MTP tensor to the reason a reader would expect; BEFORE `f.get_tensor`, so the
-                # dropped layers are never read and never touch the device.
-                if _is_beyond_decoder(name, num_layers):
-                    skips[_Q4_BEYOND_DECODER] = skips.get(_Q4_BEYOND_DECODER, 0) + 1
-                    continue
-                # Shard at READ (on the CHECKPOINT name), so the GDN in_proj concat, the gate/up
-                # merge and the per-expert stack below all compose rank-local parts. `.to(device)`
-                # comes AFTER the shard: everything downstream then composes rank-local tensors
-                # already in VRAM, and a rank never materializes the full-width tensor on its card.
-                # `override` (the NVFP4 two-level scale fold) is already on device and already
-                # full-width — the fold reads both levels whole and the shard applies to its result,
-                # so no scale is folded twice and none is folded from a partial.
-                tens = override if override is not None else f.get_tensor(name)
-                raw = _shard_qwen4_exp(
-                    name, tens, tp_info.rank, tp_info.size, config
-                ).to(device)
-                if plan[0] == "direct":
-                    yield from emit(plan[1], raw)
-                    continue
-                _, merged, slot, n_slots, cat_dim = plan
-                concat_buf.setdefault(merged, {})[slot] = raw
-                if len(concat_buf[merged]) != n_slots:
-                    continue
-                parts = [concat_buf[merged][i] for i in range(n_slots)]
-                del concat_buf[merged]
-                yield from emit(merged, torch.cat(parts, dim=cat_dim))
+                for name, override in leaves:
+                    plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+                    if plan[0] == "skip":
+                        skips[plan[1]] = skips.get(plan[1], 0) + 1
+                        continue
+                    # `layers.<n>` with n >= num_layers is not this model's. The `model-bf16-*`
+                    # shards carry every layer the CHECKPOINT has, so a config that serves fewer — a
+                    # layer subset, the only way this checkpoint is bootable on one card — is handed
+                    # ~44 layers' worth of body tensors it has no home for, and `load_state_dict`
+                    # refuses with "Unexpected keys". Every other family gets this filter from
+                    # `load_weight`; the qwen4_exp remap did not carry it, so it lived in
+                    # `qwen4_exp_chunked_source`'s `stream` wrapper — i.e. the CHUNKED path could
+                    # load a subset and the ONE-SHOT path could not, for the same checkpoint and the
+                    # same config. It belongs here, once, on the code path both share.
+                    #
+                    # AFTER the remap's own skip branch, so the ignore ledger still attributes a
+                    # vision or MTP tensor to the reason a reader would expect; BEFORE
+                    # `f.get_tensor`, so the dropped layers are never read and never touch the device.
+                    if _is_beyond_decoder(name, num_layers):
+                        skips[_Q4_BEYOND_DECODER] = skips.get(_Q4_BEYOND_DECODER, 0) + 1
+                        continue
+                    # Shard at READ (on the CHECKPOINT name), so the GDN in_proj concat, the gate/up
+                    # merge and the per-expert stack below all compose rank-local parts.
+                    # `.to(device)` comes AFTER the shard: everything downstream then composes
+                    # rank-local tensors already in VRAM, and a rank never materializes the
+                    # full-width tensor on its card. An `override` (an NVFP4 leaf scale) is already
+                    # full-width — both levels are read whole and the shard applies to the result,
+                    # so no scale is folded/split twice and none from a partial.
+                    tens = override if override is not None else f.get_tensor(name)
+                    raw = _shard_qwen4_exp(
+                        name, tens, tp_info.rank, tp_info.size, config
+                    ).to(device)
+                    if plan[0] == "direct":
+                        yield from emit(plan[1], raw)
+                        continue
+                    _, merged, slot, n_slots, cat_dim = plan
+                    concat_buf.setdefault(merged, {})[slot] = raw
+                    if len(concat_buf[merged]) != n_slots:
+                        continue
+                    parts = [concat_buf[merged][i] for i in range(n_slots)]
+                    del concat_buf[merged]
+                    yield from emit(merged, torch.cat(parts, dim=cat_dim))
 
     # Only shards that were actually opened contribute to this ledger; when the n-gram table lives in
     # its own directory (the normal deployment) its 129 keys are never seen at all, which is why the
@@ -1454,50 +1513,66 @@ class Qwen4ExpExpertRowSource:
         return h
 
     def _leaf(self, layer: int, eid: int, projs: "Tuple[str, ...]"):
+        """(packed, block_scale, global_vec) for one expert, gate|up already concatenated on dim 0.
+
+        The gate|up concat on the GLOBAL is the same `torch.cat(dim=0)` the one-shot loader's
+        `emit` does, on the same axis, for the same reason — the global is a per-output-channel
+        vector, so merging two differently-scaled matrices just concatenates their channel ranges.
+        """
         from minisgl.quant import nvfp4
 
         f = self._handle(layer, (eid // 128) * 128)
         pre = f"model.language_model.layers.{layer}.mlp.experts.{eid}."
-        packed, scales = [], []
+        packed, scales, globals_ = [], [], []
         for p in projs:
             w = f.get_tensor(pre + p + ".weight")
             s = f.get_tensor(pre + p + ".weight_scale")
             # `_MODELOPT_GLOBAL_SCALE` already carries its leading dot (it is a SUFFIX matched
-            # against full tensor names elsewhere in this file), while `fold_nvfp4_scale` keys its
-            # convention table on the bare field name. Two spellings of one thing, so both are
-            # derived from the constant rather than written out.
+            # against full tensor names elsewhere in this file), while the nvfp4 convention table is
+            # keyed on the bare field name. Two spellings of one thing, so both are derived from the
+            # constant rather than written out.
             g = f.get_tensor(pre + p + _MODELOPT_GLOBAL_SCALE)
             self.bytes_read += w.numel() * w.element_size() + s.numel() * s.element_size() + 4
-            packed.append(w.to(self.device, non_blocking=True))
-            scales.append(
-                nvfp4.fold_nvfp4_scale(
-                    s.to(self.device),
-                    g.to(self.device),
-                    global_field=_MODELOPT_GLOBAL_SCALE.lstrip("."),
-                )
+            block, gvec = nvfp4.split_nvfp4_scale(
+                s, g, global_field=_MODELOPT_GLOBAL_SCALE.lstrip(".")
             )
+            packed.append(w.to(self.device, non_blocking=True))
+            scales.append(block.to(self.device, non_blocking=True))
+            globals_.append(gvec.to(self.device, non_blocking=True))
         if len(projs) == 1:
-            return packed[0], scales[0]
-        return torch.cat(packed, dim=0), torch.cat(scales, dim=0)
+            return packed[0], scales[0], globals_[0]
+        return (
+            torch.cat(packed, dim=0),
+            torch.cat(scales, dim=0),
+            torch.cat(globals_, dim=0),
+        )
 
     def gather(self, layer: int, expert_ids) -> "Dict[str, Dict[str, torch.Tensor]]":
         from minisgl.quant import nvfp4
 
-        p13, s13, p2, s2 = [], [], [], []
+        p13, s13, g13, p2, s2, g2 = [], [], [], [], [], []
         for e in expert_ids:
-            a, b = self._leaf(layer, int(e), ("gate_proj", "up_proj"))
-            c, d = self._leaf(layer, int(e), ("down_proj",))
+            a, b, c = self._leaf(layer, int(e), ("gate_proj", "up_proj"))
+            d, x, y = self._leaf(layer, int(e), ("down_proj",))
             p13.append(a)
             s13.append(b)
-            p2.append(c)
-            s2.append(d)
+            g13.append(c)
+            p2.append(d)
+            s2.append(x)
+            g2.append(y)
         out: "Dict[str, Dict[str, torch.Tensor]]" = {}
-        for attr, packed, scale in (("gate_up_proj", p13, s13), ("down_proj", p2, s2)):
+        for attr, packed, scale, glob in (
+            ("gate_up_proj", p13, s13, g13),
+            ("down_proj", p2, s2, g2),
+        ):
             conv = nvfp4.convert_nvfp4_moe(torch.stack(packed), torch.stack(scale))
             out[attr] = {
                 "_w_op": conv["w_packed"],
                 # GROUP-MAJOR, exactly as `_GroupedNvFp4Experts.post_load` leaves it.
                 "_scales_op": conv["scales"].transpose(1, 2).contiguous(),
+                # (E, N) f32 global bitcast to int32 — the `w_zeros` pointer slot, exactly as
+                # `post_load` leaves it. Bit-for-bit the same transform, not a second recipe.
+                "_global_op": torch.stack(glob).contiguous().view(torch.int32),
             }
         return out
 
@@ -2121,6 +2196,13 @@ def _shard_laguna(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.T
         or name == "model.norm.weight"
     ):
         return t
+    # NVFP4 split arm: `.down_proj.weight_global` is the per-OUTPUT-CHANNEL f32 global, an (N,)
+    # vector, and down_proj is ROW-parallel — it splits the input K, so its output N is full width on
+    # every rank and the global REPLICATES. Matched before the `.down_proj.` rule below, which would
+    # chunk a 1-D tensor on dim 1 and raise. (gate/up's global DOES split, on dim 0, which is what the
+    # column-parallel rule already does.)
+    if name.endswith(".down_proj.weight_global"):
+        return t
     # Column-parallel (output dim 0): attention q/k/v/g; dense-L0 + routed-expert gate/up.
     if name.endswith((".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".g_proj.weight")) or (
         ".gate_proj." in name or ".up_proj." in name
@@ -2173,34 +2255,39 @@ def _load_laguna_weight(
 
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
-                # NVFP4: fold e4m3 block scale / per-tensor global -> one fp16 per-group scale at the
-                # LEAF (before rename / gate-up merge / expert stack). weight_packed passes through 4-bit;
-                # input_global_scale (FP4 act calib) is dropped (the e2m1 kernel quantizes acts to fp8).
-                override = None
+            for ckpt_name in f.keys():
+                # NVFP4 scale resolution at the LEAF (before rename / gate-up merge / expert stack).
+                # Routed experts keep BOTH levels and emit TWO leaves; dense linears still fold to one
+                # fp16 per-group scale — `nvfp4.nvfp4_leaf_scales` owns that split, once, for every
+                # loader. weight_packed passes through 4-bit; input_global_scale (FP4 act calib) is
+                # dropped (the e2m1 kernel quantizes acts to fp8).
+                leaves: "list[Tuple[str, torch.Tensor | None]]" = [(ckpt_name, None)]
                 if _is_nvfp4:
-                    if name.endswith(".input_global_scale"):
+                    if ckpt_name.endswith(".input_global_scale"):
                         continue
-                    if name.endswith((".weight_scale", ".weight_global_scale")):
-                        base, field = name.rsplit(".", 1)
+                    if ckpt_name.endswith((".weight_scale", ".weight_global_scale")):
+                        base, field = ckpt_name.rsplit(".", 1)
                         buf = nvfp4_fold_buf.setdefault(base, {})
-                        buf[field] = f.get_tensor(name)
+                        buf[field] = f.get_tensor(ckpt_name)
                         if len(buf) < 2:
                             continue
                         del nvfp4_fold_buf[base]
-                        name = base + ".weight_scale"
-                        override = nvfp4.fold_nvfp4_scale(
-                            buf["weight_scale"],
-                            buf["weight_global_scale"],
-                            global_field="weight_global_scale",
+                        leaves = list(
+                            nvfp4.nvfp4_leaf_scales(
+                                base,
+                                buf["weight_scale"],
+                                buf["weight_global_scale"],
+                                global_field="weight_global_scale",
+                            )
                         )
-                plan = _laguna_remap(name)
-                if plan is None:
-                    continue
-                native = plan[0]
-                tens = override if override is not None else f.get_tensor(name)
-                raw = _shard_laguna(native, tens, tp_info.rank, tp_info.size, config)
-                yield from emit(native, raw)
+                for name, override in leaves:
+                    plan = _laguna_remap(name)
+                    if plan is None:
+                        continue
+                    native = plan[0]
+                    tens = override if override is not None else f.get_tensor(name)
+                    raw = _shard_laguna(native, tens, tp_info.rank, tp_info.size, config)
+                    yield from emit(native, raw)
     assert not merge_buf, f"incomplete gate/up merges in checkpoint: {list(merge_buf.keys())}"
     assert not expert_buf, f"incomplete expert stacks in checkpoint: {expert_buf.pending}"
     assert not nvfp4_fold_buf, (
@@ -2294,11 +2381,15 @@ def _load_muse_glimmer_weight(
             for name in f.keys():
                 if name.startswith(_MUSE_SKIP_PREFIXES):
                     continue  # vision stack: unquantized, so it never enters the fold buffer
-                # NVFP4: fold the e4m3 block scale and the per-tensor global into ONE fp16 per-group
-                # scale at the LEAF — before the rename and before the gate/up merge — so no
-                # per-tensor scalar ever has to survive a concat. weight_packed passes through still
-                # 4-bit; input_global_scale (the FP4 activation calibration) is dropped, because the
-                # e2m1 kernel quantizes activations to fp8 dynamically.
+                # NVFP4 scale resolution at the LEAF — before the rename and before the gate/up
+                # merge — so no per-tensor scalar ever has to survive a concat. weight_packed passes
+                # through still 4-bit; input_global_scale (the FP4 activation calibration) is
+                # dropped, because the e2m1 kernel quantizes activations to fp8 dynamically.
+                #
+                # Muse-Glimmer is DENSE, so `nvfp4_leaf_scales` always takes its FOLD arm here and
+                # this loader can only ever see one leaf per pair — asserted rather than assumed, so
+                # that adding an `.experts.` module to this family (which would start splitting) is a
+                # loud failure here instead of a global vector silently dropped on the floor.
                 override = None
                 if _is_nvfp4:
                     if name.endswith(".input_global_scale"):
@@ -2310,12 +2401,18 @@ def _load_muse_glimmer_weight(
                         if len(buf) < 2:
                             continue
                         del nvfp4_fold_buf[base]
-                        name = base + ".weight_scale"
-                        override = nvfp4.fold_nvfp4_scale(
+                        leaves = nvfp4.nvfp4_leaf_scales(
+                            base,
                             buf["weight_scale"],
                             buf["weight_global_scale"],
                             global_field="weight_global_scale",
                         )
+                        assert len(leaves) == 1, (
+                            f"{base}: Muse-Glimmer is dense, but nvfp4_leaf_scales returned "
+                            f"{len(leaves)} leaves ({[n for n, _ in leaves]}). This loader has no "
+                            f"expert stack to carry a per-output-channel global through."
+                        )
+                        name, override = leaves[0]
                 native = _muse_glimmer_remap(name)
                 if native is None:
                     continue

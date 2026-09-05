@@ -459,13 +459,73 @@ def moe_route_sigmoid_bias(
     return moe_hip.moe_topk_sigmoid_bias(g, b, top_k, renormalize, routed_scaling_factor)
 
 
+def _check_moe_scale_pair(
+    w: torch.Tensor, scales: torch.Tensor, zeros: "torch.Tensor | None", which: str
+) -> None:
+    """Assert the (scales dtype, zeros slot) PAIR is one of the two the kernel can dispatch.
+
+    THE KERNEL PICKS ITS WScale POLICY OFF THE SCALES DTYPE and nothing else
+    (`moe_kernel.hip::MOE_SCALE_FMT_DISPATCH`; `torch_binding.cpp` gates the same three dtypes). The
+    `w_zeros` pointer slot is then read as AWQ packed zeros under `Fp16GroupScale` and as the
+    per-output-channel f32 global under `E4m3GroupScaleGlobal`. Those are different tensors of
+    different rank in the same argument, so a mismatched pair is not a shape error the op would catch
+    — it is a pointer the kernel dereferences with the wrong stride. Both failure directions are
+    silent and finite:
+
+      * e4m3 scales with AWQ-shaped zeros -> the epilogue reads a packed-nibble word as an f32 global
+        and every output channel is multiplied by a denormal or a huge number;
+      * fp16 scales with an (E, N) global -> `Fp16GroupScale::wz_base` strides by `G*(N/8)`, so the
+        zero-point read runs off the end of a tensor 1/(G/8) its expected size.
+
+    So the pair is checked here, on the ONE call path both formats share, rather than trusted to
+    line up because the container that built them happened to be consistent.
+
+    NOTE (kernel-side gap, 2026-09-05): `fp8_wmma/torch-ext/torch_binding.cpp` still validates the
+    zeros slot as `w_zeros.dim() == 3 && w_zeros.size(2)*8 == N && w_zeros.size(1) == scales.size(1)`
+    on all eleven grouped-MoE entry points, which REJECTS the (E, N) global. The kernel bodies accept
+    it (the policy owns the slot); only the binding's shape predicate needs widening to "AWQ zeros
+    (E,G,N/8) i32 XOR NVFP4 global (E,N) i32, selected by the scales dtype". Until that lands this
+    check fires first and names the reason, instead of the binding failing with a shape message that
+    points at the wrong tensor.
+    """
+    if scales.dtype == torch.float16:
+        if zeros is not None and zeros.dim() != 3:
+            raise AssertionError(
+                f"w4a8_moe {which}: fp16 (folded) scales pair with AWQ packed zeros (E, G, N/8) "
+                f"int32, but got a {zeros.dim()}-D {zeros.dtype} tensor {tuple(zeros.shape)}. A 2-D "
+                f"zeros tensor here is an NVFP4 per-output-channel global handed to the fp16 policy, "
+                f"which would stride it as if it were (E, G, N/8)."
+            )
+        return
+    if scales.dtype not in (torch.float8_e4m3fn, torch.uint8):
+        raise AssertionError(
+            f"w4a8_moe {which}: scales must be fp16 (folded per-group) or float8_e4m3fn/uint8 "
+            f"(NVFP4 block scale); got {scales.dtype}"
+        )
+    E, N = w.shape[0], w.shape[1]
+    if zeros is None:
+        raise AssertionError(
+            f"w4a8_moe {which}: e4m3 block scales REQUIRE the per-output-channel f32 global in the "
+            f"zeros slot — the two-level scale is incomplete without it, and the kernel's "
+            f"`epi(nullptr)` returns 1.0f, i.e. it would serve the block scale alone. That is a "
+            f"~1/global error per weight (4.8e3x on this checkpoint), fluent and finite."
+        )
+    if zeros.dtype != torch.int32 or tuple(zeros.shape) != (E, N):
+        raise AssertionError(
+            f"w4a8_moe {which}: the NVFP4 global must be the (E, N)=({E}, {N}) f32 vector BITCAST to "
+            f"int32 (the `w_zeros` slot is typed `const int*` and the kernel does "
+            f"reinterpret_cast<const float*>); got {zeros.dtype} {tuple(zeros.shape)}. A "
+            f"`.to(torch.int32)` instead of `.view(torch.int32)` truncates every global to 0."
+        )
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
-    w13_scales: torch.Tensor,  # (E, 2*inter, K//g) f16
-    w13_zeros: torch.Tensor | None,
+    w13_scales: torch.Tensor,  # (E, K//g, 2*inter) GROUP-MAJOR f16 (folded) | f8_e4m3 (NVFP4 block)
+    w13_zeros: torch.Tensor | None,  # AWQ zeros (E,G,N/8) i32 | NVFP4 global (E,N) f32-as-i32 | None
     w2: torch.Tensor,  # (E, K, inter//8) i32
-    w2_scales: torch.Tensor,  # (E, K, inter//g) f16
+    w2_scales: torch.Tensor,  # (E, inter//g, K) GROUP-MAJOR f16 | f8_e4m3
     w2_zeros: torch.Tensor | None,
     gating_output: torch.Tensor | None,  # (M, E); ignored when topk_ids/topk_weights are given
     top_k: int,
@@ -475,7 +535,7 @@ def w4a8_moe(
     topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
     block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
-    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
+    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4/NVFP4 (OCP E2M1)
     activation: str = "silu",  # gated activation on the gemm1 [gate|up] output: "silu" | "gelu"
     x_fp8: torch.Tensor | None = None,  # PRODUCER-quantized activations — see below
     act_scales: torch.Tensor | None = None,
@@ -483,8 +543,11 @@ def w4a8_moe(
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> gated activation
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
     w4a8_fp8_wmma `_run_grouped_moe` (non-GEMV, unfused-silu) path. Returns (M, K).
-    `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight decode instead of uniform int4
-    (the scales are the E8M0 group exponents folded to fp16; w13_zeros/w2_zeros MUST be None).
+    `weight_is_e2m1=True` selects the kernel's MXFP4/NVFP4 (E2M1) weight decode instead of uniform
+    int4. The SCALE FORMAT is then chosen by the scales DTYPE, not by a flag: fp16 = one folded
+    per-group scale (MXFP4's E8M0 exponents, or NVFP4's legacy fold) and the zeros slot must be
+    empty; float8_e4m3fn = NVFP4's native per-16 block scale, and the zeros slot carries its
+    per-output-channel f32 global bitcast to int32. `_check_moe_scale_pair` enforces the pairing.
     `activation` picks the gated activation: "silu" (default, and the only one with a fused gemm1
     epilogue) or "gelu" == HF `gelu_pytorch_tanh` (Gemma4's routed experts), which forces the
     unfused gemm1 path below.
@@ -535,6 +598,8 @@ def w4a8_moe(
     _gemv_ok = (_grp % 32 == 0) or (_grp % 16 == 0 and _NVFP4_GEMV)
     gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
+    _check_moe_scale_pair(w13, w13_scales, w13_zeros, "w13")
+    _check_moe_scale_pair(w2, w2_scales, w2_zeros, "w2")
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:

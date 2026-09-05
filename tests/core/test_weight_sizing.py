@@ -26,6 +26,7 @@ from minisgl.weights.sizing import (
     SCHEME_UNQUANTIZED,
     ExpertScheme,
     analytic_gemm_bytes,
+    analytic_gemm_rows,
     expert_stack_bytes,
     post_load_delta_bytes,
     scheme_from_quant,
@@ -195,14 +196,46 @@ def test_mxfp4_scale_is_one_byte_e8m0_on_disk_and_two_bytes_resident():
     nv = analytic_gemm_bytes(ExpertScheme(SCHEME_NVFP4, bits=4, group_size=16), E, N, K)
     assert mx.weight == nv.weight == E * N * (K // 2)
     assert mx.scale == E * N * (K // 32) * 1
-    assert nv.scale == E * N * (K // 16) * 2
-    assert nv.scale == 4 * mx.scale
+    # NVFP4 keeps the checkpoint's TWO levels: a 1-byte e4m3 block scale every 16 elements, plus a
+    # per-OUTPUT-CHANNEL f32 global. (It was a single FOLDED fp16 scale until 2026-09-05; that fold
+    # was both bigger -- 2 B per group -- and lossy at 4.37e-04 max rel-err. See quant/nvfp4.py.)
+    assert nv.scale == E * N * (K // 16) * 1
+    assert nv.scale == 2 * mx.scale  # twice as MANY groups, half the bytes each
+    assert nv.scale2 == E * N * 4
+    assert nv.checkpoint_total == nv.weight + nv.scale + nv.scale2
     # post_load widens E8M0 -> fp16: +1 byte per group scale, per expert, and it IS per-expert so
     # it is charged to the granule as well as to residency.
     assert mx.post_load_resident == E * N * (K // 32)
     assert mx.post_load_granule == N * (K // 32)
     assert mx.total == mx.checkpoint_total + E * N * (K // 32)
-    assert nv.post_load_resident == 0  # NVFP4's folded scale is already fp16 on disk
+    # NVFP4's post_load is a pack + a transpose + a BITCAST -- three same-size operations.
+    assert nv.post_load_resident == 0
+
+
+def test_nvfp4_global_is_its_own_arena_row_and_the_rows_sum_to_the_total():
+    """THE UNDER-COUNTING GUARD. `weight_global` is a real `torch.empty` in the container, so it is
+    a resident row AND a per-expert granule component. Charging it inside `scale` would size the
+    total right and the RESERVATION wrong (rows never straddle a chunk), and omitting it entirely
+    silently spills weights to VRAM with a KV pool sized off the same under-count.
+    """
+    nv = analytic_gemm_bytes(ExpertScheme(SCHEME_NVFP4, bits=4, group_size=16), E, N, K)
+    rows = dict(analytic_gemm_rows(nv, "w13"))
+    assert "w13.scale2" in rows, f"the NVFP4 global lost its own row: {sorted(rows)}"
+    assert rows["w13.scale2"] == E * N * 4
+    assert rows["w13.scale"] == E * N * (K // 16)  # NOT widened by the global
+    assert sum(rows.values()) == nv.total
+
+
+def test_nvfp4_two_level_scale_is_smaller_than_the_fp16_fold_it_replaced():
+    """The byte claim, stated as arithmetic rather than as prose.
+
+    The fold stored 2 B per 16-element group. The split stores 1 B per group plus 4 B per output
+    channel, so it wins whenever K/16 > 4 -- i.e. K > 64, true of every projection this repo serves.
+    """
+    nv = analytic_gemm_bytes(ExpertScheme(SCHEME_NVFP4, bits=4, group_size=16), E, N, K)
+    folded_scale_bytes = E * N * (K // 16) * 2
+    assert nv.scale + nv.scale2 < folded_scale_bytes
+    assert nv.total == nv.weight + E * N * (K // 16) + E * N * 4
 
 
 @pytest.mark.parametrize(

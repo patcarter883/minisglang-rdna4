@@ -12,18 +12,23 @@ will otherwise think the ABI drifted:
      layer and derives the per-expert strides from (hidden, inter). Flattening to the declared slab
      would mean a third full copy of the tier's ~27 GiB.
   2. NO `lut256`. That is policy A/B state (an e4m3->float table with the per-tensor global folded
-     in). The resident scales here are already `fp16(e4m3_block_scale * weight_scale_2)` — the
-     loader folds at the leaf (`models/weight.py:1343-1351`) and `post_load` `del`s the checkpoint
-     copies — so the policy is `WLoadVnniFp16`, whose `post_scale()` is 1.0 and which needs no table.
+     in). This backend was written against resident scales of `fp16(e4m3_block_scale *
+     weight_scale_2)` — the loader used to FOLD at the leaf — so the policy is `WLoadVnniFp16`,
+     whose `post_scale()` is 1.0 and which needs no table.
 
-WHICH POLICY, AND THE 10% THAT IS REAL AND UNCLAIMED
+WHICH POLICY, AND THE 10% THAT IS NOW ON THE ENGINE'S SIDE OF THE SEAM
     `sizing._CPU_WLOAD_BY_SCHEME` maps NVFP4 to `vnni_nvfp4_e4m3_g16` — the checkpoint's own e4m3
-    group scale, 0.5625 B/weight, 10% smaller AND ~1800x more accurate than the fp16 fold. That
-    policy reads bytes THE ENGINE NO LONGER HAS by the time the CPU tier bakes. Getting it needs a
-    repacker that re-reads the raw checkpoint, which is exactly what `resolve_weight_plan(
-    cpu_repacked=)` gates and what nothing implements. So this backend serves policy E at
-    `layout_fraction = 1.0` and the 10% capacity/bandwidth win stays on the table. Stated here
-    because the projection arithmetic in `cpu_tier.py` quotes the e4m3 figure.
+    group scale, 0.5625 B/weight, 10% smaller AND ~1800x more accurate than the fp16 fold. That used
+    to name bytes the engine no longer had, because the fold happened at the leaf and `post_load`
+    deleted the originals.
+
+    AS OF 2026-09-05 THAT IS NO LONGER TRUE, AND THE GAP MOVED. The NVFP4 containers now hold exactly
+    the `vnni_nvfp4_e4m3_g16` layout — a 1-byte e4m3 block scale plus a per-output-channel f32 global
+    — so no checkpoint repacker is needed any more; what is missing is the CPU CORE's instantiation
+    of that policy and a `global` pointer threaded to its `post_scale()`. Until that lands,
+    `pack_layer` REFUSES an e4m3 scale slab rather than reading half a slab through the fp16 policy
+    and dropping the global (see the dtype check there). The 10% capacity/bandwidth win, and the
+    ~1800x accuracy win with it, is now one kernel-side policy away instead of one repacker away.
 
 THE TILING IS DONE IN PLACE
     The VNNI core reads 16x16 tiles; the engine's tensors are row-major (codes) and group-major
@@ -161,6 +166,27 @@ class NativeVnniBackend:
                 )
             if not t.is_contiguous():
                 raise CpuTierError(f"{what} is not contiguous; the tiler indexes it as a flat slab")
+        # THE .so IS `WLoadVnniFp16`: `cpu_moe_pack_fp16` reads the scale slab as `__half` and its
+        # `post_scale()` is 1.0f. Since 2026-09-05 the NVFP4 containers keep the checkpoint's TWO
+        # levels — a 1-byte e4m3 block scale plus a per-output-channel f32 global — so this backend's
+        # inputs are no longer what it was written against, in BOTH directions at once: half as many
+        # scale bytes as it will read (it walks off the end of the slab, into the next expert), and
+        # the global entirely absent (a uniform ~4.8e3x error per weight). Neither is a crash.
+        # Refuse, and name the fix: `sizing._CPU_WLOAD_BY_SCHEME` already maps NVFP4 to
+        # `vnni_nvfp4_e4m3_g16`, which is EXACTLY this layout — the CPU core needs that policy
+        # instantiated and a `global` pointer threaded to its `post_scale()`, i.e. the same
+        # WScale-policy change the GPU kernels just took. (The module docstring above says this
+        # backend "serves policy E at layout_fraction = 1.0"; that is now a refusal, not a default.)
+        for t, what in ((w13s, "w13 scales"), (w2s, "w2 scales")):
+            if t.dtype != torch.float16:
+                raise CpuTierError(
+                    f"CPU-tier layer at expert offset {expert_offset}: {what} is {t.dtype}, but "
+                    f"`cpu_moe_pack_fp16` reads a fp16 slab. This is the NVFP4 two-level scale "
+                    f"(e4m3 block + per-output-channel f32 global); the CPU core must be built with "
+                    f"the `vnni_nvfp4_e4m3_g16` WLoad policy before it can serve these experts. "
+                    f"Serving them through the fp16 policy would read half a slab and drop the "
+                    f"global — finite, plausible, and wrong."
+                )
         E, N13, _ = w13c.shape
         H = self.hidden
         I = self.inter

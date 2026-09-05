@@ -259,8 +259,8 @@ def _scheme_from_quant(quant: Any, fp8_experts: bool, compute_dtype_bytes: int) 
     bits = int(getattr(quant, "bits", 4) or 4)
     sym = bool(getattr(quant, "sym", True))
     if bool(getattr(quant, "is_nvfp4", False)):
-        # The loader folds NVFP4's e4m3 block scale + fp32 global into ONE fp16 per-group scale at
-        # the leaf, so by load time the container is (E,N,K/2) u8 + (E,N,K/16) fp16.
+        # The loader keeps NVFP4's TWO scale levels for MoE experts, so the container is
+        # (E,N,K/2) u8 + (E,N,K/16) float8_e4m3fn + (E,N) f32 -- see `_checkpoint_gemm_bytes`.
         return ExpertScheme(SCHEME_NVFP4, bits=4, group_size=g or 16, sym=True,
                             elem_bytes=compute_dtype_bytes)
     if bool(getattr(quant, "is_rxf", False)):
@@ -326,7 +326,8 @@ class PostLoadDelta:
 
     Every other container's `post_load` is a permutation or a same-size repack: GPTQ/AWQ
     `(E,K/pf,N)->(E,N,K/pf)`, CT-asymmetric `(E,N/pf,G)->(E,G,N/pf)`, NVFP4 `u8 (E,N,K/2)` ->
-    `i32 (E,N,K/8)`, fp8 `view(uint8)` + `squeeze(-1)`, RXF `transpose(1,2)`. Those are 0 here, and
+    `i32 (E,N,K/8)` plus an e4m3 `transpose(1,2)` and an f32->i32 BITCAST of the global (all three
+    same-size), fp8 `view(uint8)` + `squeeze(-1)`, RXF `transpose(1,2)`. Those are 0 here, and
     the `_w_rep`/`_scales_rd` register-direct repacks go through kernels this file cannot see — if
     one of those ever pads, only the post-`post_load()` reconciliation can catch it.
     """
@@ -384,11 +385,21 @@ class GemmBytes:
     post_load_resident: int = 0
     post_load_granule: int = 0
     post_load_note: str = ""
+    # A SECOND scale level, when the container keeps one. Today that is exactly NVFP4's
+    # per-output-channel f32 global (`_GroupedNvFp4Experts.weight_global`, E*N*4 bytes), which is a
+    # real allocated tensor and a real per-expert granule component.
+    #
+    # IT IS A FIELD, NOT A TERM ROLLED INTO `scale`, BECAUSE THE ROWS ARE THE POINT. The arena is
+    # reserved by ENUMERATING rows (`placement.LayerWeights.rows`) and rows never straddle a chunk,
+    # so "one 25 MiB row + one 8 MiB row" and "one 33 MiB row" reserve DIFFERENTLY. Folding the
+    # global into `scale` would size the total correctly and the reservation optimistically — which
+    # is the failure this file's docstring warns about, arriving through a different door.
+    scale2: int = 0
 
     @property
     def checkpoint_total(self) -> int:
         """Bytes the container holds as `__init__` declares it, before `post_load()` runs."""
-        return self.weight + self.scale + self.zero
+        return self.weight + self.scale + self.scale2 + self.zero
 
     @property
     def total(self) -> int:
@@ -464,10 +475,21 @@ def _checkpoint_gemm_bytes(
         return GemmBytes(E * N * (K // 2), E * N * (K // g), 0, E, kind,
                          f"E*N*K/2 + E*N*K/{g}*1")
     if kind == SCHEME_NVFP4:
-        # weight_packed (E,N,K/2) u8 + weight_scale (E,N,K/g) f16 (the FOLDED single-level scale).
+        # weight_packed (E,N,K/2) u8 + weight_scale (E,N,K/g) float8_e4m3fn (1 B, the checkpoint's
+        # own block scale) + weight_global (E,N) f32 (the per-output-channel global MULTIPLIER).
+        #
+        # THE `weight_global` TERM IS A NEW GRANULE ROW AND UNDER-COUNTING IT IS SILENT. It is a real
+        # `torch.empty` in `_GroupedNvFp4Experts.__init__` and survives `post_load` as `_global_op`
+        # (a bitcast view of the same bytes), so the arena must hold it and the route must carry it.
+        # Omitted, the plan under-reserves by E*N*4 per container, the bump allocator runs dry, and
+        # weights budgeted host-resident land in VRAM — with a KV pool sized off the same under-count
+        # and a boot that looks fine.
+        #
+        # This arm used to charge `E*N*K/g*2` for a FOLDED fp16 scale. The split is NET SMALLER at
+        # this shape: -1 B per group beats +4 B per output channel whenever K/g > 4, i.e. K > 64.
         _require_div(K, g, "NVFP4 K")
-        return GemmBytes(E * N * (K // 2), E * N * (K // g) * 2, 0, E, kind,
-                         f"E*N*K/2 + E*N*K/{g}*2")
+        return GemmBytes(E * N * (K // 2), E * N * (K // g), 0, E, kind,
+                         f"E*N*K/2 + E*N*K/{g}*1 + E*N*4", scale2=E * N * 4)
 
     pf = 32 // scheme.bits  # int4 -> 8 nibbles per int32
     if kind == SCHEME_GPTQ:
@@ -509,14 +531,17 @@ def analytic_gemm_rows(gb: GemmBytes, prefix: str) -> Tuple[Tuple[str, int], ...
     `gb.total`.
 
     A row is ONE COMPONENT's stacked slab (`moe_interpose._plan_items` calls `alloc_like` per
-    storage, never per expert), so the closed form's three terms are three rows and the `post_load`
-    delta is a fourth -- except for MXFP4, whose delta WIDENS the existing scale row rather than
+    storage, never per expert), so the closed form's four terms are four rows and the `post_load`
+    delta is a fifth -- except for MXFP4, whose delta WIDENS the existing scale row rather than
     adding one. That distinction is not cosmetic: two 24 MiB rows pack into a chunk tail that one
     48 MiB row does not, so modelling a widened row as a separate row would make the reservation
     optimistic in exactly the place the never-straddle rule bites.
+
+    `scale2` is NVFP4's per-output-channel f32 global, a separate `torch.empty` in the container and
+    therefore its own row -- see `GemmBytes.scale2`.
     """
     rows = [(f"{prefix}.weight", gb.weight), (f"{prefix}.scale", gb.scale),
-            (f"{prefix}.zero", gb.zero)]
+            (f"{prefix}.scale2", gb.scale2), (f"{prefix}.zero", gb.zero)]
     delta = gb.post_load_resident
     if delta:
         if gb.scheme == SCHEME_MXFP4:
