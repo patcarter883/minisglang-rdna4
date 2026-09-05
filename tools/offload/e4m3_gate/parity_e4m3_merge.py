@@ -126,12 +126,12 @@ def rec_moe(name, out, sti, M):
     uninitialized memory, and it does not fail loudly: it reports the op as nondeterministic and
     every downstream verdict becomes "cannot discriminate".
 
-    That is not hypothetical. The previous round's gate log (`logs/gate_a.log`) called 215 of its
-    360 tensors self-nondeterministic, and the ops it DID find reproducible are dominated by
-    `g2fuse` — whose output is (M, N) and has no pad rows at all. That gate could therefore not
-    answer the question it was built for. Whether every remaining case is the same cause is not
-    assumed here: the split makes it MEASURABLE, because a pad-row block that is noise on both
-    builds while the valid block is bit-exact says so directly.
+    MEASURED, AND THE PRECAUTION WAS NOT VINDICATED: across 148 pad-row blocks the same-build AND
+    cross-build deltas are both 0, i.e. on this build pair the skipped slots ARE written
+    deterministically. The split is kept anyway — it costs nothing, and a gate should compare the
+    rows it means to compare rather than rely on that staying true. It is explicitly NOT offered as
+    the explanation for the previous round's abandoned gate log (`logs/gate_a.log`, 215 of 360
+    tensors called self-nondeterministic); that configuration was not reproduced here.
 
     So the valid rows are recorded under `name` (the gate), and the pad rows under `name#pad`
     (evidence, expected to be noise on both builds — recorded rather than dropped so the claim
