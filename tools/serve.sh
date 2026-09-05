@@ -638,6 +638,25 @@ case "$MODEL" in
                          "MINISGL_PLE_FILES explicitly." >&2
                     exit 2
                   fi
+                  # `[SHIP-2026-09-05]` The META shard is checked TOO, and it was not before. The
+                  # block above guarded only the plefp8 list, so a HALF-mounted sidecar — the ten
+                  # plefp8 shards present, `model-bf16-00010.safetensors` absent — sailed past this
+                  # gate and died in `ple/source.py::PLEEmbeddingSource.__init__` with the KeyError
+                  # about `ngram_heads_offsets`, which is exactly the "three minutes into a
+                  # ten-minute boot" failure the comment above says this block exists to prevent.
+                  # It is a separate file in a separate shard SET, so it goes missing independently.
+                  # Only the DERIVED default is checked: an operator who names the file explicitly
+                  # in MINISGL_PLE_META_FILES may point at a multi-path list or a future layout, and
+                  # this gate must not out-guess them.
+                  if [[ "$MINISGL_PLE_META_FILES" == "$Q4E_PLE_DIR/model-bf16-00010.safetensors" \
+                        && ! -f "$MINISGL_PLE_META_FILES" ]]; then
+                    echo "[serve] ERROR: qwen4_exp found $(awk -F: '{print NF}' <<< "$MINISGL_PLE_FILES") PLE shards but" \
+                         "not the n-gram HEAD METADATA at $MINISGL_PLE_META_FILES. It lives in a" \
+                         "bf16 shard that is NOT part of the plefp8 set, and without it the row ids" \
+                         "cannot be formed at all — the boot would reach a KeyError minutes from" \
+                         "now. Mount the full sidecar or set MINISGL_PLE_META_FILES explicitly." >&2
+                    exit 2
+                  fi
                   export MINISGL_PLE_FILES MINISGL_PLE_META_FILES ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
