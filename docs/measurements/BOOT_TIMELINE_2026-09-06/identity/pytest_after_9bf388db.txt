@@ -1,0 +1,70 @@
+            k = qkv[:, :HEAD_SIZE]
+            v = qkv[:, HEAD_SIZE : HEAD_SIZE * 2]
+>           store_cache(
+                k_cache,
+                v_cache,
+                indices,
+                k,
+                v,
+            )
+
+tests/kernel/test_store.py:25: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+python/minisgl/kernel/store.py:41: in store_cache
+    module = _jit_store_module(element_size)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/minisgl/kernel/store.py:22: in _jit_store_module
+    return load_jit(
+python/minisgl/kernel/utils.py:120: in load_jit
+    return load_inline(
+/opt/venv/lib/python3.12/site-packages/tvm_ffi/cpp/extension.py:1174: in load_inline
+    build_inline(
+/opt/venv/lib/python3.12/site-packages/tvm_ffi/cpp/extension.py:1016: in build_inline
+    return _build_impl(
+/opt/venv/lib/python3.12/site-packages/tvm_ffi/cpp/extension.py:780: in _build_impl
+    build_ninja(str(build_dir))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+build_dir = '/root/.cache/tvm-ffi/minisgl__store_256_128_1_false_138a0886d9012a68'
+
+    def build_ninja(build_dir: str) -> None:
+        """Build the module in the given build directory using ninja."""
+        command = ["ninja", "-v"]
+        num_workers = os.environ.get("MAX_JOBS", None)
+        if num_workers is not None:
+            command += ["-j", num_workers]
+        if IS_WINDOWS:
+            status = _run_command_in_dev_prompt(args=command, cwd=build_dir, capture_output=True)
+        else:
+            status = subprocess.run(check=False, args=command, cwd=build_dir, capture_output=True)
+        encoding = "oem" if IS_WINDOWS else "utf-8"
+        if status.returncode != 0:
+            msg = [f"ninja exited with status {status.returncode}"]
+            if status.stdout:
+                msg.append(f"stdout:\n{status.stdout.decode(encoding)}")
+            if status.stderr:
+                msg.append(f"stderr:\n{status.stderr.decode(encoding)}")
+    
+>           raise RuntimeError("\n".join(msg))
+E           RuntimeError: ninja exited with status 1
+E           stdout:
+E           [1/2] /opt/rocm-7.2.1/bin/hipcc -std=c++17 -O2 -fPIC -D__HIP_PLATFORM_AMD__=1 -fno-gpu-rdc --offload-arch=gfx1201 --offload-arch=gfx1036 -std=c++20 -O3 --expt-relaxed-constexpr -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/rocm-7.2.1/include -I/engine/python/minisgl/kernel/csrc/include -c /root/.cache/tvm-ffi/minisgl__store_256_128_1_false_138a0886d9012a68/cuda.cu -o cuda_0.o
+E           FAILED: cuda_0.o 
+E           /opt/rocm-7.2.1/bin/hipcc -std=c++17 -O2 -fPIC -D__HIP_PLATFORM_AMD__=1 -fno-gpu-rdc --offload-arch=gfx1201 --offload-arch=gfx1036 -std=c++20 -O3 --expt-relaxed-constexpr -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/rocm-7.2.1/include -I/engine/python/minisgl/kernel/csrc/include -c /root/.cache/tvm-ffi/minisgl__store_256_128_1_false_138a0886d9012a68/cuda.cu -o cuda_0.o
+E           clang++: error: unknown argument: '--expt-relaxed-constexpr'
+E           failed to execute:/opt/rocm-7.2.1/lib/llvm/bin/clang++  --offload-arch=gfx1201 --offload-arch=gfx1036  -std=c++17 -O2 -fPIC -D__HIP_PLATFORM_AMD__=1 -fno-gpu-rdc -std=c++20 -O3 --expt-relaxed-constexpr -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/venv/lib/python3.12/site-packages/tvm_ffi/include -I/opt/rocm-7.2.1/include -I/engine/python/minisgl/kernel/csrc/include -c -x hip /root/.cache/tvm-ffi/minisgl__store_256_128_1_false_138a0886d9012a68/cuda.cu -o "cuda_0.o"
+E           ninja: build stopped: subcommand failed.
+
+/opt/venv/lib/python3.12/site-packages/tvm_ffi/cpp/extension.py:646: RuntimeError
+=============================== warnings summary ===============================
+tests/core/test_granule_regdirect_gpu.py::test_mxfp4_regdirect
+  /kbuild/fp8_wmma/weight_repack.py:247: UserWarning: MXFP4 E8M0 -> fp16 scale overflow: 7373 group scale(s) exceed fp16 max (~65504) and became +inf; the largest E8M0 exponent was 254 (2^127). Clamp/rescale the checkpoint if this is unexpected.
+    scales_fp16 = _mxfp4_scale_to_fp16(weight_scale)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/core/test_weight_boot_budget.py::test_kv_budget_keeps_exactly_five_subtrahends
+FAILED tests/kernel/test_index.py::test_indexing - RuntimeError: ninja exited...
+FAILED tests/kernel/test_index.py::test_indexing_with_mask - RuntimeError: ni...
+FAILED tests/kernel/test_store.py::test_store_cache - RuntimeError: ninja exi...
+4 failed, 1045 passed, 14 skipped, 1 warning in 12.65s

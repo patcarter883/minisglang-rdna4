@@ -1404,19 +1404,25 @@ def _load_qwen4_exp_weight(
     # into ONE process-wide REUSED buffer, and the four 3.4-10.0 GiB `model-bf16-*` body shards stay
     # on safetensors' mmap, byte-for-byte the reader they always had.
     #
-    # MEASURED, 48-layer TP=2, two worktrees, sequential, quiet box
-    # (docs/measurements/BOOT_TIMELINE_2026-09-06/r3/): boot 574.2 -> 254.6 s, stage_b 376.6 ->
-    # 111.1 s, ckpt.h2d 194.0 -> 51.6 s, swap-out 11.68M -> 3.05M pages. Bit-identical — digest
-    # a5e49a2e2b307ff3, 156/156 regions, 1236 keys, torch_fallbacks 0, same greedy tokens.
+    # MEASURED [BOOT-2026-09-05], 48-layer TP=2, FOUR boots (n=2 per arm), two worktrees, strictly
+    # sequential, one job on the box (docs/measurements/BOOT_DEFECT.md): boot 506.6 -> 300.1 s
+    # (1.69x), weight_load 355.5 -> 140.6 s, ckpt.h2d 243.5 -> 33.2 s, ckpt.shard 42.2 -> 8.1 s,
+    # major faults 56-60 M -> 24 M. Identical weights, proven byte-exactly: blake2b over 1990
+    # tensors / 70.44 GiB per rank read through the device pointer, same digest on all four boots.
     #
-    # It is NOT a transfer win, and the proof is in the buckets that are not reads at all:
-    # `stageb.post_load` (device-side NVFP4 conversion) fell 106.1 -> 7.0 s and `graph_capture` fell
-    # 84.1 -> 33.6 s. Neither touches the checkpoint. They were slow because the box was stopping
-    # both processes. On this pool, one cold 337.7 MiB shard per leg: mmap 627.0 MiB/s costing
-    # +0.33 GiB of page cache AND +0.33 GiB of ARC, O_DIRECT into the reused buffer 4967.0 MiB/s
-    # costing NOTHING. By the time Stage B streams, the two 24.12 GiB pinned arenas have taken half
-    # of RAM, so every mmap fault must allocate a page-cache page, which means reclaiming one, which
-    # on this box means a zram compression.
+    # IT IS THE READ. The single-leg r3 verdict claimed otherwise ("the two largest wins are not
+    # reads: post_load 106.1 -> 7.0, graph_capture 84.1 -> 33.6") and n=2 refutes it: post_load is
+    # 6.67 and 6.72 s on BOTH before legs, and graph_capture does not improve (68.79/53.62 before vs
+    # 68.65/70.45 after). What actually happens is that `ckpt.h2d` is a COPY whose mmap'd source
+    # pages used to be faulted in DURING the copy, so the read was billed to it; O_DIRECT moves the
+    # same work into `ckpt.safe_open` (0.5 -> 19.0 s) and the faults disappear.
+    #
+    # On this pool, one cold 337.7 MiB shard per leg: mmap 4 KiB walk 621.7-627.0 MiB/s costing
+    # +0.33 GiB of page cache AND +0.33 GiB of ARC, O_DIRECT into the reused buffer 5122.9 MiB/s
+    # costing NOTHING.
+    #
+    # REAL COSTS, not netted out: `ckpt.nvfp4_prepass` 2.2 -> 21.1 s and `ct_sign_verify` 0.1 ->
+    # 8.4 s. Both still read through mmap and were cheap only while something else left the ARC warm.
     #
     # WHAT ROUND 2'S 3.5x LOSS TAUGHT (docs/measurements/BOOT_TIMELINE_2026-09-06/r2/): a FRESH
     # buffer per shard is NOT this change. It made the read 5x faster and the boot 3.5x slower,

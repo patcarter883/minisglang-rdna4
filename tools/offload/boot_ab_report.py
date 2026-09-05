@@ -80,25 +80,93 @@ print("\n=== BIT-IDENTITY ===")
 if not ta or not tb:
     print(f"  MISSING test json ({A}={bool(ta)} {B}={bool(tb)})")
 else:
-    same_keys = ("arena_pinned_bytes", "arena_carved_bytes", "arena_torch_fallbacks",
+    # WEIGHT IDENTITY FIRST, because it is the only field here that is a statement about the DATA.
+    # Everything under it is an accounting identity, and every one of those passes over an arena
+    # holding the right number of the wrong bytes.
+    same_keys = ("weight_digest", "weight_digest_tensors", "weight_digest_bytes",
+                 "weight_digest_host_tensors", "weight_digest_host_bytes",
+                 "weight_digest_device_tensors", "weight_digest_device_bytes",
+                 "weight_digest_arena_owned_tensors", "weight_digest_layer_buckets",
+                 # BEHAVIOUR, at the ONLY width where it is evidence. `parity_*_ids` is the 12-step
+                 # bs=1 probe, captured and eager.
+                 "parity_captured_ids", "parity_eager_ids",
+                 "arena_pinned_bytes", "arena_carved_bytes", "arena_torch_fallbacks",
                  "seam_pointer_checked", "stage_b_keys_filled", "stage_b_host_layers",
                  "stage_b_device_layers", "plan_host_bytes", "plan_device_bytes",
-                 "copied_bytes", "stage_b_chunks", "token_ids", "text", "engaged",
+                 "copied_bytes", "stage_b_chunks", "engaged",
                  "seam_host_bytes", "seam_device_bytes", "kv_pages")
-    show_keys = ("boot_seconds", "stage_b_seconds", "stage_b_peak_host_rss")
+    # REPORTED, NEVER GATED — and `token_ids` MOVED HERE [BOOT-2026-09-05].
+    #
+    # `out["token_ids"]` is the `[5]` probe, which submits BOTH prompts in ONE `llm.generate([...])`
+    # with `max_running_req=2`. They therefore decode TOGETHER at bs=2, where the MoE gemm2 is
+    # `mmq_fp8_moe_gemm_scatter` — an ATOMIC scatter, whose accumulation order is not fixed and which
+    # is documented as not bit-exact. Those six ids are not a function of the weights and they vary
+    # boot to boot on unchanged code: `L48_r2_before`, `L48_r3_before`, `L48_r2_after`, `L48_r3_after`
+    # all recorded [11751, 13, 11751, 369, 264, 3177] while `L48_id_before`/`L48_id_before2` — the
+    # SAME 02957062 checkout as `L48_r3_before` — both recorded [11751, 13, 561, 6511, 314, 9564].
+    # Gating on them, as the r2/r3 reports did, produces a green that is a coin landing the same way
+    # twice and a red that indicts a correct change.
+    report_only = ("token_ids", "text")
+    show_keys = ("boot_seconds", "stage_b_seconds", "stage_b_peak_host_rss",
+                 "weight_digest_seconds")
     bad = []
     for i, (ra, rb) in enumerate(zip(ta["ranks"], tb["ranks"])):
         for k in same_keys:
             va, vb = ra.get(k), rb.get(k)
+            if va is None and vb is None:
+                continue  # the leg did not run this probe; say nothing rather than "SAME None"
             ok = va == vb
-            print(f"  rank{i} {k:<28} {'SAME' if ok else 'DIFFER'}  "
+            print(f"  rank{i} {k:<32} {'SAME' if ok else 'DIFFER'}  "
                   f"{va if ok else (va, vb)}")
             if not ok:
                 bad.append(f"rank{i}.{k}")
+        # PER-LAYER, so a divergence names the layer instead of only existing. 48 layers + body.
+        la, lb = ra.get("weight_digest_per_layer"), rb.get("weight_digest_per_layer")
+        if la and lb:
+            diff = sorted(k for k in set(la) | set(lb) if la.get(k) != lb.get(k))
+            print(f"  rank{i} {'weight_digest_per_layer':<32} "
+                  f"{'ALL ' + str(len(la)) + ' MATCH' if not diff else 'DIFFER: ' + str(diff[:8])}")
+            if diff:
+                bad.append(f"rank{i}.per_layer[{len(diff)}]")
+        for k in report_only:
+            va, vb = ra.get(k), rb.get(k)
+            if va is None and vb is None:
+                continue
+            tag = "same" if va == vb else "VARIES (bs=2 atomic scatter; not a gate)"
+            print(f"  rank{i} {k+' [report-only]':<32} {tag}")
+            if va != vb:
+                print(f"        {va}\n     -> {vb}")
         for k in show_keys:
-            print(f"  rank{i} {k:<28} {ra.get(k)} -> {rb.get(k)}")
+            if ra.get(k) is not None or rb.get(k) is not None:
+                print(f"  rank{i} {k:<32} {ra.get(k)} -> {rb.get(k)}")
     print(f"  failures: {ta.get('failures')} -> {tb.get('failures')}")
     print("  *** DIVERGED: " + ", ".join(bad) if bad else "  *** every identity field matches")
+
+    # --- BEHAVIOUR AND THROUGHPUT -------------------------------------------------------------
+    # Separate block, because these are not identity claims of the same kind. Greedy ids either
+    # match or they do not; tok/s is a measurement with spread and is only allowed to be "unchanged"
+    # within it. `repro_engine_is_reproducible` is the FLOOR: if the engine does not reproduce its
+    # own ids inside one boot, an ids-match across two boots is not evidence of anything.
+    print("\n=== BEHAVIOUR / THROUGHPUT ===")
+    for i, (ra, rb) in enumerate(zip(ta["ranks"], tb["ranks"])):
+        for k in ("repro_engine_is_reproducible", "parity_verdict",
+                  "throughput_captured_tok_per_s", "throughput_eager_tok_per_s",
+                  "throughput_captured_spread_s", "throughput_eager_spread_s",
+                  "throughput_captured_samples_s", "throughput_eager_samples_s"):
+            va, vb = ra.get(k), rb.get(k)
+            if va is None and vb is None:
+                continue
+            print(f"  rank{i} {k:<32} {va} -> {vb}")
+        for k in ("repro_captured", "repro_eager"):
+            v = ra.get(k), rb.get(k)
+            if v[0] is None and v[1] is None:
+                continue
+            print(f"  rank{i} {k+'.all_identical':<32} "
+                  f"{None if v[0] is None else v[0].get('all_identical')} -> "
+                  f"{None if v[1] is None else v[1].get('all_identical')}")
+            print(f"  rank{i} {k+'.distinct_outputs':<32} "
+                  f"{None if v[0] is None else v[0].get('distinct_outputs')} -> "
+                  f"{None if v[1] is None else v[1].get('distinct_outputs')}")
 
 for tag in (A, B):
     p = os.path.join(OUT, f"{tag}.run.log")

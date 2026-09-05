@@ -710,6 +710,164 @@ def _parity_one_width(llm, gr, ple_rt, args, width: int) -> dict:
     return d
 
 
+def _weight_digest(llm, args) -> dict:
+    """A BYTE-EXACT content hash of every weight tensor the built model can reach on this rank.
+
+    WHY THIS EXISTS. A boot-time change that only moves bytes faster has exactly one thing it must
+    prove: the bytes are the same. Every other gate in this file is an accounting identity — plan
+    digest, region counts, `arena_pinned_bytes`, `copied_bytes`, `stage_b_keys_filled` — and every
+    one of them is a statement about the LEDGER, not about the DATA. All of them pass over an arena
+    that was filled with the right NUMBER of the wrong bytes. The arena's own `selftest_light` is a
+    512-probe SAMPLE of a 1.34 GiB chunk (one probe per 2.7 MiB) compared against fingerprints the
+    arena itself wrote, so it proves the mapping is not aliased; it says nothing about whether the
+    CHECKPOINT landed correctly. This does, and it is not a sample: every byte of every tensor.
+
+    READ THROUGH THE POINTER THE KERNEL USES. A host-placed expert stack lives in `hipHostMalloc`
+    pages addressed through `hipHostGetDevicePointer`, so its tensor reports `device='cuda'`. The
+    copy below therefore goes out through the same mapping a MoE kernel dereferences, which is the
+    stronger statement: Phase 0 found this driver serving STALE pages at a live VA with every HIP
+    call returning success, and a digest taken from the host virtual address would not have seen it.
+
+    TWO WALKS, because one does not reach everything:
+      1. `granule._iter_tensors(model)` descends `BaseOP`/`nn.Module` children, so it reaches every
+         dense weight, norm, embedding and GDN projection — but NOT a plain expert-container object
+         hanging off a layer attribute, because the walker only descends into module-like nodes.
+      2. `seam.live_tensors()` per discovered MoE layer, which is the canonical tensor per alias
+         group for exactly the containers walk 1 misses. This is the same enumeration
+         `prove_seam_residency` asks the arena about, so the digest covers precisely the tensors
+         residency was proven for.
+    Names are unioned, so a tensor both walks reach is hashed once and the count stays physical.
+    """
+    import hashlib
+
+    from minisgl.weights import granule
+    from minisgl.weights.moe_interpose import discover_moe_layers
+    from minisgl.weights.stacks import StackKind
+
+    model = llm.engine.model
+    arena = getattr(getattr(getattr(llm.engine, "_woff", None), "driver", None), "arena", None)
+
+    named: dict = {}
+    for name, t in granule._iter_tensors(model, "", set()):
+        named.setdefault(name, t)
+    n_model_walk = len(named)
+    live = dict(discover_moe_layers(model))
+    seam_kind: dict = {}
+    for path, layer in sorted(live.items()):
+        seam = getattr(layer, "_weight_offload", None)
+        if seam is None:
+            continue
+        for name, t in seam.live_tensors():
+            named.setdefault(name, t)
+            seam_kind[name] = seam.kind
+
+    # ONE staging buffer, reused. 34 GiB of weights hashed through fresh allocations would add tens
+    # of GiB of transient RSS to a process whose whole defect is that this box reclaims under
+    # exactly that pressure — the digest would perturb the thing it is auditing.
+    CH = 32 << 20
+    stage = torch.empty(CH, dtype=torch.uint8, device="cpu")
+    mv = memoryview(stage.numpy())
+
+    def _hash(t) -> tuple:
+        """(hexdigest, nbytes). Streams the tensor's BYTES; never its numbers."""
+        x = t.detach()
+        if not x.is_contiguous():
+            x = x.contiguous()
+        flat = x.reshape(-1)
+        flat = flat.view(torch.uint8) if flat.numel() else flat
+        n = flat.numel()
+        h = hashlib.blake2b(digest_size=16)
+        h.update(f"{tuple(t.shape)}|{t.dtype}|{n}|".encode())
+        off = 0
+        while off < n:
+            k = min(CH, n - off)
+            stage[:k].copy_(flat[off : off + k])
+            h.update(mv[:k])
+            off += k
+        return h.hexdigest(), n
+
+    o: dict = {"weight_digest_model_walk_tensors": n_model_walk}
+    print(f"\n[8] weight digest: {len(named)} tensors "
+          f"({n_model_walk} from the model walk, {len(seam_kind)} from the seams)", flush=True)
+    t0 = time.perf_counter()
+    per_tensor: dict = {}
+    total_bytes = host_bytes = device_bytes = 0
+    host_tensors = device_tensors = 0
+    arena_owned = 0
+    failures: list = []
+    for name in sorted(named):
+        t = named[name]
+        try:
+            d, n = _hash(t)
+        except Exception as e:  # recorded, never swallowed — a tensor that cannot be read is a fact
+            failures.append(f"{name}: {e!r}")
+            continue
+        per_tensor[name] = d
+        total_bytes += n
+        kind = seam_kind.get(name)
+        if kind is StackKind.HOST:
+            host_tensors += 1
+            host_bytes += n
+            if arena is not None and arena.owns_pointer(t.data_ptr(), n):
+                arena_owned += 1
+        else:
+            device_tensors += 1
+            device_bytes += n
+    o["weight_digest_seconds"] = round(time.perf_counter() - t0, 2)
+
+    # PER LAYER, so a mismatch says WHICH layer rather than only that one exists. The bucket key is
+    # the `model.layers.<i>` prefix the plan and the seam paths both use.
+    per_layer: dict = {}
+    for name in sorted(per_tensor):
+        parts = name.split(".")
+        key = "body"
+        for i, p in enumerate(parts[:-1]):
+            if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                key = f"layer{int(parts[i + 1]):03d}"
+                break
+        per_layer.setdefault(key, hashlib.blake2b(digest_size=8))
+        per_layer[key].update(f"{name}={per_tensor[name]}\n".encode())
+    o["weight_digest_per_layer"] = {k: v.hexdigest() for k, v in sorted(per_layer.items())}
+
+    agg = hashlib.blake2b(digest_size=16)
+    for name in sorted(per_tensor):
+        agg.update(f"{name}={per_tensor[name]}\n".encode())
+    o.update(
+        weight_digest=agg.hexdigest(),
+        weight_digest_tensors=len(per_tensor),
+        weight_digest_bytes=int(total_bytes),
+        weight_digest_host_tensors=int(host_tensors),
+        weight_digest_host_bytes=int(host_bytes),
+        weight_digest_device_tensors=int(device_tensors),
+        weight_digest_device_bytes=int(device_bytes),
+        weight_digest_arena_owned_tensors=int(arena_owned),
+        weight_digest_layer_buckets=len(o["weight_digest_per_layer"]),
+        weight_digest_failures=failures,
+    )
+    print(f"  digest {o['weight_digest']}  over {o['weight_digest_tensors']} tensors / "
+          f"{_gib(total_bytes)} in {o['weight_digest_seconds']} s", flush=True)
+    print(f"  host {host_tensors} tensors / {_gib(host_bytes)} ({arena_owned} arena-owned)   "
+          f"device {device_tensors} tensors / {_gib(device_bytes)}", flush=True)
+    print(f"  layer buckets: {o['weight_digest_layer_buckets']}", flush=True)
+
+    # NON-VACUITY, GATED rather than reported. Each of these has been a real shape of green: a
+    # digest over zero tensors; a digest that never left the device tier, so the offloaded 25.7 GiB
+    # — the only bytes this fix moves differently — went unhashed; and a "host" digest read from a
+    # pointer the arena does not own, i.e. from a VRAM copy, which would make the whole comparison a
+    # statement about the wrong memory.
+    check_true("weight digest covered every layer + the body",
+               o["weight_digest_layer_buckets"] == args.layers + 1,
+               f"{o['weight_digest_layer_buckets']} buckets for {args.layers} layers")
+    check_true("weight digest is non-vacuous (bytes hashed)", total_bytes > 0, _gib(total_bytes))
+    check_true("weight digest covers the HOST tier (the bytes this change moves)",
+               host_bytes > 0, f"{host_tensors} tensors / {_gib(host_bytes)}")
+    check_true("every hashed HOST tensor was read through an ARENA-OWNED pointer",
+               arena is not None and arena_owned == host_tensors,
+               f"{arena_owned}/{host_tensors}")
+    check("no tensor failed to hash", len(failures), 0)
+    return o
+
+
 def _repro_probe(llm, args) -> dict:
     """Is the engine a fixed function of its inputs? Asked WITHOUT capture in the picture at all.
 
@@ -788,8 +946,19 @@ def _capture_throughput_ab(llm, args) -> dict:
     gr = llm.engine.graph_runner
     prompt = _PARITY_PROMPTS[0]
     warm = SamplingParams(temperature=0.0, max_tokens=8)
-    run = SamplingParams(temperature=0.0, max_tokens=args.throughput_tokens)
-    o: dict = {"throughput_tokens": int(args.throughput_tokens)}
+    # `ignore_eos=True` ON THE TIMED LEG, for the same reason `_capture_ab_sampled` does it, and
+    # FIXED HERE [BOOT-2026-09-05] because this function's own equal-token-count gate could not pass
+    # without it. Greedy ids are NOT bit-reproducible past ~32 tokens on this engine (a per-request
+    # recurrent-state slot that alternates; see `_repro_probe`), so over a 128-token run the captured
+    # and eager legs drift apart and one of them reaches EOS first. Measured 2026-09-06 at 48 layers
+    # TP=2: captured stopped at 68 tokens, eager ran the full 128, and `check("throughput legs
+    # generated the same token count", 68, 128)` FAILED — a red run for a property of the engine that
+    # has nothing to do with capture, over two legs that had by then done different amounts of work
+    # and were therefore not a throughput comparison at all. Pinning the count makes the legs equal
+    # work; it does not make them equal ids, and nothing here claims it does.
+    run = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=args.throughput_tokens)
+    o: dict = {"throughput_tokens": int(args.throughput_tokens),
+               "throughput_ignore_eos": True}
     print(f"\n[6c] throughput A/B: {args.throughput_tokens} greedy tokens, "
           f"captured vs eager (one boot)", flush=True)
 
@@ -1258,6 +1427,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--throughput-tokens", type=int, default=0)
     # N identical generates per mode, to separate the ENGINE's reproducibility from capture's.
     ap.add_argument("--repro-probe", type=int, default=0)
+    # THE WEIGHT-IDENTITY GATE for a boot-PERFORMANCE change. Hashes every byte of every reachable
+    # weight tensor, host tier included and read through the device-side mapping the kernels use.
+    # Off by default because it costs ~30 s and 34 GiB of reads; on for any A/B whose claim is
+    # "same model, loaded faster", where the accounting identities alone are not evidence.
+    ap.add_argument("--weight-digest", action="store_true")
     ap.add_argument("--throughput-repeats", type=int, default=3)
     # THE DELIVERABLE A/B (`_capture_ab_sampled`). Distinct from --throughput-tokens, which is the
     # GREEDY sanity version of the same switch: this one runs the checkpoint's own sampler, fixes the
@@ -1735,6 +1909,13 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
         out.update(tier.stats())
         check_true("the stream tier actually staged experts during the forwards",
                    tier.stages > 0 and tier.experts_staged > 0, tier.describe())
+
+    # [8] WEIGHT IDENTITY. DEAD LAST, after every timed leg, because it streams 34 GiB through the
+    # host mapping: run earlier it would sit inside the throughput A/B's cache and PCIe state and
+    # make the tok/s number a measurement of this probe. The weights are frozen at seal(), so the
+    # position cannot change what it reads.
+    if args.weight_digest:
+        out.update(_weight_digest(llm, args))
 
     out["kv_pages"] = int(llm.engine.num_pages)
     out["failures"] = _failures

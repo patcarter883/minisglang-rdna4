@@ -1,20 +1,30 @@
 """O_DIRECT reader for safetensors shards, into ONE REUSED page-aligned buffer.
 
 --------------------------------------------------------------------------------------------------
-VERDICT, 2026-09-06, 48-layer TP=2, sequential, quiet box, both legs at floor=4 GiB, two separate
-worktrees so neither leg could read the other's source
-(docs/measurements/BOOT_TIMELINE_2026-09-06/r3/):
+VERDICT [BOOT-2026-09-05], 48-layer TP=2, FOUR boots (n=2 per arm), strictly sequential, one job on
+the box at a time, two separate worktrees so neither arm could read the other's source, both arms at
+floor=4 GiB (docs/measurements/BOOT_DEFECT.md; artifacts in .../BOOT_TIMELINE_2026-09-06/identity/):
 
-    boot                574.2 s  ->  254.6 s      (2.26x)
-    stage_b             376.6 s  ->  111.1 s
-    ckpt.h2d            194.0 s  ->   51.6 s
-    stageb.post_load    106.1 s  ->    7.0 s      <- NOT a read; the box had been stopping it
-    graph_capture        84.1 s  ->   33.6 s      <- NOT a read either
-    swap-out         11.68 M pages -> 3.05 M   |  major faults 61.2 M -> 19.6 M
+    boot                506.6 s  ->  300.1 s      (1.69x, -206.5 s)   [503.5/509.7 -> 303.8/296.4]
+    weight_load         355.5 s  ->  140.6 s
+    stage_b_run         338.9 s  ->  105.7 s
+    ckpt.h2d            243.5 s  ->   33.2 s      <- the READ, which mmap billed here as faults
+    ckpt.shard           42.2 s  ->    8.1 s
+    ckpt.safe_open        0.5 s  ->   19.0 s      <- the same read, finally in its own bucket
+    ckpt.nvfp4_prepass    2.2 s  ->   21.1 s      <- REAL COST: the prepass is still on mmap
+    ct_sign_verify        0.1 s  ->    8.4 s      <- REAL COST, same cause
+    major faults      56-60 M    ->  24 M
 
-Bit-identical: digest a5e49a2e2b307ff3, 156 forecast / 156 actual regions, arena_pinned_bytes
-25,895,632,896 x2, torch_fallbacks 0, seam_pointer_checked, 1236 keys, and the same greedy token ids
-from both prompts on both ranks.
+IDENTITY: byte-exact blake2b over 1990 tensors / 70.44 GiB per rank, read THROUGH THE DEVICE POINTER
+the kernels dereference, identical on all four boots (19f67bc6... rank0, ef7229c5... rank1), all 49
+per-layer buckets matching; plan digest a5e49a2e2b307ff3, 156/156 regions, 1236 keys,
+torch_fallbacks 0; and 192/192 identical greedy ids on the bs=1 parity probe. Throughput unchanged:
+14.782 -> 14.703/14.788 tok/s sampled.
+
+SUPERSEDES the r3 single-leg verdict that stood here. Corrected: the 2.26x was 1.69x at n=2; and
+"the two largest wins are NOT reads" is REFUTED — stageb.post_load is 6.67/6.72 s on BOTH repeat
+before-legs (the 106.1 s was an outlier, so the 99 s saving does not exist) and graph_capture does
+not improve at all (68.79/53.62 before vs 68.65/70.45 after). THE WIN IS THE READ.
 
 --------------------------------------------------------------------------------------------------
 HISTORY, IN THE ORDER IT WAS MEASURED — this module shipped WRONG once, and the way it was wrong is

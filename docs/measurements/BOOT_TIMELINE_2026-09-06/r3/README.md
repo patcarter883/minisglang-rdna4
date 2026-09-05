@@ -1,5 +1,30 @@
 # 48-layer TP=2 boot A/B — O_DIRECT into ONE REUSED buffer, 2026-09-06 (round 3)
 
+> ## `[BOOT-2026-09-05]` SUPERSEDED IN PART — read `docs/measurements/BOOT_DEFECT.md` first
+>
+> This page is **one leg per arm**. A four-boot, n=2-per-arm repeat corrects three of its claims:
+>
+> 1. **The 2.26x is inflated.** `574.2 -> 254.6 s` becomes **506.6 -> 300.1 s (1.69x)** at n=2.
+>    Same direction, same sign on every large bucket; this page's before leg was unusually slow.
+> 2. **"THE TWO LARGEST WINS ARE NOT READS" is REFUTED.** `stageb.post_load` measures **6.67 and
+>    6.72 s on both** repeat before-legs, so the 106.1 -> 7.0 s saving does not exist — 106.1 was
+>    the outlier. `graph_capture` does **not** improve: 68.79 / 53.62 before vs 68.65 / 70.45 after.
+>    `arena_pin_attach` spans 71.6-101.6 s on the before arm alone, so its -22.8 s is noise too.
+>    The win IS the read, and it is large because mmap billed it to `ckpt.h2d` as deferred page
+>    faults (`major_faults` 56-60 M -> 24 M).
+> 3. **The bit-identity claim below rests on a field that cannot discriminate.** "the same greedy
+>    token ids from both prompts on both ranks" is the `[5]` probe, which decodes **both prompts
+>    together at bs=2**, where MoE gemm2 is the non-bit-exact atomic scatter
+>    `mmq_fp8_moe_gemm_scatter`. `L48_id_before` runs the **same `02957062` checkout** as
+>    `L48_r3_before` and produces different ids. Identity is now carried by a byte-exact weight
+>    digest over 1990 tensors / 70.44 GiB per rank, plus the **bs=1** parity ids.
+>
+> Also: `zfs_readpath_r3.txt`'s "`posix_fadvise(DONTNEED)` returns 0 and frees NOTHING" was measured
+> on the 16 MiB-stride CONTROL leg, whose cache was empty. Re-measured on a populated cache it frees
+> 0.11 GiB of ARC while mapped and the full 0.33 GiB of page cache after munmap. It works.
+>
+> The landed fix and its direction are unaffected. The mechanism story and the magnitude are.
+
 Both legs: 48 layers, TP=2, `--device-gb 8.1 --host-gb 28.0 --cuda-graph-max-bs 2`, chunk 1372 MiB,
 `gpu-lease -n 2`, ONE job on the box at a time, sequential and back to back, host sampled at 1 Hz
 throughout, container named and reaped on timeout.

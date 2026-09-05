@@ -13,12 +13,19 @@ Measured 2026-09-06 on `zpcachyoshome/home` (ZFS 2.4.3, 16 GiB ARC cap, 45.9 GiB
     O_DIRECT into reused buf 1829.1 MiB/s   dCached +0.00 GiB  dARC +0.00 GiB   <- what ships now
 
 mmap costs TWICE the bytes — a page-cache page AND an ARC buffer per 4 KiB — at a third of the rate.
-The `posix_fadvise(POSIX_FADV_DONTNEED)` legs are here because bounding mmap's footprint IN PLACE
-would have been the smaller, safer change: it returns 0 on this mount and frees nothing.
+The `posix_fadvise(POSIX_FADV_DONTNEED)` leg is here because bounding mmap's footprint IN PLACE
+would have been the smaller, safer change.
 
 The first leg walks one byte per 16 MiB block on purpose. It is a control, not a reader: it shows
 that a walk which does not touch every page also does not pay for every page, so only the 4 KiB leg
 is the apples-to-apples mmap number.
+
+[BOOT-2026-09-05] THE FADVISE LEG MOVED, and the earlier result it produced must not be quoted. It
+used to run on leg 1 — the 16 MiB-stride CONTROL, which populates `dCached +0.00 GiB`. Asking a cache
+with nothing in it to drop something and reporting "returns 0 and frees nothing" is a statement about
+the control, not about `fadvise`, and that non-result was the recorded reason for not pursuing the
+smallest available fix. It now runs after leg 4, which has just put +0.33 GiB into both `Cached` and
+the ARC. Re-run before citing it either way.
 
     python tools/offload/zfs_readpath_probe.py <four distinct cold shards>
 """
@@ -60,20 +67,13 @@ for off in range(0, n, BLK):
     s += mv[off:off+BLK][0]
 dt = time.perf_counter() - t
 b1 = box(); show("mmap walk", b0, b1, n, dt)
-# fadvise DONTNEED test on the SAME fd/inode while still mapped, then after munmap
-libc = ctypes.CDLL("libc.so.6", use_errno=True)
-libc.posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_long, ctypes.c_long, ctypes.c_int]
-POSIX_FADV_DONTNEED = 4
-rc = libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-b2 = box()
-print(f"  fadvise(DONTNEED) while mapped rc={rc}  dCached {(b2[0]-b1[0])/2**30:+7.2f} GiB  dARC {(b2[1]-b1[1])/2**30:+7.2f} GiB")
+# `mmap.close()` releases this fd on CPython, so closing it again raises EBADF. Guarded rather than
+# omitted: leaking it would keep leg 1's inode referenced while later legs measure reclaim.
 del mv; mm.close()
-b3 = box()
-print(f"  after munmap                      dCached {(b3[0]-b2[0])/2**30:+7.2f} GiB  dARC {(b3[1]-b2[1])/2**30:+7.2f} GiB")
-rc = libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-b4 = box()
-print(f"  fadvise(DONTNEED) after munmap rc={rc}  dCached {(b4[0]-b3[0])/2**30:+7.2f} GiB  dARC {(b4[1]-b3[1])/2**30:+7.2f} GiB")
-os.close(fd)
+try:
+    os.close(fd)
+except OSError:
+    pass
 
 # ---- leg 2: buffered read() into ONE reused pre-faulted buffer ----
 f = files[1]
@@ -123,5 +123,31 @@ for off in range(0, n, 4096):
     s += mv[off]
 dt = time.perf_counter() - t
 b1 = box(); show("mmap 4K walk", b0, b1, n, dt)
-del mv; mm.close(); os.close(fd)
+
+# ---- leg 5: can mmap's footprint be bounded IN PLACE? ------------------------------------------
+# THIS RUNS HERE, ON THE 4 KiB LEG, AND NOT ON LEG 1 — CORRECTED [BOOT-2026-09-05].
+# It used to run against the leg-1 control, which walks one byte per 16 MiB and therefore populates
+# essentially nothing (`dCached +0.00 GiB`). "fadvise returned 0 and freed nothing" measured against
+# an empty cache is not a measurement of fadvise; it is a measurement of an empty cache, and it was
+# the stated reason for rejecting the smallest available fix. Leg 4 has just put +0.33 GiB into
+# `Cached` and +0.33 GiB into the ARC, so here there is something to free and the answer counts.
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_long, ctypes.c_long, ctypes.c_int]
+POSIX_FADV_DONTNEED = 4
+rc = libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+b2 = box()
+print(f"  fadvise(DONTNEED) while mapped rc={rc}  dCached {(b2[0]-b1[0])/2**30:+7.2f} GiB  "
+      f"dARC {(b2[1]-b1[1])/2**30:+7.2f} GiB")
+del mv; mm.close()
+b3 = box()
+print(f"  after munmap                      dCached {(b3[0]-b2[0])/2**30:+7.2f} GiB  "
+      f"dARC {(b3[1]-b2[1])/2**30:+7.2f} GiB")
+rc = libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+b4 = box()
+print(f"  fadvise(DONTNEED) after munmap rc={rc}  dCached {(b4[0]-b3[0])/2**30:+7.2f} GiB  "
+      f"dARC {(b4[1]-b3[1])/2**30:+7.2f} GiB")
+try:
+    os.close(fd)
+except OSError:
+    pass
 print("box now: Cached %.2f GiB  ARC %.2f GiB  Avail %.2f GiB" % tuple(x/2**30 for x in box()))
