@@ -207,8 +207,40 @@ class GroupedRMSNorm(BaseOP):
         self._group_size = group_size
         self._groups = hidden_size // group_size
         self._eps = eps
+        # `(1 + weight)` is a CONSTANT of the loaded checkpoint, and it was being recomputed on every
+        # forward: one extra `add` launch per call on a 10240-wide vector. At 97 hyper-connection
+        # blocks + 3 PLE norms per decode step that is ~100 kernels/step doing nothing but adding 1.0
+        # to the same numbers (MEASURED at 0.29 ms/step of the hyper-connections' 7.53 ms captured
+        # cost — `docs/measurements/HC_FUSION_2026-09-05/`). Cached here rather than in `post_load`
+        # so a layer built and driven WITHOUT a load (every unit test, the parity test) takes the
+        # same path the serve does, and so a re-load cannot leave a stale gain behind.
+        self._gain: torch.Tensor | None = None
+        self._gain_src: torch.Tensor | None = None
+        self._gain_key: tuple | None = None
+
+    def _gain_vec(self, capturing: bool) -> torch.Tensor:
+        """`1 + weight`, memoized against the identity AND the version of `self.weight`.
+
+        Invalidation is the whole point: `BaseOP.load_state_dict` REBINDS `weight` (`setattr`), a
+        `copy_` mutates it in place, and the offload machinery may move it — so the key is
+        (data_ptr, _version, dtype, device) and a strong reference to the weight tensor is held
+        alongside, which is what makes the data_ptr unambiguous (the storage cannot be freed and
+        handed to a different tensor while we are caching it).
+
+        `capturing`: never memoize a tensor allocated inside a graph capture — it lives in the
+        graph's private pool and is only valid during replay. Recomputing it there is correct and
+        costs the one launch the cache exists to remove, which capture is going to record anyway."""
+        w = self.weight
+        key = (w.data_ptr(), w._version, w.dtype, w.device)
+        if self._gain is not None and self._gain_key == key:
+            return self._gain
+        gain = w + 1.0
+        if not capturing:
+            self._gain, self._gain_src, self._gain_key = gain, w, key
+        return gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         grouped = x.reshape(*x.shape[:-1], self._groups, self._group_size)
         normed = _rms_norm(grouped, None, self._eps).flatten(-2)
-        return normed * (self.weight + 1.0)
+        capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+        return normed * self._gain_vec(capturing)
