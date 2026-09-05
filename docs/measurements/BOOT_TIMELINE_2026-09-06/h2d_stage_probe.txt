@@ -1,0 +1,12 @@
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+device: AMD Radeon RX 9070 XT   4000 calls x 176 KiB = 688 MiB
+
+=== per-call, the boot's shape ===
+  A pageable .to(device)   [what ships]          0.118 s     5818.3 MiB/s      29.5 us/call
+  B pinned staging, blocking                     0.152 s     4531.1 MiB/s      37.9 us/call
+  C pinned staging, non_blocking+sync            0.163 s     4209.4 MiB/s      40.8 us/call
+
+=== reference: the same bytes in ONE transfer ===
+  D one pageable transfer                        0.191 s     3599.7 MiB/s      47.7 us/call
+
+B/A = 0.78x   C/A = 0.72x   ceiling(D)/A = 0.62x
