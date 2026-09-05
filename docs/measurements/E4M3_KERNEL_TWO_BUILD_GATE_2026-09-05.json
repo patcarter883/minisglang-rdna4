@@ -15,18 +15,21 @@
   "method": "Each build dumped TWICE in separate processes so every tensor carries its own same-code floor; a cross-build delta is evidence only where that floor is 0. Grouped-MoE results are split into valid rows and pad rows, because moe_align's pad sentinel leaves output rows unwritten and a raw (P,N) dump compares uninitialised memory.",
   "shapes": "The SERVED geometry: hidden 2560, inter 320/rank, group_size 16 (NVFP4) plus 32/128 controls, top_k 10, block_m 32 (128 for the flag arms), fp16 and bf16 activations, e2m1 and AWQ-zeros weight encodings, T in {1,2,8,64}.",
   "result_bit_exact_zero_floor": {
+    "_note": "VALID-ROW tensors only (the gate). Counts differ from an earlier draft that also counted the separately-recorded #pad blocks; those add 148 more tensors, all of which are also 0 vs 0.",
     "dense_gemv": 40,
     "dense_gemv_silu": 32,
-    "moe_gemm": 96,
-    "moe_gemm1_silu": 160,
-    "moe_flag_gemm": 16,
-    "moe_flag_silu": 24,
+    "moe_gemm": 48,
+    "moe_gemm1_silu": 80,
+    "moe_flag_gemm": 8,
+    "moe_flag_silu": 12,
     "moe_g2_gather_reduce": 9,
-    "total": 377
+    "total_valid_row_tensors": 241,
+    "bit_exact": 229
   },
   "result_not_gateable": {
     "moe_scatter": 12,
-    "why": "mmq_fp8_moe_gemm_scatter accumulates through a global atomicAdd whose order varies; minisgl python/minisgl/quant/kernels.py already documents it as not bit-exact. Its MEASURED same-code floor is 1.4e-06..1.3e-05 and the cross-build delta is the same magnitude (1.3e-06..8.6e-06), i.e. indistinguishable from the op's own noise. No tensor anywhere had a ZERO floor and a non-zero cross-build delta, which is the only signature a regression could have."
+    "measured": "same-code floor up to 1.287e-05; cross-build delta up to 8.583e-06 \u2014 i.e. the cross-build difference is SMALLER than the op's own run-to-run variation.",
+    "why": "mmq_fp8_moe_gemm_scatter accumulates through a global atomicAdd whose order varies; minisgl python/minisgl/quant/kernels.py already documents it as not bit-exact. No tensor anywhere had a ZERO floor and a non-zero cross-build delta, which is the only signature a regression could have."
   },
   "highest_risk_hunk": "moe_gemm1_silu \u2014 the alds/ashuffle staging swap the commit named as its biggest risk \u2014 is 160/160 bit-exact across both the wmma and gemv arms.",
   "wscale_epi_hook": "gemv_decode.h:1588's new wscale_epi call in the dense SILU epilogue is a no-op for the fp16 policy: dense_gemv_silu is 32/32 bit-exact. PROVEN, not assumed.",
@@ -35,5 +38,6 @@
     "topk_weights was drawn from the global RNG, which differs per process, so the two dumps of the SAME build disagreed and the two ops consuming it looked nondeterministic.",
     "gather_reduce was handed a (T*top_k, top_k) topk_weights, which sized its output at T*top_k rows of which only T were written; the unwritten rows were the apparent 0.03-0.5 'floor'."
   ],
-  "pad_rows_measured": "The valid/pad split was a PRECAUTION, and the measurement does not support the reason it was taken. Across 148 recorded pad-row blocks the same-build delta is 0 and the cross-build delta is 0 \u2014 on this build pair the skipped slots are written deterministically, not left uninitialised. So the split is retained (it costs nothing and keeps the gate honest about what it is comparing) but it is NOT the explanation for the previous round's gate log calling 215 of 360 tensors self-nondeterministic; that configuration was not reproduced here and remains unexplained. The apparent nondeterminism in THIS harness had two identified causes, both in the harness: unseeded topk_weights and a mis-sized gather_reduce output."
+  "pad_rows_measured": "The valid/pad split was a PRECAUTION, and the measurement does not support the reason it was taken. Across 148 recorded pad-row blocks the same-build delta is 0 and the cross-build delta is 0 \u2014 on this build pair the skipped slots are written deterministically, not left uninitialised. So the split is retained (it costs nothing and keeps the gate honest about what it is comparing) but it is NOT the explanation for the previous round's gate log calling 215 of 360 tensors self-nondeterministic; that configuration was not reproduced here and remains unexplained. The apparent nondeterminism in THIS harness had two identified causes, both in the harness: unseeded topk_weights and a mis-sized gather_reduce output.",
+  "served_path_coverage": "The engage ledger of the live 48-layer serve names four fp8_wmma MoE entry points: mmq_fp8_moe_gemm1_silu(gemv+e2m1) and mmq_fp8_moe_gemm(wmma+e2m1) are both covered and both bit-exact; mmq_fp8_moe_gemm_scatter+e2m1 is covered but ungateable (atomic); mmq_fp8_moe_gather_reduce (the STANDALONE reduce, not the fused gemm2 variant this gate exercises) is NOT covered and is the remaining gap."
 }
