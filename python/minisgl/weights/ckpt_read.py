@@ -1,4 +1,33 @@
-"""`read()` the checkpoint instead of faulting it in through `mmap`.
+"""O_DIRECT reader for safetensors shards. **NOT WIRED IN — it was A/B'd and it LOSES.**
+
+--------------------------------------------------------------------------------------------------
+VERDICT FIRST, 2026-09-06, 48-layer TP=2, sequential, quiet box, both legs at floor=4 GiB
+
+    boot           520.5 s  ->  1808.3 s     (3.5x WORSE)
+    stage_b        334.1 s  ->  1498.4 s
+    ckpt.h2d       174.7 s  ->  1382.1 s
+    read total     ~297 s   ->    59.2 s     (5x BETTER -- 64.8 GiB at 1660 MiB/s)
+    swap-out       6.18 M pages -> 44.58 M   |  major faults 46.9 M -> 132.8 M
+
+The read got five times faster and the boot got three and a half times slower, and the reason is
+WHERE THE BYTES LAND, not how fast they arrive. `safe_open`'s pages are FILE-BACKED, so reclaiming
+one is free -- the kernel drops a clean page. This reader's destination is an ANONYMOUS buffer, and
+on this box reclaiming anonymous memory means compressing it into zram. Streaming the 72.6 GiB
+checkpoint through anonymous buffers, on a box whose two 24.12 GiB pinned arenas have already taken
+half of RAM, converts every reclaimed checkpoint page from a free drop into a compression. The
+tensors handed to `.to(device)` live in those buffers, which is why `ckpt.h2d` -- the bucket this
+was aimed at -- absorbed the entire regression.
+
+WHAT WOULD MAKE IT WIN: ONE REUSED, pre-faulted, page-aligned buffer instead of a fresh `mmap` per
+shard, so the anon footprint is 337 MiB for the whole boot rather than 64.8 GiB of churn. That needs
+a guarantee that no `get_tensor` view outlives its shard, which is NOT free on the qwen4_exp path
+(`fold_buf` holds a `weight_scale` view across `get_tensor` calls). Until that exists, this module
+stays parity-gated and unwired, and `models/weight.py` reads through `safetensors.safe_open`.
+
+Raw artifacts: docs/measurements/BOOT_TIMELINE_2026-09-06/r2/.
+
+--------------------------------------------------------------------------------------------------
+WHAT WAS TRUE ABOUT THE ORIGINAL DIAGNOSIS (kept, because the rate numbers are still right)
 
 --------------------------------------------------------------------------------------------------
 WHY THIS EXISTS — a measured 4x tax that is invisible in every profile bucket
