@@ -43,7 +43,9 @@ class ArenaSettings:
     align: int = ALIGN
     floor_bytes: int = DEFAULT_FLOOR_BYTES
     selftest: bool = True
-    first_touch: bool = True
+    #: OFF — see `PinnedWeightArena.attach()`. It cost 171.8 s of a 618.3 s 48-layer TP=2 boot and
+    #: the premise behind it (lazy page commit) is refuted by measurement on this box.
+    first_touch: bool = False
 
     def describe(self) -> str:
         return (
@@ -72,7 +74,10 @@ def resolve_arena_settings() -> ArenaSettings:
         align=ALIGN,
         floor_bytes=max(0, int(floor_gib * GIB)),
         selftest=_env_int("MINISGL_WEIGHT_ARENA_SELFTEST", 1) != 0,
-        first_touch=_env_int("MINISGL_WEIGHT_ARENA_FIRST_TOUCH", 1) != 0,
+        # DEFAULT 0. The whole-chunk device fill is a diagnostic now, not a commit mechanism:
+        # `attach()` carries the probe that refutes the lazy-commit premise, and the aliasing
+        # resweep it used to feed is preserved (and 51x denser) through `_write_fingerprints`.
+        first_touch=_env_int("MINISGL_WEIGHT_ARENA_FIRST_TOUCH", 0) != 0,
     )
 
 

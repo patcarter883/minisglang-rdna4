@@ -1,0 +1,15 @@
+=== box state at Run A launch, Sat 05 Sep 2026 19:16:22 AEST ===
+ 19:16:22 up 35 days,  3:05,  1 user,  load average: 15.44, 16.61, 12.24
+               total        used        free      shared  buff/cache   available
+Mem:              91          33          52           0           6          58
+Swap:             53          28          25
+16
+--- co-tenants (CPU-only, expected) ---
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+pat       693955  629  3.8 11713580 3669312 ?    Rl   19:12  22:23 python3 -u /home/pat/code/minisgl-rdna4-mlxk2/tools/k2_convert_stats.py --json /tmp
+pat        31044  2.8  0.6 78081324 626220 pts/0 Sl+  Aug01 1439:35 /opt/claude-code/bin/claude
+pat      3391462  1.7  0.3 5612700 351516 pts/3  Sl+  13:50   5:48 /opt/claude-code/bin/claude --resume 6d6de4fa-96bf-42df-803d-84857ea32bc8
+pat      2964647  4.3  0.3 56312208 327140 ?     Sl   11:56  19:01 /home/pat/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-cras
+root      712765  101  0.2 6585404 196244 ?      R    19:16   0:00 python -m pytest -p no:cacheprovider -c /dev/null tests/core/test_cpu_tier_handoff.
+pat       711091  6.3  0.2 5586792 195340 ?      Ssl  19:16   0:01 /opt/claude-code/bin/claude --output-format stream-json --verbose --input-format st
+472      2439990  0.8  0.1 2764308 173488 ?      Ssl  Aug13 289:42 grafana server --homepath=/usr/share/grafana --config=/etc/grafana/grafana.ini --pa

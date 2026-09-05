@@ -480,13 +480,18 @@ def _check_moe_scale_pair(
     So the pair is checked here, on the ONE call path both formats share, rather than trusted to
     line up because the container that built them happened to be consistent.
 
-    NOTE (kernel-side gap, 2026-09-05): `fp8_wmma/torch-ext/torch_binding.cpp` still validates the
-    zeros slot as `w_zeros.dim() == 3 && w_zeros.size(2)*8 == N && w_zeros.size(1) == scales.size(1)`
-    on all eleven grouped-MoE entry points, which REJECTS the (E, N) global. The kernel bodies accept
-    it (the policy owns the slot); only the binding's shape predicate needs widening to "AWQ zeros
-    (E,G,N/8) i32 XOR NVFP4 global (E,N) i32, selected by the scales dtype". Until that lands this
-    check fires first and names the reason, instead of the binding failing with a shape message that
-    points at the wrong tensor.
+    KERNEL-SIDE STATUS (was a gap; CLOSED in rdna4-hip-kernels @ 38ec157, "the e4m3 bindings
+    rejected the scale they were written for"). `torch_binding.cpp` used to validate the zeros slot
+    as `w_zeros.dim() == 3 && w_zeros.size(2)*8 == N && w_zeros.size(1) == scales.size(1)` on every
+    grouped-MoE entry point, which REJECTED the (E, N) global with a message naming a tensor that was
+    not the one being passed. `check_moe_w_zeros` now picks the predicate off the SCALES DTYPE — the
+    same single fact `MOE_SCALE_FMT_DISPATCH` selects the WScale policy from — on the three launchers
+    that have an e4m3 arm (`mmq_fp8_moe_gemm`, `_gemm1_silu`, `_gemm_scatter`). This check is
+    therefore no longer the thing standing between an NVFP4 checkpoint and a shape error; it is kept
+    because it is the ONE call path both formats share and it still catches a MISMATCHED pair
+    (fp16 scales + (E,N) global) that the binding's fp16 arm would accept as a rank-3 failure only by
+    accident. Verify with a `--build-context kernels=` at or past 38ec157; an older kernels tree
+    still fails at the binding, loudly.
     """
     if scales.dtype == torch.float16:
         if zeros is not None and zeros.dim() != 3:
@@ -618,7 +623,15 @@ def w4a8_moe(
     # `MINISGL_MOE_G2FUSE=0` as selecting — so the cost is one extra launch and a (P,K) round-trip at
     # small-M prefill, and nothing numeric. Lifting it is a KERNEL change (give the remaining three
     # launchers the same `MOE_SCALE_FMT_DISPATCH` the other three have), not an engine one.
-    _two_level = w2_scales.dtype in (torch.float8_e4m3fn, torch.uint8)
+    #
+    # DERIVED FROM BOTH CONTAINERS, not just w2. `_flag1` gates the w13 (gemm1) launcher, so reading
+    # only `w2_scales` here made w13's format a statement about a tensor w13 has nothing to do with.
+    # On this checkpoint the two always agree (one `convert_nvfp4_moe` produces both), and the group
+    # test on `_flag1` fences NVFP4 a second time, so this has never fired — which is exactly why it
+    # is worth writing down rather than leaving as two accidents stacked. The predicate can only ever
+    # turn a fused/flag arm OFF, so a false positive costs a launch, never a wrong number.
+    _E4M3_SCALE_DTYPES = (torch.float8_e4m3fn, torch.uint8)
+    _two_level = (w13_scales.dtype in _E4M3_SCALE_DTYPES) or (w2_scales.dtype in _E4M3_SCALE_DTYPES)
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:

@@ -1,0 +1,107 @@
+====================================================================================================
+RUNS
+====================================================================================================
+SMOKE_L24.json                     dev=12 host=12 card=n RX 9070 XT rank=0 cap_wall= 24.801 dev_busy= 22.473 eag_wall= 26.660
+  (other rank 1)                   card=deon RX 9070 cap_wall= 24.800 dev_busy= 22.519
+
+====================================================================================================
+MARGINAL HOST LAYER  d(step)/d(host layer)
+====================================================================================================
+  host_layers=12  wall= 24.801 ms/step
+
+====================================================================================================
+LEVEL 1 — partition of the 24.801 ms CAPTURED step (wall, difference method)
+====================================================================================================
+  recv              0.002 ms    0.0%
+  sched             2.142 ms    8.6%
+  fwd_launch        0.649 ms    2.6%
+  gpu_wait         21.948 ms   88.5%
+  commit            0.041 ms    0.2%
+  loop_residual     0.017 ms    0.1%   (generate/run_forever outside the 5 stages)
+  SUM              24.801 ms  vs wall 24.801
+
+  device_busy (HIP event pair around forward_batch)   22.473 ms   90.6%
+  gpu_idle    (wall - device_busy)                     2.327 ms    9.4%
+  gpu_wait vs device_busy (independent instruments): 21.948 vs 22.473  -> delta -0.525 ms
+  host-only stages that CANNOT overlap the device (recv+sched+commit): 2.186 ms
+
+====================================================================================================
+LEVEL 2 — inside device_busy (eager HIP-event regions)
+====================================================================================================
+  eager wall 26.660 ms/step, eager device_busy 24.266 ms/step
+  capture factor: wall 1.075  device 1.0798
+  instrument overhead 3.786 ms/step (wrapped_off 28.112 -> wrapped_on 31.898)
+
+  region                      eager ms   /step   scaled
+  moe.routed.host                8.294    12.0    7.682
+  moe.all_reduce                 5.440    24.0    5.038
+  hc.mix                         3.455    48.0    3.200
+  mixer.gdn                      3.125    18.0    2.894
+  moe.routed.dev                 1.840    12.0    1.704
+  mixer.attn                     1.325     6.0    1.228
+  lm_head                        1.007     1.0    0.933
+  hc.combine                     0.839    48.0    0.777
+  moe.shared                     0.720    24.0    0.667
+  moe.router                     0.377    24.0    0.349
+  moe.shared_gate                0.318    24.0    0.295
+  ple                            0.295     1.0    0.273
+  sampler                        0.227     1.4    0.210
+  embed                          0.072     1.0    0.067
+  hc.final_mix                   0.053     1.0    0.049
+  LEAF SUM                      27.388
+  MODEL_TOTAL                   29.143
+  unattributed in model          1.982
+
+====================================================================================================
+LEVEL 1b — inside sched/commit (pure host wall, captured leg)
+====================================================================================================
+  wrapper overhead 0.7344 ms/step (off 24.82363866874948 -> on 25.55800072150305)
+  nested.process_last_data=gpu_wait+commit    21.1191 ms  x1.0
+  sched._schedule_next_batch                   2.6340 ms  x1.0
+  sched._prepare_batch                         2.3478 ms  x1.0
+  sched._finish_prepare                        2.3431 ms  x1.0
+  sched._stage_ple                             1.9624 ms  x1.0
+  sched.prepare_metadata                       0.0803 ms  x1.0
+  sched.sampler_prepare                        0.0630 ms  x1.0
+  sched.gdn_state_indices                      0.0449 ms  x1.0
+  sched.allocate_paged                         0.0143 ms  x1.0
+  fwd.ple_commit_staged                        0.0107 ms  x1.0
+  sched.decode_schedule                        0.0023 ms  x1.0
+  commit.send_result                           0.0015 ms  x1.0
+  sched._grammar_bitmask                       0.0014 ms  x1.0
+  recv.receive_msg                             0.0014 ms  x1.0
+  recv._flush_stats                            0.0002 ms  x0.0
+
+====================================================================================================
+LEVEL 3 — the host layer, four independent estimators
+====================================================================================================
+  (a) IN-BOOT ABLATION, eager wall slope (removes the routed-expert call):
+        host ablated  0 -> 26.503 ms/step
+        host ablated  3 -> 23.74 ms/step
+        host ablated  6 -> 21.857 ms/step
+        host ablated  9 -> 18.948 ms/step
+        host ablated 12 -> 15.332 ms/step
+        dev  ablated  0 -> 26.547 ms/step
+        dev  ablated  6 -> 26.544 ms/step
+        dev  ablated 12 -> 24.527 ms/step
+      host 0.9045 ms/layer, device 0.1683 ms/layer, PREMIUM 0.7362 ms/layer
+  (b) IN-SITU REGION (eager device time): host/layer 0.6912, dev/layer 0.1534, premium 0.5378
+  (c) ISOLATION REPLAY (live weights, 1 event pair per pass): host/layer 0.6494, dev/layer 0.1058, premium 0.5436
+  (d) CROSS-BOOT PLANNER SWEEP: NOT AVAILABLE (only one boot fit in RAM)
+
+  bytes read per host layer per rank per token: 0
+
+====================================================================================================
+CROSS-CHECK: the all-reduce line is bandwidth or SKEW?
+====================================================================================================
+  in-step:   5.440 ms over 24 calls = 0.2267 ms/call
+  synthetic: 0.0115 ms/call at shape [1, 2560] (100 reps, both ranks in lockstep)
+  => 5.164 ms/step of the all-reduce line is CROSS-RANK SKEW absorbed at the collective, not collective cost (95% of the line)
+
+CROSS-CHECK: hyper-connections, region sum vs one-pair isolation replay
+  region sum 4.347 ms over 97 event-paired regions/step
+  isolate hc_full 4.9076 ms for 49 blocks (2 boundaries total)
+  => -0.561 ms of the region figure is the instrument's own per-boundary cost (97 pairs)
+
+  sample text: 平生[first�ubromooth_pay/payeselesel(LoggerHWedly monop获得超过spurdigt|Rswire://'整个 whole;breakfus现场确认뇨yeonguncture有志首发 fico主要$__ escondushielosamico Jeburally Preprrorelps#acABS按照 how中控amidDisappear
+  loadavg during the captured leg: 16.25

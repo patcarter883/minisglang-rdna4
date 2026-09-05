@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import re
+import time
 from typing import (
     Any,
     Callable,
@@ -1284,10 +1285,16 @@ def qwen4_exp_nvfp4_prepass(files: "Sequence[str]") -> "tuple[set[str], FrozenSe
     packed E2M1 blob through as a bf16 matrix. On this checkpoint the pair is always co-located, but
     that is a property of one file layout, not of the format.
     """
+    from minisgl.weights.boot_timeline import timeline as _bt_timeline
+
+    _tl = _bt_timeline()
+    _t0 = time.perf_counter()
     ckpt_names: "set[str]" = set()
     for file in files:
+        _tl.note_file(file, "header")
         with safetensors.safe_open(file, framework="pt", device="cpu") as f:
             ckpt_names.update(f.keys())
+    _tl.tick("ckpt.nvfp4_prepass", time.perf_counter() - _t0)
     bases = {
         n[: -len(_MODELOPT_GLOBAL_SCALE)] for n in ckpt_names if n.endswith(_MODELOPT_GLOBAL_SCALE)
     }
@@ -1355,6 +1362,8 @@ def _load_qwen4_exp_weight(
     skips: Dict[str, int] = {}
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
+        from minisgl.weights.boot_timeline import tick as _tk
+
         if (mm := _gate_up_merge(native_key)) is not None:
             merged_key, slot = mm
             merge_buf.setdefault(merged_key, {})[slot] = tensor
@@ -1365,18 +1374,38 @@ def _load_qwen4_exp_weight(
             # NVFP4 packs along the INPUT K (weight_packed [N, K//2], folded weight_scale [N, K//16])
             # and the gate/up merge concatenates the OUTPUT N — so dim 0 for every leaf here, unlike
             # AWQ's K-major qweight/qzeros/scales, which merge on dim 1.
+            _t = time.perf_counter()
             native_key, tensor = merged_key, torch.cat(parts, dim=0)
+            _tk("ckpt.gate_up_cat", time.perf_counter() - _t)
         if (einfo := _get_expert_stack_info(native_key)) is not None:
             packed_key, idx = einfo
+            _t = time.perf_counter()
             stacked = expert_buf.add(packed_key, idx, tensor, config.num_experts)
+            _tk("ckpt.expert_stack_add", time.perf_counter() - _t)
             if stacked is None:
                 return
             yield packed_key, stacked
         else:
             yield native_key, tensor
 
+    # BOOT ATTRIBUTION. These are bare dict adds against a `perf_counter()` delta (see
+    # `weights/boot_timeline.py`): this loop runs ~2.2e5 times on a 48-layer boot, so a context
+    # manager or a formatted log per tensor would itself be a measurable term. The buckets partition
+    # the per-tensor pipeline — header read, tensor read, NVFP4 scale fold, remap, TP shard, H2D,
+    # concat/merge, expert stack — which is the split that says where 105-174 MB/s goes against a
+    # 4.9 GB/s drive.
+    from minisgl.weights.boot_timeline import count as _bt_count
+    from minisgl.weights.boot_timeline import tick as _bt_tick
+    from minisgl.weights.boot_timeline import timeline as _bt_timeline
+
+    _bt_tl = _bt_timeline()
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device="cpu") as f:
+        _t = time.perf_counter()
+        _fh = safetensors.safe_open(file, framework="pt", device="cpu")
+        _bt_tick("ckpt.safe_open", time.perf_counter() - _t)
+        _bt_count("ckpt.files_opened")
+        _bt_tl.note_file(file, "tensors")
+        with _fh as f:
             for ckpt_name in list(f.keys()):
                 # ONE checkpoint key can produce TWO leaves. An NVFP4 routed expert now keeps its
                 # scale in the checkpoint's own TWO levels — the e4m3 block scale byte-verbatim plus
@@ -1396,10 +1425,16 @@ def _load_qwen4_exp_weight(
                 base, _, field = ckpt_name.rpartition(".")
                 if base in nvfp4_ckpt_bases and field in ("weight_scale", "weight_scale_2"):
                     buf = fold_buf.setdefault(base, {})
-                    buf[field] = f.get_tensor(ckpt_name)
+                    _t = time.perf_counter()
+                    _sc = f.get_tensor(ckpt_name)
+                    _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
+                    _bt_count("ckpt.get_tensor_calls")
+                    _bt_count("ckpt.get_tensor_bytes", _sc.numel() * _sc.element_size())
+                    buf[field] = _sc
                     if len(buf) < 2:
                         continue
                     del fold_buf[base]
+                    _t = time.perf_counter()
                     leaves = list(
                         nvfp4.nvfp4_leaf_scales(
                             base,
@@ -1409,8 +1444,11 @@ def _load_qwen4_exp_weight(
                             device=device,
                         )
                     )
+                    _bt_tick("ckpt.nvfp4_leaf_scales", time.perf_counter() - _t)
                 for name, override in leaves:
+                    _t = time.perf_counter()
                     plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+                    _bt_tick("ckpt.remap", time.perf_counter() - _t)
                     if plan[0] == "skip":
                         skips[plan[1]] = skips.get(plan[1], 0) + 1
                         continue
@@ -1437,10 +1475,27 @@ def _load_qwen4_exp_weight(
                     # full-width tensor on its card. An `override` (an NVFP4 leaf scale) is already
                     # full-width — both levels are read whole and the shard applies to the result,
                     # so no scale is folded/split twice and none from a partial.
-                    tens = override if override is not None else f.get_tensor(name)
-                    raw = _shard_qwen4_exp(
-                        name, tens, tp_info.rank, tp_info.size, config
-                    ).to(device)
+                    if override is not None:
+                        tens = override
+                    else:
+                        _t = time.perf_counter()
+                        tens = f.get_tensor(name)
+                        _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
+                        _bt_count("ckpt.get_tensor_calls")
+                        _bt_count("ckpt.get_tensor_bytes", tens.numel() * tens.element_size())
+                    _t = time.perf_counter()
+                    sharded = _shard_qwen4_exp(name, tens, tp_info.rank, tp_info.size, config)
+                    _t2 = time.perf_counter()
+                    _bt_tick("ckpt.shard", _t2 - _t)
+                    # THE H2D. One `.to(device)` per LEAF — ~2.2e5 of them on a 48-layer boot, each a
+                    # pageable copy of a few hundred KiB. Timed on its own because "the checkpoint is
+                    # read slowly" and "the checkpoint is copied to the card in 200k pieces" are
+                    # different defects with different fixes, and the byte counter next to it prices
+                    # the transfer against PCIe.
+                    raw = sharded.to(device)
+                    _bt_tick("ckpt.h2d", time.perf_counter() - _t2)
+                    _bt_count("ckpt.h2d_calls")
+                    _bt_count("ckpt.h2d_bytes", raw.numel() * raw.element_size())
                     if plan[0] == "direct":
                         yield from emit(plan[1], raw)
                         continue
@@ -1450,7 +1505,10 @@ def _load_qwen4_exp_weight(
                         continue
                     parts = [concat_buf[merged][i] for i in range(n_slots)]
                     del concat_buf[merged]
-                    yield from emit(merged, torch.cat(parts, dim=cat_dim))
+                    _t = time.perf_counter()
+                    _cat = torch.cat(parts, dim=cat_dim)
+                    _bt_tick("ckpt.gdn_concat", time.perf_counter() - _t)
+                    yield from emit(merged, _cat)
 
     # Only shards that were actually opened contribute to this ledger; when the n-gram table lives in
     # its own directory (the normal deployment) its 129 keys are never seen at all, which is why the
