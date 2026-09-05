@@ -229,9 +229,29 @@ class GroupedRMSNorm(BaseOP):
 
         `capturing`: never memoize a tensor allocated inside a graph capture — it lives in the
         graph's private pool and is only valid during replay. Recomputing it there is correct and
-        costs the one launch the cache exists to remove, which capture is going to record anyway."""
+        costs the one launch the cache exists to remove, which capture is going to record anyway.
+
+        `_version` IS NOT ALWAYS READABLE, and that is not a corner case — it is the serve path.
+        Every forward in this engine runs under `torch.inference_mode()` (`Engine.forward_batch`, and
+        `@torch.inference_mode()` on the offload harness's `rank_main`), where the weights are
+        INFERENCE TENSORS and `t._version` raises `RuntimeError: Inference tensors do not track
+        version counter`. The memo therefore crashed on the FIRST decode of a real boot. Nothing
+        caught it before the merge because nothing that exercised this code ran in inference mode:
+        `tests/qwen4exp_hc_parity_test.py` uses `torch.no_grad()` and the two HC A/B drivers
+        (`tools/offload/hc_fusion_ab.py`, `hc_capture_prize.py`) use neither.
+
+        Dropping the version term there is sound, not merely necessary. The counter exists to catch
+        an in-place `copy_` into a weight that keeps its storage, and every such write in this engine
+        — `load_state_dict`, `post_load`, the arena bake — happens at BOOT, outside inference mode
+        and before any forward. The offload bake additionally REBINDS the attribute, which moves
+        `data_ptr()` and invalidates the key on its own, and `moe_interpose.freeze()` makes a rebind
+        after that an error rather than a silent staleness."""
         w = self.weight
-        key = (w.data_ptr(), w._version, w.dtype, w.device)
+        try:
+            ver = w._version
+        except RuntimeError:
+            ver = None  # inference tensor — see above
+        key = (w.data_ptr(), ver, w.dtype, w.device, tuple(w.shape))
         if self._gain is not None and self._gain_key == key:
             return self._gain
         gain = w + 1.0

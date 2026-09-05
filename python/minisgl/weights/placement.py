@@ -606,19 +606,26 @@ class OffloadPlan:
         anonymously by the `MemPool` C ABI, so they fix the LAYOUT without claiming the carve will
         use these names. See `RegionRequest.forecast`.
         """
-        from .chunk_plan import RegionRequest, torch_allocation_bytes
+        from .chunk_plan import RegionRequest, torch_charged_rows
 
         if not self.host_rows_known:
             return ()
-        out = []
-        for p in self.placements:
-            if p.kind is not StackKind.HOST:
-                continue
-            for name, nbytes in p.rows:
-                out.append(
-                    RegionRequest(f"{p.path}.{name}", torch_allocation_bytes(nbytes), forecast=True)
-                )
-        return tuple(out)
+        # ONE ordered pass over EVERY host row, not a per-layer one: torch's free list survives
+        # across layers (measured — layer 1's e4m3 globals come out of the segment layer 0 opened),
+        # so a per-layer charge would re-open a segment the allocator does not re-open.
+        flat = [
+            (f"{p.path}.{name}", nbytes)
+            for p in self.placements
+            if p.kind is StackKind.HOST
+            for name, nbytes in p.rows
+        ]
+        # Charge 0 == served from a split remainder: no arena callback, and so no position in the
+        # layout the next-fit packing is laid out against.
+        return tuple(
+            RegionRequest(name, charge, forecast=True)
+            for name, charge in torch_charged_rows(flat)
+            if charge > 0
+        )
 
     @property
     def unused_device_bytes(self) -> int:

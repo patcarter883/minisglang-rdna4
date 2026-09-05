@@ -47,6 +47,14 @@ from .pinned_arena import PinnedWeightArena
 # Module-level, permanent, never cleared. See note 1 above.
 _KEEP: List[Any] = []
 
+# DIAGNOSTIC ONLY. `MINISGL_ARENA_TRACE_ALLOCS=1` prints every (requested, carved) pair the torch
+# MemPool callback sees. It is the only way to compare the rows the BAKE asks for against the rows
+# `placement._spec_rows` enumerated, which is exactly the disagreement `verify_matches_plan`
+# reports as "+N MiB" without saying which row.
+import os as _os  # noqa: E402
+
+_TRACE_ALLOCS = _os.environ.get("MINISGL_ARENA_TRACE_ALLOCS", "0") == "1"
+
 # The live `ArenaMemPool`s. Held separately from `_KEEP` so `_release_pools_at_exit` can drop the
 # `torch.cuda.MemPool` each one owns WITHOUT dropping the trampolines that pool calls. See that
 # function for why the two lifetimes must part ways.
@@ -204,6 +212,10 @@ class ArenaMemPool:
                     if r is not None:
                         self.served_from_arena += 1
                         self.served_bytes += r.nbytes
+                        if _TRACE_ALLOCS:
+                            _shout(f"[arena-alloc] #{self.served_from_arena} req={size} "
+                                   f"({size / (1 << 20):.4f} MiB) carved={r.nbytes} "
+                                   f"({r.nbytes / (1 << 20):.4f} MiB)")
                         return r.device_ptr
                 return self._fallback(size, reason=(
                     "wrong device" if int(device) != arena.device_index else "arena exhausted"))

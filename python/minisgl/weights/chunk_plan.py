@@ -69,31 +69,113 @@ MIN_CHUNK_BYTES = CHUNK_GRANULE
 # the rounding.
 TORCH_ALLOC_GRANULE = 2 * MIB
 
+# The rest of `get_allocation_size` / `should_split`, now that a shape reaches the middle bucket.
+# MEASURED on the 48-layer qwen4_exp boot (2026-09-05, `MINISGL_ARENA_TRACE_ALLOCS=1`): the NVFP4
+# two-level scale added the first arena rows this feature has ever had in the (1 MiB, 10 MiB) band —
+# `_global_op` is E*N*4 B, 1.25 MiB for w13 and 5.00 MiB for w2 — and the trace shows torch asking
+# the arena for a 20 MiB segment for the first of them and then serving the next FIVE from the split
+# remainder with no callback at all.
+TORCH_SMALL_SIZE = 1 * MIB  # kSmallSize   — at or below this, the small pool
+TORCH_SMALL_BUFFER = 2 * MIB  # kSmallBuffer — small-pool segment
+TORCH_MIN_LARGE_ALLOC = 10 * MIB  # kMinLargeAlloc
+TORCH_LARGE_BUFFER = 20 * MIB  # kLargeBuffer — segment for the (1 MiB, 10 MiB) band
+TORCH_MIN_BLOCK = 512  # kMinBlockSize — `round_size` granularity
+
 
 def torch_allocation_bytes(nbytes: int) -> int:
-    """Arena bytes ONE torch `MemPool` allocation of `nbytes` consumes. See `TORCH_ALLOC_GRANULE`.
+    """Arena bytes ONE torch `MemPool` segment of `nbytes` costs, IGNORING block reuse.
 
-    MODELLED, NEVER MEASURED — this is the single largest assumption in the exact-packing
-    reservation and a GPU run must replace it (compare `ArenaMemPool.stats()`'s served sizes with
-    `OffloadPlan.host_row_requests()`). Two deliberate choices:
+    This is `get_allocation_size` for the rows above the `kMinLargeAlloc` (10 MiB) boundary and a
+    deliberate UNDER-estimate below it — a 5 MiB row really costs a 20 MiB `kLargeBuffer` segment,
+    and this returns 6 MiB. That is fine here and nowhere else: sub-10-MiB rows are never charged
+    one at a time any more. `torch_charged_rows` is the function the reservation goes through, and
+    it models the segment AND the split, which is the only way the two can agree — charging every
+    band row a full 20 MiB over-reserves ~3x, and charging it 6 MiB under-reserves, so neither
+    per-row answer is available.
 
-      * `round_up(max(n, 2 MiB), 2 MiB)` mirrors `kRoundLarge`/`kSmallBuffer` exactly for every row
-        this feature actually reserves (a component's stacked slab is tens to hundreds of MiB).
-      * the `kLargeBuffer` bucket — a 6 MiB row costing a 20 MiB segment — is deliberately NOT
-        modelled. torch SPLITS a large block, so a run of such rows shares one buffer, and charging
-        every one of them 20 MiB over-reserves ~3x on a small-row shape. Over-reserving is not the
-        polite failure here: it is charged against the live `MemAvailable` gate and refuses boots
-        that would have fitted. The residual exposure is bounded by
-        `sum(kLargeBuffer - modelled)` over rows in the (1 MiB, 10 MiB) band and, on the target
-        shape, is absorbed by the tail next-fit already abandons in each chunk; a shape where it is
-        not absorbed fails LOUDLY at the carve (`allocate_raw` refuses, `mark_populated` raises)
-        rather than silently in VRAM, which is why the optimistic direction is affordable here and
-        was not affordable for `headroom_chunks`.
+    Kept as the per-row primitive because that is what it is, and because the >10 MiB arm — which is
+    every component slab this feature reserves — is exactly right.
     """
     n = int(nbytes)
     if n <= 0:
         return 0
     return round_up(max(n, TORCH_ALLOC_GRANULE), TORCH_ALLOC_GRANULE)
+
+
+def torch_segment_bytes(nbytes: int) -> int:
+    """`CUDACachingAllocator::get_allocation_size` verbatim: the segment torch asks the BACKING
+    allocator for when it has no free block. Not the same as the bytes the tensor uses."""
+    n = round_up(int(nbytes), TORCH_MIN_BLOCK)
+    if n <= 0:
+        return 0
+    if n <= TORCH_SMALL_SIZE:
+        return TORCH_SMALL_BUFFER
+    if n < TORCH_MIN_LARGE_ALLOC:
+        return TORCH_LARGE_BUFFER
+    return round_up(n, TORCH_ALLOC_GRANULE)
+
+
+def torch_charged_rows(rows: Sequence[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """An ORDERED row list -> the ordered list of SEGMENTS the arena will actually be asked for.
+
+    THE RESERVATION IS A SEQUENCE PROPERTY, NOT A PER-ROW ONE, and modelling it per row is what
+    broke the 48-layer boot. torch's caching allocator sits between the seam and the arena: it asks
+    the arena for a whole segment, hands the tensor a slice, and keeps the remainder on a free list
+    that LATER rows are served from — with no arena callback at all. So a row's cost depends on
+    every row before it, and a `map(torch_allocation_bytes, rows)` is wrong in BOTH directions at
+    once: it charges 2 MiB for a 1.25 MiB row that really opens a 20 MiB segment (under), and it
+    charges another 2 MiB for the next one, which is really free (over).
+
+    Before NVFP4's two-level scale every row this feature reserved was >= 25 MiB, i.e. above
+    `kMinLargeAlloc`, where segment == `round_up(n, 2 MiB)` and no splitting happens — so the per-row
+    model was exactly right and stayed right for a year. The e4m3 global (`E*N*4` B: 1.25 MiB for
+    w13, 5.00 MiB for w2) is the first row in the middle band, and it made the two models diverge by
+    +2.0 MiB per host layer — enough that the carve overran the plan and `verify_matches_plan`
+    refused the boot.
+
+    MEASURED, not assumed. `MINISGL_ARENA_TRACE_ALLOCS=1` on the 4-layer TP=2 boot logs every
+    (request, carve) pair the callback sees; this function reproduces that trace exactly:
+
+        layer 0:  400 MiB -> 400 | 50 -> 50 | 1.25 -> **20** | 200 -> 200 | 25 -> 26 | 5.00 -> **0**
+        layer 1:  400 MiB -> 400 | 50 -> 50 | 1.25 ->   **0** | 200 -> 200 | 25 -> 26 | 5.00 -> **0**
+
+    i.e. nine callbacks where a per-row model predicts twelve, and 1372 MiB carved against 1368 MiB
+    reserved. Rows the free list absorbs are returned with a charge of 0 and MUST be dropped by the
+    caller — they consume no arena and, more importantly, they occupy no position in the chunk
+    layout, which is what the next-fit packing is laid out against.
+
+    Faithful to `should_split`: the large pool splits only when the remainder EXCEEDS `kSmallSize`,
+    so a 26 MiB segment serving a 25 MiB row leaves 1 MiB that torch does not put on the free list.
+    Best-fit over the free list, and the two pools are kept apart, because that is what
+    `get_free_block` does.
+    """
+    small_free: List[int] = []
+    large_free: List[int] = []
+    out: List[Tuple[str, int]] = []
+    for name, nbytes in rows:
+        n = round_up(int(nbytes), TORCH_MIN_BLOCK)
+        if n <= 0:
+            continue
+        is_small = n <= TORCH_SMALL_SIZE
+        pool = small_free if is_small else large_free
+        # `get_free_block`: smallest block that fits.
+        pick = -1
+        for i, avail in enumerate(pool):
+            if avail >= n and (pick < 0 or avail < pool[pick]):
+                pick = i
+        if pick >= 0:
+            block = pool.pop(pick)
+            charge = 0
+        else:
+            block = torch_segment_bytes(n)
+            charge = block
+        remaining = block - n
+        # `should_split`: kMinBlockSize in the small pool, strictly more than kSmallSize in the
+        # large one. An unsplit remainder is internal fragmentation torch never hands out again.
+        if remaining >= (TORCH_MIN_BLOCK if is_small else TORCH_SMALL_SIZE + 1):
+            pool.append(remaining)
+        out.append((name, charge))
+    return out
 
 
 class ArenaLayoutError(RuntimeError):

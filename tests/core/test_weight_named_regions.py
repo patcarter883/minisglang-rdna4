@@ -161,10 +161,20 @@ def test_host_row_requests_covers_host_layers_only_and_keeps_carve_order():
     plan = plan_layer_granular(layers, device_budget_bytes=8 * MIB)  # exactly one layer on device
     assert plan.num_device_layers == 1 and plan.host_rows_known
     reqs = plan.host_row_requests()
-    assert [r.name for r in reqs] == [
-        f"model.layers.{i}.mlp.experts.{n}" for i in (1, 2) for n, _ in rows
+    # ONE segment, not six requests. Every row here (4, 2, 2 MiB x two host layers) is inside torch's
+    # `kLargeBuffer` band, so the FIRST one opens a single 20 MiB segment and the remaining five are
+    # served from its split remainder without ever reaching the arena's allocator. The request list
+    # is what the arena will really be asked for, so it names the row that OPENS each segment and
+    # carries the segment's size -- see `chunk_plan.torch_charged_rows`.
+    assert [(r.name, r.nbytes) for r in reqs] == [
+        ("model.layers.1.mlp.experts.w13.weight", 20 * MIB)
     ]
     assert all(r.forecast for r in reqs)
+    # CARVE ORDER is still the invariant: whatever survives is a subsequence of the host rows, in
+    # order, and never reordered across layers.
+    host_order = [f"model.layers.{i}.mlp.experts.{n}" for i in (1, 2) for n, _ in rows]
+    got = [r.name for r in reqs]
+    assert got == [n for n in host_order if n in set(got)]
     # A device layer never touches the arena, so charging its rows would reserve host RAM for
     # weights staying in VRAM -- and the greedy fill puts the LARGEST layers on the device.
     assert not any(".layers.0." in r.name for r in reqs)
@@ -351,7 +361,20 @@ def test_the_observed_path_asks_for_a_correction_only_on_meta():
 def test_exact_packing_beats_the_bound_on_the_target_shape():
     r = resolve()
     rows = r.plan.host_row_requests()
-    assert len(rows) == 48 * 6, "48 layers x (w13 weight/scale/post_load + w2 weight/scale/post_load)"
+    # NOT `48 * 6` — a request is a torch SEGMENT, and segments are not 1:1 with rows. The target
+    # shape's `w2.post_load` row is 6 MiB, i.e. inside torch's `kLargeBuffer` band, so it opens a
+    # 20 MiB segment whose remainder then serves the 12 MiB `w13.post_load` of the NEXT layer with no
+    # arena callback at all. 241 segments for 288 rows, and the composition is exact:
+    #   384 x48, 192 x48, 48 x48, 24 x48   the four slabs above kMinLargeAlloc, one segment each
+    #   20  x48                            one kLargeBuffer per layer, opened by w2.post_load
+    #   12  x1                             layer 0's w13.post_load, before any remainder exists
+    # See `chunk_plan.torch_charged_rows`, whose model is checked against a live
+    # MINISGL_ARENA_TRACE_ALLOCS=1 callback trace.
+    from collections import Counter
+
+    assert len(rows) == 241
+    assert Counter(rq.nbytes // MIB for rq in rows) == {384: 48, 192: 48, 48: 48, 24: 48, 20: 48,
+                                                        12: 1}
 
     payload = sum(nb for _, nb in r.layers[0].rows) * 48
     assert payload == r.host_bytes_per_rank

@@ -59,7 +59,7 @@ from .chunk_plan import (
     plan_regions,
     round_up,
     suggest_chunk_bytes,
-    torch_allocation_bytes,
+    torch_charged_rows,
 )
 from .host_capacity import (
     DEFAULT_FLOOR_BYTES,
@@ -1145,10 +1145,16 @@ def required_device_bytes(
         idx = sorted(host_idx)
         if not idx or any(not layers[i].rows for i in idx):
             return None
+        # Charged as ONE ordered sequence — see `chunk_plan.torch_charged_rows`. This is the
+        # feasibility side of the same arithmetic `OffloadPlan.host_row_requests` reserves with, so
+        # the two must go through the same function or the walk picks a tier the arena then refuses.
+        flat = [
+            (f"{layers[i].path}.{name}", nb) for i in idx for name, nb in layers[i].rows
+        ]
         return [
-            RegionRequest(f"{layers[i].path}.{name}", torch_allocation_bytes(nb), forecast=True)
-            for i in idx
-            for name, nb in layers[i].rows
+            RegionRequest(name, charge, forecast=True)
+            for name, charge in torch_charged_rows(flat)
+            if charge > 0
         ]
 
     def _fits(host_payload: int, host_idx: Sequence[int]) -> bool:

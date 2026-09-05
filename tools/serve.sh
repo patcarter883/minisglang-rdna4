@@ -574,28 +574,50 @@ case "$MODEL" in
                   # operating point has been booted at; raising it raises coverage but is unmeasured
                   # and eats VRAM at exactly the moment VRAM is tightest.
                   if [ "$CONC" -gt 2 ]; then CONC=2; fi
-                  # THE OFFLOAD TIER. 8.1 GiB/rank = 11 of 48 layers device-side; the other 37 are
-                  # host-pinned at 27.10 GiB/rank (54.20 GiB across the node).
-                  # * 8.1 not 9.0: 12 device layers OOMs in STAGE B, not at rest. Stage B's peak is
-                  #   the tier plus ONE layer in flight (~1.46 GiB), which at 12 layers is 14.96 GiB
-                  #   allocated with 224 MiB free and dies asking for a 400 MiB row. At 11 the same
-                  #   run leaves min_device_free 0.66 GiB. Size the device tier against the LOAD
-                  #   peak, not the resting footprint.
-                  # * chunk 750 MiB, not the 2048 default and NOT rounded to a 256 MiB granule: the
-                  #   arena packs next-fit over ROWS and a region may never straddle a chunk. This
-                  #   checkpoint's rows are 400/200/100/50 MiB = exactly 750 MiB per layer per rank
-                  #   at TP=2, so 750 wastes ZERO (27.100 GiB/rank) while 768 costs +0.650 and 1024
-                  #   costs +9.900 (one layer per chunk). The curve is NOT monotone in chunk size —
-                  #   sweep it with tools/offload/plan_chunk_sweep.py, never extrapolate.
-                  woff_device_gb="8.1"; woff_host_gb="28"; woff_chunk_mib="750"
+                  # THE OFFLOAD TIER. `[E4M3-2026-09-05]` 8.1 GiB/rank now buys **12** of 48 layers
+                  # device-side, not 11, and the other 36 are host-pinned at 24.12 GiB/rank
+                  # (48.23 GiB across the node — MEASURED: 18 chunks, payload 24.00 GiB, 120 MiB
+                  # abandoned, fill 99.5%, torch_fallbacks 0, min_device_free 1.11 GiB, 14.55 tok/s).
+                  # The NVFP4 two-level scale moved both numbers: an e4m3 block scale is 1 B per 16
+                  # weights where the fp16 fold was 2, so a layer's expert rows fell 0.7324 ->
+                  # 0.6680 GiB/rank. Same 8.1 GiB budget, one MORE layer on the card, and 5.97 GiB
+                  # LESS pinned host RAM than the 54.20 this arm used to need.
+                  # * 8.1 still not 9.0, and the old reason has not expired — it has been re-priced.
+                  #   Stage B's peak is the tier plus one layer in flight; at 12 e4m3 layers that is
+                  #   a MEASURED 40.91 GiB allocated leaving min_device_free 1.11 GiB, i.e. healthier
+                  #   than the 0.66 GiB the 11-layer fp16-fold point left. 13 layers (device-gb 9.0)
+                  #   is 8.57 GiB of tier against a 14.14 GiB budget and leaves the KV pool at
+                  #   ~0.16 GiB — UNMEASURED, and on the wrong side of a load peak. Size the device
+                  #   tier against the LOAD peak, not the resting footprint.
+                  # * chunk 1372 MiB, not 750 and not the 2048 default. THE CHUNK IS A FEASIBILITY
+                  #   TERM AND e4m3 MOVED IT. The arena packs next-fit over ROWS and a region may
+                  #   never straddle a chunk, but the row set is no longer {400,200,100,50} = 750: it
+                  #   is {400, 200, 50, 25, 5, 1.25} MiB, and torch serves the last two out of ONE
+                  #   shared 20 MiB kLargeBuffer segment (weights/chunk_plan.py::torch_charged_rows,
+                  #   whose model is checked against a live allocator-callback trace). 1372 = 2x686
+                  #   packs the CHARGED rows into 18 chunks with 120 MiB abandoned; the old 750
+                  #   wastes 2.417 GiB/rank on the new row set. The curve is NOT monotone in chunk
+                  #   size — sweep it with tools/offload/plan_chunk_sweep.py, never extrapolate.
+                  # * host_gb 25, not 28: the clamp must sit above the 24.12 GiB the plan reserves.
+                  #   28 also admits it; 25 is the point that was actually booted and measured.
+                  woff_device_gb="8.1"; woff_host_gb="25"; woff_chunk_mib="1372"
                   # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
-                  # that must NOT be carried to another machine. 27.10 x 2 = 54.20 GiB pinned, and
-                  # the rank processes see ~62-65 GiB of MemAvailable (2-3 GiB less than the host
-                  # reads, because both engines are already up), so 54.20 + the 12 GiB default floor
-                  # = 66.20 does not fit and 54.20 + 9 = 63.20 does. Four 48-layer boots died in
-                  # HostArenaCapacityError / HostArenaSwapThrashError purely because ~10 GiB of
-                  # tmpfs was squatting under /tmp. Free ~3 GiB on this box and the default floor
-                  # works unchanged.
+                  # that must NOT be carried to another machine. The arena is now 24.12 x 2 =
+                  # 48.23 GiB, and the rank processes read ~2-6 GiB LESS `MemAvailable` than the host
+                  # does because both engines are already up: a host reading 60.7 GiB presented as
+                  # 54.60 GiB inside the ranks, so 48.23 + 9 = 57.23 was refused and 48.23 + 6 =
+                  # 54.23 booted. 9 is kept as the DEFAULT because it is the value with margin; the
+                  # 2026-09-05 run that produced every number in this arm ran at
+                  # MINISGL_WEIGHT_ARENA_FLOOR_GIB=6 and is recorded as such.
+                  #
+                  # WHAT THE FLOOR IS ACTUALLY PROTECTING AGAINST IS SMALLER THAN IT LOOKS ON THIS
+                  # BOX, and the reason is worth writing down because it is invisible in every tool:
+                  # /home is ZFS and the ARC is NOT counted in `MemAvailable`. It sat at 13.8 GiB
+                  # while the gate believed there were only 6 GiB spare. Under the pinning the
+                  # kernel's shrinker gave 9.2 GiB of it straight back (13.8 -> 4.5 GiB, watched
+                  # live), MemAvailable never fell below 11.0 GiB during Stage B, and SwapFree moved
+                  # <1 GiB. So a refusal at floor 9 here is the gate being blind to the ARC, not the
+                  # box being full — check `/proc/spl/kstat/zfs/arcstats` before believing it.
                   : "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:=9}"; export MINISGL_WEIGHT_ARENA_FLOOR_GIB
                   # THE PLE N-GRAM SIDECAR. Qwen4ExpPLE reads its embeddings out of a separate
                   # ~49 GiB shard set that is NOT part of the model directory, and the head metadata

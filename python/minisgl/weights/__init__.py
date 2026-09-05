@@ -46,6 +46,8 @@ from .chunk_plan import (
     plan_regions,
     suggest_chunk_bytes,
     torch_allocation_bytes,
+    torch_charged_rows,
+    torch_segment_bytes,
 )
 from .config import ArenaSettings, create_pinned_weight_arena, resolve_arena_settings
 from .host_capacity import (
@@ -92,6 +94,8 @@ __all__ = [
     "plan_regions",
     "suggest_chunk_bytes",
     "torch_allocation_bytes",
+    "torch_charged_rows",
+    "torch_segment_bytes",
     # capacity
     "DEFAULT_SWAP_TRIPWIRE_ARM_MULTIPLE",
     "DEFAULT_SWAP_TRIPWIRE_FRACTION",

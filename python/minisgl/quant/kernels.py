@@ -600,6 +600,25 @@ def w4a8_moe(
     gemm2_kernel = kernel
     _check_moe_scale_pair(w13, w13_scales, w13_zeros, "w13")
     _check_moe_scale_pair(w2, w2_scales, w2_zeros, "w2")
+    # WHICH ENTRY POINTS CAN READ A TWO-LEVEL SCALE. `E4m3GroupScaleGlobal` reached the kernel bodies
+    # and the THREE launchers that dispatch on the scale format — `mmq_fp8_moe_gemm`,
+    # `mmq_fp8_moe_gemm1_silu`, `mmq_fp8_moe_gemm_scatter` (moe_kernel.hip's
+    # `MOE_SCALE_FMT_DISPATCH`). The other three grouped launchers are still fp16-only on BOTH sides:
+    # `mmq_fp8_moe_gemm1_silu_flag`, `mmq_fp8_moe_gemm_flag` and `mmq_fp8_moe_gemm2_gather_reduce`
+    # each begin `TORCH_CHECK(scales.scalar_type() == at::kHalf)`.
+    #
+    # The two `_flag` arms were already unreachable for NVFP4 — they gate on group in {32,64,128} and
+    # NVFP4 is group 16 — but that is an ACCIDENT of the group size, not a decision, so it is spelled
+    # out below rather than relied on. `mmq_fp8_moe_gemm2_gather_reduce` was NOT excluded by anything
+    # and it is selected at 3 <= M <= _MOE_GEMM1_GEMV_MAX, i.e. by any short prefill: a 48-layer
+    # NVFP4 boot died there on its first prompt with "scales must be fp16".
+    #
+    # Excluded rather than emulated. The fallback is the unfused `mmq_fp8_moe_gemm` + the weightless
+    # `mmq_fp8_moe_gather_reduce`, which is the bit-exact reference path this file already documents
+    # `MINISGL_MOE_G2FUSE=0` as selecting — so the cost is one extra launch and a (P,K) round-trip at
+    # small-M prefill, and nothing numeric. Lifting it is a KERNEL change (give the remaining three
+    # launchers the same `MOE_SCALE_FMT_DISPATCH` the other three have), not an engine one.
+    _two_level = w2_scales.dtype in (torch.float8_e4m3fn, torch.uint8)
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:
@@ -665,7 +684,7 @@ def w4a8_moe(
         # PREFILL (block_m in {64,128}): the silu-fused flagship register-tiled gemm1 flag — bit-exact
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
-        _flag1 = _MOE_FLAG and block_m in (64, 128) and \
+        _flag1 = _MOE_FLAG and not _two_level and block_m in (64, 128) and \
             (w13.shape[-1] * 8) // w13_scales.shape[1] in (32, 64, 128)  # scales (E, G, N): G=shape[1]
         if _flag1:
             engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}{_pq}")
@@ -757,7 +776,7 @@ def w4a8_moe(
     # gather_reduce launch AND skipping the alignment-padding rows the WMMA gemm2 computes. gemv-math
     # down-proj -> ~1e-4 vs the WMMA path (accumulation order; user-accepted). Prefill (M>threshold) keeps
     # the flag/WMMA gemm2 + gather_reduce below.
-    if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
+    if _MOE_G2FUSE and not _two_level and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
             and hasattr(fp8_wmma, "mmq_fp8_moe_gemm2_gather_reduce"):
         # _gemv_ok: the decode gemm2 gather-reduce is gemv-math (now group_size%16, incl. NVFP4 group-16
         # via the unified loader's per-16-K-half scale fold).
@@ -775,7 +794,7 @@ def w4a8_moe(
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
     # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
-    _flag2 = _MOE_FLAG and block_m == 128 and \
+    _flag2 = _MOE_FLAG and not _two_level and block_m == 128 and \
         (w2.shape[-1] * 8) // w2_scales.shape[1] in (32, 64, 128)  # group 32/64/128; scales (E,G,N)
     if _flag2:
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")
