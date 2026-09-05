@@ -105,10 +105,11 @@ print(f"model={MODEL}  {len(shards)} expert shards, {PER_LEG} cold shards per le
 print(f"raw read() of one untouched shard, for reference:", flush=True)
 _ref = shards[-1]
 _t = time.perf_counter()
-_b = read_file_bytes(os.path.join(MODEL, _ref))
+_b, _gen = read_file_bytes(os.path.join(MODEL, _ref))
+_n = os.path.getsize(os.path.join(MODEL, _ref))
 _dt = time.perf_counter() - _t
-print(f"  {_ref}  {len(_b) / MIB:.1f} MiB in {_dt:.3f} s = {len(_b) / MIB / _dt:.1f} MiB/s "
-      f"(no tensors built, no touch)", flush=True)
+print(f"  {_ref}  {_n / MIB:.1f} MiB in {_dt:.3f} s = {_n / MIB / _dt:.1f} MiB/s "
+      f"(no tensors built, no touch; shared-buffer gen {_gen})", flush=True)
 del _b
 
 results = []

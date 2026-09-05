@@ -23,6 +23,7 @@ import torch
 from minisgl.distributed import get_dp_info, get_ep_rank, get_ep_size, get_tp_info, is_ep_enabled
 from minisgl.quant import nvfp4
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight, init_logger
+from minisgl.weights import ckpt_read
 from tqdm import tqdm
 
 logger = init_logger(__name__)
@@ -1398,29 +1399,41 @@ def _load_qwen4_exp_weight(
     from minisgl.weights.boot_timeline import tick as _bt_tick
     from minisgl.weights.boot_timeline import timeline as _bt_timeline
 
-    # MMAP, DELIBERATELY — `weights/ckpt_read.py`'s O_DIRECT reader was wired in here and MEASURED
-    # 3.5x WORSE on the 48-layer TP=2 boot (1808.3 s vs 520.5 s, 2026-09-06 A/B in
-    # docs/measurements/BOOT_TIMELINE_2026-09-06/r2/). Do not re-land it without fixing the buffer.
+    # THE READ. `ckpt_read.safe_open` is a routing POLICY, not a second reader: expert shards
+    # (<= WHOLE_FILE_CAP — 64.8 GiB of this checkpoint's 72.6) are read with one O_DIRECT `preadv`
+    # into ONE process-wide REUSED buffer, and the four 3.4-10.0 GiB `model-bf16-*` body shards stay
+    # on safetensors' mmap, byte-for-byte the reader they always had.
     #
-    # The read itself got 5x FASTER — `ckpt.safe_open` + `ckpt.get_tensor` + `ckpt.shard` fell from
-    # ~297 s to 59.2 s, i.e. 64.8 GiB of expert shards at 1660 MiB/s against ZFS mmap's 551 — and it
-    # still lost, because of WHERE the bytes land. `safe_open`'s pages are FILE-BACKED: reclaiming
-    # one is free, the kernel drops it. The O_DIRECT reader's destination is an anonymous buffer, and
-    # reclaiming one of those on this box means COMPRESSING IT INTO ZRAM. Swapping the 72.6 GiB
-    # checkpoint stream from file-backed to anonymous took the boot from 6.2M to 44.6M swap-out pages
-    # and from 46.9M to 132.8M major faults, and `ckpt.h2d` — whose source tensors are those buffers
-    # — went 174.7 s -> 1382.1 s. The page-cache pressure this was meant to remove was the CHEAP
-    # kind of pressure.
+    # Measured on this pool, one cold 337.7 MiB shard per leg, CPU only: mmap 614.9 MiB/s costing
+    # +0.33 GiB of page cache AND +0.33 GiB of ARC; O_DIRECT into the reused buffer 1829.1 MiB/s
+    # costing NOTHING. The footprint column is the one that decides a 48-layer TP=2 boot — by the
+    # time Stage B streams, the two 24.12 GiB pinned arenas have taken half of RAM, so every mmap
+    # fault must allocate a page-cache page, which means reclaiming one, which on this box means a
+    # zram compression. The 2026-09-06 baseline's per-layer rows are that mechanism in the raw:
+    # 2.5 s for a layer whose ARC is falling, 20-28 s for the identical bytes when the ARC is at its
+    # 16 GiB cap with millions of direct-reclaim scans.
     #
-    # The reader is kept, parity-gated and unwired: the fix it still wants is ONE REUSED, pre-faulted
-    # aligned buffer instead of a fresh `mmap` per shard, which needs a guarantee that no `get_tensor`
-    # view outlives its shard. That guarantee is not free on this path (`fold_buf` holds a view across
-    # calls) and was not in scope for the round that measured this.
+    # WHAT ROUND 2'S 3.5x LOSS TAUGHT (docs/measurements/BOOT_TIMELINE_2026-09-06/r2/): a FRESH
+    # buffer per shard is NOT this change. It made the read 5x faster and the boot 3.5x slower,
+    # because 64.8 GiB of anonymous churn is reclaimed by COMPRESSION where file-backed pages are
+    # reclaimed by being dropped. REUSE is what makes O_DIRECT viable — and reuse is a correctness
+    # hazard, because `get_tensor` hands out zero-copy views of the shared buffer, so a view that
+    # outlives its shard would read the NEXT shard's bytes under this shard's name: an expert
+    # dequantized against another expert's scale, which is plausible text and no crash. The two
+    # halves of the contract are marked below, and `_SharedReadBuffer.acquire` proves the first one
+    # mechanically at every refill rather than trusting this comment.
     _bt_tl = _bt_timeline()
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
+        # CONTRACT, HALF 1 — no host view of the PREVIOUS shard may be alive when this one is read.
+        # These are the loop's only host-side tensor locals (`raw`, `_cat`, and everything in
+        # `concat_buf`/`merge_buf`/`expert_buf` is already on the device), and a generator frame
+        # keeps its locals bound across the `for file` boundary, so without this the last tensor of
+        # the previous shard is still exported when the next `acquire()` runs.
+        _sc = tens = sharded = leaves = override = None
         _t = time.perf_counter()
-        _fh = safetensors.safe_open(file, framework="pt", device="cpu")
+        _fh = ckpt_read.safe_open(file, framework="pt", device="cpu")
         _bt_tick("ckpt.safe_open", time.perf_counter() - _t)
+        _bt_count("ckpt.file_bytes", os.path.getsize(file))
         _bt_count("ckpt.files_opened")
         _bt_tl.note_file(file, "tensors")
         with _fh as f:
@@ -1448,7 +1461,16 @@ def _load_qwen4_exp_weight(
                     _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
                     _bt_count("ckpt.get_tensor_calls")
                     _bt_count("ckpt.get_tensor_bytes", _sc.numel() * _sc.element_size())
-                    buf[field] = _sc
+                    # CONTRACT, HALF 2 — `fold_buf` is the ONE place a `get_tensor` result is
+                    # retained past the call that produced it: it parks a `weight_scale` until its
+                    # `weight_scale_2` arrives. On this checkpoint the pair is always co-located in
+                    # one shard, but that is a property of one repack (see `qwen4_exp_nvfp4_prepass`,
+                    # which exists because another Qwen NVFP4 repack splits every pair across
+                    # shards), so the retention is made SAFE rather than assumed-not-to-happen: the
+                    # clone costs ~1/8 of the packed bytes and buys a fold that cannot read the next
+                    # shard's buffer.
+                    buf[field] = _sc.clone()
+                    _sc = None
                     if len(buf) < 2:
                         continue
                     del fold_buf[base]

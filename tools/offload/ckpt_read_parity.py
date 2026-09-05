@@ -109,11 +109,11 @@ for fn in pick:
         failures.append(f"{fn}: whole-shard sha256 differs {ha.hexdigest()[:16]} vs "
                         f"{hb.hexdigest()[:16]}")
     # WHICH MODE RAN matters as much as the bytes: `ReadSafeOpen` serves shards <= WHOLE_FILE_CAP
-    # from one buffer and larger ones with a per-tensor aligned pread, and those are two different
-    # offset computations (the per-tensor one indexes into a block-aligned read-around window).
+    # from the shared O_DIRECT buffer and `safe_open()` routes anything larger to safetensors' mmap.
     # `pick` deliberately spans both -- expert shards are 337 MiB, the `model-bf16-*` body shards
-    # are 3.4-10.0 GiB -- so a green run that exercised only one would be half a gate. `direct`
-    # records whether O_DIRECT was actually granted on this mount.
+    # are 3.4-10.0 GiB -- so a green run that exercised only one would be half a gate, and a cap
+    # regression that pushed a 10 GiB shard onto the shared buffer would make that buffer 10 GiB
+    # resident for the life of the process. `direct` records whether O_DIRECT was granted here.
     mode = "O_DIRECT" if size <= WHOLE_FILE_CAP else "mmap(policy)"
     if (size <= WHOLE_FILE_CAP) != isinstance(got, ReadSafeOpen):
         failures.append(f"{fn}: safe_open routed a {size} B shard to the wrong reader "
@@ -122,15 +122,82 @@ for fn in pick:
           f"direct={str(getattr(got, 'direct', 'n/a')):<5} "
           f"mmap {size / MIB / (t1 - t0):7.1f} MiB/s   O_DIRECT {size / MIB / (t2 - t1):7.1f} MiB/s  "
           f"sha {ha.hexdigest()[:16]}", flush=True)
+    # EVERY name that can still hold a view of the shared buffer, not just the obvious ones. The
+    # per-tensor comparison leaves `b`/`rb` bound to the LAST tensor of this shard, and the reuse
+    # guard caught exactly that on the first run of this gate — which is the point of having it.
     del ref_t, got_t, ref, got, ref_h, got_h
+    a = b = ra = rb = None
 
 print(f"\n{checked} tensors compared byte-for-byte over {tot_bytes / GIB:.2f} GiB", flush=True)
 print(f"mmap  (safe_open + touch): {t_mmap:7.2f} s = {tot_bytes / MIB / t_mmap:8.1f} MiB/s")
 print(f"O_DIRECT (ReadSafeOpen)  : {t_read:7.2f} s = {tot_bytes / MIB / t_read:8.1f} MiB/s")
 print(f"speedup {t_mmap / t_read:.2f}x")
+# ---------------------------------------------------------------------------------------------
+# THE REUSE CONTRACT, TESTED IN BOTH DIRECTIONS.
+#
+# The shared buffer is what makes O_DIRECT win instead of lose (round 2 lost 3.5x with a fresh
+# buffer per shard), and it is also the only way this reader can return WRONG BYTES under RIGHT
+# NAMES. Byte parity above cannot see that failure at all — it compares one shard at a time. So the
+# gate also proves the two halves of the guard:
+#
+#   NEGATIVE — a tensor view held across a shard boundary must RAISE, not silently alias.
+#   POSITIVE — the guard must not fire on the legal pattern (consume, drop, read the next shard),
+#              or it would be an unrunnable reader that passes its own test by refusing everything.
+smalls = [f for f in files if os.path.getsize(os.path.join(MODEL, f)) <= WHOLE_FILE_CAP][:2]
+if len(smalls) < 2:
+    failures.append("reuse-contract test needs two shards under WHOLE_FILE_CAP")
+else:
+    a, b = (os.path.join(MODEL, s) for s in smalls)
+
+    h = ckpt_read.safe_open(a)
+    held = h.get_tensor(h.keys()[0])          # a live zero-copy view of the shared buffer
+    h.__exit__()
+    try:
+        ckpt_read.safe_open(b)
+        failures.append("REUSE GUARD DID NOT FIRE: a shard was read into the shared buffer while a "
+                        "tensor view of the previous shard was still alive. That is silent weight "
+                        "corruption, not a crash")
+    except ckpt_read.CheckpointReadError as e:
+        print(f"\nreuse guard NEGATIVE: raised as required — {str(e).split(chr(10))[0][:110]}",
+              flush=True)
+    stale_ok = True
+    del held
+
+    h2 = ckpt_read.safe_open(a)
+    k = h2.keys()[0]
+    ref_bytes = raw(h2.get_tensor(k)).clone()
+    h2.__exit__()
+    try:
+        h3 = ckpt_read.safe_open(b)
+        h3.__exit__()
+        print("reuse guard POSITIVE: the legal consume-then-advance pattern is not blocked",
+              flush=True)
+    except ckpt_read.CheckpointReadError as e:
+        failures.append(f"REUSE GUARD FALSE POSITIVE on the legal pattern: {e}")
+        stale_ok = False
+
+    # The stale-handle fence: `h2` names shard A, but the buffer now holds shard B.
+    if stale_ok:
+        try:
+            h2.get_tensor(k)
+            failures.append("STALE HANDLE SERVED: get_tensor on a handle whose shard has been "
+                            "overwritten returned bytes instead of raising")
+        except (ckpt_read.CheckpointReadError, ValueError) as e:
+            print(f"stale-handle fence: raised as required — {type(e).__name__}", flush=True)
+        # and the same shard re-read gives the same bytes, i.e. the buffer is not stateful
+        h4 = ckpt_read.safe_open(a)
+        again = raw(h4.get_tensor(k)).clone()
+        h4.__exit__()
+        if not torch.equal(ref_bytes, again):
+            failures.append("the shared buffer is stateful: re-reading the same shard gave "
+                            "different bytes")
+        else:
+            print(f"buffer re-read is byte-stable over {ref_bytes.numel()} B", flush=True)
+
 if failures:
     print(f"\nFAIL: {len(failures)} problem(s)")
     for f in failures[:20]:
         print("  " + f)
     sys.exit(1)
-print("\nPARITY PASS: identical keys(), order, dtypes, shapes and bytes")
+print("\nPARITY PASS: identical keys(), order, dtypes, shapes and bytes; reuse guard fires on an "
+      "outstanding view, does not fire on the legal pattern, and the stale-handle fence holds")

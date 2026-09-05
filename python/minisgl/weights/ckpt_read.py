@@ -1,30 +1,46 @@
-"""O_DIRECT reader for safetensors shards. **NOT WIRED IN — it was A/B'd and it LOSES.**
+"""O_DIRECT reader for safetensors shards, into ONE REUSED page-aligned buffer.
 
 --------------------------------------------------------------------------------------------------
-VERDICT FIRST, 2026-09-06, 48-layer TP=2, sequential, quiet box, both legs at floor=4 GiB
+HISTORY, IN THE ORDER IT WAS MEASURED — this module shipped WRONG once, and the way it was wrong is
+the whole design of what is here now.
+
+2026-09-06 round 2 wired an O_DIRECT reader that allocated a FRESH whole-file buffer per shard. The
+48-layer TP=2 A/B (docs/measurements/BOOT_TIMELINE_2026-09-06/r2/):
 
     boot           520.5 s  ->  1808.3 s     (3.5x WORSE)
-    stage_b        334.1 s  ->  1498.4 s
     ckpt.h2d       174.7 s  ->  1382.1 s
     read total     ~297 s   ->    59.2 s     (5x BETTER -- 64.8 GiB at 1660 MiB/s)
     swap-out       6.18 M pages -> 44.58 M   |  major faults 46.9 M -> 132.8 M
 
-The read got five times faster and the boot got three and a half times slower, and the reason is
-WHERE THE BYTES LAND, not how fast they arrive. `safe_open`'s pages are FILE-BACKED, so reclaiming
-one is free -- the kernel drops a clean page. This reader's destination is an ANONYMOUS buffer, and
-on this box reclaiming anonymous memory means compressing it into zram. Streaming the 72.6 GiB
-checkpoint through anonymous buffers, on a box whose two 24.12 GiB pinned arenas have already taken
-half of RAM, converts every reclaimed checkpoint page from a free drop into a compression. The
-tensors handed to `.to(device)` live in those buffers, which is why `ckpt.h2d` -- the bucket this
-was aimed at -- absorbed the entire regression.
+The read got five times faster and the boot got three and a half times slower, because of WHERE the
+bytes landed. `safe_open`'s pages are FILE-BACKED, so reclaiming one is free -- the kernel drops a
+clean page. A fresh anonymous buffer per shard streams 64.8 GiB of ANONYMOUS memory through a box
+whose two 24.12 GiB pinned arenas have already taken half of RAM, and reclaiming anonymous memory
+here means COMPRESSING IT INTO ZRAM. The tensors handed to `.to(device)` live in those buffers,
+which is why `ckpt.h2d` absorbed the entire regression.
 
-WHAT WOULD MAKE IT WIN: ONE REUSED, pre-faulted, page-aligned buffer instead of a fresh `mmap` per
-shard, so the anon footprint is 337 MiB for the whole boot rather than 64.8 GiB of churn. That needs
-a guarantee that no `get_tensor` view outlives its shard, which is NOT free on the qwen4_exp path
-(`fold_buf` holds a `weight_scale` view across `get_tensor` calls). Until that exists, this module
-stays parity-gated and unwired, and `models/weight.py` reads through `safetensors.safe_open`.
+That commit's own postmortem named the fix: ONE REUSED, pre-faulted buffer, so the anon footprint is
+337 MiB for the whole boot instead of 64.8 GiB of churn. It did not land it because reuse needs a
+guarantee that no `get_tensor` view outlives its shard, and that guarantee was not free.
 
-Raw artifacts: docs/measurements/BOOT_TIMELINE_2026-09-06/r2/.
+THIS MODULE NOW HOLDS BOTH HALVES. `_SharedReadBuffer` is the single buffer; the guarantee is
+MECHANICAL rather than argued -- see `_SharedReadBuffer.acquire`, which refuses to reuse a buffer
+that still has a tensor view exported and raises instead of handing out another shard's bytes.
+
+--------------------------------------------------------------------------------------------------
+WHY THE READ PATH MATTERS AT ALL — measured on THIS pool, one cold 337.7 MiB expert shard per leg,
+CPU only, quiet box (2026-09-06, four distinct cold shards so no leg warms another):
+
+    reader                        rate          dCached      dARC
+    mmap, 4 KiB walk          614.9 MiB/s     +0.33 GiB   +0.33 GiB   <-- what shipped
+    read() into reused buf   1653.8 MiB/s     +0.00 GiB   +0.31 GiB
+    O_DIRECT into reused buf 1829.1 MiB/s     +0.00 GiB   +0.00 GiB   <-- what this module does
+
+Three times the rate, and — the half that actually dominates a 48-layer boot — mmap costs TWICE the
+bytes in reclaimable footprint (a page-cache page AND an ARC buffer per 4 KiB) while O_DIRECT into a
+buffer that already exists costs NOTHING. `posix_fadvise(POSIX_FADV_DONTNEED)` was tried first, as
+the smaller change: it returns 0 on this ZFS 2.4.3 mount and frees nothing, so bounding the mmap
+path's footprint in place is not available.
 
 --------------------------------------------------------------------------------------------------
 WHAT WAS TRUE ABOUT THE ORIGINAL DIAGNOSIS (kept, because the rate numbers are still right)
@@ -209,46 +225,91 @@ def _pread_into(fd: int, mv: memoryview, want: int, file_off: int, path: str) ->
         got += n
 
 
-def _aligned_buffer(nbytes: int):
-    """A page-aligned, page-granular anonymous buffer, freed to the OS the moment it is dropped.
+class _SharedReadBuffer:
+    """THE buffer. One page-aligned anonymous mapping, allocated once and refilled per shard.
 
-    `mmap.mmap(-1, n)` rather than `bytearray(n)`: O_DIRECT needs the ADDRESS aligned, and CPython
-    gives no alignment guarantee for a bytearray. A fresh buffer per file/tensor on purpose — a
-    REUSED one would be a correctness bug, because `get_tensor` hands out zero-copy views and
-    `fold_buf` can legitimately hold one across the next `get_tensor`.
+    A fresh buffer per shard is what made round 2's O_DIRECT reader lose 3.5x (see the module
+    docstring): 64.8 GiB of anonymous churn on a box that answers anonymous reclaim with zram
+    compression. Reused, the checkpoint stream's anonymous footprint is ONE shard — 337.7 MiB for
+    the whole boot — and it is faulted in exactly once.
+
+    REUSE IS A CORRECTNESS HAZARD AND IS GATED MECHANICALLY. `get_tensor` hands out zero-copy views
+    of this buffer; refilling it while one is alive would not crash, it would silently dequantize
+    one expert against another expert's scale. So `acquire()` proves, before every refill, that the
+    previous shard's views are all gone — by asking CPython to `resize()` the mapping, which raises
+    `BufferError` while ANY buffer export (a `memoryview` slice, a `torch.frombuffer` storage) is
+    outstanding. Same-size `resize` is an `mremap` no-op on Linux, so the check costs nothing and
+    cannot be satisfied by inspection or by comment. A caller that retains a view across shards gets
+    a loud `CheckpointReadError` naming the contract, not wrong weights.
     """
-    import mmap as _mmap
 
-    return _mmap.mmap(-1, _align_up(max(nbytes, 1)))
+    __slots__ = ("_buf", "_cap", "gen")
+
+    def __init__(self) -> None:
+        self._buf: Any = None
+        self._cap = 0
+        # Bumped on every refill. `ReadSafeOpen` records the value it was read at and refuses to
+        # serve a tensor once the buffer has moved on -- the second half of the guard, for the case
+        # where the caller kept the HANDLE rather than a view.
+        self.gen = 0
+
+    def acquire(self, nbytes: int, path: str):
+        """The buffer, sized >= `nbytes`, with no live view of the PREVIOUS shard in it."""
+        import mmap as _mmap
+
+        want = _align_up(max(nbytes, 1))
+        if self._buf is not None:
+            try:
+                # Same size on purpose: this is an export CHECK, not a resize. It is also what
+                # makes growth safe, below, since a grow is the same check plus a real mremap.
+                self._buf.resize(self._cap)
+            except BufferError:
+                raise CheckpointReadError(
+                    f"{path}: the shared checkpoint read buffer still has a tensor view exported "
+                    f"from the PREVIOUS shard. Refilling it would silently replace that tensor's "
+                    f"bytes with this shard's. Every `get_tensor` result must be consumed (or "
+                    f"`.clone()`d) before the next shard is opened — see the reuse contract in "
+                    f"`_SharedReadBuffer` and the `fold_buf` clone in `_load_qwen4_exp_weight`."
+                ) from None
+            if want > self._cap:
+                self._buf.close()
+                self._buf = None
+        if self._buf is None:
+            self._buf = _mmap.mmap(-1, want)
+            self._cap = want
+            # PRE-FAULT ONCE. O_DIRECT's `get_user_pages` faults its destination INSIDE the read
+            # syscall; on an untouched mapping that turns the first read of every shard into a page
+            # allocation under whatever memory pressure the box happens to be in — which is the
+            # shape of the failure that made per-tensor O_DIRECT collapse to 53 MiB/s. One pass of
+            # zeros here pays it once for the whole boot, in READ_BLOCK steps so the temporary is
+            # 16 MiB rather than a second copy of the whole buffer.
+            zeros = b"\0" * min(READ_BLOCK, want)
+            done = 0
+            while done < want:
+                done += self._buf.write(zeros[: want - done])
+            self._buf.seek(0)
+        self.gen += 1
+        return self._buf
+
+
+_SHARED = _SharedReadBuffer()
 
 
 def read_file_bytes(path: str):
-    """The whole shard, via O_DIRECT `preadv` into one page-aligned anonymous buffer.
+    """The whole shard in the shared buffer, via O_DIRECT `preadv`.
 
-    Returns the buffer (an anonymous `mmap`); its first `os.path.getsize(path)` bytes are the file.
-
-    O_DIRECT, not buffered `read()`, and neither is `mmap` — measured on this box's ZFS pool, one
-    cold 337.7 MiB shard per leg (`docs/measurements/BOOT_TIMELINE_2026-09-06/zfs_readpath.txt`):
-
-        O_DIRECT preadv 4 MiB      2978.8 MiB/s         5 ARC demand hits
-        read() 4 MiB buffered      2209.4 MiB/s     1,272 ARC demand hits
-        mmap, 16 MiB slices         550.9 MiB/s    91,855 ARC demand hits   <-- what shipped
-
-    The RATE is only half the reason. The other half is the ARC/page-cache column, and on a
-    48-layer TP=2 boot it is the half that dominates: by the time Stage B starts streaming, pinning
-    the two 24.12 GiB arenas has driven the box's page cache from 23 GiB to 0.7 GiB and the ZFS ARC
-    from 15.8 GiB to 2.9 GiB, with ~21 GiB pushed into zram. Every mmap fault after that point must
-    ALLOCATE a page-cache page, which means reclaiming one, which means a zram compression — so the
-    checkpoint read is paying box reclaim per 4 KiB. O_DIRECT reads into a buffer that already
-    exists and caches nothing, so it takes no page-cache page and grows no ARC.
+    Returns `(buffer, generation)`; the buffer's first `os.path.getsize(path)` bytes are the file
+    and are valid only until the next `read_file_bytes`/`ReadSafeOpen` call. See
+    `_SharedReadBuffer`.
     """
-    return _read_file(path)[0]
+    buf, _direct, gen = _read_file(path)
+    return buf, gen
 
 
 def _read_file(path: str):
-    """`(buffer, direct)` — `read_file_bytes` plus whether O_DIRECT was granted."""
+    """`(buffer, direct, generation)` — the shared buffer refilled from `path`."""
     size = os.path.getsize(path)
-    buf = _aligned_buffer(size)
+    buf = _SHARED.acquire(size, path)
     mv = memoryview(buf)
     fd, direct = _open_direct(path)
     try:
@@ -256,7 +317,7 @@ def _read_file(path: str):
     finally:
         os.close(fd)
         mv.release()
-    return buf, direct
+    return buf, direct, _SHARED.gen
 
 
 class ReadSafeOpen:
@@ -266,15 +327,20 @@ class ReadSafeOpen:
     manager — and nothing else, so an unsupported call fails with `AttributeError` at the call site
     instead of quietly diverging from `safe_open`'s semantics somewhere subtler.
 
-    ONE SHARD, ONE BUFFER. The whole file is read into a single page-aligned buffer and tensors are
-    zero-copy views of it, exactly as mmap gave. That is only viable while a shard is small enough
-    for its buffer to be a non-event -- which is why `safe_open()` below, not this class, decides
-    WHICH files come here; a 10 GiB transient buffer would itself be the memory event this reader
-    exists to avoid, and `ReadSafeOpen` REFUSES such a file rather than growing a second mode for it.
+    ONE BUFFER, ALL SHARDS. The whole file is read into the process-wide `_SharedReadBuffer` and
+    tensors are zero-copy views of it, exactly as mmap gave -- but the buffer is REFILLED by the
+    next shard, so those views are valid only until then. `_SharedReadBuffer.acquire` enforces that
+    mechanically (it refuses to refill while a view is exported) and `get_tensor` refuses to serve a
+    handle whose shard has already been overwritten, so a stale handle raises instead of returning
+    another shard's bytes under this shard's names.
+
+    `safe_open()` below, not this class, decides WHICH files come here: a 10 GiB body shard would
+    make the shared buffer 10 GiB forever, which is the memory event this reader exists to avoid, so
+    `ReadSafeOpen` REFUSES an oversized file rather than growing a second mode for it.
     """
 
     __slots__ = ("path", "_buf", "_mv", "_index", "_data0", "_keys", "metadata",
-                 "_size", "_direct")
+                 "_size", "_direct", "_gen")
 
     def __init__(self, path: str, framework: str = "pt", device: str = "cpu") -> None:
         if framework != "pt" or device != "cpu":
@@ -293,7 +359,7 @@ class ReadSafeOpen:
                 f" GiB whole-file cap. Route it with ckpt_read.safe_open(), which sends oversized"
                 f" shards to safetensors' mmap on purpose -- see that function for the measurement."
             )
-        self._buf, self._direct = _read_file(path)
+        self._buf, self._direct, self._gen = _read_file(path)
         self._mv = memoryview(self._buf)
         head = self._mv
         hdr_len = struct.unpack_from("<Q", head, 0)[0]
@@ -324,6 +390,16 @@ class ReadSafeOpen:
     def get_tensor(self, name: str) -> Any:
         import torch
 
+        # THE STALE-HANDLE FENCE. The buffer under `self._mv` belongs to whichever shard was read
+        # LAST. Serving from a handle whose shard has been overwritten would return this shard's
+        # NAME with another shard's BYTES — an expert dequantized against a different expert's
+        # scale, which is plausible text and no crash. Refuse instead.
+        if self._gen != _SHARED.gen:
+            raise CheckpointReadError(
+                f"{self.path}: get_tensor({name!r}) on a stale handle — the shared read buffer has "
+                f"been refilled {_SHARED.gen - self._gen} time(s) since this shard was read. Open "
+                f"one shard at a time, or route this call through safetensors' mmap."
+            )
         try:
             spec = self._index[name]
         except KeyError:
@@ -348,10 +424,12 @@ class ReadSafeOpen:
         return self
 
     def __exit__(self, *exc: Any) -> bool:
-        # Deliberately NOT freeing the buffer: `get_tensor` returns zero-copy views and the caller
-        # may legitimately still hold one (`fold_buf` pairs a `weight_scale` with its
-        # `weight_scale_2`). Python frees the buffer when the last view dies, which is the same
-        # lifetime rule mmap gave. The read fd is already closed -- `_read_file` closes it.
+        # Drop THIS handle's own export of the shared buffer. It has to go, or the next shard's
+        # `acquire()` would see an outstanding export that belongs to nobody and refuse to reuse.
+        # Slices already handed to `torch.frombuffer` hold their own independent exports and are
+        # NOT released here — that is exactly the condition `acquire()` is there to catch.
+        # The read fd is already closed; `_read_file` closes it.
+        self._mv.release()
         return False
 
     def __len__(self) -> int:
@@ -383,6 +461,12 @@ def safe_open(path: str, framework: str = "pt", device: str = "cpu") -> Any:
     and leaves the 4 `model-bf16-*` body shards on exactly the reader they had before. A file over
     the cap is not a fallback-by-accident: `ReadSafeOpen` raises on one, and only this function is
     allowed to route around it.
+
+    THE CAP IS ALSO A MEMORY BOUND, not just a routing rule: `_SharedReadBuffer` grows to the
+    largest shard it is ever handed and never shrinks, so routing one 10 GiB body shard here would
+    cost 10 GiB of resident anonymous memory for the rest of the process — per rank — which is the
+    exact quantity this reader exists to keep at zero. On this checkpoint the buffer settles at
+    337.7 MiB.
     """
     if os.path.getsize(path) <= WHOLE_FILE_CAP:
         return ReadSafeOpen(path, framework=framework, device=device)
