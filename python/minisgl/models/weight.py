@@ -1398,10 +1398,24 @@ def _load_qwen4_exp_weight(
     from minisgl.weights.boot_timeline import tick as _bt_tick
     from minisgl.weights.boot_timeline import timeline as _bt_timeline
 
+    # O_DIRECT, NOT `safetensors.safe_open`. `weights/ckpt_read.py` is a byte-for-byte work-alike
+    # (same keys, same ORDER, same dtypes, same bytes — asserted by tools/offload/ckpt_read_parity.py
+    # over every tensor of a shard, not asserted in prose) whose only difference is the syscall.
+    # It is here because `safe_open` mmaps, and on this box's ZFS pool an mmap fault costs one ARC
+    # lookup per 4 KiB AND one page-cache page: 550.9 MiB/s against O_DIRECT's 2978.8 MiB/s, with
+    # 91,855 ARC demand hits against 5 (docs/measurements/BOOT_TIMELINE_2026-09-06/zfs_readpath.txt).
+    # On the 48-layer TP=2 boot the second column is the one that costs. The two 24.12 GiB pinned
+    # arenas leave the box at ~15 GiB MemAvailable with its page cache already reclaimed to 0.7 GiB,
+    # so every page-cache page the mmap read then wants must be reclaimed out of somebody else and
+    # compressed into zram first. That is what made `ckpt.h2d` a 116.7 s bucket whose stalls land in
+    # the SAME WALL SECOND on both ranks — and, at layer 0, in a DIFFERENT bucket on each rank,
+    # which is the signature of the box stopping both processes rather than of a slow transfer.
+    from minisgl.weights import ckpt_read as _ckpt_read
+
     _bt_tl = _bt_timeline()
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         _t = time.perf_counter()
-        _fh = safetensors.safe_open(file, framework="pt", device="cpu")
+        _fh = _ckpt_read.safe_open(file, framework="pt", device="cpu")
         _bt_tick("ckpt.safe_open", time.perf_counter() - _t)
         _bt_count("ckpt.files_opened")
         _bt_tl.note_file(file, "tensors")

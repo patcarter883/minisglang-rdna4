@@ -256,6 +256,13 @@ class BootTimeline:
         self.counters[bucket] = self.counters.get(bucket, 0) + n
 
     def row(self, r: Dict[str, Any]) -> None:
+        # Stamp WHEN, not just how long. A row's `seconds` says a chunk took 14.5 s; it cannot say
+        # whether the two ranks stalled at the SAME MOMENT, which is the only question that separates
+        # "this operation is slow" from "the box stopped both processes". `t_end_wall` is the anchor
+        # `tools/offload/box_sampler.py`'s 1 Hz /proc/vmstat trace is joined on, and it is what
+        # showed the 2026-09-06 `ckpt.h2d` spikes to be box-reclaim stalls rather than PCIe.
+        r.setdefault("t_end", round(time.perf_counter() - self.t_origin, 3))
+        r.setdefault("t_end_wall", round(time.time(), 3))
         self.rows.append(r)
 
     def note_file(self, path: str, purpose: str) -> None:
@@ -285,6 +292,10 @@ class BootTimeline:
         io = _read_io()
         return {
             "total_seconds": round(self.total_seconds(), 3),
+            # Wall clock at `t_origin`, so this rank's rows and another rank's rows (and the host's
+            # box sampler) share one timeline. Without it, two per-rank reports can only be compared
+            # by bucket totals, which is exactly how a box-wide stall reads as an op-specific defect.
+            "t_origin_wall": round(time.time() - self.total_seconds(), 3),
             "pre_engine_seconds": round(self.pre_engine_seconds, 3),
             "process_age_seconds": round(_process_age_seconds(), 3),
             "phases": [s.as_dict() for s in self.spans],

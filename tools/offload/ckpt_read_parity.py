@@ -27,7 +27,7 @@ sys.path.insert(0, "/engine/python")
 import safetensors  # noqa: E402
 import torch  # noqa: E402
 
-from minisgl.weights.ckpt_read import ReadSafeOpen  # noqa: E402
+from minisgl.weights.ckpt_read import WHOLE_FILE_CAP, ReadSafeOpen  # noqa: E402
 
 MODEL = os.environ.get("PARITY_MODEL", "/model")
 N_FILES = int(os.environ.get("PARITY_FILES", "4"))
@@ -103,14 +103,22 @@ for fn in pick:
     if ha.hexdigest() != hb.hexdigest():
         failures.append(f"{fn}: whole-shard sha256 differs {ha.hexdigest()[:16]} vs "
                         f"{hb.hexdigest()[:16]}")
-    print(f"  {fn:<46} {size / MIB:8.1f} MiB  keys={len(ref_keys):>5}  "
-          f"mmap {size / MIB / (t1 - t0):7.1f} MiB/s   read() {size / MIB / (t2 - t1):7.1f} MiB/s  "
+    # WHICH MODE RAN matters as much as the bytes: `ReadSafeOpen` serves shards <= WHOLE_FILE_CAP
+    # from one buffer and larger ones with a per-tensor aligned pread, and those are two different
+    # offset computations (the per-tensor one indexes into a block-aligned read-around window).
+    # `pick` deliberately spans both -- expert shards are 337 MiB, the `model-bf16-*` body shards
+    # are 3.4-10.0 GiB -- so a green run that exercised only one would be half a gate. `direct`
+    # records whether O_DIRECT was actually granted on this mount.
+    mode = "whole" if size <= WHOLE_FILE_CAP else "per-tensor"
+    print(f"  {fn:<46} {size / MIB:8.1f} MiB  keys={len(ref_keys):>5}  {mode:<10} "
+          f"direct={str(got.direct):<5} "
+          f"mmap {size / MIB / (t1 - t0):7.1f} MiB/s   O_DIRECT {size / MIB / (t2 - t1):7.1f} MiB/s  "
           f"sha {ha.hexdigest()[:16]}", flush=True)
     del ref_t, got_t, ref, got, ref_h, got_h
 
 print(f"\n{checked} tensors compared byte-for-byte over {tot_bytes / GIB:.2f} GiB", flush=True)
 print(f"mmap  (safe_open + touch): {t_mmap:7.2f} s = {tot_bytes / MIB / t_mmap:8.1f} MiB/s")
-print(f"read() (ReadSafeOpen)    : {t_read:7.2f} s = {tot_bytes / MIB / t_read:8.1f} MiB/s")
+print(f"O_DIRECT (ReadSafeOpen)  : {t_read:7.2f} s = {tot_bytes / MIB / t_read:8.1f} MiB/s")
 print(f"speedup {t_mmap / t_read:.2f}x")
 if failures:
     print(f"\nFAIL: {len(failures)} problem(s)")

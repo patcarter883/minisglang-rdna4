@@ -88,6 +88,20 @@ _DTYPES: Dict[str, str] = {
 # nothing above ~1 MiB changed the rate.
 READ_BLOCK = 16 << 20
 
+# O_DIRECT alignment. 4096 covers this box's NVMe logical block size and ZFS's requirement; the
+# buffer comes from an anonymous `mmap`, which is page-aligned by construction (a `bytearray` is
+# NOT: CPython's allocator gives no alignment guarantee, and an unaligned O_DIRECT buffer fails
+# with EINVAL, which would look like "this filesystem does not support O_DIRECT").
+DIO_ALIGN = 4096
+
+# Whole-file O_DIRECT is used up to this size; above it the reader preads ONE TENSOR AT A TIME.
+# 1.5 GiB covers all 192 `layer-*-experts-*.safetensors` shards (337.7 MiB each, 64.8 GiB of the
+# checkpoint's 72.6 GiB) with one buffer per file, and keeps the 3.4-10.0 GiB `model-bf16-*` body
+# shards off a whole-file allocation — a 10 GiB transient buffer would itself be the memory event
+# this whole change exists to avoid. Body tensors average ~12 MiB (821 keys in a 10 GiB shard), so
+# per-tensor O_DIRECT is large-block there anyway.
+WHOLE_FILE_CAP = 3 << 29
+
 
 class CheckpointReadError(RuntimeError):
     """The shard is not a safetensors file this reader can serve verbatim."""
@@ -113,42 +127,132 @@ def _torch_dtype(name: str) -> Any:
     return dt
 
 
-def read_file_bytes(path: str) -> bytearray:
-    """The whole shard, via `read()`.
+def _align_down(x: int, a: int = DIO_ALIGN) -> int:
+    return x - (x % a)
 
-    A fresh `bytearray` per file on purpose. CPython services an allocation this large with its own
-    `mmap`, so freeing it returns the pages to the OS immediately and there is no arena growth
-    across 196 shards — and a REUSED buffer would be a correctness bug, because `get_tensor` hands
-    out zero-copy views and `fold_buf` can legitimately hold one across the next `get_tensor`.
 
-    `buffering=0` so Python's io layer does not add a second copy on top of the kernel's.
+def _align_up(x: int, a: int = DIO_ALIGN) -> int:
+    return -(-x // a) * a
+
+
+def _open_direct(path: str) -> Tuple[int, bool]:
+    """`(fd, direct)`. Falls back to a buffered fd when O_DIRECT is refused.
+
+    The fallback is NOT silent-by-design the way a fallback to mmap would be: buffered `read()` is
+    still 4x mmap on this box (2209 vs 551 MiB/s) and still writes into a buffer this reader owns.
+    What it loses is only the page-cache/ARC bypass. `ReadSafeOpen.direct` records which one ran so
+    a boot report can say so.
     """
-    size = os.path.getsize(path)
-    buf = bytearray(size)
-    view = memoryview(buf)
+    flags = os.O_RDONLY
+    odirect = getattr(os, "O_DIRECT", 0)
+    if odirect:
+        try:
+            return os.open(path, flags | odirect), True
+        except OSError:
+            pass
+    return os.open(path, flags), False
+
+
+def _pread_into(fd: int, mv: memoryview, want: int, file_off: int, path: str) -> None:
+    """Fill `mv[:want]` from `file_off`, in READ_BLOCK steps. `mv` must be page-aligned for O_DIRECT.
+
+    O_DIRECT requires the OFFSET, the LENGTH and the BUFFER address to be block-aligned, so both the
+    offset and the per-call length are aligned here and the tail of the last call is allowed to run
+    past EOF: the kernel then returns a short count, which is not an error and is why the loop
+    tolerates `got + n > want`. A count of ZERO before `want` is a truncated shard and raises —
+    a short checkpoint read loads a truncated tensor with no other symptom.
+    """
     got = 0
-    with open(path, "rb", buffering=0) as fh:
-        while got < size:
-            n = fh.readinto(view[got:got + min(READ_BLOCK, size - got)])
-            if not n:
-                raise CheckpointReadError(
-                    f"{path}: read() returned EOF after {got} of {size} bytes. A short checkpoint "
-                    f"read would load a TRUNCATED tensor with no other symptom"
-                )
-            got += n
-    view.release()
-    return buf
+    while got < want:
+        n = os.preadv(fd, [mv[got:got + min(READ_BLOCK, len(mv) - got)]], file_off + got)
+        got_next = got + n
+        # A short read that is NOT at EOF would leave `got` unaligned, and the NEXT O_DIRECT call
+        # would then fail EINVAL on the buffer address — which reads as "this mount does not support
+        # O_DIRECT" rather than as what it is. Refuse loudly instead. (The final call is allowed to
+        # come up short: it is the one whose block-aligned length runs past EOF.)
+        if got_next < want and n % DIO_ALIGN:
+            raise CheckpointReadError(
+                f"{path}: short read of {n} B (not a multiple of {DIO_ALIGN}) at offset "
+                f"{file_off + got}, {got_next} of {want} B done. Continuing would misalign every "
+                f"subsequent O_DIRECT read of this shard"
+            )
+        if n == 0:
+            raise CheckpointReadError(
+                f"{path}: read returned EOF after {got} of {want} bytes at offset {file_off}. "
+                f"A short checkpoint read would load a TRUNCATED tensor with no other symptom"
+            )
+        got += n
+
+
+def _aligned_buffer(nbytes: int):
+    """A page-aligned, page-granular anonymous buffer, freed to the OS the moment it is dropped.
+
+    `mmap.mmap(-1, n)` rather than `bytearray(n)`: O_DIRECT needs the ADDRESS aligned, and CPython
+    gives no alignment guarantee for a bytearray. A fresh buffer per file/tensor on purpose — a
+    REUSED one would be a correctness bug, because `get_tensor` hands out zero-copy views and
+    `fold_buf` can legitimately hold one across the next `get_tensor`.
+    """
+    import mmap as _mmap
+
+    return _mmap.mmap(-1, _align_up(max(nbytes, 1)))
+
+
+def read_file_bytes(path: str):
+    """The whole shard, via O_DIRECT `preadv` into one page-aligned anonymous buffer.
+
+    Returns the buffer (an anonymous `mmap`); its first `os.path.getsize(path)` bytes are the file.
+
+    O_DIRECT, not buffered `read()`, and neither is `mmap` — measured on this box's ZFS pool, one
+    cold 337.7 MiB shard per leg (`docs/measurements/BOOT_TIMELINE_2026-09-06/zfs_readpath.txt`):
+
+        O_DIRECT preadv 4 MiB      2978.8 MiB/s         5 ARC demand hits
+        read() 4 MiB buffered      2209.4 MiB/s     1,272 ARC demand hits
+        mmap, 16 MiB slices         550.9 MiB/s    91,855 ARC demand hits   <-- what shipped
+
+    The RATE is only half the reason. The other half is the ARC/page-cache column, and on a
+    48-layer TP=2 boot it is the half that dominates: by the time Stage B starts streaming, pinning
+    the two 24.12 GiB arenas has driven the box's page cache from 23 GiB to 0.7 GiB and the ZFS ARC
+    from 15.8 GiB to 2.9 GiB, with ~21 GiB pushed into zram. Every mmap fault after that point must
+    ALLOCATE a page-cache page, which means reclaiming one, which means a zram compression — so the
+    checkpoint read is paying box reclaim per 4 KiB. O_DIRECT reads into a buffer that already
+    exists and caches nothing, so it takes no page-cache page and grows no ARC.
+    """
+    return _read_file(path)[0]
+
+
+def _read_file(path: str):
+    """`(buffer, direct)` — `read_file_bytes` plus whether O_DIRECT was granted."""
+    size = os.path.getsize(path)
+    buf = _aligned_buffer(size)
+    mv = memoryview(buf)
+    fd, direct = _open_direct(path)
+    try:
+        _pread_into(fd, mv, size, 0, path)
+    finally:
+        os.close(fd)
+        mv.release()
+    return buf, direct
 
 
 class ReadSafeOpen:
-    """A `safetensors.safe_open` work-alike whose bytes came from `read()`, not `mmap`.
+    """A `safetensors.safe_open` work-alike whose bytes came from O_DIRECT `preadv`, not `mmap`.
 
     Implements exactly the surface `weight.py` uses — `keys()`, `get_tensor()`, and the context
     manager — and nothing else, so an unsupported call fails with `AttributeError` at the call site
     instead of quietly diverging from `safe_open`'s semantics somewhere subtler.
+
+    TWO MODES, one rule: never hold more than one shard's worth of transient buffer.
+      * `size <= WHOLE_FILE_CAP` (every expert shard): one aligned buffer, tensors are zero-copy
+        views of it, exactly as mmap gave.
+      * larger (the `model-bf16-*` body shards, up to 10 GiB): the header only, then ONE ALIGNED
+        PREAD PER TENSOR into that tensor's own buffer. Same bytes, same order; the difference is
+        that peak transient memory is one tensor (~12 MiB average here) instead of 10 GiB.
     """
 
-    __slots__ = ("path", "_buf", "_mv", "_index", "_data0", "_keys", "metadata")
+    __slots__ = (
+        "path", "_buf", "_mv", "_index", "_data0", "_keys", "metadata",
+        "_size", "_fd", "_direct", "_whole",
+    )
 
     def __init__(self, path: str, framework: str = "pt", device: str = "cpu") -> None:
         if framework != "pt" or device != "cpu":
@@ -158,16 +262,40 @@ class ReadSafeOpen:
                 f"reader would silently change WHERE the tensor lands"
             )
         self.path = path
-        self._buf = read_file_bytes(path)
-        self._mv = memoryview(self._buf)
-        if len(self._buf) < 8:
-            raise CheckpointReadError(f"{path}: {len(self._buf)} bytes is not a safetensors file")
-        hdr_len = struct.unpack_from("<Q", self._buf, 0)[0]
-        if 8 + hdr_len > len(self._buf):
+        self._size = os.path.getsize(path)
+        if self._size < 8:
+            raise CheckpointReadError(f"{path}: {self._size} bytes is not a safetensors file")
+        self._whole = self._size <= WHOLE_FILE_CAP
+        self._fd = -1
+        self._direct = False
+        if self._whole:
+            self._buf, self._direct = _read_file(path)
+            self._mv = memoryview(self._buf)
+            head = self._mv
+        else:
+            # Header first, then keep the fd for per-tensor preads. The header read is aligned up to
+            # a block like any other O_DIRECT read; 1 MiB comfortably covers the largest header in
+            # this checkpoint family (821 keys ~= 190 KiB) and is re-read exactly if it does not.
+            self._fd, self._direct = _open_direct(path)
+            probe = min(_align_up(1 << 20), _align_up(self._size))
+            hb = _aligned_buffer(probe)
+            hmv = memoryview(hb)
+            _pread_into(self._fd, hmv, min(probe, self._size), 0, path)
+            need = 8 + struct.unpack_from("<Q", hmv, 0)[0]
+            if need > probe:
+                hmv.release()
+                hb = _aligned_buffer(need)
+                hmv = memoryview(hb)
+                _pread_into(self._fd, hmv, min(_align_up(need), self._size), 0, path)
+            self._buf = hb
+            self._mv = hmv
+            head = hmv
+        hdr_len = struct.unpack_from("<Q", head, 0)[0]
+        if 8 + hdr_len > self._size:
             raise CheckpointReadError(
-                f"{path}: header claims {hdr_len} bytes but the file is {len(self._buf)}"
+                f"{path}: header claims {hdr_len} bytes but the file is {self._size}"
             )
-        header = json.loads(bytes(self._mv[8:8 + hdr_len]))
+        header = json.loads(bytes(head[8:8 + hdr_len]))
         self.metadata: Optional[Dict[str, Any]] = header.get("__metadata__")
         self._index: Dict[str, Dict[str, Any]] = {
             k: v for k, v in header.items() if k != "__metadata__"
@@ -182,6 +310,11 @@ class ReadSafeOpen:
     def keys(self) -> List[str]:
         return list(self._keys)
 
+    @property
+    def direct(self) -> bool:
+        """Whether O_DIRECT was actually granted (whole-file mode reports its own open)."""
+        return self._direct
+
     def get_tensor(self, name: str) -> Any:
         import torch
 
@@ -193,9 +326,9 @@ class ReadSafeOpen:
         shape: Tuple[int, ...] = tuple(spec["shape"])
         dt = _torch_dtype(spec["dtype"])
         a, b = self._data0 + int(start), self._data0 + int(end)
-        if b > len(self._buf) or a > b:
+        if b > self._size or a > b:
             raise CheckpointReadError(
-                f"{self.path}: {name} data_offsets [{start}, {end}) fall outside the {len(self._buf)}"
+                f"{self.path}: {name} data_offsets [{start}, {end}) fall outside the {self._size}"
                 f" byte shard"
             )
         if b == a:
@@ -203,16 +336,30 @@ class ReadSafeOpen:
             # right dtype/shape or `load_state_dict` reports a shape mismatch instead of the real
             # problem.
             return torch.empty(shape, dtype=dt)
-        return torch.frombuffer(self._mv[a:b], dtype=dt).reshape(shape)
+        if self._whole:
+            return torch.frombuffer(self._mv[a:b], dtype=dt).reshape(shape)
+        # Per-tensor O_DIRECT read-around: the tensor's byte range rarely starts on a block, so read
+        # from the block BELOW it and index into the result. The buffer is kept alive by the
+        # memoryview `torch.frombuffer` holds, exactly as the whole-file mode's is.
+        lo = _align_down(a)
+        want = b - lo
+        buf = _aligned_buffer(want)
+        mv = memoryview(buf)
+        _pread_into(self._fd, mv, want, lo, self.path)
+        return torch.frombuffer(mv[a - lo:b - lo], dtype=dt).reshape(shape)
 
     def __enter__(self) -> "ReadSafeOpen":
         return self
 
     def __exit__(self, *exc: Any) -> bool:
-        # Deliberately NOT freeing the buffer: `get_tensor` returns zero-copy views and the caller
-        # may legitimately still hold one (`fold_buf` pairs a `weight_scale` with its
-        # `weight_scale_2`). Python frees the bytearray when the last view dies, which is the same
-        # lifetime rule mmap gave.
+        # The fd is closed here (nothing outlives it: in per-tensor mode each tensor owns its own
+        # buffer already). The BUFFERS are deliberately NOT freed: `get_tensor` returns zero-copy
+        # views and the caller may legitimately still hold one (`fold_buf` pairs a `weight_scale`
+        # with its `weight_scale_2`). Python frees each buffer when the last view dies, which is the
+        # same lifetime rule mmap gave.
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
         return False
 
     def __len__(self) -> int:
