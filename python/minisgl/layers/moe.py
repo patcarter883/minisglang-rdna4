@@ -378,14 +378,31 @@ class _GroupedMxFp4Experts(ExpertContainer, BaseOP):
 
 class _GroupedNvFp4Experts(ExpertContainer, BaseOP):
     """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') experts for one MoE GEMM (w13 or w2), STACKED
-    over E. NVFP4 has the IDENTICAL 4-bit E2M1 weight codes as MXFP4; only the scale differs, and the
-    WEIGHT LOADER folds NVFP4's e4m3 block scale / per-tensor global into one fp16 per-group scale at
-    the leaf (before the gate/up merge + expert stack), so by load time these are MXFP4-shaped:
-        weight_packed (E, N, K//2) uint8 — 2 E2M1 nibbles/byte.
-        weight_scale  (E, N, K//16) fp16 — per-16-group scale (folded).
-    `post_load` packs the nibbles to (E,N,K//8) int32 codes and passes the fp16 scale through, so
-    `kernels.w4a8_moe(..., weight_is_e2m1=True)` at group_size 16 consumes `_w_op/_scales_op` exactly as
-    the MXFP4 experts do (group-16 rides the generic runtime-group_size e2m1 instance). Symmetric."""
+    over E. NVFP4 has the IDENTICAL 4-bit E2M1 weight codes as MXFP4; only the scale differs, and this
+    container keeps that scale in the CHECKPOINT'S OWN TWO LEVELS rather than folding it:
+
+        weight_packed (E, N, K//2)  uint8          — 2 E2M1 nibbles/byte.
+        weight_scale  (E, N, K//16) float8_e4m3fn  — the per-16-element block scale, BYTE-VERBATIM.
+        weight_global (E, N)        float32        — the per-OUTPUT-CHANNEL global MULTIPLIER.
+
+    WHY TWO TENSORS AND NOT ONE FOLDED fp16 SCALE (which is what this was until 2026-09-05). The fold
+    is LOSSY — a measured 4.37e-04 max / 1.4-2.4e-04 mean relative error on every weight of a real
+    checkpoint, where the two-level form is exact — and it is BIGGER, because an fp16 group scale is
+    2 bytes per 16 weights where an e4m3 block scale is 1. See `quant/nvfp4.py`'s module docstring;
+    the old claim that the fold was exact is the reason this sat unfixed.
+
+    The global is a per-output-channel VECTOR, not a scalar, because the loader's gate|up merge and
+    per-expert stack combine differently-scaled matrices: after the merge the global is constant on
+    each contiguous output-channel RANGE, which an (N,) vector expresses and a scalar cannot. That
+    shape is what lets `torch.cat(dim=0)` and `_ExpertStacker` carry it with no special case.
+
+    `post_load` packs the nibbles to (E,N,K//8) int32 codes, transposes the block scale group-major,
+    and bitcasts the global to int32 so it can ride the kernel's `w_zeros` POINTER SLOT — NVFP4 is
+    symmetric, so that slot is otherwise null and there is no op-schema change (precedent:
+    `_GroupedRXFExperts` threads the RXF NL codebook the same way). `kernels.w4a8_moe(...,
+    weight_is_e2m1=True)` at group_size 16 then consumes `_w_op/_scales_op/_global_op`; the kernel
+    picks `w4a8_tile::E4m3GroupScaleGlobal` vs `Fp16GroupScale` off the SCALES DTYPE, so there is no
+    flag to get out of sync. Symmetric — there are no zero-points to displace."""
 
     def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
         g = quant.group_size  # 16
@@ -394,7 +411,11 @@ class _GroupedNvFp4Experts(ExpertContainer, BaseOP):
             f"grouped NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
         )
         self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
-        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float16)
+        # float8_e4m3fn, not uint8: this is the checkpoint tensor's own dtype, so the loader's
+        # BaseOP dtype assertion passes on a VERBATIM tensor and no cast is possible. A uint8
+        # declaration would accept a value-converted tensor (byte 126 -> 126.0) just as happily.
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float8_e4m3fn)
+        self.weight_global = torch.empty((num_experts, N), dtype=torch.float32)
         self._quant = quant
         # E recorded, never inferred — see weights/granule.py::ExpertContainer.
         self._num_experts = num_experts
@@ -408,8 +429,15 @@ class _GroupedNvFp4Experts(ExpertContainer, BaseOP):
         conv = nvfp4.convert_nvfp4_moe(self.weight_packed, self.weight_scale)
         self._w_op = conv["w_packed"]  # (E, N, K//8) int32
         # GROUP-MAJOR for the op's coalesced `[g*N + n]` scale read (see _GroupedAWQExperts).
-        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//16, N) fp16
-        del self.weight_packed, self.weight_scale
+        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//16, N) e4m3
+        # (E, N) f32 -> the SAME BYTES viewed as int32, because the op's global slot is `w_zeros`,
+        # typed `const int*`. `Tensor.view(dtype)` is a zero-copy bitcast at equal itemsize, and the
+        # kernel does `reinterpret_cast<const float*>` on the other side — so the f32 values survive
+        # exactly. A `.to(torch.int32)` here would VALUE-convert (2.078e-04 -> 0) and produce a model
+        # whose every expert output is zero; the two spellings are one character apart, so this
+        # comment is the guard.
+        self._global_op = self.weight_global.contiguous().view(torch.int32)  # (E, N)
+        del self.weight_packed, self.weight_scale, self.weight_global
 
 
 class _GroupedFP8Experts(ExpertContainer, BaseOP):
@@ -761,11 +789,13 @@ class _MxFp4MoEMethod(MoEQuantMethod):
 
 class _NvFp4MoEMethod(MoEQuantMethod):
     """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') grouped experts through `kernels.w4a8_moe`
-    with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay 4-bit;
-    the loader folded NVFP4's two-level scale to one fp16 per-group scale). Always the LDS path (the
-    register-direct b128 wide-load requires group_size%32, which NVFP4's 16 is not — see
-    `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE hands raw router_logits, which w4a8_moe routes
-    internally (topk_ids None). EP-capable like the other e2m1 experts (E on dim 0)."""
+    with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay
+    4-bit), but consuming the checkpoint's TWO-LEVEL scale directly: an e4m3 block scale plus the
+    per-output-channel f32 global, which rides the `w_zeros` pointer slot. See
+    `_GroupedNvFp4Experts`. Always the LDS path (the register-direct b128 wide-load requires
+    group_size%32, which NVFP4's 16 is not — see `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE
+    hands raw router_logits, which w4a8_moe routes internally (topk_ids None). EP-capable like the
+    other e2m1 experts (E on dim 0 of every buffer, including the global)."""
 
     supports_producer_actquant = True
 
@@ -782,9 +812,13 @@ class _NvFp4MoEMethod(MoEQuantMethod):
               x_fp8=None, act_scales=None):
         _check_activation("NVFP4", activation)
         assert not apply_router_weight_on_input, "MoE NVFP4 path has no router-weight-on-input"
+        # `_global_op` occupies the ZEROS argument. That is not a hack in the shape of one: the
+        # kernel's WScale policy owns the slot (`E4m3GroupScaleGlobal::wz_base/epi`) and its
+        # `uses_zeros=false` is constexpr, so the zero-point read is dead-code-eliminated under this
+        # policy and cannot decode the global's f32 bits as packed nibbles.
         return kernels.w4a8_moe(
-            hidden_states, w13._w_op, w13._scales_op, None,
-            w2._w_op, w2._scales_op, None,
+            hidden_states, w13._w_op, w13._scales_op, w13._global_op,
+            w2._w_op, w2._scales_op, w2._global_op,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
             weight_is_e2m1=True, activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
@@ -793,8 +827,8 @@ class _NvFp4MoEMethod(MoEQuantMethod):
                  activation="silu"):
         _check_activation("NVFP4", activation)
         return kernels.w4a8_moe(
-            g_hidden, w13._w_op, w13._scales_op, None,
-            w2._w_op, w2._scales_op, None,
+            g_hidden, w13._w_op, w13._scales_op, w13._global_op,
+            w2._w_op, w2._scales_op, w2._global_op,
             None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
             weight_is_e2m1=True, activation=activation,
         )
@@ -940,9 +974,10 @@ def create_moe_quant_method(
     if quant is None:
         return _UnquantizedMoEMethod()
     if quant.is_nvfp4:
-        # NVFP4 -> the MXFP4 e2m1 kernel at group-16 (weights stay 4-bit; the loader folded the
-        # two-level scale to one fp16 per-group scale at the leaf, which also lets the gate/up merge +
-        # expert stack just work — see _GroupedNvFp4Experts / nvfp4.fold_nvfp4_scale).
+        # NVFP4 -> the MXFP4 e2m1 kernel at group-16 (weights stay 4-bit). The loader keeps the
+        # checkpoint's TWO scale levels — an e4m3 block scale + a per-OUTPUT-CHANNEL f32 global — and
+        # that shape is what lets the gate/up merge and the expert stack carry the global with no
+        # special case. See _GroupedNvFp4Experts / nvfp4.nvfp4_leaf_scales.
         return _NvFp4MoEMethod(quant)
     if quant.is_rxf:
         return _RXFMoEMethod(quant)

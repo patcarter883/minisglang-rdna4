@@ -676,7 +676,24 @@ class NvFp4LinearMethod:
     dropping the global tensors. So by the time this method loads, the checkpoint is MXFP4-shaped:
     weight_packed uint8 (N,K//2) 2 E2M1 nibbles/byte + weight_scale fp16 (N,K//16). `process_weights_
     after_load` packs the nibbles to (N,K//8) int32 codes (verbatim) and passes the fp16 scale through;
-    `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4."""
+    `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4.
+
+    STILL ON THE FOLD, DELIBERATELY AND NAMED (2026-09-05). The MoE experts moved to the checkpoint's
+    native TWO-LEVEL scale — a 1-byte e4m3 block scale plus a per-output-channel f32 global — which is
+    both SMALLER and EXACT where the fold carries a measured 4.37e-04 max relative error. The dense
+    path did NOT move with them, and the reason is a kernel fact rather than an oversight:
+    `moe_kernel.hip` / `moe_gemm_tiled.h` / `gemv_decode.h` are templated on a WScale policy and carry
+    an `E4m3GroupScaleGlobal` instantiation, while the DENSE cores (`w4a8_fp8_wmma_kernel.hip`,
+    `gemm_tiled.h`) still hardcode `const __half* w_scales` and have no policy seam at all. Handing
+    them e4m3 bytes would reinterpret them as halves and return finite, plausible, wrong numbers.
+
+    `nvfp4.nvfp4_leaf_splits` is the fence that keeps this true — it splits `.experts.` modules and
+    folds everything else — so a dense NVFP4 linear cannot start receiving e4m3 by accident. The
+    follow-up is to template those two dense cores exactly as the MoE cores were templated, after
+    which that predicate becomes `return True` and `fold_nvfp4_scale` is deleted. On the checkpoints
+    served today the dense NVFP4 surface is small (Laguna / Muse-Glimmer dense linears; the target
+    `Qwen3.8-Flash-Next-NVFP4` quantizes ONLY its routed experts), so the accuracy and byte wins land
+    where the bytes actually are."""
 
     def __init__(self, quant: QuantConfig) -> None:
         self.quant = quant
