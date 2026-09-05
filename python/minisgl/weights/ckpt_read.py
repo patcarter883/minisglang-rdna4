@@ -1,6 +1,22 @@
 """O_DIRECT reader for safetensors shards, into ONE REUSED page-aligned buffer.
 
 --------------------------------------------------------------------------------------------------
+VERDICT, 2026-09-06, 48-layer TP=2, sequential, quiet box, both legs at floor=4 GiB, two separate
+worktrees so neither leg could read the other's source
+(docs/measurements/BOOT_TIMELINE_2026-09-06/r3/):
+
+    boot                574.2 s  ->  254.6 s      (2.26x)
+    stage_b             376.6 s  ->  111.1 s
+    ckpt.h2d            194.0 s  ->   51.6 s
+    stageb.post_load    106.1 s  ->    7.0 s      <- NOT a read; the box had been stopping it
+    graph_capture        84.1 s  ->   33.6 s      <- NOT a read either
+    swap-out         11.68 M pages -> 3.05 M   |  major faults 61.2 M -> 19.6 M
+
+Bit-identical: digest a5e49a2e2b307ff3, 156 forecast / 156 actual regions, arena_pinned_bytes
+25,895,632,896 x2, torch_fallbacks 0, seam_pointer_checked, 1236 keys, and the same greedy token ids
+from both prompts on both ranks.
+
+--------------------------------------------------------------------------------------------------
 HISTORY, IN THE ORDER IT WAS MEASURED — this module shipped WRONG once, and the way it was wrong is
 the whole design of what is here now.
 
@@ -32,15 +48,19 @@ WHY THE READ PATH MATTERS AT ALL — measured on THIS pool, one cold 337.7 MiB e
 CPU only, quiet box (2026-09-06, four distinct cold shards so no leg warms another):
 
     reader                        rate          dCached      dARC
-    mmap, 4 KiB walk          614.9 MiB/s     +0.33 GiB   +0.33 GiB   <-- what shipped
-    read() into reused buf   1653.8 MiB/s     +0.00 GiB   +0.31 GiB
-    O_DIRECT into reused buf 1829.1 MiB/s     +0.00 GiB   +0.00 GiB   <-- what this module does
+    mmap, 4 KiB walk          627.0 MiB/s     +0.33 GiB   +0.33 GiB   <-- what shipped
+    read() into reused buf   4947.8 MiB/s     +0.00 GiB   +0.31 GiB
+    O_DIRECT into reused buf 4967.0 MiB/s     +0.00 GiB   +0.00 GiB   <-- what this module does
 
-Three times the rate, and — the half that actually dominates a 48-layer boot — mmap costs TWICE the
-bytes in reclaimable footprint (a page-cache page AND an ARC buffer per 4 KiB) while O_DIRECT into a
-buffer that already exists costs NOTHING. `posix_fadvise(POSIX_FADV_DONTNEED)` was tried first, as
-the smaller change: it returns 0 on this ZFS 2.4.3 mount and frees nothing, so bounding the mmap
-path's footprint in place is not available.
+The rate column is the smaller half. mmap costs TWICE the bytes in reclaimable footprint — a
+page-cache page AND an ARC buffer per 4 KiB — while O_DIRECT into a buffer that already exists costs
+NOTHING, and once the two 24.12 GiB pinned arenas have taken half of RAM, every one of those
+allocations must reclaim, which here means a zram compression. That is why the boot's two BIGGEST
+wins (`stageb.post_load`, `graph_capture`) are phases that never touch the checkpoint at all.
+
+`posix_fadvise(POSIX_FADV_DONTNEED)` was tried first as the smaller, safer change — bound mmap's
+footprint in place and touch nothing else. It returns 0 on this ZFS 2.4.3 mount and frees nothing,
+so that option does not exist here. `tools/offload/zfs_readpath_probe.py` re-measures all of it.
 
 --------------------------------------------------------------------------------------------------
 WHAT WAS TRUE ABOUT THE ORIGINAL DIAGNOSIS (kept, because the rate numbers are still right)

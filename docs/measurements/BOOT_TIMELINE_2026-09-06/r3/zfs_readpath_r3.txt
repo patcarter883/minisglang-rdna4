@@ -1,0 +1,9 @@
+=== zfs read-path probe, 2026-09-06T03:10:17+10:00, quiet box (load 3.30) ===
+mmap walk                     66820.9 MiB/s   dCached   +0.00 GiB   dARC   +0.01 GiB   dAvail   -0.00 GiB
+  fadvise(DONTNEED) while mapped rc=0  dCached   +0.00 GiB  dARC   -0.00 GiB
+  after munmap                      dCached   +0.00 GiB  dARC   +0.00 GiB
+  fadvise(DONTNEED) after munmap rc=0  dCached   +0.00 GiB  dARC   +0.00 GiB
+read() reused buf              4947.8 MiB/s   dCached   +0.00 GiB   dARC   +0.31 GiB   dAvail   -0.32 GiB
+O_DIRECT reused buf            4967.0 MiB/s   dCached   +0.00 GiB   dARC   +0.00 GiB   dAvail   -0.01 GiB
+mmap 4K walk                    627.0 MiB/s   dCached   +0.33 GiB   dARC   +0.33 GiB   dAvail   -0.28 GiB
+box now: Cached 1.23 GiB  ARC 2.32 GiB  Avail 73.31 GiB

@@ -1404,14 +1404,19 @@ def _load_qwen4_exp_weight(
     # into ONE process-wide REUSED buffer, and the four 3.4-10.0 GiB `model-bf16-*` body shards stay
     # on safetensors' mmap, byte-for-byte the reader they always had.
     #
-    # Measured on this pool, one cold 337.7 MiB shard per leg, CPU only: mmap 614.9 MiB/s costing
-    # +0.33 GiB of page cache AND +0.33 GiB of ARC; O_DIRECT into the reused buffer 1829.1 MiB/s
-    # costing NOTHING. The footprint column is the one that decides a 48-layer TP=2 boot — by the
-    # time Stage B streams, the two 24.12 GiB pinned arenas have taken half of RAM, so every mmap
-    # fault must allocate a page-cache page, which means reclaiming one, which on this box means a
-    # zram compression. The 2026-09-06 baseline's per-layer rows are that mechanism in the raw:
-    # 2.5 s for a layer whose ARC is falling, 20-28 s for the identical bytes when the ARC is at its
-    # 16 GiB cap with millions of direct-reclaim scans.
+    # MEASURED, 48-layer TP=2, two worktrees, sequential, quiet box
+    # (docs/measurements/BOOT_TIMELINE_2026-09-06/r3/): boot 574.2 -> 254.6 s, stage_b 376.6 ->
+    # 111.1 s, ckpt.h2d 194.0 -> 51.6 s, swap-out 11.68M -> 3.05M pages. Bit-identical — digest
+    # a5e49a2e2b307ff3, 156/156 regions, 1236 keys, torch_fallbacks 0, same greedy tokens.
+    #
+    # It is NOT a transfer win, and the proof is in the buckets that are not reads at all:
+    # `stageb.post_load` (device-side NVFP4 conversion) fell 106.1 -> 7.0 s and `graph_capture` fell
+    # 84.1 -> 33.6 s. Neither touches the checkpoint. They were slow because the box was stopping
+    # both processes. On this pool, one cold 337.7 MiB shard per leg: mmap 627.0 MiB/s costing
+    # +0.33 GiB of page cache AND +0.33 GiB of ARC, O_DIRECT into the reused buffer 4967.0 MiB/s
+    # costing NOTHING. By the time Stage B streams, the two 24.12 GiB pinned arenas have taken half
+    # of RAM, so every mmap fault must allocate a page-cache page, which means reclaiming one, which
+    # on this box means a zram compression.
     #
     # WHAT ROUND 2'S 3.5x LOSS TAUGHT (docs/measurements/BOOT_TIMELINE_2026-09-06/r2/): a FRESH
     # buffer per shard is NOT this change. It made the read 5x faster and the boot 3.5x slower,

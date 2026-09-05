@@ -1,0 +1,681 @@
+gpu-lease: leased card(s) [0,1] as 'gpu0-1'  (HIP=0,1, port=8000, project=lease-gpu0-1)
+>> fp8_wmma /kbuild/fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so
+>> sha256   ef05d46a09226f5be73b8b287d5cbedc1190a36a96bb1511e6cf9e3d8d47d31b
+[subset] /tmp/q4e-offload-hx3ywhhv (48 layers, 512 experts, tp=2)
+
+[1] boot the engine WITH offload
+
+[1] boot the engine WITH offload
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid', 'hybrid_sliding'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid', 'hybrid_sliding'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[1m[2026-09-05|16:53:33|core|rank=0][0m [32mINFO    [0m Auto-selected MoE backend: fused
+[1m[2026-09-05|16:53:33|core|rank=0][0m [32mINFO    [0m custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.15-1.2x vs RCCL at every size; slot 0.0 MiB -> covers up to 40960 B/collective)
+[1m[2026-09-05|16:53:33|core|rank=0][0m [32mINFO    [0m Free memory before loading model: 15.71 GiB
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m qwen4_exp built: 48 layers (36 GDN + 12 full-attn), PLE on decoder index [1], 4x2560-wide hyper-connection residual. NOT implemented in this build:
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m   * QSA sparse-attention indexer on the 12 full-attention layers
+      (plan T5: needs a second KV pool for the index keys and a BaseAttnBackend ABI that can carry a per-query selected-page set. Below indexer_budget (2048) the selection is the identity, so the DENSE attention that runs is bit-equivalent; Qwen4ExpAttn.forward raises the moment a request's context exceeds the budget)
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m   * vision tower (model.visual.*)
+      (text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/front-end concern and never reaches this model)
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m   * MTP speculative head (mtp.*)
+      (plan T8.1: fused expert tensors, its own hyper-connections, and it seeds from the hc_count-wide PRE-mixer stream. ModelConfig.from_hf REFUSES --spec-algorithm mtp for this architecture rather than half-building the Qwen3.5 head against those tensors)
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m   * cudagraph capture of the PREFILL / spec-VERIFY forwards
+      (DECODE capture is implemented and exercised (2026-09-04): boot with the `hip` attention backend and --cuda-graph-max-bs > 0, and `PLEGraphCapture` stages the n-gram batch the capture-time warmup forward needs. Prefill stays eager everywhere in this engine, and spec-verify capture is moot while --spec-algorithm mtp is refused for this architecture. The `rdna4` attention backend still raises on capture (its Phase-4 gap, not this model's); the capture-capable subclass is `hip`, which is what every production serve here uses)
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m weight offload: weight-arena=7.98 GiB (dev tier, inside model) host=23.95 GiBx2 [12/48 layers device, f=0.250]; step floor 42.4 ms -> 23.6 tok/s projected
+[1m[2026-09-05|16:53:34|core|rank=0][0m [32mINFO    [0m [mem] after build (meta): used=0.22 GiB allocated=0.06 GiB reserved=0.19 GiB non-torch=0.04 GiB | peak_alloc=0.16 GiB peak_reserved=0.19 GiB
+[1m[2026-09-05|16:55:05|core|rank=0][0m [32mINFO    [0m weight offload: host arena attached, 23.95 GiB planned (device cost 0.00 GiB, must be ~0)
+[1m[2026-09-05|16:55:05|core|rank=0][0m [32mINFO    [0m weight offload: arena reservation: chunks=18×1.34 GiB reserved=24.12 GiB payload=24.00 GiB pad=0 B abandoned=120.0 MiB headroom=0 B fill=99.5% regions=156(forecast=156) digest=a5e49a2e2b307ff3
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid', 'hybrid_sliding'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+[1m[2026-09-05|16:55:24|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+Loading weights:  25%|██▌       | 1/4 [00:05<00:15,  5.19s/it]Loading weights:  50%|█████     | 2/4 [00:05<00:04,  2.27s/it]Loading weights:  75%|███████▌  | 3/4 [00:09<00:02,  2.99s/it]Loading weights: 100%|██████████| 4/4 [00:24<00:00,  7.84s/it]Loading weights: 100%|██████████| 4/4 [00:24<00:00,  6.13s/it]
+[1m[2026-09-05|16:55:49|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 366 checkpoint tensors, by reason:
+[1m[2026-09-05|16:55:49|core|rank=0][0m [32mINFO    [0m       333  vision: model.visual.* — vision tower; this engine serves the text decoder only
+[1m[2026-09-05|16:55:49|core|rank=0][0m [32mINFO    [0m        31  mtp-head: mtp.* — the MTP speculative head is not implemented (bring-up plan T8.1)
+[1m[2026-09-05|16:55:49|core|rank=0][0m [32mINFO    [0m         2  ple-ngram-table: ple_embedding.ngram_embedding.* + ngram head metadata — the 51.2 GB n-gram table stays NVMe-resident and is served by weights/row_table.py, never streamed into VRAM
+[1m[2026-09-05|16:55:49|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.83it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  3.03it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.29it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.17it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.31it/s]
+[1m[2026-09-05|16:55:51|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:55:51|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:56:14|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:01<00:03,  1.12s/it]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.59it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.07it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  2.36it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.95it/s]
+[1m[2026-09-05|16:56:16|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:56:16|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:56:16|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.60it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.77it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.96it/s][1m[2026-09-05|16:56:18|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:56:18|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.75it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.77it/s]
+[1m[2026-09-05|16:56:18|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.84it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.94it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.95it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.18it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.40it/s]
+[1m[2026-09-05|16:56:20|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:56:20|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:57:33|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  1.51it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.51it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.98it/s][1m[2026-09-05|16:57:35|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:35|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.33it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.05it/s]
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:57:35|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.73it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.29it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.73it/s][1m[2026-09-05|16:57:37|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:37|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.10it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.09it/s]
+[1m[2026-09-05|16:57:37|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.25it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.43it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.69it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.86it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.72it/s]
+[1m[2026-09-05|16:57:39|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:39|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:39|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.78it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.39it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.71it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.54it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.56it/s]
+[1m[2026-09-05|16:57:41|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:41|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:41|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.00it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.60it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.50it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.49it/s][1m[2026-09-05|16:57:43|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:43|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.54it/s]
+[1m[2026-09-05|16:57:43|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  1.82it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.43it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.04it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.19it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.16it/s]
+[1m[2026-09-05|16:57:45|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:45|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:57:45|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.32it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.72it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.75it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.64it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.71it/s]
+[1m[2026-09-05|16:57:47|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:47|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:47|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.95it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.76it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.09it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.27it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.20it/s]
+[1m[2026-09-05|16:57:49|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:49|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:49|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.17it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.86it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.95it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.93it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.94it/s]
+[1m[2026-09-05|16:57:51|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:51|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:51|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.97it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  3.05it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.83it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.79it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.84it/s]
+[1m[2026-09-05|16:57:52|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:57:52|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:57:53|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.04it/s]Loading weights:  50%|█████     | 2/4 [00:09<00:10,  5.32s/it]Loading weights:  75%|███████▌  | 3/4 [00:09<00:03,  3.05s/it]Loading weights: 100%|██████████| 4/4 [00:09<00:00,  1.99s/it]Loading weights: 100%|██████████| 4/4 [00:09<00:00,  2.46s/it]
+[1m[2026-09-05|16:58:02|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:58:02|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:58:03|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.98it/s]Loading weights:  50%|█████     | 2/4 [00:03<00:04,  2.06s/it]Loading weights:  75%|███████▌  | 3/4 [00:03<00:01,  1.28s/it]Loading weights: 100%|██████████| 4/4 [00:04<00:00,  1.11it/s]Loading weights: 100%|██████████| 4/4 [00:04<00:00,  1.07s/it]
+[1m[2026-09-05|16:58:07|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:58:07|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:58:08|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.19it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.25it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.24it/s][1m[2026-09-05|16:58:14|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:58:14|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:06<00:00,  2.43s/it]Loading weights: 100%|██████████| 4/4 [00:06<00:00,  1.70s/it]
+[1m[2026-09-05|16:58:15|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  1.74it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.79it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.07it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.18it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.06it/s]
+[1m[2026-09-05|16:58:17|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:58:17|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:58:17|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.67it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.54it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.79it/s][1m[2026-09-05|16:58:18|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:58:18|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.86it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.79it/s]
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:58:19|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.73it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.74it/s]Loading weights:  75%|███████▌  | 3/4 [01:05<00:29, 29.75s/it]Loading weights: 100%|██████████| 4/4 [01:05<00:00, 18.17s/it]Loading weights: 100%|██████████| 4/4 [01:05<00:00, 16.47s/it]
+[1m[2026-09-05|16:59:25|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:25|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:26|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  4.13it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  4.33it/s]Loading weights:  75%|███████▌  | 3/4 [00:00<00:00,  4.32it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.66it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  3.09it/s]
+[1m[2026-09-05|16:59:27|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:27|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:59:27|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.96it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  3.36it/s]Loading weights:  75%|███████▌  | 3/4 [00:00<00:00,  3.48it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  3.81it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  3.70it/s]
+[1m[2026-09-05|16:59:28|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:28|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:29|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  4.25it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  3.24it/s]Loading weights:  75%|███████▌  | 3/4 [00:00<00:00,  3.18it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.95it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  3.09it/s]
+[1m[2026-09-05|16:59:30|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:30|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:30|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.44it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.80it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.88it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.84it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.81it/s]
+[1m[2026-09-05|16:59:32|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:32|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:59:32|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.80it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.62it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.65it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.60it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.63it/s]
+[1m[2026-09-05|16:59:34|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:34|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:34|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.07it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.98it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.95it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.88it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.91it/s]
+[1m[2026-09-05|16:59:36|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:36|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:36|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.38it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.43it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.75it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.04it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.05it/s]
+[1m[2026-09-05|16:59:38|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:38|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:39|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.94it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.80it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.75it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.83it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.82it/s]
+[1m[2026-09-05|16:59:40|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:40|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:59:41|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  1.75it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.24it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.39it/s][1m[2026-09-05|16:59:42|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:42|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.61it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.43it/s]
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|16:59:43|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.60it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.73it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.08it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.39it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.24it/s]
+[1m[2026-09-05|16:59:44|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:44|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:45|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.05it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.89it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.78it/s][1m[2026-09-05|16:59:47|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:47|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:02<00:00,  2.03it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.97it/s]
+[1m[2026-09-05|16:59:47|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.96it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.72it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.78it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.77it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.78it/s]
+[1m[2026-09-05|16:59:49|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:49|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:49|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  1.68it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.95it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.32it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.47it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.29it/s]
+[1m[2026-09-05|16:59:51|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:51|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:51|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.02it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.63it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.67it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.77it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.75it/s]
+[1m[2026-09-05|16:59:53|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|16:59:53|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|16:59:53|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.37it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.85it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.09it/s][1m[2026-09-05|17:00:04|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:04|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:10<00:00,  3.97s/it]Loading weights: 100%|██████████| 4/4 [00:10<00:00,  2.69s/it]
+[1m[2026-09-05|17:00:04|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.67it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  3.37it/s]Loading weights:  75%|███████▌  | 3/4 [00:00<00:00,  3.34it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.37it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.67it/s]
+[1m[2026-09-05|17:00:06|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:06|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:06|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.09it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.10it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.36it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.42it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.34it/s]
+[1m[2026-09-05|17:00:08|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:08|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:08|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:13<00:39, 13.21s/it]Loading weights:  50%|█████     | 2/4 [00:13<00:11,  5.67s/it]Loading weights:  75%|███████▌  | 3/4 [00:14<00:03,  3.41s/it]Loading weights: 100%|██████████| 4/4 [00:14<00:00,  2.27s/it]Loading weights: 100%|██████████| 4/4 [00:14<00:00,  3.71s/it]
+[1m[2026-09-05|17:00:23|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:23|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:23|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.95it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.91it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.75it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.58it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.67it/s]
+[1m[2026-09-05|17:00:25|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:25|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:25|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.61it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.71it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.74it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.94it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.91it/s]
+[1m[2026-09-05|17:00:27|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:27|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:28|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:02,  1.14it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.59it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.94it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  2.17it/s]Loading weights: 100%|██████████| 4/4 [00:02<00:00,  1.91it/s]
+[1m[2026-09-05|17:00:30|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:30|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|17:00:30|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.60it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.47it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.12it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.10it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.18it/s]
+[1m[2026-09-05|17:00:32|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:00:32|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:00:32|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.89it/s]Loading weights:  50%|█████     | 2/4 [00:43<00:51, 25.52s/it]Loading weights:  75%|███████▌  | 3/4 [00:43<00:14, 14.07s/it]Loading weights: 100%|██████████| 4/4 [00:44<00:00,  8.66s/it]Loading weights: 100%|██████████| 4/4 [00:44<00:00, 11.07s/it]
+[1m[2026-09-05|17:01:17|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:01:17|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:01:22|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:02,  1.21it/s]Loading weights:  50%|█████     | 2/4 [00:01<00:01,  1.85it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.28it/s][1m[2026-09-05|17:01:24|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.39it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.14it/s]
+[1m[2026-09-05|17:01:24|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s][1m[2026-09-05|17:01:25|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.48it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.83it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.98it/s][1m[2026-09-05|17:01:34|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:01:34|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:09<00:00,  3.56s/it]Loading weights: 100%|██████████| 4/4 [00:09<00:00,  2.39s/it]
+[1m[2026-09-05|17:01:35|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.41it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.88it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.31it/s][1m[2026-09-05|17:01:36|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:01:36|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.02it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.18it/s]
+[1m[2026-09-05|17:01:37|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:01,  2.12it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.59it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  1.98it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.15it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.16it/s]
+[1m[2026-09-05|17:01:39|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:01:39|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-05|17:01:39|core|rank=0][0m [32mINFO    [0m qwen4_exp: 4 shards, 73728 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/4 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 1/4 [00:00<00:00,  3.25it/s]Loading weights:  50%|█████     | 2/4 [00:00<00:00,  2.30it/s]Loading weights:  75%|███████▌  | 3/4 [00:01<00:00,  2.50it/s][1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 1536 checkpoint tensors, by reason:
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m      1536  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.51it/s]Loading weights: 100%|██████████| 4/4 [00:01<00:00,  2.52it/s]
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.stage_b_chunked_load
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m weight offload: stage-B chunked load: 49 chunks, 1236 keys, 37.10 GiB staged, 36 host / 12 device layers, peak device alloc 38.10 GiB (reserved 38.61), peak host RSS 29.19 GiB, 376.6 s
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m [mem] after post_load: used=14.68 GiB allocated=37.40 GiB reserved=38.61 GiB non-torch=-23.94 GiB | peak_alloc=38.10 GiB peak_reserved=38.61 GiB
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m weight offload: weight-offload bound: 36 MoE layers host-resident (23.95 GiB moved), 12 device-resident (7.98 GiB measured), plan=f7979cfa3ac45401
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m weight offload: arena layout verified — named 0/0 checked, forecast 156/156 attributed, 156 anonymous carve(s), footprint 24.12 GiB of 24.12 GiB planned
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m weight offload [seal]: seam proof: 48 MoE layers reachable from the LIVE model, 36 host (216 tensors, 23.950 GiB INSIDE the pinned arena), 12 device (72 tensors, 7.983 GiB)
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.stage_a_sealed
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m weight-arena accounting:
+  [ok  ] host arena costs 0 device bytes: actual=0.00 GiB expected=0.00 GiB (tol 0.06 GiB) — free-VRAM delta across arena attach. Phase 0: hipMemCreate(location=Host) silently returned VRAM with the property echoed back, and hipPointerGetAttributes reports 'Device' for real host pages — neither query is trusted, so this asks the card how much of itself is left
+  [ok  ] bake moved plan.host_resident_bytes: actual=23.95 GiB expected=23.95 GiB (tol 0.06 GiB) — bytes actually copied into the arena vs what the plan priced; a mismatch means the KV pool is about to be sized against a plan that is not what happened
+  [ok  ] device tier == plan.device_resident_bytes: actual=7.98 GiB expected=7.98 GiB (tol 0.06 GiB) — device-resident bytes MEASURED off the live post-load containers, not from an allocator statistic, so caching and fragmentation cannot fool it. A mismatch means the config-time byte model and post_load() disagree and the device tier is billed wrong inside model_memory
+  [ok  ] torch released the originals: actual=24.00 GiB expected=23.95 GiB (tol 0.06 GiB) — allocator delta across the bake, net of the arena rows it added. Short means a live reference to a pre-offload weight survived and peak VRAM never comes down
+  samples:
+    pre_attach   free=15.49 GiB alloc=0.06 GiB res=0.19 GiB
+    post_attach  free=15.49 GiB alloc=0.06 GiB res=0.19 GiB
+    pre_bake     free=1.04 GiB alloc=37.40 GiB res=38.61 GiB
+    post_bake    free=1.04 GiB alloc=37.40 GiB res=38.61 GiB
+  model_memory correction: allocated -23.95 GiB reserved -0.00 GiB
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m [mem] after weight offload: used=14.68 GiB allocated=37.40 GiB reserved=38.61 GiB non-torch=-23.94 GiB | peak_alloc=38.10 GiB peak_reserved=38.61 GiB
+[1m[2026-09-05|17:01:41|core|rank=1][0m [32mINFO    [0m KV sizing: free=15.71 GiB x ratio=0.9 = 14.14 GiB budget; model=13.45 GiB state=0.13 GiB draft=0.00 GiB graph=0.00 GiB snap=0.00 GiB ple=0.00 GiB -> available=0.56 GiB @ 196608 B/page; resident tensors=37.40 GiB torch reserved=38.22 GiB (host-arena corrected: -23.95 GiB allocated, -0.00 GiB reserved) weight-arena=7.98 GiB (dev tier, inside model) host=23.95 GiBx2 [12/48 layers device, f=0.250]; step floor 42.4 ms -> 23.6 tok/s projected
+[1m[2026-09-05|17:01:41|core|rank=1][0m [32mINFO    [0m Reserved 0.13 GiB for GDN state (2 slots); KV pool gets the remainder
+[1m[2026-09-05|17:01:41|core|rank=1][0m [32mINFO    [0m Reserved 0.00 GiB for CUDA graph capture (max_bs=2); KV pool gets the remainder
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m KV sizing: free=15.71 GiB x ratio=0.9 = 14.14 GiB budget; model=13.45 GiB state=0.13 GiB draft=0.00 GiB graph=0.00 GiB snap=0.00 GiB ple=0.00 GiB -> available=0.56 GiB @ 196608 B/page; resident tensors=37.40 GiB torch reserved=38.22 GiB (host-arena corrected: -23.95 GiB allocated, -0.00 GiB reserved) weight-arena=7.98 GiB (dev tier, inside model) host=23.95 GiBx2 [12/48 layers device, f=0.250]; step floor 42.4 ms -> 23.6 tok/s projected
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m Reserved 0.13 GiB for GDN state (2 slots); KV pool gets the remainder
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m Reserved 0.00 GiB for CUDA graph capture (max_bs=2); KV pool gets the remainder
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m Allocating 48848 tokens for KV cache, K + V = 0.56 GiB
+[1m[2026-09-05|17:01:41|core|rank=1][0m [32mINFO    [0m Allocating 48848 tokens for KV cache, K + V = 0.56 GiB
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m GDN state: 36 layers x 4 slots (conv_dim=10240); conv warmup done
+[1m[2026-09-05|17:01:41|core|rank=0][0m [32mINFO    [0m PLE runtime: n-gram table open, 4 state slots, staging 8 tokens x 2560 (0.00 GiB device)
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[1m[2026-09-05|17:01:42|core|rank=0][0m [32mINFO    [0m sampler: masking padded vocab tail [248077, 248320) — 243 untrained ids fenced off
+[1m[2026-09-05|17:01:42|core|rank=0][0m [32mINFO    [0m Free memory after initialization: 0.86 GiB
+[1m[2026-09-05|17:01:42|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2]
+Preparing for capturing CUDA graphs...:   0%|          | 0/2 [00:00<?, ?batch/s]Capturing graphs: bs = 2   | avail_mem = 0.86 GiB:   0%|          | 0/2 [00:00<?, ?batch/s][1m[2026-09-05|17:01:42|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 0.86 GiB
+[1m[2026-09-05|17:01:43|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm
+[1m[2026-09-05|17:01:43|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv(minv_decode)
+[1m[2026-09-05|17:02:51|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv[gdn_proj]
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_decode_conv_gated_replay
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.silu_and_mul
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.moe_resolve[device]
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] moe_hip.moe_route_align
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv+e2m1)
+[1m[2026-09-05|17:02:52|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter+e2m1
+[1m[2026-09-05|17:02:53|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rope
+[1m[2026-09-05|17:02:53|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.store_kv
+[1m[2026-09-05|17:02:53|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_decode.flash_decode_paged
+[1m[2026-09-05|17:02:53|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.moe_resolve[host]
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+Capturing graphs: bs = 2   | avail_mem = 0.86 GiB:  50%|█████     | 1/2 [01:23<01:23, 84.00s/batch]Capturing graphs: bs = 1   | avail_mem = 0.56 GiB:  50%|█████     | 1/2 [01:23<01:23, 84.00s/batch]Capturing graphs: bs = 1   | avail_mem = 0.56 GiB: 100%|██████████| 2/2 [01:24<00:00, 34.65s/batch]Capturing graphs: bs = 1   | avail_mem = 0.56 GiB: 100%|██████████| 2/2 [01:24<00:00, 42.05s/batch]
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m Free GPU memory after capturing CUDA graphs: 0.56 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.verify_after_capture
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m weight offload [post-capture]: seam proof: 48 MoE layers reachable from the LIVE model, 36 host (216 tensors, 23.950 GiB INSIDE the pinned arena), 12 device (72 tensors, 7.983 GiB)
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m weight offload: arena clean after graph capture
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] total 572.9 s inside Engine.__init__, 4.4 s before it (torch import + config), process age now 577.3 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] init_communication                     0.39 s  anon  +0.07 file  +0.04 dev  +0.00 GiB  disk   0.03 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] model_construct_meta                   0.72 s  anon  +0.12 file  +0.02 dev  +0.06 GiB  disk   0.06 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_stream_tier_build               0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_plan_resolve                    0.05 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] arena_pin_attach                     103.03 s  anon +16.37 file  -0.32 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_enumerate_prepass              7.00 s  anon  +7.02 file  +0.00 dev  +0.00 GiB  disk   0.04 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_run                          376.57 s  anon  +0.29 file  +0.00 dev +37.34 GiB  disk  66.98 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_trailing_post_load             0.01 s  anon  +0.00 file  +0.00 dev  -0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_load                          383.62 s  anon  +7.33 file  +0.00 dev +37.34 GiB  disk  67.03 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] ct_sign_verify                         0.24 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_offload_bind_seal               0.01 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_sizing                              0.08 s  anon  +0.02 file  +0.01 dev  +0.00 GiB  disk   0.02 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_pool_alloc                          0.01 s  anon  +0.00 file  +0.00 dev  +0.56 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] gdn_conv_warmup                        0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] ple_runtime_build                      0.01 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] snapshot_host_arena                    0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] backends_init                          0.07 s  anon  +0.01 file  +0.01 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] graph_capture                         84.11 s  anon  +0.50 file  +0.57 dev  +0.01 GiB  disk   1.37 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] canvas_capture                         0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] verify_arena_after_capture             0.02 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- inner-loop buckets (seconds) ---
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.stream_next                         257.70 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d                                   194.04 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.post_load                           106.08 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.host_alloc                            89.98 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.shard                                  44.33 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor                              7.66 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.gc_collect                            7.35 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.sink_place                            4.77 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_leaf_scales                       2.89 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.expert_stack_add                        1.96 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.remap                                   1.57 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gate_up_cat                             0.98 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.safe_open                               0.72 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.discover_moe_layers                   0.34 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_prepass                           0.26 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.load_state_dict                       0.14 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.cast                                  0.14 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.selftest                               0.12 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gdn_concat                              0.04 s
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- counters ---
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.chunks                                           18
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.pinned_bytes                         25,895,632,896  (24.12 GiB)
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.files_opened                                     196
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_bytes                      77,843,416,856  (72.50 GiB)
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_calls                             222,252
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_bytes                             39,992,310,168  (37.25 GiB)
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_calls                                    222,252
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] checkpoint files: 196 distinct, 196 header opens, 196 tensor opens, 0 opened >1x for tensors (max 1x)
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] RSS end: total 25.71 GiB (anon 25.09 + file 0.60 + shmem 0.02), peak VmHWM 35.05 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] disk read_bytes 68.59 GiB, rchar 0.03 GiB
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] box: MemAvailable 57.6 -> 22.6 GiB, swap used 25.7 -> 30.4 GiB; swapped in 39.55 GiB, out 44.54 GiB during boot
+[1m[2026-09-05|17:03:06|core|rank=0][0m [32mINFO    [0m [boot-timeline] wrote /out/L48_r3_before.boot.rank0.json
+[1m[2026-09-05|17:03:06|core|rank=0][0m [33mWARNING [0m recurrent-state hybrid model: prefix cache 'naive' (was 'radix'); PLE recurrent state is not covered by the recurrent-radix snapshot store
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid', 'hybrid_sliding'}
+[1m[2026-09-05|17:03:07|core|rank=0][0m [32mINFO    [0m weight offload [post-capture]: seam proof: 48 MoE layers reachable from the LIVE model, 36 host (216 tensors, 23.950 GiB INSIDE the pinned arena), 12 device (72 tensors, 7.983 GiB)
+[1m[2026-09-05|17:03:07|core|rank=0][0m [32mINFO    [0m weight offload: arena clean after graph capture
+  ok   decode graphs were actually captured                 requested max_bs=2, captured [1, 2]
+  ok   the PLE capturer is wired into the GraphRunner       without it the capture-time warmup forward raises in Qwen4ExpPLE.forward
+  ok   PLE stages discarded == graphs captured              got=2                            want=2
+  ok   no PLE commit ran with nothing staged (boot)         got=0                            want=0
+  ok   decode graphs were actually captured                 requested max_bs=2, captured [1, 2]
+  ok   the PLE capturer is wired into the GraphRunner       without it the capture-time warmup forward raises in Qwen4ExpPLE.forward
+  ok   PLE stages discarded == graphs captured              got=2                            want=2
+  ok   no PLE commit ran with nothing staged (boot)         got=0                            want=0
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid', 'hybrid_sliding'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_section', 'mrope_interleaved'}
+  ok   the op walk found the GDN layers at all              1433 ops walked
+  ok   GDN k-heads sharded 16 -> 8 at tp=2                  local [8]
+  ok   GDN v-heads sharded 48 -> 24 at tp=2                 local [24]
+  ok   the op walk found the GDN layers at all              1433 ops walked
+  ok   GDN k-heads sharded 16 -> 8 at tp=2                  local [8]
+  ok   GDN v-heads sharded 48 -> 24 at tp=2                 local [24]
+  ok   the op walk found the hyper-connection tensors at all 774 tensors over 1433 ops
+  ok   the op walk found the hyper-connection tensors at all 774 tensors over 1433 ops
+  ok   hyper-connections REPLICATED (byte-identical on every rank) 774 tensors, 0 differ: []
+  ok   GDN local head counts identical across ranks         
+  ok   CT sign decisions agree across ranks                 0 CT container(s) — 0 means this checkpoint has none (NVFP4/MXFP4/RXF declare no _ct_sign, so the gate is a no-op here and only the AWQ arm exercises it)
+  ok   Stage-A session ENABLED (plan is non-empty)          host=23.950 GiB device=7.983 GiB
+  ok   Stage-A phase                                        got='SEALED'                     want='SEALED'
+
+[1b] the load path
+  ok   Stage B ran (engine holds a chunked-load ledger)     one-shot load — chunked_weight_source returned None, or the session was disabled
+  ok   weight_offload.stage_b_chunked_load engaged          
+  ok   hyper-connections REPLICATED (byte-identical on every rank) 774 tensors, 0 differ: []
+  ok   GDN local head counts identical across ranks         
+  ok   CT sign decisions agree across ranks                 0 CT container(s) — 0 means this checkpoint has none (NVFP4/MXFP4/RXF declare no _ct_sign, so the gate is a no-op here and only the AWQ arm exercises it)
+  ok   Stage-A session ENABLED (plan is non-empty)          host=23.950 GiB device=7.983 GiB
+  ok   Stage-A phase                                        got='SEALED'                     want='SEALED'
+
+[1b] the load path
+  ok   Stage B ran (engine holds a chunked-load ledger)     one-shot load — chunked_weight_source returned None, or the session was disabled
+  ok   weight_offload.stage_b_chunked_load engaged          
+  stage-B chunked load: 49 chunks, 1236 keys, 37.10 GiB staged, 36 host / 12 device layers, peak device alloc 38.10 GiB (reserved 38.61), peak host RSS 29.19 GiB, 376.6 s
+  ok   chunks == 1 body + 1/layer                           got=49                           want=49
+  ok   layers placed == model layers                        got=48                           want=48
+  ok   cpu-compute layers placed == asked for               got=0                            want=0
+  ok   bake copied bytes into the arena                     23.950 GiB
+  stage-B chunked load: 49 chunks, 1236 keys, 37.10 GiB staged, 36 host / 12 device layers, peak device alloc 38.10 GiB (reserved 38.61), peak host RSS 29.22 GiB, 371.5 s
+  ok   chunks == 1 body + 1/layer                           got=49                           want=49
+  ok   layers placed == model layers                        got=48                           want=48
+  ok   cpu-compute layers placed == asked for               got=0                            want=0
+  ok   bake copied bytes into the arena                     23.950 GiB
+  ok   arena hipMalloc fallbacks                            got=0                            want=0
+  arena pinned=24.117 GiB carved=24.000 GiB served=24.000 GiB
+
+[3] assert the seam against the live engine model
+  ok   seal() produced a seam residency proof               
+  seam proof: 48 MoE layers reachable from the LIVE model, 36 host (216 tensors, 23.950 GiB INSIDE the pinned arena), 12 device (72 tensors, 7.983 GiB)
+  ok   proof consulted the arena (pointer-checked)          an unchecked proof is a structural claim, not residency
+  ok   at least one HOST-resident MoE layer                 36 host / 12 device
+  ok   host bytes proven inside the arena == bake's copied bytes 25716326400 vs 25716326400
+  ok   arena hipMalloc fallbacks                            got=0                            want=0
+  arena pinned=24.117 GiB carved=24.000 GiB served=24.000 GiB
+
+[3] assert the seam against the live engine model
+  ok   seal() produced a seam residency proof               
+  seam proof: 48 MoE layers reachable from the LIVE model, 36 host (216 tensors, 23.950 GiB INSIDE the pinned arena), 12 device (72 tensors, 7.983 GiB)
+  ok   proof consulted the arena (pointer-checked)          an unchecked proof is a structural claim, not residency
+  ok   at least one HOST-resident MoE layer                 36 host / 12 device
+  ok   host bytes proven inside the arena == bake's copied bytes 25716326400 vs 25716326400
+  ok   live MoE layers == model layers                      got=48                           want=48
+  ok   HOST layers on the live model == the plan's HOST set ['model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.40.mlp.experts', 'model.layers.41.mlp.experts', 'model.layers.42.mlp.experts', 'model.layers.43.mlp.experts', 'model.layers.44.mlp.experts', 'model.layers.45.mlp.experts', 'model.layers.46.mlp.experts', 'model.layers.47.mlp.experts'] vs ['model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.40.mlp.experts', 'model.layers.41.mlp.experts', 'model.layers.42.mlp.experts', 'model.layers.43.mlp.experts', 'model.layers.44.mlp.experts', 'model.layers.45.mlp.experts', 'model.layers.46.mlp.experts', 'model.layers.47.mlp.experts']
+  ok   every live MoE layer carries a bound, frozen seam    
+  ok   live MoE layers == model layers                      got=48                           want=48
+  ok   HOST layers on the live model == the plan's HOST set ['model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.40.mlp.experts', 'model.layers.41.mlp.experts', 'model.layers.42.mlp.experts', 'model.layers.43.mlp.experts', 'model.layers.44.mlp.experts', 'model.layers.45.mlp.experts', 'model.layers.46.mlp.experts', 'model.layers.47.mlp.experts'] vs ['model.layers.12.mlp.experts', 'model.layers.13.mlp.experts', 'model.layers.14.mlp.experts', 'model.layers.15.mlp.experts', 'model.layers.16.mlp.experts', 'model.layers.17.mlp.experts', 'model.layers.18.mlp.experts', 'model.layers.19.mlp.experts', 'model.layers.20.mlp.experts', 'model.layers.21.mlp.experts', 'model.layers.22.mlp.experts', 'model.layers.23.mlp.experts', 'model.layers.24.mlp.experts', 'model.layers.25.mlp.experts', 'model.layers.26.mlp.experts', 'model.layers.27.mlp.experts', 'model.layers.28.mlp.experts', 'model.layers.29.mlp.experts', 'model.layers.30.mlp.experts', 'model.layers.31.mlp.experts', 'model.layers.32.mlp.experts', 'model.layers.33.mlp.experts', 'model.layers.34.mlp.experts', 'model.layers.35.mlp.experts', 'model.layers.36.mlp.experts', 'model.layers.37.mlp.experts', 'model.layers.38.mlp.experts', 'model.layers.39.mlp.experts', 'model.layers.40.mlp.experts', 'model.layers.41.mlp.experts', 'model.layers.42.mlp.experts', 'model.layers.43.mlp.experts', 'model.layers.44.mlp.experts', 'model.layers.45.mlp.experts', 'model.layers.46.mlp.experts', 'model.layers.47.mlp.experts']
+  ok   every live MoE layer carries a bound, frozen seam    
+  ok   host tensors are arena-owned                         216 tensors
+  ok   device tensors are NOT arena-owned (proof is non-vacuous) got=0                            want=0
+  ok   no stream tier when none was asked for               got=None                         want=None
+
+[4] the post-capture gate
+  ok   verify_after_capture() reached its body              2 call(s) — Engine.__init__ and Scheduler.__init__
+  ok   post-capture seam proof is present                   
+
+[5] generate through host-resident experts
+  ok   host tensors are arena-owned                         216 tensors
+  ok   device tensors are NOT arena-owned (proof is non-vacuous) got=0                            want=0
+  ok   no stream tier when none was asked for               got=None                         want=None
+
+[4] the post-capture gate
+  ok   verify_after_capture() reached its body              2 call(s) — Engine.__init__ and Scheduler.__init__
+  ok   post-capture seam proof is present                   
+
+[5] generate through host-resident experts
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_prefill_wmma
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.rmsnorm_gated
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma+e2m1)
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[1m[2026-09-05|17:03:08|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_hip.flash_prefill
+[1m[2026-09-05|17:03:09|core|rank=0][0m [32mINFO    [0m [hip-engage] attn_prefill_paged.flash_prefill_paged
+[1m[2026-09-05|17:03:09|core|rank=0][0m [32mINFO    [0m [attn] attn_prefill_paged split_ctx=48864 (global page-table token width); the SAME value is passed on the eager and captured paths, and the kernel no longer infers it from the block-table row width
+  [0] 6 tok: ' Paris. Paris is a city'
+  [1] 6 tok: '.\n\n<think>\nThe user'
+  [0] 6 tok: ' Paris. Paris is a city'
+  [1] 6 tok: '.\n\n<think>\nThe user'
+  ok   both requests produced tokens                        [6, 6]
+
+[6] engaged ledger
+  ok   both requests produced tokens                        [6, 6]
+
+[6] engaged ledger
+  [hip-engage] weight_offload.moe_resolve[device]
+  [hip-engage] weight_offload.moe_resolve[host]
+  [hip-engage] weight_offload.stage_a_sealed
+  [hip-engage] weight_offload.stage_b_chunked_load
+  [hip-engage] weight_offload.verify_after_capture
+  [hip-engage] weight_offload.moe_resolve[device]
+  [hip-engage] weight_offload.moe_resolve[host]
+  [hip-engage] weight_offload.stage_a_sealed
+  [hip-engage] weight_offload.stage_b_chunked_load
+  [hip-engage] weight_offload.verify_after_capture
+  ok   weight_offload.moe_resolve[host] engaged             a forward resolved a HOST-placed MoE layer through the seam
+  ok   weight_offload.moe_resolve[host] engaged             a forward resolved a HOST-placed MoE layer through the seam
+  ok   weight_offload.stage_a_sealed engaged                
+  ok   weight_offload.verify_after_capture engaged          
+
+[rank 1] PASS: 0 failure(s)
+  ok   weight_offload.stage_a_sealed engaged                
+  ok   weight_offload.verify_after_capture engaged          
+
+[rank 0] PASS: 0 failure(s)
+{
+  "layers": 48,
+  "device_gb": 8.1,
+  "host_gb": 28.0,
+  "tp": 2,
+  "rank": 1,
+  "stream_layers_requested": 0,
+  "cpu_layers_requested": 0,
+  "cpu_threads_per_rank": 2,
+  "boot_seconds": 574.2,
+  "card": "AMD Radeon RX 9070",
+  "device_index": 1,
+  "offload": true,
+  "attention_backend": "hip",
+  "cuda_graph_max_bs_requested": 2,
+  "cuda_graph_bs_captured": [
+    1,
+    2
+  ],
+  "graph_capture_engaged": true,
+  "ple_graph_capturer": "PLEGraphCapture",
+  "boot_ple_prepares": 2,
+  "boot_ple_commits": 0,
+  "boot_ple_discards": 2,
+  "boot_ple_commit_noops": 0,
+  "gdn_layers": 36,
+  "gdn_local_k_heads": [
+    8
+  ],
+  "gdn_local_v_heads": [
+    24
+  ],
+  "gdn_global_k_heads": 16,
+  "gdn_global_v_heads": 48,
+  "ep_enabled": false,
+  "ep_over_tp": false,
+  "ep_size": 1,
+  "hc_tensors": 774,
+  "ct_sign_decisions": 0,
+  "hc_replicated": true,
+  "hc_diverging_tensors": [],
+  "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+  "session_enabled": true,
+  "plan_host_bytes": 25716326400,
+  "plan_device_bytes": 8572108800,
+  "copied_bytes": 25716326400,
+  "stage_b_chunks": 49,
+  "stage_b_keys_filled": 1236,
+  "stage_b_peak_device_allocated": 40909668352,
+  "stage_b_peak_device_reserved": 41460695040,
+  "stage_b_min_device_free": 1113587712,
+  "stage_b_peak_host_rss": 31371038720,
+  "stage_b_seconds": 371.5,
+  "stage_b_host_layers": 36,
+  "stage_b_device_layers": 12,
+  "stage_b_cpu_layers": 0,
+  "arena_pinned_bytes": 25895632896,
+  "arena_carved_bytes": 25769803776,
+  "arena_torch_fallbacks": 0,
+  "seam_moe_layers": 48,
+  "seam_host_layers": 36,
+  "seam_device_layers": 12,
+  "seam_host_bytes": 25716326400,
+  "seam_device_bytes": 8572108800,
+  "seam_pointer_checked": true,
+  "verify_after_capture_fired": 2,
+  "token_ids": [
+    [
+      11751,
+      13,
+      11751,
+      369,
+      264,
+      3177
+    ],
+    [
+      13,
+      271,
+      248068,
+      198,
+      760,
+      1156
+    ]
+  ],
+  "text": [
+    " Paris. Paris is a city",
+    ".\n\n<think>\nThe user"
+  ],
+  "engaged": [
+    "weight_offload.moe_resolve[device]",
+    "weight_offload.moe_resolve[host]",
+    "weight_offload.stage_a_sealed",
+    "weight_offload.stage_b_chunked_load",
+    "weight_offload.verify_after_capture"
+  ],
+  "kv_pages": 3053,
+  "failures": 0
+}
+{
+  "layers": 48,
+  "device_gb": 8.1,
+  "host_gb": 28.0,
+  "tp": 2,
+  "rank": 0,
+  "stream_layers_requested": 0,
+  "cpu_layers_requested": 0,
+  "cpu_threads_per_rank": 2,
+  "boot_seconds": 574.2,
+  "card": "AMD Radeon RX 9070 XT",
+  "device_index": 0,
+  "offload": true,
+  "attention_backend": "hip",
+  "cuda_graph_max_bs_requested": 2,
+  "cuda_graph_bs_captured": [
+    1,
+    2
+  ],
+  "graph_capture_engaged": true,
+  "ple_graph_capturer": "PLEGraphCapture",
+  "boot_ple_prepares": 2,
+  "boot_ple_commits": 0,
+  "boot_ple_discards": 2,
+  "boot_ple_commit_noops": 0,
+  "gdn_layers": 36,
+  "gdn_local_k_heads": [
+    8
+  ],
+  "gdn_local_v_heads": [
+    24
+  ],
+  "gdn_global_k_heads": 16,
+  "gdn_global_v_heads": 48,
+  "ep_enabled": false,
+  "ep_over_tp": false,
+  "ep_size": 1,
+  "hc_tensors": 774,
+  "ct_sign_decisions": 0,
+  "hc_replicated": true,
+  "hc_diverging_tensors": [],
+  "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+  "session_enabled": true,
+  "plan_host_bytes": 25716326400,
+  "plan_device_bytes": 8572108800,
+  "copied_bytes": 25716326400,
+  "stage_b_chunks": 49,
+  "stage_b_keys_filled": 1236,
+  "stage_b_peak_device_allocated": 40909668352,
+  "stage_b_peak_device_reserved": 41460695040,
+  "stage_b_min_device_free": 1113587712,
+  "stage_b_peak_host_rss": 31345971200,
+  "stage_b_seconds": 376.6,
+  "stage_b_host_layers": 36,
+  "stage_b_device_layers": 12,
+  "stage_b_cpu_layers": 0,
+  "arena_pinned_bytes": 25895632896,
+  "arena_carved_bytes": 25769803776,
+  "arena_torch_fallbacks": 0,
+  "seam_moe_layers": 48,
+  "seam_host_layers": 36,
+  "seam_device_layers": 12,
+  "seam_host_bytes": 25716326400,
+  "seam_device_bytes": 8572108800,
+  "seam_pointer_checked": true,
+  "verify_after_capture_fired": 2,
+  "token_ids": [
+    [
+      11751,
+      13,
+      11751,
+      369,
+      264,
+      3177
+    ],
+    [
+      13,
+      271,
+      248068,
+      198,
+      760,
+      1156
+    ]
+  ],
+  "text": [
+    " Paris. Paris is a city",
+    ".\n\n<think>\nThe user"
+  ],
+  "engaged": [
+    "weight_offload.moe_resolve[device]",
+    "weight_offload.moe_resolve[host]",
+    "weight_offload.stage_a_sealed",
+    "weight_offload.stage_b_chunked_load",
+    "weight_offload.verify_after_capture"
+  ],
+  "kv_pages": 3053,
+  "failures": 0
+}
+
+[parent] rank exit codes [0, 0]
+
+[parent] cross-rank greedy ids identical: True
+
+PASS: 0 failure(s) across 2 rank record(s)
+wrote /out/L48_r3_before.test.json
