@@ -765,6 +765,222 @@ def _repro_probe(llm, args) -> dict:
     return o
 
 
+# ---------------------------------------------------------------------------------------------
+# HYPER-CONNECTION FUSION, AS A RUNTIME A/B
+# ---------------------------------------------------------------------------------------------
+# The HC fusion (commit 5c64fc8a) is four changes that are all claimed EXACT, and its own gates are
+# a unit parity test plus an in-boot probe on a 40-LAYER boot. Neither is the served 48-layer model,
+# and the merge left no switch to ask the question on one: `post_load` rewrites the weights in
+# place, so "fusion off" is not a flag, it is a different set of tensors.
+#
+# It IS reversible, though, and exactly reversible, which is the whole point of the claim: the fold
+# is a multiply by a power of two and the pack is a copy. So this pair of helpers reconstructs the
+# PRE-FUSION module state from the post-fusion one and rebinds the pre-fusion `mix`/`combine`
+# bodies (transcribed from the reference math in the class docstring, which is what the fused code
+# replaced), runs the same greedy prompt, and compares token ids.
+#
+# ALL FOUR changes are reverted, not just the two that move weights, so a green result covers the
+# whole commit:
+#   1. the `(1 + w)` memo -> `_gain_vec` recomputes per call
+#   2. the `/ hc` weight fold -> weights multiplied back by hc, runtime divides restored
+#   3. the [324, 10240] pack -> two separate contiguous buffers, two GEMVs
+#   4. `torch.add(alpha=2.0)` -> an explicit `2 * sigmoid(...)` then a plain add
+#
+# The legs run EAGER on both sides. A captured graph baked the fused pointers at capture time, so
+# replaying it after an unfuse would read the packed buffer and measure nothing; capture-vs-eager is
+# a separate gate that runs with fusion ON.
+
+
+def _hc_blocks(llm) -> list:
+    """Every `HyperConnection` in the live model, via the repo's ONE op-tree walk."""
+    from minisgl.layers.hyperconnection import HyperConnection
+    from minisgl.weights.moe_interpose import _iter_ops
+
+    seen: set[int] = set()
+    found = []
+    for _, op in _iter_ops(llm.engine.model, "", set()):
+        if isinstance(op, HyperConnection) and id(op) not in seen:
+            seen.add(id(op))
+            found.append(op)
+    return found
+
+
+def _hc_legacy_mix(self, hyper_input):
+    """`mix` as it was BEFORE 5c64fc8a — one GEMV per projection, the `/ hc` at runtime.
+
+    Transcribed from `git show 5c64fc8a^:python/minisgl/layers/hyperconnection.py`, not
+    reconstructed from the class docstring: an A/B whose "off" leg is a paraphrase of the old code
+    measures the paraphrase. The only intentional difference is the residual tuple, which carries a
+    third `None` so the CURRENT `combine` signature still accepts it — and `None` is exactly the
+    value that makes `combine` issue the inject GEMV itself, i.e. the pre-fusion shape."""
+    import torch.nn.functional as _F
+
+    normed = self.hc_norm.forward(hyper_input)
+    if hyper_input.shape[0] == 0:
+        empty_inj = (
+            hyper_input.new_empty((*hyper_input.shape[:-1], self._hc))
+            if self._use_combine
+            else None
+        )
+        return hyper_input.new_empty((*hyper_input.shape[:-1], self._hs)), (
+            hyper_input, normed, empty_inj)
+    down = self.input_mix_weight_down.forward(normed) / self._hc
+    t = _F.silu(down)
+    gate = torch.sigmoid(self.input_mix_weight_up.forward(t))
+    mixed = (
+        gate.unflatten(-1, (self._hc, self._hs))
+        * normed.unflatten(-1, (self._hc, self._hs))
+    ).mean(dim=-2)
+    # inject_logits=None -> `combine` issues the inject GEMV itself, which is the pre-fusion shape.
+    return mixed, (hyper_input, normed, None)
+
+
+def _hc_legacy_combine(self, block_output, residuals):
+    """`combine` as it was BEFORE 5c64fc8a — its own inject GEMV, `/ hc`, and an explicit `2 *`."""
+    hyper_input, normed, _ = residuals
+    if block_output.shape[0] == 0:
+        return hyper_input
+    inject = self.block_inject_weight.forward(normed) / self._hc
+    gate = 2.0 * torch.sigmoid(inject)
+    branches = hyper_input.unflatten(-1, (self._hc, self._hs))
+    return (branches + block_output.unsqueeze(-2) * gate.unsqueeze(-1)).flatten(-2)
+
+
+def _hc_set_fusion(blocks: list, on: bool) -> dict:
+    """Flip every HC block between the fused and the pre-fusion form. Exactly reversible, and it
+    ALLOCATES NOTHING.
+
+    THAT IS A REQUIREMENT, NOT AN OPTIMISATION, and the first version of this probe learned it the
+    expensive way: it rebuilt each unfused weight as its own contiguous buffer, and at the 48-layer
+    operating point the card has ~58 MB free once the KV pool, the captured graphs and a few
+    generates have run. A 20 MB `torch.empty` was enough to raise OutOfMemoryError, so a gate about
+    numerics failed for a reason that had nothing to do with numerics.
+
+    It is avoidable because `post_load` already left the two checkpoint-named weights as CONTIGUOUS
+    DISJOINT VIEWS of the packed buffer — `fused[:lowrank]` and `fused[lowrank:]`. Those views ARE
+    the unpacked operands. So "unpack" is not a copy at all:
+
+      * the PACK is turned off by clearing `_fused_w`, which makes `_fused_ok()` fail closed and
+        sends `mix` down the two-separate-GEMV path against those same views;
+      * the FOLD is undone by `fused.mul_(hc)` IN PLACE and restored by `fused.div_(hc)` — exact in
+        both directions because `hc` is a power of two, so only the exponent moves;
+      * `_fused_lin` is stashed and handed back, rather than reconstructed, so not even the
+        `LinearReplicated` constructor's `torch.empty` runs.
+
+    Every byte the model holds is the same byte before and after. The caller still digests the
+    packed buffer either side, because "should be exact" is the claim under test.
+    """
+    import types
+
+    n_touched = n_nopack = 0
+    for h in blocks:
+        if on:
+            for attr in ("mix", "combine"):
+                h.__dict__.pop(attr, None)
+            h.hc_norm.__dict__.pop("_gain_vec", None)
+            saved = h.__dict__.pop("_ab_saved", None)
+            if saved is None:
+                continue
+            was_folded, fused, lin = saved
+            if was_folded:
+                fused.div_(h._hc)          # in place, exact: power-of-two exponent shift
+            h._fused_w = fused
+            h._fused_lin = lin
+            h._scale_folded = was_folded
+            n_touched += 1
+            continue
+
+        if h._fused_w is None:
+            n_nopack += 1
+            continue
+        if not h._use_combine:
+            # The top-level `hyper_connection_mixer` packs nothing to unpack (use_combine=False),
+            # but the `/ hc` fold DOES apply to it, so it still gets the legacy `mix`.
+            n_nopack += 1
+        h.__dict__["_ab_saved"] = (h._scale_folded, h._fused_w, h._fused_lin)
+        if h._scale_folded:
+            h._fused_w.mul_(h._hc)         # in place; the .weight views see it, no copy
+        h._fused_w = None                  # -> _fused_ok() fails closed -> two separate GEMVs
+        h._fused_lin = None
+        h._scale_folded = False
+        h.__dict__["mix"] = types.MethodType(_hc_legacy_mix, h)
+        if h._use_combine:
+            h.__dict__["combine"] = types.MethodType(_hc_legacy_combine, h)
+        # change 1: recompute `(1 + w)` every call instead of reading the memo
+        h.hc_norm.__dict__["_gain_vec"] = types.MethodType(
+            lambda s, capturing: s.weight + 1.0, h.hc_norm)
+        n_touched += 1
+    return {"blocks_touched": n_touched, "blocks_without_pack": n_nopack}
+
+
+def _hc_fusion_ab(llm, args) -> dict:
+    """Greedy token ids with the HC fusion ON vs reverted, in ONE boot, EAGER on both legs."""
+    from minisgl.core import SamplingParams
+
+    gr = llm.engine.graph_runner
+    blocks = _hc_blocks(llm)
+    packed = sum(1 for h in blocks if h._fused_w is not None)
+    o: dict = {
+        "hc_ab_blocks_found": len(blocks),
+        "hc_ab_blocks_packed_before": packed,
+    }
+    print(f"\n[6e] HC fusion A/B: {len(blocks)} hyper-connection blocks, {packed} packed", flush=True)
+    check_true("HC A/B found the hyper-connection blocks", len(blocks) > 0,
+               "a probe that finds nothing reports 'identical' and means nothing")
+    n = int(args.hc_ab_steps)
+    sp = SamplingParams(temperature=0.0, max_tokens=n)
+    prompts = _PARITY_PROMPTS[:2]
+    # The flip itself allocates nothing, but the two generates either side of it do, and at this
+    # operating point the card is down to tens of MB. Hand back whatever the allocator is merely
+    # caching first.
+    torch.cuda.empty_cache()
+    # The fold is undone and redone IN PLACE, so the packed bytes are checked either side.
+    dig_before = [_tensor_digest(h._fused_w) for h in blocks if h._fused_w is not None]
+    saved_bs = gr.max_graph_bs
+    flipped = False
+    try:
+        gr.max_graph_bs = 0  # both legs eager; the captured graph baked the fused pointers
+        on1 = [list(llm.generate([p], sp)[0]["token_ids"]) for p in prompts]
+        o["hc_ab_flip_census"] = _hc_set_fusion(blocks, on=False)
+        flipped = True
+        o["hc_ab_packed_while_off"] = sum(1 for h in blocks if h._fused_w is not None)
+        off = [list(llm.generate([p], sp)[0]["token_ids"]) for p in prompts]
+        _hc_set_fusion(blocks, on=True)
+        flipped = False
+        o["hc_ab_packed_after_restore"] = sum(1 for h in blocks if h._fused_w is not None)
+        dig_after = [_tensor_digest(h._fused_w) for h in blocks if h._fused_w is not None]
+        o["hc_ab_packed_bytes_restored_exactly"] = bool(dig_before == dig_after)
+        on2 = [list(llm.generate([p], sp)[0]["token_ids"]) for p in prompts]
+    finally:
+        # The model must go back to the shipped form whatever happened here — anything measured
+        # after this point would otherwise be measuring the unfused path without saying so.
+        if flipped:
+            _hc_set_fusion(blocks, on=True)
+        gr.max_graph_bs = saved_bs
+    o["hc_ab_ids_fused"] = on1
+    o["hc_ab_ids_unfused"] = off
+    o["hc_ab_ids_fused_again"] = on2
+    o["hc_ab_tokens_per_prompt"] = n
+    # The SAME-CODE FLOOR for this gate: two runs of the fused path, either side of the unfused one.
+    # If they disagree, an ON-vs-OFF disagreement is not attributable to the fusion.
+    o["hc_ab_same_code_floor_identical"] = bool(on1 == on2)
+    o["hc_ab_ids_identical"] = bool(on1 == off)
+    o["hc_ab_first_divergence"] = None
+    if not o["hc_ab_ids_identical"]:
+        for i, (a, b) in enumerate(zip(on1, off)):
+            for j, (x, y) in enumerate(zip(a, b)):
+                if x != y:
+                    o["hc_ab_first_divergence"] = {"prompt": i, "step": j, "fused": x, "unfused": y}
+                    break
+            if o["hc_ab_first_divergence"]:
+                break
+    print(f"  fused==unfused: {o['hc_ab_ids_identical']}  "
+          f"same-code floor (fused vs fused): {o['hc_ab_same_code_floor_identical']}  "
+          f"restored packs: {o['hc_ab_packed_after_restore']}/{packed}", flush=True)
+    check("HC A/B restored every pack", o["hc_ab_packed_after_restore"], packed)
+    return o
+
+
 def _capture_throughput_ab(llm, args) -> dict:
     """Decode tok/s with the graphs live vs with them forced off, in ONE boot.
 
@@ -1258,6 +1474,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--throughput-tokens", type=int, default=0)
     # N identical generates per mode, to separate the ENGINE's reproducibility from capture's.
     ap.add_argument("--repro-probe", type=int, default=0)
+    # HC FUSION ON/OFF (`_hc_fusion_ab`). The merge left no switch — `post_load` rewrites the
+    # weights — so this reconstructs the pre-fusion tensors and rebinds the pre-fusion mix/combine
+    # bodies inside the live boot. `>0` is the number of greedy tokens per prompt.
+    ap.add_argument("--hc-ab-steps", type=int, default=0)
     ap.add_argument("--throughput-repeats", type=int, default=3)
     # THE DELIVERABLE A/B (`_capture_ab_sampled`). Distinct from --throughput-tokens, which is the
     # GREEDY sanity version of the same switch: this one runs the checkpoint's own sampler, fixes the
@@ -1726,6 +1946,20 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
         except BaseException as e:
             out["quality_error"] = f"{type(e).__name__}: {e}"
             check_true("quality leg produced tokens", False, out["quality_error"][:300])
+            traceback.print_exc()
+
+    # [8] HC FUSION ON/OFF. DELIBERATELY LAST, and contained, for a memory reason rather than a
+    # logical one: reverting the pack needs its own contiguous copy of every `[lowrank, wide]`
+    # weight, and although the flip frees the packed buffer as it goes, it is still ~640 MB of
+    # allocator churn on a card this operating point leaves ~0.86 GiB free on. Every other
+    # measurement in this run is already in `out` by the time it starts, so if it OOMs it costs
+    # itself and nothing else. Its failure is RECORDED, never swallowed.
+    if args.hc_ab_steps > 0:
+        try:
+            out.update(_hc_fusion_ab(llm, args))
+        except BaseException as e:
+            out["hc_ab_error"] = f"{type(e).__name__}: {e}"
+            check_true("HC fusion A/B ran", False, out["hc_ab_error"][:300])
             traceback.print_exc()
 
     # LAST, so the counters cover every forward this file ran. Taken at [3b] they read all zeros —

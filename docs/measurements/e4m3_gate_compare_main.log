@@ -1,0 +1,42 @@
+op group                    BIT-EXACT  UNDER-FLOOR  REGRESSION  ABOVE-FLOOR  SHAPE
+dense_gemv                         40            0           0            0      0
+dense_gemv_silu                    32            0           0            0      0
+moe_flag_gemm                      16            0           0            0      0
+moe_flag_silu                      24            0           0            0      0
+moe_g2_gather_reduce                0            5           0            4      0
+moe_gemm                           96            0           0            0      0
+moe_gemm1_silu                    160            0           0            0      0
+moe_scatter                         0            9           0            3      0
+
+389 tensors compared, 0 present in only one build
+
+7 NOT attributable to the same-code floor:
+  ABOVE-FLOOR  moe_g2_gather_reduce/torch.float16/g16/e2True/T4  cross=0.481583 floor=0.478896
+  ABOVE-FLOOR  moe_g2_gather_reduce/torch.float16/g32/e2False/T1  cross=1.01554 floor=0.920817
+  ABOVE-FLOOR  moe_g2_gather_reduce/torch.float16/g32/e2False/T2  cross=1.14434 floor=0.927482
+  ABOVE-FLOOR  moe_g2_gather_reduce/torch.float16/g32/e2False/T4  cross=1.26544 floor=1.09194
+  ABOVE-FLOOR  moe_scatter/g32/e2True/sk1/T8  cross=4.26358 floor=4.07186
+  ABOVE-FLOOR  moe_scatter/g32/e2True/sk2/T2  cross=3.27366 floor=2.6413
+  ABOVE-FLOOR  moe_scatter/g32/e2True/sk2/T8  cross=3.34726 floor=1.86186
+
+tensors with a NON-ZERO same-code floor (i.e. the gate cannot discriminate on them): 21
+  floor=0.409637 cross=0.362449  moe_g2_gather_reduce/torch.float16/g16/e2True/T1
+  floor=0.57048 cross=0.397539  moe_g2_gather_reduce/torch.float16/g16/e2True/T2
+  floor=0.478896 cross=0.481583  moe_g2_gather_reduce/torch.float16/g16/e2True/T4
+  floor=0.920817 cross=1.01554  moe_g2_gather_reduce/torch.float16/g32/e2False/T1
+  floor=0.927482 cross=1.14434  moe_g2_gather_reduce/torch.float16/g32/e2False/T2
+  floor=1.09194 cross=1.26544  moe_g2_gather_reduce/torch.float16/g32/e2False/T4
+  floor=0.528898 cross=0.507732  moe_g2_gather_reduce/torch.float16/g32/e2True/T1
+  floor=0.359404 cross=0.332035  moe_g2_gather_reduce/torch.float16/g32/e2True/T2
+  floor=0.596944 cross=0.429396  moe_g2_gather_reduce/torch.float16/g32/e2True/T4
+  floor=2.82325 cross=0.539542  moe_scatter/g16/e2True/sk1/T2
+  floor=3.42117 cross=2.90384  moe_scatter/g16/e2True/sk1/T8
+  floor=0.866758 cross=0.363882  moe_scatter/g16/e2True/sk2/T2
+  floor=4.15699 cross=3.88925  moe_scatter/g16/e2True/sk2/T8
+  floor=2.69507 cross=1.03482  moe_scatter/g32/e2False/sk1/T2
+  floor=9.32195 cross=6.84948  moe_scatter/g32/e2False/sk1/T8
+  floor=6.18532 cross=5.21516  moe_scatter/g32/e2False/sk2/T2
+  floor=4.88437 cross=3.1305  moe_scatter/g32/e2False/sk2/T8
+  floor=2.16589 cross=1.29363  moe_scatter/g32/e2True/sk1/T2
+  floor=4.07186 cross=4.26358  moe_scatter/g32/e2True/sk1/T8
+  floor=2.6413 cross=3.27366  moe_scatter/g32/e2True/sk2/T2

@@ -1,0 +1,8 @@
+op group                    BIT-EXACT  UNDER-FLOOR  REGRESSION  ABOVE-FLOOR  SHAPE
+moe_g2_gather_reduce                9            0           0            0      0
+
+9 tensors compared, 0 present in only one build
+
+Every tensor is either bit-exact or inside its own same-code floor.
+
+tensors with a NON-ZERO same-code floor (i.e. the gate cannot discriminate on them): 0

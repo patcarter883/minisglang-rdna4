@@ -1,0 +1,38 @@
+{
+  "what": "Two-build max|delta| gate for the surface rewritten by rdna4-hip-kernels 8acbc8e (e4m3 WLoad policy). The commit itself said this was NOT proven and must not be reported as bit-exact until run. This is that run.",
+  "builds": {
+    "baseline": {
+      "repo": "/home/pat/code/rdna4-hip-kernels-e4m3-base",
+      "ref": "169be57",
+      "note": "8acbc8e's parent, extracted with `git archive`; contains ZERO E4m3GroupScaleGlobal symbols (checked with nm/strings)"
+    },
+    "changed": {
+      "repo": "/home/pat/code/rdna4-hip-kernels-e4m3",
+      "ref": "38ec157",
+      "note": "944 E4m3GroupScaleGlobal exported symbols; identical op-name set and byte-identical torch-ext/__init__.py, so the API under test is the same"
+    }
+  },
+  "method": "Each build dumped TWICE in separate processes so every tensor carries its own same-code floor; a cross-build delta is evidence only where that floor is 0. Grouped-MoE results are split into valid rows and pad rows, because moe_align's pad sentinel leaves output rows unwritten and a raw (P,N) dump compares uninitialised memory.",
+  "shapes": "The SERVED geometry: hidden 2560, inter 320/rank, group_size 16 (NVFP4) plus 32/128 controls, top_k 10, block_m 32 (128 for the flag arms), fp16 and bf16 activations, e2m1 and AWQ-zeros weight encodings, T in {1,2,8,64}.",
+  "result_bit_exact_zero_floor": {
+    "dense_gemv": 40,
+    "dense_gemv_silu": 32,
+    "moe_gemm": 96,
+    "moe_gemm1_silu": 160,
+    "moe_flag_gemm": 16,
+    "moe_flag_silu": 24,
+    "moe_g2_gather_reduce": 9,
+    "total": 377
+  },
+  "result_not_gateable": {
+    "moe_scatter": 12,
+    "why": "mmq_fp8_moe_gemm_scatter accumulates through a global atomicAdd whose order varies; minisgl python/minisgl/quant/kernels.py already documents it as not bit-exact. Its MEASURED same-code floor is 1.4e-06..1.3e-05 and the cross-build delta is the same magnitude (1.3e-06..8.6e-06), i.e. indistinguishable from the op's own noise. No tensor anywhere had a ZERO floor and a non-zero cross-build delta, which is the only signature a regression could have."
+  },
+  "highest_risk_hunk": "moe_gemm1_silu \u2014 the alds/ashuffle staging swap the commit named as its biggest risk \u2014 is 160/160 bit-exact across both the wmma and gemv arms.",
+  "wscale_epi_hook": "gemv_decode.h:1588's new wscale_epi call in the dense SILU epilogue is a no-op for the fp16 policy: dense_gemv_silu is 32/32 bit-exact. PROVEN, not assumed.",
+  "harness_defects_found_and_fixed": [
+    "moe_align's pad sentinel is an OUT-OF-RANGE row index into x and the grouped decode arm dereferences it before masking: GPU 'Memory access fault ... Page not present' on the served NVFP4 shape. The in-tree recorders build routing identically and survive only because their tensors are small enough for the extra row to land in allocator slack.",
+    "topk_weights was drawn from the global RNG, which differs per process, so the two dumps of the SAME build disagreed and the two ops consuming it looked nondeterministic.",
+    "gather_reduce was handed a (T*top_k, top_k) topk_weights, which sized its output at T*top_k rows of which only T were written; the unwritten rows were the apparent 0.03-0.5 'floor'."
+  ]
+}
