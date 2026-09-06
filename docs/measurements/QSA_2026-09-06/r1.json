@@ -1,0 +1,130 @@
+{
+  "tp": 2,
+  "layers": 48,
+  "lens": "4096,16384",
+  "sampler": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "failures": 4,
+  "ranks": [
+    {
+      "rank": 0,
+      "tp": 2,
+      "layers": 48,
+      "boot_seconds": 287.7,
+      "card": "AMD Radeon RX 9070 XT",
+      "device_index": 0,
+      "kv_pages": 2810,
+      "page_size": 16,
+      "kv_pool_tokens": 44976,
+      "engine_max_seq_len": 44960,
+      "checkpoint_max_position": 262144,
+      "kv_layers": 12,
+      "kv_bytes_per_token_per_rank": 12288,
+      "kv_pool_bytes_per_rank": 552665088,
+      "qsa_active": false,
+      "ladder": [
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 0,
+          "ok": false,
+          "error_type": "DistBackendError",
+          "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 0,
+          "ok": false,
+          "error_type": "DistBackendError",
+          "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+        }
+      ],
+      "max_context_served_tokens": 0,
+      "first_refusal": {
+        "target": 4096,
+        "error_type": "DistBackendError",
+        "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+      },
+      "retrieval": {},
+      "failures": 2
+    },
+    {
+      "rank": 1,
+      "tp": 2,
+      "layers": 48,
+      "boot_seconds": 287.6,
+      "card": "AMD Radeon RX 9070",
+      "device_index": 1,
+      "kv_pages": 2810,
+      "page_size": 16,
+      "kv_pool_tokens": 44976,
+      "engine_max_seq_len": 44960,
+      "checkpoint_max_position": 262144,
+      "kv_layers": 12,
+      "kv_bytes_per_token_per_rank": 12288,
+      "kv_pool_bytes_per_rank": 552665088,
+      "qsa_active": false,
+      "ladder": [
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 1,
+          "ok": false,
+          "error_type": "DistBackendError",
+          "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 1,
+          "ok": false,
+          "error_type": "DistBackendError",
+          "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+        }
+      ],
+      "max_context_served_tokens": 0,
+      "first_refusal": {
+        "target": 4096,
+        "error_type": "DistBackendError",
+        "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+      },
+      "retrieval": {},
+      "failures": 2
+    }
+  ],
+  "max_context_served_tokens": 0,
+  "engine_max_seq_len": 44960,
+  "first_refusal": {
+    "target": 4096,
+    "error_type": "DistBackendError",
+    "error": "NCCL error in: /__w/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:92, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.27.7\nncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\nFailed to CUDA calloc 33554432 bytes"
+  }
+}

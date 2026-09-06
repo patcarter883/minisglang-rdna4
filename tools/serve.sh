@@ -574,6 +574,27 @@ case "$MODEL" in
                   # operating point has been booted at; raising it raises coverage but is unmeasured
                   # and eats VRAM at exactly the moment VRAM is tightest.
                   if [ "$CONC" -gt 2 ]; then CONC=2; fi
+                  # `[QSA-2026-09-06]` AND WITH QSA LIVE THE CAP IS 1, NOT 2 — a MEASURED refusal,
+                  # not caution. Two prompts submitted together share a leading token run, the second
+                  # resumes its prefill at the matched length, and that length is a TOKEN count, not
+                  # a page count. `QSAPlan.build` then raises:
+                  #     QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of
+                  #     compress_ratio=4
+                  # because the r members of the group straddling that boundary were never stored in
+                  # this request's raw-key ring (the prefix was REUSED, not recomputed), so the
+                  # compression step has nothing to average. Reproduced twice on deliberately
+                  # different configurations — 48 layers TP=2 (cached_len=2) and a 4-layer subset
+                  # TP=1 on one card (cached_len=9) — so it is not a TP, depth or scale effect. It
+                  # RAISES rather than serving wrong attention, which is the guard working; but a
+                  # default that provably fails the second concurrent request is not a default, and
+                  # every real serve has shared prefixes (a system prompt, a chat template), so this
+                  # is not a corner case.
+                  # THE FIX IS NOT IN QSA: round the prefix match DOWN to a multiple of r before the
+                  # request resumes (costs at most 3 tokens of reuse and leaves the DSV4 identity
+                  # `physical_slot // r` untouched). Raise this back to 2 in the same commit that
+                  # lands it. CONC=2 with MINISGL_QSA=0 is unaffected (and re-arms the 2048
+                  # refusal). See docs/measurements/QSA_INDEXER.md 4c.
+                  if [ "${MINISGL_QSA:-1}" != "0" ] && [ "$CONC" -gt 1 ]; then CONC=1; fi
                   # THE OFFLOAD TIER. `[E4M3-2026-09-05]` 8.1 GiB/rank now buys **12** of 48 layers
                   # device-side, not 11, and the other 36 are host-pinned at 24.12 GiB/rank
                   # (48.23 GiB across the node — MEASURED: 18 chunks, payload 24.00 GiB, 120 MiB
@@ -600,10 +621,61 @@ case "$MODEL" in
                   #   size — sweep it with tools/offload/plan_chunk_sweep.py, never extrapolate.
                   # * host_gb 25, not 28: the clamp must sit above the 24.12 GiB the plan reserves.
                   #   28 also admits it; 25 is the point that was actually booted and measured.
-                  woff_device_gb="8.1"; woff_host_gb="25"; woff_chunk_mib="1372"
+                  #
+                  # `[QSA-2026-09-06]` THE TIER IS NOW 7.4, NOT 8.1 — 11 device layers, not 12 — and
+                  # it is a REACH decision, not a memory-safety one. The sparse-attention path
+                  # (§QSA below) removed the 2048-token refusal, and the moment requests get long
+                  # the binding constraint stops being the weights and becomes the KV POOL:
+                  # `Engine.__init__` sets max_seq_len = min(checkpoint 262144, num_pages*page_size).
+                  # MEASURED, same boot procedure, same day, both at memory-ratio 0.90 with graphs
+                  # off (docs/measurements/QSA_INDEXER.md §5):
+                  #
+                  #     device-gb 8.1 -> model 13.45 GiB -> pool 0.51 GiB -> 2,810 pages ->  44,960 tok
+                  #     device-gb 7.4 -> model 12.79 GiB -> pool 1.20 GiB -> 6,569 pages -> 105,104 tok
+                  #
+                  # i.e. ONE MoE layer off the card (0.668 GiB/rank at the e4m3 two-level scale) buys
+                  # 3,759 KV pages = 60,144 tokens of context, at 12,288 B/token/rank. The 12-layer
+                  # point also OOM'd on its first 4k prefill at the old 2048 chunk (92 MB requested,
+                  # 138 MB free — docs/measurements/QSA_2026-09-06/r1.log); 8.1 WITH the 1024 chunk is UNTESTED
+                  # and would trade those 60,144 tokens back for one device layer, so it is left as
+                  # an override (WOFF_DEVICE_GB=8.1), not a default.
+                  # * host_gb 26, not 25: the 37th host layer pushes the plan's reserve from 24.12 to
+                  #   24.62 GiB/rank and the clamp must sit above it. 26 is the point that booted.
+                  woff_device_gb="7.4"; woff_host_gb="26"; woff_chunk_mib="1372"
+                  # ---- QSA SPARSE ATTENTION (`[QSA-2026-09-06]`) --------------------------------
+                  # The 2048-token refusal is GONE: the sparse selection exists
+                  # (python/minisgl/attention/qsa + the qsa_index HIP package), so this arm serves
+                  # LONG CONTEXT — 105,104 tokens, MEASURED coherent with retrieval at 4k and above.
+                  # Two more terms had to move and neither is a preference:
+                  #
+                  # 1. GRAPH_BS=0 — FORCED, not chosen. `QSARuntime.prepare` RAISES inside a
+                  #    cudagraph capture: the selection allocates its per-forward
+                  #    logits/blocks/tokens workspace and does a host `.max()` to size the block
+                  #    window, neither of which a capture admits (plan T5.1). A QSA build therefore
+                  #    decodes EAGER. That cost was already priced BEFORE QSA and is small on this
+                  #    model — captured 14.55 vs eager 13.93 wall tok/s
+                  #    (QWEN4EXP_L48_E4M3_HCFUSE_2026-09-05.json) — because 37 of 48 layers read
+                  #    their experts over PCIe and a PCIe-bound decode has little launch overhead to
+                  #    remove. GRAPH_BS>0 is only legal together with MINISGL_QSA=0, which re-arms
+                  #    the 2048 refusal; it does not "turn off" long context, it REFUSES it.
+                  # 2. MAX_PREFILL_LENGTH=1024, not 2048 — a FEASIBILITY term. The selection's
+                  #    stage-4b workspace is full CHUNK width (`[chunk, 2051]` int32 tokens and
+                  #    slots plus an int64 `flat` gather index), so the prefill activation peak
+                  #    scales with the chunk. The structural fix is to row-tile 4b the way the
+                  #    sparse attention already is (QSA_INDEXER.md §8.1) and it would let this go
+                  #    back to 2048.
+                  #
+                  # --page-size 16 (PAGE_SIZE's default, below) is now a HARD REQUIREMENT rather
+                  # than a convention: a compressed index key is addressed by
+                  # `physical_kv_slot // indexer_compress_ratio` with no allocator of its own, and
+                  # that identity holds only when a group of r=4 cannot straddle a page.
+                  # `QSAProfile.require_page_size` RAISES on anything else rather than falling back
+                  # to a second, untested addressing scheme.
+                  : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=1024}"
                   # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
-                  # that must NOT be carried to another machine. The arena is now 24.12 x 2 =
-                  # 48.23 GiB, and the rank processes read ~2-6 GiB LESS `MemAvailable` than the host
+                  # that must NOT be carried to another machine. `[QSA-2026-09-06]` the arena is now
+                  # 24.62 x 2 = 49.24 GiB (the 37th host layer; it was 24.12 x 2 = 48.23 at the
+                  # 12-device-layer tier), and the rank processes read ~2-6 GiB LESS `MemAvailable` than the host
                   # does because both engines are already up: a host reading 60.7 GiB presented as
                   # 54.60 GiB inside the ranks, so 48.23 + 9 = 57.23 was refused and 48.23 + 6 =
                   # 54.23 booted. 9 is kept as the DEFAULT because it is the value with margin; the

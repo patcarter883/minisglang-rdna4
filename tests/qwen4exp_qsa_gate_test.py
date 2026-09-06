@@ -41,7 +41,7 @@ RUN (card 0, in the serve image):
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES=0 \
       -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
-      'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_qsa_gate_test.py --all'
+      'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_qsa_gate_test.py --gate all'
 """
 
 from __future__ import annotations

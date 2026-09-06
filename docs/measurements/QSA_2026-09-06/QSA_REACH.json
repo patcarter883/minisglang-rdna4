@@ -1,0 +1,24 @@
+{
+  "what": "QSA sparse-attention reach + sparsity, measured. 4 full-attn layers, random weights, one RX 9070 XT, chunked prefill (2048-token group-aligned chunks) + 2 greedy decodes.",
+  "harness": "tests/qwen4exp_qsa_gate_test.py helpers driven by out/qsa_chunked.py",
+  "old_bound_tokens": 2048,
+  "ladder": [
+    {"ctx": 8192,   "ok": true,  "sparsity_visited_over_dense": 0.4377, "seconds": 8.5,  "peak_MiB": 4336},
+    {"ctx": 32768,  "ok": true,  "sparsity_visited_over_dense": 0.1212, "seconds": 3.3,  "peak_MiB": 4660},
+    {"ctx": 131072, "ok": true,  "sparsity_visited_over_dense": 0.0310, "seconds": 15.9, "peak_MiB": 5953},
+    {"ctx": 163840, "ok": true,  "sparsity_visited_over_dense": 0.0249, "seconds": 28.6, "peak_MiB": 6365},
+    {"ctx": 196608, "ok": true,  "sparsity_visited_over_dense": 0.0207, "seconds": 26.3, "peak_MiB": 6836},
+    {"ctx": 262144, "ok": false, "failure": "GPU memory access fault (Page not present) — see open_defect"}
+  ],
+  "unchunked_prefill_ladder": [
+    {"ctx": 4096, "ok": true, "sparsity": 0.7501},
+    {"ctx": 16384, "ok": true, "sparsity": 0.2345},
+    {"ctx": 65536, "ok": false, "failure": "host-side OOM: an unchunked prefill materialises a [rows, index_width=2051] selection; a scheduler never does this, hence the chunked ladder above"}
+  ],
+  "open_defect": {
+    "symptom": "Memory access fault by GPU node-1, Reason: Page not present, at ctx=262144",
+    "bracket": "196608 OK (max compressed-block window 49152) / 262144 FAULT (window 65536)",
+    "leading_suspect": "the boundary sits exactly at max_blocks = 65536 = 2^16 in the qsa_index selection kernels; nothing on the engine side changes shape across that point (the fp32 logits workspace is 2^25 elements on BOTH sides — 1024x32768 at 131072 and 512x65536 at 262144 — and the score grid is 131072 CTAs on both)",
+    "repro": "out/qsa_chunked.py with LENS=262144"
+  }
+}

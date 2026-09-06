@@ -23,6 +23,8 @@ class RequestStatus:
     uid: int
     input_ids: List[int]
     output_ids: List[int]
+    # TERMINAL REJECTION, carried through to `generate`'s result dict. See `offline_send_result`.
+    error: str | None = None
 
 
 class LLM(Scheduler):
@@ -77,6 +79,19 @@ class LLM(Scheduler):
     def offline_send_result(self, reply: List[DetokenizeMsg]) -> None:
         for msg in reply:
             status = self.status_map[msg.uid]
+            # A TERMINAL REJECTION IS NOT A TOKEN. `Scheduler._handle_msg` refuses a request whose
+            # input exceeds `max_seq_len` by replying `DetokenizeMsg(next_token=0, finished=True,
+            # error=...)`, and that field's own comment says the filler token "must NOT be decoded".
+            # The HTTP detokenizer honours it; this path did not — it appended token 0 like any other
+            # token and dropped `error` on the floor, so an over-length request came back as a
+            # successful ONE-TOKEN completion ('!' for this checkpoint) with no signal anywhere the
+            # caller could see. MEASURED 2026-09-06: the QSA long-context ladder scored a rejected
+            # 131,056-token request as a passing run (docs/measurements/QSA_INDEXER.md §4b). Every
+            # offline consumer — the benches in tools/, kv_fp8_calibrate.py, every harness in tests/
+            # — reads this path, so the failure was silent-wrong for all of them, not just one.
+            if msg.error is not None:
+                status.error = msg.error
+                continue
             if not (msg.finished and msg.next_token in self.eos_token_ids):
                 status.output_ids.append(msg.next_token)
 
@@ -100,7 +115,10 @@ class LLM(Scheduler):
         for i in range(len(prompts)):
             status = self.status_map[i]
             output_text = self.tokenizer.decode(status.output_ids)
-            results.append({"text": output_text, "token_ids": status.output_ids})
+            # `error` is always present (None on the normal path) so a caller can test it without a
+            # `.get` and cannot mistake "key absent" for "no error".
+            results.append({"text": output_text, "token_ids": status.output_ids,
+                            "error": status.error})
         return results
 
     def base_logits(self, token_ids: List[int]) -> torch.Tensor:

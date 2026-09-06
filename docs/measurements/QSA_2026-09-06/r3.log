@@ -1,0 +1,133 @@
+gpu-lease: leased card(s) [0] as 'gpu0'  (HIP=0, port=8000, project=lease-gpu0)
+>> fp8_wmma: /kern/fp8_wmma/torch-ext/fp8_wmma/fp8_wmma_C.cpython-312-x86_64-linux-gnu.so
+>> sha256 be8a6b5670f246c465a826010d01f8caa450d93aedee002b1cfe6cb8e0087211
+>> qsa_index: /kern/qsa_index/torch-ext/qsa_index/qsa_index_C.cpython-312-x86_64-linux-gnu.so
+>> sha256 cedde0c4041bb64cd1169a614b8caccd0ea0a7d53eafe0a62ffbbe3681c130ce
+[subset] /tmp/q4e-offload-kruel1rl (4 layers, 512 experts, tp=1)
+
+[1] boot rank 0/1
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[1m[2026-09-06|03:26:25|core|rank=0][0m [32mINFO    [0m Auto-selected MoE backend: fused
+[1m[2026-09-06|03:26:25|core|rank=0][0m [32mINFO    [0m Free memory before loading model: 15.86 GiB
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m qwen4_exp built: 4 layers (3 GDN + 1 full-attn), PLE on decoder index [1], 4x2560-wide hyper-connection residual. NOT implemented in this build:
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m   * cudagraph capture of the QSA SELECTION (the sparse attention itself captures fine)
+      (plan T5.1: the selection allocates its per-forward logits/blocks/tokens workspace and does a host `.max()` to size the block window, neither of which a captured graph admits. A qwen4_exp build with QSA active therefore runs its decode EAGER; the refusal that used to bound context at indexer_budget is GONE (the sparse path is implemented and gated — see tests/qwen4exp_qsa_gate_test.py), so this costs throughput, not correctness or reach)
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m   * vision tower (model.visual.*)
+      (text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/front-end concern and never reaches this model)
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m   * MTP speculative head (mtp.*)
+      (plan T8.1: fused expert tensors, its own hyper-connections, and it seeds from the hc_count-wide PRE-mixer stream. ModelConfig.from_hf REFUSES --spec-algorithm mtp for this architecture rather than half-building the Qwen3.5 head against those tensors)
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m   * cudagraph capture of the PREFILL / spec-VERIFY forwards
+      (DECODE capture is implemented and exercised (2026-09-04): boot with the `hip` attention backend and --cuda-graph-max-bs > 0, and `PLEGraphCapture` stages the n-gram batch the capture-time warmup forward needs. Prefill stays eager everywhere in this engine, and spec-verify capture is moot while --spec-algorithm mtp is refused for this architecture. The `rdna4` attention backend still raises on capture (its Phase-4 gap, not this model's); the capture-capable subclass is `hip`, which is what every production serve here uses)
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m [mem] after build (meta): used=0.37 GiB allocated=0.06 GiB reserved=0.19 GiB non-torch=0.18 GiB | peak_alloc=0.16 GiB peak_reserved=0.19 GiB
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'mrope_interleaved', 'mrope_section'}
+[1m[2026-09-06|03:26:26|core|rank=0][0m [32mINFO    [0m qwen4_exp: 20 shards, 6144 NVFP4 modules (structural: they ship a '.weight_scale_2')
+Loading weights:   0%|          | 0/20 [00:00<?, ?it/s]Loading weights:   5%|▌         | 1/20 [00:00<00:08,  2.35it/s]Loading weights:  10%|█         | 2/20 [00:00<00:07,  2.47it/s]Loading weights:  15%|█▌        | 3/20 [00:00<00:05,  3.29it/s]Loading weights:  20%|██        | 4/20 [00:01<00:04,  3.33it/s]Loading weights:  25%|██▌       | 5/20 [00:01<00:03,  3.87it/s]Loading weights:  30%|███       | 6/20 [00:01<00:03,  4.38it/s]Loading weights:  35%|███▌      | 7/20 [00:01<00:02,  4.73it/s]Loading weights:  40%|████      | 8/20 [00:02<00:02,  5.01it/s]Loading weights:  45%|████▌     | 9/20 [00:02<00:02,  5.14it/s]Loading weights:  50%|█████     | 10/20 [00:02<00:01,  5.25it/s]Loading weights:  55%|█████▌    | 11/20 [00:02<00:01,  5.34it/s]Loading weights:  60%|██████    | 12/20 [00:02<00:01,  5.40it/s]Loading weights:  65%|██████▌   | 13/20 [00:02<00:01,  5.46it/s]Loading weights:  70%|███████   | 14/20 [00:03<00:01,  5.48it/s]Loading weights:  75%|███████▌  | 15/20 [00:03<00:00,  5.51it/s]Loading weights:  80%|████████  | 16/20 [00:03<00:00,  5.48it/s]Loading weights:  85%|████████▌ | 17/20 [00:04<00:01,  2.31it/s]Loading weights:  95%|█████████▌| 19/20 [00:04<00:00,  2.86it/s]Loading weights: 100%|██████████| 20/20 [00:08<00:00,  1.08s/it]Loading weights: 100%|██████████| 20/20 [00:08<00:00,  2.42it/s]
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m qwen4_exp loader ignored 7478 checkpoint tensors, by reason:
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m      6144  act-calibration: *.input_scale / *.input_global_scale — FP4 activation calibration. gfx1201 has no FP4 math, so the e2m1 kernel quantizes activations to fp8 and this calibration is unused (the served scheme is W4A8, not the declared W4A4)
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m       968  beyond-decoder: layers.<n> with n >= num_hidden_layers — the model-bf16-* shards carry every layer the CHECKPOINT has, and a config that serves fewer (a layer-subset bring-up config) declares fewer. Same rule `load_weight` applies for every other family
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m       333  vision: model.visual.* — vision tower; this engine serves the text decoder only
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m        31  mtp-head: mtp.* — the MTP speculative head is not implemented (bring-up plan T8.1)
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m         2  ple-ngram-table: ple_embedding.ngram_embedding.* + ngram head metadata — the 51.2 GB n-gram table stays NVMe-resident and is served by weights/row_table.py, never streamed into VRAM
+[1m[2026-09-06|03:26:34|core|rank=0][0m [32mINFO    [0m [mem] after load_state_dict: used=8.65 GiB allocated=8.37 GiB reserved=8.47 GiB non-torch=0.18 GiB | peak_alloc=8.44 GiB peak_reserved=8.47 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [mem] after post_load: used=10.42 GiB allocated=8.37 GiB reserved=10.23 GiB non-torch=0.19 GiB | peak_alloc=9.35 GiB peak_reserved=10.23 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m KV sizing: free=15.86 GiB x ratio=0.85 = 13.48 GiB budget; model=8.56 GiB state=0.02 GiB draft=0.00 GiB graph=0.00 GiB snap=0.00 GiB ple=0.02 GiB -> available=4.88 GiB @ 32768 B/page; resident tensors=8.37 GiB torch reserved=8.76 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m Reserved 0.02 GiB for GDN state (2 slots); KV pool gets the remainder
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m Allocating 2557968 tokens for KV cache, K + V = 4.88 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m GDN state: 3 layers x 4 slots (conv_dim=10240); conv warmup done
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m PLE runtime: n-gram table open, 4 state slots, staging 1024 tokens x 2560 (0.02 GiB device)
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m sampler: masking padded vocab tail [248077, 248320) — 243 untrained ids fenced off
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m Free memory after initialization: 2.02 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m CUDA graph is disabled.
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] total 11.2 s inside Engine.__init__, 6.4 s before it (torch import + config), process age now 17.7 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] init_communication                     0.01 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] model_construct_meta                   0.85 s  anon  +0.16 file  +0.05 dev  +0.06 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_stream_tier_build               0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_plan_resolve                    0.02 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] arena_pin_attach                       0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   oneshot_read_and_fill                  8.48 s  anon  +0.04 file  -0.05 dev  +8.31 GiB  disk  12.55 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   oneshot_post_load                      1.24 s  anon  +0.01 file  +0.00 dev  +0.00 GiB  disk   0.02 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_load                            9.72 s  anon  +0.05 file  -0.04 dev  +8.31 GiB  disk  12.57 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] ct_sign_verify                         0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_offload_bind_seal               0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_sizing                              0.03 s  anon  +0.01 file  +0.01 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_pool_alloc                          0.01 s  anon  +0.00 file  +0.00 dev  +4.88 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] gdn_conv_warmup                        0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] ple_runtime_build                      0.02 s  anon  +0.02 file  +0.00 dev  +0.02 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] snapshot_host_arena                    0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] backends_init                          0.04 s  anon  +0.00 file  +0.01 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] graph_capture                          0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] canvas_capture                         0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] verify_arena_after_capture             0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- inner-loop buckets (seconds) ---
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d                                     4.66 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.safe_open                               2.68 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_leaf_scales                       0.18 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.expert_stack_add                        0.12 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor                              0.10 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.remap                                   0.09 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gate_up_cat                             0.06 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_prepass                           0.02 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.shard                                   0.01 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gdn_concat                              0.00 s
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- counters ---
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.file_bytes                            21,673,343,630  (20.18 GiB)
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.files_opened                                      20
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_bytes                       8,890,088,280  (8.28 GiB)
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_calls                              18,532
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_bytes                              8,921,520,984  (8.31 GiB)
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_calls                                     18,532
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] checkpoint files: 20 distinct, 20 header opens, 20 tensor opens, 0 opened >1x for tensors (max 1x)
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] RSS end: total 2.43 GiB (anon 0.94 + file 0.30 + shmem 1.19), peak VmHWM 4.65 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] disk read_bytes 12.59 GiB, rchar 6.78 GiB
+[1m[2026-09-06|03:26:36|core|rank=0][0m [32mINFO    [0m [boot-timeline] box: MemAvailable 70.7 -> 67.0 GiB, swap used 28.5 -> 28.6 GiB; swapped in 0.05 GiB, out 0.18 GiB during boot
+[1m[2026-09-06|03:26:36|core|rank=0][0m [33mWARNING [0m recurrent-state hybrid model: prefix cache 'naive' (was 'radix'); PLE recurrent state is not covered by the recurrent-radix snapshot store
+[transformers] You are using a model of type `qwen4_exp` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'hybrid_sliding', 'hybrid'}
+[1m[2026-09-06|03:26:37|core|rank=0][0m [32mINFO    [0m qwen4_exp QSA ACTIVE: budget=2048 ratio=4 block_topk=512 index_width=2051 ops=hip QSAIndexCache(layers=1, req_rows=3, ratio=4, head_dim=128, comp_slots=639496, MiB=156.1)
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv(minv_decode)
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv[gdn_proj]
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_prefill_wmma
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.rmsnorm_gated
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.silu_and_mul
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] moe_hip.moe_route_align
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv+e2m1)
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma+e2m1)
+[1m[2026-09-06|03:26:39|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[1m[2026-09-06|03:26:40|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rope
+[1m[2026-09-06|03:26:40|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.store_kv
+[1m[2026-09-06|03:26:40|core|rank=0][0m [32mINFO    [0m [hip-engage] qsa.flash_decode_paged
+[1m[2026-09-06|03:26:40|core|rank=0][0m [32mINFO    [0m [hip-engage] sampler_hip.top_k_top_p_sampling_from_logits_
+  [ok] QSA runtime is ACTIVE (this file measures nothing without it) — MINISGL_QSA=0, a bad page size, or the qsa_index kernels are missing
+  kv_pages=159873 pool_tokens=2557968 engine_max_seq_len=262144 checkpoint_max_position=262144
+
+[2] the long-context ladder (sampled: temp=1.0 top_k=20 top_p=0.95)
+[1m[2026-09-06|03:26:41|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma+e2m1)
+[1m[2026-09-06|03:26:42|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_decode_conv_gated_replay
+[1m[2026-09-06|03:26:42|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter+e2m1
+  ctx=   4096 w=1 (4087 tok) prefill 1.172s (3487.0 tok/s) decode 292.03 tok/s sparsity 0.748599 needles early=False late=False
+    -> ' correct渗透渗透時計ineseikke Structures差异torihciukulatform有所思 Rresteemaineleveisphererics oftenendment Whilstpone eingel'
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (357600 > 262144). Running this sequence through the model will result in indexing errors
+[1m[2026-09-06|03:27:14|core|rank=0][0m [33mWARNING [0m input sequence length 999997 exceeds the servable maximum 262144 (KV pool); request rejected [uid=0]
+  ctx=999999 w=1: REFUSED by the scheduler — input sequence length 999997 exceeds the servable maximum 262144 (KV pool); request rejected
+
+[2b] CONC=2 at ctx=4096
+  ctx=4096 w=2: REFUSED ValueError: QSA prefill chunk is not group-aligned: cached_len=9 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.
+
+[3] gates
+  [ok] at least one run finished ABOVE indexer_budget (the old refusal is gone) — 1 runs ok, none above budget
+  [ok] ctx=4087: the selection actually skipped keys (ratio<1) — ratio=0.748599
+  [ok] ctx=4087: decode steps were EAGER (QSA refuses capture): ['decode_eager']
+  [ok] ctx=4087: no loop signature — run=0
+  [ok] ctx=4087: no letter-spell signature — run=0
+  [FAIL] ctx=4087: no token-noise signature — frac=0.0957
+
+[rank 0] FAIL: 1 failure(s)
+
+FAIL: 1 failure(s)
+wrote /out/r3.json
