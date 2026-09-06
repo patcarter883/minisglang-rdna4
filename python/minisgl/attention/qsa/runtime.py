@@ -259,7 +259,14 @@ class QSARuntime:
         # skipped — a "sparse" path that quietly selected everything passes every coherence test.
         self.total_visited = 0
         self.total_dense = 0
-        self.last_sparsity: Optional[float] = None
+        #: Device-side sparsity accumulator for the DYNAMIC path. The static path has had one
+        #: since capture landed (`visited_acc`); this is the same treatment here. Lazily made
+        #: on first `select` so it lands on the right device without this __init__ knowing it.
+        self._dyn_acc: Optional[torch.Tensor] = None
+        #: Most recent step's (visited-on-device, dense-on-host), for the `last_sparsity`
+        #: property. Held, not read: reading is a sync and only the gates ever ask.
+        self._last_sp_num: Optional[torch.Tensor] = None
+        self._last_sp_den: int = 0
         # ---- static decode plan (cudagraph capture); None until init_capture() ------------------
         self.max_graph_bs = 0
         self.static_max_blocks = 0
@@ -483,10 +490,20 @@ class QSARuntime:
         """(visited, dense) over the whole run — the dynamic path's host counters PLUS the static
         path's device counters. Syncs once, when asked; never per layer."""
         v, d = self.total_visited, self.total_dense
+        if self._dyn_acc is not None:
+            v += int(self._dyn_acc.item())
         if self._s:
             v += int(self._s["visited_acc"].item())
             d += int(self._s["dense_acc"].item())
         return v, d
+
+    @property
+    def last_sparsity(self) -> "Optional[float]":
+        """visited/dense for the most recent `select`. SYNCS ON READ — never per step. The serve
+        never touches it; the gates do, and one sync when a test asks is free."""
+        if self._last_sp_num is None or not self._last_sp_den:
+            return None
+        return int(self._last_sp_num.item()) / self._last_sp_den
 
     def select(
         self,
@@ -576,12 +593,23 @@ class QSARuntime:
         )
         sel_slots = self.page_table.reshape(-1).index_select(0, flat.reshape(-1)).reshape(rows, width)
         sel_slots = sel_slots.to(torch.int32).contiguous()
-        visited = int(lens.to(torch.int64).sum().item())
-        self.total_visited += visited
+        # THE LEDGER, ON THE DEVICE. This was `int(lens.to(torch.int64).sum().item())` — a host
+        # sync per INDEX LAYER, i.e. 12 pipeline drains per decode token on this checkpoint, for a
+        # number nothing in the forward pass reads. py-spy put it at 36% of the scheduler rank's
+        # samples and the serving path measured 131 ms/token against the harness's 60.5
+        # [PERF-2026-09-06]. The static path stopped doing this when capture landed; the dynamic
+        # path — the one a GRAPH_BS=0 serve actually runs — never got the same fix.
+        # `sparsity_totals()` and `last_sparsity` still sync, ONCE, when something asks.
+        vis = lens.to(torch.int64).sum()
+        if self._dyn_acc is None:
+            self._dyn_acc = torch.zeros((), dtype=torch.int64, device=vis.device)
+        self._dyn_acc += vis
         self.total_dense += plan.dense_total
-        self.last_sparsity = visited / plan.dense_total if plan.dense_total else None
+        self._last_sp_num, self._last_sp_den = vis, plan.dense_total
+        # visited=-1 for the same reason the static path returns -1: it is not knowable without a
+        # sync, and no consumer reads it — the ledger is read through sparsity_totals().
         return QSASelection(
-            slots=sel_slots, lens=lens, visited=visited, dense=plan.dense_total
+            slots=sel_slots, lens=lens, visited=-1, dense=plan.dense_total
         )
 
     def _select_static(
