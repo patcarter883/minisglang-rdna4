@@ -1,0 +1,5 @@
+=== provenance 2026-09-06T02:53:14+10:00 ===
+before REPO=/home/pat/code/minisgl-rdna4-ramperf-base  sha=02957062e75b9cfa961003041448e8cfeb8b9ef9
+after  REPO=/home/pat/code/minisgl-rdna4-ramperf       sha=25d6178713e74222ba6297f62d13f943cfe1a06a
+ckpt_read.safe_open occurrences in models/weight.py: base=0 new=2
+kernels sha=38ec1572a150bffbd44f26bde4cf9ad37396199f

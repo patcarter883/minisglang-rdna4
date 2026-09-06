@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Protocol, Tuple, runtime_checkable
 
 import torch
 import torch.nn.functional as F
@@ -28,16 +28,294 @@ def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -
     return x.shape[0] <= 16 and x.shape[1] % 512 == 0 and group_size % 32 == 0 and N % 2 == 0
 
 
-def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
+# Packed WORDS (elements of the container dtype, whatever its width) drawn for the sign-convention
+# decision. 65536 int32 words = 524,288 nibbles, which resolves a real mode beyond any doubt; a
+# narrower container yields proportionally fewer nibbles from the same word count, which the
+# `min_margin` floor then judges on its own terms rather than by a fixed count.
+_CT_SIGN_SAMPLE_WORDS = 1 << 16
+
+# ...and WHERE those words are drawn from, which is exactly as load-bearing as how many. The sample
+# is BLOCKS, not a strided lattice, because a lattice gets the "where" wrong twice on the shipped
+# shapes and both failures are silent:
+#
+#   * TRUNCATION. `raw[::n // 65536][:65536]` keeps only the first 65536 strided rows, so for
+#     `65536 < n < 131072` the sample is a PREFIX covering as little as 50% of the tensor — the very
+#     prefix bias this detector was rewritten to remove. A TP=2-sharded dense CT linear
+#     (N=768, K=1024 -> n=98304 int32 words) covers 66.7% and decides from its first two thirds.
+#   * ROW ALIASING, which is worse, and which the shipped MoE shapes hit exactly. The stride comes
+#     out an exact multiple of the packed row length: w13 at E=128 / N=1536 / K=4096 gives
+#     n=100,663,296 and stride=1536 = 3 x (K/8), so `i % (K/8) == 0` for EVERY sampled index; w2
+#     (n=50,331,648, stride=768, K/8=96) is the same. "Sampled with a fixed stride across all E
+#     experts" is then true and useless — the sample sees exactly ONE of the 512 (resp. 96) packed
+#     input groups, the same 8 input channels of the model, and the whole checkpoint's decode
+#     convention is decided from them. Real checkpoints have outlier input channels that quantize to
+#     the int4 rail (`tests/gemma4_parity_test.py` measures that rail fraction), and a rail-saturated
+#     column has its mode at neither 8 nor 0: at best `c8 ~ c0` refuses a healthy checkpoint, at
+#     worst it picks the wrong convention and XORs every nibble of every expert into plausible
+#     garbage.
+#
+# So: `_CT_SIGN_SAMPLE_BLOCKS` contiguous runs, starts spread evenly across `[0, n - block]` and
+# INCLUDING the tail, so the sampled index range is exactly `[0, n)`. Each run covers 128 consecutive
+# packed columns and the runs cover every expert and every output row, so neither axis can be aliased
+# away by an unlucky stride. Integer arithmetic, no RNG, one `index_select`.
+_CT_SIGN_SAMPLE_BLOCKS = 512
+# Minimum |counts[8] - counts[0]| / sampled nibbles for the histogram to be a DECISION rather than a
+# coin flip. A genuine symmetric int4 stack puts ~12% of its nibbles on the mode and a small fraction
+# of that on the opposite value, so real checkpoints clear this by orders of magnitude; 0.1% fires
+# only on a near-perfect tie, which is exactly the case where guessing XOR-corrupts every weight.
+_CT_SIGN_MIN_MARGIN = 1e-3
+
+
+class CtSignConvention(NamedTuple):
+    """The packed-nibble sign convention of ONE compressed-tensors stack, decided once.
+
+    Threaded rather than re-derived, because the derivation is a SAMPLE: two calls that look at
+    different parts of the same stack can disagree, and disagreeing means one contiguous block of
+    experts gets XORed and the rest does not — plausible text, no crash, and nothing downstream can
+    detect it. A chunked per-expert-range repack (weight offload Stage B, plan §5.2) MUST carry this
+    object into every chunk instead of calling the detector again."""
+
+    uint4b8: bool
+    margin: float
+    sampled_words: int
+    # Spacing between the starts of consecutive sampled BLOCKS, in packed words (1 when the whole
+    # tensor was sampled). NOT an element-by-element stride: see `_CT_SIGN_SAMPLE_BLOCKS` for why a
+    # lattice sample is unsafe on the shipped shapes.
+    stride: int
+    # How many contiguous runs the sample was drawn from. 1 == "the whole tensor", which is the
+    # only case in which `stride` is meaningful as a step of one.
+    blocks: int = 1
+
+
+def _ct_sign_sample(raw: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+    """`(sampled_rows, blocks, block_start_stride)` for the `(n, elem)` byte view `raw`.
+
+    Draws at most `_CT_SIGN_SAMPLE_WORDS` packed words spread over ALL of `raw` as
+    `_CT_SIGN_SAMPLE_BLOCKS` contiguous runs — never a prefix, never a single-column lattice. See
+    `_CT_SIGN_SAMPLE_BLOCKS` for the two shipped shapes that forced this.
+
+    Blocks cannot overlap or duplicate: the start step is `floor((n - block) / (blocks - 1))`, and
+    `n > _CT_SIGN_SAMPLE_WORDS = blocks * block` makes that at least `block`. The last start is
+    exactly `n - block`, so the sampled index range is `[0, n)` with no truncation.
+    """
+    n = int(raw.shape[0])
+    if n <= _CT_SIGN_SAMPLE_WORDS:
+        return raw, 1, 1
+    blocks = _CT_SIGN_SAMPLE_BLOCKS
+    block = max(1, _CT_SIGN_SAMPLE_WORDS // blocks)
+    span = n - block  # last legal start; > 0 because n > _CT_SIGN_SAMPLE_WORDS >= block
+    starts = torch.arange(blocks, dtype=torch.int64, device=raw.device) * span // (blocks - 1)
+    within = torch.arange(block, dtype=torch.int64, device=raw.device)
+    idx = (starts[:, None] + within[None, :]).reshape(-1)
+    return raw.index_select(0, idx), blocks, span // (blocks - 1)
+
+
+def ct_packed_sign_convention(
+    packed: torch.Tensor,
+    *,
+    name: str = "weight_packed",
+    min_margin: float = _CT_SIGN_MIN_MARGIN,
+) -> CtSignConvention:
     """Decide a compressed-tensors int4 checkpoint's packed sign convention from the nibble
-    distribution. Returns True if the packed nibbles are already uint4b8 (q+8; mode at 8 for
-    symmetric weights) -> pass through; False for two's-complement (mode at 0) -> XOR 0x88.
-    Samples a slice (the decision is uniform across a tensor's nibbles)."""
-    flat = packed.flatten()
-    sample = flat[: min(flat.numel(), 1 << 16)].to(torch.int64) & 0xFFFFFFFF
-    nib = torch.cat([(sample >> (4 * p)) & 0xF for p in range(8)])
+    distribution: uint4b8 (q+8, mode at 8 for symmetric weights) -> pass through; two's-complement
+    (mode at 0) -> XOR 0x88.
+
+    Samples the WHOLE stack, not the leading 65536 words. The prefix sample read only the first
+    ~0.5% of a 512-expert stack, so the decision was made from expert 0 and applied to all 512 — and,
+    worse, it made the answer depend on WHICH SLICE the caller happened to hold, which is what breaks
+    the moment a chunked loader repacks expert ranges separately.
+
+    "The whole stack" means both axes. The sample is contiguous BLOCKS spread across `[0, n)`, not a
+    strided lattice: on every shipped MoE shape the lattice stride came out an exact multiple of the
+    packed row length, so a sample that spanned all 128 experts still only ever read packed column 0
+    — one input group out of 512. See `_CT_SIGN_SAMPLE_BLOCKS`.
+
+    DETERMINISM IS NOT CROSS-RANK AGREEMENT, and reading it as such is the trap this paragraph
+    replaces. There is no RNG here, so the same tensor always yields the same answer — but under TP
+    the ranks do not hold the same tensor. Plain TP gives rank r a `w13` of shape (E, 2*I/tp, H);
+    EP-over-TP gives it experts [r*E/ep, (r+1)*E/ep). Different bytes, sampled independently,
+    decided independently. On a homogeneously-packed checkpoint (every real one) both ranks land on
+    the same answer because the convention is a property of the PRODUCER and not of a slice; on a
+    mixed-packing stack they can diverge, and then one rank's half of a TP-split GEMM is dequantized
+    in the uint4b8 domain and the other's in two's-complement — plausible text, no error anywhere.
+
+    What would close it: compare the returned `CtSignConvention` across the CPU group at post_load,
+    or decide once per checkpoint and thread the object (which is also what Stage B's chunked repack
+    needs). Neither exists yet, and `tests/core/test_ct_sign_convention.py::TestCrossRankHazard`
+    pins the hazard so the "every rank agrees" claim cannot quietly come back.
+
+    Raises on an ambiguous histogram instead of coin-flipping: the old `counts[8] >= counts[0]`
+    silently resolved a tie toward pass-through, and a wrong resolution XORs every nibble.
+    """
+    # BYTE-WISE, NOT int32-WISE, and that is a correctness property rather than a refactor. The
+    # previous form hardcoded a 32-bit word: it masked `& 0xFFFFFFFF` and unpacked `range(8)`
+    # nibbles per element. Hand it a stack whose int4 codes are packed into uint8 — which is exactly
+    # how `_GroupedMxFp4Experts`, `_GroupedNvFp4Experts` and `_GroupedRXFExperts` already ship 4-bit
+    # weights in this file's own sibling module, and how any future int4 loader policy on the shared
+    # kernel core would arrive — and nibble positions 2..7 of every element read as 0. `counts[0]`
+    # is then inflated by 6/8 of the sample, the histogram decides "two's-complement" with a huge
+    # (and entirely fake) margin, and `apply_ct_sign` XORs a stack that needed no XOR: every weight
+    # off by 8 quanta, right shapes, no error. Deriving the element width from the tensor makes the
+    # decision a property of the BYTES, which is what it always claimed to be, and the repo's
+    # "dtype-agnostic, template the core" rule spells out as the general form.
+    #
+    # Sampling stays WORD-ALIGNED (a whole packed element at a time, every byte lane of it), so a
+    # layout in which one lane is systematically different cannot be missed by a byte stride that
+    # happens to be a multiple of the element size.
+    if packed.numel() == 0:
+        raise ValueError(f"{name}: empty packed tensor, no sign convention to decide")
+    elem = packed.element_size()
+    raw = packed.contiguous().view(torch.uint8).reshape(-1, elem)
+    n = int(raw.shape[0])
+    sample, blocks, stride = _ct_sign_sample(raw)
+    sample = sample.to(torch.int16)
+    nib = torch.cat([sample & 0xF, (sample >> 4) & 0xF]).reshape(-1).to(torch.int64)
     counts = torch.bincount(nib, minlength=16)
-    return bool(counts[8] >= counts[0])
+    c8, c0 = int(counts[8]), int(counts[0])
+    total = int(nib.numel())
+    margin = abs(c8 - c0) / total if total else 0.0
+    if margin < min_margin:
+        raise ValueError(
+            f"{name}: cannot decide the compressed-tensors int4 packing. Sampled "
+            f"{int(sample.shape[0])} of {n} packed {elem * 8}-bit words ({blocks} contiguous "
+            f"block(s), block-start stride {stride}, spanning the whole tensor); "
+            f"nibble counts at 8 and 0 are {c8} and {c0}, a "
+            f"margin of {margin:.2e} against a {min_margin:.0e} floor. uint4b8 and two's-complement "
+            f"are indistinguishable here and guessing XORs every nibble of the stack, which produces "
+            f"plausible text rather than an error. Inspect the checkpoint's quantization_config."
+        )
+    return CtSignConvention(
+        uint4b8=c8 > c0,
+        margin=margin,
+        sampled_words=int(sample.shape[0]),
+        stride=stride,
+        blocks=blocks,
+    )
+
+
+def apply_ct_sign(t: torch.Tensor, conv: CtSignConvention) -> torch.Tensor:
+    """Put a packed int4 tensor into the op's uint4b8 domain under an already-decided convention.
+
+    The ONE place the transform lives, so a weight and its zero-point can never end up in different
+    domains: they share a quantizer, so `scale*(W_u - Z_u) == scale*(q - zp)` holds only if both got
+    the same treatment. Callers pass the SAME `conv` for both.
+
+    DTYPE-PRESERVING, not int32-pinned. The flip is `^ 0x88` over the raw BYTES — every packed
+    format's nibble pair, whatever container dtype it arrived in — so the result is restored to
+    `t.dtype` rather than reinterpreted as int32. Hardcoding int32 was not merely inelegant: given a
+    uint8-packed stack (how `_GroupedMxFp4Experts` / `_GroupedNvFp4Experts` / `_GroupedRXFExperts`
+    already ship 4-bit weights, and how any new int4 loader policy on the shared kernel core would
+    arrive) `.view(torch.int32)` silently returns a tensor of one quarter the last dimension, in the
+    wrong dtype, whenever that dimension happens to divide by 4 — and raises a shape error, blamed
+    on the checkpoint, when it does not. `t.dtype` is the identity transform for the int32 case that
+    exists today, so this is byte-identical on every shipped path."""
+    if conv.uint4b8:
+        return t
+    return (t.contiguous().view(torch.uint8) ^ 0x88).view(t.dtype).contiguous()
+
+
+def _ct_packed_is_uint4b8(packed: torch.Tensor) -> bool:
+    """Boolean form of `ct_packed_sign_convention`, for call sites that need nothing else."""
+    return ct_packed_sign_convention(packed).uint4b8
+
+
+class CtSignRankDivergence(RuntimeError):
+    """Two TP ranks put the SAME logical weights in different int4 sign domains."""
+
+
+def collect_ct_sign_decisions(model) -> Dict[str, bool]:
+    """`{op path: conv.uint4b8}` for every container that made a packed-int4 sign decision.
+
+    Uses `weights.moe_interpose._iter_ops`, which is the repo's ONE op-tree walk and produces the
+    same dotted paths `BaseOP.state_dict` emits. That matters twice over: `BaseOP` is not an
+    `nn.Module`, so `named_modules()` does not exist on most of this tree; and the paths are the
+    strings the two ranks compare, so they have to be a pure function of the module tree rather than
+    of a construction order that an MTP head or a differing shard count could renumber.
+
+    The VALUE is the boolean and nothing else. `margin`, `sampled_words`, `stride` and `blocks` are
+    properties of the SHARD each rank happened to sample and legitimately differ between ranks —
+    comparing them would fail every healthy TP=2 boot on a perfectly uniform checkpoint. `uint4b8`
+    is the only field that has to agree, because it is the only one that changes bytes.
+    """
+    # local: quant <- weights <- layers would be an import cycle at module load.
+    from minisgl.weights.moe_interpose import _iter_ops
+
+    out: Dict[str, bool] = {}
+    for path, mod in _iter_ops(model, "", set()):
+        conv = getattr(mod, "_ct_sign", None)
+        if conv is not None and hasattr(conv, "uint4b8"):
+            out[path] = bool(conv.uint4b8)
+    return out
+
+
+def verify_ct_sign_across_ranks(model, group, tp_size: int, tp_rank: int) -> Dict[str, bool]:
+    """CLOSE the cross-rank hazard `ct_packed_sign_convention` documents. Call at post_load.
+
+    THE HAZARD, restated because the failure has no symptom. The sign convention is decided from a
+    SAMPLE of the packed nibbles, and under TP no two ranks hold the same bytes: plain TP gives rank
+    r a `w13` of shape (E, 2*I/tp, H), EP-over-TP gives it experts [r*E/ep, (r+1)*E/ep). Each rank
+    runs `post_load` on its own container and decides independently. On a homogeneously packed
+    checkpoint — every real one — both land on the same answer, because the convention is a property
+    of the PRODUCER rather than of a slice. On a mixed-packing stack they diverge, and then one
+    rank's half of a TP-split GEMM is dequantized in the uint4b8 domain and the other's in
+    two's-complement. The shapes are right, no kernel errors, and the model produces fluent text
+    that is wrong. Nothing downstream can see it.
+
+    `ct_packed_sign_convention` itself REFUSES a tie (it raises below `_CT_SIGN_MIN_MARGIN`) — but
+    that refusal is evaluated per shard, and a mixed stack is only a tie when you can see all of it.
+    Neither rank ever does, so the refusal cannot fire. A collective is the only place the whole
+    stack is observable, which is why this lives here and not inside the detector.
+
+    Cheap enough to be unconditional: one `all_gather_object` of a dict of bools at boot, on the
+    gloo CPU group the engine already builds for its control messages. `tp_size == 1` returns
+    immediately — there is nothing to disagree with — and so does any model with no CT containers
+    (the NVFP4 / MXFP4 / RXF MoE paths declare no `_ct_sign` at all, so qwen4_exp's NVFP4 body walks
+    straight through this and only its AWQ sibling is actually gated).
+
+    Raises rather than warns. A warning here is a serve that answers questions wrongly for as long
+    as it is up.
+    """
+    local = collect_ct_sign_decisions(model)
+    if tp_size <= 1 or group is None:
+        return local
+    import torch.distributed as dist
+
+    gathered: List[Dict[str, bool] | None] = [None] * tp_size
+    dist.all_gather_object(gathered, local, group=group)
+    ref = gathered[0] or {}
+    bad_keys: List[str] = []
+    missing: List[str] = []
+    for d in gathered:
+        d = d or {}
+        # A path present on one rank and absent on another is ALSO a divergence: it means one rank
+        # built a CT container where its peer built something else, so the two are not running the
+        # same model. Reported separately because the fix differs (a build/config skew, not a
+        # mixed-packing checkpoint).
+        if set(d) != set(ref):
+            missing.extend(sorted(set(d) ^ set(ref)))
+        for k in sorted(set(d) & set(ref)):
+            if d[k] != ref[k] and k not in bad_keys:
+                bad_keys.append(k)
+    if bad_keys or missing:
+        detail = "\n".join(
+            f"    {k}: " + ", ".join(f"rank{r}={(g or {}).get(k)}" for r, g in enumerate(gathered))
+            for k in (bad_keys + sorted(set(missing)))[:20]
+        )
+        raise CtSignRankDivergence(
+            f"compressed-tensors int4 SIGN CONVENTION DIVERGED ACROSS TP RANKS "
+            f"(tp_size={tp_size}, this rank={tp_rank}). Each rank samples only its own shard, so a "
+            f"mixed-packing stack is decided independently and one rank dequantizes in the uint4b8 "
+            f"domain while the other uses two's-complement. Every weight in the disagreeing stack "
+            f"is then off by 8 quanta on one rank: right shapes, no kernel error, fluent and wrong "
+            f"text.\n"
+            f"  {len(bad_keys)} container(s) disagreed"
+            + (f", {len(set(missing))} present on some ranks only" if missing else "")
+            + f":\n{detail}\n"
+            f"  This is a CHECKPOINT property, not a runtime one — inspect its quantization_config "
+            f"and repack it with a single convention, or serve it at TP=1, where one rank sees the "
+            f"whole stack and the detector's own tie-refusal can fire."
+        )
+    return local
 
 
 @runtime_checkable
@@ -152,11 +430,12 @@ class W4A8LinearMethod:
             N, Kp = layer.weight_packed.shape  # type: ignore[attr-defined]
             G = layer.weight_scale.shape[-1]  # type: ignore[attr-defined]
             wp = layer.weight_packed.contiguous()  # type: ignore[attr-defined]
-            uint4b8 = _ct_packed_is_uint4b8(wp)
-            if uint4b8:
-                layer._w_packed_op = wp
-            else:
-                layer._w_packed_op = (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+            # ONE decision for this stack, kept on the layer. `_ct_sign` is what a chunked repack
+            # (weight offload Stage B) must reuse; re-deriving it per chunk XOR-corrupts whichever
+            # chunks disagree, with no crash and plausible output.
+            conv = ct_packed_sign_convention(wp, name=f"{type(layer).__name__}.weight_packed")
+            layer._ct_sign = conv  # type: ignore[attr-defined]
+            layer._w_packed_op = apply_ct_sign(wp, conv)
             # GROUP-MAJOR: the op indexes scales `[g*N + n]` / zeros `[g*(N/8) + n/8]`, so N is the
             # contiguous axis and a fragment's 16 lanes coalesce into one request.
             layer._scales_op = layer.weight_scale.to(torch.float16).transpose(0, 1).contiguous()  # type: ignore[attr-defined]
@@ -171,8 +450,7 @@ class W4A8LinearMethod:
                 # op's zeros layout). It shares the weight's sign convention (same quantizer), so apply
                 # the SAME uint4b8-vs-two's-complement transform: W_u and Z_u then live in one unsigned
                 # domain and the op computes scale*(W_u - Z_u) = scale*(q - zp), exact.
-                zp = zp.contiguous()
-                zp = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+                zp = apply_ct_sign(zp.contiguous(), conv)
                 # The 4-bit packing runs along N *within* each int32, so transposing (N//pf, G) is safe.
                 layer._zeros_op = zp.transpose(0, 1).contiguous()  # (N//pf, G) -> (G, N//pf)
                 del layer.weight_zero_point
@@ -398,7 +676,24 @@ class NvFp4LinearMethod:
     dropping the global tensors. So by the time this method loads, the checkpoint is MXFP4-shaped:
     weight_packed uint8 (N,K//2) 2 E2M1 nibbles/byte + weight_scale fp16 (N,K//16). `process_weights_
     after_load` packs the nibbles to (N,K//8) int32 codes (verbatim) and passes the fp16 scale through;
-    `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4."""
+    `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4.
+
+    STILL ON THE FOLD, DELIBERATELY AND NAMED (2026-09-05). The MoE experts moved to the checkpoint's
+    native TWO-LEVEL scale — a 1-byte e4m3 block scale plus a per-output-channel f32 global — which is
+    both SMALLER and EXACT where the fold carries a measured 4.37e-04 max relative error. The dense
+    path did NOT move with them, and the reason is a kernel fact rather than an oversight:
+    `moe_kernel.hip` / `moe_gemm_tiled.h` / `gemv_decode.h` are templated on a WScale policy and carry
+    an `E4m3GroupScaleGlobal` instantiation, while the DENSE cores (`w4a8_fp8_wmma_kernel.hip`,
+    `gemm_tiled.h`) still hardcode `const __half* w_scales` and have no policy seam at all. Handing
+    them e4m3 bytes would reinterpret them as halves and return finite, plausible, wrong numbers.
+
+    `nvfp4.nvfp4_leaf_splits` is the fence that keeps this true — it splits `.experts.` modules and
+    folds everything else — so a dense NVFP4 linear cannot start receiving e4m3 by accident. The
+    follow-up is to template those two dense cores exactly as the MoE cores were templated, after
+    which that predicate becomes `return True` and `fold_nvfp4_scale` is deleted. On the checkpoints
+    served today the dense NVFP4 surface is small (Laguna / Muse-Glimmer dense linears; the target
+    `Qwen3.8-Flash-Next-NVFP4` quantizes ONLY its routed experts), so the accuracy and byte wins land
+    where the bytes actually are."""
 
     def __init__(self, quant: QuantConfig) -> None:
         self.quant = quant

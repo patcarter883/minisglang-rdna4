@@ -237,6 +237,7 @@ class GraphRunner:
         cca_state: object | None = None,
         max_running_req: int | None = None,
         cam: object | None = None,
+        ple: object | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -245,6 +246,12 @@ class GraphRunner:
             max_running_req=max_running_req,
         )
         self.attn_backend = attn_backend
+        # Held for `replay`: `BaseLLMModel.prepare_for_replay` is the seam for HOST-side per-step
+        # work/guards a model needs when its decode forward is a graph REPLAY. Everything a model
+        # does in Python inside `forward()` runs exactly once — at capture, against the DUMMY request
+        # set — and then never again, so a per-batch guard written there silently stops guarding the
+        # moment capture is enabled. qwen4_exp's QSA indexer budget check is exactly that guard.
+        self.model = model
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
@@ -273,6 +280,16 @@ class GraphRunner:
 
             inner = getattr(model, "model", model)
             self.cam_capture = CAMGraphCapture(cam, inner, device, self.max_graph_bs)
+        # Qwen4-Exp PLE: the n-gram block reads a staged batch off `Context.ple` and RAISES when
+        # there is none, so without this the capture-time warmup forward dies before the first graph
+        # is recorded. `PLEGraphCapture` stages the synthetic capture batch on the reserved NULL slot
+        # and, on every replay, asserts the scheduler staged one of the right width at the addresses
+        # the graph baked. None for every non-PLE model.
+        self.ple_capture = None
+        if ple is not None and self.max_graph_bs > 0:
+            from minisgl.ple.graph_capture import PLEGraphCapture
+
+            self.ple_capture = PLEGraphCapture(ple)
         # v2: stashed for the spec-VERIFY capturer (built in capture_verify_graphs, needs num_draft).
         self._cca_state = cca_state
         self.cca_verify = None
@@ -299,6 +316,8 @@ class GraphRunner:
         self._verify_max_seq_len = max_seq_len
         self._verify_vocab = vocab_size
         import os as _os
+        # Always-on replay counter — see `replay()` for why this is not env-gated.
+        self.replays = 0
         self._timing = ({"n": 0, "copy": 0.0, "prep": 0.0, "replay": 0.0}
                         if _os.environ.get("MINISGL_GRAPH_TIMING") == "1" else None)
         self._capture_graphs(max_seq_len, vocab_size, model)
@@ -319,6 +338,24 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+
+        # QSA (qwen4_exp sparse attention): arm the SELECTION's static decode plan before the first
+        # warmup forward. `ctx.qsa` is built lazily on the model's first forward — which would be the
+        # warmup INSIDE the loop below, i.e. after the plan was needed — so force it here. Two
+        # properties this buys, and both are the point:
+        #   * `max_blocks = ceil(max_seq_len/r)` is a build-time constant, so the scorer's key-tile
+        #     grid and the split top-k's `num_splits` (a policy on the logits tensor's STATIC width)
+        #     are IDENTICAL at capture and at replay. Deriving the width from the step's own
+        #     `row_ends.max()` is the 61d96cf/0972e387 bug class exactly.
+        #   * every decode step then takes the same static path whether it is captured or eager, so
+        #     an eager-vs-captured A/B measures CAPTURE rather than a kernel swap.
+        # No-op for every model that is not qwen4_exp, and for a qwen4_exp build with QSA off.
+        prep_qsa = getattr(model, "prepare_qsa", None)
+        if prep_qsa is not None:
+            prep_qsa()
+            qsa = getattr(get_global_ctx(), "qsa", None)
+            if qsa is not None:
+                qsa.init_capture(self.max_graph_bs, max_seq_len)
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
@@ -341,6 +378,8 @@ class GraphRunner:
                 self.cca_capture.prepare_for_capture(batch)
             if self.cam_capture is not None:
                 self.cam_capture.prepare_for_capture(batch)
+            if self.ple_capture is not None:
+                self.ple_capture.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             # inference_mode around BOTH the warmup and captured forwards: capture never needs
             # autograd, and with grad active the models' in-place-on-view ops (e.g. q_norm/k_norm
@@ -357,6 +396,11 @@ class GraphRunner:
 
         if self.cam_capture is not None:
             self.cam_capture.after_capture()  # revert Python hook to eager single-bank path
+        if self.ple_capture is not None:
+            # DISCARD (not commit) the synthetic capture batch, so the once-per-forward
+            # prepare/commit pairing stays exact and a forward with no fresh `_stage_ple` still
+            # raises in the PLE layer instead of silently re-reading the capture's embeddings.
+            self.ple_capture.after_capture()
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
@@ -366,6 +410,15 @@ class GraphRunner:
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
+        # PROVENANCE, always on and unconditional. A capture-vs-eager A/B is only worth reading if the
+        # two legs actually took different code paths, and "graphs were captured at boot" does not
+        # prove the decode steps REPLAYED one: a batch wider than max_graph_bs, a prefill-shaped step,
+        # or a scheduler that never reaches the decode lane all produce a captured-but-never-replayed
+        # run that benches EXACTLY like eager. This counter (paired with
+        # `Engine.eager_decode_forwards`) is what turns "the legs differ" from an assumption into an
+        # arithmetic fact: captured leg replays>0/eager==0, eager leg replays==0/eager>0. One int add
+        # per decode step, so it is not a debug knob that can be off when the number is taken.
+        self.replays += 1
         # Env-gated per-step host-cost timing (MINISGL_GRAPH_TIMING=1). Diagnostics only: splits the
         # host wall of a captured decode step into copy_from (I/O staging), prepare_for_replay (attn +
         # recurrent metadata rebuild — the eager work NOT in the graph), and the g.replay() launch.
@@ -383,6 +436,9 @@ class GraphRunner:
                 self.cca_capture.prepare_for_replay(batch)
             if self.cam_capture is not None:
                 self.cam_capture.prepare_for_replay(batch)
+            if self.ple_capture is not None:
+                self.ple_capture.prepare_for_replay(batch)
+            self.model.prepare_for_replay(batch)
             t2 = _t.perf_counter()
             g.replay()
             t3 = _t.perf_counter()
@@ -407,6 +463,10 @@ class GraphRunner:
             self.cca_capture.prepare_for_replay(batch)
         if self.cam_capture is not None:
             self.cam_capture.prepare_for_replay(batch)
+        if self.ple_capture is not None:
+            self.ple_capture.prepare_for_replay(batch)
+        # HOST-side model guards that the captured region cannot run (see `self.model` above).
+        self.model.prepare_for_replay(batch)
         g.replay()
         return self.buffer.logits[: batch.size]
 

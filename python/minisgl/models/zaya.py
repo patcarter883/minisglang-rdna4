@@ -39,6 +39,7 @@ from minisgl.layers import (
     ParallelLMHead,
     RMSNorm,
     VocabParallelEmbedding,
+    load_nn_bridge_state,
 )
 from minisgl.layers.norm import _rms_norm
 from minisgl.utils import div_even, init_logger, nvtx_annotate
@@ -573,13 +574,18 @@ class ZayaCCAAttn(BaseOP):
             result[_concat(prefix, _concat("qkv", name))] = tensor
         return result
 
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        self.o_proj.load_state_dict(state_dict, prefix=_concat(prefix, "o_proj"), _internal=True)
-        self.attn.load_state_dict(state_dict, prefix=_concat(prefix, "attn"), _internal=True)
-        qkv_prefix = _concat(prefix, "qkv")
-        sub = {name: state_dict.pop(_concat(qkv_prefix, name)) for name in self._cca.state_dict()}
-        missing, unexpected = self._cca.load_state_dict(sub, strict=True, assign=True)
-        assert not missing and not unexpected, (missing, unexpected)
+    def load_state_dict(
+        self, state_dict, *, prefix: str = "", _internal: bool = False, missing_ok: bool = False
+    ) -> None:
+        self.o_proj.load_state_dict(
+            state_dict, prefix=_concat(prefix, "o_proj"), _internal=True, missing_ok=missing_ok
+        )
+        self.attn.load_state_dict(
+            state_dict, prefix=_concat(prefix, "attn"), _internal=True, missing_ok=missing_ok
+        )
+        load_nn_bridge_state(
+            self._cca, state_dict, _concat(prefix, "qkv"), missing_ok=missing_ok
+        )
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
@@ -671,12 +677,15 @@ class ZayaMoEBlock(BaseOP):
             result[_concat(prefix, _concat("router", name))] = tensor
         return result
 
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        self.experts.load_state_dict(state_dict, prefix=_concat(prefix, "experts"), _internal=True)
-        router_prefix = _concat(prefix, "router")
-        sub = {name: state_dict.pop(_concat(router_prefix, name)) for name in self.router.state_dict()}
-        missing, unexpected = self.router.load_state_dict(sub, strict=True, assign=True)
-        assert not missing and not unexpected, (missing, unexpected)
+    def load_state_dict(
+        self, state_dict, *, prefix: str = "", _internal: bool = False, missing_ok: bool = False
+    ) -> None:
+        self.experts.load_state_dict(
+            state_dict, prefix=_concat(prefix, "experts"), _internal=True, missing_ok=missing_ok
+        )
+        load_nn_bridge_state(
+            self.router, state_dict, _concat(prefix, "router"), missing_ok=missing_ok
+        )
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 

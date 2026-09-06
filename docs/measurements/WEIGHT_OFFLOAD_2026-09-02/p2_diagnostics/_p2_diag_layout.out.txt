@@ -1,0 +1,22 @@
+{"gran": 4096, "total_bytes": 1782579200, "n_runs": 256, "n_chunks_expected": 1026, "row_bytes": {"w13": 1572864, "w13_scales": 49152, "w2": 786432, "w2_scales": 24576}, "offsets": {"w13": 0, "w13_scales": 805306368, "w2": 830472192, "w2_scales": 1233125376}}
+{
+ "chunks_ok": 1,
+ "dev_bytes": 1572864,
+ "host_bytes": 0,
+ "fail": {
+  "call": "hipMemSetAccess",
+  "rc": 1,
+  "chunk_index": 1,
+  "component": "w13",
+  "is_host": true,
+  "expert_start": 1,
+  "count": 5,
+  "size": 7864320,
+  "ptr_hex": "0x7fb283f80000",
+  "ptr_align": 524288,
+  "dev_bytes_so_far": 1572864,
+  "host_bytes_so_far": 0,
+  "chunks_ok": 1
+ }
+}
+{"retry_same_range_rc": 1, "retry_one_gran_rc": 1}

@@ -1,0 +1,27 @@
+{
+ "bdf": "0000:03:00.0",
+ "bytes": 536870912,
+ "sysfs_before": {
+  "mem_info_vram_used": 272089088,
+  "mem_info_gtt_used": 26222592
+ },
+ "memavailable_before_kb": 70491748,
+ "hipMallocManaged_rc": 0,
+ "base": "0x7fe1bde00000",
+ "advise_second_half_rc": 0,
+ "advise_accessed_by_rc": 0,
+ "prefetch_first_half_rc": 0,
+ "prefetch_second_half_cpu_rc": 0,
+ "sysfs_after": {
+  "mem_info_vram_used": 272093184,
+  "mem_info_gtt_used": 26222592
+ },
+ "memavailable_after_kb": 70142512,
+ "vram_delta": 4096,
+ "gtt_delta": 0,
+ "memavail_delta_kb": -349236,
+ "read_gbps_device_half": 28.8,
+ "read_gbps_cpu_advised_half": 28.8,
+ "ratio_device_over_cpu": 1.0,
+ "verdict": "NO MEDIA SEPARATION \u2014 managed+advise does not give a host tier either"
+}

@@ -86,6 +86,19 @@ def resolve_prefix_cache(config: "EngineConfig") -> PrefixCachePlan:
     mc = config.model_config
     cache_type = getattr(config, "cache_type", "radix")
 
+    # A PLE layer (Qwen4-Exp) carries per-sequence recurrent state of its OWN — a 9-column dilated
+    # conv window and a 2-token n-gram history — that the recurrent-radix snapshot store does not
+    # capture: `GDNStateCache.clone_slot` clones the GDN buffers and nothing else. A radix hit would
+    # restore the GDN state at a prefix boundary and leave the PLE state at zero/EOS, which is
+    # exactly the silent-garbage case the snapshot store exists to prevent, one block deeper.
+    # Extending the snapshot to cover PLE is a real feature (it also has to reach the host-side token
+    # history); refusing the snapshot radix is the honest interim and costs only prefix reuse.
+    # Checked BEFORE the GDN arm because qwen4_exp is ALSO a GDN hybrid and would match it.
+    if getattr(mc, "ple_layer_ids", ()):
+        return PrefixCachePlan(
+            "naive", "", "PLE recurrent state is not covered by the recurrent-radix snapshot store"
+        )
+
     # GDN (Qwen3.5/3.6) and CCA (ZAYA) recurrent state is not prefix-cacheable UNLESS it is
     # snapshotted: a plain radix hit would report cached_len>0 with no state behind it (silent
     # garbage). --gdn-radix (default on) opts into the snapshot-capable radix; --no-gdn-radix forces
@@ -146,6 +159,48 @@ class EngineConfig:
     use_pynccl: bool = field(default_factory=lambda: not is_rocm())
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    # --- weight offload (weights/plan.py::resolve_weight_plan) ----------------------------------
+    # These two fields are READ BY NAME by `resolve_weight_plan` through a defensive `getattr`.
+    # Until they existed here that `getattr` fell through to 0.0 on every real serve, and the
+    # resolver reads 0.0 as "the expert tier may occupy ZERO bytes of VRAM" — i.e. an ALL-HOST plan
+    # for every MoE model, including ones that fit the card several times over. A missing field is
+    # not a neutral default here; it is a decision, and it was the wrong one.
+    #
+    # `weight_offload_device_gb`: VRAM PER RANK the MoE expert tier may occupy. 0.0 means "not
+    # configured", and `Engine._weight_offload_device_budget` derives it from the card's TOTAL
+    # memory — a stable, rank-identical hardware constant, never a live `mem_get_info` delta (two
+    # ranks measuring different deltas resolve different plans and stream different layers, with no
+    # error anywhere).
+    # `weight_offload_gb`: an upper CLAMP on the pinned host arena per rank; 0.0 means no clamp. It
+    # is never an on/off switch (plan §6.2) — the placement decision is derived either way.
+    weight_offload_device_gb: float = 0.0
+
+    # `weight_offload_cpu_layers`: how many of the DEEPEST offloadable MoE layers are computed by
+    # host AVX-512 cores instead of being streamed to the card. A THIRD placement tier, not a
+    # variation on the host tier: a CPU layer's weights are read by CPU cores with ordinary loads,
+    # so they need neither VRAM nor PINNED host memory, and nothing about them crosses PCIe except
+    # the ~15 KB of activation and route per layer per token.
+    #
+    # 0 means the tier is off, and that is the default because it is not free: it costs physical
+    # cores (`cpu_tier.CoreBudget` REFUSES an over-budget request rather than clamping), it costs
+    # int8-activation accuracy (8.3e-03 rel_rms, against the 4.1e-02 the GPU's per-token fp8 costs
+    # today), and its core is a GEMV — correct at any batch, economic only at M=1, so a prefill
+    # chunk pays M times the decode cost.
+    #
+    # `resolve_weight_plan` RAISES on a request it cannot honour (no CPU core for the quant format,
+    # EP active, core budget exceeded, nothing to place) instead of downgrading to 0.
+    weight_offload_cpu_layers: int = 0
+    weight_offload_gb: float = 0.0
+    # `weight_offload_stream_layers`: how many of the LAST MoE layers are served by the THIRD tier —
+    # experts re-read from the checkpoint per forward instead of living in VRAM or in the pinned
+    # arena (`weights/stream_tier.py`). 0 = off, and off is right for every model that fits
+    # {device, pinned host}. It exists because the target checkpoint does not: 70.31 GiB of routed
+    # experts against a 15.92 GiB card and ~53 GiB of usable RAM is short by ~15.5 GiB at 48 layers,
+    # and no chunk size, device tier or arena budget closes that. A COUNT and not a byte budget,
+    # because the tier's cost is per LAYER PER FORWARD (a streamed layer reads ~29 MiB per decode
+    # step) and an operator trading throughput for capacity is choosing how many layers to slow
+    # down, not how many bytes to house. NOT CAPTURE-SAFE: requires --cuda-graph-max-bs 0.
+    weight_offload_stream_layers: int = 0
     # --- speculative decoding (off by default; see SPEC_DECODE.md) ------------------------------
     # "none" disables every spec path (byte-for-byte unchanged serve). "ngram" enables the
     # prompt-lookup MVP. These flat fields mirror the argparse dests; spec_config assembles them.

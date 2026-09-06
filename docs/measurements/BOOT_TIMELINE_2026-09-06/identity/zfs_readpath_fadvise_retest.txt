@@ -1,0 +1,8 @@
+mmap walk                     40819.7 MiB/s   dCached   +0.00 GiB   dARC   +0.01 GiB   dAvail   -0.00 GiB
+read() reused buf              5099.3 MiB/s   dCached   +0.00 GiB   dARC   +0.32 GiB   dAvail   -0.33 GiB
+O_DIRECT reused buf            5122.9 MiB/s   dCached   +0.00 GiB   dARC   +0.00 GiB   dAvail   -0.01 GiB
+mmap 4K walk                    621.7 MiB/s   dCached   +0.33 GiB   dARC   +0.34 GiB   dAvail   -0.30 GiB
+  fadvise(DONTNEED) while mapped rc=0  dCached   +0.00 GiB  dARC   -0.11 GiB
+  after munmap                      dCached   +0.00 GiB  dARC   +0.00 GiB
+  fadvise(DONTNEED) after munmap rc=0  dCached   -0.33 GiB  dARC   +0.00 GiB
+box now: Cached 0.98 GiB  ARC 3.76 GiB  Avail 71.19 GiB

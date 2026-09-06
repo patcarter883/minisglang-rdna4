@@ -1,0 +1,16 @@
+=== provenance 2026-09-06T04:18:50+10:00 ===
+before arm REPO=/home/pat/code/minisgl-rdna4-ramperf-base  sha=02957062 (mmap)
+after  arm REPO=/home/pat/code/minisgl-rdna4-ramperf       sha=9bf388db (O_DIRECT, reused buffer)
+9bf388db executable AST == measured 25d61787 for weight.py and ckpt_read.py (docstrings/comments only)
+harness tests/qwen4exp_offload_serve_test.py BYTE-IDENTICAL in both worktrees:
+  sha256 2cdeb317d4226d52dbcca95cef9b435252e0d249dbb066de687129f2116d3da4
+  sha256 2cdeb317d4226d52dbcca95cef9b435252e0d249dbb066de687129f2116d3da4
+ckpt_read call sites in models/weight.py, COMMENT LINES EXCLUDED: ckpt_read.safe_open base=0 new=1;
+  bare ckpt_read base=0 new=2. (A raw grep says base=1 new=3 -- the base hit is a COMMENT naming
+  the module, not a call. The r3 provenance line did not exclude comments.)
+kernels=/home/pat/code/rdna4-hip-kernels-e4m3 sha=38ec157
+  fp8_wmma_C.so sha256 ef05d46a09226f5be73b8b287d5cbedc1190a36a96bb1511e6cf9e3d8d47d31b
+image=minisgl-rdna4:m1b-20260903  args: --tp 2 --layers 48 --device-gb 8.1 --host-gb 28.0 --cuda-graph-max-bs 2
+  --weight-digest --parity-steps 12 --parity-batches 1 --repro-probe 4 --ab-tokens 128 --ab-repeats 5
+  CHUNK_MIB=1372 FLOOR_GIB=4 (both arms), gpu-lease -n 2, one job at a time
+leg order: L48_id_before (probe set v1) ; then sequentially before2 -> after1 -> after2

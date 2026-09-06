@@ -108,7 +108,15 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    # `--strict-markers` is on, so a marker must be DECLARED here or using it is a collection error.
+    # GPU tests are excluded by default (see `-m "not gpu"` below): the two gfx1201 cards are shared
+    # across every repo on this box, so a `pytest` that silently grabs one is a booking violation.
+    # Run them deliberately and SERIALLY, one at a time: `pytest -m gpu tests/...`.
+    "gpu: requires a real GPU. Excluded by default; run serially with `pytest -m gpu`.",
+]
 addopts = [
+    "-m", "not gpu",
     "--strict-markers",
     "--strict-config",
     "--cov=minisgl",

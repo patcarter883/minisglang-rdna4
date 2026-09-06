@@ -126,9 +126,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         *,
         prefix: str = "",
         _internal: bool = False,
+        missing_ok: bool = False,
     ) -> None:
         if not self.tied_embedding:
-            return super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+            return super().load_state_dict(
+                state_dict, prefix=prefix, _internal=_internal, missing_ok=missing_ok
+            )
         else:
             # pop the lm_head.weights and lm_head.bias if they exist
             possible_weight = f"{prefix}.weight"

@@ -1,0 +1,18 @@
+{
+  "tp": 2,
+  "layers": 48,
+  "lens": "4096,16384,32768,65536",
+  "sampler": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "failures": 1,
+  "ranks": [
+    {
+      "rank": -1,
+      "failures": 1,
+      "error": "rank exit codes [-6, -6]"
+    }
+  ]
+}

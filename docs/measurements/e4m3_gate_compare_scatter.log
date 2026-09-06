@@ -1,0 +1,32 @@
+op group                    BIT-EXACT  UNDER-FLOOR  REGRESSION  ABOVE-FLOOR  SHAPE
+moe_g2_gather_reduce                3            6           0            0      0
+moe_scatter                         0            9           0            3      0
+
+21 tensors compared, 0 present in only one build
+
+3 NOT attributable to the same-code floor:
+  ABOVE-FLOOR  moe_scatter/g16/e2True/sk2/T2  cross=2.26498e-06 floor=1.78814e-06
+  ABOVE-FLOOR  moe_scatter/g32/e2False/sk1/T8  cross=8.58307e-06 floor=7.15256e-06
+  ABOVE-FLOOR  moe_scatter/g32/e2False/sk2/T2  cross=5.72205e-06 floor=4.05312e-06
+
+tensors with a NON-ZERO same-code floor (i.e. the gate cannot discriminate on them): 20
+  floor=0.0313517 cross=0  moe_g2_gather_reduce/torch.float16/g16/e2True/T1
+  floor=0.242527 cross=0.242527  moe_g2_gather_reduce/torch.float16/g16/e2True/T2
+  floor=0.0995317 cross=0  moe_g2_gather_reduce/torch.float16/g16/e2True/T4
+  floor=0.506012 cross=0.468211  moe_g2_gather_reduce/torch.float16/g32/e2False/T2
+  floor=0.180173 cross=0.171098  moe_g2_gather_reduce/torch.float16/g32/e2False/T4
+  floor=0.0363197 cross=0.033456  moe_g2_gather_reduce/torch.float16/g32/e2True/T1
+  floor=0.228117 cross=0.220382  moe_g2_gather_reduce/torch.float16/g32/e2True/T2
+  floor=0.0892481 cross=0.0845132  moe_g2_gather_reduce/torch.float16/g32/e2True/T4
+  floor=1.43051e-06 cross=1.3113e-06  moe_scatter/g16/e2True/sk1/T2
+  floor=4.05312e-06 cross=2.38419e-06  moe_scatter/g16/e2True/sk1/T8
+  floor=1.78814e-06 cross=2.26498e-06  moe_scatter/g16/e2True/sk2/T2
+  floor=4.05312e-06 cross=3.57628e-06  moe_scatter/g16/e2True/sk2/T8
+  floor=3.33786e-06 cross=2.38419e-06  moe_scatter/g32/e2False/sk1/T2
+  floor=7.15256e-06 cross=8.58307e-06  moe_scatter/g32/e2False/sk1/T8
+  floor=4.05312e-06 cross=5.72205e-06  moe_scatter/g32/e2False/sk2/T2
+  floor=1.28746e-05 cross=7.86781e-06  moe_scatter/g32/e2False/sk2/T8
+  floor=1.66893e-06 cross=1.3113e-06  moe_scatter/g32/e2True/sk1/T2
+  floor=3.57628e-06 cross=2.86102e-06  moe_scatter/g32/e2True/sk1/T8
+  floor=1.96695e-06 cross=1.90735e-06  moe_scatter/g32/e2True/sk2/T2
+  floor=4.29153e-06 cross=3.33786e-06  moe_scatter/g32/e2True/sk2/T8

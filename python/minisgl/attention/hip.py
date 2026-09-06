@@ -39,6 +39,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Row tile for the QSA sparse path (see HIPAttnBackend.forward_sparse). Bounds attn_decode's
+# split-KV [rows, q_heads, splits, head_dim] fp32 partial workspace on a big prefill chunk.
+_QSA_ATTN_ROW_TILE = int(os.environ.get("MINISGL_QSA_ATTN_ROW_TILE", "256") or 256)
+
+
 class HIPAttnBackend(RDNA4Backend):
     def __init__(self, config: "ModelConfig") -> None:
         super().__init__(config)
@@ -134,6 +139,128 @@ class HIPAttnBackend(RDNA4Backend):
                 scale, 1, 0,  # causal=1, sliding_window=0 (matches the Triton path)
             )
         return out
+
+    # ---- QSA sparse attention -----------------------------------------------------------------
+    def forward_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_id: int,
+        batch: "Batch",
+        sel_slots: torch.Tensor,
+        sel_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attention restricted to a PER-QUERY-ROW set of KV slots. No new kernel.
+
+        THIS IS THE WHOLE SPARSE-ATTENTION HALF, and the reason it is nine lines of dispatch rather
+        than a kernel: sparse attention computes the SAME shape as paged attention and differs only
+        in WHICH rows it visits. `attn_decode.flash_decode_paged` already expresses "visit the rows
+        named by a block table", so a selection is just a different block table — one whose
+        `block_size` is 1 and whose entries are the SELECTED PHYSICAL SLOTS. Per KERNEL_CORE_POLICY
+        that makes selection a caller-side policy on the existing core, not a fork of it: every
+        occupancy/coalescing win in that kernel reaches the sparse path for free, and a sparse bug
+        cannot be a copy of the dense loop that drifted.
+
+        Three consequences worth stating because they are the design, not side effects:
+
+        * BIT-EXACTNESS AT/BELOW THE BUDGET IS STRUCTURAL, not a tolerance. Below `indexer_budget`
+          the selection contains every visible token in ascending order, so `sel_slots[b][j]` names
+          exactly the physical row the dense call's `bt[j/page][j%page]` names, and the kernel's key
+          loop (`j = warp_id; j < ctx_len; j += NWARPS`) visits them in the same order with the same
+          online-softmax accumulation. Same code, same order -> same bits. (The one thing that can
+          break it is the split-KV policy, which is keyed on the block-table ROW WIDTH: dense keys on
+          max_seq_len, sparse on index_width. `MINISGL_ATTN_SPLIT_MIN_CTX` above both forces the
+          single-pass kernel on both sides, which is how the gate pins it.)
+        * THE SPLIT-K LANDMINE IS DISSOLVED, NOT ADDED TO. The known bug class is a kernel policy
+          inferred from a shape that differs between capture and replay. `sel_slots` has a FIXED
+          width (`index_width`, 2051) at every context length, so the sparse path's inferred
+          `max_blocks * block_size` is a compile-time-constant 2051 — the policy cannot change
+          between capture and replay, whatever the sequence length does.
+        * PREFILL AND DECODE ARE THE SAME CALL. Selection is per QUERY ROW, so the sparse form has
+          no notion of "a sequence's page table"; every query row IS its own sequence to this
+          kernel. That is also what the upstream Triton reference does (one program per query row,
+          heads as the M dimension) — it is a decode kernel wearing a prefill name.
+
+        Rows are tiled: attn_decode's split-KV path allocates [rows, q_heads, splits, head_dim] fp32
+        partials, which at a 2048-row prefill would be hundreds of MB.
+        """
+        from minisgl._hip_engage import engaged
+
+        if q.shape[-1] not in _HIP_HEAD_DIMS:
+            self._no_hip_kernel(q.shape[-1])
+        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        kc = self.kvcache.k_cache(layer_id)          # [num_pages, page_size, kv_heads, head_dim]
+        vc = self.kvcache.v_cache(layer_id)
+        n_slots, kvh, hd = kc.shape[0] * kc.shape[1], kc.shape[2], kc.shape[3]
+        # Slot-granular view: page_size 1, so the "block table" is literally a list of KV slots.
+        k_slots = kc.view(n_slots, 1, kvh, hd)
+        v_slots = vc.view(n_slots, 1, kvh, hd)
+        scale = self._softmax_scale(q)
+        rows = q.shape[0]
+        out = self._get_out_buf(q)
+        tile = _QSA_ATTN_ROW_TILE if rows > _QSA_ATTN_ROW_TILE else rows
+        for lo in range(0, rows, tile):
+            hi = min(lo + tile, rows)
+            qs = q[lo:hi].contiguous()
+            bt = sel_slots[lo:hi].contiguous()
+            cl = sel_lens[lo:hi].contiguous()
+            if self.kv_is_fp8:
+                ks, vs = self.kvcache.k_descale[layer_id], self.kvcache.v_descale[layer_id]
+                engaged("qsa.flash_decode_paged_fp8")
+                out[lo:hi] = self._decode_fp8(qs, k_slots, v_slots, bt, cl, scale, ks, vs, 0, 0)
+            else:
+                engaged("qsa.flash_decode_paged")
+                out[lo:hi] = self._decode(qs, k_slots, v_slots, bt, cl, scale, 0, 0)
+        if self._qsa_dense_check:
+            self._qsa_check_vs_dense(q, out[:rows], layer_id, batch, sel_lens, scale)
+        return out[:rows]
+
+    @property
+    def _qsa_dense_check(self) -> bool:
+        v = getattr(self, "_qsa_dc", None)
+        if v is None:
+            v = self._qsa_dc = os.environ.get("MINISGL_QSA_DENSE_CHECK", "0") != "0"
+            self._qsa_dc_worst = 0.0
+            self._qsa_dc_calls = 0
+            self._qsa_dc_bitexact = 0
+        return v
+
+    def _qsa_check_vs_dense(self, q, out, layer_id, batch, sel_lens, scale) -> None:
+        """MINISGL_QSA_DENSE_CHECK=1 — the ≤budget bit-exactness claim, tested IN PLACE.
+
+        End-to-end logits cannot test it: the prefill kernels genuinely differ, so by the first
+        decode step the two legs' KV caches and hidden states have already diverged and any decode
+        comparison is measuring that, not the decode attention. Here the SAME q and the SAME KV
+        cache go through both the sparse call and the ordinary dense paged call, so a difference is
+        the attention and nothing else. Debug only: it doubles the attention work and cannot run
+        inside a captured graph.
+        """
+        md = getattr(batch, "attn_metadata", None)
+        if md is None or getattr(md, "max_seqlen_q", 1) != 1:
+            return  # decode-shaped batches only; a prefill row is not one dense "sequence"
+        if torch.cuda.is_current_stream_capturing():
+            return  # a debug tap with a host sync cannot be recorded into a graph
+        try:
+            ref = self._decode(
+                q.contiguous(), self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id),
+                md.page_table.to(torch.int32), md.cache_seqlens.to(torch.int32), scale, 0, 0,
+            )
+        except Exception as exc:  # a broken check must never take down the run
+            logger.warning_rank0(f"[qsa-dense-check] failed: {exc}")
+            return
+        self._qsa_dc_calls += 1
+        if torch.equal(ref, out):
+            self._qsa_dc_bitexact += 1
+        d = float((ref.float() - out.float()).abs().max().item())
+        self._qsa_dc_worst = max(self._qsa_dc_worst, d)
+        full = int(md.cache_seqlens.max().item())
+        sel = int(sel_lens.max().item())
+        logger.info_rank0(
+            f"[qsa-dense-check] layer={layer_id} sel_max={sel} ctx_max={full} "
+            f"max|d|={d:.3e} bitexact={torch.equal(ref, out)} "
+            f"({self._qsa_dc_bitexact}/{self._qsa_dc_calls} exact, worst {self._qsa_dc_worst:.3e})"
+        )
 
     def _forward_decode(
         self, q: torch.Tensor, layer_id: int, metadata: RDNA4Metadata

@@ -1,0 +1,24 @@
+{
+  "pin_split": true,
+  "eps0": 0.0,
+  "floor_ids_equal": true,
+  "le_budget_prefill_maxabs": 0.015190184116363525,
+  "le_budget_decode_e2e_maxabs": 0.01440131664276123,
+  "le_budget_ids_equal": true,
+  "in_place_dense_check": {
+    "calls": 16,
+    "bitexact": 16,
+    "worst": 0.0
+  },
+  "above_ids": [
+    148819,
+    190638,
+    199850,
+    190508
+  ],
+  "visited": 16229992,
+  "dense": 18054040,
+  "sparsity_ratio": 0.8989673225494128,
+  "f64_rows_checked": 4,
+  "f64_rows_mismatched": 0
+}

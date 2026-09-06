@@ -459,13 +459,78 @@ def moe_route_sigmoid_bias(
     return moe_hip.moe_topk_sigmoid_bias(g, b, top_k, renormalize, routed_scaling_factor)
 
 
+def _check_moe_scale_pair(
+    w: torch.Tensor, scales: torch.Tensor, zeros: "torch.Tensor | None", which: str
+) -> None:
+    """Assert the (scales dtype, zeros slot) PAIR is one of the two the kernel can dispatch.
+
+    THE KERNEL PICKS ITS WScale POLICY OFF THE SCALES DTYPE and nothing else
+    (`moe_kernel.hip::MOE_SCALE_FMT_DISPATCH`; `torch_binding.cpp` gates the same three dtypes). The
+    `w_zeros` pointer slot is then read as AWQ packed zeros under `Fp16GroupScale` and as the
+    per-output-channel f32 global under `E4m3GroupScaleGlobal`. Those are different tensors of
+    different rank in the same argument, so a mismatched pair is not a shape error the op would catch
+    — it is a pointer the kernel dereferences with the wrong stride. Both failure directions are
+    silent and finite:
+
+      * e4m3 scales with AWQ-shaped zeros -> the epilogue reads a packed-nibble word as an f32 global
+        and every output channel is multiplied by a denormal or a huge number;
+      * fp16 scales with an (E, N) global -> `Fp16GroupScale::wz_base` strides by `G*(N/8)`, so the
+        zero-point read runs off the end of a tensor 1/(G/8) its expected size.
+
+    So the pair is checked here, on the ONE call path both formats share, rather than trusted to
+    line up because the container that built them happened to be consistent.
+
+    KERNEL-SIDE STATUS (was a gap; CLOSED in rdna4-hip-kernels @ 38ec157, "the e4m3 bindings
+    rejected the scale they were written for"). `torch_binding.cpp` used to validate the zeros slot
+    as `w_zeros.dim() == 3 && w_zeros.size(2)*8 == N && w_zeros.size(1) == scales.size(1)` on every
+    grouped-MoE entry point, which REJECTED the (E, N) global with a message naming a tensor that was
+    not the one being passed. `check_moe_w_zeros` now picks the predicate off the SCALES DTYPE — the
+    same single fact `MOE_SCALE_FMT_DISPATCH` selects the WScale policy from — on the three launchers
+    that have an e4m3 arm (`mmq_fp8_moe_gemm`, `_gemm1_silu`, `_gemm_scatter`). This check is
+    therefore no longer the thing standing between an NVFP4 checkpoint and a shape error; it is kept
+    because it is the ONE call path both formats share and it still catches a MISMATCHED pair
+    (fp16 scales + (E,N) global) that the binding's fp16 arm would accept as a rank-3 failure only by
+    accident. Verify with a `--build-context kernels=` at or past 38ec157; an older kernels tree
+    still fails at the binding, loudly.
+    """
+    if scales.dtype == torch.float16:
+        if zeros is not None and zeros.dim() != 3:
+            raise AssertionError(
+                f"w4a8_moe {which}: fp16 (folded) scales pair with AWQ packed zeros (E, G, N/8) "
+                f"int32, but got a {zeros.dim()}-D {zeros.dtype} tensor {tuple(zeros.shape)}. A 2-D "
+                f"zeros tensor here is an NVFP4 per-output-channel global handed to the fp16 policy, "
+                f"which would stride it as if it were (E, G, N/8)."
+            )
+        return
+    if scales.dtype not in (torch.float8_e4m3fn, torch.uint8):
+        raise AssertionError(
+            f"w4a8_moe {which}: scales must be fp16 (folded per-group) or float8_e4m3fn/uint8 "
+            f"(NVFP4 block scale); got {scales.dtype}"
+        )
+    E, N = w.shape[0], w.shape[1]
+    if zeros is None:
+        raise AssertionError(
+            f"w4a8_moe {which}: e4m3 block scales REQUIRE the per-output-channel f32 global in the "
+            f"zeros slot — the two-level scale is incomplete without it, and the kernel's "
+            f"`epi(nullptr)` returns 1.0f, i.e. it would serve the block scale alone. That is a "
+            f"~1/global error per weight (4.8e3x on this checkpoint), fluent and finite."
+        )
+    if zeros.dtype != torch.int32 or tuple(zeros.shape) != (E, N):
+        raise AssertionError(
+            f"w4a8_moe {which}: the NVFP4 global must be the (E, N)=({E}, {N}) f32 vector BITCAST to "
+            f"int32 (the `w_zeros` slot is typed `const int*` and the kernel does "
+            f"reinterpret_cast<const float*>); got {zeros.dtype} {tuple(zeros.shape)}. A "
+            f"`.to(torch.int32)` instead of `.view(torch.int32)` truncates every global to 0."
+        )
+
+
 def w4a8_moe(
     x: torch.Tensor,  # (M, K) activations
     w13: torch.Tensor,  # (E, 2*inter, K//8) i32 — gate|up stacked
-    w13_scales: torch.Tensor,  # (E, 2*inter, K//g) f16
-    w13_zeros: torch.Tensor | None,
+    w13_scales: torch.Tensor,  # (E, K//g, 2*inter) GROUP-MAJOR f16 (folded) | f8_e4m3 (NVFP4 block)
+    w13_zeros: torch.Tensor | None,  # AWQ zeros (E,G,N/8) i32 | NVFP4 global (E,N) f32-as-i32 | None
     w2: torch.Tensor,  # (E, K, inter//8) i32
-    w2_scales: torch.Tensor,  # (E, K, inter//g) f16
+    w2_scales: torch.Tensor,  # (E, inter//g, K) GROUP-MAJOR f16 | f8_e4m3
     w2_zeros: torch.Tensor | None,
     gating_output: torch.Tensor | None,  # (M, E); ignored when topk_ids/topk_weights are given
     top_k: int,
@@ -475,7 +540,7 @@ def w4a8_moe(
     topk_ids: torch.Tensor | None = None,  # (M, top_k) i32 — precomputed expert ids
     kernel: str = "wmma",
     block_m: int | None = None,  # None -> derive the WMMA tile height from the workload (_moe_block_m)
-    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4 (OCP E2M1), zeros must be None
+    weight_is_e2m1: bool = False,  # True -> decode w13/w2 nibbles as MXFP4/NVFP4 (OCP E2M1)
     activation: str = "silu",  # gated activation on the gemm1 [gate|up] output: "silu" | "gelu"
     x_fp8: torch.Tensor | None = None,  # PRODUCER-quantized activations — see below
     act_scales: torch.Tensor | None = None,
@@ -483,8 +548,11 @@ def w4a8_moe(
     """Grouped W4A8 MoE forward: topk -> moe_align -> grouped GEMM(w13) -> gated activation
     -> grouped GEMM(w2) -> topk-weighted gather-reduce. Mirrors the proven
     w4a8_fp8_wmma `_run_grouped_moe` (non-GEMV, unfused-silu) path. Returns (M, K).
-    `weight_is_e2m1=True` selects the kernel's MXFP4 (E2M1) weight decode instead of uniform int4
-    (the scales are the E8M0 group exponents folded to fp16; w13_zeros/w2_zeros MUST be None).
+    `weight_is_e2m1=True` selects the kernel's MXFP4/NVFP4 (E2M1) weight decode instead of uniform
+    int4. The SCALE FORMAT is then chosen by the scales DTYPE, not by a flag: fp16 = one folded
+    per-group scale (MXFP4's E8M0 exponents, or NVFP4's legacy fold) and the zeros slot must be
+    empty; float8_e4m3fn = NVFP4's native per-16 block scale, and the zeros slot carries its
+    per-output-channel f32 global bitcast to int32. `_check_moe_scale_pair` enforces the pairing.
     `activation` picks the gated activation: "silu" (default, and the only one with a fused gemm1
     epilogue) or "gelu" == HF `gelu_pytorch_tanh` (Gemma4's routed experts), which forces the
     unfused gemm1 path below.
@@ -535,6 +603,35 @@ def w4a8_moe(
     _gemv_ok = (_grp % 32 == 0) or (_grp % 16 == 0 and _NVFP4_GEMV)
     gemm1_kernel = "gemv" if (M <= _MOE_GEMM1_GEMV_MAX and _gemv_ok) else kernel
     gemm2_kernel = kernel
+    _check_moe_scale_pair(w13, w13_scales, w13_zeros, "w13")
+    _check_moe_scale_pair(w2, w2_scales, w2_zeros, "w2")
+    # WHICH ENTRY POINTS CAN READ A TWO-LEVEL SCALE. `E4m3GroupScaleGlobal` reached the kernel bodies
+    # and the THREE launchers that dispatch on the scale format — `mmq_fp8_moe_gemm`,
+    # `mmq_fp8_moe_gemm1_silu`, `mmq_fp8_moe_gemm_scatter` (moe_kernel.hip's
+    # `MOE_SCALE_FMT_DISPATCH`). The other three grouped launchers are still fp16-only on BOTH sides:
+    # `mmq_fp8_moe_gemm1_silu_flag`, `mmq_fp8_moe_gemm_flag` and `mmq_fp8_moe_gemm2_gather_reduce`
+    # each begin `TORCH_CHECK(scales.scalar_type() == at::kHalf)`.
+    #
+    # The two `_flag` arms were already unreachable for NVFP4 — they gate on group in {32,64,128} and
+    # NVFP4 is group 16 — but that is an ACCIDENT of the group size, not a decision, so it is spelled
+    # out below rather than relied on. `mmq_fp8_moe_gemm2_gather_reduce` was NOT excluded by anything
+    # and it is selected at 3 <= M <= _MOE_GEMM1_GEMV_MAX, i.e. by any short prefill: a 48-layer
+    # NVFP4 boot died there on its first prompt with "scales must be fp16".
+    #
+    # Excluded rather than emulated. The fallback is the unfused `mmq_fp8_moe_gemm` + the weightless
+    # `mmq_fp8_moe_gather_reduce`, which is the bit-exact reference path this file already documents
+    # `MINISGL_MOE_G2FUSE=0` as selecting — so the cost is one extra launch and a (P,K) round-trip at
+    # small-M prefill, and nothing numeric. Lifting it is a KERNEL change (give the remaining three
+    # launchers the same `MOE_SCALE_FMT_DISPATCH` the other three have), not an engine one.
+    #
+    # DERIVED FROM BOTH CONTAINERS, not just w2. `_flag1` gates the w13 (gemm1) launcher, so reading
+    # only `w2_scales` here made w13's format a statement about a tensor w13 has nothing to do with.
+    # On this checkpoint the two always agree (one `convert_nvfp4_moe` produces both), and the group
+    # test on `_flag1` fences NVFP4 a second time, so this has never fired — which is exactly why it
+    # is worth writing down rather than leaving as two accidents stacked. The predicate can only ever
+    # turn a fused/flag arm OFF, so a false positive costs a launch, never a wrong number.
+    _E4M3_SCALE_DTYPES = (torch.float8_e4m3fn, torch.uint8)
+    _two_level = (w13_scales.dtype in _E4M3_SCALE_DTYPES) or (w2_scales.dtype in _E4M3_SCALE_DTYPES)
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:
@@ -600,7 +697,7 @@ def w4a8_moe(
         # PREFILL (block_m in {64,128}): the silu-fused flagship register-tiled gemm1 flag — bit-exact
         # to the tiled gemm1_silu (max|Δ|=0), W4 wins 1.28x @128 / 1.58x @64 (the 53% real-traffic
         # band). Decode/small-M (block_m<64) stays on the tiled/gemv fused path.
-        _flag1 = _MOE_FLAG and block_m in (64, 128) and \
+        _flag1 = _MOE_FLAG and not _two_level and block_m in (64, 128) and \
             (w13.shape[-1] * 8) // w13_scales.shape[1] in (32, 64, 128)  # scales (E, G, N): G=shape[1]
         if _flag1:
             engaged(f"fp8_wmma.mmq_fp8_moe_gemm1_silu_flag{_e2m1}{_pq}")
@@ -661,7 +758,16 @@ def w4a8_moe(
     # contention-free gather_reduce (the (P,K) out2 reuse amortizes better at larger M).
     # NOT bit-exact vs gather_reduce: the atomic reduction order varies, so this is a tolerance-gated
     # path, never a bit-exact one.
-    if M <= 2:
+    #
+    # AND THAT IS WHY `MINISGL_MOE_G2FUSE=0` GATES IT TOO (plan §5.4 A1.0). The knob's stated job is
+    # "revert to the bit-exact WMMA gemm2 + gather_reduce", and it did not cover this branch — so at
+    # bs<=2, which is every decode step of a bs=1 serve, there was NO deterministic reference in the
+    # binary at all: two runs of the same weights on the same input differ, and every weight-offload
+    # numerics gate had to be scored against a measured noise floor with no way to check that the
+    # floor was not hiding a real difference. With the knob off, M<=2 falls through to the
+    # gather_reduce path below (its own `_MOE_G2FUSE` test also fails), which is the bit-exact one.
+    # Default is unchanged: the fused scatter is still ON for every serve.
+    if _MOE_G2FUSE and M <= 2:
         acc = torch.zeros((M, K), dtype=torch.float32, device=dev)
         # split_k is an AXIS on the shared scatter core (workload-derived), not a second kernel and
         # not a second package: same op, same weights, same epilogue, one extra grid dimension.
@@ -683,7 +789,7 @@ def w4a8_moe(
     # gather_reduce launch AND skipping the alignment-padding rows the WMMA gemm2 computes. gemv-math
     # down-proj -> ~1e-4 vs the WMMA path (accumulation order; user-accepted). Prefill (M>threshold) keeps
     # the flag/WMMA gemm2 + gather_reduce below.
-    if _MOE_G2FUSE and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
+    if _MOE_G2FUSE and not _two_level and M <= _MOE_GEMM1_GEMV_MAX and block_m != 128 and _gemv_ok \
             and hasattr(fp8_wmma, "mmq_fp8_moe_gemm2_gather_reduce"):
         # _gemv_ok: the decode gemm2 gather-reduce is gemv-math (now group_size%16, incl. NVFP4 group-16
         # via the unified loader's per-16-K-half scale fold).
@@ -701,7 +807,7 @@ def w4a8_moe(
     ident = torch.arange(P, dtype=torch.int32, device=dev)
     # PREFILL gemm2 (non-scatter): register-tiled flag kernel at block_m==128 + group 128 (bit-exact,
     # ~1.1-1.4x); else the tiled wmma. Group = inter // (inter//group) = (w2 packed inter*8) / scale K-dim.
-    _flag2 = _MOE_FLAG and block_m == 128 and \
+    _flag2 = _MOE_FLAG and not _two_level and block_m == 128 and \
         (w2.shape[-1] * 8) // w2_scales.shape[1] in (32, 64, 128)  # group 32/64/128; scales (E,G,N)
     if _flag2:
         engaged(f"fp8_wmma.mmq_fp8_moe_gemm_flag{_e2m1}")

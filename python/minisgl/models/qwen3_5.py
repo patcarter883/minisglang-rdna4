@@ -37,6 +37,7 @@ from minisgl.layers import (
     RMSNorm,
     RMSNormFused,
     VocabParallelEmbedding,
+    load_nn_bridge_state,
 )
 from minisgl.quant import create_linear_method
 from minisgl.utils import div_even, init_logger, nvtx_annotate
@@ -161,7 +162,10 @@ class Qwen3_5Attn(BaseOP):
         self._num_qo_heads = div_even(nqo, get_tp_info().size)
 
     @nvtx_annotate("MHA_gated")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, selection: object | None = None) -> torch.Tensor:
+        # `selection` (a QSASelection, Qwen4-Exp only) is threaded through rather than handled by a
+        # subclass override, so the dense and sparse forwards are literally the same code above the
+        # attention call — see AttentionLayer.forward.
         n = x.shape[0]
         hd = self._head_dim
         qg = self.q_proj.forward(x).view(n, self._num_qo_heads, 2 * hd)
@@ -170,7 +174,7 @@ class Qwen3_5Attn(BaseOP):
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x)
         # AttentionLayer applies q_norm/k_norm (over head_dim) then partial rotary, then attn.
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        o = self.attn.forward(torch.cat([q, k, v], dim=-1), selection)
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 
@@ -255,10 +259,10 @@ class GDNLinearAttn(BaseOP):
             result[_concat(prefix, name)] = tensor
         return result
 
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
-        sub = {name: state_dict.pop(_concat(prefix, name)) for name in self._gdn.state_dict()}
-        missing, unexpected = self._gdn.load_state_dict(sub, strict=True, assign=True)
-        assert not missing and not unexpected, (missing, unexpected)
+    def load_state_dict(
+        self, state_dict, *, prefix: str = "", _internal: bool = False, missing_ok: bool = False
+    ) -> None:
+        load_nn_bridge_state(self._gdn, state_dict, prefix, missing_ok=missing_ok)
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 

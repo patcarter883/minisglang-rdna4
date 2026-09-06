@@ -1,0 +1,645 @@
+{
+  "tp": 2,
+  "layers": 48,
+  "lens": "4096,16384,32768,65536,131072",
+  "sampler": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "failures": 4,
+  "ranks": [
+    {
+      "rank": 0,
+      "tp": 2,
+      "layers": 48,
+      "boot_seconds": 300.1,
+      "card": "AMD Radeon RX 9070 XT",
+      "device_index": 0,
+      "kv_pages": 6569,
+      "page_size": 16,
+      "kv_pool_tokens": 105104,
+      "engine_max_seq_len": 105104,
+      "checkpoint_max_position": 262144,
+      "kv_layers": 12,
+      "kv_bytes_per_token_per_rank": 12288,
+      "kv_pool_bytes_per_rank": 1291517952,
+      "qsa_active": true,
+      "qsa_profile": {
+        "budget": 2048,
+        "compress_ratio": 4,
+        "block_topk": 512,
+        "index_width": 2051,
+        "head_dim": 128
+      },
+      "qsa_cache": "QSAIndexCache(layers=12, req_rows=3, ratio=4, head_dim=128, comp_slots=26280, MiB=77.0)",
+      "qsa_cache_bytes": 80772144,
+      "ladder": [
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            4087
+          ],
+          "wall_seconds": 70.598,
+          "ok": true,
+          "prefill_steps": 4,
+          "prefill_seconds": 67.084,
+          "prefill_tok_per_s": 60.9,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 60.8,
+          "decode_tok_per_s_median": 16.45,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.524,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 76235256,
+          "dense": 102069000,
+          "sparsity_visited_over_dense": 0.746899
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            16382
+          ],
+          "wall_seconds": 167.771,
+          "ok": true,
+          "prefill_steps": 16,
+          "prefill_seconds": 161.653,
+          "prefill_tok_per_s": 101.3,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.18,
+          "decode_tok_per_s_median": 16.35,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.221,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 378618504,
+          "dense": 1617599880,
+          "sparsity_visited_over_dense": 0.234062
+        },
+        {
+          "target_tokens": 32768,
+          "actual_tokens": 32761,
+          "filler_sentences": 1572,
+          "chat_templated": true,
+          "early_needle_line": 31,
+          "late_needle_line": 1414,
+          "early_needle_depth_frac": 0.0197,
+          "late_needle_depth_frac": 0.8995,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            32761
+          ],
+          "wall_seconds": 425.449,
+          "ok": true,
+          "prefill_steps": 32,
+          "prefill_seconds": 416.011,
+          "prefill_tok_per_s": 78.8,
+          "decode_steps": 32,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.59,
+          "decode_tok_per_s_median": 16.24,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor is Dr. Imogen Halloway.",
+          "gen_tokens": 32,
+          "wall_tok_per_s": 0.075,
+          "degeneration": {
+            "chars": 97,
+            "words": 15,
+            "distinct_word_ratio": 0.8667,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 32
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 781320636,
+          "dense": 6452481852,
+          "sparsity_visited_over_dense": 0.121088
+        },
+        {
+          "target_tokens": 65536,
+          "actual_tokens": 65530,
+          "filler_sentences": 3096,
+          "chat_templated": true,
+          "early_needle_line": 61,
+          "late_needle_line": 2786,
+          "early_needle_depth_frac": 0.0197,
+          "late_needle_depth_frac": 0.8999,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            65530
+          ],
+          "wall_seconds": 535.57,
+          "ok": true,
+          "prefill_steps": 64,
+          "prefill_seconds": 519.601,
+          "prefill_tok_per_s": 126.1,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.94,
+          "decode_tok_per_s_median": 16.14,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.069,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 1587364416,
+          "dense": 25794582336,
+          "sparsity_visited_over_dense": 0.061539
+        },
+        {
+          "target_tokens": 131072,
+          "actual_tokens": 131056,
+          "filler_sentences": 6144,
+          "chat_templated": true,
+          "early_needle_line": 122,
+          "late_needle_line": 5529,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8999,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            131056
+          ],
+          "wall_seconds": 0.015,
+          "ok": false,
+          "prefill_steps": 0,
+          "prefill_seconds": 0,
+          "prefill_tok_per_s": null,
+          "decode_steps": 0,
+          "decode_phases": [],
+          "text": "!",
+          "gen_tokens": 1,
+          "wall_tok_per_s": 66.667,
+          "degeneration": {
+            "chars": 1,
+            "words": 0,
+            "distinct_word_ratio": 0.0,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 1,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 1
+          },
+          "retrieved_early_needle": false,
+          "retrieved_late_needle": false,
+          "visited": 0,
+          "dense": 0,
+          "sparsity_visited_over_dense": null,
+          "error_type": "Rejected",
+          "error": "input sequence length 131056 exceeds the servable maximum 105104 (KV pool); request rejected  [relabelled post hoc \u2014 see post_hoc_correction]"
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 0,
+          "batch_width": 2,
+          "batch_actual_tokens": [
+            16382,
+            16358
+          ],
+          "ok": false,
+          "error_type": "ValueError",
+          "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+          "terminal": false,
+          "leg": "concurrency"
+        }
+      ],
+      "concurrency": {
+        "target_tokens": 16384,
+        "actual_tokens": 16382,
+        "filler_sentences": 801,
+        "chat_templated": true,
+        "early_needle_line": 16,
+        "late_needle_line": 720,
+        "early_needle_depth_frac": 0.02,
+        "late_needle_depth_frac": 0.8989,
+        "rank": 0,
+        "batch_width": 2,
+        "batch_actual_tokens": [
+          16382,
+          16358
+        ],
+        "ok": false,
+        "error_type": "ValueError",
+        "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+        "terminal": false,
+        "leg": "concurrency"
+      },
+      "max_context_served_tokens": 65530,
+      "first_refusal": {
+        "target": 16384,
+        "error_type": "ValueError",
+        "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk."
+      },
+      "retrieval": {
+        "4087": {
+          "early": true,
+          "late": true
+        },
+        "16382": {
+          "early": true,
+          "late": true
+        },
+        "32761": {
+          "early": true,
+          "late": true
+        },
+        "65530": {
+          "early": true,
+          "late": true
+        },
+        "131056": {
+          "early": false,
+          "late": false
+        }
+      },
+      "failures": 2
+    },
+    {
+      "rank": 1,
+      "tp": 2,
+      "layers": 48,
+      "boot_seconds": 300.1,
+      "card": "AMD Radeon RX 9070",
+      "device_index": 1,
+      "kv_pages": 6569,
+      "page_size": 16,
+      "kv_pool_tokens": 105104,
+      "engine_max_seq_len": 105104,
+      "checkpoint_max_position": 262144,
+      "kv_layers": 12,
+      "kv_bytes_per_token_per_rank": 12288,
+      "kv_pool_bytes_per_rank": 1291517952,
+      "qsa_active": true,
+      "qsa_profile": {
+        "budget": 2048,
+        "compress_ratio": 4,
+        "block_topk": 512,
+        "index_width": 2051,
+        "head_dim": 128
+      },
+      "qsa_cache": "QSAIndexCache(layers=12, req_rows=3, ratio=4, head_dim=128, comp_slots=26280, MiB=77.0)",
+      "qsa_cache_bytes": 80772144,
+      "ladder": [
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 1,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            4087
+          ],
+          "wall_seconds": 70.595,
+          "ok": true,
+          "prefill_steps": 4,
+          "prefill_seconds": 67.086,
+          "prefill_tok_per_s": 60.9,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 60.86,
+          "decode_tok_per_s_median": 16.43,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.524,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 76235256,
+          "dense": 102069000,
+          "sparsity_visited_over_dense": 0.746899
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 1,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            16382
+          ],
+          "wall_seconds": 167.792,
+          "ok": true,
+          "prefill_steps": 16,
+          "prefill_seconds": 161.67,
+          "prefill_tok_per_s": 101.3,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.24,
+          "decode_tok_per_s_median": 16.33,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.221,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 378618504,
+          "dense": 1617599880,
+          "sparsity_visited_over_dense": 0.234062
+        },
+        {
+          "target_tokens": 32768,
+          "actual_tokens": 32761,
+          "filler_sentences": 1572,
+          "chat_templated": true,
+          "early_needle_line": 31,
+          "late_needle_line": 1414,
+          "early_needle_depth_frac": 0.0197,
+          "late_needle_depth_frac": 0.8995,
+          "rank": 1,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            32761
+          ],
+          "wall_seconds": 425.418,
+          "ok": true,
+          "prefill_steps": 32,
+          "prefill_seconds": 415.994,
+          "prefill_tok_per_s": 78.8,
+          "decode_steps": 32,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.63,
+          "decode_tok_per_s_median": 16.23,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor is Dr. Imogen Halloway.",
+          "gen_tokens": 32,
+          "wall_tok_per_s": 0.075,
+          "degeneration": {
+            "chars": 97,
+            "words": 15,
+            "distinct_word_ratio": 0.8667,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 32
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 781320636,
+          "dense": 6452481852,
+          "sparsity_visited_over_dense": 0.121088
+        },
+        {
+          "target_tokens": 65536,
+          "actual_tokens": 65530,
+          "filler_sentences": 3096,
+          "chat_templated": true,
+          "early_needle_line": 61,
+          "late_needle_line": 2786,
+          "early_needle_depth_frac": 0.0197,
+          "late_needle_depth_frac": 0.8999,
+          "rank": 1,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            65530
+          ],
+          "wall_seconds": 535.591,
+          "ok": true,
+          "prefill_steps": 64,
+          "prefill_seconds": 519.643,
+          "prefill_tok_per_s": 126.1,
+          "decode_steps": 37,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 61.98,
+          "decode_tok_per_s_median": 16.13,
+          "text": "The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.",
+          "gen_tokens": 37,
+          "wall_tok_per_s": 0.069,
+          "degeneration": {
+            "chars": 125,
+            "words": 20,
+            "distinct_word_ratio": 0.85,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 37
+          },
+          "retrieved_early_needle": true,
+          "retrieved_late_needle": true,
+          "visited": 1587364416,
+          "dense": 25794582336,
+          "sparsity_visited_over_dense": 0.061539
+        },
+        {
+          "target_tokens": 131072,
+          "actual_tokens": 131056,
+          "filler_sentences": 6144,
+          "chat_templated": true,
+          "early_needle_line": 122,
+          "late_needle_line": 5529,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8999,
+          "rank": 1,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            131056
+          ],
+          "wall_seconds": 0.009,
+          "ok": false,
+          "prefill_steps": 0,
+          "prefill_seconds": 0,
+          "prefill_tok_per_s": null,
+          "decode_steps": 0,
+          "decode_phases": [],
+          "text": "!",
+          "gen_tokens": 1,
+          "wall_tok_per_s": 111.111,
+          "degeneration": {
+            "chars": 1,
+            "words": 0,
+            "distinct_word_ratio": 0.0,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 1,
+            "non_ascii_char_frac": 0.0,
+            "tokens": 1
+          },
+          "retrieved_early_needle": false,
+          "retrieved_late_needle": false,
+          "visited": 0,
+          "dense": 0,
+          "sparsity_visited_over_dense": null,
+          "error_type": "Rejected",
+          "error": "input sequence length 131056 exceeds the servable maximum 105104 (KV pool); request rejected  [relabelled post hoc \u2014 see post_hoc_correction]"
+        },
+        {
+          "target_tokens": 16384,
+          "actual_tokens": 16382,
+          "filler_sentences": 801,
+          "chat_templated": true,
+          "early_needle_line": 16,
+          "late_needle_line": 720,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.8989,
+          "rank": 1,
+          "batch_width": 2,
+          "batch_actual_tokens": [
+            16382,
+            16358
+          ],
+          "ok": false,
+          "error_type": "ValueError",
+          "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+          "terminal": false,
+          "leg": "concurrency"
+        }
+      ],
+      "concurrency": {
+        "target_tokens": 16384,
+        "actual_tokens": 16382,
+        "filler_sentences": 801,
+        "chat_templated": true,
+        "early_needle_line": 16,
+        "late_needle_line": 720,
+        "early_needle_depth_frac": 0.02,
+        "late_needle_depth_frac": 0.8989,
+        "rank": 1,
+        "batch_width": 2,
+        "batch_actual_tokens": [
+          16382,
+          16358
+        ],
+        "ok": false,
+        "error_type": "ValueError",
+        "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+        "terminal": false,
+        "leg": "concurrency"
+      },
+      "max_context_served_tokens": 65530,
+      "first_refusal": {
+        "target": 16384,
+        "error_type": "ValueError",
+        "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk."
+      },
+      "retrieval": {
+        "4087": {
+          "early": true,
+          "late": true
+        },
+        "16382": {
+          "early": true,
+          "late": true
+        },
+        "32761": {
+          "early": true,
+          "late": true
+        },
+        "65530": {
+          "early": true,
+          "late": true
+        },
+        "131056": {
+          "early": false,
+          "late": false
+        }
+      },
+      "failures": 2
+    }
+  ],
+  "max_context_served_tokens": 65530,
+  "engine_max_seq_len": 105104,
+  "first_refusal": {
+    "target": 16384,
+    "error_type": "ValueError",
+    "error": "QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk."
+  },
+  "post_hoc_correction": "The 131,056-token row was recorded ok=True with 1 token and text '!'. That was a SCHEDULER REJECTION (input > max_seq_len 105,104) which the offline LLM path silently turned into a one-token completion \u2014 the defect documented in QSA_INDEXER.md 4b and fixed in minisgl/llm/llm.py AFTER this run. The row is relabelled here as the refusal it was; no measured quantity in this file is altered."
+}

@@ -1,0 +1,28 @@
+image=minisgl-rdna4:lean id=sha256:9748d5f9ec1da5f959b0254e9b93c99bfdf35ffe9ecb47e19cbd2d09c0b02a67
+worktree=/home/pat/code/minisgl-rdna4-offload git=8bcc7035d10937f0720cb3148f2acb473ab24fa2 dirty_files=3
+2026-09-03T03:05:24+10:00
+WARNING: AMD GPU device(s) is/are in a low-power state. Check power control/runtime_status
+
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 4
+GPU[1]		: GPU use (%): 3
+GPU[2]		: GPU use (%): 0
+==========================================================================================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 17095983104
+GPU[0]		: VRAM Total Used Memory (B): 59924480
+GPU[1]		: VRAM Total Memory (B): 17095983104
+GPU[1]		: VRAM Total Used Memory (B): 59924480
+GPU[2]		: VRAM Total Memory (B): 2147483648
+GPU[2]		: VRAM Total Used Memory (B): 1134141440
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+               total        used        free      shared  buff/cache   available
+Mem:              91          19          68           0           4          71
+Swap:             53          19          34
+pswpin 201510497
+pswpout 407142868
+pgmajfault 4079771582

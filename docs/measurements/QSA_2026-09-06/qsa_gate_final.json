@@ -1,0 +1,30 @@
+{
+  "pin_split": true,
+  "eps0": 0.0,
+  "eps_prefill_kernel_swap": 0.0,
+  "eps_kernel_ids_equal": true,
+  "floor_ids_equal": true,
+  "le_budget_prefill_maxabs": 0.014197826385498047,
+  "le_budget_decode_e2e_maxabs": 0.016091734170913696,
+  "le_budget_ids_equal": true,
+  "in_place_dense_check": {
+    "calls": 16,
+    "bitexact": 16,
+    "worst": 0.0
+  },
+  "le_budget_prefill_rel": 0.005993885934387935,
+  "le_budget_logit_scale": 2.368718147277832,
+  "f64_rel_dense_prefill": 0.0020321983494609908,
+  "f64_rel_sparse_prefill": 0.001651480415268622,
+  "above_ids": [
+    175778,
+    175778,
+    175778,
+    175778
+  ],
+  "visited": 49021992,
+  "dense": 98126040,
+  "sparsity_ratio": 0.49958188468626674,
+  "f64_rows_checked": 4,
+  "f64_rows_mismatched": 0
+}

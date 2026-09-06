@@ -1,0 +1,14 @@
+PER-RANK, and this is the whole result: the two ranks do the SAME work on links that differ 2x
+region                   rank0 card0 Gen5x8   rank1 card1 Gen4x8
+moe.routed.host                      24.645               37.603
+moe.all_reduce                       14.758                1.761
+moe.routed.dev                        1.831                1.852
+mixer.gdn                             5.755                5.783
+hc.mix                                6.253                6.039
+MODEL_TOTAL                          64.554               64.549
+rank0: host-expert 24.645 ms for 502.3 MB = 20.38 GB/s (70% of its 28.93 GB/s link) ; all_reduce 14.758 ; SUM 39.403
+rank1: host-expert 37.603 ms for 502.3 MB = 13.36 GB/s (92% of its 14.48 GB/s link) ; all_reduce 1.761 ; SUM 39.364
+
+The two SUMs agree to 0.1%: rank 0's 'all-reduce' line is not collective cost, it is rank 0
+standing still while rank 1's slower link finishes the identical read. A synthetic all-reduce
+at the same [1,2560] shape with both ranks in lockstep costs 0.0118 ms/call x 48 = 0.57 ms/step.

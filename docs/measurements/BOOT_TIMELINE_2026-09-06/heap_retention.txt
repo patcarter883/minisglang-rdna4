@@ -1,0 +1,5 @@
+mode=default  N=222252  RSS before 744.1 MiB
+mode=default  RSS after  744.9 MiB   VmHWM 744.9 MiB   RETAINED 0.8 MiB
+mallopt(M_MMAP_THRESHOLD, 128K)=1  mallopt(M_TRIM_THRESHOLD, 128K)=1
+mode=mallopt  N=222252  RSS before 744.2 MiB
+mode=mallopt  RSS after  744.9 MiB   VmHWM 744.9 MiB   RETAINED 0.7 MiB

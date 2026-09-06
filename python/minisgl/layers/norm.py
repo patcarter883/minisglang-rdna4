@@ -166,3 +166,101 @@ class RMSNormFused(BaseOP):
             out, res = self.forward(x, residual)
             return out, res, None, None
         return r[0], residual, r[1], r[2]
+
+
+class GroupedRMSNorm(BaseOP):
+    """`groups` independent RMSNorms packed into one `hidden_size` vector, with the Gemma `(1 + w)`
+    gain.
+
+    Qwen3.8-Flash-Next (`qwen4_exp`) carries a `hc_count * hidden_size` residual stream, and every
+    norm that touches that WIDE vector normalizes each of the `hc_count` branches on its own:
+    the hyper-connections' `hc_norm` and the PLE block's `norm_key`/`norm_query`/`norm_conv`. One
+    class serves all four — the width and the group size are the only things that differ.
+
+    Transcribed from the reference implementations rather than a paraphrase of them; both agree:
+      * `transformers/models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextRMSNorm` with `group_size`
+      * `sglang/srt/layers/hyperconnection.py::GroupedGemmaRMSNorm` with `group_size`
+
+        x   = x.reshape(*x.shape[:-1], -1, group_size)
+        out = x * rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)      # fp32 internally
+        return (out.flatten(-2) * (1.0 + weight)).type_as(x)
+
+    The variance is per group of `group_size` channels, NOT over the full width. A full-width
+    `RMSNorm` here is a different function that produces plausible garbage, which is why the reshape
+    is explicit and the divisibility is checked in `__init__`.
+
+    Reuses the shared `_rms_norm` core with a NULL gain (`weight=None` — the same entry point
+    `RMSNormNoScale` uses) on the reshaped view, then applies the `(1 + w)` gain on the flat view.
+    The gain is per channel of the WIDE vector, so it cannot be handed to a kernel whose gain has
+    the group's width; a `group_size` policy on the tail_hip rms_norm core would fold it in and drop
+    the second pass — a policy on the existing core, never a forked kernel. The only numeric
+    difference from the references is that the shared core rounds the normalized value back to
+    `x.dtype` before the gain, one rounding earlier than their fp32-until-the-end.
+    """
+
+    def __init__(self, hidden_size: int, group_size: int, eps: float) -> None:
+        if hidden_size % group_size:
+            raise ValueError(
+                f"GroupedRMSNorm hidden_size {hidden_size} not divisible by group_size {group_size}"
+            )
+        self.weight = torch.empty(hidden_size)
+        self._group_size = group_size
+        self._groups = hidden_size // group_size
+        self._eps = eps
+        # `(1 + weight)` is a CONSTANT of the loaded checkpoint, and it was being recomputed on every
+        # forward: one extra `add` launch per call on a 10240-wide vector. At 97 hyper-connection
+        # blocks + 3 PLE norms per decode step that is ~100 kernels/step doing nothing but adding 1.0
+        # to the same numbers (MEASURED at 0.29 ms/step of the hyper-connections' 7.53 ms captured
+        # cost — `docs/measurements/HC_FUSION_2026-09-05/`). Cached here rather than in `post_load`
+        # so a layer built and driven WITHOUT a load (every unit test, the parity test) takes the
+        # same path the serve does, and so a re-load cannot leave a stale gain behind.
+        self._gain: torch.Tensor | None = None
+        self._gain_src: torch.Tensor | None = None
+        self._gain_key: tuple | None = None
+
+    def _gain_vec(self, capturing: bool) -> torch.Tensor:
+        """`1 + weight`, memoized against the identity AND the version of `self.weight`.
+
+        Invalidation is the whole point: `BaseOP.load_state_dict` REBINDS `weight` (`setattr`), a
+        `copy_` mutates it in place, and the offload machinery may move it — so the key is
+        (data_ptr, _version, dtype, device) and a strong reference to the weight tensor is held
+        alongside, which is what makes the data_ptr unambiguous (the storage cannot be freed and
+        handed to a different tensor while we are caching it).
+
+        `capturing`: never memoize a tensor allocated inside a graph capture — it lives in the
+        graph's private pool and is only valid during replay. Recomputing it there is correct and
+        costs the one launch the cache exists to remove, which capture is going to record anyway.
+
+        `_version` IS NOT ALWAYS READABLE, and that is not a corner case — it is the serve path.
+        Every forward in this engine runs under `torch.inference_mode()` (`Engine.forward_batch`, and
+        `@torch.inference_mode()` on the offload harness's `rank_main`), where the weights are
+        INFERENCE TENSORS and `t._version` raises `RuntimeError: Inference tensors do not track
+        version counter`. The memo therefore crashed on the FIRST decode of a real boot. Nothing
+        caught it before the merge because nothing that exercised this code ran in inference mode:
+        `tests/qwen4exp_hc_parity_test.py` uses `torch.no_grad()` and the two HC A/B drivers
+        (`tools/offload/hc_fusion_ab.py`, `hc_capture_prize.py`) use neither.
+
+        Dropping the version term there is sound, not merely necessary. The counter exists to catch
+        an in-place `copy_` into a weight that keeps its storage, and every such write in this engine
+        — `load_state_dict`, `post_load`, the arena bake — happens at BOOT, outside inference mode
+        and before any forward. The offload bake additionally REBINDS the attribute, which moves
+        `data_ptr()` and invalidates the key on its own, and `moe_interpose.freeze()` makes a rebind
+        after that an error rather than a silent staleness."""
+        w = self.weight
+        try:
+            ver = w._version
+        except RuntimeError:
+            ver = None  # inference tensor — see above
+        key = (w.data_ptr(), ver, w.dtype, w.device, tuple(w.shape))
+        if self._gain is not None and self._gain_key == key:
+            return self._gain
+        gain = w + 1.0
+        if not capturing:
+            self._gain, self._gain_src, self._gain_key = gain, w, key
+        return gain
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        grouped = x.reshape(*x.shape[:-1], self._groups, self._group_size)
+        normed = _rms_norm(grouped, None, self._eps).flatten(-2)
+        capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+        return normed * self._gain_vec(capturing)

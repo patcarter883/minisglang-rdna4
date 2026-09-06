@@ -12,9 +12,9 @@ from minisgl.core import Batch, Context, Req, SamplingParams, set_global_ctx
 from minisgl.distributed import (
     EPCommunicator,
     destroy_distributed,
-    enable_pynccl_distributed,
     enable_custom_ar_distributed,
     enable_custom_ar_ep,
+    enable_pynccl_distributed,
     set_dp_info,
     set_tp_info,
 )
@@ -23,7 +23,7 @@ from minisgl.kvcache.cca_state import CCAStateCache
 from minisgl.kvcache.gdn_state import GDNStateCache
 from minisgl.kvcache.host_arena import PinnedFrameArena, host_tier_enabled, stage_ring_depth
 from minisgl.layers import set_rope_device
-from minisgl.models import ModelConfig, create_model, load_weight
+from minisgl.models import ModelConfig, cast_checkpoint_tensor, create_model, load_weight
 from minisgl.moe import create_moe_backend
 from minisgl.utils import (
     div_even,
@@ -33,6 +33,8 @@ from minisgl.utils import (
     is_sm100_supported,
     torch_dtype,
 )
+from minisgl.weights.accounting import corrected_model_memory
+from minisgl.weights.bake import StageASession
 
 from .config import EngineConfig, resolve_prefix_cache, snapshot_ladder_depth
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -61,6 +63,22 @@ _GRAPH_ROUNDUP = 1.1
 # capture, i.e. ~2.2 MiB per canvas token. This is an OBSERVATION with headroom, not a derivation,
 # and it is named that way so nobody mistakes it for a model of the allocator.
 _CANVAS_GRAPH_BYTES_PER_TOKEN = int(2.5 * (1 << 20))
+
+
+def _ple_stage_tokens(config: EngineConfig) -> int:
+    """Tokens the Qwen4-Exp PLE staging buffer must hold — the largest single forward.
+
+    Two batch shapes, and it is the MAX of both, not the prefill one: an extend batch is bounded by
+    the chunked-prefill budget (`SchedulerConfig.max_extend_tokens`), but a DECODE batch carries one
+    token per running sequence and those are configured independently. `--max-extend-tokens 8` with
+    `--max-running-requests 256` is a legal (and, for a 16 GB card, sensible) combination that sizes
+    the buffer at 8 and then hands it a 256-token decode step. `PLEEmbeddingSource.stage_rows` does
+    raise on that rather than corrupt anything — but it raises on the first busy decode step of a
+    serve that booted fine, which is the wrong place to find out.
+
+    The allocation and the KV-pool reservation both call this, so they cannot disagree.
+    """
+    return max(config.max_forward_len, config.max_running_req + 2)
 
 
 def _swa_kv_geometry(mc: ModelConfig) -> Tuple[int, int]:
@@ -209,14 +227,74 @@ class Engine:
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
-        self.tp_cpu_group = self._init_communication(config)
+        # BOOT ATTRIBUTION (`weights/boot_timeline.py`). Every `with _bt.phase(...)` below is two
+        # `perf_counter()` calls plus four small reads, against phases measured in seconds — so it
+        # runs unconditionally rather than behind a flag. Boot on this model takes 519-871 s and,
+        # before this, only the Stage-B slice of it had ever been timed; the other 352-593 s was dark.
+        from minisgl.weights import boot_timeline as _bt
+
+        with _bt.phase("init_communication"):
+            self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(config.model_config)
+        with _bt.phase("model_construct_meta"):
+            with torch.device("meta"), torch_dtype(config.dtype):
+                self.model = create_model(config.model_config)
+        # Weight offload, step 1 of 4: resolve the plan from the META-BUILT model — after the build
+        # (which allocates ZERO bytes on the card) and before anything is loaded, so an unsatisfiable
+        # plan is still a config error in seconds rather than a 90-second OOM. Inert, at zero device
+        # cost, whenever the model fits, which is why it runs unconditionally instead of behind a
+        # flag — see weights/bake.py for the whole window.
+        #
+        # RESOLVING OFF THE MODEL, NOT OFF config, IS THE GENERALITY REQUIREMENT. Given a model
+        # object `resolve_weight_plan` reads the layer set, this rank's EP/TP sharding and the
+        # per-expert byte count off objects that already exist (one format-agnostic granule walker),
+        # so a new model family or quant format implements NOTHING. Given only config it TRANSCRIBES
+        # seven builder files and nine container `__init__`s, and that transcription is already
+        # wrong here: `models/utils.py`'s `MoEMLP` builds its `MoELayer` with no `quant=` at all, so
+        # its experts are bf16 whatever `config.quant` says — the config path sizes them int4 and
+        # under-reserves the arena ~4x, in the direction that makes an infeasible plan look feasible.
+        # The THIRD tier, built BEFORE the plan is resolved because the plan must not see the layers
+        # it takes. Returns (None, ()) unless --weight-offload-stream-layers asked for it.
+        with _bt.phase("weight_stream_tier_build"):
+            self._woff_stream, stream_layers = self._build_weight_stream_tier(config)
+        _bt_plan = _bt.phase("weight_plan_resolve")
+        _bt_plan.__enter__()
+        self._woff = StageASession.begin(
+            config,
+            probe=self._woff_mem_probe,
+            log=logger.info_rank0,
+            model=self.model,
+            stream=self._woff_stream,
+            stream_layers=stream_layers,
+            # EXPLICIT, never omitted: `resolve_weight_plan` reads an absent/zero device budget as
+            # "the expert tier may occupy zero VRAM", i.e. an all-host plan for every MoE model.
+            device_budget_bytes=self._weight_offload_device_budget(config),
+            # DERIVED, or CHOSEN? The resolver cannot tell the two apart and they do not mean the
+            # same thing. With no --weight-offload-device-gb the budget above falls back to
+            # `total_memory * memory_ratio` — the WHOLE KV budget — and the device tier is billed
+            # inside `model` in _determine_num_pages (by design: the plan forbids a sixth
+            # subtrahend). So a non-empty plan under a derived budget makes `available_memory`
+            # negative before state/draft/graph/snap are even counted, and `assert num_pages > 1`
+            # cannot not fire. Saying which it was lets that verdict be reached from integers here,
+            # instead of after the arena has pinned tens of GiB of unevictable host RAM and the whole
+            # checkpoint has been read and repacked.
+            budget_is_derived=config.weight_offload_device_gb <= 0,
+            # PROVE the plan is rank-identical rather than arguing that it is. It is pure only if
+            # every input is, and `device_budget_bytes` is an input the resolver cannot vet: a budget
+            # derived from a live per-rank free-memory reading differs by tens of MiB between the two
+            # rank processes, which is enough to move one layer across the greedy fill boundary. From
+            # there the ranks hold different device tiers, `_determine_num_pages` bills a different
+            # `model_memory` (the offload correction is per-rank and `num_pages` is NOT cross-rank
+            # reduced), and the two KV pools come out different sizes with no error anywhere. One
+            # tiny gloo all_gather_object at boot, over the TP CPU group built at :213.
+            agreement_group=self.tp_cpu_group,
+        )
+        _bt_plan.__exit__()
+
         def _mem_probe(tag: str) -> None:
             """Localize where DEVICE memory goes that torch does not account for. `used` is the true
             device-wide draw (what the KV sizing bills as `model`); `reserved` is everything torch
@@ -236,21 +314,81 @@ class Engine:
             )
 
         _mem_probe("after build (meta)")
-        self.model.load_state_dict(self._load_weight_state_dict(config))
-        _mem_probe("after load_state_dict")
-        self.model.post_load()  # finalize weights (e.g. quantized layout conversion)
+        # Weight offload, step 2 of 4: pin the host arena BEFORE the checkpoint is read. Pinning is
+        # the slow, capacity-bound step (P3b: 4.88 GB/s, and 62 of 68 GiB was the ceiling for two
+        # ranks on an IDLE box), so doing it first turns "this box does not have the RAM" into a
+        # failure in seconds instead of after a full load. It takes ZERO device bytes — asserted at
+        # seal(), never assumed, because Phase 0 caught the driver reporting host memory that was
+        # actually VRAM.
+        with _bt.phase("arena_pin_attach"):
+            self._woff.attach()
+        #: `stage_b.ChunkedLoadLedger` when the load was chunked, None when it was one-shot. Always
+        #: present so "was this serve chunked?" is a readable fact rather than a `hasattr`.
+        self.stage_b_ledger = None
+        # Stage B, when the model family has a chunk enumeration AND there is a host tier to bake
+        # into: read-fill-finalize-PLACE one chunk at a time, so the peak live set is one chunk
+        # instead of one checkpoint. Falls back to the one-shot load for every other model, and for
+        # this one when offload is not configured — the fallback is the shipped path, unchanged.
+        with _bt.phase("weight_load"):
+            if not self._load_weight_chunked(config):
+                with _bt.phase("oneshot_read_and_fill"):
+                    self.model.load_state_dict(self._load_weight_state_dict(config))
+                _mem_probe("after load_state_dict")
+                with _bt.phase("oneshot_post_load"):
+                    self.model.post_load()  # finalize weights (quantized layout conversion)
         _mem_probe("after post_load")
+        # THE ONE DECISION post_load MAKES THAT NO TENSOR RECORDS, checked across the ranks that made
+        # it independently. A compressed-tensors int4 container decides its packed sign convention
+        # from a SAMPLE of its own shard, and no two TP ranks hold the same bytes (plain TP splits
+        # the output rows, EP-over-TP splits the experts). On a mixed-packing checkpoint the ranks
+        # can land on opposite answers, and then half a TP-split GEMM is dequantized in the uint4b8
+        # domain and half in two's-complement — right shapes, no kernel error, fluent wrong text.
+        # The detector cannot catch it alone: its tie-refusal is evaluated per shard, and a mixed
+        # stack is only a tie when you can see all of it, which no rank ever does. One
+        # all_gather_object of a dict of bools on the gloo group the engine already built. Runs
+        # unconditionally so a checkpoint that develops the problem cannot boot quietly; it is a
+        # no-op at TP=1 and on every model with no CT containers (NVFP4/MXFP4/RXF declare none).
+        from minisgl._hip_engage import engaged
+        from minisgl.quant.method import verify_ct_sign_across_ranks
+
+        with _bt.phase("ct_sign_verify"):
+            self.ct_sign_decisions = verify_ct_sign_across_ranks(
+                self.model, self.tp_cpu_group, config.tp_info.size, config.tp_info.rank
+            )
+        if self.ct_sign_decisions:
+            engaged(f"quant.ct_sign_cross_rank[tp{config.tp_info.size}]")
+        # Weight offload, steps 3-4: host-placed containers are copied into the arena and their
+        # device originals dropped STRICTLY between post_load() and _determine_num_pages. That
+        # placement is the whole VRAM-accounting design: everything the bake moves is inside the
+        # `device_used = old_free - new_free` window measured below, so the device tier is billed by
+        # the existing `model_memory` term and the KV budget needs no sixth subtrahend (which, at a
+        # 16 GB tier, would size the pool negative). Device-placed layers are NOT copied — they are
+        # already where they belong, and reallocating them would hold two copies live at once.
+        # seal() closes the mapping window (rule R1); a later mapping would be invisible both to
+        # this sizing and to Scheduler._prefill_budget_now.
+        with _bt.phase("weight_offload_bind_seal"):
+            self._woff.note_loaded()
+            self._woff.bind(self.model)
+            self._woff.seal()
+        # AFTER seal, which is the moment residency stops changing. The hook is a forward-path
+        # wrapper, not a residency change, but installing it inside the window would put file I/O in
+        # the middle of the gates that are still measuring the window's device cost.
+        self._woff.install_stream_hooks()
+        if self._woff.enabled:
+            _mem_probe("after weight offload")
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        with _bt.phase("kv_sizing"):
+            self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
-            model_config=config.model_config,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
-            page_size=config.page_size,
-            device=self.device,
-            dtype=self.kv_dtype,
-        )
+        with _bt.phase("kv_pool_alloc"):
+            self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
+                model_config=config.model_config,
+                num_pages=self.num_pages + 1,  # +1 for dummy page
+                page_size=config.page_size,
+                device=self.device,
+                dtype=self.kv_dtype,
+            )
 
         # ======================= SWA (sliding-window) ring KV pool ========================
         # A SWA-hybrid model (Laguna) keeps its FULL-attention layers in the main pool above (sized by
@@ -348,8 +486,9 @@ class Engine:
             # Settle causal_conv1d's per-process in-place batch_ptr autotune on a private
             # scratch BEFORE the first real batch (3c-3) — an unwarmed first prefill is
             # op-sequence-sensitive (NaN/0/OOM). Writes no real state.
-            for gdn in self.model.iter_gdn_layers():
-                gdn.warmup_conv(_GDN_WARMUP_TOKENS)
+            with _bt.phase("gdn_conv_warmup"):
+                for gdn in self.model.iter_gdn_layers():
+                    gdn.warmup_conv(_GDN_WARMUP_TOKENS)
             logger.info_rank0(
                 f"GDN state: {mc.num_gdn_layers} layers x {config.max_running_req + 2} slots "
                 f"(conv_dim={mc.gdn_conv_dim}); conv warmup done"
@@ -392,6 +531,35 @@ class Engine:
         else:
             self.cca_state = None  # type: ignore[var-annotated]  # CCAStateCache | None
 
+        # ======================= Qwen4-Exp PLE n-gram runtime ========================
+        # The PLE block on one decoder layer reads its n-gram embeddings from `Context.ple`, staged
+        # host-side before every forward (`Scheduler._stage_ple`). It is built HERE, next to the GDN
+        # cache, because it is the same kind of object: a fixed per-sequence recurrent state indexed
+        # by the SAME slot id the GDN slot manager hands out, plus a static staging buffer. Passing
+        # the identical `max_running_req + 2` slot count is what keeps those slot ids valid on both
+        # sides. `Qwen4ExpPLE.forward` REFUSES when nothing is staged rather than skipping the block,
+        # so a model with `ple_layer_ids` and no runtime cannot serve quietly-degraded output — which
+        # is exactly what this wiring closes: before it, every qwen4_exp forward raised.
+        self.ple_runtime = None
+        if getattr(mc, "ple_layer_ids", ()) and hasattr(self.model, "ple_block"):
+            from minisgl.ple import build_ple_runtime
+
+            with _bt.phase("ple_runtime_build"):
+                self.ctx.ple = self.ple_runtime = build_ple_runtime(
+                    model=self.model,
+                    config=mc,
+                    model_path=config.model_path,
+                    num_slots=config.max_running_req + 2,  # == the GDNStateCache slot count above
+                    max_tokens=_ple_stage_tokens(config),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            logger.info_rank0(
+                f"PLE runtime: n-gram table open, {config.max_running_req + 2} state slots, "
+                f"staging {_ple_stage_tokens(config)} tokens x {mc.ple_embed_dim} "
+                f"({mem_GB(self._ple_runtime_bytes(config))} device)"
+            )
+
         # Pinned host arena for the recurrent-radix snapshot store. HERE, not in
         # _determine_num_pages: the pool is sized at line ~220, BEFORE either state cache exists
         # (which is exactly why _recurrent_state_bytes is config-derived rather than measured), so
@@ -399,7 +567,8 @@ class Engine:
         # arena is HOST memory and does not come out of the device budget; the only device cost is
         # the staging ring, which each state cache allocates in its own ctor and which
         # _rec_snapshot_store_bytes already reserved.
-        self._build_snapshot_host_arena(config)
+        with _bt.phase("snapshot_host_arena"):
+            self._build_snapshot_host_arena(config)
 
         # ======================= CAM editable-memory (Option B, Phase 0) ========================
         # Build the CAM store+tap+router IN THE BACKEND, reusing the SERVED model's weights (no
@@ -483,11 +652,12 @@ class Engine:
         )
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
-        )
-        if config.model_config.is_moe:
-            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+        with _bt.phase("backends_init"):
+            self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+                config.attention_backend, config.model_config
+            )
+            if config.model_config.is_moe:
+                self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
         # ======================= Sampler initialization ========================
         # real_vocab_size fences the untrained padded lm_head tail off from sampling (see Sampler).
@@ -531,6 +701,8 @@ class Engine:
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         # GDN-hybrid models capture too: per-seq recurrent-state slots are threaded through static
         # buffers (GDNGraphCapture), so the decode graph replays against the live conv/ssm state.
+        _bt_cap = _bt.phase("graph_capture")
+        _bt_cap.__enter__()
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -546,11 +718,50 @@ class Engine:
             cca_state=self.cca_state,
             max_running_req=config.max_running_req,
             cam=self.cam,
+            # Qwen4-Exp PLE. Without it the capture-time warmup forward raises inside
+            # `Qwen4ExpPLE.forward` ("no staged batch") before the first graph is recorded: the block
+            # reads `Context.ple` and REFUSES to run without one, while `_capture_graphs` stages
+            # attn/GDN/CCA/CAM metadata and nothing else. None for every other model.
+            ple=self.ple_runtime,
         )
+        _bt_cap.__exit__()
         # Block-diffusion canvas graphs. Unlike the spec-verify families this needs nothing from the
         # scheduler (no proposer, no aux-capture layers) — the shape is fixed by the checkpoint's
         # canvas_length — so it is captured here, beside the decode graphs, on the engine stream.
-        self._capture_canvas_graphs(config)
+        with _bt.phase("canvas_capture"):
+            self._capture_canvas_graphs(config)
+        # Weight offload, POST-capture gate. `seal()` above ran at :284, before a single graph was
+        # captured, so the one thing `ArenaMemPool.assert_clean()` cannot have seen there is its own
+        # `alloc_during_capture` branch — the counter only moves while a HIP capture is in flight,
+        # which is exactly the window between there and here. An arena allocation served mid-capture
+        # bakes a bump-allocated address (never freed, never reclaimable) into a graph that replays
+        # for the life of the process; one that MISSES the arena mid-capture cannot fall back at all,
+        # because hipMalloc is illegal during capture, and returns NULL for torch to dereference.
+        # Re-gating here is what turns both into a boot error. Inert on every serve that does not
+        # offload. NOT the last capture in the process — see the method's docstring.
+        with _bt.phase("verify_arena_after_capture"):
+            self.verify_weight_arena_after_capture()
+        # THE REPORT. Emitted at the end of every boot, not behind a flag: it is ~30 log lines once
+        # per process, and an instrument that has to be switched on is never on for the run that
+        # turned out to matter. `MINISGL_BOOT_TIMELINE_JSON` additionally writes the machine-readable
+        # form (rank-suffixed) for a harness to diff across configurations.
+        for _line in _bt.timeline().describe().splitlines():
+            logger.info_rank0(_line)
+        if (_p := _bt.timeline().dump()) is not None:
+            logger.info_rank0(f"[boot-timeline] wrote {_p}")
+
+    def verify_weight_arena_after_capture(self) -> None:
+        """Re-gate the weight arena on the far side of graph capture. Idempotent, any rank.
+
+        Called TWICE on purpose, and the second call is the load-bearing one. `Engine.__init__` ends
+        after the decode and canvas graphs, but three of the five capture families — spec-verify,
+        propose, fused-TiDAR and DDTree — are captured from `Scheduler.__init__` (`scheduler.py`
+        :636/:666/:684/:793), because they need the proposer, which does not exist here yet. So the
+        scheduler calls this again as its last capture-time act. Without that call, the three
+        families that dominate a spec serve would run with no arena gate behind them at all, which
+        is the same hole `seal()` had — a check placed where the thing it detects cannot occur.
+        """
+        self._woff.verify_after_capture()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         # self.dp_cpu_group is the cross-replica gloo group over the dp ranks (one member per replica,
@@ -718,52 +929,167 @@ class Engine:
                 )
         return tp_cpu_group
 
+    @staticmethod
+    def _dummy_like(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """A plausible dummy value for one parameter, in ITS OWN dtype.
+
+        `--use-dummy-weight` boots without a checkpoint, and it used to be a bare `randn_like`, which
+        raises `NotImplementedError: "normal_kernel_cuda" not implemented for 'Byte'` on any model
+        with a packed-integer parameter — so the one path designed to work WITHOUT a checkpoint was
+        the one path a quantized checkpoint could not use. Only the non-float arms are new; float
+        parameters keep the exact `randn_like` every existing dummy boot has always had.
+
+        The integer split follows `tests/qwen4exp_gpu_forward_test.py::_fill_random`, which was
+        validated against real NVFP4 kernels: a uint8 blob is packed E2M1 pairs and ANY byte is a
+        legal pair, so randomise it; wider integer tensors are index / id / hash constants
+        (`layer_multipliers`, expert maps) where a random value is not "dummy", it is wrong — and
+        wrong in the out-of-bounds-index way, not the plausible-noise way.
+        """
+        if t.dtype == torch.uint8:
+            return torch.randint(0, 256, t.shape, dtype=torch.uint8, device=device)
+        if not t.is_floating_point():
+            return torch.zeros_like(t, device=device)
+        return torch.randn_like(t, device=device)
+
+    def _build_weight_stream_tier(self, config: EngineConfig):
+        """The THIRD weight tier, or `(None, ())`. See `weights/stream_tier.py`.
+
+        Which layers: the LAST `--weight-offload-stream-layers` MoE layers of the decoder. Last,
+        because the plan's greedy device fill walks `(-priority, declaration index)` — it takes the
+        FIRST layers onto the card — so streaming the tail keeps the two orders from fighting over
+        the same layers. The MTP draft head owns a `MoELayer` too and is never a candidate: it is
+        re-read every draft step, its granule shapes differ from a decoder layer's, and aliasing it
+        onto the tier's shared buffers would read the wrong bytes.
+
+        Every refusal here is loud. A stream tier that silently does not engage is the worst outcome
+        available: the boot then tries to keep 70 GiB of experts resident and dies in
+        `load_state_dict` with an OOM that names nothing.
+        """
+        n = int(getattr(config, "weight_offload_stream_layers", 0) or 0)
+        if n <= 0:
+            return None, ()
+        if config.use_dummy_weight:
+            raise ValueError(
+                "--weight-offload-stream-layers with --dummy-weight: there is no checkpoint to "
+                "re-read, so a streamed layer would serve whatever the donor layer left behind."
+            )
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0:
+            raise ValueError(
+                "--weight-offload-stream-layers requires --cuda-graph-max-bs 0. The per-forward "
+                "expert gather does file I/O, allocates and synchronizes inside MoELayer.forward, "
+                "and all three are illegal under HIP graph capture. Capturing it would bake one "
+                "batch's expert rows into every replay -- plausible logits, wrong weights, no error."
+            )
+        from minisgl.models import expert_row_source
+        from minisgl.weights.plan import _path_layer_index, is_mtp_path
+        from minisgl.weights.moe_interpose import discover_moe_layers
+        from minisgl.weights.stream_tier import ExpertStreamTier
+
+        source = expert_row_source(config.model_path, self.device, config.spec_algorithm)
+        if source is None:
+            raise ValueError(
+                f"--weight-offload-stream-layers {n} was asked for, but this checkpoint family has "
+                f"no per-expert row source (models/weight.py::expert_row_source). Streaming a whole "
+                f"1.4 GiB stack per layer per token is not a serve, so this refuses rather than "
+                f"falling back to it."
+            )
+        candidates = [
+            i
+            for p, _ in discover_moe_layers(self.model)
+            if not is_mtp_path(p)
+            for i in (_path_layer_index(p),)
+            if i is not None
+        ]
+        if n > len(candidates):
+            raise ValueError(
+                f"--weight-offload-stream-layers {n} exceeds the {len(candidates)} offloadable MoE "
+                f"layers this model has."
+            )
+        ids = tuple(sorted(candidates)[-n:])
+        logger.info_rank0(
+            f"weight offload: stream tier will take the last {n} MoE layer(s) {ids[0]}..{ids[-1]}; "
+            f"they are excluded from the placement plan."
+        )
+        return ExpertStreamTier(source, device=self.device, log=logger.info_rank0), ids
+
+    def _load_weight_chunked(self, config: EngineConfig) -> bool:
+        """Stage B: load + finalize + PLACE the checkpoint one chunk at a time. True if it ran.
+
+        WHY THE ENGINE AND NOT A HARNESS. `Engine.__init__`'s load is
+        `load_state_dict(dict(load_weight(...)))`: the generator is drained into one dict, so every
+        tensor of the checkpoint is live on the card simultaneously and the peak is the whole
+        checkpoint. That ceiling is what stops `RadixArk/Qwen3.8-Flash-Next-NVFP4` at 4 layers of 48
+        — it OOMs INSIDE `load_state_dict`, before the Stage-A bake that exists to make it fit has
+        run at all. No arena size fixes that, because the bake is downstream of the OOM.
+
+        The chunked driver interleaves the two: each chunk is read, filled, `post_load`ed and handed
+        to the sink, which bakes the host-placed layers into the arena and drops their device
+        originals before the next chunk is read. The steady state is one chunk (1.465 GiB here), and
+        a host-placed layer costs zero VRAM the moment its chunk closes.
+
+        THREE CONDITIONS, ALL REQUIRED, AND EACH IS A DIFFERENT KIND OF "NO":
+          * `use_dummy_weight` — there is no checkpoint to chunk. The dummy path fabricates from the
+            model's own state_dict and is unaffected by any of this.
+          * no chunk enumeration for this family (`chunked_weight_source` -> None) — the shipped
+            one-shot load is correct and is what every other model here uses.
+          * the Stage-A session is disabled — no host tier, so the sink would have nothing to bake.
+            Chunking alone would still lower the load peak, but it would do so on a path no test
+            covers for models that have never needed it; turning it on for them is a separate change
+            with its own A/B, not a side effect of this one.
+
+        The trailing `model.post_load()` is NOT redundant with the per-chunk ones: the chunks
+        finalize only the ops they complete (the MoE stacks), and the non-expert body's containers
+        are finalized here. `BaseOP._post_load_done` is what keeps that call from re-entering the
+        layers the chunks already did — a second `post_load` on a quantized MoE container reads
+        buffers its first one deleted.
+        """
+        if config.use_dummy_weight or not self._woff.enabled:
+            return False
+        from minisgl.models import chunked_weight_source
+        from minisgl.weights.stage_b import ChunkedWeightLoader
+
+        from minisgl.weights import boot_timeline as _bt
+
+        # SEPARATE from `stage_b_run`: this enumerates the 196 shards and runs the checkpoint-wide
+        # NVFP4 header pre-pass (196 `safe_open`s). That is real seconds before a single tensor is
+        # read, and it is charged to the wrong phase if it is folded into the chunk loop.
+        with _bt.phase("stage_b_enumerate_prepass"):
+            source = chunked_weight_source(
+                config.model_path, self.device, spec_algorithm=config.spec_algorithm
+            )
+        if source is None:
+            return False
+        chunks, stream = source
+        loader = ChunkedWeightLoader(
+            self.model,
+            cast=lambda k, v: cast_checkpoint_tensor(k, v, self.dtype),
+            sink=self._woff.chunked_sink(),
+            log=logger.debug_rank0,
+        )
+        with _bt.phase("stage_b_run"):
+            ledger = loader.run(chunks, stream)
+        with _bt.phase("stage_b_trailing_post_load"):
+            self.model.post_load()
+        # KEPT, and MARKED. A boot log proves nothing an A/B can diff, and this repo's rule is that a
+        # vanished arm shows up as a missing `engaged()` line rather than as a number nobody notices.
+        # The ledger is what a harness asserts on: chunks, keys filled, and the peak device
+        # allocation that is the entire claim being made here.
+        self.stage_b_ledger = ledger
+        from minisgl._hip_engage import engaged
+
+        engaged("weight_offload.stage_b_chunked_load")
+        logger.info_rank0(f"weight offload: {ledger.describe()}")
+        return True
+
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         if config.use_dummy_weight:
             return {
-                k: torch.randn_like(v, device=self.device)
+                k: self._dummy_like(v, self.device)
                 for k, v in self.model.state_dict().items()
             }
         else:
-            # Cast bf16 weights/biases to the model dtype, but PRESERVE quantized tensors:
-            # int packs (qweight/qzeros) and fp16 scales must keep their checkpoint dtype.
-            def _cast(k: str, v: torch.Tensor) -> torch.Tensor:
-                if not v.is_floating_point() or k.endswith(".scales"):
-                    return v
-                # ZAYA experts stay fp8: the F8_E4M3 weight must NOT be upcast (that re-inflates
-                # ~8 GB fp8 -> ~16 GB bf16 and OOMs the 16 GB card), and its per-channel fp32
-                # weight_scale must keep fp32. Dequant is deferred to compute (_GroupedFP8Experts).
-                if v.dtype == torch.float8_e4m3fn:
-                    return v
-                if k.endswith(".weight_scale"):
-                    # fp8 (ZAYA) per-channel scales are fp32 and MUST stay fp32; compressed-tensors
-                    # int4 scales ship fp16 OR bf16 -> normalize to fp16 (the op's + the linear
-                    # buffer's declared scale dtype) so a bf16-scale head and an fp16-scale backbone
-                    # both load against the same float16 buffer.
-                    return v if v.dtype == torch.float32 else v.to(torch.float16)
-                # GDN gating params stay fp32 (A_log ships fp32; dt_bias ships bf16 -> upcast).
-                # The kernels + the model's nn.Parameter dtype both require fp32 here.
-                if k.endswith((".A_log", ".dt_bias")):
-                    return v.to(torch.float32)
-                # ZAYA router balancing_biases is an fp32 buffer (added to the fp32 router softmax;
-                # ships bf16, upcast to keep the buffer fp32 and the choice numerics faithful). The
-                # ResidualScaling affines run in fp32 on the fp32 residual stream (scale_residual_merge
-                # ships bf16 -> upcast so the merge stays fp32). CCA conv/temp can stay bf16 (post_load
-                # upcasts them to fp32 once for the kernel-weight cache).
-                if k.endswith(
-                    (
-                        ".balancing_biases",
-                        ".hidden_states_scale",
-                        ".hidden_states_bias",
-                        ".residual_scale",
-                        ".residual_bias",
-                    )
-                ):
-                    return v.to(torch.float32)
-                return v.to(self.dtype)
-
             return {
-                k: _cast(k, v)
+                k: cast_checkpoint_tensor(k, v, self.dtype)
                 for k, v in load_weight(
                     config.model_path, self.device, spec_algorithm=config.spec_algorithm
                 )
@@ -989,6 +1315,26 @@ class Engine:
             )
         return total
 
+    def _ple_runtime_bytes(self, config: EngineConfig) -> int:
+        """Bytes the Qwen4-Exp PLE runtime will consume on the DEVICE. Zero for every other model.
+
+        Same reason as `_recurrent_state_bytes`: the runtime is built after the KV pool is sized, so
+        without this its staging buffers come out of the (1-memory_ratio) slack. They are not small
+        — two `max_extend_tokens x ple_embed_dim` buffers, ~126 MiB at the 8192-token default —
+        which on a 16 GB card is real KV pool. The formula lives in `ple/runtime.py` next to the
+        allocation it mirrors."""
+        mc = config.model_config
+        if not getattr(mc, "ple_layer_ids", ()):
+            return 0
+        from minisgl.ple import ple_device_bytes
+
+        return ple_device_bytes(
+            mc,
+            num_slots=config.max_running_req + 2,
+            max_tokens=_ple_stage_tokens(config),
+            dtype=self.dtype,
+        )
+
     def _draft_model_bytes(self, config: EngineConfig) -> int:
         """Bytes the speculative DRAFT model (EAGLE3 / DFlash) will consume. The proposer loads it in
         ``Scheduler.__init__`` — AFTER the engine has built and the KV pool is allocated — so, like the
@@ -1132,6 +1478,116 @@ class Engine:
             total += int(float(margin) * (1 << 30))
         return total
 
+    def _weight_offload_device_budget(self, config: EngineConfig) -> int:
+        """VRAM per rank the MoE expert tier may occupy — the input `resolve_weight_plan` needs.
+
+        WHY THIS EXISTS AT ALL. The resolver is a pure function of config and cannot ask the card
+        anything. Left to its own fallback it reads `config.weight_offload_device_gb` and, at 0.0,
+        plans EVERY MoE layer host-resident — a 4.5 GiB expert stack on a 16 GB card would be pinned
+        to host RAM and streamed over PCIe at ~1/10 the native rate, on a serve that never asked for
+        offload and with no flag to turn it off. So the engine, which is the only component that
+        knows the hardware, supplies the number.
+
+        WHY `total_memory` AND NOT `mem_get_info`. The two TP ranks must resolve the IDENTICAL plan:
+        if they disagree about which layers are host-resident, one rank streams a layer the other
+        holds resident and the model emits plausible wrong text with no error anywhere. A live free-
+        memory delta differs between the rank processes by whatever else touched the card; total
+        memory is a hardware constant. It is still MIN-reduced over the TP group so a heterogeneous
+        pair (this box: RX 9070 XT + RX 9070) cannot make the ranks diverge either.
+
+        WHY OVER-GRANTING IS THE RIGHT DIRECTION, AND WHERE IT STOPS. This budget deliberately does
+        not subtract the KV pool, dense weights or graph buffers — there is no honest config-time
+        number for those, and a guess would be a confident wrong number. Granting too little silently
+        converts a serve that fits into a PCIe-streamed one, so the bias is towards resident.
+
+        But the derived value is not merely generous, it is the ENTIRE KV budget, and that has a hard
+        consequence rather than a soft one. `_determine_num_pages` computes
+        `available = memory_ratio * old_free - model - ...` with the device tier billed inside
+        `model` (the plan forbids a sixth subtrahend), so whenever the expert stack does not fit —
+        i.e. exactly when the plan is non-empty — the greedy fill takes the tier up to this number
+        and `available` is negative before anything else is counted. `assert num_pages > 1` cannot
+        not fire. That is why `StageASession.begin` is told `budget_is_derived`: the unbootable case
+        is refused from integers at plan time (`bake._refuse_derived_budget_that_leaves_no_kv`)
+        instead of after the arena has pinned tens of GiB and the checkpoint has been loaded. A model
+        that FITS still resolves to an empty plan and never reaches that refusal, which is what keeps
+        this path on every serve.
+        """
+        if config.weight_offload_device_gb > 0:
+            # GiB, and the UNIT IS NOT A STYLE CHOICE. This value has two readers: here, and
+            # `resolve_weight_plan`'s own fallback when no budget is passed. That fallback is
+            # `weight_offload_device_gb * GIB_PER_UNIT` (plan.py), the plan's `_gb()` renders every
+            # figure it prints in GiB, and `WeightPlanResolution.summary_line()` — which is what the
+            # `[serve]` banner and the `KV sizing:` line quote — prints the granted tier back in GiB
+            # too. Reading the same field as decimal 1e9 here would grant 7.4% LESS VRAM than the
+            # operator asked for while every log line echoed the request as honoured, and 7.4% of a
+            # tier is enough to push a layer across the greedy fill boundary into host residency.
+            # plan.py's own comment names this exact trap; one unit, one place.
+            from minisgl.weights.plan import GIB_PER_UNIT
+
+            return int(config.weight_offload_device_gb * GIB_PER_UNIT)
+        total = int(torch.cuda.get_device_properties(self.device).total_memory)
+        if config.tp_info.size > 1 and self.tp_cpu_group is not None:
+            t = torch.tensor([total], device="cpu", dtype=torch.int64)
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+            )
+            total = int(t[0].item())
+        return int(total * config.memory_ratio)
+
+    def _woff_mem_probe(self) -> Tuple[int, int, int]:
+        """`(free, allocated, reserved)` for the weight-arena ledger (weights/accounting.py).
+
+        Deliberately does NOT call `empty_cache()`, unlike `_sync_get_memory`: the ledger's whole job
+        is to attribute changes in device-free memory to the arena, and returning segments to the
+        driver mid-window would move `free` for a reason that has nothing to do with the arena and
+        make the Phase-0 "is this really host memory?" assertion meaningless. It DOES synchronize,
+        because `mem_get_info` is only meaningful once queued frees have retired.
+
+        `free` is the driver's own number. That is the point: Phase 0 found `hipMemCreate(location=
+        Host)` returning VRAM while the property query echoed "Host", and P5b found
+        `hipPointerGetAttributes` reporting "Device" for real host pages — both queries lie, in both
+        directions, so the arena is verified by asking the card how much of itself is left.
+        """
+        torch.cuda.synchronize(self.device)
+        # Scoped to `self.device`, not the ambient current device. `free` already is (it goes
+        # through `mem_get_info(device)`), and mixing a device-scoped `free` with process-current
+        # allocator stats would compare two different cards' numbers the moment anything moved the
+        # current device — the ledger's whole output is differences between these three, so a
+        # mismatch there is a plausible wrong number rather than an error.
+        return (
+            get_free_memory(self.device),
+            torch.cuda.memory_allocated(self.device),
+            torch.cuda.memory_reserved(self.device),
+        )
+
+    def _tp_min_num_pages(self, num_pages: int, config: EngineConfig) -> int:
+        """MIN-reduce the KV page count across this replica's TP ranks. See the call site.
+
+        Scoped to `self.tp_cpu_group` — the per-replica TP subgroup under DP — for the same reason
+        `_sync_get_memory` is: different DP replicas sit on different cards and are sized
+        independently, so reducing across replicas would shrink every one of them to the weakest.
+
+        Called UNCONDITIONALLY (including on the `--num-pages` override path, where it is a no-op in
+        value): a collective that only some ranks enter is a worse failure than the one it fixes.
+        """
+        if config.tp_info.size <= 1 or self.tp_cpu_group is None:
+            return num_pages
+        t = torch.tensor([int(num_pages)], device="cpu", dtype=torch.int64)
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
+        )
+        reduced = int(t[0].item())
+        if reduced != num_pages:
+            # Not fatal — MIN is exactly the resolution — but it means the per-rank terms of the KV
+            # budget disagreed, which is worth a line because it is invisible in every other log.
+            logger.warning(
+                f"KV sizing disagreed across TP ranks: this rank sized {num_pages} pages, the "
+                f"replica minimum is {reduced}; using the minimum so every rank's pool can hold "
+                f"every page id. The per-rank terms are memory_allocated/memory_reserved and the "
+                f"weight-arena correction."
+            )
+        return reduced
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         mc = config.model_config
@@ -1171,8 +1627,40 @@ class Engine:
             # non-torch (HIP context, kernel code objects). Unquantized models barely notice — their
             # load has almost no transient (qwen27b: reserved 9.09 vs allocated 9.00).
             device_used = old_free_memory - new_free_memory
-            model_memory = torch.cuda.memory_allocated() + max(
-                0, device_used - torch.cuda.memory_reserved()
+            # WEIGHT OFFLOAD: a MEASURED correction, not a reservation. The offload arena's DEVICE
+            # tier stays fully billed — it is inside `device_used` and that is exactly where the plan
+            # wants it (no sixth subtrahend). What is corrected here is the HOST arena: P5b validated
+            # it through torch's `_cuda_customAllocator` + `MemPool`, and a pool-served tensor over
+            # `hipHostGetDevicePointer` pages is an ordinary `cuda` tensor to
+            # `memory_allocated()`/`memory_reserved()`. Left alone, ~50 GB of HOST RAM would be billed
+            # as device memory, `available_memory` would go hard negative and the assert below would
+            # refuse to boot. Both terms are the delta measured across arena construction, clamped to
+            # the arena size, and are exactly 0 when the arena is invisible to torch — so every serve
+            # that does not offload is byte-identical. `reserved` is corrected too: fixing only
+            # `allocated` would zero the non-torch term and under-bill the HIP context.
+            #
+            # BOTH terms are CLAMPED TO THE LIVE READING before they are applied, and that clamp is
+            # load-bearing rather than defensive. The corrections are deltas sampled at `seal()`,
+            # but they are applied to `memory_allocated()`/`memory_reserved()` read HERE — and
+            # `self._sync_get_memory()` on the first line of this method calls
+            # `torch.cuda.empty_cache()` in between. `empty_cache` releases the segments the bake's
+            # dropped originals left behind, so `reserved` can legitimately fall by roughly the
+            # arena size between the sample and the read. Subtracting an unclamped seal-time delta
+            # from a shrunken reading drives `reserved - woff_reserved` NEGATIVE, which inflates the
+            # non-torch term `max(0, device_used - reserved)` by up to the whole arena and refuses
+            # the boot; the mirror case on `allocated` makes `model_memory` negative, which
+            # over-states `available_memory` and sizes a KV pool that OOMs on the first forward.
+            # A clamp cannot mask a real fault — the ledger's own gate at `seal()` already refused
+            # to reach this line if the arena and the plan disagreed — it only stops a stale delta
+            # from turning into a wrong pool size in either direction.
+            alloc_now, reserved_now = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+            _c_alloc, _c_reserved = self._woff.model_memory_correction()
+            model_memory, woff_alloc, woff_reserved = corrected_model_memory(
+                allocated=alloc_now,
+                reserved=reserved_now,
+                device_used=device_used,
+                alloc_correction=_c_alloc,
+                reserved_correction=_c_reserved,
             )
             # Reserve the fixed GDN/CCA recurrent-state cache, which is allocated AFTER the KV pool
             # and scales with max_running_req. Without this the KV pool takes the whole budget and the
@@ -1187,6 +1675,7 @@ class Engine:
             draft_memory = self._draft_model_bytes(config)
             graph_memory = self._graph_capture_bytes(config, old_free_memory)
             snap_memory = self._rec_snapshot_store_bytes(config)
+            ple_memory = self._ple_runtime_bytes(config)
             available_memory = (
                 int(config.memory_ratio * old_free_memory)
                 - model_memory
@@ -1194,6 +1683,7 @@ class Engine:
                 - draft_memory
                 - graph_memory
                 - snap_memory
+                - ple_memory
             )
             # Per-term breakdown. Without it the "Not enough memory for KV cache" assert below names
             # five candidate causes and gives no way to tell which one actually ate the budget —
@@ -1203,16 +1693,39 @@ class Engine:
                 f"{mem_GB(int(config.memory_ratio * old_free_memory))} budget; "
                 f"model={mem_GB(model_memory)} state={mem_GB(state_memory)} "
                 f"draft={mem_GB(draft_memory)} graph={mem_GB(graph_memory)} "
-                f"snap={mem_GB(snap_memory)} -> available={mem_GB(available_memory)} "
+                f"snap={mem_GB(snap_memory)} ple={mem_GB(ple_memory)} "
+                f"-> available={mem_GB(available_memory)} "
                 f"@ {cache_per_page} B/page; "
                 # `model` is a free-memory DELTA, so it also carries allocator slack, fragmentation
                 # and the HIP context. `allocated` is the exact resident tensor total — when the two
                 # diverge the gap is overhead, not weights, and the fix is not a higher memory-ratio.
-                f"resident tensors={mem_GB(torch.cuda.memory_allocated())} "
+                f"resident tensors={mem_GB(alloc_now)} "
                 # reserved-minus-allocated is torch's own segment overhead (kept after empty_cache
                 # because those segments still hold a live block); whatever `model` exceeds RESERVED
                 # by is not torch at all — HIP context, kernel code objects, comms buffers.
-                f"torch reserved={mem_GB(torch.cuda.memory_reserved())}"
+                f"torch reserved={mem_GB(reserved_now)}"
+                # The two raw figures above are UNCORRECTED, and with a pool-served host arena they
+                # include tens of GB of host RAM: on a 16 GB card "resident tensors=42.31 GiB" is
+                # not a typo and not a bug, it is the arena. Print what was actually removed, on the
+                # same line, or the only way to tell a mis-sized pool from a mis-read log is to
+                # re-derive both numbers by hand. Empty when nothing was corrected, so a serve that
+                # does not offload keeps this line byte-identical.
+                + (
+                    f" (host-arena corrected: -{mem_GB(woff_alloc)} allocated, "
+                    f"-{mem_GB(woff_reserved)} reserved)"
+                    if (woff_alloc or woff_reserved)
+                    else ""
+                )
+                # One annotation on the SAME line rather than a second log line, so an operator
+                # diagnosing a small pool sees the arena in the same place they see the five
+                # reservations. Empty string when nothing is offloaded, so this line is
+                # byte-identical on every serve that does not offload. It delegates to the resolved
+                # plan's own `summary_line()` so the KV-sizing line and the `[serve]` banner can
+                # never quote different numbers for the same plan — including the step floor, which
+                # is derived against the SLOWEST rank's measured host bandwidth (the links are
+                # independent, so at tp>=2 the slower card sets the step and quoting card 0's
+                # 28.93 GB/s for the pair is wrong by ~2x).
+                + self._woff.kv_annotation()
             )
             num_pages = available_memory // cache_per_page
             if snap_memory:
@@ -1257,10 +1770,38 @@ class Engine:
                     f"(max_bs={config.cuda_graph_max_bs}{spec_note}); KV pool gets the remainder"
                 )
 
+        # Make the pool size RANK-IDENTICAL before anything is allocated against it. Every other
+        # input above is either a config constant or already cross-rank reduced (`_sync_get_memory`
+        # returns the MIN/MAX all_reduce, so `old_free_memory`, `new_free_memory` and therefore
+        # `device_used` are the same integer on every rank). The exceptions are
+        # `torch.cuda.memory_allocated()` / `memory_reserved()` — live per-rank allocator readings —
+        # and now the weight-arena correction derived from them, which is measured across the bake on
+        # each rank's own card. They agree when both ranks run an identical allocation sequence on
+        # identical hardware, which is an assumption, not an invariant: this box's TP pair is an
+        # RX 9070 XT and an RX 9070, `empty_cache()` runs between the correction's sample and its use
+        # (`corrected_model_memory`'s clamp exists precisely because that reading can move), and the
+        # offload path adds a second measured term on top.
+        #
+        # A single page of disagreement is not a small error. `num_pages` sizes the KV pool AND
+        # bounds the page indices the primary rank hands out (`weights/plan.py`'s own divergence
+        # message names this: "size different KV pools (num_pages is not cross-rank reduced)"), so a
+        # rank with fewer pages is written past the end of its pool by the peer's page ids — silently
+        # wrong attention, not an allocation error. MIN is the safe side: every rank can hold it.
+        # No-op at tp_size == 1, and a no-op in bytes whenever the ranks already agreed.
+        num_pages = self._tp_min_num_pages(int(num_pages), config)
+
         assert num_pages > 1, (
             "Not enough memory for KV cache after reserving recurrent state / draft model / "
             "CUDA-graph buffers; reduce --max-running-requests, lower --memory-ratio, or set "
             "--num-pages"
+            # WEIGHT OFFLOAD: name the device tier when there is one. `--weight-offload-device-gb`
+            # (and its default, a fraction of the card's TOTAL memory) grants VRAM to the resident
+            # expert tier BEFORE the KV pool is sized, and that tier lands inside `model` — by
+            # design, since the plan forbids a sixth subtrahend. So the single most likely way to
+            # reach this assert on an offloading serve is a device tier that left nothing for KV,
+            # and the four causes listed above do not include it. Without this clause the operator
+            # is sent to `--memory-ratio`, which makes the budget SMALLER and the failure worse.
+            + self._woff.kv_budget_failure_hint()
         )
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
@@ -1327,6 +1868,14 @@ class Engine:
     # prompt.
     prefill_computed_tokens_total: int = 0
 
+    # Decode steps that ran the EAGER `model.forward()` instead of replaying a captured graph. The
+    # counter-part to `GraphRunner.replays`, and it exists for the same provenance reason: with only
+    # a replay count, "eager leg" is a claim about a switch someone flipped, not an observation. With
+    # both, a capture-vs-eager A/B leg is arithmetically pinned — the captured leg must show
+    # replays>0 AND eager_decode_forwards unchanged, the eager leg the exact mirror. A leg where both
+    # move is a leg where the graphs only covered part of the decode and the ratio means nothing.
+    eager_decode_forwards: int = 0
+
     def _drain_prefill_events(self) -> None:
         """Fold completed prefill event pairs into the counter. Non-blocking: an incomplete pair is
         left for a later step, so this never syncs the host onto the GPU just to keep a metric."""
@@ -1372,6 +1921,8 @@ class Engine:
             elif self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
+                if batch.is_decode:
+                    self.eager_decode_forwards += 1
                 logits = self.model.forward()
 
         for req in batch.reqs:

@@ -1,0 +1,38 @@
+{"mode": "F1", "rep": 0, "chunks": 1024, "n_fail": 556, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13", "va": "0x7f1eaff80000", "size": 7864320}}
+{"mode": "F1", "rep": 1, "chunks": 1024, "n_fail": 922, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13", "va": "0x7f1eb0b80000", "size": 3145728}}
+{"mode": "F1", "rep": 2, "chunks": 1024, "n_fail": 924, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13", "va": "0x7f1eb0700000", "size": 4718592}}
+{"mode": "F1", "rep": 3, "chunks": 1024, "n_fail": 742, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13", "va": "0x7f1eb0b80000", "size": 3145728}}
+{"mode": "F2", "rep": 0, "chunks": 1024, "n_fail": 2, "first_fail": {"call": "setaccess(component)", "rc": 1, "comp": "w13_scales", "va": "0x7f1edfe00000", "size": 25165824}}
+{"mode": "F2", "rep": 1, "chunks": 1024, "n_fail": 1, "first_fail": {"call": "setaccess(component)", "rc": 1, "comp": "w13_scales", "va": "0x7f1edfe00000", "size": 25165824}}
+{"mode": "F2", "rep": 2, "chunks": 1024, "n_fail": 2, "first_fail": {"call": "setaccess(component)", "rc": 1, "comp": "w13_scales", "va": "0x7f1edfe00000", "size": 25165824}}
+{"mode": "F2", "rep": 3, "chunks": 1024, "n_fail": 2, "first_fail": {"call": "setaccess(component)", "rc": 1, "comp": "w13_scales", "va": "0x7f1edfe00000", "size": 25165824}}
+{"mode": "F3", "rep": 0, "chunks": 1024, "n_fail": 0, "first_fail": null}
+{"mode": "F3", "rep": 1, "chunks": 1024, "n_fail": 0, "first_fail": null}
+{"mode": "F3", "rep": 2, "chunks": 1024, "n_fail": 0, "first_fail": null}
+{"mode": "F3", "rep": 3, "chunks": 1024, "n_fail": 0, "first_fail": null}
+{"mode": "F4", "rep": 0, "chunks": 2048, "n_fail": 1536, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13_scales", "va": "0x7f1edf800000", "size": 49152}}
+{"mode": "F4", "rep": 1, "chunks": 2048, "n_fail": 1536, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13_scales", "va": "0x7f1edf800000", "size": 49152}}
+{"mode": "F4", "rep": 2, "chunks": 2048, "n_fail": 1536, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13_scales", "va": "0x7f1edf800000", "size": 49152}}
+{"mode": "F4", "rep": 3, "chunks": 2048, "n_fail": 1536, "first_fail": {"call": "setaccess", "rc": 1, "comp": "w13_scales", "va": "0x7f1edf800000", "size": 49152}}
+{
+ "F1": {
+  "reps": 4,
+  "total_fail": 3144,
+  "clean_reps": 0
+ },
+ "F2": {
+  "reps": 4,
+  "total_fail": 7,
+  "clean_reps": 0
+ },
+ "F3": {
+  "reps": 4,
+  "total_fail": 0,
+  "clean_reps": 4
+ },
+ "F4": {
+  "reps": 4,
+  "total_fail": 6144,
+  "clean_reps": 0
+ }
+}

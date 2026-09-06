@@ -1,0 +1,3 @@
+  weight-arena capacity: need 48.00 GiB/rank × 1 = 48.00 GiB, MemAvailable 59.13 GiB, floor 12.00 GiB, headroom -890.2 MiB -> DOES NOT FIT
+  reason: needs 48.00 GiB + 12.00 GiB floor = 60.00 GiB, but MemAvailable is only 59.13 GiB
+  short by: 890.2 MiB

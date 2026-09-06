@@ -199,6 +199,14 @@ def minv_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """True iff `minv_linear` will run the M-invariant kernel (else it falls back to F.linear)."""
     if weight.dtype not in (torch.bfloat16, torch.float16):
         return False
+    # The M-invariant GEMM and the decode GEMV are HIP kernels registered for the CUDA backend ONLY.
+    # Without this guard a CPU bf16 linear passes every other check and then dies inside the
+    # dispatcher — "Could not run 'fp8_wmma_C::dense_bf16_gemv' with arguments from the 'CPU'
+    # backend" — instead of taking the F.linear fallback this function exists to select. It bit a
+    # CPU-only bf16 parity test (`tests/qwen4exp_hc_parity_test.py`); anything that runs a bf16 layer
+    # off-device (a numerics oracle, a shape probe on a box with no free card) hits it.
+    if not (x.is_cuda and weight.is_cuda):
+        return False
     if weight.shape[-1] % 16 != 0:  # IN must be WMMA-friendly (full-K reduction in 16-wide steps)
         return False
     # Under CUDA-graph capture we STILL use dense_gemm (the whole point of removing rocBLAS): its only

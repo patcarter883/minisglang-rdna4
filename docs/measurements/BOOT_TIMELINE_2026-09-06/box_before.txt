@@ -1,0 +1,41 @@
+=== box BEFORE L48_dev8p1, 2026-09-05T23:50:00+10:00 ===
+ 23:50:00 up 35 days,  7:38,  1 user,  load average: 2.56, 2.32, 3.41
+               total        used        free      shared  buff/cache   available
+Mem:              91          23          66           0           3          68
+Swap:             53          26          27
+MemAvailable:   71778212 kB
+SwapFree:       28320920 kB
+c                               4    7136614600
+c_min                           4    3081749632
+size                            4    7068056760
+--- docker ps (must contain no minisgl/boot-timeline container) ---
+hermes-00078d59 nikolaik/python-nodejs:python3.11-nodejs20 Up 24 hours
+minisgl-cloudflared cloudflare/cloudflared:latest Up 2 weeks
+vllm-gfx1201-grafana grafana/grafana:latest Up 3 weeks
+firecrawl-api-1 firecrawl-api Up 4 weeks
+firecrawl-rabbitmq-1 rabbitmq:3-management Up 4 weeks (healthy)
+firecrawl-nuq-postgres-1 firecrawl-nuq-postgres Up 4 weeks
+firecrawl-redis-1 redis:alpine Up 4 weeks
+firecrawl-playwright-service-1 firecrawl-playwright-service Up 4 weeks
+turnstone-node-2-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-10-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-9-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-7-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-3-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-1-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-8-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-6-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-5-1 turnstone:local Up 5 weeks (healthy)
+turnstone-node-4-1 turnstone:local Up 5 weeks (healthy)
+turnstone-channel-1 turnstone:local Up 5 weeks
+turnstone-console-1 turnstone:local Up 5 weeks (healthy)
+turnstone-caddy-1 caddy:2.11 Up 5 weeks
+turnstone-postgres-1 pgautoupgrade/pgautoupgrade:18-alpine Up 5 weeks (healthy)
+turnstone-searxng-1 searxng/searxng:latest Up 5 weeks (healthy)
+vllm-gfx1201-gpu-exporter 44805f13028b Up 4 weeks
+vllm-gfx1201-prometheus prom/prometheus:latest Up 5 weeks
+--- diskstats ---
+   8       0 sda 341 0 16560 683 0 0 0 0 0 545 683 0 0 0 0 0 0
+   8      16 sdb 8299827 103359 261517449 4025269 1344421 2457629 415630552 78714366 0 3697536 83395478 164635 0 1017068600 637692 2684 18150
+ 259       0 nvme1n1 195750113 764145 37233163972 24095788 73803158 429886 3825010544 49236894 0 43017906 80467462 4097169 544 3579159128 4430495 3228932 2704283
+ 259       1 nvme0n1 28620976 243026 2591707560 3993871 100573196 1976464 7075193488 21746807 0 21222827 32949432 4708321 598 6091194360 4210344 11875109 2998408

@@ -16,6 +16,15 @@ from minisgl.distributed import (
 )
 from minisgl.quant import kernels
 from minisgl.utils import div_even
+from minisgl.weights.granule import (
+    ExpertContainer,
+    GranuleSpec,
+    assert_decode_policy_agrees,
+    assert_granule_pair_consistent,
+    decode_policy,
+    spec_for_container,
+)
+from minisgl.weights.granule import offload_refusal as granule_offload_refusal
 
 from .base import BaseOP
 
@@ -30,7 +39,7 @@ if TYPE_CHECKING:
 # compute to hide a collective behind.
 
 
-class _GroupedGPTQExperts(BaseOP):
+class _GroupedGPTQExperts(ExpertContainer, BaseOP):
     """Per-expert grouped GPTQ buffers for one of the two MoE GEMMs (w13 or w2).
 
     Declared in CHECKPOINT layout, STACKED over the E experts so the streaming loader's
@@ -52,6 +61,8 @@ class _GroupedGPTQExperts(BaseOP):
         self.scales = torch.empty((num_experts, K // g, N), dtype=torch.float16)
         self.qzeros = torch.empty((num_experts, K // g, N // pf), dtype=torch.int32)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedGPTQExperts holds weights; call kernels.w4a8_moe instead")
@@ -83,7 +94,7 @@ class _GroupedGPTQExperts(BaseOP):
         del self.qweight, self.scales, self.qzeros
 
 
-class _GroupedAWQExperts(BaseOP):
+class _GroupedAWQExperts(ExpertContainer, BaseOP):
     """AWQ-gemm experts for one MoE GEMM (w13 or w2), STACKED over E (checkpoint layout).
 
     AWQ packs int4 along the OUTPUT N with the GEMM interleave: qweight (E, K, N//pf) int32,
@@ -101,6 +112,8 @@ class _GroupedAWQExperts(BaseOP):
         self.scales = torch.empty((num_experts, K // g, N), dtype=torch.float16)
         self.qzeros = torch.empty((num_experts, K // g, N // pf), dtype=torch.int32)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedAWQExperts holds weights; call kernels.w4a8_moe instead")
@@ -131,7 +144,7 @@ class _GroupedAWQExperts(BaseOP):
         del self.qweight, self.scales, self.qzeros
 
 
-class _GroupedRXFExperts(BaseOP):
+class _GroupedRXFExperts(ExpertContainer, BaseOP):
     """RXF W4(NL)-A8 experts for one MoE GEMM (w13 or w2), STACKED over E.
 
     RXF ships weights op-layout already (no AWQ/GPTQ unpack-transpose-repack): weight_packed
@@ -149,6 +162,8 @@ class _GroupedRXFExperts(BaseOP):
         self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
         self.weight_scale = torch.empty((num_experts, N, K // 32), dtype=torch.float16)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
@@ -173,7 +188,7 @@ class _GroupedRXFExperts(BaseOP):
         del self.weight_packed
 
 
-class _GroupedCompressedTensorsExperts(BaseOP):
+class _GroupedCompressedTensorsExperts(ExpertContainer, BaseOP):
     """compressed-tensors int4 *weight-only* (W4A16) experts for one MoE GEMM (w13 or w2), STACKED
     over E. The checkpoint ships (N=out, K=in per expert):
         weight_packed (E, N, K//pf) int32 — 8 int4 per int32, packed along INPUT K in natural order
@@ -202,6 +217,15 @@ class _GroupedCompressedTensorsExperts(BaseOP):
     activations are quantized to int8 by that kernel — same W4A16-weights-through-W4A8-kernel path the
     AWQ experts already use)."""
 
+    # This is the one shipped format whose post_load makes a DECODE decision that no tensor records:
+    # `ct_packed_sign_convention` reads the nibble histogram and either XORs the whole stack to
+    # uint4b8 or leaves it. w13 and w2 come from one checkpoint and one quantizer, so they must
+    # resolve identically; a disagreement decodes one GEMM `q+8` and the other two's-complement, with
+    # right shapes and plausible text. Declaring the DECISION path (not `_ct_sign` itself, whose
+    # margin/sample counts differ per stack) puts it in `GranuleSpec.policy`, in `fingerprint()` and
+    # under `assert_granule_pair_consistent`, which `MoELayer.granule_specs` runs over the pair.
+    _granule_policy = ("_ct_sign.uint4b8",)
+
     def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
         pf = 32 // quant.bits  # 8
         g = quant.group_size  # 32
@@ -220,21 +244,29 @@ class _GroupedCompressedTensorsExperts(BaseOP):
             # ASYMMETRIC: real per-group zero-points, already the op's packed [N//pf, G] layout.
             self.weight_zero_point = torch.empty((num_experts, N // pf, K // g), dtype=torch.int32)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedCompressedTensorsExperts holds weights; call kernels.w4a8_moe")
 
     def post_load(self) -> None:
         from minisgl.quant import kernels
-        from minisgl.quant.method import _ct_packed_is_uint4b8
+        from minisgl.quant.method import apply_ct_sign, ct_packed_sign_convention
 
         pf = 32 // self._quant.bits
         E, N, Kp = self.weight_packed.shape
         G = self.weight_scale.shape[-1]
         wp = self.weight_packed.contiguous()
         # Detected, not assumed — see the class docstring. XOR only for two's-complement packing.
-        uint4b8 = _ct_packed_is_uint4b8(wp)
-        self._w_op = wp if uint4b8 else (wp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+        # ONE decision for the WHOLE (E, N, K/8) stack, sampled with a fixed stride across all E
+        # experts and kept on the container. `_ct_sign` is what a chunked per-expert-range repack
+        # (weight offload Stage B, plan §5.2) must reuse: re-deriving it per chunk lets two chunks
+        # disagree, which XORs one contiguous block of experts and not the rest — plausible text, no
+        # crash, and undetectable downstream.
+        conv = ct_packed_sign_convention(wp, name="_GroupedCompressedTensorsExperts.weight_packed")
+        self._ct_sign = conv
+        self._w_op = apply_ct_sign(wp, conv)
         # GROUP-MAJOR scales/zeros: the op indexes `[g*N + n]`, so N must be the CONTIGUOUS axis (a
         # fragment's 16 lanes differ only in n, and then coalesce into one request). The
         # compressed-tensors checkpoint ships channel-major, so this path transposes; AWQ/GPTQ already
@@ -246,11 +278,22 @@ class _GroupedCompressedTensorsExperts(BaseOP):
             zeros = torch.empty((E, G, N // pf), dtype=torch.int32)
             zeros.view(torch.uint8).fill_(0x88)
             self._zeros_op = zeros.to(wp.device)
+            # DECLARE the residency exemption HERE, in the branch that made the buffer constant.
+            # Every expert row is the same 0x88 fill, so it need not travel per granule (~3% of w13).
+            # It has to be a DECLARATION rather than something the granule walker detects from the
+            # bytes, because each TP rank walks its OWN shard (w13 is column-split, w2 row-split) and
+            # a content-derived exemption is a decision two ranks can make differently with no
+            # collective to catch it — they would then hold different granule_bytes, different
+            # fingerprints and different placement (`weights/placement.py:24`,
+            # `weights/host_capacity.py:178`). `quant.sym` is config, so this branch is taken on
+            # every rank or on none. `derive_granule_spec` re-verifies it bitwise, so if a future
+            # checkpoint or repack makes these rows differ the boot fails loudly instead of
+            # dequantizing every expert against expert 0's zeros.
+            self._residency_shared = ("_zeros_op",)
         else:
             # ASYMMETRIC: same sign convention as the weight, so the same transform. The 4-bit packing
             # runs along N *within* each int32, so transposing the (N//pf, G) axes leaves it intact.
-            zp = zp.contiguous()
-            zp = zp if uint4b8 else (zp.view(torch.uint8) ^ 0x88).view(torch.int32).contiguous()
+            zp = apply_ct_sign(zp.contiguous(), conv)
             self._zeros_op = zp.transpose(1, 2).contiguous()  # (E, N//pf, G) -> (E, G, N//pf)
             del self.weight_zero_point
         del self.weight_packed, self.weight_scale
@@ -266,7 +309,7 @@ class _GroupedCompressedTensorsExperts(BaseOP):
             del self._w_op
 
 
-class _GroupedMxFp4Experts(BaseOP):
+class _GroupedMxFp4Experts(ExpertContainer, BaseOP):
     """MXFP4 (OCP E2M1 weights + E8M0 per-32-block scale) experts for one MoE GEMM (w13 or w2),
     STACKED over E. The compressed-tensors `mxfp4-pack-quantized` checkpoint ships (per expert,
     merged gate|up into w13 / down into w2 by the loader):
@@ -287,6 +330,8 @@ class _GroupedMxFp4Experts(BaseOP):
         self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
         self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.uint8)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedMxFp4Experts holds weights; call kernels.w4a8_moe instead")
@@ -331,16 +376,33 @@ class _GroupedMxFp4Experts(BaseOP):
         del self.weight_packed, self.weight_scale
 
 
-class _GroupedNvFp4Experts(BaseOP):
+class _GroupedNvFp4Experts(ExpertContainer, BaseOP):
     """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') experts for one MoE GEMM (w13 or w2), STACKED
-    over E. NVFP4 has the IDENTICAL 4-bit E2M1 weight codes as MXFP4; only the scale differs, and the
-    WEIGHT LOADER folds NVFP4's e4m3 block scale / per-tensor global into one fp16 per-group scale at
-    the leaf (before the gate/up merge + expert stack), so by load time these are MXFP4-shaped:
-        weight_packed (E, N, K//2) uint8 — 2 E2M1 nibbles/byte.
-        weight_scale  (E, N, K//16) fp16 — per-16-group scale (folded).
-    `post_load` packs the nibbles to (E,N,K//8) int32 codes and passes the fp16 scale through, so
-    `kernels.w4a8_moe(..., weight_is_e2m1=True)` at group_size 16 consumes `_w_op/_scales_op` exactly as
-    the MXFP4 experts do (group-16 rides the generic runtime-group_size e2m1 instance). Symmetric."""
+    over E. NVFP4 has the IDENTICAL 4-bit E2M1 weight codes as MXFP4; only the scale differs, and this
+    container keeps that scale in the CHECKPOINT'S OWN TWO LEVELS rather than folding it:
+
+        weight_packed (E, N, K//2)  uint8          — 2 E2M1 nibbles/byte.
+        weight_scale  (E, N, K//16) float8_e4m3fn  — the per-16-element block scale, BYTE-VERBATIM.
+        weight_global (E, N)        float32        — the per-OUTPUT-CHANNEL global MULTIPLIER.
+
+    WHY TWO TENSORS AND NOT ONE FOLDED fp16 SCALE (which is what this was until 2026-09-05). The fold
+    is LOSSY — a measured 4.37e-04 max / 1.4-2.4e-04 mean relative error on every weight of a real
+    checkpoint, where the two-level form is exact — and it is BIGGER, because an fp16 group scale is
+    2 bytes per 16 weights where an e4m3 block scale is 1. See `quant/nvfp4.py`'s module docstring;
+    the old claim that the fold was exact is the reason this sat unfixed.
+
+    The global is a per-output-channel VECTOR, not a scalar, because the loader's gate|up merge and
+    per-expert stack combine differently-scaled matrices: after the merge the global is constant on
+    each contiguous output-channel RANGE, which an (N,) vector expresses and a scalar cannot. That
+    shape is what lets `torch.cat(dim=0)` and `_ExpertStacker` carry it with no special case.
+
+    `post_load` packs the nibbles to (E,N,K//8) int32 codes, transposes the block scale group-major,
+    and bitcasts the global to int32 so it can ride the kernel's `w_zeros` POINTER SLOT — NVFP4 is
+    symmetric, so that slot is otherwise null and there is no op-schema change (precedent:
+    `_GroupedRXFExperts` threads the RXF NL codebook the same way). `kernels.w4a8_moe(...,
+    weight_is_e2m1=True)` at group_size 16 then consumes `_w_op/_scales_op/_global_op`; the kernel
+    picks `w4a8_tile::E4m3GroupScaleGlobal` vs `Fp16GroupScale` off the SCALES DTYPE, so there is no
+    flag to get out of sync. Symmetric — there are no zero-points to displace."""
 
     def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
         g = quant.group_size  # 16
@@ -349,8 +411,14 @@ class _GroupedNvFp4Experts(BaseOP):
             f"grouped NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
         )
         self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
-        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float16)
+        # float8_e4m3fn, not uint8: this is the checkpoint tensor's own dtype, so the loader's
+        # BaseOP dtype assertion passes on a VERBATIM tensor and no cast is possible. A uint8
+        # declaration would accept a value-converted tensor (byte 126 -> 126.0) just as happily.
+        self.weight_scale = torch.empty((num_experts, N, K // g), dtype=torch.float8_e4m3fn)
+        self.weight_global = torch.empty((num_experts, N), dtype=torch.float32)
         self._quant = quant
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedNvFp4Experts holds weights; call kernels.w4a8_moe instead")
@@ -361,11 +429,18 @@ class _GroupedNvFp4Experts(BaseOP):
         conv = nvfp4.convert_nvfp4_moe(self.weight_packed, self.weight_scale)
         self._w_op = conv["w_packed"]  # (E, N, K//8) int32
         # GROUP-MAJOR for the op's coalesced `[g*N + n]` scale read (see _GroupedAWQExperts).
-        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//16, N) fp16
-        del self.weight_packed, self.weight_scale
+        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//16, N) e4m3
+        # (E, N) f32 -> the SAME BYTES viewed as int32, because the op's global slot is `w_zeros`,
+        # typed `const int*`. `Tensor.view(dtype)` is a zero-copy bitcast at equal itemsize, and the
+        # kernel does `reinterpret_cast<const float*>` on the other side — so the f32 values survive
+        # exactly. A `.to(torch.int32)` here would VALUE-convert (2.078e-04 -> 0) and produce a model
+        # whose every expert output is zero; the two spellings are one character apart, so this
+        # comment is the guard.
+        self._global_op = self.weight_global.contiguous().view(torch.int32)  # (E, N)
+        del self.weight_packed, self.weight_scale, self.weight_global
 
 
-class _GroupedFP8Experts(BaseOP):
+class _GroupedFP8Experts(ExpertContainer, BaseOP):
     """Weight-only fp8 (F8_E4M3) experts for one MoE GEMM (w13 or w2), STACKED over E.
 
     ZAYA's experts are compressed-tensors *float-quant*: each expert weight is F8_E4M3 with a
@@ -383,9 +458,39 @@ class _GroupedFP8Experts(BaseOP):
         N, K = out_features, in_features
         self.weight = torch.empty((num_experts, N, K), dtype=torch.float8_e4m3fn)
         self.weight_scale = torch.empty((num_experts, N, 1), dtype=torch.float32)
+        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
+        self._num_experts = num_experts
 
     def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
         raise RuntimeError("_GroupedFP8Experts holds weights; dequant per-expert at compute")
+
+    # Which whole-stack A/B knob was LIVE when `post_load` built these buffers, or None. RECORDED at
+    # the point of decision, never re-read: `offload_refusal` runs at placement time, arbitrarily
+    # later than both `_FP8MoEMethod.__init__` (which snapshots MINISGL_ZAYA_OLDMOE at construction)
+    # and `post_load` (which snapshots both to decide whether to repack). Three reads of a mutable
+    # process global at three times can disagree, and one direction of disagreement is silent: a
+    # container BUILT under the knob but ASKED after it was cleared answers "offloadable", becomes
+    # host-resident, and then streams the whole (E,N,K) stack over PCIe every step — which presents
+    # as "the offload mechanism does not work", not as a stale env read.
+    _whole_stack_knob: "str | None" = None
+
+    def offload_refusal(self) -> "str | None":
+        """Refuse host residency under the two whole-stack A/B toggles.
+
+        `MINISGL_ZAYA_OLDMOE=1` routes the forward through `dequant()`, which materializes the ENTIRE
+        (E, N, K) bf16 stack every GEMM every forward, and `MINISGL_ZAYA_W8A16=1` reads `_w_op` for
+        every expert rather than the routed ones. Either one pulls the whole stack across PCIe per
+        step regardless of routing, so an offloaded serve would be catastrophically slow for a reason
+        that has nothing to do with the mechanism — and somebody would reasonably conclude the
+        mechanism does not work. Refuse at boot with the knob named."""
+        knob = self._whole_stack_knob
+        if knob is None:
+            return None
+        return (
+            f"{knob}=1 was live when these buffers were built, so the forward reads EVERY expert's "
+            f"weights (whole-stack dequant / full _w_op scan) and host residency would stream the "
+            f"entire stack per step. Unset {knob} and rebuild the model to offload these experts."
+        )
 
     def dequant(self, dtype: torch.dtype) -> torch.Tensor:
         """A/B-reference ONLY (`MINISGL_ZAYA_OLDMOE=1`): dequantize ALL experts to `dtype` -> (E,N,K).
@@ -418,6 +523,11 @@ class _GroupedFP8Experts(BaseOP):
         # _w_op/weight. (Per-container repack transient is one GEMM's ~128 MB, not the whole model.)
         _oldmoe = os.environ.get("MINISGL_ZAYA_OLDMOE", "0") == "1"
         _w8a16 = os.environ.get("MINISGL_ZAYA_W8A16", "0") == "1"
+        # Snapshot the whole-stack knob HERE, where it is actually read, so `offload_refusal` reports
+        # what this container WAS BUILT AS rather than what the environment happens to say later.
+        self._whole_stack_knob = (
+            "MINISGL_ZAYA_OLDMOE" if _oldmoe else ("MINISGL_ZAYA_W8A16" if _w8a16 else None)
+        )
         if kernels.MOE_W8A8_REGDIRECT and not _oldmoe and not _w8a16:
             import fp8_wmma
 
@@ -679,11 +789,13 @@ class _MxFp4MoEMethod(MoEQuantMethod):
 
 class _NvFp4MoEMethod(MoEQuantMethod):
     """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') grouped experts through `kernels.w4a8_moe`
-    with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay 4-bit;
-    the loader folded NVFP4's two-level scale to one fp16 per-group scale). Always the LDS path (the
-    register-direct b128 wide-load requires group_size%32, which NVFP4's 16 is not — see
-    `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE hands raw router_logits, which w4a8_moe routes
-    internally (topk_ids None). EP-capable like the other e2m1 experts (E on dim 0)."""
+    with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay
+    4-bit), but consuming the checkpoint's TWO-LEVEL scale directly: an e4m3 block scale plus the
+    per-output-channel f32 global, which rides the `w_zeros` pointer slot. See
+    `_GroupedNvFp4Experts`. Always the LDS path (the register-direct b128 wide-load requires
+    group_size%32, which NVFP4's 16 is not — see `kernels._w4a16_wide`), so no `_w_rep`. Qwen3.5-MoE
+    hands raw router_logits, which w4a8_moe routes internally (topk_ids None). EP-capable like the
+    other e2m1 experts (E on dim 0 of every buffer, including the global)."""
 
     supports_producer_actquant = True
 
@@ -700,9 +812,13 @@ class _NvFp4MoEMethod(MoEQuantMethod):
               x_fp8=None, act_scales=None):
         _check_activation("NVFP4", activation)
         assert not apply_router_weight_on_input, "MoE NVFP4 path has no router-weight-on-input"
+        # `_global_op` occupies the ZEROS argument. That is not a hack in the shape of one: the
+        # kernel's WScale policy owns the slot (`E4m3GroupScaleGlobal::wz_base/epi`) and its
+        # `uses_zeros=false` is constexpr, so the zero-point read is dead-code-eliminated under this
+        # policy and cannot decode the global's f32 bits as packed nibbles.
         return kernels.w4a8_moe(
-            hidden_states, w13._w_op, w13._scales_op, None,
-            w2._w_op, w2._scales_op, None,
+            hidden_states, w13._w_op, w13._scales_op, w13._global_op,
+            w2._w_op, w2._scales_op, w2._global_op,
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
             weight_is_e2m1=True, activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
@@ -711,8 +827,8 @@ class _NvFp4MoEMethod(MoEQuantMethod):
                  activation="silu"):
         _check_activation("NVFP4", activation)
         return kernels.w4a8_moe(
-            g_hidden, w13._w_op, w13._scales_op, None,
-            w2._w_op, w2._scales_op, None,
+            g_hidden, w13._w_op, w13._scales_op, w13._global_op,
+            w2._w_op, w2._scales_op, w2._global_op,
             None, top_k, renormalize, topk_weights=local_weights, topk_ids=local_ids,
             weight_is_e2m1=True, activation=activation,
         )
@@ -858,9 +974,10 @@ def create_moe_quant_method(
     if quant is None:
         return _UnquantizedMoEMethod()
     if quant.is_nvfp4:
-        # NVFP4 -> the MXFP4 e2m1 kernel at group-16 (weights stay 4-bit; the loader folded the
-        # two-level scale to one fp16 per-group scale at the leaf, which also lets the gate/up merge +
-        # expert stack just work — see _GroupedNvFp4Experts / nvfp4.fold_nvfp4_scale).
+        # NVFP4 -> the MXFP4 e2m1 kernel at group-16 (weights stay 4-bit). The loader keeps the
+        # checkpoint's TWO scale levels — an e4m3 block scale + a per-OUTPUT-CHANNEL f32 global — and
+        # that shape is what lets the gate/up merge and the expert stack carry the global with no
+        # special case. See _GroupedNvFp4Experts / nvfp4.nvfp4_leaf_scales.
         return _NvFp4MoEMethod(quant)
     if quant.is_rxf:
         return _RXFMoEMethod(quant)
@@ -875,6 +992,15 @@ def create_moe_quant_method(
 
 
 class MoELayer(BaseOP):
+    # ── WEIGHT-OFFLOAD INTERPOSITION POINT ──────────────────────────────────────────────────────
+    # A `weights/moe_interpose.MoEWeightSeam`, or None. Declared as a CLASS attribute so that a
+    # serve with no offload pays exactly one `is not None` test per MoE forward and stores nothing
+    # per layer — and, more importantly, so it stays out of `vars(self)`, which is what
+    # `BaseOP.state_dict` / `load_state_dict` / `post_load` and the granule walk all iterate.
+    # `moe_interpose.attach_seams` sets it on the INSTANCE (never on the class) after `post_load()`,
+    # and freezes it before the first graph capture.
+    _weight_offload = None
+
     def __init__(
         self,
         num_experts: int,
@@ -952,6 +1078,99 @@ class MoELayer(BaseOP):
             self.local_num_experts, hidden_size, intermediate_size_per_partition
         )
 
+    # ── granule descriptor ──────────────────────────────────────────────────────────────────────
+    # The MoE seam for weight residency. `forward` reads `w13, w2 = self.gate_up_proj, self.down_proj`
+    # and hands them to `method.apply`/`method.ep_local` AS ARGUMENTS — no format reads weights off
+    # `self` — so a residency layer that knows what one expert IS needs nothing format-specific here.
+    # Seven model families (qwen2_moe, qwen3_5_moe, gemma4, glm4_moe_lite, models/utils, laguna, zaya)
+    # share this one MoELayer, so what lands here is general by construction.
+
+    def expert_containers(self) -> "dict[str, object]":
+        """The two per-expert weight containers of this layer, keyed by attribute name."""
+        return {"gate_up_proj": self.gate_up_proj, "down_proj": self.down_proj}
+
+    def post_load(self) -> None:
+        """Finalize both containers, then prove they made the SAME decode decisions.
+
+        UNCONDITIONAL, and that is the whole point of overriding here. The w13/w2 decode-policy
+        comparison already existed — inside `granule_specs()` via `assert_granule_pair_consistent` —
+        but `granule_specs()` is called by `weights/moe_interpose.attach_seams` and by nothing else,
+        so it ran only on a serve that offloads weights. On every other serve the two containers of a
+        layer could resolve the compressed-tensors sign convention in opposite directions and nothing
+        looked: `_GroupedCompressedTensorsExperts.post_load` samples w13's nibble histogram and w2's
+        independently, and the two stacks are differently shaped (w13 is 2*inter x hidden, w2 is
+        hidden x inter, and under TP they are split on different axes), so they are genuinely two
+        samples of two different tensors. A disagreement decodes one GEMM as `q + 8` and the other as
+        two's-complement — every weight of that GEMM off by 8 quanta, right shapes, no kernel fault,
+        plausible text.
+
+        Cheap: it reads the declared `_granule_policy` paths off each container (two `getattr`
+        chains), with no tensor walk, no `torch.equal` and no synchronize — see
+        `granule.decode_policy` for why it deliberately does not go through spec derivation.
+        """
+        super().post_load()
+        assert_decode_policy_agrees(
+            {name: decode_policy(c) for name, c in self.expert_containers().items()},
+            where=f"{type(self).__name__} w13/w2",
+        )
+
+    def granule_specs(self, **kw) -> "dict[str, GranuleSpec]":
+        """Derive both GEMMs' granule descriptors. Call AFTER `post_load()` — before it, the
+        quantized containers still hold checkpoint buffers that `post_load` deletes.
+
+        `local_num_experts` is passed explicitly rather than inferred: under EP each rank holds a
+        SHARD, so the container's dim 0 is E/ep_size and an inferred count would be right by accident
+        on one topology and silently wrong on another.
+
+        BOOT-TIME ONLY, and never from `forward`: derivation walks attributes, launches the
+        declaration check's `torch.equal` and synchronizes, so it is illegal under graph capture and
+        a per-step stall in eager decode. `derive_granule_spec` refuses under capture; this is the
+        note for the eager case.
+        """
+        specs = {
+            name: spec_for_container(c, self.local_num_experts, **kw)
+            for name, c in self.expert_containers().items()
+        }
+        assert_granule_pair_consistent(
+            specs["gate_up_proj"], specs["down_proj"], where=type(self).__name__
+        )
+        return specs
+
+    def co_demanded_granule_bytes(self, **kw) -> int:
+        """Bytes moved by routing ONE expert in this layer: its slice of w13 AND of w2.
+
+        This is the unit the route oracle counts and the placement plan prices — the two GEMMs are
+        always demanded together, so they are one granule for accounting even though each component
+        still gets its own contiguous slab (see `plan_component_major`).
+        """
+        return sum(s.granule_bytes for s in self.granule_specs(**kw).values())
+
+    def offload_refusal(self) -> "str | None":
+        """Why this layer's experts cannot be host-resident, or None. First refusal wins.
+
+        Surfaced at the LAYER because that is the object a placement pass iterates; the refusal
+        itself lives on the container (`_GroupedFP8Experts` under `MINISGL_ZAYA_OLDMOE=1` /
+        `MINISGL_ZAYA_W8A16=1`, whose forwards read EVERY expert). `derive_granule_spec` only
+        consults it when asked (`for_offload=True`), and `granule_specs` deliberately does not ask —
+        a spec is also derived for pure sizing, which must work for a layer that will never move. So
+        a planner has to call this before it places a layer on host, or it will happily place one
+        whose forward streams the whole stack per step.
+
+        Rank-uniform: the refusal is a function of WHAT `post_load` BUILT (snapshotted into
+        `_GroupedFP8Experts._whole_stack_knob` at the point the knob is actually read), and every
+        rank runs the same `post_load` under the same launch environment. Deliberately NOT a live
+        `os.environ` read here: the environment can move between build and placement, and the silent
+        direction of that disagreement is a layer built under the knob being reported offloadable,
+        then streaming the whole stack per step. A per-rank knob would place a layer on host on one
+        rank and on device on the other — different budgets, different placement, no collective to
+        catch it — so if that ever becomes settable per rank it must be agreed, not read.
+        """
+        for name, c in self.expert_containers().items():
+            why = granule_offload_refusal(c)
+            if why is not None:
+                return f"{name}: {why}"
+        return None
+
     def _ep_route(
         self,
         router_logits: "torch.Tensor | None",
@@ -959,10 +1178,26 @@ class MoELayer(BaseOP):
         topk_ids: "torch.Tensor | None",
     ):
         """Return (topk_weights f32, topk_ids i32) for the EP dispatch. EP must all_gather a route, so
-        it can't defer to the kernel's fused softmax+topk — precompute it here (matching the kernel's
-        own torch route: softmax -> top_k -> optional renorm, kernels.py w4a8_moe._route). A model that
-        already provides a route (GLM/DeepSeek noaux_tc) passes it through unchanged; renormalize must
-        happen over ALL top_k here, BEFORE the per-rank local-expert masking in _ep_dispatch."""
+        it can't defer to the kernel's fused softmax+topk — precompute it here. A model that already
+        provides a route (GLM/DeepSeek noaux_tc) passes it through unchanged; renormalize must happen
+        over ALL top_k here, BEFORE the per-rank local-expert masking in _ep_dispatch.
+
+        NOT bit-identical to the non-EP route, and it must NOT be used to PREDICT which experts the
+        kernel will read. This used to claim it matched "the kernel's own torch route (kernels.py
+        w4a8_moe._route)". That function no longer exists — the served route is
+        `moe_hip.moe_route_align`, which does softmax + top-k INSIDE the kernel — and the two break
+        EXACT TIES at the k-th boundary opposite ways. Ties are common, not exotic: the gate logits are
+        bf16 (8 mantissa bits) spread over hundreds of experts. MEASURED on Qwen3.8-Flash-Next
+        (E=512, top_k=10), layer 0 of an 8-token prefill: experts 324 and 366 both scored exactly
+        -5.09375 at ranks 9 and 10, straddling the cut; the kernel kept the LOWER index (324) and
+        `torch.topk` kept the higher (366). Two of the eight MoE calls in that one forward diverged by
+        exactly one expert this way.
+
+        This is self-consistent for EP — `_ep_dispatch` hands these ids to the kernel, so an EP serve
+        uses this route end to end — but it does mean an EP and a non-EP serve of the same model can
+        select a different expert on a tie row. Anything that needs the set of experts the GEMM will
+        actually dereference (a routed weight gather, an offload prefetch) must call
+        `quant.kernels._route_align` and read its `topk_ids`/`expert_ids`, not re-derive it here."""
         if topk_ids is not None:
             assert topk_weights is not None, "topk_weights required when topk_ids is given"
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
@@ -1059,6 +1294,46 @@ class MoELayer(BaseOP):
         # owns routing + the EP dispatch/combine + the TP all-reduce.
         method = self._moe_method
         w13, w2 = self.gate_up_proj, self.down_proj
+        # WEIGHT-OFFLOAD SEAM. Every scheme's `apply`/`ep_local` takes the pair AS ARGUMENTS and no
+        # format reads its weights off `self`, so substituting the containers HERE is format-agnostic
+        # by construction and covers all seven model families that share this MoELayer.
+        #
+        # Under the layer-granular plan the substitution already happened at bind time (a layer is
+        # entirely device- or entirely host-resident, decided once at boot and frozen), so this is an
+        # identity plus two `is` checks — no allocation, no launch, no host sync, nothing that could
+        # differ between an eager warmup and a captured replay. The checks are load-bearing: the MTP
+        # draft head builds its own MoELayer, so a seam bound to the wrong layer would read
+        # identically-shaped containers and produce plausible logits with no crash.
+        if self._weight_offload is not None:
+            # THIRD TIER: CPU-COMPUTE. The experts of this layer are executed by AVX-512 cores on
+            # the host, where the weights already are, instead of being streamed to the GPU over
+            # PCIe. Only the activation crosses the bus (~5 KB down, ~10 KB up, against 30.7 MB of
+            # weights), which is the whole thesis — see weights/cpu_tier.py.
+            #
+            # Tested BEFORE resolve(), not after: a CPU-tier seam's containers are PAGEABLE host
+            # memory with no device mapping, so `resolve()` deliberately refuses on one rather than
+            # handing the grouped kernel a pointer the device cannot dereference.
+            #
+            # The route has to be materialised here — the non-EP path normally defers softmax+topk
+            # into the kernel, and there is no kernel on this path. This is BLOCK mode: submit and
+            # join in one call, GPU idle for the duration. It is still 3.6-4.3x cheaper per layer
+            # than streaming the same layer (0.583 ms at the measured 6-thread knee vs 2.12-2.49 ms
+            # over card 1's Gen4 x8 link). The concurrent composition — submit, run GPU work, join
+            # — is `seam.cpu_submit`/`cpu_join` and needs SPLIT mode to have any GPU work to hide
+            # behind, because the residual stream is sequential.
+            if self._weight_offload.computes_on_cpu:
+                assert not self.enable_ep, (
+                    "the CPU-compute tier is not wired through the EP all_gather: _ep_dispatch "
+                    "re-orders rows across ranks, so a CPU partial computed from pre-gather rows "
+                    "would be added to the wrong tokens. Plan CPU layers only on an EP-free rank, "
+                    "or pack the CPU partial into the gather first."
+                )
+                tw, ti = self._ep_route(router_logits, topk_weights, topk_ids)
+                out = self._weight_offload.cpu_forward(hidden_states, tw, ti)
+                if self.tp_size > 1 and reduce:
+                    out = self._comm.all_reduce(out)
+                return out
+            w13, w2 = self._weight_offload.resolve(w13, w2)
         # PRODUCER-SIDE act quant: the pair describes `hidden_states` ROW FOR ROW. Under EP the rows
         # are all_gather'd and re-ordered before the local kernel sees them (see _ep_dispatch), so a
         # pair that was not gathered alongside them would be silently mismatched -- every token would

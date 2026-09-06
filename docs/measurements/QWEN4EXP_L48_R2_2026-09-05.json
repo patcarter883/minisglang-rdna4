@@ -1,0 +1,1786 @@
+{
+  "tp": 2,
+  "layers": 48,
+  "device_gb": 8.1,
+  "cards": [
+    "AMD Radeon RX 9070 XT",
+    "AMD Radeon RX 9070"
+  ],
+  "device_indices": [
+    0,
+    1
+  ],
+  "failures": 2,
+  "ranks": [
+    {
+      "layers": 48,
+      "device_gb": 8.1,
+      "host_gb": 25.0,
+      "tp": 2,
+      "rank": 0,
+      "stream_layers_requested": 0,
+      "cpu_layers_requested": 0,
+      "cpu_threads_per_rank": 2,
+      "boot_seconds": 726.1,
+      "card": "AMD Radeon RX 9070 XT",
+      "device_index": 0,
+      "offload": true,
+      "attention_backend": "hip",
+      "cuda_graph_max_bs_requested": 2,
+      "cuda_graph_bs_captured": [
+        1,
+        2
+      ],
+      "graph_capture_engaged": true,
+      "ple_graph_capturer": "PLEGraphCapture",
+      "boot_ple_prepares": 2,
+      "boot_ple_commits": 0,
+      "boot_ple_discards": 2,
+      "boot_ple_commit_noops": 0,
+      "gdn_layers": 36,
+      "gdn_local_k_heads": [
+        8
+      ],
+      "gdn_local_v_heads": [
+        24
+      ],
+      "gdn_global_k_heads": 16,
+      "gdn_global_v_heads": 48,
+      "ep_enabled": false,
+      "ep_over_tp": false,
+      "ep_size": 1,
+      "hc_tensors": 774,
+      "ct_sign_decisions": 0,
+      "hc_replicated": true,
+      "hc_diverging_tensors": [],
+      "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+      "session_enabled": true,
+      "plan_host_bytes": 25716326400,
+      "plan_device_bytes": 8572108800,
+      "copied_bytes": 25716326400,
+      "stage_b_chunks": 49,
+      "stage_b_keys_filled": 1236,
+      "stage_b_peak_device_allocated": 40909012992,
+      "stage_b_peak_device_reserved": 41460695040,
+      "stage_b_min_device_free": 1113587712,
+      "stage_b_peak_host_rss": 30071132160,
+      "stage_b_seconds": 261.9,
+      "stage_b_host_layers": 36,
+      "stage_b_device_layers": 12,
+      "stage_b_cpu_layers": 0,
+      "arena_pinned_bytes": 25895632896,
+      "arena_carved_bytes": 25769803776,
+      "arena_torch_fallbacks": 0,
+      "seam_moe_layers": 48,
+      "seam_host_layers": 36,
+      "seam_device_layers": 12,
+      "seam_host_bytes": 25716326400,
+      "seam_device_bytes": 8572108800,
+      "seam_pointer_checked": true,
+      "verify_after_capture_fired": 2,
+      "token_ids": [
+        [
+          11751,
+          13,
+          11751,
+          369,
+          264,
+          3177,
+          13,
+          1942,
+          9432,
+          513,
+          7172,
+          383
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "text": [
+        " Paris. Paris is a city. All cities are located on",
+        ".\n\n<think>\nThe user wants a single sentence about bicycles"
+      ],
+      "engaged": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "parity_steps": 12,
+      "parity_widths": [
+        1,
+        2
+      ],
+      "parity_by_width": {
+        "1": {
+          "width": 1,
+          "prompts": [
+            "The capital of France is"
+          ],
+          "captured_bucket_exists": true,
+          "captured_seconds": 34.306,
+          "eager_seconds": 0.825,
+          "captured_self": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.41975,
+            "n_disagreements": 0
+          },
+          "eager_self": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.29127,
+            "n_disagreements": 0
+          },
+          "captured_self_ids_match": true,
+          "eager_self_ids_match": true,
+          "run_to_run_floor": 0.41975,
+          "captured_ids": [
+            [
+              11751,
+              13,
+              561,
+              6511,
+              314,
+              9564,
+              369,
+              19241,
+              13,
+              561,
+              6511,
+              314
+            ]
+          ],
+          "eager_ids": [
+            [
+              11751,
+              13,
+              561,
+              6511,
+              314,
+              9564,
+              369,
+              19241,
+              13,
+              561,
+              6511,
+              314
+            ]
+          ],
+          "captured_text": [
+            " Paris. The capital of Germany is Berlin. The capital of"
+          ],
+          "eager_text": [
+            " Paris. The capital of Germany is Berlin. The capital of"
+          ],
+          "verdict": "IDENTICAL over 12 greedy ids in 1 row(s)",
+          "margins": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.46442,
+            "n_disagreements": 0
+          },
+          "engine_deterministic_at_this_config": false,
+          "real_disagreements": 0,
+          "ple_captured_leg": {
+            "prepares": 24,
+            "commits": 24
+          },
+          "ple_eager_leg": {
+            "prepares": 24,
+            "commits": 24
+          }
+        },
+        "2": {
+          "width": 2,
+          "prompts": [
+            "The capital of France is",
+            "Write one sentence about bicycles"
+          ],
+          "captured_bucket_exists": true,
+          "captured_seconds": 2.106,
+          "eager_seconds": 1.405,
+          "captured_self": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 8,
+                "row": 0,
+                "captured_top1": 14833,
+                "eager_top1": 1942,
+                "captured_top2": 1942,
+                "eager_top2": 14833,
+                "captured_margin": 0.0901,
+                "eager_margin": 0.35835,
+                "cross_leg_top1_delta": 0.08809,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              },
+              {
+                "step": 9,
+                "row": 0,
+                "captured_top1": 11,
+                "eager_top1": 9432,
+                "captured_top2": 30,
+                "eager_top2": 89798,
+                "captured_margin": 2.27238,
+                "eager_margin": 5.8485,
+                "cross_leg_top1_delta": 0.60826,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 10,
+                "row": 0,
+                "captured_top1": 1092,
+                "eager_top1": 513,
+                "captured_top2": 279,
+                "eager_top2": 599,
+                "captured_margin": 0.22619,
+                "eager_margin": 0.78298,
+                "cross_leg_top1_delta": 0.56376,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 11,
+                "row": 0,
+                "captured_top1": 369,
+                "eager_top1": 7172,
+                "captured_top2": 628,
+                "eager_top2": 303,
+                "captured_margin": 0.07486,
+                "eager_margin": 0.95947,
+                "cross_leg_top1_delta": 3.18971,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 279,
+                "eager_top1": 303,
+                "captured_top2": 11751,
+                "eager_top2": 383,
+                "captured_margin": 1.32596,
+                "eager_margin": 0.05068,
+                "cross_leg_top1_delta": 0.50831,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              }
+            ],
+            "worst_cross_leg_top1_delta": 3.18971,
+            "n_disagreements": 5
+          },
+          "eager_self": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 383,
+                "eager_top1": 303,
+                "captured_top2": 303,
+                "eager_top2": 383,
+                "captured_margin": 0.30111,
+                "eager_margin": 0.14061,
+                "cross_leg_top1_delta": 0.18448,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              }
+            ],
+            "worst_cross_leg_top1_delta": 0.74065,
+            "n_disagreements": 1
+          },
+          "captured_self_ids_match": false,
+          "eager_self_ids_match": false,
+          "run_to_run_floor": 3.18971,
+          "captured_ids": [
+            [
+              11751,
+              13,
+              11751,
+              369,
+              264,
+              3177,
+              13,
+              14833,
+              11,
+              1092,
+              369,
+              279
+            ],
+            [
+              13,
+              271,
+              248068,
+              198,
+              760,
+              1156,
+              6587,
+              264,
+              3074,
+              11316,
+              883,
+              70386
+            ]
+          ],
+          "eager_ids": [
+            [
+              11751,
+              13,
+              11751,
+              369,
+              264,
+              3177,
+              13,
+              1942,
+              9432,
+              513,
+              7172,
+              383
+            ],
+            [
+              13,
+              271,
+              248068,
+              198,
+              760,
+              1156,
+              6587,
+              264,
+              3074,
+              11316,
+              883,
+              70386
+            ]
+          ],
+          "captured_text": [
+            " Paris. Paris is a city. Therefore, what is the",
+            ".\n\n<think>\nThe user wants a single sentence about bicycles"
+          ],
+          "eager_text": [
+            " Paris. Paris is a city. All cities are located on",
+            ".\n\n<think>\nThe user wants a single sentence about bicycles"
+          ],
+          "verdict": "DIVERGED: row0@step7",
+          "margins": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 8,
+                "row": 0,
+                "captured_top1": 14833,
+                "eager_top1": 1942,
+                "captured_top2": 1942,
+                "eager_top2": 14833,
+                "captured_margin": 0.0901,
+                "eager_margin": 0.74746,
+                "cross_leg_top1_delta": 0.78413,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              },
+              {
+                "step": 9,
+                "row": 0,
+                "captured_top1": 11,
+                "eager_top1": 9432,
+                "captured_top2": 30,
+                "eager_top2": 89798,
+                "captured_margin": 2.27238,
+                "eager_margin": 6.25032,
+                "cross_leg_top1_delta": 0.98095,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 10,
+                "row": 0,
+                "captured_top1": 1092,
+                "eager_top1": 513,
+                "captured_top2": 279,
+                "eager_top2": 599,
+                "captured_margin": 0.22619,
+                "eager_margin": 0.8971,
+                "cross_leg_top1_delta": 0.73291,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 11,
+                "row": 0,
+                "captured_top1": 369,
+                "eager_top1": 7172,
+                "captured_top2": 628,
+                "eager_top2": 303,
+                "captured_margin": 0.07486,
+                "eager_margin": 0.96905,
+                "cross_leg_top1_delta": 3.19002,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 279,
+                "eager_top1": 383,
+                "captured_top2": 11751,
+                "eager_top2": 303,
+                "captured_margin": 1.32596,
+                "eager_margin": 0.30111,
+                "cross_leg_top1_delta": 0.28892,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              }
+            ],
+            "worst_cross_leg_top1_delta": 3.19002,
+            "n_disagreements": 5
+          },
+          "engine_deterministic_at_this_config": false,
+          "real_disagreements": 0,
+          "ple_captured_leg": {
+            "prepares": 26,
+            "commits": 26
+          },
+          "ple_eager_leg": {
+            "prepares": 26,
+            "commits": 26
+          }
+        }
+      },
+      "replay_matches_eager": "bs=1: IDENTICAL over 12 greedy ids in 1 row(s) | bs=2: DIVERGED: row0@step7",
+      "parity_captured_ids": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ]
+      ],
+      "parity_eager_ids": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ]
+      ],
+      "parity_captured_text": [
+        " Paris. The capital of Germany is Berlin. The capital of"
+      ],
+      "parity_eager_text": [
+        " Paris. The capital of Germany is Berlin. The capital of"
+      ],
+      "parity_captured_seconds": 34.306,
+      "parity_eager_seconds": 0.825,
+      "parity_ple_prepares": 115,
+      "parity_ple_commits": 113,
+      "parity_ple_discards": 2,
+      "parity_ple_commit_noops": 0,
+      "engaged_after_capture": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "repro_probe_n": 4,
+      "repro_captured": {
+        "runs": [
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ]
+        ],
+        "equality_matrix": [
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ]
+        ],
+        "same_as_first": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "all_identical": true,
+        "matches_slot_parity_prediction": false,
+        "distinct_outputs": 1
+      },
+      "repro_eager": {
+        "runs": [
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ]
+        ],
+        "equality_matrix": [
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ]
+        ],
+        "same_as_first": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "all_identical": true,
+        "matches_slot_parity_prediction": false,
+        "distinct_outputs": 1
+      },
+      "repro_engine_is_reproducible": true,
+      "ab_sampler": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "eos_token_id": [
+          248046,
+          248044
+        ],
+        "ignore_eos_on_timed_legs": true
+      },
+      "ab_prompt": "Explain in three sentences why the sky is blue.",
+      "ab_tokens": 128,
+      "ab_repeats": 5,
+      "ab_captured_wall_tok_per_s_samples": [
+        14.299,
+        14.578,
+        14.398,
+        14.623,
+        14.526
+      ],
+      "ab_captured_wall_tok_per_s_median": 14.526,
+      "ab_captured_wall_tok_per_s_min": 14.299,
+      "ab_captured_wall_tok_per_s_max": 14.623,
+      "ab_captured_steady_ms_per_step_samples": [
+        0.618,
+        0.497,
+        0.484,
+        0.435,
+        0.552
+      ],
+      "ab_captured_steady_ms_per_step_median": 0.497,
+      "ab_captured_steady_ms_per_step_min": 0.435,
+      "ab_captured_steady_ms_per_step_max": 0.618,
+      "ab_captured_steady_tok_per_s_median": 2011.217,
+      "ab_captured_prefill_s": 0.3009,
+      "ab_captured_residual_s": 8.4391,
+      "ab_captured_residual_ms_per_token": 65.93,
+      "ab_captured_forward_share_of_wall": 0.0422,
+      "ab_captured_tokens": 128,
+      "ab_captured_decode_steps": 127,
+      "ab_captured_steady_n": 126,
+      "ab_captured_tokens_per_rep": [
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "ab_captured_decode_steps_per_rep": [
+        127,
+        127,
+        127,
+        127,
+        127
+      ],
+      "ab_captured_prefill_steps_per_rep": [
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "ab_eager_wall_tok_per_s_samples": [
+        13.613,
+        13.676,
+        13.669,
+        13.829,
+        13.696
+      ],
+      "ab_eager_wall_tok_per_s_median": 13.676,
+      "ab_eager_wall_tok_per_s_min": 13.613,
+      "ab_eager_wall_tok_per_s_max": 13.829,
+      "ab_eager_steady_ms_per_step_samples": [
+        30.634,
+        30.246,
+        30.061,
+        29.035,
+        29.219
+      ],
+      "ab_eager_steady_ms_per_step_median": 30.061,
+      "ab_eager_steady_ms_per_step_min": 29.035,
+      "ab_eager_steady_ms_per_step_max": 30.634,
+      "ab_eager_steady_tok_per_s_median": 33.265,
+      "ab_eager_prefill_s": 0.3066,
+      "ab_eager_residual_s": 5.157,
+      "ab_eager_residual_ms_per_token": 40.289,
+      "ab_eager_forward_share_of_wall": 0.4493,
+      "ab_eager_tokens": 128,
+      "ab_eager_decode_steps": 127,
+      "ab_eager_steady_n": 126,
+      "ab_eager_tokens_per_rep": [
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "ab_eager_decode_steps_per_rep": [
+        127,
+        127,
+        127,
+        127,
+        127
+      ],
+      "ab_eager_prefill_steps_per_rep": [
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "ab_speedup_wall": 1.0622,
+      "ab_speedup_steady": 60.4849,
+      "ab_ms_per_step_saved": 29.564,
+      "ab_steady_fields_are_host_forward_wall_not_device_time": true,
+      "ab_residual_ms_per_token_delta": 25.641,
+      "ab_net_ms_per_step_saved_after_residual": 3.923,
+      "ab_wall_ms_per_decode_step_captured": 69.384,
+      "ab_wall_ms_per_decode_step_eager": 73.697,
+      "ab_speedup_per_decode_step": 1.0622,
+      "ab_provenance": {
+        "captured_replays_total": 635,
+        "captured_eager_decode_total": 0,
+        "eager_replays_total": 0,
+        "eager_eager_decode_total": 635,
+        "captured_decode_phases": [
+          "decode_graph"
+        ],
+        "eager_decode_phases": [
+          "decode_eager"
+        ],
+        "captured_resolve_delta": {
+          "weight_offload.moe_resolve[host]": 288,
+          "weight_offload.moe_resolve[device]": 96
+        },
+        "eager_resolve_delta": {
+          "weight_offload.moe_resolve[host]": 4860,
+          "weight_offload.moe_resolve[device]": 1620
+        },
+        "host_layers_per_eager_forward_captured_leg": 36.0,
+        "host_layers_per_eager_forward_eager_leg": 36.0,
+        "captured_leg_prefill_forwards": 8,
+        "eager_leg_total_forwards": 135
+      },
+      "ab_quality_captured": "We need to respond to user: \"Explain in three sentences why the sky is blue. Must be exactly three sentences? User says in three sentences. We should satisfy. Need final only three sentences. Explain Rayleigh scattering, violet vs blue, cones/energy. Keep simple. Ensure three sentences exactly. Sentence ",
+      "ab_quality_captured_tokens": 64,
+      "ab_quality_eager": "We need to respond to user: \"Explain in three sentences why the sky is blue.\" Simple. Final exactly three sentences likely. Need ensure three sentences. Could be: \"Sunlight contains many colors. Molecules scatter short blue wavelengths more strongly than longer red wavelengths. This scattered blue light reaches our eyes from all",
+      "ab_quality_eager_tokens": 64,
+      "quality_sampler": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "max_tokens": 128
+      },
+      "quality_prompt": "Explain in three sentences why the sky is blue.",
+      "quality_text": "We need to respond to user: \"Explain in three sentences why the sky is blue.\" Need final only three sentences. Ensure concise.\n</think>\n\nSunlight contains all colors of visible light. When sunlight passes through Earth\u2019s atmosphere, molecules scatter shorter blue wavelengths more strongly than longer red wavelengths. This scattered blue light reaches our eyes from all directions, making the sky appear blue.",
+      "quality_tokens_out": 77,
+      "quality_seconds": 5.91,
+      "tok_per_s": 13.022,
+      "hc_ab_error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 15.92 GiB of which 52.00 MiB is free. Of the allocated memory 38.16 GiB is allocated by PyTorch, with 37.00 MiB allocated in private pools (e.g., CUDA Graphs), and 1.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "kv_pages": 3057,
+      "failures": 1
+    },
+    {
+      "layers": 48,
+      "device_gb": 8.1,
+      "host_gb": 25.0,
+      "tp": 2,
+      "rank": 1,
+      "stream_layers_requested": 0,
+      "cpu_layers_requested": 0,
+      "cpu_threads_per_rank": 2,
+      "boot_seconds": 726.2,
+      "card": "AMD Radeon RX 9070",
+      "device_index": 1,
+      "offload": true,
+      "attention_backend": "hip",
+      "cuda_graph_max_bs_requested": 2,
+      "cuda_graph_bs_captured": [
+        1,
+        2
+      ],
+      "graph_capture_engaged": true,
+      "ple_graph_capturer": "PLEGraphCapture",
+      "boot_ple_prepares": 2,
+      "boot_ple_commits": 0,
+      "boot_ple_discards": 2,
+      "boot_ple_commit_noops": 0,
+      "gdn_layers": 36,
+      "gdn_local_k_heads": [
+        8
+      ],
+      "gdn_local_v_heads": [
+        24
+      ],
+      "gdn_global_k_heads": 16,
+      "gdn_global_v_heads": 48,
+      "ep_enabled": false,
+      "ep_over_tp": false,
+      "ep_size": 1,
+      "hc_tensors": 774,
+      "ct_sign_decisions": 0,
+      "hc_replicated": true,
+      "hc_diverging_tensors": [],
+      "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+      "session_enabled": true,
+      "plan_host_bytes": 25716326400,
+      "plan_device_bytes": 8572108800,
+      "copied_bytes": 25716326400,
+      "stage_b_chunks": 49,
+      "stage_b_keys_filled": 1236,
+      "stage_b_peak_device_allocated": 40909012992,
+      "stage_b_peak_device_reserved": 41460695040,
+      "stage_b_min_device_free": 1113587712,
+      "stage_b_peak_host_rss": 30092464128,
+      "stage_b_seconds": 262.0,
+      "stage_b_host_layers": 36,
+      "stage_b_device_layers": 12,
+      "stage_b_cpu_layers": 0,
+      "arena_pinned_bytes": 25895632896,
+      "arena_carved_bytes": 25769803776,
+      "arena_torch_fallbacks": 0,
+      "seam_moe_layers": 48,
+      "seam_host_layers": 36,
+      "seam_device_layers": 12,
+      "seam_host_bytes": 25716326400,
+      "seam_device_bytes": 8572108800,
+      "seam_pointer_checked": true,
+      "verify_after_capture_fired": 2,
+      "token_ids": [
+        [
+          11751,
+          13,
+          11751,
+          369,
+          264,
+          3177,
+          13,
+          1942,
+          9432,
+          513,
+          7172,
+          383
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "text": [
+        " Paris. Paris is a city. All cities are located on",
+        ".\n\n<think>\nThe user wants a single sentence about bicycles"
+      ],
+      "engaged": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "parity_steps": 12,
+      "parity_widths": [
+        1,
+        2
+      ],
+      "parity_by_width": {
+        "1": {
+          "width": 1,
+          "prompts": [
+            "The capital of France is"
+          ],
+          "captured_bucket_exists": true,
+          "captured_seconds": 34.306,
+          "eager_seconds": 0.825,
+          "captured_self": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.41975,
+            "n_disagreements": 0
+          },
+          "eager_self": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.29127,
+            "n_disagreements": 0
+          },
+          "captured_self_ids_match": true,
+          "eager_self_ids_match": true,
+          "run_to_run_floor": 0.41975,
+          "captured_ids": [
+            [
+              11751,
+              13,
+              561,
+              6511,
+              314,
+              9564,
+              369,
+              19241,
+              13,
+              561,
+              6511,
+              314
+            ]
+          ],
+          "eager_ids": [
+            [
+              11751,
+              13,
+              561,
+              6511,
+              314,
+              9564,
+              369,
+              19241,
+              13,
+              561,
+              6511,
+              314
+            ]
+          ],
+          "captured_text": [
+            " Paris. The capital of Germany is Berlin. The capital of"
+          ],
+          "eager_text": [
+            " Paris. The capital of Germany is Berlin. The capital of"
+          ],
+          "verdict": "IDENTICAL over 12 greedy ids in 1 row(s)",
+          "margins": {
+            "steps_compared": 12,
+            "captured_steps": 12,
+            "eager_steps": 12,
+            "disagreements": [],
+            "worst_cross_leg_top1_delta": 0.46442,
+            "n_disagreements": 0
+          },
+          "engine_deterministic_at_this_config": false,
+          "real_disagreements": 0,
+          "ple_captured_leg": {
+            "prepares": 24,
+            "commits": 24
+          },
+          "ple_eager_leg": {
+            "prepares": 24,
+            "commits": 24
+          }
+        },
+        "2": {
+          "width": 2,
+          "prompts": [
+            "The capital of France is",
+            "Write one sentence about bicycles"
+          ],
+          "captured_bucket_exists": true,
+          "captured_seconds": 2.106,
+          "eager_seconds": 1.405,
+          "captured_self": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 8,
+                "row": 0,
+                "captured_top1": 14833,
+                "eager_top1": 1942,
+                "captured_top2": 1942,
+                "eager_top2": 14833,
+                "captured_margin": 0.0901,
+                "eager_margin": 0.35835,
+                "cross_leg_top1_delta": 0.08809,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              },
+              {
+                "step": 9,
+                "row": 0,
+                "captured_top1": 11,
+                "eager_top1": 9432,
+                "captured_top2": 30,
+                "eager_top2": 89798,
+                "captured_margin": 2.27238,
+                "eager_margin": 5.8485,
+                "cross_leg_top1_delta": 0.60826,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 10,
+                "row": 0,
+                "captured_top1": 1092,
+                "eager_top1": 513,
+                "captured_top2": 279,
+                "eager_top2": 599,
+                "captured_margin": 0.22619,
+                "eager_margin": 0.78298,
+                "cross_leg_top1_delta": 0.56376,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 11,
+                "row": 0,
+                "captured_top1": 369,
+                "eager_top1": 7172,
+                "captured_top2": 628,
+                "eager_top2": 303,
+                "captured_margin": 0.07486,
+                "eager_margin": 0.95947,
+                "cross_leg_top1_delta": 3.18971,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 279,
+                "eager_top1": 303,
+                "captured_top2": 11751,
+                "eager_top2": 383,
+                "captured_margin": 1.32596,
+                "eager_margin": 0.05068,
+                "cross_leg_top1_delta": 0.50831,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              }
+            ],
+            "worst_cross_leg_top1_delta": 3.18971,
+            "n_disagreements": 5
+          },
+          "eager_self": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 383,
+                "eager_top1": 303,
+                "captured_top2": 303,
+                "eager_top2": 383,
+                "captured_margin": 0.30111,
+                "eager_margin": 0.14061,
+                "cross_leg_top1_delta": 0.18448,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              }
+            ],
+            "worst_cross_leg_top1_delta": 0.74065,
+            "n_disagreements": 1
+          },
+          "captured_self_ids_match": false,
+          "eager_self_ids_match": false,
+          "run_to_run_floor": 3.18971,
+          "captured_ids": [
+            [
+              11751,
+              13,
+              11751,
+              369,
+              264,
+              3177,
+              13,
+              14833,
+              11,
+              1092,
+              369,
+              279
+            ],
+            [
+              13,
+              271,
+              248068,
+              198,
+              760,
+              1156,
+              6587,
+              264,
+              3074,
+              11316,
+              883,
+              70386
+            ]
+          ],
+          "eager_ids": [
+            [
+              11751,
+              13,
+              11751,
+              369,
+              264,
+              3177,
+              13,
+              1942,
+              9432,
+              513,
+              7172,
+              383
+            ],
+            [
+              13,
+              271,
+              248068,
+              198,
+              760,
+              1156,
+              6587,
+              264,
+              3074,
+              11316,
+              883,
+              70386
+            ]
+          ],
+          "captured_text": [
+            " Paris. Paris is a city. Therefore, what is the",
+            ".\n\n<think>\nThe user wants a single sentence about bicycles"
+          ],
+          "eager_text": [
+            " Paris. Paris is a city. All cities are located on",
+            ".\n\n<think>\nThe user wants a single sentence about bicycles"
+          ],
+          "verdict": "DIVERGED: row0@step7",
+          "margins": {
+            "steps_compared": 13,
+            "captured_steps": 13,
+            "eager_steps": 13,
+            "disagreements": [
+              {
+                "step": 8,
+                "row": 0,
+                "captured_top1": 14833,
+                "eager_top1": 1942,
+                "captured_top2": 1942,
+                "eager_top2": 14833,
+                "captured_margin": 0.0901,
+                "eager_margin": 0.74746,
+                "cross_leg_top1_delta": 0.78413,
+                "margin_exceeds_delta": false,
+                "swapped_top2": true
+              },
+              {
+                "step": 9,
+                "row": 0,
+                "captured_top1": 11,
+                "eager_top1": 9432,
+                "captured_top2": 30,
+                "eager_top2": 89798,
+                "captured_margin": 2.27238,
+                "eager_margin": 6.25032,
+                "cross_leg_top1_delta": 0.98095,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 10,
+                "row": 0,
+                "captured_top1": 1092,
+                "eager_top1": 513,
+                "captured_top2": 279,
+                "eager_top2": 599,
+                "captured_margin": 0.22619,
+                "eager_margin": 0.8971,
+                "cross_leg_top1_delta": 0.73291,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 11,
+                "row": 0,
+                "captured_top1": 369,
+                "eager_top1": 7172,
+                "captured_top2": 628,
+                "eager_top2": 303,
+                "captured_margin": 0.07486,
+                "eager_margin": 0.96905,
+                "cross_leg_top1_delta": 3.19002,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              },
+              {
+                "step": 12,
+                "row": 0,
+                "captured_top1": 279,
+                "eager_top1": 383,
+                "captured_top2": 11751,
+                "eager_top2": 303,
+                "captured_margin": 1.32596,
+                "eager_margin": 0.30111,
+                "cross_leg_top1_delta": 0.28892,
+                "margin_exceeds_delta": false,
+                "swapped_top2": false
+              }
+            ],
+            "worst_cross_leg_top1_delta": 3.19002,
+            "n_disagreements": 5
+          },
+          "engine_deterministic_at_this_config": false,
+          "real_disagreements": 0,
+          "ple_captured_leg": {
+            "prepares": 26,
+            "commits": 26
+          },
+          "ple_eager_leg": {
+            "prepares": 26,
+            "commits": 26
+          }
+        }
+      },
+      "replay_matches_eager": "bs=1: IDENTICAL over 12 greedy ids in 1 row(s) | bs=2: DIVERGED: row0@step7",
+      "parity_captured_ids": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ]
+      ],
+      "parity_eager_ids": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ]
+      ],
+      "parity_captured_text": [
+        " Paris. The capital of Germany is Berlin. The capital of"
+      ],
+      "parity_eager_text": [
+        " Paris. The capital of Germany is Berlin. The capital of"
+      ],
+      "parity_captured_seconds": 34.306,
+      "parity_eager_seconds": 0.825,
+      "parity_ple_prepares": 115,
+      "parity_ple_commits": 113,
+      "parity_ple_discards": 2,
+      "parity_ple_commit_noops": 0,
+      "engaged_after_capture": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "repro_probe_n": 4,
+      "repro_captured": {
+        "runs": [
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ]
+        ],
+        "equality_matrix": [
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ]
+        ],
+        "same_as_first": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "all_identical": true,
+        "matches_slot_parity_prediction": false,
+        "distinct_outputs": 1
+      },
+      "repro_eager": {
+        "runs": [
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ],
+          [
+            11751,
+            13,
+            561,
+            6511,
+            314,
+            9564,
+            369,
+            19241,
+            13,
+            561,
+            6511,
+            314
+          ]
+        ],
+        "equality_matrix": [
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ],
+          [
+            true,
+            true,
+            true,
+            true
+          ]
+        ],
+        "same_as_first": [
+          true,
+          true,
+          true,
+          true
+        ],
+        "all_identical": true,
+        "matches_slot_parity_prediction": false,
+        "distinct_outputs": 1
+      },
+      "repro_engine_is_reproducible": true,
+      "ab_sampler": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "eos_token_id": [
+          248046,
+          248044
+        ],
+        "ignore_eos_on_timed_legs": true
+      },
+      "ab_prompt": "Explain in three sentences why the sky is blue.",
+      "ab_tokens": 128,
+      "ab_repeats": 5,
+      "ab_captured_wall_tok_per_s_samples": [
+        14.299,
+        14.578,
+        14.398,
+        14.623,
+        14.526
+      ],
+      "ab_captured_wall_tok_per_s_median": 14.526,
+      "ab_captured_wall_tok_per_s_min": 14.299,
+      "ab_captured_wall_tok_per_s_max": 14.623,
+      "ab_captured_steady_ms_per_step_samples": [
+        0.627,
+        0.513,
+        0.516,
+        0.456,
+        0.563
+      ],
+      "ab_captured_steady_ms_per_step_median": 0.516,
+      "ab_captured_steady_ms_per_step_min": 0.456,
+      "ab_captured_steady_ms_per_step_max": 0.627,
+      "ab_captured_steady_tok_per_s_median": 1936.324,
+      "ab_captured_prefill_s": 0.2943,
+      "ab_captured_residual_s": 8.4434,
+      "ab_captured_residual_ms_per_token": 65.964,
+      "ab_captured_forward_share_of_wall": 0.0418,
+      "ab_captured_tokens": 128,
+      "ab_captured_decode_steps": 127,
+      "ab_captured_steady_n": 126,
+      "ab_captured_tokens_per_rep": [
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "ab_captured_decode_steps_per_rep": [
+        127,
+        127,
+        127,
+        127,
+        127
+      ],
+      "ab_captured_prefill_steps_per_rep": [
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "ab_eager_wall_tok_per_s_samples": [
+        13.613,
+        13.675,
+        13.669,
+        13.829,
+        13.695
+      ],
+      "ab_eager_wall_tok_per_s_median": 13.675,
+      "ab_eager_wall_tok_per_s_min": 13.613,
+      "ab_eager_wall_tok_per_s_max": 13.829,
+      "ab_eager_steady_ms_per_step_samples": [
+        30.895,
+        30.496,
+        30.416,
+        29.477,
+        29.215
+      ],
+      "ab_eager_steady_ms_per_step_median": 30.416,
+      "ab_eager_steady_ms_per_step_min": 29.215,
+      "ab_eager_steady_ms_per_step_max": 30.895,
+      "ab_eager_steady_tok_per_s_median": 32.878,
+      "ab_eager_prefill_s": 0.3101,
+      "ab_eager_residual_s": 5.1134,
+      "ab_eager_residual_ms_per_token": 39.948,
+      "ab_eager_forward_share_of_wall": 0.4537,
+      "ab_eager_tokens": 128,
+      "ab_eager_decode_steps": 127,
+      "ab_eager_steady_n": 126,
+      "ab_eager_tokens_per_rep": [
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "ab_eager_decode_steps_per_rep": [
+        127,
+        127,
+        127,
+        127,
+        127
+      ],
+      "ab_eager_prefill_steps_per_rep": [
+        8,
+        8,
+        8,
+        8,
+        8
+      ],
+      "ab_speedup_wall": 1.0622,
+      "ab_speedup_steady": 58.9457,
+      "ab_ms_per_step_saved": 29.9,
+      "ab_steady_fields_are_host_forward_wall_not_device_time": true,
+      "ab_residual_ms_per_token_delta": 26.016,
+      "ab_net_ms_per_step_saved_after_residual": 3.884,
+      "ab_wall_ms_per_decode_step_captured": 69.384,
+      "ab_wall_ms_per_decode_step_eager": 73.702,
+      "ab_speedup_per_decode_step": 1.0622,
+      "ab_provenance": {
+        "captured_replays_total": 635,
+        "captured_eager_decode_total": 0,
+        "eager_replays_total": 0,
+        "eager_eager_decode_total": 635,
+        "captured_decode_phases": [
+          "decode_graph"
+        ],
+        "eager_decode_phases": [
+          "decode_eager"
+        ],
+        "captured_resolve_delta": {
+          "weight_offload.moe_resolve[host]": 288,
+          "weight_offload.moe_resolve[device]": 96
+        },
+        "eager_resolve_delta": {
+          "weight_offload.moe_resolve[host]": 4860,
+          "weight_offload.moe_resolve[device]": 1620
+        },
+        "host_layers_per_eager_forward_captured_leg": 36.0,
+        "host_layers_per_eager_forward_eager_leg": 36.0,
+        "captured_leg_prefill_forwards": 8,
+        "eager_leg_total_forwards": 135
+      },
+      "ab_quality_captured": "We need to respond to user: \"Explain in three sentences why the sky is blue. Must be exactly three sentences? User says in three sentences. We should satisfy. Need final only three sentences. Explain Rayleigh scattering, violet vs blue, cones/energy. Keep simple. Ensure three sentences exactly. Sentence ",
+      "ab_quality_captured_tokens": 64,
+      "ab_quality_eager": "We need to respond to user: \"Explain in three sentences why the sky is blue.\" Simple. Final exactly three sentences likely. Need ensure three sentences. Could be: \"Sunlight contains many colors. Molecules scatter short blue wavelengths more strongly than longer red wavelengths. This scattered blue light reaches our eyes from all",
+      "ab_quality_eager_tokens": 64,
+      "quality_sampler": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 0.95,
+        "max_tokens": 128
+      },
+      "quality_prompt": "Explain in three sentences why the sky is blue.",
+      "quality_text": "We need to respond to user: \"Explain in three sentences why the sky is blue.\" Need final only three sentences. Ensure concise.\n</think>\n\nSunlight contains all colors of visible light. When sunlight passes through Earth\u2019s atmosphere, molecules scatter shorter blue wavelengths more strongly than longer red wavelengths. This scattered blue light reaches our eyes from all directions, making the sky appear blue.",
+      "quality_tokens_out": 77,
+      "quality_seconds": 5.92,
+      "tok_per_s": 13.008,
+      "hc_ab_error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 1 has a total capacity of 15.92 GiB of which 58.00 MiB is free. Of the allocated memory 38.16 GiB is allocated by PyTorch, with 37.00 MiB allocated in private pools (e.g., CUDA Graphs), and 1.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+      "kv_pages": 3057,
+      "failures": 1
+    }
+  ],
+  "token_ids": [
+    [
+      11751,
+      13,
+      11751,
+      369,
+      264,
+      3177,
+      13,
+      1942,
+      9432,
+      513,
+      7172,
+      383
+    ],
+    [
+      13,
+      271,
+      248068,
+      198,
+      760,
+      1156,
+      6587,
+      264,
+      3074,
+      11316,
+      883,
+      70386
+    ]
+  ],
+  "text": [
+    " Paris. Paris is a city. All cities are located on",
+    ".\n\n<think>\nThe user wants a single sentence about bicycles"
+  ]
+}

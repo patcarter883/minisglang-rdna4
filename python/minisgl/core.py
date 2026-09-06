@@ -315,6 +315,19 @@ class Context:
     # ZAYA CCA recurrent-state cache (conv_states + prev_hs) — set by the Engine ONLY for CCA-hybrid
     # models, reached via `get_global_ctx().cca_state`. Stays None for every non-Zaya model.
     cca_state: "CCAStateCache | None" = field(default=None, init=False)
+    # Qwen4-Exp PLE runtime (`minisgl/ple/runtime.py::PLERuntime`) — the NVMe-resident n-gram table,
+    # its per-sequence conv/token state, and the batch staged for the current forward. Set by the
+    # Engine ONLY for qwen4_exp; None everywhere else. `Qwen4ExpPLE.forward` reaches it via
+    # `get_global_ctx().ple` and REFUSES when no batch was staged — a PLE block that quietly skips
+    # itself drops the n-gram features, which costs quality and errors nowhere.
+    ple: "object | None" = field(default=None, init=False)
+    # Qwen4-Exp QSA sparse-attention runtime (`minisgl/attention/qsa/runtime.py::QSARuntime`) — the
+    # index-key ring + compressed-key cache + the index RoPE, and the per-forward selection plan.
+    # Installed by `Qwen4ExpForConditionalGeneration.prepare_qsa` on the first (warmup) forward and
+    # reached by the full-attention layers via `get_global_ctx().qsa`. None for every other model AND
+    # for a qwen4_exp build where the sparse path is unavailable — in which case those layers run
+    # DENSE and refuse any context past indexer_budget rather than silently attending more.
+    qsa: "object | None" = field(default=None, init=False)
     # CAM editable-memory (Option B) — the built CAMMemory (store+tap+router), set by the Engine ONLY
     # when MINISGL_CAM=1 + a checkpoint is given. The model's L24 tap reaches it via stage_cam; stays
     # None for every non-memory run, where the tap is a byte-exact no-op.

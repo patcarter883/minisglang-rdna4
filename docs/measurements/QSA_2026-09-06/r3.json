@@ -1,0 +1,166 @@
+{
+  "tp": 1,
+  "layers": 4,
+  "lens": "4096,999999",
+  "sampler": {
+    "temperature": 1.0,
+    "top_k": 20,
+    "top_p": 0.95
+  },
+  "failures": 1,
+  "ranks": [
+    {
+      "rank": 0,
+      "tp": 1,
+      "layers": 4,
+      "boot_seconds": 11.6,
+      "card": "AMD Radeon RX 9070 XT",
+      "device_index": 0,
+      "kv_pages": 159873,
+      "page_size": 16,
+      "kv_pool_tokens": 2557968,
+      "engine_max_seq_len": 262144,
+      "checkpoint_max_position": 262144,
+      "kv_layers": 1,
+      "kv_bytes_per_token_per_rank": 2048,
+      "kv_pool_bytes_per_rank": 5238718464,
+      "qsa_active": true,
+      "qsa_profile": {
+        "budget": 2048,
+        "compress_ratio": 4,
+        "block_topk": 512,
+        "index_width": 2051,
+        "head_dim": 128
+      },
+      "qsa_cache": "QSAIndexCache(layers=1, req_rows=3, ratio=4, head_dim=128, comp_slots=639496, MiB=156.1)",
+      "qsa_cache_bytes": 163714352,
+      "ladder": [
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            4087
+          ],
+          "wall_seconds": 1.854,
+          "ok": true,
+          "prefill_steps": 4,
+          "prefill_seconds": 1.172,
+          "prefill_tok_per_s": 3487.0,
+          "decode_steps": 23,
+          "decode_phases": [
+            "decode_eager"
+          ],
+          "decode_ms_per_step_median": 3.42,
+          "decode_tok_per_s_median": 292.03,
+          "text": " correct\u6e17\u900f\u6e17\u900f\u6642\u8a08ineseikke Structures\u5dee\u5f02torihciukulatform\u6709\u6240\u601d Rresteemaineleveisphererics oftenendment Whilstpone eingel",
+          "gen_tokens": 24,
+          "wall_tok_per_s": 12.945,
+          "degeneration": {
+            "chars": 115,
+            "words": 6,
+            "distinct_word_ratio": 1.0,
+            "longest_immediate_repeat_run": 0,
+            "longest_single_char_run": 0,
+            "non_ascii_char_frac": 0.0957,
+            "tokens": 24
+          },
+          "retrieved_early_needle": false,
+          "retrieved_late_needle": false,
+          "visited": 6324245,
+          "dense": 8448105,
+          "sparsity_visited_over_dense": 0.748599
+        },
+        {
+          "target_tokens": 999999,
+          "actual_tokens": 999997,
+          "filler_sentences": 44935,
+          "chat_templated": true,
+          "early_needle_line": 898,
+          "late_needle_line": 40441,
+          "early_needle_depth_frac": 0.02,
+          "late_needle_depth_frac": 0.9,
+          "rank": 0,
+          "batch_width": 1,
+          "batch_actual_tokens": [
+            999997
+          ],
+          "wall_seconds": 0.055,
+          "ok": false,
+          "error_type": "Rejected",
+          "error": "input sequence length 999997 exceeds the servable maximum 262144 (KV pool); request rejected",
+          "terminal": false
+        },
+        {
+          "target_tokens": 4096,
+          "actual_tokens": 4087,
+          "filler_sentences": 201,
+          "chat_templated": true,
+          "early_needle_line": 4,
+          "late_needle_line": 180,
+          "early_needle_depth_frac": 0.0199,
+          "late_needle_depth_frac": 0.8955,
+          "rank": 0,
+          "batch_width": 2,
+          "batch_actual_tokens": [
+            4087,
+            4085
+          ],
+          "ok": false,
+          "error_type": "ValueError",
+          "error": "QSA prefill chunk is not group-aligned: cached_len=9 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+          "terminal": false,
+          "leg": "concurrency"
+        }
+      ],
+      "concurrency": {
+        "target_tokens": 4096,
+        "actual_tokens": 4087,
+        "filler_sentences": 201,
+        "chat_templated": true,
+        "early_needle_line": 4,
+        "late_needle_line": 180,
+        "early_needle_depth_frac": 0.0199,
+        "late_needle_depth_frac": 0.8955,
+        "rank": 0,
+        "batch_width": 2,
+        "batch_actual_tokens": [
+          4087,
+          4085
+        ],
+        "ok": false,
+        "error_type": "ValueError",
+        "error": "QSA prefill chunk is not group-aligned: cached_len=9 is not a multiple of compress_ratio=4. The KV page size must be a multiple of r so a group cannot straddle a chunk.",
+        "terminal": false,
+        "leg": "concurrency"
+      },
+      "max_context_served_tokens": 4087,
+      "first_refusal": {
+        "target": 999999,
+        "error_type": "Rejected",
+        "error": "input sequence length 999997 exceeds the servable maximum 262144 (KV pool); request rejected"
+      },
+      "retrieval": {
+        "4087": {
+          "early": false,
+          "late": false
+        }
+      },
+      "failures": 1
+    }
+  ],
+  "max_context_served_tokens": 4087,
+  "engine_max_seq_len": 262144,
+  "first_refusal": {
+    "target": 999999,
+    "error_type": "Rejected",
+    "error": "input sequence length 999997 exceeds the servable maximum 262144 (KV pool); request rejected"
+  }
+}

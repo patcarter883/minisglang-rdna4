@@ -1,0 +1,428 @@
+{
+  "tp": 2,
+  "layers": 48,
+  "device_gb": 8.1,
+  "cards": [
+    "AMD Radeon RX 9070 XT",
+    "AMD Radeon RX 9070"
+  ],
+  "device_indices": [
+    0,
+    1
+  ],
+  "failures": 0,
+  "ranks": [
+    {
+      "layers": 48,
+      "device_gb": 8.1,
+      "host_gb": 25.0,
+      "tp": 2,
+      "rank": 0,
+      "stream_layers_requested": 0,
+      "cpu_layers_requested": 0,
+      "cpu_threads_per_rank": 2,
+      "boot_seconds": 1046.7,
+      "card": "AMD Radeon RX 9070 XT",
+      "device_index": 0,
+      "offload": true,
+      "attention_backend": "hip",
+      "cuda_graph_max_bs_requested": 2,
+      "cuda_graph_bs_captured": [
+        1,
+        2
+      ],
+      "graph_capture_engaged": true,
+      "ple_graph_capturer": "PLEGraphCapture",
+      "boot_ple_prepares": 2,
+      "boot_ple_commits": 0,
+      "boot_ple_discards": 2,
+      "boot_ple_commit_noops": 0,
+      "gdn_layers": 36,
+      "gdn_local_k_heads": [
+        8
+      ],
+      "gdn_local_v_heads": [
+        24
+      ],
+      "gdn_global_k_heads": 16,
+      "gdn_global_v_heads": 48,
+      "ep_enabled": false,
+      "ep_over_tp": false,
+      "ep_size": 1,
+      "hc_tensors": 774,
+      "ct_sign_decisions": 0,
+      "hc_replicated": true,
+      "hc_diverging_tensors": [],
+      "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+      "session_enabled": true,
+      "plan_host_bytes": 25716326400,
+      "plan_device_bytes": 8572108800,
+      "copied_bytes": 25716326400,
+      "stage_b_chunks": 49,
+      "stage_b_keys_filled": 1236,
+      "stage_b_peak_device_allocated": 40909012992,
+      "stage_b_peak_device_reserved": 41460695040,
+      "stage_b_min_device_free": 1113587712,
+      "stage_b_peak_host_rss": 30096207872,
+      "stage_b_seconds": 438.0,
+      "stage_b_host_layers": 36,
+      "stage_b_device_layers": 12,
+      "stage_b_cpu_layers": 0,
+      "arena_pinned_bytes": 25895632896,
+      "arena_carved_bytes": 25769803776,
+      "arena_torch_fallbacks": 0,
+      "seam_moe_layers": 48,
+      "seam_host_layers": 36,
+      "seam_device_layers": 12,
+      "seam_host_bytes": 25716326400,
+      "seam_device_bytes": 8572108800,
+      "seam_pointer_checked": true,
+      "verify_after_capture_fired": 2,
+      "token_ids": [
+        [
+          11751,
+          13,
+          11751,
+          369
+        ],
+        [
+          13,
+          271,
+          248068,
+          198
+        ]
+      ],
+      "text": [
+        " Paris. Paris is",
+        ".\n\n<think>\n"
+      ],
+      "engaged": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "hc_ab_blocks_found": 97,
+      "hc_ab_blocks_packed_before": 97,
+      "hc_ab_flip_census": {
+        "blocks_touched": 97,
+        "blocks_without_pack": 1
+      },
+      "hc_ab_packed_while_off": 0,
+      "hc_ab_packed_after_restore": 97,
+      "hc_ab_packed_bytes_restored_exactly": true,
+      "hc_ab_ids_fused": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_ids_unfused": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_ids_fused_again": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_tokens_per_prompt": 12,
+      "hc_ab_same_code_floor_identical": true,
+      "hc_ab_ids_identical": true,
+      "hc_ab_first_divergence": null,
+      "kv_pages": 3057,
+      "failures": 0
+    },
+    {
+      "layers": 48,
+      "device_gb": 8.1,
+      "host_gb": 25.0,
+      "tp": 2,
+      "rank": 1,
+      "stream_layers_requested": 0,
+      "cpu_layers_requested": 0,
+      "cpu_threads_per_rank": 2,
+      "boot_seconds": 1046.6,
+      "card": "AMD Radeon RX 9070",
+      "device_index": 1,
+      "offload": true,
+      "attention_backend": "hip",
+      "cuda_graph_max_bs_requested": 2,
+      "cuda_graph_bs_captured": [
+        1,
+        2
+      ],
+      "graph_capture_engaged": true,
+      "ple_graph_capturer": "PLEGraphCapture",
+      "boot_ple_prepares": 2,
+      "boot_ple_commits": 0,
+      "boot_ple_discards": 2,
+      "boot_ple_commit_noops": 0,
+      "gdn_layers": 36,
+      "gdn_local_k_heads": [
+        8
+      ],
+      "gdn_local_v_heads": [
+        24
+      ],
+      "gdn_global_k_heads": 16,
+      "gdn_global_v_heads": 48,
+      "ep_enabled": false,
+      "ep_over_tp": false,
+      "ep_size": 1,
+      "hc_tensors": 774,
+      "ct_sign_decisions": 0,
+      "hc_replicated": true,
+      "hc_diverging_tensors": [],
+      "ct_sign_cross_rank": "not exercised: 0 CT containers in this checkpoint",
+      "session_enabled": true,
+      "plan_host_bytes": 25716326400,
+      "plan_device_bytes": 8572108800,
+      "copied_bytes": 25716326400,
+      "stage_b_chunks": 49,
+      "stage_b_keys_filled": 1236,
+      "stage_b_peak_device_allocated": 40909012992,
+      "stage_b_peak_device_reserved": 41460695040,
+      "stage_b_min_device_free": 1113587712,
+      "stage_b_peak_host_rss": 30077222912,
+      "stage_b_seconds": 438.0,
+      "stage_b_host_layers": 36,
+      "stage_b_device_layers": 12,
+      "stage_b_cpu_layers": 0,
+      "arena_pinned_bytes": 25895632896,
+      "arena_carved_bytes": 25769803776,
+      "arena_torch_fallbacks": 0,
+      "seam_moe_layers": 48,
+      "seam_host_layers": 36,
+      "seam_device_layers": 12,
+      "seam_host_bytes": 25716326400,
+      "seam_device_bytes": 8572108800,
+      "seam_pointer_checked": true,
+      "verify_after_capture_fired": 2,
+      "token_ids": [
+        [
+          11751,
+          13,
+          11751,
+          369
+        ],
+        [
+          13,
+          271,
+          248068,
+          198
+        ]
+      ],
+      "text": [
+        " Paris. Paris is",
+        ".\n\n<think>\n"
+      ],
+      "engaged": [
+        "weight_offload.moe_resolve[device]",
+        "weight_offload.moe_resolve[host]",
+        "weight_offload.stage_a_sealed",
+        "weight_offload.stage_b_chunked_load",
+        "weight_offload.verify_after_capture"
+      ],
+      "hc_ab_blocks_found": 97,
+      "hc_ab_blocks_packed_before": 97,
+      "hc_ab_flip_census": {
+        "blocks_touched": 97,
+        "blocks_without_pack": 1
+      },
+      "hc_ab_packed_while_off": 0,
+      "hc_ab_packed_after_restore": 97,
+      "hc_ab_packed_bytes_restored_exactly": true,
+      "hc_ab_ids_fused": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_ids_unfused": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_ids_fused_again": [
+        [
+          11751,
+          13,
+          561,
+          6511,
+          314,
+          9564,
+          369,
+          19241,
+          13,
+          561,
+          6511,
+          314
+        ],
+        [
+          13,
+          271,
+          248068,
+          198,
+          760,
+          1156,
+          6587,
+          264,
+          3074,
+          11316,
+          883,
+          70386
+        ]
+      ],
+      "hc_ab_tokens_per_prompt": 12,
+      "hc_ab_same_code_floor_identical": true,
+      "hc_ab_ids_identical": true,
+      "hc_ab_first_divergence": null,
+      "kv_pages": 3057,
+      "failures": 0
+    }
+  ],
+  "token_ids": [
+    [
+      11751,
+      13,
+      11751,
+      369
+    ],
+    [
+      13,
+      271,
+      248068,
+      198
+    ]
+  ],
+  "text": [
+    " Paris. Paris is",
+    ".\n\n<think>\n"
+  ]
+}

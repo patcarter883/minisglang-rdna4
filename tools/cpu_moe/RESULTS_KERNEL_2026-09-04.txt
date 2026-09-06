@@ -1,0 +1,126 @@
+CPU MoE expert path -- one layer, decode (M=1), Qwen3.8-Flash-Next-NVFP4
+Ryzen 7 7800X3D (8C/16T, 96 MB V-cache), DDR5-4800 dual channel, 2026-09-04
+Build: g++ 16.2.1  -O3 -march=znver4 -std=c++17   (gcc, host, no container needed)
+Route taken: (b) own AVX-512 kernel, bit-exact on the checkpoint's own NVFP4 bytes.
+
+BOX CONDITIONS MATTER AND ARE RECORDED PER TABLE.  A TP=2 minisgl serve belonging to a
+concurrent graph-capture workflow came up mid-session; every number below says which.
+
+================================================================================
+0. CHECKPOINT FORMAT -- pinned empirically, and it is NOT what quant/nvfp4.py says
+================================================================================
+  weight         uint8 (N,K/2)   E2M1, LOW nibble = lower K index
+  weight_scale   e4m3  (N,K/16)  per-16 block scale
+  weight_scale_2 f32   scalar    per-tensor global -- a MULTIPLIER
+
+      W[n,k] = E2M1_LUT[code] * e4m3(weight_scale[n,k/16]) * weight_scale_2
+
+  minisgl's python/minisgl/quant/nvfp4.py documents and implements the llm-compressor
+  convention -- `weight_global_scale = 448*6/amax`, a DIVISOR -- and its loader keys on the
+  NAME `.weight_global_scale`.  This checkpoint spells it `.weight_scale_2` and stores the
+  RECIPROCAL.  Using the documented sign gives |W| ~ 4.2e6 instead of rms 0.0135.
+  Four independent confirmations:
+    * dividing -> |W| 4.2e6 (absurd); multiplying -> rms 0.0135 (a textbook weight matrix)
+    * down_proj's largest block-scale byte is 126 (= e4m3 448 = FP8_E4M3_MAX) for EVERY
+      expert -- only scale = block_amax/FP4_MAX/weight_scale_2 can produce that saturation
+    * gate_proj and up_proj share ONE weight_scale_2 across all 512 experts (quantized as one
+      stacked/fused tensor), which is exactly why THEIR per-expert block maxima sit below 448
+    * input_scale * 2688 = 5.3, a plausible activation amax; the reciprocal would be 1.4e6
+  Not currently a live bug: config.py:385 lists `.weight_scale_2` among the names the loader
+  ignores, so this checkpoint's experts are not silently mis-folded -- they are simply not
+  served through the NVFP4 fold path at all.
+
+================================================================================
+1. CORRECTNESS -- proven before any throughput number was quoted
+================================================================================
+Reference: float64 dequant-and-GEMM over the RAW safetensors bytes (make_fixture.py), on
+real expert tensors read from /home/pat/.cache/hf-q4e.  Full layer: 10 experts x
+(gate, up, SiLU-mul, down) with real routing weights.
+
+  layer  policy  rel_rms    max_abs    ref_rms   verdict
+  L0     e4m3    1.988e-07  8.224e-09  0.0091    PASS
+  L1     e4m3    1.992e-07  7.062e-09  0.0084    PASS
+  L2     e4m3    1.760e-07  5.925e-09  0.0085    PASS
+  L3     e4m3    2.082e-07  6.635e-09  0.0078    PASS
+  L0     fp16    3.577e-04  1.244e-05  0.0091    PASS (see note)
+
+  * ~2e-07 is pure fp32 accumulation rounding -- the kernel is exact on the checkpoint bytes.
+  * Bit-identical at T=1, T=4 and T=8: the thread partition is deterministic.
+  * The fp16 policy's 3.58e-04 is NOT a kernel error, it is the fp16 group-scale fold's own
+    quantization loss (fp16 has 11 mantissa bits -> ~2.4e-04 relative; measured matches).
+    i.e. holding the checkpoint's e4m3 scale byte is BOTH smaller (2.7648 vs 3.072 MB/expert)
+    and ~1800x more accurate than the fp16-folded layout the GPU path keeps in VRAM.
+
+Core self-test, all three WLoad policies vs a scalar fp64 reference (mode=selftest):
+  nvfp4_e4m3_g16 8.8e-08 PASS | nvfp4_fp16_g16 7.7e-08 PASS | mxfp4_e8m0_g32 9.5e-08 PASS
+
+================================================================================
+2. THROUGHPUT -- 4-layer resident table, 2048 experts, 5.27 GiB (55x the V-cache)
+   top-10 routing redrawn every iteration; GB/s is WEIGHT bytes actually consumed
+   (10 x 2,764,800 B = 27.648 MB per layer-token)
+================================================================================
+(a) QUIET BOX (load avg 2.31, the other workflow's serve was down), e4m3 policy:
+
+   T   ms/layer(med)  GB/s(med)   ms(p5)  GB/s(p5)
+   1      3.263          8.47      3.115     8.88
+   2      1.641         16.84      1.575    17.56
+   3      1.117         24.75      1.062    26.04
+   4      0.843         32.79      0.800    34.58
+   6      0.583         47.45      0.545    50.74
+   8      0.842         32.85 *    0.517    53.48     * median disturbed, p5 is the signal
+  12      0.581         47.61      0.566    48.86
+  16      0.498         55.46      0.460    60.13   <-- headline
+
+  HEADLINE: 55.46 GB/s, 0.498 ms/layer at top-10, 16 threads.
+  Scaling is LINEAR to ~6 threads (8.47 -> 47.45) then flattens into the DDR ceiling.
+
+(b) UNDER a co-running TP=2 serve (~8 busy hardware threads from another workflow,
+    load 15-18).  Medians become scheduler noise; p5 is the usable statistic:
+      T1 ~8.3-10.0 | T2 ~15.3-17.0 | T4 ~27.4-29.6 | T6 ~38.0-43.8 | T8 ~33.3-35.1 GB/s
+    Above ~6 threads it goes BACKWARDS -- there are no free cores to take.
+
+(c) Cache-resident (cap=16 experts = 44 MB, inside the 96 MB V-cache) = COMPUTE ceiling:
+      e4m3  T1=8.8  T4=33.0  T8=57.2  T16=66.5 GB/s
+    This is the finding that matters: the DDR-resident numbers in (a) are within a few
+    percent of the cache-resident numbers at the same T.  The kernel is COMPUTE-bound per
+    core and only reaches the DDR ceiling by spending every thread on it.
+
+================================================================================
+3. WHY -- decode-only microbench, 1 thread, L1-resident, pinned (decode_microbench.cpp)
+================================================================================
+  A  cvtepu8_epi32 + vpermps   (this core)     18.08 Gw/s   11.30 GB/s   3.58 w/cyc
+  B  vpshufb -> fp16 -> vcvtph2ps              15.26 Gw/s    9.54 GB/s   3.02 w/cyc
+  C  vpshufb -> int8 -> vpdpbusd (VNNI)       108.03 Gw/s   67.52 GB/s  21.39 w/cyc
+  D  A with the scale multiply removed         20.08 Gw/s   12.55 GB/s   3.98 w/cyc
+  E  fp32 vfmadd roofline, decode DELETED      26.47 Gw/s   16.54 GB/s   5.24 w/cyc
+
+  * E is a HARD ARCHITECTURAL CEILING: 16.54 GB/s of 4-bit weights per core is the most any
+    fp32-ACTIVATION kernel can do here even if dequant were free.  This core sits at 68% of
+    it, so at most 1.46x is left on the table in this formulation.
+  * C beats E by 4.1x for one reason: VPDPBUSD retires 64 weights per instruction (4 int8
+    MACs x 16 lanes) where fp32 VFMADD retires 16, AND int8 weights need no int->float
+    conversion at all.  That is an ALGORITHM difference, not an implementation defect.
+  * B was the optimization I was about to write (E2M1 -> fp16 is a pure high-byte table --
+    every fp16 low byte is 0x00).  Measured SLOWER than A.  Not adopted.
+  * Row blocking (RB = 1 / 2 / 4, interleaved A/B, 3 rounds) is a measured NO-WIN:
+    T1 = 8.5-9.0 GB/s for all three widths.  Consistent with E: x-loads were never the
+    constraint.  Shipped RB=1 (CPU_MOE_ROW_BLOCK).
+
+================================================================================
+4. WHAT THIS MEANS FOR THE HYBRID
+================================================================================
+  * Aggregate throughput target: MET.  55.46 GB/s == the 55.0 GB/s saturated DDR value the
+    ceiling task measured; 0.498 ms/layer x 37 offloaded layers = 18.4 ms of MoE weight
+    traffic per token = 54.2 tok/s.  That is a BANDWIDTH CEILING for the offloaded-expert
+    portion only -- it excludes attention, the shared expert, lm_head, activation round
+    trips and CPU/GPU serialization, and is not an end-to-end prediction.
+  * Core budget: NOT met by this formulation.  The ceiling task's premise that "~1-2 cores
+    saturate the memory system, leaving 4-6 cores for the engine" holds for its VNNI
+    int8-activation kernel (57.2 GB/s at 1 thread), not for an fp32-activation one.  This
+    core needs 6 threads for 47 GB/s and all 16 for 55, and measurement (b) shows it cannot
+    get them while the engine is running.
+  * So the production choice is a VNNI int8-activation core -- for CORE OCCUPANCY, not for
+    bandwidth.  The accuracy cost is real but it is a cost the GPU path already pays: the
+    HIP W4A8 path quantizes activations to fp8 dynamically.  This fp32 core stays valuable
+    regardless as the correctness ORACLE that a VNNI core must be validated against, and as
+    the higher-fidelity option when spare cores exist.

@@ -7,6 +7,7 @@ from minisgl.layers import BaseOP
 
 if TYPE_CHECKING:
     import torch
+    from minisgl.core import Batch
 
 
 class BaseLLMModel(ABC, BaseOP):
@@ -46,6 +47,29 @@ class BaseLLMModel(ABC, BaseOP):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support aux-hidden capture (set_capture_layers)"
             )
+
+    def prepare_for_replay(self, batch: "Batch") -> None:
+        """HOST-side per-step work/guards for a decode step that is a captured-graph REPLAY.
+
+        Called by ``GraphRunner.replay`` immediately before ``g.replay()``, eager, on the same
+        stream, alongside the attention/GDN/CCA/CAM/PLE capturers' own ``prepare_for_replay``.
+        Default: nothing, which is right for every model whose ``forward()`` is pure device work.
+
+        IT EXISTS BECAUSE CAPTURE DELETES PYTHON. Everything a model does in Python inside
+        ``forward()`` — a host-side branch, an assertion over ``batch.reqs``, a budget check — runs
+        exactly ONCE, at capture time, against the synthetic ``[dummy_req] * bs`` batch
+        ``GraphRunner._capture_graphs`` builds, and then never again for the life of the process.
+        A device computation is faithfully recorded; a *guard* is silently deleted. So a per-batch
+        refusal written in ``forward()`` (qwen4_exp's QSA indexer-budget check is the live example:
+        past ``indexer_budget`` this engine's dense attention stops being bit-equivalent to the
+        checkpoint's sparse one, and running it anyway is a DIFFERENT MODEL producing plausible
+        text) stops refusing the moment ``--cuda-graph-max-bs`` goes above zero.
+
+        Override this to restate such a guard where capture cannot erase it. Anything that must
+        affect the replayed COMPUTATION, rather than merely gate it, has to be written IN PLACE into
+        a buffer whose address was baked at capture — a fresh tensor built here is invisible to the
+        graph.
+        """
 
     @abstractmethod
     def forward(
