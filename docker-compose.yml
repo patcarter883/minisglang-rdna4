@@ -662,6 +662,16 @@ services:
       # This service REDEFINES volumes rather than inheriting *lean-common's, so /ghost has to be
       # repeated here — the anchor's copy does not merge in. Durable host path; see the anchor.
       - ${GHOST_ORACLE_DIR:-/home/pat/fixtures/minisgl-ghost-oracle}:/ghost
+      # qwen4_exp (Qwen3.8-Flash-Next NVFP4) is a LOCAL checkpoint in two parts, and serve.sh's
+      # arm preflights BOTH: the expert stacks ship as per-layer shard files under /model, and the
+      # 51.2 GB n-gram table is a separate sidecar under /ple that stays NVMe-resident (mmap'd by
+      # weights/row_table.py, never streamed into VRAM). Without these two the arm dies in preflight
+      # with "none matched /ple/model-plefp8-*.safetensors" — which is what a panel launch hit on
+      # 2026-09-06, because the measured runs mounted them by hand in tools/qsa/run_qsa_longctx.sh
+      # and that never made it into the compose service every other model serves from.
+      # Read-only: a serve has no business writing to either.
+      - ${Q4E_MODEL_DIR:-/home/pat/.cache/hf-q4e}:/model:ro
+      - ${Q4E_PLE_DIR:-/home/pat/.cache/hf-ple}:/ple:ro
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"
@@ -687,7 +697,13 @@ services:
       # mid-forward on wide-activation models — gemma-4-26B-A4B took a ~7k-token prompt as one chunk
       # and OOM'd with devfree at 0. Overridable per launch (MAX_PREFILL_LENGTH=8192) for a model
       # with the headroom to want bigger chunks.
-      MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-2048}"
+      # EMPTY passthrough, not a 2048 default: serve.sh's per-model table must win. A literal
+      # default here is EXPORTED into the container, so an arm's `: "${MAX_PREFILL_LENGTH:=1024}"`
+      # (qwen4_exp, where 1024 is a FEASIBILITY term for the QSA selection workspace, not a tuning
+      # knob) never fires and the arm silently serves at 2048. serve.sh still applies the global
+      # 2048 default for every model that wants it. Caught 2026-09-06 by diffing the live [serve]
+      # banner against DRY_RUN — the only way this class of shadowing is visible.
+      MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-}"
       # torch allocator config. Loading streams each checkpoint tensor, slices the rank shard and
       # frees the rest, which leaves the heap fragmented: on Qwen3.8-27B-NVFP4 torch reserved 14.13
       # GiB for 11.62 GiB of tensors, and the empty_cache() before KV sizing dropped `reserved` to
