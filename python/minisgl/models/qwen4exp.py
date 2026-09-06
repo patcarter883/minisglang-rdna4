@@ -83,6 +83,7 @@ indexer, and the absence of the per-layer input/post norms and the final norm.
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -120,11 +121,12 @@ logger = init_logger(__name__)
 # summary, never the enforcement.
 UNIMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     (
-        "QSA sparse-attention indexer on the 12 full-attention layers",
-        "plan T5: needs a second KV pool for the index keys and a BaseAttnBackend ABI that can "
-        "carry a per-query selected-page set. Below indexer_budget (2048) the selection is the "
-        "identity, so the DENSE attention that runs is bit-equivalent; Qwen4ExpAttn.forward raises "
-        "the moment a request's context exceeds the budget",
+        "cudagraph capture of the QSA SELECTION (the sparse attention itself captures fine)",
+        "plan T5.1: the selection allocates its per-forward logits/blocks/tokens workspace and does "
+        "a host `.max()` to size the block window, neither of which a captured graph admits. A "
+        "qwen4_exp build with QSA active therefore runs its decode EAGER; the refusal that used to "
+        "bound context at indexer_budget is GONE (the sparse path is implemented and gated — see "
+        "tests/qwen4exp_qsa_gate_test.py), so this costs throughput, not correctness or reach",
     ),
     (
         "vision tower (model.visual.*)",
@@ -182,7 +184,7 @@ class QSAIndexer(BaseOP):
     budget, so nothing can quietly run a wrong attention believing it is sparse.
     """
 
-    def __init__(self, config: "ModelConfig") -> None:
+    def __init__(self, config: "ModelConfig", index_layer_id: int = 0) -> None:
         d = config.indexer_head_dim
         assert d and config.indexer_n_heads and config.indexer_kv_heads, (
             "qwen4_exp full-attention layers need indexer_head_dim / _n_heads / _kv_heads"
@@ -193,10 +195,40 @@ class QSAIndexer(BaseOP):
         self.k_layernorm = RMSNorm(d, eps=config.rms_norm_eps, plus_one=True)
         self._budget = int(config.indexer_budget or 0)
         assert self._budget > 0, "qwen4_exp needs a positive indexer_budget"
+        # Compact 0..11 index into the index-key cache's layer dimension. The global layer_id is
+        # 3,7,...,47, so it would index a 48-deep cache of which 36 rows are never written — the
+        # same compaction `attn_kv_id` already does for the paged KV pool.
+        self._index_layer_id = int(index_layer_id)
+        self._n_heads = int(config.indexer_n_heads)
+        self._head_dim = int(d)
 
     @property
     def budget(self) -> int:
         return self._budget
+
+    @property
+    def index_layer_id(self) -> int:
+        return self._index_layer_id
+
+    def forward(self, hidden_states: torch.Tensor, qsa) -> "object":
+        """Run the four selection stages for this layer; return its `QSASelection`.
+
+        Stage 1 (here): project, then build the QUERY — `RoPE(pos, GemmaRMSNorm(q_raw))`, per
+        128-dim index head. The KEY half `k_tok` is emitted RAW: it is neither normed nor roped per
+        token, because normalisation and rotation happen once per GROUP, after the fp32 mean. Doing
+        either per token instead is a different (and quietly worse) selector that no output text
+        distinguishes.
+
+        Stages 2-4 (`QSARuntime.select`): ring-store the raw key, compress the groups that complete
+        at this forward, score, top-k, expand, and resolve to physical KV slots.
+        """
+        qk = self.index_qk_proj.forward(hidden_states)
+        d, hi = self._head_dim, self._n_heads
+        q_raw = qk[:, : hi * d]
+        token_k = qk[:, hi * d :].reshape(-1, d)
+        q = self.q_layernorm.forward(q_raw.reshape(-1, d)).reshape(-1, hi * d)
+        q = qsa.rotary.forward_one(qsa.plan.rope_pos, q).reshape(-1, hi, d)
+        return qsa.select(self._index_layer_id, q, token_k, self.k_layernorm)
 
     def assert_dense_is_exact(self, max_ctx_len: int) -> None:
         """Raise unless dense causal attention is BIT-EQUIVALENT to this layer's sparse selection.
@@ -210,22 +242,16 @@ class QSAIndexer(BaseOP):
         if max_ctx_len > self._budget:
             raise NotImplementedError(
                 f"qwen4_exp: a request reached context length {max_ctx_len}, past the QSA indexer "
-                f"budget of {self._budget}. Below the budget the indexer selects every visible "
-                f"token, so this engine's DENSE causal attention is bit-equivalent and is what runs; "
-                f"beyond it the checkpoint's attention is genuinely sparse and this engine does not "
-                f"implement it (bring-up plan T5: a second KV pool for the index keys plus a "
-                f"BaseAttnBackend ABI that can carry a per-query selected-page set). Cap "
-                f"max_total_tokens / the request length at {self._budget}, or implement T5 — do not "
-                f"raise this bound, it would silently serve a different model."
+                f"budget of {self._budget} WITH THE QSA RUNTIME DISABLED. Below the budget the "
+                f"indexer selects every visible token, so this engine's dense causal attention is "
+                f"bit-equivalent and is what ran; beyond it the checkpoint's attention is genuinely "
+                f"sparse. The sparse path EXISTS (minisgl/attention/qsa) — this build simply is not "
+                f"running it. Re-enable it (do not set MINISGL_QSA=0), make the `qsa_index` kernel "
+                f"package importable, and serve with a KV page size that is a multiple of "
+                f"indexer_compress_ratio (--page-size 16). Do NOT raise this bound instead: running "
+                f"dense above the budget attends MORE, so the text stays fluent and the substitution "
+                f"is undetectable from the output."
             )
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "qwen4_exp QSA indexer is not implemented (bring-up plan T5): it needs a second KV pool "
-            "for index keys and a BaseAttnBackend ABI that can carry a per-query selected-page set. "
-            f"Selection is bit-equivalent to dense causal attention at seq_len <= {self._budget}, "
-            f"which is the regime Qwen4ExpAttn.forward enforces and runs densely."
-        )
 
 
 class Qwen4ExpAttn(Qwen3_5Attn):
@@ -236,23 +262,33 @@ class Qwen4ExpAttn(Qwen3_5Attn):
     o_proj [2560, 6144], q_norm/k_norm [256]. So the Qwen3.5 class is reused unchanged and only the
     `indexer` submodule is added.
 
-    The forward is the Qwen3.5 dense one, GATED on the budget check above. That is the whole sparse
-    story for now and it is exact where it runs: below `indexer_budget` the indexer's selection is
-    the identity, above it this raises.
+    TWO FORWARDS, AND WHICH ONE RUNS. When `ctx.qsa` is set (a `QSARuntime` — built by
+    `Qwen4ExpForConditionalGeneration._ensure_qsa` on the first forward of a QSA-capable build) the
+    indexer selects and the attention is genuinely sparse, at any context length. When it is NOT set
+    — no `qsa_index` kernels, a KV page size the DSV4 addressing cannot use, or `MINISGL_QSA=0` —
+    the layer runs DENSE and `assert_dense_is_exact` re-arms the old refusal, because dense is
+    bit-equivalent to the selection only below `indexer_budget`. The refusal was never about
+    approximation quality: attending MORE keeps the text fluent, so a silent fallback above the
+    budget is undetectable from the output. It is therefore kept as the no-QSA path's guard rather
+    than deleted with the feature that replaced it.
     """
 
     def __init__(self, config: "ModelConfig", layer_id: int, *, attn_kv_id: int) -> None:
         super().__init__(config, layer_id, attn_kv_id=attn_kv_id)
-        self.indexer = QSAIndexer(config)
+        self.indexer = QSAIndexer(config, index_layer_id=attn_kv_id or 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # `device_len` is prompt + committed tokens, i.e. the KV length this forward attends over —
-        # the quantity the budget bounds. Checked per FORWARD rather than per request admission
-        # because a request crosses the budget mid-generation: admitted at 2000 tokens it is fine, at
-        # 2049 it is not, and only the forward sees that moment. `default=0` covers the empty-batch
-        # cases the engine legitimately issues (an idle EP replica's dummy step), which attend over
-        # nothing and so cannot exceed anything.
-        batch = get_global_ctx().batch
+        ctx = get_global_ctx()
+        qsa = getattr(ctx, "qsa", None)
+        if qsa is not None:
+            return super().forward(x, self.indexer.forward(x, qsa))
+        # No QSA runtime: dense, and only legal below the budget. `device_len` is prompt + committed
+        # tokens, i.e. the KV length this forward attends over — the quantity the budget bounds.
+        # Checked per FORWARD rather than per request admission because a request crosses the budget
+        # mid-generation: admitted at 2000 tokens it is fine, at 2049 it is not, and only the forward
+        # sees that moment. `default=0` covers the empty-batch cases the engine legitimately issues
+        # (an idle EP replica's dummy step), which attend over nothing.
+        batch = ctx.batch
         self.indexer.assert_dense_is_exact(max((r.device_len for r in batch.reqs), default=0))
         return super().forward(x)
 
@@ -584,6 +620,12 @@ class Qwen4ExpModel(BaseOP):
     def forward(
         self, input_ids: torch.Tensor, return_hidden: bool = False
     ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]":
+        # Build the QSA plan ONCE per forward, before any layer runs. Everything in it is
+        # batch-derived and layer-independent (positions, the visible-block window, the compressed
+        # page table, the compression plan), so the 12 index layers share one index-arithmetic bill.
+        qsa = getattr(get_global_ctx(), "qsa", None)
+        if qsa is not None:
+            qsa.prepare(get_global_ctx().batch)
         x = self.embed_tokens.forward(input_ids)
         # The stream starts as hc_count copies of the embedding (upstream `_prepare_qwen4_exp_attn`
         # does this lazily on the first layer; doing it once here is identical and cheaper).
@@ -694,8 +736,104 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
         )
         for what, why in UNIMPLEMENTED:
             logger.info_rank0(f"  * {what}\n      ({why})")
+        self._config = config
+        self._qsa_built = False
+
+    # ---- QSA runtime construction -------------------------------------------------------------
+    def build_qsa_runtime(self, *, force: bool = False):
+        """Build `ctx.qsa` — the index-key cache + the index RoPE — or explain why it is not built.
+
+        Called once, from `prepare_qsa` on the first forward (which is a WARMUP forward, so the
+        allocations land before graph capture). Returns the runtime or None; when it returns None
+        the full-attention layers run dense and `assert_dense_is_exact` re-arms the >budget refusal,
+        which is the honest behaviour — this must never silently serve dense above the budget.
+
+        `force=True` turns each of the three "not available" cases into a raise, so a test that
+        MEANS to exercise the sparse path cannot accidentally measure the dense one. (The gate
+        harness uses it; that is the `ab-harness-must-assert-provenance` rule applied to a feature
+        whose failure mode is running the OTHER implementation and looking fine.)
+        """
+        from minisgl.attention.qsa import QSAIndexCache, QSARuntime, parse_qsa_profile
+        from minisgl.attention.qsa import ops as qsa_ops
+        from minisgl.layers.rotary import get_rope
+
+        ctx = get_global_ctx()
+        if os.environ.get("MINISGL_QSA", "1") == "0":
+            if force:
+                raise RuntimeError("MINISGL_QSA=0 disables the sparse path this run requires")
+            logger.warning_rank0("qwen4_exp: MINISGL_QSA=0 — full-attn layers run DENSE (<=budget)")
+            return None
+        profile = parse_qsa_profile(self._config)
+        if profile is None:
+            if force:
+                raise RuntimeError("config carries no QSA indexer fields")
+            return None
+        indexers = self.indexers()
+        if not indexers:
+            if force:
+                raise RuntimeError("this build has no full-attention layer, so no indexer")
+            return None
+        try:
+            profile.require_page_size(ctx.page_size)
+            qsa_ops.backend()  # resolves + imports qsa_index unless MINISGL_QSA_OPS=torch
+        except Exception as exc:
+            if force:
+                raise
+            logger.warning_rank0(
+                f"qwen4_exp: QSA sparse path unavailable ({exc}) — full-attn layers run DENSE, "
+                f"and any request past indexer_budget will be REFUSED rather than served densely."
+            )
+            return None
+        rot = self._config.rotary_config
+        # The index RoPE is the LAYER'S OWN attention rope — same rotary_dim/base/scaling — read
+        # over the 128-wide index head instead of the 256-wide attention head. Only the head width
+        # differs, so cos/sin are literally the same table; building it here rather than reaching
+        # into `self.attn.rotary` keeps the 128-vs-256 view explicit.
+        page_table = ctx.page_table
+        with torch.device(page_table.device):
+            rotary = get_rope(
+                head_dim=profile.head_dim,
+                rotary_dim=rot.rotary_dim,
+                max_position=rot.max_position,
+                base=rot.base,
+                rope_scaling=tuple(rot.scaling.items()) if rot.scaling else None,
+                interleave=rot.interleave,
+            )
+        kv = ctx.kv_cache
+        n_slots = kv.k_cache(0).shape[0] * kv.k_cache(0).shape[1]
+        cache = QSAIndexCache(
+            profile=profile,
+            num_index_layers=len(indexers),
+            num_req_rows=page_table.shape[0],
+            num_kv_slots=n_slots,
+            dtype=torch.bfloat16,
+            device=page_table.device,
+        )
+        logger.info_rank0(
+            f"qwen4_exp QSA ACTIVE: budget={profile.budget} ratio={profile.compress_ratio} "
+            f"block_topk={profile.block_topk} index_width={profile.index_width} "
+            f"ops={qsa_ops.backend()} {cache}"
+        )
+        return QSARuntime(profile, cache, rotary, page_table)
+
+    def prepare_qsa(self, *, force: bool = False) -> None:
+        """Idempotently install `ctx.qsa`. Must run OUTSIDE cudagraph capture (it allocates)."""
+        ctx = get_global_ctx()
+        if self._qsa_built:
+            return
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "QSA runtime built during graph capture — it allocates the index-key cache. Build it "
+            "in warmup (the engine calls prepare_qsa before capture)."
+        )
+        ctx.qsa = self.build_qsa_runtime(force=force)
+        self._qsa_built = True
 
     def forward(self, return_hidden: bool = False):
+        if not self._qsa_built:
+            # First forward is a warmup (eager, pre-capture), which is exactly where the index-key
+            # cache must be allocated. Guarded by the flag so the captured decode path never
+            # re-enters this — `prepare_qsa` asserts it is not capturing.
+            self.prepare_qsa()
         input_ids = get_global_ctx().batch.input_ids
         if return_hidden:
             # (post-mixer for lm_head, the WIDE pre-mixer stream, aux=None). Nothing consumes the
@@ -749,6 +887,8 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
         bound is a property of the config's `indexer_budget` and is identical on every indexer, so
         the first one answers for all of them.
         """
+        if getattr(get_global_ctx(), "qsa", None) is not None:
+            return  # the sparse path is live: there is no budget to enforce.
         idx = self.indexers()
         if not idx:
             return

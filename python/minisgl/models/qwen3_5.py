@@ -162,7 +162,10 @@ class Qwen3_5Attn(BaseOP):
         self._num_qo_heads = div_even(nqo, get_tp_info().size)
 
     @nvtx_annotate("MHA_gated")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, selection: object | None = None) -> torch.Tensor:
+        # `selection` (a QSASelection, Qwen4-Exp only) is threaded through rather than handled by a
+        # subclass override, so the dense and sparse forwards are literally the same code above the
+        # attention call — see AttentionLayer.forward.
         n = x.shape[0]
         hd = self._head_dim
         qg = self.q_proj.forward(x).view(n, self._num_qo_heads, 2 * hd)
@@ -171,7 +174,7 @@ class Qwen3_5Attn(BaseOP):
         k = self.k_proj.forward(x)
         v = self.v_proj.forward(x)
         # AttentionLayer applies q_norm/k_norm (over head_dim) then partial rotary, then attn.
-        o = self.attn.forward(torch.cat([q, k, v], dim=-1))
+        o = self.attn.forward(torch.cat([q, k, v], dim=-1), selection)
         o = o * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 

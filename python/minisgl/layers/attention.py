@@ -62,7 +62,14 @@ class AttentionLayer(StateLessOP):
         self.q_norm = q_norm
         self.k_norm = k_norm
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor, selection: object | None = None) -> torch.Tensor:
+        """`selection` is a `minisgl.attention.qsa.QSASelection` on a QSA full-attention layer.
+
+        It changes exactly ONE thing: which backend entry point the (already normed, already roped)
+        q/k/v go to. Everything above that line — the q/k norms, the partial rotary, the contiguity
+        invariant — is byte-identical between the dense and the sparse call, which is what makes
+        "sparse == dense when the selection is everything" a statement about the attention kernel
+        alone rather than about two independently-assembled forwards."""
         ctx = get_global_ctx()
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
@@ -81,7 +88,12 @@ class AttentionLayer(StateLessOP):
             # neighbouring op to launder it.
             q, k = q.contiguous(), k.contiguous()
         q = q.view(-1, self.num_qo_heads, self.head_dim)
-        o = ctx.attn_backend.forward(
-            q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
-        )
+        if selection is not None:
+            o = ctx.attn_backend.forward_sparse(
+                q, k, v, self.layer_id, ctx.batch, selection.slots, selection.lens
+            )
+        else:
+            o = ctx.attn_backend.forward(
+                q, k, v, self.layer_id, ctx.batch, sliding_window=self.sliding_window
+            )
         return o.view(-1, self.qo_attn_dim)
