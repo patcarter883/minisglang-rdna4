@@ -222,7 +222,8 @@ RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; mkdir -p /opt/kernels; \
         custom_ar:custom_ar \
         swiglu:swiglu_hip \
         sampler:sampler_hip \
-        tail:tail_hip ; do \
+        tail:tail_hip \
+        qsa_index:qsa_index ; do \
       dir="${pkg%%:*}"; mod="${pkg##*:}"; \
       echo "=== building canonical kernel: ${dir} -> import ${mod} ==="; \
       ( cd "/opt/rdna4-hip-kernels/${dir}" && GPU_ARCHS=gfx1201 bash local/build_local.sh ); \
@@ -233,7 +234,7 @@ RUN set -eux; export MAX_JOBS="${MAX_JOBS}"; mkdir -p /opt/kernels; \
 import sys; sys.path.insert(0, "/opt/kernels")
 for m in ["gdn_hip","zaya_cca","mla_hip","attn_hip","attn_decode","attn_prefill_paged",
           "dense_gemm","fp8_wmma","moe_hip",
-          "custom_ar","swiglu_hip","sampler_hip","tail_hip"]:
+          "custom_ar","swiglu_hip","sampler_hip","tail_hip","qsa_index"]:
     __import__(m); print("ok import", m)
 PY
 
