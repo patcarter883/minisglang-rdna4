@@ -844,6 +844,14 @@ def _served_model_path() -> str | None:
         return None
 
 
+def _served_model_name() -> str:
+    """The name the server ADVERTISES: --served-model-name when set, else the checkpoint path.
+    Client-facing only (/v1/models id, /health, response echoes) — weight loading, tokenizer and
+    template resolution always use the real model_path."""
+    cfg = get_global_state().config
+    return cfg.served_model_name or cfg.model_path
+
+
 @functools.cache
 def _template_level_kwarg(model_path: str) -> str | None:
     """Which kwarg (if any) this checkpoint's chat template reads the reasoning LEVEL from.
@@ -3551,7 +3559,8 @@ async def health():
     global state and launches the backend, so a 200 here means the server is serving. Agents /
     monitors / load balancers should poll this."""
     state = get_global_state()
-    return {"status": "ok", "model": state.config.model_path}
+    return {"status": "ok", "model": state.config.served_model_name or state.config.model_path,
+            "model_path": state.config.model_path}
 
 
 @app.get("/metrics")
@@ -3568,7 +3577,10 @@ async def metrics():
 async def available_models():
     state = get_global_state()
     ctx = state.max_seq_len
-    return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path,
+    # Advertise the SERVED name (--served-model-name, e.g. "Qwen3.8-27B") as the id clients use;
+    # root keeps the real checkpoint path for anyone who needs it.
+    return ModelList(data=[ModelCard(id=state.config.served_model_name or state.config.model_path,
+                                     root=state.config.model_path,
                                      max_model_len=ctx, context_length=ctx)])
 
 

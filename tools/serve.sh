@@ -58,6 +58,10 @@ PORT="${PORT:-1919}"
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
+# Short ALIAS the server advertises in /v1/models (--served-model-name), so clients key on the
+# BASE MODEL (Qwen3.8-27B), not whichever checkpoint quant happens to be loaded. Per arm below;
+# SERVED_NAME= overrides; the catch-all derives the basename of whatever was passed.
+served_name=""
 # Per-model default presence penalty (server-side, request-unset only; explicit client values —
 # including 0.0 — win). Empty = no default, penalty path skipped.
 presence_default=""
@@ -76,7 +80,8 @@ min_tp=1
 # checkpoint, attention backend and tuned defaults.
 case "$MODEL" in
   qwen35b-awq|cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit)
-                  model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit";        spec_default="mtp"; k_mtp=4
+                  model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"; served_name="Qwen3.6-35B-A3B";
+                  spec_default="mtp"; k_mtp=4
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
                   # SPEC=dflash on this pair could not boot AT ALL on 16 GB cards until these.
                   # 35B weights are ~11.4 GB/card, so a 737 MB bf16 drafter REPLICATED on every rank
@@ -99,7 +104,8 @@ case "$MODEL" in
                     if [ "$CONC" -gt 4 ]; then CONC=4; fi
                   fi ;;
   qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
-                  model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; spec_default="mtp"; k_mtp=2
+                  model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; served_name="Qwen3.6-35B-A3B";
+                  spec_default="mtp"; k_mtp=2
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
                   # Same 737 MB bf16 drafter beside a same-size 4-bit 35B target as the AWQ twin
                   # above, so the same footprint arithmetic applies: at the global 0.80 default a
@@ -115,10 +121,12 @@ case "$MODEL" in
   # GLM's MTP head is a measured NET LOSS on this box, so its default is EAGLE3 (K=6 from the
   # spec-len sweep). MTP remains selectable — it is just not the default.
   glm|QuantTrio/GLM-4.7-Flash-AWQ)
-                  model_id="QuantTrio/GLM-4.7-Flash-AWQ";              spec_default="eagle3"; k_mtp=2
+                  model_id="QuantTrio/GLM-4.7-Flash-AWQ"; served_name="GLM-4.7-Flash";
+                  spec_default="eagle3"; k_mtp=2
                   eagle3_draft="thoughtworks/GLM-4.7-Flash-Eagle3"; k_eagle3=6 ;;
   laguna|poolside/Laguna-XS-2.1-NVFP4)
-                  model_id="poolside/Laguna-XS-2.1-NVFP4";             spec_default="none"
+                  model_id="poolside/Laguna-XS-2.1-NVFP4"; served_name="Laguna-XS-2.1";
+                  spec_default="none"
                   dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85"
                   mem_default_spec="0.93"
                   swa_hybrid=1 ;;
@@ -131,7 +139,8 @@ case "$MODEL" in
   # tool_format=atem pins its native <atem:invoke> XML. Auto-derivation reaches the same answer from
   # the template, but pinning keeps a FORCED tool call off the JSON fallback.
   muse|muse-glimmer|RedHatAI/Muse-Glimmer-30B-NVFP4)
-                  model_id="RedHatAI/Muse-Glimmer-30B-NVFP4";          spec_default="none"
+                  model_id="RedHatAI/Muse-Glimmer-30B-NVFP4"; served_name="Muse-Glimmer-30B";
+                  spec_default="none"
                   tool_format="atem"; min_tp=2
                   # 0.85 mirrors Laguna, the other NVFP4 SWA hybrid: ~9.8 GB/card of weights leaves
                   # room for a real KV pool. Validated booting + serving at TP=2 (83% VRAM).
@@ -204,7 +213,8 @@ case "$MODEL" in
   # — but that lived only in the doc, so every launch that did not retype the magic numbers failed.
   # Encode them here, like qwen35b-awq (0.86) and laguna (0.93) already do.
   qwen27b|cyankiwi/Qwen3.6-27B-AWQ-INT4)
-                  model_id="cyankiwi/Qwen3.6-27B-AWQ-INT4";            spec_default="none"
+                  model_id="cyankiwi/Qwen3.6-27B-AWQ-INT4"; served_name="Qwen3.6-27B";
+                  spec_default="none"
                   dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15
                   if [[ "${SPEC:-$spec_default}" =~ ^(dflash|dspark)$ ]]; then
                     mem_default_spec="0.90"
@@ -217,7 +227,8 @@ case "$MODEL" in
                     if [ "$CONC" -gt 2 ]; then CONC=2; fi
                   fi ;;
   qwen27b-nvfp4|cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4)
-                  model_id="cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4";      spec_default="none"
+                  model_id="cyankiwi/Qwen3.6-27B-AWQ-BF16-NVFP4"; served_name="Qwen3.6-27B";
+                  spec_default="none"
                   dflash_draft="z-lab/Qwen3.6-27B-DFlash"; k_dflash=15 ;;
   # Qwen3.8-27B, unsloth's MIXED-PRECISION quant: NVFP4 (group-16 e2m1) for the bulk MLP, fp8 W8A8
   # for attention / GDN in_proj / lm_head / the last 8 MLP layers. Same backbone as the 3.6-27B above
@@ -278,7 +289,8 @@ case "$MODEL" in
   # not pay. NOTE: spec is also auto-disabled whenever batch>1, so any concurrent traffic
   # turns it off regardless.
   qwen38-27b-int4|cyankiwi/Qwen3.8-27B-AWQ-INT4)
-                  model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4";            spec_default="none"; k_mtp=4
+                  model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4"; served_name="Qwen3.8-27B";
+                  spec_default="none"; k_mtp=4
                   # MEASURED TP=2 2026-08-15: resident 9.47 GiB/card, the LIGHTEST of the three
                   # Qwen3.8 builds. 0.92, NOT the 0.97 the other two carry: because this model is so
                   # light the pool grows to fill whatever the ratio allows, and at 0.97 it took
@@ -370,7 +382,8 @@ case "$MODEL" in
   # inside a 0.490-0.599 spread) — the draft head reads the same KV as the target, so cleaner
   # KV moves both sides together. It is an OUTPUT-QUALITY fix, not a spec-acceptance one.
   qwen38-27b|sakamakismile/Qwen3.8-27B-MTP-NVFP4)
-                  model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4";      spec_default="none"; k_mtp=4
+                  model_id="sakamakismile/Qwen3.8-27B-MTP-NVFP4"; served_name="Qwen3.8-27B";
+                  spec_default="none"; k_mtp=4
                   # MEASURED 2026-08-16: long THINKING (>1024 reasoning tokens, newly reachable now
                   # the think budget honours the template's reasoning_effort) hits the card's
                   # documented "endless repetition" at the card's own thinking sampling
@@ -450,7 +463,8 @@ case "$MODEL" in
                   # No dflash_draft: the z-lab 27B drafter is the TIED-VOCAB dialect (it borrows the
                   # target's embed/lm_head), so pairing it across a model generation is only valid if
                   # the vocabularies match — unverified here. SPEC=dflash therefore requires DRAFT=.
-                  model_id="unsloth/Qwen3.8-27B-NVFP4";                spec_default="none"; k_mtp=4
+                  model_id="unsloth/Qwen3.8-27B-NVFP4"; served_name="Qwen3.8-27B";
+                  spec_default="none"; k_mtp=4
                   # Same base model + card as qwen38-27b above — see that entry: the presence
                   # default was applied and REVERTED same day (long-generation starvation).
                   presence_default=""
@@ -503,7 +517,8 @@ case "$MODEL" in
                     fi
                   fi ;;
   zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
-                  model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}";      spec_default="none"
+                  model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}"; served_name="ZAYA1-8B";
+                  spec_default="none"
                   tool_format="zaya_xml"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
   # Qwen4-Exp (`qwen4_exp`), NVFP4, 48 layers (36 GDN + 12 full-attn), 512 experts/layer, a PLE
@@ -769,6 +784,14 @@ case "$MODEL" in
                   export MINISGL_PLE_FILES MINISGL_PLE_META_FILES ;;
   *)              model_id="$MODEL" ;;     # any other HF id or local path, straight through
 esac
+# The ADVERTISED name (/v1/models id): SERVED_NAME= wins, then the table's per-model alias, then
+# the basename of whatever was passed. This is what lets clients key on the base model
+# (Qwen3.8-27B) instead of the publisher/quant checkpoint currently loaded.
+if [[ -n "${SERVED_NAME:-}" ]]; then
+  served_name="$SERVED_NAME"
+elif [[ -z "$served_name" ]]; then
+  served_name="${model_id##*/}"
+fi
 [[ -z "$SPEC" ]] && SPEC="$spec_default"
 # Refuse a TP the weights cannot fit in, rather than OOM'ing several minutes into the load. Says
 # what to do, because the panel's TP dropdown is where this gets chosen wrongly.
@@ -983,6 +1006,7 @@ woff_args=()
 
 cmd=(python -m minisgl
   --model "$model_id"
+  --served-model-name "$served_name"
   --host 0.0.0.0 --port "$PORT"
   --cache-type "$CACHE_TYPE"
   --attention-backend "$ATTN"
@@ -999,8 +1023,8 @@ cmd=(python -m minisgl
 # EXTRA_ARGS last so it can override anything above.
 [[ -n "${EXTRA_ARGS:-}" ]] && read -r -a _extra <<< "$EXTRA_ARGS" && cmd+=("${_extra[@]}")
 
-printf '[serve] model=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=%s graph_bs=%s\n' \
-  "$model_id" "$SPEC" "${SPEC_K:+ k=$SPEC_K}" "$TP" "$DP" "$EP" "${CTX:-checkpoint}" "$CONC" \
+printf '[serve] model=%s served=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=%s graph_bs=%s\n' \
+  "$model_id" "$served_name" "$SPEC" "${SPEC_K:+ k=$SPEC_K}" "$TP" "$DP" "$EP" "${CTX:-checkpoint}" "$CONC" \
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2

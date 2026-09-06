@@ -665,6 +665,10 @@ services:
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"
+      # Short ALIAS to advertise in /v1/models (--served-model-name). Empty => serve.sh's
+      # per-model table decides (the BASE model name, e.g. Qwen3.8-27B, so swapping checkpoint
+      # quants doesn't change the name clients use). Set to force a specific alias.
+      SERVED_NAME: "${SERVED_NAME:-}"
       SPEC: "${SPEC:-}"
       SPEC_K: "${SPEC_K:-}"
       TP: "${TP:-2}"

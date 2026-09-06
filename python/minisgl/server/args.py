@@ -39,6 +39,11 @@ class ServerArgs(SchedulerConfig):
     # api_server.v1_chat_completions (RSA is chat-only: /v1/completions 400s an `rsa` field, because
     # the rollout loop drives chat messages and has nothing to do with a raw prompt).
     rsa_defaults: RSAParams = field(default_factory=RSAParams)
+    # Name the server ADVERTISES in /v1/models (and echoes in responses), decoupled from the
+    # checkpoint path given to --model. Lets serve.sh expose a stable short alias (e.g.
+    # "Qwen3.8-27B") so clients don't have to track the publisher/quant suffix of whichever
+    # checkpoint happens to be loaded. None => advertise model_path, as before.
+    served_model_name: str | None = None
 
     @property
     def share_tokenizer(self) -> bool:
@@ -99,6 +104,14 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=str,
         required=True,
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+    )
+
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=ServerArgs.served_model_name,
+        help="Name advertised in /v1/models and echoed in responses. Defaults to the --model "
+        "path; set a short alias (e.g. Qwen3.8-27B) so clients don't depend on the checkpoint.",
     )
 
     parser.add_argument(
