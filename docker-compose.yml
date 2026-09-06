@@ -42,7 +42,7 @@ x-lean-common: &lean-common
   volumes:
     # Engine source (kernels are NOT here anymore — they come from /opt/kernels in the image).
     - .:/engine
-    - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+    - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
     # Ghost-oracle state. A DURABLE host path on purpose: it accumulates over days and must outlive
     # both the container and this worktree (which goes away when the branch merges), so it does not
     # belong in a container layer or under /engine.
@@ -210,6 +210,12 @@ x-lean-common: &lean-common
     # independent of ctx and bs) while the card still filled up, so the OOM lives in the baseline
     # climbing between steps, not in one step's spike. It synchronizes per prefill: diagnostic only,
     # never set it on a timed run. Was engine-side only and unreachable from compose until now.
+    # Per-stage HOST-overhead profiler: =N logs the decode loop's wall-time breakdown (recv,
+    # sched, gpu_wait, ...) every N steps on rank 0. Zero cost unset. It existed in the scheduler
+    # but was unreachable from a compose serve, so the one instrument that attributes serving
+    # overhead could only be used from the in-process harness — which is the path that does NOT
+    # have the overhead. Plumbed 2026-09-07 while chasing 131 ms/token vs the harness's 60.5.
+    MINISGL_HOSTPROF: "${MINISGL_HOSTPROF:-}"
     MINISGL_PREFILL_MEM_PROBE: "${MINISGL_PREFILL_MEM_PROBE:-}"
     # Prefill activation guard (scheduler.py): affordable = (devfree - SAFETY) / KIB_PER_TOKEN.
     # The default 64 KiB/token was MEASURED ON Qwen3.6-35B (58-65 KiB/token) and is MODEL-SPECIFIC —
@@ -433,7 +439,7 @@ services:
     profiles: ["run"]
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
       - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
       # Magpie/metrix site-packages at the path profile_kernel.sh expects (MX_SITE_PACKAGES=/mx).
       # Without this the runner cannot host a profiling run, which forced agents back to hand-rolled
@@ -469,7 +475,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
       # DEFAULT ON: paged-aware gdn_hip glue over the baked (slow, fp32-full-cache-copy) one.
       - ${VHIP_GLUE_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/vllm_oot_slotfix.py}:${VHIP_GLUE_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/vllm_oot.py}:ro
       # DEFAULT ON: rebuilt stride-aware gdn_hip_C.so over the baked contiguous-only one.
@@ -553,7 +559,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
     # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
     # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
     # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
@@ -655,7 +661,7 @@ services:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
       # Local checkpoints (ZAYA, Laguna) and DFlash drafts, so a model alias can name a path.
       - ${MODELS_DIR:-/home/pat/models}:/models
       - ${DRAFT_DIR:-/home/pat/code/_models}:/drafts:ro
@@ -670,8 +676,8 @@ services:
       # 2026-09-06, because the measured runs mounted them by hand in tools/qsa/run_qsa_longctx.sh
       # and that never made it into the compose service every other model serves from.
       # Read-only: a serve has no business writing to either.
-      - ${Q4E_MODEL_DIR:-/home/pat/.cache/hf-q4e}:/model:ro
-      - ${Q4E_PLE_DIR:-/home/pat/.cache/hf-ple}:/ple:ro
+      - ${Q4E_MODEL_DIR:-/home/pat/ai/hf/q4e}:/model:ro
+      - ${Q4E_PLE_DIR:-/home/pat/ai/ple}:/ple:ro
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"
@@ -733,7 +739,7 @@ services:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
       - ${MINISGL_CAM_CHECKPOINT_HOST:-/home/pat/code/memory-organ-softsteer/cam_ckpt}:/cam_ckpt:ro
       - ${MINISGL_CAM_STORE_HOST:-./.cam_store}:/cam_store
       - ${MINISGL_CAM_GTE_HOST:-/home/pat/code/minisgl-rdna4/.cam_gte}:/cam_gte:ro   # whitened-GTE key artifact (opt-in)
