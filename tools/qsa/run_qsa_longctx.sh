@@ -49,6 +49,20 @@ timeout --signal=KILL "$RUN_TIMEOUT" docker run --rm -i --name "$CNAME" \
   -e MINISGL_PLE_META_FILES=/ple/model-bf16-00010.safetensors \
   -e MINISGL_WEIGHT_ARENA_CHUNK_MIB="${CHUNK_MIB:-1372}" \
   -e MINISGL_WEIGHT_ARENA_FLOOR_GIB="${FLOOR_GIB:-6}" \
+  `# DEVICE-SYNCED per-forward timing, ON by default HERE and off everywhere else. STEP_LOG's` \
+  `# default window closes when the host finished ENQUEUING, so a captured decode step — one` \
+  `# hipGraphLaunch that returns immediately — logs its launch latency and not its forward. This` \
+  `# script exists to produce an eager-vs-captured ms/forward, and that comparison is meaningless` \
+  `# without the bracket: MEASURED, 0.54 ms/step captured against 60.8 eager, a 112x that is` \
+  `# entirely the instrument. The harness GATES on it for any --graph-bs > 0 leg and records it in` \
+  `# the artifact. STEP_LOG_SYNC=0 to take the host-enqueue number deliberately.` \
+  -e MINISGL_STEP_LOG_SYNC="${STEP_LOG_SYNC:-1}" \
+  `# DEBUG-ONLY passthrough. AMD_SERIALIZE_KERNEL=3 makes every dispatch synchronous so a` \
+  `# HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION names the kernel that faulted instead of` \
+  `# aborting the queue some launches later. Unset (empty) on every measurement run: it` \
+  `# serialises the whole forward and the timings it produces are not comparable.` \
+  -e AMD_SERIALIZE_KERNEL="${AMD_SERIALIZE_KERNEL:-}" \
+  -e AMD_LOG_LEVEL="${AMD_LOG_LEVEL:-}" \
   --entrypoint bash "$IMAGE" -s -- "$@" <<'INNER'
 set -euo pipefail
 export MINISGL_PLE_FILES="$(ls /ple/model-plefp8-*.safetensors | paste -sd:)"

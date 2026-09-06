@@ -23,6 +23,38 @@ SPARSITY IS A MEASURED OUTPUT, NOT AN ASSUMPTION. `QSASelection.visited` is the 
 the attention kernel will actually read; `dense` is what it would have read. Below the budget they
 are equal BY CONSTRUCTION (the selection contains every visible token — that is the free
 correctness gate), and above it the ratio is the proof that anything was skipped at all.
+
+CUDAGRAPH CAPTURE — THE STATIC DECODE PLAN (was a named NotImplementedError until 2026-09-06)
+--------------------------------------------------------------------------------------------
+A captured graph admits no host reads, no host syncs, no host->device copy of a python list and no
+python branch on a device value. `QSAPlan.build` does all four. So a DECODE batch takes a second,
+STATIC path — the same treatment decode's `cache_seqlens`/page_table, SWA's ring and GDN's
+`state_indices` already have — installed by `QSARuntime.init_capture` and refreshed in place by
+`QSARuntime.prepare_for_replay`:
+
+  * `max_blocks` is `ceil(max_seq_len / r)`, a BUILD-TIME constant, not `row_ends.max().item()`.
+    Every launch grid downstream is therefore shape-derived and constant across capture and replay:
+    the scorer's is `(rows, ceil(max_blocks/256))` and the split top-k's `num_splits` is a policy on
+    the logits tensor's STATIC column width (`qsa_index` README, "caller obligation"). A row whose
+    window is shorter simply leaves the trailing key tiles/slabs writing -inf and doing no work.
+  * logits / blocks / tokens / slots / lens live in ONE preallocated set at MAX width, reused by all
+    12 index layers (each layer's selection is consumed by that layer's attention before the next
+    index layer runs — the same lifetime argument `_get_out_buf` makes).
+  * COMPRESSION IS UNCONDITIONAL. Only one decode row in r actually completes a group, but a graph
+    cannot branch, so every row runs the mean/norm/rope and the rows that completed nothing write to
+    `QSAIndexCache.scratch_slot` — the row past `num_kv_slots // r`, which the DSV4 identity
+    `physical_slot // r` can never name. Padded (dummy) rows are forced to the scratch slot too.
+  * THE SPARSITY LEDGER STAYS ALIVE, on the device. `visited`/`dense` were `.item()` syncs per
+    layer; under the static path they accumulate into int64 device counters that the host reads only
+    when asked. A ledger that had to be switched off for capture would mean every captured number
+    was taken with the one instrument that proves the path was sparse at all turned off.
+
+The static path is used for EVERY decode batch once `init_capture` has run, not only for captured
+ones. That is deliberate: it makes the eager and captured legs run the identical ops at the identical
+launch policies, so an eager-vs-captured comparison measures CAPTURE and nothing else. (Had eager
+kept the dynamic width, the top-k would have taken the one-CTA path on one leg and the split path on
+the other — bit-identical by that kernel's own gate, but no longer the same-kernel comparison this
+repo's capture-identity rule asks for.)
 """
 
 from __future__ import annotations
@@ -71,8 +103,20 @@ class QSAPlan:
         "profile", "rows", "bs", "row_seq", "logical_pos", "rope_pos", "seq_len_row",
         "row_starts", "row_ends", "max_blocks", "comp_page_table", "ring_slots",
         "write_locs", "member_rows", "member_ring", "row_table_idx", "page_stride",
-        "is_prefill", "dense_total",
+        "is_prefill", "dense_total", "static", "pos_i32", "ring_slots_long",
+        "member_ring_flat", "write_locs_long", "dense_total_dev",
     )
+
+    def __init__(self) -> None:
+        # Defaults for the fields only one of the two builders sets. Explicit because __slots__
+        # gives no class-level fallback: reading an unset slot is an AttributeError, and the two
+        # builders (dynamic `build`, static `QSARuntime._fill_decode_plan`) populate different sets.
+        self.static = False
+        self.pos_i32 = None
+        self.ring_slots_long = None
+        self.member_ring_flat = None
+        self.write_locs_long = None
+        self.dense_total_dev = None
 
     @staticmethod
     def build(
@@ -216,28 +260,233 @@ class QSARuntime:
         self.total_visited = 0
         self.total_dense = 0
         self.last_sparsity: Optional[float] = None
+        # ---- static decode plan (cudagraph capture); None until init_capture() ------------------
+        self.max_graph_bs = 0
+        self.static_max_blocks = 0
+        self._s: dict = {}
+        self._static_plan: Optional[QSAPlan] = None
+        self.static_steps = 0        # PROVENANCE: decode forwards that took the static path
+        self.captured_steps = 0      # ...of which ran inside a capture
+
+    # -- cudagraph capture ---------------------------------------------------------------------
+    def init_capture(self, max_bs: int, max_seq_len: int) -> None:
+        """Allocate the static decode workspaces. Must run OUTSIDE capture (it allocates).
+
+        `max_blocks` is `ceil(max_seq_len / r)` — the block window a request at the engine's own
+        context ceiling would have. It is a build-time constant, which is the whole point: every grid
+        downstream (the scorer's key tiles, the split top-k's `num_splits`) is derived from a tensor
+        SHAPE, so it is identical at capture and at replay. Deriving it from `row_ends.max()` instead
+        is exactly the width-inference bug class this repo already shipped once (61d96cf/0972e387).
+        """
+        if max_bs <= 0 or self._s:
+            return
+        p, dev = self.profile, self.page_table.device
+        r = p.compress_ratio
+        mb = max(1, (max_seq_len + r - 1) // r)
+        self.max_graph_bs = int(max_bs)
+        self.static_max_blocks = mb
+        w, k = p.index_width, p.block_topk
+        z = lambda *shape, dt=torch.int32: torch.zeros(shape, dtype=dt, device=dev)  # noqa: E731
+        self._s = {
+            # plan
+            "row_seq": torch.arange(max_bs, dtype=torch.int32, device=dev),
+            "row_starts": z(max_bs),
+            "row_ends": z(max_bs),
+            "pos": z(max_bs, dt=torch.int64),
+            "pos_i32": z(max_bs),
+            "seq_len": z(max_bs),
+            "table": z(max_bs, dt=torch.int64),
+            "ring": z(max_bs),
+            "ring_long": z(max_bs, dt=torch.int64),
+            "cpt": z(max_bs, mb),
+            "cpt_idx": z(max_bs, mb, dt=torch.int64),
+            "cols": (torch.arange(mb, dtype=torch.int64, device=dev) * r),
+            "off": torch.arange(r, dtype=torch.int64, device=dev),
+            "member_ring": z(max_bs, r, dt=torch.int64),
+            "write": z(max_bs),
+            "write_long": z(max_bs, dt=torch.int64),
+            "scratch": torch.full((max_bs,), self.cache.scratch_slot, dtype=torch.int64, device=dev),
+            "dense": z(1, dt=torch.int64),
+            # 1 for a REAL row, 0 for a dummy padded one — the sparsity ledger must not count the
+            # padding, or a bs=1 request replaying a bs=2 graph would report 2x the visited slots.
+            "real": z(max_bs, dt=torch.int64),
+            # selection workspace, shared by all index layers (see the module docstring)
+            "logits": torch.zeros((max_bs, mb), dtype=torch.float32, device=dev),
+            "blocks": z(max_bs, k),
+            "tokens": z(max_bs, w),
+            "slots": z(max_bs, w),
+            "lens": z(max_bs),
+            "flat": z(max_bs, w, dt=torch.int64),
+            # device-side sparsity ledger (no per-layer .item())
+            "visited_acc": z(1, dt=torch.int64),
+            "dense_acc": z(1, dt=torch.int64),
+            # pinned host staging for the ONE H2D per forward
+            "host": torch.zeros((3, max_bs), dtype=torch.int64, pin_memory=True),
+            "host_dev": z(3, max_bs, dt=torch.int64),
+        }
+        logger.info_rank0(
+            f"QSA graph capture ARMED: max_bs={max_bs} max_blocks={mb} (max_seq_len={max_seq_len}, "
+            f"r={r}) logits={max_bs * mb * 4 / 2**20:.1f} MiB, scratch_slot={self.cache.scratch_slot}"
+        )
+
+    @property
+    def capture_ready(self) -> bool:
+        return bool(self._s)
+
+    def _use_static(self, batch: "Batch") -> bool:
+        return (
+            bool(self._s)
+            and batch.is_decode
+            and len(batch.padded_reqs) <= self.max_graph_bs
+            and all(req.extend_len == 1 for req in batch.padded_reqs)
+        )
+
+    def _fill_decode_plan(self, batch: "Batch") -> QSAPlan:
+        """Refresh the static decode buffers IN PLACE from `batch.padded_reqs`. Eager, never inside a
+        capture. One pinned H2D of (table_idx, position, seq_len); everything else is device math."""
+        s = self._s
+        reqs = batch.padded_reqs
+        n_real, P = batch.size, len(reqs)
+        r = self.profile.compress_ratio
+        host = s["host"]
+        for i, req in enumerate(reqs):
+            host[0, i] = req.table_idx
+            host[1, i] = req.cached_len          # decode: extend_len == 1, so pos == cached_len
+            host[2, i] = req.device_len
+        s["host_dev"][:, :P].copy_(host[:, :P], non_blocking=True)
+        tbl, pos, slen = s["host_dev"][0, :P], s["host_dev"][1, :P], s["host_dev"][2, :P]
+
+        s["real"][:P].zero_()
+        s["real"][:n_real] = 1
+        s["pos"][:P].copy_(pos)
+        s["pos_i32"][:P].copy_(pos)
+        s["seq_len"][:P].copy_(slen)
+        s["table"][:P].copy_(tbl)
+        s["row_ends"][:P].copy_(torch.div(pos + 1, r, rounding_mode="floor"))
+        s["ring"][:P].copy_(tbl * r + torch.remainder(pos, r))
+        s["ring_long"][:P].copy_(s["ring"][:P])
+
+        stride = self.page_table.shape[1]
+        flat_pt = self.page_table.reshape(-1)
+        # compressed page table: block g of this row -> compressed slot, via `physical_slot // r` on
+        # the group's FIRST token. Refreshed at FULL static width; columns past the row's own window
+        # hold stale slots and are never read (the scorer bounds j by row_ends).
+        torch.add(tbl[:, None] * stride, s["cols"][None, :], out=s["cpt_idx"][:P])
+        s["cpt"][:P].copy_(
+            torch.div(
+                flat_pt.index_select(0, s["cpt_idx"][:P].reshape(-1)).reshape(P, -1),
+                r, rounding_mode="floor",
+            )
+        )
+        # compression plan: EVERY row runs it; only the rows that actually complete a group (and are
+        # real, not dummy padding) write to a live compressed slot. The rest write to `scratch_slot`.
+        gfp = pos - (r - 1)                                   # group's first member position
+        boundary = torch.remainder(pos + 1, r) == 0
+        if n_real < P:
+            boundary[n_real:] = False
+        first_slot = flat_pt.index_select(0, tbl * stride + gfp.clamp(min=0))
+        s["write_long"][:P].copy_(
+            torch.where(boundary, torch.div(first_slot, r, rounding_mode="floor").to(torch.int64),
+                        s["scratch"][:P])
+        )
+        s["write"][:P].copy_(s["write_long"][:P])
+        s["member_ring"][:P].copy_(
+            (tbl * r)[:, None] + torch.remainder(gfp[:, None] + s["off"][None, :], r)
+        )
+        # dense causal count, on the device (was an .item()): min(pos+1, seq_len) over REAL rows.
+        d = torch.minimum(pos + 1, slen)
+        if n_real < P:
+            d = d[:n_real]
+        torch.sum(d, dim=0, keepdim=True, out=s["dense"])
+
+        plan = QSAPlan()
+        plan.profile, plan.static, plan.is_prefill = self.profile, True, False
+        plan.rows, plan.bs, plan.page_stride = P, P, stride
+        plan.row_seq = s["row_seq"][:P]
+        plan.logical_pos = plan.rope_pos = s["pos"][:P]
+        plan.pos_i32 = s["pos_i32"][:P]
+        plan.seq_len_row = s["seq_len"][:P]
+        plan.row_table_idx = s["table"][:P]
+        plan.row_starts = s["row_starts"][:P]
+        plan.row_ends = s["row_ends"][:P]
+        plan.max_blocks = self.static_max_blocks
+        plan.comp_page_table = s["cpt"][:P]
+        plan.ring_slots = s["ring"][:P]
+        plan.ring_slots_long = s["ring_long"][:P]
+        plan.write_locs = s["write"][:P]
+        plan.write_locs_long = s["write_long"][:P]
+        plan.member_ring = s["member_ring"][:P]
+        plan.member_ring_flat = s["member_ring"][:P].reshape(-1)
+        plan.member_rows = None
+        plan.dense_total = -1
+        plan.dense_total_dev = s["dense"]
+        self._static_plan = plan
+        return plan
+
+    def prepare_for_replay(self, batch: "Batch") -> None:
+        """`GraphRunner.replay`'s pre-hook (via `BaseLLMModel.prepare_for_replay`). Runs EAGER,
+        outside the graph, and writes the exact tensors the captured kernels read through their baked
+        pointers. The captured `model.forward()` never re-enters `prepare()`."""
+        assert self._s, "QSARuntime.prepare_for_replay before init_capture"
+        assert self._use_static(batch), (
+            f"QSA: a decode batch reached the graph replay path that the static plan cannot serve "
+            f"(padded_size={len(batch.padded_reqs)} > max_graph_bs={self.max_graph_bs}, or a "
+            f"multi-query row). can_use_cuda_graph should have routed this to eager."
+        )
+        self.plan = self._fill_decode_plan(batch)
+        self._last = {}
+        self.static_steps += 1
 
     # -- per-forward -------------------------------------------------------------------------
     def prepare(self, batch: "Batch") -> None:
         if torch.cuda.is_current_stream_capturing():
-            # NAMED refusal, not a confusing capture failure. `QSAPlan.build` reads request lengths
-            # on the HOST, does an H2D of the derived vectors, and syncs on `row_ends.max().item()`
-            # to size the block window — none of which a captured graph admits. Making it capturable
-            # is the static-buffer treatment every other per-step-varying structure here already has
-            # (decode's cache_seqlens/page_table, SWA's ring, GDN's state_indices): a fixed
-            # `max_blocks = ceil(max_seq/r)`, per-bs preallocated logits/blocks/tokens/slots buffers,
-            # and a `prepare_for_replay` that refreshes their CONTENTS in place. The SPARSE ATTENTION
-            # itself is already capture-safe — `forward_sparse` calls one kernel through fixed
-            # pointers at a fixed `index_width` — so this is a selection-side gap only.
-            raise NotImplementedError(
-                "qwen4_exp QSA selection cannot run inside a cudagraph capture (plan T5.1: it needs "
-                "static per-bs workspaces and a fixed block window instead of a host .max()). Serve "
-                "with --graph 0 / --cuda-graph-max-bs 0, or set MINISGL_QSA=0 to fall back to the "
-                "dense path — which is bit-equivalent ONLY at or below indexer_budget and refuses "
-                "above it."
+            # Inside a capture the plan CONTENTS are irrelevant (only the op stream is recorded) and
+            # the fill is exactly the host work a capture forbids — the warmup forward that precedes
+            # every capture already filled the same buffers from the same batch. So: reuse, don't
+            # refill. Anything that is not a static-plan decode is a genuine refusal.
+            assert self._static_plan is not None and self._use_static(batch), (
+                "qwen4_exp QSA: only a DECODE batch with a static plan is capturable "
+                f"(is_decode={batch.is_decode}, padded={len(batch.padded_reqs)}, "
+                f"max_graph_bs={self.max_graph_bs}). Prefill is eager everywhere in this engine."
             )
+            # AND IT HAS TO BE **THIS** BUCKET'S PLAN. `_static_plan` is a single mutable slot that
+            # every `_fill_decode_plan` overwrites, and reusing it here is sound only because
+            # `GraphRunner`'s capture loop runs an EAGER WARMUP at the same bs immediately before
+            # each capture. That ordering belongs to GraphRunner, not to this class, and nothing
+            # else enforces it — so without this line a reordered or added capture step would bake
+            # the PREVIOUS bucket's row count into the graph: a different `num_splits` for the split
+            # top-k, a different scorer grid, a different row count in every static view, and no
+            # error at capture OR at replay. Silently-wrong attention, which is the failure class
+            # this whole file is written against. Assert the identity instead of documenting the
+            # ordering, because an ordering nobody checks is an ordering that eventually changes.
+            assert self._static_plan.rows == len(batch.padded_reqs), (
+                "qwen4_exp QSA: the static plan on hand was built for a DIFFERENT batch width "
+                f"(plan.rows={self._static_plan.rows}, this capture's padded batch="
+                f"{len(batch.padded_reqs)}). Every capture must be immediately preceded by an eager "
+                "warmup at its own bs — that warmup is what refreshes the plan. Capturing here "
+                "would bake the other bucket's row count and would never raise."
+            )
+            self.plan = self._static_plan
+            self._last = {}
+            self.captured_steps += 1
+            return
+        if self._use_static(batch):
+            self.plan = self._fill_decode_plan(batch)
+            self._last = {}
+            self.static_steps += 1
+            return
         self.plan = QSAPlan.build(self.profile, self.cache, batch, self.page_table)
         self._last = {}
+
+    # -- the sparsity ledger, which survives capture ---------------------------------------------
+    def sparsity_totals(self) -> "tuple[int, int]":
+        """(visited, dense) over the whole run — the dynamic path's host counters PLUS the static
+        path's device counters. Syncs once, when asked; never per layer."""
+        v, d = self.total_visited, self.total_dense
+        if self._s:
+            v += int(self._s["visited_acc"].item())
+            d += int(self._s["dense_acc"].item())
+        return v, d
 
     def select(
         self,
@@ -249,6 +498,8 @@ class QSARuntime:
         """Stages 1-4 for ONE index layer. `q` is [rows, Hi, D] already normed + roped."""
         plan = self.plan
         assert plan is not None, "QSARuntime.select before prepare()"
+        if plan.static:
+            return self._select_static(index_layer, q, token_k, k_layernorm, plan)
         r = self.profile.compress_ratio
         cache = self.cache
 
@@ -332,6 +583,72 @@ class QSARuntime:
         return QSASelection(
             slots=sel_slots, lens=lens, visited=visited, dense=plan.dense_total
         )
+
+    def _select_static(
+        self, index_layer: int, q: torch.Tensor, token_k: torch.Tensor, k_layernorm,
+        plan: QSAPlan,
+    ) -> QSASelection:
+        """The SAME four stages, on the preallocated buffers, with no host read and no branch.
+
+        Every difference from the dynamic body above is one of exactly three things, and none of
+        them changes a value:
+          * the workspaces are the preallocated ones (allocation is not a value);
+          * the logits width is the STATIC `max_blocks` instead of this step's `row_ends.max()` —
+            the scorer bounds `j` by `row_ends` and writes -inf elsewhere, and the top-k reads only
+            `[row_starts, row_starts+row_ends)`, so the extra columns are never read;
+          * the compression is unconditional, with the non-boundary and padded rows aimed at
+            `scratch_slot` (a row the DSV4 identity cannot name) instead of skipped.
+        """
+        s, r, cache = self._s, self.profile.compress_ratio, self.cache
+        P, d = plan.rows, self.profile.head_dim
+
+        # 1. raw key -> pending ring.
+        pend = cache.pending_keys(index_layer)
+        pend.index_copy_(0, plan.ring_slots_long, token_k.to(pend.dtype))
+        cache.pending_pos.index_copy_(0, plan.ring_slots_long, plan.pos_i32)
+
+        # 2. compress — UNCONDITIONAL; see the docstring. fp32 mean -> Gemma norm -> rope at the
+        #    group's OLDEST member. Order is load-bearing and invisible when wrong.
+        members = pend.index_select(0, plan.member_ring_flat)
+        first_pos = cache.pending_pos.index_select(0, plan.member_ring[:, 0]).to(torch.int64)
+        pooled = members.reshape(-1, r, d).float().mean(dim=1)
+        normed = k_layernorm.forward(pooled.to(token_k.dtype))
+        roped = self.rotary.forward_one(first_pos, normed)
+        comp = cache.compressed_keys(index_layer)
+        comp.reshape(comp.shape[0], -1).index_copy_(0, plan.write_locs_long, roped.to(comp.dtype))
+
+        # 3. score + 4a. top-k, at the STATIC width (no row tiling: P <= max_graph_bs).
+        logits = s["logits"][:P]
+        blocks = s["blocks"][:P]
+        ops.score_paged(
+            q.contiguous(), comp, plan.comp_page_table,
+            plan.row_starts, plan.row_ends, plan.row_seq, logits, self.scale,
+        )
+        ops.topk(logits, plan.row_starts, plan.row_ends, blocks)
+
+        # 4b. blocks -> token positions -> PHYSICAL kv slots.
+        sel_tokens = s["tokens"][:P]
+        ops.expand(
+            blocks, plan.pos_i32, plan.seq_len_row, sel_tokens, r, self.profile.budget,
+        )
+        lens = s["lens"][:P]
+        torch.sum((sel_tokens >= 0).to(torch.int32), dim=1, out=lens)
+        torch.add(
+            plan.row_table_idx[:, None] * plan.page_stride,
+            sel_tokens.clamp(min=0).to(torch.int64),
+            out=s["flat"][:P],
+        )
+        sel_slots = s["slots"][:P]
+        sel_slots.copy_(
+            self.page_table.reshape(-1)
+            .index_select(0, s["flat"][:P].reshape(-1))
+            .reshape(P, -1)
+        )
+        # The ledger, on the device. `visited` counts REAL rows only — a padded dummy row's
+        # selection is discarded by the sampler and counting it would inflate the sparsity ratio.
+        s["visited_acc"] += (lens.to(torch.int64) * s["real"][:P]).sum()
+        s["dense_acc"] += plan.dense_total_dev
+        return QSASelection(slots=sel_slots, lens=lens, visited=-1, dense=-1)
 
 
 def _logits_row_tile(rows: int, cols: int) -> int:

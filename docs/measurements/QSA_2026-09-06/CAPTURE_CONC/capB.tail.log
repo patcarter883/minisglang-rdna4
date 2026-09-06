@@ -1,0 +1,120 @@
+[1m[2026-09-06|05:07:35|core|rank=1][0m [32mINFO    [0m Allocating 104912 tokens for KV cache, K + V = 1.20 GiB
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m GDN state: 36 layers x 4 slots (conv_dim=10240); conv warmup done
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m PLE runtime: n-gram table open, 4 state slots, staging 1024 tokens x 2560 (0.02 GiB device)
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m sampler: masking padded vocab tail [248077, 248320) — 243 untrained ids fenced off
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m Free memory after initialization: 0.88 GiB
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m Start capturing CUDA graphs with sizes: [1, 2]
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m Free GPU memory before capturing CUDA graphs: 0.88 GiB
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m qwen4_exp QSA ACTIVE: budget=2048 ratio=4 block_topk=512 index_width=2051 ops=hip QSAIndexCache(layers=12, req_rows=3, ratio=4, head_dim=128, comp_slots=26232, MiB=76.9)
+[1m[2026-09-06|05:07:35|core|rank=0][0m [32mINFO    [0m QSA graph capture ARMED: max_bs=2 max_blocks=26232 (max_seq_len=104928, r=4) logits=0.2 MiB, scratch_slot=26232
+Preparing for capturing CUDA graphs...:   0%|          | 0/2 [00:00<?, ?batch/s]Capturing graphs: bs = 2   | avail_mem = 0.65 GiB:   0%|          | 0/2 [00:00<?, ?batch/s][1m[2026-09-06|05:07:36|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rms_norm
+[1m[2026-09-06|05:07:36|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv(minv_decode)
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.dense_bf16_gemv[gdn_proj]
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_decode_conv_gated_replay
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.silu_and_mul
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.moe_resolve[device]
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] moe_hip.moe_route_align
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(gemv+e2m1)
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm_scatter+e2m1
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.rope
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] qsa_index.score_paged
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] qsa_index.topk
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] qsa_index.expand
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] tail_hip.store_kv
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] qsa.flash_decode_paged
+[1m[2026-09-06|05:07:37|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.moe_resolve[host]
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+/opt/venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: FutureWarning: `torch.distributed.all_gather_into_tensor` is deprecated. Please use `torch.distributed.all_gather_single` instead.
+  return func(*args, **kwargs)
+Capturing graphs: bs = 2   | avail_mem = 0.65 GiB:  50%|█████     | 1/2 [00:24<00:24, 24.91s/batch]Capturing graphs: bs = 1   | avail_mem = 0.42 GiB:  50%|█████     | 1/2 [00:24<00:24, 24.91s/batch]Capturing graphs: bs = 1   | avail_mem = 0.42 GiB: 100%|██████████| 2/2 [00:25<00:00, 10.32s/batch]Capturing graphs: bs = 1   | avail_mem = 0.42 GiB: 100%|██████████| 2/2 [00:25<00:00, 12.51s/batch]
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m Free GPU memory after capturing CUDA graphs: 0.42 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [hip-engage] weight_offload.verify_after_capture
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m weight offload [post-capture]: seam proof: 48 MoE layers reachable from the LIVE model, 37 host (222 tensors, 24.615 GiB INSIDE the pinned arena), 11 device (66 tensors, 7.318 GiB)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m weight offload: arena clean after graph capture
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] total 107.8 s inside Engine.__init__, 4.2 s before it (torch import + config), process age now 112.0 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] init_communication                     0.20 s  anon  +0.07 file  +0.03 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] model_construct_meta                   0.31 s  anon  +0.12 file  +0.02 dev  +0.06 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_stream_tier_build               0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_plan_resolve                    0.03 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] arena_pin_attach                       2.34 s  anon +25.46 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_enumerate_prepass              0.74 s  anon  +0.03 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_run                           76.49 s  anon  +0.10 file  +0.01 dev +37.34 GiB  disk  78.14 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stage_b_trailing_post_load             0.00 s  anon  +0.00 file  +0.00 dev  -0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_load                           77.25 s  anon  +0.12 file  +0.01 dev +37.34 GiB  disk  78.14 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] ct_sign_verify                         2.15 s  anon  +0.00 file  -0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] weight_offload_bind_seal               0.01 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_sizing                              0.02 s  anon  +0.00 file  +0.01 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] kv_pool_alloc                          0.02 s  anon  +0.00 file  +0.00 dev  +1.20 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] gdn_conv_warmup                        0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] ple_runtime_build                      0.01 s  anon  +0.02 file  +0.00 dev  +0.02 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] snapshot_host_arena                    0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] backends_init                          0.03 s  anon  +0.00 file  +0.01 dev  +0.00 GiB  disk   0.01 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] graph_capture                         25.02 s  anon  +0.34 file  +0.35 dev  +0.15 GiB  disk   0.68 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] canvas_capture                         0.00 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] verify_arena_after_capture             0.01 s  anon  +0.00 file  +0.00 dev  +0.00 GiB  disk   0.00 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- inner-loop buckets (seconds) ---
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.stream_next                          59.08 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.safe_open                              25.86 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d                                    14.57 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.shard                                   7.69 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.post_load                             6.69 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.gc_collect                            5.34 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.sink_place                            4.88 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.host_alloc                             2.27 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_leaf_scales                       2.19 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.expert_stack_add                        1.54 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor                              1.28 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.remap                                   1.07 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gate_up_cat                             0.73 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.discover_moe_layers                   0.29 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.nvfp4_prepass                           0.23 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.load_state_dict                       0.13 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   stageb.cast                                  0.05 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.selftest                               0.04 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.gdn_concat                              0.03 s
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] --- counters ---
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.chunks                                           19
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   arena.pinned_bytes                         27,334,279,168  (25.46 GiB)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.file_bytes                            83,995,035,950  (78.23 GiB)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.files_opened                                     196
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_bytes                      77,843,416,856  (72.50 GiB)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.get_tensor_calls                             222,252
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_bytes                             39,992,310,168  (37.25 GiB)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline]   ckpt.h2d_calls                                    222,252
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] checkpoint files: 196 distinct, 196 header opens, 196 tensor opens, 0 opened >1x for tensors (max 1x)
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] RSS end: total 27.89 GiB (anon 26.81 + file 0.71 + shmem 0.37), peak VmHWM 35.73 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] disk read_bytes 78.83 GiB, rchar 64.83 GiB
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m [boot-timeline] box: MemAvailable 69.0 -> 22.3 GiB, swap used 0.0 -> 4.1 GiB; swapped in 12.63 GiB, out 16.71 GiB during boot
+[1m[2026-09-06|05:08:00|core|rank=0][0m [33mWARNING [0m recurrent-state hybrid model: prefix cache 'naive' (was 'radix'); PLE recurrent state is not covered by the recurrent-radix snapshot store
+[1m[2026-09-06|05:08:00|core|rank=0][0m [32mINFO    [0m prefill chunk granularity = 4 (QSA indexer_compress_ratio): a non-final chunk ends on a group boundary
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m weight offload [post-capture]: seam proof: 48 MoE layers reachable from the LIVE model, 37 host (222 tensors, 24.615 GiB INSIDE the pinned arena), 11 device (66 tensors, 7.318 GiB)
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m weight offload: arena clean after graph capture
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.causal_conv1d_fwd
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.gdn_prefill_wmma
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] gdn_hip.rmsnorm_gated
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm(wmma+e2m1)
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gather_reduce
+[1m[2026-09-06|05:08:01|core|rank=0][0m [32mINFO    [0m [hip-engage] sampler_hip.top_k_top_p_sampling_from_logits_
+  [ok] QSA runtime is ACTIVE (this file measures nothing without it) — MINISGL_QSA=0, a bad page size, or the qsa_index kernels are missing
+  kv_pages=6557 pool_tokens=104912 engine_max_seq_len=104912 checkpoint_max_position=262144
+
+[2] the long-context ladder (sampled: temp=1.0 top_k=20 top_p=0.95)
+  [ok] QSA runtime is ACTIVE (this file measures nothing without it) — MINISGL_QSA=0, a bad page size, or the qsa_index kernels are missing
+  kv_pages=6557 pool_tokens=104912 engine_max_seq_len=104912 checkpoint_max_position=262144
+
+[2] the long-context ladder (sampled: temp=1.0 top_k=20 top_p=0.95)
+[1m[2026-09-06|05:08:02|core|rank=0][0m [32mINFO    [0m [hip-engage] fp8_wmma.mmq_fp8_moe_gemm1_silu(wmma+e2m1)
+[1m[2026-09-06|05:08:02|core|rank=0][0m [32mINFO    [0m TP comms/compute overlap ENGAGED (side stream; first tensor (512, 2560), min_tokens=256, row chunks=2)
+  ctx=   4096 w=1 (4087 tok) prefill 18.384s (222.3 tok/s) decode 1841.25 tok/s sparsity 0.746899 needles early=True late=True
+    -> 'The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.'
+  ctx=   4096 w=1 (4087 tok) prefill 18.383s (222.3 tok/s) decode 1779.16 tok/s sparsity 0.746899 needles early=True late=True
+    -> 'The Meridian vault access code is 47-ZEBRA-9183, and the night supervisor on the eastern depot roster is Dr. Imogen Halloway.'
+Memory access fault by GPU node-1 (Agent handle: 0x39d01170) on address 0x7ff1a34ad000. Reason: Page not present or supervisor privilege.
+Memory access fault by GPU node-2 (Agent handle: 0x314aaa70) on address 0x7f9e95ca8000. Reason: Page not present or supervisor privilege.
+Failed to fetch queues snapshot.
+GPU core dump failed
+GPU coredump: execvp failed: No such file or directory
+Failed to write segment data to pipe: Bad address
+GPU coredump: handler exited with error (status: 1)
+GPU core dump failed

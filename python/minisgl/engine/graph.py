@@ -339,6 +339,24 @@ class GraphRunner:
 
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
 
+        # QSA (qwen4_exp sparse attention): arm the SELECTION's static decode plan before the first
+        # warmup forward. `ctx.qsa` is built lazily on the model's first forward — which would be the
+        # warmup INSIDE the loop below, i.e. after the plan was needed — so force it here. Two
+        # properties this buys, and both are the point:
+        #   * `max_blocks = ceil(max_seq_len/r)` is a build-time constant, so the scorer's key-tile
+        #     grid and the split top-k's `num_splits` (a policy on the logits tensor's STATIC width)
+        #     are IDENTICAL at capture and at replay. Deriving the width from the step's own
+        #     `row_ends.max()` is the 61d96cf/0972e387 bug class exactly.
+        #   * every decode step then takes the same static path whether it is captured or eager, so
+        #     an eager-vs-captured A/B measures CAPTURE rather than a kernel swap.
+        # No-op for every model that is not qwen4_exp, and for a qwen4_exp build with QSA off.
+        prep_qsa = getattr(model, "prepare_qsa", None)
+        if prep_qsa is not None:
+            prep_qsa()
+            qsa = getattr(get_global_ctx(), "qsa", None)
+            if qsa is not None:
+                qsa.init_capture(self.max_graph_bs, max_seq_len)
+
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
             desc="Preparing for capturing CUDA graphs...",

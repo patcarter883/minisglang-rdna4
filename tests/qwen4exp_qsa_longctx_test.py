@@ -33,11 +33,14 @@ The claims it is built to support, each with the counter-evidence it would produ
     and decode tok/s from the median decode step. A `len(tokens)/wall` figure would tax every token
     with a 64k prefill and is not a decode number.
 
-CAPTURE IS OFF AND THAT IS NOT A CHOICE. `QSARuntime.prepare` raises inside a cudagraph capture
-(the selection sizes its block window with a host `.max()`), so a QSA build serves EAGER. The
-harness therefore boots with `cuda_graph_max_bs=0` and ASSERTS the decode steps were eager — if a
-future change makes capture work, this assert fires and tells you to re-measure rather than
-silently reporting captured numbers under an eager label.
+CAPTURE IS NOW A LEG, NOT A REFUSAL (2026-09-06). `QSARuntime.prepare` used to raise inside a
+cudagraph capture, so this harness hard-wired `cuda_graph_max_bs=0` and ASSERTED the decode steps
+were eager. The selection now has a static decode plan, so `--graph-bs` selects the leg and the
+assert became a CHECK OF WHAT WAS ASKED FOR: `--graph-bs 0` still demands `decode_eager` on every
+decode step, `--graph-bs N` demands `decode_graph`. A leg that silently ran the other dispatch is
+the one thing an A/B of the two must not be able to do, so the per-rung phase set is recorded and
+gated either way, alongside the engine's own replay/eager COUNTERS (never the engaged() set, which
+saturates).
 """
 
 from __future__ import annotations
@@ -248,7 +251,7 @@ def run_batch(llm, tokenizer, args, target: int, rank: int, width: int = 1) -> d
     result while refusing is a capacity result. Running them together is the only way to see which.
     """
     from minisgl.core import SamplingParams
-    from minisgl.scheduler.scheduler import STEP_LOG
+    from minisgl.scheduler.scheduler import STEP_LOG, STEP_LOG_SYNC as _STEP_LOG_SYNC
 
     prompts, metas = [], []
     for w in range(width):
@@ -263,8 +266,22 @@ def run_batch(llm, tokenizer, args, target: int, rank: int, width: int = 1) -> d
     row["batch_actual_tokens"] = [m["actual_tokens"] for m in metas]
 
     qsa = getattr(llm.engine.ctx, "qsa", None)
-    v0 = getattr(qsa, "total_visited", 0)
-    d0 = getattr(qsa, "total_dense", 0)
+    # `sparsity_totals()` and not `total_visited`: the static (capturable) decode path accumulates
+    # the ledger in DEVICE counters, because a per-layer `.item()` is a host sync a graph cannot
+    # record. Reading the python attributes alone would report 0 visited on every captured leg —
+    # i.e. the one instrument that proves the path is sparse would read zero exactly when capture
+    # is on.
+    v0, d0 = qsa.sparsity_totals() if qsa is not None else (0, 0)
+    gr0 = int(getattr(getattr(llm.engine, "graph_runner", None), "replays", 0) or 0)
+    eg0 = int(getattr(llm.engine, "eager_decode_forwards", 0) or 0)
+    # THE ENGAGED LEDGER, PER RUNG, AS COUNTS AND NOT AS THE SET. The set saturates on the first
+    # forward of the first rung, so a set-diff across rungs — or across the two legs of the
+    # eager-vs-captured A/B — is empty by construction and can only ever report "nothing changed".
+    # The tally says which arms actually dispatched HERE, which is what makes a vanished arm
+    # visible. Read it with the caveat in `_hip_engage`: a graph replay re-enters no host python,
+    # so on a captured leg these counts move at CAPTURE time and then stand still.
+    from minisgl._hip_engage import counts as _eng_counts, counts_delta as _eng_delta
+    eng0 = _eng_counts()
     mark = len(STEP_LOG)
 
     sp = SamplingParams(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
@@ -317,6 +334,12 @@ def run_batch(llm, tokenizer, args, target: int, rank: int, width: int = 1) -> d
         med = _median([d for _, d in dec])
         row["decode_ms_per_step_median"] = round(med * 1e3, 2)
         row["decode_tok_per_s_median"] = round(1.0 / med, 2) if med else None
+        # WHAT THAT NUMBER IS, recorded beside it rather than left to the reader. Without
+        # MINISGL_STEP_LOG_SYNC the STEP_LOG window closes when the HOST finished enqueuing, so on a
+        # captured leg it is a `hipGraphLaunch` return time and not a forward at all (MEASURED: 0.54
+        # ms/step captured against 60.8 eager, a 112x that is an instrument artefact). Carried per
+        # row so a future reader of the artifact cannot mistake one for the other.
+        row["decode_ms_is_device_time"] = _STEP_LOG_SYNC
 
     def _needles(t: str) -> tuple:
         low = t.lower()
@@ -342,9 +365,15 @@ def run_batch(llm, tokenizer, args, target: int, rank: int, width: int = 1) -> d
                                 for e, l in (_needles(r["text"]) for r in results)]
         row["batch_gen_tokens"] = [len(r["token_ids"]) for r in results]
 
+    row["graph_replays"] = int(getattr(getattr(llm.engine, "graph_runner", None),
+                                       "replays", 0) or 0) - gr0
+    row["eager_decode_forwards"] = int(getattr(llm.engine, "eager_decode_forwards", 0) or 0) - eg0
+    row["engaged_counts"] = _eng_delta(eng0)
     if qsa is not None:
-        dv = qsa.total_visited - v0
-        dd = qsa.total_dense - d0
+        v1, d1 = qsa.sparsity_totals()
+        dv, dd = v1 - v0, d1 - d0
+        row["qsa_static_steps"] = int(qsa.static_steps)
+        row["qsa_captured_steps"] = int(qsa.captured_steps)
         row["visited"] = dv
         row["dense"] = dd
         row["sparsity_visited_over_dense"] = round(dv / dd, 6) if dd else None
@@ -374,8 +403,10 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
         model_path=model_dir,
         dtype=torch.bfloat16,
         tp_info=DistributedInfo(rank, tp),
-        # 0 IS MANDATORY WITH QSA, not a default: QSARuntime.prepare raises inside a capture.
-        cuda_graph_max_bs=0,
+        # WAS hard-wired to 0 ("QSARuntime.prepare raises inside a capture"). The selection is now
+        # capturable (static decode plan), so this is the A/B knob: 0 = eager decode, N = capture
+        # buckets up to N. Whichever is asked for is GATED below, per rung.
+        cuda_graph_max_bs=args.graph_bs,
         page_size=args.page_size,
         memory_ratio=args.memory_ratio,
         attention_backend="hip",
@@ -466,19 +497,33 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
             print("  ladder ABORTED: the engine is no longer usable after that failure", flush=True)
             break
 
-    # ---- the CONC=2 capacity leg ---------------------------------------------------------------
+    # ---- the CONC=2 capacity legs ---------------------------------------------------------------
     # The operating point admits 2 running requests, and the KV pool is SHARED between them. This is
     # the only leg that can distinguish the three things "CONC=2 at 16k" could mean: both resident
     # at once, the second QUEUED behind the first (a latency result), or a refusal (a capacity one).
-    if args.conc_len > 0 and not out.get("ladder_aborted_after"):
-        print(f"\n[2b] CONC={args.conc_width} at ctx={args.conc_len}", flush=True)
-        cr = run_batch(llm, hf_tok, args, args.conc_len, rank, width=args.conc_width)
+    #
+    # MORE THAN ONE LENGTH, because the group-alignment defect this leg exists to catch is CHUNK
+    # PACKING ARITHMETIC and each prompt length is its own instance of it. The two recorded
+    # reproductions are different leftovers, not the same bug seen twice:
+    #     16382 = 15*1024 + 1022 -> leftover 2 -> the next request's chunk is 2  (48L TP=2, r2b.log)
+    #      4087 =  3*1024 + 1015 -> leftover 9 -> ...its chunk is 9             (4L  TP=1, r3.log)
+    # A fix verified at only one of them is verified against one arithmetic instance.
+    conc_lens = [int(x) for x in str(args.conc_len).split(",") if x.strip() and int(x) > 0]
+    conc_rows = []
+    for cl in conc_lens:
+        if out.get("ladder_aborted_after"):
+            break
+        print(f"\n[2b] CONC={args.conc_width} at ctx={cl}", flush=True)
+        cr = run_batch(llm, hf_tok, args, cl, rank, width=args.conc_width)
         cr["leg"] = "concurrency"
         rows.append(cr)
-        out["concurrency"] = cr
+        conc_rows.append(cr)
         if args.rank_json:
             with open(f"{args.rank_json}.rank{rank}.json", "w") as fh:
                 json.dump(out, fh, indent=2)
+    if conc_rows:
+        out["concurrency_legs"] = conc_rows
+        out["concurrency"] = conc_rows[0]  # back-compat with the r2b-era artifacts and the report
 
     ok_rows = [r for r in rows if r.get("ok")]
     out["max_context_served_tokens"] = max((r["actual_tokens"] for r in ok_rows), default=0)
@@ -487,6 +532,21 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
 
     # ---- the gates -----------------------------------------------------------------------------
     print("\n[3] gates", flush=True)
+    # THE INSTRUMENT, BEFORE ANY NUMBER TAKEN WITH IT. `decode_ms_per_step_median` comes from
+    # STEP_LOG, which by default closes its window when the HOST finished enqueuing the step. A
+    # captured decode step is a single graph launch that returns immediately, so without
+    # MINISGL_STEP_LOG_SYNC=1 that column is launch latency and not a forward — MEASURED on this
+    # exact configuration as 0.54 ms/step against the eager leg's 60.8, which would read as a 112x
+    # "win" and is an instrument artefact. A captured leg may therefore not publish a forward time
+    # unless the device-synced bracket was on. (The eager leg happens to read near-true either way,
+    # because the dynamic QSA plan syncs on `row_ends.max().item()` every forward — which is exactly
+    # why the artefact is so easy to miss: only one of the two legs is wrong.)
+    from minisgl.scheduler.scheduler import STEP_LOG_SYNC as _SYNC_ON
+    out["step_log_sync"] = bool(_SYNC_ON)
+    if args.graph_bs > 0:
+        check_true("a CAPTURED leg's ms/forward was taken with the device-synced bracket "
+                   "(MINISGL_STEP_LOG_SYNC=1)", bool(_SYNC_ON),
+                   "without it decode_ms_per_step_median is a hipGraphLaunch return time")
     above = [r for r in ok_rows if r["actual_tokens"] > (qsa.profile.budget if qsa else 2048)]
     check_true("at least one run finished ABOVE indexer_budget (the old refusal is gone)",
                bool(above), f"{len(ok_rows)} runs ok, none above budget")
@@ -495,10 +555,38 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
         sr = r.get("sparsity_visited_over_dense")
         check_true(f"ctx={r['actual_tokens']}: the selection actually skipped keys (ratio<1)",
                    sr is not None and sr < 0.999, f"ratio={sr}")
-        # DECODE WAS EAGER. If this ever fails, capture started working and every throughput
-        # number in this file needs retaking under the new dispatch.
-        check("ctx=%d: decode steps were EAGER (QSA refuses capture)" % r["actual_tokens"],
-              r["decode_phases"], ["decode_eager"])
+        # THE SELECTION ARM IS THE ONE THAT DISPATCHED, per rung, from the COUNTS. The `engaged()`
+        # SET saturates at the first forward of the first rung and would report every later rung as
+        # unchanged whatever it ran. What this catches and nothing else here does: a build where
+        # `qsa_index` failed to import falls back to `MINISGL_QSA_OPS=torch`, which computes the
+        # same values — so sparsity, coherence and retrieval all stay green while the HIP kernels
+        # under test never ran. Prefill is eager on every leg, so these arms must appear on a
+        # captured leg too.
+        ec = r.get("engaged_counts", {})
+        check_true(f"ctx={r['actual_tokens']}: the three qsa_index HIP arms dispatched",
+                   all(ec.get(f"qsa_index.{k}", 0) > 0
+                       for k in ("score_paged", "topk", "expand")),
+                   f"{ {k: v for k, v in ec.items() if k.startswith('qsa_index')} }")
+        check_true(f"ctx={r['actual_tokens']}: the TORCH selection fallback never dispatched",
+                   not any(k.endswith("(torch)") for k in ec),
+                   f"{[k for k in ec if k.endswith('(torch)')]}")
+        # THE DISPATCH THIS LEG ASKED FOR IS THE DISPATCH IT GOT. Both directions are gated: an
+        # eager leg that quietly replayed graphs and a captured leg that quietly fell back to eager
+        # would both make the A/B "new vs itself". The phase tags come from STEP_LOG; the counters
+        # come from the engine and the GraphRunner (an int add per step, not a saturating set).
+        want = ["decode_graph"] if args.graph_bs > 0 else ["decode_eager"]
+        check("ctx=%d: decode dispatch is what --graph-bs %d asked for"
+              % (r["actual_tokens"], args.graph_bs), r["decode_phases"], want)
+        if args.graph_bs > 0:
+            check_true(f"ctx={r['actual_tokens']}: every decode step REPLAYED a graph",
+                       r.get("graph_replays", 0) == r["decode_steps"]
+                       and r.get("eager_decode_forwards", 0) == 0,
+                       f"replays={r.get('graph_replays')} eager={r.get('eager_decode_forwards')} "
+                       f"decode_steps={r['decode_steps']}")
+        else:
+            check_true(f"ctx={r['actual_tokens']}: NO graph was replayed",
+                       r.get("graph_replays", 0) == 0,
+                       f"replays={r.get('graph_replays')}")
         dg = r["degeneration"]
         check_true(f"ctx={r['actual_tokens']}: no loop signature",
                    dg["longest_immediate_repeat_run"] <= args.max_repeat_run,
@@ -507,6 +595,29 @@ def rank_main(rank: int, tp: int, args, model_dir: str) -> dict:
                    dg["longest_single_char_run"] <= 4, f"run={dg['longest_single_char_run']}")
         check_true(f"ctx={r['actual_tokens']}: no token-noise signature",
                    dg["non_ascii_char_frac"] <= 0.05, f"frac={dg['non_ascii_char_frac']}")
+    # ---- CONCURRENCY, GATED EXPLICITLY --------------------------------------------------------
+    # NOT covered by the `above` loop, and the reason is the whole hazard: `above` is filtered to
+    # rows with `ok`, so a concurrency leg that RAISED — which is exactly the failure this leg was
+    # added to catch (`QSA prefill chunk is not group-aligned: cached_len=2`) — drops silently out
+    # of every check above it and the run still reports PASS. The refusal has to be gated where it
+    # cannot be filtered away.
+    for cr in conc_rows:
+        w, n = args.conc_width, cr["target_tokens"]
+        check_true(f"CONC={w} at ctx={n}: the batch ran (no group-alignment refusal)",
+                   bool(cr.get("ok")),
+                   f"{cr.get('error_type')}: {str(cr.get('error'))[:200]}")
+        if not cr.get("ok"):
+            continue
+        # AND IT RAN AS A BATCH, not as two sequential requests. `chunk_gran` is about what the
+        # PREFILL PACKER does when a second request shares a step's token budget, so a leg where the
+        # scheduler happened to serialise the two proves nothing about it.
+        check_true(f"CONC={w} at ctx={n}: {w} requests actually completed",
+                   len(cr.get("batch_gen_tokens", [])) == w,
+                   f"gen_tokens={cr.get('batch_gen_tokens')}")
+        check_true(f"CONC={w} at ctx={n}: every request generated tokens",
+                   all(t > 0 for t in cr.get("batch_gen_tokens", [0])),
+                   f"gen_tokens={cr.get('batch_gen_tokens')}")
+
     # RETRIEVAL is reported for every run and gated only when asked, because a sampled single
     # generation at temperature 1.0 is a noisy retrieval test — the ladder's shape across lengths
     # is the signal, not any one row.
@@ -544,6 +655,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--page-size", type=int, default=16)
     ap.add_argument("--memory-ratio", type=float, default=0.90)
     ap.add_argument("--max-running-req", type=int, default=2)
+    # 0 = eager decode; N = capture decode buckets up to N. THE A/B KNOB — see the module docstring.
+    ap.add_argument("--graph-bs", type=int, default=0)
     # The PREFILL CHUNK. QSA needs every chunk boundary group-aligned (cached_len % r == 0); the
     # scheduler chunks on page boundaries and page_size 16 is a multiple of r=4, so any multiple of
     # the page size is legal. It is also the row count the [rows, compressed_blocks] scoring
@@ -559,7 +672,11 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--late-frac", type=float, default=0.90)
     ap.add_argument("--max-repeat-run", type=int, default=6)
     ap.add_argument("--no-chat-template", action="store_true")
-    ap.add_argument("--conc-len", type=int, default=0, help="0 = skip the concurrency leg")
+    # A COMMA LIST, not one length: the chunk-packing arithmetic that produced the group-alignment
+    # refusal is per prompt length (16382 -> leftover 2, 4087 -> leftover 9), so one length verifies
+    # one instance. "" or 0 skips the concurrency legs entirely.
+    ap.add_argument("--conc-len", type=str, default="0",
+                    help="comma list of prompt lengths to drive at --conc-width; 0 = skip")
     ap.add_argument("--conc-width", type=int, default=2)
     ap.add_argument("--gate-retrieval", action="store_true")
     ap.add_argument("--json", default="")

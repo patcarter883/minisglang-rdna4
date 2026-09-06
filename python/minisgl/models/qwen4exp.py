@@ -121,14 +121,6 @@ logger = init_logger(__name__)
 # summary, never the enforcement.
 UNIMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     (
-        "cudagraph capture of the QSA SELECTION (the sparse attention itself captures fine)",
-        "plan T5.1: the selection allocates its per-forward logits/blocks/tokens workspace and does "
-        "a host `.max()` to size the block window, neither of which a captured graph admits. A "
-        "qwen4_exp build with QSA active therefore runs its decode EAGER; the refusal that used to "
-        "bound context at indexer_budget is GONE (the sparse path is implemented and gated — see "
-        "tests/qwen4exp_qsa_gate_test.py), so this costs throughput, not correctness or reach",
-    ),
-    (
         "vision tower (model.visual.*)",
         "text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 "
         "skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/"
@@ -887,8 +879,13 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
         bound is a property of the config's `indexer_budget` and is identical on every indexer, so
         the first one answers for all of them.
         """
-        if getattr(get_global_ctx(), "qsa", None) is not None:
-            return  # the sparse path is live: there is no budget to enforce.
+        qsa = getattr(get_global_ctx(), "qsa", None)
+        if qsa is not None:
+            # The sparse path is live: there is no budget to enforce — but the SELECTION's static
+            # plan has to be refreshed here, because the captured `model.forward()` never re-enters
+            # `QSARuntime.prepare`. This hook is the only place per replay that runs on the host.
+            qsa.prepare_for_replay(batch)
+            return
         idx = self.indexers()
         if not idx:
             return

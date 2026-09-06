@@ -574,27 +574,34 @@ case "$MODEL" in
                   # operating point has been booted at; raising it raises coverage but is unmeasured
                   # and eats VRAM at exactly the moment VRAM is tightest.
                   if [ "$CONC" -gt 2 ]; then CONC=2; fi
-                  # `[QSA-2026-09-06]` AND WITH QSA LIVE THE CAP IS 1, NOT 2 — a MEASURED refusal,
-                  # not caution. Two prompts submitted together share a leading token run, the second
-                  # resumes its prefill at the matched length, and that length is a TOKEN count, not
-                  # a page count. `QSAPlan.build` then raises:
+                  # `[QSA-CAP-2026-09-06]` THE QSA CAP OF 1 IS GONE — CONC=2 IS BACK, AND IT IS
+                  # MEASURED, not restored on argument. What used to sit here clamped CONC to 1
+                  # because the second concurrent request died in `QSAPlan.build`:
                   #     QSA prefill chunk is not group-aligned: cached_len=2 is not a multiple of
                   #     compress_ratio=4
-                  # because the r members of the group straddling that boundary were never stored in
-                  # this request's raw-key ring (the prefix was REUSED, not recomputed), so the
-                  # compression step has nothing to average. Reproduced twice on deliberately
-                  # different configurations — 48 layers TP=2 (cached_len=2) and a 4-layer subset
-                  # TP=1 on one card (cached_len=9) — so it is not a TP, depth or scale effect. It
-                  # RAISES rather than serving wrong attention, which is the guard working; but a
-                  # default that provably fails the second concurrent request is not a default, and
-                  # every real serve has shared prefixes (a system prompt, a chat template), so this
-                  # is not a corner case.
-                  # THE FIX IS NOT IN QSA: round the prefix match DOWN to a multiple of r before the
-                  # request resumes (costs at most 3 tokens of reuse and leaves the DSV4 identity
-                  # `physical_slot // r` untouched). Raise this back to 2 in the same commit that
-                  # lands it. CONC=2 with MINISGL_QSA=0 is unaffected (and re-arms the 2048
-                  # refusal). See docs/measurements/QSA_INDEXER.md 4c.
-                  if [ "${MINISGL_QSA:-1}" != "0" ] && [ "$CONC" -gt 1 ]; then CONC=1; fi
+                  # THAT COMMENT'S DIAGNOSIS WAS WRONG and the wrong fix it proposed (round the
+                  # PREFIX MATCH down to a multiple of r) is a provable no-op here: qwen4_exp forces
+                  # the NAIVE prefix cache (`resolve_prefix_cache` — the PLE recurrent state is not
+                  # covered by the snapshot store), so `handle.cached_len` is ALWAYS 0 and there is
+                  # no prefix match to round. The real source is chunk PACKING: `token_budget` is
+                  # per STEP, a request's FINAL chunk is its arbitrary `remain_len`, and the leftover
+                  # handed to the next request in the same batch becomes that request's first chunk.
+                  # Both recorded reproductions are that arithmetic and nothing else:
+                  #     16382 = 15*1024 + 1022 -> leftover 2 -> cached_len=2  (48L TP=2)
+                  #      4087 =  3*1024 + 1015 -> leftover 9 -> cached_len=9  (4L  TP=1)
+                  # `PrefillAdder.chunk_gran` now rounds a NON-FINAL chunk's end down to a multiple
+                  # of `indexer_compress_ratio` and defers a request for which no aligned chunk
+                  # fits, which closes it at the source for at most r-1 tokens of one step's budget.
+                  #
+                  # MEASURED GREEN at BOTH recorded shapes, 48 layers TP=2, cards 0+1, sampled at
+                  # temp 1.0 / top_k 20 / top_p 0.95 (never greedy), 0 harness failures:
+                  #     CONC=2 @ ctx=4087  -> both requests completed, gen_tokens [32, 37]
+                  #     CONC=2 @ ctx=16382 -> both requests completed, gen_tokens [37, 37]
+                  #     both needles recovered verbatim on every request; loop-run 0, letter-spell
+                  #     run 0, non-ASCII 0.0
+                  #   raw: docs/measurements/QSA_2026-09-06/CAPTURE_CONC/eagS.json
+                  # A fix verified at only one leftover is verified against one arithmetic instance,
+                  # which is why both are in the artifact.
                   # THE OFFLOAD TIER. `[E4M3-2026-09-05]` 8.1 GiB/rank now buys **12** of 48 layers
                   # device-side, not 11, and the other 36 are host-pinned at 24.12 GiB/rank
                   # (48.23 GiB across the node — MEASURED: 18 chunks, payload 24.00 GiB, 120 MiB
@@ -648,16 +655,46 @@ case "$MODEL" in
                   # LONG CONTEXT — 105,104 tokens, MEASURED coherent with retrieval at 4k and above.
                   # Two more terms had to move and neither is a preference:
                   #
-                  # 1. GRAPH_BS=0 — FORCED, not chosen. `QSARuntime.prepare` RAISES inside a
-                  #    cudagraph capture: the selection allocates its per-forward
-                  #    logits/blocks/tokens workspace and does a host `.max()` to size the block
-                  #    window, neither of which a capture admits (plan T5.1). A QSA build therefore
-                  #    decodes EAGER. That cost was already priced BEFORE QSA and is small on this
-                  #    model — captured 14.55 vs eager 13.93 wall tok/s
-                  #    (QWEN4EXP_L48_E4M3_HCFUSE_2026-09-05.json) — because 37 of 48 layers read
-                  #    their experts over PCIe and a PCIe-bound decode has little launch overhead to
-                  #    remove. GRAPH_BS>0 is only legal together with MINISGL_QSA=0, which re-arms
-                  #    the 2048 refusal; it does not "turn off" long context, it REFUSES it.
+                  # 1. GRAPH_BS=0 — STILL 0, BUT THE REASON ON FILE HAS EXPIRED AND THE NEW ONE IS
+                  #    A MEASURED TRADE, NOT A REFUSAL. `QSARuntime.prepare` no longer raises inside
+                  #    a capture: the selection has a static decode plan (`init_capture` /
+                  #    `_fill_decode_plan` / `prepare_for_replay`), plan T5.1 is IMPLEMENTED, and a
+                  #    captured QSA decode runs correctly — 37/37 steps replayed with 0 eager
+                  #    forwards, both needles recovered verbatim, and sparsity 0.746899 identical to
+                  #    the eager leg to six decimals. `[QSA-CAP-2026-09-06]`, 48 layers TP=2, cards 0
+                  #    (RX 9070 XT) + 1 (RX 9070), decode ms/forward taken with the DEVICE-SYNCED
+                  #    bracket (MINISGL_STEP_LOG_SYNC=1) on BOTH legs — without it a captured step
+                  #    logs its hipGraphLaunch return (0.54 ms) and not its forward — both ranks
+                  #    agreeing to 0.1%:
+                  #        ctx=4087   eager 60.52 / 60.55 ms  ->  captured 57.07 / 57.06 ms   -5.7%
+                  #        ctx=16382  eager 60.33 / 60.34 ms  ->  captured 56.67 / 56.70 ms   -6.1%
+                  #    raw: docs/measurements/QSA_2026-09-06/CAPTURE_CONC/{eagS,capC,cap16kmr}*.json
+                  #    That is 3.45-3.66 ms off a ~60 ms step: capture recovers about a TENTH of the
+                  #    33.5 ms QSA adds over the 27.05 ms short-context eager reference. It is the
+                  #    same 2.80-3.78 ms/step capture was worth BEFORE QSA (a PCIe-bound decode has
+                  #    little launch overhead to remove), so QSA neither helps nor hurts what capture
+                  #    can win. Do not read it as a throughput lever; it is a wash-adjacent 6%.
+                  #
+                  #    WHAT MAKES IT UNSHIPPABLE HERE IS REACH, AND THAT IS MEASURED TOO. Capture
+                  #    allocates its graphs out of the same headroom the KV pool is sized from, and
+                  #    at this arm's mem_default of 0.90 that leaves 0.42 GiB free — not enough for
+                  #    the QSA selection's stage-4b prefill workspace, which is FULL CHUNK WIDTH
+                  #    (QSA_INDEXER.md §8.1). The failure is NOT a clean OOM, which is why it has to
+                  #    be written down rather than discovered:
+                  #        Memory access fault ... HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
+                  #    about one second into the FIRST prefill chunk of a 16,382-token request,
+                  #    aborting both ranks (-6). Reproduced on THREE independent 48-layer TP=2 boots
+                  #    and NOT reproducible at 4 layers TP=1. ctx=4087 captured is unaffected, and
+                  #    the fault is LENGTH-gated rather than rung-order-gated: it fires on the first
+                  #    rung when 16384 is the only rung in the ladder.
+                  #    Dropping MEM_RATIO to 0.84 leaves 1.41 GiB free and the captured 16k run
+                  #    passes clean — but the KV pool falls 104,912 -> 22,592 tokens. So capture
+                  #    costs 78% of this arm's context reach to buy 6% of its decode step, and reach
+                  #    is the entire point of QSA. GRAPH_BS stays 0 until stage 4b is row-tiled
+                  #    (§8.1), which bounds the prefill peak and is the thing that would make
+                  #    capture free. GRAPH_BS=2 is left as an OVERRIDE for a short-context serve
+                  #    (measured good to ctx=4087 at 0.90, and to 16382 at MEM_RATIO=0.84), never a
+                  #    default. It no longer requires MINISGL_QSA=0.
                   # 2. MAX_PREFILL_LENGTH=1024, not 2048 — a FEASIBILITY term. The selection's
                   #    stage-4b workspace is full CHUNK width (`[chunk, 2051]` int32 tokens and
                   #    slots plus an int64 `flat` gather index), so the prefill activation peak

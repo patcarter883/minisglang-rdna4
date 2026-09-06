@@ -30,6 +30,8 @@ from typing import Optional
 
 import torch
 
+from minisgl._hip_engage import engaged as _engaged
+
 _BACKEND: Optional[str] = None
 _OPS = None
 
@@ -69,11 +71,13 @@ def score_paged(
     logits    [rows, num_key_cols] float32 OUT (caller-owned; the served path is graph-captured)
     """
     if backend() == "hip":
+        _engaged("qsa_index.score_paged")
         _OPS.qsa_index_score_paged(
             q, k_cache, page_table, row_starts, row_ends, row_seq, logits, scale,
             logits.shape[1],
         )
         return
+    _engaged("qsa_index.score_paged(torch)")
     _torch_score_paged(q, k_cache, page_table, row_starts, row_ends, row_seq, logits, scale)
 
 
@@ -81,8 +85,10 @@ def topk(logits: torch.Tensor, row_starts: torch.Tensor, lengths: torch.Tensor,
          out: torch.Tensor) -> None:
     """Exact top-`out.shape[1]` of each row's window, RELATIVE, ASCENDING, -1 padded."""
     if backend() == "hip":
+        _engaged("qsa_index.topk")
         _OPS.qsa_index_topk(logits, row_starts, lengths, out)
         return
+    _engaged("qsa_index.topk(torch)")
     _torch_topk(logits, row_starts, lengths, out)
 
 
@@ -90,8 +96,10 @@ def expand(block_indices: torch.Tensor, query_positions: torch.Tensor, seq_lens:
            out: torch.Tensor, ratio: int, token_topk: int) -> None:
     """Selected BLOCKS -> selected TOKEN positions, valid entries contiguous at the front."""
     if backend() == "hip":
+        _engaged("qsa_index.expand")
         _OPS.qsa_index_expand(block_indices, query_positions, seq_lens, out, ratio, token_topk)
         return
+    _engaged("qsa_index.expand(torch)")
     _torch_expand(block_indices, query_positions, seq_lens, out, ratio, token_topk)
 
 

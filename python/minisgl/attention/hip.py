@@ -239,6 +239,8 @@ class HIPAttnBackend(RDNA4Backend):
         md = getattr(batch, "attn_metadata", None)
         if md is None or getattr(md, "max_seqlen_q", 1) != 1:
             return  # decode-shaped batches only; a prefill row is not one dense "sequence"
+        if torch.cuda.is_current_stream_capturing():
+            return  # a debug tap with a host sync cannot be recorded into a graph
         try:
             ref = self._decode(
                 q.contiguous(), self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id),

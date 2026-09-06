@@ -99,6 +99,21 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _qsa_chunk_granularity(model_config) -> int:
+    """`indexer_compress_ratio` when this build's QSA sparse path can be live, else 1.
+
+    Read from the CONFIG, not from `ctx.qsa`: the runtime is built on the model's first forward,
+    which is long after the scheduler has to know how to pack a prefill. Erring on the side of
+    aligning is free — the cost is at most r-1 tokens of one step's token budget — whereas erring
+    the other way is a hard refusal on the second concurrent request.
+    """
+    if os.environ.get("MINISGL_QSA", "1") == "0":
+        return 1
+    r = int(getattr(model_config, "indexer_compress_ratio", 0) or 0)
+    return r if r > 1 else 1
+
+
 # Per-forward wall times, most recent last: (phase, batch_size, seconds).
 #
 # WHY A PER-STEP LOG AT ALL. A tok/s taken as `len(tokens) / wall(generate)` folds the PREFILL into
@@ -117,6 +132,25 @@ logger = init_logger(__name__)
 # (microseconds against a ~50 ms step) and cannot be accidentally left disabled on the run whose
 # number gets published, which an env gate can. The cap keeps a long-lived serve's memory flat.
 STEP_LOG: "deque[Tuple[str, int, float]]" = deque(maxlen=8192)
+
+# WHAT STEP_LOG MEASURES BY DEFAULT IS HOST WALL, AND ON A CAPTURED LEG THAT IS NOT THE FORWARD.
+# `perf_counter` around `_forward` records when the host finished ENQUEUING the step, not when the
+# device finished executing it. On an EAGER leg the two are close by accident — the python path
+# hits host syncs on its own (qwen4_exp's dynamic QSA plan does a `row_ends.max().item()` every
+# forward, and the sampler reads back tokens) — but a CAPTURED leg is one `hipGraphLaunch` and
+# returns immediately. MEASURED, 48-layer TP=2 qwen4_exp at ctx=4087: the captured leg logs
+# 0.54 ms/step against the eager leg's 60.8 ms, a 112x that is a launch cost being compared with a
+# forward. The same artefact is already published in this repo (QSA_INDEXER.md §6's "captured ...
+# 0.504 ms/step, 1983 tok/s forward-only") and is the reason `ab_*_steady_ms_per_step` is on this
+# repo's forbidden-metrics list.
+#
+# So an eager-vs-captured ms/forward has to bracket the step with DEVICE syncs, and this knob is
+# that bracket. Default OFF because a sync per step is a real cost on a serve and STEP_LOG is
+# always-on; set to 1 on a measurement run, where the artifact records that it was set. It does not
+# make the number "more accurate" — it changes WHAT IS MEASURED, from enqueue latency to device
+# execution time, so the two settings are not comparable with each other and a leg taken with it on
+# may only be compared with another leg taken with it on.
+STEP_LOG_SYNC = os.environ.get("MINISGL_STEP_LOG_SYNC", "0") == "1"
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
@@ -311,6 +345,19 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        # QSA (qwen4_exp): a NON-FINAL prefill chunk must end on a multiple of
+        # `indexer_compress_ratio`, or the group straddling that boundary has no members to average
+        # and `QSAPlan.build` refuses the request. Derived from the CONFIG rather than from
+        # `ctx.qsa` because the runtime is built lazily on the first forward, while this has to be
+        # known before the first request is packed. See PrefillAdder.chunk_gran for the arithmetic
+        # this closes (it is chunk PACKING, not prefix reuse) — that defect is what capped
+        # tools/serve.sh's qwen4exp arm at CONC=1.
+        self.prefill_manager.chunk_gran = _qsa_chunk_granularity(config.model_config)
+        if self.prefill_manager.chunk_gran > 1:
+            logger.info_rank0(
+                f"prefill chunk granularity = {self.prefill_manager.chunk_gran} "
+                f"(QSA indexer_compress_ratio): a non-final chunk ends on a group boundary"
+            )
         # runaway-generation-kv-guard: a single degenerate no-EOS generation can grow its context to
         # ~100% of the KV pool and then crawl (every decode step attends over the whole pool) while
         # starving every other request. This second, POOL-RELATIVE cap force-finishes any one request
@@ -2789,6 +2836,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # longer exists. The graph/eager split is taken from the replay counter MOVING across this
         # step rather than by re-asking `can_use_cuda_graph` — that is the dispatch that actually
         # happened, not a second opinion about what should have.
+        # STEP_LOG_SYNC: drain the device BEFORE starting the clock, so this step's window does not
+        # inherit the previous step's unfinished work. Paired with the sync before the append below.
+        if STEP_LOG_SYNC:
+            torch.cuda.synchronize()
         _step_t0 = time.perf_counter()
         _step_is_pf = bool(batch.is_prefill)
         _step_bs = int(batch.size)
@@ -2844,6 +2895,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # `complete_one`). Inert for every non-PLE model. See PLERuntime.commit_staged.
         if self._ple is not None:
             self._ple.commit_staged()
+        # Close the window on the DEVICE, not on the host queue — see STEP_LOG_SYNC. Without this
+        # the captured leg's entry is a `hipGraphLaunch` return time.
+        if STEP_LOG_SYNC:
+            torch.cuda.synchronize()
         STEP_LOG.append((
             "prefill" if _step_is_pf else
             ("decode_graph" if self.engine.graph_runner.replays > _step_r0 else "decode_eager"),
