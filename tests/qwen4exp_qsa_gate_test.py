@@ -385,7 +385,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--layers", type=int, default=4)
-    ap.add_argument("--experts", type=int, default=8)
+    # 16, not 8: this checkpoint routes `num_experts_per_tok=10`, so a default of 8 dies in
+    # `fused_topk` with "selected index k out of range" BEFORE QSA is exercised at all —
+    # `--gate all` with defaults never reached the thing it was written to test.
+    ap.add_argument("--experts", type=int, default=16)
     ap.add_argument("--max-seq", type=int, default=4096)
     ap.add_argument("--prompt-len", type=int, default=1024)
     ap.add_argument("--long-prompt-len", type=int, default=0,
@@ -525,10 +528,20 @@ def main() -> int:
         check("G3 logits are finite above the budget", ok_fin)
         report["above_ids"] = ids
         # --- sparsity, measured ---
-        vis, dense = rt.total_visited, rt.total_dense
+        # `sparsity_totals()`, NOT `rt.total_visited`. ffa1d8c6 moved the dynamic path's
+        # accumulation onto the device (a per-INDEX-LAYER `.item()` was 36% of the scheduler rank),
+        # which ORPHANED the host counter — it is initialised to 0 and never incremented again.
+        # This gate kept reading it and kept passing, because `0 < dense` is true: the check written
+        # to catch "a sparse path that quietly selected everything" was proving nothing at all.
+        # Found 2026-09-07 when the gate reported `visited=0 dense=32522112 ratio=0.0000` and PASSED.
+        vis, dense = rt.sparsity_totals()
         report["visited"] = vis
         report["dense"] = dense
         report["sparsity_ratio"] = (vis / dense) if dense else None
+        # `vis > 0` is half the assertion and the half that was missing: without it the gate accepts
+        # a ledger that counted nothing, which is exactly how it failed silently.
+        check("G3 selection ledger actually counted (visited > 0)", vis > 0,
+              f"visited={vis} — the ledger is not accumulating; sparsity below is unproven")
         check("G3 selection is genuinely SPARSE (visited < dense)", vis < dense,
               f"visited={vis} dense={dense} ratio={vis / dense:.4f}" if dense else "")
         # --- f64 reference on the selection ---
