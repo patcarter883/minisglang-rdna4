@@ -709,6 +709,19 @@ services:
       # knob) never fires and the arm silently serves at 2048. serve.sh still applies the global
       # 2048 default for every model that wants it. Caught 2026-09-06 by diffing the live [serve]
       # banner against DRY_RUN — the only way this class of shadowing is visible.
+      # Weight-offload tier, per rank. Empty = serve.sh's per-model table decides. These were not
+      # reachable from a compose serve, so the placement decision the whole offload design exists to
+      # make could only be exercised by hand — which is how the arm ended up shipping an 11/48-layer
+      # device tier (f=0.229) that was never checked against the plan's own A0.4 gate of >=40% byte
+      # hit rate. Plumbed 2026-09-07 to bring up the all-host (T1) configuration.
+      # Host-arena capacity floor, GiB. A BOX property, not a model one. serve.sh defaults it to 9;
+      # the gate that uses it is BLIND TO THE ZFS ARC (which is not in MemAvailable and which the
+      # shrinker hands back under pinning), so a refusal at 9 can be the gate being wrong rather than
+      # the box being full — check /proc/spl/kstat/zfs/arcstats before believing it.
+      MINISGL_WEIGHT_ARENA_FLOOR_GIB: "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:-}"
+      WOFF_DEVICE_GB: "${WOFF_DEVICE_GB:-}"
+      WOFF_HOST_GB: "${WOFF_HOST_GB:-}"
+      WOFF_CHUNK_MIB: "${WOFF_CHUNK_MIB:-}"
       MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-}"
       # torch allocator config. Loading streams each checkpoint tensor, slices the rank shard and
       # frees the rest, which leaves the heap fragmented: on Qwen3.8-27B-NVFP4 torch reserved 14.13

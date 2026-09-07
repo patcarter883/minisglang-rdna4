@@ -581,7 +581,12 @@ case "$MODEL" in
                   # with graphs live and is left as an override, not a default: raising it buys KV
                   # pages the operating point has never needed at CONC=2 and spends the headroom
                   # capture allocates its pool out of. MEM_RATIO=0.96 to try it.
-                  mem_default="0.90"
+                  mem_default="0.85"  # [ALL-HOST 2026-09-07] 0.90 left 0.42 GiB free and killed two boots
+                  # today: an RCCL `Failed to CUDA calloc` at 32 MiB and again at 2 MiB, and
+                  # (with capture) an HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION. Two
+                  # different-looking failures, one cause: no VRAM margin. All-host frees
+                  # 7.32 GiB/rank, so 0.85 still yields a 1,350,160-token KV pool — 12.8x what
+                  # 0.90 gave with the device tier. Margin is worth more than the last 5%.
                   # A CAP, not a default (CONC is already assigned above this case block, so
                   # `${CONC:=2}` would be a silent no-op). GRAPH_BS follows CONC, so this is also
                   # the capture coverage: buckets [1,2] are what was captured and measured, and a
@@ -663,7 +668,30 @@ case "$MODEL" in
                   # an override (WOFF_DEVICE_GB=8.1), not a default.
                   # * host_gb 26, not 25: the 37th host layer pushes the plan's reserve from 24.12 to
                   #   24.62 GiB/rank and the clamp must sit above it. 26 is the point that booted.
-                  woff_device_gb="7.4"; woff_host_gb="26"; woff_chunk_mib="1372"
+                  # [ALL-HOST 2026-09-07] ALL MoE layers live in system RAM. This is a FIXED
+                  # CONDITION of the project, not a tuning choice: the external performance target
+                  # (llama.cpp, 23.3 tok/s) was measured on an all-MoE-in-RAM setup, so a device
+                  # tier makes our numbers non-comparable with it. It is also what the offload plan
+                  # itself specifies — WEIGHT_OFFLOAD_PLAN.md K1: "hit rate < 40% -> the device tier
+                  # is worthless; ship T1 only (all-host)". The tier that shipped here until today
+                  # was 11/48 layers at f=0.229 device byte fraction, i.e. BELOW that 40% gate,
+                  # which was never measured before the tier was configured.
+                  #
+                  # device_gb 0.5 is not a budget, it is a way of spelling ZERO: one MoE layer is
+                  # 0.668 GiB/rank, so any value under that places no layer on the card. 0.0 means
+                  # "unconfigured" and `bake.UnconfiguredDeviceTierError` refuses it, which is why
+                  # this is 0.5 and not 0. Resolves to `[0/48 layers device, f=0.000]`.
+                  #
+                  # MEASURED at this point (2026-09-07, TP=2, 48 layers, cards 0+1):
+                  #   host arena 31.93 GiB x2 = 63.86 GiB pinned; KV pool 1,350,160 tokens
+                  #   (the 11/48 tier gave 105,104 — freeing 7.32 GiB/rank of VRAM is 12.8x context)
+                  #   loop 70.4 ms/step (gpu_wait 42.0 / fwd_launch 26.7 / sched 1.5)
+                  #   e2e decode ~10.4 tok/s steady; the device tier was ~11.7, i.e. it bought
+                  #   ~9 ms/step and cost 12.8x the context.
+                  #
+                  # host_gb 33, not 26: 26 was sized for 37 host layers; all 48 need 31.93/rank and
+                  # the clamp must sit above the plan's reserve.
+                  woff_device_gb="0.5"; woff_host_gb="33"; woff_chunk_mib="1372"
                   # ---- QSA SPARSE ATTENTION (`[QSA-2026-09-06]`) --------------------------------
                   # The 2048-token refusal is GONE: the sparse selection exists
                   # (python/minisgl/attention/qsa + the qsa_index HIP package), so this arm serves
@@ -742,7 +770,16 @@ case "$MODEL" in
                   # live), MemAvailable never fell below 11.0 GiB during Stage B, and SwapFree moved
                   # <1 GiB. So a refusal at floor 9 here is the gate being blind to the ARC, not the
                   # box being full — check `/proc/spl/kstat/zfs/arcstats` before believing it.
-                  : "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:=9}"; export MINISGL_WEIGHT_ARENA_FLOOR_GIB
+                  # [ALL-HOST 2026-09-07] 4, not 9. The all-host arena is 64.31 GiB and the gate
+                  # computes `arena + floor <= MemAvailable`. At floor 9 and floor 6 it REFUSED —
+                  # at floor 6 by 0.97 GiB — while 7.96 GiB sat in the ZFS ARC that the gate cannot
+                  # see (see the paragraph above: the ARC is not in MemAvailable, and the shrinker
+                  # only hands it back UNDER pinning, which a pre-pinning gate never reaches).
+                  # Forcing the ARC down (7.96 -> 2.47 GiB) and floor 4 booted; under load the ARC
+                  # settled back at 4.03 GiB with MemAvailable 7.2 GiB, exactly as predicted.
+                  # OPERATIONAL: drop the ARC before booting this arm, or the gate refuses a
+                  # configuration that would have worked.
+                  : "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:=4}"; export MINISGL_WEIGHT_ARENA_FLOOR_GIB
                   # THE PLE N-GRAM SIDECAR. Qwen4ExpPLE reads its embeddings out of a separate
                   # ~49 GiB shard set that is NOT part of the model directory, and the head metadata
                   # (ngram_heads_offsets / ngram_heads_vocab_sizes) lives in a bf16 shard that is
