@@ -718,6 +718,13 @@ services:
       # the gate that uses it is BLIND TO THE ZFS ARC (which is not in MemAvailable and which the
       # shrinker hands back under pinning), so a refusal at 9 can be the gate being wrong rather than
       # the box being full — check /proc/spl/kstat/zfs/arcstats before believing it.
+      # Comms/compute overlap for the MoE all-reduce. EMPTY = the engine's default (ON). Plumbed
+      # because the CPU-compute expert tier runs INSIDE `rowchunked_ar_span`, whose async collectives
+      # live on a side stream, while `cpu_forward`'s blocking D2H is a host sync in the middle of that
+      # region — a combination that DEADLOCKED both ranks at TP=2 (both blocked in `_ep_route`'s
+      # torch.topk, card 1 pinned at 100% with a collective that never completed). Set 0 to take the
+      # plain-all_reduce path. Empty is safe: the engine tests `!= "0"`, not truthiness.
+      MINISGL_TP_OVERLAP: "${MINISGL_TP_OVERLAP:-}"
       MINISGL_WEIGHT_ARENA_FLOOR_GIB: "${MINISGL_WEIGHT_ARENA_FLOOR_GIB:-}"
       WOFF_DEVICE_GB: "${WOFF_DEVICE_GB:-}"
       WOFF_HOST_GB: "${WOFF_HOST_GB:-}"

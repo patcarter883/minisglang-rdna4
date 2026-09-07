@@ -548,8 +548,13 @@ static double selftest_policy(const char* name) {
 // SAME quantized activation, so this isolates the tile layout / bias correction / scale folding
 // from the activation-quantization error.  That error is measured separately, on the real
 // checkpoint, by --mode verify.
+//
+// `gvec != nullptr` exercises the PER-OUTPUT-CHANNEL second scale level: the SIMD core folds it as
+// one zmm multiply per 16-row block while the scalar twin applies it per row, so a disagreement
+// here means the row-block fold is indexing the wrong channels (the failure mode that produces
+// finite, plausible, wrong text rather than a fault).
 template <class WL>
-static double selftest_vnni(const char* name) {
+static double selftest_vnni(const char* name, const float* gvec = nullptr) {
     const int N = 64, K = 512;
     const int NT = (N / VNNI_RB) * (K / VNNI_GS);
     std::vector<uint8_t> codes((size_t)NT * VNNI_TILE_W);
@@ -569,6 +574,7 @@ static double selftest_vnni(const char* name) {
     quantize_act_g16(x.data(), K, xq.data(), xsc.data(), xsum.data());
     typename WL::ctx_t ctx{};
     ctx.gmul = 1.0f;
+    if constexpr (WL::POST_PER_ROW) ctx.gvec = gvec;
     const QAct qa{xq.data(), xsc.data(), xsum.data()};
     gemv_e2m1_vnni<WL, false>(codes.data(), scales.data(), ctx, qa, N, K, 0, N / VNNI_RB,
                               out.data(), 0.0f);
@@ -720,7 +726,15 @@ int main(int argc, char** argv) {
         printf("  e2m1 int8 codebook == kE2M1*2 : %s\n", tab_ok ? "PASS" : "FAIL");
         double d = selftest_vnni<WLoadVnniE4m3>("vnni_nvfp4_e4m3_g16");
         double e = selftest_vnni<WLoadVnniFp16>("vnni_nvfp4_fp16_g16");
-        return (a < 1e-5 && b < 1e-5 && c < 1e-5 && d < 1e-6 && e < 1e-6 && tab_ok) ? 0 : 1;
+        // The ENGINE's shape of the second scale level: a per-output-channel f32 vector, not a
+        // scalar. Values spread over ~4 decades and DIFFER PER ROW on purpose — a constant vector
+        // would pass even if the core applied channel 0 to every row.
+        std::vector<float> gv(64);
+        uint64_t gs2 = 0xDEADBEEFCAFEF00Dull;
+        for (int i = 0; i < 64; ++i) gv[i] = 1e-4f * (float)(xs(gs2) % 10000 + 1);
+        double f = selftest_vnni<WLoadVnniE4m3>("vnni_e4m3_g16 +gvec", gv.data());
+        return (a < 1e-5 && b < 1e-5 && c < 1e-5 && d < 1e-6 && e < 1e-6 && f < 1e-6 && tab_ok)
+                   ? 0 : 1;
     }
     if (planpaths.empty()) {
         fprintf(stderr, "need --plan\n");

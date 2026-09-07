@@ -302,7 +302,12 @@ class SeamLayerSink:
                 # neither has to be transcribed from config.
                 e, n13, k8 = op.gate_up_proj._w_op.shape
                 self.cpu_worker = self.cpu_worker_factory(
-                    hidden=int(k8) * 8, inter=int(n13) // 2, top_k=int(op.top_k)
+                    hidden=int(k8) * 8, inter=int(n13) // 2, top_k=int(op.top_k),
+                    # And the SCALE ENCODING, off the same live container. It selects the core's
+                    # WLoad policy (fp16 folded group scale vs the checkpoint's e4m3 block scale +
+                    # per-output-channel global) — the two read different byte counts per group, so
+                    # this is as load-bearing as the shapes and comes from the same place.
+                    scales_dtype=op.gate_up_proj._scales_op.dtype,
                 )
             seam.attach_cpu_worker(self.cpu_worker, backend_expert_offset=offset)
             self.cpu_worker.backend.pack_layer(

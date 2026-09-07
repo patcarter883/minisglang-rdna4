@@ -385,8 +385,35 @@ class StageASession:
 
     @property
     def enabled(self) -> bool:
-        """A plan with at least one host-resident layer. An all-device plan is a no-op by design."""
-        return self.driver is not None and self.accounting.host_bytes > 0
+        """A plan that places ANY layer off the device — pinned host arena OR the CPU-compute tier.
+
+        An all-device plan is a no-op by design and stays disabled.
+
+        WHY THIS IS NOT JUST `host_bytes > 0`, WHICH IS WHAT IT USED TO BE. `host_bytes` counts only
+        the PINNED ARENA tier. A CPU-tier layer is read by CPU cores with ordinary loads, so it needs
+        neither VRAM nor pinned host memory and contributes ZERO host bytes — which meant that the
+        one configuration where every expert layer is CPU-computed (`--weight-offload-cpu-layers` =
+        every offloadable layer, the all-CPU operating point) reported `enabled = False`.
+
+        That is not a cosmetic mis-report. `Engine._load_weight_chunked` gates on exactly this
+        property, so the plan that needs Stage B most got the ONE-SHOT loader instead — and the
+        one-shot loader materialises each expert stack ON THE DEVICE (`models/weight.py`'s
+        `_ExpertStacker.add` -> `torch.empty(..., device=cuda)`) before anything can be placed. It
+        OOM'd at 15.54 GiB of a 15.92 GiB card while trying to allocate a 400 MiB expert stack, on a
+        plan whose whole point was that no expert stack should be on the card at all. The failure was
+        a `torch.OutOfMemoryError` in the loader, which reads as "the model does not fit" rather than
+        as "the offload path was skipped".
+
+        So the question this property answers is "is there anything to place off-device?", and the
+        CPU tier is an off-device placement. `num_cpu_layers` rather than `cpu_resident_bytes`
+        because it is the PLACEMENT that matters here, not its size.
+        """
+        if self.driver is None:
+            return False
+        if self.accounting.host_bytes > 0:
+            return True
+        plan = getattr(self.driver, "plan", None)
+        return int(getattr(plan, "num_cpu_layers", 0) or 0) > 0
 
     # -- phase machine ------------------------------------------------------------------------
 
@@ -1060,7 +1087,7 @@ class StageARuntime:
         )
         return self.sink
 
-    def _make_cpu_worker(self, *, hidden: int, inter: int, top_k: int) -> Any:
+    def _make_cpu_worker(self, *, hidden: int, inter: int, top_k: int, scales_dtype: Any) -> Any:
         """Open the AVX-512 pool for this rank and start its dispatcher. Called ONCE, by the sink.
 
         The core list is PHYSICAL and node-wide disjoint across ranks — `cpu_native.
@@ -1083,7 +1110,11 @@ class StageARuntime:
             what=f"the CPU MoE tier at {threads} thread(s)/rank x {self.local_ranks} rank(s)",
         )
         cores = default_core_list(self.rank, self.local_ranks, threads)
-        backend = NativeVnniBackend(hidden, inter, top_k, threads, cores)
+        # `scales_dtype` selects the core's WLoad policy and comes off the LIVE container for the
+        # same reason the shapes do: it is a property of what `post_load` BUILT, and transcribing it
+        # from the quant config would be a second source of truth for the resident byte layout.
+        backend = NativeVnniBackend(hidden, inter, top_k, threads, cores,
+                                    scales_dtype=scales_dtype)
         self.cpu_worker = CpuMoEWorker(backend, name=f"cpu-moe-r{self.rank}").start()
         return self.cpu_worker
 

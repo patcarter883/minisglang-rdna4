@@ -1,0 +1,27 @@
+# Compose OVERRIDE: run the serve on docker's default bridge instead of a per-project network.
+#
+#   docker compose -f docker-compose.yml -f tools/offload/compose.default-bridge.yml \
+#     --profile serve up -d
+#
+# WHY. Every `docker compose up` allocates a NEW subnet for its project network, and docker's
+# predefined address pools are finite (~31 /16s by default). A box that has accumulated stale
+# compose projects — each exited-but-not-`down`ed project still holds its network — runs out, and
+# then EVERY new compose project on the box fails at boot with:
+#
+#     failed to create network <project>_default: Error response from daemon:
+#     all predefined address pools have been fully subnetted
+#
+# That is not a fault in the service being started; it is box state. Under `gpu-lease` it bites
+# hard, because the arbiter rewrites COMPOSE_PROJECT_NAME per lease, so every leased run is a NEW
+# project and therefore wants a NEW subnet.
+#
+# `network_mode: bridge` puts the container on the pre-existing default bridge and allocates
+# nothing. It is SAFE for this service specifically: `serve` has no `depends_on`, is not addressed
+# by container name from any other service, and is reached only through its published host port —
+# which `ports:` still publishes exactly as before. Nothing about the measured serve changes.
+#
+# The real fix is to reclaim the networks (`docker network prune`, and `docker compose -p <stale>
+# down` for exited projects that still hold one). Use this when that is not yours to do.
+services:
+  serve:
+    network_mode: bridge

@@ -246,6 +246,26 @@ PY
 # .dockerignore (see the repo) already strips __pycache__/*.so/logs from this COPY.
 COPY python /opt/minisgl/python
 
+# --- the CPU MoE expert tier's shared library ----------------------------------------------------
+# `--weight-offload-cpu-layers` computes whole MoE layers on the host AVX-512 cores, and
+# `weights/cpu_native.find_library` REFUSES rather than degrading when the `.so` is missing (there
+# is deliberately no float64 fallback — it would serve ~1000x too slowly and read as a hang). It is
+# a build artifact, `.gitignore`d, so before 2026-09-07 it existed only if someone had compiled it
+# by hand, which is the whole reason that tier had never been reachable in a serve. Build it here so
+# the image is self-contained, into /opt/kernels (already on PYTHONPATH and already one of the
+# paths `find_library` looks at).
+#
+# `-march=znver4` because the ONE host this image runs on is a Ryzen 7 7800X3D, and every number in
+# tools/cpu_moe/RESULTS_*.txt was measured with it. The core needs AVX-512 + VNNI + F16C and has no
+# scalar fallback by design; on a machine without them the library builds and SIGILLs, so change
+# CPU_MOE_ARCH deliberately rather than widening the ISA and losing VPDPBUSD.
+ARG CPU_MOE_ARCH=znver4
+COPY tools/cpu_moe /opt/cpu_moe_src
+RUN set -eux; \
+    make -C /opt/cpu_moe_src ARCH="${CPU_MOE_ARCH}" so; \
+    install -D /opt/cpu_moe_src/libcpumoe.so /opt/kernels/libcpumoe.so; \
+    rm -rf /opt/cpu_moe_src
+
 # /opt/kernels first so the canonical builds are authoritative, then the baked engine. The dev
 # compose OVERRIDES PYTHONPATH to /opt/kernels:/engine/python:/engine (mounted source + the 3
 # not-yet-canonical vendored kernels); the default below is what the turnkey image runs with.

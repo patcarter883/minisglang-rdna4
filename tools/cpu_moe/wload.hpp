@@ -189,15 +189,41 @@ struct WLoadVnniE4m3 {
     static constexpr int GROUP = 16;
     static constexpr bool TILED = true;
     static constexpr const char* NAME = "vnni_nvfp4_e4m3_g16";
-    struct ctx_t { float gmul; };  // this checkpoint's weight_scale_2, a MULTIPLIER
 
-    // the 16 RAW row-scales of one tile.  The per-matrix global is NOT applied here -- it is a
-    // scalar, so the core folds it into the per-group constant instead of paying a zmm multiply
-    // per tile.  post_scale() is that scalar.
+    // THE SECOND SCALE LEVEL HAS TWO SHAPES AND THEY ARE NOT INTERCHANGEABLE.
+    //   gmul  a per-MATRIX multiplier -- what a RAW checkpoint leaf carries (`weight_scale_2` is
+    //         one f32 per tensor), and what cpu_moe_layer.cpp's bench reads straight off disk.
+    //   gvec  a per-OUTPUT-CHANNEL f32 vector of length N, in ROW order -- what the ENGINE holds
+    //         (`_GroupedNvFp4Experts._global_op`, (E, N) f32). It is a vector rather than a scalar
+    //         because the loader's gate|up merge and per-expert stack combine differently-scaled
+    //         matrices: after the merge the global is constant on each contiguous output-channel
+    //         RANGE, which an N-vector expresses and a scalar cannot (quant/nvfp4.py, "WHY THE
+    //         GLOBAL IS A PER-OUTPUT-CHANNEL VECTOR").
+    // gvec WINS when set; gmul is then unused. Serving the engine's tensors through the scalar
+    // form would apply one channel's global to all N, so the two are kept distinct rather than
+    // collapsed into "the global".
+    struct ctx_t {
+        float gmul = 1.0f;
+        const float* gvec = nullptr;  // N floats, row-major; nullptr -> use gmul
+    };
+
+    // the 16 RAW row-scales of one tile.  The second level is NOT applied here: as a scalar it
+    // folds into the per-group constant (post_scale), and as a vector it is constant along k so it
+    // folds ONCE PER ROW BLOCK at the end of the row (post_vec) -- one zmm multiply per ~K/16
+    // tiles either way, never one per tile.
     static inline __m512 tile_scale(const scale_t* sp, const ctx_t&) {
         return e4m3x16_normpos_to_ps(sp);
     }
-    static inline float post_scale(const ctx_t& c) { return c.gmul; }
+    // Applied per row BLOCK by the core, and only for policies that ask for it.
+    static constexpr bool POST_PER_ROW = true;
+    static inline float post_scale(const ctx_t& c) { return c.gvec ? 1.0f : c.gmul; }
+    static inline __m512 post_vec(const ctx_t& c, int rb) {
+        return c.gvec ? _mm512_loadu_ps(c.gvec + (size_t)rb * VNNI_RB) : _mm512_set1_ps(1.0f);
+    }
+    // Scalar twin of post_scale x post_vec[lane], for the reference.
+    static inline float post_ref(const ctx_t& c, int rb, int r) {
+        return c.gvec ? c.gvec[(size_t)rb * VNNI_RB + r] : c.gmul;
+    }
     // Scalar twin: the GENERAL e4m3 decode, not the specialised one, so the reference does not
     // inherit the fast path's precondition.
     static inline float scale_ref(const scale_t* sp, int r, const ctx_t&) {
@@ -222,7 +248,12 @@ struct WLoadVnniFp16 {
     static inline __m512 tile_scale(const scale_t* sp, const ctx_t&) {
         return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)sp));
     }
+    // No second level AT ALL: it is inside the fp16 scale. There is deliberately no `gvec` field
+    // here, so a caller that has an engine-shaped per-channel global cannot hand it to this policy
+    // and have it silently ignored -- the code does not compile instead.
+    static constexpr bool POST_PER_ROW = false;
     static inline float post_scale(const ctx_t&) { return 1.0f; }  // folded in at repack time
+    static inline float post_ref(const ctx_t&, int, int) { return 1.0f; }
     static inline float scale_ref(const scale_t* sp, int r, const ctx_t&) {
         return _cvtsh_ss(sp[r]);
     }

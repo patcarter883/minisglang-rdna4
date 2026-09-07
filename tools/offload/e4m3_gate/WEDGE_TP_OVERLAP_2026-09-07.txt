@@ -1,0 +1,198 @@
+[catch] API bound 2026-09-07T13:41:25Z
+[catch] API bound 2026-09-07T13:41:28Z
+[catch] still outstanding at 25s -> WEDGED; dumping RANKS first
+[catch] still outstanding at 25s -> WEDGED; dumping RANKS first
+########## pid=4063304 rss=33746M ##########
+########## pid=4063304 rss=33746M ##########
+/opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=28
+/opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=28
+
+
+Process 4063304: /opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=28) --multiprocessing-fork
+Process 4063304: /opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=28) --multiprocessing-fork
+Python v3.12.3 (/usr/bin/python3.12)
+Python v3.12.3 (/usr/bin/python3.12)
+
+
+Error: Failed to get stack traces
+
+Caused by:
+    0: Failed to suspend process
+    1: EPERM: Operation not permitted
+    2: EPERM: Operation not permitted
+
+Thread 39 (active): "MainThread"
+    forward (torch/nn/modules/linear.py:134)
+    forward (gdn/layer.py:171)
+    _call_impl (torch/nn/modules/module.py:1791)
+    _wrapped_call_impl (torch/nn/modules/module.py:1780)
+    forward_prefill (gdn/layer.py:454)
+    forward (models/qwen3_5.py:242)
+    forward (models/qwen4exp.py:560)
+    wrapper (utils/torch_utils.py:33)
+    forward (models/qwen4exp.py:626)
+    forward (models/qwen4exp.py:836)
+    forward_batch (engine/engine.py:1926)
+    _forward (scheduler/scheduler.py:2890)
+    normal_loop (scheduler/scheduler.py:1150)
+    run_forever (scheduler/scheduler.py:1319)
+    decorate_context (torch/utils/_contextlib.py:124)
+    _run_scheduler (server/launch.py:31)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 118 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1073)
+    _bootstrap (threading.py:1030)
+Thread 136 (idle): "cpu-moe-r1"
+    wait (threading.py:355)
+    get (queue.py:171)
+    _run (weights/cpu_worker.py:436)
+    run (threading.py:1010)
+    _bootstrap_inner (threading.py:1073)
+    _bootstrap (threading.py:1030)
+########## pid=4063303 rss=32501M ##########
+
+########## pid=4063303 rss=32501M ##########
+/opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=26
+/opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=26
+
+
+Process 4063303: /opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=26) --multiprocessing-fork
+Process 4063303: /opt/venv/bin/python -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=24, pipe_handle=26) --multiprocessing-fork
+Python v3.12.3 (/usr/bin/python3.12)
+Python v3.12.3 (/usr/bin/python3.12)
+
+
+Error: Failed to get stack traces
+
+Caused by:
+    0: Failed to suspend process
+    1: EPERM: Operation not permitted
+    2: EPERM: Operation not permitted
+
+Thread 38 (active): "MainThread"
+    _page_to_token (scheduler/cache.py:172)
+    allocate_paged (scheduler/cache.py:88)
+    _finish_prepare (scheduler/scheduler.py:1965)
+    _prepare_batch (scheduler/scheduler.py:1954)
+    _schedule_next_batch (scheduler/scheduler.py:2422)
+    normal_loop (scheduler/scheduler.py:1145)
+    run_forever (scheduler/scheduler.py:1319)
+    decorate_context (torch/utils/_contextlib.py:124)
+    _run_scheduler (server/launch.py:31)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 117 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1073)
+    _bootstrap (threading.py:1030)
+Thread 134 (idle): "cpu-moe-r0"
+    wait (threading.py:355)
+    get (queue.py:171)
+    _run (weights/cpu_worker.py:436)
+    run (threading.py:1010)
+    _bootstrap_inner (threading.py:1073)
+    _bootstrap (threading.py:1030)
+Thread 145 (idle): "QueueFeederThread"
+    wait (threading.py:355)
+    _feed (multiprocessing/queues.py:251)
+    run (threading.py:1010)
+    _bootstrap_inner (threading.py:1073)
+    _bootstrap (threading.py:1030)
+########## pid=1244618 rss=9M ##########
+
+/home/pat/.local/bin/python3 /home/pat/code/minisgl-rdna4/control-panel/server.py 
+
+########## pid=1244618 rss=9M ##########
+/home/pat/.local/bin/python3 /home/pat/code/minisgl-rdna4/control-panel/server.py 
+
+Process 1244618: /home/pat/.local/bin/python3 /home/pat/code/minisgl-rdna4/control-panel/server.py
+Python v3.12.13 (/home/pat/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12)
+
+Process 1244618: /home/pat/.local/bin/python3 /home/pat/code/minisgl-rdna4/control-panel/server.py
+Python v3.12.13 (/home/pat/.local/share/uv/python/cpython-3.12.13-linux-x86_64-gnu/bin/python3.12)
+
+Error: Failed to get stack traces
+
+Caused by:
+    0: Failed to suspend process
+    1: EPERM: Operation not permitted
+    2: EPERM: Operation not permitted
+
+Thread 1244618 (idle): "MainThread"
+    select (selectors.py:415)
+    serve_forever (socketserver.py:235)
+########## pid=4052121 rss=2M ##########
+    main (server.py:644)
+    <module> (server.py:650)
+bash /tmp/claude-1000/-home-pat-code-minisgl-rdna4/36039161-cc69-402f-a0b6-b5813c739e8b/scratchpad/catch_wedge
+
+
+########## pid=4052121 rss=2M ##########
+bash /tmp/claude-1000/-home-pat-code-minisgl-rdna4/36039161-cc69-402f-a0b6-b5813c739e8b/scratchpad/catch_wedge
+
+Error: Failed to find python version from target process
+Error: Failed to find python version from target process
+
+
+########## pid=4062823 rss=2M ##########
+########## pid=4062823 rss=2M ##########
+bash /tmp/claude-1000/-home-pat-code-minisgl-rdna4/36039161-cc69-402f-a0b6-b5813c739e8b/scratchpad/catch_wedge
+
+bash /tmp/claude-1000/-home-pat-code-minisgl-rdna4/36039161-cc69-402f-a0b6-b5813c739e8b/scratchpad/catch_wedge
+
+Error: Failed to find python version from target process
+Error: Failed to find python version from target process
+
+
+########## pid=4062829 rss=1M ##########
+########## pid=4062829 rss=1M ##########
+timeout 4800 gpu-lease -n 2 -- bash /home/pat/code/minisgl-rdna4-cpue4m3/tools/offload/_cpu_tier_leg.sh 
+
+timeout 4800 gpu-lease -n 2 -- bash /home/pat/code/minisgl-rdna4-cpue4m3/tools/offload/_cpu_tier_leg.sh 
+
+Error: Failed to find python version from target process
+Error: Failed to find python version from target process
+
+[catch] --- rocm ---
+
+[catch] --- rocm ---
+=================================== Power Consumption ====================================
+GPU[0]		: Average Graphics Package Power (W): 22.0
+GPU[1]		: Average Graphics Package Power (W): 56.0
+GPU[2]		: Current Socket Graphics Package Power (W): 60.013
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 3
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[0]		: GPU Memory Allocated (VRAM%): 80
+GPU[0]		: GPU Memory Read/Write Activity (%): 0
+GPU[0]		: Memory Activity: N/A
+GPU[0]		: Avg. Memory Bandwidth: 0
+[catch] done
+=================================== Power Consumption ====================================
+GPU[0]		: Average Graphics Package Power (W): 22.0
+GPU[1]		: Average Graphics Package Power (W): 56.0
+GPU[2]		: Current Socket Graphics Package Power (W): 60.013
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 3
+GPU[1]		: GPU use (%): 100
+GPU[2]		: GPU use (%): 0
+GPU[0]		: GPU Memory Allocated (VRAM%): 80
+GPU[0]		: GPU Memory Read/Write Activity (%): 0
+GPU[0]		: Memory Activity: N/A
+GPU[0]		: Avg. Memory Bandwidth: 0
+[catch] done
+[catch] request returned rc=0 2026-09-07T13:47:04Z
+[catch] request returned rc=0 2026-09-07T13:47:04Z

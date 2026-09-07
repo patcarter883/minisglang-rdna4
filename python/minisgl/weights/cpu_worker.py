@@ -36,6 +36,7 @@ WHAT IS NOT HERE
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -313,6 +314,14 @@ class CpuMoEWorker:
         self._stopped = False
         self.layers_computed = 0
         self.compute_seconds = 0.0
+        # THE TIER'S PROOF OF LIFE, on the serve log, every N layer-computations. Off by default.
+        #
+        # `engaged()` is a SET and saturates at one, so it cannot tell a tier that bound 12 layers
+        # and executed 3 of them from one that executed all 12 — and a CPU tier that silently stops
+        # being reached costs nothing visible except tok/s, which is exactly the shape of regression
+        # the repo's A/B rule says to check the ledgers for. Until now `NativeVnniBackend.counters()`
+        # had no caller at all: the numbers existed and nothing ever printed them.
+        self._stats_every = int(os.environ.get("MINISGL_CPU_MOE_STATS", "0") or "0")
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> "CpuMoEWorker":
@@ -400,6 +409,27 @@ class CpuMoEWorker:
         finally:
             self._done.pop(handoff.seq, None)
 
+    def _log_stats(self) -> None:
+        """Counters from BOTH sides of the seam, which is the point of there being two.
+
+        The Python counts say the forward reached the tier; the `.so`'s say the native core ran.
+        A pair that diverges is a specific, nameable failure (a backend that returns without
+        computing) rather than a mystery, and neither number alone can say that.
+        """
+        from minisgl.utils import init_logger
+
+        c = {}
+        try:
+            c = self._backend.counters()
+        except Exception:  # noqa: BLE001 - a backend without counters is not a serve failure
+            pass
+        init_logger("cpu-moe").info_rank0(
+            f"[cpu-moe] {self._name}: layers_computed={self.layers_computed} "
+            f"compute={self.compute_seconds:.3f}s "
+            f"({1000 * self.compute_seconds / max(1, self.layers_computed):.3f} ms/layer) "
+            + " ".join(f"{k}={v}" for k, v in sorted(c.items()))
+        )
+
     # -- the thread ------------------------------------------------------------------------------
     def _run(self) -> None:
         while True:
@@ -427,6 +457,8 @@ class CpuMoEWorker:
                        else self._backend.compute(x, ids, weights))
                 item.finish(out)
                 self.layers_computed += 1
+                if self._stats_every and self.layers_computed % self._stats_every == 0:
+                    self._log_stats()
             except BaseException as exc:  # noqa: BLE001 - re-raised at join()
                 try:
                     if item.state.name == "SEALED":

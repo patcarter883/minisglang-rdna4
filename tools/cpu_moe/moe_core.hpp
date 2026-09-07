@@ -178,9 +178,12 @@ static inline void gemv_e2m1_vnni_ref(const uint8_t* codes, const typename WL::s
                     gs += 0.5 * (double)kE2M1I8[code] * (double)x.q[g * 16 + j];
                 }
                 s += gs * (double)WL::scale_ref(scales + ((size_t)rb * NG + g) * VNNI_RB, r, ctx) *
-                     (double)WL::post_scale(ctx) * (double)x.sc[g];
+                     (double)x.sc[g];
             }
-            out[rb * VNNI_RB + r] = s;
+            // The second scale level is constant along k, so it factors out of the group sum
+            // exactly -- which is also why the SIMD core can apply it once per row block.
+            // post_ref() is post_scale() x post_vec()[lane], as ONE scalar per (row block, row).
+            out[rb * VNNI_RB + r] = s * (double)WL::post_ref(ctx, rb, r);
         }
     }
 }
@@ -232,6 +235,12 @@ static inline void gemv_e2m1_vnni(const uint8_t* __restrict codes,
                                             _mm512_set1_ps(0.5f * x.sc[g] * post));
             yacc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), sc, yacc);
         }
+        // The PER-OUTPUT-CHANNEL second scale level, for the policies that have one (NVFP4's
+        // engine-shaped (N,) f32 global). Lane == row within the block, and the value does not
+        // depend on k, so ONE zmm multiply per row block is exact -- there is no per-tile or
+        // per-weight version of this to be cheaper than. Policies whose global is a scalar (or
+        // absent) fold it into `post` above and compile this away entirely.
+        if constexpr (WL::POST_PER_ROW) yacc = _mm512_mul_ps(yacc, WL::post_vec(ctx, rb));
         float* o = out + (size_t)rb * VNNI_RB;
         if (ACCUMULATE)
             _mm512_storeu_ps(o, _mm512_fmadd_ps(yacc, as, _mm512_loadu_ps(o)));
