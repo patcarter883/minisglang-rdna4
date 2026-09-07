@@ -129,9 +129,64 @@ def default_core_list(rank: int, ranks: int, threads: int) -> list[int]:
     if env:
         cores = [int(x) for x in env.replace(",", " ").split()]
         per = max(1, len(cores) // max(1, ranks))
-        return cores[rank * per: rank * per + threads] or cores[:threads]
+        picked = cores[rank * per: rank * per + threads] or cores[:threads]
+        _refuse_smt_siblings(picked, source=f"{_ENV_CORES}={env!r}")
+        return picked
     base = 1 + rank * threads          # core 0 reserved for the engine
-    return list(range(base, base + threads))
+    # THE DERIVED LIST RUNS OFF THE END OF THE PHYSICAL CORES AND INTO THE SIBLINGS.
+    # `base + threads` is unbounded, and Linux numbers the SMT sibling of physical core c as c+P
+    # (measured on this box: cpu0's siblings are "0,8"). So at ranks=2, threads=4 rank 1 gets
+    # [5, 6, 7, 8] -- and 8 is the sibling of core 0, the core this function's own docstring
+    # reserves for the engine. That is §1.4's ~50% penalty, silently, on the rank that draws it.
+    # It has been unreachable only because `CoreBudget` capped the node-wide total at 5; raising
+    # that cap to measure a wider pool makes it reachable, so it is a refusal now rather than a
+    # comment. The caller is told the one thing that fixes it.
+    top = base + threads
+    phys = _physical_core_count()
+    if top > phys:
+        raise CpuTierError(
+            f"the CPU MoE tier asks rank {rank} for physical cores {base}..{top - 1} but this box "
+            f"has {phys} ({ranks} rank(s) x {threads} thread(s), core 0 reserved for the engine). "
+            f"Core ids >= {phys} are SMT SIBLINGS, not cores -- pinning a worker onto the sibling "
+            f"of a busy core measured ~50% slower (docs/CPU_MOE_OFFLOAD.md §1.4), so this refuses "
+            f"rather than quietly handing one out. To use every core including core 0, set "
+            f"{_ENV_CORES} explicitly, e.g. "
+            f"{_ENV_CORES}='{','.join(str(c) for c in range(phys))}'."
+        )
+    return list(range(base, top))
+
+
+def _physical_core_count(default: int = 8) -> int:
+    """Physical cores = distinct SMT sibling GROUPS, never `os.cpu_count()` (which counts threads)."""
+    try:
+        groups = set()
+        for cpu in os.listdir("/sys/devices/system/cpu"):
+            path = f"/sys/devices/system/cpu/{cpu}/topology/thread_siblings_list"
+            if os.path.exists(path):
+                with open(path) as fh:
+                    groups.add(fh.read().strip())
+        return len(groups) or default
+    except OSError:
+        return default
+
+
+def _refuse_smt_siblings(cores: Sequence[int], *, source: str) -> None:
+    """Refuse a hand-written core list that pins two workers onto one physical core."""
+    seen: dict[str, int] = {}
+    for c in cores:
+        path = f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+        try:
+            with open(path) as fh:
+                group = fh.read().strip()
+        except OSError:
+            continue
+        if group in seen:
+            raise CpuTierError(
+                f"{source}: cpu{seen[group]} and cpu{c} are SMT siblings of the same physical core "
+                f"({group}). Two spinning MoE workers on one core is §1.4's ~50% penalty and §1.5's "
+                f"barrier cliff, so this is a refusal. List one hw thread per physical core."
+            )
+        seen[group] = c
 
 
 def _global_slab(container: Any, expert_offset: int) -> Any:

@@ -104,6 +104,7 @@ card and no working torch.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Mapping, Sequence, Tuple
@@ -290,6 +291,9 @@ ACT_POLICIES: Dict[str, CpuActPolicy] = {p.name: p for p in (ACT_FP32, ACT_VNNI_
 # ────────────────────────────────────────────────────────────────────────────────────────────────
 # The core budget — a FIRST-CLASS constraint, denominated in PHYSICAL cores
 # ────────────────────────────────────────────────────────────────────────────────────────────────
+_ENV_CORE_BUDGET = "MINISGL_CPU_MOE_CORE_BUDGET"
+
+
 @dataclass(frozen=True)
 class CoreBudget:
     """How many PHYSICAL cores the CPU tier may take, and from whom.
@@ -338,7 +342,28 @@ class CoreBudget:
 
     @property
     def max_threads(self) -> int:
-        """The most PINNED PHYSICAL cores the CPU tier may take, node-wide, across all ranks."""
+        """The most PINNED PHYSICAL cores the CPU tier may take, node-wide, across all ranks.
+
+        `MINISGL_CPU_MOE_CORE_BUDGET` OVERRIDES THE DERIVED CAP, and it exists because the derived
+        one is built on `engine_cores`, which `provenance` above admits is ONE OBSERVATION taken
+        without a known decode load. A cap resting on a single measurement must not be the thing
+        that makes the opposing measurement unrunnable — otherwise "2 threads is the maximum" is
+        true only because nothing was ever allowed to test 3.
+
+        It is an override, not a new default: unset, the refusal is exactly what it was. Set, the
+        caller is deliberately overcommitting and owns §1.5's cliff (an oversubscribed pool does not
+        degrade in proportion; it goes to a FIXED ~6.0 ms/layer and takes the engine's cores with
+        it), which is why the sweep that uses it must read the per-layer counters and not just the
+        end-to-end tok/s.
+        """
+        override = os.environ.get(_ENV_CORE_BUDGET)
+        if override:
+            n = int(override)
+            if n < 1:
+                raise CpuTierError(
+                    f"{_ENV_CORE_BUDGET}={override!r}: the node-wide core budget must be >= 1"
+                )
+            return n
         return int(self.usable_physical)  # floor: a fractional core is not a core
 
     def assert_fits(self, total_threads: int, *, what: str = "the CPU MoE tier") -> None:

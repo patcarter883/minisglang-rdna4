@@ -74,6 +74,20 @@ export MINISGL_HOSTPROF=50
 # `engaged()` is a SET and saturates at one, so it cannot tell a tier that bound 12 layers and
 # executed 3 from one that executed all 12.
 export MINISGL_CPU_MOE_STATS=200
+# THE CORE SWEEP'S ARM VARIABLES. Exported (not just inherited) so `docker compose` interpolates
+# them, and echoed below so the leg's own log records which arm it was -- an A/B whose arm is not in
+# its artifact is a measurement of nothing. Empty = the engine's shipped default (2 threads/rank,
+# derived core list, derived node-wide cap of 5).
+export MINISGL_CPU_MOE_THREADS="${MINISGL_CPU_MOE_THREADS:-}"
+export MINISGL_CPU_MOE_CORES="${MINISGL_CPU_MOE_CORES:-}"
+export MINISGL_CPU_MOE_CORE_BUDGET="${MINISGL_CPU_MOE_CORE_BUDGET:-}"
+# AFTER the exports, not before: this line names every one of them and the script runs under
+# `set -u`, so printing the arm before it is defined aborts the leg with "unbound variable" before
+# a single card is leased.
+echo "[cpu-tier] ARM: threads/rank='${MINISGL_CPU_MOE_THREADS:-<default 2>}'" \
+     "cores='${MINISGL_CPU_MOE_CORES:-<derived>}'" \
+     "core_budget='${MINISGL_CPU_MOE_CORE_BUDGET:-<derived 5>}'" \
+     "stats_every=${MINISGL_CPU_MOE_STATS}"
 
 cd "$REPO" || exit 1
 timeout "$((READY_TIMEOUT + 2400))" \

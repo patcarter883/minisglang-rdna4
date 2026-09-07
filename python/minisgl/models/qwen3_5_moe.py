@@ -142,16 +142,37 @@ class Qwen3_5MoeSparseBlock(BaseOP):
         # too — the helper itself falls back to the plain produce+all_reduce under graph capture, below
         # the token threshold, or when overlap is off, so there is no condition to keep in sync here.
         #
-        # It is now DEFAULT-OFF (MINISGL_TP_AR_CHUNKS=1), which is a deliberate behaviour change. The
+        # NOTE [2026-09-08]: this said "now DEFAULT-OFF (MINISGL_TP_AR_CHUNKS=1)" and that is WRONG —
+        # tp_overlap.py:157 reads `_env_int("MINISGL_TP_AR_CHUNKS", 2)`, so overlap is ON by default. The
         # row split was documented here as bit-exact "by construction"; it is not, and never was — the
         # argument covers the all_reduce but not the expert GEMM, whose kernel choice depends on M.
         # Measured up to 1.6e-2 on bf16 (tools/tp_overlap_bitexact.py). This block fuses shared+routed
         # into ONE collective and so has no second independent branch to hide it behind, which means a
         # row split is the only overlap available here — hence: opt in, knowing the trade.
         if fuse:
+            # A CPU-COMPUTED expert tier must NOT run inside the chunked span. `cpu_submit` does a
+            # blocking `.to("cpu", copy=True)` to hand activations to the host pool — a HOST SYNC —
+            # and a host sync inside the span's side-stream region deadlocks: chunk i's async
+            # all_reduce is still in flight, the collective needs BOTH ranks to keep issuing, and
+            # both ranks are parked in the copy instead. Observed 2026-09-07 as `gpu-lease` exit 76
+            # ~3 s into the first forward: one card at 100% util with 0% memory traffic and idle
+            # power (a kernel that never returned), the peer idle at 3%/22 W, both CPU-MoE worker
+            # threads asleep in `queue.get` — i.e. the tier was never given work, the collective
+            # was. It is CPU-tier-exclusive because this is the only path that routes on the host
+            # (`_ep_route`) instead of inside the kernel.
+            #
+            # num_chunks=1 takes `rowchunked_ar_span`'s plain `produce(x) + one all_reduce` arm, on
+            # the main stream with no span at all. Scoped to the layer that host-syncs rather than
+            # disabling overlap globally (MINISGL_TP_OVERLAP=0), so streamed layers keep it.
+            # NOTE: overlap is ON by default — `_CHUNKS = _env_int("MINISGL_TP_AR_CHUNKS", 2)`. The
+            # comment above claiming "DEFAULT-OFF (MINISGL_TP_AR_CHUNKS=1)" is stale and is why this
+            # looked impossible; corrected there too.
+            _cpu_moe = bool(getattr(getattr(experts, "_weight_offload", None),
+                                    "computes_on_cpu", False))
             combined = rowchunked_ar_span(
                 experts._comm, hidden_states, self._fused_partial,
                 row_aligned=(x_fp8, act_scales),
+                num_chunks=1 if _cpu_moe else None,
             )
             return combined.view(num_tokens, hidden_dim)
         # "shared" sub-bucket of the layer-prof "ffn" total (MINISGL_LAYER_PROF). Summed over all

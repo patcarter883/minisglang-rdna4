@@ -729,6 +729,28 @@ services:
       WOFF_DEVICE_GB: "${WOFF_DEVICE_GB:-}"
       WOFF_HOST_GB: "${WOFF_HOST_GB:-}"
       WOFF_CHUNK_MIB: "${WOFF_CHUNK_MIB:-}"
+      # ---- CPU-COMPUTE EXPERT TIER ---------------------------------------------------------------
+      # NONE of these reached a compose serve before 2026-09-08, which is the five-hops trap again
+      # and it invalidated an instrument rather than a feature: the CPU-tier harness exported
+      # MINISGL_CPU_MOE_STATS=200 for four legs and the container never saw it, so every one of
+      # those runs reported an EMPTY "[cpu-moe] counters" section and the per-layer cost of the tier
+      # -- the only number that separates "the AVX-512 kernel is slow" from "the submit/join handoff
+      # is slow" -- was never actually collected. `engaged()` is a set and saturates at one, so it
+      # cannot stand in for these.
+      # Threads (= PINNED PHYSICAL CORES) per rank; engine default 2. The node-wide total is
+      # refused by `cpu_tier.CoreBudget` unless _CORE_BUDGET below raises the cap.
+      MINISGL_CPU_MOE_THREADS: "${MINISGL_CPU_MOE_THREADS:-}"
+      # Explicit physical-core list, overriding the derived per-rank range. Needed for any pool wide
+      # enough to want core 0 (the derived list reserves it for the engine and refuses to run off
+      # the end of the physical cores into the SMT siblings). Split across ranks in order.
+      MINISGL_CPU_MOE_CORES: "${MINISGL_CPU_MOE_CORES:-}"
+      # Print the seam's own counters every N layer-calls. This is the decomposition instrument.
+      MINISGL_CPU_MOE_STATS: "${MINISGL_CPU_MOE_STATS:-}"
+      # Override the node-wide physical-core cap. Unset = the measured refusal (8 physical - 1.88
+      # engine - 0.5 OS = 5). Set only to deliberately overcommit for a sweep, and read the
+      # per-layer counters when you do -- an oversubscribed pool does not degrade in proportion, it
+      # goes to a FIXED ~6.0 ms/layer (docs/CPU_MOE_OFFLOAD.md §1.5).
+      MINISGL_CPU_MOE_CORE_BUDGET: "${MINISGL_CPU_MOE_CORE_BUDGET:-}"
       MAX_PREFILL_LENGTH: "${MAX_PREFILL_LENGTH:-}"
       # torch allocator config. Loading streams each checkpoint tensor, slices the rank shard and
       # frees the rest, which leaves the heap fragmented: on Qwen3.8-27B-NVFP4 torch reserved 14.13
