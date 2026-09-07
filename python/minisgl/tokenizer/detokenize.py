@@ -68,6 +68,11 @@ class DecodeStatus:
     surr_offset: int  # length of surr ids
     sent_offset: int  # length of sent out string
     num_tokens: int = 0  # cumulative committed (generated) tokens — for the OpenAI usage block
+    # How much of `decoded_str` the stop-string scan has already cleared. Only the COMMITTED prefix
+    # counts: the provisional tail past it (the replacement-char branch below leaves `decoded_str`
+    # untouched and re-derives that tail next step) can still change, so it must be re-scanned.
+    # See the windowed search in `detokenize` for why this is exact rather than an approximation.
+    stop_scan_base: int = 0
 
 
 class DetokenizeManager:
@@ -160,22 +165,44 @@ class DetokenizeManager:
                 # Earliest match by START position wins; an exclusive `stop` cuts BEFORE it (trimmed),
                 # an inclusive `stop_keep` cuts AFTER it (the matched string — e.g. a `</tool_call>`
                 # closer — is kept so the block still parses). Both end generation.
+                #
+                # INCREMENTAL WINDOW. Re-scanning the whole cumulative text every step is O(n) per
+                # token, i.e. O(n²) per request. It is also redundant: by induction no stop string
+                # lies entirely within `stop_scan_base` chars of committed text (had one, we would
+                # have stopped there). An occurrence that is NOT already inside that prefix must end
+                # past it, so — being at most `lmax` chars long — it must START at or after
+                # `stop_scan_base - lmax + 1`. Searching from there therefore finds the same
+                # EARLIEST match the full scan did, while touching only the new text plus one
+                # stop-string of overlap. `str.find(ss, win)` takes the start offset directly, so
+                # this costs no slice copy either.
+                lmax = 0
+                for ss in stops or ():
+                    if ss and len(ss) > lmax:
+                        lmax = len(ss)
+                for ss in keeps or ():
+                    if ss and len(ss) > lmax:
+                        lmax = len(ss)
+                win = max(0, s.stop_scan_base - lmax + 1)
                 best_start, best_cut = -1, -1
                 for ss in stops or ():
                     if not ss:
                         continue
-                    idx = output_str.find(ss)
+                    idx = output_str.find(ss, win)
                     if idx != -1 and (best_start == -1 or idx < best_start):
                         best_start, best_cut = idx, idx
                 for ss in keeps or ():
                     if not ss:
                         continue
-                    idx = output_str.find(ss)
+                    idx = output_str.find(ss, win)
                     if idx != -1 and (best_start == -1 or idx < best_start):
                         best_start, best_cut = idx, idx + len(ss)
                 if best_start != -1:
                     stop_hit = True
                     output_str = output_str[:best_cut]
+                # Advance the cleared prefix to the COMMITTED text only. In the replacement-char
+                # branch `decoded_str` did not move, so the provisional tail is re-scanned next
+                # step — which is what keeps this exact when a character resolves late.
+                s.stop_scan_base = len(s.decoded_str)
 
             incremental_output = output_str[s.sent_offset :] if len(output_str) > s.sent_offset else ""
             s.sent_offset = max(s.sent_offset, len(output_str))

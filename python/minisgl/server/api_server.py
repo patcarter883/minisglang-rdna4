@@ -2208,22 +2208,29 @@ class _JsonArgStreamer:
         self._esc = False
         self._vstart = -1          # index (in the block body) where the value starts
 
-    def scan(self, body: str) -> Tuple[str | None, str | None]:
-        """Given the FULL accumulated block body (opener stripped), return
-        ``(name_if_newly_found, new_args_fragment)``. Idempotent per growth of ``body``."""
+    def scan(self, body: str, base: int = 0) -> Tuple[str | None, str | None]:
+        """Given the FULL accumulated buffer and the offset ``base`` at which the block body starts
+        (i.e. past the opener), return ``(name_if_newly_found, new_args_fragment)``. Idempotent per
+        growth of ``body``.
+
+        Indices are ABSOLUTE into ``body`` — ``base`` is passed rather than the caller slicing,
+        because that slice copied the whole held body once per token. Both patterns are unanchored
+        and lookbehind-free, so ``search(body, base)`` matches exactly what ``search(body[base:])``
+        did. ``_vstart`` is likewise absolute; ``base`` is fixed for the life of a block, so the
+        incremental ``_vstart + streamed`` cursor below is unaffected."""
         if self.dead or self.args_done:
             return None, None
         if self.name is None:
-            m = self._NAME_RE.search(body)
+            m = self._NAME_RE.search(body, base)
             if m is None:
                 # A body that already contains "arguments" before any name is not the clean shape.
-                if self._ARGS_KEY_RE.search(body):
+                if self._ARGS_KEY_RE.search(body, base):
                     self.dead = True
                 return None, None
             self.name = m.group(1)
         new_name = None
         if self._vstart < 0:
-            m = self._ARGS_KEY_RE.search(body)
+            m = self._ARGS_KEY_RE.search(body, base)
             if m is None:
                 return None, None
             if m.end() >= len(body):
@@ -2350,8 +2357,10 @@ class ToolCallStreamState:
         js = self._jstream
         if js is None or js.dead:
             return []
-        body = self.buf[len(self.opener or ""):]
-        name, frag = js.scan(body)
+        # Pass the buffer WHOLE plus the body's start offset instead of slicing the opener off: the
+        # slice copied the entire held body on every token (O(n²) over a block) purely to drop a
+        # fixed-length prefix. `scan` works in absolute indices instead.
+        name, frag = js.scan(self.buf, len(self.opener or ""))
         out: List[dict] = []
         if name is not None:
             if not _tool_name_allowed(name, self.allowed):
@@ -2391,6 +2400,13 @@ class ToolCallStreamState:
     def push(self, delta: str) -> Tuple[str | None, List[dict]]:
         content_parts: List[str] = []
         tool_deltas: List[dict] = []
+        # How much of `text` a PREVIOUS push already scanned for a closer and found none. Inside a
+        # block the held body is re-scanned from zero every token, which is O(held) per token and
+        # O(n²) over a block — the measured cost of the trapped-block/runaway shape, where the body
+        # runs to the 64 KiB cap. A closer that is not already wholly inside the scanned prefix must
+        # END past it, so it can start no earlier than `scanned - len(closer) + 1`; searching from
+        # there is exact. Reset to 0 whenever we enter a block mid-chunk, since that body is new.
+        scanned = len(self.buf) if self.in_tool else 0
         text = self.buf + delta
         self.buf = ""
         while text:
@@ -2418,15 +2434,17 @@ class ToolCallStreamState:
                 )
                 self._jstream_index = None
                 text = text[idx:]  # keep the opener token as the head of the block buffer
+                scanned = 0  # this body is new to us; nothing of it has been scanned for a closer
             else:
                 closer = _TOOL_CLOSERS[self.opener]  # type: ignore[index]
-                cidx = text.find(closer)
+                cidx = text.find(closer, max(0, scanned - len(closer) + 1))
                 if cidx == -1:
                     self.buf = text  # block still open; hold the whole body
                     tool_deltas.extend(self._jstream_advance())
                     break
                 block = text[: cidx + len(closer)]
                 text = text[cidx + len(closer):]
+                scanned = 0  # remainder after the block is unscanned text
                 if self._jstream is not None and self._jstream_index is not None and not self._jstream.dead:
                     # Name (and possibly some argument bytes) already streamed incrementally: emit
                     # the REMAINING argument bytes and close out this index — never re-emit through
