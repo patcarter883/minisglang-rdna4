@@ -153,8 +153,7 @@ class ExpertResidencyCache:
         self.stats = {"hits": 0, "misses": 0, "promotions": 0, "evictions": 0, "drains": 0}
 
     # -- setup -----------------------------------------------------------------------------------
-    def register_layer(self, layer_id: int, host_w: torch.Tensor,
-                       host_s: torch.Tensor, host_z: Optional[torch.Tensor]) -> None:
+    def register_layer(self, layer_id: int, gate_up: "tuple", down: "tuple") -> None:
         """Bind one layer's HOST-resident expert tensors and allocate its `slot_of` table.
 
         The table is allocated ONCE and never reallocated, because its ADDRESS is what graph capture
@@ -163,25 +162,32 @@ class ExpertResidencyCache:
         """
         if layer_id in self._layers:
             raise ExpertCacheError(f"layer {layer_id} registered twice")
-        if host_w.shape[0] != self.num_experts:
-            raise ExpertCacheError(
-                f"layer {layer_id}: host weight has {host_w.shape[0]} experts, cache was built for "
-                f"{self.num_experts} — a mismatch would index the wrong slab row."
-            )
+        for name, (w, s_, _z) in (("gate_up", gate_up), ("down", down)):
+            if w.shape[0] != self.num_experts:
+                raise ExpertCacheError(
+                    f"layer {layer_id} {name}: host weight has {w.shape[0]} experts, cache was "
+                    f"built for {self.num_experts} — a mismatch would index the wrong slab row."
+                )
         slot_of = torch.full((self.num_experts,), -1, dtype=torch.int32, device=self.device)
-        self._layers[layer_id] = {"w": host_w, "s": host_s, "z": host_z, "slot_of": slot_of}
+        self._layers[layer_id] = {"gate_up": gate_up, "down": down, "slot_of": slot_of}
         if not self._slabs:
-            self._alloc_slabs(host_w, host_s, host_z)
+            self._alloc_slabs(gate_up, down)
 
-    def _alloc_slabs(self, w: torch.Tensor, s: torch.Tensor, z: Optional[torch.Tensor]) -> None:
+    def _alloc_slabs(self, gate_up: "tuple", down: "tuple") -> None:
         """One VRAM slab per tensor kind, `slots` rows each, laid out exactly like the host tensor's
         per-expert row so the kernel's existing `wq_expert(base, idx, ...)` arithmetic is unchanged —
         that is what makes this a (base, index) redirect rather than a new addressing scheme."""
-        def slab(t: torch.Tensor) -> torch.Tensor:
-            return torch.empty((self.slots, *t.shape[1:]), dtype=t.dtype, device=self.device)
-        self._slabs["w"] = slab(w)
-        self._slabs["s"] = slab(s)
-        self._slabs["z"] = slab(z) if z is not None else None
+        def slab(t):
+            return (torch.empty((self.slots, *t.shape[1:]), dtype=t.dtype, device=self.device)
+                    if t is not None else None)
+        # TWO PLANES, ONE SLOT INDEX. gemm1_silu reads gate_up, the scatter/down GEMV reads down;
+        # an expert is promoted as ONE granule spanning both, so "expert e is resident" stays a
+        # single fact. A half-resident expert would read one tensor from VRAM and the other from
+        # host at the same slot number — wrong bytes, no error.
+        for plane, (w, sc, z) in (("gate_up", gate_up), ("down", down)):
+            self._slabs[f"{plane}_w"] = slab(w)
+            self._slabs[f"{plane}_s"] = slab(sc)
+            self._slabs[f"{plane}_z"] = slab(z)
         # A DEDICATED copy stream: promotions must not serialise behind the forward, which is the
         # entire point of the asynchronous manager. On CPU (the selftest) there are no streams and
         # the ordering is trivially sequential — the TABLE and SLAB mutations, which is what the
@@ -198,9 +204,15 @@ class ExpertResidencyCache:
         """
         L = self._layers.get(layer_id)
         if L is None:
-            set_map_op(None, None, None, None)      # unregistered layer -> cache off, host reads
+            # Unregistered layer -> cache OFF for it: the kernel reads the host base exactly as
+            # today. A layer the cache does not manage must never see a stale map from the
+            # PREVIOUS layer's install, which is why this clears rather than returning early.
+            set_map_op(None, None, None, None, None, None, None)
             return
-        set_map_op(L["slot_of"], self._slabs["w"], self._slabs["s"], self._slabs["z"])
+        S = self._slabs
+        set_map_op(L["slot_of"],
+                   S["gate_up_w"], S["gate_up_s"], S["gate_up_z"],
+                   S["down_w"], S["down_s"], S["down_z"])
 
     # -- the asynchronous manager ----------------------------------------------------------------
     def observe(self, layer_id: int, expert_ids) -> None:
@@ -255,10 +267,12 @@ class ExpertResidencyCache:
             stream.wait_stream(compute)
         import contextlib
         with (torch.cuda.stream(stream) if cuda else contextlib.nullcontext()):
-            self._slabs["w"][slot].copy_(L["w"][expert], non_blocking=cuda)
-            self._slabs["s"][slot].copy_(L["s"][expert], non_blocking=cuda)
-            if self._slabs["z"] is not None and L["z"] is not None:
-                self._slabs["z"][slot].copy_(L["z"][expert], non_blocking=cuda)
+            for plane in ("gate_up", "down"):
+                w, sc, z = L[plane]
+                self._slabs[f"{plane}_w"][slot].copy_(w[expert], non_blocking=cuda)
+                self._slabs[f"{plane}_s"][slot].copy_(sc[expert], non_blocking=cuda)
+                if self._slabs[f"{plane}_z"] is not None and z is not None:
+                    self._slabs[f"{plane}_z"][slot].copy_(z[expert], non_blocking=cuda)
         # (3) FENCE: the publish must not become visible before the bytes land, or the kernel reads
         #     a slot whose copy is still in flight. This is the invariant the whole design rests on.
         if cuda:

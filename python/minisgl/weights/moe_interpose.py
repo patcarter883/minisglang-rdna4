@@ -296,6 +296,35 @@ def discover_moe_layers(root: Any, *, prefix: str = "") -> list[tuple[str, Any]]
 # =====================================================================================
 
 
+# The live per-expert VRAM cache, or None. Set by `attach_expert_cache()` at bind time; read on the
+# hot path by `MoEWeightSeam.resolve`. A module global rather than a field on every seam because it
+# is ONE cache shared across layers — a global slot pool lets a hot layer borrow capacity from a
+# cold one, which the oracle measured as the better arrangement (`--pool global`).
+_EXPERT_CACHE = None
+
+
+def _set_expert_slot_map(*args):
+    """Install the residency map for the next MoE launch on this rank.
+
+    Resolved lazily and cached on first use: importing the kernel package at module scope would make
+    this file unimportable on a host without the built extension, which the offload tests rely on.
+    """
+    global _SET_MAP_OP
+    if _SET_MAP_OP is None:
+        import torch
+        _SET_MAP_OP = torch.ops.fp8_wmma_C.set_expert_slot_map
+    return _SET_MAP_OP(*args)
+
+
+_SET_MAP_OP = None
+
+
+def attach_expert_cache(cache) -> None:
+    """Publish the cache to the hot path (or None to detach)."""
+    global _EXPERT_CACHE
+    _EXPERT_CACHE = cache
+
+
 @dataclass
 class SeamBindReport:
     """One layer's bake outcome. Summed across layers by `BindOutcome`."""
@@ -394,6 +423,11 @@ class MoEWeightSeam:
         self._engage = "weight_offload.moe_resolve[unbound]"
         self._cpu_worker = None
         self._cpu_expert_offset = 0
+        # Memoised layer index for the expert cache. Derived from `path` with the SAME parser the
+        # route tracer uses, so the cache, the tracer and the plan cannot disagree about which
+        # layer a seam is — a mismatch would install one layer's residency map for another's
+        # launch, which is a wrong-weights bug with no error.
+        self._cache_lid = None
 
     # -- hot path ------------------------------------------------------------------------------
     def resolve(self, w13: Any, w2: Any) -> tuple[Any, Any]:
@@ -433,6 +467,19 @@ class MoEWeightSeam:
             )
         engaged(self._engage)
         RESOLVE_COUNTS[self._engage] = RESOLVE_COUNTS.get(self._engage, 0) + 1
+        # PER-EXPERT VRAM CACHE. `resolve` is the one per-forward hook that runs BEFORE both of this
+        # layer's kernels (gemm1_silu reads gate_up, the scatter GEMV reads down), which is why the
+        # map carries both planes and is installed once here rather than twice further down. Costs
+        # one op call that stores four raw pointers host-side: no sync, no allocation, no device
+        # work. `install` CLEARS the map for a layer the cache does not manage, so a cached layer's
+        # map can never leak into an uncached one's launch.
+        cache = _EXPERT_CACHE
+        if cache is not None:
+            lid = self._cache_lid
+            if lid is None:
+                from .stream_tier import layer_index_of_path
+                lid = self._cache_lid = layer_index_of_path(self.path)
+            cache.install(lid, _set_expert_slot_map)
         return self.assert_identity(w13, w2)
 
     def assert_identity(self, w13: Any, w2: Any) -> tuple[Any, Any]:

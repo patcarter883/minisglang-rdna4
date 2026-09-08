@@ -38,10 +38,14 @@ def _build(slots: int):
                                  budget_bytes=slots * ROW * 4, device=CPU)
     hosts = {}
     for lid in range(LAYERS):
-        w = torch.arange(E, dtype=torch.float32).view(E, 1).repeat(1, ROW) + lid * 1000
-        s = torch.arange(E, dtype=torch.float32).view(E, 1).repeat(1, 2) + lid * 1000
-        cache.register_layer(lid, w, s, None)
-        hosts[lid] = (w, s)
+        # DISTINCT VALUES PER PLANE as well as per expert: if the two planes were ever crossed —
+        # gate_up read from the down slab or vice versa — the +500 offset makes it provable.
+        w13 = torch.arange(E, dtype=torch.float32).view(E, 1).repeat(1, ROW) + lid * 1000
+        s13 = torch.arange(E, dtype=torch.float32).view(E, 1).repeat(1, 2) + lid * 1000
+        w2 = w13 + 500
+        s2 = s13 + 500
+        cache.register_layer(lid, (w13, s13, None), (w2, s2, None))
+        hosts[lid] = {"gate_up": (w13, s13), "down": (w2, s2)}
     return cache, hosts
 
 
@@ -54,10 +58,12 @@ def _check_invariant(cache, hosts):
             slot = int(tbl[e])
             if slot < 0:
                 continue
-            if not torch.equal(cache._slabs["w"][slot], hosts[lid][0][e]):
-                bad.append((lid, e, slot, "w"))
-            if not torch.equal(cache._slabs["s"][slot], hosts[lid][1][e]):
-                bad.append((lid, e, slot, "s"))
+            for plane in ("gate_up", "down"):
+                hw, hs = hosts[lid][plane]
+                if not torch.equal(cache._slabs[f"{plane}_w"][slot], hw[e]):
+                    bad.append((lid, e, slot, f"{plane}.w"))
+                if not torch.equal(cache._slabs[f"{plane}_s"][slot], hs[e]):
+                    bad.append((lid, e, slot, f"{plane}.s"))
     return bad
 
 
