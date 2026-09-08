@@ -55,7 +55,13 @@ echo "[cpu-tier] MemAvailable=${avail}GiB repo=$REPO cpu_layers=$CPU_LAYERS labe
 extra=""
 [[ "$CPU_LAYERS" != "0" ]] && extra="--weight-offload-cpu-layers $CPU_LAYERS"
 
-export MODEL=qwen4exp SPEC=none TP=2 CONC=2 MEM_RATIO=0.75 GRAPH_BS=0
+# TP and MEM_RATIO are caller-overridable (they were hardcoded TP=2/0.75). TP=1 is a REAL
+# configuration for this arm, not a degenerate one: with all 48 MoE layers on the CPU tier the
+# pinned arena is empty, so the min_tp=2 rule -- which is stated entirely in terms of pinning a
+# ~54 GiB host arena in one process -- does not bind. The defaults are unchanged, so every leg
+# measured before this edit is reproduced by running it with no TP/MEM_RATIO set.
+export MODEL=qwen4exp SPEC=none TP="${TP:-2}" CONC=2 MEM_RATIO="${MEM_RATIO:-0.75}" GRAPH_BS=0
+export MINISGL_ALLOW_TP_BELOW_MIN="${MINISGL_ALLOW_TP_BELOW_MIN:-}"
 # ARENA KNOBS ARE NOT SET HERE, and that is deliberate at high CPU_LAYERS. A CPU-tier layer is read
 # by CPU cores with ordinary loads, so it needs neither VRAM nor PINNED host memory: at
 # CPU_LAYERS=48 the pinned host tier should be EMPTY and `WOFF_HOST_GB` /
@@ -90,8 +96,10 @@ echo "[cpu-tier] ARM: threads/rank='${MINISGL_CPU_MOE_THREADS:-<default 2>}'" \
      "stats_every=${MINISGL_CPU_MOE_STATS}"
 
 cd "$REPO" || exit 1
+# `-n "$TP"`, not a hardcoded 2: `-n` is HOW MANY cards, and leasing both for a single-card TP=1
+# run starves every other agent on this box for the whole leg (CLAUDE.md, the booking rules).
 timeout "$((READY_TIMEOUT + 2400))" \
-  gpu-lease -n 2 -- bash "$REPO/tools/offload/_cpu_tier_leg.sh" 2>&1 | tee "$LOG"
+  gpu-lease -n "$TP" -- bash "$REPO/tools/offload/_cpu_tier_leg.sh" 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 echo "[cpu-tier] leg $LABEL exit=$rc  (76 = the GPU wedged, not a bug in the command — re-run once)"
 echo "[cpu-tier] log=$LOG container-log=$LOG.container json=$JSON"

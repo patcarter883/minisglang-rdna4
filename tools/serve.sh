@@ -833,9 +833,27 @@ fi
 # Refuse a TP the weights cannot fit in, rather than OOM'ing several minutes into the load. Says
 # what to do, because the panel's TP dropdown is where this gets chosen wrongly.
 if [ "$TP" -lt "$min_tp" ]; then
-  echo "[serve] ERROR: $model_id needs TP>=$min_tp (its weights do not fit on $TP card(s) at 16 GB);" \
-       "got TP=$TP. Set TP=$min_tp." >&2
-  exit 2
+  # MINISGL_ALLOW_TP_BELOW_MIN=1 downgrades this to a warning, and it exists because `min_tp` is a
+  # statement about ONE placement of the weights. qwen4_exp's is justified verbatim as "the host
+  # arena needed is ~54 GiB in ONE process, which this box cannot pin" — an argument entirely about
+  # the PINNED arena. With every MoE layer on the CPU tier there is no arena to pin: measured
+  # 2026-09-08, `weight-arena=0 MiB host=0 MiBx2`, 31.934 GiB of ordinary PAGEABLE expert weights,
+  # and the non-expert weights a rank must actually hold are 8.94 GiB (language; +0.84 vision) —
+  # which fits one 16 GiB card with 4.28 GiB left for KV at MEM_RATIO 0.85.
+  # So the guard is right for the streaming placement it was written against and inapplicable here.
+  # It stays a refusal by DEFAULT: the operator states the exception, and the reason is logged with
+  # the number that has to hold for it to be true.
+  if [ "${MINISGL_ALLOW_TP_BELOW_MIN:-0}" = "1" ]; then
+    echo "[serve] WARNING: TP=$TP is below $model_id's min_tp=$min_tp, allowed by" \
+         "MINISGL_ALLOW_TP_BELOW_MIN=1. This is only sound when the placement that motivated" \
+         "min_tp is not in force (e.g. all MoE layers on the CPU tier, so no pinned arena)." \
+         "If the weights do not fit you will OOM several minutes into the load." >&2
+  else
+    echo "[serve] ERROR: $model_id needs TP>=$min_tp (its weights do not fit on $TP card(s) at 16 GB);" \
+         "got TP=$TP. Set TP=$min_tp (or MINISGL_ALLOW_TP_BELOW_MIN=1 if the placement makes it" \
+         "inapplicable)." >&2
+    exit 2
+  fi
 fi
 
 ATTN="${ATTN:-$attn}"

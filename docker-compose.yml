@@ -739,6 +739,9 @@ services:
       # cannot stand in for these.
       # Threads (= PINNED PHYSICAL CORES) per rank; engine default 2. The node-wide total is
       # refused by `cpu_tier.CoreBudget` unless _CORE_BUDGET below raises the cap.
+      # Downgrades serve.sh's min_tp refusal to a warning. Needed here because serve.sh runs
+      # INSIDE the container, so setting it on the host does nothing without this entry.
+      MINISGL_ALLOW_TP_BELOW_MIN: "${MINISGL_ALLOW_TP_BELOW_MIN:-}"
       MINISGL_CPU_MOE_THREADS: "${MINISGL_CPU_MOE_THREADS:-}"
       # Explicit physical-core list, overriding the derived per-rank range. Needed for any pool wide
       # enough to want core 0 (the derived list reserves it for the engine and refuses to run off
