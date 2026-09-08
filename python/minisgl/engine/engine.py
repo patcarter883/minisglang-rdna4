@@ -406,8 +406,12 @@ class Engine:
                     "would ever reach it. The cache would hold VRAM and never serve a hit."
                 )
             _tracer.set_observer(_cache.observe)
+            # STARTED FROM THIS THREAD ON PURPOSE: `start()` captures the compute stream, and
+            # `torch.cuda.current_stream()` is per-thread — captured anywhere else every fence in
+            # the promotion path would order against a stream no kernel runs on.
+            _cache.start()
             print(f"[expert-cache] observing the route ring "
-                  f"(drain_every={_tracer.drain_every} steps)", flush=True)
+                  f"(drain_every={_tracer.drain_every} steps), manager thread started", flush=True)
         if self._woff.enabled:
             _mem_probe("after weight offload")
 

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 import numpy as np
 import torch
 
+from minisgl.weights import moe_interpose as _moe_interpose
 from minisgl.weights import route_trace as _route_trace
 import torch.distributed as dist
 import torch.profiler
@@ -2849,6 +2850,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # pass through. No-op unless armed; the drain runs outside the forward and outside any
         # capture region.
         _route_trace.begin_forward(_step_is_pf, batch.reqs[0].uid if batch.reqs else 0)
+        # The expert cache's scheduler-side half: retract victims, publish landed copies. Here
+        # because this is the step boundary AND this thread owns the compute stream the kernels
+        # read `slot_of` from; the expensive copies run on the manager thread. Sub-microsecond
+        # when nothing is pending, and a no-op with no cache attached.
+        _moe_interpose.tick_expert_cache()
         _step_bs = int(batch.size)
         _step_r0 = self.engine.graph_runner.replays
         batch.input_ids = self.token_pool[input_mapping]

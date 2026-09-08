@@ -120,3 +120,52 @@ def test_the_slot_map_op_actually_dispatches_through_the_seam():
 
     mi._SET_MAP_OP = None                      # force the resolution path this test is about
     mi._set_expert_slot_map(None, None, None, None, None, None, None)
+
+
+def test_observe_does_no_policy_work_once_a_manager_is_running():
+    """THE POINT OF THE THREAD. `observe()` runs on the SCHEDULER thread (route_trace.drain() is
+    called from begin_forward), so once a manager exists it must enqueue and return — no policy
+    update, no allocation, no copy. Measured cost of getting this wrong: fwd_launch 5356 ms/step
+    (92% of the step) against a 68.5 ms baseline."""
+    from minisgl.weights.expert_cache import ExpertResidencyCache
+
+    cache = ExpertResidencyCache(num_experts=8, expert_bytes=64, budget_bytes=640,
+                                 device=torch.device("cpu"))
+    w = torch.arange(8, dtype=torch.float32).view(8, 1).repeat(1, 4)
+    cache.register_layer(0, (w, w, None), (w + 100, w + 100, None))
+    cache._thread = object()          # pretend a manager is running
+    try:
+        cache.observe(0, [1, 2, 3])
+        assert cache.stats["promotions"] == 0, "observe() promoted on the scheduler thread"
+        assert cache.stats["hits"] == 0 and cache.stats["misses"] == 0, "observe() ran the policy"
+        assert len(cache._q) == 1, "the reference was not queued"
+    finally:
+        cache._thread = None
+
+
+def test_the_queue_drops_rather_than_blocks():
+    """A full queue must lose references, never stall the scheduler. Dropping is the safe
+    direction: a staler policy only ever under-reports residency, which is a host read."""
+    from minisgl.weights.expert_cache import ExpertResidencyCache
+
+    cache = ExpertResidencyCache(num_experts=8, expert_bytes=64, budget_bytes=640,
+                                 device=torch.device("cpu"))
+    cache._thread = object()
+    try:
+        for _ in range(cache._q.maxlen + 25):
+            cache.observe(0, [1])
+        assert len(cache._q) == cache._q.maxlen
+        assert cache.stats["dropped_refs"] == 25
+    finally:
+        cache._thread = None
+
+
+def test_apply_pending_is_a_noop_without_cuda():
+    """The scheduler calls this EVERY step. On CPU (and with nothing pending) it must do nothing
+    and cost nothing — a per-step hook that can raise is a per-step outage."""
+    from minisgl.weights.expert_cache import ExpertResidencyCache
+
+    cache = ExpertResidencyCache(num_experts=8, expert_bytes=64, budget_bytes=640,
+                                 device=torch.device("cpu"))
+    cache.apply_pending()
+    cache.apply_pending()

@@ -44,8 +44,10 @@ live VA serves the stale page and returns hipSuccess) and no re-capture on promo
 
 from __future__ import annotations
 
+import collections
 import os
-from typing import Dict, List, Optional, Tuple
+import threading
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import torch
 
@@ -150,7 +152,43 @@ class ExpertResidencyCache:
         self._layers: Dict[int, Dict[str, torch.Tensor]] = {}
         self._slabs: Dict[str, torch.Tensor] = {}
         self._copy_stream: Optional[torch.cuda.Stream] = None
-        self.stats = {"hits": 0, "misses": 0, "promotions": 0, "evictions": 0, "drains": 0}
+        self.stats = {"hits": 0, "misses": 0, "promotions": 0, "evictions": 0, "drains": 0,
+                      "dropped_refs": 0, "manager_batches": 0}
+
+        # ---- THE ASYNCHRONOUS MANAGER -----------------------------------------------------------
+        # A promotion is a 1.4 MB H2D copy and a cold fill is thousands of them. Run on the
+        # scheduler thread they land INSIDE the forward: measured 2026-09-08, fwd_launch went to
+        # 5356 ms/step (92% of a 5800 ms step) against a 68.5 ms baseline. So the expensive half
+        # runs here, on its own thread, and only two cheap things stay on the scheduler.
+        #
+        # THE HANDSHAKE, and why it is two-phase. PyTorch's "current stream" is PER THREAD, and
+        # writing a device tensor enqueues on the CALLER's stream — so a manager thread that wrote
+        # `slot_of` directly would order that write against nothing the compute stream can see. The
+        # split that fixes it:
+        #
+        #   manager thread : policy, and the COPIES (on `_copy_stream`), each tailed by an event
+        #   scheduler thread (`apply_pending`, once per step, at the step boundary):
+        #       (a) RETRACT victims  -> `slot_of[v] = -1` on the compute stream, event recorded
+        #       (b) PUBLISH arrivals -> `slot_of[e] = slot`, but ONLY for copies whose event has
+        #           already completed (`query()`, never `synchronize()`)
+        #
+        # A slot goes manager -> retract-queue -> (scheduler retracts, records event) -> free-list
+        # -> manager copies (after waiting that event) -> publish-queue -> (scheduler publishes).
+        # The slot is therefore never written while a launch that may still read it is in flight,
+        # and a publish is never visible before its bytes land. Both directions of the one
+        # invariant, preserved across two threads.
+        self._q: Deque = collections.deque(maxlen=max(64, _env_int("MINISGL_EXPERT_CACHE_QUEUE", 4096)))
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._stopping = False
+        #: (victim_key, slot) the manager wants retired; the scheduler retracts them.
+        self._to_retract: List[Tuple[int, int]] = []
+        #: slot -> retraction event; the manager must wait it before reusing the slot.
+        self._retract_ev: Dict[int, Any] = {}
+        #: (key, slot, event) copies in flight; the scheduler publishes those that have landed.
+        self._inflight: List[Tuple[int, int, Any]] = []
+        self._compute_stream = None
 
     # -- setup -----------------------------------------------------------------------------------
     def register_layer(self, layer_id: int, gate_up: "tuple", down: "tuple") -> None:
@@ -216,11 +254,31 @@ class ExpertResidencyCache:
 
     # -- the asynchronous manager ----------------------------------------------------------------
     def observe(self, layer_id: int, expert_ids) -> None:
-        """Feed the policy references the manager has OBSERVED. Never on the critical path.
+        """SCHEDULER THREAD. Hand the reference to the manager and return — nothing else.
 
-        `expert_ids` is a host-side sequence, drained from the route ring N steps after the fact.
-        Measured: N=64 costs nothing (h 0.8558 -> 0.8563).
+        This is called from `route_trace.drain()`, which runs in `begin_forward` on the scheduler
+        thread, so it must not touch the policy, allocate, or issue a copy. It appends to a bounded
+        deque and returns.
+
+        THE QUEUE DROPS RATHER THAN BLOCKS, and that is the safe direction: a dropped reference
+        makes the policy staler, and a stale table only ever under-reports residency (a host read —
+        correct, merely slower). Blocking the scheduler to keep the policy perfectly informed would
+        trade the one thing this design exists to protect for the one thing it can afford to lose.
         """
+        if self._thread is None:
+            # No manager running (CPU selftest, or start() not called): do it inline. Same
+            # semantics, and it is what every unit test in expert_cache_test.py exercises.
+            self._observe_now(layer_id, expert_ids)
+            return
+        ids = tuple(int(e) for e in expert_ids)
+        with self._lock:
+            if len(self._q) == self._q.maxlen:
+                self.stats["dropped_refs"] += len(ids)
+            self._q.append((int(layer_id), ids))
+        self._wake.set()
+
+    def _observe_now(self, layer_id: int, expert_ids) -> None:
+        """The policy update itself. MANAGER THREAD (or inline when there is no manager)."""
         base = layer_id * self.num_experts
         for e in expert_ids:
             key = base + int(e)
@@ -231,40 +289,136 @@ class ExpertResidencyCache:
                 self.stats["misses"] += 1
                 self._promote(key)
 
-    def _promote(self, key: int) -> None:
-        """Bring one expert into VRAM. THE ORDER HERE IS THE CORRECTNESS ARGUMENT.
+    # -- thread lifecycle ------------------------------------------------------------------------
+    def start(self) -> None:
+        """Start the manager. MUST be called from the SCHEDULER THREAD.
 
-        retract victim -> copy bytes -> fence -> publish. Never publish before the fence: the kernel
-        would read a slot whose copy is still in flight, which is a wrong-numbers bug with no error.
-        And never reuse a slot without retracting it first, or an in-flight launch reading the old
-        expert would silently get the new one's bytes.
+        The compute stream is captured HERE, from the calling thread, because
+        `torch.cuda.current_stream()` is per-thread: read on the manager it would return the
+        manager's own stream and every fence would order against nothing.
+        """
+        if self._thread is not None or self.device.type != "cuda":
+            return
+        self._compute_stream = torch.cuda.current_stream(self.device)
+        self._thread = threading.Thread(target=self._run, name="expert-cache-mgr", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._wake.set()
+        t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=5.0)
+
+    def _run(self) -> None:
+        torch.cuda.set_device(self.device)          # a fresh thread has no current device
+        while not self._stopping:
+            self._wake.wait(timeout=0.25)
+            self._wake.clear()
+            while True:
+                with self._lock:
+                    if not self._q:
+                        break
+                    layer_id, ids = self._q.popleft()
+                try:
+                    self._observe_now(layer_id, ids)
+                except Exception as e:                # never take the serve down from here
+                    print(f"[expert-cache] manager error (cache degrades to host reads): {e!r}",
+                          flush=True)
+                    return
+                self.stats["manager_batches"] += 1
+
+    # -- the scheduler-thread half of the handshake ----------------------------------------------
+    def apply_pending(self) -> None:
+        """SCHEDULER THREAD, once per step. Retract victims, publish landed copies. Cheap.
+
+        Both operations write `slot_of`, and they are here rather than on the manager precisely
+        because this thread owns the compute stream the kernels read it from.
+
+        `event.query()` and NEVER `synchronize()`: a copy that has not landed is simply published
+        next step. Waiting here would put the PCIe transfer back on the critical path, which is the
+        whole defect this thread split exists to remove.
+        """
+        if self.device.type != "cuda":
+            return
+        with self._lock:
+            retract, self._to_retract = self._to_retract, []
+            inflight, self._inflight = self._inflight, []
+        for _victim, slot in retract:
+            ev = torch.cuda.Event()
+            ev.record(self._compute_stream)         # ordered after every launch already queued
+            self._retract_ev[slot] = ev
+            with self._lock:
+                self._free.append(slot)
+        still = []
+        for key, slot, ev in inflight:
+            if not ev.query():
+                still.append((key, slot, ev))
+                continue
+            layer_id, expert = divmod(key, self.num_experts)
+            L = self._layers.get(layer_id)
+            if L is None:
+                continue
+            L["slot_of"][expert] = slot             # compute stream: this thread owns it
+            self._slot_of_key[key] = slot
+            self._key_of_slot[slot] = key
+            self.stats["promotions"] += 1
+        if still:
+            with self._lock:
+                self._inflight.extend(still)
+
+    def _promote(self, key: int) -> None:
+        """MANAGER THREAD. Issue one expert's copy; the scheduler publishes it. INLINE when no
+        manager is running (the CPU selftests), where the old single-thread order still holds.
+
+        THE ORDER IS THE CORRECTNESS ARGUMENT, and it now spans two threads:
+          retract victim (scheduler) -> fence -> copy (here) -> fence -> publish (scheduler).
+        Never publish before the copy's fence: the kernel would read a slot whose copy is in
+        flight. Never write a slot before its retraction is visible: a launch still reading the old
+        expert would silently get the new one's bytes. Both are wrong-numbers bugs with no error.
         """
         layer_id, expert = divmod(key, self.num_experts)
         L = self._layers.get(layer_id)
         if L is None:
             return
-        victim = self._policy.admit(key)
         cuda = self.device.type == "cuda"
-        compute = torch.cuda.current_stream(self.device) if cuda else None
-        stream = self._copy_stream
+        threaded = self._thread is not None and cuda
+        victim = self._policy.admit(key)
+
         if victim is not None:
             vlayer, vexpert = divmod(victim, self.num_experts)
             slot = self._slot_of_key.pop(victim)
-            # (1) RETRACT on the COMPUTE stream, so it is ordered against the launches that read it.
-            self._layers[vlayer]["slot_of"][vexpert] = -1
             self._key_of_slot[slot] = -1
             self.stats["evictions"] += 1
-        elif self._free:
-            slot = self._free.pop()
+            if threaded:
+                # HAND THE RETRACTION TO THE SCHEDULER and stop. The slot returns via `_free` only
+                # after `slot_of[victim] = -1` has been ordered against the launches that read it,
+                # so this expert is simply promoted on a later observation. Deferring costs a few
+                # steps of staleness, which is measured free.
+                with self._lock:
+                    self._to_retract.append((victim, slot))
+                self._policy.evict_key(key)
+                return
+            L2 = self._layers[vlayer]
+            L2["slot_of"][vexpert] = -1
         else:
-            self._policy.evict_key(key)
-            return
+            with self._lock:
+                if not self._free:
+                    self._policy.evict_key(key)
+                    return
+                slot = self._free.pop()
 
-        # (2) The copy must not overwrite the slot until the retraction is visible to anything
-        #     already queued. Without this a launch still reading the victim would get the new
-        #     expert's bytes: right shapes, wrong numbers, no error.
+        compute = self._compute_stream if threaded else (
+            torch.cuda.current_stream(self.device) if cuda else None)
+        stream = self._copy_stream
         if cuda:
-            stream.wait_stream(compute)
+            # The slot may have been retracted only moments ago; wait THAT event, not the whole
+            # compute stream, so an unrelated long launch does not stall the copier.
+            ev = self._retract_ev.pop(slot, None)
+            if ev is not None:
+                stream.wait_event(ev)
+            else:
+                stream.wait_stream(compute)
         import contextlib
         with (torch.cuda.stream(stream) if cuda else contextlib.nullcontext()):
             for plane in ("gate_up", "down"):
@@ -273,8 +427,14 @@ class ExpertResidencyCache:
                 self._slabs[f"{plane}_s"][slot].copy_(sc[expert], non_blocking=cuda)
                 if self._slabs[f"{plane}_z"] is not None and z is not None:
                     self._slabs[f"{plane}_z"][slot].copy_(z[expert], non_blocking=cuda)
-        # (3) FENCE: the publish must not become visible before the bytes land, or the kernel reads
-        #     a slot whose copy is still in flight. This is the invariant the whole design rests on.
+
+        if threaded:
+            done = torch.cuda.Event()
+            done.record(stream)
+            with self._lock:
+                self._inflight.append((key, slot, done))
+            return
+        # SINGLE-THREAD PATH (selftests / CPU): fence and publish right here, as before.
         if cuda:
             compute.wait_stream(stream)
         L["slot_of"][expert] = slot

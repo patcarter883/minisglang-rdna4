@@ -58,7 +58,7 @@ export EXTRA_ARGS="$extra"
 
 export MODEL=qwen4exp SPEC=none TP="${TP:-2}" CONC=2 GRAPH_BS=0
 export MEM_RATIO="${MEM_RATIO:-0.85}"
-export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-wired2}"
+export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-wired3}"
 export MINISGL_HOST_PORT="$PORT"
 export MINISGL_HOSTPROF=50
 export Q4E_MODEL_DIR="${Q4E_MODEL_DIR:-/home/pat/ai/hf/q4e}"

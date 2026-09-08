@@ -385,6 +385,18 @@ def set_expert_cache_budget(nbytes: int) -> None:
     _EXPERT_CACHE_BUDGET = int(nbytes)
 
 
+def tick_expert_cache() -> None:
+    """SCHEDULER THREAD, once per step. The cheap half of the manager handshake.
+
+    Retracts victims and publishes copies that have already landed. Called from
+    `Scheduler._forward`'s step boundary — the same place the route ring drains — because this is
+    the thread that owns the compute stream `slot_of` is read from. No-op when no cache is attached.
+    """
+    c = _EXPERT_CACHE
+    if c is not None:
+        c.apply_pending()
+
+
 def live_expert_cache():
     """The attached cache, or None. For the engine's route-ring subscription."""
     return _EXPERT_CACHE
