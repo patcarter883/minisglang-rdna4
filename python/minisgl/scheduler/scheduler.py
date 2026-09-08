@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import numpy as np
 import torch
+
+from minisgl.weights import route_trace as _route_trace
 import torch.distributed as dist
 import torch.profiler
 from minisgl.utils import roctx as _roctx
@@ -2842,6 +2844,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             torch.cuda.synchronize()
         _step_t0 = time.perf_counter()
         _step_is_pf = bool(batch.is_prefill)
+        # ROUTING-TRACE step boundary. HERE, not in normal_loop: there are eight `self._forward`
+        # call sites (overlap, hostprof, DP-dummy, spec) and this is the only point all of them
+        # pass through. No-op unless armed; the drain runs outside the forward and outside any
+        # capture region.
+        _route_trace.begin_forward(_step_is_pf, batch.reqs[0].uid if batch.reqs else 0)
         _step_bs = int(batch.size)
         _step_r0 = self.engine.graph_runner.replays
         batch.input_ids = self.token_pool[input_mapping]

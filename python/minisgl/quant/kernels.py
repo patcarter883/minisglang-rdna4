@@ -164,6 +164,9 @@ _NVFP4_GEMV = _os.environ.get("MINISGL_NVFP4_GEMV", "1") != "0"
 # ntp/block_m tiles, one expert slab per tile. So blocks/D tells you whether alignment amortizes the
 # overlap that IS there. Recorded per MoE call; rows are dumped when the sample cap is hit.
 _ROUTE_STATS_PATH = _os.environ.get("MINISGL_MOE_ROUTE_STATS", "")
+# ROUTING-TRACE hook (measure-only). `enabled()` is one `is not None`; the module imports torch
+# and kvcache._envutil only, nothing from minisgl.quant, so this cannot cycle.
+from minisgl.weights import route_trace as _route_trace
 _ROUTE_STATS_MAX = int(_os.environ.get("MINISGL_MOE_ROUTE_STATS_N") or 4000)
 _ROUTE_STATS_MAXTOK = int(_os.environ.get("MINISGL_MOE_ROUTE_STATS_MAXTOK") or 64)
 _route_stats_rows: list = []
@@ -657,6 +660,11 @@ def w4a8_moe(
     P = sorted_ids.shape[0]
     if _ROUTE_STATS_PATH:
         _route_stats(topk_ids, E, block_m, ntp)
+    # Reuses the route `_route_align` JUST produced — the ids the GEMM below actually
+    # dereferences — so it is authoritative (the Python torch.topk route in _ep_route breaks
+    # exact ties the OTHER way; see moe.py::_ep_route) and costs zero extra launches.
+    if _route_trace.enabled():
+        _route_trace.tracer().record(topk_ids, M, expert_ids, ntp, block_m)
 
     _e2m1 = "+e2m1" if weight_is_e2m1 else ""
     # The W4A8 kernel is now activation-dtype-generic (fp16 OR bf16), so pass activations in their

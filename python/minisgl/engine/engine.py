@@ -374,6 +374,21 @@ class Engine:
         # wrapper, not a residency change, but installing it inside the window would put file I/O in
         # the middle of the gates that are still measuring the window's device cost.
         self._woff.install_stream_hooks()
+        # ROUTING TRACE, AFTER the stream tier so this wrapper is the OUTERMOST one and the layer
+        # id is in scope before the tier's staging runs. Measure-only and default OFF: returns
+        # None unless MINISGL_MOE_ROUTE_TRACE names an existing writable dir, and RAISES if it
+        # names one that does not exist rather than degrading to a silent no-trace. The model
+        # shape is derived from the discovered ops, not transcribed from config -- a header that
+        # disagrees with the trace body would mis-scale every hit rate the oracle reports.
+        from minisgl.weights import route_trace as _route_trace
+
+        _route_trace.maybe_install(
+            self.model,
+            model_slug=str(config.model_path),
+            tp_rank=config.tp_info.rank,
+            dp_rank=self.dp_rank,
+            device=self.device,
+        )
         if self._woff.enabled:
             _mem_probe("after weight offload")
 

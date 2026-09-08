@@ -742,6 +742,15 @@ services:
       # Downgrades serve.sh's min_tp refusal to a warning. Needed here because serve.sh runs
       # INSIDE the container, so setting it on the host does nothing without this entry.
       MINISGL_ALLOW_TP_BELOW_MIN: "${MINISGL_ALLOW_TP_BELOW_MIN:-}"
+      # ---- routing-trace oracle (MEASURE-ONLY, default OFF) ---------------------------------
+      # An EXPLICIT directory, never a default into the repo layer (ghost_cache.py convention).
+      # Unset arrives SET-BUT-EMPTY through compose, which the module handles via env_int.
+      MINISGL_MOE_ROUTE_TRACE: "${MINISGL_MOE_ROUTE_TRACE:-}"
+      MINISGL_MOE_ROUTE_TRACE_RING: "${MINISGL_MOE_ROUTE_TRACE_RING:-}"
+      MINISGL_MOE_ROUTE_TRACE_DRAIN: "${MINISGL_MOE_ROUTE_TRACE_DRAIN:-}"
+      MINISGL_MOE_ROUTE_TRACE_MAX: "${MINISGL_MOE_ROUTE_TRACE_MAX:-}"
+      MINISGL_MOE_ROUTE_TRACE_PREFILL: "${MINISGL_MOE_ROUTE_TRACE_PREFILL:-}"
+      MINISGL_MOE_ROUTE_TRACE_BLOCKMAP: "${MINISGL_MOE_ROUTE_TRACE_BLOCKMAP:-}"
       MINISGL_CPU_MOE_THREADS: "${MINISGL_CPU_MOE_THREADS:-}"
       # Explicit physical-core list, overriding the derived per-rank range. Needed for any pool wide
       # enough to want core 0 (the derived list reserves it for the engine and refuses to run off

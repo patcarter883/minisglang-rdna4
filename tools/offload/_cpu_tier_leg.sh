@@ -127,9 +127,18 @@ if (( ready == 0 )); then
   exit 3
 fi
 
-python3 "$REPO/tools/ab_tile_serve_bench.py" --url "http://127.0.0.1:$PORT" \
-  --label "$LABEL" --reps "$REPS" --decode-tokens "$DECODE_TOKENS" \
-  --decode-m "$DECODE_M" --prefill-words 360 --out "$JSON"
+# BENCH_CMD overrides the default A/B bench. It exists for the routing-trace capture, which needs
+# ~20000 sequential decode steps from >=12 distinct prompts (the oracle's G5 provenance gate) rather
+# than 3 reps x 128 tokens. The default below is unchanged, so every leg measured before this edit
+# reproduces with BENCH_CMD unset.
+if [[ -n "${BENCH_CMD:-}" ]]; then
+  echo "[leg] BENCH_CMD override: $BENCH_CMD"
+  bash -c "$BENCH_CMD"
+else
+  python3 "$REPO/tools/ab_tile_serve_bench.py" --url "http://127.0.0.1:$PORT" \
+    --label "$LABEL" --reps "$REPS" --decode-tokens "$DECODE_TOKENS" \
+    --decode-m "$DECODE_M" --prefill-words 360 --out "$JSON"
+fi
 rc=$?
 echo "[leg] bench rc=$rc"
 
