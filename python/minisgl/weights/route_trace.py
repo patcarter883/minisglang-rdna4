@@ -339,6 +339,16 @@ class RouteTracer:
             )
 
     # -- drain --------------------------------------------------------------------------------
+    def set_observer(self, fn) -> None:
+        """Subscribe a consumer to the drained records — this is how the expert cache learns routes.
+
+        THE POINT IS THAT IT IS THE SAME RING. The cache needs "which experts did layer L read",
+        which is exactly what this tracer already collects with no host sync; building a second
+        observation path would duplicate the D2H. The consumer sees records N steps late by
+        construction, and that lag is measured to be free (h 0.8558 at lag 0 vs 0.8563 at lag 64).
+        """
+        self._observer = fn
+
     def drain(self) -> None:
         """ONE D2H of the filled ring, then dedupe+sort per (step, layer) on host and append."""
         if self.n_since_drain == 0 and not self.oversize:
@@ -356,6 +366,13 @@ class RouteTracer:
                 for lid, (step, uid, kind, chunk, ntok) in sorted(self.meta[slot].items()):
                     row = ids_np[slot, lid]
                     ids = sorted({int(e) for e in row if 0 <= int(e) < self.num_experts})
+                    obs = getattr(self, "_observer", None)
+                    if obs is not None and kind == KIND_DECODE:
+                        # DECODE ONLY. A prefill chunk touches nearly every expert in the layer, so
+                        # feeding it to the policy would look like one enormous sweep; the oracle
+                        # measured that arm separately (prefill pollution, -0.0008 for SLRU) and the
+                        # manager is sized for the decode working set.
+                        obs(lid, ids)
                     out += struct.pack(RECORD_FMT, step & 0xFFFFFFFF, uid, lid, kind, chunk,
                                        ntok, len(ids))
                     out += struct.pack(f"<{len(ids)}H", *ids)
