@@ -175,6 +175,14 @@ class EngineConfig:
     # is never an on/off switch (plan §6.2) — the placement decision is derived either way.
     weight_offload_device_gb: float = 0.0
 
+    # `expert_cache_gb`: VRAM PER RANK for the per-expert residency cache (0.0 = off). It is a
+    # SUBSTITUTE for `weight_offload_device_gb`, not an addition: at one budget the layer-granular
+    # arm pins whole layers and its hit rate IS the resident fraction (0.208 at 6.7 GiB), while the
+    # cache holds the recently-routed experts across every layer and measured 0.864 on a real
+    # 20,004-step route trace. Setting both non-zero is legal but spends the budget twice — the
+    # device-resident layers are already resident and are never registered with the cache.
+    expert_cache_gb: float = 0.0
+
     # `weight_offload_cpu_layers`: how many of the DEEPEST offloadable MoE layers are computed by
     # host AVX-512 cores instead of being streamed to the card. A THIRD placement tier, not a
     # variation on the host tier: a CPU layer's weights are read by CPU cores with ordinary loads,

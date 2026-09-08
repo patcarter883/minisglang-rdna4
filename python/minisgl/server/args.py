@@ -193,6 +193,19 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         ),
     )
     parser.add_argument(
+        "--expert-cache-gb",
+        type=float,
+        default=ServerArgs.expert_cache_gb,
+        help=(
+            "VRAM per rank (GiB) for the per-expert residency cache. 0 = off (the shipped "
+            "static-layer placement). The cache SUBSTITUTES for device-resident MoE layers rather "
+            "than adding to them, so surrender the same GiB from --weight-offload-device-gb: at "
+            "one budget the layer-granular arm keeps whole layers and reaches h = resident "
+            "fraction, while the cache keeps the RECENTLY ROUTED experts across all layers. GiB "
+            "(2**30), like every other budget here."
+        ),
+    )
+    parser.add_argument(
         "--weight-offload-gb",
         type=float,
         default=ServerArgs.weight_offload_gb,

@@ -1661,14 +1661,15 @@ def expert_cache_budget_bytes() -> int:
     return env_int("MINISGL_EXPERT_CACHE_GB", 0) * (1 << 30)
 
 
-def _build_expert_cache(seams: "Sequence[MoEWeightSeam]", plan: "OffloadPlan"):
+def _build_expert_cache(seams: "Sequence[MoEWeightSeam]", plan: "OffloadPlan",
+                        budget: int = 0):
     """Construct the one per-rank cache, or None when it is off / cannot be sized.
 
     Sized from the FIRST host-placed seam: every MoE layer in this model has the same expert
     geometry, and the cache's `register_layer` re-checks `num_experts` per layer, so a
     heterogeneous model fails loudly at registration rather than silently indexing a short slab.
     """
-    budget = expert_cache_budget_bytes()
+    budget = int(budget) or expert_cache_budget_bytes()
     if budget <= 0:
         return None
     host_paths = {p.path for p in plan.placements if p.kind is StackKind.HOST}
@@ -1708,6 +1709,7 @@ def bind_plan(
     freeze: bool = True,
     log: bool = True,
     cpu_worker: Any = None,
+    expert_cache_bytes: int = 0,
 ) -> BindOutcome:
     """Execute `plan` over `seams`: move the host-resident layers, then freeze.
 
@@ -1765,7 +1767,7 @@ def bind_plan(
     # THE CACHE IS CONSTRUCTED AND ATTACHED BEFORE THE BIND LOOP, because `bind()` registers each
     # HOST layer as it bakes it — one walk, and the tensors registered are the arena views that bake
     # just installed rather than a second enumeration that could drift from it.
-    cache = _build_expert_cache(seams, plan)
+    cache = _build_expert_cache(seams, plan, expert_cache_bytes)
     attach_expert_cache(cache)
 
     out = BindOutcome(plan_digest=plan.digest())

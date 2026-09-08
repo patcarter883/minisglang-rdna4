@@ -886,6 +886,7 @@ class StageARuntime:
         label: str = "weights",
         stream: Any = None,
         stream_layers: "Sequence[int] | None" = None,
+        expert_cache_bytes: int = 0,
     ) -> None:
         from .config import create_pinned_weight_arena, resolve_arena_settings
 
@@ -906,6 +907,11 @@ class StageARuntime:
         #: plan). None on every serve with `--weight-offload-cpu-layers 0`, which is all of them
         #: unless it was asked for.
         self.cpu_worker = None
+        #: Per-expert residency-cache budget in BYTES for this rank; 0 = cache off. Carried on the
+        #: session rather than read from the environment inside `bind_plan` so the number that sized
+        #: the cache is the one the launch line asked for — a capacity knob that lives only in the
+        #: environment is invisible in the ledger and in every A/B write-up.
+        self.expert_cache_bytes = int(expert_cache_bytes)
         self.rank = int(rank)
         self.local_ranks = int(local_ranks)
         #: Set by `chunked_sink()` when the caller loads via Stage B. Its presence is what makes
@@ -1153,7 +1159,8 @@ class StageARuntime:
             return self.outcome
         self.seams = attach_seams(model)
         self.outcome = bind_plan(self.seams, self.plan, self.allocator, freeze=False,
-                                 cpu_worker=self.cpu_worker)
+                                 cpu_worker=self.cpu_worker,
+                                 expert_cache_bytes=self.expert_cache_bytes)
         return self.outcome
 
     def prove_seam(self, model: Any) -> Any:
@@ -1516,4 +1523,10 @@ def _resolve_driver(
         local_ranks=int(getattr(resolution, "local_ranks", 1) or 1),
         stream=stream,
         stream_layers=stream_layers,
+        # GiB (2**30), the same constant every other budget in this file uses. Read off the config
+        # rather than the environment so the size that was actually allocated is the one the launch
+        # line asked for and appears in the ledger.
+        expert_cache_bytes=int(
+            float(getattr(config, "expert_cache_gb", 0.0) or 0.0) * (1 << 30)
+        ),
     )
