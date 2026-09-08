@@ -360,19 +360,45 @@ class _GroupedMxFp4Experts(ExpertContainer, BaseOP):
 
         from minisgl.quant import mxfp4
 
-        conv = mxfp4.convert_mxfp4_moe(self.weight_packed, self.weight_scale)
-        info = conv["scale_info"]
-        if not info["fp16_range_ok"]:
-            from minisgl.utils import init_logger
+        # NATIVE E8M0. The op reads the checkpoint's 1-byte block scale directly
+        # (`w4a8_tile::E8m0GroupScale` / `FmtMxfp4E8m0`, rdna4-hip-kernels ebcb0d3) instead of the
+        # fp16 widening this used to do, which was worse on two axes:
+        #   BYTES  0.5625 -> 0.53125 B/weight (5.6% fewer bytes read on a bandwidth-bound decode)
+        #          and HALF the resident scale bytes.
+        #   EXACT  E8M0 spans 2^-127..2^127 and fp16 saturates outside 2^-14..2^15, so the old path
+        #          could serve SATURATED scales on an out-of-window checkpoint — and the branch
+        #          below only LOGGED it and carried on. There is nothing to saturate now.
+        # `MINISGL_MXFP4_FP16_SCALES=1` restores the old widening; it exists so a numerics report can
+        # be bisected onto the previous path, not as a tuning knob.
+        import os as _os
 
-            init_logger("mxfp4").info_rank0(
-                f"[mxfp4-moe] E8M0 group scales exceed the fp16 store "
-                f"(exp {info['exp_min']}..{info['exp_max']}, {info['fp16_overflow_groups']} overflow "
-                f"/ {info['e8m0_nan_groups']} e8m0-NaN groups); an fp32 group-scale path may be needed."
-            )
+        if (_os.environ.get("MINISGL_MXFP4_FP16_SCALES") or "").strip() == "1":
+            conv = mxfp4.convert_mxfp4_moe(self.weight_packed, self.weight_scale)
+            info = conv["scale_info"]
+            if not info["fp16_range_ok"]:
+                from minisgl.utils import init_logger
+
+                init_logger("mxfp4").info_rank0(
+                    f"[mxfp4-moe] E8M0 group scales exceed the fp16 store "
+                    f"(exp {info['exp_min']}..{info['exp_max']}, {info['fp16_overflow_groups']} overflow "
+                    f"/ {info['e8m0_nan_groups']} e8m0-NaN groups); an fp32 group-scale path may be needed."
+                )
+        else:
+            conv = mxfp4.convert_mxfp4_moe_e8m0(self.weight_packed, self.weight_scale)
+            info = conv["scale_info"]
+            if info["would_saturate_fp16"] or info["e8m0_nan_groups"]:
+                from minisgl.utils import init_logger
+
+                init_logger("mxfp4").info_rank0(
+                    f"[mxfp4-moe] native E8M0 scales: exp {info['exp_min']}..{info['exp_max']}, "
+                    f"{info['would_saturate_fp16']} group(s) the OLD fp16 store would have saturated, "
+                    f"{info['e8m0_nan_groups']} e8m0-NaN group(s)."
+                )
         self._w_op = conv["w_packed"]  # (E, N, K//8) int32
         # GROUP-MAJOR for the op's coalesced `[g*N + n]` scale read (see _GroupedAWQExperts).
-        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//32, N) fp16
+        # GROUP-MAJOR for the op's coalesced `[g*N + n]` read. dtype now follows the path:
+        # uint8 E8M0 by default, fp16 under the bisect knob.
+        self._scales_op = conv["scales"].transpose(1, 2).contiguous()  # (E, K//32, N)
         del self.weight_packed, self.weight_scale
 
 
