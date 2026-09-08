@@ -132,15 +132,21 @@ class RouteTracer:
         blockmap_checks: int,
         device: torch.device,
     ) -> None:
-        if not os.path.isdir(out_dir):
-            raise RouteTraceError(
-                f"MINISGL_MOE_ROUTE_TRACE={out_dir!r} is not a directory. The trace is a durable "
-                f"measurement fixture and must land on a path the operator pre-created and mounted "
-                f"(`install -d -o 1000 -g 1000 <dir>`), never in a container layer or a worktree "
-                f"that gets removed. Refusing to boot rather than degrading silently."
-            )
-        if not os.access(out_dir, os.W_OK):
-            raise RouteTraceError(f"route trace dir {out_dir!r} is not writable by this uid")
+        # `out_dir=None` is OBSERVE-ONLY: ring + drain + observer, no file. That is the mode the
+        # expert cache runs in production — it needs "which experts did layer L read", which this
+        # ring already collects with no extra D2H, but it must NOT write a 35 MB trace per rank on
+        # every serve. Capture mode (a real dir) is unchanged and still writes the fixture.
+        if out_dir is not None:
+            if not os.path.isdir(out_dir):
+                raise RouteTraceError(
+                    f"MINISGL_MOE_ROUTE_TRACE={out_dir!r} is not a directory. The trace is a "
+                    f"durable measurement fixture and must land on a path the operator pre-created "
+                    f"and mounted (`install -d -o 1000 -g 1000 <dir>`), never in a container layer "
+                    f"or a worktree that gets removed. Refusing to boot rather than degrading "
+                    f"silently."
+                )
+            if not os.access(out_dir, os.W_OK):
+                raise RouteTraceError(f"route trace dir {out_dir!r} is not writable by this uid")
         if drain_every > ring_steps:
             raise RouteTraceError(
                 f"drain_every ({drain_every}) > ring_steps ({ring_steps}): the ring would wrap "
@@ -183,6 +189,10 @@ class RouteTracer:
         self.oversize: List[Tuple[int, int, int, int, int, int, List[int]]] = []
 
         slug = "".join(c if c.isalnum() or c in "-._" else "_" for c in (model_slug or "unknown"))
+        if out_dir is None:
+            self.path = None
+            self._fh = None
+            return
         self.path = os.path.join(out_dir, f"route.{slug}.rank{tp_rank}.bin")
         self._fh = open(self.path, "wb")
         self._fh.write(
@@ -385,6 +395,16 @@ class RouteTracer:
                 out += struct.pack(f"<{len(ids)}H", *ids)
                 self.records_written += 1
             self.oversize.clear()
+            if self._fh is None:
+                # OBSERVE-ONLY: the observer above has already been fed, which is the whole point of
+                # the drain in this mode. Reset the ring and skip every file operation — `out` is
+                # built unconditionally because the packing loop is also what computes `ids`, and
+                # splitting it would give the cache and the capture fixture two different notions of
+                # which experts a step touched.
+                self.meta = [{} for _ in range(self.ring_steps)]
+                self.ids_ring.fill_(-1)
+                self.n_since_drain = 0
+                return
             self._fh.write(out)
             self._fh.flush()
             # Patch num_records IN PLACE (8 aligned bytes), then seek back to append. NOT
@@ -403,8 +423,15 @@ class RouteTracer:
         try:
             self.drain()
         finally:
-            if not self._fh.closed:
+            if self._fh is not None and not self._fh.closed:
                 self._fh.close()
+        if self._fh is None:
+            print(
+                f"[route-trace] observe-only: {self.step_id + 1} steps fed to the observer, "
+                f"no fixture written",
+                flush=True,
+            )
+            return
         print(
             f"[route-trace] {self.records_written} records -> {self.path} "
             f"(steps={self.step_id + 1}, blockmap_checked={self.blockmap_seen}, "
@@ -454,8 +481,14 @@ def _derive_shape(model: Any) -> "tuple[int, int, int]":
 def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
                   device: torch.device, num_layers: "Optional[int]" = None,
                   num_experts: "Optional[int]" = None, top_k: "Optional[int]" = None,
-                  expert_bytes: int = 1382400) -> "Optional[RouteTracer]":
+                  expert_bytes: int = 1382400,
+                  observe_only: bool = False) -> "Optional[RouteTracer]":
     """Arm the tracer iff MINISGL_MOE_ROUTE_TRACE names an existing writable dir.
+
+    `observe_only=True` arms the ring with NO output file, for the expert cache: it needs the same
+    references the fixture records and reusing this ring costs no extra D2H. If the env var ALSO
+    names a dir, the fixture still wins — one ring, and a capture run keeps writing its trace while
+    the cache observes the same records.
 
     Env convention follows kvcache/ghost_cache.py:64-83 and kvcache/_envutil.py: every knob in
     docker-compose.yml is declared `FOO: "${FOO:-}"`, so an unset variable arrives SET-BUT-EMPTY and
@@ -463,8 +496,8 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
     default into the repo layer, for exactly the reason ghost_oracle_path spells out.
     """
     global _TRACER
-    d = os.environ.get("MINISGL_MOE_ROUTE_TRACE", "").strip()
-    if not d:
+    d = os.environ.get("MINISGL_MOE_ROUTE_TRACE", "").strip() or None
+    if d is None and not observe_only:
         return None
     if _TRACER is not None:
         raise RouteTraceError("route trace already armed")
@@ -482,16 +515,24 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
         expert_bytes=expert_bytes,
         ring_steps=ring,
         drain_every=env_int("MINISGL_MOE_ROUTE_TRACE_DRAIN", min(512, ring)),
-        max_steps=env_int("MINISGL_MOE_ROUTE_TRACE_MAX", 40000),
-        record_prefill=os.environ.get("MINISGL_MOE_ROUTE_TRACE_PREFILL", "1") != "0",
+        # max_steps bounds the FIXTURE (a 35 MB file is a measurement artefact, not a log). In
+        # observe-only mode there is no file and the cache needs references for the life of the
+        # serve, so it must never disarm — a tracer that quietly stopped at step 40,000 would
+        # freeze the residency map and the hit rate would decay with no error anywhere.
+        max_steps=(1 << 62) if d is None else env_int("MINISGL_MOE_ROUTE_TRACE_MAX", 40000),
+        # Prefill records are never fed to the observer (decode-only, see drain()) and in
+        # observe-only mode nothing else consumes them, so collecting them is pure overhead.
+        record_prefill=(d is not None
+                        and os.environ.get("MINISGL_MOE_ROUTE_TRACE_PREFILL", "1") != "0"),
         blockmap_checks=env_int("MINISGL_MOE_ROUTE_TRACE_BLOCKMAP", 64),
         device=device,
     )
     t.install_hooks(model)
     _TRACER = t
     print(
-        f"[route-trace] ARMED: {t.path} ring={t.ring_steps} drain={t.drain_every} "
-        f"max_steps={t.max_steps} prefill={t.record_prefill} layers={len(t.ops)}",
+        f"[route-trace] ARMED: {t.path or 'observe-only (no fixture)'} ring={t.ring_steps} "
+        f"drain={t.drain_every} max_steps={t.max_steps} prefill={t.record_prefill} "
+        f"layers={len(t.ops)}",
         flush=True,
     )
     return t

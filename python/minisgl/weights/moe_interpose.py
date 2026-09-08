@@ -87,6 +87,7 @@ from typing import Any, Iterator, Sequence
 
 import torch
 from minisgl._hip_engage import engaged
+from minisgl.kvcache._envutil import env_int
 from minisgl.utils import init_logger
 
 from .granule import (
@@ -319,10 +320,50 @@ def _set_expert_slot_map(*args):
 _SET_MAP_OP = None
 
 
+def _cache_plane_tensors(path: str, attr: str, container, method) -> tuple:
+    """The (w, scales, zeros) triple the kernel dereferences for one expert container.
+
+    Read off the LAYER'S OWN QUANT METHOD (`cache_plane_attrs`), which is the same declaration
+    `apply()` builds its kernel arguments from — so the bytes the cache copies and the pointers the
+    kernel reads cannot name different tensors. Never a table in this file: a per-format table here
+    would be a second spelling of the call site, and the failure mode of the two disagreeing is the
+    cache handing the kernel one expert's weights under another expert's id, which produces
+    plausible wrong numbers with no error anywhere.
+    """
+    attrs = getattr(method, "cache_plane_attrs", ())
+    if not attrs:
+        raise _CacheUnsupported(type(method).__name__)
+    if len(attrs) != 3:
+        raise InterpositionError(
+            f"seam {path!r}: {type(method).__name__}.cache_plane_attrs has {len(attrs)} entries, "
+            f"expected exactly 3 — `set_expert_slot_map` takes (w, scales, zeros) per plane."
+        )
+    out = []
+    for a in attrs:
+        t = getattr(container, a, None) if a else None
+        if a and t is None:
+            raise InterpositionError(
+                f"seam {path!r}: {attr} declares cache tensor {a!r} but the container does not "
+                f"hold it. Registration runs AFTER the bake, so this means the bake rebound a "
+                f"different attribute name than the method reads."
+            )
+        out.append(t)
+    return tuple(out)
+
+
+class _CacheUnsupported(Exception):
+    """This layer's quant method declares no slot triple — cache OFF for it, not cache wrong."""
+
+
 def attach_expert_cache(cache) -> None:
     """Publish the cache to the hot path (or None to detach)."""
     global _EXPERT_CACHE
     _EXPERT_CACHE = cache
+
+
+def live_expert_cache():
+    """The attached cache, or None. For the engine's route-ring subscription."""
+    return _EXPERT_CACHE
 
 
 @dataclass
@@ -761,7 +802,50 @@ class MoEWeightSeam:
             else f"weight_offload.moe_resolve[{kind.name.lower()}]"
         )
         self._report = report
+        if kind is StackKind.HOST:
+            self._register_with_expert_cache()
         return report
+
+    def _register_with_expert_cache(self) -> None:
+        """Bind this layer's post-bake host tensors into the residency cache, if one is attached.
+
+        HOST ONLY, and after the bake, both for the same reason: the cache's whole job is to keep
+        HOST-resident experts in VRAM, and the tensors it must copy FROM are the arena views the
+        bake just installed — registering the pre-bake device originals would have the manager copy
+        from memory the bake is about to free.
+
+        A DEVICE layer is already fully resident, so caching it would spend slots to duplicate bytes
+        that are already there. A CPU-tier layer computes on the host and never dereferences
+        `slot_of` at all. Both are skipped, which is why `install()` CLEARS the map for an
+        unregistered layer rather than returning early — a cached layer's map must never survive
+        into an uncached layer's launch.
+        """
+        cache = _EXPERT_CACHE
+        if cache is None:
+            return
+        from .stream_tier import layer_index_of_path
+        lid = self._cache_lid
+        if lid is None:
+            lid = self._cache_lid = layer_index_of_path(self.path)
+        method = getattr(self._layer, "_moe_method", None)
+        if method is None:
+            raise InterpositionError(
+                f"seam {self.path!r}: the MoE layer exposes no `_moe_method`, so the residency "
+                f"cache cannot learn which tensors the kernel dereferences."
+            )
+        try:
+            planes = [
+                _cache_plane_tensors(self.path, attr, getattr(self._layer, attr), method)
+                for attr in self._attrs
+            ]
+        except _CacheUnsupported as why:
+            # Cache OFF for this layer, by declaration. It keeps reading the host base exactly as
+            # today; `install()` clears the map for an unregistered layer, so no other layer's
+            # residency can leak into its launch.
+            print(f"[expert-cache] {self.path}: method {why} declares no slot triple — "
+                  f"cache OFF for this layer (reads the host base, as today)", flush=True)
+            return
+        cache.register_layer(lid, planes[0], planes[1])
 
     def _enumerate_named_tensors(self) -> list[tuple[str, Any, tuple[str, ...], Any]]:
         """`(owner_attr, container, alias_names, canonical_tensor)` for every tensor the layer's
@@ -1565,6 +1649,56 @@ def iter_seams(root: Any) -> Iterator[MoEWeightSeam]:
             yield seam
 
 
+def expert_cache_budget_bytes() -> int:
+    """VRAM the residency cache may hold, in bytes. 0 = cache off (the shipped path).
+
+    Deliberately an explicit number rather than a fraction of anything: the cache SUBSTITUTES for
+    device-resident MoE layers, so its budget is the VRAM the plan would otherwise have spent
+    pinning whole layers, and that is a deployment decision the operator makes alongside
+    `--device-gb`. Sizing it off free VRAM at boot would make the residency (and therefore the
+    measured hit rate) depend on allocation order.
+    """
+    return env_int("MINISGL_EXPERT_CACHE_GB", 0) * (1 << 30)
+
+
+def _build_expert_cache(seams: "Sequence[MoEWeightSeam]", plan: "OffloadPlan"):
+    """Construct the one per-rank cache, or None when it is off / cannot be sized.
+
+    Sized from the FIRST host-placed seam: every MoE layer in this model has the same expert
+    geometry, and the cache's `register_layer` re-checks `num_experts` per layer, so a
+    heterogeneous model fails loudly at registration rather than silently indexing a short slab.
+    """
+    budget = expert_cache_budget_bytes()
+    if budget <= 0:
+        return None
+    host_paths = {p.path for p in plan.placements if p.kind is StackKind.HOST}
+    hosts = [s for s in seams if s.path in host_paths]
+    if not hosts:
+        print("[expert-cache] budget set but the plan places no layer on the HOST tier — "
+              "nothing to cache; cache OFF", flush=True)
+        return None
+    first = hosts[0]
+    # Bytes for ONE expert across BOTH GEMMs. That is the promotion granule — an expert is resident
+    # in both planes or in neither — and it is the same unit the placement plan prices, so the
+    # budget here and the budget there mean the same thing.
+    expert_bytes = int(first._layer.co_demanded_granule_bytes())
+    from .expert_cache import ExpertCacheError, ExpertResidencyCache
+    try:
+        cache = ExpertResidencyCache(
+            num_experts=int(first.num_experts),
+            expert_bytes=expert_bytes,
+            budget_bytes=budget,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    except ExpertCacheError as e:
+        print(f"[expert-cache] REFUSED: {e}", flush=True)
+        raise
+    print(f"[expert-cache] {cache.slots} slots x {expert_bytes} B = "
+          f"{cache.slots * expert_bytes / (1 << 30):.2f} GiB over {len(hosts)} host layers "
+          f"({cache.num_experts} experts/layer)", flush=True)
+    return cache
+
+
 def bind_plan(
     seams: Sequence[MoEWeightSeam],
     plan: OffloadPlan,
@@ -1627,6 +1761,12 @@ def bind_plan(
             f"degraded mode: `MoELayer.forward` would reach `cpu_forward` with nothing to submit "
             f"to and the serve would die on its first token instead of at boot."
         )
+
+    # THE CACHE IS CONSTRUCTED AND ATTACHED BEFORE THE BIND LOOP, because `bind()` registers each
+    # HOST layer as it bakes it — one walk, and the tensors registered are the arena views that bake
+    # just installed rather than a second enumeration that could drift from it.
+    cache = _build_expert_cache(seams, plan)
+    attach_expert_cache(cache)
 
     out = BindOutcome(plan_digest=plan.digest())
     cpu_expert_offset = 0

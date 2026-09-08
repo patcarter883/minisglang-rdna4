@@ -382,13 +382,32 @@ class Engine:
         # disagrees with the trace body would mis-scale every hit rate the oracle reports.
         from minisgl.weights import route_trace as _route_trace
 
-        _route_trace.maybe_install(
+        # The expert-residency cache learns routes from THIS ring, so the tracer is armed whenever
+        # a cache was attached even if no fixture dir was named (`observe_only`). One ring, one
+        # D2H: a separate observation path for the cache would pay the same transfer twice.
+        from minisgl.weights.moe_interpose import live_expert_cache
+
+        _cache = live_expert_cache()
+        _tracer = _route_trace.maybe_install(
             self.model,
             model_slug=str(config.model_path),
             tp_rank=config.tp_info.rank,
             dp_rank=self.dp_rank,
             device=self.device,
+            observe_only=_cache is not None,
         )
+        if _cache is not None:
+            if _tracer is None:
+                # The cache cannot learn anything without the ring, and a cache that observes
+                # nothing keeps `slot_of` at -1 forever: every expert reads the host base, i.e.
+                # SLOWER than the shipped path (the slab is allocated and never used). Refuse.
+                raise RuntimeError(
+                    "expert cache is attached but the route tracer did not arm, so no references "
+                    "would ever reach it. The cache would hold VRAM and never serve a hit."
+                )
+            _tracer.set_observer(_cache.observe)
+            print(f"[expert-cache] observing the route ring "
+                  f"(drain_every={_tracer.drain_every} steps)", flush=True)
         if self._woff.enabled:
             _mem_probe("after weight offload")
 

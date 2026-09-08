@@ -522,6 +522,21 @@ class MoEQuantMethod:
     The MoELayer owns routing, EP dispatch/combine and the TP all-reduce; the method owns the
     per-expert weight layout + the grouped GEMM."""
 
+    # The three tensors this method hands the kernel per PLANE, in the kernel's (w, scales, zeros)
+    # pointer-slot order — the same order `set_expert_slot_map` takes. `()` means "this method does
+    # not support the per-expert residency cache", and a layer whose method declares `()` is simply
+    # never registered (it reads the host base, exactly as today) rather than registered wrong.
+    #
+    # THIS IS THE SINGLE DECLARATION: `apply()` builds its kernel arguments from it, so the cache
+    # and the forward cannot name different tensors. A triple that drifted from the call site would
+    # copy one set of bytes and dereference another — wrong weights, no error.
+    cache_plane_attrs: tuple = ()
+
+    @classmethod
+    def plane(cls, container):
+        """This method's (w, scales, zeros) triple for one expert container."""
+        return tuple(getattr(container, a) if a else None for a in cls.cache_plane_attrs)
+
     supports_ep: bool = False  # can this scheme run the EP all_gather/mask/all_reduce shard path?
     needs_precomputed_route: bool = False  # True -> forward MUST be handed topk_weights/topk_ids
     # Can GEMM1 consume the PRODUCER's (x_fp8, act_scales) pair from the feeding RMSNorm?
@@ -768,6 +783,9 @@ class _NvFp4MoEMethod(MoEQuantMethod):
 
     supports_ep = True
 
+    # (w, scales, zeros) — the global rides the ZEROS slot; see `apply()` and `_GroupedNvFp4Experts`.
+    cache_plane_attrs = ("_w_op", "_scales_op", "_global_op")
+
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
 
@@ -783,9 +801,11 @@ class _NvFp4MoEMethod(MoEQuantMethod):
         # kernel's WScale policy owns the slot (`E4m3GroupScaleGlobal::wz_base/epi`) and its
         # `uses_zeros=false` is constexpr, so the zero-point read is dead-code-eliminated under this
         # policy and cannot decode the global's f32 bits as packed nibbles.
+        # Built from `cache_plane_attrs`, NOT spelled out again: the expert-residency cache copies
+        # exactly these tensors and hands the kernel slab pointers in their place, so a second
+        # spelling here is a chance for the two to disagree about which bytes an expert is.
         return kernels.w4a8_moe(
-            hidden_states, w13._w_op, w13._scales_op, w13._global_op,
-            w2._w_op, w2._scales_op, w2._global_op,
+            hidden_states, *self.plane(w13), *self.plane(w2),
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
             weight_is_e2m1=True, activation=activation, x_fp8=x_fp8, act_scales=act_scales,
         )
