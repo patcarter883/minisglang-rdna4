@@ -169,3 +169,45 @@ def test_apply_pending_is_a_noop_without_cuda():
                                  device=torch.device("cpu"))
     cache.apply_pending()
     cache.apply_pending()
+
+
+def test_a_bare_thread_cannot_write_inference_tensors_and_the_manager_wraps_itself():
+    """WHY `_run` OPENS AN inference_mode BLOCK. The scheduler loop is `@torch.inference_mode()`, so
+    the expert weights — and the slabs, allocated inside it — are INFERENCE tensors. `copy_` into
+    one from a thread not in that mode raises, and inference mode is per-thread, so the manager must
+    open its own.
+
+    Measured 2026-09-08: without this the manager died on its FIRST promotion, the cache degraded to
+    host reads exactly as designed, and the arm measured 69.18 ms against a 68.5 ms baseline — a
+    correct, silent, useless cache. Only the manager's own error line said so. This test reproduces
+    the mechanism on CPU so it can never come back unnoticed.
+    """
+    import threading
+
+    with torch.inference_mode():
+        dst = torch.zeros(4)
+        src = torch.ones(4)
+
+    err = {}
+
+    def bare():
+        try:
+            dst.copy_(src)
+        except RuntimeError as e:
+            err["bare"] = str(e)
+
+    def wrapped():
+        try:
+            with torch.inference_mode():
+                dst.copy_(src)
+        except RuntimeError as e:
+            err["wrapped"] = str(e)
+
+    t = threading.Thread(target=bare); t.start(); t.join()
+    assert "bare" in err and "inference tensor" in err["bare"], (
+        "expected a bare thread to be refused; if torch stopped enforcing this, the manager's "
+        "inference_mode block is no longer load-bearing and this test should be revisited")
+
+    t = threading.Thread(target=wrapped); t.start(); t.join()
+    assert "wrapped" not in err, f"the wrapped write should succeed, got {err.get('wrapped')}"
+    assert torch.equal(dst, src)

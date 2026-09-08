@@ -312,6 +312,18 @@ class ExpertResidencyCache:
 
     def _run(self) -> None:
         torch.cuda.set_device(self.device)          # a fresh thread has no current device
+        # INFERENCE MODE IS PER-THREAD AND THE WEIGHTS ARE INFERENCE TENSORS. The scheduler loop is
+        # wrapped in `@torch.inference_mode()`, so every tensor the slabs are filled from (and the
+        # slabs themselves, allocated inside it) carries the inference flag; an in-place `copy_`
+        # from a thread that is NOT in inference mode raises "Inplace update to inference tensor
+        # outside InferenceMode is not allowed". Measured 2026-09-08: the manager died on its very
+        # first promotion, the cache degraded to host reads exactly as designed, and the arm
+        # therefore measured 69.18 ms against a 68.5 ms baseline — i.e. correct, silent, and
+        # useless. The failure was visible ONLY in the manager's own error line.
+        with torch.inference_mode():
+            self._run_loop()
+
+    def _run_loop(self) -> None:
         while not self._stopping:
             self._wake.wait(timeout=0.25)
             self._wake.clear()
