@@ -160,3 +160,36 @@ def test_t6_slru_probation_absorbs_a_one_touch_sweep():
         pol.admit(k)
     survived = sum(1 for k in range(10) if k in pol)
     assert survived == 10, f"the one-touch sweep evicted {10 - survived} protected entries"
+
+
+def test_t7_take_victim_frees_capacity_without_admitting():
+    """`admit()` couples "make room" to "insert this key". The manager needs them SEPARATE: slots
+    come back through a scheduler round trip, so capacity must be freed ahead of demand.
+
+    This is the primitive whose absence froze replacement — with only `admit`, a miss on a full
+    cache evicted a victim and then dropped its own key, so 240,000 references produced 8 evictions.
+    """
+    pol = _SLRU(cap=4, protected_frac=0.5)
+    for k in range(4):
+        pol.admit(k)
+    assert len(pol) == 4
+    v = pol.take_victim()
+    assert v is not None and v not in pol, "take_victim did not remove the victim"
+    assert len(pol) == 3, "take_victim inserted something"
+    for _ in range(3):
+        pol.take_victim()
+    assert len(pol) == 0 and pol.take_victim() is None, "take_victim must be safe when empty"
+
+
+def test_t8_replacement_keeps_running_on_a_full_cache():
+    """THE REGRESSION. Drive far more distinct experts than slots and assert the cache keeps
+    PLACING, not just evicting. The stall this guards produced promotions ~= slots (fill once, then
+    frozen) while references kept arriving."""
+    cache, hosts = _build(slots=16)
+    rng = random.Random(99)
+    for _ in range(400):                       # fill, then churn well past capacity
+        cache.observe(rng.randrange(LAYERS), rng.sample(range(E), 10))
+    assert cache.stats["promotions"] > cache.slots * 3, (
+        f"replacement stalled: {cache.stats['promotions']} promotions against {cache.slots} slots — "
+        f"the cache filled once and stopped placing")
+    assert not _check_invariant(cache, hosts), "replacement broke the resident-bytes invariant"

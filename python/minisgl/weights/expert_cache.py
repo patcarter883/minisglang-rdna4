@@ -118,6 +118,27 @@ class _SLRU:
         self.probation[key] = None
         return victim
 
+    def take_victim(self) -> Optional[int]:
+        """Pop the least-valuable resident key WITHOUT admitting anything.
+
+        `admit()` couples "make room" to "insert this key", which is wrong for a cache whose slots
+        come back asynchronously: the manager needs to free capacity AHEAD of demand, then place
+        keys into it as references arrive. Probation first, exactly as `admit` chooses, so the
+        segmented behaviour the trace was scored on is unchanged.
+        """
+        if self.probation:
+            victim, _ = next(iter(self.probation.items()))
+            self.probation.pop(victim)
+            return victim
+        if self.protected:
+            victim, _ = next(iter(self.protected.items()))
+            self.protected.pop(victim)
+            return victim
+        return None
+
+    def __len__(self) -> int:
+        return len(self.probation) + len(self.protected)
+
     def evict_key(self, key: int) -> None:
         self.probation.pop(key, None)
         self.protected.pop(key, None)
@@ -191,6 +212,13 @@ class ExpertResidencyCache:
         self._compute_stream = None
         #: Manager batches between summary lines. 0 disables.
         self._report_every = _env_int("MINISGL_EXPERT_CACHE_REPORT", 200)
+        #: Free slots the manager tries to keep ready. ~0.5% of the pool: enough to absorb a
+        #: scheduler round trip at decode rates, small enough that the residency given up is noise.
+        self._low_water = max(8, _env_int("MINISGL_EXPERT_CACHE_LOW_WATER", self.slots // 200))
+        self._refill_batch = max(8, self._low_water)
+        #: apply_pending() calls. In the summary because a stalled scheduler half and a stalled
+        #: manager look identical from the outside, and this separates them.
+        self.stats["ticks"] = 0
 
     # -- setup -----------------------------------------------------------------------------------
     def register_layer(self, layer_id: int, gate_up: "tuple", down: "tuple") -> None:
@@ -341,6 +369,15 @@ class ExpertResidencyCache:
                           flush=True)
                     return
                 self.stats["manager_batches"] += 1
+                # TOP UP THE FREE POOL. A slot needs a scheduler round trip to come back, so
+                # reclaiming only when a miss needs one makes every miss pay that latency — which
+                # is exactly how replacement froze at 8 evictions in 240k references. Kept small:
+                # a reclaimed slot is a resident expert given up, so over-reclaiming lowers the hit
+                # rate for nothing.
+                with self._lock:
+                    short = self._low_water - len(self._free) - len(self._to_retract)
+                if short > 0:
+                    self._reclaim(min(short, self._refill_batch))
                 # THE INSTRUMENT. Without a hit rate a flat A/B is uninterpretable: "the cache does
                 # not help" and "the cache never warmed" produce the same TPOT, and this project has
                 # already spent three runs on the second one wearing the first one's face. Printed
@@ -362,6 +399,7 @@ class ExpertResidencyCache:
         """
         if self.device.type != "cuda":
             return
+        self.stats["ticks"] += 1
         with self._lock:
             retract, self._to_retract = self._to_retract, []
             inflight, self._inflight = self._inflight, []
@@ -395,14 +433,19 @@ class ExpertResidencyCache:
                 self._inflight.extend(still)
 
     def _promote(self, key: int) -> None:
-        """MANAGER THREAD. Issue one expert's copy; the scheduler publishes it. INLINE when no
-        manager is running (the CPU selftests), where the old single-thread order still holds.
+        """MANAGER THREAD. Place one expert into a slot we ALREADY HAVE. Inline when unthreaded.
 
-        THE ORDER IS THE CORRECTNESS ARGUMENT, and it now spans two threads:
+        THE ORDER IS THE CORRECTNESS ARGUMENT, and it spans two threads:
           retract victim (scheduler) -> fence -> copy (here) -> fence -> publish (scheduler).
-        Never publish before the copy's fence: the kernel would read a slot whose copy is in
-        flight. Never write a slot before its retraction is visible: a launch still reading the old
-        expert would silently get the new one's bytes. Both are wrong-numbers bugs with no error.
+        Never publish before the copy's fence, and never write a slot before its retraction is
+        visible. Both are wrong-numbers bugs with no error.
+
+        WHAT THIS DELIBERATELY NO LONGER DOES: call `admit()` to "make room" and then drop the key.
+        That coupling stalled replacement dead — on a full cache every miss evicted a victim and
+        discarded its OWN reference, so a promotion needed two misses AND a scheduler tick between
+        them. Measured 2026-09-08: 240,000 references produced 5,161 promotions and 8 evictions,
+        i.e. the cache filled once and then froze (observed_h 0.51 against the oracle's 0.864).
+        Capacity is now freed AHEAD of demand by `_reclaim`, and this function only places.
         """
         layer_id, expert = divmod(key, self.num_experts)
         L = self._layers.get(layer_id)
@@ -410,46 +453,42 @@ class ExpertResidencyCache:
             return
         cuda = self.device.type == "cuda"
         threaded = self._thread is not None and cuda
-        victim = self._policy.admit(key)
 
-        if victim is not None:
-            vlayer, vexpert = divmod(victim, self.num_experts)
-            slot = self._slot_of_key.pop(victim, None)
-            if slot is None:
-                # Victim never got a slot (it was refused for space, or already reclaimed). Nothing
-                # to retract; fall through to the free list rather than raising on the manager
-                # thread, where an exception kills the cache for the life of the serve.
-                self._policy.evict_key(key)
-                return
-            self._key_of_slot[slot] = -1
-            self.stats["evictions"] += 1
-            if threaded:
-                # HAND THE RETRACTION TO THE SCHEDULER and stop. The slot returns via `_free` only
-                # after `slot_of[victim] = -1` has been ordered against the launches that read it,
-                # so this expert is simply promoted on a later observation. Deferring costs a few
-                # steps of staleness, which is measured free.
-                with self._lock:
-                    self._to_retract.append((victim, slot))
-                self._policy.evict_key(key)
-                return
-            L2 = self._layers[vlayer]
-            L2["slot_of"][vexpert] = -1
-        else:
-            with self._lock:
-                if not self._free:
-                    self._policy.evict_key(key)
+        with self._lock:
+            slot = self._free.pop() if self._free else None
+        if slot is None:
+            if not threaded:
+                # UNTHREADED (selftests): keep the original synchronous behaviour — evict inline.
+                victim = self._policy.take_victim()
+                if victim is None:
                     return
-                slot = self._free.pop()
+                vslot = self._slot_of_key.pop(victim, None)
+                if vslot is None:
+                    return
+                vlayer, vexpert = divmod(victim, self.num_experts)
+                self._layers[vlayer]["slot_of"][vexpert] = -1
+                self._key_of_slot[vslot] = -1
+                self.stats["evictions"] += 1
+                slot = vslot
+            else:
+                # No slot yet. Do NOT touch the policy: the reference is simply not placed this
+                # time, and `_reclaim` will have capacity ready shortly. Counting it keeps the
+                # stall visible instead of silent.
+                self.stats["deferred"] = self.stats.get("deferred", 0) + 1
+                return
+
+        # We hold a slot, so this cannot evict — but handle it rather than assume it.
+        victim = self._policy.admit(key)
+        if victim is not None:
+            self._queue_retract(victim)
 
         compute = self._compute_stream if threaded else (
             torch.cuda.current_stream(self.device) if cuda else None)
         stream = self._copy_stream
         if cuda:
-            # The slot may have been retracted only moments ago; wait THAT event, not the whole
-            # compute stream, so an unrelated long launch does not stall the copier.
             ev = self._retract_ev.pop(slot, None)
             if ev is not None:
-                stream.wait_event(ev)
+                stream.wait_event(ev)      # this slot's own retraction, not the whole stream
             else:
                 stream.wait_stream(compute)
         import contextlib
@@ -464,25 +503,43 @@ class ExpertResidencyCache:
         if threaded:
             done = torch.cuda.Event()
             done.record(stream)
-            # CLAIM THE SLOT IN THE HOST MAP NOW, not at publish. `_slot_of_key` is the policy's
-            # bookkeeping and the policy runs on THIS thread: if the claim waited for the
-            # scheduler's publish, an expert evicted while its own copy was still in flight would
-            # have no entry to reclaim and `_promote` raised KeyError, killing the manager (measured
-            # 2026-09-08, KeyError(381), cache silently degraded to host reads for the whole run).
-            # The DEVICE table is still published only after the fence, which is the invariant that
-            # matters — this map is host-side and no kernel reads it.
-            self._slot_of_key[key] = slot
+            self._slot_of_key[key] = slot          # host claim now; device publish after the fence
             self._key_of_slot[slot] = key
             with self._lock:
                 self._inflight.append((key, slot, done))
             return
-        # SINGLE-THREAD PATH (selftests / CPU): fence and publish right here, as before.
         if cuda:
             compute.wait_stream(stream)
         L["slot_of"][expert] = slot
         self._slot_of_key[key] = slot
         self._key_of_slot[slot] = key
         self.stats["promotions"] += 1
+
+    def _queue_retract(self, victim: int) -> bool:
+        """Hand one victim's slot to the scheduler for retraction. MANAGER THREAD."""
+        slot = self._slot_of_key.pop(victim, None)
+        if slot is None:
+            return False
+        self._key_of_slot[slot] = -1
+        self.stats["evictions"] += 1
+        with self._lock:
+            self._to_retract.append((victim, slot))
+        return True
+
+    def _reclaim(self, want: int) -> None:
+        """Free capacity AHEAD of demand. MANAGER THREAD.
+
+        The whole point of the split: a slot takes a scheduler round trip to come back, so if
+        reclamation only starts when a miss needs a slot, every miss pays that latency and the
+        cache stops adapting. Keeping a small pool of slots in flight makes replacement continuous
+        — the policy decides WHO leaves, this decides WHEN, and they are different questions.
+        """
+        for _ in range(want):
+            victim = self._policy.take_victim()
+            if victim is None:
+                return
+            if not self._queue_retract(victim):
+                continue
 
     def summary(self) -> str:
         tot = self.stats["hits"] + self.stats["misses"]
@@ -491,5 +548,7 @@ class ExpertResidencyCache:
                 f"fill={len(self._slot_of_key) / max(1, self.slots):.3f} "
                 f"observed_h={h:.4f} refs={tot} promotions={self.stats['promotions']} "
                 f"evictions={self.stats['evictions']} "
-                f"inflight={len(self._inflight)} dropped_refs={self.stats['dropped_refs']} "
+                f"inflight={len(self._inflight)} free={len(self._free)} "
+                f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
+                f"dropped_refs={self.stats['dropped_refs']} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")
