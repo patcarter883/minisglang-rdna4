@@ -189,6 +189,8 @@ class ExpertResidencyCache:
         #: (key, slot, event) copies in flight; the scheduler publishes those that have landed.
         self._inflight: List[Tuple[int, int, Any]] = []
         self._compute_stream = None
+        #: Manager batches between summary lines. 0 disables.
+        self._report_every = _env_int("MINISGL_EXPERT_CACHE_REPORT", 200)
 
     # -- setup -----------------------------------------------------------------------------------
     def register_layer(self, layer_id: int, gate_up: "tuple", down: "tuple") -> None:
@@ -339,6 +341,13 @@ class ExpertResidencyCache:
                           flush=True)
                     return
                 self.stats["manager_batches"] += 1
+                # THE INSTRUMENT. Without a hit rate a flat A/B is uninterpretable: "the cache does
+                # not help" and "the cache never warmed" produce the same TPOT, and this project has
+                # already spent three runs on the second one wearing the first one's face. Printed
+                # from the manager thread, so it also proves the thread is ALIVE — a dead manager
+                # degrades to host reads silently and the line simply stops.
+                if self._report_every and self.stats["manager_batches"] % self._report_every == 0:
+                    print(self.summary(), flush=True)
 
     # -- the scheduler-thread half of the handshake ----------------------------------------------
     def apply_pending(self) -> None:
@@ -479,5 +488,8 @@ class ExpertResidencyCache:
         tot = self.stats["hits"] + self.stats["misses"]
         h = self.stats["hits"] / tot if tot else 0.0
         return (f"[expert-cache] slots={self.slots} resident={len(self._slot_of_key)} "
-                f"observed_h={h:.4f} promotions={self.stats['promotions']} "
-                f"evictions={self.stats['evictions']} drains={self.stats['drains']}")
+                f"fill={len(self._slot_of_key) / max(1, self.slots):.3f} "
+                f"observed_h={h:.4f} refs={tot} promotions={self.stats['promotions']} "
+                f"evictions={self.stats['evictions']} "
+                f"inflight={len(self._inflight)} dropped_refs={self.stats['dropped_refs']} "
+                f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")
