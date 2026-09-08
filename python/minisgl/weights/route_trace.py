@@ -514,7 +514,12 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
         dp_rank=dp_rank,
         expert_bytes=expert_bytes,
         ring_steps=ring,
-        drain_every=env_int("MINISGL_MOE_ROUTE_TRACE_DRAIN", min(512, ring)),
+        # The drain interval is the cache's LEARNING RATE: no reference reaches the policy until a
+        # drain runs, so at the capture default of 512 a serve does hundreds of decode steps with
+        # slot_of stuck at -1 and the cache cannot warm at all. The oracle measured a 64-step
+        # observation lag as free (h 0.8558 -> 0.8563), so observe-only drains at 64.
+        drain_every=env_int("MINISGL_MOE_ROUTE_TRACE_DRAIN",
+                            min(512, ring) if d is not None else min(64, ring)),
         # max_steps bounds the FIXTURE (a 35 MB file is a measurement artefact, not a log). In
         # observe-only mode there is no file and the cache needs references for the life of the
         # serve, so it must never disarm — a tracer that quietly stopped at step 40,000 would

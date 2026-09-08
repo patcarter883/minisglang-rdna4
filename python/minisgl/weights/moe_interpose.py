@@ -312,8 +312,15 @@ def _set_expert_slot_map(*args):
     """
     global _SET_MAP_OP
     if _SET_MAP_OP is None:
-        import torch
-        _SET_MAP_OP = torch.ops.fp8_wmma_C.set_expert_slot_map
+        # THROUGH THE PACKAGE, never `torch.ops.fp8_wmma_C` directly. The op namespace is populated
+        # as a SIDE EFFECT of importing fp8_wmma (that is what loads the extension .so and runs its
+        # TORCH_LIBRARY registration), so reaching into torch.ops first raises
+        # `'_OpNamespace' 'fp8_wmma_C' object has no attribute 'set_expert_slot_map'` whenever this
+        # rank has not imported the package yet — which is exactly what happened on the first serve
+        # that built a cache: the slab was allocated, the ring was subscribed, and every install
+        # then raised. Measured 2026-09-08.
+        import fp8_wmma
+        _SET_MAP_OP = fp8_wmma.set_expert_slot_map
     return _SET_MAP_OP(*args)
 
 

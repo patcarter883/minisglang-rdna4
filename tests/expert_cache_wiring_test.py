@@ -101,3 +101,22 @@ def test_the_quant_method_for_this_checkpoint_declares_a_triple():
     m = create_moe_quant_method(_nvfp4_quant())
     assert isinstance(m, _NvFp4MoEMethod)
     assert len(m.cache_plane_attrs) == 3
+
+
+def test_the_slot_map_op_actually_dispatches_through_the_seam():
+    """THE ONE THAT WAS MISSING. `hasattr(fp8_wmma, "set_expert_slot_map")` passing proves nothing
+    about the path the seam takes: `install()` calls `moe_interpose._set_expert_slot_map`, and that
+    resolved the op as `torch.ops.fp8_wmma_C.set_expert_slot_map`. The op namespace is populated as
+    a SIDE EFFECT of importing fp8_wmma, so on a rank that had not imported the package yet the
+    lookup raised `'_OpNamespace' ... has no attribute 'set_expert_slot_map'` — and it raised on
+    EVERY install, after the slab had been allocated and the ring subscribed. A live serve found it;
+    nothing at import scope could.
+
+    Calls the DISABLE form (all-None), which is the reachability case: it takes no tensor arguments,
+    so it is also the form a backend dispatch key would make unreachable.
+    """
+    pytest.importorskip("fp8_wmma")
+    from minisgl.weights import moe_interpose as mi
+
+    mi._SET_MAP_OP = None                      # force the resolution path this test is about
+    mi._set_expert_slot_map(None, None, None, None, None, None, None)
