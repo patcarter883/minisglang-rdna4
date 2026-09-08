@@ -236,7 +236,7 @@ class TestContainerDtypeGenerality:
     Both functions used to hardcode a 32-bit container: the detector masked `& 0xFFFFFFFF` and
     unpacked `range(8)` nibbles per element, and `apply_ct_sign` reinterpreted its result as
     `torch.int32`. That is a dtype pinned into a shared core, which this repo's rules forbid — and
-    it is not hypothetical: `_GroupedMxFp4Experts`, `_GroupedNvFp4Experts` and `_GroupedRXFExperts`
+    it is not hypothetical: `_GroupedMxFp4Experts` and `_GroupedNvFp4Experts`
     in `layers/moe.py` already ship 4-bit weights in `uint8` containers, and a new int4 weight format
     is supposed to be a loader policy on the existing core rather than a new kernel or a new
     detector. Hand the old code one of those and it read nibble positions 2..7 of every element as

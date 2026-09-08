@@ -159,7 +159,7 @@ def ep_size_of(layer: Any) -> int:
     """This layer's EFFECTIVE expert-parallel size — 1 unless it is genuinely EP-sharded.
 
     All THREE conjuncts `MoELayer.__init__` computes, asked of the built layer rather than of the
-    config: the engine toggle, the quant method's EP veto (`supports_ep` is False for RXF and for
+    config: the engine toggle, the quant method's EP veto (`supports_ep` is False for
     unquantized experts) and `force_no_ep` (the MTP draft head). `MoELayer` collapses them into
     `enable_ep`, so reading `ep_size` WITHOUT `enable_ep` reports the process-wide EP size for a
     layer that is fully replicated — which would halve that layer's traffic figure on a
@@ -375,6 +375,7 @@ class MoEWeightSeam:
         # `computes_on_cpu` only inside the existing `_weight_offload is not None` branch.
         "_cpu_worker",
         "_cpu_expert_offset",
+        "_cache_lid",
     )
 
     def __init__(

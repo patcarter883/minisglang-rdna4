@@ -5,7 +5,7 @@ the two TP ranks ever disagree, and does the plan describe the layer the engine 
 build?* Three clusters:
 
   * EP VETO -- `MoELayer.__init__:967` is a THREE-way conjunction and the planner only transcribed
-    two of them. RXF and unquantized experts are never EP-sharded no matter what `--enable-ep` says.
+    two of them. Unquantized experts are never EP-sharded no matter what `--enable-ep` says.
   * RANK AGREEMENT -- `placement.py` advertises `OffloadPlan.digest()` "so a caller can prove
     agreement across ranks with one tiny collective"; nothing called it, and the plan digest could
     not have caught a sizing divergence anyway because `LayerPlacement` drops the fingerprint.
@@ -37,7 +37,6 @@ from minisgl.weights.sizing import (
     SCHEME_GPTQ,
     SCHEME_MXFP4,
     SCHEME_NVFP4,
-    SCHEME_RXF,
     SCHEME_SUPPORTS_EP,
     SCHEME_UNQUANTIZED,
     scheme_supports_ep,
@@ -50,21 +49,19 @@ def resolve(config=None, **kw):
     return resolve_weight_plan(config if config is not None else make_config(), **kw)
 
 
-RXF_QUANT = FakeQuant(is_rxf=True, is_int4=False, is_compressed_tensors=False, method="rxf")
-
-
 # =================================================================================================
 # EP VETO -- the third conjunct of MoELayer.__init__:967
 # =================================================================================================
 
 
-def test_the_ep_table_names_the_two_methods_that_veto():
-    """`_RXFMoEMethod` says False out loud; `_UnquantizedMoEMethod` says nothing and INHERITS it.
+def test_the_ep_table_names_the_method_that_vetoes():
+    """`_UnquantizedMoEMethod` says nothing and INHERITS `supports_ep = False` from the base.
 
-    Both were missed by the original transcription. Pinning the table here means a future reader who
-    "fixes" one of them has to explain themselves to a test rather than to a serve.
+    Silence rather than a decision is exactly why it was missed by the original transcription and
+    why it is pinned here: a future reader who "fixes" it has to explain themselves to a test
+    rather than to a serve. (RXF was the other veto until it was deleted; the inherited-default
+    hazard it shared with unquantized is the part worth keeping under test.)
     """
-    assert SCHEME_SUPPORTS_EP[SCHEME_RXF] is False
     assert SCHEME_SUPPORTS_EP[SCHEME_UNQUANTIZED] is False
     for kind in (SCHEME_FP8, SCHEME_NVFP4, SCHEME_MXFP4, SCHEME_GPTQ, SCHEME_AWQ, SCHEME_CT_INT4):
         assert SCHEME_SUPPORTS_EP[kind] is True
@@ -76,7 +73,6 @@ def test_the_ep_table_matches_the_live_quant_method_classes():
     from minisgl.layers.moe import create_moe_quant_method
 
     cases = {
-        SCHEME_RXF: RXF_QUANT,
         SCHEME_UNQUANTIZED: None,
         SCHEME_CT_INT4: FakeQuant(),
         SCHEME_NVFP4: FakeQuant(is_nvfp4=True, group_size=16),
@@ -95,7 +91,7 @@ def test_scheme_supports_ep_is_false_for_an_unidentifiable_scheme():
     class Alien:
         method, bits, group_size, sym, weight_type = "alien", 3, 0, True, "?"
         ct_groups = ()
-        is_fp8_w8a8 = is_nvfp4 = is_rxf = weight_is_e2m1 = is_int4 = False
+        is_fp8_w8a8 = is_nvfp4 = weight_is_e2m1 = is_int4 = False
         is_gptq = is_awq = is_compressed_tensors = False
 
     assert scheme_supports_ep(Alien()) is False
@@ -109,10 +105,10 @@ def test_resolve_expert_parallel_honours_the_method_veto():
 
 @pytest.mark.parametrize(
     "quant,label",
-    [(RXF_QUANT, "rxf"), (None, "unquantized")],
+    [(None, "unquantized")],
 )
 def test_a_vetoing_scheme_is_planned_replicated_even_under_enable_ep(quant, label):
-    """THE DEFECT. `--enable-ep --tp 2` on an RXF or unquantized checkpoint builds the layer
+    """THE DEFECT. `--enable-ep --tp 2` on an unquantized checkpoint builds the layer
     REPLICATED with the intermediate tensor-split; the planner sharded it anyway.
 
     The resident-byte totals coincide (`E/2 x 2I` and `E x 2(I/2)` multiply out the same), so bytes
@@ -140,21 +136,21 @@ def test_the_veto_doubles_the_projected_host_traffic_it_used_to_hide():
     """The consequence, priced. Halving top_k halves `distinct_experts` at batch=1, so the whole
     projection -- the K4 kill gate, A1.7, the f-sweep -- read ~2x optimistic on this configuration.
     """
-    mc = make_model_config(quant=RXF_QUANT)
+    mc = make_model_config(quant=None)
     fixed = resolve(make_config(mc, tp=2, enable_ep=True))
     # What the pre-fix planner described: the same config resolved as if EP applied.
     sharded = resolve(make_config(mc, tp=2, enable_ep=False), device_budget_bytes=0)
     assert fixed.layers[0].top_k == 10
     assert fixed.layers[0].num_experts == 512
-    # Both now agree, because the veto puts EP-on and EP-off on the same footing for RXF.
+    # Both now agree: the veto puts EP-on and EP-off on the same footing for a vetoing scheme.
     assert sharded.layers[0].top_k == fixed.layers[0].top_k
     assert fixed.projection.host_ms > 0
 
 
 def test_a_vetoing_scheme_now_gets_the_tp_divisibility_check_it_will_actually_assert():
-    """The EP branch skipped `intermediate % tp_size`, so an RXF checkpoint whose intermediate is not
+    """The EP branch skipped `intermediate % tp_size`, so a vetoing checkpoint whose intermediate is not
     tp-divisible was planned as feasible and then died in `div_even` during the model build."""
-    mc = make_model_config(quant=RXF_QUANT, moe_intermediate_size=769)
+    mc = make_model_config(quant=None, moe_intermediate_size=769)
     with pytest.raises(PlacementError, match="divisible"):
         moe_layer_shapes(make_config(mc, tp=2, enable_ep=True))
 

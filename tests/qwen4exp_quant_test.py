@@ -93,7 +93,7 @@ def main() -> int:
     check("weight_is_e2m1 (MXFP4) must be False", q.weight_is_e2m1, False)
     check("is_int4 must be False", q.is_int4, False)
     check("is_fp8_w8a8 must be False", q.is_fp8_w8a8, False)
-    check("is_awq / is_gptq / is_rxf", (q.is_awq, q.is_gptq, q.is_rxf), (False, False, False))
+    check("is_awq / is_gptq", (q.is_awq, q.is_gptq), (False, False))
     # One config_group -> single-format; the scalars above ARE the whole story and `for_module`
     # degenerates to "self, unless ignored".
     check("ct_groups (single group -> empty)", q.ct_groups, ())

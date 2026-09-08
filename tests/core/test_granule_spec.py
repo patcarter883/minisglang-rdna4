@@ -29,7 +29,6 @@ from minisgl.layers.moe import (
     _GroupedGPTQExperts,
     _GroupedMxFp4Experts,
     _GroupedNvFp4Experts,
-    _GroupedRXFExperts,
 )
 from minisgl.quant.config import QuantConfig
 from minisgl.weights.granule import (
@@ -94,7 +93,6 @@ def _lds_knobs(monkeypatch):
     """Force every format onto its LDS (non-register-direct) arm — the arms whose post_load is pure
     torch. The regdirect arms need the compiled fp8_wmma repack; see test_regdirect_shapes."""
     monkeypatch.setattr(moe_mod.kernels, "MOE_W4A16", "0", raising=False)
-    monkeypatch.setattr(moe_mod.kernels, "RXF_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_MXFP4_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_W8A8_REGDIRECT", False, raising=False)
 
@@ -111,7 +109,6 @@ def _containers(monkeypatch):
     return {
         "gptq": lambda: _load(_GroupedGPTQExperts(E, N, K, _q("gptq", group_size=32, sym=False))),
         "awq": lambda: _load(_GroupedAWQExperts(E, N, K, _q("awq", group_size=32, sym=False))),
-        "rxf": lambda: _load(_GroupedRXFExperts(E, N, K, _q("rxf", group_size=32))),
         "ct_int4_sym": lambda: _load(
             _GroupedCompressedTensorsExperts(E, N, K, _q("compressed-tensors", sym=True))
         ),
@@ -132,7 +129,7 @@ def _containers(monkeypatch):
 
 
 ALL_FORMATS = [
-    "gptq", "awq", "rxf", "ct_int4_sym", "ct_int4_asym", "mxfp4", "nvfp4", "fp8", "unquantized",
+    "gptq", "awq", "ct_int4_sym", "ct_int4_asym", "mxfp4", "nvfp4", "fp8", "unquantized",
 ]
 
 

@@ -1060,7 +1060,7 @@ class TestEPTrafficIsPerRank:
 
     def test_ep_size_is_ignored_when_the_layer_is_not_actually_sharded(self):
         """The trap: `ep_size` is the PROCESS-wide value and stays set on a layer whose quant
-        method vetoed EP (`supports_ep` is False for RXF and for unquantized experts) or which was
+        method vetoed EP (`supports_ep` is False for unquantized experts) or which was
         built `force_no_ep=True` (the MTP draft head). Such a layer is fully REPLICATED, so reading
         `ep_size` without `enable_ep` would halve its traffic figure."""
         assert ep_size_of(self._ep_layer(enable_ep=False, ep_size=2)) == 1

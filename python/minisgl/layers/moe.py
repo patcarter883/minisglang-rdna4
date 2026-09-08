@@ -144,50 +144,6 @@ class _GroupedAWQExperts(ExpertContainer, BaseOP):
         del self.qweight, self.scales, self.qzeros
 
 
-class _GroupedRXFExperts(ExpertContainer, BaseOP):
-    """RXF W4(NL)-A8 experts for one MoE GEMM (w13 or w2), STACKED over E.
-
-    RXF ships weights op-layout already (no AWQ/GPTQ unpack-transpose-repack): weight_packed
-    (E, N, K/2) uint8 NL indices, weight_scale (E, N, K/32) fp16 per-group scale, group=32,
-    symmetric NL codebook (no zero-points). N=out, K=in per expert. `post_load` transposes the SCALE
-    to group-major (E, K/32, N) — the op indexes it `[g*N + n]`, so N must be the contiguous axis for
-    the 16-lane fragment read to coalesce. Consumed by kernels.rxf_moe."""
-
-    def __init__(self, num_experts: int, out_features: int, in_features: int, quant: "QuantConfig"):
-        N, K = out_features, in_features
-        span = quant.rotation_span
-        assert K % 32 == 0 and K % span == 0 and K % 2 == 0, (
-            f"grouped RXF needs K%32==0,K%span({span})==0,K%2==0; got N={N},K={K}"
-        )
-        self.weight_packed = torch.empty((num_experts, N, K // 2), dtype=torch.uint8)
-        self.weight_scale = torch.empty((num_experts, N, K // 32), dtype=torch.float16)
-        self._quant = quant
-        # E recorded, never inferred — see weights/granule.py::ExpertContainer.
-        self._num_experts = num_experts
-
-    def forward(self, *args, **kwargs):  # pragma: no cover - storage container, never called
-        raise RuntimeError("_GroupedRXFExperts holds weights; call kernels.rxf_moe instead")
-
-    def post_load(self) -> None:
-        # GROUP-MAJOR scale, for BOTH the LDS and register-direct paths (they share the same kernel
-        # scale contract, so this must NOT sit behind the RXF_REGDIRECT gate — that would feed the
-        # LDS path a channel-major tensor and silently compute wrong numbers).
-        self.weight_scale = self.weight_scale.transpose(1, 2).contiguous()  # (E, N, K/32) -> (E, K/32, N)
-        # Register-direct b128: pre-permute the NL codes into WMMA-B lane order (repack_rxf_w_rep_moe)
-        # for kernels.rxf_moe_regdirect (~2x the LDS-staged rxf_moe at decode). Drop weight_packed
-        # (the LDS path's buffer) — never both. Off -> keep the as-is buffers for the LDS rxf_moe.
-        if not kernels.RXF_REGDIRECT:
-            return
-        import fp8_wmma  # rxf folded into fp8_wmma
-
-        E, N, Kp = self.weight_packed.shape
-        ktiles = (Kp * 2) // 16
-        wide = 4 if ktiles % 4 == 0 else 2  # b128 when K%64==0 (ZAYA), else b64
-        self._w_rep = fp8_wmma.rxf_repack_w_rep_moe(self.weight_packed.contiguous(), wide)
-        self._wide = wide
-        del self.weight_packed
-
-
 class _GroupedCompressedTensorsExperts(ExpertContainer, BaseOP):
     """compressed-tensors int4 *weight-only* (W4A16) experts for one MoE GEMM (w13 or w2), STACKED
     over E. The checkpoint ships (N=out, K=in per expert):
@@ -410,7 +366,7 @@ class _GroupedNvFp4Experts(ExpertContainer, BaseOP):
     `post_load` packs the nibbles to (E,N,K//8) int32 codes, transposes the block scale group-major,
     and bitcasts the global to int32 so it can ride the kernel's `w_zeros` POINTER SLOT — NVFP4 is
     symmetric, so that slot is otherwise null and there is no op-schema change (precedent:
-    `_GroupedRXFExperts` threads the RXF NL codebook the same way). `kernels.w4a8_moe(...,
+    the NVFP4 path threads its global scale the same way). `kernels.w4a8_moe(...,
     weight_is_e2m1=True)` at group_size 16 then consumes `_w_op/_scales_op/_global_op`; the kernel
     picks `w4a8_tile::E4m3GroupScaleGlobal` vs `Fp16GroupScale` off the SCALES DTYPE, so there is no
     flag to get out of sync. Symmetric — there are no zero-points to displace."""
@@ -845,42 +801,6 @@ class _NvFp4MoEMethod(MoEQuantMethod):
         )
 
 
-class _RXFMoEMethod(MoEQuantMethod):
-    """RXF W4(NL)-A8 grouped experts (`kernels.rxf_moe`). No EP path (RXF has no precomputed-topk
-    shard route, which EP requires) — stays replicated."""
-
-    supports_ep = False
-
-    def __init__(self, quant: "QuantConfig"):
-        self._quant = quant
-
-    def create_experts(self, num_experts, out_features, in_features):
-        return _GroupedRXFExperts(num_experts, out_features, in_features, self._quant)
-
-    def apply(self, w13, w2, hidden_states, *, router_logits, topk_weights, topk_ids,
-              top_k, renormalize, activation, apply_router_weight_on_input,
-              x_fp8=None, act_scales=None):
-        # Still silu-ONLY, deliberately: both `kernels.rxf_moe` and `rxf_moe_regdirect` hard-code
-        # silu_and_mul on their tail, and no RXF checkpoint we serve declares a gelu. Rejecting is the
-        # point — the alternative is a gelu model quietly getting silu experts. Adding gelu here is
-        # the same one-line policy threading w4a8_moe just got, on those two functions.
-        _check_activation("RXF", activation, allowed=("silu",))
-        assert not apply_router_weight_on_input, "MoE RXF path has no router-weight-on-input"
-        if getattr(w13, "_w_rep", None) is not None:
-            # Register-direct b128 (LDS-bypass) — the default RXF path (~2x rxf_moe at decode,
-            # bit-exact). post_load built _w_rep/_wide and dropped weight_packed.
-            return kernels.rxf_moe_regdirect(
-                hidden_states, w13._w_rep, w13.weight_scale, w2._w_rep, w2.weight_scale,
-                top_k, topk_weights=topk_weights, topk_ids=topk_ids,
-                span=self._quant.rotation_span, wide=w13._wide,
-            )
-        return kernels.rxf_moe(
-            hidden_states, w13.weight_packed, w13.weight_scale, w2.weight_packed, w2.weight_scale,
-            router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
-            span=self._quant.rotation_span,
-        )
-
-
 class _FP8MoEMethod(MoEQuantMethod):
     """fp8 W8A8 experts (ZAYA): F8_E4M3 weights + a per-output-channel f32 scale, fed to the native
     `kernels.w8a8_moe` fp8-WMMA kernel with per-token fp8 activations — the CHECKPOINT-DECLARED
@@ -973,7 +893,6 @@ def create_moe_quant_method(
     quant.method.create_linear_method for dense linears). Route:
       * fp8 W8A8 (compressed-tensors float-quantized 8-bit, or the explicit `fp8_experts` signal) ->
         native w8a8_moe (per-token fp8 acts; W8A16 is an env opt-in, never the default);
-      * RXF -> rxf_moe;
       * MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the shared w4a8_moe kernel with
         weight_is_e2m1=True (same kernel, e2m1 decode + E8M0->fp16 group scale);
       * int4 AWQ / GPTQ / compressed-tensors int4 -> the shared w4a8_moe kernel;
@@ -990,8 +909,6 @@ def create_moe_quant_method(
         # that shape is what lets the gate/up merge and the expert stack carry the global with no
         # special case. See _GroupedNvFp4Experts / nvfp4.nvfp4_leaf_scales.
         return _NvFp4MoEMethod(quant)
-    if quant.is_rxf:
-        return _RXFMoEMethod(quant)
     if quant.weight_is_e2m1:
         return _MxFp4MoEMethod(quant)
     if quant.is_int4:
@@ -1042,7 +959,7 @@ class MoELayer(BaseOP):
         # (fp8 AND quantized: _w_op/_scales_op/_zeros_op / weight_packed) puts E on dim 0, and every
         # grouped kernel reads E = w13.shape[0], so a shard is a pure dim-0 slice — EP is quant-agnostic
         # for the W4A8 (GPTQ/AWQ) and W4A16 (compressed-tensors) op layouts (shared w4a8_moe kernel) and
-        # the fp8 W8A8/W8A16 layouts. RXF is excluded (no precomputed-topk path, which EP requires).
+        # the fp8 W8A8/W8A16 layouts.
         # `force_no_ep` keeps a specific layer replicated even under EP — used for the tiny MTP draft
         # head, whose EP-sharding would make spec-decode propose issue data-dependent collectives.
         # Config-driven expert quant method (mirrors create_linear_method for the dense linears): it
@@ -1077,9 +994,9 @@ class MoELayer(BaseOP):
         intermediate_size_per_partition = (
             intermediate_size if self.enable_ep else div_even(intermediate_size, tp_size))
         # The method allocates the per-expert container for each GEMM (config-driven: fp8 F8_E4M3,
-        # int4 W4A8/W4A16 grouped, RXF NL, or a plain stacked bf16/fp16 tensor). EP: size to the LOCAL
+        # int4 W4A8/W4A16 grouped, or a plain stacked bf16/fp16 tensor). EP: size to the LOCAL
         # expert shard (E/dp) so this replica loads + runs only its experts; the streaming loader skips
-        # non-local ids (weight.py mirror). enable_ep off (unquantized, RXF, force_no_ep) =>
+        # non-local ids (weight.py mirror). enable_ep off (unquantized, force_no_ep) =>
         # local_num_experts == num_experts (full replicated). Both GEMMs, w13 = gate|up (2*inter), w2 =
         # down (hidden), share the method and the silu_and_mul convention.
         self.gate_up_proj = self._moe_method.create_experts(

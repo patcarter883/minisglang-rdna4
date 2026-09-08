@@ -359,7 +359,7 @@ def _tp_structure(llm, tp: int, rank: int, model_dir: str) -> dict:
         check_true(
             "CT sign decisions agree across ranks",
             all((g or {}).get("ct") == ref["ct"] for g in gathered),
-            f"{len(ref['ct'])} CT container(s) — 0 means this checkpoint has none (NVFP4/MXFP4/RXF "
+            f"{len(ref['ct'])} CT container(s) — 0 means this checkpoint has none (NVFP4/MXFP4 "
             f"declare no _ct_sign, so the gate is a no-op here and only the AWQ arm exercises it)",
         )
         out["ct_sign_cross_rank"] = (

@@ -347,7 +347,7 @@ class Engine:
         # stack is only a tie when you can see all of it, which no rank ever does. One
         # all_gather_object of a dict of bools on the gloo group the engine already built. Runs
         # unconditionally so a checkpoint that develops the problem cannot boot quietly; it is a
-        # no-op at TP=1 and on every model with no CT containers (NVFP4/MXFP4/RXF declare none).
+        # no-op at TP=1 and on every model with no CT containers (NVFP4/MXFP4 declare none).
         from minisgl._hip_engage import engaged
         from minisgl.quant.method import verify_ct_sign_across_ranks
 

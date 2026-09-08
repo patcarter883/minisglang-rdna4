@@ -701,7 +701,8 @@ class Glm4MoeLiteForCausalLM(BaseLLMModel):
         # MTP self-speculation head (model.layers.<num_layers>). Built only when the checkpoint ships
         # one (num_nextn_predict_layers>0). Its MoE follows the checkpoint's precision: quantized only
         # if the head's module is NOT in the quant ignore list. A checkpoint may keep the MTP head
-        # bf16/fp16 on a quantized backbone (e.g. GLM-RXF keeps layers.<num_layers> unquantized) — then
+        # bf16/fp16 on a quantized backbone (some GLM checkpoints keep layers.<num_layers>
+        # unquantized) — then
         # build it unquantized so its full-precision weights load (QuantConfig.is_module_quantized).
         mtp_quant = expert_quant
         if expert_quant is not None and not expert_quant.is_module_quantized(

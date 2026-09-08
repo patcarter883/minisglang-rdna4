@@ -631,7 +631,7 @@ class ModelConfig:
         num_nextn_predict_layers = getattr(config, "num_nextn_predict_layers", 0) or 0
         mtp_num_hidden_layers = getattr(config, "mtp_num_hidden_layers", 0) or 0
         # Some checkpoints ship the MTP-head TENSORS but leave the count at 0 in config (e.g. a quant
-        # tool that dropped the field — GLM-4.7-Flash-RXF). MINISGL_NUM_NEXTN / MINISGL_MTP_LAYERS
+        # tool that dropped the field). MINISGL_NUM_NEXTN / MINISGL_MTP_LAYERS
         # force the head on so spec-decode can use it. 0/unset -> trust the config.
         _mtp_forced = False
         if (_nn := os.environ.get("MINISGL_NUM_NEXTN")):

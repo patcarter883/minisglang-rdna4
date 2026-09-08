@@ -89,7 +89,7 @@ class _MethodLinear(nn.Module):
     bridge — GDNLinearAttn delegating to the wrapped module with assign=True — loads it), but
     delegates weight layout + the GEMM to the GENERIC minisgl `LinearMethod` (the same
     `create_linear_method` the dense/MoE linears use: W4A8 for AWQ/GPTQ/compressed-tensors int4,
-    RXF for rxf, any future scheme for free). It registers the method's CHECKPOINT buffers
+    any future scheme for free). It registers the method's CHECKPOINT buffers
     (weight_packed/scale[/zero_point]) as nn buffers so load reaches them; `process_quant()`
     converts them to op layout (post-load); forward runs the method's quantized matmul.
 

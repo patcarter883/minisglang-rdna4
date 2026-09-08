@@ -232,16 +232,21 @@ def test_the_compressed_tensors_symmetric_zeros_are_a_row_of_their_own():
     assert dict(s.rows)["w13.post_load"] == 512 * (2048 // 32) * ((2 * 384) // 8) * 4
 
 
-def test_the_mxfp4_scale_row_WIDENS_instead_of_gaining_a_sibling():
-    """E8M0 u8 -> fp16 on the SAME buffer. Two half-size rows pack into a chunk tail that one
-    full-size row does not, so modelling the widening as a separate row would make the reservation
-    optimistic in exactly the place the never-straddle rule bites."""
+def test_the_mxfp4_scale_row_IS_THE_E8M0_BYTE_and_gains_no_sibling():
+    """One u8 row, no widening and no post_load sibling.
+
+    The E8M0 byte now reaches the kernel natively, so `post_load` leaves the buffer alone. Two
+    things are pinned here and they pull in opposite directions: the row must be charged at ONE
+    byte per group (charging two over-reserves and silently shrinks the KV pool), and the widening
+    must not reappear as a SEPARATE row either — two half-size rows pack into a chunk tail that one
+    full-size row does not, so a sibling row would make the reservation optimistic in exactly the
+    place the never-straddle rule bites."""
     mx = FakeQuant(is_int4=False, is_compressed_tensors=False, weight_is_e2m1=True, group_size=32)
     s = _sized(mx)
     names = [n for n, _ in s.rows]
     assert "w13.post_load" not in names
     E, N, K = 512, 2 * 384, 2048
-    assert dict(s.rows)["w13.scale"] == E * N * (K // 32) * 2   # u8 charged, then widened to fp16
+    assert dict(s.rows)["w13.scale"] == E * N * (K // 32)   # 1 B/group, native E8M0
     assert sum(nb for _, nb in s.rows) == s.total
 
 

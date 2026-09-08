@@ -42,7 +42,7 @@ from typing import Any, Dict, Optional, Tuple
 
 # ---------------------------------------------------------------------------------------------
 # Scheme identification. Mirrors `layers/moe.py::create_moe_quant_method` ORDER EXACTLY -- the
-# dispatch there is `fp8 -> unquantized -> nvfp4 -> rxf -> e2m1 -> int4 -> raise`, and getting the
+# dispatch there is `fp8 -> unquantized -> nvfp4 -> e2m1 -> int4 -> raise`, and getting the
 # order wrong silently sizes an NVFP4 checkpoint as if it were MXFP4 (different group size, 2x the
 # scale bytes). Keyed on the same QuantConfig predicates, never on a model name.
 # ---------------------------------------------------------------------------------------------
@@ -50,7 +50,6 @@ from typing import Any, Dict, Optional, Tuple
 SCHEME_UNQUANTIZED = "unquantized"
 SCHEME_FP8 = "fp8"
 SCHEME_NVFP4 = "nvfp4"
-SCHEME_RXF = "rxf"
 SCHEME_MXFP4 = "mxfp4"
 SCHEME_GPTQ = "gptq"
 SCHEME_AWQ = "awq"
@@ -72,8 +71,7 @@ _INT4_SCHEMES = (SCHEME_GPTQ, SCHEME_AWQ, SCHEME_CT_INT4)
 # -- the quant method holds a VETO over `--enable-ep`, and a planner that reads only the engine-level
 # toggle shards experts the engine will not shard.
 #
-# TWO of the six methods veto, and both are easy to miss because neither says so in its name:
-#   * `_RXFMoEMethod`         `supports_ep = False` (moe.py:805) -- "no precomputed-topk shard route".
+# ONE of the five methods vetoes, and it is easy to miss because it does not say so in its name:
 #   * `_UnquantizedMoEMethod` (moe.py:585) never sets it at all, so it INHERITS the base-class
 #     default `supports_ep: bool = False` (moe.py:528). Silence, not a decision -- which is exactly
 #     why it is spelled out here rather than assumed.
@@ -83,7 +81,6 @@ SCHEME_SUPPORTS_EP: Dict[str, bool] = {
     SCHEME_FP8: True,  # _FP8MoEMethod   (moe.py:846)
     SCHEME_UNQUANTIZED: False,  # _UnquantizedMoEMethod inherits the base False (moe.py:528/585)
     SCHEME_NVFP4: True,  # _NvFp4MoEMethod (moe.py:770)
-    SCHEME_RXF: False,  # _RXFMoEMethod   (moe.py:805) -- the explicit veto
     SCHEME_MXFP4: True,  # _MxFp4MoEMethod (moe.py:707)
     SCHEME_GPTQ: True,  # _W4A8MoEMethod  (moe.py:617)
     SCHEME_AWQ: True,
@@ -263,9 +260,6 @@ def _scheme_from_quant(quant: Any, fp8_experts: bool, compute_dtype_bytes: int) 
         # (E,N,K/2) u8 + (E,N,K/16) float8_e4m3fn + (E,N) f32 -- see `_checkpoint_gemm_bytes`.
         return ExpertScheme(SCHEME_NVFP4, bits=4, group_size=g or 16, sym=True,
                             elem_bytes=compute_dtype_bytes)
-    if bool(getattr(quant, "is_rxf", False)):
-        return ExpertScheme(SCHEME_RXF, bits=4, group_size=32, sym=True,
-                            elem_bytes=compute_dtype_bytes)
     if bool(getattr(quant, "weight_is_e2m1", False)):
         return ExpertScheme(SCHEME_MXFP4, bits=4, group_size=g or 32, sym=True,
                             elem_bytes=compute_dtype_bytes)
@@ -327,7 +321,7 @@ class PostLoadDelta:
     Every other container's `post_load` is a permutation or a same-size repack: GPTQ/AWQ
     `(E,K/pf,N)->(E,N,K/pf)`, CT-asymmetric `(E,N/pf,G)->(E,G,N/pf)`, NVFP4 `u8 (E,N,K/2)` ->
     `i32 (E,N,K/8)` plus an e4m3 `transpose(1,2)` and an f32->i32 BITCAST of the global (all three
-    same-size), fp8 `view(uint8)` + `squeeze(-1)`, RXF `transpose(1,2)`. Those are 0 here, and
+    same-size) and fp8 `view(uint8)` + `squeeze(-1)`. Those are 0 here, and
     the `_w_rep`/`_scales_rd` register-direct repacks go through kernels this file cannot see — if
     one of those ever pads, only the post-`post_load()` reconciliation can catch it.
     """
@@ -356,13 +350,13 @@ def post_load_delta_bytes(
         )
     if scheme.kind == SCHEME_MXFP4:
         _require_div(K, g, "MXFP4 K")
-        # E8M0 uint8 -> fp16 group scale: +1 byte per group, per expert, on BOTH the LDS
-        # (`_scales_op`) and the register-direct (`_scales_rd`) arms.
-        return PostLoadDelta(
-            resident=E * N * (K // g),
-            granule=N * (K // g),
-            note=f"_scales_op E8M0 u8 -> fp16, +E*N*K/{g}*1",
-        )
+        # ZERO since the E8M0 scale byte started going to the kernel NATIVELY (the E8m0GroupScale
+        # WSP policy decodes `s << 23` as fp32 in-register). post_load used to widen u8 -> fp16 for
+        # both the LDS (`_scales_op`) and register-direct (`_scales_rd`) arms, costing +E*N*K/g
+        # bytes per container; it no longer does, so charging for it over-reserves the arena and
+        # under-sizes the KV pool by the same amount. The scale is resident at its CHECKPOINT size,
+        # which `analytic_gemm_bytes` already counts.
+        return PostLoadDelta()
     return PostLoadDelta()
 
 
@@ -463,14 +457,10 @@ def _checkpoint_gemm_bytes(
     if kind == SCHEME_FP8:
         # weight (E,N,K) f8_e4m3 + weight_scale (E,N,1) f32 -- per-OUTPUT-CHANNEL, not per group.
         return GemmBytes(E * N * K, E * N * 4, 0, E, kind, "E*N*K*1 + E*N*4")
-    if kind == SCHEME_RXF:
-        # weight_packed (E,N,K/2) u8 + weight_scale (E,N,K/32) f16. Span-32 by construction.
-        _require_div(K, 32, "RXF K")
-        return GemmBytes(E * N * (K // 2), E * N * (K // 32) * 2, 0, E, kind,
-                         "E*N*K/2 + E*N*K/32*2")
     if kind == SCHEME_MXFP4:
         # weight_packed (E,N,K/2) u8 + weight_scale (E,N,K/g) u8 (E8M0 exponent, 1 byte).
-        # post_load widens that scale to fp16 on BOTH arms -- see `post_load_delta_bytes`.
+        # The byte reaches the kernel NATIVELY -- post_load no longer widens it to fp16, so
+        # there is no post-load delta here (see `post_load_delta_bytes`).
         _require_div(K, g, "MXFP4 K")
         return GemmBytes(E * N * (K // 2), E * N * (K // g), 0, E, kind,
                          f"E*N*K/2 + E*N*K/{g}*1")

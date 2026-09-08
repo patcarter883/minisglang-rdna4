@@ -20,7 +20,6 @@ from minisgl.weights.sizing import (
     SCHEME_GPTQ,
     SCHEME_MXFP4,
     SCHEME_NVFP4,
-    SCHEME_RXF,
     SCHEME_SUPPORTS_EP,
     SCHEME_UNKNOWN,
     SCHEME_UNQUANTIZED,
@@ -45,7 +44,6 @@ class FakeQuant:
         self.ct_groups = kw.pop("ct_groups", ())
         self.is_fp8_w8a8 = kw.pop("is_fp8_w8a8", False)
         self.is_nvfp4 = kw.pop("is_nvfp4", False)
-        self.is_rxf = kw.pop("is_rxf", False)
         self.weight_is_e2m1 = kw.pop("weight_is_e2m1", False)
         self.is_int4 = kw.pop("is_int4", True)
         self.is_gptq = kw.pop("is_gptq", False)
@@ -69,7 +67,7 @@ def test_fp8_wins_over_every_other_predicate():
     """`create_moe_quant_method` tests fp8 FIRST. A checkpoint that is both fp8-declared and
     int4-shaped must size as fp8, or ZAYA's 8 GB expert stack is sized as 4 GB and the arena is
     half what it needs."""
-    q = FakeQuant(is_fp8_w8a8=True, is_int4=True, is_nvfp4=True, is_rxf=True)
+    q = FakeQuant(is_fp8_w8a8=True, is_int4=True, is_nvfp4=True)
     assert scheme_from_quant(q).kind == SCHEME_FP8
 
 
@@ -84,11 +82,6 @@ def test_nvfp4_wins_over_e2m1():
     q = FakeQuant(is_nvfp4=True, weight_is_e2m1=True, group_size=16, is_int4=False)
     assert scheme_from_quant(q).kind == SCHEME_NVFP4
     assert scheme_from_quant(q).group_size == 16
-
-
-def test_rxf_wins_over_e2m1():
-    q = FakeQuant(is_rxf=True, weight_is_e2m1=True, is_int4=False)
-    assert scheme_from_quant(q).kind == SCHEME_RXF
 
 
 def test_int4_methods_split_by_checkpoint_layout():
@@ -187,11 +180,11 @@ def test_symmetric_ct_zeros_are_resident_but_not_part_of_the_granule():
     assert d.granule == 0
 
 
-def test_mxfp4_scale_is_one_byte_e8m0_on_disk_and_two_bytes_resident():
+def test_mxfp4_scale_is_one_byte_e8m0_on_disk_and_stays_one_byte_resident():
     """The whole reason NVFP4 and MXFP4 must not be conflated, in one assertion -- plus the fact
-    that MXFP4's E8M0 uint8 scale is widened to fp16 by `post_load` on BOTH arms
-    (`convert_mxfp4_moe` -> `_scales_op`, `mxfp4_to_w_rep_moe` -> `_scales_rd`), so the resident
-    scale is 2 bytes even though the checkpoint's is 1."""
+    that MXFP4's E8M0 uint8 scale is NOT widened by `post_load` any more: the byte goes to the
+    kernel natively (the E8m0GroupScale WSP policy decodes `s << 23` in-register), so the resident
+    scale is the checkpoint's 1 byte per group on both arms."""
     mx = analytic_gemm_bytes(ExpertScheme(SCHEME_MXFP4, bits=4, group_size=32), E, N, K)
     nv = analytic_gemm_bytes(ExpertScheme(SCHEME_NVFP4, bits=4, group_size=16), E, N, K)
     assert mx.weight == nv.weight == E * N * (K // 2)
@@ -203,11 +196,12 @@ def test_mxfp4_scale_is_one_byte_e8m0_on_disk_and_two_bytes_resident():
     assert nv.scale == 2 * mx.scale  # twice as MANY groups, half the bytes each
     assert nv.scale2 == E * N * 4
     assert nv.checkpoint_total == nv.weight + nv.scale + nv.scale2
-    # post_load widens E8M0 -> fp16: +1 byte per group scale, per expert, and it IS per-expert so
-    # it is charged to the granule as well as to residency.
-    assert mx.post_load_resident == E * N * (K // 32)
-    assert mx.post_load_granule == N * (K // 32)
-    assert mx.total == mx.checkpoint_total + E * N * (K // 32)
+    # No post_load growth at all: the scale is resident at its checkpoint size. A non-zero delta
+    # here is the stale fp16-widening charge, which over-reserves the weight arena and shrinks the
+    # KV pool by E*N*K/32 per container with no error anywhere.
+    assert mx.post_load_resident == 0
+    assert mx.post_load_granule == 0
+    assert mx.total == mx.checkpoint_total
     # NVFP4's post_load is a pack + a transpose + a BITCAST -- three same-size operations.
     assert nv.post_load_resident == 0
 
@@ -243,7 +237,6 @@ def test_nvfp4_two_level_scale_is_smaller_than_the_fp16_fold_it_replaced():
     [
         ExpertScheme(SCHEME_UNQUANTIZED, bits=16),
         ExpertScheme(SCHEME_FP8, bits=8),
-        ExpertScheme(SCHEME_RXF, bits=4, group_size=32),
         ExpertScheme(SCHEME_NVFP4, bits=4, group_size=16),
         ExpertScheme(SCHEME_GPTQ, bits=4, group_size=128),
         ExpertScheme(SCHEME_AWQ, bits=4, group_size=128),
@@ -261,12 +254,6 @@ def test_every_other_container_is_byte_invariant_across_post_load(scheme):
     gb = analytic_gemm_bytes(scheme, E, N, K)
     assert gb.post_load_resident == 0 and gb.post_load_granule == 0
     assert gb.total == gb.checkpoint_total
-
-
-def test_rxf_is_span32_by_construction():
-    got = analytic_gemm_bytes(ExpertScheme(SCHEME_RXF, bits=4, group_size=32), E, N, K)
-    assert got.weight == E * N * (K // 2)
-    assert got.scale == E * N * (K // 32) * 2
 
 
 def test_indivisible_shape_raises_rather_than_rounding():
@@ -386,7 +373,6 @@ class UnknownQuant:
     ct_groups = ()
     is_fp8_w8a8 = False
     is_nvfp4 = False
-    is_rxf = False
     weight_is_e2m1 = False
     is_int4 = False
     is_gptq = False

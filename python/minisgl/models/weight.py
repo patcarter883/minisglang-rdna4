@@ -744,7 +744,7 @@ def _ep_expert_shard(config) -> Tuple[bool, int, int]:
     sharding, each replica keeps only experts [offset : offset+local) and stacks them at local ids
     0..local-1; off => (False, num_experts, 0) i.e. the full replicated stack (unchanged). Only the
     EP-eligible quant formats shard — W4A8 (GPTQ/AWQ) and W4A16 (compressed-tensors), which share the
-    w4a8_moe op layout; RXF and unquantized experts are replicated (must match the MoELayer decision or
+    w4a8_moe op layout; unquantized experts are replicated (must match the MoELayer decision or
     the loaded stack won't fit the buffer). fp8/ZAYA has its own sharded loader (_load_zaya_weight)."""
     q = getattr(config, "quant", None)
     ep_quant = q is not None and (q.is_gptq or q.is_awq or q.is_compressed_tensors)
@@ -1995,7 +1995,7 @@ def _load_zaya_weight(
         local_id = gid - ep_offset
         native_key = f"{m.group('prefix')}.{_FC_TO_NATIVE[m.group('fc')]}"
         field = m.group("field")
-        # Field-agnostic: fp8 experts ship {weight, weight_scale}; RXF experts ship {weight_packed,
+        # Field-agnostic: fp8 experts ship {weight, weight_scale}; 4-bit experts ship {weight_packed,
         # weight_scale}. Accumulate whatever fields the checkpoint has, stack each independently over E.
         fields = expert_buf.setdefault(native_key, {})
         slots = fields.setdefault(field, {})

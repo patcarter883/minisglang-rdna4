@@ -45,7 +45,6 @@ from minisgl.layers.moe import (
     _GroupedGPTQExperts,
     _GroupedMxFp4Experts,
     _GroupedNvFp4Experts,
-    _GroupedRXFExperts,
 )
 from minisgl.quant.config import QuantConfig
 from minisgl.weights.granule import (
@@ -195,7 +194,6 @@ def _fill(t: torch.Tensor, seed: int, kind: str = "random") -> torch.Tensor:
 
 def _lds(monkeypatch):
     monkeypatch.setattr(moe_mod.kernels, "MOE_W4A16", "0", raising=False)
-    monkeypatch.setattr(moe_mod.kernels, "RXF_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_MXFP4_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_W8A8_REGDIRECT", False, raising=False)
 
@@ -216,7 +214,6 @@ def _load(container):
 _FORMATS = {
     "gptq": lambda: _GroupedGPTQExperts(E, N, K, _q("gptq", sym=False)),
     "awq": lambda: _GroupedAWQExperts(E, N, K, _q("awq", sym=False)),
-    "rxf": lambda: _GroupedRXFExperts(E, N, K, _q("rxf")),
     "ct_sym": lambda: _GroupedCompressedTensorsExperts(E, N, K, _q("compressed-tensors", sym=True)),
     "ct_asym": lambda: _GroupedCompressedTensorsExperts(E, N, K, _q("compressed-tensors", sym=False)),
     "mxfp4": lambda: _GroupedMxFp4Experts(E, N, K, _q("compressed-tensors", weight_type="float")),

@@ -40,7 +40,6 @@ from minisgl.layers.moe import (
     _GroupedGPTQExperts,
     _GroupedMxFp4Experts,
     _GroupedNvFp4Experts,
-    _GroupedRXFExperts,
 )
 from minisgl.quant.config import QuantConfig
 from minisgl.weights import sizing
@@ -93,7 +92,6 @@ def _load(container, seed: int = 0):
 
 def _built(monkeypatch, cls, quant, *, shape=(N, K), **kw):
     monkeypatch.setattr(moe_mod.kernels, "MOE_W4A16", "0", raising=False)
-    monkeypatch.setattr(moe_mod.kernels, "RXF_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_MXFP4_REGDIRECT", False, raising=False)
     monkeypatch.setattr(moe_mod.kernels, "MOE_W8A8_REGDIRECT", False, raising=False)
     n, k = shape
@@ -104,7 +102,6 @@ def _built(monkeypatch, cls, quant, *, shape=(N, K), **kw):
 CASES = {
     "gptq": (_GroupedGPTQExperts, lambda: _q("gptq", group_size=32, sym=False)),
     "awq": (_GroupedAWQExperts, lambda: _q("awq", group_size=32, sym=False)),
-    "rxf": (_GroupedRXFExperts, lambda: _q("rxf", group_size=32)),
     "ct_int4_sym": (_GroupedCompressedTensorsExperts, lambda: _q("compressed-tensors", sym=True)),
     "ct_int4_asym": (_GroupedCompressedTensorsExperts, lambda: _q("compressed-tensors", sym=False)),
     "nvfp4": (
@@ -202,10 +199,16 @@ def test_symmetric_ct_zeros_are_replicated_in_the_granule_but_CHARGED_as_residen
     assert analytic.total == spec.total_bytes
 
 
-def test_mxfp4_scale_widens_at_post_load(monkeypatch):
-    """The MXFP4 checkpoint's E8M0 group scale is 1 byte; `post_load` converts it to an fp16 group
-    scale, so the OFFLOADED bytes are 2 per group. Pinned on both sides so neither can move alone:
-    the checkpoint term stays 1 byte/group, and the RESIDENT total carries the widening."""
+def test_mxfp4_scale_stays_one_byte_through_post_load(monkeypatch):
+    """The MXFP4 checkpoint's E8M0 group scale is 1 byte and STAYS 1 byte: it reaches the kernel
+    natively (the E8m0GroupScale WSP policy decodes `s << 23` in-register), so `post_load` no
+    longer widens it to fp16.
+
+    This test asserted the OPPOSITE until the native path landed, and it is the reason the stale
+    charge was caught: `post_load_delta_bytes` still billed +E*N*K/g for a widening that no longer
+    happens, which over-reserves the weight arena and under-sizes the KV pool by exactly that much
+    — a silent capacity loss, not an error. Pinned on both sides so neither can move alone: the
+    checkpoint term is 1 byte/group and the RESIDENT total equals it."""
     quant = _q("compressed-tensors", group_size=32, weight_type="float",
                ct_format="mxfp4-pack-quantized")
     c = _built(monkeypatch, _GroupedMxFp4Experts, quant)
@@ -217,12 +220,13 @@ def test_mxfp4_scale_widens_at_post_load(monkeypatch):
     weight_bytes = by_name["_w_op"].nbytes * E
     scale_bytes = by_name["_scales_op"].nbytes * E
     assert weight_bytes == analytic.weight
-    assert scale_bytes == 2 * analytic.scale, (
-        "MXFP4 post_load no longer widens E8M0 -> fp16, or sizing.py changed: "
+    assert scale_bytes == analytic.scale, (
+        "MXFP4 scale is no longer 1 byte/group, or sizing.py changed: "
         f"derived scale {scale_bytes} B vs analytic {analytic.scale} B"
     )
-    assert analytic.post_load_resident == analytic.scale
-    # Unlike CT's zeros this widening IS per-expert, so it is charged to the granule too.
-    assert analytic.post_load_granule == analytic.scale // E
+    assert by_name["_scales_op"].dtype == torch.uint8, "the E8M0 byte was widened after all"
+    # No widening => no post-load delta. A non-zero here is the over-charge this test now guards.
+    assert analytic.post_load_resident == 0
+    assert analytic.post_load_granule == 0
     assert spec.stacked_bytes == analytic.total
     assert spec.total_bytes == analytic.total

@@ -150,7 +150,7 @@ def ct_packed_sign_convention(
     # BYTE-WISE, NOT int32-WISE, and that is a correctness property rather than a refactor. The
     # previous form hardcoded a 32-bit word: it masked `& 0xFFFFFFFF` and unpacked `range(8)`
     # nibbles per element. Hand it a stack whose int4 codes are packed into uint8 — which is exactly
-    # how `_GroupedMxFp4Experts`, `_GroupedNvFp4Experts` and `_GroupedRXFExperts` already ship 4-bit
+    # how `_GroupedMxFp4Experts` and `_GroupedNvFp4Experts` already ship 4-bit
     # weights in this file's own sibling module, and how any future int4 loader policy on the shared
     # kernel core would arrive — and nibble positions 2..7 of every element read as 0. `counts[0]`
     # is then inflated by 6/8 of the sample, the histogram decides "two's-complement" with a huge
@@ -203,7 +203,7 @@ def apply_ct_sign(t: torch.Tensor, conv: CtSignConvention) -> torch.Tensor:
     DTYPE-PRESERVING, not int32-pinned. The flip is `^ 0x88` over the raw BYTES — every packed
     format's nibble pair, whatever container dtype it arrived in — so the result is restored to
     `t.dtype` rather than reinterpreted as int32. Hardcoding int32 was not merely inelegant: given a
-    uint8-packed stack (how `_GroupedMxFp4Experts` / `_GroupedNvFp4Experts` / `_GroupedRXFExperts`
+    uint8-packed stack (how `_GroupedMxFp4Experts` / `_GroupedNvFp4Experts`
     already ship 4-bit weights, and how any new int4 loader policy on the shared kernel core would
     arrive) `.view(torch.int32)` silently returns a tensor of one quarter the last dimension, in the
     wrong dtype, whenever that dimension happens to divide by 4 — and raises a shape error, blamed
@@ -269,7 +269,7 @@ def verify_ct_sign_across_ranks(model, group, tp_size: int, tp_rank: int) -> Dic
     Cheap enough to be unconditional: one `all_gather_object` of a dict of bools at boot, on the
     gloo CPU group the engine already builds for its control messages. `tp_size == 1` returns
     immediately — there is nothing to disagree with — and so does any model with no CT containers
-    (the NVFP4 / MXFP4 / RXF MoE paths declare no `_ct_sign` at all, so qwen4_exp's NVFP4 body walks
+    (the NVFP4 / MXFP4 MoE paths declare no `_ct_sign` at all, so qwen4_exp's NVFP4 body walks
     straight through this and only its AWQ sibling is actually gated).
 
     Raises rather than warns. A warning here is a serve that answers questions wrongly for as long
@@ -602,46 +602,6 @@ class MxFp4LinearMethod:
         ).to(x.dtype)
 
 
-class RXFLinearMethod:
-    """RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) linear, native HIP (rxf_hip).
-
-    The checkpoint already ships op-layout (no AWQ/GPTQ unpack-transpose-repack): a uint8
-    weight_packed (N, K/2) of NL indices and an fp16 per-group weight_scale (N, K/32), group=32.
-    The weights were rotated offline by a fixed block-diagonal Hadamard (FWHT-span); apply()
-    rotates+int8-quantizes the activation with the SAME span so the rotation cancels in the dot
-    (and spreads activation outliers to tighten the 4-bit scale). NL codebook is model-wide
-    (kernels._rxf_nl). No zero-points (the NL codebook is symmetric)."""
-
-    def __init__(self, quant: QuantConfig) -> None:
-        self.quant = quant
-
-    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
-        N, K = out_features, in_features
-        span = self.quant.rotation_span
-        assert K % 32 == 0 and K % span == 0 and K % 2 == 0, (
-            f"RXF needs K%32==0,K%span({span})==0,K%2==0; got N={N},K={K}"
-        )
-        layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
-        layer.weight_scale = torch.empty((N, K // 32), dtype=torch.float16)
-
-    def process_weights_after_load(self, layer: "BaseOP") -> None:
-        # GROUP-MAJOR scale: the op indexes it `[g*N + n]`, so N must be the contiguous axis for the
-        # 16-lane fragment read to coalesce. The checkpoint ships channel-major, so transpose here.
-        layer.weight_scale = layer.weight_scale.transpose(0, 1).contiguous()  # type: ignore[attr-defined]
-
-    def apply(
-        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
-    ) -> torch.Tensor:
-        out = kernels.rxf_linear(
-            x,
-            layer.weight_packed,  # type: ignore[attr-defined]
-            layer.weight_scale,  # type: ignore[attr-defined]
-            bias,
-            self.quant.rotation_span,
-        )
-        return out.to(x.dtype)
-
-
 def create_linear_method(
     quant: QuantConfig | None, *, quantized: bool = True
 ) -> LinearMethod:
@@ -652,8 +612,6 @@ def create_linear_method(
     if quant.is_nvfp4:
         # gfx1201 has no FP4 hardware -> upconvert NVFP4 to the fp8 W8A8 path at load (see NvFp4LinearMethod).
         return NvFp4LinearMethod(quant)
-    if quant.is_rxf:
-        return RXFLinearMethod(quant)
     # MXFP4 (compressed-tensors float-quantized 4-bit, OCP E2M1) -> the W4A8 kernel with the e2m1
     # decode. Config-selected from the DECLARED scheme (no model-name branch); disjoint from the int4
     # W4A8 path below (weight_type=="int") and the fp8 W8A8 path (bits==8).

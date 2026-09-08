@@ -185,7 +185,7 @@ def resolve_expert_parallel(config: Any, *, method_supports_ep: bool = True) -> 
 
         self.enable_ep = is_ep_enabled() and self._moe_method.supports_ep and not force_no_ep
 
-    so the quant method holds a VETO. `_RXFMoEMethod` (`supports_ep = False`, "no precomputed-topk
+    so the quant method holds a VETO. `_UnquantizedMoEMethod` (`supports_ep = False`, "no precomputed-topk
     shard route") and `_UnquantizedMoEMethod` (inherits the base-class `False`) both exercise it. On
     such a checkpoint served `--enable-ep --tp 2` the layer is built REPLICATED with the intermediate
     tensor-split, and a planner that shards it anyway describes a layer that does not exist: it
@@ -286,7 +286,7 @@ def moe_layer_shapes(
     of routed experts, not by the average. Rounding up is the conservative direction.
 
     EP is asked as all THREE conjuncts of `MoELayer.__init__` (moe.py:1004), not just the engine
-    toggle: the quant method vetoes it for RXF and for unquantized experts, and a planner that
+    toggle: the quant method vetoes it for unquantized experts, and a planner that
     misses the veto halves every traffic figure on a `--enable-ep --tp 2` serve of such a
     checkpoint. See `resolve_expert_parallel`.
     """

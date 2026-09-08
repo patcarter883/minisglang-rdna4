@@ -7,7 +7,7 @@ expert `e` against expert `e'`'s scale. Shapes stay right, no kernel faults, not
 model emits plausible text. That silent-corruption class is the entire reason this module exists, and
 it is why the descriptor is DERIVED from the live container rather than written down per format:
 which buffers survive `post_load` is a function of `format x six env knobs` (`MINISGL_MOE_W4A16`,
-`MINISGL_RXF_REGDIRECT`, `MINISGL_MOE_MXFP4_REGDIRECT`, `MINISGL_MOE_W8A8_REGDIRECT`,
+`MINISGL_MOE_MXFP4_REGDIRECT`, `MINISGL_MOE_W8A8_REGDIRECT`,
 `MINISGL_ZAYA_OLDMOE`, `MINISGL_ZAYA_W8A16`), so any hand-maintained per-format table is wrong the
 first time somebody flips a knob — and wrong SILENTLY, by omitting a scale.
 

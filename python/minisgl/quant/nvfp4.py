@@ -17,7 +17,7 @@ scale passes through BYTE-VERBATIM (1 B per 16 weights) and the per-tensor globa
 MULTIPLIER and broadcast to a per-OUTPUT-CHANNEL f32 vector. The kernel consumes them as two levels
 (`w4a8_tile::E4m3GroupScaleGlobal` in `rdna4-hip-kernels/fp8_wmma/fp8_wmma_rocm/tile_config.h`), with
 the (E, N) f32 global riding the existing `w_zeros` pointer slot — NVFP4 is symmetric, so that slot is
-null and there is no op-schema change (precedent: `NlInt8Loader` threads the RXF NL codebook the same
+null and there is no op-schema change (precedent: `NlInt8Loader` threads an NL codebook the same
 way). This is the ACCURATE arm and it is also the SMALL one: 1 byte of block scale instead of 2.
 
 **(2) FOLD — `fold_nvfp4_scale`, the legacy arm, still the DENSE-linear path.** Collapse both levels

@@ -1,7 +1,7 @@
 """GPU-ONLY: the granule descriptor over the REAL register-direct repacks.
 
 Every other granule test runs on CPU. These four cannot: the `_w_rep` buffers are built by the
-compiled `fp8_wmma` repack kernels (`repack_int4_to_w_rep_moe`, `rxf_repack_w_rep_moe`,
+compiled `fp8_wmma` repack kernels (`repack_int4_to_w_rep_moe`,
 `mxfp4_to_w_rep_moe`, `repack_fp8_to_w_rep_moe`), which need a device. They close the one gap in
 `test_granule_spec.py`, whose `test_regdirect_shapes` SYNTHESIZES the post-regdirect buffer set
 rather than producing it.
@@ -30,7 +30,6 @@ from minisgl.layers.moe import (
     _GroupedCompressedTensorsExperts,
     _GroupedFP8Experts,
     _GroupedMxFp4Experts,
-    _GroupedRXFExperts,
 )
 from minisgl.quant.config import QuantConfig
 from minisgl.weights.granule import spec_for_container
@@ -81,13 +80,6 @@ def test_ct_int4_w4a16_regdirect(monkeypatch):
     _assert_granule_is_sane(
         spec_for_container(c, E), ["_w_rep", "_scales_op", "_zeros_op"], ["_w_op", "weight_packed"]
     )
-
-
-def test_rxf_regdirect(monkeypatch):
-    monkeypatch.setattr(moe_mod.kernels, "RXF_REGDIRECT", True, raising=False)
-    q = QuantConfig(method="rxf", bits=4, group_size=32, sym=True, rotation_span=32)
-    c = _fill_on_device(_GroupedRXFExperts(E, N, K, q))
-    _assert_granule_is_sane(spec_for_container(c, E), ["_w_rep", "weight_scale"], ["weight_packed"])
 
 
 def test_mxfp4_regdirect(monkeypatch):

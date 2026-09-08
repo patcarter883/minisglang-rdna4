@@ -63,7 +63,6 @@ class FakeQuant:
         self.ct_groups = kw.pop("ct_groups", ())
         self.is_fp8_w8a8 = kw.pop("is_fp8_w8a8", False)
         self.is_nvfp4 = kw.pop("is_nvfp4", False)
-        self.is_rxf = kw.pop("is_rxf", False)
         self.weight_is_e2m1 = kw.pop("weight_is_e2m1", False)
         self.is_int4 = kw.pop("is_int4", True)
         self.is_gptq = kw.pop("is_gptq", False)

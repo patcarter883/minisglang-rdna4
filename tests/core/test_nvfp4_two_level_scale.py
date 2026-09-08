@@ -346,7 +346,6 @@ def test_the_meta_container_and_the_analytic_byte_model_agree_exactly():
         ct_groups = ()
         is_fp8_w8a8 = False
         is_nvfp4 = True
-        is_rxf = False
         weight_is_e2m1 = False
         is_int4 = False
         is_gptq = False

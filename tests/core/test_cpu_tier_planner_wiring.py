@@ -39,7 +39,6 @@ class _Nvfp4Quant:
     ct_groups = ()
     is_fp8_w8a8 = False
     is_nvfp4 = True
-    is_rxf = False
     weight_is_e2m1 = True
     is_int4 = False
     is_gptq = False

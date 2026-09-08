@@ -150,22 +150,19 @@ class QuantConfig:
     ignore list). group_size is the checkpoint's; the kernel provider converts to its
     native layout (op group_size=32)."""
 
-    method: str  # "awq" | "compressed-tensors" | "gptq" | "rxf"
+    method: str  # "awq" | "compressed-tensors" | "gptq"
     bits: int  # 4 (int4 W4A8/W4A16 family) | 8 (fp8 W8A8, compressed-tensors float-quantized)
-    group_size: int  # 128 (AWQ/GPTQ) / 32 (compressed-tensors, rxf)
+    group_size: int  # 128 (AWQ/GPTQ) / 32 (compressed-tensors)
     sym: bool  # symmetric (no zero-point) vs asymmetric (AWQ zero_point=True -> False)
     ignore: tuple[str, ...] = ()  # module-name suffixes left unquantized (CT); () for AWQ
     # GPTQ act-order: when True the checkpoint reorders input channels by activation magnitude
     # (g_idx is a non-trivial permutation). False (the common case, e.g. Qwen1.5-MoE) -> g_idx is
     # the identity i//group_size and can be ignored on repack.
     desc_act: bool = False
-    # RXF only: block-diagonal Hadamard rotation span (offline weights + runtime activations are
-    # rotated by the same orthonormal FWHT-span; it cancels in the dot). 32 is the shipped default.
-    rotation_span: int = 32
     # WEIGHT storage element type (compressed-tensors `config_groups[*].weights.type`):
     #   "int"   -> integer-quantized (int4 W4A8/W4A16, int8) — the AWQ/GPTQ/CT-int4 path.
     #   "float" -> float-quantized (fp8 e4m3 weights, e.g. ZAYA's W8A8; MXFP4 e2m1 in future).
-    # AWQ/GPTQ/RXF are always integer, so this defaults "int"; only compressed-tensors reads it.
+    # AWQ/GPTQ are always integer, so this defaults "int"; only compressed-tensors reads it.
     weight_type: str = "int"
     # ACTIVATION scheme the checkpoint DECLARES for its quantized GEMMs (compressed-tensors
     # `input_activations`): "fp8" -> per-token dynamic fp8 acts (W8A8 — MUST be honored, the acts
@@ -181,7 +178,7 @@ class QuantConfig:
     # MIXED-PRECISION (compressed-tensors `format: mixed-precision`): one entry per `config_groups`
     # group, as (targets, scheme) — `targets` is the group's regex/substring module selector and
     # `scheme` is that group's own fully-parsed QuantConfig. EMPTY for every single-format checkpoint
-    # (AWQ/GPTQ/RXF and single-group compressed-tensors), where the scalar fields above ARE the whole
+    # (AWQ/GPTQ and single-group compressed-tensors), where the scalar fields above ARE the whole
     # story and `for_module` degenerates to "self, unless ignored" — i.e. behaviour is unchanged.
     # Populated only when a checkpoint genuinely mixes schemes across modules, e.g. Qwen3.8-27B-NVFP4:
     # NVFP4 for the bulk MLP, fp8 W8A8 for attention / GDN in_proj / lm_head / the last 8 MLP layers.
@@ -200,10 +197,6 @@ class QuantConfig:
     @property
     def is_awq(self) -> bool:
         return self.method == "awq"
-
-    @property
-    def is_rxf(self) -> bool:
-        return self.method == "rxf"
 
     @property
     def is_gptq(self) -> bool:
@@ -247,12 +240,12 @@ class QuantConfig:
     def is_int4(self) -> bool:
         """Integer 4-bit weight family (AWQ / GPTQ / compressed-tensors int4) — the shared W4A8
         expert/linear kernel (int4 weight x per-token fp8 act, or true W4A16 where flagged)."""
-        return self.bits == 4 and self.weight_type == "int" and not self.is_rxf
+        return self.bits == 4 and self.weight_type == "int"
 
     def is_module_quantized(self, name: str, *, exact: bool = False) -> bool:
         """Is the weight module `name` (e.g. 'model.layers.47.mlp.experts.0.gate_proj') quantized
         under this config? False if `name` matches any `ignore` entry — a `re:`-prefixed regex
-        (compressed-tensors / RXF) or a plain substring (AWQ/GPTQ `modules_to_not_convert`). This lets
+        (compressed-tensors) or a plain substring (AWQ/GPTQ `modules_to_not_convert`). This lets
         a checkpoint keep specific modules at full precision (bf16/fp16) on an otherwise-quantized
         backbone — an MTP / draft head, the router gate, dense early layers — and the model build it
         unquantized accordingly (universal: not tied to any one model or quant method).
@@ -368,18 +361,6 @@ class QuantConfig:
                 sym=bool(d.get("sym", True)),
                 desc_act=bool(d.get("desc_act", False)),
                 ignore=_norm_ignore(not_convert),
-            )
-        if method == "rxf":
-            # RXF ("Rotated eXtra Fast") W4(NL codebook)-A8(int8) with a fixed Hadamard rotation.
-            # Op layout already (weight_packed uint8 [N,K/2], weight_scale fp16 [N,K/32]); group=32,
-            # symmetric NL codebook (no zero-points). Served by the native rxf_hip kernels.
-            return cls(
-                method="rxf",
-                bits=4,
-                group_size=32,
-                sym=True,
-                rotation_span=int(d.get("rotation_span", 32)),
-                ignore=_norm_ignore(tuple(d.get("ignore", ()) or ())),  # e.g. a bf16 MTP head
             )
         if method in ("compressed-tensors", "compressed_tensors"):
             # Read group_size / num_bits / symmetric off the FIRST weights group (uniform across
