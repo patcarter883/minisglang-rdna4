@@ -95,6 +95,76 @@ def e8m0_to_fp16_scales(weight_scale: torch.Tensor) -> tuple[torch.Tensor, dict]
     return scales, info
 
 
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# NATIVE E8M0 — the path that does NOT inflate the scale
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# `e8m0_to_fp16_scales` above widens a 1-byte block scale to 2 bytes and can saturate. The kernel
+# now reads E8M0 directly (`Int4E8m0GemvLoader`, rdna4-hip-kernels 5155b68), so the conversion is
+# avoidable on both counts:
+#
+#   BYTES   group-32 e2m1 + fp16 scale = 0.5 + 2/32 = 0.5625 B/weight
+#           group-32 e2m1 + E8M0 scale = 0.5 + 1/32 = 0.53125  -> 5.6% fewer bytes read, and HALF
+#           the resident scale bytes (which on an offloading serve is expert-cache slots).
+#   RANGE   E8M0 spans 2^-127..2^127; fp16 saturates outside 2^-14..2^15. The fp16 path logs
+#           `fp16_range_ok` and PROCEEDS, so an out-of-window checkpoint is served with saturated
+#           scales and no failure. Nothing to saturate here.
+#
+# The E8M0 codes are passed through UNTOUCHED — this function deliberately does no arithmetic on
+# them, because the decode (2^(s-127), one shift into the fp32 exponent field, E8M0's bias being
+# exactly fp32's) belongs in the kernel where it is free.
+def e8m0_scale_health(weight_scale: torch.Tensor) -> dict:
+    """Count the codes the kernel decode treats specially. Cheap, and it runs BEFORE boot.
+
+    The native path cannot saturate, so the only remaining special codes are the two ends of the
+    domain: 0 (true value 2^-127, an fp32 subnormal the kernel spells out) and 255 (the E8M0 NaN
+    code, which the kernel's shift lands on +inf). Both are counted so a checkpoint carrying them
+    is a KNOWN quantity rather than a surprise in the accumulator.
+    """
+    assert weight_scale.dtype == torch.uint8, weight_scale.dtype
+    exp = weight_scale.to(torch.int32) - E8M0_BIAS
+    return {
+        "exp_min": int(exp.min()), "exp_max": int(exp.max()),
+        "e8m0_nan_groups": int((weight_scale == 0xFF).sum()),
+        "e8m0_zero_code_groups": int((weight_scale == 0).sum()),
+        # Recorded for contrast with the fp16 path: how much WOULD have been saturated.
+        "would_saturate_fp16": int(((exp > 15) | ((exp < -14) & (weight_scale != 0))).sum()),
+    }
+
+
+def convert_mxfp4_moe_e8m0(weight_packed: torch.Tensor,
+                           weight_scale: torch.Tensor) -> dict:
+    """Stacked per-expert MoE conversion that KEEPS the E8M0 scale byte.
+
+    (E, N, K//2) uint8 packed + (E, N, K//32) uint8 E8M0 ->
+    {w_packed (E,N,K//8) int32, scales (E,N,K//32) uint8 E8M0, w_zeros None, group_size 32}.
+    Identical to `convert_mxfp4_moe` except the scale is passed through rather than widened.
+    """
+    assert weight_packed.ndim == 3 and weight_scale.ndim == 3, (
+        weight_packed.shape, weight_scale.shape)
+    e, n, k_half = weight_packed.shape
+    k = k_half * 2
+    es, ns, k_groups = weight_scale.shape
+    assert (es, ns) == (e, n), f"shape mismatch: weight {(e, n)} vs scale {(es, ns)}"
+    assert k_groups == k // OCP_MX_BLOCK_SIZE, (
+        f"scale groups {k_groups} != K//{OCP_MX_BLOCK_SIZE} = {k // OCP_MX_BLOCK_SIZE}")
+    # PER-EXPERT LOOP, for the reason `convert_mxfp4_moe` documents and not for symmetry: a single
+    # flattened unpack over (E*N, K) materialises the int64 nibble-widen transient for the WHOLE
+    # stack, a multi-GB spike that OOMs the 16 GB card once the model is resident. The scale needs
+    # no loop at all here — that is the point of this path — so only the weight is chunked.
+    w_out = torch.empty((e, n, k // 8), dtype=torch.int32, device=weight_packed.device)
+    for i in range(e):
+        w_out[i] = pack_codes_to_int32(unpack_e2m1_nibbles(weight_packed[i]))
+    return {
+        "w_packed": w_out,                        # (E, N, K//8) int32, E2M1 codes
+        "scales": weight_scale.contiguous(),      # (E, N, K//32) uint8 E8M0 — UNTOUCHED
+        "w_zeros": None,                          # symmetric; no zero-points, no NVFP4 global
+        "group_size": OCP_MX_BLOCK_SIZE,
+        "scale_is_e8m0": True,                    # the dispatch flag; see the note below
+        "scale_info": e8m0_scale_health(weight_scale),
+        "shape": (e, n, k),
+    }
+
+
 def convert_mxfp4_weight(weight_packed: torch.Tensor,
                          weight_scale: torch.Tensor) -> dict:
     """Full conversion for one MXFP4 linear/expert weight matrix.
