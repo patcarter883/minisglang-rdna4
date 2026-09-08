@@ -194,7 +194,16 @@ def convert_mxfp4_weight(weight_packed: torch.Tensor,
 
 def convert_mxfp4_moe(weight_packed: torch.Tensor,
                       weight_scale: torch.Tensor) -> dict:
-    """Stacked per-expert MoE variant of convert_mxfp4_weight.
+    """NOT ON THE SERVING PATH. The MoE path takes `convert_mxfp4_moe_e8m0`; this fp16-widening
+    variant is kept ONLY as the parity comparand in `tests/mxfp4_e8m0_test.py`, which proves the
+    native E8M0 scales agree with it bit-for-bit inside fp16's exponent window.
+
+    It is NOT reachable from a serve and NOT selectable by any flag — deliberately, per the
+    project's no-env-gating rule: if a faster path merges it is ON, and a "control leg" reproducing
+    the old behaviour from the same binary is an emulated baseline, not the old code. If this ever
+    needs to be measured against for real, check out the commit before the switch.
+
+    Stacked per-expert MoE variant of convert_mxfp4_weight.
 
     weight_packed (E, N, K//2) uint8, weight_scale (E, N, K//32) uint8 ->
     {w_packed (E,N,K//8) int32, scales (E,N,K//32) fp16, w_zeros None, group_size 32}.
