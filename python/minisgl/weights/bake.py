@@ -912,6 +912,15 @@ class StageARuntime:
         #: the cache is the one the launch line asked for — a capacity knob that lives only in the
         #: environment is invisible in the ledger and in every A/B write-up.
         self.expert_cache_bytes = int(expert_cache_bytes)
+        # ARMED HERE, not in `bind_plan`, because this constructor is the ONE point both bind paths
+        # pass through: the standalone `bind_plan` driver and `stage_b.SeamLayerSink` (which every
+        # production serve uses — the chunked load binds each seam as its chunk lands and never
+        # calls `bind_plan` at all). Arming in bind_plan meant a real serve carried the flag and
+        # built nothing, measuring identical to baseline with no error. The cache itself is built
+        # lazily by the first HOST seam that binds.
+        if self.expert_cache_bytes:
+            from .moe_interpose import set_expert_cache_budget
+            set_expert_cache_budget(self.expert_cache_bytes)
         self.rank = int(rank)
         self.local_ranks = int(local_ranks)
         #: Set by `chunked_sink()` when the caller loads via Stage B. Its presence is what makes

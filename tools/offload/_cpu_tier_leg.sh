@@ -82,7 +82,10 @@ else
   echo "[leg] NOT dropping page cache during load (no passwordless sudo, or disabled)"
 fi
 
-FATAL='died unexpectedly|OutOfMemoryError|HIP failure|CUDA calloc|CpuTierError|UnconfiguredDeviceTierError|HSA_STATUS_ERROR'
+# HostArenaCapacityError is a REFUSAL, not a crash: the engine aborts in seconds before
+# pinning a byte. Without it here the readiness loop spun the full READY_TIMEOUT (40 min)
+# against a container that had already exited — measured 2026-09-08, twice.
+FATAL='died unexpectedly|OutOfMemoryError|HIP failure|CUDA calloc|CpuTierError|UnconfiguredDeviceTierError|HSA_STATUS_ERROR|HostArenaCapacityError|ExpertCacheError'
 deadline=$(( $(date +%s) + READY_TIMEOUT ))
 ready=0
 while (( $(date +%s) < deadline )); do

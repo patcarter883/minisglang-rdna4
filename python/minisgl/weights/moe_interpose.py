@@ -361,6 +361,23 @@ def attach_expert_cache(cache) -> None:
     _EXPERT_CACHE = cache
 
 
+_EXPERT_CACHE_BUDGET = 0
+
+
+def set_expert_cache_budget(nbytes: int) -> None:
+    """Arm the residency cache with a per-rank byte budget; 0 disarms.
+
+    Set once at Stage-A start, and the cache is then built LAZILY by the first HOST seam that binds.
+    That is not an optimisation — it is what makes the feature path-independent. There are TWO bind
+    paths in this engine (`bind_plan` for the standalone driver, `stage_b.SeamLayerSink` per chunk
+    for every production serve) and the first wiring of this cache built it in `bind_plan` only, so
+    a real serve carried the flag, sized nothing, registered nothing, and measured IDENTICAL to the
+    baseline with no error anywhere. Building where the seams actually bind cannot miss a path.
+    """
+    global _EXPERT_CACHE_BUDGET
+    _EXPERT_CACHE_BUDGET = int(nbytes)
+
+
 def live_expert_cache():
     """The attached cache, or None. For the engine's route-ring subscription."""
     return _EXPERT_CACHE
@@ -822,7 +839,10 @@ class MoEWeightSeam:
         """
         cache = _EXPERT_CACHE
         if cache is None:
-            return
+            cache = _build_expert_cache_for_seam(self)
+            if cache is None:
+                return
+            attach_expert_cache(cache)
         from .stream_tier import layer_index_of_path
         lid = self._cache_lid
         if lid is None:
@@ -1661,6 +1681,37 @@ def expert_cache_budget_bytes() -> int:
     return env_int("MINISGL_EXPERT_CACHE_GB", 0) * (1 << 30)
 
 
+def _build_expert_cache_for_seam(seam: "MoEWeightSeam"):
+    """Build the one per-rank cache off the FIRST host seam to bind, or None if disarmed.
+
+    Every MoE layer in this model has the same expert geometry, and `register_layer` re-checks
+    `num_experts` per layer, so a heterogeneous model fails loudly at the second registration rather
+    than silently indexing a short slab.
+    """
+    budget = _EXPERT_CACHE_BUDGET or expert_cache_budget_bytes()
+    if budget <= 0:
+        return None
+    # Bytes for ONE expert across BOTH GEMMs — the promotion granule (an expert is resident in both
+    # planes or neither), and the same unit the placement plan prices, so this budget and that one
+    # mean the same thing.
+    expert_bytes = int(seam._layer.co_demanded_granule_bytes())
+    from .expert_cache import ExpertCacheError, ExpertResidencyCache
+    try:
+        cache = ExpertResidencyCache(
+            num_experts=int(seam.num_experts),
+            expert_bytes=expert_bytes,
+            budget_bytes=budget,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
+    except ExpertCacheError as e:
+        print(f"[expert-cache] REFUSED: {e}", flush=True)
+        raise
+    print(f"[expert-cache] BUILT: {cache.slots} slots x {expert_bytes} B = "
+          f"{cache.slots * expert_bytes / (1 << 30):.2f} GiB "
+          f"({cache.num_experts} experts/layer, budget {budget / (1 << 30):.2f} GiB)", flush=True)
+    return cache
+
+
 def _build_expert_cache(seams: "Sequence[MoEWeightSeam]", plan: "OffloadPlan",
                         budget: int = 0):
     """Construct the one per-rank cache, or None when it is off / cannot be sized.
@@ -1767,8 +1818,8 @@ def bind_plan(
     # THE CACHE IS CONSTRUCTED AND ATTACHED BEFORE THE BIND LOOP, because `bind()` registers each
     # HOST layer as it bakes it — one walk, and the tensors registered are the arena views that bake
     # just installed rather than a second enumeration that could drift from it.
-    cache = _build_expert_cache(seams, plan, expert_cache_bytes)
-    attach_expert_cache(cache)
+    if expert_cache_bytes:
+        set_expert_cache_budget(expert_cache_bytes)
 
     out = BindOutcome(plan_digest=plan.digest())
     cpu_expert_offset = 0
