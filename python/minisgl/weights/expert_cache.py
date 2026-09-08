@@ -371,9 +371,15 @@ class ExpertResidencyCache:
             L = self._layers.get(layer_id)
             if L is None:
                 continue
+            if self._slot_of_key.get(key) != slot:
+                # The manager already evicted this key and reassigned the slot while the copy was
+                # in flight. Publishing now would point `expert` at another expert's bytes — the
+                # exact wrong-numbers bug this design exists to prevent. Drop it; the expert simply
+                # reads the host base until it is promoted again.
+                self.stats["stale_publishes_dropped"] = \
+                    self.stats.get("stale_publishes_dropped", 0) + 1
+                continue
             L["slot_of"][expert] = slot             # compute stream: this thread owns it
-            self._slot_of_key[key] = slot
-            self._key_of_slot[slot] = key
             self.stats["promotions"] += 1
         if still:
             with self._lock:
@@ -399,7 +405,13 @@ class ExpertResidencyCache:
 
         if victim is not None:
             vlayer, vexpert = divmod(victim, self.num_experts)
-            slot = self._slot_of_key.pop(victim)
+            slot = self._slot_of_key.pop(victim, None)
+            if slot is None:
+                # Victim never got a slot (it was refused for space, or already reclaimed). Nothing
+                # to retract; fall through to the free list rather than raising on the manager
+                # thread, where an exception kills the cache for the life of the serve.
+                self._policy.evict_key(key)
+                return
             self._key_of_slot[slot] = -1
             self.stats["evictions"] += 1
             if threaded:
@@ -443,6 +455,15 @@ class ExpertResidencyCache:
         if threaded:
             done = torch.cuda.Event()
             done.record(stream)
+            # CLAIM THE SLOT IN THE HOST MAP NOW, not at publish. `_slot_of_key` is the policy's
+            # bookkeeping and the policy runs on THIS thread: if the claim waited for the
+            # scheduler's publish, an expert evicted while its own copy was still in flight would
+            # have no entry to reclaim and `_promote` raised KeyError, killing the manager (measured
+            # 2026-09-08, KeyError(381), cache silently degraded to host reads for the whole run).
+            # The DEVICE table is still published only after the fence, which is the invariant that
+            # matters — this map is host-side and no kernel reads it.
+            self._slot_of_key[key] = slot
+            self._key_of_slot[slot] = key
             with self._lock:
                 self._inflight.append((key, slot, done))
             return
