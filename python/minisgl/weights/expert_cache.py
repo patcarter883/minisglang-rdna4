@@ -216,6 +216,13 @@ class ExpertResidencyCache:
         #: scheduler round trip at decode rates, small enough that the residency given up is noise.
         self._low_water = max(8, _env_int("MINISGL_EXPERT_CACHE_LOW_WATER", self.slots // 200))
         self._refill_batch = max(8, self._low_water)
+        #: OUTSTANDING COPIES CEILING. Unbounded, the manager queues the whole cold fill onto the
+        #: copy stream at once — measured 2026-09-08: 4,418 in-flight x 1.36 MiB = 6.2 GB, which
+        #: saturates the same card-1-gated PCIe link the forward streams its OWN experts over. The
+        #: scheduler then stalls (ticks froze at 66), so nothing is published, so no slot is freed,
+        #: so the cache jams with `free=0` and a climbing `deferred`. A cache that starves the path
+        #: it is accelerating is worse than no cache. 64 x 1.36 MiB = ~87 MiB of PCIe in flight.
+        self._max_inflight = max(8, _env_int("MINISGL_EXPERT_CACHE_MAX_INFLIGHT", 64))
         #: apply_pending() calls. In the summary because a stalled scheduler half and a stalled
         #: manager look identical from the outside, and this separates them.
         self.stats["ticks"] = 0
@@ -455,6 +462,11 @@ class ExpertResidencyCache:
         threaded = self._thread is not None and cuda
 
         with self._lock:
+            # RATE LIMIT FIRST. Backpressure belongs before the slot is taken: taking one and then
+            # refusing to copy would strand it out of the pool.
+            if len(self._inflight) >= self._max_inflight:
+                self.stats["throttled"] = self.stats.get("throttled", 0) + 1
+                return
             slot = self._free.pop() if self._free else None
         if slot is None:
             if not threaded:
@@ -550,5 +562,6 @@ class ExpertResidencyCache:
                 f"evictions={self.stats['evictions']} "
                 f"inflight={len(self._inflight)} free={len(self._free)} "
                 f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
+                f"throttled={self.stats.get('throttled', 0)} "
                 f"dropped_refs={self.stats['dropped_refs']} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")

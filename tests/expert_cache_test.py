@@ -193,3 +193,26 @@ def test_t8_replacement_keeps_running_on_a_full_cache():
         f"replacement stalled: {cache.stats['promotions']} promotions against {cache.slots} slots — "
         f"the cache filled once and stopped placing")
     assert not _check_invariant(cache, hosts), "replacement broke the resident-bytes invariant"
+
+
+def test_t9_outstanding_copies_are_bounded():
+    """THE PCIe GUARD. Unbounded, the manager queues the whole cold fill at once — measured 4,418
+    in-flight copies = 6.2 GB on the same link the forward streams its own experts over, which
+    stalled the scheduler and jammed the cache at free=0. The ceiling must hold even when the
+    scheduler never publishes."""
+    cache, _ = _build(slots=64)
+    cache._thread = object()            # threaded bookkeeping without a real manager
+    cache.device = torch.device("cpu")  # keeps _promote on the non-CUDA path
+    try:
+        cache._max_inflight = 4
+        cache._inflight = [("x", i, None) for i in range(4)]   # already at the ceiling
+        before = cache.stats["promotions"]
+        for _ in range(50):
+            cache.observe(0, [1, 2, 3])
+            while cache._q:
+                lid, ids = cache._q.popleft()
+                cache._observe_now(lid, ids)
+        assert cache.stats.get("throttled", 0) > 0, "the ceiling never engaged"
+        assert cache.stats["promotions"] == before, "promoted past the in-flight ceiling"
+    finally:
+        cache._thread = None
