@@ -184,6 +184,41 @@ class ModelConfig:
     # nothing about it. None for every autoregressive model, which is what `is_block_diffusion` keys
     # on, so no path anywhere branches on a model name.
     canvas_length: int | None = None
+    # ---- Nemotron-H hybrid (Mamba-2 + MoE + a few global-attention layers). Populated by from_hf
+    # ONLY when model_type == "nemotron_h".
+    #
+    # This family does not fit the `layer_types` vocabulary and is deliberately NOT squeezed into it.
+    # Two reasons, and both are structural rather than cosmetic:
+    #
+    #  1. Every other model here has layer = mixer + MLP. Nemotron-H has ONE mixer per layer, and it
+    #     is a mamba mixer, an attention mixer, or the MoE itself — 52 layers, 52 norms, one sublayer
+    #     each. "moe" is a peer of "attention" in this schedule, not something that follows it.
+    #  2. Mapping "mamba" onto "linear_attention" would make `is_gdn_hybrid` True and route this
+    #     model into the GDN state cache, the GDN slot manager and the GDN kernels — a DIFFERENT
+    #     recurrence. It would build, run, and be wrong.
+    #
+    # So the schedule gets its own field with its own vocabulary ("mamba"/"moe"/"attention") and
+    # `layer_types` stays None, which keeps every GDN and SWA branch dead for this family.
+    block_types: tuple[str, ...] | None = None
+    # Mamba-2 geometry. inner = mamba_num_heads * mamba_head_dim (4096); the conv1d runs over
+    # inner + 2*n_groups*ssm_state (6144) and in_proj emits 2*inner + 2*n_groups*ssm_state +
+    # num_heads (10304) as [z, x, B, C, dt].
+    mamba_num_heads: int | None = None
+    mamba_head_dim: int | None = None
+    mamba_ssm_state: int | None = None
+    mamba_n_groups: int | None = None
+    mamba_conv_kernel: int | None = None
+    mamba_chunk_size: int | None = None
+    mamba_dt_min: float | None = None
+    mamba_dt_max: float | None = None
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    # Nemotron-H's experts are NOT SwiGLU: `mlp_hidden_act: "relu2"`, a single up_proj into a squared
+    # ReLU into down_proj, with no gate half. Every MoE in this repo before it was gate+up fused with
+    # SiLU, so this is load-bearing — a gated path applied here silently halves the intermediate and
+    # multiplies by the wrong thing. Read from the checkpoint, never defaulted.
+    moe_act: str | None = None
+    moe_shared_intermediate: int | None = None
     # ---- ZAYA CCA hybrid (cross-channel attention conv front-end + EDA/MOD MoE). None for non-Zaya.
     # Populated by from_hf ONLY when model_type == "zaya", so every other model keeps is_cca_hybrid
     # False. The schedule is implicit (even layer -> CCA attention, odd -> MoE), so there is no
@@ -261,6 +296,49 @@ class ModelConfig:
     def is_mla(self) -> bool:
         """True for a multi-head latent-attention model (DeepSeek / GLM-4.x MoE)."""
         return self.kv_lora_rank is not None
+
+    @property
+    def is_mamba_hybrid(self) -> bool:
+        """True for Nemotron-H. Keyed on an actual mamba layer, mirroring `is_gdn_hybrid`'s rule —
+        presence of the layer kind, never merely "the list exists"."""
+        return self.block_types is not None and any(t == "mamba" for t in self.block_types)
+
+    @property
+    def mamba_layer_ids(self) -> list[int]:
+        """Decoder indices whose mixer is Mamba-2. Position in THIS list is the compact recurrent-slot
+        id, mirroring gdn_layer_ids — the state cache is sized by len(), not by num_layers."""
+        return [] if self.block_types is None else [
+            i for i, t in enumerate(self.block_types) if t == "mamba"]
+
+    @property
+    def moe_block_layer_ids(self) -> list[int]:
+        """Decoder indices whose mixer IS the MoE. Named `moe_block_` rather than `moe_` because a
+        conventional MoE model has an MoE inside most layers; here it replaces the mixer."""
+        return [] if self.block_types is None else [
+            i for i, t in enumerate(self.block_types) if t == "moe"]
+
+    @property
+    def mamba_inner_dim(self) -> int | None:
+        if self.mamba_num_heads is None or self.mamba_head_dim is None:
+            return None
+        return self.mamba_num_heads * self.mamba_head_dim
+
+    @property
+    def mamba_conv_dim(self) -> int | None:
+        """Width the causal conv1d runs over: x plus B and C, NOT z and NOT dt."""
+        inner = self.mamba_inner_dim
+        if inner is None or self.mamba_n_groups is None or self.mamba_ssm_state is None:
+            return None
+        return inner + 2 * self.mamba_n_groups * self.mamba_ssm_state
+
+    @property
+    def mamba_in_proj_dim(self) -> int | None:
+        """Width in_proj emits: [z, x, B, C, dt]. Checked against the checkpoint at load; a mismatch
+        means the split order or the group count is wrong and every number downstream is garbage."""
+        inner, conv = self.mamba_inner_dim, self.mamba_conv_dim
+        if inner is None or conv is None or self.mamba_num_heads is None:
+            return None
+        return inner + conv + self.mamba_num_heads
 
     @property
     def is_gdn_hybrid(self) -> bool:
@@ -376,7 +454,13 @@ class ModelConfig:
         position in THIS list (a compact kv id) — the GDN/linear layers keep no paged KV, so
         indexing the pool by the global layer_id would allocate (and strand) a KV slot for every
         linear layer. For a non-hybrid model every layer is full-attention, so this is the identity
-        [0..num_layers)."""
+        [0..num_layers).
+
+        Nemotron-H answers from `block_types`, and it MUST: only 6 of its 52 layers are attention, so
+        falling through to the non-hybrid identity would size the paged pool for 52 layers and strand
+        8.7x the KV it needs — a pure capacity loss with no error anywhere to attribute it to."""
+        if self.block_types is not None:
+            return [i for i, t in enumerate(self.block_types) if t == "attention"]
         if self.layer_types is None:
             return list(range(self.num_layers))
         return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
@@ -770,6 +854,28 @@ class ModelConfig:
                 ]
             layer_types = tuple(layer_types)
 
+        # Nemotron-H (Mamba-2 + MoE + global attention). Its schedule is `layers_block_type`, a per
+        # layer choice of the ONE mixer that layer runs. Deliberately kept out of `layer_types` — see
+        # the `block_types` field comment for why mapping "mamba" onto "linear_attention" would build
+        # a working, wrong model.
+        _is_nemotron_h = getattr(config, "model_type", None) == "nemotron_h"
+        block_types = None
+        if _is_nemotron_h:
+            _bt = getattr(config, "layers_block_type", None)
+            if _bt is None:
+                raise ValueError(
+                    "nemotron_h config has no `layers_block_type`; the mixer schedule is not "
+                    "derivable from anything else in the config and must not be guessed")
+            _known = {"mamba", "moe", "attention"}
+            _bad = sorted(set(_bt) - _known)
+            if _bad:
+                raise ValueError(f"nemotron_h `layers_block_type` has unknown kinds {_bad}")
+            if len(_bt) != config.num_hidden_layers:
+                raise ValueError(
+                    f"nemotron_h `layers_block_type` has {len(_bt)} entries but "
+                    f"num_hidden_layers is {config.num_hidden_layers}")
+            block_types = tuple(_bt)
+
         # Sliding-window-attention hybrid (Laguna): an UN-gated `layer_types` of "full_attention" /
         # "sliding_attention" plus a top-level `sliding_window`. Kept separate from the GDN branch
         # above (which is gated on linear_num_key_heads) so the two schedules never collide; a SWA
@@ -947,6 +1053,24 @@ class ModelConfig:
             linear_value_head_dim=getattr(config, "linear_value_head_dim", None),
             linear_conv_kernel_dim=getattr(config, "linear_conv_kernel_dim", None),
             layer_types=layer_types,
+            block_types=block_types,
+            mamba_num_heads=getattr(config, "mamba_num_heads", None) if _is_nemotron_h else None,
+            mamba_head_dim=getattr(config, "mamba_head_dim", None) if _is_nemotron_h else None,
+            mamba_ssm_state=getattr(config, "ssm_state_size", None) if _is_nemotron_h else None,
+            mamba_n_groups=getattr(config, "n_groups", None) if _is_nemotron_h else None,
+            mamba_conv_kernel=getattr(config, "conv_kernel", None) if _is_nemotron_h else None,
+            mamba_chunk_size=getattr(config, "chunk_size", None) if _is_nemotron_h else None,
+            # The shipped spelling is time_step_min/time_step_max, not the `time_step_limit` tuple
+            # other Mamba-2 configs use. Defaulted only because a config that omits both is using
+            # the upstream defaults, which are these.
+            mamba_dt_min=float(getattr(config, "time_step_min", 0.001)) if _is_nemotron_h else None,
+            mamba_dt_max=float(getattr(config, "time_step_max", 0.1)) if _is_nemotron_h else None,
+            mamba_conv_bias=bool(getattr(config, "use_conv_bias", True)),
+            mamba_proj_bias=bool(getattr(config, "mamba_proj_bias", False)),
+            moe_act=getattr(config, "mlp_hidden_act", None) if _is_nemotron_h else None,
+            moe_shared_intermediate=(
+                getattr(config, "moe_shared_expert_intermediate_size", None)
+                if _is_nemotron_h else None),
             sliding_window=(
                 sliding_window
                 if layer_types is not None
