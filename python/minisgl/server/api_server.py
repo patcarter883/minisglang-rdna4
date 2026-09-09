@@ -514,9 +514,15 @@ def _derive_tool_format() -> str | None:
 
     The template is the fact: it is what turns a `tool_calls` message into bytes, so whatever it emits
     around the call IS this checkpoint's native format. Only a shape the forced path can actually
-    CONSTRAIN is reported — today Gemma-4's `<|tool_call>call:NAME{…}` and Muse-Glimmer's ATEM XML;
-    everything else returns None and keeps the JSON default, so this can never downgrade a family it
-    does not recognise."""
+    CONSTRAIN is reported — today Gemma-4's `<|tool_call>call:NAME{…}`, Muse-Glimmer's ATEM XML and
+    ZAYA's `<zyphra_tool_call>` wrapper; everything else returns None and keeps the JSON default, so
+    this can never downgrade a family it does not recognise.
+
+    ZAYA was added because the alias arm that pins `MINISGL_TOOL_FORMAT=zaya_xml` in serve.sh only
+    matched the fp8 checkpoint: a ZAYA path that fell through to the catch-all reached this probe,
+    which did not know the wrapper, and got the JSON default — i.e. a forced tool call grammar-
+    constrained to a shape the checkpoint was never trained to emit. The template is the fact, and
+    it plainly renders `<zyphra_tool_call>` (see `_zaya_xml_grammar`, which constrains exactly it)."""
     tok = _frontend_tokenizer()
     if tok is None:
         return None
@@ -530,6 +536,8 @@ def _derive_tool_format() -> str | None:
         return "gemma_native"
     if "<atem:invoke" in rendered:
         return "atem"
+    if "<zyphra_tool_call>" in rendered:
+        return "zaya_xml"
     return None
 
 

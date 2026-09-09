@@ -516,8 +516,21 @@ case "$MODEL" in
                       : "${MINISGL_DSPARK_CONF_TAU:=0}"; export MINISGL_DSPARK_CONF_TAU
                     fi
                   fi ;;
-  zaya|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
-                  model_id="${ZAYA_MODEL:-/models/ZAYA1-8B-fp8}"; served_name="ZAYA1-8B";
+  # ZAYA1-8B. The arm matches EVERY quant of the checkpoint, not just fp8: the MXFP4 conversion
+  # landed as /models/ZAYA1-8B-MXFP4 and — matching only `*/ZAYA1-8B-fp8` — fell through to the
+  # catch-all, which is the exact failure the comment above this `case` describes. It cost the
+  # `ZAYA1-8B` alias (clients saw the quant suffix) and `tool_format=zaya_xml`, and the format
+  # probe could not recover the second one until it learned the `<zyphra_tool_call>` wrapper.
+  # `zaya` bare selects MXFP4 — the current checkpoint; `zaya-fp8` keeps the older one addressable.
+  # A full path always wins over both. ZAYA_MODEL is GONE: a checkpoint is chosen by naming it,
+  # like every other model in this table, not by an env var only this arm knew about.
+  zaya|zaya-mxfp4|zaya-fp8|*/ZAYA1-8B-MXFP4|ZAYA1-8B-MXFP4|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
+                  case "$MODEL" in
+                    zaya|zaya-mxfp4) model_id="/models/ZAYA1-8B-MXFP4" ;;
+                    zaya-fp8)        model_id="/models/ZAYA1-8B-fp8" ;;
+                    *)               model_id="$MODEL" ;;
+                  esac
+                  served_name="ZAYA1-8B"
                   spec_default="none"
                   tool_format="zaya_xml"
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
