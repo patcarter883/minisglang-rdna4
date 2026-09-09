@@ -603,33 +603,43 @@ async def _select(
     # Force the final aggregation call below, which regenerates the answer under the grammar/tools.
     structured = grammar is not None or tools is not None
     if not structured:
-        if params.selection == "sample":
-            return answer_text(rng.choice(population).text, think_close_delim), "sample", None
+        # A ROLLOUT'S ANSWER CAN BE EMPTY, AND EMPTY IS NOT AN ANSWER. Under a think budget the
+        # rollout's job is to REASON; it is force-closed at beta and may emit little or nothing after
+        # the delimiter. `sample`/`majority` return a rollout verbatim, so without this they hand
+        # back "" (measured 2026-09-09 on ZAYA: selection=sample and =majority both returned empty
+        # content at every effort rung, while final_agg returned the correct \boxed{0.05}).
+        # Candidates with no answer are dropped here; if none survive, fall through to the final
+        # aggregation, which GENERATES an answer rather than quoting one.
+        answered = [c for c in population if answer_text(c.text, think_close_delim).strip()]
+        if answered:
+            if params.selection == "sample":
+                return answer_text(rng.choice(answered).text, think_close_delim), "sample", None
 
-        # Extract over the ANSWER, not the raw text: a \boxed{} inside the reasoning is a value the
-        # model was still working on, not the one it committed to.
-        answers = [
-            extract.extract_boxed(answer_text(c.text, think_close_delim)) for c in population
-        ]
-        normalized = [
-            extract.normalize_answer(a) if a is not None else None for a in answers
-        ]
-        extractable = sum(1 for a in normalized if a)
-        want_vote = params.selection == "majority" or (
-            params.selection == "auto" and extractable >= 2
-        )
-        if want_vote:
-            vote = extract.majority_vote(answers)
-            if vote is not None:
-                winner, tally = vote
-                matching = [c for c, a in zip(population, normalized) if a == winner]
-                best = next(
-                    (c for c in matching if c.finish_reason == "stop"), matching[0]
-                )
-                return (answer_text(best.text, think_close_delim), "majority_vote",
-                        {"winner": winner, "tally": dict(tally)})
-            if params.selection == "majority":
-                return answer_text(rng.choice(population).text, think_close_delim), "sample", None
+            # Extract over the ANSWER, not the raw text: a \boxed{} inside the reasoning is a
+            # value the model was still working on, not the one it committed to.
+            answers = [
+                extract.extract_boxed(answer_text(c.text, think_close_delim)) for c in answered
+            ]
+            normalized = [
+                extract.normalize_answer(a) if a is not None else None for a in answers
+            ]
+            extractable = sum(1 for a in normalized if a)
+            want_vote = params.selection == "majority" or (
+                params.selection == "auto" and extractable >= 2
+            )
+            if want_vote:
+                vote = extract.majority_vote(answers)
+                if vote is not None:
+                    winner, tally = vote
+                    matching = [c for c, a in zip(answered, normalized) if a == winner]
+                    best = next(
+                        (c for c in matching if c.finish_reason == "stop"), matching[0]
+                    )
+                    return (answer_text(best.text, think_close_delim), "majority_vote",
+                            {"winner": winner, "tally": dict(tally)})
+                if params.selection == "majority":
+                    return (answer_text(rng.choice(answered).text, think_close_delim),
+                            "sample", None)
 
     # Fallback (selection == "final_agg", OR any structured request): one final aggregation call over
     # the sampled candidate tails.
