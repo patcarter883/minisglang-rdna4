@@ -745,6 +745,16 @@ services:
       # ---- routing-trace oracle (MEASURE-ONLY, default OFF) ---------------------------------
       # An EXPLICIT directory, never a default into the repo layer (ghost_cache.py convention).
       # Unset arrives SET-BUT-EMPTY through compose, which the module handles via env_int.
+      # ---- per-expert VRAM residency cache (--expert-cache-gb; these are TUNING, not gates) ----
+      # MAX_INFLIGHT is the one that matters and it is a two-sided constraint, measured both ways:
+      # unbounded, the cold fill queues thousands of copies and starves the forward's OWN expert
+      # streaming over the same card-1-gated link (4,418 in flight -> the serve jammed); at 64 the
+      # fill can never complete, because the forward already saturates PCIe and only ~1 copy lands
+      # per step (448 promotions in 513 steps, fill stuck at 0.099).
+      MINISGL_EXPERT_CACHE_MAX_INFLIGHT: "${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-}"
+      MINISGL_EXPERT_CACHE_LOW_WATER: "${MINISGL_EXPERT_CACHE_LOW_WATER:-}"
+      MINISGL_EXPERT_CACHE_INFLIGHT_AGE: "${MINISGL_EXPERT_CACHE_INFLIGHT_AGE:-}"
+      MINISGL_EXPERT_CACHE_REPORT: "${MINISGL_EXPERT_CACHE_REPORT:-}"
       MINISGL_MOE_ROUTE_TRACE: "${MINISGL_MOE_ROUTE_TRACE:-}"
       MINISGL_MOE_ROUTE_TRACE_RING: "${MINISGL_MOE_ROUTE_TRACE_RING:-}"
       MINISGL_MOE_ROUTE_TRACE_DRAIN: "${MINISGL_MOE_ROUTE_TRACE_DRAIN:-}"

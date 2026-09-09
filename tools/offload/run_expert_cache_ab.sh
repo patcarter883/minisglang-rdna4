@@ -58,11 +58,16 @@ export EXTRA_ARGS="$extra"
 
 export MODEL=qwen4exp SPEC=none TP="${TP:-2}" CONC=2 GRAPH_BS=0
 export MEM_RATIO="${MEM_RATIO:-0.85}"
-export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-mgr7}"
+export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-mgr8}"
 export MINISGL_HOST_PORT="$PORT"
 export MINISGL_HOSTPROF=50
+# Forwarded so the ARM is in the artifact: an A/B whose tuning is not in its own log is a
+# measurement of nothing.
+export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-}"
+export MINISGL_EXPERT_CACHE_LOW_WATER="${MINISGL_EXPERT_CACHE_LOW_WATER:-}"
 export Q4E_MODEL_DIR="${Q4E_MODEL_DIR:-/home/pat/ai/hf/q4e}"
 
+echo "[xcache] cache tuning: max_inflight=${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-<default 64>} low_water=${MINISGL_EXPERT_CACHE_LOW_WATER:-<default slots/200>}"
 echo "[xcache] ARM=$ARM EXTRA_ARGS='$EXTRA_ARGS' image=$MINISGL_IMAGE tp=$TP mem_ratio=$MEM_RATIO"
 echo "[xcache] MemAvailable=${avail}GiB out=$OUT label=$LABEL"
 
