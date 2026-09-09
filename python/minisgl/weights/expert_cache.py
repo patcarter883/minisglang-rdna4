@@ -223,6 +223,8 @@ class ExpertResidencyCache:
         #: so the cache jams with `free=0` and a climbing `deferred`. A cache that starves the path
         #: it is accelerating is worse than no cache. 64 x 1.36 MiB = ~87 MiB of PCIe in flight.
         self._max_inflight = max(8, _env_int("MINISGL_EXPERT_CACHE_MAX_INFLIGHT", 64))
+        #: Ticks an in-flight copy may go unlanded before its slot is reclaimed unpublished.
+        self._inflight_max_age = max(4, _env_int("MINISGL_EXPERT_CACHE_INFLIGHT_AGE", 64))
         #: apply_pending() calls. In the summary because a stalled scheduler half and a stalled
         #: manager look identical from the outside, and this separates them.
         self.stats["ticks"] = 0
@@ -417,9 +419,26 @@ class ExpertResidencyCache:
             with self._lock:
                 self._free.append(slot)
         still = []
-        for key, slot, ev in inflight:
+        for entry in inflight:
+            key, slot, ev = entry[0], entry[1], entry[2]
+            age = (entry[3] if len(entry) > 3 else 0) + 1
             if not ev.query():
-                still.append((key, slot, ev))
+                if age > self._inflight_max_age:
+                    # A copy that has not landed in this many ticks never will — its work was lost
+                    # (a capture boundary is the known way). Reclaim the SLOT but do NOT publish:
+                    # publishing bytes that may never have been written is the wrong-numbers bug.
+                    # Without this the entry pins a slot forever and, once `_max_inflight` such
+                    # entries accumulate, the whole cache jams at `throttled` with nothing moving —
+                    # measured 2026-09-08, 64 stuck entries and 227,150 throttled references.
+                    self.stats["abandoned"] = self.stats.get("abandoned", 0) + 1
+                    if self._slot_of_key.get(key) == slot:
+                        self._slot_of_key.pop(key, None)
+                        self._key_of_slot[slot] = -1
+                        self._policy.evict_key(key)
+                    with self._lock:
+                        self._free.append(slot)
+                    continue
+                still.append((key, slot, ev, age))
                 continue
             layer_id, expert = divmod(key, self.num_experts)
             L = self._layers.get(layer_id)
@@ -460,6 +479,12 @@ class ExpertResidencyCache:
             return
         cuda = self.device.type == "cuda"
         threaded = self._thread is not None and cuda
+        if cuda and torch.cuda.is_current_stream_capturing():
+            # NEVER during capture. Work enqueued around a capture can be swallowed or captured
+            # into the graph, and an event that never completes jams a slot forever. `route_trace`
+            # guards its own drain the same way and for the same reason.
+            self.stats["skipped_capture"] = self.stats.get("skipped_capture", 0) + 1
+            return
 
         with self._lock:
             # RATE LIMIT FIRST. Backpressure belongs before the slot is taken: taking one and then
@@ -529,7 +554,7 @@ class ExpertResidencyCache:
             self._slot_of_key[key] = slot          # host claim now; device publish after the fence
             self._key_of_slot[slot] = key
             with self._lock:
-                self._inflight.append((key, slot, done))
+                self._inflight.append((key, slot, done, 0))
             return
         if cuda:
             compute.wait_stream(stream)
@@ -574,5 +599,7 @@ class ExpertResidencyCache:
                 f"inflight={len(self._inflight)} free={len(self._free)} "
                 f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
                 f"throttled={self.stats.get('throttled', 0)} "
+                f"abandoned={self.stats.get('abandoned', 0)} "
+                f"skipped_capture={self.stats.get('skipped_capture', 0)} "
                 f"dropped_refs={self.stats['dropped_refs']} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")
