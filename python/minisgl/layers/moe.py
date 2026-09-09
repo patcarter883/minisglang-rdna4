@@ -939,6 +939,10 @@ def create_moe_quant_method(
     )
 
 
+#: One EP-decision line per process, from the first MoE layer built.
+_EP_DECISION_LOGGED = False
+
+
 class MoELayer(BaseOP):
     # ── WEIGHT-OFFLOAD INTERPOSITION POINT ──────────────────────────────────────────────────────
     # A `weights/moe_interpose.MoEWeightSeam`, or None. Declared as a CLASS attribute so that a
@@ -1004,6 +1008,25 @@ class MoELayer(BaseOP):
         else:
             self.local_num_experts = num_experts
             self.local_expert_offset = 0
+        # SAY WHAT WAS DECIDED, ONCE. EP is a three-way AND (`is_ep_enabled()` x the method's
+        # `supports_ep` x `not force_no_ep`) and every failure mode is SILENT: the layer builds, the
+        # checkpoint loads, generation is correct — the experts are simply replicated on every rank
+        # and the whole point of --enable-ep is lost. Diagnosing it from outside took byte
+        # arithmetic on the KV-sizing line (2026-09-09, ZAYA1-8B-MXFP4 at dp=2: model=5.02 GiB
+        # against an EP-sharded prediction of ~3.0). One line at build removes that entirely.
+        global _EP_DECISION_LOGGED
+        if not _EP_DECISION_LOGGED:
+            _EP_DECISION_LOGGED = True
+            _why = ("ON" if self.enable_ep else
+                    "OFF: " + ("is_ep_enabled()=False" if not is_ep_enabled()
+                               else f"{type(self._moe_method).__name__}.supports_ep=False"
+                               if not self._moe_method.supports_ep else "force_no_ep"))
+            from minisgl.utils import init_logger
+            init_logger("moe").info_rank0(
+                f"expert parallelism {_why} | ep_size={self.ep_size} ep_rank={self.ep_rank} "
+                f"num_experts={num_experts} local_num_experts={self.local_num_experts} "
+                f"top_k={top_k} method={type(self._moe_method).__name__}"
+            )
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
