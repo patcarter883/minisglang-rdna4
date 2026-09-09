@@ -66,14 +66,27 @@ def test_only_the_first_delimiter_splits():
     assert answer_text(t, DELIM) == "the tag </think> is literal"
 
 
-@pytest.mark.parametrize("branch", ["sample", "majority_vote", "final_aggregation"])
-def test_every_selection_branch_applies_the_split(branch):
-    """A branch that forgot the split would reintroduce the leak on that path only — which is how
-    this survived: the defect is invisible until you read the actual answer text."""
+def test_selection_returns_RAW_text_so_the_parser_owns_the_split():
+    """THE DOUBLE-STRIP REGRESSION. `api_server` parses `final_text` with the same reasoning parser
+    the plain lane uses. If RSA pre-strips the `</think>`, that parser sees an open span with no
+    closer, takes its "never closed => all reasoning" branch, and returns content="" — measured
+    2026-09-09: n=8 produced an empty answer after 67,585 completion tokens.
+
+    So `_select` must return the RAW candidate text. `answer_text` stays internal: a predicate for
+    "did this candidate answer" and the input to boxed extraction. One split, one owner.
+    """
     import inspect
     from minisgl.rsa import core
     src = inspect.getsource(core._select)
-    # every `return <something>.text` in the selector must go through answer_text
     bad = [ln.strip() for ln in src.splitlines()
-           if "return" in ln and ".text" in ln and "answer_text" not in ln]
-    assert not bad, f"selection branch returns raw .text without answer_text: {bad}"
+           if "return" in ln and "answer_text(" in ln]
+    assert not bad, f"_select must not pre-strip the returned text: {bad}"
+
+
+def test_answer_text_is_still_used_as_an_internal_predicate():
+    """...but it must not be deleted either: dropping it would let an answerless rollout be voted
+    on and returned, which is the bug it was added for."""
+    import inspect
+    from minisgl.rsa import core
+    src = inspect.getsource(core._select)
+    assert "answer_text(" in src, "answer_text no longer used to filter/extract"

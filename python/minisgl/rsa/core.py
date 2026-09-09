@@ -384,7 +384,14 @@ def reasoning_trace(text: str, close_delim: Optional[str]) -> str:
 def answer_text(text: str, close_delim: Optional[str]) -> str:
     """The ANSWER portion of a rollout: everything AFTER the think-close delimiter.
 
-    The exact inverse of `reasoning_trace`, and the thing that was missing. `Candidate.text` from the
+    USED INTERNALLY ONLY — to test whether a candidate actually answered, and to extract its boxed
+    value for the vote. It is deliberately NOT applied to the returned `final_text`: `api_server`
+    parses that text with the SAME reasoning parser the plain lane uses, and pre-stripping the
+    `</think>` here left it with an open span and no closer, so it took its "never closed => it is
+    all reasoning" branch and returned content="" (measured 2026-09-09: n=8 returned an empty answer
+    after 67,585 completion tokens). One split, one owner.
+
+    The exact inverse of `reasoning_trace`. `Candidate.text` from the
     IN-PROCESS client is the RAW generation — `<think>...</think>` and the answer — because it
     accumulates `ack.incremental_output`, the same stream `/v1/chat/completions` splits into
     `reasoning_content` + `content` before returning. RSA never split it, so `final_text` carried the
@@ -613,7 +620,7 @@ async def _select(
         answered = [c for c in population if answer_text(c.text, think_close_delim).strip()]
         if answered:
             if params.selection == "sample":
-                return answer_text(rng.choice(answered).text, think_close_delim), "sample", None
+                return rng.choice(answered).text, "sample", None
 
             # Extract over the ANSWER, not the raw text: a \boxed{} inside the reasoning is a
             # value the model was still working on, not the one it committed to.
@@ -635,11 +642,10 @@ async def _select(
                     best = next(
                         (c for c in matching if c.finish_reason == "stop"), matching[0]
                     )
-                    return (answer_text(best.text, think_close_delim), "majority_vote",
+                    return (best.text, "majority_vote",
                             {"winner": winner, "tally": dict(tally)})
                 if params.selection == "majority":
-                    return (answer_text(rng.choice(answered).text, think_close_delim),
-                            "sample", None)
+                    return rng.choice(answered).text, "sample", None
 
     # Fallback (selection == "final_agg", OR any structured request): one final aggregation call over
     # the sampled candidate tails.
@@ -682,7 +688,7 @@ async def _select(
         think_budget=_final_budget,
     )
     if final is None:
-        return answer_text(rng.choice(population).text, think_close_delim), "sample", None
+        return rng.choice(population).text, "sample", None
     usage.add(final)
     logger.info(
         "[rsa-timing] final-aggregation gen: %d prompt + %d completion tok, finish=%s, structured=%s",
@@ -690,5 +696,4 @@ async def _select(
     )
     # `_final_close` is the delimiter THIS call was generated under (a structured final answer is a
     # thinking-OFF extraction and has none), so split on that rather than the rollout delimiter.
-    return (answer_text(final.text, _final_close),
-            ("structured_aggregation" if structured else "final_aggregation"), None)
+    return final.text, ("structured_aggregation" if structured else "final_aggregation"), None
