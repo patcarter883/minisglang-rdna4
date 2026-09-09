@@ -87,16 +87,19 @@ def resolve_prefix_cache(config: "EngineConfig") -> PrefixCachePlan:
     cache_type = getattr(config, "cache_type", "radix")
 
     # A PLE layer (Qwen4-Exp) carries per-sequence recurrent state of its OWN — a 9-column dilated
-    # conv window and a 2-token n-gram history — that the recurrent-radix snapshot store does not
-    # capture: `GDNStateCache.clone_slot` clones the GDN buffers and nothing else. A radix hit would
-    # restore the GDN state at a prefix boundary and leave the PLE state at zero/EOS, which is
-    # exactly the silent-garbage case the snapshot store exists to prevent, one block deeper.
-    # Extending the snapshot to cover PLE is a real feature (it also has to reach the host-side token
-    # history); refusing the snapshot radix is the honest interim and costs only prefix reuse.
-    # Checked BEFORE the GDN arm because qwen4_exp is ALSO a GDN hybrid and would match it.
-    if getattr(mc, "ple_layer_ids", ()):
+    # conv window and a 2-token n-gram history. That state is NOW covered: PLE and GDN share one slot
+    # space (`PLERuntime.prepare`), so `CompositeRecurrentState` snapshots both behind the store's
+    # single clone_slot/load_slot pair, all-or-nothing. Until 2026-09-09 it was not covered, and this
+    # returned "naive" unconditionally — a radix hit would have restored GDN state at the boundary
+    # and left PLE at zero/EOS, silent wrong text. The cost of that honesty was total: a PLE serve
+    # got ZERO prefix reuse, so every turn of a conversation re-prefilled the whole transcript.
+    #
+    # The composite still needs the GDN/CCA arm below to choose the snapshot-capable radix, so PLE no
+    # longer short-circuits here; a PLE model that is NOT a GDN/CCA hybrid has no recurrent store to
+    # compose with and still falls through to naive.
+    if getattr(mc, "ple_layer_ids", ()) and not (mc.is_gdn_hybrid or mc.is_cca_hybrid):
         return PrefixCachePlan(
-            "naive", "", "PLE recurrent state is not covered by the recurrent-radix snapshot store"
+            "naive", "", "PLE model with no GDN/CCA recurrent store to compose a snapshot with"
         )
 
     # GDN (Qwen3.5/3.6) and CCA (ZAYA) recurrent state is not prefix-cacheable UNLESS it is

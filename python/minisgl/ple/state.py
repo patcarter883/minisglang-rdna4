@@ -57,6 +57,39 @@ class PLEStateCache:
             (self.num_slots, self.context_len), self.eos_token_id, dtype=np.int64
         )
 
+    # -- recurrent-radix snapshots ---------------------------------------------------------------
+    # PLE state is per-SLOT and slot-agnostic once copied, exactly like GDN's conv+ssm, so it
+    # snapshots the same way. Both halves are mandatory and they must be captured TOGETHER: the
+    # conv window is device state advanced by the forward, the n-gram history is host state advanced
+    # by `commit` after it. Restoring one without the other leaves a slot's history out of step with
+    # its conv state — the same "one chunk ahead" hazard `prepare`/`commit` are split to avoid, and
+    # it produces wrong text with no error.
+
+    def clone_slot(self, slot: int):
+        """Slot-agnostic snapshot of ONE slot's PLE state, installable into a DIFFERENT slot.
+
+        Mirrors `GDNStateCache.clone_slot`'s contract. No host arena here: the conv window is
+        kilobytes per slot, not the 16.4 MiB GDN frame, so the staged-D2H machinery would cost more
+        than it saves. `token_history` is host numpy and is copied outright.
+        """
+        s = int(slot)
+        return (self.conv_state[s].clone(), self.token_history[s].copy())
+
+    def load_slot(self, slot: int, snap) -> None:
+        """Install a `clone_slot` snapshot into `slot`. Both halves or neither."""
+        if snap is None:
+            return
+        conv, hist = snap
+        s = int(slot)
+        self.conv_state[s].copy_(conv)
+        np.copyto(self.token_history[s], hist)
+
+    @property
+    def nbytes_snapshot(self) -> int:
+        """Bytes ONE snapshot holds (device conv + host history), for store sizing."""
+        per_slot_conv = self.conv_state[0].numel() * self.conv_state.element_size()
+        return int(per_slot_conv + self.token_history[0].nbytes)
+
     @property
     def nbytes_device(self) -> int:
         return self.conv_state.numel() * self.conv_state.element_size()

@@ -413,14 +413,32 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         self.canvas_slots = (
             CanvasManager(self._canvas_cfg, self.device) if self._canvas_cfg is not None else None
         )
-        # Recurrent-radix prefix caching binds to the single active recurrent state cache + its slot
+        # Recurrent-radix prefix caching binds to the active recurrent state cache + its slot
         # manager (a model is GDN xor CCA, never both). None unless --gdn-radix enabled it above.
+        #
+        # A PLE model (qwen4_exp) carries a SECOND per-sequence state in the SAME slot space, so the
+        # binding is the COMPOSITE of both: snapshotting only GDN would restore the delta-rule state
+        # at the prefix boundary and leave the n-gram conv window and token history at zero/EOS.
+        # That is the silent-garbage case the `resolve_prefix_cache` PLE gate used to prevent by
+        # refusing prefix caching outright; composing the two is what lets the gate come off.
         if self._rec_radix and self.gdn_slots is not None:
             self._rec_cache, self._rec_slots = self.engine.gdn_state, self.gdn_slots
         elif self._rec_radix and self.cca_slots is not None:
             self._rec_cache, self._rec_slots = self.engine.cca_state, self.cca_slots
         else:
             self._rec_cache, self._rec_slots = None, None
+        _ple_rt = getattr(self.engine, "ple_runtime", None)
+        if self._rec_cache is not None and _ple_rt is not None and getattr(_ple_rt, "state", None):
+            from minisgl.kvcache.composite_state import CompositeRecurrentState
+
+            base_name = "gdn" if self.gdn_slots is not None else "cca"
+            self._rec_cache = CompositeRecurrentState(
+                ((base_name, self._rec_cache), ("ple", _ple_rt.state))
+            )
+            logger.warning_rank0(
+                f"recurrent-radix: snapshotting {base_name.upper()} + PLE state together "
+                f"(shared slot space); a prefix hit restores both or neither"
+            )
         # SWA-radix window snapshotter (parallel to _rec_cache; a model is SWA xor GDN/CCA). It clones
         # the sliding-window ring at a page-aligned boundary and restores it on a prefix hit. The
         # snapshot is stored on the radix node's rec_state field (opaque) and stashed via the shared
