@@ -702,6 +702,9 @@ case "$MODEL" in
                   # ran for 60093 ms), and FOUR of them had no expert cache attached — so it is a
                   # property of the all-host arm, not of anything layered on it. 600 s still
                   # catches a genuine hang; it just stops calling a slow step one.
+                  # (the global default is now also 600 — see DIST_TIMEOUT below; kept explicit
+                  # here because this arm's reason is its own and should not vanish if the global
+                  # default is ever reconsidered)
                   dist_timeout="600"
                   # ---- QSA SPARSE ATTENTION (`[QSA-2026-09-06]`) --------------------------------
                   # The 2048-token refusal is GONE: the sparse selection exists
@@ -1070,9 +1073,18 @@ WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
 # L48_tp2_chunk750_dev11.json (48-layer row), chunk_sweep_tp2_L48.json (the sweep).
 WOFF_CHUNK_MIB="${WOFF_CHUNK_MIB:-${woff_chunk_mib:-}}"
 [[ -n "$WOFF_CHUNK_MIB" ]] && export MINISGL_WEIGHT_ARENA_CHUNK_MIB="$WOFF_CHUNK_MIB"
-# Per-model default from the table (`dist_timeout`), overridable by the environment. Empty keeps
-# the engine's 60 s.
-DIST_TIMEOUT="${DIST_TIMEOUT:-${dist_timeout:-}}"
+# NCCL collective watchdog, seconds. The engine default is 60 and that is too short for ANY
+# multi-rank serve here — it is a watchdog, and exceeding it does not slow a request, it ABORTS the
+# process group (worker dies, exitcode -6/1, mid-request). Two models have now hit it for unrelated
+# reasons:
+#   * qwen4_exp: all 48 MoE layers stream from host RAM every step, so a rank can sit in the
+#     vocab-parallel all-gather past 60 s while its peer waits on PCIe. SIX legs died this way.
+#   * ZAYA1-8B at tp=1/dp=2/ep=1 under concurrent RSA: rollouts generate for minutes and the
+#     scheduler worker died with the same NCCL/TCPStore signature (2026-09-09).
+# Neither is model-specific — both are "a rank legitimately took a while". So the DEFAULT is 600 for
+# every arm, not a per-model override; 600 still catches a genuine hang, it just stops calling a slow
+# step one. A per-model `dist_timeout=` in the table still wins, as does DIST_TIMEOUT= in the env.
+DIST_TIMEOUT="${DIST_TIMEOUT:-${dist_timeout:-600}}"
 dist_args=()
 [[ -n "$DIST_TIMEOUT" ]] && dist_args+=(--distributed-timeout "$DIST_TIMEOUT")
 
