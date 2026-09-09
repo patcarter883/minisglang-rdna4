@@ -2334,7 +2334,9 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         p=0 so it is ALWAYS rejected, exactly as the greedy masked-argmax rejects it. On reject/bonus the
         token is sampled from the (masked) p; the matcher is advanced by every committed token. Output is
         distributed as plain constrained sampled decode (distributionally lossless). ``logits_block``
-        [K+1, V] on device.
+        [K+1, V] on device, ALREADY head-conditioned — it is a slice of _spec_decode_step's
+        Sampler.condition_logits output, so the NaN scrub / softcap / padded-vocab fence are in it
+        before the grammar bitmask is laid on top.
 
         As with the greedy twin, a reasoning-gated req never reaches here — pass 1 owns it, so the
         gate only ever advances from committed rank0 tokens."""
@@ -3493,6 +3495,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
 
         # --- one forward; argmax the k mask positions per req -------------------------------------
         logits = self.engine.forward_verify(batch)  # [sum(k+1), vocab]
+        # Same head-side conditioning the plain sampler and the linear verify apply — a pad-tail
+        # dequant artifact would otherwise win the argmax here and be DRAFTED, and the top-K
+        # marginals below would seat it in the DDTree. The linear verify would then reject it
+        # (its p is fenced to 0), so the cost is a burnt draft slot rather than a bad token — but
+        # the draft is what block_predict exists to get right.
+        logits = self.engine.sampler.condition_logits(logits)
         preds = logits.argmax(dim=-1).to(torch.int32).cpu()
         # DDTree: also stash the per-position top-K MARGINALS (ids + log-probs) of the k mask rows per
         # req, keyed by id(req), for build_draft_tree. Rows off+1..off+k are the block's L=k positions.
@@ -3676,6 +3684,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             batch.gdn_metadata.verify_max_qlen = tree_qlen
             gdn_snap = self.engine.gdn_state.snapshot(gdn_idx)
         logits = self.engine.forward_verify(batch)
+        # Head-side conditioning before the per-node argmax (see engine/sample.py::condition_logits).
+        # The walk below reads these argmaxes as the target's chain, so an unfenced pad-tail id would
+        # both truncate the accepted path and be handed on as a draft.
+        logits = self.engine.sampler.condition_logits(logits)
         argmax = logits.argmax(dim=-1).to(torch.int32).cpu().tolist()
         off = 0
         r0 = getattr(self, "_ddtree_rank0", None)
@@ -4045,6 +4057,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
 
         t_stage = _tstamp()
         logits = self.engine.forward_verify(batch)  # [total_q, vocab]
+        # Head-side conditioning (engine/sample.py::condition_logits) — MANDATORY here, not just
+        # hygiene: this step COMMITS its verify argmax directly (verify_greedy over `target` below,
+        # then straight into `outcomes`), with no second linear verify to catch a pad-tail id. It was
+        # the one commit path left reading raw logits after 2fba9ae fenced only _spec_decode_step.
+        logits = self.engine.sampler.condition_logits(logits)
         t_fwd = _tstamp()
         vocab = logits.shape[-1]
 
@@ -4733,19 +4750,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         else:
             logits = self.engine.forward_verify(batch)
 
-        # Head-side processing, mirroring what Sampler.sample does exactly once on the plain path
-        # (engine/sample.py): scrub transient NaNs, softcap when the checkpoint asks, and fence off
-        # the untrained padded-vocab tail. Without this a dequant-artifact logit in a pad row can win
-        # the verify argmax (or enter the sampled nucleus) and commit an out-of-tokenizer token id —
-        # every accept branch below (host greedy, on-device, sampled, constrained) reads `logits`.
-        # In-place is safe on a captured graph's output buffer: replay overwrites it fully.
-        _smp = self.engine.sampler
-        if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
-            torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
-        if _smp.logit_softcap:
-            logits = torch.tanh(logits.float() / _smp.logit_softcap) * _smp.logit_softcap
-        if _smp.real_vocab_size is not None and _smp.real_vocab_size < logits.shape[-1]:
-            logits[:, _smp.real_vocab_size:] = float("-inf")
+        # Head-side processing, THE SAME CODE Sampler.sample runs once on the plain path
+        # (engine/sample.py::condition_logits): scrub transient NaNs, softcap when the checkpoint asks,
+        # and fence off the untrained padded-vocab tail. Without this a dequant-artifact logit in a pad
+        # row can win the verify argmax (or enter the sampled nucleus) and commit an out-of-tokenizer
+        # token id — every accept branch below (host greedy, on-device, sampled, constrained) reads
+        # `logits`. This used to be an inline copy of the sampler's block; it is a call now so the
+        # three sibling verify forwards can share it instead of each growing their own copy.
+        logits = self.engine.sampler.condition_logits(logits)
 
         # Reasoning gate on the spec path: mask the verify logits IN PLACE for any req still inside <think>
         # (EOS-suppress under budget / force-</think> over budget) BEFORE the argmax/accept below, so a
