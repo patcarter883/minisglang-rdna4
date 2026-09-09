@@ -749,12 +749,16 @@ case "$MODEL" in
                   #    capture free. GRAPH_BS=2 is left as an OVERRIDE for a short-context serve
                   #    (measured good to ctx=4087 at 0.90, and to 16382 at MEM_RATIO=0.84), never a
                   #    default. It no longer requires MINISGL_QSA=0.
-                  # 2. MAX_PREFILL_LENGTH=1024, not 2048 — a FEASIBILITY term. The selection's
-                  #    stage-4b workspace is full CHUNK width (`[chunk, 2051]` int32 tokens and
-                  #    slots plus an int64 `flat` gather index), so the prefill activation peak
-                  #    scales with the chunk. The structural fix is to row-tile 4b the way the
-                  #    sparse attention already is (QSA_INDEXER.md §8.1) and it would let this go
-                  #    back to 2048.
+                  # 2. MAX_PREFILL_LENGTH=2048. It was 1024 as a FEASIBILITY term while stage 4b
+                  #    ran at full CHUNK width; 4b is now ROW-TILED at _ATTN_ROW_TILE
+                  #    (QSA_INDEXER.md §8.1, the structural fix this comment used to point at), so
+                  #    the int64 gather index is one tile instead of `[chunk, 2051]` — 8x less
+                  #    transient — and the prefill peak no longer scales with the chunk.
+                  #    WHY IT MATTERS HERE more than the memory: on an all-host arm the ENTIRE
+                  #    31.9 GiB/rank expert set is re-streamed per CHUNK, so chunk width is what
+                  #    amortises it. Measured at 1024: 81 tok/s prefill, i.e. 4.1 min for a
+                  #    20k-token turn. The tiling is bit-exact vs the untiled form
+                  #    (tests/qsa_4b_rowtile_test.py) because the 4b mapping is per row.
                   #
                   # --page-size 16 (PAGE_SIZE's default, below) is now a HARD REQUIREMENT rather
                   # than a convention: a compressed index key is addressed by
@@ -762,7 +766,7 @@ case "$MODEL" in
                   # that identity holds only when a group of r=4 cannot straddle a page.
                   # `QSAProfile.require_page_size` RAISES on anything else rather than falling back
                   # to a second, untested addressing scheme.
-                  : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=1024}"
+                  : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=2048}"
                   # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
                   # that must NOT be carried to another machine. `[QSA-2026-09-06]` the arena is now
                   # 24.62 x 2 = 49.24 GiB (the 37th host layer; it was 24.12 x 2 = 48.23 at the

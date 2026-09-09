@@ -587,12 +587,41 @@ class QSARuntime:
                 "row_seq": plan.row_seq.detach().clone(),
                 "compressed": cache.compressed_keys(index_layer).detach().clone(),
             }
-        flat = (
-            plan.row_table_idx[:, None] * plan.page_stride
-            + sel_tokens.clamp(min=0).to(torch.int64)
-        )
-        sel_slots = self.page_table.reshape(-1).index_select(0, flat.reshape(-1)).reshape(rows, width)
-        sel_slots = sel_slots.to(torch.int32).contiguous()
+        # ROW-TILED (QSA_INDEXER.md §8.1). The full-width form built a `[rows, width]` **int64**
+        # gather index — 33.6 MB at a 2048 chunk, int64 only because `index_select` demands it — plus
+        # an int64 copy of `sel_tokens`, and that transient is what made the prefill activation peak
+        # scale with the chunk. It is why this arm is pinned to `--max-prefill-length 1024`, and the
+        # chunk is what amortises the host-streamed expert set: at 1024 the whole 31.9 GiB/rank is
+        # re-streamed per chunk, so prefill measured 81 tok/s and a 20k-token turn cost 4.1 minutes.
+        #
+        # Tiling is EXACT, not an approximation: the mapping is per ROW (row_table_idx[i] and
+        # sel_tokens[i] determine slot row i with no cross-row term), so a tile boundary cannot
+        # change a value. `qsa_4b_rowtile_test` pins that bit-for-bit against the untiled form.
+        #
+        # NOT TILED when `rows <= _ATTN_ROW_TILE`: that is the whole decode/capture regime, and a
+        # Python loop there would either bloat a captured graph with unrolled tiles or introduce a
+        # data-dependent trip count. Prefill is the only caller with more rows than the tile.
+        pt_flat = self.page_table.reshape(-1)
+        if rows <= _ATTN_ROW_TILE:
+            flat = (
+                plan.row_table_idx[:, None] * plan.page_stride
+                + sel_tokens.clamp(min=0).to(torch.int64)
+            )
+            sel_slots = pt_flat.index_select(0, flat.reshape(-1)).reshape(rows, width)
+            sel_slots = sel_slots.to(torch.int32).contiguous()
+        else:
+            sel_slots = torch.empty((rows, width), dtype=torch.int32, device=q.device)
+            for lo in range(0, rows, _ATTN_ROW_TILE):
+                hi = min(lo + _ATTN_ROW_TILE, rows)
+                flat_t = (
+                    plan.row_table_idx[lo:hi, None] * plan.page_stride
+                    + sel_tokens[lo:hi].clamp(min=0).to(torch.int64)
+                )
+                sel_slots[lo:hi] = (
+                    pt_flat.index_select(0, flat_t.reshape(-1))
+                    .reshape(hi - lo, width)
+                    .to(torch.int32)
+                )
         # THE LEDGER, ON THE DEVICE. This was `int(lens.to(torch.int64).sum().item())` — a host
         # sync per INDEX LAYER, i.e. 12 pipeline drains per decode token on this checkpoint, for a
         # number nothing in the forward pass reads. py-spy put it at 36% of the scheduler rank's
