@@ -64,6 +64,10 @@ class InProcessBackendClient(BackendClient):
         chat_template_kwargs: Optional[dict] = None,
         think_close_delim: Optional[str] = None,
         think_budget: Optional[int] = None,
+        think_tool_release: Optional[List[str]] = None,
+        think_answer_delim: Optional[str] = None,
+        think_close_prefix: Optional[str] = None,
+        think_close_suffix: Optional[str] = None,
     ) -> Optional[Candidate]:
         """One chat generation through the in-process engine. Returns None on
         permanent failure (RSA tolerates dropped rollouts). The structured knobs
@@ -92,6 +96,17 @@ class InProcessBackendClient(BackendClient):
                             grammar=grammar,
                             think_close_delim=think_close_delim,
                             think_budget=think_budget,
+                            # The REST of the reasoning-delimiter set. api_server passes all six to
+                            # `run_markovian_rsa`; only two reached the rollout's SamplingParams, so
+                            # an RSA rollout closed its think span by a different rule than the
+                            # /v1/chat/completions lane it is supposed to mirror. Dropping them
+                            # silently is the worse failure: the tool-opener release and the
+                            # wildcard close prefix/suffix are what stop a rollout reasoning past
+                            # its delimiter on models whose closer is not a bare literal.
+                            think_tool_release=list(think_tool_release or []),
+                            think_answer_delim=think_answer_delim,
+                            think_close_prefix=think_close_prefix,
+                            think_close_suffix=think_close_suffix,
                             # RSA rollouts/aggregation are ephemeral: their unique generations are never
                             # reused, so don't insert them into the prefix cache (avoids polluting the
                             # radix + inflating KV; finished rollouts release cleanly). The shared prompt

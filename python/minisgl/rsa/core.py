@@ -161,6 +161,10 @@ class BackendClient:
         chat_template_kwargs: Optional[dict] = None,
         think_close_delim: Optional[str] = None,
         think_budget: Optional[int] = None,
+        think_tool_release: Optional[List[str]] = None,
+        think_answer_delim: Optional[str] = None,
+        think_close_prefix: Optional[str] = None,
+        think_close_suffix: Optional[str] = None,
     ) -> Optional[Candidate]:
         """One chat completion; returns None on permanent failure. The structured knobs
         (grammar/tools/chat_template_kwargs/think_*) mirror the in-process client; over HTTP they ride
@@ -179,6 +183,20 @@ class BackendClient:
                     extra["think_close_delim"] = think_close_delim
                 if think_budget is not None:
                     extra["reasoning_max_tokens"] = think_budget
+                # The rest of the reasoning-delimiter set. These reached `run_markovian_rsa` from
+                # api_server but stopped at its signature, so EVERY rsa request 500'd with
+                # `unexpected keyword argument 'think_tool_release'` — RSA was unreachable, not
+                # merely degraded (found 2026-09-09 on the first ZAYA RSA call). A rollout that
+                # silently dropped them would be worse: it would reason past its budget and miss the
+                # tool-opener release the non-RSA path applies.
+                if think_tool_release:
+                    extra["think_tool_release"] = list(think_tool_release)
+                if think_answer_delim is not None:
+                    extra["think_answer_delim"] = think_answer_delim
+                if think_close_prefix is not None:
+                    extra["think_close_prefix"] = think_close_prefix
+                if think_close_suffix is not None:
+                    extra["think_close_suffix"] = think_close_suffix
                 resp = await self.openai.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -289,6 +307,10 @@ async def _run_round(
     chat_template_kwargs: Optional[dict] = None,
     think_close_delim: Optional[str] = None,
     think_budget: Optional[int] = None,
+    think_tool_release: Optional[List[str]] = None,
+    think_answer_delim: Optional[str] = None,
+    think_close_prefix: Optional[str] = None,
+    think_close_suffix: Optional[str] = None,
 ) -> List[Candidate]:
     """Fan out one rollout per message set, bounded by *semaphore*."""
 
@@ -311,6 +333,10 @@ async def _run_round(
                 chat_template_kwargs=chat_template_kwargs,
                 think_close_delim=think_close_delim,
                 think_budget=think_budget,
+                think_tool_release=think_tool_release,
+                think_answer_delim=think_answer_delim,
+                think_close_prefix=think_close_prefix,
+                think_close_suffix=think_close_suffix,
             )
         return c, time.monotonic()  # (candidate, absolute finish time) for straggler analysis
 
@@ -382,6 +408,10 @@ async def run_markovian_rsa(
     tools: Optional[List[dict]] = None,
     think_close_delim: Optional[str] = None,
     think_budget: Optional[int] = None,
+    think_tool_release: Optional[List[str]] = None,
+    think_answer_delim: Optional[str] = None,
+    think_close_prefix: Optional[str] = None,
+    think_close_suffix: Optional[str] = None,
 ) -> RSAResult:
     """Run the full Markovian RSA loop and return the aggregated result.
 
@@ -541,6 +571,10 @@ async def _select(
     chat_template_kwargs: Optional[dict] = None,
     think_close_delim: Optional[str] = None,
     think_budget: Optional[int] = None,
+    think_tool_release: Optional[List[str]] = None,
+    think_answer_delim: Optional[str] = None,
+    think_close_prefix: Optional[str] = None,
+    think_close_suffix: Optional[str] = None,
 ) -> tuple:
     """Pick the final answer text from the final-round population."""
     # A structured request (response_format / json_schema / tools) CANNOT be satisfied by the
