@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.utils import load_generation_config, load_tokenizer
-from minisgl.rsa.config import merge_params
+from minisgl.rsa.config import RSAParams, merge_params
 from minisgl.rsa.core import RSAError, run_markovian_rsa
 from minisgl.rsa.inproc import InProcessBackendClient
 from minisgl.message import (
@@ -837,6 +837,42 @@ _LEVEL_PROBE = "__minisgl_level_probe__"
 # Real rung names, weakest first. Used for two things the sentinel probe cannot do on a template
 # that VALIDATES its level: detect that the kwarg is read at all, and learn which values it accepts.
 _LEVEL_LADDER = ("low", "medium", "high", "xhigh")
+
+# reasoning_effort -> Markovian-RSA (n, k, T), for a serve launched with --rsa-effort-ladder.
+# The OpenAI effort knob is the only "think harder" dial a standard client has, and RSA's whole
+# shape — WIDTH (n candidates per round) and DEPTH (T aggregation rounds) — is exactly what "harder"
+# should move. Without this the knob only ever set a token budget: a client asking for `max` got one
+# longer rollout, never a population.
+#
+# `None` = no fan-out (ordinary single completion). `minimal` is the lowest reasoning RUNG, not the
+# absence of reasoning, but one rollout IS its RSA analogue — n=1/T=1 is a plain call with extra
+# bookkeeping, so it takes the plain lane.
+#
+# What the rungs move, and what they deliberately do NOT:
+#   * n (width) parallelises — the rollouts of one round are concurrent internal generations, so
+#     n=8 costs roughly what n=4 costs in WALL time on a serve with headroom. MEASURED on this box:
+#     high (n=8, T=2) 1144 s vs medium (n=4, T=2) 1158 s, same 3-problem probe.
+#   * T (depth) does NOT — round t+1 consumes round t's tails, so it is strictly sequential.
+#     max (T=3) took 1593 s, +39% over the same width at T=2. Depth is the expensive axis; that is
+#     why only the top rung buys one.
+#   * tau/beta are NOT laddered. They stay at the serve's --rsa-tail-tokens / --rsa-think-budget for
+#     every rung, because shortening the workspace at a LOW rung spends the rollout compute and then
+#     truncates the reasoning it produced. Effort buys more search, not shorter thoughts.
+# Spellings mirror _EFFORT_BUDGET. xhigh has no rung of its own and clamps DOWN to `high` (the
+# nearest weaker rung — never escalate, matching _EFFORT_LEVEL's clamp direction).
+_EFFORT_RSA: dict[str, tuple[int, int, int] | None] = {
+    "minimal": None,
+    "low": (2, 2, 1),
+    "medium": (4, 4, 2),
+    "high": (8, 4, 2),
+    "extra_high": (8, 4, 2),
+    "xhigh": (8, 4, 2),
+    "x_high": (8, 4, 2),
+    "very_high": (8, 4, 2),
+    "max": (8, 4, 3),
+    "maximum": (8, 4, 3),
+    "unlimited": (8, 4, 3),
+}
 # Per-request "no β backstop at all", distinct from None ("nothing asked for" -> server default).
 # Negative because the budget is a token count; `ThinkGate.arm` reads any negative as unbounded.
 THINK_BUDGET_UNBOUNDED = -1
@@ -1001,6 +1037,36 @@ def _effort_is_on(req: "OpenAICompletionRequest") -> bool:
         if eff and _norm_effort(eff) in _EFFORT_BUDGET:
             return True
     return False
+
+
+def _rsa_from_effort(req: "OpenAICompletionRequest", cfg) -> "RSAParams | None":
+    """RSA parameters implied by the request's `reasoning_effort`, or None for the plain lane.
+
+    Consulted ONLY when the client sent no explicit `rsa` field — an explicit `rsa` (including
+    `false`) always wins, so a caller that knows about RSA is never second-guessed. Returns None
+    unless the serve was launched with --rsa-effort-ladder, so this can never turn an ordinary
+    deployment's requests into an N-way fan-out by surprise.
+
+    The rung patches n/k/t over the server's --rsa-* defaults; everything else (tau, beta,
+    max_tokens, temperature, selection, concurrency) comes from those defaults unchanged. See
+    _EFFORT_RSA for why width and depth are the only two terms the ladder moves.
+    """
+    base = getattr(cfg, "rsa_defaults", None)
+    if base is None or not base.enabled or not getattr(base, "effort_ladder", False):
+        return None
+    # An explicit thinking-OFF request is a request for LESS, not for a population.
+    if _effort_is_off(req):
+        return None
+    eff = _requested_effort(req)
+    if not eff:
+        return None
+    # `.get` with a missing-key default of None: an effort spelling this table does not know takes
+    # the plain lane rather than guessing a rung for it.
+    rung = _EFFORT_RSA.get(eff)
+    if rung is None:
+        return None
+    n, k, t = rung
+    return RSAParams(**{**base.model_dump(), "n": n, "k": k, "t": t})
 
 
 def _resolve_think_budget(req: "OpenAICompletionRequest",
@@ -3072,7 +3138,11 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # so N rollouts fan out across the scheduler / DP-EP replicas exactly like concurrent requests.
     # `merge_params` returns None for an absent/false/disabled `rsa`, which falls through to the
     # ordinary single-completion path below.
-    rsa_params = merge_params(state.config.rsa_defaults, req.rsa) if req.rsa is not None else None
+    # No `rsa` field -> the reasoning_effort ladder gets a say (--rsa-effort-ladder only), so a
+    # standard OpenAI client that can set nothing but `reasoning_effort` can still ask for width and
+    # depth. An explicit `rsa` — including `false` — always wins over the ladder.
+    rsa_params = (merge_params(state.config.rsa_defaults, req.rsa) if req.rsa is not None
+                  else _rsa_from_effort(req, state.config))
     if rsa_params is not None:
         if not req.messages:
             return JSONResponse(
@@ -3175,6 +3245,11 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             },
             "rsa": {
                 "selection_method": result.selection_method,
+                # Which rung ran, and whether the ladder (not the client) chose it — without this a
+                # caller that only ever sets `reasoning_effort` has no way to tell an n=8 fan-out
+                # from an n=2 one, and no way to tell RSA ran at all.
+                "effort": _requested_effort(req) if req.rsa is None else None,
+                "effort_ladder": req.rsa is None,
                 "n": rsa_params.n,
                 "k": rsa_params.k,
                 "t": rsa_params.t,

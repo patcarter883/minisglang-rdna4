@@ -58,6 +58,10 @@ PORT="${PORT:-1919}"
 # length, and (for dflash) the draft checkpoint. `attn=hip` is the canonical served backend; `auto`
 # survives only where a model has not been re-validated on it.
 dflash_draft=""; eagle3_draft=""; attn="hip"; spec_default="none"; swa_hybrid=""; tool_format=""
+# Markovian-RSA per-model defaults. `rsa_ladder=1` maps the request's reasoning_effort onto RSA's
+# (n, k, T) — the only "think harder" dial a standard OpenAI client has. Empty = RSA stays strictly
+# opt-in per request, which is what every arm but ZAYA wants.
+rsa_ladder=""; rsa_tail=""; rsa_beta=""; rsa_rollout_max=""
 # Short ALIAS the server advertises in /v1/models (--served-model-name), so clients key on the
 # BASE MODEL (Qwen3.8-27B), not whichever checkpoint quant happens to be loaded. Per arm below;
 # SERVED_NAME= overrides; the catch-all derives the basename of whatever was passed.
@@ -521,9 +525,8 @@ case "$MODEL" in
   # catch-all, which is the exact failure the comment above this `case` describes. It cost the
   # `ZAYA1-8B` alias (clients saw the quant suffix) and `tool_format=zaya_xml`, and the format
   # probe could not recover the second one until it learned the `<zyphra_tool_call>` wrapper.
-  # `zaya` bare selects MXFP4 — the current checkpoint; `zaya-fp8` keeps the older one addressable.
-  # A full path always wins over both. ZAYA_MODEL is GONE: a checkpoint is chosen by naming it,
-  # like every other model in this table, not by an env var only this arm knew about.
+  # `zaya` bare selects MXFP4 — the checkpoint the RSA ladder was measured on; `zaya-fp8` keeps the
+  # older one addressable. A full path always wins over both.
   zaya|zaya-mxfp4|zaya-fp8|*/ZAYA1-8B-MXFP4|ZAYA1-8B-MXFP4|*/ZAYA1-8B-fp8|ZAYA1-8B-fp8)
                   case "$MODEL" in
                     zaya|zaya-mxfp4) model_id="/models/ZAYA1-8B-MXFP4" ;;
@@ -533,6 +536,14 @@ case "$MODEL" in
                   served_name="ZAYA1-8B"
                   spec_default="none"
                   tool_format="zaya_xml"
+                  # Markovian-RSA operating point, MEASURED 2026-09-09/10 at tp=1 dp=2 ep=1 conc=64
+                  # (docs + raw run in the ladder artifacts). tau=512 with beta=4096 is the only
+                  # coherent pairing tested: beta is the per-rollout reasoning CHUNK and tau the tail
+                  # carried into aggregation, so beta must be >> tau (the papers run 2-10x; this is
+                  # 8x). An earlier sweep at beta=256..2048 against tau=4096 was the degenerate
+                  # regime run_markovian_rsa's own guard warns about, and its numbers meant nothing.
+                  # These are NOT laddered by reasoning_effort — see api_server._EFFORT_RSA.
+                  rsa_ladder=1; rsa_tail=512; rsa_beta=4096; rsa_rollout_max=6000
                   dflash_draft="/drafts/ZAYA1-8B-DFlash-CCA-5L-minv-ep4"; k_dflash=4 ;;
   # Qwen4-Exp (`qwen4_exp`), NVFP4, 48 layers (36 GDN + 12 full-attn), 512 experts/layer, a PLE
   # n-gram block on decoder index 1, and a 4x-wide (10240) hyper-connection residual. The ONLY model
@@ -1101,6 +1112,18 @@ DIST_TIMEOUT="${DIST_TIMEOUT:-${dist_timeout:-600}}"
 dist_args=()
 [[ -n "$DIST_TIMEOUT" ]] && dist_args+=(--distributed-timeout "$DIST_TIMEOUT")
 
+# Markovian-RSA. RSA_LADDER=0 in the env disables the per-arm ladder without editing the table;
+# RSA_TAIL / RSA_BETA / RSA_ROLLOUT_MAX override the measured operating point.
+RSA_LADDER="${RSA_LADDER:-${rsa_ladder:-}}"
+RSA_TAIL="${RSA_TAIL:-${rsa_tail:-}}"
+RSA_BETA="${RSA_BETA:-${rsa_beta:-}}"
+RSA_ROLLOUT_MAX="${RSA_ROLLOUT_MAX:-${rsa_rollout_max:-}}"
+rsa_args=()
+[[ "$RSA_LADDER" = "1" ]] && rsa_args+=(--rsa-effort-ladder)
+[[ -n "$RSA_TAIL" ]] && rsa_args+=(--rsa-tail-tokens "$RSA_TAIL")
+[[ -n "$RSA_BETA" ]] && rsa_args+=(--rsa-think-budget "$RSA_BETA")
+[[ -n "$RSA_ROLLOUT_MAX" ]] && rsa_args+=(--rsa-max-tokens "$RSA_ROLLOUT_MAX")
+
 woff_args=()
 [[ -n "$WOFF_DEVICE_GB" ]] && woff_args+=(--weight-offload-device-gb "$WOFF_DEVICE_GB")
 [[ -n "$WOFF_HOST_GB" ]] && woff_args+=(--weight-offload-gb "$WOFF_HOST_GB")
@@ -1121,6 +1144,7 @@ cmd=(python -m minisgl
   "${spec_args[@]}"
   "${woff_args[@]}"
   "${dist_args[@]}"
+  "${rsa_args[@]}"
 )
 # EXTRA_ARGS last so it can override anything above.
 [[ -n "${EXTRA_ARGS:-}" ]] && read -r -a _extra <<< "$EXTRA_ARGS" && cmd+=("${_extra[@]}")
@@ -1128,6 +1152,8 @@ cmd=(python -m minisgl
 printf '[serve] model=%s served=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=%s graph_bs=%s\n' \
   "$model_id" "$served_name" "$SPEC" "${SPEC_K:+ k=$SPEC_K}" "$TP" "$DP" "$EP" "${CTX:-checkpoint}" "$CONC" \
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
+[[ "$RSA_LADDER" = "1" ]] && printf '[serve] RSA effort ladder: ON (tau=%s beta=%s rollout_max=%s) — reasoning_effort low/medium/high/max -> (n,k,T)\n' \
+  "${RSA_TAIL:-<default 4096>}" "${RSA_BETA:-<default: the request think budget>}" "${RSA_ROLLOUT_MAX:-<default 8192>}" >&2
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
   "$MINISGL_SWA_RADIX" "$MINISGL_SPEC_MHA_PAGED" >&2
 # The offload tier ON THE BANNER, because it is invisible in every other observable: a serve with

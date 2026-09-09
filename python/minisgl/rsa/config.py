@@ -42,6 +42,15 @@ class RSAParams(BaseModel):
     """
 
     enabled: bool = True
+    effort_ladder: bool = Field(
+        default=False,
+        description="map the request's OpenAI `reasoning_effort` onto the (n, k, T) ladder "
+        "when the client sent no explicit `rsa` field. OFF by default: RSA is a fan-out, and "
+        "silently turning every effort-carrying request into N rollouts is not something a "
+        "serve should do unasked. tau/beta/max_tokens are NOT laddered — they stay at these "
+        "defaults for every rung, because a rung that shortens the workspace spends the "
+        "compute and then throws the reasoning away (see api_server._EFFORT_RSA).",
+    )
     n: int = Field(default=16, ge=1, description="population size N")
     k: int = Field(default=4, ge=1, description="aggregation subset size C (C<=N)")
     t: int = Field(default=2, ge=1, description="total rounds T (round 0 = expand)")
@@ -144,6 +153,13 @@ class ShimConfig:
 def add_rsa_args(parser: argparse.ArgumentParser) -> None:
     d = RSAParams()
     g = parser.add_argument_group("Markovian RSA parameters")
+    g.add_argument(
+        "--rsa-effort-ladder",
+        action="store_true",
+        default=d.effort_ladder,
+        help="map reasoning_effort (low/medium/high/max) onto the RSA (n, k, T) ladder for "
+        "requests that carry an effort but no explicit `rsa` field; off by default",
+    )
     g.add_argument("--rsa-n", type=int, default=d.n, help="population size N")
     g.add_argument("--rsa-k", type=int, default=d.k, help="aggregation set size K")
     g.add_argument(
@@ -214,6 +230,7 @@ def add_rsa_args(parser: argparse.ArgumentParser) -> None:
 
 def params_from_args(args: argparse.Namespace) -> RSAParams:
     return RSAParams(
+        effort_ladder=args.rsa_effort_ladder,
         n=args.rsa_n,
         k=args.rsa_k,
         t=args.rsa_t,
