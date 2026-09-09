@@ -503,10 +503,23 @@ def _check_moe_scale_pair(
         return
     if scales.dtype not in (torch.float8_e4m3fn, torch.uint8):
         raise AssertionError(
-            f"w4a8_moe {which}: scales must be fp16 (folded per-group) or float8_e4m3fn/uint8 "
-            f"(NVFP4 block scale); got {scales.dtype}"
+            f"w4a8_moe {which}: scales must be fp16 (folded per-group), float8_e4m3fn/uint8 "
+            f"(NVFP4 two-level block scale) or uint8 with no zeros (MXFP4 E8M0); "
+            f"got {scales.dtype}"
         )
     E, N = w.shape[0], w.shape[1]
+    # MXFP4 E8M0: a 1-BYTE scale with NO zeros slot. Both live formats are one byte wide, so dtype
+    # alone cannot separate them — the discriminator is the zeros slot, which is exactly the rule
+    # the kernel's own `MOE_SCALE_FMT_DISPATCH_G` uses (`w_zeros.defined() && w_zeros.numel() > 0`).
+    # Keeping the two in agreement is the whole point of checking here.
+    #
+    # THIS ARM IS WHY: MXFP4 group scales used to be WIDENED to fp16 at load, so they returned above
+    # and never reached this check. Passing the E8M0 byte through natively (2026-09-08) made them
+    # uint8, and this guard then read every MXFP4 MoE checkpoint as an e4m3 pair missing its global
+    # and refused to serve it. Caught 2026-09-09 booting ZAYA1-8B-MXFP4; the qwen4_exp serve never
+    # saw it because that checkpoint is genuinely NVFP4 and does carry the global.
+    if scales.dtype == torch.uint8 and zeros is None:
+        return
     if zeros is None:
         raise AssertionError(
             f"w4a8_moe {which}: e4m3 block scales REQUIRE the per-output-channel f32 global in the "
