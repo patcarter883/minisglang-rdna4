@@ -498,11 +498,22 @@ class ExpertResidencyCache:
             torch.cuda.current_stream(self.device) if cuda else None)
         stream = self._copy_stream
         if cuda:
+            # ORDER AGAINST THE RETRACTION ONLY — and only when there was one.
+            #
+            # A slot carries a retract event iff it was previously published and has since been
+            # taken out of `slot_of`. Waiting that event is exactly the required fence: it makes
+            # the copy follow every launch that could still have been reading the old expert.
+            #
+            # A slot with NO retract event has never appeared in `slot_of`, so no kernel has ever
+            # been able to reach it, and there is nothing to order against. The previous code fell
+            # back to `wait_stream(compute)` there, which waits for EVERYTHING currently queued on
+            # the compute stream — so during continuous decode the copy stream perpetually chased
+            # the compute tail and copies only landed when the GPU briefly idled. Measured
+            # 2026-09-08: 448 promotions against 227,150 throttled references, fill stuck at 0.099,
+            # with `inflight` pinned at the ceiling because nothing ever completed.
             ev = self._retract_ev.pop(slot, None)
             if ev is not None:
-                stream.wait_event(ev)      # this slot's own retraction, not the whole stream
-            else:
-                stream.wait_stream(compute)
+                stream.wait_event(ev)
         import contextlib
         with (torch.cuda.stream(stream) if cuda else contextlib.nullcontext()):
             for plane in ("gate_up", "down"):
