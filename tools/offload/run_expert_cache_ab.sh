@@ -58,7 +58,7 @@ export EXTRA_ARGS="$extra"
 
 export MODEL=qwen4exp SPEC=none TP="${TP:-2}" CONC=2 GRAPH_BS=0
 export MEM_RATIO="${MEM_RATIO:-0.85}"
-export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-mgr8}"
+export MINISGL_IMAGE="${MINISGL_IMAGE:-minisgl-rdna4:cache-adm}"
 export MINISGL_HOST_PORT="$PORT"
 export MINISGL_HOSTPROF=50
 # Forwarded so the ARM is in the artifact: an A/B whose tuning is not in its own log is a
