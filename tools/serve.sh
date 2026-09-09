@@ -71,6 +71,29 @@ served_name=""
 presence_default=""
 # Per-model torch allocator config (exported just before exec). Empty = torch default.
 alloc_conf=""
+# k_dflash IS NOT FREE — it is bounded by the DRAFT CHECKPOINT, and it is a CEILING, not the width
+# that runs. Both halves have bitten this table:
+#
+#   BOUND. A DFlash step feeds the drafter one block of [anchor, mask x (B-1)] and reads B-1 drafts
+#   off it, so a K above `block_size - 1` is silently clipped in spec/dflash.py `propose`
+#   (`min(num_draft, B - 1, ...)`) while engine.py still reserves verify buffers at K+1 rows and the
+#   SWA ring at window+K+1. The blocks the drafters here declare: z-lab Qwen3.6-35B-A3B-DFlash 16,
+#   z-lab Qwen3.6-27B-DFlash 16, Muse-Glimmer-30B-assistant 16, Laguna-XS-2.1-DFlash-NVFP4 16,
+#   RadixArk Qwen3.8-27B-DSpark **7** — so 15 everywhere except DSpark's 6, and the ZAYA CCA drafter
+#   which declares none and takes block = K+1 by construction. The block-1 relationship is stated,
+#   not inferred: the cached `speculators`-dialect poolside/Laguna-XS.2-speculator.dflash carries
+#   `block_size: 8` beside `speculative_tokens: 7`. (No arm uses it, but `DRAFT=` reaches it, and at
+#   k_dflash=15 it would draft 7.) A mismatch now WARNS at proposer construction naming both numbers
+#   (`dflash_check_num_draft`); it used to be silent, which is how laguna shipped k_dflash=16
+#   against a block of 16 from this table's first commit.
+#
+#   CEILING. K sizes the captured verify-width LADDER (spec/width.py `verify_width_ladder`:
+#   K=15 -> [3, 7, 15]), and the adaptive controller picks a rung per step from measured acceptance
+#   and a verify-row budget. So the shipped K is the widest rung the run may use, not its operating
+#   point, and a table entry that reads like a tuned width is not one. Measured on qwen35b-awq +
+#   z-lab DFlash at K=15, 4100 verify steps: accept-len 1.20 drafts/verify (2.20 committed),
+#   verify-width[3:2751(67%) 7:1323(32%) 15:0(0%)] — rung 15 was captured and never chosen. That is
+#   the controller working, not a mis-set K; the drafter genuinely can emit 15, so 15 stays.
 k_mtp=4; k_dflash=15; k_eagle3=4; k_tidar=4; mem_default="0.80"
 # Minimum TP a model's WEIGHTS require. A general knob, not a special case: some checkpoints simply
 # do not fit on one 16 GB card, and the control panel exposes TP as a free dropdown — so picking one
@@ -131,7 +154,18 @@ case "$MODEL" in
   laguna|poolside/Laguna-XS-2.1-NVFP4)
                   model_id="poolside/Laguna-XS-2.1-NVFP4"; served_name="Laguna-XS-2.1";
                   spec_default="none"
-                  dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=16; mem_default="0.85"
+                  # 15, NOT the 16 this line carried from the table's first commit (8e2bc35). The
+                  # drafter declares `dflash_config.block_size: 16`, i.e. [anchor, 15 masks], so
+                  # `propose` clipped the 16th draft away every step while engine.py reserved verify
+                  # buffers and the SWA ring at 17 rows — and spec/width.py's own M-cliff cap
+                  # measured that extra row as the WRONG side of a kernel boundary: on this NVFP4
+                  # (e2m1) pair, K=16 (qlen 17) -> K=15 (qlen 16) is +20% end-to-end at identical
+                  # accept-len (docs/CONTINUANCE_laguna_spec_and_decode_perf.md §2 finding 1). The
+                  # cap already forced the ladder to [3, 7, 15], so this is the table catching up to
+                  # what ran, not a new operating point: it changes no width, only the K+1-sized
+                  # reservations (one row narrower, i.e. slightly MORE KV pool than 0.93 was
+                  # measured with).
+                  dflash_draft="poolside/Laguna-XS-2.1-DFlash-NVFP4"; k_dflash=15; mem_default="0.85"
                   mem_default_spec="0.93"
                   swa_hybrid=1 ;;
   # Muse-Glimmer: dense SWA hybrid (39 sliding @2048 + 13 full, the full ones NoPE), NVFP4,
@@ -204,8 +238,10 @@ case "$MODEL" in
   # Qwen3.6-27B + the z-lab DFlash drafter. The drafter is the TIED-VOCAB z-lab dialect (no own
   # embed/lm_head/d2t — it borrows the target's), non-causal and UNWINDOWED, so it attends its whole
   # prefix bidirectionally and takes the EAGER per-uid propose path rather than the captured ring
-  # (spec/dflash.py: that is a checkpoint property, not a switch). Its config states no block_size,
-  # so block = SPEC_K + 1 and k_dflash=15 gives the block of 16 the other DFlash pairs use.
+  # (spec/dflash.py: that is a checkpoint property, not a switch). It DOES declare a block: 16, as a
+  # TOP-LEVEL `block_size` rather than inside `dflash_config` (the claim here that it "states no
+  # block_size, so block = SPEC_K + 1" was reading only the sub-dict). k_dflash=15 is therefore the
+  # checkpoint's own width — [anchor, 15 masks] — and not a number that happens to land on it.
   #
   # This arm carried NO spec defaults, on the claim that the 27B INT4 target costs "~6.8 GiB/card at
   # TP=2" and so a bf16 drafter "fits with room". That arithmetic was wrong: the checkpoint is

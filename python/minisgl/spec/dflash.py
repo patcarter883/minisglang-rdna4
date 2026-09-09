@@ -137,6 +137,72 @@ def dflash_layer_masks(cfg, num_layers: int):
     return causal, window
 
 
+def dflash_block_size(cfg, num_draft: int):
+    """The drafter's trained BLOCK `B`, and where the number came from.
+
+    ONE derivation, because there are three builders below and each used to spell it its own way —
+    with a different fallback (`or 0` vs `or 16`), which is a silent geometry difference between two
+    checkpoints that declare the same thing in different places.
+
+    A DFlash step feeds the drafter a block of ``[anchor, mask x (B-1)]`` and reads drafts off
+    positions 1..B-1, so ``B - 1`` is the MOST this checkpoint can emit — see `propose`'s
+    ``k_i = max(0, min(num_draft, B - 1, req.remain_len - 1))``. The three declaration dialects on
+    this box, in the order they are read:
+
+      dflash_config.block_size   z-lab Qwen3.6-35B-A3B-DFlash 16, poolside Laguna-XS-2.1 16,
+                                 RadixArk Qwen3.8-27B-DSpark **7**
+      TOP-LEVEL block_size       meta-models Muse-Glimmer-30B-assistant 16, z-lab Qwen3.6-27B-DFlash
+                                 16 — transformers keeps unrecognised top-level keys as attributes,
+                                 so `getattr` finds them; the sub-dict lookup alone does not
+      neither                    the ZAYA CCA drafters, whose trained block is num_spec masks + 1
+                                 anchor. `--spec-num-draft` carries that num_spec, so block =
+                                 num_draft + 1 makes K set the width exactly and matches training
+                                 (m4dss num_spec=4 -> block 5; ns15=15 -> 16).
+
+    MINISGL_DFLASH_BLOCK overrides in BOTH directions: it can also RAISE the block past the declared
+    block_size (positions past the trained block are then out-of-distribution — verify gates them, so
+    it is an empirical lever, not a hazard).
+    """
+    dfc = getattr(cfg, "dflash_config", None) or {}
+    if not isinstance(dfc, dict):
+        dfc = dict(dfc)
+    block, source = int(dfc.get("block_size") or 0), "dflash_config.block_size"
+    if block < 2:
+        block, source = int(getattr(cfg, "block_size", 0) or 0), "top-level block_size"
+    if block < 2:
+        block, source = int(num_draft) + 1, "derived num_draft+1 (checkpoint declares no block_size)"
+    cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
+    if cap:
+        block, source = cap, "MINISGL_DFLASH_BLOCK"
+    assert block >= 2, f"DFlash block_size must be >= 2, got {block} (from {source})"
+    return block, source
+
+
+def dflash_check_num_draft(num_draft: int, block: int, source: str, draft_model_path: str) -> int:
+    """Drafts this checkpoint can actually emit per step, WARNING when the request exceeds it.
+
+    `propose` clips with `min(num_draft, B - 1, ...)`, so a K past the block is not an error and not
+    a fallback — it is a number that never appears anywhere downstream, while every K-sized
+    reservation (engine.py's `qlen = num_draft + 1` verify buffers, the SWA ring stride
+    `window + num_draft + 1`) is still built from it. That silence is the defect this exists for:
+    the serve.sh table shipped `k_dflash=16` against Laguna's block of 16 (i.e. 15 drafts) from the
+    table's first commit, and nothing in a boot log or a metric ever said the 16 was inert.
+
+    One line, at construction — not per step: the block is fixed for the life of the proposer.
+    """
+    width = block - 1
+    if num_draft > width:
+        logger.warning_rank0(
+            f"spec-decode: --spec-num-draft {num_draft} is MORE than this DFlash drafter can "
+            f"deliver. {draft_model_path} has block_size {block} ([anchor, {width} masks], from "
+            f"{source}), so propose emits {width} drafts per step and the extra "
+            f"{num_draft - width} is silently dropped — while the verify buffers and the SWA ring "
+            f"are still reserved at {num_draft}+1 rows. Set --spec-num-draft {width} "
+            f"(serve.sh: SPEC_K={width}) so the configured K is the one that runs, or raise the "
+            f"block with MINISGL_DFLASH_BLOCK if you mean to draft past the trained width.")
+    return width
+
+
 def dflash_trunk_probe(names):
     """What KIND of trunk this drafter is, from the CHECKPOINT'S OWN TENSORS — never its name.
 
@@ -207,6 +273,7 @@ class DFlashProposer(CapturableProposer):
 
         self._engine = engine
         self._num_draft = num_draft
+        self._draft_path = draft_model_path   # for diagnostics; the builders below only get `folder`
         self._device = engine.device
         self._dtype = engine.dtype
 
@@ -302,23 +369,12 @@ class DFlashProposer(CapturableProposer):
                 f"({dict(rope_scaling)}) — applied, not defaulted")
         max_pos = int(cfg("max_position_embeddings", default=262144))
 
-        self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 0)
-        if self._block_size < 2:
-            # The ZAYA DFlash checkpoints don't record block_size in dflash_config; the trained block is
-            # num_spec masks + 1 anchor. --spec-num-draft carries the trained num_spec, and the propose
-            # step emits min(block-1, num_draft) drafts, so block = num_draft+1 makes --spec-num-draft
-            # set the width exactly and matches training (m4dss num_spec=4 -> block 5; ns15=15 -> 16).
-            self._block_size = self._num_draft + 1
-        assert self._block_size >= 2, f"DFlash block_size must be >= 2, got {self._block_size}"
+        self._block_size, _blk_src = dflash_block_size(hf, self._num_draft)
+        self._draft_width = dflash_check_num_draft(
+            self._num_draft, self._block_size, _blk_src, draft_model_path)
         self._mask_token_id = int(
             dfc.get("mask_token_id") if "mask_token_id" in dfc else getattr(hf, "mask_token_id")
         )
-        block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
-        if block_cap:
-            # An EXPLICIT override wins in BOTH directions: it can also RAISE the block past the
-            # checkpoint's declared block_size (positions past the trained block are then
-            # out-of-distribution — verify gates them, so it is an empirical lever, not a hazard).
-            self._block_size = block_cap
 
         # Captured target-layer ids (z-lab target_layer_ids / speculators aux_hidden_state_layer_ids).
         # Read through `cfg`, not `dfc.get`: Muse-Glimmer's assistant checkpoint ships NO
@@ -960,7 +1016,10 @@ class DFlashProposer(CapturableProposer):
         self.capture_layer_ids = [int(x) for x in ids]
         target_hidden = engine.model.model.embed_tokens.weight.shape[1]
 
+        # Block DERIVED from K, so K is delivered exactly and `dflash_check_num_draft` has nothing to
+        # warn about here by construction — recorded anyway so every path publishes `_draft_width`.
         self._block_size = 1 + self._num_draft  # block = [anchor, mask*num_draft]
+        self._draft_width = self._num_draft
         self._mask_token_id = int(dfc.get("mask_token_id", 0))
         self._compressed = False
         self._d2t = None
@@ -1051,14 +1110,12 @@ class DFlashProposer(CapturableProposer):
         sliding_window = max(self._layer_window)
         causal = all(self._layer_causal)
 
-        self._block_size = int(dfc.get("block_size") or getattr(hf, "block_size", 0) or 16)
-        block_cap = int(os.environ.get("MINISGL_DFLASH_BLOCK", "0") or 0)
-        if block_cap:
-            # An EXPLICIT override wins in BOTH directions: it can also RAISE the block past the
-            # checkpoint's declared block_size (positions past the trained block are then
-            # out-of-distribution — verify gates them, so it is an empirical lever, not a hazard).
-            self._block_size = block_cap
-        assert self._block_size >= 2, f"DFlash block_size must be >= 2, got {self._block_size}"
+        # Same derivation as the ungated trunk — this used to fall back to a hard-coded 16 where the
+        # other builder fell back to num_draft+1, so two checkpoints declaring nothing got different
+        # blocks depending only on which builder their tensors selected.
+        self._block_size, _blk_src = dflash_block_size(hf, self._num_draft)
+        self._draft_width = dflash_check_num_draft(
+            self._num_draft, self._block_size, _blk_src, self._draft_path)
         self._mask_token_id = int(dfc.get("mask_token_id", 12))
 
         ids = dfc.get("target_layer_ids") or getattr(hf, "aux_hidden_state_layer_ids", None)
