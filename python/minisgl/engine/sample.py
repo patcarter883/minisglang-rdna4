@@ -204,23 +204,49 @@ class Sampler:
             min_p = make_device_tensor(min_ps, torch.float32, self.device)
         return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, min_p=min_p, **pen)
 
+    def condition_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Head-side logit conditioning that EVERY lane turning a logit row into a committed token
+        must apply — the plain sampler below, and every speculative verify forward alike.
+
+        Three steps, in this order (matching what both reference engines do at the head):
+
+        1. NaN/Inf scrub BEFORE anything reads the row. A transient NaN from any upstream kernel
+           makes sampling undefined — SGLang's sanitizer documents the exact consequence ("can come
+           back as out-of-vocab token ids", srt/utils/async_probe.py) and runs on every sample; vLLM
+           leans on masking alone. Unconditional nan_to_num_ is one elementwise op (no host sync — an
+           isnan().any() check would cost more than the scrub); NaN -> -1e30 removes the token from
+           contention rather than crowning it argmax-of-garbage.
+        2. Final-logit softcap, when the checkpoint asks for one (see logit_softcap).
+        3. The padded-vocab fence: the untrained lm_head tail can never be sampled (see
+           real_vocab_size). MEASURED on cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit, which logs at boot
+           `masking padded vocab tail [248077, 248320) — 243 untrained ids fenced off`; those 243
+           rows carry AWQ dequant noise, and an unfenced row is fully eligible for a greedy argmax
+           or a top-k nucleus.
+
+        This is ONE function, not three inline copies, because the copy already cost us: 2fba9ae
+        landed exactly this block inline in Scheduler._spec_decode_step and left the three sibling
+        verify forwards (_tidar_block_predict, _ddtree_tree_verify, _spec_decode_step_tidar_fused)
+        reading raw logits — the fused-TiDAR one COMMITS its argmax directly. Anything that grows a
+        fourth processor here reaches every lane at once.
+
+        In-place where it can be (scrub + fence): safe even on a captured graph's static output
+        buffer, because a replay overwrites it fully. The softcap has to allocate, so the returned
+        tensor is NOT always the argument — callers must rebind, never assume in-place.
+        """
+        if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
+            torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
+        if self.logit_softcap:
+            logits = torch.tanh(logits.float() / self.logit_softcap) * self.logit_softcap
+        if self.real_vocab_size is not None and self.real_vocab_size < logits.shape[-1]:
+            logits[:, self.real_vocab_size:] = float("-inf")
+        return logits
+
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
-            # NaN/Inf scrub BEFORE anything reads the row. A transient NaN from any upstream kernel
-            # makes sampling undefined — SGLang's sanitizer documents the exact consequence ("can
-            # come back as out-of-vocab token ids", srt/utils/async_probe.py) and runs on every
-            # sample; vLLM leans on masking alone. Unconditional nan_to_num_ is one elementwise op
-            # (no host sync — an isnan().any() check would cost more than the scrub); NaN -> -1e30
-            # removes the token from contention rather than crowning it argmax-of-garbage.
-            # In-place is safe even on a captured graph's output buffer: replay overwrites it fully.
-            if os.environ.get("MINISGL_SANITIZE_LOGITS", "1") != "0":
-                torch.nan_to_num_(logits, nan=-1e30, posinf=1e30, neginf=-1e30)
-            if self.logit_softcap:
-                logits = torch.tanh(logits.float() / self.logit_softcap) * self.logit_softcap
-            # Padded-vocab fence: the untrained tail can never be sampled (see real_vocab_size).
-            if self.real_vocab_size is not None and self.real_vocab_size < logits.shape[-1]:
-                logits[:, self.real_vocab_size:] = float("-inf")
+            # Scrub / softcap / padded-vocab fence. Shared verbatim with the spec verify lane — see
+            # condition_logits for why each step is here and why it is not inlined.
+            logits = self.condition_logits(logits)
             # Per-token logprob capture, for the rows that asked (SamplingParams.logprobs > 0).
             # Taken HERE — after the scrub / softcap / padded-vocab fence, before grammar masks,
             # EOS suppression and penalties — so it reports the raw model distribution rather than

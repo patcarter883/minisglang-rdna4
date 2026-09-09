@@ -28,7 +28,15 @@ def probs_from_logits(
     """Build the target sampling distribution from logits, applying the request's temp/min_p/top_k/top_p
     the same way the fused sampler does (temperature scale -> min-p floor -> top-k mask -> softmax ->
     top-p renormalize). ``logits`` [.., V] (any float); returns probs [.., V] fp32.
-    temperature<=0 -> onehot(argmax)."""
+    temperature<=0 -> onehot(argmax).
+
+    CONTRACT: ``logits`` must ALREADY be head-conditioned — NaN-scrubbed, softcapped, and with the
+    untrained padded-vocab tail fenced to -inf. That is Sampler.condition_logits (engine/sample.py),
+    which every verify forward runs on its output before anything here is reached. This function
+    deliberately does not repeat it: it is called per request and per position, it has no view of
+    real_vocab_size, and re-masking [K+1, V] rows once per req per step is exactly the cost that
+    conditioning once per forward avoids. Fed RAW logits it puts a pad-tail dequant artifact into the
+    nucleus, and top-k selects it like any other token."""
     logits = logits.float()
     if temperature <= 0.0:
         out = torch.zeros_like(logits)

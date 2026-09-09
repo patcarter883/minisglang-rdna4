@@ -461,6 +461,15 @@ def ddtree_walk_sampled(
     NOTE the tree's higher-acceptance benefit is realized only when the walk's output is COMMITTED (a
     2-forward direct commit): under the 3-forward re-verify the linear verify_sampled re-samples, and
     greedy discovery would then dominate. Returns (accepted token ids in order, next bonus token).
+
+    CONTRACT (same as probs_from_logits, and it BINDS harder here because the 2-forward mode commits
+    directly): ``node_logits`` must already be head-conditioned by Sampler.condition_logits — NaN
+    scrub, softcap, padded-vocab fence. The only producer of these rows is
+    Scheduler._ddtree_tree_verify, which conditions its forward output before slicing per-node rows,
+    so the contract holds by construction; anything that grows a second producer must condition too.
+    ``min_p`` is not plumbed because no scheduler path calls this walk today — the shipped DDTree
+    steps discover with the greedy ``ddtree_walk`` and commit through the linear verify. Wiring this
+    in means threading min_p, not just calling it.
     """
     from .sampling import probs_from_logits
 
