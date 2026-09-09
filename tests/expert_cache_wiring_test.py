@@ -84,7 +84,11 @@ def test_registering_the_real_container_matches_slab_geometry():
             assert slab is not None, f"{plane}.{kind} slab missing for a tensor that exists"
             assert slab.shape[1:] == host.shape[1:], f"{plane}.{kind} row shape mismatch"
             assert slab.dtype == host.dtype, f"{plane}.{kind} dtype mismatch"
-    # and the promotion actually reproduces the host bytes
+    # and the promotion actually reproduces the host bytes. TWICE, because admission is
+    # second-reference: a single sighting deliberately spends no bandwidth (see
+    # expert_cache_test.py::test_t10), so one observe() would leave slot_of at -1 and this test
+    # would be asserting the filter rather than the geometry it is about.
+    cache.observe(0, [1, 5])
     cache.observe(0, [1, 5])
     for e in (1, 5):
         slot = int(cache._layers[0]["slot_of"][e])

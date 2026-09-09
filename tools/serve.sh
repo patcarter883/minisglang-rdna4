@@ -692,6 +692,17 @@ case "$MODEL" in
                   # host_gb 33, not 26: 26 was sized for 37 host layers; all 48 need 31.93/rank and
                   # the clamp must sit above the plan's reserve.
                   woff_device_gb="0.5"; woff_host_gb="33"; woff_chunk_mib="1372"
+                  # `[DIST-TIMEOUT 2026-09-08]` 600 s, not the 60 s default, and this is a CRASH
+                  # fix rather than a tuning preference. The NCCL watchdog aborts the process group
+                  # — scheduler dead, exitcode -6, mid-request — when a collective exceeds it, and
+                  # on THIS arm a rank legitimately can: all 48 MoE layers stream from host RAM
+                  # every step over a card-1-gated link, so a peer can sit in the vocab-parallel
+                  # embedding all-gather for a long time while the other rank waits on PCIe. SIX
+                  # measured legs died exactly that way (WorkNCCL SeqNum=350, _ALLGATHER_BASE,
+                  # ran for 60093 ms), and FOUR of them had no expert cache attached — so it is a
+                  # property of the all-host arm, not of anything layered on it. 600 s still
+                  # catches a genuine hang; it just stops calling a slow step one.
+                  dist_timeout="600"
                   # ---- QSA SPARSE ATTENTION (`[QSA-2026-09-06]`) --------------------------------
                   # The 2048-token refusal is GONE: the sparse selection exists
                   # (python/minisgl/attention/qsa + the qsa_index HIP package), so this arm serves
@@ -1055,6 +1066,12 @@ WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
 # L48_tp2_chunk750_dev11.json (48-layer row), chunk_sweep_tp2_L48.json (the sweep).
 WOFF_CHUNK_MIB="${WOFF_CHUNK_MIB:-${woff_chunk_mib:-}}"
 [[ -n "$WOFF_CHUNK_MIB" ]] && export MINISGL_WEIGHT_ARENA_CHUNK_MIB="$WOFF_CHUNK_MIB"
+# Per-model default from the table (`dist_timeout`), overridable by the environment. Empty keeps
+# the engine's 60 s.
+DIST_TIMEOUT="${DIST_TIMEOUT:-${dist_timeout:-}}"
+dist_args=()
+[[ -n "$DIST_TIMEOUT" ]] && dist_args+=(--distributed-timeout "$DIST_TIMEOUT")
+
 woff_args=()
 [[ -n "$WOFF_DEVICE_GB" ]] && woff_args+=(--weight-offload-device-gb "$WOFF_DEVICE_GB")
 [[ -n "$WOFF_HOST_GB" ]] && woff_args+=(--weight-offload-gb "$WOFF_HOST_GB")
@@ -1074,6 +1091,7 @@ cmd=(python -m minisgl
   "${ctx_args[@]}"
   "${spec_args[@]}"
   "${woff_args[@]}"
+  "${dist_args[@]}"
 )
 # EXTRA_ARGS last so it can override anything above.
 [[ -n "${EXTRA_ARGS:-}" ]] && read -r -a _extra <<< "$EXTRA_ARGS" && cmd+=("${_extra[@]}")

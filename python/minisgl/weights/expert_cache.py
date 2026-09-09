@@ -225,6 +225,13 @@ class ExpertResidencyCache:
         self._max_inflight = max(8, _env_int("MINISGL_EXPERT_CACHE_MAX_INFLIGHT", 64))
         #: Ticks an in-flight copy may go unlanded before its slot is reclaimed unpublished.
         self._inflight_max_age = max(4, _env_int("MINISGL_EXPERT_CACHE_INFLIGHT_AGE", 64))
+        #: Second-reference admission (see `_admit_ok`). ON: the sweep showed indiscriminate
+        #: promotion costs both hit rate and throughput on a saturated link.
+        self._admit_second_ref = _env_int("MINISGL_EXPERT_CACHE_ADMIT_SECOND", 1) != 0
+        #: Recent-miss window. ~2x the slot count: large enough that a genuinely recurring expert
+        #: is still remembered on its next route, small enough to forget a one-touch sweep.
+        self._candidate_cap = max(256, _env_int("MINISGL_EXPERT_CACHE_CANDIDATES", self.slots * 2))
+        self._candidates: Dict[int, None] = {}
         #: apply_pending() calls. In the summary because a stalled scheduler half and a stalled
         #: manager look identical from the outside, and this separates them.
         self.stats["ticks"] = 0
@@ -326,7 +333,42 @@ class ExpertResidencyCache:
                 self.stats["hits"] += 1
             else:
                 self.stats["misses"] += 1
-                self._promote(key)
+                if self._admit_ok(key):
+                    self._promote(key)
+
+    def _admit_ok(self, key: int) -> bool:
+        """Has this expert EARNED a transfer? (Second-reference admission.)
+
+        WHY A FILTER AT ALL, and why this one. Every promotion is a 1.36 MiB copy over a link the
+        forward has already saturated streaming its own experts, so a promotion is not free capacity
+        — it is bandwidth taken from the thing being accelerated. Measured on the low-water sweep:
+
+            low_water=25    h=0.6314  evictions=1,475   TPOT 50.26 ms
+            low_water=1024  h=0.5961  evictions=61,404  TPOT 53.14 ms
+
+        Churning 41x harder made the hit rate WORSE and the serve slower. Indiscriminate promotion
+        loses; that is the evidence this filter is built on, not a hunch about locality.
+
+        The rule: a missing expert is not promoted on its FIRST sighting, only on a second within
+        the recency window. A one-touch expert (a prefill sweep, a passing route) then costs zero
+        bandwidth instead of displacing a resident one. It is the admission-side analogue of what
+        SLRU's probation already does on the eviction side, and the oracle measured the same
+        asymmetry there (prefill pollution -0.0008 for SLRU vs +0.028 for LFU).
+
+        The window is a bounded ring of recent misses, so a candidate that never returns simply
+        ages out — no unbounded ghost table.
+        """
+        if not self._admit_second_ref:
+            return True
+        seen = self._candidates
+        if key in seen:
+            seen.pop(key, None)
+            return True
+        seen[key] = None
+        if len(seen) > self._candidate_cap:
+            seen.pop(next(iter(seen)))          # oldest candidate ages out
+        self.stats["admit_deferred"] = self.stats.get("admit_deferred", 0) + 1
+        return False
 
     # -- thread lifecycle ------------------------------------------------------------------------
     def start(self) -> None:
@@ -600,6 +642,7 @@ class ExpertResidencyCache:
                 f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
                 f"throttled={self.stats.get('throttled', 0)} "
                 f"abandoned={self.stats.get('abandoned', 0)} "
+                f"admit_deferred={self.stats.get('admit_deferred', 0)} "
                 f"skipped_capture={self.stats.get('skipped_capture', 0)} "
                 f"dropped_refs={self.stats['dropped_refs']} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")

@@ -165,6 +165,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help=(
+            "Seconds a TP collective may run before the NCCL watchdog aborts the process group "
+            "(default 60). This is a WATCHDOG, not a deadline: exceeding it kills the scheduler "
+            "with exitcode -6 mid-request. Raise it on any serve where a rank can legitimately "
+            "stall — an all-host weight-offload arm streams its experts over PCIe every step, and "
+            "a link contended by a second consumer can hold one rank past 60 s while its peer "
+            "waits in the embedding all-gather. Six measured legs on the qwen4_exp all-host arm "
+            "died exactly that way, four of them with no expert cache attached at all."
+        ),
+    )
+    parser.add_argument(
         "--memory-ratio",
         type=float,
         default=ServerArgs.memory_ratio,

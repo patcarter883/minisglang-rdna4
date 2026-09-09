@@ -751,6 +751,9 @@ services:
       # streaming over the same card-1-gated link (4,418 in flight -> the serve jammed); at 64 the
       # fill can never complete, because the forward already saturates PCIe and only ~1 copy lands
       # per step (448 promotions in 513 steps, fill stuck at 0.099).
+      # NCCL watchdog, seconds. serve.sh sets 600 for the qwen4exp all-host arm (six legs died at
+      # the 60 s default). Empty keeps the per-arm value from serve.sh's table.
+      DIST_TIMEOUT: "${DIST_TIMEOUT:-}"
       MINISGL_EXPERT_CACHE_MAX_INFLIGHT: "${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-}"
       MINISGL_EXPERT_CACHE_LOW_WATER: "${MINISGL_EXPERT_CACHE_LOW_WATER:-}"
       MINISGL_EXPERT_CACHE_INFLIGHT_AGE: "${MINISGL_EXPERT_CACHE_INFLIGHT_AGE:-}"

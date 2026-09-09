@@ -216,3 +216,41 @@ def test_t9_outstanding_copies_are_bounded():
         assert cache.stats["promotions"] == before, "promoted past the in-flight ceiling"
     finally:
         cache._thread = None
+
+
+def test_t10_a_one_touch_sweep_costs_no_transfers():
+    """SECOND-REFERENCE ADMISSION. Every promotion is a copy over a link the forward has already
+    saturated, so a one-touch expert must cost ZERO bandwidth rather than displacing a resident one.
+
+    This is the admission-side analogue of what SLRU probation does on the eviction side, and it is
+    built on measurement, not intuition: raising the reclaim rate 41x (low_water 25 -> 1024) moved
+    the hit rate DOWN 0.6314 -> 0.5961 and TPOT UP 50.26 -> 53.14 ms. Indiscriminate promotion
+    loses.
+    """
+    cache, _ = _build(slots=32)
+    assert cache._admit_second_ref, "the filter under test is off"
+    for e in range(E):                       # a single sweep, every expert touched ONCE
+        cache.observe(0, [e])
+    assert cache.stats["promotions"] == 0, (
+        f"a one-touch sweep spent {cache.stats['promotions']} transfers")
+    assert cache.stats["admit_deferred"] == E
+
+
+def test_t11_a_recurring_expert_is_admitted_on_its_second_reference():
+    """The other half: the filter must not starve the working set it exists to protect."""
+    cache, hosts = _build(slots=32)
+    cache.observe(0, [3])
+    assert cache.stats["promotions"] == 0
+    cache.observe(0, [3])                    # second sighting -> earns its transfer
+    assert cache.stats["promotions"] == 1
+    assert int(cache._layers[0]["slot_of"][3]) >= 0
+    assert not _check_invariant(cache, hosts)
+
+
+def test_t12_the_candidate_window_is_bounded():
+    """A candidate that never returns must age out — no unbounded ghost table on a long serve."""
+    cache, _ = _build(slots=16)
+    cache._candidate_cap = 64
+    for k in range(500):
+        cache.observe(k % LAYERS, [k % E])
+    assert len(cache._candidates) <= cache._candidate_cap + 1
