@@ -1069,6 +1069,59 @@ def _rsa_from_effort(req: "OpenAICompletionRequest", cfg) -> "RSAParams | None":
     return RSAParams(**{**base.model_dump(), "n": n, "k": k, "t": t})
 
 
+async def _rsa_as_sse(payload: dict, include_usage: bool):
+    """Re-frame a FINISHED RSA chat completion as a valid SSE stream.
+
+    RSA cannot stream as it goes — the answer does not exist until the last aggregation round picks
+    it — but `stream: true` is a statement about the WIRE, not about latency, and a client that
+    asked for `text/event-stream` cannot parse a `chat.completion` object. Before this, an RSA call
+    with stream=true returned application/json with zero `data:` frames and openai-python raised
+    rather than reading the answer. Measured on this serve: `Content-Type: application/json`,
+    `object: chat.completion`, 0 SSE frames.
+
+    So the whole answer arrives as one content frame, followed by the same terminal chunk + usage
+    chunk + [DONE] the ordinary chat stream ends with. Reasoning goes out on `reasoning_content`
+    exactly as the incremental lane emits it, so a client that renders a thinking channel still
+    gets one.
+    """
+    choice = payload["choices"][0]
+    msg = choice["message"]
+    cid, model, created = payload["id"], payload["model"], payload["created"]
+
+    def frame(delta: dict, finish=None, usage=False) -> bytes:
+        chunk = {
+            "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [{"delta": delta, "index": 0, "finish_reason": finish}],
+        }
+        if usage or include_usage:
+            # Spec: usage is null on every content chunk (the finish chunk included) whenever a
+            # dedicated trailing usage chunk is coming.
+            chunk["usage"] = None if include_usage else payload["usage"]
+        return f"data: {json.dumps(chunk)}\n\n".encode()
+
+    yield frame({"role": "assistant"})
+    if msg.get("reasoning_content"):
+        yield frame({"reasoning_content": msg["reasoning_content"]})
+    if msg.get("content"):
+        yield frame({"content": msg["content"]})
+    if msg.get("tool_calls"):
+        yield frame({"tool_calls": [
+            {**tc, "index": tc.get("index", i)} for i, tc in enumerate(msg["tool_calls"])]})
+    # Terminal chunk carries finish_reason, and the totals unless a usage chunk follows.
+    end = {
+        "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"delta": {}, "index": 0, "finish_reason": choice["finish_reason"]}],
+        "usage": None if include_usage else payload["usage"],
+        # The RSA telemetry has nowhere else to go on this wire — a streaming caller would otherwise
+        # have no way to see which rung ran.
+        "rsa": payload.get("rsa"),
+    }
+    yield f"data: {json.dumps(end)}\n\n".encode()
+    if include_usage:
+        yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [], 'usage': payload['usage']})}\n\n".encode()
+    yield b"data: [DONE]\n\n"
+
+
 def _resolve_think_budget(req: "OpenAICompletionRequest",
                           model_path: str | None = None) -> int | None:
     """Per-request reasoning-token budget, or None for unbounded (the server's MINISGL_THINK_BUDGET
@@ -3226,7 +3279,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 message["content"] = _tc_content
                 message["tool_calls"] = tool_calls
                 finish_reason = "tool_calls"
-        return {
+        rsa_payload = {
             "id": f"chatcmpl-rsa-{state.uid_counter}",
             "object": "chat.completion",
             "created": int(time.time()),
@@ -3264,6 +3317,14 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 "vote_detail": result.vote_detail,
             },
         }
+        # `stream: true` is about the WIRE, not about latency. RSA has nothing to emit until the
+        # final round resolves, but a client that asked for SSE must still get SSE — see _rsa_as_sse.
+        if req.stream:
+            return StreamingResponse(
+                _rsa_as_sse(rsa_payload, bool((req.stream_options or {}).get("include_usage"))),
+                media_type="text/event-stream",
+            )
+        return rsa_payload
 
     if req.messages:
         # exclude_none so tool-calling turns render cleanly (assistant content=None + tool_calls; a
