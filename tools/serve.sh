@@ -646,7 +646,15 @@ case "$MODEL" in
   # A/B, graphs off on BOTH legs because the tier cannot be captured at all: 36 CPU layers =
   # 11.19 tok/s vs 12.61 with the tier off. It buys 52.7 GiB of pinned host RAM and costs 11%
   # decode. Turn it on only for CAPACITY. See ENDGAME §5.
-  qwen4exp|qwen4-exp|q4e)
+  # THE PATH SPELLINGS ARE NOT OPTIONAL, for the same reason zaya matches `*/ZAYA1-8B-MXFP4` as well
+  # as `zaya`: the control panel's MODEL dropdown is built by scanning the filesystem
+  # (control-panel/server.py::list_models), NOT from this table, so what it hands back for a LOCAL
+  # checkpoint is the container PATH — `/root/.cache/huggingface/q4e`. Matching only the aliases
+  # sent that straight past every entry here into the `*)` catch-all, where model_id="$MODEL" and
+  # the advertised name became basename("/root/.cache/huggingface/q4e") = "q4e", along with the
+  # catch-all's generic spec/attn defaults instead of this arm's measured ones. An alias-only entry
+  # is unreachable from the one UI that launches it.
+  qwen4exp|qwen4-exp|q4e|/model|*/q4e|*/hf-q4e)
                   # A local checkpoint, not an HF id: the expert stacks ship as per-layer shard
                   # files and the n-gram table is a separate 49 GiB sidecar. The measured runs
                   # mounted /home/pat/.cache/hf-q4e at /model and /home/pat/.cache/hf-ple at /ple.
@@ -662,7 +670,14 @@ case "$MODEL" in
                   # 1f7171f correctly removed the pin this arm started advertising itself as
                   # "model" on /v1/models (visible in Hermes' context_length_cache as the bare
                   # `model@http://localhost:1919/v1` entry).
-                  model_id="${Q4E_MODEL:-/model}";  served_name="Qwen3.8-Flash-Next"
+                  # An explicit PATH wins over the alias default, mirroring zaya's inner case: the
+                  # panel hands back a real path and forcing it to ${Q4E_MODEL:-/model} would
+                  # silently serve a DIFFERENT directory than the one the operator picked.
+                  case "$MODEL" in
+                    /*)  model_id="$MODEL" ;;
+                    *)   model_id="${Q4E_MODEL:-/model}" ;;
+                  esac
+                  served_name="Qwen3.8-Flash-Next"
                   spec_default="none"
                   # min_tp=2 is a HARD requirement, not a preference: at TP=1 the per-rank expert
                   # rows double to 1.465 GiB/layer and the host arena needed is ~54 GiB in ONE
