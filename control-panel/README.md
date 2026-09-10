@@ -114,3 +114,26 @@ set `"host": "127.0.0.1"`.
   environment variables at launch (the compose files already read them as `${VAR:-default}`).
 - Card count is a guess you can override per-launch. `-n` is **how many** cards, never which —
   the arbiter assigns the lowest free card(s), same as the CLI.
+
+## profile_defaults: leave the per-model knobs EMPTY
+
+`config.json`'s `profile_defaults` are applied to every launch of a profile. Anything pinned there
+**overrides `tools/serve.sh`'s per-model table**, which is where this repo keeps its *measured*
+defaults — the served alias, the spec algorithm, the memory ratio, the draft checkpoint. A value that
+is right for one model becomes wrong for every other one the moment you change `MODEL` in the UI
+without also clearing it.
+
+Two that were pinned and should not have been, both found 2026-09-10:
+
+| key | was | cost |
+|---|---|---|
+| `SERVED_NAME` | `Qwen3.8-Flash-Next` | every checkpoint advertised itself as Flash-Next in `/v1/models`, whatever it was. Pinned beside the default `MODEL: qwen4exp` and never cleared when the model changed. The UI field's own placeholder reads "auto (base model name)". |
+| `SPEC` | `none` | every arm lost its measured `spec_default`. Qwen3.6-35B-A3B's own default is `mtp` at 105.4 tok/s; the panel had been sending `none`/`dflash` at 79.3. **33% throughput on a daily-driver serve.** |
+
+The rule: `profile_defaults` is for things that are genuinely a property of the BOX or of how you
+like to launch — `TP`, `DP`, `EP`, `CONC`, the `MINISGL_*` box knobs. It is not for anything
+`serve.sh`'s table has an opinion about. If serve.sh derives it per model, leave it empty and let it.
+
+`config.json` is not tracked (the repo `.gitignore` blanket-ignores `*.json`), so this rule lives
+here rather than in the file it governs. The file itself keeps `_comment_served_name` and
+`_comment_spec_default` saying the same thing at the point of use.
