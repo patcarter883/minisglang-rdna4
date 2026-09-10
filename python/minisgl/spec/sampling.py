@@ -73,11 +73,18 @@ def probs_from_logits(
         return probs / probs.sum(dim=-1, keepdim=True)
 
     # NO FULL-VOCAB SORT. This was two `torch.sort`s over the whole row -- one for top_k and a second
-    # for top_p -- i.e. 2 x O(V log V) per row, per position, for BOTH p and q, at V ~ 150k. It is a
-    # known cost, not a subtle one: FlashInfer measures PyTorch's sort-based top-k/top-p at ~20% of
-    # serving time and vLLM and SGLang both replaced it. This repo already solved it on the PLAIN
-    # lane, whose fused HIP sampler is documented "no sort"; the spec mirror never got the same
-    # treatment. Measured as a 27% end-to-end loss the moment the spec lane built q as well as p.
+    # for top_p -- i.e. 2 x O(V log V) per row, per position, at V ~ 150k. FlashInfer measures
+    # PyTorch's sort-based top-k/top-p at ~20% of serving time and vLLM and SGLang both replaced it;
+    # this repo already solved it on the PLAIN lane, whose fused HIP sampler is documented "no sort",
+    # and the spec mirror never got the same treatment.
+    #
+    # HONEST ABOUT THE PAYOFF: on Qwen3.6-35B-A3B (tp=2, dflash k=15, conc=2) this bought NOTHING
+    # measurable -- 81.4 tok/s before, 80.3 after, inside a ~2.6% boot-to-boot band that a greedy
+    # control leg exposed. It was landed on a 27% figure that turned out to be a COLD-BOOT artifact:
+    # the first battery after a serve boot runs ~18% slow (65.7 vs 80.3 warm on the identical build),
+    # and that cold run was being compared against a warm serve. Kept because O(V) selection beats
+    # O(V log V) order asymptotically and vocabularies only grow -- not because it measured faster
+    # here. Do not cite a speedup for it.
     #
     # A rank-k mask needs SELECTION, not order. `torch.topk` is O(V) with a k-heap and already returns
     # descending, so top_p's nucleus scan then runs over k elements instead of V -- both filters in one
