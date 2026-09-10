@@ -2092,6 +2092,36 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             offset += q_len
         return any_gated
 
+    def _penalise_spec_logits(
+        self, reqs: List[Req], staged_drafts: List[List[int]], logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Presence/frequency penalties on the SPEC verify path — the analogue of the plain lane's
+        penalty block in `Sampler.sample`, and the last processor that lane was missing.
+
+        Penalised requests used to be refused the spec lane outright (`_req_spec_ok`), because every
+        accept path reads these logits raw and the penalty would have been silently inert. That was a
+        guard around a gap, not a limit of the technique: row i of a verify block needs the history
+        plus `staged_drafts[:i]`, and the drafts are proposed and TP-broadcast BEFORE the verify
+        forward, so the whole per-row prefix is known up front. See `Sampler.penalise_block`.
+
+        Returns the logits to use — fp32 when any request is penalised, because the counts are fp32
+        and the plain lane likewise promotes before subtracting; unchanged otherwise. In place after
+        that promotion, matching `_gate_mask_spec_logits`."""
+        if not any(r.has_penalty for r in reqs):
+            return logits
+        sampler = self.engine.sampler
+        logits = logits.float()
+        offset = 0
+        for req, sd in zip(reqs, staged_drafts):
+            q_len = len(sd) + 1
+            if req.has_penalty:
+                sp = req.sampling_params
+                sampler.penalise_block(
+                    logits[offset:offset + q_len], sampler.penalty_counts(req),
+                    sp.presence_penalty, sp.frequency_penalty, sd)
+            offset += q_len
+        return logits
+
     def _resolve_delim_ids(self, delim: str) -> tuple[int, ...] | None:
         """Token ids of a reasoning delimiter (e.g. "</think>"), cached per string. Most families
         register the tag as one special/added token, so `convert_tokens_to_ids` answers directly;
@@ -4319,11 +4349,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         via _verify_sampled_constrained (grammar-masked rejection). See docs/SAMPLED_SPEC_VERIFY.md.
         Thinking (reasoning-gate) requests DO speculate — the gate is enforced on the verify logits
         (EOS-suppression + budget force-</think>) in _spec_decode_step, see _apply_think_gate_spec.
-        Penalised reqs (presence/frequency) take plain decode: every spec accept path consumes raw
-        verify logits, so the penalties Sampler.sample applies — even at temperature 0 — would be
-        silently inert on the spec lane."""
+        Penalised reqs (presence/frequency) SPECULATE: `_penalise_spec_logits` applies the same
+        presence/frequency subtraction to the verify block that `Sampler.sample` applies on the plain
+        lane, per position, against the history plus that row's draft prefix. They used to be refused
+        the lane because the accept paths read raw logits and the penalty would have been inert —
+        a guard around a missing processor, which is now present."""
         sp = req.sampling_params
-        return (sp.is_greedy or self._spec_sampled) and not req.has_penalty
+        return sp.is_greedy or self._spec_sampled
 
     def _fused_route_ok(self, reqs: List[Req]) -> bool:
         """Whether a batch may take the fused-TiDAR single-forward step. Its accept path commits raw
@@ -4758,6 +4790,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # `logits`. This used to be an inline copy of the sampler's block; it is a call now so the
         # three sibling verify forwards can share it instead of each growing their own copy.
         logits = self.engine.sampler.condition_logits(logits)
+        # Penalties, on the same logits every accept path below reads. Before the reasoning gate,
+        # which writes -inf: a penalty subtracted from -inf is still -inf, but the reverse order
+        # would have the gate's forced 0.0 rows penalised into a different forced token.
+        logits = self._penalise_spec_logits(reqs, staged_drafts, logits)
 
         # Reasoning gate on the spec path: mask the verify logits IN PLACE for any req still inside <think>
         # (EOS-suppress under budget / force-</think> over budget) BEFORE the argmax/accept below, so a
@@ -5005,6 +5041,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             gate_armed = self._think_gate.is_armed(req.uid)
             if gate_armed:
                 self._think_gate.commit_many(req.uid, keep)
+            # Penalty counts advance by the whole COMMITTED chain, not one token: a spec step emits an
+            # accepted prefix plus one token. Done here, in the rank0-authoritative pass, so every TP
+            # rank moves the count identically — same reason the reasoning gate commits here.
+            if req.has_penalty:
+                self.engine.sampler.commit_penalty_tokens(req.uid, keep)
             c0 = req.cached_len
 
             # On-policy Draft-OPD capture (guarded; DFlash linear block only). One opdbuf record per

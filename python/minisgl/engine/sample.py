@@ -135,18 +135,7 @@ class Sampler:
         counts, uids = [], []
         for i in rows:
             req = batch.reqs[i]
-            buf = self._pen_counts.get(req.uid)
-            if buf is None:
-                buf = torch.zeros(self.vocab_size, dtype=torch.float32, device=self.device)
-                # Seed from whatever this request already generated, so a penalty is correct even if
-                # the buffer is created mid-stream (preemption, or a first decode after prefill).
-                gen = req.generated_ids
-                if gen.numel():
-                    buf.index_add_(
-                        0, gen.to(self.device, torch.long),
-                        torch.ones(gen.numel(), dtype=torch.float32, device=self.device))
-                self._pen_counts[req.uid] = buf
-            counts.append(buf)
+            counts.append(self.penalty_counts(req))
             uids.append(req.uid)
         sp = [batch.reqs[i].sampling_params for i in rows]
         return dict(
@@ -161,6 +150,61 @@ class Sampler:
             pen_uids=uids,
         )
 
+    def penalty_counts(self, req) -> torch.Tensor:
+        """This request's PERSISTENT [vocab] token-count buffer, created on first use.
+
+        Seeded from whatever the request has already generated, so a penalty is correct even when the
+        buffer is created mid-stream (preemption, or the first decode after prefill). Shared by the
+        plain lane (`_penalty_plan`) and the spec verify lane, which must penalise against the same
+        running count or the two lanes disagree about what has been said."""
+        buf = self._pen_counts.get(req.uid)
+        if buf is None:
+            buf = torch.zeros(self.vocab_size, dtype=torch.float32, device=self.device)
+            gen = req.generated_ids
+            if gen.numel():
+                buf.index_add_(
+                    0, gen.to(self.device, torch.long),
+                    torch.ones(gen.numel(), dtype=torch.float32, device=self.device))
+            self._pen_counts[req.uid] = buf
+        return buf
+
+    def commit_penalty_tokens(self, uid: int, ids) -> None:
+        """Fold COMMITTED tokens into a request's running count. The spec lane's entry point: it
+        commits an accepted prefix plus one emitted token per step, not a single token."""
+        buf = self._pen_counts.get(uid)
+        if buf is None or not len(ids):
+            return
+        idx = torch.as_tensor(list(ids), dtype=torch.long, device=buf.device)
+        buf.index_add_(0, idx, torch.ones(idx.numel(), dtype=buf.dtype, device=buf.device))
+
+    def penalise_block(self, block: torch.Tensor, counts: torch.Tensor,
+                       presence: float, frequency: float, drafts) -> None:
+        """Apply OpenAI presence/frequency penalties to ONE request's [q, V] verify block, in place.
+
+        The plain lane penalises one row against one count vector. A verify block is q = K+1 rows of
+        the SAME request at consecutive positions, so row i must be penalised against the history plus
+        whatever occupies positions before it — i.e. `drafts[:i]`. That prefix is known before the
+        verify forward (the drafter proposes and the drafts are TP-broadcast first), so no rollback is
+        needed: if verify rejects at n, rows > n are discarded and their assumed prefix never reaches
+        the output, while row n assumed `drafts[:n]`, which IS the accepted prefix.
+
+        Row i differs from row i-1 in exactly one column, so this is one broadcast subtract plus <=K
+        single-column corrections rather than a dense [K+1, V] penalty tensor."""
+        V = block.shape[-1]
+        c = counts[:V]
+        block -= (presence * (c > 0).to(block.dtype) + frequency * c).unsqueeze(0)
+        seen = c.clone()
+        for i, tok in enumerate(drafts):
+            if i + 1 >= block.shape[0]:
+                break                       # a padded staged row past the real block; never accepted
+            t = int(tok)
+            if t >= V:
+                continue                    # fenced pad id; it can never be committed anyway
+            before = presence * (seen[t] > 0).to(block.dtype) + frequency * seen[t]
+            seen[t] += 1
+            after = presence * (seen[t] > 0).to(block.dtype) + frequency * seen[t]
+            block[i + 1:, t] -= (after - before)
+
     def _commit_penalty(self, tokens: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         """Fold the tokens just drawn into the penalised rows' running counts — one index_add per
         penalised row, so per-step cost is O(1) in output length. No-op when nothing is penalised."""
@@ -169,7 +213,17 @@ class Sampler:
         picked = tokens[args.pen_rows].to(torch.long)
         ones = torch.ones(1, dtype=args.pen_counts.dtype, device=args.pen_counts.device)
         for i in range(picked.numel()):
-            args.pen_counts[i].index_add_(0, picked[i : i + 1], ones)
+            # Write the PERSISTENT per-uid buffer, not `args.pen_counts`. That field is a
+            # `torch.stack` COPY built fresh by `_penalty_plan` every step, so an index_add_ into it
+            # landed in a temporary that was dropped when the step ended: the running count never
+            # advanced past its creation-time seed (empty for a request that starts fresh), every
+            # `c` read at the penalty site was all-zero, and presence/frequency resolved to exactly
+            # 0.0 for the whole life of the request. MEASURED before this line changed: with
+            # presence_penalty=20.0, temperature 0 and top_k 1, the model emitted
+            # "banana banana banana banana banana banana banana banana banana banana" —
+            # byte-identical to presence_penalty=0.01, reproducibly. The penalty was inert.
+            self._pen_counts[args.pen_uids[i]].index_add_(0, picked[i : i + 1], ones)
+            args.pen_counts[i].index_add_(0, picked[i : i + 1], ones)  # keep the step copy coherent
         return tokens
 
     def free_penalty_state(self, uid: int) -> None:

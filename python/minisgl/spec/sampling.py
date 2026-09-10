@@ -68,9 +68,29 @@ def probs_from_logits(
 
 
 def verify_sampled(
-    draft: Sequence[int], p: torch.Tensor, gen: torch.Generator
+    draft: Sequence[int], p: torch.Tensor, gen: torch.Generator,
+    q: "torch.Tensor | None" = None,
 ) -> AcceptResult:
-    """Rejection-sampling acceptance for one request (deterministic-proposal q = onehot(draft)).
+    """Rejection-sampling acceptance for one request.
+
+    ``q`` [K, V] fp32 = the DRAFTER's per-position proposal distribution, the one each ``draft[i]``
+    was actually drawn from. Standard speculative sampling: accept with ``min(1, p/q)``, and on the
+    first reject emit from ``normalize(relu(p - q))``.
+
+    ``q=None`` keeps the historical DETERMINISTIC-proposal form (q = onehot(draft)), which is exact
+    but caps acceptance at ``p(draft)``: with a point-mass proposal the accept probability IS the
+    target's probability of the drafted token, so even a perfect drafter proposing the target's own
+    argmax is accepted only ``p(argmax)`` of the time. At this checkpoint's own temperature 1.0 that
+    is a few tenths on ordinary prose, which bounds acceptance by the TARGET'S ENTROPY and has
+    nothing to do with drafter quality — measured 0.266 accept rate on Qwen3.6-35B where the greedy
+    lane on the same drafter is far higher. Supplying ``q`` lifts that bound: expected acceptance
+    becomes ``1 - TV(p, q)``, which is high for a well-matched drafter at any entropy.
+
+    Both forms emit exactly the target distribution; they differ only in how often the draft
+    survives. Keep the ``None`` path for proposers that cannot report a distribution (n-gram, and
+    any semi-autoregressive walk whose per-position conditional is not the one its token was drawn
+    from) — using a soft q for a token that was drawn by argmax is NOT exact and would silently
+    skew the output.
 
     ``p`` [K+1, V] fp32 = the target's per-position sampling distribution (from probs_from_logits) over
     the K draft positions plus the bonus position. Accept ``draft[i]`` with prob ``p[i, draft[i]]``
@@ -97,13 +117,26 @@ def verify_sampled(
     idx = torch.tensor(draft, dtype=torch.long, device=device)
     p_at = p[rows, idx]                                        # [K] = p_i(draft_i)
     u = torch.rand(K, device=device, generator=gen)            # [K] accept draws (fixed order)
-    rejected = u >= p_at                                        # accept iff u < p_i(draft_i)
+    if q is None:
+        ratio = p_at                                            # q_i(draft_i) == 1
+    else:
+        q_at = q[rows, idx]                                     # [K] = q_i(draft_i)
+        # q_at is > 0 for a token actually drawn from q; the guard covers a proposal whose
+        # distribution was reshaped after the draw (a truncation that excluded its own sample),
+        # where the ratio is undefined and accepting is the conservative choice.
+        ratio = torch.where(q_at > 0, p_at / q_at, torch.ones_like(p_at))
+    rejected = u >= ratio                                       # accept iff u < min(1, p/q)
     # first reject index (argmax of all-False is 0, so gate it on any()); K == all accepted
     n_t = torch.where(
         rejected.any(), rejected.int().argmax(), torch.tensor(K, device=device, dtype=torch.long)
     )
-    resid = p.clone()
-    resid[rows, idx] = 0.0                                      # relu(p - onehot) zeroes the draft
+    if q is None:
+        resid = p.clone()
+        resid[rows, idx] = 0.0                                  # relu(p - onehot) zeroes the draft
+    else:
+        # relu(p - q) on the K draft rows; the bonus row K has no proposal to subtract.
+        resid = p.clone()
+        resid[:K] = torch.clamp(p[:K] - q, min=0.0)
     # degenerate p==onehot -> fall back to p; row K stays p[K] (the bonus dist)
     dist = torch.where(resid.sum(dim=-1, keepdim=True) > 0.0, resid, p)
     toks = torch.multinomial(dist, 1, generator=gen).squeeze(-1)  # [K+1] per-row samples (normalizes)
