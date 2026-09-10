@@ -42,6 +42,10 @@ __all__ = ["DFlashProposer"]
 # this constant. Override with MINISGL_DFLASH_SEED_TAIL (0 = seeding off).
 _SEED_TAIL_DEFAULT = 64
 
+# Confidence-head CALIBRATION diagnostic (MINISGL_DSPARK_CONF_CAL=1). Off by default and inert:
+# it only forces the already-computed confidence row host-side and records it. Host-side only.
+_CONF_CAL = os.environ.get("MINISGL_DSPARK_CONF_CAL") == "1"
+
 # Compacting-buffer slack, in rows, on top of the drafter's attention window (see _init_prefix_kv).
 # Amortisation only, never correctness: the newest `window` rows are resident at every step for any
 # slack >= the per-step append (<= block_size). 128 makes the memmove fire roughly every 128/accepted
@@ -410,6 +414,7 @@ class DFlashProposer(CapturableProposer):
         # is tied, whatever the config says about tying.
         target_vocab = int(engine.model.model.embed_tokens.weight.shape[0])
         draft_vocab = int(getattr(hf, "draft_vocab_size", 0) or 0)
+        self._last_conf: "dict[int, list[float]]" = {}
         self._compressed = 0 < draft_vocab < target_vocab
         if self._compressed and bool(cfg("tie_word_embeddings", default=False)):
             # A checkpoint claiming both a pruned vocab and tied embeddings is self-contradictory;
@@ -970,12 +975,17 @@ class DFlashProposer(CapturableProposer):
         out: List[List[int]] = [[] for _ in reqs]
         Q = self._block_size
         drafts = self._g_out[: staged.bs].cpu().tolist()      # ONE D2H for the whole step
+        # `_conf_tau > 0` is the SERVING need (cut the draft). MINISGL_DSPARK_CONF_CAL=1 also brings
+        # it host-side at tau=0, where the head is otherwise computed and thrown away — that is the
+        # only way to ask whether the drafter KNOWS it is guessing, which acceptance alone cannot say.
         conf = (self._g_conf[: staged.bs].cpu().tolist()
-                if self._draft.has_confidence and self._conf_tau > 0.0 else None)
+                if self._draft.has_confidence and (self._conf_tau > 0.0 or _CONF_CAL) else None)
         for j, (i, k_i, row) in enumerate(zip(staged.rows, staged.budget, drafts)):
             if conf is not None:
                 k_i = self._conf_cut(conf[j], k_i)
             out[i] = row[:k_i]
+            if _CONF_CAL and conf is not None:
+                self._last_conf[reqs[i].uid] = list(conf[j][:k_i])
             if self._dbg:
                 print(f"[dflash-dbg] uid={reqs[i].uid} k={k_i} draft={out[i]}"
                       + (f" conf={[round(c, 3) for c in conf[j][:k_i]]}" if conf else ""),
@@ -993,6 +1003,14 @@ class DFlashProposer(CapturableProposer):
                 b = j * (Q - 1)
                 self._ddtree_topk[id(reqs[i])] = (ti_all[b : b + k_i], tv_all[b : b + k_i])
         return out
+
+    def last_conf(self) -> "dict[int, list[float]] | None":
+        """uid -> the confidence head's per-position predicted acceptance for the draft just
+        proposed, or None when the calibration diagnostic is off. Compared against what the verify
+        actually accepted, this separates an HONEST weak drafter (predictions track reality; it knows
+        it is guessing) from an OUT-OF-DISTRIBUTION one (confidently wrong) — the two call for
+        completely different fixes, and accept-rate cannot tell them apart."""
+        return self._last_conf if _CONF_CAL else None
 
     def _conf_cut(self, conf_row: List[float], k_i: int) -> int:
         """DSpark adaptive draft length: keep draft j while the predicted cumulative survival

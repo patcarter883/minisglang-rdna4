@@ -939,6 +939,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             and not getattr(self, "_tidar_fused", False)
         )
         self._spec_step = 0
+        # [reached, predicted_sum, accepted] per draft position; None disables the whole path.
+        self._conf_cal = ([0] * 32, [0.0] * 32, [0] * 32) \
+            if os.environ.get("MINISGL_DSPARK_CONF_CAL") == "1" else None
+        self._conf_cal_n = 0
         self._spec_seed_base = int(os.environ.get("MINISGL_SPEC_SAMPLED_SEED", "42"))
         if self._spec_sampled:
             logger.info_rank0("spec-decode: SAMPLED (rejection-sampling) verify ENABLED")
@@ -2091,6 +2095,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     block[:, eos_ids] = float("-inf")  # reasoning phase: forbid EOS until close/budget
             offset += q_len
         return any_gated
+
+    def _log_conf_cal(self) -> None:
+        """Predicted vs actual acceptance, per draft position. A CALIBRATED head tracks the actual
+        column: the drafter is weak but honest, and its own confidence is a usable cut signal. An
+        over-confident head (predicted >> actual) means the drafter is out of distribution — it is
+        wrong about inputs it has never seen, and no amount of gating fixes that, only retraining."""
+        reached, pred, acc = self._conf_cal
+        rows = ["[dspark-cal] pos  reached  accepted   actual   predicted   gap"]
+        for j in range(len(reached)):
+            if reached[j] == 0:
+                break
+            a, p = acc[j] / reached[j], pred[j] / reached[j]
+            rows.append(f"[dspark-cal] {j:>3}  {reached[j]:>7}  {acc[j]:>8}   {a:>6.3f}   "
+                        f"{p:>9.3f}   {p - a:+.3f}")
+        logger.info_rank0("\n".join(rows))
 
     def _penalise_spec_logits(
         self, reqs: List[Req], staged_drafts: List[List[int]], logits: torch.Tensor
@@ -5041,6 +5060,24 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             gate_armed = self._think_gate.is_armed(req.uid)
             if gate_armed:
                 self._think_gate.commit_many(req.uid, keep)
+            # DSpark confidence CALIBRATION (MINISGL_DSPARK_CONF_CAL=1). Position j is REACHED when
+            # every position before it was accepted (j <= num_accepted) and ACCEPTED when
+            # j < num_accepted. Comparing P(accept | reached) against the head's own prediction says
+            # whether the drafter knows it is guessing. Inert unless the env is set.
+            if self._conf_cal is not None:
+                _lc = self._proposer.last_conf() if self._proposer is not None else None
+                _cr = _lc.get(req.uid) if _lc else None
+                if _cr:
+                    for _j in range(min(len(d), len(_cr))):
+                        if _j > num_accepted_i:
+                            break
+                        self._conf_cal[0][_j] += 1                      # reached
+                        self._conf_cal[1][_j] += float(_cr[_j])         # predicted
+                        if _j < num_accepted_i:
+                            self._conf_cal[2][_j] += 1                  # accepted
+                    self._conf_cal_n += 1
+                    if self._conf_cal_n % 200 == 0:
+                        self._log_conf_cal()
             # Penalty counts advance by the whole COMMITTED chain, not one token: a spec step emits an
             # accepted prefix plus one token. Done here, in the rank0-authoritative pass, so every TP
             # rank moves the count identically — same reason the reasoning gate commits here.
