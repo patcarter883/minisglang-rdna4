@@ -4786,6 +4786,19 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             batch.cca_metadata.capture_verify_state = True
             batch.cca_metadata.verify_max_qlen = max(len(d) + 1 for d in staged_drafts)
 
+        # Qwen4-Exp PLE, for the VERIFY batch. The n-gram rows are gathered per TOKEN, and this
+        # forward carries width+1 tokens per request instead of the decode step's one — so the
+        # staging done for the ordinary step describes a different batch entirely. The model's own
+        # guard catches the mismatch ("PLE staged N token embeddings but the forward carries M"),
+        # which is how this surfaced the moment spec decode was first enabled on a PLE model; the
+        # combination could not occur before, because --spec-algorithm mtp was refused for the only
+        # architecture that has a PLE block. Staged HERE, after the drafts are appended to the batch
+        # and immediately before the forward, for the same reason as the decode-path call: mmap
+        # reads, a numpy hash and an H2D cannot happen inside the model or inside a captured graph.
+        # Inert for every other model.
+        if self._ple is not None:
+            self._stage_ple(batch)
+
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
         # Draft-head proposers also need the target's hidden states at the verified positions; the
         # engine returns them from the SAME forward (no extra pass). last_hidden [T, hidden], aux

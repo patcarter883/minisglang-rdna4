@@ -642,6 +642,14 @@ _QWEN4EXP_REPLICATED_SUBSTRINGS = (
     "hyper_connection_mixer.",
     ".self_attn.indexer.",
     ".ple.",
+    # The MTP head's seed path. fc_embedding/fc_hidden are LinearReplicated on purpose (they build
+    # the seed that feeds the head-sharded MTP layer; a column-parallel output would hand the layer
+    # a truncated hidden under TP>1, and this arm is TP=2 only), and the pre-fc norms are plain
+    # full-width norms. All four are replicated on every rank.
+    "mtp.fc_embedding.",
+    "mtp.fc_hidden.",
+    "mtp.pre_fc_norm_embedding.",
+    "mtp.pre_fc_norm_hidden.",
 )
 _QWEN4EXP_REPLICATED_SUFFIXES = (
     ".mlp.gate.weight",
@@ -714,6 +722,17 @@ def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torc
     if name.endswith(_QWEN4EXP_REPLICATED_SUFFIXES):
         return t
 
+    if name.startswith("mtp.") and ".mlp.experts." in name:
+        # The head's experts ship STACKED [E, out, in] and BF16 — no packed/scale leaves — so the
+        # split axes are one higher than the backbone's per-expert 2-D rule: gate_up is
+        # column-parallel on its OUTPUT (dim 1) and down_proj row-parallel on its INPUT (dim 2).
+        # NOT index-sharded even when EP is on: the head is built force_no_ep (it is tiny and stays
+        # replicated), so an EP index split here would disagree with the module it loads into.
+        if name.endswith(".gate_up_proj"):
+            return t.chunk(n, dim=1)[r].clone()
+        if name.endswith(".down_proj"):
+            return t.chunk(n, dim=2)[r].clone()
+        return t
     if ".mlp.experts." in name:
         # Under EP the experts are sharded by expert INDEX at full intermediate width, exactly as
         # `_shard_qwen3_5` documents — no tensor split here. (EP is off for this model today; the
@@ -1114,7 +1133,30 @@ def qwen4_exp_nvfp4_modules(ckpt_names: "Collection[str]") -> FrozenSet[str]:
     )
 
 
-def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = ()):
+# qwen4_exp MTP head (`mtp.*`) -> model-native `mtp.*`. Same collapse rule as Qwen3.5's
+# (`mtp.layers.0.X` -> `mtp.X`, because the head flattens the single layer onto itself), but this
+# head's leaves differ: it carries hyper-connections instead of input/post layernorms, two separate
+# fc projections instead of one concat fc, and STACKED expert tensors whose names already match the
+# native `experts.gate_up_proj` / `experts.down_proj` — so no concat group anywhere in here.
+_QWEN4EXP_MTP_LAYER0 = "mtp.layers.0."
+
+
+def _qwen4_exp_mtp_remap(ckpt_key: str):
+    """Map an `mtp.*` qwen4_exp checkpoint key to its native key plan.
+
+    The head is BF16 end to end in this checkpoint (no *_scale / *_packed under `mtp.` at all), so
+    unlike the backbone there is no quant-suffix handling to do — but the shared skip rules still
+    apply first at the call site, so an activation-calibration or fp8-kv leaf under `mtp.` is
+    attributed to its own reason rather than silently renamed."""
+    if ckpt_key.startswith(_QWEN4EXP_MTP_LAYER0):
+        return ("direct", "mtp." + ckpt_key[len(_QWEN4EXP_MTP_LAYER0):])
+    # mtp.fc_embedding / mtp.fc_hidden / mtp.pre_fc_norm_* / mtp.hyper_connection_mixer.* are
+    # already native — the head owns them directly.
+    return ("direct", ckpt_key)
+
+
+def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = (),
+                    load_mtp: bool = False):
     """Map a Qwen3.8-Flash-Next checkpoint key to a minisgl-native key plan. Pure (no tensors), so
     it is CPU-testable against the checkpoint index vs. the model's `state_dict()`.
 
@@ -1137,10 +1179,20 @@ def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = ()):
     # (`mtp.<...>.input_scale` is skipped because the MTP head is not built, not because of FP4
     # activation calibration).
     if ckpt_key.startswith("mtp."):
-        # The MTP head is a different animal here (fused expert tensors, its own hyper-connections,
-        # a 10240-wide pre-mixer seed) and is not implemented — ModelConfig.from_hf refuses
-        # --spec-algorithm mtp for this architecture rather than letting it half-build.
-        return ("skip", "mtp-head")
+        # The head IS implemented now (models/qwen4exp.py::Qwen4ExpMTPHead). It is still SKIPPED
+        # unless the model was built with it: `from_hf` zeroes mtp_num_hidden_layers when spec is
+        # not mtp, and the builder then creates no `self.mtp`, so loading these would have nowhere
+        # to land. The two must agree or the load ends in unfilled buffers holding torch.empty
+        # garbage — which is exactly how this arm failed the first time it was wired.
+        if not load_mtp:
+            return ("skip", "mtp-head")
+        if ckpt_key.endswith(".weight_shape"):
+            return ("skip", "quant-metadata")
+        if ckpt_key.endswith((".k_scale", ".v_scale")):
+            return ("skip", "fp8-kv-scale")
+        if ckpt_key.endswith(_MODELOPT_ACT_CALIB):
+            return ("skip", "act-calibration")
+        return _qwen4_exp_mtp_remap(ckpt_key)
     if ckpt_key.startswith(_QWEN4EXP_SKIP_PREFIXES):
         return ("skip", "vision")
     if ckpt_key.endswith(".weight_shape"):
@@ -1498,7 +1550,8 @@ def _load_qwen4_exp_weight(
                     _bt_tick("ckpt.nvfp4_leaf_scales", time.perf_counter() - _t)
                 for name, override in leaves:
                     _t = time.perf_counter()
-                    plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules)
+                    plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules,
+                                           load_mtp=config.mtp_num_hidden_layers > 0)
                     _bt_tick("ckpt.remap", time.perf_counter() - _t)
                     if plan[0] == "skip":
                         skips[plan[1]] = skips.get(plan[1], 0) + 1
