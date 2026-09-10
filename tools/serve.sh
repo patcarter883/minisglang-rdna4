@@ -108,6 +108,22 @@ min_tp=1
 case "$MODEL" in
   qwen35b-awq|cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit)
                   model_id="cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"; served_name="Qwen3.6-35B-A3B";
+                  # Qwen3.6-35B-A3B's card names `presence_penalty=1.5` for THINKING-MODE GENERAL
+                  # tasks, and generation_config.json has no field to carry it — it ships only
+                  # temperature/top_p/top_k, so every other term of the card's preset arrives by
+                  # inheritance (`_resolve_sampling`) and this one silently did not. 1.5 is the
+                  # card's number, not a tuned one: NOT yet validated here for repetition or for the
+                  # English/Chinese code-switching this checkpoint shows at temperature 1.0
+                  # (measured 2026-09-10: 27 occurrences over ~1.2M generated chars, 85% of them
+                  # inside the reasoning span, and NOT caused by spec decode — a matched A/B put
+                  # SPEC=none at 18 occurrences against SPEC=dflash's 9).
+                  # An explicit client value, INCLUDING 0.0, still wins (`_resolve_penalties`).
+                  # Deliberately NOT extended to the Qwen3.6-27B arms: that card recommends
+                  # presence_penalty=0.0 for thinking mode and reserves 1.5 for instruct/non-
+                  # thinking. Same family, different preset — do not carry this value across.
+                  # The card's other two presets are a CLIENT choice, not a serve default: coding
+                  # is temperature 0.6 / presence 0.0, instruct is 0.7 / top_p 0.80 / presence 1.5.
+                  presence_default="1.5"
                   spec_default="mtp"; k_mtp=4
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
                   # SPEC=dflash on this pair could not boot AT ALL on 16 GB cards until these.
@@ -132,6 +148,22 @@ case "$MODEL" in
                   fi ;;
   qwen35b-mxfp4|pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
                   model_id="pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4"; served_name="Qwen3.6-35B-A3B";
+                  # Qwen3.6-35B-A3B's card names `presence_penalty=1.5` for THINKING-MODE GENERAL
+                  # tasks, and generation_config.json has no field to carry it — it ships only
+                  # temperature/top_p/top_k, so every other term of the card's preset arrives by
+                  # inheritance (`_resolve_sampling`) and this one silently did not. 1.5 is the
+                  # card's number, not a tuned one: NOT yet validated here for repetition or for the
+                  # English/Chinese code-switching this checkpoint shows at temperature 1.0
+                  # (measured 2026-09-10: 27 occurrences over ~1.2M generated chars, 85% of them
+                  # inside the reasoning span, and NOT caused by spec decode — a matched A/B put
+                  # SPEC=none at 18 occurrences against SPEC=dflash's 9).
+                  # An explicit client value, INCLUDING 0.0, still wins (`_resolve_penalties`).
+                  # Deliberately NOT extended to the Qwen3.6-27B arms: that card recommends
+                  # presence_penalty=0.0 for thinking mode and reserves 1.5 for instruct/non-
+                  # thinking. Same family, different preset — do not carry this value across.
+                  # The card's other two presets are a CLIENT choice, not a serve default: coding
+                  # is temperature 0.6 / presence 0.0, instruct is 0.7 / top_p 0.80 / presence 1.5.
+                  presence_default="1.5"
                   spec_default="mtp"; k_mtp=2
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
                   # Same 737 MB bf16 drafter beside a same-size 4-bit 35B target as the AWQ twin
