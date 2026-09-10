@@ -6,9 +6,16 @@ decode and the drafter never engages. Speculative sampling (Leviathan 2023 / Che
 lossless for SAMPLING: the emitted tokens are drawn from exactly the target's temp/top_k/top_p
 distribution. See docs/SAMPLED_SPEC_VERIFY.md.
 
-v1 treats the draft as a DETERMINISTIC proposal (q = onehot(draft_i)) — correct for any proposer with
-no proposer changes; acceptance is `p_i(draft_i)` per position. Sampling the draft from the drafter's
-own softmax (a better q, higher acceptance) is a v1.1 proposer opt-in.
+Two proposal regimes reach `verify_sampled`, and the boot log says which one is live:
+
+* DETERMINISTIC (``q=None``, ``q = onehot(draft_i)``) — correct for any proposer with no proposer
+  changes, but acceptance is `p_i(draft_i)` per position, i.e. bounded by the TARGET'S ENTROPY.
+* DISTRIBUTION-MATCHED (``q`` supplied) — acceptance becomes `1 - TV(p, q)`, which is not bounded
+  by entropy. `verify_sampled` accepts ``q`` today; NO caller supplies one on this branch, so the
+  deterministic regime is what runs. Wiring a proposer to report and draw from its own distribution
+  is separate work.
+
+Both emit exactly the target's distribution; they differ only in how often a draft survives.
 """
 
 from __future__ import annotations
@@ -18,6 +25,11 @@ from typing import Sequence
 import torch
 
 from .accept import AcceptResult
+
+# Prefix taken when top_p is set with NO top_k. Large enough that a nucleus of any realistic
+# top_p sits inside it on a ~150k vocab; when it does not, the code falls back to the exact
+# full sort -- so this is a performance constant and never a correctness one.
+_NUCLEUS_PREFIX = 8192
 
 __all__ = ["probs_from_logits", "verify_sampled"]
 
@@ -54,16 +66,39 @@ def probs_from_logits(
         # processor order). The max-prob token itself always survives, so the row never zeroes out.
         floor = probs.max(dim=-1, keepdim=True).values * min_p
         probs = probs.masked_fill(probs < floor, 0.0)
-    if top_k and 0 < top_k < V:
-        sp, si = torch.sort(probs, descending=True, dim=-1)
-        ranks = torch.arange(V, device=probs.device).expand_as(sp)
-        sp = sp.masked_fill(ranks >= top_k, 0.0)  # keep exactly the top_k by RANK (matches _apply_top_k)
-        probs = torch.zeros_like(probs).scatter_(-1, si, sp)
-    if top_p and 0.0 < top_p < 1.0:
-        sp, si = torch.sort(probs, descending=True, dim=-1)
-        cumsum = sp.cumsum(dim=-1)
-        sp = sp.masked_fill((cumsum - sp) > top_p, 0.0)  # keep the nucleus (matches _apply_top_p)
-        probs = torch.zeros_like(probs).scatter_(-1, si, sp)
+
+    k = top_k if (top_k and 0 < top_k < V) else 0
+    nucleus = top_p if (top_p and 0.0 < top_p < 1.0) else 0.0
+    if not k and not nucleus:
+        return probs / probs.sum(dim=-1, keepdim=True)
+
+    # NO FULL-VOCAB SORT. This was two `torch.sort`s over the whole row -- one for top_k and a second
+    # for top_p -- i.e. 2 x O(V log V) per row, per position, for BOTH p and q, at V ~ 150k. It is a
+    # known cost, not a subtle one: FlashInfer measures PyTorch's sort-based top-k/top-p at ~20% of
+    # serving time and vLLM and SGLang both replaced it. This repo already solved it on the PLAIN
+    # lane, whose fused HIP sampler is documented "no sort"; the spec mirror never got the same
+    # treatment. Measured as a 27% end-to-end loss the moment the spec lane built q as well as p.
+    #
+    # A rank-k mask needs SELECTION, not order. `torch.topk` is O(V) with a k-heap and already returns
+    # descending, so top_p's nucleus scan then runs over k elements instead of V -- both filters in one
+    # pass. The processor ORDER is unchanged and still load-bearing: top_p sees UN-renormalized top_k
+    # probs and the single normalize happens at the end (see the note above).
+    if k:
+        vals, idx = torch.topk(probs, k, dim=-1)
+    else:
+        # top_p with no top_k. A prefix whose mass already covers the nucleus contains every token the
+        # nucleus can contain, so nothing outside it can change the answer -- the same "raise a pivot
+        # until the remaining mass falls under the threshold" argument FlashInfer's sorting-free
+        # sampler makes, bounded to one step. One sync confirms it held; the exact sort is the
+        # fallback, never the path.
+        cap = min(_NUCLEUS_PREFIX, V)
+        vals, idx = torch.topk(probs, cap, dim=-1)
+        if cap < V and not bool((vals.sum(dim=-1) >= nucleus).all()):
+            vals, idx = torch.sort(probs, descending=True, dim=-1)
+    if nucleus:
+        cumsum = vals.cumsum(dim=-1)
+        vals = vals.masked_fill((cumsum - vals) > nucleus, 0.0)  # keep the nucleus (matches _apply_top_p)
+    probs = torch.zeros_like(probs).scatter_(-1, idx, vals)
     return probs / probs.sum(dim=-1, keepdim=True)
 
 
