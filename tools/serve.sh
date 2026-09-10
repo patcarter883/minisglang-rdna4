@@ -650,7 +650,20 @@ case "$MODEL" in
                   # A local checkpoint, not an HF id: the expert stacks ship as per-layer shard
                   # files and the n-gram table is a separate 49 GiB sidecar. The measured runs
                   # mounted /home/pat/.cache/hf-q4e at /model and /home/pat/.cache/hf-ple at /ple.
-                  model_id="${Q4E_MODEL:-/model}";                     spec_default="none"
+                  #
+                  # served_name IS REQUIRED HERE, and it is required BECAUSE model_id is a local
+                  # path. The advertised-name chain is SERVED_NAME -> this table -> basename of
+                  # model_id, and the basename of "/model" is the word "model". Every other entry
+                  # gets away with omitting it only because its model_id is an HF id whose basename
+                  # is already a sensible name; this one is the exception and it was the only entry
+                  # in the table without it. It went unnoticed while control-panel/config.json
+                  # pinned SERVED_NAME="Qwen3.8-Flash-Next" in profile_defaults — that pin was
+                  # masking this gap for this model while mislabelling every OTHER model, and when
+                  # 1f7171f correctly removed the pin this arm started advertising itself as
+                  # "model" on /v1/models (visible in Hermes' context_length_cache as the bare
+                  # `model@http://localhost:1919/v1` entry).
+                  model_id="${Q4E_MODEL:-/model}";  served_name="Qwen3.8-Flash-Next"
+                  spec_default="none"
                   # min_tp=2 is a HARD requirement, not a preference: at TP=1 the per-rank expert
                   # rows double to 1.465 GiB/layer and the host arena needed is ~54 GiB in ONE
                   # process, which this box cannot pin. TP=2 is the only configuration the 48-layer
