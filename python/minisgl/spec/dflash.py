@@ -391,9 +391,32 @@ class DFlashProposer(CapturableProposer):
         num_aux = len(self.capture_layer_ids)
 
         # Pruned-vocab variant (Checkpoint B) ships its own embed/lm_head over a compressed draft vocab.
+        #
+        # DECIDED BY THE VOCAB SIZES, not by whether a config key is present. This used to read
+        #     draft_vocab = int(getattr(hf, "draft_vocab_size", 0) or 0)
+        #     tied = tie_word_embeddings or draft_vocab == 0
+        # i.e. it treated an ABSENT `draft_vocab_size` as "tied". transformers 5.x defines that field
+        # on Qwen3Config with a DEFAULT EQUAL TO vocab_size, so the attribute is never absent any
+        # more and the `0` fallback is dead: every drafter whose config also says
+        # `tie_word_embeddings: false` was mis-detected as compressed-vocab. Measured on
+        # transformers 5.14.1: RadixArk/Qwen3.8-27B-DSpark (no d2t, no t2d, no embed_tokens, vocab
+        # 248320 — plainly the TIED dialect) reported draft_vocab_size 248320 and failed to load at
+        # all, first on "Markov heads unsupported on a compressed-vocab drafter" and then on
+        # "compressed DFlash ckpt missing embed_tokens". z-lab's drafter escaped only because its
+        # config pins `draft_vocab_size: null` explicitly; omitting the key was enough to break it.
+        #
+        # A compressed vocab is SMALLER than the target's — that is what "pruned" means — so compare
+        # the two rather than testing a key for existence. A drafter reporting the target's own vocab
+        # is tied, whatever the config says about tying.
+        target_vocab = int(engine.model.model.embed_tokens.weight.shape[0])
         draft_vocab = int(getattr(hf, "draft_vocab_size", 0) or 0)
-        tied = bool(cfg("tie_word_embeddings", default=False)) or draft_vocab == 0
-        self._compressed = draft_vocab > 0 and not tied
+        self._compressed = 0 < draft_vocab < target_vocab
+        if self._compressed and bool(cfg("tie_word_embeddings", default=False)):
+            # A checkpoint claiming both a pruned vocab and tied embeddings is self-contradictory;
+            # trust the sizes and say so rather than picking one silently.
+            logger.warning_rank0(
+                "DFlash ckpt says tie_word_embeddings=True but its draft vocab %d is smaller than "
+                "the target's %d — loading as COMPRESSED on the sizes.", draft_vocab, target_vocab)
 
         target_hidden = engine.model.model.embed_tokens.weight.shape[1]
         assert hidden == target_hidden, (
