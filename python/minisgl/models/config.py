@@ -649,24 +649,14 @@ class ModelConfig:
         if spec_algorithm != "mtp" and not _mtp_forced:
             mtp_num_hidden_layers = 0
             num_nextn_predict_layers = 0
-        if _is_qwen4_exp and (mtp_num_hidden_layers or num_nextn_predict_layers):
-            # Qwen3.8-Flash-Next ships an MTP head (`mtp.*`, mtp_num_hidden_layers: 1) that this
-            # engine does NOT implement (bring-up plan T8.1). It is not the Qwen3.5 head with a new
-            # prefix: its experts are FUSED single tensors (`mtp.layers.0.mlp.experts.gate_up_proj`)
-            # in a different quant group, it carries its own hyper-connections, and it seeds from the
-            # 10240-wide PRE-mixer stream rather than a post-final-norm hidden. Building the Qwen3.5
-            # head against those tensors would be wrong in shape and in seed. Refuse loudly when it
-            # was explicitly asked for; otherwise just do not build it.
-            if _mtp_forced or spec_algorithm == "mtp":
-                raise NotImplementedError(
-                    "qwen4_exp (Qwen3.8-Flash-Next) speculative decoding via its `mtp.*` head is NOT "
-                    "implemented (bring-up plan T8.1): the head's experts are fused single tensors, "
-                    "it carries its own hyper-connections, and it seeds from the hc_count-wide "
-                    "pre-mixer stream. Serve with --spec-algorithm none (or ngram), which needs no "
-                    "MTP head."
-                )
-            mtp_num_hidden_layers = 0
-            num_nextn_predict_layers = 0
+        # qwen4_exp's MTP head IS implemented (models/qwen4exp.py::Qwen4ExpMTPHead, bring-up plan
+        # T8.1). The refusal that stood here was correct while it did not exist — the head is not
+        # the Qwen3.5 one with a different prefix, and half-building it would have drafted badly
+        # rather than raised. Its three stated blockers resolved as: the fused expert tensors are
+        # the STACKED layout MoELayer already wants (the easy case, not the hard one); the head's
+        # own hyper-connections are built by the same `_make_hc` the backbone uses; and the
+        # hc_count-wide seed is exactly what `Qwen4ExpModel.forward(return_hidden=True)` already
+        # returns, consumed PER BRANCH rather than folded (see the head's docstring).
 
         # A config field is a CLAIM; the tensors are the fact. `cyankiwi/Agents-A1-AWQ-INT4` declares
         # `mtp_num_hidden_layers: 1` in its own config.json and ships ZERO mtp.* tensors — the
