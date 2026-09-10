@@ -132,6 +132,56 @@ class Message(BaseModel):
         return self
 
 
+# Output cap for a request that sets NEITHER `max_tokens` NOR `max_completion_tokens`.
+#
+# The two OpenAI lanes have DIFFERENT documented defaults and this model serves both. `/v1/completions`
+# (text) really does default to 16. Chat Completions defaults to the MODEL MAXIMUM — and applying the
+# text lane's 16 to it capped every request from a client that omits the field, which is most of them
+# (the OpenAI SDK sends nothing unless you ask it to; so does Hermes).
+#
+# What 16 does to a thinking model, measured on this serve 2026-09-10: `max_tokens` is the ONLY bound
+# on the reasoning span, so all 16 tokens are spent inside `<think>` and the reply carries no visible
+# content and no tool_calls at all. There is no backstop to rescue it — the reasoning-budget gate
+# clamps to 3/4 of max_tokens ONLY for a request with a BOUNDED budget (`think_gate.arm`, the
+# `eff != _UNBOUNDED` guard), and Qwen3.8's template takes the unbounded path by design; the
+# `_maybe_arm_think_gate` fallback to the server default applies only when the grammar is REQUIRED,
+# which the permissive tag attached by `tool_choice: auto` is not. So on a typical agent turn nothing
+# force-closes the span and the cap is the whole story.
+#
+# Every reply came back `finish_reason="length"` with an empty body (a model with a bounded budget
+# instead leaks a few characters — "You're absolutely", "I've searched" — and is equally useless).
+# An agent harness reads that as truncation and retries: Hermes burned one continuation attempt per
+# tool round and failed the turn outright with "Response remained truncated after 4 continuation
+# attempts", after paying a full prefill for every discarded call.
+#
+# The chat default is FINITE rather than the true model maximum, and that is deliberate. The prefill
+# manager RESERVES `output_len` KV tokens at admission (`scheduler/prefill.py::_try_allocate_one`:
+# `estimated_len = extend_len + req.output_len`), so a request carrying the whole remaining context as
+# its cap reserves the whole remaining pool and nothing else can be admitted beside it — an uncapped
+# default would silently serialise the serve to one request at a time. A generous finite cap costs
+# nothing (8192 x max_running against a 225k-token pool here) and the scheduler still clamps it to
+# `max_seq_len - input_len` per request, so it is only ever an upper bound.
+#
+# 8192 has to cover the reasoning span AND the answer, since (per above) nothing else bounds the
+# span: it clears the ladder's `high` budget (4096) with as much again for the reply, and it is also
+# what stops a model that rambles and never closes `</think>` from decoding until the KV runs out —
+# under the old 16 that runaway was "capped" only by failing every request instead. A degenerate
+# input can still spend the whole 8192 inside the span and return an empty body; that is an honest
+# truncation a harness can retry, not a cap the server invented. Raise it with
+# MINISGL_DEFAULT_MAX_TOKENS when a lane genuinely needs longer uncapped replies.
+_CHAT_DEFAULT_MAX_TOKENS = 8192
+_TEXT_COMPLETION_DEFAULT_MAX_TOKENS = 16
+
+
+def default_max_tokens(is_text_completion: bool) -> int:
+    """The output cap for a request that asked for none. See `_CHAT_DEFAULT_MAX_TOKENS`."""
+    if is_text_completion:
+        return _TEXT_COMPLETION_DEFAULT_MAX_TOKENS
+    # Floor at 1: `_reject_malformed` 400s on `max_tokens < 1`, so a junk knob must not turn every
+    # uncapped request into a client error.
+    return max(1, env_int("MINISGL_DEFAULT_MAX_TOKENS", _CHAT_DEFAULT_MAX_TOKENS))
+
+
 class OpenAICompletionRequest(BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
@@ -141,9 +191,9 @@ class OpenAICompletionRequest(BaseModel):
     messages: List[Message] | None = None
 
     # OpenAI renamed `max_tokens` -> `max_completion_tokens` (max_tokens is deprecated but still sent
-    # by older clients). Accept BOTH and coalesce: max_tokens ?? max_completion_tokens ?? 16. Kept as
-    # `int | None` so the validator can tell "unset" from an explicit value; downstream code reads the
-    # coalesced int `max_tokens`.
+    # by older clients). Accept BOTH and coalesce: max_tokens ?? max_completion_tokens ?? the lane's
+    # default (see `default_max_tokens`). Kept as `int | None` so the validator can tell "unset" from
+    # an explicit value; downstream code reads the coalesced int `max_tokens`.
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     # Sampling. Unset (None) inherits the checkpoint's generation_config.json via `_resolve_sampling`
@@ -268,10 +318,19 @@ class OpenAICompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def _coalesce_max_tokens(self) -> "OpenAICompletionRequest":
-        """max_tokens ?? max_completion_tokens ?? 16 — accept the OpenAI-renamed field. After this,
-        `self.max_tokens` is always the resolved int the rest of the code reads."""
+        """max_tokens ?? max_completion_tokens ?? the lane's default — accept the OpenAI-renamed
+        field. After this, `self.max_tokens` is always the resolved int the rest of the code reads.
+
+        The default is per-LANE, because the two OpenAI endpoints document different ones and this
+        model serves both: text completions default to 16, chat completions to the model maximum
+        (approximated by a generous finite cap — see `default_max_tokens`). The lane is read the same
+        way `_reject_malformed` reads it: a `prompt` with no `messages` is the text lane."""
         if self.max_tokens is None:
-            self.max_tokens = self.max_completion_tokens if self.max_completion_tokens is not None else 16
+            self.max_tokens = self.max_completion_tokens
+        if self.max_tokens is None:
+            self.max_tokens = default_max_tokens(
+                is_text_completion=self.prompt is not None and not self.messages
+            )
         return self
 
     @model_validator(mode="after")
@@ -3876,6 +3935,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")
+    # A client that sends no output cap gets this one, and every reply it truncates comes back as
+    # finish_reason="length" — worth one line at boot rather than a per-request mystery.
+    logger.info(
+        "default max_tokens for a request that sets neither max_tokens nor max_completion_tokens: "
+        "%d (chat, MINISGL_DEFAULT_MAX_TOKENS), %d (/v1/completions, the OpenAI text-lane default); "
+        "the scheduler clamps both to max_seq_len - prompt_len",
+        default_max_tokens(is_text_completion=False),
+        default_max_tokens(is_text_completion=True),
+    )
     if not run_shell:
         # uvicorn's per-request HTTP access log (one INFO line per POST /v1/... or /generate) is the
         # ~200-lines-per-run noise; default it OFF. MINISGL_HTTP_ACCESS_LOG=1 re-enables it.
