@@ -92,6 +92,35 @@ So for ANY container/GPU run, or any multi-step task that edits code while somet
    not at all) until the run is fully done, because the container re-reads source lazily.
 4. **Clean up when done:** `git worktree remove <path>` after you've committed/merged.
 
+### Cleaning up after yourself is part of the task, not an optional courtesy (MANDATORY)
+
+This rule exists because it was ignored until 2026-09-11, when the repo held **173 branches and 90
+worktrees** consuming **135 GB**, and — far worse — a stale worktree silently shipped a REGRESSION:
+a serve was run from a branch that predated a merged `api_server.py` fix, so an already-fixed
+truncation bug came back in production and cost a user session before anyone noticed.
+
+Before you end a task:
+
+1. **Merge or archive your branch.** Work that only exists on a task branch is work nobody else
+   gets, and it is work that a later serve can silently REVERT. Merge to `rdna4` when it is done.
+   If it is not done, say so explicitly in your handover — do not leave it implied.
+2. **Remove your worktree.** `git worktree remove <path>` (add `--force` if it holds build
+   artifacts). Do not leave it "in case". A tag costs nothing and keeps commits reachable forever:
+   `git tag archive/<branch> <branch>` before deleting anything unmerged.
+3. **Delete your branch** once merged or archived.
+4. **Remove what you extracted, downloaded or built outside the repo's own build dirs.** Profiling
+   traces, `_kern*` build trees, extracted archives. If you ran `lsinitcpio -x`, `tar -x` or any
+   extractor, check `git status` afterwards — one such command dumped an entire initramfs (`usr/`,
+   `etc/`, `init`, `lib64`, …) into the repo root and it sat there unnoticed.
+
+**SERVING FROM A WORKTREE: check it is not behind first.** A container mounts whatever tree you
+point it at, so a stale worktree serves stale code with no error and no warning:
+
+    git log --oneline rdna4 ^HEAD        # anything listed is a fix your serve does NOT have
+    git merge-base --is-ancestor <fix-sha> HEAD && echo present || echo MISSING
+
+Run that before you attribute any behaviour — good or bad — to your changes.
+
 This rule got skipped once (an EP validation read a tree another agent was mid-edit on) **because the
 GPU-lease rule was written down and this one was not.** Both are now codified; treat them as equally
 mandatory.
