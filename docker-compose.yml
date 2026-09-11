@@ -771,6 +771,10 @@ services:
       # NCCL watchdog, seconds. serve.sh sets 600 for the qwen4exp all-host arm (six legs died at
       # the 60 s default). Empty keeps the per-arm value from serve.sh's table.
       DIST_TIMEOUT: "${DIST_TIMEOUT:-}"
+      # The knob that ENABLES the expert cache. Without it the four MINISGL_EXPERT_CACHE_*
+      # tuning vars below govern a feature that is never switched on (--expert-cache-gb
+      # defaults to 0.0 and serve.sh never emitted it until 2026-09-11).
+      EXPERT_CACHE_GB: "${EXPERT_CACHE_GB:-}"
       MINISGL_EXPERT_CACHE_MAX_INFLIGHT: "${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-}"
       MINISGL_EXPERT_CACHE_LOW_WATER: "${MINISGL_EXPERT_CACHE_LOW_WATER:-}"
       MINISGL_EXPERT_CACHE_INFLIGHT_AGE: "${MINISGL_EXPERT_CACHE_INFLIGHT_AGE:-}"

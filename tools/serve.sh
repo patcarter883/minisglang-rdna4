@@ -1151,6 +1151,15 @@ ctx_args=()
 # lever that decides how much of the MoE expert tier stays in VRAM — see the header. Both values are
 # GiB (2**30), matching plan.GIB_PER_UNIT and every figure the engine logs back.
 WOFF_DEVICE_GB="${WOFF_DEVICE_GB:-${woff_device_gb:-}}"
+# EXPERT_CACHE_GB: per-rank VRAM (GiB) for the per-expert residency cache. It SUBSTITUTES for
+# device-resident MoE layers rather than adding to them, so surrender the same GiB from
+# WOFF_DEVICE_GB when you enable it — at one budget the static arm keeps whole layers and
+# reaches h = resident fraction (6/48 = 0.125 on this arm), while the cache keeps the RECENTLY
+# ROUTED experts across ALL layers (h = 0.51 measured at 6.7 GiB on a sibling arm, 1.264x).
+# This was UNREACHABLE from serve.sh until 2026-09-11: compose forwarded four
+# MINISGL_EXPERT_CACHE_* tuning knobs while the flag that ENABLES the feature was never
+# emitted, so it sat at the 0.0 default and the tuning knobs governed nothing.
+EXPERT_CACHE_GB="${EXPERT_CACHE_GB:-${expert_cache_gb:-}}"
 WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
 # Arena chunk size, in MiB. MEASURED 2026-09-03, card 0, qwen4_exp (1.465 GiB of experts per layer):
 # a layer's rows may never straddle a chunk, so a 2 GiB chunk holds ONE layer and abandons 0.535 GiB
@@ -1249,6 +1258,7 @@ rsa_args=()
 
 woff_args=()
 [[ -n "$WOFF_DEVICE_GB" ]] && woff_args+=(--weight-offload-device-gb "$WOFF_DEVICE_GB")
+[[ -n "$EXPERT_CACHE_GB" ]] && woff_args+=(--expert-cache-gb "$EXPERT_CACHE_GB")
 [[ -n "$WOFF_HOST_GB" ]] && woff_args+=(--weight-offload-gb "$WOFF_HOST_GB")
 
 cmd=(python -m minisgl
