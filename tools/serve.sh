@@ -679,6 +679,25 @@ case "$MODEL" in
                   esac
                   served_name="Qwen3.8-Flash-Next"
                   spec_default="none"; k_mtp=2
+                  # SPEC IS OFF ON PURPOSE AND MUST STAY OFF UNTIL THE EXPERT CACHE IS ON.
+                  # MEASURED 2026-09-11, same build, warm, single request:
+                  #     SPEC=none   15.23 / 15.27 tok/s   (~65 ms/token)
+                  #     SPEC=mtp K=2 10.15 / 10.32 tok/s  (~102 ms/token)  -> spec is 1.57x SLOWER
+                  # The engine per-phase split says why (MINISGL_SPEC_TIMING=1):
+                  #     propose=8.4ms stage=5.3ms forward=120.6ms accept=4.8ms total=139.0ms
+                  # accept-len was 1.358 committed/verify, so 139 ms buys 1.358 tokens.
+                  # The verify FORWARD alone is 120.6 ms against ~62 ms for a 1-token decode forward:
+                  # on a host-offloaded MoE the verify carries K+1 query tokens and the UNION of routed
+                  # experts across them is ~2-3x one token's, so the dominant term of the step — host
+                  # expert bytes pulled over PCIe — scales with QUERY TOKENS, not with parameters.
+                  # Break-even therefore needs accept_len ~ K+1, i.e. ~100% acceptance. Lowering K does
+                  # not help: K=1 still roughly doubles the bytes to buy ~1.25 tokens.
+                  # THIS IS NOT A DRAFTER-QUALITY PROBLEM. Acceptance was improved 36% today
+                  # (1db9743, grouped pre_fc_norm_hidden) and spec still lost. The only lever that
+                  # changes the arithmetic is making the extra query tokens NOT pull extra host bytes,
+                  # i.e. a device-resident expert cache (--expert-cache-gb; 1.264x measured on a
+                  # sibling arm). Re-measure spec ONLY after that, and only against a warm no-spec
+                  # control on the same build.
                   # k_mtp=2, NOT the table's default 4. The checkpoint ships ONE MTP module
                   # (`mtp_num_hidden_layers=1`, only `mtp.layers.0`), so it is trained for exactly
                   # one token of speculation: given the TARGET's hidden state at t and the embedding
