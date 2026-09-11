@@ -1,0 +1,858 @@
+{
+ "repo": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark",
+ "revision": "main",
+ "tensors": {
+  "fc.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.down_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.gate_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.up_proj.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "markov_head.markov_w2.weight_scale_2": {
+   "dtype": "F32",
+   "shape": [],
+   "shard": "model.safetensors"
+  },
+  "embed_tokens.weight": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "hidden_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.input_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.post_attention_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.attention_sink_bias": {
+   "dtype": "BF16",
+   "shape": [
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.k_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.k_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.o_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.q_norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.q_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.self_attn.v_proj.weight": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "markov_head.markov_w1.weight": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    512
+   ],
+   "shard": "model.safetensors"
+  },
+  "norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard": "model.safetensors"
+  },
+  "fc.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    1008
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.down_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    384
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.gate_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.up_proj.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    6144,
+    168
+   ],
+   "shard": "model.safetensors"
+  },
+  "markov_head.markov_w2.weight_scale": {
+   "dtype": "F8_E4M3",
+   "shape": [
+    131072,
+    32
+   ],
+   "shard": "model.safetensors"
+  },
+  "fc.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    8064
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.0.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.1.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.2.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.3.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.4.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.down_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    2688,
+    3072
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.gate_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "layers.5.mlp.up_proj.weight": {
+   "dtype": "U8",
+   "shape": [
+    6144,
+    1344
+   ],
+   "shard": "model.safetensors"
+  },
+  "markov_head.markov_w2.weight": {
+   "dtype": "U8",
+   "shape": [
+    131072,
+    256
+   ],
+   "shard": "model.safetensors"
+  }
+ }
+}

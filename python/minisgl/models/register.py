@@ -16,6 +16,9 @@ _MODEL_REGISTRY = {
     # this checkpoint does not ship.
     "Qwen4ExpForConditionalGeneration": (".qwen4exp", "Qwen4ExpForConditionalGeneration"),
     "Glm4MoeLiteForCausalLM": (".glm4_moe_lite", "Glm4MoeLiteForCausalLM"),
+    # Nemotron-H (Mamba-2 + MoE + 6 global-attention layers). ONE mixer per layer, on its own
+    # `block_types` vocabulary — see models/nemotron_h.py and config.py's block_types field.
+    "NemotronHForCausalLM": (".nemotron_h", "NemotronHForCausalLM"),
     "ZayaForCausalLM": (".zaya", "ZayaForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
