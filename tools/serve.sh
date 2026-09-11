@@ -711,6 +711,24 @@ case "$MODEL" in
                   # expert bytes pulled over PCIe — scales with QUERY TOKENS, not with parameters.
                   # Break-even therefore needs accept_len ~ K+1, i.e. ~100% acceptance. Lowering K does
                   # not help: K=1 still roughly doubles the bytes to buy ~1.25 tokens.
+                  # ACCEPTANCE IS FINE AND CONTENT-DEPENDENT — MEASURED 2026-09-12, greedy, K=2:
+                  #     counting 2.000 committed/verify (p=0.618)   JSON 1.826 (p=0.537)
+                  #     code     1.686 (p=0.468)                    verbatim 1.618 (p=0.432)
+                  #     free-form technical prose 1.372 (p=0.289)
+                  # The "p=0.28 fault" chased for most of a day was the WORST-CASE content measured
+                  # once and compared against llama.cpp numbers taken on file-rewrite/code content.
+                  # Apples to oranges. Numerically exonerated as well: the fuse (parity test), the
+                  # draft attention and the prompt seeding (ring-vs-dense invariant, 6 falsification
+                  # arms), and the layer geometry all check out; greedy acceptance is no better than
+                  # sampled (0.307 vs 0.370), so the sampler is not implicated either.
+                  #
+                  # AND SPEC STILL LOSES, which is the point. At its BEST content the head buys
+                  # exactly 2.000 committed tokens per verify while the 3-position verify forward
+                  # costs 2.0x a 1-position forward (120.6 ms vs ~60.5 ms). Break-even on bytes,
+                  # before paying propose+stage+accept. On worse content it is far under. So the
+                  # ceiling is set by the UNION of experts routed across the verify positions, not
+                  # by the drafter — improving acceptance further cannot fix it.
+                  #
                   # THIS IS NOT A DRAFTER-QUALITY PROBLEM. Acceptance was improved 36% today
                   # (1db9743, grouped pre_fc_norm_hidden) and spec still lost. The only lever that
                   # changes the arithmetic is making the extra query tokens NOT pull extra host bytes,
