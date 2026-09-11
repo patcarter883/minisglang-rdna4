@@ -722,6 +722,22 @@ case "$MODEL" in
                   # arms), and the layer geometry all check out; greedy acceptance is no better than
                   # sampled (0.307 vs 0.370), so the sampler is not implicated either.
                   #
+                  # K=1 WAS MEASURED TOO (2026-09-12) — it is the best case and it still does not pay.
+                  # Matched config both arms (WOFF_DEVICE_GB=2, no expert cache), greedy:
+                  #     content        no-spec   MTP K=1   committed/verify
+                  #     counting        11.14     11.30     1.738   -> +1.4%
+                  #     JSON            12.20     11.25     1.579   -> -7.8%
+                  #     code            12.40     10.57     1.421   -> -14.8%
+                  #     free-form       12.25     10.15     1.354   -> -17.1%
+                  # THE UNION RATIO IS MEASURED, NOT ASSUMED: forward(2 positions) = 99.8 ms vs
+                  # forward(1) = 62.6 ms = 1.595x; forward(3) = 120.6 ms = 1.926x. So the FIRST
+                  # extra verify position already costs +0.595 of a forward, and break-even needs
+                  # p > 0.595 BEFORE the 11.4 ms/step of propose+stage+accept. Only the most
+                  # predictable content in the sweep (counting, p=0.738) clears that, and the
+                  # overhead eats its 9% byte win down to +1.4%.
+                  # Lowering K therefore does not rescue spec: the marginal union cost of position 2
+                  # exceeds the marginal acceptance of every realistic content class.
+                  #
                   # AND SPEC STILL LOSES, which is the point. At its BEST content the head buys
                   # exactly 2.000 committed tokens per verify while the 3-position verify forward
                   # costs 2.0x a 1-position forward (120.6 ms vs ~60.5 ms). Break-even on bytes,
