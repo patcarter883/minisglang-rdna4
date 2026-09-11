@@ -660,7 +660,26 @@ services:
     <<: *lean-common
     profiles: ["serve"]
     container_name: ${LEASE_NAME:-minisgl-lean}-serve
-    restart: unless-stopped
+    # "no", NOT unless-stopped: A RESTART POLICY OUTLIVES THE GPU LEASE.
+    #
+    # The lease is bound to a PROCESS (`gpu-lease --detach` ties it to container lifetime); the
+    # container is bound to Docker's restart policy. Those are not the same lifetime, and under
+    # `unless-stopped` they come apart in the dangerous direction: the lease-holding process dies,
+    # the flock releases, and Docker then brings the container back up — on both cards, with
+    # `gpu-status` reporting them FREE. Another agent leasing a card collides with a serve the
+    # arbiter cannot see. `docker compose down` is the only thing that clears it, because `stop`
+    # leaves the policy armed.
+    #
+    # Observed repeatedly on 2026-09-10/11: every failed boot (a crash, a placement error, a rank
+    # exception) left a container Docker kept resurrecting unleased, each time noticed only by
+    # chance. The policy was also actively harmful during a crash LOOP — a serve that dies at boot
+    # restarts forever, holding the lease and burning the cards, instead of failing once and
+    # freeing them.
+    #
+    # A supervised production serve wants a restart policy; a LEASED one must not have one, because
+    # the arbiter, not Docker, owns when this may run. The `*lean-common` anchor already says "no";
+    # this service used to override it.
+    restart: "no"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
@@ -805,7 +824,10 @@ services:
     <<: *lean-common
     profiles: ["cam"]
     container_name: ${LEASE_NAME:-minisgl-lean}-cam
-    restart: unless-stopped
+    # "no", for the same reason as `serve` above — this is the other lease-wrapped GPU service, so
+    # it had the identical restart-outlives-the-lease hazard. Fixed here rather than left for the
+    # next time it fires.
+    restart: "no"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
