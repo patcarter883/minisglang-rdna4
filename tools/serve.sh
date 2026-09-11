@@ -679,6 +679,25 @@ case "$MODEL" in
                   esac
                   served_name="Qwen3.8-Flash-Next"
                   spec_default="none"; k_mtp=2
+                  # ---- EXPERT CACHE: VALIDATED OPERATING POINT, MEASURED 2026-09-11 -------------
+                  # Trade KV for a device-resident expert cache. Serving from the MERGED tree the
+                  # KV pool is 3.69 GiB / 644,608 tokens, so 2.5 GiB of it is affordable and still
+                  # leaves 207,456 tokens — more context than this box can prefill in useful time.
+                  #   TPOT 65.4 ms -> 58.4 ms/token (-10.7%), throughput 15.25 -> 16.8-18.4 tok/s.
+                  # The cache SUBSTITUTES for device-resident layers in principle, but NOT here:
+                  # shrinking WOFF_DEVICE_GB pushes layers into the PINNED host arena, which does
+                  # not fit (see the note below). So this budget comes from KV, and WOFF_DEVICE_GB
+                  # stays at 4.
+                  expert_cache_gb=2.5
+                  # MINISGL_EXPERT_CACHE_MAX_INFLIGHT=512 IS NOT OPTIONAL AND THE DEFAULT IS A TRAP.
+                  # expert_cache.py:225 defaults it to 64, and at 64 the cache SATURATES and never
+                  # fills: measured fill=0.399, observed_h=0.0841, evictions=0, inflight pinned at
+                  # 64 with 182,243 admissions deferred — i.e. a hit rate BELOW the static
+                  # f=0.125 it replaced, so enabling the cache at the default makes things WORSE.
+                  # At 512: fill=0.995, observed_h=0.28-0.35, evictions=90+ (replacement actually
+                  # running), inflight 9. That is the whole difference between the win above and no
+                  # win at all. Exported here rather than left to the caller for that reason.
+                  export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-512}"
                   # SPEC IS OFF ON PURPOSE AND MUST STAY OFF UNTIL THE EXPERT CACHE IS ON.
                   # MEASURED 2026-09-11, same build, warm, single request:
                   #     SPEC=none   15.23 / 15.27 tok/s   (~65 ms/token)
