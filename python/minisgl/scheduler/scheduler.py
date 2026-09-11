@@ -2837,7 +2837,8 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 conf_chunks.append(torch.zeros(nt, device=dev))
         inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
 
-    def _stage_ple(self, batch: Batch, extra_tokens: "dict[int, list[int]] | None" = None) -> None:
+    def _stage_ple(self, batch: Batch, extra_tokens: "dict[int, list[int]] | None" = None,
+                   *, defer_commit: bool = False) -> None:
         """Stage the Qwen4-Exp PLE n-gram embeddings for `batch` (host work, before the forward).
 
         `extra_tokens` maps uid -> the tokens of this pass that are NOT yet in the host buffer. It
@@ -2915,7 +2916,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 )
             slots.append(slot)
             tokens.append(ids.to(torch.int64).numpy())
-        self._ple.prepare(slots, tokens)
+        self._ple.prepare(slots, tokens, defer_commit=defer_commit)
 
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
@@ -4816,8 +4817,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         if self._ple is not None:
             # qlen rows per request = the last COMMITTED token followed by that request's drafts.
             # Only the first is in the host buffer, so hand the drafts over explicitly.
+            # defer_commit: these rows carry UNCOMMITTED drafts. Advancing the n-gram history or
+            # the conv window over them here would bake rejected tokens into the PLE state with no
+            # way back — see PLEStateCache.install_verify_conv.
             self._stage_ple(
-                batch, {r.uid: list(d) for r, d in zip(reqs, staged_drafts)}
+                batch, {r.uid: list(d) for r, d in zip(reqs, staged_drafts)},
+                defer_commit=True,
             )
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
@@ -4952,6 +4957,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         gdn_finish_batch_idx, gdn_finish_t_index = [], []
         # Fresh per-uid target hidden seeds for the NEXT step's propose (draft-head proposers only).
         new_last_hidden: dict[int, torch.Tensor] = {}
+        # slot -> committed token count of THIS verify pass (confirmed token + accepted drafts),
+        # i.e. the same `len(keep)` GDN installs as `t_index = len(keep)-1`. Consumed by
+        # PLERuntime.commit_verified so the PLE n-gram history and conv window advance over exactly
+        # the tokens that survived. Collected for FINISHED reqs too: their slot is cloned into the
+        # recurrent radix cache before it is freed, so a drifted state would be cached and restored.
+        ple_keep: dict[int, int] = {}
         new_aux_hidden: dict[int, torch.Tensor] = {}
         # PASS 1: compute the accept OUTCOME (num_accepted, keep, eos) per req. This is the ONLY step
         # whose result can differ across TP ranks (the verify logits are not bit-identical), so it is
@@ -5181,6 +5192,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             # captured the state after each token; install scratch index committed-1 (state after the
             # last committed token). committed == len(keep) >= 1 (always >= the 1 bonus token) for a
             # non-EOS-truncated, still-running seq. Finished reqs free their slot, so state is moot.
+            if self._ple is not None:
+                _ple_slot = self.gdn_slots.slot_for(req.uid)
+                if _ple_slot:
+                    ple_keep[_ple_slot] = len(keep)
             if (gdn_state_indices is not None or cca_state_indices is not None) and not finished:
                 gdn_install_batch_idx.append(i)
                 gdn_install_t_index.append(len(keep) - 1)
@@ -5304,6 +5319,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 fslots = gdn_state_indices.to(torch.long)[fsel]
                 ft = torch.tensor(gdn_finish_t_index, dtype=torch.long, device=device)
                 self.engine.gdn_state.rollback_ring(fslots, (qlen_f - 1 - ft).to(torch.int32))
+
+        # PLE: resolve the verify pass parked by `commit_staged` — advance the n-gram history over
+        # the committed tokens only, and roll the conv window back to the state after those same
+        # tokens. Must run BEFORE a finished req's slot is freed (and cloned into the recurrent radix
+        # cache), which is the same ordering constraint the GDN finish-rollback above observes.
+        if self._ple is not None:
+            self._ple.commit_verified(ple_keep)
 
         # CCA: install the captured accepted-prefix conv window + prev_hs into each still-running seq's
         # slot (same install_batch_idx/t_index bookkeeping — a model is GDN XOR CCA, never both).

@@ -421,6 +421,14 @@ class Qwen4ExpPLE(BaseOP):
             xs = x[start : start + n].t().unsqueeze(0)  # (1, wide, n)
             full = torch.cat([conv_state[slot].unsqueeze(0), xs], dim=-1)  # (1, wide, s+n)
             y = F.conv1d(full, w, groups=self._wide, dilation=d)  # (1, wide, n)
+            # Spec VERIFY: stash the `[state | chunk]` window BEFORE collapsing it to the last `s`
+            # columns. The accepted-prefix state is `full[0][:, keep : keep+s]`, which is already in
+            # hand here and unrecoverable afterwards — the write below keeps only the t == n case,
+            # i.e. the state after every draft including the rejected ones. `commit_verified`
+            # installs the right slice once the accept loop knows `keep`. Costs one reference to a
+            # tensor this forward allocated anyway; nothing is copied.
+            if batch.defer_commit and slot:
+                batch.conv_windows[slot] = full[0]
             conv_state[slot].copy_(full[0, :, -s:])
             outs.append(y[0].t())
             start += n
