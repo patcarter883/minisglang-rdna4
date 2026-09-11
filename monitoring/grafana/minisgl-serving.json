@@ -78,7 +78,7 @@
   "timezone": "",
   "title": "minisgl Serving + Spec Decode",
   "uid": "minisgl-serving",
-  "version": 4,
+  "version": 7,
   "weekStart": "",
   "panels": [
     {
@@ -2715,6 +2715,1735 @@
             "uid": "vllm-prometheus"
           },
           "expr": "sum(minisgl_cam_crowded_banks{model_name=~\"$model\"})"
+        }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "row",
+      "title": "Host \u2014 CPU & system RAM",
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 104
+      },
+      "panels": []
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "CPU busy",
+      "description": "node_cpu_seconds_total, all cores, non-idle share. Whole-box: every container and host process, not just the serve. Sustained high with low GPU load means the host side is the limiter.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[$__rate_interval])))"
+        }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "stat",
+      "title": "CPU iowait",
+      "description": "Share of CPU time blocked on I/O. Rises when the offload path is reading weights or the PLE table from NVMe faster than it can be served. Compare against the demand-paging panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 25
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * avg(rate(node_cpu_seconds_total{mode=\"iowait\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 55,
+      "type": "stat",
+      "title": "RAM used",
+      "description": "1 - MemAvailable/MemTotal. MemAvailable already discounts reclaimable page cache, so this is real pressure, not cache. Above ~90% expect allocation stalls and swap.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 85
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)"
+        }
+      ]
+    },
+    {
+      "id": 56,
+      "type": "stat",
+      "title": "RAM available",
+      "description": "node_memory_MemAvailable_bytes \u2014 what a new allocation can get without swapping, including reclaimable cache. This is the headroom figure to size an offload arena against, not MemFree.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 8589934592
+              },
+              {
+                "color": "green",
+                "value": 25769803776
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_MemAvailable_bytes"
+        }
+      ]
+    },
+    {
+      "id": 57,
+      "type": "stat",
+      "title": "Swap used",
+      "description": "SwapTotal - SwapFree across both swap devices: 45.9 GiB of zram (compressed RAM, priority 100, filled first) and an 8 GiB file on /mnt/data (sdb, priority 10). Because zram absorbs the first ~46 GiB this costs CPU and RAM rather than disk latency \u2014 but it is still memory the offload arena cannot have.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1073741824
+              },
+              {
+                "color": "red",
+                "value": 8589934592
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes"
+        }
+      ]
+    },
+    {
+      "id": 58,
+      "type": "stat",
+      "title": "Order\u22659 free",
+      "description": "Free physically-contiguous memory in blocks of 2 MiB or larger, from /proc/buddyinfo. This is the ceiling on a PINNED host arena, and it collapses under fragmentation long before 'RAM available' looks alarming \u2014 when a pin fails despite plenty available, read this.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 105
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 8589934592
+              },
+              {
+                "color": "green",
+                "value": 25769803776
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(node_buddyinfo_blocks{size=\"9\"}) * 2097152 + sum(node_buddyinfo_blocks{size=\"10\"}) * 4194304"
+        }
+      ]
+    },
+    {
+      "id": 59,
+      "type": "timeseries",
+      "title": "CPU utilization by mode (%)",
+      "description": "Averaged across all cores and stacked to the total busy figure. 'system' dominating points at kernel work (page faults, DMA setup, copies); 'iowait' at storage; 'user' at compute.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 109
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * avg by (mode) (rate(node_cpu_seconds_total{mode!=\"idle\"}[$__rate_interval]))",
+          "legendFormat": "{{mode}}"
+        }
+      ]
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "System memory breakdown",
+      "description": "Stacks to MemTotal. 'page cache' holds the NVMe-mmap'd PLE table, so it grows as that table is touched and is reclaimable; 'used' is anonymous/pinned and is not. Watch free approach zero while used climbs \u2014 that is the point swap starts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 109
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_MemTotal_bytes - node_memory_MemFree_bytes - node_memory_Cached_bytes - node_memory_Buffers_bytes - node_memory_SReclaimable_bytes",
+          "legendFormat": "used (anon + pinned)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_Cached_bytes + node_memory_Buffers_bytes + node_memory_SReclaimable_bytes",
+          "legendFormat": "page cache (reclaimable)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_MemFree_bytes",
+          "legendFormat": "free"
+        }
+      ]
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Locked / unevictable host memory",
+      "description": "Host pages the kernel cannot reclaim or swap. Mlocked counts mlock()'d pages; Unevictable is the superset that also covers driver-pinned pages. Which one a ROCm host arena lands in depends on the pinning path \u2014 read both, and treat the larger as the arena's true footprint.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_Mlocked_bytes",
+          "legendFormat": "Mlocked"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_memory_Unevictable_bytes",
+          "legendFormat": "Unevictable"
+        }
+      ]
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Swap traffic",
+      "description": "Bytes/s paged to and from swap (vmstat pswpin/pswpout x 4 KiB). Swap is zram-backed first, so this traffic is compression work against RAM, not NVMe I/O \u2014 it will NOT appear on the NVMe panels unless zram fills and the sdb swapfile takes over. Sustained bidirectional traffic still means host memory is oversubscribed and latency taken from that window is not comparable.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_vmstat_pswpin[$__rate_interval]) * 4096",
+          "legendFormat": "swap in"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_vmstat_pswpout[$__rate_interval]) * 4096",
+          "legendFormat": "swap out"
+        }
+      ]
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Demand paging \u2014 major faults & NVMe reads",
+      "description": "Major faults are page faults that had to hit disk: for an NVMe-mmap'd weight or PLE table that is the read path itself, so a steady rate is normal and its size is the cost. Compare against NVMe bytes/s (right axis) to see the page amplification \u2014 bytes moved per fault.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 125
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "NVMe read B/s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "Bps"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_vmstat_pgmajfault[$__rate_interval])",
+          "legendFormat": "major faults/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_read_bytes_total{device=~\"nvme.+\"}[$__rate_interval]))",
+          "legendFormat": "NVMe read B/s"
+        }
+      ]
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Pressure stall (PSI)",
+      "description": "Percent of wall time tasks were stalled waiting on a resource, from /proc/pressure. 'some' = at least one task stalled, 'full' = every runnable task stalled (memory only). This leads the utilization gauges: memory PSI rises while RAM used still looks fine, and full > 0 means the box is losing real throughput to reclaim.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 125
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_pressure_memory_waiting_seconds_total[$__rate_interval])",
+          "legendFormat": "memory: some"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_pressure_memory_stalled_seconds_total[$__rate_interval])",
+          "legendFormat": "memory: full"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_pressure_io_waiting_seconds_total[$__rate_interval])",
+          "legendFormat": "io: some"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_pressure_cpu_waiting_seconds_total[$__rate_interval])",
+          "legendFormat": "cpu: some"
+        }
+      ]
+    },
+    {
+      "id": 65,
+      "type": "row",
+      "title": "NVMe \u2014 weight streaming",
+      "collapsed": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 133
+      },
+      "panels": []
+    },
+    {
+      "id": 66,
+      "type": "stat",
+      "title": "NVMe read",
+      "description": "Read throughput on the weight device. nvme1n1 backs the zpcachyoshome pool \u2014 /home/pat/ai/ple (the mmap'd n-gram table), /home/pat/ai/q4e and /home/pat/code \u2014 so it is the weight-streaming device. nvme0n1 is the zpcachyos root pool and should stay near idle during a serve.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_read_bytes_total{device=\"nvme1n1\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 67,
+      "type": "stat",
+      "title": "NVMe read IOPS",
+      "description": "Completed read requests/s on the weight device. Read alongside 'Avg read size': the same throughput at 10x the IOPS means the access pattern fragmented, not that the device got busier.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "iops",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_reads_completed_total{device=\"nvme1n1\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 68,
+      "type": "stat",
+      "title": "Avg read size",
+      "description": "Bytes per completed read = read_bytes / reads_completed. This is the prefetch signal: at ~4 KiB the device is servicing single-page demand faults one at a time; 128 KiB and up means readahead or the prefetch threads are coalescing. Low value with high IOPS is the pattern to fix.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 16384
+              },
+              {
+                "color": "green",
+                "value": 131072
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_read_bytes_total{device=\"nvme1n1\"}[$__rate_interval])) / sum(rate(node_disk_reads_completed_total{device=\"nvme1n1\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 69,
+      "type": "stat",
+      "title": "Read latency",
+      "description": "Average service time per read = read_time / reads_completed. Includes queueing, so it climbs under depth even when the device itself is fine \u2014 check it against queue depth before blaming the drive.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.001
+              },
+              {
+                "color": "red",
+                "value": 0.005
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_read_time_seconds_total{device=\"nvme1n1\"}[$__rate_interval])) / sum(rate(node_disk_reads_completed_total{device=\"nvme1n1\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 70,
+      "type": "stat",
+      "title": "Device busy",
+      "description": "Percent of wall time the weight device had at least one I/O in flight. Near 100% means the NVMe is the streaming bottleneck; well below it with poor throughput means the bottleneck is upstream (too few prefetch threads, or serialized faults).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * sum(rate(node_disk_io_time_seconds_total{device=\"nvme1n1\"}[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 71,
+      "type": "stat",
+      "title": "ARC hit ratio",
+      "description": "ZFS ARC hits / (hits + misses). The weight and PLE files are on ZFS, so ARC is the cache in front of the NVMe \u2014 a high ratio means most 'reads' never reach the device, and NVMe throughput understates real demand. ARC is capped well below the working set, so expect this to be low during streaming.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 134
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 85
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_zfs_arc_hits[$__rate_interval]) / (rate(node_zfs_arc_hits[$__rate_interval]) + rate(node_zfs_arc_misses[$__rate_interval]))"
+        }
+      ]
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "NVMe throughput by device",
+      "description": "Read and write bytes/s per physical NVMe. nvme1n1 backs the zpcachyoshome pool \u2014 /home/pat/ai/ple (the mmap'd n-gram table), /home/pat/ai/q4e and /home/pat/code \u2014 so it is the weight-streaming device. nvme0n1 is the zpcachyos root pool and should stay near idle during a serve. Writes on the weight device during a read-only serve are ZFS metadata or another job \u2014 worth explaining before trusting a read number.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 138
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_read_bytes_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} read"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_written_bytes_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} write"
+        }
+      ]
+    },
+    {
+      "id": 73,
+      "type": "timeseries",
+      "title": "NVMe IOPS & queue depth",
+      "description": "Completed requests/s per device, with average queue depth on the right axis (io_time_weighted rate = mean requests in flight). Depth near 1 with high latency means requests are serialized \u2014 the streaming path is not issuing enough concurrency to fill the device.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 138
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "iops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nvme0n1 avg queue"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nvme1n1 avg queue"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_reads_completed_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} reads/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_writes_completed_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} writes/s"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_io_time_weighted_seconds_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} avg queue"
+        }
+      ]
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "NVMe read latency & busy",
+      "description": "Average read service time per device (left, seconds) against device busy percent (right). Latency rising while busy is flat is queueing upstream; both rising together is genuine device saturation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nvme0n1 busy"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nvme1n1 busy"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_read_time_seconds_total{device=~\"nvme.+\"}[$__rate_interval]) / rate(node_disk_reads_completed_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} read latency"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_disk_io_time_seconds_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}} busy"
+        }
+      ]
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Average read size (I/O granularity)",
+      "description": "Bytes per completed read, over time. Flat at ~4 KiB is page-at-a-time demand faulting \u2014 the worst case for streaming, since every page costs a full round trip. Steps upward mean readahead or prefetch threads are coalescing requests. This is the series to watch when tuning prefetch depth, not raw throughput.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "rate(node_disk_read_bytes_total{device=~\"nvme.+\"}[$__rate_interval]) / rate(node_disk_reads_completed_total{device=~\"nvme.+\"}[$__rate_interval])",
+          "legendFormat": "{{device}}"
+        }
+      ]
+    },
+    {
+      "id": 76,
+      "type": "timeseries",
+      "title": "ZFS ARC \u2014 size vs cap, hit ratio",
+      "description": "ARC is the cache in front of the NVMe for the weight and PLE datasets, and it is host RAM the offload arena cannot use: ARC size counts as kernel memory, not page cache, so it inflates 'used' on the memory breakdown. Size pinned at the cap with a low hit ratio is the worst case \u2014 paying full RAM for a cache that is not absorbing the working set.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 154
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "hit ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_zfs_arc_size",
+          "legendFormat": "ARC size"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "node_zfs_arc_c_max",
+          "legendFormat": "ARC cap (c_max)"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "100 * rate(node_zfs_arc_hits[$__rate_interval]) / (rate(node_zfs_arc_hits[$__rate_interval]) + rate(node_zfs_arc_misses[$__rate_interval]))",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Page amplification \u2014 NVMe bytes per major fault",
+      "description": "Bytes read from the weight device per 4 KiB major fault. 1.0 means each fault moved exactly its own page; higher means readahead pulled in more than was asked for \u2014 useful when it is prefetch, waste when it is not. The fault rate is floored at 1/s so that pread-thread traffic, which reaches the device without faulting, does not render as an infinite ratio.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "vllm-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 154
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "last",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "vllm-prometheus"
+          },
+          "expr": "sum(rate(node_disk_read_bytes_total{device=\"nvme1n1\"}[$__rate_interval])) / clamp_min(sum(rate(node_vmstat_pgmajfault[$__rate_interval])), 1) / 4096",
+          "legendFormat": "x amplification"
         }
       ]
     }
