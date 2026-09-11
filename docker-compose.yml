@@ -243,12 +243,6 @@ x-lean-common: &lean-common
     VLLM_W4A8_MOE_G2FUSE_BYLANE: "${VLLM_W4A8_MOE_G2FUSE_BYLANE:-}"
     # MoE quant mode: 0 = W4A8 (int4 wt + int8/fp8 act via FP8-WMMA); 1 = W4A16 (weight-only, fp16 act).
     MINISGL_MOE_W4A16: "${MINISGL_MOE_W4A16:-0}"
-    # MHA/SWA spec page-aware rollback: =1 keeps page_size=16 under spec (validated coherent +
-    # lossless, but A/B showed NO prefill win, so unset = the engine's shipped page_size->1).
-    # Forwarded EMPTY: serve.sh unsets the empty string (the engine's `!= "0"` gate would read ""
-    # as ON) and opts SWA-hybrid models in to 1, where paged is what makes SWA-radix hit. CPU
-    # proof: tools/spec_page_rollback_check.py.
-    MINISGL_SPEC_MHA_PAGED: "${MINISGL_SPEC_MHA_PAGED:-}"
     # SSM recurrent-state STORAGE dtype: 1 (default) = bf16, 0 = fp32. Passed through for the
     # Qwen3.8 corruption bisection — the bf16 bounded-rounding claim is horizon/model-dependent.
     MINISGL_SSM_BF16: "${MINISGL_SSM_BF16:-1}"
@@ -341,11 +335,6 @@ x-lean-common: &lean-common
     # decode step dies with a shape error. =0 restores the 2-D legacy aux and makes that baseline
     # servable. Inert on the current tree (the gate is fixed) — production keeps the default.
     MINISGL_DFLASH_FULLCTX: "${MINISGL_DFLASH_FULLCTX:-}"
-    # Fraction of FREE memory the DFlash propose prefix RING may take (spec/dflash.py:373, default
-    # 0.30). The ring is allocated after the KV pool, so it competes with the (1-memory_ratio) slack
-    # that long prompts at concurrency also need. Forwarded so that competition can be measured
-    # rather than argued about; a slot outside the pool simply skips propose, which is lossless.
-    MINISGL_DFLASH_KV_FRAC: "${MINISGL_DFLASH_KV_FRAC:-}"
     # Propose-ring sizing. All three MUST be declared here or they are SILENTLY INERT: compose passes
     # only the variables it lists, so setting them on the host looks like it worked and does nothing
     # — the same trap MINISGL_DRAFT_RESERVE* and MINISGL_DFLASH_CAPTURE_LAYERS already hit.
@@ -370,8 +359,6 @@ x-lean-common: &lean-common
     # AUX_MODE repeat their code defaults because those readers are not empty-string-safe (int("")
     # at import; "" != "xr" flips the aux capture); the rest use the `or` form and forward empty.
     MINISGL_EAGLE3_KV_WINDOW: "${MINISGL_EAGLE3_KV_WINDOW:-}"
-    MINISGL_EAGLE3_MAX_CTX: "${MINISGL_EAGLE3_MAX_CTX:-}"
-    MINISGL_EAGLE3_KV_FRAC: "${MINISGL_EAGLE3_KV_FRAC:-}"
     # Forwarded EMPTY: a non-empty default here would force the env-override path and defeat the
     # checkpoint-declared / target-depth-derived capture ids in draft_model.py (reader is
     # empty-string-safe).
@@ -847,10 +834,6 @@ services:
       <<: *lean-env
       MINISGL_CAM: "1"
       MINISGL_CAM_CHECKPOINT: /cam_ckpt
-      # Pinned: cam launches the engine directly (no serve.sh), and this service has always run the
-      # paged spec-verify path with its --page-size 16. Keep that explicit rather than inheriting
-      # the engine's default-off gate.
-      MINISGL_SPEC_MHA_PAGED: "${MINISGL_SPEC_MHA_PAGED:-1}"
       # Sampled (rejection) spec-verify ON by default: lets MTP engage for NON-greedy UNCONSTRAINED
       # requests instead of falling back to plain decode. NOTE: does NOT help grammar-constrained
       # requests (the JSON-schema spine turns) — those still fall back until spec+grammar is wired.
