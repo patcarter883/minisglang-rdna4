@@ -12,6 +12,16 @@ sharing of code with the implementation, no cleverness — so that a disagreemen
 implementation is wrong rather than that both share a misreading. That is the same discipline the
 Nemotron parity test used, where it caught two bugs.
 
+THE DISCIPLINE FAILED ONCE HERE, WHICH IS WHY ARM (d) EXISTS. The first version of this file
+transcribed sglang's ungrouped `pre_fc_norm_hidden` into BOTH the reference and the implementation,
+so it passed while the head drafted at 0.444 accepted-drafts/verify. `pre_fc_norm_hidden.weight` is
+[10240] — a WIDE-stream norm — and every other wide norm in this checkpoint is grouped per hc branch
+in HF *and* in sglang; sglang's MTP head is the lone exception and HF ships no MTP head to arbitrate.
+A live A/B (same 4 prompts, same protocol, sampled) measured GROUPED 0.605 vs FULL-WIDTH 0.444
+accepted-drafts/verify, ~4.4 sigma. So the reference below is NOT a verbatim copy of upstream at that
+one line: it encodes the measured convention, arm (d) pins the upstream reading as a DIFFERENT
+function, and both facts are stated rather than left for the next reader to rediscover.
+
 WHAT THIS CAN AND CANNOT CATCH:
   * CAN: a transposed view, a wrong broadcast axis, folding the wide stream when it should stay
     wide, applying fc_hidden across the whole 10240 instead of per-branch, norm convention
@@ -95,11 +105,25 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return (d * (1.0 + w.float())).to(x.dtype)
 
 
+def grouped_gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, group: int) -> torch.Tensor:
+    """The WIDE-stream norm: variance per group of `group` channels, gain over the full width.
+
+    Transcribed from `Qwen4ExpTextRMSNorm.forward` (HF) / `GroupedGemmaRMSNorm` (sglang), which are
+    the same function. THIS IS THE ONE PLACE THE REFERENCE DEPARTS FROM sglang's MTP HEAD, which
+    builds `pre_fc_norm_hidden` as an UNGROUPED `GemmaRMSNorm(hc_count*hidden_size)`. The departure
+    is deliberate and measured, not a transcription slip — see the falsification arm below and
+    `Qwen4ExpMTPHead`'s docstring point 3.
+    """
+    d = x.float().reshape(*x.shape[:-1], -1, group)
+    d = d * torch.rsqrt(d.pow(2).mean(-1, keepdim=True) + eps)
+    return (d.flatten(-2) * (1.0 + w.float())).to(x.dtype)
+
+
 def reference_fuse(embed_e: torch.Tensor, wide_hidden: torch.Tensor) -> torch.Tensor:
     e = gemma_rmsnorm(embed_e, T("mtp.pre_fc_norm_embedding.weight"), EPS)
     e = torch.nn.functional.linear(e, T("mtp.fc_embedding.weight"))
     orig = wide_hidden.shape
-    h = gemma_rmsnorm(wide_hidden, T("mtp.pre_fc_norm_hidden.weight"), EPS)
+    h = grouped_gemma_rmsnorm(wide_hidden, T("mtp.pre_fc_norm_hidden.weight"), EPS, H)
     view = h.view(*h.shape[:-1], HC, H)
     enc = torch.nn.functional.linear(view, T("mtp.fc_hidden.weight"))
     return (e.unsqueeze(-2) + enc).reshape(orig)
@@ -117,7 +141,7 @@ print("IMPL: build Qwen4ExpMTPHead's seed path with the checkpoint's own weights
 from minisgl.distributed import set_tp_info  # noqa: E402
 
 set_tp_info(0, 1)
-from minisgl.layers import LinearReplicated, RMSNorm  # noqa: E402
+from minisgl.layers import GroupedRMSNorm, LinearReplicated, RMSNorm  # noqa: E402
 
 
 class ImplFuse:
@@ -125,7 +149,7 @@ class ImplFuse:
 
     def __init__(self) -> None:
         self.pre_e = RMSNorm(H, eps=EPS, plus_one=True)
-        self.pre_h = RMSNorm(HC * H, eps=EPS, plus_one=True)
+        self.pre_h = GroupedRMSNorm(HC * H, group_size=H, eps=EPS)
         self.fc_e = LinearReplicated(H, H, has_bias=False)
         self.fc_h = LinearReplicated(H, H, has_bias=False)
         self.pre_e.weight = T("mtp.pre_fc_norm_embedding.weight").clone()
@@ -190,6 +214,17 @@ wrong_norm = (e_p.unsqueeze(-2) + torch.nn.functional.linear(
     h_p.view(5, HC, H), T("mtp.fc_hidden.weight"))).reshape(5, HC * H)
 check("(c) plain-RMSNorm (no +1) disagrees", rel(wrong_norm, ref) > 1e-2,
       f"rel={rel(wrong_norm, ref):.3e}")
+
+# (d) FULL-WIDTH norm on the wide hidden — one variance over 10240 instead of four over 2560.
+# This is what sglang's MTP head does and what this file asserted until 2026-09-11. It must
+# DISAGREE, because the earlier version of this test transcribed the full-width reading into BOTH
+# the implementation and its reference and therefore could not tell the two apart. Measured on the
+# live serve: grouped 0.605 accepted-drafts/verify vs full-width 0.444 over the same 4 prompts.
+h_full = gemma_rmsnorm(wide, T("mtp.pre_fc_norm_hidden.weight"), EPS)
+wrong_full = (e_p.unsqueeze(-2) + torch.nn.functional.linear(
+    h_full.view(5, HC, H), T("mtp.fc_hidden.weight"))).reshape(5, HC * H)
+check("(d) FULL-WIDTH (ungrouped) hidden norm disagrees", rel(wrong_full, ref) > 1e-2,
+      f"rel={rel(wrong_full, ref):.3e}")
 
 print()
 if FAILED:

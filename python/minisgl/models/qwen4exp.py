@@ -725,9 +725,16 @@ class Qwen4ExpMTPHead(BaseOP):
        post_attention_layernorm — `hc_norm` inside `mix` is the pre-block norm. Same structure as
        `Qwen4ExpDecoderLayer`, so the dataflow here is that layer's, not Qwen3.5's.
 
-    3. **`pre_fc_norm_*` are plain full-width `(1 + w)` norms** (upstream `GemmaRMSNorm`), 2560 for
-       the embedding and 10240 for the hidden — NOT the grouped convention the hyper-connection
-       blocks' `hc_norm` uses at the same width.
+    3. **`pre_fc_norm_hidden` is GROUPED, and this DIVERGES from upstream sglang.** Both norms use
+       the `(1 + w)` gain; `pre_fc_norm_embedding` is a plain 2560 norm over the embedding. But
+       `pre_fc_norm_hidden` is [10240] — it touches the WIDE stream, and every other wide norm in
+       this checkpoint normalizes each hc branch on its own (`hc_norm`, and the PLE's
+       `norm_key`/`norm_query`/`norm_conv`; grouped in HF transformers AND in sglang). sglang's MTP
+       head is the lone exception, building it as a full-width `GemmaRMSNorm(hc_count*hidden_size)`;
+       HF ships no MTP head at all, so it cannot arbitrate. A/B on this checkpoint, same 4 prompts,
+       same protocol, sampled: GROUPED 0.605 accepted-drafts/verify vs FULL-WIDTH 0.444 (+36%, ~4.4
+       sigma on 451 vs 368 accepted). The two are different functions — one variance over 10240 vs
+       four over 2560 — and the difference is SILENT: both draft fluently, they just get rejected.
 
     Reuses the target's embed_tokens and (untied) lm_head, like every other MTP head here.
     """
@@ -737,8 +744,23 @@ class Qwen4ExpMTPHead(BaseOP):
         eps = config.rms_norm_eps
         hs, hc = config.hidden_size, config.hc_count
         self.pre_fc_norm_embedding = RMSNorm(hs, eps=eps, plus_one=True)
-        # Full width, ungrouped — see point 3 in the class docstring.
-        self.pre_fc_norm_hidden = RMSNorm(hc * hs, eps=eps, plus_one=True)
+        # GROUPED (group = hidden_size), which DIVERGES from upstream sglang — measured, see below.
+        #
+        # `pre_fc_norm_hidden.weight` is [hc*H] = [10240], i.e. it touches the WIDE residual stream,
+        # and every other wide norm in this checkpoint is grouped per branch: `hc_norm` and the PLE's
+        # `norm_key`/`norm_query`/`norm_conv` are all `Qwen4ExpTextRMSNorm(..., group_size=hidden_size)`
+        # in HF transformers, and sglang uses its own `GroupedGemmaRMSNorm(group_size=hidden_size)` for
+        # `hc_norm`. The ONE exception is sglang's MTP head, which builds this norm as a plain
+        # full-width `GemmaRMSNorm(hc_count * hidden_size)` — and HF ships no MTP head at all
+        # (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`), so it cannot arbitrate.
+        #
+        # The two are different functions (one variance over 10240 vs four over 2560 each), and the
+        # difference is silent: both produce fluent drafts, they just get REJECTED. Measured on this
+        # checkpoint, full-width scored mean accept-len 0.28-0.33 against a trained head's expected
+        # 0.55-0.8. See tests/qwen4exp_mtp_parity_test.py, whose falsification arm now pins the
+        # grouped-vs-full-width distinction (the earlier version transcribed the full-width reading
+        # into BOTH the implementation and its reference, so it could not see this).
+        self.pre_fc_norm_hidden = GroupedRMSNorm(hc * hs, group_size=hs, eps=eps)
         # REPLICATED for the same reason the Qwen3.5 fc is: these produce the seed that feeds the
         # (head-sharded) MTP layer, so a column-parallel output would hand the layer a truncated
         # hidden under TP>1 — and this arm is TP=2 ONLY (min_tp=2), so that path is not theoretical.
