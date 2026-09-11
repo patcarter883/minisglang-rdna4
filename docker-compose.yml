@@ -134,6 +134,13 @@ x-lean-common: &lean-common
     # PROTOTYPE (perf/custom-ar-ep): route the in-graph EP MoE all_reduce through the custom_ar one-shot
     # P2P all-reduce instead of RCCL (dp_size==2 + P2P only). Default 0 (RCCL) so this is an opt-in A/B.
     MINISGL_CUSTOM_AR_EP: "${MINISGL_CUSTOM_AR_EP:-0}"
+    # custom_ar peer-wait BOUND, in seconds. The cross-GPU handshake used to spin forever on a peer
+    # that never arrived, pinning a card at 100% gfx / 0% memory; it is now bounded in-kernel with a
+    # 30 s default. This forwards the override — and it is here because the knob was added WITHOUT
+    # it and was therefore inert: compose only forwards variables it NAMES, so three A/B boots ran
+    # at the 30 s default while reporting 20 s. Same trap the header of docker-compose.override.yml
+    # describes. 0 restores the old unbounded spin (only to prove a hang is real).
+    MINISGL_CUSTOM_AR_TIMEOUT_S: "${MINISGL_CUSTOM_AR_TIMEOUT_S:-}"
     # Custom one-shot P2P EP all_GATHER (all_gather_p2p, baked into the lean custom_ar). DEFAULT ON —
     # moves the fused EP dispatch gather off RCCL; decoupled from AR, no-ops on non-EP serves, and falls
     # back to RCCL if the baked custom_ar lacks the kernel or P2P is unavailable. Set 0 to force RCCL.
