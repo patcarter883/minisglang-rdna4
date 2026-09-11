@@ -757,6 +757,17 @@ class Qwen4ExpMTPHead(BaseOP):
         self.hyper_connection_mixer = _make_hc(config, use_combine=False)
         self._hc_count = hc
         self._hidden_size = hs
+        # The width of the key set this head's attention was TRAINED to see: QSA selects up to
+        # `indexer_budget` compressed groups, expanded to `budget + ratio - 1` token columns
+        # (QSAConfig.index_width). Published so the proposer can size its draft window to it — a
+        # recent-history window narrower than this shows the drafter a strictly different context
+        # from the one the target attended over. None on a non-QSA build, where the proposer keeps
+        # its own measured default.
+        self.qsa_index_width = (
+            int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1
+            if config.indexer_budget and config.indexer_compress_ratio
+            else None
+        )
         self._embed = embed
         self._lm_head = lm_head
 
