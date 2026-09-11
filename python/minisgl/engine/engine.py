@@ -2280,26 +2280,28 @@ def _adjust_config(config: EngineConfig):
             # kernel reads the global page_size=1 table STRIDED by page_size (hip.py: gpt[..., ::ps]),
             # and the 30 SWA layers use an independent page_size=1 ring — so the whole MHA/SWA spec path
             # is page_size-parametrized. page_size>1 gives the 10 full-attn layers 16-token-contiguous KV
-            # (better decode/prefill gather coalescing). GATED default-off pending GPU validation:
-            # MINISGL_SPEC_MHA_PAGED=1 keeps the configured page_size (already snapped to a %16 multiple
-            # by the HIP backend rule above); unset restores the shipped byte-identical page_size=1.
-            # `or "0"`: compose forwards unset host vars as the EMPTY string, which must read as the
-            # shipped default for launchers that bypass serve.sh's unset-normalization (cam, run).
-            _mha_paged = (os.environ.get("MINISGL_SPEC_MHA_PAGED") or "0") != "0"
-            if _mha_paged and config.page_size > 1:
-                logger.warning_rank0(
-                    f"spec-decode (MHA): keeping page_size={config.page_size} (page-aware rollback; "
-                    "MINISGL_SPEC_MHA_PAGED opt-in — validate before making this the default)"
-                )
-            elif config.page_size != 1:
-                override("page_size", 1)
-                logger.warning_rank0("spec-decode (MHA): overriding page_size -> 1 (rollback)")
+            # (better decode/prefill gather coalescing).
+            #
+            # THIS IS NOW THE DEFAULT and the MINISGL_SPEC_MHA_PAGED gate is gone. The gate existed
+            # only because the MHA/SWA path had never been exercised at page_size>1 on a GPU; the
+            # rollback itself is the same page-aware form MLA spec has shipped at page_size=16. What
+            # backs the change:
+            #   * tools/spec_page_rollback_check.py — the CPU proof of I1-I4 (kept slots unique, no
+            #     kept KV freed, no page leak, ps=16 frees a whole-page superset of ps=1) over 1,989
+            #     shapes for ps in {1,16}. Re-run it if this is ever touched.
+            #   * Qwen3.8-27B-MTP-NVFP4 (MHA + MTP, TP=2) has served with it on.
+            #   * Qwen3.8-Flash-Next (qwen4_exp: GDN hybrid + PLE + MTP, TP=2) booted and returned
+            #     coherent greedy output at page_size=16, 2026-09-11 — the harder case, because GDN
+            #     recurrent state and a PLE n-gram block both ride the same rollback.
+            # Output correctness was never the exposure and that is what makes this safe to default:
+            # spec decode is lossless by construction, so a rollback freeing the wrong pages shows up
+            # as corrupted KV and visibly degraded text, not as a plausible-but-different answer.
             # All non-MLA backbones now cudagraph-capture the spec-VERIFY forward: the HIP attn
             # verify-capture (S1) is model-agnostic (pure MHA works by itself), and the recurrent
             # backbones thread their per-token state through static scratch buffers — CCA via
             # CCAVerifyGraphCapture, GDN via GDNVerifyGraphCapture. So keep graphs ON for MHA, GDN,
-            # and CCA alike. (page_size is 1 above unless MINISGL_SPEC_MHA_PAGED opts into paged
-            # rollback; the verify capture reads the global table strided by page_size either way.)
+            # and CCA alike. (the verify capture reads the global table strided by
+            # page_size, so it is correct at any page_size.)
             # The FUSED TiDAR
             # forward's non-K+1 qlen auto-falls-back to eager via can_use_verify_graph until S4.
             pass

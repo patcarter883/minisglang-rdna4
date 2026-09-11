@@ -127,7 +127,8 @@ def main() -> None:
                 cases += 1
     print(f"OK  page-aware spec rollback invariants hold for ps in {{1,16}} across {cases} shapes")
     print("    (I1 unique kept slots, I2 no kept-KV freed, I3 no page leak) — MHA/SWA spec is")
-    print("    page_size-safe; MINISGL_SPEC_MHA_PAGED=1 lifts the legacy page_size->1 override.")
+    print("    page_size-safe. This proof is what retired the legacy page_size->1 override;")
+    print("    paged rollback is now the DEFAULT (engine.py), so re-run this if it is touched.")
 
 
 if __name__ == "__main__":
