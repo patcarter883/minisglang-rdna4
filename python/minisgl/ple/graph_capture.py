@@ -72,6 +72,30 @@ class PLEGraphCapture:
         b = self._ple.prepare([0] * bs, [seed] * bs, is_decode=True)
         self._check_addresses(b, bs, "capture")
 
+    def prepare_for_verify_capture(self, batch: "Batch", bs: int, qlen: int) -> None:
+        """Stage the synthetic batch for a SPEC-VERIFY capture warmup.
+
+        Separate from `prepare_for_capture` for one reason that is easy to get wrong: a verify
+        forward carries `bs * qlen` tokens, not `bs`. The PLE block consumes one embedding per
+        TOKEN and checks the two counts agree, so staging the decode shape here fails with
+        "PLE staged N token embeddings but the forward carries M" — which is what it did.
+
+        `PLERuntime.prepare` counts SEQUENCES, not tokens (it is capped at `max_seqs`), and a
+        multi-token pass is one slot carrying a token ARRAY — the same shape `Scheduler._stage_ple`
+        builds. So this stages `bs` sequences of `qlen` tokens each, giving bs*qlen embeddings.
+        Passing bs*qlen single-token sequences instead trips "10 sequences > max_seqs 4".
+
+        Values are irrelevant (a synthetic warmup on the reserved NULL slot 0, discarded by
+        `after_capture`); only the token COUNT and the buffer addresses matter, because the
+        addresses are what the captured graph bakes in."""
+        self._ple.discard_staged()
+        eos = int(self._ple.state.eos_token_id)
+        seed = np.full(qlen, eos, dtype=np.int64)
+        # is_decode=False: these rows carry qlen>1 tokens, which is the varlen shape, not the
+        # single-token static-conv decode shape.
+        b = self._ple.prepare([0] * bs, [seed] * bs, is_decode=(qlen == 1))
+        self._check_addresses(b, bs, "verify-capture")
+
     def after_capture(self) -> None:
         """Drop the capture-staged batch. See the module docstring: NOT a commit."""
         self._ple.discard_staged()

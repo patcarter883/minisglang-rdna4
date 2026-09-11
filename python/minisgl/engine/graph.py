@@ -589,6 +589,14 @@ class GraphRunner:
             wbuf: VerifyCaptureBuffer = ent["buf"]
             wbuf.set_batch(batch)
             T = wbuf.total(batch)
+            if self.ple_capture is not None:
+                # The verify WARMUP is a real model forward, so the PLE block demands a staged batch
+                # exactly as the decode-capture path above does — but sized to the VERIFY token
+                # count T (bs*qlen), not bs. Staged after T is known for that reason. Missing it
+                # raised "PLE: no staged batch"; staging the decode shape raised "staged N ... the
+                # forward carries M". PLE x spec had no exercised path before, because
+                # --spec-algorithm mtp was refused for the only architecture with a PLE block.
+                self.ple_capture.prepare_for_verify_capture(batch, bs, T // max(bs, 1))
             with get_global_ctx().forward_batch(batch), torch.inference_mode():
                 self._run_verify_into(model, wbuf, T, needs_hidden)  # warmup
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
@@ -596,6 +604,11 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()
             ent["graphs"][bs] = graph
+        if self.ple_capture is not None:
+            # DISCARD the synthetic capture batch, same contract as the decode path: the
+            # prepare/commit pairing stays exact, so a later forward with no fresh `_stage_ple`
+            # still raises rather than silently re-reading the capture's embeddings.
+            self.ple_capture.after_capture()
         self._verify = {"buf": vbuf, "widths": by_qlen, "qlens": sorted(by_qlen),
                         "qlen": qlen, "graphs": by_qlen[qlen]["graphs"],
                         "bs_list": sorted(bs_list), "needs_hidden": needs_hidden, "num_aux": num_aux}
