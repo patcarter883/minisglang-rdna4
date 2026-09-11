@@ -46,6 +46,10 @@ if ENABLED:
     _rms_norm = tail_hip.rms_norm
     _rms_norm_add = tail_hip.rms_norm_add
     _rope = tail_hip.rope
+    # Fused hyper-connection epilogues. getattr-with-default, not attribute access: an image
+    # whose tail package predates them must still import cleanly and fall back.
+    _hc_mix_epilogue = getattr(tail_hip, "hc_mix_epilogue", None)
+    _hc_combine = getattr(tail_hip, "hc_combine", None)
     # PRODUCER-SIDE act-quant twins. OPTIONAL for the same reason gelu_and_mul is: an older baked
     # .so predates them and a hard attribute lookup would crash the import for every model.
     #
@@ -73,6 +77,19 @@ if ENABLED:
     def rope(*args, **kwargs):
         _engaged("tail_hip.rope")
         return _rope(*args, **kwargs)
+
+    # These two carry an engage line for the same reason every other op does: the caller gates on
+    # hasattr, so a build without them degrades SILENTLY to the slow torch chain and the only
+    # difference is a few ms/step that looks like noise. The ledger is what makes that visible.
+    if _hc_mix_epilogue is not None:
+        def hc_mix_epilogue(*args, **kwargs):
+            _engaged("tail_hip.hc_mix_epilogue")
+            return _hc_mix_epilogue(*args, **kwargs)
+
+    if _hc_combine is not None:
+        def hc_combine(*args, **kwargs):
+            _engaged("tail_hip.hc_combine")
+            return _hc_combine(*args, **kwargs)
 
     if _rms_norm_quant is not None:
         def rms_norm_quant(*args, **kwargs):

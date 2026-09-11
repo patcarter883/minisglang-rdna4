@@ -102,6 +102,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
+from . import _tail_hip
 from .base import BaseOP
 from .linear import LinearReplicated
 from .norm import GroupedRMSNorm
@@ -328,7 +329,16 @@ class HyperConnection(BaseOP):
         if not self._scale_folded:
             down = down / self._hc
         t = F.silu(down)
-        gate = torch.sigmoid(self.input_mix_weight_up.forward(t))
+        gate_logits = self.input_mix_weight_up.forward(t)
+        # ONE launch for sigmoid + per-branch multiply + mean, instead of three on a 20 KB tensor.
+        # The kernel takes the PRE-sigmoid logits and rounds at the reference's rounding points, so
+        # this is bit-exact with the fallback below, not merely close (tail_kernels.hip).
+        if hasattr(_tail_hip, "hc_mix_epilogue") and _tail_hip.active(gate_logits, None):
+            mixed = _tail_hip.hc_mix_epilogue(
+                gate_logits.contiguous(), normed.contiguous(), self._hc
+            )
+            return mixed, (hyper_input, normed, inject_logits)
+        gate = torch.sigmoid(gate_logits)
         mixed = (
             gate.unflatten(-1, (self._hc, self._hs))
             * normed.unflatten(-1, (self._hc, self._hs))
@@ -365,6 +375,16 @@ class HyperConnection(BaseOP):
             inject_logits = self.block_inject_weight.forward(normed)
             if not self._scale_folded:
                 inject_logits = inject_logits / self._hc
+        # ONE launch for sigmoid + the gated broadcast-add. The kernel takes the PRE-sigmoid
+        # logits, keeps the leading 2x as an exact power-of-two scale on a product that is rounded
+        # to the tensor dtype FIRST, and compiles with fp contract off — so it reproduces the
+        # `torch.add(..., alpha=2.0)` chain below bit for bit rather than contracting to an FMA,
+        # which is the ~1 ulp drift this method already refuses addcmul over.
+        if hasattr(_tail_hip, "hc_combine") and _tail_hip.active(hyper_input, None):
+            return _tail_hip.hc_combine(
+                hyper_input.contiguous(), block_output.contiguous(),
+                inject_logits.contiguous(), self._hc,
+            )
         gate = torch.sigmoid(inject_logits)
         branches = hyper_input.unflatten(-1, (self._hc, self._hs))
         # Leading 2x: the gate is neutral at 1.0, not 0.5. Dropping it halves every block's
