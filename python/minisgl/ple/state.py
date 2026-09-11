@@ -103,6 +103,33 @@ class PLEStateCache:
         self.conv_state[slot].zero_()
         self.token_history[slot] = self.eos_token_id
 
+    def install_verify_conv(self, slot: int, window: torch.Tensor, keep: int) -> None:
+        """Roll this slot's conv window back to the ACCEPTED prefix of a spec-verify pass.
+
+        `window` is the `[state | chunk]` tensor the verify forward built, (wide, state_len + n),
+        and `keep` is how many of that pass's n tokens were actually committed. After processing t
+        tokens the window is `window[:, t : t + state_len]`, so the full-pass write the forward
+        already did is the t == n case; this installs the t == keep case instead.
+
+        WHY THIS EXISTS. A spec verify runs the backbone over `[confirmed, d0 .. d_{K-1}]` and the
+        conv state comes out advanced over ALL of them, including drafts that are rejected a moment
+        later. Nothing resyncs it, so the drift is permanent and compounds for the rest of the
+        sequence: the PLE block then reads a lexical context that never existed, which corrupts the
+        target's own hidden states (i.e. makes speculative decoding LOSSY, not merely slow) and
+        poisons the seeds the draft head seeds from. GDN and CCA have carried the equivalent
+        accepted-prefix install since spec decode landed (`install_verify_state`); PLE was the one
+        recurrent block in this model that did not, because the only architecture with a PLE block
+        also refused `--spec-algorithm mtp` until now.
+        """
+        s_len = self.state_len
+        k = int(keep)
+        if not 0 <= k <= window.shape[-1] - s_len:
+            raise ValueError(
+                f"PLE install_verify_conv: keep={k} outside [0, {window.shape[-1] - s_len}] for a "
+                f"window of {window.shape[-1]} columns with state_len={s_len}"
+            )
+        self.conv_state[slot].copy_(window[:, k : k + s_len])
+
     def history(self, slot: int) -> np.ndarray:
         return self.token_history[slot]
 

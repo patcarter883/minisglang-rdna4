@@ -57,6 +57,15 @@ class PLEBatch:
     #: reads it) without inventing token ids; `commit_staged` REFUSES an empty one rather than
     #: quietly advancing nothing.
     tokens: List[np.ndarray] = field(default_factory=list)
+    #: Spec-decode VERIFY pass: this batch's tokens are `[confirmed, d0 .. d_{K-1}]` and the drafts
+    #: are NOT committed yet, so neither the n-gram history nor the conv window may be advanced over
+    #: them until the accept decision is known. `commit_staged` parks such a batch instead of
+    #: advancing it, and `commit_verified` finishes the job with the accepted lengths.
+    defer_commit: bool = False
+    #: slot -> the `[state | chunk]` window (wide, state_len + n) the verify forward built, stashed
+    #: by `Qwen4ExpPLE._short_conv` so the accepted-prefix conv state can be recovered exactly
+    #: (`PLEStateCache.install_verify_conv`) rather than approximated or recomputed.
+    conv_windows: dict = field(default_factory=dict)
 
 
 class PLERuntime:
@@ -73,6 +82,8 @@ class PLERuntime:
         self.source = source
         self.state = state
         self.max_seqs = int(max_seqs)
+        #: A deferred spec-verify batch awaiting its accept decision (see commit_staged/commit_verified).
+        self._pending: "PLEBatch | None" = None
         # Static index buffer: `index_select`/`index_copy_` inside a captured graph must read a
         # tensor at a fixed address. Long, because that is what index_copy_ wants everywhere.
         self._slot_idx = torch.zeros(self.max_seqs, dtype=torch.long, device=device)
@@ -100,6 +111,7 @@ class PLERuntime:
         token_lists: Sequence[np.ndarray],
         *,
         is_decode: bool | None = None,
+        defer_commit: bool = False,
     ) -> PLEBatch:
         """Stage the host side of one forward. Call BEFORE the model forward, never inside capture.
 
@@ -125,6 +137,7 @@ class PLERuntime:
             seq_lens=seq_lens,
             is_decode=bool(is_decode),
             tokens=[np.asarray(t, dtype=np.int64).reshape(-1) for t in token_lists],
+            defer_commit=bool(defer_commit),
         )
         self.prepares += 1
         return self.batch
@@ -151,6 +164,21 @@ class PLERuntime:
             return
         self.batch = None
         self.commits += 1
+        if b.defer_commit:
+            # Spec VERIFY: park it. The history must not advance over drafts that the accept loop
+            # is about to reject, and the conv window the forward already wrote is the "after every
+            # draft" one. `commit_verified` (scheduler, next to the GDN accepted-prefix install)
+            # finishes both halves with the accepted lengths. The ledger still counts this as the
+            # commit for this forward, so `prepares == commits` stays the once-per-forward invariant.
+            if self._pending is not None:
+                raise RuntimeError(
+                    "PLE commit_staged: a deferred verify batch was already parked and never "
+                    "resolved. `commit_verified` must run after every deferred forward — a second "
+                    "one means the accept path was skipped, which would silently freeze the n-gram "
+                    "history at the earlier pass."
+                )
+            self._pending = b
+            return
         if len(b.tokens) != len(b.slots):
             raise RuntimeError(
                 f"PLE commit_staged: {len(b.slots)} slots but {len(b.tokens)} token lists. The "
@@ -159,6 +187,45 @@ class PLERuntime:
                 f"its EOS seed for the rest of the sequence, silently."
             )
         self.source.advance(self.state, b.slots, b.tokens)
+
+    def commit_verified(self, keep_by_slot: "dict[int, int]") -> None:
+        """Resolve the parked spec-verify batch against the accepted lengths.
+
+        `keep_by_slot` maps each real slot to how many tokens of that pass were COMMITTED — the
+        confirmed token plus the accepted drafts, i.e. `len(keep)` at the accept site, which is the
+        same quantity GDN installs as `t_index = len(keep) - 1`.
+
+        Both halves move together, which is the whole point: the n-gram history advances over
+        exactly the committed tokens, and the conv window is rolled back to the state after those
+        same tokens. Advancing one without the other is the "history one chunk ahead of its conv
+        state" hazard that `prepare`/`commit` were split apart to prevent.
+
+        A slot missing from the map keeps the full-pass advance the forward already did. That is the
+        right fallback for a row this step did not adjudicate (a cudagraph padding row on the NULL
+        slot), and it is what the pre-fix behaviour was for everything.
+        """
+        b = self._pending
+        if b is None:
+            return
+        self._pending = None
+        slots: "list[int]" = []
+        toks: "list[np.ndarray]" = []
+        for slot, tok in zip(b.slots, b.tokens):
+            if slot == 0:            # reserved NULL slot: padding rows own no sequence
+                continue
+            keep = keep_by_slot.get(slot)
+            if keep is None:
+                keep = int(tok.size)  # not adjudicated -> behave exactly as before
+            keep = max(0, min(int(keep), int(tok.size)))
+            win = b.conv_windows.get(slot)
+            if win is not None and keep != int(tok.size):
+                self.state.install_verify_conv(slot, win, keep)
+            if keep:
+                slots.append(slot)
+                toks.append(tok[:keep])
+        b.conv_windows.clear()
+        if slots:
+            self.source.advance(self.state, slots, toks)
 
     def discard_staged(self) -> None:
         """Drop the staged batch WITHOUT advancing any history. Cudagraph capture only.

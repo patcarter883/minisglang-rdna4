@@ -106,7 +106,7 @@ from minisgl.quant import create_linear_method
 from minisgl.utils import init_logger, nvtx_annotate
 
 from .base import BaseLLMModel
-from .qwen3_5 import GDNLinearAttn, Qwen3_5Attn
+from .qwen3_5 import GDNLinearAttn, Qwen3_5Attn, Qwen3_5MTPAttn
 from .qwen3_5_moe import Qwen3_5MoeSparseBlock
 
 if TYPE_CHECKING:
@@ -125,12 +125,6 @@ UNIMPLEMENTED: Tuple[Tuple[str, str], ...] = (
         "text-only serve, as for every other multimodal checkpoint here. The loader counts the 333 "
         "skipped vision tensors in its ignore ledger; an image token in a prompt is a tokenizer/"
         "front-end concern and never reaches this model",
-    ),
-    (
-        "MTP speculative head (mtp.*)",
-        "plan T8.1: fused expert tensors, its own hyper-connections, and it seeds from the "
-        "hc_count-wide PRE-mixer stream. ModelConfig.from_hf REFUSES --spec-algorithm mtp for this "
-        "architecture rather than half-building the Qwen3.5 head against those tensors",
     ),
     (
         "cudagraph capture of the PREFILL / spec-VERIFY forwards",
@@ -427,6 +421,14 @@ class Qwen4ExpPLE(BaseOP):
             xs = x[start : start + n].t().unsqueeze(0)  # (1, wide, n)
             full = torch.cat([conv_state[slot].unsqueeze(0), xs], dim=-1)  # (1, wide, s+n)
             y = F.conv1d(full, w, groups=self._wide, dilation=d)  # (1, wide, n)
+            # Spec VERIFY: stash the `[state | chunk]` window BEFORE collapsing it to the last `s`
+            # columns. The accepted-prefix state is `full[0][:, keep : keep+s]`, which is already in
+            # hand here and unrecoverable afterwards — the write below keeps only the t == n case,
+            # i.e. the state after every draft including the rejected ones. `commit_verified`
+            # installs the right slice once the accept loop knows `keep`. Costs one reference to a
+            # tensor this forward allocated anyway; nothing is copied.
+            if batch.defer_commit and slot:
+                batch.conv_windows[slot] = full[0]
             conv_state[slot].copy_(full[0, :, -s:])
             outs.append(y[0].t())
             start += n
@@ -686,6 +688,222 @@ def _assert_tp_divides(config: "ModelConfig", tp: int) -> None:
         )
 
 
+class Qwen4ExpMTPAttn(Qwen3_5MTPAttn):
+    """The MTP layer's self-attention: `Qwen3_5MTPAttn`'s draft entry points, plus the QSA indexer
+    submodule the checkpoint ships for this layer.
+
+    THE INDEXER IS BUILT AND NEVER CALLED, exactly as it is on the backbone's full-attention layers
+    (`QSAIndexer`: "Not called by anything"). It exists here so `mtp.layers.0.self_attn.indexer.*`
+    has somewhere to load; the draft chain then runs DENSE, which is the same regime the backbone
+    already serves in below `indexer_budget` and not a new approximation. It is also the only
+    regime available: the draft attention keeps its OWN [max_slots, max_ctx, nkv, hd] buffer and
+    never touches the paged KV pool, so there is no compressed page table for a selection to index.
+
+    A dense draft cannot make the serve wrong. Speculative decoding is lossless by construction —
+    every draft is verified against the target — so an imperfect draft head costs ACCEPTANCE RATE
+    and nothing else. That is why this is a defensible first implementation rather than a guess.
+    """
+
+    def __init__(self, config: "ModelConfig", layer_id: int) -> None:
+        super().__init__(config, layer_id)
+        # index_layer_id 0: this is the head's only attention layer. The submodule is parameter
+        # storage; nothing reads the id on a path that runs.
+        self.indexer = QSAIndexer(config, index_layer_id=0)
+
+
+class Qwen4ExpMTPHead(BaseOP):
+    """Qwen3.8-Flash-Next MTP self-speculation head (`mtp.*`), bring-up plan T8.1.
+
+    NOT the Qwen3.5 head with a different prefix. Three things differ, and each one is silent
+    rather than loud if it is transcribed from the tensor shapes instead of from the reference
+    (`sglang/srt/models/qwen4_exp_mtp.py::_fuse_residual_linear_shared`):
+
+    1. **The seed stays hc_count-WIDE.** `fc_hidden` is [2560, 2560] while `pre_fc_norm_hidden` is
+       [10240], which reads like something must fold 10240 -> 2560 between them — and the head even
+       ships a `hyper_connection_mixer` that performs exactly that fold for the backbone. It does
+       not do it here. `fc_hidden` is applied PER HYPER-CONNECTION BRANCH (the wide stream is
+       viewed as [.., hc, H]), the embedding term is BROADCAST-added to all four branches, and the
+       result stays wide and feeds the layer directly. The mixer is for the layer OUTPUT, where it
+       replaces a final norm before the lm_head, exactly as in the backbone. Folding the seed and
+       re-widening it type-checks end to end, produces fluent-looking drafts, and would show up
+       only as an acceptance rate near zero.
+
+    2. **The layer is a hyper-connection block, not a pre/post-norm block.** `mtp.layers.0` ships
+       `attn_hyper_connection` / `mlp_hyper_connection` at [4, 10240] and NO input_layernorm or
+       post_attention_layernorm — `hc_norm` inside `mix` is the pre-block norm. Same structure as
+       `Qwen4ExpDecoderLayer`, so the dataflow here is that layer's, not Qwen3.5's.
+
+    3. **`pre_fc_norm_hidden` is GROUPED, and this DIVERGES from upstream sglang.** Both norms use
+       the `(1 + w)` gain; `pre_fc_norm_embedding` is a plain 2560 norm over the embedding. But
+       `pre_fc_norm_hidden` is [10240] — it touches the WIDE stream, and every other wide norm in
+       this checkpoint normalizes each hc branch on its own (`hc_norm`, and the PLE's
+       `norm_key`/`norm_query`/`norm_conv`; grouped in HF transformers AND in sglang). sglang's MTP
+       head is the lone exception, building it as a full-width `GemmaRMSNorm(hc_count*hidden_size)`;
+       HF ships no MTP head at all, so it cannot arbitrate. A/B on this checkpoint, same 4 prompts,
+       same protocol, sampled: GROUPED 0.605 accepted-drafts/verify vs FULL-WIDTH 0.444 (+36%, ~4.4
+       sigma on 451 vs 368 accepted). The two are different functions — one variance over 10240 vs
+       four over 2560 — and the difference is SILENT: both draft fluently, they just get rejected.
+
+    Reuses the target's embed_tokens and (untied) lm_head, like every other MTP head here.
+    """
+
+    def __init__(self, config: "ModelConfig", embed: VocabParallelEmbedding,
+                 lm_head: ParallelLMHead, expert_quant) -> None:
+        eps = config.rms_norm_eps
+        hs, hc = config.hidden_size, config.hc_count
+        self.pre_fc_norm_embedding = RMSNorm(hs, eps=eps, plus_one=True)
+        # GROUPED (group = hidden_size), which DIVERGES from upstream sglang — measured, see below.
+        #
+        # `pre_fc_norm_hidden.weight` is [hc*H] = [10240], i.e. it touches the WIDE residual stream,
+        # and every other wide norm in this checkpoint is grouped per branch: `hc_norm` and the PLE's
+        # `norm_key`/`norm_query`/`norm_conv` are all `Qwen4ExpTextRMSNorm(..., group_size=hidden_size)`
+        # in HF transformers, and sglang uses its own `GroupedGemmaRMSNorm(group_size=hidden_size)` for
+        # `hc_norm`. The ONE exception is sglang's MTP head, which builds this norm as a plain
+        # full-width `GemmaRMSNorm(hc_count * hidden_size)` — and HF ships no MTP head at all
+        # (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`), so it cannot arbitrate.
+        #
+        # The two are different functions (one variance over 10240 vs four over 2560 each), and the
+        # difference is silent: both produce fluent drafts, they just get REJECTED. Measured on this
+        # checkpoint, full-width scored mean accept-len 0.28-0.33 against a trained head's expected
+        # 0.55-0.8. See tests/qwen4exp_mtp_parity_test.py, whose falsification arm now pins the
+        # grouped-vs-full-width distinction (the earlier version transcribed the full-width reading
+        # into BOTH the implementation and its reference, so it could not see this).
+        self.pre_fc_norm_hidden = GroupedRMSNorm(hc * hs, group_size=hs, eps=eps)
+        # REPLICATED for the same reason the Qwen3.5 fc is: these produce the seed that feeds the
+        # (head-sharded) MTP layer, so a column-parallel output would hand the layer a truncated
+        # hidden under TP>1 — and this arm is TP=2 ONLY (min_tp=2), so that path is not theoretical.
+        self.fc_embedding = LinearReplicated(hs, hs, has_bias=False)
+        self.fc_hidden = LinearReplicated(hs, hs, has_bias=False)
+        # THE LAYER IS THE REPO'S OWN `Qwen4ExpDecoderLayer`, not a transcription of it. The first
+        # version of this head hand-copied that layer's dataflow into a private `_block` — the same
+        # copy-a-similar-thing mistake KERNEL_CORE_POLICY forbids for kernels. The backbone layer is
+        # PROVEN (it serves this model correctly) and a divergence in a copy is silent: the head
+        # drafts plausible tokens that are simply never the target's, which is indistinguishable
+        # from a weak drafter. Building the real layer and swapping ONLY its attention keeps the
+        # hyper-connection order, the MoE routing and the residual handling as the shipped code.
+        #
+        # `layers` (an OPList of one) also makes the state_dict path `mtp.layers.0.*`, which is
+        # EXACTLY the checkpoint's spelling. layer_id = num_layers: past the decoder, so it cannot
+        # be in `ple_layer_ids` (the head carries no PLE — upstream sets `ple_layer_ids = []` for
+        # the MTP model) and its quant namespace cannot collide with a real decoder layer's.
+        # expert_quant=None: the head is BF16 END TO END here (no *_scale / *_packed under `mtp.`),
+        # so passing the backbone's quant would hunt for packs that do not exist.
+        self.layers = OPList([
+            Qwen4ExpDecoderLayer(
+                config, config.num_layers,
+                is_gdn=False, gdn_layer_id=None, attn_kv_id=0, expert_quant=None,
+            )
+        ])
+        # The draft chain cannot use the paged-KV attention: it runs K steps ahead of the target over
+        # its own ring. Swap in the draft-capable attention — the SAME projections, gate and norms
+        # (it subclasses the same hierarchy) plus the three draft entry points.
+        _layer = self.layers.op_list[0]
+        _layer.self_attn = Qwen4ExpMTPAttn(config, config.num_layers)
+        _layer._attn_op = _layer.self_attn
+        # Folds the layer's wide output to hidden for the lm_head; this checkpoint ships no final
+        # norm for the head, exactly as the backbone ships none for itself.
+        self.hyper_connection_mixer = _make_hc(config, use_combine=False)
+        self._hc_count = hc
+        self._hidden_size = hs
+        # The width of the key set this head's attention was TRAINED to see: QSA selects up to
+        # `indexer_budget` compressed groups, expanded to `budget + ratio - 1` token columns
+        # (QSAConfig.index_width). Published so the proposer can size its draft window to it — a
+        # recent-history window narrower than this shows the drafter a strictly different context
+        # from the one the target attended over. None on a non-QSA build, where the proposer keeps
+        # its own measured default.
+        self.qsa_index_width = (
+            int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1
+            if config.indexer_budget and config.indexer_compress_ratio
+            else None
+        )
+        self._embed = embed
+        self._lm_head = lm_head
+
+    # -- the MTPProposer contract ---------------------------------------------------------------
+
+    @property
+    def self_attn(self):
+        """The draft attention, where `MTPProposer` expects to find it (`spec/mtp.py` reads
+        `head.self_attn.draft_buffer_dims()` to size the draft-KV ring).
+
+        A PROPERTY, not an attribute: `BaseOP.state_dict` / `load_state_dict` / `post_load` all walk
+        `vars(self)`, and a property is not in `vars`. So this exposes the contract without creating
+        a second weight path — an attribute alias would make the same tensors reachable as both
+        `mtp.self_attn.*` and `mtp.layers.0.self_attn.*`, and the loader would fill one and leave
+        the other holding torch.empty garbage."""
+        return self.layers.op_list[0].self_attn
+
+    def embed(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self._embed.forward(tokens)
+
+    def fuse(self, embed_e: torch.Tensor, last_hidden: torch.Tensor) -> torch.Tensor:
+        """`last_hidden` is the hc_count-WIDE pre-mixer stream (what
+        `Qwen4ExpModel.forward(return_hidden=True)` returns as its second value), NOT a post-norm
+        hidden. Returns a wide seed. See point 1 of the class docstring for why this is per-branch."""
+        if last_hidden.shape[-1] != self._hc_count * self._hidden_size:
+            raise ValueError(
+                f"qwen4_exp MTP seeds from the {self._hc_count}x{self._hidden_size}-wide pre-mixer "
+                f"stream; got a {last_hidden.shape[-1]}-wide hidden. A folded (hidden-size) seed is "
+                f"the one mistake this head cannot detect at runtime — it would run and draft badly."
+            )
+        e = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embed_e))   # [.., H]
+        h = self.pre_fc_norm_hidden.forward(last_hidden)                             # [.., hc*H]
+        branches = h.view(*h.shape[:-1], self._hc_count, self._hidden_size)          # [.., hc, H]
+        branches = self.fc_hidden.forward(branches)                                  # per-branch
+        return (e.unsqueeze(-2) + branches).reshape(*h.shape)                        # [.., hc*H]
+
+    def _block(self, wide: torch.Tensor, attn_fn) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The layer body, shared by step()/step_masked(): identical to `Qwen4ExpDecoderLayer.forward`
+        (no PLE — the head carries none), with the attention call injected so the two draft paths
+        differ ONLY in their attention core, as they do on the Qwen3.5 head."""
+        layer = self.layers.op_list[0]
+        # Exactly `Qwen4ExpDecoderLayer.forward`, with only the attention call substituted (the
+        # draft attention takes ring buffers instead of the paged context). Every other statement
+        # reads the LAYER's own attributes, so the order cannot drift from the shipped one.
+        x, res = layer.attn_hyper_connection.mix(wide)
+        x = attn_fn(x)
+        wide = layer.attn_hyper_connection.combine(x, res)
+        x, res = layer.mlp_hyper_connection.mix(wide)
+        x = layer.mlp.forward(x)
+        wide = layer.mlp_hyper_connection.combine(x, res)
+        # `.mix` replaces the final norm, as it does for the backbone's lm_head.
+        mixed = self.hyper_connection_mixer.mix(wide)[0]
+        return self._lm_head.logits_all_rows(mixed), wide
+
+    def step(
+        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._block(
+            fused,
+            lambda x: self.layers.op_list[0].self_attn.forward_draft(x, positions, cache, step),
+        )
+
+    def step_masked(
+        self, fused: torch.Tensor, positions: torch.Tensor,
+        k_buf: torch.Tensor, v_buf: torch.Tensor, slot_rows: torch.Tensor,
+        write_col: torch.Tensor, mask_bias: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._block(
+            fused,
+            lambda x: self.layers.op_list[0].self_attn.forward_draft_masked(
+                x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias),
+        )
+
+    @torch.inference_mode()
+    def seed_buffered(
+        self, tokens: torch.Tensor, prev_hidden: torch.Tensor, positions: torch.Tensor,
+        k_buf: torch.Tensor, v_buf: torch.Tensor, slot: int, start_col: int = 0,
+    ) -> None:
+        """Seed the draft-KV buffer from the prompt prefill. Mirrors `step_masked`'s fuse + pre-block
+        norm before the attention, which HERE is `attn_hyper_connection.mix` rather than an
+        input_layernorm — the residual pair it returns is discarded because seeding writes k/v and
+        runs no attention."""
+        fused = self.fuse(self.embed(tokens), prev_hidden)
+        _layer = self.layers.op_list[0]
+        x = _layer.attn_hyper_connection.mix(fused)[0]
+        _layer.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)
+
+
 class Qwen4ExpForConditionalGeneration(BaseLLMModel):
     def __init__(self, config: "ModelConfig") -> None:
         if not config.is_qwen4_exp:
@@ -713,6 +931,15 @@ class Qwen4ExpForConditionalGeneration(BaseLLMModel):
             # UNTIED in this checkpoint (`lm_head.weight` is a top-level tensor of its own).
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+        )
+        # The MTP self-speculation head (bring-up plan T8.1). Built only when the config says the
+        # checkpoint ships one AND spec is actually mtp — `from_hf` zeroes mtp_num_hidden_layers
+        # otherwise, so a non-spec serve pays nothing and loads no mtp.* tensor.
+        self.mtp = (
+            Qwen4ExpMTPHead(config, embed=self.model.embed_tokens, lm_head=self.lm_head,
+                            expert_quant=None)
+            if config.mtp_num_hidden_layers > 0
+            else None
         )
         super().__init__()
         # Say what this build does NOT do, once, at boot — where an operator reads it — rather than

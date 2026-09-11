@@ -678,7 +678,15 @@ case "$MODEL" in
                     *)   model_id="${Q4E_MODEL:-/model}" ;;
                   esac
                   served_name="Qwen3.8-Flash-Next"
-                  spec_default="none"
+                  spec_default="none"; k_mtp=2
+                  # k_mtp=2, NOT the table's default 4. The checkpoint ships ONE MTP module
+                  # (`mtp_num_hidden_layers=1`, only `mtp.layers.0`), so it is trained for exactly
+                  # one token of speculation: given the TARGET's hidden state at t and the embedding
+                  # of t+1, predict t+2. A K-step chain re-feeds the head its OWN predicted hidden
+                  # state, which it never saw in training, so every position past the first is an
+                  # extrapolation. Every other implementation runs 2-3: sglang's recipe is MTP-213
+                  # (2 draft steps), vLLM's is num_speculative_tokens=3, llama.cpp measures
+                  # 89.2%/85.7% acceptance at n-max 2/3. Nobody runs 4.
                   # min_tp=2 is a HARD requirement, not a preference: at TP=1 the per-rank expert
                   # rows double to 1.465 GiB/layer and the host arena needed is ~54 GiB in ONE
                   # process, which this box cannot pin. TP=2 is the only configuration the 48-layer

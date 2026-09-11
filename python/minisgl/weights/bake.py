@@ -1165,6 +1165,27 @@ class StageARuntime:
                     "the plan named was supposed to pass through it; an empty seam list means the "
                     "chunk enumeration finalized nothing and the arena holds no weights."
                 )
+            # THE SINK ONLY SEES WHAT THE CHUNK ENUMERATION FINALIZES, which is the backbone's
+            # layers. A MoE the plan excludes BY POLICY — today that is the MTP draft head
+            # (`plan.OFFLOAD_MTP_HEAD = False`, re-read every draft step so it must stay resident) —
+            # is loaded outside that enumeration and therefore reaches `resolve()` with no seam at
+            # all. `bind_plan` already handles the equivalent case on the one-shot path by binding
+            # every discovered-but-unplanned layer DEVICE; this does the same for the chunked path,
+            # which otherwise fails the unseamed check with the head as its only offender.
+            from .moe_interpose import StackKind, attach_seam, bind_seam, discover_moe_layers
+
+            late = [(path, layer) for path, layer in discover_moe_layers(model)
+                    if getattr(layer, "_weight_offload", None) is None]
+            for path, layer in late:
+                bind_seam(attach_seam(path, layer), StackKind.DEVICE, None,
+                          out=self.outcome, count_device_bytes=False)
+                self.outcome.notes.append(
+                    f"{path}: not in the chunk enumeration (excluded by policy) -> DEVICE, "
+                    f"0 bytes moved")
+            if late:
+                self.seams = self.seams + tuple(
+                    layer._weight_offload for _p, layer in late
+                    if getattr(layer, "_weight_offload", None) is not None)
             return self.outcome
         self.seams = attach_seams(model)
         self.outcome = bind_plan(self.seams, self.plan, self.allocator, freeze=False,

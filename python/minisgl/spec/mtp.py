@@ -115,7 +115,19 @@ class MTPProposer(CapturableProposer):
         # allocated from what is free AFTER the pool is sized — so it buys OOM headroom for the
         # capture/transient path, which is exactly where this stack runs out (see _spec_seed_fits).
         # Raise it if a model's drafter turns out to be more context-sensitive than MTP's.
-        self._ring = max(64, int(os.environ.get("MINISGL_MTP_KV_WINDOW") or 512))
+        # 512 IS A MEASURED DEFAULT, BUT IT WAS MEASURED ON A DENSE-ATTENTION DRAFTER. For a
+        # QSA model the draft window and the target's attention are not the same thing: upstream's
+        # MTP decode "reuses the draft-extend's target-aligned selection" (sglang qwen4_exp.py,
+        # `_compute_qsa_topk_indices`), i.e. the drafter sees the up-to-`indexer_budget` keys the
+        # TARGET selected out of the whole context. This ring instead holds the most RECENT tokens.
+        # Below the budget the two coincide — the selection takes every visible key, which is why
+        # the short-context numbers are unaffected — but past it a 512-token recent window is a
+        # strictly different (and much narrower) view than the 2048 keys the target attended over,
+        # and the drafter was trained on the latter. So on a QSA model the floor is the selection
+        # width, not 512. Still an approximation of upstream, and deliberately labelled as one.
+        _idx_width = getattr(self._head, "qsa_index_width", None)
+        _floor = max(512, int(_idx_width)) if _idx_width else 512
+        self._ring = max(64, int(os.environ.get("MINISGL_MTP_KV_WINDOW") or _floor))
         # Kept as an ESCAPE HATCH only (unset = unbounded). It used to default to the full-context
         # buffer length and was the silent cliff; the ring makes any length drafts-capable, so there
         # is nothing to gate.
