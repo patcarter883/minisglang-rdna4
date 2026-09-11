@@ -260,6 +260,21 @@ class GroupedRMSNorm(BaseOP):
         return gain
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ONE launch when the native core carries the group policy. The kernel reduces over
+        # `group_size` while indexing the gain across the FULL width and applies `(1 + w)` itself,
+        # which is the whole reason the two-pass fallback below existed: the gain's width is the
+        # wide vector's, not the group's. ~100 of these run per decode step (97 hyper-connection
+        # hc_norms + the PLE block's three), each on a 20 KB tensor where the launch dominates the
+        # work — see docs/measurements/QWEN4EXP_ENDGAME.md §4.2.
+        if hasattr(_tail_hip, "rms_norm") and _tail_hip.active(x, self.weight):
+            try:
+                return _tail_hip.rms_norm(
+                    x.contiguous(), self.weight, self._eps, 1, self._group_size
+                )
+            except (TypeError, RuntimeError):
+                # An older tail_hip whose rms_norm has no group_size parameter. Fall through to the
+                # two-pass path rather than failing a boot on a perf-only feature.
+                pass
         grouped = x.reshape(*x.shape[:-1], self._groups, self._group_size)
         normed = _rms_norm(grouped, None, self._eps).flatten(-2)
         capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
