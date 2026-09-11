@@ -1160,6 +1160,22 @@ WOFF_DEVICE_GB="${WOFF_DEVICE_GB:-${woff_device_gb:-}}"
 # MINISGL_EXPERT_CACHE_* tuning knobs while the flag that ENABLES the feature was never
 # emitted, so it sat at the 0.0 default and the tuning knobs governed nothing.
 EXPERT_CACHE_GB="${EXPERT_CACHE_GB:-${expert_cache_gb:-}}"
+# MEASURED 2026-09-11 ON THIS BOX: the cache is now REACHABLE but cannot be given a useful
+# budget here, and the blocker is HOST RAM, not VRAM. The substitution the --expert-cache-gb
+# help describes (surrender the same GiB from WOFF_DEVICE_GB) does not close on this arm:
+#   WOFF_DEVICE_GB=0   -> refused. 0 is indistinguishable from UNSET (the engine default IS
+#                        0.0), so the tier is DERIVED as the whole KV budget and
+#                        bake.UnconfiguredDeviceTierError refuses from integers.
+#   WOFF_DEVICE_GB=0.5 -> boots the planner, then HostArenaCapacityError: dropping the device
+#                        tier moves those layers INTO the pinned host arena, so 48/48 layers
+#                        host = 31.93 GiB x 2 ranks = 63.9 GiB pinned on a 91.8 GiB box. Does
+#                        not fit. At the shipped WOFF_DEVICE_GB=4 it is 42 layers = 27.94 GiB
+#                        x 2 = 55.9 GiB, which does.
+# So the device tier is pinned from BELOW by host RAM, and the only VRAM slack for a cache is
+# whatever the KV pool can spare (~1-3 GiB), well under the 6.7 GiB that measured 1.264x.
+# The path that would actually free room is WOFF_CPU_LAYERS: host-COMPUTED layers need neither
+# VRAM nor PINNED host memory (ordinary pageable pages suffice), so moving the deepest layers
+# to CPU shrinks the pinned arena and lets the device tier shrink with it. Untested here.
 WOFF_HOST_GB="${WOFF_HOST_GB:-${woff_host_gb:-}}"
 # Arena chunk size, in MiB. MEASURED 2026-09-03, card 0, qwen4_exp (1.465 GiB of experts per layer):
 # a layer's rows may never straddle a chunk, so a 2 GiB chunk holds ONE layer and abandons 0.535 GiB
