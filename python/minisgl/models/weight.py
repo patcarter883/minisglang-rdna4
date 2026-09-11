@@ -1138,9 +1138,6 @@ def qwen4_exp_nvfp4_modules(ckpt_names: "Collection[str]") -> FrozenSet[str]:
 # head's leaves differ: it carries hyper-connections instead of input/post layernorms, two separate
 # fc projections instead of one concat fc, and STACKED expert tensors whose names already match the
 # native `experts.gate_up_proj` / `experts.down_proj` — so no concat group anywhere in here.
-_QWEN4EXP_MTP_LAYER0 = "mtp.layers.0."
-
-
 def _qwen4_exp_mtp_remap(ckpt_key: str):
     """Map an `mtp.*` qwen4_exp checkpoint key to its native key plan.
 
@@ -1148,10 +1145,12 @@ def _qwen4_exp_mtp_remap(ckpt_key: str):
     unlike the backbone there is no quant-suffix handling to do — but the shared skip rules still
     apply first at the call site, so an activation-calibration or fp8-kv leaf under `mtp.` is
     attributed to its own reason rather than silently renamed."""
-    if ckpt_key.startswith(_QWEN4EXP_MTP_LAYER0):
-        return ("direct", "mtp." + ckpt_key[len(_QWEN4EXP_MTP_LAYER0):])
-    # mtp.fc_embedding / mtp.fc_hidden / mtp.pre_fc_norm_* / mtp.hyper_connection_mixer.* are
-    # already native — the head owns them directly.
+    # NO COLLAPSE. Qwen3.5's head flattens its single layer onto itself so its remap rewrites
+    # `mtp.layers.0.X` -> `mtp.X`; this head does NOT — it holds a real `Qwen4ExpDecoderLayer` in an
+    # `OPList` named `layers`, so its state_dict path is already `mtp.layers.0.X`, exactly the
+    # checkpoint's spelling. Every `mtp.*` key is therefore native as it stands. Re-introducing the
+    # collapse here would leave the layer's tensors unfilled (torch.empty garbage) while the loader
+    # reported success, which is precisely the failure the head-shape change was made to remove.
     return ("direct", ckpt_key)
 
 

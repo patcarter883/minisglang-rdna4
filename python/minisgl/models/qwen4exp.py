@@ -744,14 +744,32 @@ class Qwen4ExpMTPHead(BaseOP):
         # hidden under TP>1 — and this arm is TP=2 ONLY (min_tp=2), so that path is not theoretical.
         self.fc_embedding = LinearReplicated(hs, hs, has_bias=False)
         self.fc_hidden = LinearReplicated(hs, hs, has_bias=False)
-        self.self_attn = Qwen4ExpMTPAttn(config, config.num_layers)
-        # The head is BF16 END TO END in this checkpoint (verified: no *_scale / *_packed tensor
-        # under `mtp.` at all), so its experts are built UNQUANTIZED regardless of what the
-        # backbone carries — passing the backbone's expert_quant would look for packs that do not
-        # exist. force_no_ep because the head is tiny and must stay replicated under EP.
-        self.mlp = Qwen3_5MoeSparseBlock(config, None, force_no_ep=True)
-        self.attn_hyper_connection = _make_hc(config, use_combine=True)
-        self.mlp_hyper_connection = _make_hc(config, use_combine=True)
+        # THE LAYER IS THE REPO'S OWN `Qwen4ExpDecoderLayer`, not a transcription of it. The first
+        # version of this head hand-copied that layer's dataflow into a private `_block` — the same
+        # copy-a-similar-thing mistake KERNEL_CORE_POLICY forbids for kernels. The backbone layer is
+        # PROVEN (it serves this model correctly) and a divergence in a copy is silent: the head
+        # drafts plausible tokens that are simply never the target's, which is indistinguishable
+        # from a weak drafter. Building the real layer and swapping ONLY its attention keeps the
+        # hyper-connection order, the MoE routing and the residual handling as the shipped code.
+        #
+        # `layers` (an OPList of one) also makes the state_dict path `mtp.layers.0.*`, which is
+        # EXACTLY the checkpoint's spelling. layer_id = num_layers: past the decoder, so it cannot
+        # be in `ple_layer_ids` (the head carries no PLE — upstream sets `ple_layer_ids = []` for
+        # the MTP model) and its quant namespace cannot collide with a real decoder layer's.
+        # expert_quant=None: the head is BF16 END TO END here (no *_scale / *_packed under `mtp.`),
+        # so passing the backbone's quant would hunt for packs that do not exist.
+        self.layers = OPList([
+            Qwen4ExpDecoderLayer(
+                config, config.num_layers,
+                is_gdn=False, gdn_layer_id=None, attn_kv_id=0, expert_quant=None,
+            )
+        ])
+        # The draft chain cannot use the paged-KV attention: it runs K steps ahead of the target over
+        # its own ring. Swap in the draft-capable attention — the SAME projections, gate and norms
+        # (it subclasses the same hierarchy) plus the three draft entry points.
+        _layer = self.layers.op_list[0]
+        _layer.self_attn = Qwen4ExpMTPAttn(config, config.num_layers)
+        _layer._attn_op = _layer.self_attn
         # Folds the layer's wide output to hidden for the lm_head; this checkpoint ships no final
         # norm for the head, exactly as the backbone ships none for itself.
         self.hyper_connection_mixer = _make_hc(config, use_combine=False)
@@ -772,6 +790,18 @@ class Qwen4ExpMTPHead(BaseOP):
         self._lm_head = lm_head
 
     # -- the MTPProposer contract ---------------------------------------------------------------
+
+    @property
+    def self_attn(self):
+        """The draft attention, where `MTPProposer` expects to find it (`spec/mtp.py` reads
+        `head.self_attn.draft_buffer_dims()` to size the draft-KV ring).
+
+        A PROPERTY, not an attribute: `BaseOP.state_dict` / `load_state_dict` / `post_load` all walk
+        `vars(self)`, and a property is not in `vars`. So this exposes the contract without creating
+        a second weight path — an attribute alias would make the same tensors reachable as both
+        `mtp.self_attn.*` and `mtp.layers.0.self_attn.*`, and the loader would fill one and leave
+        the other holding torch.empty garbage."""
+        return self.layers.op_list[0].self_attn
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         return self._embed.forward(tokens)
@@ -796,12 +826,16 @@ class Qwen4ExpMTPHead(BaseOP):
         """The layer body, shared by step()/step_masked(): identical to `Qwen4ExpDecoderLayer.forward`
         (no PLE — the head carries none), with the attention call injected so the two draft paths
         differ ONLY in their attention core, as they do on the Qwen3.5 head."""
-        x, res = self.attn_hyper_connection.mix(wide)
+        layer = self.layers.op_list[0]
+        # Exactly `Qwen4ExpDecoderLayer.forward`, with only the attention call substituted (the
+        # draft attention takes ring buffers instead of the paged context). Every other statement
+        # reads the LAYER's own attributes, so the order cannot drift from the shipped one.
+        x, res = layer.attn_hyper_connection.mix(wide)
         x = attn_fn(x)
-        wide = self.attn_hyper_connection.combine(x, res)
-        x, res = self.mlp_hyper_connection.mix(wide)
-        x = self.mlp.forward(x)
-        wide = self.mlp_hyper_connection.combine(x, res)
+        wide = layer.attn_hyper_connection.combine(x, res)
+        x, res = layer.mlp_hyper_connection.mix(wide)
+        x = layer.mlp.forward(x)
+        wide = layer.mlp_hyper_connection.combine(x, res)
         # `.mix` replaces the final norm, as it does for the backbone's lm_head.
         mixed = self.hyper_connection_mixer.mix(wide)[0]
         return self._lm_head.logits_all_rows(mixed), wide
@@ -810,7 +844,8 @@ class Qwen4ExpMTPHead(BaseOP):
         self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._block(
-            fused, lambda x: self.self_attn.forward_draft(x, positions, cache, step)
+            fused,
+            lambda x: self.layers.op_list[0].self_attn.forward_draft(x, positions, cache, step),
         )
 
     def step_masked(
@@ -820,7 +855,7 @@ class Qwen4ExpMTPHead(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._block(
             fused,
-            lambda x: self.self_attn.forward_draft_masked(
+            lambda x: self.layers.op_list[0].self_attn.forward_draft_masked(
                 x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias),
         )
 
@@ -834,8 +869,9 @@ class Qwen4ExpMTPHead(BaseOP):
         input_layernorm — the residual pair it returns is discarded because seeding writes k/v and
         runs no attention."""
         fused = self.fuse(self.embed(tokens), prev_hidden)
-        x = self.attn_hyper_connection.mix(fused)[0]
-        self.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)
+        _layer = self.layers.op_list[0]
+        x = _layer.attn_hyper_connection.mix(fused)[0]
+        _layer.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)
 
 
 class Qwen4ExpForConditionalGeneration(BaseLLMModel):
