@@ -2837,8 +2837,17 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 conf_chunks.append(torch.zeros(nt, device=dev))
         inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
 
-    def _stage_ple(self, batch: Batch) -> None:
+    def _stage_ple(self, batch: Batch, extra_tokens: "dict[int, list[int]] | None" = None) -> None:
         """Stage the Qwen4-Exp PLE n-gram embeddings for `batch` (host work, before the forward).
+
+        `extra_tokens` maps uid -> the tokens of this pass that are NOT yet in the host buffer. It
+        exists for ONE caller, the speculative verify forward, and it is the only way PLE and spec
+        decode can coexist: the n-gram hash needs every token of the pass, and a draft is by
+        definition uncommitted (it may be rejected). Passing them explicitly keeps the host buffer
+        the single source of truth for COMMITTED tokens — the alternative, writing drafts into
+        `req.input_ids` before verification, would corrupt the very buffer that rollback restores
+        from. A uid absent from the map falls through to the original hard error, so a genuine
+        overlap-scheduling hazard still raises instead of being papered over.
 
         Row order matches `_make_positions` — `padded_reqs`, each contributing `extend_len` tokens —
         because the PLE layer consumes one embedding per token of `batch.input_ids` and checks the
@@ -2886,6 +2895,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 if batch.is_prefill and req.cached_len == 0:
                     self._ple.reset_slot(slot)
             ids = req.input_ids[req.cached_len : req.device_len]
+            _extra = (extra_tokens or {}).get(req.uid)
+            if _extra and ids.numel() + len(_extra) == req.extend_len:
+                # The committed prefix of this pass, then this pass's drafts, in emission order —
+                # the same order the verify batch lays its qlen rows out in, because the n-gram
+                # features are positional and a permuted tail hashes a context that never existed.
+                ids = torch.cat(
+                    [ids, torch.tensor(_extra, dtype=ids.dtype, device=ids.device)]
+                )
             if ids.numel() != req.extend_len:
                 # The host token buffer is short of this pass's span — the overlap-scheduling hazard,
                 # or a path that advanced device_len without committing the token. Say so here: the
@@ -4797,7 +4814,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # reads, a numpy hash and an H2D cannot happen inside the model or inside a captured graph.
         # Inert for every other model.
         if self._ple is not None:
-            self._stage_ple(batch)
+            # qlen rows per request = the last COMMITTED token followed by that request's drafts.
+            # Only the first is in the host buffer, so hand the drafts over explicitly.
+            self._stage_ple(
+                batch, {r.uid: list(d) for r, d in zip(reqs, staged_drafts)}
+            )
 
         # --- 4. verify forward -> per-position argmax (greedy == sampling here) ----------------
         # Draft-head proposers also need the target's hidden states at the verified positions; the
