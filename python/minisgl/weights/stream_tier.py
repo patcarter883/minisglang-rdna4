@@ -78,6 +78,26 @@ def layer_index_of_path(path: str) -> int:
     stages the wrong layer's experts, which is numerically silent, so it raises rather than
     defaulting.
     """
+    # THE MTP HEAD SHARES THIS NUMBERING AND MUST NEVER REACH HERE. Its seam path is
+    # "mtp.layers.0.mlp.experts", so the walk below returns 0 — the SAME index as the backbone's
+    # "model.layers.0.mlp.experts". A caller that then does `cache.install(lid, ...)` would hand the
+    # MTP head's kernel launch decoder layer 0's slot map and slabs. Both have identical geometry
+    # (512 experts, same dims), so nothing would raise: the draft head would read the wrong experts
+    # and produce plausible, fluent, WRONG drafts, which reads as "the drafter is weak" and never as
+    # a cache bug. That is the most expensive class of failure this engine has.
+    #
+    # Today it is masked by policy rather than by structure — `plan.OFFLOAD_MTP_HEAD = False` keeps
+    # the head out of every tier, and `_UnquantizedMoEMethod.cache_plane_attrs` is empty so
+    # registration raises `_CacheUnsupported`. Both are one edit away from changing (quantizing the
+    # head's experts requires a method WITH cache planes), so the guard belongs in the one function
+    # that turns a path into an index, not in the policies that currently happen to avoid it.
+    if path.startswith("mtp.") or ".mtp." in path:
+        raise StreamTierError(
+            f"MoE path {path!r} belongs to the MTP draft head, which shares the backbone's layer "
+            f"numbering ('mtp.layers.0' -> 0, colliding with 'model.layers.0'). The head is "
+            f"device-resident by policy (plan.OFFLOAD_MTP_HEAD = False) and must never be staged "
+            f"or cached through a layer index. Give it its own namespace before routing it here."
+        )
     parts = path.split(".")
     for i, p in enumerate(parts):
         if p == "layers" and i + 1 < len(parts):
