@@ -60,6 +60,24 @@ def _dense_w8a16_gemv():
         else:
             _w8a16_gemv_fn = dense_w8a16_gemv
     return _w8a16_gemv_fn
+
+
+_int8a16_gemv_fn = None
+_int8a16_gemv_looked = False
+
+
+def _dense_int8a16_gemv():
+    """Lazily resolve `fp8_wmma.dense_int8a16_gemv` (None when unavailable). FORMAT_MATRIX.md G9."""
+    global _int8a16_gemv_fn, _int8a16_gemv_looked
+    if not _int8a16_gemv_looked:
+        _int8a16_gemv_looked = True
+        try:
+            from fp8_wmma import dense_int8a16_gemv
+        except Exception:
+            _int8a16_gemv_fn = None
+        else:
+            _int8a16_gemv_fn = dense_int8a16_gemv
+    return _int8a16_gemv_fn
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.layers.base import BaseOP
 from minisgl.utils import init_logger
@@ -175,7 +193,9 @@ class DraftLinear(BaseOP):
         # (N,) f32 per OUTPUT CHANNEL — the layout `fp8_wmma.dense_w8a16_gemv` wants. Cached at load
         # because it is a constant of the loaded weight; recomputing a squeeze+cast per forward on
         # the decode path is exactly the kind of per-step allocation this class exists to avoid.
-        self._ws_f32 = s.squeeze(-1).float().contiguous().to(device) if mode == "fp8" else None
+        # (N,) f32 per OUTPUT CHANNEL — the layout both dense GEMVs want. fp8 and int8 share it:
+        # the two ops differ only in the byte-decode policy inside one shared loader.
+        self._ws_f32 = s.squeeze(-1).float().contiguous().to(device)
         self.weight = None
 
     def _w8a16_or_dequant(self, x: torch.Tensor) -> torch.Tensor:
@@ -195,17 +215,25 @@ class DraftLinear(BaseOP):
         DRAFTER that matters: its whole job is agreeing with the target, so acceptance has to be
         measured, not assumed. `tests/draft_linear_w8a16_parity_test.py` pins the numeric distance.
 
-        Falls back for int8 (no dense counterpart on this card — gap G9), for M > 16 or K % 16 (the
-        op's stated shape limits), and when the kernel package is absent.
+        int8 takes `dense_int8a16_gemv` (gap G9, closed). Falls back for M > 16 or K % 16 (the ops'
+        stated shape limits) and when the kernel package is absent.
         """
         wq, ws = self._wq, self._ws
-        if wq.dtype is torch.float8_e4m3fn and x.is_cuda and self._ws_f32 is not None:
-            shp = x.shape
-            x2 = x.reshape(-1, shp[-1])
-            if x2.shape[0] <= 16 and (x2.shape[-1] % 16) == 0:
-                fn = _dense_w8a16_gemv()
-                if fn is not None:
-                    out = fn(x2.contiguous(), wq.view(torch.uint8), self._ws_f32)
+        if x.is_cuda and self._ws_f32 is not None:
+            # fp8 -> dense_w8a16_gemv (G1); int8 -> dense_int8a16_gemv (G9). Same core, same
+            # per-output-channel f32 scale, same M<=16 / K%16 limits — they differ only in the
+            # byte-decode policy, which is why one branch selects between them.
+            if wq.dtype is torch.float8_e4m3fn:
+                fn, wbytes = _dense_w8a16_gemv(), wq.view(torch.uint8)
+            elif wq.dtype is torch.int8:
+                fn, wbytes = _dense_int8a16_gemv(), wq
+            else:
+                fn, wbytes = None, None
+            if fn is not None:
+                shp = x.shape
+                x2 = x.reshape(-1, shp[-1])
+                if x2.shape[0] <= 16 and (x2.shape[-1] % 16) == 0:
+                    out = fn(x2.contiguous(), wbytes, self._ws_f32)
                     return out.reshape(*shp[:-1], out.shape[-1])
         return F.linear(x, wq.to(x.dtype) * ws)  # dequant [out,in] * [out,1]
 

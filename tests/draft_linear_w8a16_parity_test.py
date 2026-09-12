@@ -110,10 +110,22 @@ x_big = torch.randn(17, IN, dtype=DT, device=dev) * 0.1
 check("M=17 (>16) falls back and still matches the dequant path",
       torch.equal(fp8.forward(x_big), dequant_path(fp8, x_big)))
 
+# G9 CLOSED: int8 now has its own dense GEMV (dense_int8a16_gemv), the SAME core with one
+# byte-decode policy swapped. It is held to the same standard as the fp8 arm — closer to the
+# dequant path than the int8 quantisation error both carry.
 i8 = build("int8")
-x = torch.randn(4, IN, dtype=DT, device=dev) * 0.1
-check("int8 falls back (gap G9: no dense counterpart on this card)",
-      i8._ws_f32 is None and torch.equal(i8.forward(x), dequant_path(i8, x)))
+for M in (1, 4, 16):
+    x = torch.randn(M, IN, dtype=DT, device=dev) * 0.1
+    got, deq = i8.forward(x), dequant_path(i8, x)
+    exact = torch.nn.functional.linear(x.float(), ref_w.to(dev).float())
+    scale = exact.abs().max().clamp_min(1e-6)
+    d_kd = (got.float() - deq.float()).abs().max() / scale
+    d_de = (deq.float() - exact).abs().max() / scale
+    check(f"int8 M={M:<3} kernel tracks dequant inside the int8 error", d_kd < d_de,
+          f"|k-d|={d_kd:.3e} vs |d-exact|={d_de:.3e}")
+    check(f"int8 M={M:<3} the kernel path actually RAN", not torch.equal(got, deq))
+x = torch.randn(17, IN, dtype=DT, device=dev) * 0.1
+check("int8 M=17 (>16) falls back", torch.equal(i8.forward(x), dequant_path(i8, x)))
 
 lin_k = DraftLinear(IN + 8, OUT)      # K % 16 != 0
 lin_k.load_quant(torch.randn(OUT, IN + 8) * 0.05, "fp8", DT, dev)
