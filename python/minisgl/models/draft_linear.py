@@ -40,44 +40,33 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-_w8a16_gemv_fn = None
-_w8a16_gemv_looked = False
+_QUANT_OPS: dict[str, object] = {}
 
 
-def _dense_w8a16_gemv():
-    """Lazily resolve `fp8_wmma.dense_w8a16_gemv` (None when the kernel package is unavailable).
+def _quant_op(name: str):
+    """Lazily resolve a `fp8_wmma` op by name, caching the miss as well as the hit.
 
-    Same shape as `layers/embedding.py`'s `dense_bf16_gemv` resolver: one import attempt, cached,
-    so a build without the op degrades to the dequant path instead of failing a boot.
+    Same shape as `layers/embedding.py`'s `dense_bf16_gemv` resolver: one import attempt per op, so a
+    build without the kernel package degrades to the dequant path instead of failing a boot.
     """
-    global _w8a16_gemv_fn, _w8a16_gemv_looked
-    if not _w8a16_gemv_looked:
-        _w8a16_gemv_looked = True
+    if name not in _QUANT_OPS:
         try:
-            from fp8_wmma import dense_w8a16_gemv
+            _QUANT_OPS[name] = getattr(__import__("fp8_wmma", fromlist=[name]), name)
         except Exception:
-            _w8a16_gemv_fn = None
-        else:
-            _w8a16_gemv_fn = dense_w8a16_gemv
-    return _w8a16_gemv_fn
+            _QUANT_OPS[name] = None
+    return _QUANT_OPS[name]
 
 
-_int8a16_gemv_fn = None
-_int8a16_gemv_looked = False
+# (decode GEMV, prefill GEMM) per stored weight format. Both arms of a pair take the SAME weight
+# layout — (N,K) bytes plus (N,) f32 per output channel — so one prepared weight serves every M, and
+# the only thing M selects is which kernel reads it.
+#   fp8  : FORMAT_MATRIX.md G1 (GEMV) + G2 (GEMM)
+#   int8 : FORMAT_MATRIX.md G9, both halves
+_QUANT_ARMS = {
+    torch.float8_e4m3fn: ("dense_w8a16_gemv", "dense_w8a16_gemm"),
+    torch.int8: ("dense_int8a16_gemv", "dense_int8a16_gemm"),
+}
 
-
-def _dense_int8a16_gemv():
-    """Lazily resolve `fp8_wmma.dense_int8a16_gemv` (None when unavailable). FORMAT_MATRIX.md G9."""
-    global _int8a16_gemv_fn, _int8a16_gemv_looked
-    if not _int8a16_gemv_looked:
-        _int8a16_gemv_looked = True
-        try:
-            from fp8_wmma import dense_int8a16_gemv
-        except Exception:
-            _int8a16_gemv_fn = None
-        else:
-            _int8a16_gemv_fn = dense_int8a16_gemv
-    return _int8a16_gemv_fn
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.layers.base import BaseOP
 from minisgl.utils import init_logger
@@ -215,25 +204,24 @@ class DraftLinear(BaseOP):
         DRAFTER that matters: its whole job is agreeing with the target, so acceptance has to be
         measured, not assumed. `tests/draft_linear_w8a16_parity_test.py` pins the numeric distance.
 
-        int8 takes `dense_int8a16_gemv` (gap G9, closed). Falls back for M > 16 or K % 16 (the ops'
-        stated shape limits) and when the kernel package is absent.
+        int8 takes the same treatment via `dense_int8a16_gemv` / `dense_int8a16_gemm` (gap G9) — the
+        identical core with one byte-decode policy swapped, which is why it is a branch here and not
+        a second code path. M > 16 goes to the GEMM arm rather than falling back: a drafter prefills
+        too, and leaving prefill on the dequant path would have kept the [out, in] temporary on
+        exactly the shapes where it costs most. Only K % 16 (a kernel shape limit) and a missing
+        kernel package still fall back.
         """
         wq, ws = self._wq, self._ws
-        if x.is_cuda and self._ws_f32 is not None:
-            # fp8 -> dense_w8a16_gemv (G1); int8 -> dense_int8a16_gemv (G9). Same core, same
-            # per-output-channel f32 scale, same M<=16 / K%16 limits — they differ only in the
-            # byte-decode policy, which is why one branch selects between them.
-            if wq.dtype is torch.float8_e4m3fn:
-                fn, wbytes = _dense_w8a16_gemv(), wq.view(torch.uint8)
-            elif wq.dtype is torch.int8:
-                fn, wbytes = _dense_int8a16_gemv(), wq
-            else:
-                fn, wbytes = None, None
-            if fn is not None:
-                shp = x.shape
-                x2 = x.reshape(-1, shp[-1])
-                if x2.shape[0] <= 16 and (x2.shape[-1] % 16) == 0:
-                    out = fn(x2.contiguous(), wbytes, self._ws_f32)
+        arms = _QUANT_ARMS.get(wq.dtype)
+        if arms is not None and x.is_cuda and self._ws_f32 is not None:
+            shp = x.shape
+            x2 = x.reshape(-1, shp[-1])
+            if (x2.shape[-1] % 16) == 0:
+                fn = _quant_op(arms[0] if x2.shape[0] <= 16 else arms[1])
+                if fn is not None:
+                    # e4m3 has no uint8 storage of its own in torch; the ops take the byte view.
+                    wb = wq.view(torch.uint8) if wq.dtype is torch.float8_e4m3fn else wq
+                    out = fn(x2.contiguous(), wb, self._ws_f32)
                     return out.reshape(*shp[:-1], out.shape[-1])
         return F.linear(x, wq.to(x.dtype) * ws)  # dequant [out,in] * [out,1]
 

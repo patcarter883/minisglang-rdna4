@@ -54,9 +54,9 @@ from minisgl.distributed import set_tp_info, try_get_tp_info  # noqa: E402
 if try_get_tp_info() is None:
     set_tp_info(0, 1)
 
-from minisgl.models.draft_linear import DraftLinear, _dense_w8a16_gemv  # noqa: E402
+from minisgl.models.draft_linear import DraftLinear, _quant_op  # noqa: E402
 
-if _dense_w8a16_gemv() is None:
+if _quant_op("dense_w8a16_gemv") is None:
     print("SKIPPED: fp8_wmma.dense_w8a16_gemv unavailable in this image.")
     sys.exit(0)
 
@@ -106,9 +106,10 @@ for M in (1, 4, 16):
 
 print()
 print("GATES: every documented fallback must fall back, not crash or silently mis-dispatch")
-x_big = torch.randn(17, IN, dtype=DT, device=dev) * 0.1
-check("M=17 (>16) falls back and still matches the dequant path",
-      torch.equal(fp8.forward(x_big), dequant_path(fp8, x_big)))
+# M > 16 USED to be a fallback and is no longer one: G2 gave fp8 a dense tiled GEMM, so the band
+# hands off to that kernel instead of the dequant path. The assertion that it falls back is kept
+# here as a DELETED line on purpose — it was the one check this change had to invalidate, and the
+# PREFILL BAND section below is what replaces it. Anything else that still falls back is asserted.
 
 # G9 CLOSED: int8 now has its own dense GEMV (dense_int8a16_gemv), the SAME core with one
 # byte-decode policy swapped. It is held to the same standard as the fp8 arm — closer to the
@@ -124,13 +125,36 @@ for M in (1, 4, 16):
     check(f"int8 M={M:<3} kernel tracks dequant inside the int8 error", d_kd < d_de,
           f"|k-d|={d_kd:.3e} vs |d-exact|={d_de:.3e}")
     check(f"int8 M={M:<3} the kernel path actually RAN", not torch.equal(got, deq))
-x = torch.randn(17, IN, dtype=DT, device=dev) * 0.1
-check("int8 M=17 (>16) falls back", torch.equal(i8.forward(x), dequant_path(i8, x)))
+# --------------------------------------------------------------------------------------------
+# M > 16 is no longer a fallback: G2 (fp8) and G9's prefill half route it to the tiled GEMM. These
+# are the shapes a drafter PREFILLS at, where the [out,in] dequant temporary cost the most, so the
+# band that used to be silently excluded is now the band under test.
+print("")
+print("PREFILL BAND (M > 16) — the tiled GEMM arm, G2 + G9")
+for mod, name in ((fp8, "fp8 "), (i8, "int8")):
+    for M in (17, 64, 129):
+        x = torch.randn(M, IN, dtype=DT, device=dev) * 0.1
+        got, deq = mod.forward(x), dequant_path(mod, x)
+        exact = torch.nn.functional.linear(x.float(), ref_w.to(dev).float())
+        scale = exact.abs().max().clamp_min(1e-6)
+        d_kd = (got.float() - deq.float()).abs().max() / scale
+        d_de = (deq.float() - exact).abs().max() / scale
+        check(f"{name} M={M:<4} GEMM tracks dequant inside the quantisation error", d_kd < d_de,
+              f"|k-d|={d_kd:.3e} vs |d-exact|={d_de:.3e}")
+        check(f"{name} M={M:<4} the GEMM path actually RAN", not torch.equal(got, deq))
+        # M=129 exercises the ragged tail: block_m is 128, so the last block is 1 valid row and 127
+        # guard rows. A GATHER=false bug there writes the guard rows out or reads past A.
+        check(f"{name} M={M:<4} no NaN/Inf in the output", torch.isfinite(got).all())
+
 
 lin_k = DraftLinear(IN + 8, OUT)      # K % 16 != 0
 lin_k.load_quant(torch.randn(OUT, IN + 8) * 0.05, "fp8", DT, dev)
-xk = torch.randn(2, IN + 8, dtype=DT, device=dev) * 0.1
-check("K % 16 != 0 falls back", torch.equal(lin_k.forward(xk), dequant_path(lin_k, xk)))
+# BOTH M bands: K % 16 is a shape limit of the GEMV *and* the GEMM, so the M > 16 arm must fall back
+# for it too. Checking only M=2 would have let a GEMM that silently accepts a ragged K through.
+for M in (2, 64):
+    xk = torch.randn(M, IN + 8, dtype=DT, device=dev) * 0.1
+    check(f"K % 16 != 0 falls back (M={M})",
+          torch.equal(lin_k.forward(xk), dequant_path(lin_k, xk)))
 
 print()
 print("nvfp4 arm is untouched by this change")

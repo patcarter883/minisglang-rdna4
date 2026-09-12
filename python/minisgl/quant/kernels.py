@@ -1060,27 +1060,59 @@ def w8a8_moe(
     P = sorted_ids.shape[0]
 
     x16 = _moe_time("cast", lambda: x.to(torch.float16).contiguous())
-    engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
-    out1 = _moe_time(
-        "gemm1",
-        lambda: fp8_wmma.mmq_w8a8_moe_gemm(
-            x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, gemm1_kernel,
-        ),
-    )  # (P, 2*inter)
-    d = out1.shape[1] // 2
-    # Gated SiLU-mul via the dtype-generic native HIP tail_hip.silu_and_mul (one launch, fp32
-    # internal, no temps); MINISGL_TAIL_HIP=0 reverts to the torch ref. (The gemm1-epilogue fused
-    # silu is wmma-only -> unusable at decode where gemm1 must be gemv.)
-    if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
-        import tail_hip  # canonical package: silu_and_mul is a module-level callable
-
-        engaged("tail_hip.silu_and_mul")
-        buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
+    # Gated gemm1 + activation. FUSED (default): one kernel writes silu(gate)*up -> (P, inter),
+    # dropping the separate silu launch and the (P, 2*inter) round-trip — at decode that round-trip
+    # is comparable to the gemm itself.
+    #
+    # This used to read "the gemm1-epilogue fused silu is wmma-only -> unusable at decode where
+    # gemm1 must be gemv", and that was true: the fp8-weight decode GEMV loader had never been
+    # instantiated with SILU=true (FORMAT_MATRIX.md G8) while its int4 twin had, so the entire fp8
+    # decode band — the band this engine actually serves — took the unfused shape. The GEMV arm now
+    # exists, so both bands fuse and the unfused path below is a real fallback again rather than the
+    # only reachable route.
+    if _MOE_FUSED_SILU:
+        # PREFILL: the flagship register-tiled fused gemm1 (block_m 64/128), bit-exact to the tiled
+        # fused arm. DECODE/small-M: the tiled or GEMV fused arm, picked by gemm1_kernel.
+        if _MOE_FLAG and block_m in (64, 128):
+            engaged("fp8_wmma.mmq_w8a8_moe_gemm1_silu_flag")
+            buf2 = _moe_time(
+                "gemm1silu",
+                lambda: fp8_wmma.mmq_w8a8_moe_gemm1_silu_flag(
+                    x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                ),
+            )  # (P, inter)
+        else:
+            engaged(f"fp8_wmma.mmq_w8a8_moe_gemm1_silu({gemm1_kernel})")
+            buf2 = _moe_time(
+                "gemm1silu",
+                lambda: fp8_wmma.mmq_w8a8_moe_gemm1_silu(
+                    x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m,
+                    kernel=gemm1_kernel,
+                ),
+            )  # (P, inter)
     else:
-        buf2 = _moe_time(
-            "silu",
-            lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float()).to(torch.float16).contiguous(),
-        )
+        engaged(f"fp8_wmma.mmq_w8a8_moe_gemm({gemm1_kernel})")
+        out1 = _moe_time(
+            "gemm1",
+            lambda: fp8_wmma.mmq_w8a8_moe_gemm(
+                x16, w13, w13_scales, sorted_ids, expert_ids, ntp, top_k, block_m, gemm1_kernel,
+            ),
+        )  # (P, 2*inter)
+        d = out1.shape[1] // 2
+        # Gated SiLU-mul via the dtype-generic native HIP tail_hip.silu_and_mul (one launch, fp32
+        # internal, no temps); MINISGL_TAIL_HIP=0 reverts to the torch ref.
+        if _TAIL_HIP and out1.dtype in _SILU_DTYPES:
+            import tail_hip  # canonical package: silu_and_mul is a module-level callable
+
+            engaged("tail_hip.silu_and_mul")
+            buf2 = _moe_time("silu", lambda: tail_hip.silu_and_mul(out1.contiguous()))
+        else:
+            buf2 = _moe_time(
+                "silu",
+                lambda: (F.silu(out1[:, :d].float()) * out1[:, d:].float())
+                .to(torch.float16)
+                .contiguous(),
+            )
 
     tw_flat = topk_weights.reshape(-1).float().contiguous()
     # DECODE fast path: fuse gemm2 + topk-weight + reduce into ONE atomic-scatter kernel
