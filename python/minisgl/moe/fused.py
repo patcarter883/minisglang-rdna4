@@ -1,6 +1,8 @@
 import functools
 from typing import Dict, Tuple
 
+import os
+
 import torch
 from minisgl.moe import BaseMoeBackend
 from minisgl.utils import div_ceil
@@ -235,6 +237,12 @@ def _fused_experts_bf16_hip(
 
     from fp8_wmma import moe_bf16_gemm_out, moe_bf16_gemm_scatter_out
 
+    # gemm1's DECODE arm (FORMAT_MATRIX.md G3). Optional so an older kernel package still imports.
+    try:
+        from fp8_wmma import moe_bf16_gemv_out
+    except ImportError:
+        moe_bf16_gemv_out = None
+
     M, K = hidden_states.shape
     E, twoN, _ = w1.shape
     N = twoN // 2
@@ -257,10 +265,30 @@ def _fused_experts_bf16_hip(
     )
 
     # gemm1: inter1[P, 2N] = hidden[offs//top_k] @ w1[e]^T  (sorted-padded rows; no router weight)
-    moe_bf16_gemm_out(
-        hidden_states, w1, sorted_ids, expert_ids, num_pad, None, inter1,
-        top_k, block_m, num_valid, BN, 0,
-    )
+    #
+    # DECODE takes the GEMV arm. The tiled WMMA body is starved at M=1 — one A-row per expert block
+    # against a tile sized for prefill — which is why every other weight format here has both arms.
+    # bf16 had only the tiled one (FORMAT_MATRIX.md G3), so until the GEMV existed EVERY unquantized
+    # MoE checkpoint ran the PREFILL kernel at decode, including the Flash-Next MTP draft head.
+    #
+    # The threshold mirrors the quantized spine's `_MOE_GEMM1_GEMV_MAX = 32` (quant/kernels.py:130),
+    # and the bound is on M (tokens), not P: the GEMV's MMAX is sized by a block's REAL rows, which
+    # is min(block_m, M) because a token routes to an expert at most once.
+    #
+    # gemm2 deliberately stays tiled. Its GEMV twin needs the fused weighted gather-reduce that is
+    # FORMAT_MATRIX.md G7, and the matrix records that G6/G7 "are one epilogue story across both
+    # spines and should not be split" — landing half of it here would bank the smaller half of a
+    # measured win while leaving the round-trip in place.
+    if moe_bf16_gemv_out is not None and M <= _MOE_BF16_GEMV_MAX:
+        moe_bf16_gemv_out(
+            hidden_states, w1, sorted_ids, expert_ids, num_pad, inter1,
+            top_k, block_m, num_valid,
+        )
+    else:
+        moe_bf16_gemm_out(
+            hidden_states, w1, sorted_ids, expert_ids, num_pad, None, inter1,
+            top_k, block_m, num_valid, BN, 0,
+        )
     # gated activation on the sorted-padded intermediate -> inter2[P, N]
     (gelu_and_mul if activation == "gelu" else silu_and_mul)(inter1, inter2)
     # gemm2 + topk-weighted scatter-combine into the fp32 accumulator (zeroed first — capturable).
@@ -270,6 +298,11 @@ def _fused_experts_bf16_hip(
         top_k, block_m, num_valid, BN, top_k,
     )
     return out_accum.to(hidden_states.dtype)
+
+
+# M ceiling for gemm1's GEMV arm. Mirrors the quantized spine's _MOE_GEMM1_GEMV_MAX
+# (quant/kernels.py:130) — one decision, two spines, so a retune reaches both.
+_MOE_BF16_GEMV_MAX = int(os.environ.get("MINISGL_MOE_BF16_GEMV_MAX") or 32)
 
 
 def get_default_config(
