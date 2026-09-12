@@ -39,6 +39,27 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+_w8a16_gemv_fn = None
+_w8a16_gemv_looked = False
+
+
+def _dense_w8a16_gemv():
+    """Lazily resolve `fp8_wmma.dense_w8a16_gemv` (None when the kernel package is unavailable).
+
+    Same shape as `layers/embedding.py`'s `dense_bf16_gemv` resolver: one import attempt, cached,
+    so a build without the op degrades to the dequant path instead of failing a boot.
+    """
+    global _w8a16_gemv_fn, _w8a16_gemv_looked
+    if not _w8a16_gemv_looked:
+        _w8a16_gemv_looked = True
+        try:
+            from fp8_wmma import dense_w8a16_gemv
+        except Exception:
+            _w8a16_gemv_fn = None
+        else:
+            _w8a16_gemv_fn = dense_w8a16_gemv
+    return _w8a16_gemv_fn
 from minisgl.distributed import DistributedCommunicator, get_tp_info
 from minisgl.layers.base import BaseOP
 from minisgl.utils import init_logger
@@ -151,7 +172,42 @@ class DraftLinear(BaseOP):
             wq = (wf / s).round().clamp(-127, 127).to(torch.int8)
         self._wq = wq.contiguous().to(device)
         self._ws = s.to(compute_dtype).to(device)
+        # (N,) f32 per OUTPUT CHANNEL — the layout `fp8_wmma.dense_w8a16_gemv` wants. Cached at load
+        # because it is a constant of the loaded weight; recomputing a squeeze+cast per forward on
+        # the decode path is exactly the kind of per-step allocation this class exists to avoid.
+        self._ws_f32 = s.squeeze(-1).float().contiguous().to(device) if mode == "fp8" else None
         self.weight = None
+
+    def _w8a16_or_dequant(self, x: torch.Tensor) -> torch.Tensor:
+        """The fp8/int8 weight arm. Streams the e4m3 weight through a kernel when one applies.
+
+        WHY THIS EXISTS. `F.linear(x, self._wq.to(x.dtype) * self._ws)` materialises a full
+        [out, in] dequantised temporary on EVERY forward — ~9 B/elem against bf16's 2 — which is the
+        mechanism behind `tools/serve.sh:324` "fp8 on this drafter is WORSE, 27.0 tok/s". The kernel
+        that removes it (`fp8_wmma.dense_w8a16_gemv`, e4m3 weight x UNQUANTIZED bf16/fp16 act) has
+        existed since 2026-09-07 and was recorded as closing gap G1 — but NOTHING EVER CALLED IT.
+        `rdna4-hip-kernels/FORMAT_MATRIX.md` listed G1 as closed on the strength of the kernel alone.
+
+        NOT BIT-IDENTICAL to the dequant path, and the op's own docstring says so: the activation is
+        untouched (still bf16/fp16, never quantised per token), but the scale is applied once in fp32
+        AFTER the K-sum instead of being folded into a bf16-ROUNDED weight before the GEMM. One
+        rounding step is removed — plausibly more accurate — and the accumulation order differs. On a
+        DRAFTER that matters: its whole job is agreeing with the target, so acceptance has to be
+        measured, not assumed. `tests/draft_linear_w8a16_parity_test.py` pins the numeric distance.
+
+        Falls back for int8 (no dense counterpart on this card — gap G9), for M > 16 or K % 16 (the
+        op's stated shape limits), and when the kernel package is absent.
+        """
+        wq, ws = self._wq, self._ws
+        if wq.dtype is torch.float8_e4m3fn and x.is_cuda and self._ws_f32 is not None:
+            shp = x.shape
+            x2 = x.reshape(-1, shp[-1])
+            if x2.shape[0] <= 16 and (x2.shape[-1] % 16) == 0:
+                fn = _dense_w8a16_gemv()
+                if fn is not None:
+                    out = fn(x2.contiguous(), wq.view(torch.uint8), self._ws_f32)
+                    return out.reshape(*shp[:-1], out.shape[-1])
+        return F.linear(x, wq.to(x.dtype) * ws)  # dequant [out,in] * [out,1]
 
     # ---- forward -------------------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -167,7 +223,7 @@ class DraftLinear(BaseOP):
             out = kernels.w4a8_linear(x2, self._w4, self._w4s, None, 16, weight_is_e2m1=True)
             y = out.reshape(*shp[:-1], out.shape[-1])
         elif self._wq is not None:
-            y = F.linear(x, self._wq.to(x.dtype) * self._ws)  # dequant [out,in] * [out,1]
+            y = self._w8a16_or_dequant(x)
         else:
             y = F.linear(x, self.weight)
         if self._comm is not None:
