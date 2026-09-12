@@ -2918,6 +2918,44 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             tokens.append(ids.to(torch.int64).numpy())
         self._ple.prepare(slots, tokens, defer_commit=defer_commit)
 
+    def _step_boundary(self, batch, is_prefill: bool, *, trace: bool = True) -> None:
+        """One decode/prefill step has begun: drain the routing trace and tick the expert cache.
+
+        MUST be called once per forward, on EVERY path that reaches the model — including the four
+        speculative VERIFY sites, which call `engine.forward_verify` directly and never pass through
+        `_forward`.
+
+        THE SPEC PATH WAS MISSING IT ENTIRELY, and the failure was silent in the worst way: with no
+        boundary, `route_trace.drain()` never feeds `ExpertCache.observe`, so the policy sees no
+        references; `tick_expert_cache()` never runs, so no victim is retracted and no landed copy is
+        ever PUBLISHED; `slot_of` freezes at whatever the last non-spec forward left; and because the
+        in-flight reaper ages entries in TICKS, stuck entries never expire, `_max_inflight` fills and
+        the manager throttles permanently. Net effect: on a spec serve the expert cache is inert —
+        it holds VRAM and does nothing. Any measurement of "spec with the expert cache on" taken
+        before this fix was measuring a frozen cache, not a cache.
+
+        `trace=False` TICKS THE CACHE WITHOUT ARMING THE ROUTING TRACE, and the verify sites use it
+        deliberately. A verify carries M>1 rows, which `RouteTrace.record` sends down its HOST path:
+        one blocking `topk_ids.tolist()` PER MoE LAYER, i.e. ~42 D2H syncs on the verify's critical
+        path. Today that is masked — `_cur_kind` still holds the last `_forward`'s value, which on a
+        spec serve is a prefill, and the prefill branch early-returns. Arming the trace here would
+        un-gate those syncs, and it would buy nothing: the host-path records land in `self.oversize`,
+        which `drain()` writes to the trace file but never forwards to the observer (only ring
+        `KIND_DECODE` records reach `obs`). So the policy would still starve, at the cost of 42 syncs.
+
+        Feeding verify routings to the policy therefore needs a change in `route_trace` — route the
+        oversize records to `obs` and make the M>1 gather non-blocking — not a flag here. Until then
+        the cache's scheduler-side half (publish landed copies, retract victims) is what the spec
+        path was missing and what this restores.
+        """
+        if trace:
+            _route_trace.begin_forward(bool(is_prefill), batch.reqs[0].uid if batch.reqs else 0)
+        # The expert cache's scheduler-side half: retract victims, publish landed copies. Here
+        # because this is the step boundary AND this thread owns the compute stream the kernels
+        # read `slot_of` from; the expensive copies run on the manager thread. Sub-microsecond
+        # when nothing is pending, and a no-op with no cache attached.
+        _moe_interpose.tick_expert_cache()
+
     def _forward(self, forward_input: ForwardInput, track_reqs: bool = True) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         # STEP_LOG bookkeeping (see the module-level comment). Both fields are read BEFORE the
@@ -2932,16 +2970,11 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             torch.cuda.synchronize()
         _step_t0 = time.perf_counter()
         _step_is_pf = bool(batch.is_prefill)
-        # ROUTING-TRACE step boundary. HERE, not in normal_loop: there are eight `self._forward`
-        # call sites (overlap, hostprof, DP-dummy, spec) and this is the only point all of them
-        # pass through. No-op unless armed; the drain runs outside the forward and outside any
-        # capture region.
-        _route_trace.begin_forward(_step_is_pf, batch.reqs[0].uid if batch.reqs else 0)
-        # The expert cache's scheduler-side half: retract victims, publish landed copies. Here
-        # because this is the step boundary AND this thread owns the compute stream the kernels
-        # read `slot_of` from; the expensive copies run on the manager thread. Sub-microsecond
-        # when nothing is pending, and a no-op with no cache attached.
-        _moe_interpose.tick_expert_cache()
+        # ROUTING-TRACE + expert-cache step boundary. This used to claim it was "the only point all
+        # of them pass through, (overlap, hostprof, DP-dummy, spec)". IT WAS NOT: every speculative
+        # VERIFY calls `engine.forward_verify` directly and never reaches `_forward`, so on a spec
+        # serve the boundary never ran — see `_step_boundary`.
+        self._step_boundary(batch, _step_is_pf)
         _step_bs = int(batch.size)
         _step_r0 = self.engine.graph_runner.replays
         batch.input_ids = self.token_pool[input_mapping]
@@ -3561,6 +3594,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             gdn_snapshot = self.engine.gdn_state.snapshot(gdn_idx)
 
         # --- one forward; argmax the k mask positions per req -------------------------------------
+        self._step_boundary(batch, False, trace=False)
         logits = self.engine.forward_verify(batch)  # [sum(k+1), vocab]
         # Same head-side conditioning the plain sampler and the linear verify apply — a pad-tail
         # dequant artifact would otherwise win the argmax here and be DRAFTED, and the top-K
@@ -3750,6 +3784,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             batch.gdn_metadata.capture_verify_state = True
             batch.gdn_metadata.verify_max_qlen = tree_qlen
             gdn_snap = self.engine.gdn_state.snapshot(gdn_idx)
+        self._step_boundary(batch, False, trace=False)
         logits = self.engine.forward_verify(batch)
         # Head-side conditioning before the per-node argmax (see engine/sample.py::condition_logits).
         # The walk below reads these argmaxes as the target's chain, so an unfenced pad-tail id would
@@ -4123,6 +4158,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             batch.cca_metadata.verify_max_qlen = max(nq for (_, _, nq, _, _, _) in per_req)
 
         t_stage = _tstamp()
+        self._step_boundary(batch, False, trace=False)
         logits = self.engine.forward_verify(batch)  # [total_q, vocab]
         # Head-side conditioning (engine/sample.py::condition_logits) — MANDATORY here, not just
         # hygiene: this step COMMITS its verify argmax directly (verify_greedy over `target` below,
@@ -4835,6 +4871,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             _t_stage = _time.perf_counter()  # CPU-side staging (steps 2-3) done; forward next
         if _rtx:
             _roctx.pop(); _roctx.push("verify_forward")
+        self._step_boundary(batch, False, trace=False)
         if capture:
             logits, last_hidden, aux_hidden = self.engine.forward_verify(batch, return_hidden=True)
         else:

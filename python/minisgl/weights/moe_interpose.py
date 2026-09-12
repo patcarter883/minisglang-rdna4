@@ -555,9 +555,27 @@ class MoEWeightSeam:
         if cache is not None:
             lid = self._cache_lid
             if lid is None:
+                from .plan import is_mtp_path
                 from .stream_tier import layer_index_of_path
+                # THE MTP DRAFT HEAD IS NOT CACHEABLE AND MUST NOT ASK FOR A LAYER INDEX.
+                # Its seam path is "mtp.layers.0.mlp.experts", which shares the backbone's numbering
+                # and resolves to 0 — the SAME id as "model.layers.0.mlp.experts". Installing under
+                # that id hands the draft head's kernel launch decoder layer 0's slot map and slabs;
+                # the geometry is identical (512 experts, same dims), so nothing raises and the head
+                # silently reads the wrong experts, which presents as "the drafter is weak".
+                #
+                # This is REACHABLE, not theoretical: it fires the moment an expert cache and
+                # --spec-algorithm mtp are enabled together, a pair that had never been run because
+                # the head's 2.43 GiB/rank and the cache's budget did not fit on a 16 GiB card until
+                # both were shrunk. `layer_index_of_path` now refuses an mtp path outright; this is
+                # the caller that must not ask. The head is device-resident by policy
+                # (plan.OFFLOAD_MTP_HEAD = False), so it has nothing to gain from the cache anyway.
+                if is_mtp_path(self.path):
+                    self._cache_lid = -1          # sentinel: asked and answered, never cacheable
+                    return self.assert_identity(w13, w2)
                 lid = self._cache_lid = layer_index_of_path(self.path)
-            cache.install(lid, _set_expert_slot_map)
+            if lid >= 0:
+                cache.install(lid, _set_expert_slot_map)
         return self.assert_identity(w13, w2)
 
     def assert_identity(self, w13: Any, w2: Any) -> tuple[Any, Any]:
