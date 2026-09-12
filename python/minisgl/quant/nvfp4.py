@@ -184,7 +184,12 @@ def fold_nvfp4_scale(
 ) -> torch.Tensor:
     """(N, K//16) e4m3 block scale + per-tensor f32 global -> (N, K//16) fp16 per-group scale.
 
-    LEGACY, LOSSY, AND STILL LIVE FOR DENSE LINEARS. See the module docstring: the fp16 collapse
+    LEGACY AND LOSSY. NO LONGER ON ANY LOAD PATH (FORMAT_MATRIX.md G14 templated the dense cores on
+    the WScale policy, so `nvfp4_leaf_splits` is now unconditionally True and every NVFP4 module
+    keeps two levels). Retained ONLY as the reference the A/B in
+    `fp8_wmma/tests/test_dense_w4_scale_formats.py` scores the native path against — that test
+    asserts the native path is CLOSER to an fp64 reference than this fold, which needs this fold to
+    exist. Do not reintroduce it as a load step. See the module docstring: the fp16 collapse
     carries a MEASURED 4.37e-04 max / 1.4-2.4e-04 mean relative error on every weight of a real
     checkpoint (1.2e-03..3.2e-03 through a 4-row GEMV), where `split_nvfp4_scale` is exact. This
     function used to be documented as exact; it is not, and that claim is why the split was never
@@ -244,10 +249,17 @@ def nvfp4_leaf_splits(base: str) -> bool:
     "gets split" set and the "gets stacked into an (E, ...) MoE container" set are the same set by
     construction, rather than by two rules that could drift.
 
-    When the dense cores are templated too, this becomes `return True` and `fold_nvfp4_scale` goes
-    away — that is the whole of the follow-up.
+    THE DENSE CORES ARE NOW TEMPLATED TOO (2026-09-12, FORMAT_MATRIX.md G14), so this is the
+    `return True` that follow-up promised: every NVFP4 module keeps its checkpoint-native two-level
+    scale. `w4a8_fp8_wmma_kernel.hip` and `gemm_tiled.h` take a `WSP` weight-scale policy on every
+    arm (scalar / prefill-wmma / wmma-tiled-tuned / ashuffle / decode-GEMV, and the W4A16 twins),
+    selected by `W4A8_DENSE_SCALE_FMT_DISPATCH` on the PRESENCE of the per-output-channel global.
+
+    The predicate is kept rather than deleted: it is the single place this decision is stated, and
+    a future format without a policy instantiation would reinstate a fence here rather than
+    scattering one across the loaders again.
     """
-    return ".experts." in base
+    return True
 
 
 def nvfp4_leaf_scales(

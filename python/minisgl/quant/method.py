@@ -540,7 +540,7 @@ class MxFp4LinearMethod:
     checkpoint (compressed-tensors `mxfp4-pack-quantized`) ships weights ALREADY in a compact
     packed form — weight_packed uint8 (N, K//2) 2 E2M1 nibbles/byte + weight_scale uint8 (N, K//32)
     E8M0 group exponent — so `process_weights_after_load` runs the MXFP4 converter (nibbles ->
-    (N,K//8) int32 codes verbatim; E8M0 -> fp16 group scale) and drops the checkpoint copies.
+    (N,K//8) int32 codes verbatim; E8M0 kept as the checkpoint's own byte, G14) and drops the checkpoint copies.
     Symmetric (no zero-points). Config-selected purely from `quant.weight_is_e2m1`."""
 
     def __init__(self, quant: QuantConfig) -> None:
@@ -562,18 +562,22 @@ class MxFp4LinearMethod:
 
         conv = mxfp4.convert_mxfp4_weight(layer.weight_packed, layer.weight_scale)  # type: ignore[attr-defined]
         info = conv["scale_info"]
-        if not info["fp16_range_ok"]:
+        # The fp16-overflow warning is GONE because the overflow is gone: the kernel now takes the
+        # checkpoint's E8M0 byte directly (FORMAT_MATRIX.md G14), and E8M0's bias is 127 — exactly
+        # fp32's — so the device decode is one shift into the exponent field, not a convert. What
+        # remains worth reporting is the e8m0 NaN code (255), which is a property of the CHECKPOINT
+        # and poisons its group whatever the kernel does.
+        if info["e8m0_nan_groups"]:
             from minisgl.utils import init_logger
 
             init_logger("mxfp4").info_rank0(
-                f"[mxfp4] E8M0 group scales exceed the fp16 store on "
-                f"{getattr(layer, 'prefix', '<linear>')} (exp {info['exp_min']}..{info['exp_max']}, "
-                f"{info['fp16_overflow_groups']} overflow / {info['e8m0_nan_groups']} e8m0-NaN "
-                f"groups); an fp32 group-scale path may be needed for this checkpoint."
+                f"[mxfp4] {info['e8m0_nan_groups']} e8m0-NaN group scale(s) on "
+                f"{getattr(layer, 'prefix', '<linear>')} (exp {info['exp_min']}..{info['exp_max']});"
+                f" those groups decode to +inf."
             )
         layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32
         # GROUP-MAJOR: the op indexes scales `[g*N + n]` so N is the contiguous axis (coalesced read).
-        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//32, N) fp16
+        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//32, N) uint8 E8M0
         del layer.weight_packed, layer.weight_scale
 
     def apply(
@@ -636,36 +640,31 @@ class NvFp4LinearMethod:
     after_load` packs the nibbles to (N,K//8) int32 codes (verbatim) and passes the fp16 scale through;
     `apply` calls the e2m1 kernel at group_size 16. Symmetric (no zero-points). From quant.is_nvfp4.
 
-    STILL ON THE FOLD, DELIBERATELY AND NAMED (2026-09-05). The MoE experts moved to the checkpoint's
-    native TWO-LEVEL scale — a 1-byte e4m3 block scale plus a per-output-channel f32 global — which is
-    both SMALLER and EXACT where the fold carries a measured 4.37e-04 max relative error. The dense
-    path did NOT move with them, and the reason is a kernel fact rather than an oversight:
-    `moe_kernel.hip` / `moe_gemm_tiled.h` / `gemv_decode.h` are templated on a WScale policy and carry
-    an `E4m3GroupScaleGlobal` instantiation, while the DENSE cores (`w4a8_fp8_wmma_kernel.hip`,
-    `gemm_tiled.h`) still hardcode `const __half* w_scales` and have no policy seam at all. Handing
-    them e4m3 bytes would reinterpret them as halves and return finite, plausible, wrong numbers.
-
-    `nvfp4.nvfp4_leaf_splits` is the fence that keeps this true — it splits `.experts.` modules and
-    folds everything else — so a dense NVFP4 linear cannot start receiving e4m3 by accident. The
-    follow-up is to template those two dense cores exactly as the MoE cores were templated, after
-    which that predicate becomes `return True` and `fold_nvfp4_scale` is deleted. On the checkpoints
-    served today the dense NVFP4 surface is small (Laguna / Muse-Glimmer dense linears; the target
-    `Qwen3.8-Flash-Next-NVFP4` quantizes ONLY its routed experts), so the accuracy and byte wins land
-    where the bytes actually are."""
+    NATIVE TWO-LEVEL SINCE 2026-09-12 (FORMAT_MATRIX.md G14). It was on the fp16 fold until then,
+    and the reason was a kernel fact rather than an oversight: the MoE cores were templated on a
+    WScale policy and carried an `E4m3GroupScaleGlobal` instantiation while the DENSE cores
+    (`w4a8_fp8_wmma_kernel.hip`, `gemm_tiled.h`) hardcoded `const __half* w_scales`, so handing
+    them e4m3 bytes would have read them as halves and returned finite, plausible, wrong numbers.
+    The dense cores now carry the same policy on every arm, so the fold — a measured 4.37e-04 max
+    relative error, in MORE bytes than the native form — is gone from the load path."""
 
     def __init__(self, quant: QuantConfig) -> None:
         self.quant = quant
 
     def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
-        # POST-FOLD checkpoint layout (the loader already folded the scale to fp16 and dropped the
-        # per-tensor globals): weight_packed uint8, weight_scale fp16 at group_size 16.
+        # CHECKPOINT-NATIVE TWO-LEVEL layout, the same pair `_GroupedNVFP4Experts` declares: a
+        # 1-byte e4m3 block scale per (channel, group) PLUS a per-output-channel f32 global. This
+        # used to be a single fp16 `weight_scale` because the dense cores had no WScale policy;
+        # they do now (FORMAT_MATRIX.md G14), so `nvfp4_leaf_splits` is True for every module and
+        # the loader delivers both leaves here exactly as it does for routed experts.
         N, K = out_features, in_features
         g = self.quant.group_size  # 16 (NVFP4 block)
         assert K % 2 == 0 and K % g == 0 and N % 8 == 0, (
             f"NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
         )
         layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
-        layer.weight_scale = torch.empty((N, K // g), dtype=torch.float16)
+        layer.weight_scale = torch.empty((N, K // g), dtype=torch.uint8)   # e4m3 block, BYTE-verbatim
+        layer.weight_global = torch.empty((N,), dtype=torch.float32)       # per-OUTPUT-CHANNEL
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         from . import nvfp4
@@ -673,8 +672,14 @@ class NvFp4LinearMethod:
         conv = nvfp4.convert_nvfp4_weight(layer.weight_packed, layer.weight_scale)  # type: ignore[attr-defined]
         layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32 E2M1 codes
         # GROUP-MAJOR: the op indexes scales `[g*N + n]` so N is the contiguous axis (coalesced read).
-        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//16, N) fp16 per-group
-        del layer.weight_packed, layer.weight_scale
+        layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//16, N) e4m3 bytes
+        # (N,) f32 -> the SAME BYTES viewed as int32, because the op's global slot is `w_zeros`,
+        # typed `const int*`, and the kernel does `reinterpret_cast<const float*>` on the other
+        # side. `.view()` is a zero-copy bitcast; `.to(torch.int32)` would VALUE-convert
+        # (2.078e-04 -> 0) and give an all-zero layer. The two spellings are one character apart —
+        # this is the same guard `_GroupedNVFP4Experts.post_load` carries, for the same reason.
+        layer._global_op = layer.weight_global.contiguous().view(torch.int32)  # type: ignore[attr-defined]
+        del layer.weight_packed, layer.weight_scale, layer.weight_global
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
@@ -683,7 +688,7 @@ class NvFp4LinearMethod:
             x,
             layer._w_packed_op,  # type: ignore[attr-defined]
             layer._scales_op,  # type: ignore[attr-defined]
-            None,  # symmetric — no zero-points
+            layer._global_op,  # type: ignore[attr-defined]  the f32 global rides the zeros slot
             self.quant.group_size,
             weight_is_e2m1=True,
         )

@@ -170,7 +170,19 @@ def convert_mxfp4_weight(weight_packed: torch.Tensor,
     """Full conversion for one MXFP4 linear/expert weight matrix.
 
     weight_packed (N, K//2) uint8, weight_scale (N, K//32) uint8 ->
-    {w_packed (N,K//8) int32, scales (N,K//32) fp16, w_zeros None, group_size 32, scale_info}.
+    {w_packed (N,K//8) int32, scales (N,K//32) uint8 E8M0, w_zeros None, group_size 32, scale_info}.
+
+    THE SCALE IS NOW PASSED THROUGH AS THE CHECKPOINT'S OWN E8M0 BYTE (FORMAT_MATRIX.md G14). It
+    used to be widened to fp16 here, which cost on both axes the native form fixes:
+
+      BYTES.  group-32 e2m1 + fp16 = 0.5625 B/weight; + E8M0 = 0.53125. 5.6% fewer bytes on a
+              bandwidth-bound decode, and HALF the resident scale bytes.
+      EXACT.  E8M0 spans 2^-127..2^127 and fp16 SATURATES outside 2^-14..2^15. The widening logged
+              `fp16_overflow_groups` and PROCEEDED, so an out-of-window checkpoint was served with
+              saturated scales — wrong numbers, no failure. Nothing saturates now.
+
+    `scale_info` is still computed and returned: callers keep reporting the exponent window, and
+    the e8m0-NaN count (code 255) is a real checkpoint property worth surfacing either way.
     """
     n, k_half = weight_packed.shape
     k = k_half * 2
@@ -181,10 +193,12 @@ def convert_mxfp4_weight(weight_packed: torch.Tensor,
 
     codes = unpack_e2m1_nibbles(weight_packed)
     w_packed = pack_codes_to_int32(codes)
-    scales, scale_info = e8m0_to_fp16_scales(weight_scale)
+    # e8m0_to_fp16_scales is called for its SCALE_INFO only — the exponent window and NaN counts —
+    # and its fp16 output is deliberately discarded. The kernel takes the raw byte.
+    _widened, scale_info = e8m0_to_fp16_scales(weight_scale)
     return {
         "w_packed": w_packed,          # (N, K//8) int32, E2M1 codes (decode via e2m1_to_e4m3)
-        "scales": scales,              # (N, K//32) fp16
+        "scales": weight_scale.contiguous(),   # (N, K//32) uint8 E8M0, checkpoint-verbatim
         "w_zeros": None,               # symmetric
         "group_size": OCP_MX_BLOCK_SIZE,
         "scale_info": scale_info,
