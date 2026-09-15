@@ -698,6 +698,24 @@ case "$MODEL" in
                   # running), inflight 9. That is the whole difference between the win above and no
                   # win at all. Exported here rather than left to the caller for that reason.
                   export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-512}"
+                  # LOW_WATER=25 AND THE DEFAULT IS WRONG AT THIS CACHE SIZE. expert_cache.py:217
+                  # computes `max(8, slots // 200)`, and 2.5 GiB gives 1923 slots -> 9. The sweep
+                  # recorded in that file's own `_admit_ok` docstring measured 25 as the optimum
+                  # (h=0.6314, TPOT 50.26 ms; 1024 was WORSE at h=0.5961/53.14). The formula only
+                  # reaches 25 at ~5000 slots, i.e. a cache far larger than this arm runs — so the
+                  # default was never re-derived after expert_cache_gb was set to 2.5.
+                  #
+                  # At 9 the free pool refills 9 slots at a time and replacement FREEZES once full.
+                  # MEASURED 2026-09-15, same build, before -> after, across identical generations:
+                  #   evictions      9 -> 200   (9 == low_water exactly: ONE batch, then stalled)
+                  #   inflight     387 ->  25   (was pinned near the 512 cap; now at low_water)
+                  #   throttled  29067 -> 24068 and NOT rising between runs
+                  #   observed_h  0.40 -> 0.4314 and still climbing run over run
+                  #   TPOT       64.26 -> 49.23 ms   =  15.56 -> 20.31 tok/s
+                  # `evictions` frozen at exactly low_water is the signature to look for; it is the
+                  # same freeze expert_cache.py:424 describes ("froze at 8 evictions in 240k
+                  # references"), recurring at a different cache size for the same reason.
+                  export MINISGL_EXPERT_CACHE_LOW_WATER="${MINISGL_EXPERT_CACHE_LOW_WATER:-25}"
                   # SPEC IS OFF ON PURPOSE AND MUST STAY OFF UNTIL THE EXPERT CACHE IS ON.
                   # MEASURED 2026-09-11, same build, warm, single request:
                   #     SPEC=none   15.23 / 15.27 tok/s   (~65 ms/token)
@@ -868,10 +886,14 @@ case "$MODEL" in
                   # an override (WOFF_DEVICE_GB=8.1), not a default.
                   # * host_gb 26, not 25: the 37th host layer pushes the plan's reserve from 24.12 to
                   #   24.62 GiB/rank and the clamp must sit above it. 26 is the point that booted.
-                  # [ALL-HOST 2026-09-07] ALL MoE layers live in system RAM. This is a FIXED
-                  # CONDITION of the project, not a tuning choice: the external performance target
-                  # (llama.cpp, 23.3 tok/s) was measured on an all-MoE-in-RAM setup, so a device
-                  # tier makes our numbers non-comparable with it. It is also what the offload plan
+                  # [ALL-HOST 2026-09-07; SUPERSEDED 2026-09-15 — see DEVICE TIER RESTORED below]
+                  # This block read "ALL MoE layers live in system RAM. This is a FIXED CONDITION of
+                  # the project" because the llama.cpp 23.3 tok/s target was measured all-in-RAM and
+                  # a device tier makes our numbers non-comparable with it. The operator has since
+                  # clarified that the comparison existed only to establish a MINIMUM performance
+                  # level in the same state — it was never a constraint on how the arm is served.
+                  # Kept rather than deleted because the REASONING below (what device_gb 0.5 means,
+                  # the 0.668 GiB/layer arithmetic, the K1 gate) is all still correct and load-bearing. It is also what the offload plan
                   # itself specifies — WEIGHT_OFFLOAD_PLAN.md K1: "hit rate < 40% -> the device tier
                   # is worthless; ship T1 only (all-host)". The tier that shipped here until today
                   # was 11/48 layers at f=0.229 device byte fraction, i.e. BELOW that 40% gate,
@@ -891,7 +913,35 @@ case "$MODEL" in
                   #
                   # host_gb 33, not 26: 26 was sized for 37 host layers; all 48 need 31.93/rank and
                   # the clamp must sit above the plan's reserve.
-                  woff_device_gb="0.5"; woff_host_gb="33"; woff_chunk_mib="1372"
+                  # [DEVICE TIER RESTORED 2026-09-15] 4, not 0.5. The all-host condition above was
+                  # relaxed by the operator: the llama.cpp 23.3 tok/s figure was only ever for
+                  # establishing a MINIMUM performance level in the same state, not a permanent
+                  # constraint on how we run. With that gone, 6/48 layers on the card is a straight
+                  # win on both axes it was costing us.
+                  #
+                  # MEASURED 2026-09-15, TP=2, desktop stack down, warm, 220-token generations,
+                  # against device_gb=0.5 on the same build and the same day:
+                  #
+                  #                       device_gb 0.5     device_gb 4.0
+                  #   pinned host arena   31.93x2 = 63.9    27.94x2 = 55.9 GiB
+                  #   swap used              54.9              33.9 GiB
+                  #   MemAvailable            5.7              11.1 GiB
+                  #   KV pool context         262k             ~208k tokens   <- the cost
+                  #   planner step floor     53.7 ms           48.1 ms
+                  #
+                  # Throughput moved 15.56 -> 20.31 tok/s, but DO NOT attribute that to this knob
+                  # alone: MINISGL_EXPERT_CACHE_LOW_WATER=25 landed in the same restart and the
+                  # cache counters say it did most of the work (see the export above). This knob's
+                  # own instrument is swap/MemAvailable/step-floor, and those are the rows above.
+                  #
+                  # f=0.125 device byte fraction. WEIGHT_OFFLOAD_PLAN.md K1 gates the tier on expert
+                  # hit rate >= 40%; with low_water fixed, observed_h is 0.43 and still climbing, so
+                  # the gate is CLEARED rather than marginal — which was not true when the old 11/48
+                  # tier was configured without measuring it.
+                  #
+                  # host_gb 33 is left alone: the plan now reserves 27.94/rank, so the clamp still
+                  # sits above it with room. Chunk 1372 MiB unchanged (21x1.34 GiB, fill 99.5%).
+                  woff_device_gb="4"; woff_host_gb="33"; woff_chunk_mib="1372"
                   # `[DIST-TIMEOUT 2026-09-08]` 600 s, not the 60 s default, and this is a CRASH
                   # fix rather than a tuning preference. The NCCL watchdog aborts the process group
                   # — scheduler dead, exitcode -6, mid-request — when a collective exceeds it, and
