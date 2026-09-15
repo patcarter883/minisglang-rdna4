@@ -232,6 +232,10 @@ x-lean-common: &lean-common
     # so it is not link-bound), while the slab costs 0.67 GiB of KV pool. Set to 1 only on a
     # serve whose prefill is actually bound by host-resident expert reads.
     MINISGL_MOE_PREFILL_STAGE: "${MINISGL_MOE_PREFILL_STAGE:-}"
+    # Preload the SYSTEM HSA runtime. OFF by default: it stops torch's bundled runtime busy-polling
+    # one core per rank at idle, but costs 13.2x on PREFILL (3.56 vs 46.83 tok/s, measured A/B
+    # 2026-09-15). Set to 1 only on a serve that never prefills anything long.
+    MINISGL_HSA_PRELOAD: "${MINISGL_HSA_PRELOAD:-}"
     MINISGL_PREFILL_MEM_PROBE: "${MINISGL_PREFILL_MEM_PROBE:-}"
     # Prefill activation guard (scheduler.py): affordable = (devfree - SAFETY) / KIB_PER_TOKEN.
     # The default 64 KiB/token was MEASURED ON Qwen3.6-35B (58-65 KiB/token) and is MODEL-SPECIFIC —

@@ -1506,8 +1506,24 @@ fi
 #
 # Guarded on the file existing so a future image without it degrades to the old behaviour rather
 # than failing to exec, and an explicit LD_PRELOAD from the caller always wins.
+# [PREFILL REGRESSION 2026-09-15 — DEFAULT IS NOW OFF] Preloading the system HSA runtime costs
+# 13.2x ON PREFILL. Controlled A/B, same prompt, same boot procedure, only LD_PRELOAD differing:
+#
+#     system  /opt/rocm libhsa-runtime64.so.1 : 1820 tok / 511.2 s =  3.56 tok/s
+#     torch's bundled libhsa (no preload)     : 1816 tok /  38.8 s = 46.83 tok/s
+#
+# DECODE IS IDENTICAL EITHER WAY (~65 ms/step), which is exactly why this shipped: the commit that
+# added it (1cd0233) verified TPOT and never measured prefill. `docs/measurements/QSA_INDEXER.md`
+# §5 recorded 60-126 tok/s prefill on 2026-09-06, before that commit — those numbers were correct
+# and became unreachable the moment this line landed. An 8.5-minute wait on a 1.8k-token prompt was
+# reported repeatedly as "5 minutes before prefill starts"; it was this.
+#
+# WHAT IS GIVEN BACK BY TURNING IT OFF: torch's bundled runtime busy-polls one core per rank at
+# idle (201.4% -> 2.6% CPU, 50-54C -> 39.6C was the win). That is a real cost and it is ~10 W and
+# some idle heat. It is not worth 13x on every prompt. Set MINISGL_HSA_PRELOAD=1 to take the idle
+# win back on a serve that never prefills anything long.
 _HSA_SYS=/opt/rocm/lib/libhsa-runtime64.so.1
-if [[ -z "${LD_PRELOAD:-}" && -e "$_HSA_SYS" ]]; then
+if [[ "${MINISGL_HSA_PRELOAD:-}" == "1" && -z "${LD_PRELOAD:-}" && -e "$_HSA_SYS" ]]; then
   export LD_PRELOAD="$_HSA_SYS"
   printf '[serve] LD_PRELOAD=%s (system HSA runtime; torch'"'"'s bundled one busy-polls one core per rank at idle)\n' "$_HSA_SYS"
 elif [[ -n "${LD_PRELOAD:-}" ]]; then
