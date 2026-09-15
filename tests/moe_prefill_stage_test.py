@@ -73,11 +73,23 @@ class Experts:
 
 
 class Seam:
-    """The two attributes `prefill_stage` reads off a seam."""
+    """The attributes `prefill_stage` reads off a seam.
+
+    __slots__ ON PURPOSE, and it is the whole reason this fixture is written out rather than being
+    a plain object. The real `MoEWeightSeam` declares __slots__, so `seam._prefill_twin = twin` is
+    an AttributeError unless the slot is declared — and the first version of this test used a
+    slot-less fixture, passed 34/34, and the change then crashed the serve on its first prefill
+    with exactly that error. A fixture that is more permissive than production cannot test
+    production. `_prefill_twin` is listed here because the seam lists it.
+    """
+
+    __slots__ = ("path", "num_experts", "_prefill_twin")
 
     def __init__(self, path: str = "model.layers.0.mlp.experts") -> None:
+        from minisgl.weights.moe_interpose import _STAGE_UNTRIED
         self.path = path
         self.num_experts = E
+        self._prefill_twin = _STAGE_UNTRIED
 
 
 def tensors_of(c):
@@ -170,6 +182,21 @@ if got is not None:
           f"staged_launches={st2.staged_launches}")
 
 print()
+print("THE PRODUCTION CLASS can actually hold what the stager assigns")
+# Asserted against MoEWeightSeam ITSELF, not a fixture. The fixtures below declare their own
+# __slots__, so they would accept `_prefill_twin` whether or not the real class does — which is
+# precisely how the shipped version passed 34/34 and then died on the first prefill with
+# "AttributeError: 'MoEWeightSeam' object has no attribute '_prefill_twin'". A fixture cannot
+# stand in for a slots declaration; only the class can.
+from minisgl.weights.moe_interpose import MoEWeightSeam, _STAGE_UNTRIED  # noqa: E402
+
+check("MoEWeightSeam declares the _prefill_twin slot",
+      "_prefill_twin" in getattr(MoEWeightSeam, "__slots__", ()),
+      "without it the stager's memoising assignment is an AttributeError on the first staged launch")
+check("the untried sentinel is distinct from None (a refusal is remembered, not retried)",
+      _STAGE_UNTRIED is not None)
+
+print()
 print("THE GATE: decode must not stage, a sweep must")
 # Called unbound on a duck-typed seam so the gate is tested on its own, without a model. These are
 # the only attributes `_stage_for_prefill` reads, and getting this wrong in either direction is the
@@ -180,12 +207,18 @@ from minisgl.weights.stacks import ExpertStackTable, StackKind  # noqa: E402
 
 
 class FakeSeam:
+    """__slots__, for the same reason as `Seam` above — the gate path assigns `_prefill_twin`."""
+
+    __slots__ = ("path", "_bound", "_table", "top_k_local", "num_experts", "_prefill_twin")
+
     def __init__(self, kind=StackKind.HOST, top_k_local=8, num_experts=512, bound=True):
+        from minisgl.weights.moe_interpose import _STAGE_UNTRIED
         self.path = "model.layers.1.mlp.experts"
         self._bound = bound
         self._table = ExpertStackTable.uniform(num_experts, kind)
         self.top_k_local = top_k_local
         self.num_experts = num_experts
+        self._prefill_twin = _STAGE_UNTRIED
 
 
 # A container whose dim 0 matches the 512-expert FakeSeam, kept tiny in the other dims.

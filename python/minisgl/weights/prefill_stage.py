@@ -194,8 +194,16 @@ class PrefillStager:
 
     def resolve(self, seam: Any, w13: Any, w2: Any) -> "tuple[Any, Any] | None":
         """Refill the slab for this seam and return its staged pair, or None to fall back."""
-        twin = getattr(seam, "_prefill_twin", False)
-        if twin is False:
+        # The seam declares `_prefill_twin` in __slots__ and initialises it to _STAGE_UNTRIED.
+        # Imported lazily to keep this module free of a moe_interpose import at load time. The
+        # getattr default covers a seam-shaped object that predates the slot (tests, offline tools)
+        # — but note that assigning below still REQUIRES the slot, which is exactly the failure this
+        # module shipped with: `MoEWeightSeam` has __slots__, so the assignment raised
+        # AttributeError on the first prefill that tripped the gate and took the forward with it.
+        from .moe_interpose import _STAGE_UNTRIED
+
+        twin = getattr(seam, "_prefill_twin", _STAGE_UNTRIED)
+        if twin is _STAGE_UNTRIED:
             try:
                 twin = self.build_twin(seam, w13, w2)
             except Exception as e:  # noqa: BLE001

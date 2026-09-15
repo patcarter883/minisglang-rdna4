@@ -420,6 +420,12 @@ class SeamBindReport:
         )
 
 
+# "staging never attempted" for `MoEWeightSeam._prefill_twin`. A distinct sentinel, not None:
+# None is the REMEMBERED REFUSAL, and conflating them would re-attempt (and re-log) a refused
+# seam on every prefill launch for the life of the process.
+_STAGE_UNTRIED = object()
+
+
 class MoEWeightSeam:
     """The interposition object bound to one `MoELayer` as `layer._weight_offload`.
 
@@ -453,6 +459,13 @@ class MoEWeightSeam:
         "_cpu_worker",
         "_cpu_expert_offset",
         "_cache_lid",
+        # Memoised prefill staging twin (weights/prefill_stage.py): the staged container pair for
+        # this seam, or None once staging has been tried and refused. MUST be declared here — this
+        # class defines __slots__, so the stager's `seam._prefill_twin = ...` is an AttributeError
+        # without it, raised on the FIRST prefill that trips the gate and taking the forward with
+        # it. Initialised in __init__ rather than left unset, so `_stage_for_prefill` reads an
+        # attribute that always exists instead of relying on a getattr default.
+        "_prefill_twin",
     )
 
     def __init__(
@@ -506,6 +519,9 @@ class MoEWeightSeam:
         # layer a seam is — a mismatch would install one layer's residency map for another's
         # launch, which is a wrong-weights bug with no error.
         self._cache_lid = None
+        # Sentinel for "staging never attempted" (None means "attempted and refused"), so the
+        # stager can tell a first call from a remembered refusal without a second flag.
+        self._prefill_twin = _STAGE_UNTRIED
 
     # -- hot path ------------------------------------------------------------------------------
     def resolve(self, w13: Any, w2: Any, num_tokens: "int | None" = None) -> tuple[Any, Any]:
