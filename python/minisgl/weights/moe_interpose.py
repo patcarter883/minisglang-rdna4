@@ -508,8 +508,14 @@ class MoEWeightSeam:
         self._cache_lid = None
 
     # -- hot path ------------------------------------------------------------------------------
-    def resolve(self, w13: Any, w2: Any) -> tuple[Any, Any]:
+    def resolve(self, w13: Any, w2: Any, num_tokens: "int | None" = None) -> tuple[Any, Any]:
         """Return the containers this layer's kernels must read. Called once per MoE forward.
+
+        ``num_tokens`` is the row count this launch will compute. It is what selects between the two
+        regimes the offload plan's P1 gate conflated: a decode launch reads top_k of num_experts and
+        must keep reading the arena in place, while a prefill chunk touches ~every expert and is far
+        better served by one bulk DMA into a device slab (see `prefill_stage`). Omitted (None) means
+        "do not stage", which is what the boot-time proof and every non-forward caller want.
 
         Under layer-granular placement this is an identity plus two `is` checks — the substitution
         already happened at `bind()`. The checks are not decoration: they are the only thing that
@@ -545,6 +551,13 @@ class MoEWeightSeam:
             )
         engaged(self._engage)
         RESOLVE_COUNTS[self._engage] = RESOLVE_COUNTS.get(self._engage, 0) + 1
+        staged = self._stage_for_prefill(w13, w2, num_tokens)
+        if staged is not None:
+            # The INPUT check still runs, and must: staging substitutes the containers the kernels
+            # read, so a seam bound to the wrong layer would otherwise stage the wrong weights and
+            # lose the one check that catches it.
+            self.assert_identity(w13, w2)
+            return staged
         # PER-EXPERT VRAM CACHE. `resolve` is the one per-forward hook that runs BEFORE both of this
         # layer's kernels (gemm1_silu reads gate_up, the scatter GEMV reads down), which is why the
         # map carries both planes and is installed once here rather than twice further down. Costs
@@ -577,6 +590,41 @@ class MoEWeightSeam:
             if lid >= 0:
                 cache.install(lid, _set_expert_slot_map)
         return self.assert_identity(w13, w2)
+
+    def _stage_for_prefill(self, w13: Any, w2: Any, num_tokens: "int | None") -> "tuple[Any, Any] | None":
+        """Bulk-DMA this layer's experts into the shared device slab, or None to read in place.
+
+        THE GATE IS THE WHOLE POINT. `num_tokens * top_k_local >= num_experts` is the condition
+        "this launch would touch essentially every expert anyway" — the only regime in which copying
+        a whole layer beats reading the routed fraction of it in place. A bs=1 decode fails it by
+        two orders of magnitude and takes the identity path exactly as before, which is what keeps
+        this change invisible to every measured decode number.
+
+        `top_k_local` and not the layer's global `top_k`: under EP this rank computes only its own
+        slice of the routed slots, so the global value would over-count the traffic and stage on
+        launches that do not sweep.
+        """
+        if num_tokens is None or not self._bound:
+            return None
+        if self._table.uniform_kind is not StackKind.HOST:
+            return None  # device-resident layers are already in VRAM; CPU-tier never reaches here
+        if num_tokens * max(1, int(self.top_k_local)) < self.num_experts:
+            return None  # decode / small extend: the routed fraction is cheaper read in place
+        from . import prefill_stage
+
+        stager = prefill_stage.get()
+        if stager is None:
+            return None
+        out = stager.resolve(self, w13, w2)
+        if out is None:
+            return None
+        # A staged launch reads the SLAB and nothing else, so a per-expert cache map left over from
+        # the previous (decode) layer must not survive into it — it addresses cache slabs, not this
+        # one. `install` on an unmanaged id is the documented way to clear it.
+        cache = _EXPERT_CACHE
+        if cache is not None:
+            cache.install(-1, _set_expert_slot_map)
+        return out
 
     def assert_identity(self, w13: Any, w2: Any) -> tuple[Any, Any]:
         """`resolve()` WITHOUT the ledger line. The check, on its own.

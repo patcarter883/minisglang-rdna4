@@ -1019,6 +1019,47 @@ case "$MODEL" in
                   # that identity holds only when a group of r=4 cannot straddle a page.
                   # `QSAProfile.require_page_size` RAISES on anything else rather than falling back
                   # to a second, untested addressing scheme.
+                  # [PREFILL CHUNK 2026-09-15] 2048 -> 8192. THE CHUNK IS THE PREFILL LEVER ON THIS
+                  # ARM, and the reason is in item 2 above: the ENTIRE 31.9 GiB/rank expert set is
+                  # re-streamed PER CHUNK, so a 20k-token turn at chunk 2048 pays that sweep ten
+                  # times. The file's own measurement: 81 tok/s prefill at chunk 1024 = 4.1 minutes
+                  # for a 20k turn. That is the multi-minute "nothing is happening before prefill"
+                  # the operator kept reporting — it is prefill grinding, not a stall, and the
+                  # `minisgl_running_requests` gauge reads 0 throughout because it counts DECODE.
+                  #
+                  # THE EXPERT CACHE DOES NOT AND CANNOT FIX THIS, which is the obvious objection:
+                  # 512 experts x 42 host layers = 21,504 instances against 1,923 cache slots (8.9%),
+                  # and a prefill chunk routes up to ALL 512 per layer — 12x capacity. It is also
+                  # excluded BY DESIGN: `_admit_ok`'s second-reference rule keeps one-touch prefill
+                  # sweeps out because admitting them measured WORSE (prefill pollution +0.028 LFU
+                  # vs -0.0008 SLRU). The cache is a DECODE structure; prefill is a separate problem
+                  # on the same link.
+                  #
+                  # What held the chunk at 1024, then 2048, was stage 4b's full-CHUNK workspace.
+                  # `b7f9ae3` row-tiled it at _ATTN_ROW_TILE, so the prefill peak no longer scales
+                  # with chunk width and the ceiling moved without anyone raising the value.
+                  # 8192 is the ENGINE's own default and what line ~1161 already anticipates.
+                  # COST, and it is accounted rather than assumed: `_ple_runtime_bytes` is
+                  # subtracted BEFORE the KV pool is sized, so this shrinks KV instead of OOMing —
+                  # two `max_extend_tokens x ple_embed_dim` staging buffers, 0.03 GiB at 2048 ->
+                  # ~0.126 GiB at 8192, taking the pool ~1.18 -> ~1.08 GiB (~206k -> ~189k tokens).
+                  # MEASURED 2026-09-15, AND IT IS WHY THIS SAYS 2048 AGAIN: 8192 OOMs. The line
+                  # above ("raise further only with the prefill ACTIVATION peak measured against the
+                  # ~2.35 GiB slack, which is NOT accounted for") was written and then ignored; the
+                  # boot at 21:01 died in the GDN prefill, not in attention —
+                  #   gdn/layer.py:332 `_output_projection` -> gdn.rmsnorm_gated
+                  #   torch.OutOfMemoryError: tried to allocate 48.00 MiB, 168 MiB free of 15.92 GiB
+                  # on BOTH ranks, taking 4 in-flight requests with it. `b7f9ae3` row-tiled stage
+                  # 4b's ATTENTION workspace, which is what the paragraph above credits — but GDN's
+                  # prefill output projection is a different block and still allocates O(chunk).
+                  # One sibling tiled, the other not, so the ceiling never actually moved.
+                  #
+                  # The expert re-sweep argument above is CORRECT and still stands: prefill measured
+                  # 4.0 tok/s (minisgl_prefill_seconds_total 558.6 s for 2243 tokens) because each
+                  # chunk re-streams the host expert set over PCIe at ~52 MB/s effective. But the
+                  # chunk cannot buy the way out — VRAM runs out first. The fix is to stop the
+                  # kernels reading host memory during prefill (stage a layer's experts to a VRAM
+                  # scratch by DMA, prefetched a layer ahead), not to widen the chunk.
                   : "${GRAPH_BS:=0}"; : "${MAX_PREFILL_LENGTH:=2048}"
                   # FLOOR_GIB is a BOX property, not a model property, and it is the one value here
                   # that must NOT be carried to another machine. `[QSA-2026-09-06]` the arena is now

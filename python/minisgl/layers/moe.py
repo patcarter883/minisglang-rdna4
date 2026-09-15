@@ -1304,7 +1304,12 @@ class MoELayer(BaseOP):
                 if self.tp_size > 1 and reduce:
                     out = self._comm.all_reduce(out)
                 return out
-            w13, w2 = self._weight_offload.resolve(w13, w2)
+            # `num_tokens` selects the offload regime: a prefill chunk touches ~every expert and
+            # gets one bulk DMA into a device slab, a decode reads the routed fraction of the arena
+            # in place (weights/prefill_stage.py). Rows BEFORE the EP gather, which is what this
+            # rank's kernels will actually compute — the gather only re-orders and re-splits them.
+            w13, w2 = self._weight_offload.resolve(
+                w13, w2, num_tokens=int(hidden_states.shape[0]))
         # PRODUCER-SIDE act quant: the pair describes `hidden_states` ROW FOR ROW. Under EP the rows
         # are all_gather'd and re-ordered before the local kernel sees them (see _ep_dispatch), so a
         # pair that was not gathered alongside them would be silently mismatched -- every token would
