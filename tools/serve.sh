@@ -1444,4 +1444,33 @@ if [[ -n "$alloc_conf" ]]; then
   printf '[serve] alloc_conf=%s\n' "$PYTORCH_HIP_ALLOC_CONF" >&2
 fi
 [[ -n "${DRY_RUN:-}" ]] && exit 0
+# ---- IDLE BUSY-WAIT: preload the SYSTEM HSA runtime instead of torch's bundled one -------------
+# torch ships its own `libhsa-runtime64.so` under `torch/lib/` and loads it ahead of the system
+# ROCm one. THE BUNDLED BUILD SPINS: its `rocr::core::Runtime::AsyncEventsLoop` busy-polls in USER
+# SPACE (500/500 samples of /proc/<tid>/syscall read "running", i.e. never in a syscall) from the
+# first device allocation onward, forever, ONE THREAD PER RANK. On a TP=2 serve that is two cores
+# pinned at 100% while completely idle, which is ~10-13 C of package temperature.
+#
+# MEASURED 2026-09-15, live TP=2 serve (Qwen3.8-27B-MTP-NVFP4), before -> after:
+#   idle CPU across ranks   201.4%  ->   2.6%      (2.01 cores -> 0.03)
+#   Tctl                    50-54 C ->  40.5 C     (= the no-GPU-process idle temperature)
+#   TPOT                    24.30   ->  24.47 ms   (-0.7%, inside run-to-run spread)
+#   TTFT                    87.5    ->  88.7 ms
+# and on a standalone probe, identical numerics and speed: 2048^3 fp32 matmul rel-err 1.985e-06 on
+# BOTH runtimes, 1.092 ms vs 1.087 ms.
+#
+# This is why the HSA_* knobs are all inert (see docker-compose.yml): HSA_ENABLE_INTERRUPT=1 and
+# HSA_ENABLE_MWAITX=1 were both measured to change nothing, because they were being read by a build
+# that polls regardless of them.
+#
+# Guarded on the file existing so a future image without it degrades to the old behaviour rather
+# than failing to exec, and an explicit LD_PRELOAD from the caller always wins.
+_HSA_SYS=/opt/rocm/lib/libhsa-runtime64.so.1
+if [[ -z "${LD_PRELOAD:-}" && -e "$_HSA_SYS" ]]; then
+  export LD_PRELOAD="$_HSA_SYS"
+  printf '[serve] LD_PRELOAD=%s (system HSA runtime; torch'"'"'s bundled one busy-polls one core per rank at idle)\n' "$_HSA_SYS"
+elif [[ -n "${LD_PRELOAD:-}" ]]; then
+  printf '[serve] LD_PRELOAD left as caller set it: %s\n' "$LD_PRELOAD"
+fi
+
 exec "${cmd[@]}"

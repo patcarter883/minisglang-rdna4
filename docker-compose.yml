@@ -374,6 +374,54 @@ x-lean-common: &lean-common
     # embedding lookup on a -1 token id), and it reproduced deterministically under serialisation.
     AMD_SERIALIZE_KERNEL: "${AMD_SERIALIZE_KERNEL:-}"
     HIP_LAUNCH_BLOCKING: "${HIP_LAUNCH_BLOCKING:-}"
+    # IDLE BUSY-WAIT. `libhsa-runtime64.so`'s `rocr::core::Runtime::AsyncEventsLoop` parks in
+    # `hsaKmtWaitOnMultipleEvents_ExtCtx`, and that wait POLLS rather than blocking — one thread per
+    # RANK pinned at 100% of a core for as long as the serve is up, at idle, proportional to rank
+    # count and not to load (measured 2026-09-15: 2 cores, 164 min of CPU each, on an idle TP=2
+    # serve). It is NOT our scheduler: rank0 parks in `poll()` inside libzmq and rank1 in
+    # `pthread_cond_wait` inside `c10d::Work::wait`, both correctly blocked, and the expert-cache
+    # manager is on a 0.25 s `threading.Event.wait`.
+    #
+    # `HSA_ENABLE_INTERRUPT=1` asks the HSA runtime for interrupt-driven signal completion instead
+    # of polling. EMPTY = the ROCm default (poll), so this entry changes nothing until it is set.
+    # It is a TRADE, not a free win: interrupt delivery costs a few microseconds per completion
+    # against a spin that is already hot. Noise on a ~50 ms/token decode loop; measure before
+    # assuming it is free on anything latency-sensitive.
+    #
+    # Plumbed here because compose forwards ONLY declared names: exporting it on the host without
+    # this line is silently dropped, and the serve looks unchanged for the wrong reason.
+    HSA_ENABLE_INTERRUPT: "${HSA_ENABLE_INTERRUPT:-}"
+    # MEASURED 2026-09-15: HSA_ENABLE_INTERRUPT=1 changed NOTHING — idle 201.4% -> 201.8% of a core
+    # and TPOT 24.30 -> 24.30 ms on the 27B. The var reaches the rank (verified in /proc/<pid>/environ)
+    # and the symbol exists in libhsa-runtime64.so, so it is accepted and ignored on this build.
+    # Kept plumbed because it costs nothing and is the first thing anyone will reach for.
+    #
+    # HSA_ENABLE_MWAITX asks the runtime to park on AMD's MONITOR/MWAITX (a low-power wait) instead
+    # of a bare spin. ALSO MEASURED, ALSO A DUD: idle 201.4% -> 210.4% (i.e. very slightly WORSE, and
+    # inside run-to-run spread), TPOT 24.30 -> 24.38 ms. Both knobs are plumbed and both are inert on
+    # ROCm 7.2.1; they are kept ONLY so the next person finds this note instead of re-running the
+    # experiment. DO NOT set either expecting the idle core back.
+    HSA_ENABLE_MWAITX: "${HSA_ENABLE_MWAITX:-}"
+    # THE ACTUAL FIX for the idle spin, and it is not an HSA knob at all.
+    #
+    # torch ships its OWN `libhsa-runtime64.so` in `torch/lib/` (4,230,361 B) and loads it in
+    # preference to the system ROCm one (`/opt/rocm/lib/libhsa-runtime64.so.1.18.70201`,
+    # 4,248,144 B, different build). THE BUNDLED BUILD SPINS: its
+    # `rocr::core::Runtime::AsyncEventsLoop` busy-polls in USER SPACE — 500/500 samples of
+    # /proc/<tid>/syscall show "running", i.e. never in a syscall — from the first device
+    # allocation onward, forever, one thread per rank. The system build does not, and starts one
+    # fewer thread. That is why every HSA_* knob above measured inert: they were being read by a
+    # build that polls regardless.
+    #
+    # MEASURED 2026-09-15 with a 10 s reproducer (torch.cuda.init + one tensor, then sleep):
+    #   torch-bundled HSA   99.7% CPU, 19 threads        system HSA   0.1% CPU, 18 threads
+    # and after real GPU work, with identical numerics and speed:
+    #   matmul rel-err 1.985e-06 both;  2048^3 fp32  1.092 ms vs 1.087 ms;  idle 99.7% -> 0.0%
+    #
+    # Empty by default: this preloads a DIFFERENT HSA runtime under torch, which is a real ABI
+    # surface, so it is opt-in until it has run a while. Set to
+    # /opt/rocm/lib/libhsa-runtime64.so.1 to enable.
+    LD_PRELOAD: "${LD_PRELOAD:-}"
     TORCH_USE_HIP_DSA: "${TORCH_USE_HIP_DSA:-}"
     # TiDAR logit-mixing "Trust-Diffusion" verify (fused-TiDAR path only): verify each draft position
     # against argmax(beta*p_ar + (1-beta)*R_i[0]). 1.0 (default) = the lossless-vs-AR-greedy path
