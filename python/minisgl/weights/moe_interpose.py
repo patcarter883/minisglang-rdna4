@@ -624,6 +624,11 @@ class MoEWeightSeam:
         cache = _EXPERT_CACHE
         if cache is not None:
             cache.install(-1, _set_expert_slot_map)
+        # Its own ledger line, beside `weight_offload.moe_resolve[host]`. The two now mean different
+        # things — resolve[host] says a forward went through the seam, this says a launch was served
+        # from the device slab instead of the arena — and an A/B that cannot tell them apart cannot
+        # tell a staged prefill from an unstaged one. Fires once, ever, like every other arm.
+        engaged("weight_offload.moe_stage[prefill]")
         return out
 
     def assert_identity(self, w13: Any, w2: Any) -> tuple[Any, Any]:
