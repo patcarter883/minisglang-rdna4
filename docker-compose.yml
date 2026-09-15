@@ -76,6 +76,13 @@ x-lean-common: &lean-common
     # SAME binary, _DEBUG makes the launcher print the count it chose (the A/B's provenance).
     MINISGL_MOE_G2_SPLIT_K: "${MINISGL_MOE_G2_SPLIT_K:-}"
     MINISGL_MOE_G2_SPLIT_DEBUG: "${MINISGL_MOE_G2_SPLIT_DEBUG:-}"
+    # MINISGL_HOSTPROF=<N>: partition the scheduler loop by stage (recv / sched / fwd_launch /
+    # gpu_wait) and log it every N decode steps. Diagnostic only, inert unset, never alters tokens.
+    # Plumbed 2026-09-15 for the prefill investigation: prefill measured 4.0 tok/s (558.6 s for 2243
+    # tokens) and the log shows a single unbroken ~9 min gap, so the first question is whether that
+    # time is in `gpu_wait` (the GPU really is busy and the next step is a kernel profile) or on the
+    # host. Nothing in this repo could answer that without a code change until now.
+    MINISGL_HOSTPROF: "${MINISGL_HOSTPROF:-}"
     # Tool-call runaway defenses (api_server; empty-safe via env_int, defaults live in code):
     # _CONT_LIMIT rejects a continuation replaying an unclosed block past N chars (default 49152);
     # _RUNAWAY_LIMIT force-finishes an in-flight generation once a single unclosed block passes N
