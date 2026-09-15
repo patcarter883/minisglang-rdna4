@@ -61,6 +61,22 @@ def cast_checkpoint_tensor(key: str, v: torch.Tensor, model_dtype: torch.dtype) 
         # dtype) so a bf16-scale head and an fp16-scale backbone both load against the same float16
         # buffer.
         return v if v.dtype == torch.float32 else v.to(torch.float16)
+    # NVFP4 `.weight_global` is fp32 BY CONTRACT, not by precision preference, so it is exempt from
+    # the model-dtype rule exactly as `.weight_scale` is. `NvFp4LinearMethod.process_weights_after_load`
+    # hands it to the kernel as `weight_global.view(torch.int32)` — a zero-copy BITCAST into the op's
+    # `w_zeros` slot, which the kernel `reinterpret_cast`s back to float. A bitcast is a
+    # BYTES-per-element contract: at bf16 the same 8192-element vector views as 4096 int32 and the
+    # kernel rejects it with "NVFP4 global must have one entry per output channel (N=8192); got 4096".
+    #
+    # This bit the FUSED GDN projections specifically and nothing else, which is the part worth
+    # remembering. A `BaseOP` parameter is declared fp32 and `layers/base.py::_coerce_dtype` casts the
+    # incoming tensor back to the declared dtype, so `gate_up_proj.weight_global` survived a bf16 cast
+    # unharmed. `GDNLinearAttn` loads its wrapped module with `assign=True` (see this docstring
+    # above), which takes the INCOMING dtype and has no declared-dtype check to restore it — so only
+    # `in_proj_qkvz` / `in_proj_ba` / `out_proj` carried the damage. Same trap the A_log/dt_bias rule
+    # below exists for, one tensor kind later.
+    if key.endswith(".weight_global"):
+        return v.to(torch.float32)
     # GDN gating params stay fp32. The kernels and the model's nn.Parameter require fp32 whatever the
     # checkpoint stores, so the upcast is unconditional: A_log ships fp32 in the Qwen3.5 line and
     # BF16 in Qwen3.8-Flash-Next, dt_bias ships bf16 in both.
@@ -344,7 +360,14 @@ _QWEN35_CONCAT = {
 # dim (0) — output channels are independent under group-wise W4A16, and the zero_point is int4-packed
 # 8-per-int32 ALONG N (each part's N is a multiple of 8: 10240 & 6144), so the packed-row concat is
 # exact. Same ordered [qkv, z] members as the bf16 _QKVZ; in_proj_a/b stay bf16 (.weight, above).
-for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
+# `weight_global` joins this list for NVFP4 (FORMAT_MATRIX.md G14). It is safe to concat on dim 0
+# for the SAME reason weight_scale is, and the reason is NOT obvious from the checkpoint: the
+# checkpoint ships a per-TENSOR scalar (`weight_global_scale`, shape [1]) and a DIFFERENT one for
+# each of in_proj_qkv / in_proj_z. `nvfp4.split_nvfp4_scale` has already expanded each to its own
+# per-OUTPUT-CHANNEL (N_part,) vector by the time this map is consulted — that expansion exists
+# precisely so the fusion needs no special case. Concatenating the raw [1] scalars would give [2]
+# instead of [16384] and silently mis-scale, so do not "simplify" this to the checkpoint field name.
+for _fld in ("weight_packed", "weight_scale", "weight_zero_point", "weight_global"):
     _qz = (f".linear_attn.in_proj_qkv.{_fld}", f".linear_attn.in_proj_z.{_fld}")
     _merged = f".linear_attn.in_proj_qkvz.{_fld}"
     _QWEN35_CONCAT[_qz[0]] = (_merged, _qz, 0)
@@ -354,7 +377,7 @@ for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
 # in_proj_b + in_proj_a — so their weight_packed / weight_scale concat into in_proj_ba.<field> along
 # the OUTPUT dim (0), same [b, a] order as the bf16 _BA members. (No weight_zero_point: MXFP4 is
 # symmetric; that key simply never appears, so its map entry is inert.)
-for _fld in ("weight_packed", "weight_scale", "weight_zero_point"):
+for _fld in ("weight_packed", "weight_scale", "weight_zero_point", "weight_global"):
     _ba = (f".linear_attn.in_proj_b.{_fld}", f".linear_attn.in_proj_a.{_fld}")
     _merged = f".linear_attn.in_proj_ba.{_fld}"
     _QWEN35_CONCAT[_ba[0]] = (_merged, _ba, 0)
@@ -488,24 +511,36 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     # pre-sharded parts. (n==1 already returned; nothing runs at TP=1.)
     if config.quant is not None:
         pf = 32 // config.quant.bits
+        # `.weight_global` is the NVFP4 per-OUTPUT-CHANNEL (N,) global and takes the SAME axis as
+        # its own weight_scale on every column-parallel part: an (N,) vector over [q|k|v] head
+        # blocks splits exactly as the block scale does. (Row-parallel out_proj is the exception and
+        # is matched separately below.)
         if name.endswith(
-            (".linear_attn.in_proj_qkv.weight_packed", ".linear_attn.in_proj_qkv.weight_scale")
+            (".linear_attn.in_proj_qkv.weight_packed", ".linear_attn.in_proj_qkv.weight_scale",
+             ".linear_attn.in_proj_qkv.weight_global")
         ):
             return _shard_blocks_dim0(t, [key_dim, key_dim, value_dim], r, n)
         if name.endswith(".linear_attn.in_proj_qkv.weight_zero_point"):
             return _shard_blocks_dim0(t, [key_dim // pf, key_dim // pf, value_dim // pf], r, n)
         if name.endswith(
             (".linear_attn.in_proj_z.weight_packed", ".linear_attn.in_proj_z.weight_scale",
-             ".linear_attn.in_proj_z.weight_zero_point")
+             ".linear_attn.in_proj_z.weight_zero_point", ".linear_attn.in_proj_z.weight_global")
         ):
             return t.chunk(n, dim=0)[r].clone()  # z: col-parallel (output value_dim)
         if name.endswith(
             (".linear_attn.in_proj_b.weight_packed", ".linear_attn.in_proj_b.weight_scale",
              ".linear_attn.in_proj_b.weight_zero_point",
              ".linear_attn.in_proj_a.weight_packed", ".linear_attn.in_proj_a.weight_scale",
-             ".linear_attn.in_proj_a.weight_zero_point")
+             ".linear_attn.in_proj_a.weight_zero_point",
+             ".linear_attn.in_proj_b.weight_global", ".linear_attn.in_proj_a.weight_global")
         ):
             return t.chunk(n, dim=0)[r].clone()  # b/a: col-parallel (output per v-head), MXFP4 35B
+        # ROW-PARALLEL EXCEPTION, matched FIRST for the same reason `.down_proj.weight_global` is:
+        # out_proj splits its INPUT, so its output N is full width on every rank and the (N,) global
+        # REPLICATES. Falling through to the dim-1 chunk below would try to chunk a 1-D tensor on
+        # dim 1 and raise; falling all the way through to "replicate" would be right by accident.
+        if name.endswith(".linear_attn.out_proj.weight_global"):
+            return t
         if name.endswith(
             (".linear_attn.out_proj.weight_packed", ".linear_attn.out_proj.weight_scale",
              ".linear_attn.out_proj.weight_zero_point")
@@ -585,14 +620,27 @@ def _shard_qwen3_5(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.
     # weight_zero_point (asymmetric CT, [N//pf, G]) follows the SAME axis: for a column-parallel
     # linear it is packed along the OUTPUT N, so it splits dim 0 with weight_packed/scale; for a
     # row-parallel linear the output N (packed dim 0) is replicated and the input group dim 1 splits.
+    # `.weight_global` (NVFP4 split arm, FORMAT_MATRIX.md G14) follows its own weight's axis on the
+    # COLUMN-parallel linears — an (N,) per-output-channel vector splits dim 0 exactly as the block
+    # scale does. The ROW-parallel pair is the exception and is matched FIRST, immediately below,
+    # exactly as the expert branch already does for `.down_proj.weight_global`.
     if name.endswith(
         (".q_proj.weight_packed", ".q_proj.weight_scale", ".q_proj.weight_zero_point",
+         ".q_proj.weight_global",
          ".k_proj.weight_packed", ".k_proj.weight_scale", ".k_proj.weight_zero_point",
+         ".k_proj.weight_global",
          ".v_proj.weight_packed", ".v_proj.weight_scale", ".v_proj.weight_zero_point",
+         ".v_proj.weight_global",
          ".gate_proj.weight_packed", ".gate_proj.weight_scale", ".gate_proj.weight_zero_point",
-         ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point")
+         ".gate_proj.weight_global",
+         ".up_proj.weight_packed", ".up_proj.weight_scale", ".up_proj.weight_zero_point",
+         ".up_proj.weight_global")
     ):
         return t.chunk(n, dim=0)[r].clone()
+    # ROW-PARALLEL: output N is full width on every rank, so the (N,) global REPLICATES. Matched
+    # BEFORE the dim-1 rule — a 1-D tensor chunked on dim 1 raises.
+    if name.endswith((".o_proj.weight_global", ".down_proj.weight_global")):
+        return t
     if name.endswith(
         (".o_proj.weight_packed", ".o_proj.weight_scale", ".o_proj.weight_zero_point",
          ".down_proj.weight_packed", ".down_proj.weight_scale", ".down_proj.weight_zero_point")

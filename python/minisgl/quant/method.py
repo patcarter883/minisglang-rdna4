@@ -663,7 +663,14 @@ class NvFp4LinearMethod:
             f"NVFP4 needs K%2==0,K%{g}==0,N%8==0; got N={N},K={K}"
         )
         layer.weight_packed = torch.empty((N, K // 2), dtype=torch.uint8)
-        layer.weight_scale = torch.empty((N, K // g), dtype=torch.uint8)   # e4m3 block, BYTE-verbatim
+        # float8_e4m3fn, NOT uint8 — the SAME dtype `_GroupedNVFP4Experts` declares (layers/moe.py:384)
+        # and the same one `nvfp4.split_nvfp4_scale` emits (it bitcasts a uint8 checkpoint tensor to
+        # e4m3 so every consumer sees one encoding). Both are 1 byte and byte-verbatim, so this is an
+        # ENCODING declaration, not a precision one — and `layers/base.py::_coerce_dtype` hard-fails a
+        # quantized-dtype mismatch rather than casting, precisely so a disagreement here is loud.
+        # Declaring uint8 shipped briefly in 84b1ede and failed at load with
+        #   "weight dtype mismatch ... model torch.uint8 vs checkpoint torch.float8_e4m3fn".
+        layer.weight_scale = torch.empty((N, K // g), dtype=torch.float8_e4m3fn)  # e4m3 block, byte-verbatim
         layer.weight_global = torch.empty((N,), dtype=torch.float32)       # per-OUTPUT-CHANNEL
 
     def process_weights_after_load(self, layer: "BaseOP") -> None:
