@@ -294,9 +294,16 @@ def enable_custom_ar_ep(
 
 @dataclass
 class CustomARDistributedImpl(DistributedImpl):
-    """Custom 2-GPU one-shot all-reduce (custom_ar) over PCIe P2P — a low-latency, GRAPH-CAPTURABLE
-    drop-in for RCCL on the small TP=2 decode tensors (~1.3x faster; see custom_ar). all_gather is not
-    provided here, so it stays on the previous plugin (RCCL); only all_reduce is overridden.
+    """Custom 2-GPU one-shot collectives (custom_ar) over PCIe P2P — low-latency, GRAPH-CAPTURABLE
+    drop-ins for RCCL on the small TP=2 decode tensors (~1.3x faster; see custom_ar). BOTH all_reduce
+    and all_gather are overridden.
+
+    The all_gather used to be missing here: `144353c` added the one-shot P2P gather kernel but wired it
+    into the EP dispatch gather ONLY (`EPCommunicator.all_gather`), leaving this TP sibling on the line
+    "custom_ar has no all_gather; defer to RCCL". That left `LMHead.forward` — which all_gathers the
+    vocab-sharded logits on EVERY forward, decode included — as the one and only RCCL collective in a
+    TP=2 serve, since custom_ar had already taken every all_reduce. Same kernel, same IPC plumbing, one
+    sibling wired and the other not.
 
     DOUBLE-BUFFERED: back-to-back all_reduces (62+/forward) would race on a single shared buffer (the
     peer may still be reading slot K's data when call K+1 overwrites it). Two slots + a per-call counter
@@ -311,6 +318,16 @@ class CustomARDistributedImpl(DistributedImpl):
     slot_bytes: int
     _ops: "object"
     _ctr: int = 0
+    # Dedicated double-buffered IPC publish buffer for the one-shot all_GATHER. It cannot share the
+    # all_reduce slots above: the gather kernel publishes THIS rank's shard for the peer to read,
+    # while those slots carry reduce operands, and a forward interleaves the two. None -> the gather
+    # falls back to RCCL (image ships a custom_ar without `all_gather_p2p`, or no P2P).
+    ag_data: "torch.Tensor | None" = None      # [2, ag_slot_bytes] uint8 fine-grained IPC
+    ag_flags: "torch.Tensor | None" = None     # int32 [>=BLOCKS]
+    ag_peer_data_ptr: "list[int] | None" = None
+    ag_peer_flags_ptr: int = 0
+    ag_slot_bytes: int = 0
+    _ag_ctr: int = 0
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         from .info import get_tp_info
@@ -329,12 +346,44 @@ class CustomARDistributedImpl(DistributedImpl):
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        # custom_ar has no all_gather; defer to RCCL (the historical plugin's behaviour).
+        """Concatenate ``x`` across the 2 TP ranks along dim 0, rank-major — byte-identical to
+        ``dist.all_gather_into_tensor``, which is what the callers (LMHead) index into.
+
+        Mirrors `EPCommunicator.all_gather`. The gather is PURE data movement (out[i] = x[i], no
+        arithmetic), so any contiguous tensor is bit-cast to the kernel's f32/bf16 wire type purely by
+        its BYTE COUNT and the bit pattern survives the reinterpret + copy unchanged. Both TP ranks run
+        the same model in lockstep on the same batch, so shape/dtype/contiguity — and therefore the
+        branch taken here — are identical on both; a divergence would deadlock on the peer flag, which
+        is why every ineligibility test below is a property of the SHAPE, never of local state.
+        Ineligible (non-contiguous, odd byte count, or larger than the slot — e.g. a full-prefill
+        logprob gather) falls back to RCCL on both ranks together."""
         tp_size = self._tp_size_or_1()
         if tp_size == 1:
             return x
         shape = list(x.shape)
         shape[0] = shape[0] * tp_size
+        if self.ag_data is not None:
+            nbytes = x.numel() * x.element_size()
+            if nbytes % 4 == 0:
+                wire, wn = torch.float32, nbytes // 4
+            elif nbytes % 2 == 0:
+                wire, wn = torch.bfloat16, nbytes // 2
+            else:
+                wire, wn = None, 0
+            if wire is not None and x.is_contiguous() and wn > 0 and nbytes <= self.ag_slot_bytes:
+                from .info import get_tp_info
+                slot = self._ag_ctr & 1
+                # Advances on eager calls and at graph CAPTURE only, so a captured graph bakes a fixed
+                # slot per call site and replays consistently on both ranks — same discipline as _ctr.
+                self._ag_ctr += 1
+                xv = x.reshape(-1).view(torch.uint8).view(wire)   # bit-reinterpret to the wire type
+                out_w = torch.empty(tp_size * wn, dtype=wire, device=x.device)
+                publish = self.ag_data[slot].view(wire)[:wn]      # our shard, published for the peer
+                self._ops.all_gather_p2p(
+                    xv, out_w, publish, self.ag_peer_data_ptr[slot],
+                    self.ag_flags, self.ag_peer_flags_ptr, get_tp_info().rank,
+                )
+                return out_w.view(torch.uint8).view(x.dtype).view(shape)
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x.contiguous())
         return out
@@ -346,11 +395,17 @@ class CustomARDistributedImpl(DistributedImpl):
 
 
 def enable_custom_ar_distributed(
-    tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int
+    tp_info: DistributedInfo, tp_cpu_group: torch.distributed.ProcessGroup, max_bytes: int,
+    ag_max_bytes: int = 0,
 ) -> None:
-    """Install the custom_ar one-shot all-reduce as the active all_reduce plugin, if it is usable:
+    """Install the custom_ar one-shot all-reduce AND all-gather as the active plugin, if usable:
     TP==2 and the two GPUs have working P2P. Falls back silently (keeps RCCL) otherwise. Called by the
-    engine AFTER the TP process group is up."""
+    engine AFTER the TP process group is up.
+
+    ``ag_max_bytes`` sizes one rank's published shard for the all_gather (the largest the engine can
+    issue on the fast path; anything bigger self-falls-back to RCCL). 0, or an image whose custom_ar
+    predates `all_gather_p2p`, leaves the gather on RCCL — the all_reduce is unaffected either way.
+    There is deliberately NO env gate: the fallbacks below are all capability tests, not preferences."""
     if tp_info.size != 2:
         return
     try:
@@ -379,6 +434,19 @@ def enable_custom_ar_distributed(
         peer_data_base = _exchange(self_data)
         peer_flags_ptr = _exchange(self_flags)
         peer_data_ptr = [peer_data_base, peer_data_base + slot_bytes]
+
+        # The all_gather's OWN double-buffered publish buffer (see the field comments). Allocated only
+        # when the kernel exists and a size was asked for; every other case leaves the gather on RCCL.
+        ag_data = ag_flags = ag_peer_data_ptr = None
+        ag_peer_flags_ptr = 0
+        ag_slot_bytes = 0
+        if ag_max_bytes > 0 and hasattr(car, "all_gather_p2p"):
+            ag_slot_bytes = ((ag_max_bytes + 255) // 256) * 256
+            ag_data = car.alloc_shared(2 * ag_slot_bytes, 0).view(2, ag_slot_bytes)
+            ag_flags = car.alloc_shared(BLOCKS_SLACK * 4, 3)
+            ag_peer_base = _exchange(ag_data)
+            ag_peer_flags_ptr = _exchange(ag_flags)
+            ag_peer_data_ptr = [ag_peer_base, ag_peer_base + ag_slot_bytes]
         dist.barrier(group=tp_cpu_group)
     except Exception as e:  # noqa: BLE001
         from minisgl.utils import init_logger
@@ -389,6 +457,8 @@ def enable_custom_ar_distributed(
         CustomARDistributedImpl(
             self_data=self_data, self_flags=self_flags, peer_data_ptr=peer_data_ptr,
             peer_flags_ptr=peer_flags_ptr, slot_bytes=slot_bytes, _ops=car,
+            ag_data=ag_data, ag_flags=ag_flags, ag_peer_data_ptr=ag_peer_data_ptr,
+            ag_peer_flags_ptr=ag_peer_flags_ptr, ag_slot_bytes=ag_slot_bytes,
         )
     )
     from minisgl.utils import init_logger
@@ -396,9 +466,13 @@ def enable_custom_ar_distributed(
     # (anything larger self-falls-back to RCCL) — and therefore what an A/B on the cap is actually
     # varying. "ENABLED" alone cannot distinguish a serve that uses it for every collective from one
     # that uses it for none of the prefill ones.
+    _ag = (f"+ all-gather (slot {ag_slot_bytes / (1 << 20):.1f} MiB -> up to {ag_slot_bytes} B)"
+           if ag_data is not None else
+           "| all-gather on RCCL (" + ("no ag_max_bytes" if ag_max_bytes <= 0
+                                       else "image custom_ar predates all_gather_p2p") + ")")
     init_logger(__name__).info_rank0(
         f"custom_ar one-shot all-reduce ENABLED (graph-safe, ~1.15-1.2x vs RCCL at every size; "
-        f"slot {slot_bytes / (1 << 20):.1f} MiB -> covers up to {slot_bytes} B/collective)"
+        f"slot {slot_bytes / (1 << 20):.1f} MiB -> covers up to {slot_bytes} B/collective) {_ag}"
     )
 
 

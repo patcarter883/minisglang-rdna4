@@ -418,6 +418,14 @@ class Engine:
         # ======================= KV cache initialization ========================
         with _bt.phase("kv_sizing"):
             self.num_pages = self._determine_num_pages(init_free_memory, config)
+        # The slab, now that the pool has been sized around it. Allocating BEFORE the pool would let
+        # a sizing bug hide (the pool would simply shrink to fit); allocating after means a mismatch
+        # between what was reserved and what is taken shows up as an OOM here, at boot, rather than
+        # on someone's first prefill. `_moe_prefill_stage_bytes` returns 0 when it declined.
+        if self._woff.enabled:
+            from minisgl.weights import prefill_stage
+            with _bt.phase("moe_prefill_stage_alloc"):
+                prefill_stage.install(getattr(self, "_moe_stage_reserved", 0), self.device)
         num_tokens = self.num_pages * config.page_size
         with _bt.phase("kv_pool_alloc"):
             self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
@@ -884,7 +892,18 @@ class Engine:
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize,
                 car_cap_mib * 1024 * 1024,
             )
-            enable_custom_ar_distributed(config.tp_info, tp_cpu_group, car_max_bytes)
+            # all_gather slot. The gather that matters is LMHead's: it gathers the vocab-SHARDED
+            # logits on every forward, so a row is ceil(vocab/tp) elements wide, and the row count is
+            # the scored-row count — max_running_req for plain decode, and (num_draft+1) rows per
+            # request for a spec VERIFY batch, which is the widest the decode path can issue. A full
+            # prefill logprob gather is orders of magnitude larger and deliberately NOT covered: it
+            # self-falls-back to RCCL rather than reserving hundreds of MB of fine-grained IPC.
+            # Bounded by the same MINISGL_CAR_MAX_MIB cap as the all_reduce slot, for the same reason.
+            _vocab_shard = -(-config.model_config.vocab_size // config.tp_info.size)
+            _rows = config.max_running_req * (1 + (config.spec_num_draft if config.spec_config else 0))
+            car_ag_bytes = min(_rows * _vocab_shard * self.dtype.itemsize, car_cap_mib * 1024 * 1024)
+            enable_custom_ar_distributed(
+                config.tp_info, tp_cpu_group, car_max_bytes, ag_max_bytes=car_ag_bytes)
         return tp_cpu_group
 
     def _init_dp_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -1353,6 +1372,55 @@ class Engine:
             )
         return total
 
+    def _moe_prefill_stage_bytes(self, budget_left: int) -> int:
+        """Bytes to reserve for the MoE prefill expert-staging slab (`weights/prefill_stage.py`).
+
+        Sized from the LIVE seams — the largest single host-resident MoE layer — because that is
+        exactly what one staged launch copies, and the slab is reused by every layer in turn.
+
+        RESERVED HERE, ALLOCATED LATER, which is the whole reason this is a method and not a
+        `torch.empty` at the use site. A device buffer this size taken out of the (1-memory_ratio)
+        slack after the pool is sized is how the 2026-09-15 21:01 boot died: 48 MiB unavailable on a
+        16 GiB card, both ranks, mid-prefill, with four requests in flight.
+
+        THE GUARD IS A POLICY AND IS STATED AS ONE. The slab competes directly with the KV pool, so
+        it is taken only while it leaves the majority of the remaining budget to KV; past that the
+        trade stops being obviously right and the serve keeps its pool and its slow prefill instead
+        of silently shrinking context to buy throughput. Both outcomes are logged.
+        """
+        # MEMOISED, and the allocation site reads this value back rather than recomputing. The
+        # guard below depends on `budget_left`, which the allocation site does not have; a second
+        # independent derivation there is exactly how a reserve/allocate pair drifts into
+        # allocating a slab the KV pool never paid for.
+        if (prev := getattr(self, "_moe_stage_reserved", None)) is not None:
+            return prev
+
+        def _decide() -> int:
+            if not self._woff.enabled:
+                return 0
+            from minisgl.weights import prefill_stage
+            try:
+                need = prefill_stage.per_layer_host_bytes(self.model)
+            except Exception as e:  # noqa: BLE001
+                logger.info_rank0(
+                    f"MoE prefill staging: not sized ({e!r}); prefill keeps the host read.")
+                return 0
+            if need <= 0:
+                return 0  # no host-resident MoE layer on this rank -> nothing to stage
+            if need * 2 > max(0, budget_left):
+                logger.info_rank0(
+                    f"MoE prefill staging DECLINED: the slab needs {mem_GB(need)} but only "
+                    f"{mem_GB(max(0, budget_left))} is left for KV, so taking it would leave the "
+                    f"pool smaller than the slab. Prefill keeps the in-place host read (measured "
+                    f"4.0 tok/s on the Qwen4-Exp arm); raise --memory-ratio or shrink the device "
+                    f"tier to afford it."
+                )
+                return 0
+            return need
+
+        self._moe_stage_reserved = _decide()
+        return self._moe_stage_reserved
+
     def _ple_runtime_bytes(self, config: EngineConfig) -> int:
         """Bytes the Qwen4-Exp PLE runtime will consume on the DEVICE. Zero for every other model.
 
@@ -1714,6 +1782,11 @@ class Engine:
             graph_memory = self._graph_capture_bytes(config, old_free_memory)
             snap_memory = self._rec_snapshot_store_bytes(config)
             ple_memory = self._ple_runtime_bytes(config)
+            stage_memory = self._moe_prefill_stage_bytes(
+                int(config.memory_ratio * old_free_memory)
+                - model_memory - state_memory - draft_memory - graph_memory - snap_memory
+                - ple_memory
+            )
             available_memory = (
                 int(config.memory_ratio * old_free_memory)
                 - model_memory
@@ -1722,6 +1795,7 @@ class Engine:
                 - graph_memory
                 - snap_memory
                 - ple_memory
+                - stage_memory
             )
             # Per-term breakdown. Without it the "Not enough memory for KV cache" assert below names
             # five candidate causes and gives no way to tell which one actually ate the budget —
@@ -1732,6 +1806,7 @@ class Engine:
                 f"model={mem_GB(model_memory)} state={mem_GB(state_memory)} "
                 f"draft={mem_GB(draft_memory)} graph={mem_GB(graph_memory)} "
                 f"snap={mem_GB(snap_memory)} ple={mem_GB(ple_memory)} "
+                f"stage={mem_GB(stage_memory)} "
                 f"-> available={mem_GB(available_memory)} "
                 f"@ {cache_per_page} B/page; "
                 # `model` is a free-memory DELTA, so it also carries allocator slack, fragmentation
