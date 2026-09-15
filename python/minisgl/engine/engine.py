@@ -1372,7 +1372,8 @@ class Engine:
             )
         return total
 
-    def _moe_prefill_stage_bytes(self, budget_left: int) -> int:
+    def _moe_prefill_stage_bytes(self, budget_left: int, cache_per_page: int,
+                                 page_size: int, max_running_req: int) -> int:
         """Bytes to reserve for the MoE prefill expert-staging slab (`weights/prefill_stage.py`).
 
         Sized from the LIVE seams — the largest single host-resident MoE layer — because that is
@@ -1384,10 +1385,25 @@ class Engine:
         16 GiB card, both ranks, mid-prefill, with four requests in flight.
 
         THE GUARD IS A POLICY AND IS STATED AS ONE. The slab competes directly with the KV pool, so
-        it is taken only while it leaves the majority of the remaining budget to KV; past that the
-        trade stops being obviously right and the serve keeps its pool and its slow prefill instead
-        of silently shrinking context to buy throughput. Both outcomes are logged.
+        this is a capacity-for-throughput trade and the floor has to be something operational rather
+        than a ratio. The first cut required the pool to stay larger than the slab, and on the
+        served arm that declined it by arithmetic — slab 0.665 GiB against a 1.05 GiB pool — which
+        would have made the whole mechanism inert with nothing in the log but one DECLINED line.
+
+        The floor used instead is FULL CONCURRENCY AT A USABLE CONTEXT: whatever remains must still
+        hold `max_running_req` requests of `_STAGE_MIN_CTX` tokens each. A pool that cannot do that
+        is genuinely too small to spend on a slab; one that can is better spent on it, because a
+        large context you cannot afford to PREFILL is worth less than a smaller one you can — at
+        4.0 tok/s a 2k prompt costs nine minutes, so the context ceiling was never the binding
+        constraint on this arm.
+
+        Deliberately NOT keyed on `max_seq_len`: the engine derives that from the pool it is sizing
+        here (`min(checkpoint, num_pages*page_size)`), so a floor expressed in it is circular.
+
+        Both outcomes print the token counts on either side of the trade, because "the pool shrank"
+        is the one consequence an operator must never have to infer from a byte figure.
         """
+        _STAGE_MIN_CTX = 4096  # tokens per concurrent request the pool must still afford
         # MEMOISED, and the allocation site reads this value back rather than recomputing. The
         # guard below depends on `budget_left`, which the allocation site does not have; a second
         # independent derivation there is exactly how a reserve/allocate pair drifts into
@@ -1407,15 +1423,26 @@ class Engine:
                 return 0
             if need <= 0:
                 return 0  # no host-resident MoE layer on this rank -> nothing to stage
-            if need * 2 > max(0, budget_left):
+            def _tokens(nbytes: int) -> int:
+                return max(0, nbytes) // max(1, cache_per_page) * max(1, page_size)
+
+            before, after = _tokens(budget_left), _tokens(budget_left - need)
+            floor = max_running_req * _STAGE_MIN_CTX
+            if after < floor:
                 logger.info_rank0(
-                    f"MoE prefill staging DECLINED: the slab needs {mem_GB(need)} but only "
-                    f"{mem_GB(max(0, budget_left))} is left for KV, so taking it would leave the "
-                    f"pool smaller than the slab. Prefill keeps the in-place host read (measured "
-                    f"4.0 tok/s on the Qwen4-Exp arm); raise --memory-ratio or shrink the device "
-                    f"tier to afford it."
+                    f"MoE prefill staging DECLINED: the slab needs {mem_GB(need)} and would leave "
+                    f"the KV pool at {after:,} tokens, under the {floor:,} needed for "
+                    f"{max_running_req} concurrent requests of {_STAGE_MIN_CTX:,}. Prefill keeps "
+                    f"the in-place host read (measured 4.0 tok/s on the Qwen4-Exp arm); shrink the "
+                    f"device tier or raise --memory-ratio to afford it."
                 )
                 return 0
+            logger.info_rank0(
+                f"MoE prefill staging: taking {mem_GB(need)} for the slab; KV pool "
+                f"{before:,} -> {after:,} tokens ({max_running_req} x "
+                f"{after // max(1, max_running_req):,}). This is the capacity-for-prefill trade — "
+                f"the pool shrinks so a prefill chunk stops re-reading the host expert set."
+            )
             return need
 
         self._moe_stage_reserved = _decide()
@@ -1785,7 +1812,8 @@ class Engine:
             stage_memory = self._moe_prefill_stage_bytes(
                 int(config.memory_ratio * old_free_memory)
                 - model_memory - state_memory - draft_memory - graph_memory - snap_memory
-                - ple_memory
+                - ple_memory,
+                cache_per_page, config.page_size, config.max_running_req,
             )
             available_memory = (
                 int(config.memory_ratio * old_free_memory)
