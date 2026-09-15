@@ -227,6 +227,11 @@ x-lean-common: &lean-common
     # overhead could only be used from the in-process harness — which is the path that does NOT
     # have the overhead. Plumbed 2026-09-07 while chasing 131 ms/token vs the harness's 60.5.
     MINISGL_HOSTPROF: "${MINISGL_HOSTPROF:-}"
+    # MoE prefill expert staging (weights/prefill_stage.py). DEFAULT OFF after being measured:
+    # it fires correctly but buys nothing on this box (prefill is fwd_launch=83% / gpu_wait=1%,
+    # so it is not link-bound), while the slab costs 0.67 GiB of KV pool. Set to 1 only on a
+    # serve whose prefill is actually bound by host-resident expert reads.
+    MINISGL_MOE_PREFILL_STAGE: "${MINISGL_MOE_PREFILL_STAGE:-}"
     MINISGL_PREFILL_MEM_PROBE: "${MINISGL_PREFILL_MEM_PROBE:-}"
     # Prefill activation guard (scheduler.py): affordable = (devfree - SAFETY) / KIB_PER_TOKEN.
     # The default 64 KiB/token was MEASURED ON Qwen3.6-35B (58-65 KiB/token) and is MODEL-SPECIFIC —

@@ -1414,6 +1414,22 @@ class Engine:
         def _decide() -> int:
             if not self._woff.enabled:
                 return 0
+            # DEFAULT OFF, and the reason is a measurement, not caution. Wired, fired and measured
+            # end-to-end on the served Qwen4-Exp arm 2026-09-15:
+            #   staging ON : 1820 prompt tokens / 511.2 s = 3.56 tok/s, moe_stage[prefill] engaged
+            #   staging OFF: 2243 prompt tokens / 558.6 s = 4.02 tok/s
+            # i.e. no improvement, while the slab costs 0.67 GiB and takes the KV pool from 207,456
+            # to 91,184 tokens. (The two runs used different prompts, so 0.89x is NOT a controlled
+            # A/B and this does not claim staging is slower -- only that the benefit is
+            # unmeasurable while the capacity cost is certain.)
+            #
+            # WHY it does nothing, confirmed by the same boot's hostprof: prefill is
+            # fwd_launch=83% / gpu_wait=1%, so the forward is not waiting on the GPU or the PCIe
+            # link at all. Expert reads were ~0.7% of prefill by P1's own measured bandwidth
+            # (28.93 GB/s card 0), and removing 0.7% is not observable. The mechanism is correct and
+            # kept for a serve whose prefill is actually link-bound; this one is not.
+            if os.environ.get("MINISGL_MOE_PREFILL_STAGE", "0") == "0":
+                return 0
             from minisgl.weights import prefill_stage
             try:
                 need = prefill_stage.per_layer_host_bytes(self.model)
