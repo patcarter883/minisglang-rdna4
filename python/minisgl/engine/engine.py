@@ -1428,7 +1428,12 @@ class Engine:
             # link at all. Expert reads were ~0.7% of prefill by P1's own measured bandwidth
             # (28.93 GB/s card 0), and removing 0.7% is not observable. The mechanism is correct and
             # kept for a serve whose prefill is actually link-bound; this one is not.
-            if os.environ.get("MINISGL_MOE_PREFILL_STAGE", "0") == "0":
+            # `or "0"` after `.strip()`, NOT a get() default: compose passes every knob as
+            # "${VAR:-}", so the variable IS SET to the empty string when the operator did not set
+            # it, and `get(name, "0")` returns "" rather than the default. This exact trap is
+            # already recorded in this repo; the first cut of this line fell into it and shipped a
+            # boot that took the 0.67 GiB slab while claiming the feature was off.
+            if (os.environ.get("MINISGL_MOE_PREFILL_STAGE", "").strip() or "0") == "0":
                 return 0
             from minisgl.weights import prefill_stage
             try:
