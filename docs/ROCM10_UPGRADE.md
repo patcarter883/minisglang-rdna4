@@ -47,6 +47,48 @@ zero and they are dominated by one templated body:
 `gdn_decode_kernel<double,float,128,128>` itself has ZERO scratch in both legs; its deltas are
 scheduling (waitcnt +22%, total +8%), not spill.
 
+## MEASURED: the serve A/B (2026-09-16, conc=6, Qwen3.6-35B-A3B-AWQ, TP=2)
+
+Two images, each serving kernels built by ITS OWN compiler, provenance asserted by comparing the
+loaded `.so` hashes across legs (they differ). 3 reps per leg.
+
+**The 20% regression is gone.**
+
+| metric | clang22 | ROCm 10.0 | ratio | 7.14 was | verdict |
+|---|---|---|---|---|---|
+| throughput bs=1 | 94.3 | 95.0 | 1.007 | — | inside noise |
+| throughput bs=2 | 145.3 | 142.0 | **0.977** | 0.773 | OUTSIDE noise |
+| throughput bs=6 | 334.1 | 328.4 | **0.983** | 0.804 | OUTSIDE noise |
+| decode @ctx17711 | 78.3 | 80.2 | 1.024 | 0.886 | inside noise |
+| TPOT ms/tok | 10.58 | 10.50 | 1.008 | — | — |
+| prefill @3375 (cold) | 3463 | 3654 | **1.055** | — | — |
+| prefill @10533 (cold) | 5376 | 5625 | **1.046** | — | — |
+| prefill @21671 (cold) | 5423 | 5673 | **1.046** | 0.873 | — |
+
+Run-to-run spread on the throughput rows is ~1.0-1.5%, so bs=2/bs=6 at -2.3%/-1.7% are small but
+REAL; bs=1 and deep decode are genuinely neutral (the ctx17711 row's own spread is 8.7%).
+
+**Net: prefill ~+5%, deep decode neutral, concurrent throughput ~-2%.** A wash-to-slightly-positive
+trade, against 7.14's uniform 11-23% loss.
+
+### The remaining -2% is the spill, and it is the fix target
+
+The ISA said VOPD packing +19.6% and scratch +50.0%. The serve says the VOPD gain shows up as the
+prefill and deep-decode wins, and the spill shows up as the concurrency loss — concurrency is where
+occupancy matters most. That points the fix at the same place the ISA did: `gdn_decode_conv_kernel`
+and the other 48 kernels that gained scratch from zero.
+
+### MEASUREMENT TRAP: prefill tok/s is only valid on the COLD rep
+
+`serve_perf.py` reuses its prompts across reps, so reps 2+ hit the radix prefix cache, TTFT
+collapses, and "prefill tok/s" reads as 250,000-450,000:
+
+    @21671 clang22 reps = [5423, 411434, 383613]
+    @21671 ROCm10  reps = [5673, 437851, 445321]
+
+A median over reps is meaningless for that metric. Use rep 1 only, or give every prompt a fresh
+nonce. Taking the median here would have reported prefill as 1.141x and 0.904x on adjacent rows.
+
 ## What is NOT yet known
 
 * **Net throughput.** VOPD up is good, spill up is bad; which wins is not derivable from the ISA.
