@@ -505,11 +505,24 @@ class QwenGatedDeltaNet(nn.Module):
     # recurrent kernel, which measures 528 B/lane of scratch across all 72 instantiations
     # (-Rpass-analysis=kernel-resource-usage, identical on clang 22 and 23) where prefill pays none.
     #
-    # DO NOT conclude from this that spec is slow "because verify has no WMMA path". The 5-6.7x was
-    # measured at T=256..16384; a verify window is num_draft+1 (~5) tokens per sequence, where matrix
-    # cores have little to work with and the recurrent kernel is plausibly the right choice. The
-    # recorded root cause of spec being a 1.57x LOSS on the offload arm is different and larger --
-    # cost scaling with QUERY TOKENS through MoE expert streaming.
+    # HOW BIG IS THE VERIFY WINDOW? This decides whether a WMMA verify could ever pay, and the
+    # answer depends entirely on the drafter -- an earlier version of this note got it wrong by
+    # quoting the N-GRAM default (spec_num_draft=4, so ~5 tokens, where matrix cores have nothing to
+    # work with). DFlash is completely different:
+    #     GDN_WC (gdn_kernels.hip)                        = 16   <- WMMA chunk, one 16x16 tile dim
+    #     z-lab Qwen3.6-35B-A3B-DFlash  block_size        = 16
+    #     z-lab Qwen3.6-27B-DFlash / Qwen3.5-4B-DFlash    = 16
+    #     poolside Laguna-XS-2.1, Muse-Glimmer-30B        = 16
+    #     ZAYA CCA ns15                                   = 16 (num_draft+1)
+    #     RadixArk Qwen3.8-27B-DSpark                     =  7
+    # A DFlash verify window is num_draft+1 = 16 tokens = EXACTLY ONE GDN_WC CHUNK. So for every
+    # block-16 drafter the "not enough volume for matrix cores" objection does not apply at all --
+    # the window is precisely one unit of the fast kernel's work. The only real blocker is the
+    # per-token state capture above.
+    #
+    # Still DO NOT conclude that this is why spec is slow. The recorded root cause of the 1.57x LOSS
+    # on the offload arm is different and larger -- cost scaling with QUERY TOKENS through MoE expert
+    # streaming -- and that was measured while this asymmetry was also present.
     #
     # WHAT IS ACTUALLY UNKNOWN: nobody has attributed spec's cost between GDN-verify and MoE
     # streaming. If spec decode is revisited, measure that split FIRST -- it decides whether a
