@@ -498,6 +498,22 @@ class QwenGatedDeltaNet(nn.Module):
         return self._output_projection(core, z, n)
 
     # ---- verify: varlen recurrent prefill that ALSO captures the per-token recurrent state ----
+    # WHY THERE IS NO WMMA VERIFY, and what it costs. Normal prefill dispatches gdn_prefill_wmma
+    # (matrix-core chunked, 5-6.7x faster than recurrent, ZERO scratch). Verify cannot: it needs the
+    # SSM state after EVERY token so the scheduler can install the state at the accepted prefix, and
+    # a chunked matrix-core formulation only yields the end-of-chunk state. So the spec path runs the
+    # recurrent kernel, which measures 528 B/lane of scratch across all 72 instantiations
+    # (-Rpass-analysis=kernel-resource-usage, identical on clang 22 and 23) where prefill pays none.
+    #
+    # DO NOT conclude from this that spec is slow "because verify has no WMMA path". The 5-6.7x was
+    # measured at T=256..16384; a verify window is num_draft+1 (~5) tokens per sequence, where matrix
+    # cores have little to work with and the recurrent kernel is plausibly the right choice. The
+    # recorded root cause of spec being a 1.57x LOSS on the offload arm is different and larger --
+    # cost scaling with QUERY TOKENS through MoE expert streaming.
+    #
+    # WHAT IS ACTUALLY UNKNOWN: nobody has attributed spec's cost between GDN-verify and MoE
+    # streaming. If spec decode is revisited, measure that split FIRST -- it decides whether a
+    # per-token-capturing WMMA verify would be worth writing at all.
     def forward_prefill_verify(
         self,
         hidden_states: torch.Tensor,  # (T, hidden)
