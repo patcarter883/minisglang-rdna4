@@ -14,6 +14,34 @@ from .host_arena import (
 )
 
 
+def resolve_ring_len(gdn) -> int:
+    """ReplaySSM ring length, honouring MINISGL_GDN_RING_LEN.
+
+    The packaged default is 8, which the kernel docstring is explicit about NOT being the throughput
+    optimum (that is 16) -- it is a deployment trade, because the ring is bought out of the KV pool
+    (L=16 cost 8.4%: 55,792 -> 51,104 tokens) and the DECODE win only shows at M=4.
+
+    That trade predates DFlash running at verify width 15. `use_replay` in gdn/layer.py needs
+    `max_qlen <= ring_len`, and width 15 is a 16-token window, so at L=8 every width-15 verify falls
+    to the MATERIALISING path (per-token state scratch + scatter) while at L>=16 it takes the ring's
+    O(1) rollback. On math/code workloads width 15 is 96% of spec steps, so this is no longer a
+    decode-only question.
+
+    ONE resolver for both call sites on purpose: `EngineConfig._replay_ring_bytes` sizes the arena
+    from this and `GDNStateCache` allocates from it. If they disagree the engine reserves for one
+    ring and builds another -- silently over- or under-reserving the KV pool, with no error.
+    """
+    import os
+    raw = (os.environ.get("MINISGL_GDN_RING_LEN", "") or "").strip()
+    if not raw:
+        return int(gdn.REPLAY_RING_LEN)
+    try:
+        v = int(raw)
+    except ValueError:
+        return int(gdn.REPLAY_RING_LEN)
+    return v if v > 0 else int(gdn.REPLAY_RING_LEN)
+
+
 class GDNStateCache:
     """Per-sequence recurrent state for GDN (Gated Delta Net) layers.
 
@@ -99,7 +127,7 @@ class GDNStateCache:
             try:
                 import gdn_hip as _gdn
                 if hasattr(_gdn, "gdn_decode_conv_gated_replay"):
-                    self.ring_len = int(_gdn.REPLAY_RING_LEN)
+                    self.ring_len = resolve_ring_len(_gdn)
                     self._ring = [
                         _gdn.make_replay_ring(num_slots, num_v_heads, head_v_dim, head_k_dim,
                                               self.ring_len, dtype=self._ssm_dtype, device=device)

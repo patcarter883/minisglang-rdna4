@@ -71,9 +71,16 @@ def _replay_verify_available(qmax: int) -> bool:
     try:
         import gdn_hip as gdn
 
+        from minisgl.kvcache.gdn_state import resolve_ring_len
+
+        # THE SAME RESOLVER THE CACHE ALLOCATES FROM. Reading gdn.REPLAY_RING_LEN directly here was
+        # safe only while nothing could change the ring length; MINISGL_GDN_RING_LEN can, and a
+        # capturer that asks against 8 while the cache built 16 reproduces the exact corruption the
+        # docstring above describes -- capturer says "materialising" and allocates `_ssm`, layer
+        # takes the ring and never writes it, scheduler installs the zeros as SSM state.
         return (hasattr(gdn, "gdn_verify_replay")
                 and hasattr(gdn, "gdn_decode_conv_gated_replay")
-                and int(qmax) <= int(gdn.REPLAY_RING_LEN))
+                and int(qmax) <= resolve_ring_len(gdn))
     except Exception:
         return False
 

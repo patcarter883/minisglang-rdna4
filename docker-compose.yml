@@ -257,6 +257,11 @@ x-lean-common: &lean-common
     MINISGL_SSM_BF16: "${MINISGL_SSM_BF16:-1}"
     # ReplaySSM ring: 1 (default) = deferred-fold decode, 0 = bit-exact per-step path (bisection).
     MINISGL_GDN_REPLAY: "${MINISGL_GDN_REPLAY:-1}"
+    # ReplaySSM ring length. Empty = the kernel package default (8). Set to 16 to cover a
+    # width-15 verify (a 16-token window) with the ring instead of the materialising path --
+    # see kvcache/gdn_state.py resolve_ring_len, which is the single resolver the allocation,
+    # the KV-arena sizing and the graph-capture gate all read.
+    MINISGL_GDN_RING_LEN: "${MINISGL_GDN_RING_LEN:-}"
     # Debug: =1 checks every decode row's input token against the last committed token (one D2H
     # sync per step) and logs any context/emission divergence loudly. Off by default.
     MINISGL_FEEDBACK_CHECK: "${MINISGL_FEEDBACK_CHECK:-}"

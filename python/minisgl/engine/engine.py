@@ -1315,11 +1315,13 @@ class Engine:
         kernel package has no replay op, i.e. nothing will be allocated)."""
         try:
             import gdn_hip as gdn
+
+            from minisgl.kvcache.gdn_state import resolve_ring_len
             if not hasattr(gdn, "gdn_decode_conv_gated_replay"):
                 return 0
             return mc.num_gdn_layers * gdn.replay_ring_bytes(
                 num_slots, num_v_heads, mc.linear_value_head_dim, mc.linear_key_head_dim,
-                gdn.REPLAY_RING_LEN, itemsize=ssm_itemsize)
+                resolve_ring_len(gdn), itemsize=ssm_itemsize)
         except Exception:   # see GDNStateCache: the extension may fail to load, not just to import
             return 0
 
