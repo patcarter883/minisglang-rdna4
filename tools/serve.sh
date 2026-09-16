@@ -1522,7 +1522,30 @@ fi
 # idle (201.4% -> 2.6% CPU, 50-54C -> 39.6C was the win). That is a real cost and it is ~10 W and
 # some idle heat. It is not worth 13x on every prompt. Set MINISGL_HSA_PRELOAD=1 to take the idle
 # win back on a serve that never prefills anything long.
-_HSA_SYS=/opt/rocm/lib/libhsa-runtime64.so.1
+# THE IDLE BUSY-WAIT: NOT FIXABLE BY CONFIGURATION ON ROCm 7.2.1. Settled 2026-09-16; do not
+# re-run these experiments.
+#
+# One user-space thread per rank sits at 100% of a core for the life of the serve (state R, wchan 0,
+# no syscall -- a pure spin in ROCr's async-events loop). What was established:
+#
+#  * TRIGGER: enabling GPU-to-GPU P2P. A bisect probe added one action at a time and idle CPU stayed
+#    at 0.0% through cuda.init, device allocation, a 512 MiB pinned host allocation, a D2D copy, a
+#    side stream + event and a second device -- then went to 99.7% on the first CROSS-DEVICE copy.
+#    TP=2 requires P2P, so any TP=2 serve on this box pays it.
+#  * NOT torch's build. Torch bundles libhsa 1.18.70201, the system ROCm ships 1.18.70201: same
+#    version, different build, and the SAME 77 HSA_* knobs including HSA_ENABLE_INTERRUPT, with
+#    hsaKmtWaitOnEvent/hsaKmtWaitOnMultipleEvents present in both. Substituting the system build for
+#    torch's (one runtime, verified in /proc/<pid>/maps) left prefill unchanged at 183.12 tok/s and
+#    the spin unchanged at ~370%. The substitution path was written, measured and removed.
+#  * NOT fixable by a knob. HSA_ENABLE_INTERRUPT=1, HSA_ENABLE_MWAITX=1, HSA_ENABLE_SDMA=0 and
+#    GPU_MAX_HW_QUEUES=1 were each run against a reproducer validated to fire twice in a row. All
+#    four: 99.7-99.8%, i.e. inert.
+#  * AND THE LD_PRELOAD "FIX" (1cd0233) WAS NOT ONE. It does not replace torch's runtime -- torch's
+#    libamdhip64 pulls its bundled copy in by RPATH regardless, so the preload merely adds a SECOND
+#    ROCr runtime bound to the same KFD device (both listed in /proc/self/maps). That configuration
+#    silenced the spin and cost 13-51x ON PREFILL. See the MINISGL_HSA_PRELOAD note below.
+#
+# So the ~10 W and two burned cores stay, unless ROCm changes. The remaining levers are upstream.
 if [[ "${MINISGL_HSA_PRELOAD:-}" == "1" && -z "${LD_PRELOAD:-}" && -e "$_HSA_SYS" ]]; then
   export LD_PRELOAD="$_HSA_SYS"
   printf '[serve] LD_PRELOAD=%s (system HSA runtime; torch'"'"'s bundled one busy-polls one core per rank at idle)\n' "$_HSA_SYS"
