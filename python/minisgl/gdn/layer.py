@@ -585,9 +585,32 @@ class QwenGatedDeltaNet(nn.Module):
             int(max_qlen),
             1,  # SiLU
         )
-        # Gated-delta-rule verify: the RECURRENT (non-WMMA) oracle — bit-stable, the whole point of
-        # verify. Captures the ssm state after each token. (No WMMA path: the chunk-size dependence is
-        # exactly the non-bit-exactness this kernel removes.)
+        # Gated-delta-rule verify: the RECURRENT oracle. Bit-stable, and it stays the default.
+        #
+        # A CHUNKED/WMMA verify EXISTS and is NOT used here: gdn_hip.gdn_prefill_verify_wmma. It is
+        # correct (rdna4-hip-kernels tests/test_verify_wmma.py) and 3.07x faster than this kernel at
+        # the 16-token window — 7.73 -> 2.52 ms per forward across the 30 linear_attention layers.
+        # It was wired here, built, and A/B'd against old code back-to-back on 2026-09-16, and moved
+        # serve throughput by NOTHING: bs=1 108.5 -> 108.4, bs=2 131.6 -> 130.9, bs=6 202.1 -> 202.2,
+        # TPOT 9.19 -> 9.16 ms.
+        #
+        # WHY IT CHANGED NOTHING, which is the part worth keeping. `k_dflash=15` is a CEILING that
+        # sizes a width LADDER (spec/width.py verify_width_ladder -> [3, 7, 15]); an adaptive
+        # controller picks a rung per step from measured acceptance. At the served acceptance
+        # (accept-len ~2.1) it picks rung 7 in 98% of steps and rung 15 in none:
+        #     verify-width[0:17(1%) 3:11(1%) 7:1172(98%) 15:0(0%)]  verify-graph replay=1183 eager=17
+        # Rung 7 is an 8-token window, which FITS the ReplaySSM ring, so `use_replay` above is true
+        # and gdn_verify_replay carries 98% of verifies. This materialising path gets the ~1% eager
+        # remainder, so a 3x kernel here is 3x of ~1% of the work.
+        #
+        # So the win is NOT in this kernel. At the width that actually runs, gdn_verify_replay is
+        # already the faster kernel at bs=1 (0.073 ms vs 0.123 ms for the WMMA verify). It loses to
+        # WMMA only at N=4 (0.113 vs 0.056 ms), which `use_replay` never lets it compare — that gate
+        # asks "does the window FIT the ring", not "which kernel is cheaper". Measuring whether
+        # routing wide-batch width-7 windows away from replay pays is the open follow-up; it is a
+        # scheduling question, not a kernel one.
+        #
+        # Read verify-width[...] out of the serve log BEFORE optimising anything on a verify path.
         q, k, v = self._split_conv_qkv(conv_out, n)
         if use_replay:
             engaged("gdn_hip.gdn_verify_replay")
@@ -601,6 +624,8 @@ class QwenGatedDeltaNet(nn.Module):
             # cursor rewind. Verified bit-exact against the served decode trajectory
             # (rdna4-hip-kernels tests/test_verify_replay.py).
             return self._output_projection(core, z, n), conv_scratch, None
+        # hasattr, not an env knob: an older kernel package simply has no WMMA verify to call, and
+        # the recurrent kernel stays the correct answer there.
         engaged("gdn_hip.gdn_prefill_verify")
         core, ssm_scratch = gdn.gdn_prefill_verify(
             q, k, v, a.contiguous(), b.contiguous(), self.A_log, self.dt_bias,
