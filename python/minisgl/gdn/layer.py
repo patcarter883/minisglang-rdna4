@@ -598,10 +598,21 @@ class QwenGatedDeltaNet(nn.Module):
         # sizes a width LADDER (spec/width.py verify_width_ladder -> [3, 7, 15]); an adaptive
         # controller picks a rung per step from measured acceptance. At the served acceptance
         # (accept-len ~2.1) it picks rung 7 in 98% of steps and rung 15 in none:
-        #     verify-width[0:17(1%) 3:11(1%) 7:1172(98%) 15:0(0%)]  verify-graph replay=1183 eager=17
+        #     verify-width[0:17(1%) 3:11(1%) 7:1172(98%) 15:0(0%)]
+        # and the boot log says which kernel each rung commits through:
+        #     [gdn] spec-verify commit per width: qlen=4->ring-rollback, qlen=8->ring-rollback,
+        #                                         qlen=16->materialised
         # Rung 7 is an 8-token window, which FITS the ReplaySSM ring, so `use_replay` above is true
-        # and gdn_verify_replay carries 98% of verifies. This materialising path gets the ~1% eager
-        # remainder, so a 3x kernel here is 3x of ~1% of the work.
+        # and gdn_verify_replay carries it. Only rung 15 (qlen 16) reaches THIS path, and the
+        # controller picks it in 0% of steps -- so a 3x kernel here is 3x of nothing.
+        #
+        # NOT a capture problem, which is the first thing to suspect and is worth ruling out in
+        # writing: all three widths ARE captured ("Capturing spec-verify CUDA graphs (widths=[3, 7,
+        # 15] -> qlens=[4, 8, 16])"), the width-15 graph included. It is captured and never replayed.
+        # Do NOT read the `verify-graph replay=N eager=M` counter as evidence about this dispatch --
+        # it counts CUDA-graph replay vs eager execution (scheduler.py `_m_vgraph`), and its
+        # "replay" has nothing to do with gdn_verify_replay. Misreading exactly that pair is how the
+        # first write-up of this reached the right conclusion from the wrong evidence.
         #
         # So the win is NOT in this kernel. At the width that actually runs, gdn_verify_replay is
         # already the faster kernel at bs=1 (0.073 ms vs 0.123 ms for the WMMA verify). It loses to
