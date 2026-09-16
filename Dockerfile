@@ -85,13 +85,22 @@ RUN pip install \
 # rocmProfileData's default branch is **master**, not main — pinning --branch main fails the clone
 # with "Remote branch main not found" (exit 128). The original working command simply cloned the
 # default; adding a branch pin without checking it is what broke the build.
-ARG RPD_REF=master
+# PINNED, and this is a LATENT BUILD BREAK, not a preference: rocmProfileData master does not
+# build anywhere as of 2026-09-16. Its 2026-09-10 "rlog v3 integration" series (#122-#132) made
+# rpd_tracer/Utility.h include "rlog/client.h" unconditionally and RlogDataSource.cpp include
+# "rlog/Hub.h" -- and Hub.h does not exist in the public rlog repo at ANY commit, including its own
+# tip. Verified: master fails identically on THIS 7.2.1 base, so the only reason the shipping image
+# has a tracer is that it was built before that landed. Rebuilding it today would have failed.
+# 0d2144b is the last commit before the series; verified to build on this base (librpd_tracer.so,
+# 3.3 MB). Revisit when upstream publishes rlog v3 or drops the dependency.
+ARG RPD_REF=0d2144bec8765d3728cbe7c7bd68572e242e28d1
 RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get update -qq; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libsqlite3-dev libfmt-dev xxd; \
     rm -rf /var/lib/apt/lists/*; \
-    git clone --depth 1 --branch "${RPD_REF}" https://github.com/ROCm/rocmProfileData /opt/rocmProfileData; \
+    git clone https://github.com/ROCm/rocmProfileData /opt/rocmProfileData; \
+      git -C /opt/rocmProfileData checkout -q "${RPD_REF}"; \
     cd /opt/rocmProfileData; \
     make -C rocpd_python install; \
     make -C rpd_tracer; \
