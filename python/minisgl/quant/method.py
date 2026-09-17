@@ -472,34 +472,38 @@ class W4A8LinearMethod:
         layer._scales_op = scales_op
         layer._zeros_op = zeros_op
         if kernels.MOE_W4A16 != "0":
-            # W4A16 (fp16-act) dense path: repack -> register-direct wide weights, drop the op-layout.
-            import fp8_wmma
-
-            N, K8 = w_packed.shape
-            wide = kernels._w4a16_wide(self.quant.group_size)
-            w_rep = fp8_wmma.repack_int4_to_w_rep(w_packed, N, K8 * 8)
-            layer._w_rep_wide = fp8_wmma.repack_w_rep_wide(w_rep, wide)
-            layer._n_out = N
-            del layer._w_packed_op
+            # W4A16 (unquantized-act) dense path. It reads the SAME `_w_packed_op` the W4A8 arm
+            # reads — no repack, no second layout. This used to build a register-direct `w_rep` and
+            # DELETE the op-layout, which is why W4A16 cost a full extra copy of every weight and
+            # still had no unquantized arm below the WMMA band.
+            layer._w4a16 = True
+            layer._n_out = w_packed.shape[0]
         del layer.qweight, layer.scales
         if qz is not None:
             del layer.qzeros
 
     # This method's GEMM takes the producer's (x_fp8, act_scales) pair; `_LinearTPImpl.forward`
     # reads this flag rather than probing the signature, so a method that cannot use the pair needs
-    # no keyword argument and no branch. The W4A16 WIDE arm below cannot (it consumes bf16/fp16
-    # activations directly and never quantizes), so the pair is dropped there — explicitly, at the
-    # one place that knows, rather than silently at the kernel.
-    supports_producer_actquant = True
+    # no keyword argument and no branch.
+    #
+    # Under W4A16 it must be FALSE. The A16 arm consumes bf16/fp16 activations directly and never
+    # reads the pair, so advertising it makes the PRODUCER quantize every token for a consumer that
+    # discards the result — exactly the cost this path exists to remove. `apply` merely ignored the
+    # pair, which is not the same thing: the work had already been done upstream. Both sibling
+    # methods (MxFp4 / NvFp4) already declare False with this reasoning; this was the sibling the
+    # fix missed. MOE_W4A16 is a process-wide knob read at import, so a property is exact.
+    @property
+    def supports_producer_actquant(self) -> bool:  # type: ignore[override]
+        return kernels.MOE_W4A16 == "0"
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None,
         *, x_fp8: torch.Tensor | None = None, act_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if getattr(layer, "_w_rep_wide", None) is not None:
+        if getattr(layer, "_w4a16", False):
             out = kernels.w4a16_linear(
                 x,
-                layer._w_rep_wide,  # type: ignore[attr-defined]
+                layer._w_packed_op,  # type: ignore[attr-defined]
                 layer._scales_op,  # type: ignore[attr-defined]
                 layer._zeros_op,  # type: ignore[attr-defined]
                 self.quant.group_size,
@@ -523,8 +527,14 @@ class W4A8LinearMethod:
     def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
         """FUSED gate_up + silu_and_mul at decode (this linear is a merged gate_up). Returns None ->
         caller falls back to the unfused silu_and_mul(apply(...)) when the fused kernel doesn't apply:
-        the wide-W4A16 path, prefill (M>16), or an unsupported shape. Bit-exact when it fires."""
-        if getattr(layer, "_w_rep_wide", None) is not None:
+        the W4A16 path, prefill (M>16), or an unsupported shape. Bit-exact when it fires."""
+        # W4A16 keeps the op-layout weights now, so this can no longer refuse by absence — it has
+        # to refuse EXPLICITLY. `w4a8_linear_silu` quantizes the activation per token, so firing it
+        # here would put a W4A16 model's DECODE band back on quantized activations while its prefill
+        # band stayed unquantized: a silent activation-format split by M, which is the opposite of
+        # what selecting W4A16 asks for. The caller falls back to unfused gate/up + silu, which goes
+        # through `apply` and so still gets the A16 kernel. A fused A16 gate_up+silu is a real gap.
+        if getattr(layer, "_w4a16", False):
             return None
         w = layer._w_packed_op  # type: ignore[attr-defined]
         if not _fused_swiglu_ok(x, w, self.quant.group_size):
@@ -580,12 +590,12 @@ class MxFp4LinearMethod:
         layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//32, N) uint8 E8M0
         if kernels.MOE_W4A16 != "0":
             # W4A16: activations stay bf16/fp16 and are NEVER quantized. The E2M1 codes and the E8M0
-            # scale tensor go to the register-direct kernel UNCHANGED — its `bool E2M1` template flag
-            # picks the codebook decode and its WSP policy reads uint8-without-zeros as E8M0. So this
-            # is a load policy on the existing core, not a second kernel (KERNEL_CORE_POLICY).
-            layer._w_rep_w4a16 = kernels.w4a16_repack(conv["w_packed"], self.quant.group_size)
+            # scale tensor go to the kernel UNCHANGED — its `bool E2M1` template flag picks the
+            # codebook decode and its WSP policy reads uint8-without-zeros as E8M0. So this is a
+            # load policy on the existing core, not a second kernel (KERNEL_CORE_POLICY) — and it
+            # reads the op-layout `w_packed` at every M, so there is nothing to repack.
+            layer._w4a16 = True
             layer._n_out = conv["w_packed"].shape[0]
-            del layer._w_packed_op
         del layer.weight_packed, layer.weight_scale
 
     # The W4A16 arm consumes unquantized activations, so it must not advertise the producer's
@@ -596,10 +606,10 @@ class MxFp4LinearMethod:
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        if getattr(layer, "_w_rep_w4a16", None) is not None:
+        if getattr(layer, "_w4a16", False):
             out = kernels.w4a16_linear(
                 x,
-                layer._w_rep_w4a16,  # type: ignore[attr-defined]
+                layer._w_packed_op,  # type: ignore[attr-defined]
                 layer._scales_op,  # type: ignore[attr-defined]
                 None,  # symmetric — E8M0 block scales, no zero-points and no global
                 self.quant.group_size,
@@ -624,13 +634,14 @@ class MxFp4LinearMethod:
 
     def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
         """FUSED gate_up + silu (MXFP4 / E2M1, symmetric) at decode; None -> caller falls back."""
-        # NO FUSED PATH UNDER W4A16. That arm repacks to the register-direct layout and DROPS
-        # `_w_packed_op`, and there is no w4a16 silu twin to take its place, so the fused kernel has
-        # no weight to read. Returning None hands the caller back to the unfused gate/up + silu,
-        # which goes through `apply` and so still gets the W4A16 kernel. Without this guard the
-        # deleted attribute reaches `kernels.w4a8_linear_silu`, which is a null weight pointer at the
-        # kernel — a GPU page fault during graph capture, not a Python error.
-        if getattr(layer, "_w_rep_w4a16", None) is not None:
+        # NO FUSED PATH UNDER W4A16.
+        # W4A16 keeps the op-layout weights now, so this can no longer refuse by absence — it has
+        # to refuse EXPLICITLY. `w4a8_linear_silu` quantizes the activation per token, so firing it
+        # here would put a W4A16 model's DECODE band back on quantized activations while its prefill
+        # band stayed unquantized: a silent activation-format split by M, which is the opposite of
+        # what selecting W4A16 asks for. The caller falls back to unfused gate/up + silu, which goes
+        # through `apply` and so still gets the A16 kernel. A fused A16 gate_up+silu is a real gap.
+        if getattr(layer, "_w4a16", False):
             return None
         w = getattr(layer, "_w_packed_op", None)
         if w is None or not _fused_swiglu_ok(x, w, self.quant.group_size):
@@ -725,13 +736,11 @@ class NvFp4LinearMethod:
             # the f32 global in the zeros slot) -- the register-direct kernel's WSP policy reads
             # exactly that combination as E4m3GroupScaleGlobal, so nothing is normalised or folded.
             #
-            # NVFP4's group_size is 16, so group_size//16 == 1 and the WIDE b-load twin does not
-            # apply (it needs `wide` to divide group_size/16). `w4a16_repack` therefore hands back
-            # the 3-D lane-order tensor and `w4a16_linear` routes it to the non-wide entry. MXFP4
-            # (g=32) does get the wide path. That is a shape constraint, not a format one.
-            layer._w_rep_w4a16 = kernels.w4a16_repack(conv["w_packed"], self.quant.group_size)
+            # NVFP4's group_size is 16. That used to exclude it from the WIDE register-direct twin
+            # (which needs `wide` to divide group_size/16) and strand it on the narrow arm; the
+            # tiled A16 core carries a RUNTIME group size, so g=16 is served like any other.
+            layer._w4a16 = True
             layer._n_out = conv["w_packed"].shape[0]
-            del layer._w_packed_op
         del layer.weight_packed, layer.weight_scale, layer.weight_global
 
     # See MxFp4LinearMethod: the W4A16 arm must not advertise the producer act-quant pair.
@@ -740,10 +749,10 @@ class NvFp4LinearMethod:
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
-        if getattr(layer, "_w_rep_w4a16", None) is not None:
+        if getattr(layer, "_w4a16", False):
             out = kernels.w4a16_linear(
                 x,
-                layer._w_rep_w4a16,  # type: ignore[attr-defined]
+                layer._w_packed_op,  # type: ignore[attr-defined]
                 layer._scales_op,  # type: ignore[attr-defined]
                 layer._global_op,  # type: ignore[attr-defined]  f32 global rides the zeros slot
                 self.quant.group_size,

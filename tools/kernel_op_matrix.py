@@ -252,19 +252,14 @@ def main():
                                            weight_is_e2m1=e2m1),
                      rocblas_bf16, tflops_peak, gbs_peak, wbpe)
 
-            # W4A16 register-direct (mmq_regdirect_w4a16_wide) — fp16 acts direct, the MINISGL_MOE_W4A16
-            # path. Excluded below group 32 by _w4a16_wide's b128 wide-load precondition; record the
-            # exclusion rather than skipping the row.
-            if g < 32:
-                gap("w4a16 regdirect", label, "_w4a16_wide requires group_size % 32 (b128 wide load)")
-            else:
-                if "wide" not in d:                     # repack once per config, not per M band
-                    w_rep = W4.repack_int4_to_w_rep(d["w"], N, Kk)
-                    d["wide"] = W4.repack_w_rep_wide(w_rep, K._w4a16_wide(g))
-                w_rep_wide = d["wide"]
-                gemm_row(f"w4a16 regdirect [{tag}]", label, M, N, Kk,
-                         lambda: K.w4a16_linear(x_f16, w_rep_wide, d["s"], d.get("z"), g, N),
-                         rocblas_bf16, tflops_peak, gbs_peak, wbpe)
+            # W4A16 — unquantized activations, the MINISGL_MOE_W4A16 path. NO GROUP EXCLUSION any
+            # more: this used to be the register-direct wide arm, which needed group_size % 32 for
+            # its b128 wide load and so recorded a gap at g=16 (NVFP4's own group). `w4a16_linear`
+            # now dispatches a decode GEMV below M=16 and the tiled A16 core above it, both on the
+            # SAME `w_packed` this row already holds and both carrying a runtime group size.
+            gemm_row(f"w4a16 [{tag}]", label, M, N, Kk,
+                     lambda: K.w4a16_linear(x_f16, d["w"], d["s"], d.get("z"), g, N),
+                     rocblas_bf16, tflops_peak, gbs_peak, wbpe)
 
     # ============ Fused gate_up + SiLU (decode-only) — kernel arm AND engine gate ===========
     # The op takes a [gate|up] weight of (2*inter, K); with N=4096 that is inter=2048. Measured
