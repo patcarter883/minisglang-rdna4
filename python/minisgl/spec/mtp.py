@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+
+from minisgl.kvcache._envutil import env_int as _env_int
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
@@ -57,7 +59,10 @@ class MTPProposer(CapturableProposer):
             "Qwen3.5 mtp_num_hidden_layers>0); none was loaded"
         )
         self._device = engine.device
-        self._pos_shift = int(os.environ.get("MINISGL_MTP_POS_SHIFT", "0"))
+        # env_int, not int(os.environ.get(...)): a compose entry declared `"${VAR:-}"` arrives
+        # SET-BUT-EMPTY, and int("") raises at construction — a boot crash from a diagnostic
+        # knob nobody set. Same guard kvcache/_envutil.py exists for.
+        self._pos_shift = _env_int("MINISGL_MTP_POS_SHIFT", 0)
         # Draft-chain trace, on the SAME switch DFlash and EAGLE3 use. It used to be a private
         # MINISGL_MTP_DBG that docker-compose does not forward — so MTP's drafted chains were
         # unreachable through the only way this repo serves, and the replay-vs-eager identity gate

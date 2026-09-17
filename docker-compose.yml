@@ -304,6 +304,11 @@ x-lean-common: &lean-common
     # to disable seeding entirely (the control leg). NOTE the reader uses the `or` form, so the empty
     # string compose substitutes here falls back to the default instead of raising in float()/int().
     MINISGL_SPEC_SEED_MAX_PROMPT: "${MINISGL_SPEC_SEED_MAX_PROMPT:-}"
+    # The one knob that falsifies a +/-1 draft RoPE-position convention, and it was settable
+    # from nowhere: not here, not from serve.sh. Its sibling MINISGL_MTP_DBG had the identical
+    # bug and was forwarded; this one was missed. Default 0 = the engine's own default, NOT
+    # "${VAR:-}" — that arrives SET-BUT-EMPTY and int("") would crash the boot.
+    MINISGL_MTP_POS_SHIFT: "${MINISGL_MTP_POS_SHIFT:-0}"
     MINISGL_SPEC_SEED_MAX_BATCH_TOKENS: "${MINISGL_SPEC_SEED_MAX_BATCH_TOKENS:-}"
     # MEASUREMENT INSTRUMENT ONLY: pin the adaptive verify width to one captured rung (3/7/15 at
     # K=16) so each rung's TRUE tok/s is measurable at fixed K. The controller optimizes accepted
