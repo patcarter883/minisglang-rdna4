@@ -143,6 +143,96 @@ def _modelopt_to_compressed_tensors(d: dict) -> "dict | None":
     }
 
 
+# ---- Quark (AMD) -> compressed-tensors normalization -------------------------------------------
+#
+# Same trick as modelopt above, for the same reason: `quant_method: "quark"` describes on-disk
+# layouts compressed-tensors already names, so it is rewritten at parse time and every downstream
+# consumer (`weight_is_e2m1`, `is_nvfp4`, the method factories) keeps ONE code path.
+#
+# Quark spells four things differently, and three of them are silent-wrong if ignored:
+#   1. the format is a (dtype, scale_format) PAIR under `global_quant_config.weight` -- "fp4"+"e8m0"
+#      is MXFP4, "fp4"+"e4m3" is NVFP4. There is no `format` string to read.
+#   2. `exclude` is Quark's `ignore`. These are plain module paths (not globs), so they feed
+#      `_norm_ignore` directly.
+#   3. per-layer overrides live in `layer_quant_config` / `layer_type_quant_config`. This repo has no
+#      reader for a mixed-precision-per-layer scheme, so a NON-EMPTY override table REFUSES rather
+#      than quietly quantizing those layers with the global spec.
+#   4. `export.pack_method` describes the on-disk nibble order. "reorder" is the layout the
+#      compressed-tensors MXFP4/NVFP4 readers already expect; anything else is a packing this repo
+#      has no reader for and must refuse, because a wrong nibble order does not fail -- it returns
+#      plausible, finite, wrong numbers.
+#
+# ACTIVATIONS ARE DELIBERATELY DROPPED. Quark checkpoints declare `input_tensors` (this one asks for
+# dynamic per-group fp4), but gfx1201 has no FP4 arithmetic and this engine never consumes a
+# checkpoint's activation scheme for the e2m1 formats -- it picks W4A8 (per-token fp8) or W4A16
+# (unquantized) at the METHOD, exactly as it does for a compressed-tensors MXFP4 file, which
+# declares `input_activations: null`. Emitting null here keeps those two identical rather than
+# inventing an activation scheme no kernel implements.
+_QUARK_METHODS = ("quark",)
+
+# (weight dtype, scale_format) -> the compressed-tensors `format` naming the identical layout.
+# Closed table on purpose: an unlisted pair is a packing with no reader here, and returning None
+# (-> `ModelConfig.unparsed_quant_method`) names it instead of guessing.
+_QUARK_WEIGHT_FORMAT = {
+    ("fp4", "e8m0"): "mxfp4-pack-quantized",   # E2M1 codes + per-group E8M0 exponent
+    ("fp4", "e4m3"): "nvfp4-pack-quantized",   # E2M1 codes + per-group e4m3 + per-tensor global
+    ("fp8_e4m3", "float"): "float-quantized",
+    ("fp8_e4m3", ""): "float-quantized",
+}
+_QUARK_PACK_METHODS = ("reorder",)
+
+
+def _quark_to_compressed_tensors(d: dict) -> "dict | None":
+    """Rewrite a Quark `quantization_config` into the compressed-tensors shape, or None if it names
+    a scheme this repo has no reader for."""
+    gq = d.get("global_quant_config") or {}
+    w = gq.get("weight") or gq.get("weights") or {}
+    dtype = str(w.get("dtype") or "").lower()
+    sfmt = str(w.get("scale_format") or "").lower()
+    fmt = _QUARK_WEIGHT_FORMAT.get((dtype, sfmt))
+    if fmt is None:
+        return None
+    if w.get("is_dynamic"):          # weights are static by construction; dynamic means we misread it
+        return None
+    if d.get("layer_quant_config") or d.get("layer_type_quant_config"):
+        return None                  # per-layer overrides: no reader (see note 3)
+    pack = str((d.get("export") or {}).get("pack_method") or "reorder").lower()
+    if pack not in _QUARK_PACK_METHODS:
+        return None                  # unknown nibble order: wrong is SILENT here (see note 4)
+    gs = int(w.get("group_size") or 32)
+    return {
+        "quant_method": "compressed-tensors",
+        "format": fmt,
+        "config_groups": {
+            "group_0": {
+                "weights": {
+                    "num_bits": 4 if dtype == "fp4" else 8,
+                    "type": "float",
+                    "strategy": "group",
+                    "group_size": gs,
+                    "symmetric": True,
+                },
+                # See the module note: dropped on purpose, matching a compressed-tensors MXFP4 file.
+                "input_activations": None,
+                "targets": ["Linear"],
+            }
+        },
+        # STRIP THE PARAMETER SUFFIX. Quark excludes name TENSORS ("mtp.layers.0.mlp.gate_proj.weight"),
+        # compressed-tensors `ignore` names MODULES ("mtp.layers.0.mlp.gate_proj"), and the match is a
+        # substring test against the module name. An entry that is LONGER than the module name matches
+        # nothing, so every suffixed exclude evaporates — measured: `mtp.layers.0.mlp.gate_proj` came
+        # back is_module_quantized=True against a checkpoint that ships that tensor unquantized, which
+        # builds a quantized layer over full-precision weights. `lm_head` hid this because it is the
+        # one entry Quark writes without a suffix.
+        "ignore": _norm_ignore(tuple(
+            e[: -len(sfx)] if (sfx := next((x for x in (".weight", ".bias", ".weight_scale")
+                                            if e.endswith(x)), "")) else e
+            for e in (d.get("exclude") or ())
+        )),
+        "quark_pack_method": pack,
+    }
+
+
 @dataclass(frozen=True)
 class QuantConfig:
     """Parsed weight-quantization config (W4A8 family). Phase 2 targets AWQ (dense,
@@ -334,6 +424,13 @@ class QuantConfig:
         # function returns None, which `ModelConfig.unparsed_quant_method` reports by name.
         if method in _MODELOPT_METHODS:
             normalized = _modelopt_to_compressed_tensors(d)
+            if normalized is None:
+                return None
+            d, method = normalized, "compressed-tensors"
+
+        # Quark (AMD) is the same story — normalize and fall through (see the module notes above).
+        if method in _QUARK_METHODS:
+            normalized = _quark_to_compressed_tensors(d)
             if normalized is None:
                 return None
             d, method = normalized, "compressed-tensors"

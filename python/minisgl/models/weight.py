@@ -443,6 +443,13 @@ def qwen3_5_remap(ckpt_key: str, load_mtp: bool = False):
         # folds this channel scale INTO `lm_head.weight` before the remap runs, so it is never a
         # param of its own. Skipped rather than raised — it is a legitimate key, not an unknown one.
         return None
+    if ckpt_key.startswith(("model.visual.", "visual.", "vision_tower.", "multi_modal_projector.")):
+        # VISION TOWER — skipped, not raised. This architecture is a multimodal wrapper and a
+        # text-only serve never builds those modules, so their weights are pure I/O and VRAM for
+        # something nothing will consume (AMD's Quark MXFP4 build of Qwen3.8-27B ships 333 of them).
+        # A legitimate key with nowhere to go is a SKIP; the raise below is for keys we do not
+        # recognise at all, which is a different thing and must stay loud.
+        return None
     if not ckpt_key.startswith(_QWEN35_LM_PREFIX):
         raise ValueError(f"unexpected Qwen3.5 checkpoint key (not under {_QWEN35_LM_PREFIX!r}): {ckpt_key}")
     native = "model." + ckpt_key[len(_QWEN35_LM_PREFIX) :]
@@ -939,12 +946,33 @@ def _load_qwen3_5_weight(
             del w, sc
             yield from emit("lm_head.weight", out)
             return
+        # QUARK spells the packed 4-bit tensor `.weight`; every remap table here (and every
+        # method's create_weights) calls it `.weight_packed`. Normalize at the CALL SITE so
+        # `qwen3_5_remap` stays the pure key->plan function it documents itself as, and so the
+        # existing _QWEN35_CONCAT entries (in_proj_qkv + in_proj_z -> in_proj_qkvz) apply unchanged
+        # — without this the suffix misses, the key falls through as a DIRECT emit, the concat never
+        # runs, and the model raises KeyError on in_proj_qkvz.weight_packed.
+        #
+        # Gated on the module being one the checkpoint actually ships quantized (`ckpt_quantized`,
+        # built from the companion `.weight_scale`), and keyed in that set's DE-WRAPPED namespace —
+        # `_native` strips the `language_model.` INFIX, which a leading-only removeprefix does not.
+        #
+        # `ckpt_field` keeps the ON-DISK key for the file read; `name` becomes the normalized one
+        # because BOTH the remap tables and `_shard_qwen3_5` key on the suffix, and the sharder
+        # treats `.weight` (bf16, full K) differently from `.weight_packed` (uint8, K halved).
+        # Feeding it the un-normalized name would shard a packed tensor on the bf16 branch — wrong
+        # sizes, no error.
+        ckpt_field = name
+        if name.endswith(".weight") and config.quant is not None:
+            _q = config.quant.ckpt_quantized
+            if _q is not None and name[: -len(".weight")].replace("language_model.", "") in _q:
+                name = name[: -len(".weight")] + ".weight_packed"
         plan = qwen3_5_remap(name, load_mtp=config.mtp_num_hidden_layers > 0)
         if plan is None:
             return
         # Shard at READ (on the checkpoint name), so the GDN concat / gate-up merge /
         # expert stack below all compose rank-local parts (Phase 4-1; no-op at TP=1).
-        tens = override if override is not None else f.get_tensor(name)
+        tens = override if override is not None else f.get_tensor(ckpt_field)
         # .to(device) AFTER the shard: everything downstream (GDN concat, gate/up merge,
         # expert stack) then composes rank-local tensors already in VRAM, as before.
         raw = _shard_qwen3_5(name, tens, tp_info.rank, tp_info.size, config).to(device)
@@ -2733,8 +2761,13 @@ def load_weight(
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for ckpt_name in f.keys():
                 name = ckpt_name
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                # Strip multimodal wrapper prefix, skip vision/projector weights. `model.visual.`
+                # is the Qwen-VL spelling (AMD's Quark MXFP4 build of Qwen3.8-27B ships 333 such
+                # tensors); a text-only serve never builds those modules, so reading them is pure
+                # I/O and VRAM for weights nothing will consume. Matched anywhere in the name, not
+                # just as a prefix, because the VL wrapper nests them under `model.`.
+                if name.startswith(("vision_tower.", "multi_modal_projector.", "visual.")) \
+                        or ".visual." in name or name.startswith("model.visual."):
                     continue
                 # Appended MTP / next-token-prediction layers (GLM-4.x / DeepSeek): layers.<n> with
                 # n >= num_layers is the MTP head. Skip it UNLESS the model loads one (mtp proposer),
@@ -2753,6 +2786,23 @@ def load_weight(
                     continue
                 raw = f.get_tensor(ckpt_name)
                 name = name.removeprefix("language_model.")
+                # QUARK spells the packed 4-bit tensor `.weight`; compressed-tensors (and every
+                # method's create_weights here) calls it `.weight_packed`. Rename on the OBSERVED
+                # dtype rather than on a per-exporter flag: a packed 4-bit weight arrives as uint8,
+                # a full-precision one as bf16/fp16, so this can never rename a real weight. The
+                # module must also be one the checkpoint actually ships quantized — `ckpt_quantized`
+                # already knows, having been built from the companion `.weight_scale`.
+                if (raw.dtype == torch.uint8 and name.endswith(".weight")
+                        and config.quant is not None
+                        and (_q := config.quant.ckpt_quantized) is not None
+                        # `ckpt_quantized` is keyed in the DE-WRAPPED namespace (ModelConfig._native
+                        # does `.replace("language_model.", "")`, an INFIX strip). The loader's name
+                        # here is still `model.language_model.…` because `removeprefix` above only
+                        # strips a LEADING occurrence, so the membership test has to de-wrap too —
+                        # otherwise it misses every module on a multimodal-wrapped checkpoint and the
+                        # rename silently never fires (measured: KeyError on in_proj_qkvz.weight_packed).
+                        and name[: -len(".weight")].replace("language_model.", "") in _q):
+                    name = name[: -len(".weight")] + ".weight_packed"
                 # AutoGPTQ emits a bias for EVERY linear, all-zero where the original layer had
                 # bias=False (here: o_proj, all experts, the shared expert). The model declares no
                 # bias buffer for those, and adding a zero bias is a no-op, so drop all-zero biases.
