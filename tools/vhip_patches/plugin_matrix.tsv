@@ -1,0 +1,7 @@
+row	plugins	attn_backend	extra	decode_tok_s	e2e_tok_s	boot_s
+1-hip-baseline	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register	default	none	83.3	81.8	211
+2-triton-attn	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register	TRITON_ATTN	none	83.3	82.0	116
+3-rocm-attn	gdn_hip,tail_hip_register,w4a8_fp8_wmma_register	ROCM_ATTN	none	83.3	82.1	111
+4-no-w4a8	gdn_hip,tail_hip_register	default	VLLM_ROCM_W4A8_AWQ_DENSE=0	83.4	82.0	146
+5-no-tail	gdn_hip,w4a8_fp8_wmma_register	default	none	83.3	81.9	141
+# ROW 6 INVALID (compose ${VLLM_PLUGINS:-} substituted the default on empty; never tested stock) — see awqdense_matrix.tsv row D

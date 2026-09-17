@@ -1,0 +1,7 @@
+# Built extensions + build trees. Rebuild in-image with:
+#   MINISGL_IMAGE=vllm24-hip:combined \
+#   MINISGL_CMD='cd /kernels/<pkg> && GPU_ARCHS=gfx1201 bash local/build_local.sh' \
+#   gpu-lease -n 1 -- docker compose --profile run run --rm run
+*.so
+build/
+__pycache__/
