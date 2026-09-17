@@ -206,7 +206,8 @@ class LagunaSharedExpert(BaseOP):
         self.down_proj = LinearReplicated(inter, config.hidden_size, has_bias=False, quant_method=qm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        # `forward_swiglu`, NOT silu_and_mul(forward(x)) — see Linear.forward_swiglu.
+        return self.down_proj.forward(self.gate_up_proj.forward_swiglu(x))
 
 
 class LagunaSparseBlock(BaseOP):

@@ -124,6 +124,9 @@ class GatedMLP(BaseOP):
         if act_fn is None:
             raise ValueError(f"Unsupported activation function: {config.hidden_act}")
         self.act_fn = act_fn
+        # Decided ONCE at construction, not per step: only SiLU has a fused gate_up+silu kernel, and
+        # `hidden_act` cannot change at runtime. See `forward`.
+        self._swiglu = config.hidden_act == "silu"
         self.down_proj = LinearRowParallel(
             config.intermediate_size,
             config.hidden_size,
@@ -133,6 +136,19 @@ class GatedMLP(BaseOP):
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `forward_swiglu` IS `silu_and_mul(forward(x))` whenever the fused kernel does not apply --
+        # same call, same bits -- so this is a drop-in that only ever ADDS the fused decode path.
+        #
+        # It matters because this class is the dense MLP for most of the fleet (qwen3, qwen3_5,
+        # laguna, and the dense half of the MoE models), and every one of them was hand-rolling the
+        # unfused shape below. Only qwen2_moe and glm4_moe_lite ever called `forward_swiglu`, so the
+        # fused gemm+silu kernel -- which exists for W4A8 and, since this change's sibling, for
+        # W4A16 -- was unreachable on a dense model no matter how the quant path was configured. The
+        # cost of that is one extra launch plus the (M, 2*inter) HBM round-trip on every decode step.
+        if self._swiglu:
+            y = self.gate_up_proj.forward_swiglu(x)
+            del x
+            return self.down_proj.forward(y)
         gate_up = self.gate_up_proj.forward(x)
         del x
         y = self.act_fn(gate_up)

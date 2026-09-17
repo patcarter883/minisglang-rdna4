@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Validate the dense mmq_fp8_gemm_silu ENGINE wiring end-to-end: serve GLM-4.7-Flash-AWQ (W4A8 MoE with a
 # QUANTIZED merged gate_up SHARED EXPERT — the fused-silu target) TP=2 under GRAPH CAPTURE in the lean image
-# with the FUSION w4a8 .so + MINISGL_DENSE_FUSED_SILU=1, confirm the fused op fires (engaged marker), then
+# with the FUSION w4a8 .so (the fusion is unconditional -- there is no knob), confirm the fused op fires (engaged marker), then
 # coherence-check greedy answers. Base model (no spec) to isolate the shared-expert path.
 #   gpu-lease -n 2 --timeout 900 -- bash tools/glm_fused_silu_smoke.sh
 set -uo pipefail
@@ -17,7 +17,7 @@ docker run -d --name "$name" \
   --device /dev/kfd --device /dev/dri --group-add video \
   --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE --ipc host --shm-size 16gb \
   -e HIP_VISIBLE_DEVICES="$HIP_VISIBLE_DEVICES" -e ROCR_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES" \
-  -e HF_HUB_OFFLINE=1 -e MINISGL_DENSE_FUSED_SILU=1 -e MINISGL_KV_FP8=1 \
+  -e HF_HUB_OFFLINE=1 -e MINISGL_KV_FP8=1 \
   -e TORCH_BLAS_PREFER_HIPBLASLT=0 \
   -v "$W4A8FIX":/opt/w4a8fix -v "$WT":/engine \
   -v /home/pat/.cache/huggingface:/root/.cache/huggingface -p "${PORT}:1919" \

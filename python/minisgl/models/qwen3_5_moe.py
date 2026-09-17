@@ -53,7 +53,10 @@ class Qwen3_5MoeSharedExpert(BaseOP):
     def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         # reduce=False -> return the row-parallel down_proj PARTIAL so the MoE block can fuse it with
         # the routed-expert partial into a single all_reduce.
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)), reduce=reduce)
+        # `forward_swiglu`, NOT silu_and_mul(forward(x)) — see Linear.forward_swiglu. It IS that
+        # expression whenever the fused kernel does not apply, so this is never a behaviour
+        # change; hand-rolling it is how this MLP stayed unfused while two other models were not.
+        return self.down_proj.forward(self.gate_up_proj.forward_swiglu(x), reduce=reduce)
 
 
 class Qwen3_5MoeSparseBlock(BaseOP):
