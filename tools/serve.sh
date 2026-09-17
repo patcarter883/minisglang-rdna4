@@ -360,6 +360,25 @@ case "$MODEL" in
   # recorded for MTP under sampling. Still selectable with SPEC=mtp; it works, it just does
   # not pay. NOTE: spec is also auto-disabled whenever batch>1, so any concurrent traffic
   # turns it off regardless.
+  # AMD's Quark export of Qwen3.8-27B: MXFP4 (E2M1 + E8M0, g=32) weights with a vision tower the
+  # loader skips. The only arm that ships W4A16 ON, and the number is MEASURED, not inherited.
+  #
+  # MINISGL_MOE_W4A16=1 -- unquantized activations, which on this checkpoint is +11.1% (43.03 ->
+  # 47.86 tok/s, TP=2 SPEC=none, 3 rounds in rotated order, paired per prompt, positive on 36/36;
+  # W4A8 control unmoved across the change, 43.02 -> 43.03). It also puts the card ON the power cap
+  # (99% vs 86%, umc 49% -> 55%), which is the point: skipping the per-token requant frees work the
+  # engine can actually spend here.
+  #
+  # DO NOT generalise this to the other arms. W4A16 was -60% on this very checkpoint until
+  # 2026-09-17, because `w4a16_linear` had no decode GEMV and M=1 ran through a WMMA prefill body;
+  # the gain is only real with minisgl 882d1274 + rdna4-hip-kernels 997bad7. It is unmeasured on
+  # every MoE arm, where the dense linears are a much smaller share of the step.
+  qwen38-27b-mxfp4|amd/Qwen3.8-27B-Quark-AWQ-MXFP4)
+                  model_id="amd/Qwen3.8-27B-Quark-AWQ-MXFP4"; served_name="Qwen3.8-27B";
+                  spec_default="none"
+                  mem_default="0.90"; alloc_conf="expandable_segments:True"
+                  : "${MINISGL_MOE_W4A16:=1}"; export MINISGL_MOE_W4A16 ;;
+
   qwen38-27b-int4|cyankiwi/Qwen3.8-27B-AWQ-INT4)
                   model_id="cyankiwi/Qwen3.8-27B-AWQ-INT4"; served_name="Qwen3.8-27B";
                   spec_default="none"; k_mtp=4

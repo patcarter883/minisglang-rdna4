@@ -725,7 +725,7 @@ services:
   # concurrency — tools/serve.sh maps those onto the engine's flags and owns the per-model table
   # (checkpoint, attention backend, DFlash draft path, tuned draft length).
   #
-  #   MODEL=qwen35b-awq|qwen35b-mxfp4|glm|laguna|zaya|<any HF id or /models path>
+  #   MODEL=qwen35b-awq|qwen35b-mxfp4|qwen38-27b-mxfp4|glm|laguna|zaya|<any HF id or /models path>
   #   SPEC=none|mtp|dflash|eagle3|ngram    SPEC_K=<n>
   #   TP=2  DP=1  EP=0                     CTX=<tokens>   CONC=<n>
   #
