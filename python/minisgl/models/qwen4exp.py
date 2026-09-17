@@ -702,6 +702,22 @@ class Qwen4ExpMTPAttn(Qwen3_5MTPAttn):
     A dense draft cannot make the serve wrong. Speculative decoding is lossless by construction —
     every draft is verified against the target — so an imperfect draft head costs ACCEPTANCE RATE
     and nothing else. That is why this is a defensible first implementation rather than a guess.
+
+    WHERE IT STOPS BEING FREE (audit [11], threshold checked against the code 2026-09-18). Below
+    `indexer_budget` visible tokens the target's selection takes EVERY visible key, so the two key
+    sets are identical and the dense draft is not an approximation at all — it is the same
+    computation. Above it they genuinely diverge: the target attends `indexer_budget /
+    indexer_compress_ratio` compressed blocks selected from the WHOLE context (2048 tokens' worth,
+    chosen from anywhere), while this ring attends the most recent `_idx_width` positions it has
+    written. Same COUNT of keys, different SET, and the drafter's is strictly the recency one.
+
+    So acceptance is expected to fall on long contexts, and it falls silently — a spec measurement
+    taken on short prompts does not characterise the same drafter on a 32k one. The adaptive verify
+    width (spec/width.py) reacts to the acceptance drop and narrows, so this shows up as reduced
+    speculative GAIN rather than as a stall. Closing it is not a bug fix: it needs the draft head to
+    run its own QSA selection over its own ring, which needs a compressed index for a buffer that
+    deliberately has none (see the paragraph above). Measure before building that — on this box spec
+    is a measured loss on the offload arm for reasons that have nothing to do with this.
     """
 
     def __init__(self, config: "ModelConfig", layer_id: int) -> None:
