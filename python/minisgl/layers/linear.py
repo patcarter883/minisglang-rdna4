@@ -30,7 +30,7 @@ class _LinearTPImpl(ExpertContainer, BaseOP):
     # projection. Sharing the mixin is "MoE and dense land together" discharged in code.
     #
     # The quant methods build the same repack-and-delete shape the MoE containers do
-    # (`_w_packed_op` / `_scales_op` / `_zeros_op` / `_w_rep_wide`, checkpoint names deleted), so
+    # (`_w_packed_op` / `_scales_op` / `_zeros_op` / `_global_op`, checkpoint names deleted), so
     # the same underscore-inclusive walk finds them and the same fail-closed rule applies — which
     # is what makes dense offload a merge gate rather than a follow-on. And the BIAS is in the
     # granule: a moved weight with a left-behind bias is the same silent-corruption family as a

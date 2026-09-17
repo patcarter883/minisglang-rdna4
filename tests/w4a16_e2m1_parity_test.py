@@ -57,6 +57,7 @@ from minisgl.distributed import set_tp_info, try_get_tp_info  # noqa: E402
 if try_get_tp_info() is None:   # engaged() logs rank0-only and needs TP info even single-process
     set_tp_info(0, 1)
 
+from minisgl import _hip_engage as engage  # noqa: E402
 from minisgl.quant import kernels, mxfp4, nvfp4  # noqa: E402
 
 DEV = torch.device("cuda")
@@ -99,17 +100,22 @@ def run(fmt: str, group: int, dtype: torch.dtype) -> None:
         glob = torch.ones(N, device=DEV, dtype=torch.float32).contiguous().view(torch.int32)
         zeros = glob
     w_packed = conv["w_packed"]
-    rep = kernels.w4a16_repack(w_packed, group)
 
     print(f"\n{fmt.upper()}  group={group}  act={str(dtype).split('.')[-1]}  "
-          f"w_rep rank={rep.dim()} ({'wide' if rep.dim() == 4 else 'lane-order'})")
-    check(f"{fmt} g={group}: repack rank matches the group-size rule",
-          (rep.dim() == 4) == (group % 32 == 0),
-          f"group {group} -> {'wide' if group % 32 == 0 else 'lane-order'} expected")
+          f"one layout: w_packed {tuple(w_packed.shape)}")
 
-    for M in (1, 8, 64):
+    # M straddles the GEMV/tiled split (gemv_max=16) so BOTH A16 arms are covered, and the ledger
+    # says which one actually ran. `a16 != a8` is NOT evidence the A16 path was taken -- any change
+    # anywhere makes two tensors differ -- so the arm name is asserted directly.
+    for M in (1, 8, 17, 64, 200):
         x = (torch.randn(M, K, device=DEV, dtype=dtype) * 0.1)
-        a16 = kernels.w4a16_linear(x, rep, scales_op, zeros, group, N, weight_is_e2m1=True)
+        before = engage.counts()
+        a16 = kernels.w4a16_linear(x, w_packed, scales_op, zeros, group, N, weight_is_e2m1=True)
+        moved = engage.counts_delta(before)
+        want = ("fp8_wmma.mmq_regdirect_w4a16_gemv" if M <= 16
+                else "fp8_wmma.mmq_w4a16_tiled")
+        check(f"{fmt} M={M:<3} dispatched the expected A16 arm",
+              moved.get(want, 0) == 1, f"want {want}, moved={moved}")
         a8 = kernels.w4a8_linear(x, w_packed, scales_op, zeros, group, weight_is_e2m1=True)
         check(f"{fmt} M={M:<3} W4A16 output keeps the activation dtype (RULE 2)",
               a16.dtype == dtype, f"got {a16.dtype}, x was {dtype}")
@@ -124,8 +130,9 @@ def run(fmt: str, group: int, dtype: torch.dtype) -> None:
               d_pair <= max(d8 * 2.0, 5e-2), f"|a16-a8|={d_pair:.3e} vs |a8-exact|={d8:.3e}")
         check(f"{fmt} M={M:<3} W4A16 no further from exact than W4A8 (act-quant removed)",
               d16 <= d8 * 1.25 + 1e-3, f"|a16-exact|={d16:.3e} vs |a8-exact|={d8:.3e}")
-        check(f"{fmt} M={M:<3} the two paths are NOT the same tensor (W4A16 really ran)",
-              not torch.equal(a16.float(), a8.float()))
+        # Both A16 arms read the SAME `w_packed` the W4A8 call above read. That is the property
+        # this file now pins: W4A16 no longer needs a second, permuted copy of every weight
+        # (~13.5 GiB on a 27B) and no longer falls back to quantized activations above M=16.
 
 
 print("=" * 84)
