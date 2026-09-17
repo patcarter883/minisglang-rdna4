@@ -97,6 +97,9 @@ class StatsMsg(BaseTokenizerMsg):
     # dangerous direction, since the client then sends prompts the engine must reject.
     max_seq_len: int = 0
     prefill_seconds: float = 0.0
+    # HOST-side prefill the GPU-event pair cannot see (the per-chunk PLE n-gram gather: NVMe row
+    # reads + host hash + H2D). Separate from prefill_seconds so that series keeps its meaning.
+    prefill_host_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
     # Prompt tokens actually computed, accumulated PER PREFILL CHUNK as the work happens (unlike
