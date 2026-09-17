@@ -1858,11 +1858,20 @@ class Engine:
             # Per-term breakdown. Without it the "Not enough memory for KV cache" assert below names
             # five candidate causes and gives no way to tell which one actually ate the budget —
             # every diagnosis starts by re-deriving these numbers by hand.
+            #
+            # `draft=0.00` WITH SPEC ON IS NOT "spec is free". A target-embedded proposer (MTP, and
+            # the n-gram ones) has no separate checkpoint to reserve for: its head ships inside the
+            # target and its bytes are therefore already inside `model`. There is no double-count
+            # and no sizing error -- but a bare 0.00 on a spec serve reads as zero cost, and that
+            # inference has been drawn from this line before. Say which case it is.
+            _draft_note = ""
+            if config.spec_config is not None and draft_memory == 0:
+                _draft_note = "(in model: target-embedded head)"
             logger.info(
                 f"KV sizing: free={mem_GB(old_free_memory)} x ratio={config.memory_ratio} = "
                 f"{mem_GB(int(config.memory_ratio * old_free_memory))} budget; "
                 f"model={mem_GB(model_memory)} state={mem_GB(state_memory)} "
-                f"draft={mem_GB(draft_memory)} graph={mem_GB(graph_memory)} "
+                f"draft={mem_GB(draft_memory)}{_draft_note} graph={mem_GB(graph_memory)} "
                 f"snap={mem_GB(snap_memory)} ple={mem_GB(ple_memory)} "
                 f"stage={mem_GB(stage_memory)} "
                 f"-> available={mem_GB(available_memory)} "
