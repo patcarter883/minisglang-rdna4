@@ -40,7 +40,7 @@ _moe_calls = 0
 # is that the accumulator be re-zeroed on every REPLAY, and it is: the `torch.zeros((M, K))` below is
 # recorded INSIDE the captured region, so its fill kernel is part of the graph and runs on each
 # replay. Measured 2026-07-30, Qwen3.6-35B-A3B-AWQ-4bit TP=2 --graph 16, M=1 decode, interleaved
-# paired legs in one lease: all 6 decode graphs capture with the scatter engaged, and
+# paired legs in one boot: all 6 decode graphs capture with the scatter engaged, and
 #   gather_reduce -> 81.0, 81.1 tok/s    scatter -> 83.7, 83.5 tok/s   (1.0315x, non-overlap)
 # Note the size of that win, because the isolated microbench for the same op said 1.75x
 # (21.93us scatter vs 38.42us gather_reduce). e2e it is +3.2%. Trust the serve number.
@@ -1293,7 +1293,7 @@ def w8a8_moe_regdirect(
 
 def _device_cu_count() -> int:
     """CU count the dispatch reasons about — PINNED to `_PINNED_DISPATCH_CU` so both ranks of a TP
-    job agree regardless of which physical card each was leased. See the note above.
+    job agree even on a MISMATCHED pair of cards. See the note above.
 
     The physical values, for reference: torch reports RDNA's WORKGROUP PROCESSORS in
     `multi_processor_count` (32 on the RX 9070 XT, 28 on the RX 9070) and a WGP is 2 CUs, so the
@@ -1305,7 +1305,8 @@ def _device_cu_count() -> int:
     if env not in ("0", "auto"):
         return int(env)
     # Explicit opt-in to the PHYSICAL count: heterogeneous dispatch across a mismatched pair, and
-    # not reproducible across a re-lease. Only for measuring the per-device surface.
+    # not reproducible across runs that land on different cards. Only for measuring the
+    # per-device surface.
     try:
         idx = torch.cuda.current_device()
     except Exception:  # noqa: BLE001  — no HIP device at all

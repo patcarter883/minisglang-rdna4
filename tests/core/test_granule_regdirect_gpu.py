@@ -6,16 +6,19 @@ compiled `fp8_wmma` repack kernels (`repack_int4_to_w_rep_moe`,
 `test_granule_spec.py`, whose `test_regdirect_shapes` SYNTHESIZES the post-regdirect buffer set
 rather than producing it.
 
-Marked `gpu`, therefore EXCLUDED from a default `pytest` run (`addopts = -m "not gpu"`). The two
-gfx1201 cards are shared across every repo on this box; run these deliberately and SERIALLY, under
-the booking protocol in CLAUDE.md:
+Marked `gpu`, therefore EXCLUDED from a default `pytest` run (`addopts = -m "not gpu"`). They
+take a whole card for the repacks, so run them deliberately and SERIALLY, in the serve image:
 
-    gpu-lease -n 1 -- docker run --rm --device /dev/kfd --device /dev/dri --group-add video \\
+    docker run --rm --device /dev/kfd --device /dev/dri --group-add video \\
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \\
       --ipc host --shm-size 16gb \\
-      -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES \\
+      -e HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES \\
       -v <worktree>:/engine --entrypoint bash minisgl-rdna4:lean \\
       -lc 'PYTHONPATH=/engine/python:/opt/kernels pytest -m gpu /engine/tests/weights/'
+
+(The two `-e` flags are the BARE pass-through form on purpose: they forward the variables only if
+they are set in your shell, so a box with one card needs neither. `-e VAR=$VAR` with VAR unset would
+export it EMPTY, which ROCm reads as "no devices" and turns into a confusing no-GPU failure.)
 
 These assert only the DESCRIPTOR (which buffers survive, that dim 0 is E, that scales travel with
 weights) — not kernel numerics, which the format's own parity tests own.

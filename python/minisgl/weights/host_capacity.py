@@ -367,7 +367,7 @@ class CapacityVerdict:
                 "       GiB, ~23.7 tok/s; f=0.30 -> 48.2 GiB, ~25.0 tok/s. The device tier is a",
                 "       CAPACITY prerequisite here, not an optimisation.",
                 "    2. Free host RAM: stop other jobs on this box, drop the page cache, shrink the",
-                "       ZFS ARC. `gpu-status` shows who else is resident.",
+                "       ZFS ARC. `free -h` and `docker ps` show what else is resident.",
                 "    3. Use a smaller checkpoint.",
                 "    4. The file-backed overflow tier costs zero anonymous RAM (P3b: Cached delta =",
                 "       1.000x committed) but is UNBUILT and uncharacterised above 4 GiB/rank (P3c).",

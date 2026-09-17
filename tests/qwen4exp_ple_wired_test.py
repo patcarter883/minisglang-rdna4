@@ -24,10 +24,10 @@ Three things are asserted, in increasing strength:
      end, a state written before it is read, a token history advanced at the wrong moment, or the
      dilation-9 window mis-sized to the GDN-style k-1 = 3. On real weights, not a fake table.
 
-CPU only — no GPU, no lease. The table is mmapped, so the 51.2 GB is page cache, not RSS. Run:
+CPU only — no GPU. The table is mmapped, so the 51.2 GB is page cache, not RSS. Run:
 
-    docker run --rm -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro \
-      -v /home/pat/.cache/hf-ple:/ple:ro --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
+    docker run --rm -v <worktree>:/engine -v <ckpt>:/model:ro \
+      -v <ple>:/ple:ro --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_ple_wired_test.py'
 """
 

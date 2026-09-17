@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""GPU serving control panel for the shared 2x gfx1201 box.
+"""Web control panel for docker-compose serving profiles.
 
 A dependency-light (stdlib + PyYAML) web UI + JSON API to start/stop the predefined
-docker-compose profiles in minisgl-rdna4 and vllm-gfx1201, and to create/launch custom
-compose services. GPU profiles are auto-wrapped in the shared `gpu-lease` arbiter so this
-panel coordinates the two cards exactly like a hand-typed `gpu-lease -- docker compose up`.
+docker-compose profiles in the repos listed in config.json, and to create/launch custom
+compose services.
 
-Run:  python3 server.py            (binds 0.0.0.0:7070 per config.json)
+GPU arbitration is OPTIONAL. If a `gpu-lease` binary is found on PATH (or at the path named
+in config.json), GPU profiles are wrapped in it so several agents can share a box's cards.
+If it is absent -- the normal case for a single-user machine -- `docker compose` is run
+directly and the panel behaves identically otherwise.
+
+Run:  python3 server.py            (binds per config.json; 127.0.0.1:7070 by default)
 """
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -29,8 +34,13 @@ STATE_FILE = HERE / "state.json"
 CUSTOM_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 
-GPU_LEASE = CONFIG.get("gpu_lease", "gpu-lease")
-GPU_STATUS = CONFIG.get("gpu_status", "gpu-status")
+# Resolve the optional GPU arbiter ONCE at startup. shutil.which() accepts a bare name (looked up
+# on PATH) or an absolute path (checked for existence + executability), so config.json may carry
+# either. None means "not installed on this box" -- every GPU launch then runs docker compose
+# directly. This is what makes the panel portable off the box it was written for.
+GPU_LEASE = shutil.which(CONFIG.get("gpu_lease", "gpu-lease"))
+GPU_STATUS = shutil.which(CONFIG.get("gpu_status", "gpu-status"))
+HAVE_LEASE = GPU_LEASE is not None
 TOKEN = CONFIG.get("token", "") or ""
 # Env-var defaults the panel applies to services it launches, keyed by "<repo>::<profile>".
 # Surfaced in the UI (pre-filled + editable) and enforced at launch — see do_up().
@@ -44,7 +54,10 @@ SLUG_RE = re.compile(r"[^a-z0-9]+")
 MODEL_VAR_RE = re.compile(r"(^|_)MODEL(_ID)?$")   # plain MODEL too: minisgl's serve service
                                                   # takes MODEL=<alias|hf-id> (tools/serve.sh)
 
-HF_HOME = Path(CONFIG.get("hf_home") or os.environ.get("HF_HOME") or "/home/pat/.cache/huggingface")
+# Where the panel looks for locally cached HF models to populate the model picker. config.json wins,
+# then $HF_HOME, then huggingface_hub's own default (~/.cache/huggingface) — a per-user path, so the
+# panel finds the cache on any machine instead of a directory that exists only on the author's box.
+HF_HOME = Path(CONFIG.get("hf_home") or os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
 _models_cache = {"t": 0.0, "v": []}
 
 _state_lock = threading.Lock()
@@ -212,6 +225,9 @@ def docker_ps():
 
 
 def gpu_status_text():
+    """Arbiter status, or '' when no arbiter is installed (the UI hides the panel then)."""
+    if not GPU_STATUS:
+        return ""
     rc, out, err = sh([GPU_STATUS])
     return out if rc == 0 else (out + err)
 
@@ -294,8 +310,15 @@ def repo_by_id(rid):
 
 
 def _project(rec):
-    """The real docker-compose project name. gpu-lease prefixes leased jobs with 'lease-'
-    (LEASE_NAME/COMPOSE_PROJECT_NAME = lease-<name>); CPU jobs use the bare name we set."""
+    """The real docker-compose project name.
+
+    The 'lease-' prefix is the PANEL's naming convention for any GPU job, not evidence that a
+    lease ran. When gpu-lease is installed it reproduces the same name itself
+    (LEASE_NAME/COMPOSE_PROJECT_NAME = lease-<name>); when it is absent do_up() exports that
+    identical pair by hand. Both must agree, because Stop/Logs look a job up by this name --
+    if an unleased GPU job used the bare name, `docker compose -p lease-<name> down` would exit
+    0 with only a warning, the UI would show a green tick, and the container would be left
+    running and unreachable. CPU jobs use the bare name."""
     p = rec.get("project")
     if p:
         return p
@@ -314,8 +337,16 @@ def do_up(repo, profile, needs_gpu, cards, name, env_overrides, extra_args=None)
     compose_cmd = ["docker", "compose", "--profile", profile, "up", "-d"]
     if extra_args:
         compose_cmd += extra_args
-    if needs_gpu:
+    # Three cases, and all three MUST end up with the project name _project() will compute.
+    if needs_gpu and HAVE_LEASE:
+        # Arbitrated: gpu-lease exports COMPOSE_PROJECT_NAME=LEASE_NAME=lease-<name> for us.
         cmd = [GPU_LEASE, "-n", str(cards), "--detach", "--name", name, "--"] + compose_cmd
+    elif needs_gpu:
+        # GPU profile, no arbiter installed: run compose directly, but reproduce the exact pair
+        # gpu-lease would have exported, so Stop/Logs and orphan recovery keep working.
+        env.setdefault("COMPOSE_PROJECT_NAME", f"lease-{name}")
+        env.setdefault("LEASE_NAME", f"lease-{name}")
+        cmd = compose_cmd
     else:
         # CPU-only profile (e.g. monitoring): no lease, but keep a stable project name.
         env.setdefault("COMPOSE_PROJECT_NAME", name)
@@ -420,8 +451,14 @@ def do_custom(name, yaml_text, profile, needs_gpu, cards, workdir, env_overrides
     if profile:
         compose_cmd += ["--profile", profile]
     compose_cmd += ["up", "-d"]
-    if needs_gpu:
+    # Same three-way split as do_up() — see the note on _project() for why the unleased GPU path
+    # must still reproduce the 'lease-' prefixed pair.
+    if needs_gpu and HAVE_LEASE:
         cmd = [GPU_LEASE, "-n", str(cards), "--detach", "--name", lease_name, "--"] + compose_cmd
+    elif needs_gpu:
+        env.setdefault("COMPOSE_PROJECT_NAME", f"lease-{lease_name}")
+        env.setdefault("LEASE_NAME", f"lease-{lease_name}")
+        cmd = compose_cmd
     else:
         env.setdefault("COMPOSE_PROJECT_NAME", lease_name)
         env.setdefault("LEASE_NAME", lease_name)
@@ -508,6 +545,10 @@ def build_state():
         "tracked": sorted(tracked, key=lambda t: t.get("started", 0), reverse=True),
         "compose_ls": compose_ls(),
         "gpu_status": gpu_status_text(),
+        # Lets the UI hide the arbiter affordances (lease pills, card-count selector) on a box
+        # that has no gpu-lease installed, rather than rendering permanently empty controls.
+        "have_lease": HAVE_LEASE,
+        "have_gpu_status": GPU_STATUS is not None,
         "customs": list_customs(),
         "now": time.time(),
     }

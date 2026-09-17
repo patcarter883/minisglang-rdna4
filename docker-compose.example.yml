@@ -35,17 +35,23 @@ services:
       # To serve a model from local disk, uncomment and set MODEL=/models/<your-model-dir>:
       # - /path/to/your/models:/models:ro
 
+    # LIST form on purpose. In the mapping form, `HIP_VISIBLE_DEVICES: "${HIP_VISIBLE_DEVICES:-}"`
+    # resolves to an empty-but-SET variable when you have not exported it, and an empty value selects
+    # ZERO GPUs -- torch then reports no HIP device, `is_rocm()` goes false, and the engine picks a
+    # CUDA attention backend on an AMD card. A bare `- NAME` here is passed through only when it is
+    # actually set in your shell, and omitted entirely when it is not.
     environment:
       # Allow first-run downloads from Hugging Face. The image bakes HF_HUB_OFFLINE=1 for pre-cached
-      # boxes; a fresh install needs it OFF to pull the model. Set an HF_TOKEN for gated models.
-      HF_HUB_OFFLINE: "0"
-      HF_TOKEN: "${HF_TOKEN:-}"
+      # boxes; a fresh install needs it OFF to pull the model.
+      - HF_HUB_OFFLINE=0
       # Fragmentation guard for graph capture on 16 GB cards.
-      PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      # Set in your shell for gated/private models: export HF_TOKEN=hf_...
+      - HF_TOKEN
       # Multi-GPU / APU boxes: pin which card(s) to use (0-based over the DISCRETE GPUs). Leave unset
-      # to let ROCm see every GPU. On systems with an integrated GPU you usually want to pin the
-      # discrete card, e.g. HIP_VISIBLE_DEVICES=0.
-      HIP_VISIBLE_DEVICES: "${HIP_VISIBLE_DEVICES:-}"
+      # to let ROCm see every GPU. On a system with an integrated GPU you usually want the discrete
+      # card, e.g. export HIP_VISIBLE_DEVICES=0
+      - HIP_VISIBLE_DEVICES
 
     # Sensible single-card defaults. Override any of MODEL / TP / MEM_RATIO / GRAPH_BS / EXTRA_ARGS
     # from your shell or a .env file. See docs/SERVING.md for TP=2 and quantized-MoE recipes.

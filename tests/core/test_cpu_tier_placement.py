@@ -3,7 +3,7 @@
 NO GPU, NO TORCH. `minisgl.weights.cpu_tier`, `.placement`, `.prior` and `.stacks` are all in the
 torch-free planning layer, so this whole file runs on a box where `import torch` fails outright —
 which is the state of this box's host, and which is the point: the byte arithmetic is the part that
-can be silently wrong by a factor of two, and it is tested here rather than on a leased card.
+can be silently wrong by a factor of two, and it is tested here rather than on a real card.
 
 The numbers this file pins are the SHAPE OF THE REAL MODEL, not round numbers:
 Qwen3.8-Flash-Next-NVFP4, 48 layers, 512 experts, top-10, hidden 2560, moe_intermediate 640, i.e.

@@ -10,7 +10,7 @@ It mounts ONLY ``minisgl.server.cam_api.cam_router``, driven by the co-located
 ``api_server`` path (which wires a ZMQ backend scheduler and needs a *served* model too) is the
 production model-share task; this decouples the HTTP proof from it.
 
-Run (in the lean image, on a GPU lease):
+Run (in the lean image, on one card):
 
     MINISGL_CAM_CHECKPOINT=/ckpt CAM_NATIVE_GDN=1 \
       python /engine/python/minisgl/cam/serve_app.py            # serves 0.0.0.0:1919

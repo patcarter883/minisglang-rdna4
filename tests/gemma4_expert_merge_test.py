@@ -1,9 +1,9 @@
 """The gate|up merge ORDER inside the Gemma4 MoE w13 container, proven against the checkpoint.
 
-CPU-only (streams the checkpoint to CPU, never touches a GPU) — no lease, cannot disturb a serve:
+CPU-only (streams the checkpoint to CPU, never touches a GPU) — cannot disturb a running serve:
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/wt/tests:/opt/kernels \
         python tests/gemma4_expert_merge_test.py [tp_size] [rank]'
 

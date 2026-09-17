@@ -8,7 +8,7 @@ Default-ON (``MINISGL_FUSED_SAMPLER=1``) but a SOFT fallback: unlike ``layers/_t
 hard-requires its .so because the user opted default-on), the pure-torch sampler in ``sample.py`` is
 an always-correct reference, so a missing/unbuilt ``sampler_hip`` must NOT break serving — it just
 routes back to torch. The kernel and the torch path are validated equivalent by
-``rdna4-hip-kernels/sampler/tests/sampler_parity.py`` under a GPU lease before this default is
+``rdna4-hip-kernels/sampler/tests/sampler_parity.py`` on a real card before this default is
 trusted; ``MINISGL_FUSED_SAMPLER=0`` forces the torch reference (A/B / debugging).
 
 Greedy sampling never reaches here — ``Sampler.sample`` branches to ``torch.argmax`` first — and the

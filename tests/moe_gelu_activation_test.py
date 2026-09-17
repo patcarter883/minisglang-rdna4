@@ -1,4 +1,4 @@
-"""Gated-gelu activation policy for the W4A8 MoE path — CPU only, no GPU lease, no weights.
+"""Gated-gelu activation policy for the W4A8 MoE path — CPU only, no GPU, no weights.
 
 Gemma4's 128 routed experts use HF `gelu_pytorch_tanh`, which is the TANH APPROXIMATION. The trap
 this guards is that substituting the exact erf gelu (`layers.activation.gelu_and_mul`) or silu is
@@ -10,7 +10,7 @@ numbers. Checks:
   3. `kernels.w4a8_moe` still defaults to "silu" and rejects an unknown activation.
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/moe_gelu_activation_test.py'
 """

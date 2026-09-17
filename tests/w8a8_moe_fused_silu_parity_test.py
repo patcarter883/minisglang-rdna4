@@ -14,7 +14,7 @@ the comparison possible at all.
 
 M spans the gemm1 GEMV/GEMM crossover (_MOE_GEMM1_GEMV_MAX = 32) so both fused kernels are covered.
 
-Run under a lease inside the serve image:
+Run inside the serve image (needs one card):
     PYTHONPATH=/engine/python:/opt/kernels python3 /engine/tests/w8a8_moe_fused_silu_parity_test.py
 """
 import importlib, os, sys, torch

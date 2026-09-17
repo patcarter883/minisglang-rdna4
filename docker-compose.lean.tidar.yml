@@ -12,11 +12,13 @@
 #     each draft position on prior accepts and realizes the acceptance the offline metric implies.
 #   * W8A16 experts (MINISGL_ZAYA_W8A16=1) for quality; HIP attn/tail; single card (fp8 fits 16GB).
 #
-# Usage (GPU leased through the shared arbiter; --detach binds the lease to the container):
-#   gpu-lease -n 1 --detach --name ztidar -- \
-#     docker compose -f docker-compose.lean.tidar.yml --profile tidar up -d
+# Usage (single card):
+#   docker compose -f docker-compose.lean.tidar.yml --profile tidar up -d
 #   docker compose -f docker-compose.lean.tidar.yml --profile tidar logs -f
-#   docker compose -f docker-compose.lean.tidar.yml -p lease-ztidar down
+#   docker compose -f docker-compose.lean.tidar.yml --profile tidar down
+#
+# Card selection is LEASE_ROCR_DEVICES / LEASE_HIP_DEVICES below (default: card 0); on a box that
+# arbitrates its cards between jobs, run the up/down under whatever arbiter you use.
 #
 # Every knob stays env-overridable — the DEFAULTS are the consolidated best. To A/B the (capped)
 # fused path set MINISGL_TIDAR_FUSED=1; to serve a different ckpt set MINISGL_TIDAR_MODEL; to add
@@ -43,15 +45,20 @@ services:
     volumes:
       # Engine source hot-mounted (kernels come from /opt/kernels in the image, canonical).
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
-      - /home/pat/models:/models:ro
-      - /home/pat/code/_big:/big:ro          # holds zaya1-tidar-opd-fp8 (the served ckpt)
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
+      # Checkpoint dirs. Repo-relative defaults so a fresh clone resolves; the served TiDAR ckpt
+      # (zaya1-tidar-opd-fp8) is the one under /big, so point BIG_MODELS_DIR at wherever you keep
+      # it — or override MINISGL_TIDAR_MODEL with a path/HF id outright.
+      - ${MODELS_DIR:-./models}:/models:ro
+      - ${BIG_MODELS_DIR:-./models}:/big:ro
     environment:
       # /opt/kernels (canonical HIP kernels) FIRST so nothing under /engine shadows them.
       PYTHONPATH: /opt/kernels:/engine/python:/engine
       HF_HUB_OFFLINE: "1"
       TORCH_BLAS_PREFER_HIPBLASLT: "0"
-      # The lease injects the leased card set; physical id vs 0-based re-index stay distinct.
+      # Which card the container sees (default: the first). The two MUST stay distinct — ROCR_ is
+      # the PHYSICAL card, HIP_ re-indexes within that selection, so setting both to the same
+      # non-zero id selects nothing and torch reports "No HIP GPUs are available".
       ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
       HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
       MINISGL_KV_FP8: "${MINISGL_KV_FP8:-1}"

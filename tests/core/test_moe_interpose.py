@@ -7,7 +7,7 @@ move instead of being silently de-aliased, that a granule's scales travel with i
 seam bound to the wrong layer is caught loudly, and that nothing can be re-placed after freeze().
 
 The one thing these tests cannot cover is graph capture at the served TP with the real forward; that
-is an M1-D gate on a leased card, not a unit test. See the module's `not_done` notes.
+is an M1-D gate on a real card, not a unit test. See the module's `not_done` notes.
 """
 
 from __future__ import annotations

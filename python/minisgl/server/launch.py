@@ -60,8 +60,9 @@ def launch_server(run_shell: bool = False) -> None:
                     "file" if os.path.isfile(server_args.chat_template) else "inline string")
 
     # Worker processes are watched by a crash-watchdog (see below). If any dies unexpectedly (OOM,
-    # segfault, CUDA error) the parent frontend would otherwise survive as a zombie and HOLD THE GPU
-    # LEASE until the caller's timeout — a wedged bench then blocks the whole lease queue for ~40 min.
+    # segfault, CUDA error) the parent frontend would otherwise survive as a zombie still HOLDING
+    # THE GPU — VRAM reserved, device files open — until whatever launched it times out, so the
+    # next run on the same card fails to allocate.
     _procs: list = []
 
     def start_subprocess() -> None:
@@ -79,7 +80,7 @@ def launch_server(run_shell: bool = False) -> None:
 
         # Spawn dp_size*tp_size schedulers: one full-model engine replica per dp_rank, each replica's
         # tp_size TP ranks. Each process is tagged with its (dp_rank, tp_rank); the engine maps that to
-        # its own card (device_index = dp_rank*tp_size + tp_rank within the lease-visible device set)
+        # its own card (device_index = dp_rank*tp_size + tp_rank within the VISIBLE device set)
         # and its own per-replica ZMQ ingress (zmq_backend_addr keyed by dp_rank). Only the (dp=0,tp=0)
         # process plus each replica's tp-primary participate in routing; replies funnel through one
         # detokenizer. With dp_size=1 this loop is exactly the historical single-replica spawn.
@@ -148,16 +149,17 @@ def launch_server(run_shell: bool = False) -> None:
         for _ in range(dp_size + num_tokenizers + 1):
             logger.info(ack_queue.get())
 
-        # Crash-watchdog: if any worker dies UNEXPECTEDLY (OOM, CUDA error, segfault), tear the whole
-        # server down NOW so the container exits and the GPU lease frees immediately. Without this the
-        # parent frontend survives as a zombie and holds the lease until the caller's timeout (~40 min),
-        # blocking the whole lease queue. A clean SIGTERM/SIGINT (intentional `docker stop` / Ctrl-C) is
-        # NOT a crash — those exit codes are whitelisted so normal shutdown never trips the watchdog.
+        # Crash-watchdog: if any worker dies UNEXPECTEDLY (OOM, CUDA error, segfault), tear the
+        # whole server down NOW so the container exits and the GPUs free immediately. Without this
+        # the parent frontend survives as a zombie holding VRAM and the device files open until
+        # whatever launched it times out, so the next run on the same card fails to allocate. A
+        # clean SIGTERM/SIGINT (intentional `docker stop` / Ctrl-C) is NOT a crash — those exit
+        # codes are whitelisted so normal shutdown never trips the watchdog.
         _clean_exit = {0, -signal.SIGTERM, -signal.SIGINT}
 
         # MINISGL_EXIT_AFTER_STEPS bounds the SCHEDULER loop, but the frontend never runs one — so a
-        # bounded run left the parent (and therefore its container, and therefore the GPU lease) up
-        # indefinitely while the workers had already finished and flushed their profiler output.
+        # bounded run left the parent (and therefore its container, and therefore the GPUs it holds)
+        # up indefinitely while the workers had already finished and flushed their profiler output.
         # Under a bounded run a CLEAN worker exit means "the run is done", so take the server down
         # with it and let the container stop on its own.
         _bounded_run = int(os.environ.get("MINISGL_EXIT_AFTER_STEPS") or "0") > 0
@@ -185,7 +187,7 @@ def launch_server(run_shell: bool = False) -> None:
                     if ec is not None and ec not in _clean_exit:
                         logger.error(
                             "worker '%s' died unexpectedly (exitcode=%s) — shutting the server down "
-                            "immediately to release the GPU lease.", p.name, ec)
+                            "immediately to free the GPU.", p.name, ec)
                         for q in _procs:
                             if q.is_alive():
                                 try:

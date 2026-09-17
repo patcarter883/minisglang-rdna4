@@ -1,0 +1,47 @@
+{
+  "_comment": "Copy to config.json and edit. config.json is NOT tracked (the repo .gitignore blanket-ignores *.json); this example is the tracked reference for the schema. Keys prefixed _comment are ignored by server.py.",
+
+  "_comment_host": "127.0.0.1 = local only, and the only safe default: anyone who can reach the API can run containers on this host. 0.0.0.0 exposes it to the whole network - read README.md 'Security' first. If this key is absent server.py falls back to 0.0.0.0.",
+  "host": "127.0.0.1",
+  "port": 7070,
+
+  "_comment_token": "Non-empty => every /api call must carry ?token=<value> or an X-Token header. The bundled UI does not forward it, so a token currently means API-only use. See README.md 'Security'.",
+  "token": "",
+
+  "_comment_gpu_lease": "OPTIONAL and omitted here, which is the normal case: GPU profiles then run as plain `docker compose`. The keys gpu_lease and gpu_status name an external card-arbiter binary and its status command, for a box where several people or agents contend for the same cards. No such tool ships with this project. A bare name is looked up on PATH, an absolute path is used as-is; both are resolved once at startup with shutil.which(), and an unresolvable name is treated as absent.",
+
+  "_comment_hf_home": "Absolute path to the HuggingFace cache the model picker lists from. No ~ or $VAR expansion is done. Delete the key to fall back to $HF_HOME. A path that does not exist just means an empty model list.",
+  "hf_home": "/absolute/path/to/huggingface",
+
+  "_comment_custom_dir": "Where YAML created in the UI is written. Optional; defaults to control-panel/custom/.",
+
+  "_comment_repos": "One entry per compose stack. dir = the cwd every `docker compose` call runs in, so the stack's relative volume mounts resolve; compose = the file parsed for `profiles:`. Absolute paths are recommended - relative ones resolve against the panel's working directory.",
+  "repos": [
+    {
+      "id": "minisgl",
+      "name": "minisglang (rdna4)",
+      "dir": "/absolute/path/to/minisgl-rdna4",
+      "compose": "/absolute/path/to/minisgl-rdna4/docker-compose.yml"
+    }
+  ],
+
+  "_comment_profile_defaults": "Env-var defaults the panel applies to services it launches, keyed by <repo>::<profile>. Pre-filled and editable in the UI, and enforced server-side at launch so a bare /api/up is identical to a UI launch. An explicit non-empty value wins; an empty string is inert at launch and only pre-fills the control. Pin only things that are a property of THIS BOX (TP/DP/EP, concurrency, host-specific MINISGL_* knobs) - see README.md 'Leave the per-model knobs empty'.",
+  "profile_defaults": {
+    "minisgl::serve": {
+      "TP": "2",
+      "CONC": "2",
+      "SERVED_NAME": "",
+      "SPEC": ""
+    }
+  },
+
+  "_comment_profile_controls": "Knobs promoted out of the generic env-var list into real UI controls, keyed by <repo>::<profile>. type is select (needs options), number or text; label is the caption, placeholder the hint shown when the field is empty. Anything not listed here still appears in the overridable env list.",
+  "profile_controls": {
+    "minisgl::serve": [
+      { "key": "SPEC", "label": "spec decode", "type": "select",
+        "options": ["", "none", "mtp", "dflash", "eagle3", "ngram", "tidar"] },
+      { "key": "CONC", "label": "concurrency", "type": "number", "placeholder": "4" },
+      { "key": "SERVED_NAME", "label": "served alias", "type": "text", "placeholder": "auto (base model name)" }
+    ]
+  }
+}

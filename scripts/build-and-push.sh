@@ -12,15 +12,19 @@
 #
 # Env overrides:
 #   IMAGE        registry/name          (default ghcr.io/patcarter883/minisglang-rdna4)
-#   KERNELS_DIR  path to rdna4-hip-kernels checkout (default /home/pat/code/rdna4-hip-kernels)
+#   KERNELS_DIR  path to rdna4-hip-kernels checkout (default: sibling checkout, ../rdna4-hip-kernels)
 #   PUSH         1 to push after building (default 0)
 set -euo pipefail
 
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO"
+
 IMAGE="${IMAGE:-ghcr.io/patcarter883/minisglang-rdna4}"
-KERNELS_DIR="${KERNELS_DIR:-/home/pat/code/rdna4-hip-kernels}"
+# Default to the sibling checkout you get from cloning both repos side by side. An absolute path
+# would only ever resolve on the machine it was written on; KERNELS_DIR overrides it either way.
+KERNELS_DIR="${KERNELS_DIR:-$(dirname "$REPO")/rdna4-hip-kernels}"
 PUSH="${PUSH:-0}"
 
-cd "$(dirname "$0")/.."
 SHA="$(git rev-parse --short HEAD)"
 
 if [[ ! -d "$KERNELS_DIR" ]]; then

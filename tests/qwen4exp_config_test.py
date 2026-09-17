@@ -15,7 +15,7 @@ they are wrong:
   * `mtp_num_hidden_layers` — the checkpoint ships an MTP head this engine does not implement, so
     asking for it must RAISE rather than silently serve without speculation.
 
-CPU only — no GPU, no weights, no lease. Run in the serve image (host torch does not import):
+CPU only — no GPU, no weights. Run in the serve image (host torch does not import):
 
     docker run --rm -v <worktree>:/engine --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_config_test.py'

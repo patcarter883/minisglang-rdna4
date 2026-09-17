@@ -549,7 +549,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # for the plain-decode loops only (the spec step keeps the single SKIP/STEPS window).
         # One window per run means one BOOT per measured batch size, and booting a 35B at TP=2 with
         # graph capture costs more than the measurement does; a run that has to compare bs=1 against
-        # bs=8 then spends most of its GPU lease loading weights twice. Windows are matched by
+        # bs=8 then spends most of its GPU time loading weights twice. Windows are matched by
         # loop-iteration index, which is deterministic because `ignore_eos` + `max_tokens` fixes how
         # many decode steps each driving request costs. Unset => the single SKIP/STEPS window.
         _wins = (os.environ.get("MINISGL_ROCTX_WINDOWS") or "").strip()

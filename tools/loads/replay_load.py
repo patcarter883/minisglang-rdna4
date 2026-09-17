@@ -16,19 +16,20 @@ Modes:
      real shape — use only to force sustained decode for kernel profiling).
        python replay_load.py <jsonl> <port> saturate <conc> <dur_s> [model]
 
-CLEANUP: the capture contains timed-out requests that the agent re-sent later (same question, doubled
-`<objective>` tag, ending in a ptok=0 failure). DROP_IDX (indices in offset-sorted order) removes
-those retry bursts so the replay reflects the intended traffic, not the timeout noise. Override on the
-CLI with `--keep-all` to replay the raw trace.
+CLEANUP: a capture taken from a live agent contains requests that timed out client-side and were
+re-sent, so replaying it raw double-counts that work. DROP_IDX (indices in offset-sorted order)
+removes those retry bursts. It is HARDCODED for one specific capture — against any other file those
+indices remove arbitrary requests, so pass `--keep-all`, or edit DROP_IDX, for your own trace.
 """
 import sys, json, time, threading, urllib.request
 
-# Timed-out / re-sent retry bursts to drop (offset-sorted indices). Evidence:
-#  71      : dur 305s (client timeout), ptok=0 FAILED — "database migrations" objective
-#  72-75   : "exception handling" objective x4 in a row (retry burst) -> re-sent clean at idx 84
-#  76-82   : "database migrations" objective x7 in a row (retries of 71) -> re-sent clean at idx 83
-#  118     : dur 0s, ptok=0 empty FAILURE (tail of the RainGauge assembly retry storm)
-# The clean single-`<objective>` re-sends at 83-87 are KEPT.
+# Timed-out / re-sent retry bursts to drop, as offset-sorted indices into ONE specific capture.
+# What put each of them here:
+#  71      : dur 305s (client timeout), 0 prompt tokens, FAILED
+#  72-75   : the same request four times in a row (retry burst) -> re-sent cleanly at idx 84
+#  76-82   : the same request seven times in a row (retries of 71) -> re-sent cleanly at idx 83
+#  118     : dur 0s, 0 prompt tokens, empty FAILURE at the tail of a retry storm
+# The clean single re-sends at 83-87 are KEPT. These indices mean nothing in any other file.
 DROP_IDX = {71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 118}
 
 args = [a for a in sys.argv[1:] if a != "--keep-all"]
@@ -39,8 +40,9 @@ DEFMODEL = "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"
 reqs = [json.loads(l) for l in open(JSONL)]
 reqs.sort(key=lambda r: r.get("offset_s", 0))
 if not KEEP_ALL:
+    n_before = len(reqs)
     reqs = [r for i, r in enumerate(reqs) if i not in DROP_IDX]
-    print(f"[cleanup] dropped {len(DROP_IDX)} timed-out/re-sent requests -> {len(reqs)} kept "
+    print(f"[cleanup] dropped {n_before - len(reqs)} timed-out/re-sent requests -> {len(reqs)} kept "
           f"(pass --keep-all to replay raw)")
 
 lock = threading.Lock(); acc = {"n": 0, "err": 0, "out": 0}

@@ -1,9 +1,9 @@
 """The diffusion sampler, replayed against the HuggingFace reference — BIT-EXACT, every step.
 
-CPU-only, no GPU lease, cannot disturb a serve:
+CPU-only, no GPU, cannot disturb a serve:
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/diffusiongemma_sampler_test.py'
 

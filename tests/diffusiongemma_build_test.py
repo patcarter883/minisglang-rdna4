@@ -1,10 +1,10 @@
 """DiffusionGemma build + loader: one instantiated stack must serve BOTH roles, exactly.
 
-CPU/meta only — no GPU lease, cannot disturb a running serve. Run inside the serve image (the host
+CPU/meta only — no GPU, cannot disturb a running serve. Run inside the serve image (the host
 torch install is broken):
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/diffusiongemma_build_test.py [tp_size]'
 

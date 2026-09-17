@@ -111,7 +111,7 @@
           <button class="ghost" onclick="validateCustom()">Validate</button>
           <button class="primary" onclick="launchCustom()">Create & start</button>
         </div>
-        <p class="muted small">Custom files are saved to <code id="customDirHint">control-panel/custom/</code>. GPU services are auto-wrapped in <code>gpu-lease</code>. Use absolute paths for volumes unless you set a working dir.</p>
+        <p class="muted small">Custom files are saved to <code id="customDirHint">control-panel/custom/</code>. GPU services get a stable <code>lease-…</code> project name so Stop and Logs can find them again. Use absolute paths for volumes unless you set a working dir.</p>
       </div>
     </div>
   </section>
@@ -396,7 +396,7 @@ async function refresh(manual){
 function tick(){ $('#clock').textContent=new Date().toLocaleTimeString(); }
 function showWarn(){
   const loc=location.hostname;
-  $('#warnBanner').innerHTML='<div class="banner">⚠ This panel executes docker &amp; gpu-lease commands with no authentication. It is reachable on your LAN at <strong>http://'+loc+':'+location.port+'</strong>. Only expose it on a trusted network. Set <code>"token"</code> in config.json to require one.</div>';
+  $('#warnBanner').innerHTML='<div class="banner">⚠ This panel runs <code>docker compose</code> on the host, so anyone who can reach it at <strong>http://'+loc+':'+location.port+'</strong> can start containers here — that is equivalent to root. Keep <code>"host"</code> at 127.0.0.1 and read the Security section of control-panel/README.md before exposing it.</div>';
 }
 showWarn(); tick(); setInterval(tick,1000); refresh(); setInterval(()=>refresh(),5000); syncCardsField();
 </script>

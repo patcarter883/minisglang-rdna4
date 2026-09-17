@@ -1,10 +1,10 @@
 """DiffusionGemma NUMERICAL parity against the HuggingFace reference — both execution roles.
 
-CPU-only, float32 — needs no GPU lease and cannot disturb a running serve. Run inside the serve
+CPU-only, float32 — needs no GPU and cannot disturb a running serve. Run inside the serve
 image (the host torch install is broken, and the image ships `transformers.models.diffusion_gemma`):
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/diffusiongemma_parity_test.py'
 

@@ -18,7 +18,7 @@ that fail SILENTLY if the modelopt header is mis-normalized:
 Also asserts the normalization is CONFINED to modelopt: an AWQ header and a compressed-tensors
 header parse byte-identically to before.
 
-CPU only — no GPU, no weights, no lease. Run in the serve image (host torch does not import):
+CPU only — no GPU, no weights. Run in the serve image (host torch does not import):
 
     docker run --rm -v <worktree>:/engine --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_quant_test.py'
@@ -34,8 +34,12 @@ from types import SimpleNamespace
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "qwen4exp")
 #: The live checkpoint, when it is on this box. The fixture is the durable copy; if both exist they
-#: must agree, or the fixture has drifted from what we actually serve.
-LIVE_CONFIG = "/home/pat/.cache/hf-q4e/config.json"
+#: must agree, or the fixture has drifted from what we actually serve. Absent is not a failure — the
+#: comparison below is guarded by `os.path.exists`, so a box without the checkpoint just skips it.
+#: Point QWEN4EXP_CKPT at your checkout to enable it (same variable the qwen4exp tests already use).
+LIVE_CONFIG = os.path.join(
+    os.environ.get("QWEN4EXP_CKPT") or os.path.expanduser("~/.cache/hf-q4e"), "config.json"
+)
 
 _failures = 0
 

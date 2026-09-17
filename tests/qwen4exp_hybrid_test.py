@@ -54,7 +54,7 @@ Run (card 0, in the serve image):
     docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES=0 \
-      -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro -v /home/pat/.cache/hf-ple:/ple:ro \
+      -v <worktree>:/engine -v <ckpt>:/model:ro -v <ple>:/ple:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_hybrid_test.py \
          --layers 48 --device-layers 2 --arena-layers 16 --new 64 --gen-config --chat'

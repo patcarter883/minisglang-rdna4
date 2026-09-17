@@ -31,9 +31,9 @@ global value-converted, per-expert offset dropped, container-wide scalar -- and 
 CATCHES each one (mutant error must exceed even the fp16 fold's). A gate that cannot fail is not a
 gate.
 
-CPU ONLY. No GPU, no lease -- pure f64 host arithmetic over mmap'd bytes. Run in the serve image:
+CPU ONLY. No GPU -- pure f64 host arithmetic over mmap'd bytes. Run in the serve image:
 
-    docker run --rm -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro \
+    docker run --rm -v <worktree>:/engine -v <ckpt>:/model:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_nvfp4_golden_test.py /model'
 

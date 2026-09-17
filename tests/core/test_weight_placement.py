@@ -4,7 +4,7 @@ NO GPU, NO TORCH. `minisgl.weights.placement`, `.prior` and `.stacks` are delibe
 (`stacks` imports torch only inside `TorchStackAllocator` / `as_tensor`), so this whole file runs on
 a machine where `import torch` fails outright. That is the point: the part of weight offload that
 can be silently wrong by a factor of two is the byte arithmetic, and the byte arithmetic is the part
-that is tested here rather than on a leased card.
+that is tested here rather than on a real card.
 """
 
 from __future__ import annotations

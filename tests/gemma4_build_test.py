@@ -1,10 +1,10 @@
 """Gemma4 meta-device build: proves the model assembles and pins the exact parameter set + shapes.
 
-CPU/meta only — no GPU lease, no weights read, cannot disturb a running serve. Run inside the serve
+CPU/meta only — no GPU, no weights read, cannot disturb a running serve. Run inside the serve
 image (the host torch install is broken):
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/gemma4_build_test.py [tp_size]'
 

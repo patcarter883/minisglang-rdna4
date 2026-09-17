@@ -264,12 +264,14 @@ class EngineConfig:
 
     @property
     def device_index(self) -> int:
-        """Physical card slot for this replica's TP rank, within the lease-visible device set.
+        """Physical card slot for this replica's TP rank, within the VISIBLE device set.
 
-        The gpu-lease/HIP_VISIBLE_DEVICES exposes the leased cards as cuda:0..N-1; this picks the
-        slot for (dp_rank, tp_rank). With dp_size=1 this collapses to tp_info.rank — the historical
-        `cuda:{tp_rank}` mapping — so single-replica runs are unchanged. With dp_size>1 (tp_size=1
-        for ZAYA) each replica lands on its own card: dp_rank=0 -> cuda:0, dp_rank=1 -> cuda:1.
+        HIP_VISIBLE_DEVICES (CUDA_VISIBLE_DEVICES on NVIDIA) renumbers whichever cards this process
+        may use to cuda:0..N-1, so this index is into that already-filtered set and never into the
+        host's physical slots. It picks the slot for (dp_rank, tp_rank). With dp_size=1 it collapses
+        to tp_info.rank — the historical `cuda:{tp_rank}` mapping — so single-replica runs are
+        unchanged. With dp_size>1 (tp_size=1 for ZAYA) each replica lands on its own card:
+        dp_rank=0 -> cuda:0, dp_rank=1 -> cuda:1.
         """
         return self.dp_info.dp_rank * self.tp_info.size + self.tp_info.rank
 

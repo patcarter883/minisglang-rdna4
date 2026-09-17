@@ -7,7 +7,7 @@ hooking `CAMMemory.apply_tap` into the base's decoder layer `tap_layer` and gree
 NO router_delta. A tap-OFF baseline is printed for contrast (base alone should NOT know the edited
 object — the write gate only stored base-unknowable facts).
 
-Run in the lean image on a GPU lease (see scratchpad/run_tap.sh):
+Run in the lean image on one card (see scratchpad/run_tap.sh):
     python /engine/python/minisgl/cam/tap_check.py
 """
 import os, torch

@@ -1,12 +1,14 @@
 # Build the prebuilt minisglang-rdna4 serving image and push it to GHCR.
 #
-# Manual-trigger only (workflow_dispatch) — it does NOT run on push, so it never fails CI on a fork
-# that lacks the secrets below. The custom HIP kernels live in a SEPARATE (private) repo, so this
-# job checks that repo out into the `kernels` build context. It requires one repo secret:
+# Manual-trigger only (workflow_dispatch) — it does NOT run on push, so it never fails CI on a fork.
+# The custom HIP kernels live in a SEPARATE repo, checked out here into the `kernels` build context.
+# That repo is public, so actions/checkout needs no token; the image is pushed with GITHUB_TOKEN
+# (packages: write), so this job needs no secrets at all.
 #
-#   KERNELS_PAT  — a PAT (or fine-grained token) with `contents: read` on the kernels repo.
-#
-# The image is pushed with GITHUB_TOKEN (packages: write), so no extra registry secret is needed.
+# HEADS UP — the finished image is ~33 GB and the kernel compile is long. A GitHub-hosted
+# `ubuntu-latest` runner has ~14 GB of free disk, so this job will fail on space there unless you
+# free it first (or point `runs-on` at a self-hosted runner). Until that is settled, the reliable
+# path is a local build and push — see docs/IMAGE.md.
 
 name: publish-image
 
@@ -32,12 +34,20 @@ jobs:
       - name: Checkout engine repo
         uses: actions/checkout@v4
 
-      - name: Checkout canonical HIP kernels (private)
+      - name: Checkout canonical HIP kernels
         uses: actions/checkout@v4
         with:
           repository: ${{ env.KERNELS_REPO }}
-          token: ${{ secrets.KERNELS_PAT }}
           path: _kernels
+
+      # The Dockerfile's profiling stage does `COPY --from=uprof .` unconditionally, because AMD
+      # serves the uProf .deb only behind a EULA click-through and it cannot be fetched at build
+      # time. With no `uprof` context BuildKit tries to resolve the name as a REGISTRY image and
+      # dies with "pull access denied ... insufficient_scope", which reads like an auth failure
+      # rather than a missing context. An EMPTY directory is all CI needs -- the stage self-skips
+      # when it finds no .deb. Omitting this is why :latest sat frozen from 2026-07-14.
+      - name: Create empty uProf build context
+        run: mkdir -p _uprof
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -66,5 +76,6 @@ jobs:
           file: Dockerfile
           build-contexts: |
             kernels=_kernels
+            uprof=_uprof
           push: true
           tags: ${{ steps.tags.outputs.tags }}

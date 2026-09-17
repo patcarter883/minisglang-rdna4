@@ -2,7 +2,7 @@
 
 NO GPU. `plan.py` is defensively getattr-based, so a `SimpleNamespace` config is enough to drive the
 whole resolver — which is the point: the capacity arithmetic and the four refusals are the parts
-that can be silently wrong, and they are tested here rather than on a leased card.
+that can be silently wrong, and they are tested here rather than on a real card.
 
 The shape is the real checkpoint's: Qwen3.8-Flash-Next-NVFP4, 48 MoE layers, 512 experts, top-10,
 hidden 2560, moe_intermediate 640.

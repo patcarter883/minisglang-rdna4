@@ -5,7 +5,7 @@ Run in the serve image (torch does not import on this host):
     docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES=0 \
-      -v <worktree>:/engine -v /home/pat/.cache/hf-ple:/ple:ro \
+      -v <worktree>:/engine -v <ple>:/ple:ro \
       -e MINISGL_PLE_FILES="$(ls /ple/model-plefp8-*.safetensors | paste -sd:)" \
       -e MINISGL_PLE_META_FILES=/ple/model-bf16-00010.safetensors \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \

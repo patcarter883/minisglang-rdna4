@@ -38,4 +38,4 @@ services:
   serve:
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface

@@ -7,8 +7,8 @@ reference source is importable, and the checkpoint if you want the REAL layer-10
     docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES=0 \
-      -v <worktree>:/engine -v /home/pat/Projects/sglang-upstream:/sglang:ro \
-      -v /home/pat/.cache/hf-q4e:/model:ro \
+      -v <worktree>:/engine -v <sglang-upstream>:/sglang:ro \
+      -v <ckpt>:/model:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python -m pytest \
          /engine/tests/qwen4exp_hc_parity_test.py -q -o addopts=""'
@@ -69,10 +69,13 @@ LOWRANK = 320
 EPS = 1e-6
 WIDE = HC_COUNT * HIDDEN
 
+#: Where to find upstream's `hyperconnection.py`, most explicit first. `/sglang` is the container
+#: mount the docstring above sets up; the `~` entry is the convenience fallback for running straight
+#: on a host that keeps a checkout there. Set SGLANG_HC_REF to point anywhere else.
 REF_CANDIDATES = (
     os.environ.get("SGLANG_HC_REF"),
     "/sglang/python/sglang/srt/layers/hyperconnection.py",
-    "/home/pat/Projects/sglang-upstream/python/sglang/srt/layers/hyperconnection.py",
+    os.path.expanduser("~/Projects/sglang-upstream/python/sglang/srt/layers/hyperconnection.py"),
 )
 CKPT = os.environ.get("QWEN4EXP_CKPT", "/model")
 # The shard that holds `model.language_model.layers.10.{attn,mlp}_hyper_connection.*`.

@@ -1,11 +1,11 @@
 """Gemma4 NUMERICAL parity against the HuggingFace reference, module by module.
 
-CPU-only, float32 (plus one deliberate fp16 pass) — needs no GPU lease and cannot disturb a running
+CPU-only, float32 (plus one deliberate fp16 pass) — needs no GPU and cannot disturb a running
 serve. Run it inside the serve image (the host torch install is broken, and the image ships
 transformers' `models.gemma4` reference):
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/gemma4_parity_test.py'
 

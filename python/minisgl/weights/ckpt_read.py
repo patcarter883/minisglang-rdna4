@@ -125,7 +125,7 @@ expert against another's scale — plausible text, no crash (see `PinnedWeightAr
     asserts the list equality against the real `safe_open` rather than trusting this paragraph.
 
 `tools/offload/ckpt_read_parity.py` compares EVERY tensor of a whole shard, as raw uint8, against
-`safe_open` — that is the merge gate, and it runs on CPU with no GPU lease.
+`safe_open` — that is the merge gate, and it runs on CPU with no GPU at all.
 
 Unknown dtypes RAISE. A silent fallback to mmap would make the fast path opt-out-by-accident and
 hide exactly the kind of drift this file's own docstring warns about.

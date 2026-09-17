@@ -20,10 +20,10 @@ of the parameters, loaded from real bytes, is a measurement; a projection is not
 all 206 shards (bounded CPU memory: one expert stack at a time, ~4 GB peak) and additionally asserts
 that the emitted set EQUALS the declared set.
 
-CPU only. No GPU, no lease — the loader is handed `torch.device("cpu")`, so this cannot disturb a
+CPU only. No GPU — the loader is handed `torch.device("cpu")`, so this cannot disturb a
 serve. Run in the serve image:
 
-    docker run --rm -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro \
+    docker run --rm -v <worktree>:/engine -v <ckpt>:/model:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_loader_test.py /model'
 """

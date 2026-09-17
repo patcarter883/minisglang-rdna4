@@ -4,13 +4,13 @@ No weights and no model — this is arithmetic. It still needs a card, because t
 allocate PINNED host staging buffers (`pin_memory=True`) exactly as the autoregressive ones do, and
 that needs a CUDA context; it does not need much of one, so it rides along with the end-to-end run:
 
-    gpu-lease -n 1 -- bash -c 'docker run --rm --name dg_meta \
+    docker run --rm --name dg_meta \
       --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --ipc host \
-      -e HIP_VISIBLE_DEVICES=$HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES \
-      -v <worktree>:/wt -v /home/pat/.cache/huggingface:/root/.cache/huggingface \
+      -e HIP_VISIBLE_DEVICES -e ROCR_VISIBLE_DEVICES \
+      -v <worktree>:/wt -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
       -e HF_HUB_OFFLINE=1 --entrypoint bash minisgl-rdna4:gemma4 \
-      -lc "PYTHONPATH=/wt/python:/opt/kernels python /wt/tests/diffusiongemma_canvas_meta_test.py"'
+      -lc "PYTHONPATH=/wt/python:/opt/kernels python /wt/tests/diffusiongemma_canvas_meta_test.py"
 
 Three things are pinned, each of which fails SILENTLY if it drifts — a wrong ring row does not
 crash, it attends the wrong keys and produces fluent, wrong text:

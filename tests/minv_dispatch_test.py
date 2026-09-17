@@ -15,7 +15,7 @@ test refuses to take that on trust for the shapes the dispatch was re-routed on:
 
 Needs a GPU and the dense_gemm package. Run inside the serve image:
 
-    gpu-lease -n 1 -- docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+    docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       -v <worktree>:/engine -e PYTHONPATH=/opt/kernels:/engine/python \
       --entrypoint bash minisgl-rdna4:<tag> -lc 'python /engine/tests/minv_dispatch_test.py'
 """

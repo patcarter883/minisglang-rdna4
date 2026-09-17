@@ -1,9 +1,9 @@
 """Gemma4 weight loader: the emitted key set must EXACTLY match what the model declares.
 
-CPU-only (streams the checkpoint to CPU, never touches a GPU) — no lease, cannot disturb a serve:
+CPU-only (streams the checkpoint to CPU, never touches a GPU) — cannot disturb a running serve:
 
     docker run --rm --entrypoint bash -v <worktree>:/wt \
-      -v /home/pat/.cache/huggingface:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
+      -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface -e HF_HUB_OFFLINE=1 \
       minisgl-rdna4:lean -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels \
         python tests/gemma4_loader_test.py [tp_size]'
 

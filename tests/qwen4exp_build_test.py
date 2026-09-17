@@ -25,7 +25,7 @@ Two things are proved here, and they are the whole point of bring-up tranche 1a:
 Shapes are NOT checked against the checkpoint here — the 84 GB body is not downloaded, so a shape
 table would be a claim, not a measurement. Shape/dtype parity is plan T1.4 with the weights present.
 
-CPU/meta only — no GPU, no weights, no lease. Run in the serve image:
+CPU/meta only — no GPU, no weights. Run in the serve image:
 
     docker run --rm -v <worktree>:/engine --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_build_test.py [tp_size]'

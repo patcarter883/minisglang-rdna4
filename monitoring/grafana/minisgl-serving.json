@@ -3592,7 +3592,7 @@
       "id": 66,
       "type": "stat",
       "title": "NVMe read",
-      "description": "Read throughput on the weight device. nvme1n1 backs the zpcachyoshome pool \u2014 /home/pat/ai/ple (the mmap'd n-gram table), /home/pat/ai/q4e and /home/pat/code \u2014 so it is the weight-streaming device. nvme0n1 is the zpcachyos root pool and should stay near idle during a serve.",
+      "description": "Read throughput on the weight device \u2014 the NVMe holding the model weights and any mmap'd side tables (e.g. a PLE n-gram table), so it carries the weight-streaming traffic. The query pins device=\"nvme1n1\"; edit that filter to whichever device backs the model store on this box. The OS device should stay near idle during a serve.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -3972,7 +3972,7 @@
       "id": 72,
       "type": "timeseries",
       "title": "NVMe throughput by device",
-      "description": "Read and write bytes/s per physical NVMe. nvme1n1 backs the zpcachyoshome pool \u2014 /home/pat/ai/ple (the mmap'd n-gram table), /home/pat/ai/q4e and /home/pat/code \u2014 so it is the weight-streaming device. nvme0n1 is the zpcachyos root pool and should stay near idle during a serve. Writes on the weight device during a read-only serve are ZFS metadata or another job \u2014 worth explaining before trusting a read number.",
+      "description": "Read and write bytes/s per physical NVMe. The device holding the model weights and any mmap'd side tables is the weight-streaming one; the OS device should stay near idle during a serve. Writes on the weight device during a read-only serve are filesystem metadata or another job \u2014 worth explaining before trusting a read number.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"

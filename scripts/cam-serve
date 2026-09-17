@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # cam-serve — one-command lifecycle for the CAM (Canonical Associative Memory) serve.
 #
-# Wraps the leased docker-compose 'cam' profile so an operator doesn't need the tribal knowledge
-# (gpu-lease, compose project naming, GTE env, health polling). Everything is env-overridable.
+# Wraps the docker-compose 'cam' profile so an operator doesn't need the tribal knowledge
+# (compose project naming, GTE env, health polling). Everything is env-overridable.
 #
-#   scripts/cam-serve up        # lease 2 cards, boot the 35B CAM serve, wait until healthy, print the URL
-#   scripts/cam-serve status    # cards + serve health + store stats
+#   scripts/cam-serve up        # boot the 35B CAM serve (TP=2, both cards), wait until healthy, print the URL
+#   scripts/cam-serve status    # serve health + store stats
 #   scripts/cam-serve logs       # follow serve logs
-#   scripts/cam-serve down       # stop + release the lease
+#   scripts/cam-serve down       # stop the serve and free the cards
 #   scripts/cam-serve restart    # down then up
 #
 # Config (env, with defaults):
@@ -15,25 +15,41 @@
 #   MINISGL_CAM_GTE_KEY=1           whitened-GTE semantic key on (paraphrase-robust recall)
 #   MINISGL_CAM_TOKENS / _API_TOKEN auth (see docs/CAM_API.md); unset = open (dev)
 #   MINISGL_CAM_MAX_FACTS / _MAX_NAMESPACES  quotas
-#   CAM_SERVE_NAME=cam              lease/compose instance name (run several with distinct names)
+#   CAM_SERVE_NAME=cam              compose instance name (run several with distinct names)
 #   MINISGL_MOE_FUSED_SILU          set 0 if boot fails with "fused gemm1+silu needs the 'wmma' kernel"
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${MINISGL_HOST_PORT:-1919}"
 NAME="${CAM_SERVE_NAME:-cam}"
-LEASE="minisgl-${NAME}"
-PROJECT="lease-${LEASE}"
+INSTANCE="minisgl-${NAME}"
+# The compose project (and hence the container name, via ${LEASE_NAME} in docker-compose.yml) is
+# ALWAYS "lease-<instance>", whether or not a card arbiter is involved — see the note in up().
+PROJECT="lease-${INSTANCE}"
 CONTAINER="${PROJECT}-cam"
 URL="http://127.0.0.1:${PORT}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "cam-serve: '$1' not found on PATH" >&2; exit 127; }; }
 
 up() {
-  need gpu-lease; need docker; need curl
+  need docker; need curl
   export MINISGL_CAM_GTE_KEY="${MINISGL_CAM_GTE_KEY:-1}" MINISGL_HOST_PORT="$PORT"
-  echo "cam-serve: leasing 2 cards + booting (project ${PROJECT}, port ${PORT})…"
-  ( cd "$REPO" && gpu-lease -n 2 --detach --name "$LEASE" -- docker compose --profile cam up -d )
+  # A GPU arbiter (`gpu-lease`) is OPTIONAL: it only exists on boxes whose cards are shared between
+  # several concurrent jobs, where it queues this boot until both cards are free. When it is absent
+  # — the normal case — we run the same `docker compose` directly, and export by hand the exact pair
+  # the arbiter would have exported (COMPOSE_PROJECT_NAME = LEASE_NAME = lease-<instance>). Both
+  # branches MUST agree on that name: `down`/`logs` address the job as `docker compose -p $PROJECT`
+  # and the container is named from ${LEASE_NAME}, so a bare project name here would make `down`
+  # exit 0 with only a warning while leaving the serve running and unreachable. Same convention as
+  # control-panel/server.py's do_up().
+  if command -v gpu-lease >/dev/null 2>&1; then
+    echo "cam-serve: leasing 2 cards + booting (project ${PROJECT}, port ${PORT})…"
+    ( cd "$REPO" && gpu-lease -n 2 --detach --name "$INSTANCE" -- docker compose --profile cam up -d )
+  else
+    echo "cam-serve: booting on both cards (project ${PROJECT}, port ${PORT})…"
+    ( cd "$REPO" && COMPOSE_PROJECT_NAME="$PROJECT" LEASE_NAME="$PROJECT" \
+        docker compose --profile cam up -d )
+  fi
   local i
   for i in $(seq 1 60); do
     if curl -sf -m3 "${URL}/health" >/dev/null 2>&1; then
@@ -52,7 +68,11 @@ up() {
 down() { ( cd "$REPO" && docker compose -p "$PROJECT" down ); }
 
 status() {
-  command -v gpu-status >/dev/null 2>&1 && gpu-status 2>/dev/null | head -4 || true
+  # Optional extra: on a box that runs a card arbiter, prepend who currently holds the cards.
+  # Everything below works the same without it, so its absence is not an error.
+  if command -v gpu-status >/dev/null 2>&1; then
+    gpu-status 2>/dev/null | head -4 || true
+  fi
   if curl -sf -m3 "${URL}/health" >/dev/null 2>&1; then
     echo "cam-serve: UP at ${URL}"
     curl -s -m5 "${URL}/cam/stats" 2>/dev/null | sed 's/^/  stats: /' || true; echo

@@ -4,7 +4,7 @@ NO GPU. Everything is CPU tensors, because everything this file tests is bookkee
 object a container points at, which rows are NaN, which layer the buffers are holding, and which
 configurations must raise instead of running. The one thing it cannot cover is that the MoE kernel
 reads the rows this tier writes — that is `tests/qwen4exp_offload_serve_test.py --stream-layers` on
-a leased card, and its `weight_offload.moe_resolve[*]` ledger line is what proves it.
+a real card, and its `weight_offload.moe_resolve[*]` ledger line is what proves it.
 
 WHY THE POISON TESTS ARE THE IMPORTANT ONES. Every stream layer aliases ONE buffer set, so a row
 this tier fails to stage holds a DIFFERENT LAYER'S expert — real weights of the right shape and

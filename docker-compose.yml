@@ -7,13 +7,23 @@
 # The engine SOURCE is hot-mounted at /engine (edit-and-restart), but the kernels come from the image
 # (/opt/kernels, canonical) — the repo no longer vendors them.
 #
-# Usage (GPU work leased through the shared arbiter; --detach binds the lease to the container):
-#   # build (CPU only — kernel compiles need no GPU/lease):
+# Usage:
+#   # build (CPU only — the kernel compiles need no GPU):
 #   docker compose build
 #   # serve (single card):
-#   gpu-lease -n 1 --detach -- docker compose --profile serve up -d
+#   docker compose --profile serve up -d
 #   docker compose --profile serve logs -f
-#   gpu-lease -n 1 --detach -- docker compose --profile serve down
+#   docker compose --profile serve down
+#
+# On a box whose cards are shared between several concurrent jobs you will want some arbiter in
+# front of the `up`/`down` (ours is a local wrapper that flocks a card and exports LEASE_NAME /
+# LEASE_*_DEVICES, which is why those variables appear below). None of that is required: every
+# profile here runs standalone with the defaults, on card 0.
+#
+# If you do put one in front, put it in front of BOTH halves. An arbiter that exports
+# COMPOSE_PROJECT_NAME puts the containers in a project the bare `docker compose ... down` cannot
+# see, so a leased `up` paired with a plain `down` silently leaves the serve running — still
+# holding the cards — while compose reports nothing to stop.
 
 x-lean-common: &lean-common
   image: ${MINISGL_IMAGE:-minisgl-rdna4:lean}
@@ -22,13 +32,18 @@ x-lean-common: &lean-common
     dockerfile: Dockerfile
     additional_contexts:
       # The canonical kernels live outside this repo's build context — inject them by name.
-      kernels: ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}
+      # Default is the natural SIBLING checkout (../rdna4-hip-kernels); point RDNA4_HIP_KERNELS
+      # anywhere else if yours lives elsewhere. Relative paths resolve against this file's dir.
+      kernels: ${RDNA4_HIP_KERNELS:-../rdna4-hip-kernels}
       # AMD uProf .deb, likewise outside the context (AMD serves it only behind a EULA click-through,
       # so it cannot be fetched at build time). WITHOUT this entry `docker compose build` FAILS:
       # the Dockerfile's `COPY --from=uprof .` makes docker try to resolve `uprof` as a REGISTRY
       # image and it dies with "pull access denied ... insufficient_scope", which reads like an auth
-      # problem rather than a missing context. The stage skips cleanly when the dir holds no .deb.
-      uprof: ${UPROF_PKG_DIR:-/home/pat/pkgs}
+      # problem rather than a missing context. The stage skips cleanly when the dir holds no .deb,
+      # so the default points at an in-repo placeholder dir (docker/uprof/, which ships only a
+      # README): a plain `docker compose build` then works on any box, and whoever has accepted
+      # AMD's EULA drops the .deb there or sets UPROF_PKG_DIR at their own download dir.
+      uprof: ${UPROF_PKG_DIR:-./docker/uprof}
   restart: "no"
   working_dir: /engine
   devices:
@@ -42,11 +57,13 @@ x-lean-common: &lean-common
   volumes:
     # Engine source (kernels are NOT here anymore — they come from /opt/kernels in the image).
     - .:/engine
-    - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
-    # Ghost-oracle state. A DURABLE host path on purpose: it accumulates over days and must outlive
-    # both the container and this worktree (which goes away when the branch merges), so it does not
-    # belong in a container layer or under /engine.
-    - ${GHOST_ORACLE_DIR:-/home/pat/fixtures/minisgl-ghost-oracle}:/ghost
+    - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
+    # Ghost-oracle state. DURABLE on purpose: it accumulates over days and must outlive both the
+    # container and this worktree (which goes away when the branch merges), so it belongs neither
+    # in a container layer nor under /engine. Default is a NAMED VOLUME (portable, survives
+    # `down`); GHOST_ORACLE_DIR=/abs/path turns it back into a bind mount — compose reads a source
+    # that starts with `/` or `./` as a path and anything else as a volume name.
+    - ${GHOST_ORACLE_DIR:-minisgl-ghost-oracle}:/ghost
   environment: &lean-env
     # /opt/kernels (canonical HIP kernels, baked into the image) FIRST so nothing under /engine can
     # shadow them; /engine/python = engine; /engine = the 3 not-yet-canonical kernels (w8a8 /
@@ -66,8 +83,11 @@ x-lean-common: &lean-common
     # a tiny post-capture alloc then OOMs on fragmentation. expandable_segments lets the allocator
     # grow segments instead. Overridable/empty-safe.
     PYTORCH_CUDA_ALLOC_CONF: "${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-    # The lease injects the leased card set; these MUST stay distinct (physical id vs 0-based
-    # re-index) — see CLAUDE.md visible-devices recipe.
+    # Which card(s) the container sees. Default = the first card. The two MUST stay distinct
+    # (physical id vs 0-based re-index WITHIN that selection): ROCR=1 + HIP=0 is "the second card,
+    # seen as device 0", while setting BOTH to 1 double-filters and selects nothing — torch then
+    # dies with "No HIP GPUs are available". Two cards: LEASE_ROCR_DEVICES=0,1 LEASE_HIP_DEVICES=0,1.
+    # (The LEASE_ prefix is historical: a card arbiter, where one is in use, exports these.)
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
     # Fused MoE decode gemm2 top_k split (grid.z). The split itself is DERIVED from occupancy in
@@ -477,19 +497,19 @@ services:
   # ═══════════════════════════════════════════════════════════════════════════════════════════════
   # GENERIC RUNNER — the ONE correct way to run ANY test / benchmark / compile / probe / hello-world
   # in a WORKING container: correct image (minisgl-rdna4:lean), correct kernels (/opt/kernels — baked,
-  # always consistent with source), ROCm device passthrough, HF cache, and the lease-injected card set.
+  # always consistent with source), ROCm device passthrough, HF cache, and the card selection.
   # DO NOT hand-roll `docker run` for these — every hand-rolled run has gotten the kernel path wrong
   # (stale live /kernels -> gdn_decode_gated missing, fp8_wmma symlink, etc.). Use THIS.
   #
   #   Self-test (proves image+HIP+kernels all load — run this first when anything looks broken):
-  #     gpu-lease -n 1 -- docker compose --profile run run --rm run
+  #     docker compose --profile run run --rm run
   #   Run anything (env MINISGL_CMD is the command; single-quote it):
   #     MINISGL_CMD='python /engine/tools/serve_matrix_bench.py --help' \
-  #       gpu-lease -n 1 -- docker compose --profile run run --rm run
-  #   Compile a kernel into the canonical repo (CPU only, no lease needed — /kernels is mounted RW):
+  #       docker compose --profile run run --rm run
+  #   Compile a kernel into the canonical repo (CPU only, no GPU needed — /kernels is mounted RW):
   #     MINISGL_CMD='cd /kernels/gdn && GPU_ARCHS=gfx1201 bash local/build_local.sh' \
   #       docker compose --profile run run --rm run
-  #   TP=2 job: gpu-lease -n 2 -- ...   (the arbiter injects both cards via LEASE_*_DEVICES).
+  #   TP=2 job: LEASE_ROCR_DEVICES=0,1 LEASE_HIP_DEVICES=0,1 docker compose --profile run run --rm run
   #
   # Kernels default to the baked /opt/kernels (PYTHONPATH from *lean-env). The canonical repo is ALSO
   # mounted at /kernels for COMPILING or testing local kernel edits — after you build there, set
@@ -499,15 +519,18 @@ services:
     profiles: ["run"]
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
-      - ${RDNA4_HIP_KERNELS:-/home/pat/code/rdna4-hip-kernels}:/kernels
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
+      - ${RDNA4_HIP_KERNELS:-../rdna4-hip-kernels}:/kernels
       # Magpie/metrix site-packages at the path profile_kernel.sh expects (MX_SITE_PACKAGES=/mx).
       # Without this the runner cannot host a profiling run, which forced agents back to hand-rolled
       # `docker run` for exactly the workload where getting the mounts right matters most.
-      - ${MAGPIE_SITE_PACKAGES:-/home/pat/code/Magpie/.venv/lib/python3.12/site-packages}:/mx:ro
-      # The box-wide rocprofv3 mutex must be the SAME file inside the container as outside, or two
-      # profiling runs in different containers will not see each other and will SIGABRT.
-      - /home/pat/code/vllm-gfx1201/.gpu-locks:/home/pat/code/vllm-gfx1201/.gpu-locks
+      # Default assumes a sibling Magpie checkout with its venv built; override for any other venv.
+      - ${MAGPIE_SITE_PACKAGES:-../Magpie/.venv/lib/python3.12/site-packages}:/mx:ro
+      # The rocprofv3 mutex must be at the SAME path inside the container as outside, or two
+      # profiling runs in different containers will not see each other and will SIGABRT — hence the
+      # identical source and target. Any host dir does; point PROFILE_LOCK_DIR at a box-wide one if
+      # other containers outside this compose file also profile.
+      - ${PROFILE_LOCK_DIR:-/tmp/minisgl-profile-locks}:${PROFILE_LOCK_DIR:-/tmp/minisgl-profile-locks}
     entrypoint: ["bash", "-lc"]
     command:
       - ${MINISGL_CMD:-python /engine/tools/container_selftest.py}
@@ -518,11 +541,11 @@ services:
   # copy) + paged/cast-free glue + bf16 SSM state (halves recurrent-state HBM). Progression that got
   # here: 24 (baked fp32 full-cache copy) -> 72 (slot-copy) -> 79.6 (stride paged) -> 81.6 (cast-free)
   # -> 81.8 (bf16 ssm) -> 82.3 (fused conv+decode). Remaining 81.8->92 is decode launch/gap structure (~1478 dispatches/token).
-  # Run (lease-bound so the janitor never reaps it):
-  #     gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
-  #     docker compose -p lease-vhip logs -f          # watch boot (~2.5 min, no 30-min GDN autotune)
+  # Run (needs BOTH cards — see LEASE_*_DEVICES on the anchor):
+  #     LEASE_ROCR_DEVICES=0,1 LEASE_HIP_DEVICES=0,1 docker compose --profile vhip up -d
+  #     docker compose --profile vhip logs -f          # watch boot (~2.5 min, no 30-min GDN autotune)
   #     curl localhost:8000/v1/chat/completions ...    # served model name: "x"
-  #     docker compose -p lease-vhip down              # stop + release lease
+  #     docker compose --profile vhip down             # stop
   # Rebuild the stride-aware .so after editing rdna4-hip-kernels/gdn:  bash gdn/local/build_local.sh
   # (inside the image toolchain). To A/B a HIP kernel: set VLLM_PLUGINS (whitelist) /
   # VLLM_ATTENTION_BACKEND (ROCM_HIP_ATTN|TRITON_ATTN); to fall back to the baked (slow fp32-copy) glue
@@ -535,13 +558,15 @@ services:
       - "8000:8000"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
       # DEFAULT ON: paged-aware gdn_hip glue over the baked (slow, fp32-full-cache-copy) one.
-      - ${VHIP_GLUE_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/vllm_oot_slotfix.py}:${VHIP_GLUE_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/vllm_oot.py}:ro
+      # The two glue files live in THIS repo, so they are ./-relative; the .so comes from the
+      # kernels checkout and follows RDNA4_HIP_KERNELS so one variable moves every kernel path.
+      - ${VHIP_GLUE_SRC:-./tools/profiling/vllm_oot_slotfix.py}:${VHIP_GLUE_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/vllm_oot.py}:ro
       # DEFAULT ON: rebuilt stride-aware gdn_hip_C.so over the baked contiguous-only one.
-      - ${VHIP_SO_SRC:-/home/pat/code/rdna4-hip-kernels/gdn/torch-ext/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:${VHIP_SO_DST:-/opt/kernels/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:ro
+      - ${VHIP_SO_SRC:-${RDNA4_HIP_KERNELS:-../rdna4-hip-kernels}/gdn/torch-ext/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:${VHIP_SO_DST:-/opt/kernels/gdn_hip/gdn_hip_C.cpython-312-x86_64-linux-gnu.so}:ro
       # DEFAULT ON: bf16 SSM state (conv stays fp32) — halves recurrent-state traffic vs the forced-fp32 baked register.
-      - ${VHIP_REG_SRC:-/home/pat/code/minisgl-rdna4/tools/profiling/register_bf16ssm.py}:${VHIP_REG_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/register.py}:ro
+      - ${VHIP_REG_SRC:-./tools/profiling/register_bf16ssm.py}:${VHIP_REG_DST:-/usr/local/lib/python3.12/dist-packages/gdn_vllm/register.py}:ro
     # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
     # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
     # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
@@ -553,7 +578,7 @@ services:
     #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
     #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
     #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
-    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vhip -- docker compose --profile vhip up -d
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' docker compose --profile vhip up -d
     entrypoint: ["bash", "-lc"]
     command:
       - |
@@ -619,7 +644,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
     # bash-array command so an optional --speculative-config JSON (VHIP_SPEC) can be appended without
     # bash brace-expanding/word-splitting its {"...":...} — the `$$` are passed through by compose and
     # evaluated in-container at runtime. VHIP_SPEC presets (spec-decode; needs memory headroom — drop
@@ -631,7 +656,7 @@ services:
     #           are minisgl-native, so DFlash here needs an EAGLE3-format Qwen drafter checkpoint):
     #            VHIP_SPEC='{"method":"eagle3","model":"<eagle3-drafter-path>","num_speculative_tokens":3}'
     #   draft-model form (any vLLM-loadable small model):  VHIP_SPEC='{"model":"<drafter>","num_speculative_tokens":3}'
-    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' gpu-lease -n 2 --detach --name vllm -- docker compose --profile vllm up -d
+    # e.g.  VHIP_SPEC='{"method":"qwen3_next_mtp","num_speculative_tokens":2}' docker compose --profile vllm up -d
     entrypoint: ["bash", "-lc"]
     command:
       - |
@@ -716,37 +741,36 @@ services:
     <<: *lean-common
     profiles: ["serve"]
     container_name: ${LEASE_NAME:-minisgl-lean}-serve
-    # "no", NOT unless-stopped: A RESTART POLICY OUTLIVES THE GPU LEASE.
+    # "no", NOT unless-stopped: A RESTART POLICY OUTLIVES WHOEVER OWNS THE CARDS.
     #
-    # The lease is bound to a PROCESS (`gpu-lease --detach` ties it to container lifetime); the
-    # container is bound to Docker's restart policy. Those are not the same lifetime, and under
-    # `unless-stopped` they come apart in the dangerous direction: the lease-holding process dies,
-    # the flock releases, and Docker then brings the container back up — on both cards, with
-    # `gpu-status` reporting them FREE. Another agent leasing a card collides with a serve the
-    # arbiter cannot see. `docker compose down` is the only thing that clears it, because `stop`
-    # leaves the policy armed.
+    # Under `unless-stopped` Docker resurrects this container after the thing that was supposed to
+    # govern it is gone — the shell that started it, or (on a shared box) whatever arbitrates the
+    # cards. The serve comes back holding both GPUs while every external view says they are free,
+    # and `docker compose down` is the only thing that clears it, because `stop` leaves the policy
+    # armed.
     #
     # Observed repeatedly on 2026-09-10/11: every failed boot (a crash, a placement error, a rank
-    # exception) left a container Docker kept resurrecting unleased, each time noticed only by
-    # chance. The policy was also actively harmful during a crash LOOP — a serve that dies at boot
-    # restarts forever, holding the lease and burning the cards, instead of failing once and
-    # freeing them.
+    # exception) left a container Docker kept resurrecting, each time noticed only by chance. The
+    # policy was also actively harmful during a crash LOOP — a serve that dies at boot restarts
+    # forever, burning the cards, instead of failing once and freeing them.
     #
-    # A supervised production serve wants a restart policy; a LEASED one must not have one, because
-    # the arbiter, not Docker, owns when this may run. The `*lean-common` anchor already says "no";
-    # this service used to override it.
+    # A supervised production serve wants a restart policy; this one must not have one. The
+    # `*lean-common` anchor already says "no"; this service used to override it.
     restart: "no"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
       # Local checkpoints (ZAYA, Laguna) and DFlash drafts, so a model alias can name a path.
-      - ${MODELS_DIR:-/home/pat/models}:/models
-      - ${DRAFT_DIR:-/home/pat/code/_models}:/drafts:ro
+      # Repo-relative defaults so a fresh clone has somewhere to put them; MODELS_DIR / DRAFT_DIR
+      # point at wherever your checkpoints actually live (they are large — a dir outside the repo
+      # is the normal case).
+      - ${MODELS_DIR:-./models}:/models
+      - ${DRAFT_DIR:-./models/drafts}:/drafts:ro
       # This service REDEFINES volumes rather than inheriting *lean-common's, so /ghost has to be
-      # repeated here — the anchor's copy does not merge in. Durable host path; see the anchor.
-      - ${GHOST_ORACLE_DIR:-/home/pat/fixtures/minisgl-ghost-oracle}:/ghost
+      # repeated here — the anchor's copy does not merge in. Durable; see the anchor.
+      - ${GHOST_ORACLE_DIR:-minisgl-ghost-oracle}:/ghost
       # qwen4_exp (Qwen3.8-Flash-Next NVFP4) is a LOCAL checkpoint in two parts, and serve.sh's
       # arm preflights BOTH: the expert stacks ship as per-layer shard files under /model, and the
       # 51.2 GB n-gram table is a separate sidecar under /ple that stays NVMe-resident (mmap'd by
@@ -755,8 +779,8 @@ services:
       # 2026-09-06, because the measured runs mounted them by hand in tools/qsa/run_qsa_longctx.sh
       # and that never made it into the compose service every other model serves from.
       # Read-only: a serve has no business writing to either.
-      - ${Q4E_MODEL_DIR:-/home/pat/ai/hf/q4e}:/model:ro
-      - ${Q4E_PLE_DIR:-/home/pat/ai/ple}:/ple:ro
+      - ${Q4E_MODEL_DIR:-./models/q4e}:/model:ro
+      - ${Q4E_PLE_DIR:-./models/q4e-ple}:/ple:ro
     environment:
       <<: *lean-env
       MODEL: "${MODEL:-qwen35b-awq}"
@@ -876,26 +900,27 @@ services:
   # base: the 4B-trained checkpoint's hidden (2560) != served (2048), so CAM auto-falls-back to
   # pointer/retrieve-only (the residual tap needs a 35B-trained checkpoint). The /cam/* edit plane
   # mounts when MINISGL_CAM=1; transparent read/write ride /v1/*. Validated 5/5 recall + 7/7 hardening
-  # surface under graph capture (docs/zaya-port/CAM_35B_TP2_GAP.md). Needs BOTH cards (TP=2): lease -n 2.
-  #   gpu-lease -n 2 --detach --name cam -- docker compose --profile cam up -d
+  # surface under graph capture (docs/zaya-port/CAM_35B_TP2_GAP.md). Needs BOTH cards (TP=2):
+  #   LEASE_ROCR_DEVICES=0,1 LEASE_HIP_DEVICES=0,1 docker compose --profile cam up -d
   # The 4B pointer checkpoint (MINISGL_CAM_CHECKPOINT_HOST) and the persist dir (MINISGL_CAM_STORE_HOST,
   # survives restart via load-on-boot + debounced autosave) are bind-mounted; override either via env.
   cam:
     <<: *lean-common
     profiles: ["cam"]
     container_name: ${LEASE_NAME:-minisgl-lean}-cam
-    # "no", for the same reason as `serve` above — this is the other lease-wrapped GPU service, so
-    # it had the identical restart-outlives-the-lease hazard. Fixed here rather than left for the
-    # next time it fires.
+    # "no", for the same reason as `serve` above — this is the other long-lived GPU service, so it
+    # had the identical restart-outlives-its-owner hazard. Fixed here rather than left for the next
+    # time it fires.
     restart: "no"
     ports:
       - "${MINISGL_HOST_PORT:-1919}:1919"
     volumes:
       - .:/engine
-      - ${HF_HOME:-/home/pat/ai/hf}:/root/.cache/huggingface
-      - ${MINISGL_CAM_CHECKPOINT_HOST:-/home/pat/code/memory-organ-softsteer/cam_ckpt}:/cam_ckpt:ro
+      - ${HF_HOME:-${HOME:-/root}/.cache/huggingface}:/root/.cache/huggingface
+      # The pointer checkpoint is trained in a separate repo — default is the sibling checkout.
+      - ${MINISGL_CAM_CHECKPOINT_HOST:-../memory-organ-softsteer/cam_ckpt}:/cam_ckpt:ro
       - ${MINISGL_CAM_STORE_HOST:-./.cam_store}:/cam_store
-      - ${MINISGL_CAM_GTE_HOST:-/home/pat/code/minisgl-rdna4/.cam_gte}:/cam_gte:ro   # whitened-GTE key artifact (opt-in)
+      - ${MINISGL_CAM_GTE_HOST:-./.cam_gte}:/cam_gte:ro   # whitened-GTE key artifact (opt-in)
     environment:
       <<: *lean-env
       MINISGL_CAM: "1"
@@ -934,3 +959,18 @@ services:
           --memory-ratio "${MINISGL_MEM_RATIO:-0.80}" \
           --spec-algorithm "${MINISGL_CAM_SPEC:-mtp}" --spec-num-draft "${MINISGL_SPEC_K:-4}" \
           ${MINISGL_EXTRA_ARGS:-}
+
+volumes:
+  # Ghost-oracle state, declared because it is the DEFAULT source of the /ghost mount (see the
+  # *lean-common anchor). A named volume outlives `down` and the worktree without needing a
+  # machine-specific host path; GHOST_ORACLE_DIR=/abs/path overrides it with a bind and leaves this
+  # declaration unused, which compose allows.
+  #
+  # The explicit `name:` is load-bearing: without it compose prefixes the PROJECT name, so a serve
+  # launched under a different project (a per-run COMPOSE_PROJECT_NAME, another worktree) would
+  # silently start a FRESH oracle — and a cold seen-prefix LRU under-reports reuse, which is the
+  # one failure mode this store exists to avoid. One fixed name = one store per box, which is what
+  # the host path it replaces gave us. (`docker compose down -v` still deletes it; bind-mount via
+  # GHOST_ORACLE_DIR if you want it out of docker's reach.)
+  minisgl-ghost-oracle:
+    name: minisgl-ghost-oracle

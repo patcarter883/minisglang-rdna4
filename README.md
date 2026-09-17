@@ -1,19 +1,7 @@
-# minisgl-rdna4
+# minisglang-rdna4
 
-A minimal LLM serving engine for **AMD RDNA4 (gfx1201 / Radeon RX 9070 XT)**, forked from
-[mini-SGLang](https://github.com/sgl-project/mini-sglang) (upstream `9a91cfa`, tracked via the
-`upstream` remote) and re-targeted from NVIDIA/CUDA to ROCm. Built around the in-repo
-`w4a8_fp8_wmma` int4-weight / fp8-activation WMMA kernel and the tuned RDNA4 `triton_attn`, with the
-kernel-call layer kept swappable for an incoming custom kernel framework.
-
-> This README documents the RDNA4 fork. The original CUDA-targeted mini-SGLang README is in git
-> history and on the `upstream` remote.
-
-## Quickstart — serve a model in one command
-
-A **prebuilt image** (engine + all custom gfx1201 HIP kernels baked in) is published to GHCR, so
-serving is a single `docker compose up` — no building, no CUDA, no extra toolchain. You need an
-**AMD RDNA4 GPU** (RX 9070 / 9070 XT) with the ROCm kernel driver (`/dev/kfd` + `/dev/dri`).
+**An OpenAI-compatible LLM server for AMD Radeon RX 9070 / 9070 XT (RDNA4, gfx1201).**
+One `docker compose up`. No CUDA, no ROCm userland install, no Triton, no vLLM.
 
 ```bash
 git clone https://github.com/patcarter883/minisglang-rdna4.git
@@ -21,98 +9,89 @@ cd minisglang-rdna4
 MODEL=Qwen/Qwen3-4B docker compose -f docker-compose.example.yml up
 ```
 
-This pulls `ghcr.io/patcarter883/minisglang-rdna4:latest`, downloads the model from Hugging Face on
-first run, and serves an **OpenAI-compatible API** at `http://localhost:1919/v1`:
+That pulls a prebuilt image, downloads the model on first run, and serves
+`http://localhost:1919/v1` — point any OpenAI client at it.
 
-```bash
-curl -s http://localhost:1919/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3-4B","messages":[{"role":"user","content":"Hello!"}]}'
-```
+---
 
-Point `MODEL` at any supported Hugging Face repo id or local path; large quantized MoE models run
-two-card with `TP=2`. **Full guide: [`docs/SERVING.md`](docs/SERVING.md)** (prerequisites, model
-recipes, knobs, troubleshooting).
+## Why it exists
 
-**Status:** quantized MoE serving works and is validated end-to-end. Dense and quantized models
-serve coherently under CUDA-graph capture, single- and two-card, with speculative decoding and
-structured output. It remains a research fork (moving fast, not a hardened release). Live tracker:
-`PORT.md`. Optimization backlog: `PERF_NOTES.md`.
+RDNA4 has the silicon for modern inference: native fp8 and int4 WMMA instructions, and 16 GB
+of fast memory on a card you can actually buy. What it hasn't had is a serving stack that uses
+them. The mature engines target datacentre parts — CDNA and NVIDIA — and the portable fallbacks
+that do run on a Radeon reach the GPU through generic paths that dequantize quantized weights
+back to 16-bit before multiplying, spending the memory bandwidth that quantization was supposed
+to save and leaving the fp8/int4 units idle.
 
-## What works today
+This engine is written the other way round: **nothing dequantizes to fp16.** Weights stay 4-bit
+in memory, activations are quantized to per-token fp8, the WMMA units multiply them natively,
+and accumulation is f32. Every GEMM, attention and MoE path on the serving route is a
+hand-written HIP kernel compiled for gfx1201 — about 35k lines of them, in a
+[separate kernel repo](https://github.com/patcarter883/rdna4-hip-kernels) — under an 85k-line
+engine forked from [mini-SGLang](https://github.com/sgl-project/mini-sglang).
 
-Everything below serves through the OpenAI-compatible API and is validated on gfx1201.
+The practical result: a 35B mixture-of-experts model serves across two consumer Radeons, and
+models far larger than VRAM serve by streaming expert weights from host RAM.
 
-**Model families** (architecture-detected, quantization read from the checkpoint):
+## What it serves
 
-- **Dense** bf16/fp8 — Qwen2 / Qwen2.5 / Qwen3, Llama, Mistral. Logits match HF transformers to
-  **cos-sim 0.9996** (the standing oracle).
-- **MoE** — Qwen3-MoE and the **Qwen3.5 / Qwen3.6-35B-A3B GDN-hybrid MoE** (gated delta-net + 128
-  experts), **GLM-4.7-Flash** (MoE + **MLA**), and **ZAYA1-8B** (Zyphra **CCA** MoE).
-- **Laguna**.
+Architecture and quantization are both read from the checkpoint — there is nothing to configure.
 
-**Quantization** — AWQ **W4A8**, compressed-tensors **W4A16**, **MXFP4**, and **W8A8-fp8**, all via
-native RDNA4 WMMA GEMMs (int4/fp8 compute, f32 accumulate — nothing dequants to F16).
+| | |
+|---|---|
+| **Dense** | Llama, Mistral, Qwen2 / 2.5 / 3 |
+| **MoE** | Qwen2-MoE, Qwen3-MoE, Qwen3.5 / 3.6 (gated delta-net hybrid), GLM-4.7-Flash (MLA), ZAYA1 (CCA), Nemotron-H (Mamba-2) |
+| **Other** | Laguna, Gemma-4 / DiffusionGemma (block diffusion), Muse-Glimmer, Qwen3.8-Flash-Next |
+| **Checkpoint formats** | AWQ, GPTQ, compressed-tensors, MXFP4, NVFP4, fp8 — plus ModelOpt and AMD Quark headers |
 
-**Tensor / data parallelism** — TP=1 single card; **TP=2** across both cards for the 35B AWQ/MXFP4
-MoE and GLM-4.7-Flash (head-parallel MLA/CCA, EP-over-TP experts, one-shot `custom_ar` allreduce);
-**DP=2 + expert-parallel** for ZAYA.
+18 architecture strings map to 16 model implementations; anything else fails fast at load.
+4-bit checkpoints run **W4A8** by default (4-bit weights × per-token-fp8 activations); fp8
+checkpoints run W8A8. Weight-only 16-bit-activation execution is available opt-in.
 
-**Speculative decoding** — ngram, **MTP** (model's own next-token head, Qwen3.5/GLM), **EAGLE3**,
-**DFlash** (block-diffusion drafter), and **TiDAR** — all coherent and **graph-captured** (propose
-and verify), with per-model sweep-optimal draft lengths.
+A single 16 GB card comfortably serves a 4–8B dense model. Large quantized MoE checkpoints run
+across two cards with `TP=2`.
 
-**Serving features** — CUDA-graph capture across MHA / MLA / GDN / CCA; **radix prefix cache**
-(including recurrent GDN/CCA state reuse); **fp8 (e4m3) KV cache** (`MINISGL_KV_FP8=1`); structured
-output (JSON-schema / grammar via xgrammar) and **tool calling**; reasoning-content parsing; and
-**Markovian RSA** (self-refinement) in-engine for ZAYA.
+## What it does
 
-**Custom HIP kernels** (built from the canonical `rdna4-hip-kernels/` repo) — paged prefill + decode
-attention, W4A8 / W8A8 / MXFP4 / bf16 grouped-MoE and dense GEMMs, GDN, MLA, CCA, fused
-SiLU/RMSNorm/RoPE, sampling, and the `custom_ar` allreduce.
+- **Speculative decoding** — n-gram, MTP, EAGLE3, DFlash and TiDAR, with propose *and* verify
+  under graph capture, and an adaptive verify width that picks a rung per step from measured
+  acceptance. Verify is bit-exact, so sampled requests keep the target model's exact distribution.
+- **Prefix caching** — radix cache, including a recurrent variant that reuses linear-attention
+  state across prefix hits for gated-delta-net and CCA hybrids.
+- **Bigger than VRAM** — a four-tier weight placement system: expert weights stream from pinned
+  host RAM over PCIe, with an SLRU residency cache on the GPU and an optional AVX-512 CPU expert
+  tier. This is a capacity feature, not a speed one — it trades throughput for models that
+  otherwise would not load at all.
+- **Structured output and tool calling** — JSON-schema and grammar constraints via xgrammar, with
+  the tool-call format derived from the checkpoint's own chat template rather than hardcoded.
+- **Reasoning models** — `reasoning_content` is split out automatically, with the delimiter pair
+  derived from the chat template (so non-`<think>` markup works with no code change).
+- **Parallelism** — tensor parallel, data parallel and expert parallel, with a one-shot P2P
+  all-reduce over PCIe when both cards can peer.
+- **fp8 KV cache**, Prometheus metrics at `/metrics`, and a web control panel for starting and
+  stopping serve configurations.
 
-## Design principles
+## Going further
 
-1. Maximise RDNA4 strengths — native fp8/int4 WMMA, 3D flash-decode, `waves_per_eu` tuning.
-2. **Nothing dequants to F16** — I/O bf16, compute fp8 (e4m3fn), accumulate f32.
-3. Clean, tidy, agent+human-maintainable — small typed modules, Protocol-based backends.
-4. The custom HIP kernels are a **dependency** built from the canonical `rdna4-hip-kernels/` repo
-   (never copied into this repo); all quantized GEMMs route through `quant/kernels.py` so a
-   different kernel backend can drop in.
+- **[docs/SERVING.md](docs/SERVING.md)** — the full serving guide: prerequisites, model recipes,
+  two-card setups, every knob, troubleshooting.
+- **[docs/IMAGE.md](docs/IMAGE.md)** — what is inside the image and how to build it yourself.
+- **[rdna4-hip-kernels](https://github.com/patcarter883/rdna4-hip-kernels)** — the HIP kernels,
+  and the one-core-per-shape policy that governs them.
+- **[control-panel/](control-panel/)** — the web UI for managing serve configurations.
+- **[docs/journal/](docs/journal/)** — dated engineering records: measurements, bring-up notes and
+  design arguments, kept as evidence. Not maintained as guides.
 
-## Running (maintainer dev workflow — shared-box GPU lease)
+## Status
 
-> Most users want the **[Quickstart](#quickstart--serve-a-model-in-one-command)** above. This
-> section is the maintainer's development workflow on a specific shared two-card box: it builds the
-> image locally from the canonical kernels repo and books the cards through a `flock` lease. The
-> `gpu-lease`/`gpu-status` commands and hardcoded `/home/pat/...` paths are box-specific and are not
-> needed to run the published image.
+A research engine that serves real workloads daily, not a hardened release. It moves fast, and
+interfaces change. Two caveats worth stating plainly: Nemotron-H loads but runs its Mamba-2
+recurrence on an unoptimized reference path, and the engine is built and validated on gfx1201
+only — other RDNA4 parts are untested.
 
-The purpose-built minisglang image (`Dockerfile` + `docker-compose.yml`) is the only serving
-configuration — see `docs/LEAN_IMAGE.md`. GPU work goes through the shared-box `flock` lease (never
-hand-set devices/ports): the bare `gpu-lease` command on `$PATH` (canonical repo
-`/home/pat/code/gpu-lease`, installed via `lease install`).
+Issues and pull requests welcome.
 
-```bash
-# build (CPU only — kernel compiles need no GPU/lease):
-docker compose build
+## License
 
-# 35B AWQ MoE serve (TP=2):
-gpu-lease -n 2 --detach --name leanmoe -- docker compose --profile serve up -d
-docker compose -p lease-leanmoe logs -f serve   # follow boot
-docker compose -p lease-leanmoe down            # stop -> frees the lease
-```
-
-## Tools
-
-- `tools/boot_smoke.py` — load a model + greedy-generate (coherence smoke test).
-- `tools/oracle_ours.py` + `oracle_cmp.py` — the **logit oracle**: capture first-token logits and
-  compare to HF (cos-sim / top-1). `MINISGL_ORACLE_MODEL` / `MINISGL_ORACLE_REF` parameterize it.
-
-## Layout (changes from upstream)
-
-- `python/minisgl/attention/` — `triton_rdna4.py` backend + the vendored tuned kernel
-  (`_triton_unified.py`, `_triton_helpers.py`).
-- `python/minisgl/quant/` — W4A8: `config.py`, `kernels.py` (swappable provider), `method.py`.
-- Phase-0 torch shims replace flashinfer/sgl_kernel/tvm ops in `layers/`, `engine/sample.py`,
-  `kvcache/`, `kernel/radix.py`.
+MIT. Forked from [mini-SGLang](https://github.com/sgl-project/mini-sglang) (`9a91cfa`); the
+upstream copyright notice is preserved in [LICENSE](LICENSE).

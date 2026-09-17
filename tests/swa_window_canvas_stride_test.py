@@ -1,6 +1,6 @@
 """The SWA window snapshot across a BLOCK-DIFFUSION canvas: stride, aliasing, and round-trip.
 
-CPU-only, no weights, no GPU lease — it is arithmetic over a stub ring pool. Run inside the serve
+CPU-only, no weights, no GPU — it is arithmetic over a stub ring pool. Run inside the serve
 image (the host torch install is broken):
 
     docker run --rm --entrypoint bash -v <worktree>:/wt minisgl-rdna4:gemma4 \

@@ -109,8 +109,8 @@ def close() -> None:
 # ---- the tracer -----------------------------------------------------------------------------
 class RouteTraceError(RuntimeError):
     """The tracer cannot honour its own invariants. Never downgraded to a warning: a measurement
-    fixture that silently degrades is how /home/pat/fixtures/minisgl-ghost-oracle ended up with one
-    root-owned Aug-6 file that nobody noticed was stale."""
+    fixture that silently degrades is how an earlier ghost-oracle fixture ended up with one
+    root-owned, months-stale file that nobody noticed."""
 
 
 class RouteTracer:

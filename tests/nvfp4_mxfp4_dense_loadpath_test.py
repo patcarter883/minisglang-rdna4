@@ -10,7 +10,7 @@ uint8 and NVFP4 came back non-finite; the cause was 0x7F/0xFF in the fixture (th
 codes), not the kernel. A fixture that can encode NaN will report a correct path as broken, which is
 the mirror of a fixture that cannot see a real fault.
 
-Run under a lease inside the serve image:
+Run inside the serve image (needs one card):
     PYTHONPATH=/engine/python:/opt/kernels python3 /engine/tests/nvfp4_mxfp4_dense_loadpath_test.py
 """
 import sys, torch

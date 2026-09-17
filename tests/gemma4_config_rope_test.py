@@ -1,10 +1,10 @@
 """Gemma4 config-parse + RoPE parity against the HuggingFace reference.
 
-CPU-only: needs no GPU lease and cannot disturb a running serve. Run it inside the serve image
+CPU-only: needs no GPU and cannot disturb a running serve. Run it inside the serve image
 (the host torch install is broken, and the image ships the transformers Gemma4 reference):
 
     docker run --rm --entrypoint bash \
-      -v <worktree>:/wt -v /home/pat/.cache/huggingface:/root/.cache/huggingface \
+      -v <worktree>:/wt -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
       -e HF_HUB_OFFLINE=1 minisgl-rdna4:lean \
       -lc 'cd /wt && PYTHONPATH=/wt/python:/opt/kernels python tests/gemma4_config_rope_test.py'
 

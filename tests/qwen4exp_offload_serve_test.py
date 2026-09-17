@@ -112,7 +112,7 @@ Run (in the serve image; `tools/run_offload_serve.sh` wraps this and exposes BOT
     docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES=0,1 \
-      -v <worktree>:/engine -v /home/pat/.cache/hf-q4e:/model:ro -v /home/pat/.cache/hf-ple:/ple:ro \
+      -v <worktree>:/engine -v <ckpt>:/model:ro -v <ple>:/ple:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'PYTHONPATH=/engine/python:/opt/kernels python /engine/tests/qwen4exp_offload_serve_test.py \
          --layers 4 --device-gb 2.0 --tp 2'
@@ -1193,9 +1193,9 @@ def _capture_throughput_ab(llm, args) -> dict:
 
     # INTERLEAVED AND REPEATED, and the summary statistic is the MINIMUM.
     #
-    # A single captured-then-eager pair is not robust on this box: the GPU lease is waived for this
-    # task, so a co-tenant can land on either card partway through and inflate whichever leg happens
-    # to be running. That is not hypothetical — an earlier boot of this exact configuration timed the
+    # A single captured-then-eager pair is not robust on a shared box: nothing stops another job
+    # landing on either card partway through and inflating whichever leg happens to be running.
+    # That is not hypothetical — an earlier boot of this exact configuration timed the
     # eager leg at 503 ms/token while the captured leg in the SAME boot, and both legs of the
     # PREVIOUS boot, sat at 58-60 ms/token. Interleaving makes the two legs share whatever contention
     # exists instead of one of them absorbing all of it, and the minimum of several samples is the
@@ -1388,8 +1388,8 @@ def _capture_ab_sampled(llm, args, model_dir: str) -> dict:
         }
 
     # One untimed warm leg per mode before anything is recorded, then INTERLEAVED reps. Interleaving
-    # is not cosmetic: the GPU lease is waived for this task, so a co-tenant landing on either card
-    # part-way through would otherwise be absorbed entirely by whichever leg was running.
+    # is not cosmetic: on a shared box another job landing on either card part-way through would
+    # otherwise be absorbed entirely by whichever leg was running.
     leg(True, warm, True)
     leg(False, warm, True)
     cap_legs, eag_legs = [], []

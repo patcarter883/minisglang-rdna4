@@ -154,8 +154,8 @@ class Qwen3_5MoeSparseBlock(BaseOP):
             # blocking `.to("cpu", copy=True)` to hand activations to the host pool — a HOST SYNC —
             # and a host sync inside the span's side-stream region deadlocks: chunk i's async
             # all_reduce is still in flight, the collective needs BOTH ranks to keep issuing, and
-            # both ranks are parked in the copy instead. Observed 2026-09-07 as `gpu-lease` exit 76
-            # ~3 s into the first forward: one card at 100% util with 0% memory traffic and idle
+            # both ranks are parked in the copy instead. Observed 2026-09-07 as a WEDGED card ~3 s
+            # into the first forward: one card at 100% util with 0% memory traffic and idle
             # power (a kernel that never returned), the peer idle at 3%/22 W, both CPU-MoE worker
             # threads asleep in `queue.get` — i.e. the tier was never given work, the collective
             # was. It is CPU-tier-exclusive because this is the only path that routes on the host

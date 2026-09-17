@@ -12,6 +12,8 @@ __pycache__/
 *.jsonl
 # ...but keep version-controlled monitoring dashboards
 !monitoring/grafana/*.json
+# ...and the control panel's tracked config template (the real config.json stays local)
+!control-panel/config.example.json
 
 # profiling data
 *.nsys-rep
@@ -97,3 +99,24 @@ _tp_overlap_ab/
 
 # Kernel packages staged into the mount by an A/B harness (built .so, root-owned pycache).
 /_kern/
+
+# Profiling scratch. These were COMMITTED once and cost ~4.9 GB across 7 blobs, every one of them
+# over GitHub's hard 100 MiB per-file limit, which made the repo unpushable until the history was
+# purged. rocprofv3 writes kernel traces that run to >1 GB for a single profiled serve.
+.rocprofv3/
+_rocprof_*/
+**/_rocprof_*/
+*kernel_trace.csv
+*kernel_trace.dat
+
+# Repo-relative default for the compose /models, /drafts and qwen4_exp mounts (docker creates it
+# on `up` when MODELS_DIR/DRAFT_DIR are not pointed at a real checkpoint dir). Checkpoints are
+# hundreds of GB — never committed.
+/models/
+
+# Local environment overrides. docker compose auto-loads .env from the project directory, which is
+# how this box keeps its own absolute paths (HF cache, model dirs, the ghost-oracle bind) while the
+# compose defaults stay portable for anyone who clones the repo. See .env.example.
+.env
+.env.*
+!.env.example

@@ -40,10 +40,10 @@ Both a <=budget prompt (where the selection provably degenerates to dense causal
 top-k and of the expand.
 
 RUN (one card, 4-layer subset, ~3 min):
-    gpu-lease -n 1 -- docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
+    docker run --rm --device /dev/kfd --device /dev/dri --group-add video \
       --security-opt seccomp=unconfined --security-opt label=disable --cap-add SYS_PTRACE \
       --ipc host --shm-size 16gb -e ROCR_VISIBLE_DEVICES -e HIP_VISIBLE_DEVICES \
-      -v <worktree>:/engine -v <kernels>:/kern:ro -v /home/pat/.cache/hf-q4e:/model:ro \
+      -v <worktree>:/engine -v <kernels>:/kern:ro -v <ckpt>:/model:ro \
       --entrypoint bash minisgl-rdna4:m1b-20260903 -lc \
       'MINISGL_MOE_G2FUSE=0 PYTHONPATH=/engine/python:/kern/qsa_index/torch-ext:/opt/kernels \
        python /engine/tests/qwen4exp_qsa_capture_test.py'

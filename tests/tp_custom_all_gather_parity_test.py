@@ -32,7 +32,8 @@ WHAT IT PINS, and why each part is load-bearing:
 
 Needs TWO GPUs and the custom_ar package; skips cleanly otherwise rather than passing vacuously.
 
-Run:  gpu-lease -n 2 -- <docker run ...> python /engine/tests/tp_custom_all_gather_parity_test.py
+Run (BOTH cards must be visible to the container — this is a real TP=2 collective):
+      <docker run ...> python /engine/tests/tp_custom_all_gather_parity_test.py
 """
 from __future__ import annotations
 

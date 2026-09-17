@@ -29,10 +29,9 @@ Every series carries a `model_name="<model-path>"` label (mirrors vLLM; drives t
 Metrics are ON by default. `MINISGL_METRICS=0` disables the scheduler snapshot push;
 `MINISGL_METRICS_INTERVAL` (seconds, default 0.5) throttles it.
 
-## Prometheus wiring (already in place)
+## Prometheus wiring
 
-`vllm-gfx1201-prometheus` scrapes via the config at
-`/home/pat/code/vllm-gfx1201/monitoring/prometheus.yml`, which already contains a `minisgl` job:
+Add a `minisgl` job to your Prometheus config pointing at the serve's host port:
 
 ```yaml
   - job_name: minisgl
@@ -41,21 +40,23 @@ Metrics are ON by default. `MINISGL_METRICS=0` disables the scheduler snapshot p
       - targets: ['host.docker.internal:1919']
 ```
 
-A verbatim copy is vendored here as `prometheus-scrape-reference.yml`. The running Prometheus
-already has the target loaded (`curl -s localhost:9090/api/v1/targets` shows job `minisgl`); it
-reads `down` until a serve built with this code exposes `/metrics`. If the config is edited,
-reload **non-destructively** (the container runs with `--web.enable-lifecycle`):
+`prometheus-scrape-reference.yml` here is a complete, ready-to-use config carrying that job plus
+the vLLM ones — copy it, or lift just the block above into a Prometheus you already run.
+(`host.docker.internal` is how a containerised Prometheus reaches the docker host; use `localhost`
+if Prometheus runs outside docker.) Confirm the target loaded with
+`curl -s localhost:9090/api/v1/targets`; it reads `down` until a serve exposing `/metrics` is up.
+If you edit the config, reload **non-destructively** rather than restarting the container, so the
+other scrapes and TSDB continuity survive (this needs Prometheus started with
+`--web.enable-lifecycle`):
 
 ```
 curl -X POST localhost:9090/-/reload
 ```
 
-Do **not** restart the prometheus container (it would drop the vllm scrape / TSDB continuity).
-
 ## Grafana dashboard
 
-`grafana-minisgl-dashboard.json` (title: "minisgl Serving + Spec Decode") is importable into the
+`grafana/minisgl-serving.json` (title: "minisgl Serving + Spec Decode") is importable into the
 running Grafana (`localhost:3000`) against the `vllm-prometheus` datasource. It covers throughput,
 mean accept-len + acceptance rate (DFlash/DDTree headline), TTFT/TPOT/e2e p50/p95/p99, request
-rate/error rate, and KV-pool + GDN-state utilization. It is also provisioned in
-`vllm-gfx1201/monitoring/grafana/dashboards-minisgl/` so it auto-loads there.
+rate/error rate, and KV-pool + GDN-state utilization. Drop it in a Grafana provisioning
+dashboards directory instead if you want it to auto-load.

@@ -1208,14 +1208,14 @@ class Engine:
         #
         # A NOTE ON THE OLD JUSTIFICATION HERE: this comment used to claim "cap 12 and cap 23
         # produced the SAME hit count and the same TTFT ... while the difference cost 36,704 KV pool
-        # tokens", citing tools/rec_radix_ab.sh. The archived fixtures for that script
-        # (/home/pat/fixtures/minisgl-kv-calib/rec_radix_ab/) do not contain that comparison: both
-        # store legs booted at the SAME cap 23 and varied only the LADDER DEPTH (0 vs 4), which is
-        # what came back identical. The "cap 12" leg is the `tuned` arm, which also changes ladder
-        # AND --max-prefill-length, so it is not a cap-only A/B; the 36,704 figure traces to commit
-        # 209e4aaa as 11 x 16.4 MiB arithmetic, not a measurement. What IS supported: interior
-        # resume points buy nothing. Cross-request CAP depth was never measured — and with the store
-        # in host RAM it stops costing pool tokens, so it is now worth measuring properly.
+        # tokens", citing tools/rec_radix_ab.sh. The archived fixtures for that script do not
+        # contain that comparison: both store legs booted at the SAME cap 23 and varied only the
+        # LADDER DEPTH (0 vs 4), which is what came back identical. The "cap 12" leg is the `tuned`
+        # arm, which also changes ladder AND --max-prefill-length, so it is not a cap-only A/B; the
+        # 36,704 figure traces to commit 209e4aaa as 11 x 16.4 MiB arithmetic, not a measurement.
+        # What IS supported: interior resume points buy nothing. Cross-request CAP depth was never
+        # measured — and with the store in host RAM it stops costing pool tokens, so it is now worth
+        # measuring properly.
         live = self._rec_snap_live_snapshots(config)
         env_gib = os.environ.get("MINISGL_GDN_RADIX_SNAP_BUDGET_GIB")
         budget = int(float(env_gib) * (1 << 30)) if env_gib else 0
