@@ -133,11 +133,23 @@ class RadixPrefixCache(BasePrefixCache):
         # Recurrent-state radix (GDN/CCA). When True, match_prefix additionally caps the returned
         # prefix to the deepest node carrying a recurrent-state snapshot (so KV reuse and recurrent
         # reuse stay consistent), and the scheduler attaches/restores snapshots at commit points.
-        # A bounded LRU of nodes holding snapshots keeps recurrent-state HBM in check (~17 MB each for
-        # the 35B); the oldest is dropped when the cap is hit or when its node is evicted.
+        # A bounded FIFO of nodes holding snapshots keeps recurrent-state HBM in check (~17 MB each
+        # for the 35B); the OLDEST-ATTACHED is dropped when the cap is hit or when its node is
+        # evicted. FIFO, not LRU: `_rec_nodes` is append-ordered and `match_prefix` never reorders
+        # it, so a HOT shared prefix that keeps being matched is evicted on the same schedule as a
+        # cold one. This was documented as "LRU" in three places, which is the kind of comment that
+        # sends the next person looking for a recency bug that is not there -- the behaviour is
+        # correct-as-written, the description was not.
+        #
+        # Mostly inert today: the derived cap never installs for qwen4exp (CompositeRecurrentState
+        # exposes none of conv_state/ssm_state/prev_hs, so the snapshot size computes to 0 and the
+        # sizing returns early), leaving the create-time default of 64 against a pinned host arena
+        # that bounds live snapshots to ~22 -- the eviction loop cannot run. It DOES run when that
+        # arena falls back to device clones (engine.py catches the allocation failure and logs
+        # "falling back to device clones"), so this is a degraded-mode path, not dead code.
         self.recurrent = recurrent
         self.max_rec_snapshots = max_rec_snapshots
-        self._rec_nodes: List[RadixTreeNode] = []  # nodes with a live rec_state (LRU-ish, pruned lazily)
+        self._rec_nodes: List[RadixTreeNode] = []  # live rec_state, APPEND-ORDERED (FIFO), pruned lazily
 
         # Persistent leaf min-heap for eviction. Replaces rebuilding the leaf set (a full root->leaf
         # tree walk + heapify) on EVERY evict() call — under memory pressure evict() is called
@@ -209,7 +221,8 @@ class RadixPrefixCache(BasePrefixCache):
     def attach_rec_state(self, handle: RadixCacheHandle, rec_state: Any) -> None:
         """Attach a recurrent-state snapshot to the node the scheduler just inserted (its boundary ==
         the committed, page-aligned prefix length, so the snapshot corresponds to the boundary
-        exactly). Enforces the LRU cap by dropping the oldest live snapshot. No-op for a dense cache
+        exactly). Enforces the cap by dropping the oldest-ATTACHED live snapshot (FIFO, not LRU --
+        see the note in __init__). No-op for a dense cache
         or a root/empty handle."""
         if not self.recurrent:
             return

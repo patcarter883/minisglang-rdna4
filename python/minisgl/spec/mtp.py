@@ -142,8 +142,14 @@ class MTPProposer(CapturableProposer):
         self._col_idx = torch.arange(self._ring, device=dev)                     # [ring]
         self._slot_uid: Dict[int, int] = {}   # which uid owns each slot (reset the cursor on reuse)
         self._drafted_slots: List[int] = []   # slots that drafted last step (for on_accept advance)
+        # The width of the `last_hidden` the TARGET returns and this head consumes. NOT the
+        # embedding width: on a hyper-connection model (qwen4exp) the target returns the WIDE
+        # pre-mixer stream, hc_count * hidden_size, and the embedding table is one hc_count-th of
+        # it. Exposed as `verify_hidden_size` so the verify-graph capture buffer is sized from the
+        # same expression rather than guessing again from embed_tokens.
         hidden = int(getattr(self._head, "hidden_size", 0)) \
             or int(self._head.pre_fc_norm_hidden.weight.shape[-1])
+        self.verify_hidden_size = hidden
         G = self._max_slots
         self._g_seed = torch.zeros(G, hidden, device=dev, dtype=dt)
         self._g_curb = torch.zeros(G, dtype=torch.int64, device=dev)

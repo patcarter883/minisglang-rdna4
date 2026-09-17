@@ -729,7 +729,10 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     f"documented values: {'; '.join(_drift)}. The LIVE values are in force.")
             width_ladder = verify_width_ladder(_K, _quant)
             self.engine.capture_spec_verify_graphs(
-                needs_hidden, num_aux, verify_bs, widths=width_ladder
+                needs_hidden, num_aux, verify_bs, widths=width_ladder,
+                # One source of truth for the verify hidden width (see the engine's comment): the
+                # proposer derived it from the draft head, which is what actually consumes it.
+                hidden_size=getattr(self._proposer, "verify_hidden_size", None),
             )
             # Only ever choose from what was ACTUALLY captured (empty when --graph 0 / an unsupported
             # backend skipped capture — then the width is fixed and the step is eager as before).

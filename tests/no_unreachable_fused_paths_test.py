@@ -132,7 +132,16 @@ for root, _dirs, files in os.walk(ENGINE):
         read |= set(re.findall(r"""environ(?:\.get)?\(\s*["'](MINISGL_[A-Z0-9_]+)["']""", t))
         read |= set(re.findall(r"""getenv\(\s*["'](MINISGL_[A-Z0-9_]+)["']""", t))
 forwarded = set(re.findall(r"^\s+(MINISGL_[A-Z0-9_]+):", open(COMPOSE).read(), re.M))
-missing = read - forwarded
+# A knob is ALSO reachable if tools/serve.sh sets it, because serve.sh runs INSIDE the container:
+# docker-compose.yml's serve service is `command: ["exec /engine/tools/serve.sh"]`. Its exports
+# therefore land in the engine's own environment and need no compose forwarding. Omitting this
+# makes the gate cry wolf on every knob serve.sh owns -- and a gate that cries wolf gets muted.
+# What is genuinely unreachable is a knob NEITHER forwards, which is what an operator cannot set.
+SERVE_SH = os.path.join(_HERE, "..", "tools", "serve.sh")
+serve_txt = open(SERVE_SH).read() if os.path.exists(SERVE_SH) else ""
+set_by_serve = set(re.findall(r"(MINISGL_[A-Z0-9_]+)\s*=", serve_txt)) | \
+    set(re.findall(r"export\s+(MINISGL_[A-Z0-9_]+)", serve_txt))
+missing = read - forwarded - set_by_serve
 # A toggle is anything that switches an implementation on or off. These are the ones where an
 # unreachable knob turns an A/B into new-vs-itself.
 TOGGLE = re.compile(r"FUSED|REGDIRECT|_GEMV$|GEMV_|_FLAG$|SILU|W4A16|NVFP4_|BF16_|_ALIGN$")
@@ -158,7 +167,8 @@ bad = sorted(k for k in missing if TOGGLE.search(k) and k not in KNOWN_UNREACHAB
 stale = sorted(k for k in KNOWN_UNREACHABLE_TOGGLES if k not in missing)
 report("no NEW fast-path toggle is unreachable from compose", not bad,
        ", ".join(bad) if bad else
-       f"{len(read)} knobs read, {len(forwarded)} forwarded, "
+       f"{len(read)} knobs read, {len(forwarded)} forwarded by compose, "
+       f"{len(set_by_serve)} set by serve.sh (which runs IN the container), "
        f"{len(KNOWN_UNREACHABLE_TOGGLES)} known-unreachable (delete them, do not add)")
 report("the known-unreachable list has not gone stale", not stale,
        f"these are now reachable or deleted -- remove them from the list: {stale}" if stale

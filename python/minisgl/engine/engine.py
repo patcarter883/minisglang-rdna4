@@ -2266,7 +2266,7 @@ class Engine:
 
     def capture_spec_verify_graphs(
         self, needs_hidden: bool, num_aux: int, bs_list: "list[int]",
-        widths: "list[int] | None" = None,
+        widths: "list[int] | None" = None, hidden_size: "int | None" = None,
     ) -> None:
         """Capture the MLA spec-decode verify graphs. Called by the scheduler AFTER the proposer is
         built and the target's aux-capture layers are programmed (so the captured forward stashes the
@@ -2276,7 +2276,17 @@ class Engine:
         width `num_draft`."""
         if self.graph_runner.max_graph_bs == 0 or self.spec_config is None:
             return
-        hidden_size = self.model.model.embed_tokens.weight.shape[1]
+        # THE VERIFY BUFFER MUST MATCH WHAT THE MODEL RETURNS, not the embedding width. On a
+        # hyper-connection model the target's `last_hidden` is the WIDE pre-mixer stream
+        # (hc_count * hidden_size = 10240 on qwen4exp) while embed_tokens is 2560, and assigning a
+        # [T, 10240] source into a [T, 2560] destination is a RuntimeError raised inside the eager
+        # warmup — a boot crash, gated behind spec=mtp AND graph capture, which is why it stayed
+        # latent. The PROPOSER already derives this correctly for its own seed buffer; take its
+        # value rather than guess a second time. Falling back to the embedding width keeps every
+        # non-hyper-connection model on exactly its previous behaviour.
+        if hidden_size is None:
+            hidden_size = self.model.model.embed_tokens.weight.shape[1]
+        hidden_size = int(hidden_size)
         # Capture on the ENGINE stream (the scheduler may have switched the current stream to its own
         # in __init__); the warmup forward + graph context must share it.
         with torch.cuda.stream(self.stream):
