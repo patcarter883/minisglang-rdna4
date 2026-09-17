@@ -1215,6 +1215,11 @@ class WeightPlanResolution:
     # under another is a silent under-charge, which is why the engine passes ArenaSettings.chunk_bytes
     # rather than letting this default drift away from the arena's.
     arena_chunk_bytes: int = DEFAULT_CHUNK_BYTES
+    # The decode width every figure in `projection` was computed at. Retained because the boot log
+    # quotes those figures and a reader cannot otherwise tell whether they describe the SERVED
+    # configuration. They do not: the resolver is called with no `batch=`, so this is 1 while the
+    # shipped arm runs CONC=2, and a spec serve carries max_running_req*(num_draft+1) query rows.
+    projected_at_batch: int = 1
     # -- CPU-COMPUTE tier ------------------------------------------------------------------------
     # Always populated, even on a two-tier plan: `cpu_gate` says WHY the tier is or is not usable
     # and `cpu_sweep_text` prices it at every K. That is deliberate — a lever that only appears in
@@ -1530,7 +1535,11 @@ class WeightPlanResolution:
             f"[weight-offload] gates: projected {self.projection.tok_s:.2f} tok/s vs K4 "
             f"{self.prior.kill_tok_s:.3f} -> {'PASS' if self.clears_kill_gate() else 'KILL'}; "
             f"A1.7 threshold {self.acceptance_threshold_tok_s:.2f} tok/s "
-            "(PROJECTED -- A1.7 is measured on a served A/B with graphs on)"
+            f"(PROJECTED at batch={self.projected_at_batch}"
+            + (" -- so it prices neither CONC>1 nor speculative query width; a spec verify carries "
+               "max_running_req*(num_draft+1) rows and re-streams a WIDER routed-expert union per "
+               "step than this figure assumes" if self.projected_at_batch <= 1 else "")
+            + "; A1.7 is measured on a served A/B with graphs on)"
         )
         return out
 
@@ -1961,6 +1970,7 @@ def resolve_weight_plan(
         cpu_sweep=tuple(cpu_rows),
         cpu_sweep_text=format_cpu_tier_sweep(cpu_rows, gate),
         cpu_projection=cpu_projection,
+        projected_at_batch=int(batch),
     )
 
 

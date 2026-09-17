@@ -89,6 +89,21 @@ prefill_seconds_total is CUDA-event time (engine.py:1876-1882, 1918-1923), so th
 - **risk** Low. One extra forward at boot costs ~3 s and ~128 MiB of transient activation (the same `_act_bytes_per_token` x 2048 the guard at scheduler.py:2442-2487 already budgets for). It must run before the KV pool is handed to the scheduler so its pages are freed.
 - **skeptic** Evidence independently reconfirmed from Prometheus (job=minisgl, model_name=/model, the 07:35 UTC epoch): minisgl_prefill_computed_tokens_total=17127 with minisgl_prefill_seconds_total=210.557 at 07:40:30 -> 81.3 tok/s; 07:53:00->07:54:00 computed +16348 with seconds +26.43 -> 618.5 tok/s, same epoch, same --max-prefill-length 2048. Excess = 210.56 - (17127/618.5) = 183 s. minisgl_ttft_seconds_sum 700.931/count 4 at 07:40:30 vs 775.280/9 at 08:02:00 = 90.4% of epoch TTFT in the 4 boot requests; first TTFT 147.329 s. Code confirmed: the only boot warmup is engine.py:527-529 `with _bt.phase("gdn_conv_warmup") ... gdn.warmup_conv(_GDN_WARMUP_TOKENS)` (+ the CCA no-op at :564); grep for max_graph_bs==0 returns exactly 2113/2144/2170/2187/2200 and all five are canvas/spec CAPTURE entry points, never a prefill warmup, and serve.sh:1243 passes --cuda-graph-max-bs $GRAPH_BS with GRAPH_BS pinned to 0 for this arm (tools/serve.sh:886). Two corrections. (1) The finding's inference 'prefill_seconds_total is CUDA-event time, so this is device-interval, not host launch overhead' is WRONG: an event pair recorded on self.stream around forward_batch (engine.py:1930-1939) spans any HOST stall that happens between kernel launches inside the forward (code-object load, JIT, host-side staging), so the 183 s is not proof of on-device work. That does not break the fix — it actually widens the set of one-time costs a warmup forward would absorb — but the stated attribution (HIP code-object load / first-engage) remains unverified; the confirmation experiment in the finding is the right way to settle it. (2) I can partially decompose it and it does NOT look uniform: at 07:39:30 computed=10599/seconds=159.54, then +4096 tokens for only +9.06 s (4.5 s/chunk), then +2432 tokens for +41.96 s — i.e. the cold cost is concentrated in the first forward and again on the first prefix-RESTORE batch, not spread evenly, so 'warm up at max_forward_len once' may leave part of it behind. Risk to flag: a 2048-token warmup forward at boot allocates the full prefill activation peak after the KV pool is sized, which on this arm is exactly the workspace serve.sh:866-875 records faulting (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION) — a boot-time canary is arguably good, but it converts a first-request failure into a boot failure.
 
+- **RESOLUTION 2026-09-18 — FIX REJECTED ON THIS FINDING'S OWN EVIDENCE, not implemented.** The
+  mechanism states the first chunk is already AT the PCIe floor ("the ENTIRE 31.9 GiB/rank expert
+  set is re-streamed"), so a synthetic warmup forward streams the same bytes — which is why the
+  gain line says "not 'removed' — relocated into boot". A pure relocation that makes an
+  already-8-minute boot longer is not an improvement, and it puts a new failure mode (a synthetic
+  full-width prefill) on the boot path of EVERY model in the fleet to buy it.
+  The finding also contradicts itself on cost: **risk** says "one extra forward at boot costs ~3 s"
+  while **gain** says ~183 s is relocated. Both cannot be true, and the 183 s figure is the one
+  derived from measurement.
+  What WAS done instead: `minisgl_prefill_host_seconds_total` (finding [18]) now exports the host
+  half of prefill, so the cold-vs-warm gap this finding describes is visible rather than inferred
+  from a ratio that excluded it. If a warmup is revisited, the precondition is a measurement that
+  separates the PCIe floor from allocator/autotune warmup — only the latter is warmup-fixable, and
+  nothing on file establishes that it is nonzero.
+
 ### [16] The snapshot-store cap (20) is larger than the arena headroom the engine actually reserved for attached snapshots (14), so `clone_slot` silently returns None mid-prefill and the deepest chunk boundaries never get snapshotted — with no metric and no log
 
 - **dimension** `prefill-ttft` &nbsp; **severity** `medium` &nbsp; **actionable now** yes

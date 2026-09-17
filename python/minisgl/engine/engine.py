@@ -1149,6 +1149,20 @@ class Engine:
         # device fraction even considered?") had to be answered by re-deriving the planner's own
         # arithmetic by hand, which is how an operating point ends up argued from a projection
         # nobody can see. It costs one call at boot and no throughput.
+        # AUDIT [20]: the MTP draft head's expert stack is bf16 and is pinned in VRAM OUTSIDE the
+        # placement plan — `plan.py`'s exclusion list drops `mtp.*`, so the planner neither places it
+        # nor counts it, and a normal NVFP4 MoE layer is 0.663 GiB/rank against the bf16 head's 3.5x
+        # that. Option (a) of the finding is already shipped (serve.sh's table sets
+        # spec_default="none" for this arm), so the live cost is zero — but it returns the moment
+        # spec is re-enabled, and it returns INVISIBLY, which is the half worth fixing now. Say it
+        # in the same breath as the plan, where someone turning spec on will read it.
+        if config.spec_config is not None:
+            logger.info_rank0(
+                "[weight-offload] NOTE: spec is enabled and the draft head is NOT in this plan — "
+                "`mtp.*` is excluded from placement, so its (bf16, unquantized) expert stack is "
+                "pinned device-side outside every figure above. Subtract it before trusting the "
+                "device budget, and remember it competes with the expert cache for the same VRAM."
+            )
         _render = getattr(getattr(ledger, "driver", None), "render_lines", None)
         if callable(_render):
             try:
