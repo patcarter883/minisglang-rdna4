@@ -235,7 +235,22 @@ class MTPProposer(CapturableProposer):
         cur_tok = self._g_tok[:bs]
         cur_hidden = self._g_seed[:bs]
         col = self._col_idx.unsqueeze(0)
-        for j in range(self._num_draft):
+        # K+1 ITERATIONS, NOT K. Each step writes the K/V of the token it attends FROM, so a K-step
+        # loop stores [confirmed, d_0 .. d_{K-2}] and the LAST draft d_{K-1} never gets a row. On a
+        # full accept the target commits that token, so the drafter's ring was permanently one key
+        # short — and it accumulated, because nothing resyncs inside a generation. `on_accept` used
+        # to hide it by capping the cursor at K, which kept the ring self-consistent at the price of
+        # a hole that persists for the whole ~2051-label window.
+        #
+        # The extra iteration runs the head once more to store d_{K-1}'s K/V and discards its
+        # logits. Unconditional, and therefore CUDA-graph safe: making it conditional on "did the
+        # previous step fully accept" would be per-slot data-dependent control flow, which cannot be
+        # captured. Rows written for drafts that are later REJECTED are harmless — the cursor only
+        # advances by 1+n, so they are simply re-masked next step, exactly as before.
+        #
+        # COST: one extra draft-head step per propose (~+50% of propose at K=2, which is ~3% of the
+        # measured spec step). The acceptance BENEFIT is unmeasured; see the commit message.
+        for j in range(self._num_draft + 1):
             fused = head.fuse(head.embed(cur_tok), cur_hidden)
             q_abs = cur + j                                   # ABSOLUTE position being written
             write_col = torch.remainder(q_abs, self._ring)     # ring slot
@@ -249,6 +264,8 @@ class MTPProposer(CapturableProposer):
             mask_bias = torch.where(keep, 0.0, float("-inf")).to(torch.float32)
             logits, cur_hidden = head.step_masked(
                 fused, positions, self._k_buf, self._v_buf, slots, write_col, mask_bias)
+            if j == self._num_draft:
+                break        # store-only pass: d_{K-1}'s K/V is now in the ring; logits unused
             nxt = logits.argmax(dim=-1)
             self._g_out[:bs, j] = nxt
             cur_tok = nxt
@@ -317,16 +334,20 @@ class MTPProposer(CapturableProposer):
         self._cur[slot] = end
 
     def on_accept(self, reqs: List["Req"], num_accepted: List[int]) -> None:
-        # Advance each drafted slot's committed cursor by min(1+n, K) — the FULL-ACCEPT CAP: propose
-        # stores [confirmed, d0 .. d_{K-2}] and d_{K-1}'s K/V is never written, so 1+n at n==K would
-        # leave a 1-key hole that misaligns the next confirmed token. Reqs that drafted [] this step
-        # do NOT advance: their confirmed token was never written. Rejected drafts need no free —
-        # their columns are simply re-masked next step.
+        # Advance each drafted slot's committed cursor by 1+n, UNCAPPED. This used to be
+        # min(1+n, K) because propose stored only [confirmed, d0 .. d_{K-2}] — d_{K-1}'s K/V was
+        # never written, so advancing by K+1 on a full accept would have left a 1-key hole. That cap
+        # traded a hole for a permanently MISSING key: the ring simply never held the last accepted
+        # draft, and it accumulated across every full accept with no resync inside a generation.
+        # `propose_body` now runs a (K+1)-th store-only step, so all 1+n committed tokens have rows
+        # and the cursor can follow the target exactly. Reqs that drafted [] this step do NOT
+        # advance: their confirmed token was never written. Rejected drafts need no free — their
+        # columns are simply re-masked next step.
         drafted = set(self._drafted_slots)
         for req, n in zip(reqs, num_accepted):
             s = int(req.table_idx)
             if s in drafted:
-                self._cur[s] = self._cur[s] + min(1 + n, self._num_draft)
+                self._cur[s] = self._cur[s] + 1 + n
 
     def free(self, uid: int) -> None:
         # Release any slot this uid owned so a reused slot is treated as cold (cursor reset). Stale
