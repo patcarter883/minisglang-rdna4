@@ -624,8 +624,16 @@ class MxFp4LinearMethod:
 
     def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
         """FUSED gate_up + silu (MXFP4 / E2M1, symmetric) at decode; None -> caller falls back."""
-        w = layer._w_packed_op  # type: ignore[attr-defined]
-        if not _fused_swiglu_ok(x, w, self.quant.group_size):
+        # NO FUSED PATH UNDER W4A16. That arm repacks to the register-direct layout and DROPS
+        # `_w_packed_op`, and there is no w4a16 silu twin to take its place, so the fused kernel has
+        # no weight to read. Returning None hands the caller back to the unfused gate/up + silu,
+        # which goes through `apply` and so still gets the W4A16 kernel. Without this guard the
+        # deleted attribute reaches `kernels.w4a8_linear_silu`, which is a null weight pointer at the
+        # kernel — a GPU page fault during graph capture, not a Python error.
+        if getattr(layer, "_w_rep_w4a16", None) is not None:
+            return None
+        w = getattr(layer, "_w_packed_op", None)
+        if w is None or not _fused_swiglu_ok(x, w, self.quant.group_size):
             return None
         return kernels.w4a8_linear_silu(
             x, w, layer._scales_op, None, self.quant.group_size, weight_is_e2m1=True  # type: ignore[attr-defined]
