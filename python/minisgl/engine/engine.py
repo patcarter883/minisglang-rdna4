@@ -1143,6 +1143,19 @@ class Engine:
 
         engaged("weight_offload.stage_b_chunked_load")
         logger.info_rank0(f"weight offload: {ledger.describe()}")
+        # AUDIT [24]: the planner already BUILDS the whole decision table -- the reason, the capacity
+        # arithmetic, the device-fraction sweep and the K-gates -- in `render_lines()`, and nothing
+        # ever called it. So every offload question on this box ("why this tier?", "was a larger
+        # device fraction even considered?") had to be answered by re-deriving the planner's own
+        # arithmetic by hand, which is how an operating point ends up argued from a projection
+        # nobody can see. It costs one call at boot and no throughput.
+        _render = getattr(getattr(ledger, "driver", None), "render_lines", None)
+        if callable(_render):
+            try:
+                for _line in _render():
+                    logger.info_rank0(_line)
+            except Exception as _e:   # a diagnostic must never be able to fail a boot
+                logger.info_rank0(f"[weight-offload] plan report unavailable: {_e}")
         return True
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
@@ -1777,6 +1790,25 @@ class Engine:
                 * self.kv_dtype.itemsize
                 * mc.num_kv_layers  # only full-attn layers keep paged KV (GDN hybrid: 10, not 40)
             )
+        # AUDIT [34]: CHARGE THE QSA COMPRESSED-INDEX CACHE. `QSAIndexCache` allocates
+        # `num_index_layers * (num_kv_slots/r + 1) * head_dim` elements — i.e. a real per-KV-token
+        # cost — but it is built AFTER the pool has been sized and allocated, so the sizing never saw
+        # it and the overdraft came silently out of activation headroom instead of out of
+        # --memory-ratio. Measured on the live serve: 12 index layers, head_dim 128, r=4, bf16 =
+        # 12*128*2/4 = 768 B/token against the main pool's 6144, so the pool was ~11.1% larger than
+        # the memory it actually had. Billing it here shrinks the pool by that much and makes the
+        # ratio mean what it says. Zero effect on any model without an indexer (the term is 0).
+        _idx_per_page = 0
+        _r = getattr(mc, "indexer_compress_ratio", None) or 0
+        _d = getattr(mc, "indexer_head_dim", None) or 0
+        if _r > 0 and _d > 0 and mc.num_kv_layers:
+            # One compressed row per r KV tokens, per INDEX layer. The index layers are the
+            # full-attention ones — the same set `num_kv_layers` counts, which is why that is the
+            # right multiplier here and not num_layers.
+            _idx_per_page = (
+                mc.num_kv_layers * _d * self.kv_dtype.itemsize * config.page_size
+            ) // _r
+            cache_per_page += _idx_per_page
         num_pages = config.num_page_override
         if num_pages is None:
             # Bill the model for its RESIDENT tensors plus whatever is genuinely outside torch — NOT
@@ -1875,7 +1907,7 @@ class Engine:
                 f"snap={mem_GB(snap_memory)} ple={mem_GB(ple_memory)} "
                 f"stage={mem_GB(stage_memory)} "
                 f"-> available={mem_GB(available_memory)} "
-                f"@ {cache_per_page} B/page; "
+                f"@ {cache_per_page} B/page"                f"{f' (incl. {_idx_per_page} QSA index)' if _idx_per_page else ''}; "
                 # `model` is a free-memory DELTA, so it also carries allocator slack, fragmentation
                 # and the HIP context. `allocated` is the exact resident tensor total — when the two
                 # diverge the gap is overhead, not weights, and the fix is not a higher memory-ratio.
@@ -2022,6 +2054,13 @@ class Engine:
     # tok/s, which is not a prefill rate. Events measure the device interval without forcing a host
     # sync; pairs are drained opportunistically once complete, so nothing blocks the scheduler.
     prefill_seconds_total: float = 0.0
+    # AUDIT [18]: HOST-side prefill work that `prefill_seconds_total` does NOT see. That counter
+    # brackets the forward, and it is a GPU-event pair — so the per-chunk PLE n-gram gather (32768
+    # NVMe row reads per 2048-token chunk, plus a host hash and an H2D) is invisible to it, and
+    # `prefill_computed_tokens_total / prefill_seconds_total` reports a prefill throughput the serve
+    # never achieved. Exported separately rather than folded in, so the existing series keeps its
+    # meaning and a dashboard can show the gap.
+    prefill_host_seconds_total: float = 0.0
 
     # Cumulative prompt tokens actually COMPUTED, accumulated per prefill chunk as the work happens.
     # Exported as minisgl_prefill_computed_tokens_total.

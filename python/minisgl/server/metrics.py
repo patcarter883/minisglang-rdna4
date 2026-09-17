@@ -105,6 +105,7 @@ class BackendSnapshot:
     gdn_slots_total: int = 0
     gdn_slots_used: int = 0
     prefill_seconds: float = 0.0
+    prefill_host_seconds: float = 0.0
     prefix_cache_hit_tokens: int = 0
     prefix_cache_prompt_tokens: int = 0
     prefill_computed_tokens: int = 0
@@ -191,6 +192,7 @@ class FrontendMetrics:
             total.gdn_slots_total += s.gdn_slots_total
             total.gdn_slots_used += s.gdn_slots_used
             total.prefill_seconds += s.prefill_seconds
+            total.prefill_host_seconds += s.prefill_host_seconds
             total.prefix_cache_hit_tokens += s.prefix_cache_hit_tokens
             total.prefix_cache_prompt_tokens += s.prefix_cache_prompt_tokens
             total.prefill_computed_tokens += s.prefill_computed_tokens
@@ -301,6 +303,11 @@ class FrontendMetrics:
                 "Cumulative scheduler-side wall time spent on prefill batches (seconds). Denominator "
                 "of prefill throughput; the dashboard referenced this series before it existed, so "
                 "that panel rendered nothing.", b.prefill_seconds)
+        counter("minisgl_prefill_host_seconds_total",
+                "Cumulative HOST-side prefill time the forward's GPU-event pair cannot see: the "
+                "per-chunk PLE n-gram gather (NVMe row reads + host hash + H2D). Without it, "
+                "prefill_computed_tokens/prefill_seconds reports a throughput the serve never "
+                "achieved. 0 for every model without a PLE table.", b.prefill_host_seconds)
         counter("minisgl_prefix_cache_hit_tokens_total",
                 "Prompt tokens served from the prefix (radix) cache.", b.prefix_cache_hit_tokens)
         # ATTRIBUTION: credited whole at ADMISSION (once per request, before the prefill runs) so that

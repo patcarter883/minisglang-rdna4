@@ -1424,6 +1424,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 spec_steps=self._m_spec_steps,
                 max_seq_len=int(self.engine.max_seq_len),
                 prefill_seconds=self.engine.prefill_seconds_total,
+                prefill_host_seconds=self.engine.prefill_host_seconds_total,
                 running_requests=len(self.decode_manager.running_reqs),
                 waiting_requests=len(self.prefill_manager.pending_list),
                 prefix_cache_hit_tokens=self.prefill_manager.prefix_hit_tokens,
@@ -2031,7 +2032,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # numpy hash, an H2D — can happen inside the model, let alone inside a captured graph.
         # Inert (`_ple is None`) for every other model.
         if self._ple is not None:
+            # Timed because it is REAL prefill cost that the forward's GPU-event pair cannot see —
+            # NVMe row reads, a host hash and an H2D, all before the forward starts. See
+            # Engine.prefill_host_seconds_total.
+            _ple_t0 = time.perf_counter()
             self._stage_ple(batch)
+            if batch.is_prefill:
+                self.engine.prefill_host_seconds_total += time.perf_counter() - _ple_t0
         # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
         # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
         # inside a graph — read here, reuse across decode). Inert when CAM is not built.
