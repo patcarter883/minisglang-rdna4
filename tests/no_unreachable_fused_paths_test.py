@@ -167,5 +167,50 @@ if missing:
     print(f"   FYI {len(missing)} non-toggle knobs are also unreachable "
           f"({len([k for k in missing if k not in bad])} listed as informational only)")
 
+
+# ---------------------------------------------------------------------------------------------
+# THE FUSED ARM MUST REFUSE SCALES IT CANNOT TAKE.
+#
+# The two fused gate_up+silu kernels do NOT accept the same scale formats:
+#   W4A16 `mmq_regdirect_w4a16_gemv_silu` carries all three WSP policies (fp16 group scale, MXFP4
+#     E8M0 byte, NVFP4 e4m3 block + f32 global).
+#   W4A8  `mmq_fp8_gemm_silu` is fp16-ONLY -- `TORCH_CHECK(scales.scalar_type() == at::kHalf)`.
+# So an MXFP4/NVFP4 layer routed to the W4A8 arm does not fall back, it CRASHES in the op and takes
+# the serve down at the first decode step. That is not hypothetical: it killed a spec-decode run on
+# qwen38-27b (NVFP4) the first time the dense MLPs were routed through forward_swiglu, because the
+# gate checked shape and never the scale dtype.
+print()
+print("== _fused_swiglu_ok must not be stricter than the kernels it gates ==")
+try:
+    import torch
+    sys.path.insert(0, os.path.join(_HERE, "..", "python"))
+    from minisgl.quant.method import _fused_swiglu_ok
+
+    w = torch.empty(512, 64, dtype=torch.int32)   # N=512 (even), K/8
+    # BOTH fused arms carry all three WSP policies. This briefly gated W4A8 to fp16 because an
+    # MXFP4/NVFP4 layer crashed there -- but the crash was two STALE BINDING GUARDS (fp16-only
+    # scales, and group_size % 32) refusing what launch_mmq_fp8_gemm_silu_gfx1201 computes. Both
+    # now match their launcher; a scale-format gate here would make the exclusion permanent.
+    for group, what in ((128, "AWQ int4 fp16 group scale"),
+                        (32, "MXFP4 E8M0 byte scale"),
+                        (16, "NVFP4 e4m3 block + f32 global")):
+        report(f"group {group:<3} ({what}) reaches the fused arm",
+               _fused_swiglu_ok(torch.empty(4, 512), w, group),
+               "the kernel takes it -- the engine must not refuse it")
+    report("shape gate still bites (M>16)",
+           not _fused_swiglu_ok(torch.empty(17, 512), w, 128), "decode-only")
+    report("shape gate still bites (odd N)",
+           not _fused_swiglu_ok(torch.empty(4, 512), torch.empty(511, 64, dtype=torch.int32), 128),
+           "N must be 2*inter")
+except OSError as e:
+    # minisgl imports the distributed runtime, which only exists inside the serve image. This is
+    # NOT a skip: a skip that prints green is how a gate rots. Exit 2 -- distinct from pass (0) and
+    # from fail (1) -- so a host run can never be mistaken for a clean one.
+    print(f"  REQUIRES CONTAINER  cannot import minisgl here ({type(e).__name__}: {str(e)[:60]})")
+    print("  run: docker run --rm -v <worktree>:/engine --entrypoint bash <image> -lc \\")
+    print("         'source /opt/venv/bin/activate && python /engine/" + os.path.basename(__file__) + "'")
+    print(f"\n{'FAILED: ' + '; '.join(FAILS) if FAILS else 'INCOMPLETE — the scale-format gate did not run'}")
+    sys.exit(2)
+
 print(f"\n{'FAILED: ' + '; '.join(FAILS) if FAILS else 'ALL PASS'}")
 sys.exit(1 if FAILS else 0)

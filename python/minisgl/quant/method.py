@@ -40,8 +40,22 @@ def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -
     fall-through to the WMMA prefill body at M=1. Group 16 is NVFP4's native grouping.
     """
     N = w_packed.shape[0]
-    return (x.shape[0] <= 16 and x.shape[1] % 32 == 0
-            and group_size % 16 == 0 and group_size <= 128 and N % 2 == 0)
+    if not (x.shape[0] <= 16 and x.shape[1] % 32 == 0
+            and group_size % 16 == 0 and group_size <= 128 and N % 2 == 0):
+        return False
+    # NO SCALE-FORMAT RESTRICTION. Both fused arms take all three WSP policies -- fp16 group scale,
+    # MXFP4's E8M0 byte, and NVFP4's e4m3 block + f32 global.
+    #
+    # This briefly gated the W4A8 arm to fp16 only, because an MXFP4/NVFP4 layer reaching it died
+    # with `TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be fp16")` and took the
+    # serve down at the first decode step. That check, and a neighbouring `group_size % 32`, were
+    # STALE GUARDS IN THE BINDING: `launch_mmq_fp8_gemm_silu_gfx1201` has run
+    # W4A8_DENSE_SCALE_FMT_DISPATCH (Fp16GroupScale / E8m0GroupScale / E4m3GroupScaleGlobal) and
+    # required only `group_size % 16` since the WSP templating landed. Restricting the ENGINE would
+    # have made this permanent -- a gate stricter than the kernel, which is the exact defect being
+    # fixed everywhere else in this series. Both binding guards now match their launcher, verified
+    # bit-exact for AWQ/MXFP4/NVFP4 in fp8_wmma/tests/test_w4a16_gemv_silu.py.
+    return True
 
 
 # Packed WORDS (elements of the container dtype, whatever its width) drawn for the sign-convention
