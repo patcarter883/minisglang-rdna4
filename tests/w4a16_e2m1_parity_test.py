@@ -107,30 +107,6 @@ def run(fmt: str, group: int, dtype: torch.dtype) -> None:
           (rep.dim() == 4) == (group % 32 == 0),
           f"group {group} -> {'wide' if group % 32 == 0 else 'lane-order'} expected")
 
-    # THE DECODE GEMV, which is what the methods actually call now. It was built, bound, exported
-    # and had ZERO callers: every w4a16 site went to the register-direct WMMA body at every M, a
-    # prefill shape doing decode work (N/16 waves vs N/2; 1 useful MMA row in 16 at M=1). Measured
-    # 43.0 -> 17.0 tok/s end-to-end before wiring. Held to the same standard as the WMMA arm:
-    # tracks W4A8 inside the shared weight error, and no further from exact than W4A8 is.
-    for M in (1, 4, 16):
-        x = (torch.randn(M, K, device=DEV, dtype=dtype) * 0.1)
-        if not kernels.w4a16_gemv_ok(x, group):
-            check(f"{fmt} M={M:<3} GEMV band gate", True, "out of band, skipped by design")
-            continue
-        gv = kernels.w4a16_gemv(x, w_packed, scales_op, zeros, N, weight_is_e2m1=True)
-        a8g = kernels.w4a8_linear(x, w_packed, scales_op, zeros, group, weight_is_e2m1=True)
-        exact_g = torch.nn.functional.linear(x.float(), w.float())
-        scg = exact_g.abs().max().clamp_min(1e-6)
-        dg = (gv.float() - exact_g).abs().max() / scg
-        d8g = (a8g.float().to(exact_g.dtype) - exact_g).abs().max() / scg
-        check(f"{fmt} M={M:<3} GEMV keeps the activation dtype", gv.dtype == dtype,
-              f"got {gv.dtype}, x was {dtype}")
-        check(f"{fmt} M={M:<3} GEMV output finite", torch.isfinite(gv).all().item())
-        check(f"{fmt} M={M:<3} GEMV no further from exact than W4A8", dg <= d8g * 1.25 + 1e-3,
-              f"|gemv-exact|={dg:.3e} vs |a8-exact|={d8g:.3e}")
-        check(f"{fmt} M={M:<3} GEMV is not the W4A8 tensor (it really ran)",
-              not torch.equal(gv.float(), a8g.float()))
-
     for M in (1, 8, 64):
         x = (torch.randn(M, K, device=DEV, dtype=dtype) * 0.1)
         a16 = kernels.w4a16_linear(x, rep, scales_op, zeros, group, N, weight_is_e2m1=True)

@@ -1029,46 +1029,6 @@ def w4a16_linear(
     return fp8_wmma.mmq_regdirect_w4a16_wide(xin, w_rep, scales, z, N, wide, weight_is_e2m1)
 
 
-# Decode-shaped W4A16. Mirrors `_W4A8_GEMV_MAX_*` / `_W4A8_GEMV_K_MULTIPLE` on the W4A8 side —
-# the two arms route on the same criteria because they run the SAME shared core (gemv_decode_core),
-# differing only in the activation policy.
-_W4A16_GEMV_MAX_M = 16
-_W4A16_GEMV_K_MULTIPLE = 32
-
-
-def w4a16_gemv(
-    x: torch.Tensor,          # (M, K) UNQUANTIZED fp16/bf16 activations
-    w_packed: torch.Tensor,   # (N, K//8) int32 — the SAME pack the tiled arm takes, NOT w_rep
-    scales: torch.Tensor,     # (K//g, N) GROUP-MAJOR
-    w_zeros: torch.Tensor | None,
-    N: int,
-    weight_is_e2m1: bool = False,
-) -> torch.Tensor:
-    """Dense W4A16 DECODE GEMV — `mmq_regdirect_w4a16_gemv` (FORMAT_MATRIX G5).
-
-    WHY THIS WRAPPER EXISTS: the kernel was built, bound and exported and NOTHING CALLED IT. Every
-    w4a16 call site went to the register-direct WMMA body at every M, which is a prefill shape doing
-    decode work — 128 threads/block against the GEMV's 512, N/16 waves against N/2, and 1 useful MMA
-    row in 16 at M=1. Measured end-to-end before this was wired: W4A16 ran 43.0 -> 17.0 tok/s
-    against W4A8 on the same weights, and that gap was the kernel SHAPE, not the activation format.
-
-    It consumes `w_packed`, not the repacked `w_rep` the register-direct bodies need — which is why
-    the e2m1 methods keep the packed tensor rather than repacking: holding BOTH layouts would double
-    4-bit weight storage (~13.5 GiB on a 27B, not viable on 16 GiB cards)."""
-    import fp8_wmma
-
-    z = w_zeros if w_zeros is not None else torch.empty(0, dtype=torch.int32, device=x.device)
-    engaged("fp8_wmma.mmq_regdirect_w4a16_gemv")
-    return fp8_wmma.mmq_regdirect_w4a16_gemv(x.contiguous(), w_packed, scales, z, N, weight_is_e2m1)
-
-
-def w4a16_gemv_ok(x: torch.Tensor, group_size: int) -> bool:
-    """Is this shape in the decode GEMV's band? (M and K gates, mirroring the W4A8 selector.)"""
-    return (x.shape[0] <= _W4A16_GEMV_MAX_M
-            and x.shape[-1] % _W4A16_GEMV_K_MULTIPLE == 0
-            and group_size % 32 == 0)
-
-
 def w4a16_repack(w_packed: torch.Tensor, group_size: int):
     """(N, K//8) int32 4-bit codes -> the register-direct layout w4a16_linear consumes.
 
