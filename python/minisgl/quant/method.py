@@ -18,8 +18,12 @@ if TYPE_CHECKING:
 # each bit-exact to its OWN unfused pair. They are not interchangeable: fusing a W4A16 model through
 # the W4A8 kernel would quantize activations at decode only, splitting precision by M inside one
 # request. Otherwise apply_swiglu returns None and Linear.forward_swiglu falls back unfused.
-# MINISGL_DENSE_FUSED_SILU=0 reverts both.
-_DENSE_FUSED_SILU = os.environ.get("MINISGL_DENSE_FUSED_SILU", "1") != "0"
+# NO REVERT KNOB. This was gated on MINISGL_DENSE_FUSED_SILU, which was wrong twice over: a
+# merged fast path that has proved itself is simply ON -- the worktree is the isolation, not a
+# runtime flag -- and the knob was not reachable anyway, because a compose serve forwards only
+# the MINISGL_* variables docker-compose.yml enumerates by hand and this was never one of them.
+# Setting it to 0 changed nothing, silently, which invalidated an A/B of this very path twice in
+# one session: both legs engaged the fused arm, and only the hip-engage ledger showed it.
 
 
 def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -> bool:
@@ -35,8 +39,6 @@ def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -
     the plain GEMV the same staleness cost Gemma4's 2816-wide projections (2816 % 512 == 256) a
     fall-through to the WMMA prefill body at M=1. Group 16 is NVFP4's native grouping.
     """
-    if not _DENSE_FUSED_SILU:
-        return False
     N = w_packed.shape[0]
     return (x.shape[0] <= 16 and x.shape[1] % 32 == 0
             and group_size % 16 == 0 and group_size <= 128 and N % 2 == 0)

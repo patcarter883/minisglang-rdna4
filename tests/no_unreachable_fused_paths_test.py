@@ -101,5 +101,71 @@ missing = [c for c in FOUR_BIT if c not in with_swiglu]
 report("every 4-bit linear method exposes apply_swiglu", not missing,
        f"missing: {missing}" if missing else f"{sorted(with_swiglu & set(FOUR_BIT))}")
 
+
+# ---------------------------------------------------------------------------------------------
+# THE SAME DISEASE, ONE LAYER OUT: a knob the engine reads that a compose serve cannot set.
+#
+# `docker-compose.yml` enumerates the MINISGL_* variables it forwards, BY HAND. The engine reads
+# 220 of them; compose forwards 129. The other 91 are unreachable on a compose serve -- setting one
+# on the command line changes nothing, silently. That is not a theoretical problem: it invalidated
+# an A/B of the fused gate_up+silu path twice in one session, because MINISGL_DENSE_FUSED_SILU=0
+# never reached the container and BOTH legs ran the fused arm.
+#
+# This gate covers the knobs that TOGGLE A FAST PATH, because those are the ones whose
+# unreachability silently corrupts a measurement rather than merely being inconvenient. The rest are
+# listed, not failed -- a 91-item blocker would just get skipped.
+#
+# NOTE for whoever fixes the rest: do NOT mechanically add `MINISGL_X: "${MINISGL_X:-}"`. That sets
+# the variable to the EMPTY STRING rather than leaving it unset, and 34 of the missing knobs are
+# int()/float()-parsed, so it turns an unreachable knob into a boot crash. Use a passthrough that
+# omits unset variables (an env_file, or the list form `- MINISGL_X`).
+print()
+print("== every fast-path toggle the engine reads must be reachable from a compose serve ==")
+ENGINE = os.path.join(_HERE, "..", "python", "minisgl")
+COMPOSE = os.path.join(_HERE, "..", "docker-compose.yml")
+read = set()
+for root, _dirs, files in os.walk(ENGINE):
+    for fn in files:
+        if not fn.endswith(".py"):
+            continue
+        t = open(os.path.join(root, fn)).read()
+        read |= set(re.findall(r"""environ(?:\.get)?\(\s*["'](MINISGL_[A-Z0-9_]+)["']""", t))
+        read |= set(re.findall(r"""getenv\(\s*["'](MINISGL_[A-Z0-9_]+)["']""", t))
+forwarded = set(re.findall(r"^\s+(MINISGL_[A-Z0-9_]+):", open(COMPOSE).read(), re.M))
+missing = read - forwarded
+# A toggle is anything that switches an implementation on or off. These are the ones where an
+# unreachable knob turns an A/B into new-vs-itself.
+TOGGLE = re.compile(r"FUSED|REGDIRECT|_GEMV$|GEMV_|_FLAG$|SILU|W4A16|NVFP4_|BF16_|_ALIGN$")
+# PRE-EXISTING DEBT, recorded 2026-09-17. Each of these gates a fast path and cannot be set on a
+# compose serve, so any A/B of it silently measures the default on BOTH legs. Each needs one of two
+# things, and DELETING is the preferred one: a merged fast path that has proved itself should not
+# have a revert knob at all (the worktree is the isolation). Forward it only if it is a genuine
+# operating lever someone still tunes. This list must only ever SHRINK -- a new entry means the
+# mistake was repeated.
+KNOWN_UNREACHABLE_TOGGLES = {
+    "MINISGL_CCA_DECODE_FUSED",     # CCA decode fusion
+    "MINISGL_GDN_FUSED_CONV",       # GDN fused conv1d      (tools/_gdn_ab.sh sets it via docker run)
+    "MINISGL_GDN_FUSED_NORM",       # GDN fused norm        (tools/car_gdn_fused_smoke.sh)
+    "MINISGL_MOE_ALIGN",
+    "MINISGL_MOE_BF16_GEMV_MAX",
+    "MINISGL_MOE_FLAG",             # tools/gemma4_swa_radix_validate.sh
+    "MINISGL_MOE_MXFP4_REGDIRECT",
+    "MINISGL_MOE_W8A8_REGDIRECT",
+    "MINISGL_NVFP4_GEMV",
+    "MINISGL_ZAYA_FUSED_MERGE",
+}
+bad = sorted(k for k in missing if TOGGLE.search(k) and k not in KNOWN_UNREACHABLE_TOGGLES)
+stale = sorted(k for k in KNOWN_UNREACHABLE_TOGGLES if k not in missing)
+report("no NEW fast-path toggle is unreachable from compose", not bad,
+       ", ".join(bad) if bad else
+       f"{len(read)} knobs read, {len(forwarded)} forwarded, "
+       f"{len(KNOWN_UNREACHABLE_TOGGLES)} known-unreachable (delete them, do not add)")
+report("the known-unreachable list has not gone stale", not stale,
+       f"these are now reachable or deleted -- remove them from the list: {stale}" if stale
+       else "every entry still describes a real gap")
+if missing:
+    print(f"   FYI {len(missing)} non-toggle knobs are also unreachable "
+          f"({len([k for k in missing if k not in bad])} listed as informational only)")
+
 print(f"\n{'FAILED: ' + '; '.join(FAILS) if FAILS else 'ALL PASS'}")
 sys.exit(1 if FAILS else 0)
