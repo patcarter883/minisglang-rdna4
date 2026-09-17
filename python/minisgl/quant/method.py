@@ -12,20 +12,34 @@ from .config import QuantConfig
 if TYPE_CHECKING:
     from minisgl.layers.base import BaseOP
 
-# Fused dense gate_up + silu_and_mul (mmq_fp8_gemm_silu) for a MERGED gate_up projection at decode:
-# one kernel writes silu(gate)*up, dropping the separate silu launch + the [.., 2*inter] HBM round-trip.
-# Bit-exact to w4a8_linear(gate_up) + silu_and_mul. Only the decode-gemv path is fused (M<=16, K%512==0,
-# group_size%32==0); otherwise apply_swiglu returns None and Linear.forward_swiglu falls back unfused.
-# MINISGL_DENSE_FUSED_SILU=0 reverts.
+# Fused dense gate_up + silu_and_mul for a MERGED gate_up projection at decode: one kernel writes
+# silu(gate)*up, dropping the separate silu launch + the [.., 2*inter] HBM round-trip. TWO arms, one
+# per activation format -- `mmq_fp8_gemm_silu` (W4A8) and `mmq_regdirect_w4a16_gemv_silu` (W4A16) --
+# each bit-exact to its OWN unfused pair. They are not interchangeable: fusing a W4A16 model through
+# the W4A8 kernel would quantize activations at decode only, splitting precision by M inside one
+# request. Otherwise apply_swiglu returns None and Linear.forward_swiglu falls back unfused.
+# MINISGL_DENSE_FUSED_SILU=0 reverts both.
 _DENSE_FUSED_SILU = os.environ.get("MINISGL_DENSE_FUSED_SILU", "1") != "0"
 
 
 def _fused_swiglu_ok(x: torch.Tensor, w_packed: torch.Tensor, group_size: int) -> bool:
-    """Shape gate for the fused dense gemm+silu decode kernel (see mmq_fp8_gemm_silu constraints)."""
+    """Shape gate for the fused dense gemm+silu decode kernels. BOTH arms share it: the W4A8 and
+    W4A16 fused GEMVs are the same `gemv_decode_core` sweep under different loaders, so they have
+    the same shape contract.
+
+    K % 32 and group % 16 are the KERNEL's constraints, taken from its own TORCH_CHECKs. This used
+    to say `K % 512` and `group_size % 32`, which were stale: the kernel relaxed both (512 was an
+    inheritance from a retired LDS K-tiling; group 32 predates the per-16-K-half scale fold) and the
+    engine-side gate was not updated with it. A gate stricter than the kernel is not conservative
+    here -- it silently sends shapes the kernel computes correctly back to the unfused path, and for
+    the plain GEMV the same staleness cost Gemma4's 2816-wide projections (2816 % 512 == 256) a
+    fall-through to the WMMA prefill body at M=1. Group 16 is NVFP4's native grouping.
+    """
     if not _DENSE_FUSED_SILU:
         return False
     N = w_packed.shape[0]
-    return x.shape[0] <= 16 and x.shape[1] % 512 == 0 and group_size % 32 == 0 and N % 2 == 0
+    return (x.shape[0] <= 16 and x.shape[1] % 32 == 0
+            and group_size % 16 == 0 and group_size <= 128 and N % 2 == 0)
 
 
 # Packed WORDS (elements of the container dtype, whatever its width) drawn for the sign-convention
@@ -528,17 +542,17 @@ class W4A8LinearMethod:
         """FUSED gate_up + silu_and_mul at decode (this linear is a merged gate_up). Returns None ->
         caller falls back to the unfused silu_and_mul(apply(...)) when the fused kernel doesn't apply:
         the W4A16 path, prefill (M>16), or an unsupported shape. Bit-exact when it fires."""
-        # W4A16 keeps the op-layout weights now, so this can no longer refuse by absence — it has
-        # to refuse EXPLICITLY. `w4a8_linear_silu` quantizes the activation per token, so firing it
-        # here would put a W4A16 model's DECODE band back on quantized activations while its prefill
-        # band stayed unquantized: a silent activation-format split by M, which is the opposite of
-        # what selecting W4A16 asks for. The caller falls back to unfused gate/up + silu, which goes
-        # through `apply` and so still gets the A16 kernel. A fused A16 gate_up+silu is a real gap.
-        if getattr(layer, "_w4a16", False):
-            return None
         w = layer._w_packed_op  # type: ignore[attr-defined]
         if not _fused_swiglu_ok(x, w, self.quant.group_size):
             return None
+        # Pick the fused arm that MATCHES this layer's activation format. Firing the W4A8 one under
+        # W4A16 would quantize activations at decode only, while prefill stayed unquantized — an
+        # activation-format split by M inside a single request. Both arms read the same
+        # `_w_packed_op` and both are bit-exact to their own unfused pair.
+        if getattr(layer, "_w4a16", False):
+            return kernels.w4a16_linear_silu(
+                x, w, layer._scales_op, layer._zeros_op, self.quant.group_size  # type: ignore[attr-defined]
+            ).to(x.dtype)
         return kernels.w4a8_linear_silu(
             x, w, layer._scales_op, layer._zeros_op, self.quant.group_size  # type: ignore[attr-defined]
         ).to(x.dtype)
@@ -634,18 +648,14 @@ class MxFp4LinearMethod:
 
     def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
         """FUSED gate_up + silu (MXFP4 / E2M1, symmetric) at decode; None -> caller falls back."""
-        # NO FUSED PATH UNDER W4A16.
-        # W4A16 keeps the op-layout weights now, so this can no longer refuse by absence — it has
-        # to refuse EXPLICITLY. `w4a8_linear_silu` quantizes the activation per token, so firing it
-        # here would put a W4A16 model's DECODE band back on quantized activations while its prefill
-        # band stayed unquantized: a silent activation-format split by M, which is the opposite of
-        # what selecting W4A16 asks for. The caller falls back to unfused gate/up + silu, which goes
-        # through `apply` and so still gets the A16 kernel. A fused A16 gate_up+silu is a real gap.
-        if getattr(layer, "_w4a16", False):
-            return None
         w = getattr(layer, "_w_packed_op", None)
         if w is None or not _fused_swiglu_ok(x, w, self.quant.group_size):
             return None
+        # See W4A8LinearMethod.apply_swiglu: the fused arm must match the layer's activation format.
+        if getattr(layer, "_w4a16", False):
+            return kernels.w4a16_linear_silu(
+                x, w, layer._scales_op, None, self.quant.group_size, weight_is_e2m1=True  # type: ignore[attr-defined]
+            ).to(x.dtype)
         return kernels.w4a8_linear_silu(
             x, w, layer._scales_op, None, self.quant.group_size, weight_is_e2m1=True  # type: ignore[attr-defined]
         ).to(x.dtype)
@@ -774,6 +784,32 @@ class NvFp4LinearMethod:
         if bias is not None:
             out = out + bias
         return out
+
+    def apply_swiglu(self, layer: "BaseOP", x: torch.Tensor) -> torch.Tensor | None:
+        """FUSED gate_up + silu (NVFP4 / E2M1, two-level scale) at decode; None -> caller falls back.
+
+        THIS METHOD HAD NO apply_swiglu AT ALL, so an NVFP4 model never reached a fused swiglu on
+        any path — it was the sibling both earlier fusions skipped. Two things had to be true before
+        it could: the A16 GEMV had to fold per 16-K half (NVFP4's native group is 16, and the arm
+        refused group % 32 outright), and `_fused_swiglu_ok` had to stop carrying the stale % 32.
+        Both landed, so the gap is now just a missing method.
+
+        The f32 per-output-channel global rides the `w_zeros` slot, as everywhere else in this class
+        — the kernel's `wscale_epi` reads it per half, which is required here and not merely nice:
+        gate and up are independently quantised and have DIFFERENT globals.
+        """
+        w = getattr(layer, "_w_packed_op", None)
+        if w is None or not _fused_swiglu_ok(x, w, self.quant.group_size):
+            return None
+        if getattr(layer, "_w4a16", False):
+            return kernels.w4a16_linear_silu(
+                x, w, layer._scales_op, layer._global_op,  # type: ignore[attr-defined]
+                self.quant.group_size, weight_is_e2m1=True,
+            ).to(x.dtype)
+        return kernels.w4a8_linear_silu(
+            x, w, layer._scales_op, layer._global_op,  # type: ignore[attr-defined]
+            self.quant.group_size, weight_is_e2m1=True,
+        ).to(x.dtype)
 
 
 class Fp8W8A8LinearMethod:

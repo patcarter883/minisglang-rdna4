@@ -1616,6 +1616,37 @@ def w4a8_linear_silu(
     )
 
 
+def w4a16_linear_silu(
+    x: torch.Tensor,  # (M, K) activations — DIRECT, NOT quantized
+    w_packed: torch.Tensor,  # (2*inter, K/8) int32 [gate|up], the SAME op layout w4a16_linear takes
+    scales: torch.Tensor,  # (K/group, 2*inter) GROUP-MAJOR — fp16, or e4m3/uint8 for the e2m1 formats
+    w_zeros: torch.Tensor | None,  # (K/group, (2*inter)/8) int32 (AWQ) | the f32 global (NVFP4) | None
+    group_size: int,
+    weight_is_e2m1: bool = False,
+) -> torch.Tensor:
+    """FUSED dense gate_up GEMV + silu_and_mul with UNQUANTIZED activations -> (M, inter).
+
+    The A16 twin of `w4a8_linear_silu`, and the reason it has to exist separately: that one
+    quantizes x per token, so routing a W4A16 model's decode band through it would split activation
+    precision by M inside a single request — prefill unquantized, decode not. Until this arm landed
+    the only alternatives were exactly that split or no fusion at all, and `apply_swiglu` chose no
+    fusion, paying an extra launch plus the (M, 2*inter) HBM round-trip on every decode step.
+
+    Not a new kernel: `gemv_decode_core` already templates SILU and the A16 loader was already
+    instantiated with it on the MoE side (KERNEL_CORE_POLICY — the dense combination was just never
+    launched). Decode-only (M<=16, K%32==0, group_size%16==0); BIT-EXACT to
+    `w4a16_linear(gate_up) + silu_and_mul`, which is load-bearing because the caller may fuse or
+    fall back per step and the two must not disagree.
+    """
+    import fp8_wmma
+
+    xin = x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.float16)
+    engaged(f"fp8_wmma.mmq_regdirect_w4a16_gemv_silu({'e2m1' if weight_is_e2m1 else 'int4'})")
+    return fp8_wmma.mmq_regdirect_w4a16_gemv_silu(
+        xin.contiguous(), w_packed, scales, w_zeros, weight_is_e2m1
+    )
+
+
 def w8a8_dense_linear(
     x: torch.Tensor,  # (M, K) fp16/bf16 activations
     w_fp8: torch.Tensor,  # (N, K) uint8 (e4m3 bits), op layout (natural row-major)
