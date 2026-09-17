@@ -395,6 +395,13 @@ class Engine:
             dp_rank=self.dp_rank,
             device=self.device,
             observe_only=_cache is not None,
+            # A speculative VERIFY forward carries max_running_req * (num_draft + 1) rows, and the
+            # ring must hold them or the record falls to the host path and never reaches the expert
+            # cache's observer. Same row count engine.py already derives for the scored-row cap.
+            ring_rows=(
+                config.max_running_req * (1 + config.spec_num_draft)
+                if config.spec_config is not None else 1
+            ),
         )
         if _cache is not None:
             if _tracer is None:

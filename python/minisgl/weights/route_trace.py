@@ -61,6 +61,11 @@ assert struct.calcsize(HEADER_FMT) == 64
 assert struct.calcsize(RECORD_FMT) == 16
 
 KIND_PREFILL, KIND_DECODE, KIND_OTHER = 0, 1, 2
+# A speculative VERIFY forward. Distinct from KIND_DECODE in the trace FILE (its M is
+# bs*(K+1), and analyses that assume one token per record would silently mis-weight it) but
+# treated as a decode by the OBSERVER: a verify is the decode band, and its routed-expert
+# union is exactly the working set the cache is sized for.
+KIND_VERIFY = 3
 
 _FNV_OFFSET = 0xCBF29CE484222325
 _FNV_PRIME = 0x100000001B3
@@ -91,11 +96,14 @@ def enabled() -> bool:
     return _TRACER is not None
 
 
-def begin_forward(is_prefill: bool, req_uid: int) -> None:
-    """Step boundary. Called from Scheduler._forward for EVERY loop (there are eight)."""
+def begin_forward(is_prefill: bool, req_uid: int, *, is_verify: bool = False) -> None:
+    """Step boundary. Called from Scheduler._forward for EVERY loop (there are eight), and from the
+    four speculative VERIFY sites. `is_verify` is not cosmetic: without it `_cur_kind` keeps the
+    previous forward's value -- a PREFILL on a spec serve -- and every verify record early-returns
+    before reaching the ring, which is why the expert cache saw nothing under spec."""
     t = _TRACER
     if t is not None:
-        t.begin_forward(is_prefill, req_uid)
+        t.begin_forward(is_prefill, req_uid, is_verify=is_verify)
 
 
 def close() -> None:
@@ -126,6 +134,10 @@ class RouteTracer:
         dp_rank: int,
         expert_bytes: int,
         ring_steps: int,
+        # How many FORWARD ROWS one ring entry can hold. 1 is a plain decode; a speculative verify
+        # carries bs*(K+1). Sized by the caller from the engine's spec width, because a verify that
+        # does not fit falls to the host path and never reaches the observer.
+        ring_rows: int = 1,
         drain_every: int,
         max_steps: int,
         record_prefill: bool,
@@ -172,14 +184,24 @@ class RouteTracer:
         self._thread = threading.get_ident()
         self._lock = threading.Lock()
 
-        # DEVICE ring: ids only. -1 = "this (step, layer) had no decode record".
+        # RING WIDTH. One decode row needs top_k slots; a speculative VERIFY carries M = bs*(K+1)
+        # rows and its union is what the cache must see, so the ring is widened to hold `ring_rows`
+        # rows' worth. Rows beyond that are dropped with a counter rather than silently truncating
+        # the union (see `record`), because an under-reported union makes the cache look BETTER than
+        # it is -- the same failure mode the M==1 gate was protecting against.
+        self.ring_rows = max(1, int(ring_rows))
+        self.ring_width = self.top_k * self.ring_rows
+        # DEVICE ring: ids only. -1 = "this (step, layer) had no ring record".
         self.ids_ring = torch.full(
-            (self.ring_steps, self.num_layers, self.top_k), -1, dtype=torch.int32, device=device
+            (self.ring_steps, self.num_layers, self.ring_width), -1, dtype=torch.int32, device=device
         )
         # Pinned host staging for the ONE D2H per drain (the qsa runtime.py:331-333 pattern).
         self.ids_host = torch.empty(
-            (self.ring_steps, self.num_layers, self.top_k), dtype=torch.int32, pin_memory=True
+            (self.ring_steps, self.num_layers, self.ring_width), dtype=torch.int32, pin_memory=True
         )
+        # Verify rows that did not fit `ring_rows`. Reported at close; a nonzero value means the
+        # cache was fed a PARTIAL union and any hit rate measured against it is optimistic.
+        self.rows_dropped = 0
         # HOST meta (C8): every field is host-known at the call, so staging it on device would be a
         # second dispatch per layer per step for nothing. slot -> lid -> (step, uid, kind, chunk, ntok)
         self.meta: List[Dict[int, Tuple[int, int, int, int, int]]] = [
@@ -266,7 +288,7 @@ class RouteTracer:
             raise RouteTraceError(f"non-contiguous MoE layer ids: {sorted(self.ops)}")
 
     # -- step boundary ------------------------------------------------------------------------
-    def begin_forward(self, is_prefill: bool, req_uid: int) -> None:
+    def begin_forward(self, is_prefill: bool, req_uid: int, *, is_verify: bool = False) -> None:
         if self.disarmed:
             return
         assert threading.get_ident() == self._thread, (
@@ -286,7 +308,8 @@ class RouteTracer:
         self.slot = self.step_id % self.ring_steps
         self.meta[self.slot] = {}
         self._cur_uid = int(req_uid) & 0xFFFFFFFF
-        self._cur_kind = KIND_PREFILL if is_prefill else KIND_DECODE
+        self._cur_kind = (KIND_PREFILL if is_prefill
+                          else KIND_VERIFY if is_verify else KIND_DECODE)
         self.n_since_drain += 1
         _CUR_CHUNK.clear()
 
@@ -308,17 +331,30 @@ class RouteTracer:
         _CUR_CHUNK[lid] = chunk + 1          # C7: tp_overlap can call a layer twice per forward
 
         M = int(topk_ids.shape[0])
-        if M == 1 and self._cur_kind == KIND_DECODE and chunk == 0:
-            # RING PATH. Gated on M == 1, not `M <= 8`: at M>1 `reshape(-1)[:top_k]` keeps row 0
-            # only and silently under-reports the union (C6).
-            self.ids_ring[self.slot, lid, :] = topk_ids.reshape(-1)[: self.top_k]
-            self.meta[self.slot][lid] = (self.step_id, self._cur_uid, KIND_DECODE, 0, 1)
+        if chunk == 0 and self._cur_kind in (KIND_DECODE, KIND_VERIFY) and M <= self.ring_rows:
+            # RING PATH, device-side, no sync. It used to be gated on M == 1 because
+            # `reshape(-1)[:top_k]` keeps row 0 only and silently under-reports the union (C6) --
+            # so the ring is now `top_k * ring_rows` wide and takes ALL M rows' ids, with the
+            # dedupe in `drain()` collapsing them. That is what lets a spec VERIFY reach the
+            # observer at all: under MTP every target forward is a verify with M = bs*(K+1), so an
+            # M == 1 gate meant the ring never fired once and the expert cache sat inert, holding
+            # its whole budget at fill=0.000 for zero hits.
+            n = M * self.top_k
+            flat = topk_ids.reshape(-1)[:n]
+            self.ids_ring[self.slot, lid, :n] = flat
+            if n < self.ring_width:
+                self.ids_ring[self.slot, lid, n:] = -1     # stale ids from a wider previous step
+            self.meta[self.slot][lid] = (self.step_id, self._cur_uid, self._cur_kind, 0, M)
             if self.blockmap_seen < self.blockmap_checks and ntp is not None and block_m:
                 self._blockmap_check(topk_ids, expert_ids, ntp, block_m)
             return
 
-        # HOST PATH: prefill chunks, bs>1 decode, spec-verify rows. One blocking .tolist(); a
-        # prefill chunk is ~35 ms of work so this is noise, and there are only ~28 per 28k prompt.
+        # HOST PATH: prefill chunks, and any decode/verify too wide for the ring. One blocking
+        # .tolist(); a prefill chunk is ~35 ms of work so this is noise, and there are only ~28 per
+        # 28k prompt. A VERIFY landing here is a sizing miss, not a normal path -- count it, because
+        # these records never reach the observer and the cache would be fed a partial union.
+        if self._cur_kind == KIND_VERIFY:
+            self.rows_dropped += 1
         if self._cur_kind == KIND_PREFILL and not self.record_prefill:
             return
         ids = sorted({int(e) for row in topk_ids.tolist() for e in (row if isinstance(row, list) else [row])})
@@ -377,7 +413,7 @@ class RouteTracer:
                     row = ids_np[slot, lid]
                     ids = sorted({int(e) for e in row if 0 <= int(e) < self.num_experts})
                     obs = getattr(self, "_observer", None)
-                    if obs is not None and kind == KIND_DECODE:
+                    if obs is not None and kind in (KIND_DECODE, KIND_VERIFY):
                         # DECODE ONLY. A prefill chunk touches nearly every expert in the layer, so
                         # feeding it to the policy would look like one enormous sweep; the oracle
                         # measured that arm separately (prefill pollution, -0.0008 for SLRU) and the
@@ -482,6 +518,7 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
                   device: torch.device, num_layers: "Optional[int]" = None,
                   num_experts: "Optional[int]" = None, top_k: "Optional[int]" = None,
                   expert_bytes: int = 1382400,
+                  ring_rows: int = 1,
                   observe_only: bool = False) -> "Optional[RouteTracer]":
     """Arm the tracer iff MINISGL_MOE_ROUTE_TRACE names an existing writable dir.
 
@@ -504,6 +541,25 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
     if num_layers is None or num_experts is None or top_k is None:
         num_layers, num_experts, top_k = _derive_shape(model)
     ring = env_int("MINISGL_MOE_ROUTE_TRACE_RING", 1024)
+    # RING ROWS and the byte budget. One entry is `top_k * ring_rows` int32 per (step, layer), so
+    # width scales with the spec width and the ring is steps x layers x width x 4 B. A wide spec
+    # config would otherwise allocate gigabytes silently -- e.g. max_running_req 64 at K=15 is 1024
+    # rows, 10240 wide, 2 GB. Rows come first (an under-wide ring drops verify records and feeds the
+    # cache a partial union, which is the failure this whole change exists to remove); `ring_steps`
+    # is what gives way, and loudly.
+    rows = max(1, int(ring_rows))
+    width = max(1, int(top_k)) * rows
+    budget = env_int("MINISGL_MOE_ROUTE_TRACE_MAX_MB", 64) * (1 << 20)
+    per_step = max(1, int(num_layers)) * width * 4
+    if per_step * ring > budget:
+        shrunk = max(8, budget // per_step)
+        _logger.info_rank0(
+            f"[route-trace] ring {ring} -> {shrunk} steps to hold {rows} rows/entry "
+            f"({width} ids x {num_layers} layers x 4 B = {per_step / 1024:.1f} KiB/step, "
+            f"budget {budget >> 20} MiB). Rows are not negotiable: a verify that does not fit the "
+            f"ring falls to the host path and never reaches the expert cache."
+        )
+        ring = shrunk
     t = RouteTracer(
         d,
         model_slug=model_slug,
@@ -514,6 +570,7 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
         dp_rank=dp_rank,
         expert_bytes=expert_bytes,
         ring_steps=ring,
+        ring_rows=rows,
         # The drain interval is the cache's LEARNING RATE: no reference reaches the policy until a
         # drain runs, so at the capture default of 512 a serve does hundreds of decode steps with
         # slot_of stuck at -1 and the cache cannot warm at all. The oracle measured a 64-step
