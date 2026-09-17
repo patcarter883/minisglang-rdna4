@@ -29,12 +29,25 @@ class ChunkedReq(Req):
         return False  # avoid being added to decode manager
 
 
+# Budget a chunked (non-final) prefill gives back for short work queued behind it, and the floor a
+# chunk is never cut below. 256 is one eighth of the shipped 2048-token step budget: enough for a
+# short prompt or a resumed decode to enter the SAME step instead of waiting out a multi-step
+# prefill, small enough that the long prefill still runs at >=87% of full width. NOT VALIDATED
+# against a throughput measurement -- it is sized by arithmetic, and the test that covers it pins
+# the BEHAVIOUR (short work gets in, the long chunk keeps most of the budget), not the constant.
+_SHORT_REQ_RESERVE = 256
+_MIN_CHUNK = 256
+
+
 @dataclass
 class PrefillAdder:
     token_budget: int
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    # How many OTHER requests are queued this step. Zero means a lone prefill, which must keep the
+    # whole budget -- see `short_req_reserve`.
+    others_waiting: int = 0
     # HARD granularity a NON-FINAL prefill chunk's end must land on. 1 for every model that has no
     # such constraint; `indexer_compress_ratio` (4) when qwen4_exp's QSA selection is live.
     #
@@ -95,6 +108,25 @@ class PrefillAdder:
     ) -> "Req | None":
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        # HEAD-OF-LINE RESERVE. `token_budget` is per STEP, and a request mid-chunking takes ALL of
+        # it, then gets re-queued at the FRONT next step (`pending_list = chunked_list + ...`). The
+        # packing loop `break`s on the first refusal, so a 7-token prompt arriving behind a 16k one
+        # waits out every chunk of it — measured on a boot burst as 3 waiting requests while a
+        # 16738-token prompt chunked.
+        #
+        # So a chunk that will NOT finish the prompt gives back a slice of the budget for whatever
+        # is queued behind it. Two things keep this from costing throughput:
+        #   * it only fires when something IS waiting (`others_waiting`), so a lone long prefill is
+        #     bit-for-bit unchanged and pays nothing. The audit proposed an unconditional reserve
+        #     and priced it at ~12% of the long prefill; conditioning it removes that entirely.
+        #   * it never reduces a chunk below `_MIN_CHUNK`, because chunk width is what amortises the
+        #     per-step overhead — shrinking the long prefill to a trickle to serve a short request
+        #     would just move the cost.
+        # The reserve is applied BEFORE the alignment rounding below, so page/QSA granularity still
+        # has the final say on the boundary.
+        if (self.others_waiting > 0 and chunk_size < remain_len
+                and self.token_budget > _SHORT_REQ_RESERVE + _MIN_CHUNK):
+            chunk_size = min(chunk_size, self.token_budget - _SHORT_REQ_RESERVE)
         # Recurrent radix (GDN/CCA): keep every prefill SEGMENT boundary page-aligned so the linear-
         # attention recurrent-state slot can be snapshotted at that exact boundary (the losslessness
         # precondition — a snapshot at an unaligned length attached to the align_down radix node would
@@ -195,6 +227,9 @@ class PrefillManager:
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
             chunk_gran=self.chunk_gran,
+            # Everything after the head of the queue. The reserve is pointless with nothing behind
+            # it, and paying it anyway would slow a lone long prefill for no one's benefit.
+            others_waiting=max(0, len(self.pending_list) - 1),
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
