@@ -986,22 +986,64 @@ def w4a16_moe(
 
 
 def w4a16_linear(
-    x: torch.Tensor,  # (M, K) fp16 activations — DIRECT (no act-quant)
-    w_rep_wide: torch.Tensor,  # register-direct wide weights (built in process_weights_after_load)
-    scales: torch.Tensor,  # (K//g, N) fp16 GROUP-MAJOR
-    w_zeros: torch.Tensor | None,  # (K//g, N//8) int32 (AWQ) or None (symmetric)
+    x: torch.Tensor,  # (M, K) activations — DIRECT, NOT quantized
+    w_rep: torch.Tensor,  # register-direct weights, wide (4-D) or lane-order (3-D)
+    scales: torch.Tensor,  # (K//g, N) GROUP-MAJOR — fp16, or e4m3/uint8 for the e2m1 formats
+    w_zeros: torch.Tensor | None,  # (K//g, N//8) int32 (AWQ) | the f32 global (NVFP4) | None (sym)
     group_size: int,
     N: int,
+    weight_is_e2m1: bool = False,  # True -> E2M1 codebook decode (MXFP4 / NVFP4) instead of int4-zp
 ) -> torch.Tensor:
-    """Dense W4A16 GEMM (fp16 acts direct) via mmq_regdirect_w4a16_wide — the fp16-act twin of
-    w4a8_linear, for the GLM shared expert / dense layers when MINISGL_MOE_W4A16 is on."""
+    """Dense W4A16 GEMM: activations go in UNQUANTIZED, which is the whole point — the W4A8 twin
+    quantizes x per token on every forward and this path does not.
+
+    THREE weight formats on ONE kernel, selected by `weight_is_e2m1` plus the scale tensor's own
+    dtype (KERNEL_CORE_POLICY: a weight format is a load POLICY, not a new kernel). The kernel's
+    `bool E2M1` template flag picks the nibble decode, and its WSP scale policy is chosen from the
+    scales dtype and whether w_zeros is populated:
+        fp16 scales                      -> Fp16GroupScale        (AWQ/GPTQ int4, optional zeros)
+        uint8/e4m3 scales, no zeros      -> E8m0GroupScale        (MXFP4, E8M0 block exponents)
+        uint8/e4m3 scales, zeros set     -> E4m3GroupScaleGlobal  (NVFP4, block + per-channel global)
+    So MXFP4 and NVFP4 need no new kernel and no scale normalisation — pass their loader's own
+    tensors through. (Normalising them WAS a defect once: it saturated MXFP4's E8M0 outside
+    2^-14..2^15 and folded NVFP4's two levels into one.)
+
+    WIDE vs LANE-ORDER. The wide b-load twin needs `wide` to divide group_size/16, i.e. group_size a
+    multiple of 32 (`_w4a16_wide`). MXFP4's g=32 qualifies; NVFP4's g=16 does not, so a 3-D w_rep is
+    routed to the non-wide entry rather than being rejected.
+
+    DTYPE-AGNOSTIC (RULE 2). The kernel's A16 MMA policy is fp16 OR bf16 and the binding only
+    requires out.dtype == x.dtype, so a bf16 model stays bf16 here. This used to cast every input to
+    fp16 unconditionally, which is a silent precision loss on a bf16 checkpoint for no reason.
+    """
     import fp8_wmma
 
-    wide = _w4a16_wide(group_size)
-    x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
+    xin = x if x.dtype in (torch.float16, torch.bfloat16) else x.to(torch.float16)
+    xin = xin.contiguous()
     z = w_zeros if w_zeros is not None else torch.empty(0, dtype=torch.int32, device=x.device)
+    if w_rep.dim() == 3:  # lane-order (N/16, K/16, 32): group_size not a multiple of 32
+        engaged("fp8_wmma.mmq_regdirect_w4a16")
+        return fp8_wmma.mmq_regdirect_w4a16(xin, w_rep, scales, z, N, weight_is_e2m1)
+    wide = _w4a16_wide(group_size)
     engaged("fp8_wmma.mmq_regdirect_w4a16_wide")
-    return fp8_wmma.mmq_regdirect_w4a16_wide(x16.contiguous(), w_rep_wide, scales, z, N, wide)
+    return fp8_wmma.mmq_regdirect_w4a16_wide(xin, w_rep, scales, z, N, wide, weight_is_e2m1)
+
+
+def w4a16_repack(w_packed: torch.Tensor, group_size: int):
+    """(N, K//8) int32 4-bit codes -> the register-direct layout w4a16_linear consumes.
+
+    Returns the WIDE 4-D permutation when group_size allows it (a multiple of 32) and the 3-D
+    lane-order tensor otherwise; `w4a16_linear` dispatches on the rank, so callers do not branch.
+    The codes are format-agnostic here — int4 and E2M1 pack identically (8 nibbles per int32,
+    low-nibble first); only the DECODE differs, and that is the kernel's template flag."""
+    import fp8_wmma
+
+    N, K8 = w_packed.shape
+    w_rep = fp8_wmma.repack_int4_to_w_rep(w_packed, N, K8 * 8)
+    ks = group_size // 16
+    if ks >= 2 and ks % 2 == 0:
+        return fp8_wmma.repack_w_rep_wide(w_rep, _w4a16_wide(group_size))
+    return w_rep
 
 
 def w8a8_moe(

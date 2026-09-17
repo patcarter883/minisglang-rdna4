@@ -578,11 +578,37 @@ class MxFp4LinearMethod:
         layer._w_packed_op = conv["w_packed"]  # (N, K//8) int32
         # GROUP-MAJOR: the op indexes scales `[g*N + n]` so N is the contiguous axis (coalesced read).
         layer._scales_op = conv["scales"].transpose(0, 1).contiguous()  # (K//32, N) uint8 E8M0
+        if kernels.MOE_W4A16 != "0":
+            # W4A16: activations stay bf16/fp16 and are NEVER quantized. The E2M1 codes and the E8M0
+            # scale tensor go to the register-direct kernel UNCHANGED — its `bool E2M1` template flag
+            # picks the codebook decode and its WSP policy reads uint8-without-zeros as E8M0. So this
+            # is a load policy on the existing core, not a second kernel (KERNEL_CORE_POLICY).
+            layer._w_rep_w4a16 = kernels.w4a16_repack(conv["w_packed"], self.quant.group_size)
+            layer._n_out = conv["w_packed"].shape[0]
+            del layer._w_packed_op
         del layer.weight_packed, layer.weight_scale
+
+    # The W4A16 arm consumes unquantized activations, so it must not advertise the producer's
+    # (x_fp8, act_scales) pair — accepting it would make the producer quantize per token for nothing,
+    # which is exactly the cost this path exists to remove.
+    supports_producer_actquant = False
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
+        if getattr(layer, "_w_rep_w4a16", None) is not None:
+            out = kernels.w4a16_linear(
+                x,
+                layer._w_rep_w4a16,  # type: ignore[attr-defined]
+                layer._scales_op,  # type: ignore[attr-defined]
+                None,  # symmetric — E8M0 block scales, no zero-points and no global
+                self.quant.group_size,
+                layer._n_out,  # type: ignore[attr-defined]
+                weight_is_e2m1=True,
+            )
+            if bias is not None:
+                out = out + bias
+            return out
         out = kernels.w4a8_linear(
             x,
             layer._w_packed_op,  # type: ignore[attr-defined]
@@ -686,11 +712,39 @@ class NvFp4LinearMethod:
         # (2.078e-04 -> 0) and give an all-zero layer. The two spellings are one character apart —
         # this is the same guard `_GroupedNVFP4Experts.post_load` carries, for the same reason.
         layer._global_op = layer.weight_global.contiguous().view(torch.int32)  # type: ignore[attr-defined]
+        if kernels.MOE_W4A16 != "0":
+            # W4A16: unquantized activations. Same E2M1 codes, same two-level scale (e4m3 block +
+            # the f32 global in the zeros slot) -- the register-direct kernel's WSP policy reads
+            # exactly that combination as E4m3GroupScaleGlobal, so nothing is normalised or folded.
+            #
+            # NVFP4's group_size is 16, so group_size//16 == 1 and the WIDE b-load twin does not
+            # apply (it needs `wide` to divide group_size/16). `w4a16_repack` therefore hands back
+            # the 3-D lane-order tensor and `w4a16_linear` routes it to the non-wide entry. MXFP4
+            # (g=32) does get the wide path. That is a shape constraint, not a format one.
+            layer._w_rep_w4a16 = kernels.w4a16_repack(conv["w_packed"], self.quant.group_size)
+            layer._n_out = conv["w_packed"].shape[0]
+            del layer._w_packed_op
         del layer.weight_packed, layer.weight_scale, layer.weight_global
+
+    # See MxFp4LinearMethod: the W4A16 arm must not advertise the producer act-quant pair.
+    supports_producer_actquant = False
 
     def apply(
         self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
+        if getattr(layer, "_w_rep_w4a16", None) is not None:
+            out = kernels.w4a16_linear(
+                x,
+                layer._w_rep_w4a16,  # type: ignore[attr-defined]
+                layer._scales_op,  # type: ignore[attr-defined]
+                layer._global_op,  # type: ignore[attr-defined]  f32 global rides the zeros slot
+                self.quant.group_size,
+                layer._n_out,  # type: ignore[attr-defined]
+                weight_is_e2m1=True,
+            )
+            if bias is not None:
+                out = out + bias
+            return out
         out = kernels.w4a8_linear(
             x,
             layer._w_packed_op,  # type: ignore[attr-defined]
