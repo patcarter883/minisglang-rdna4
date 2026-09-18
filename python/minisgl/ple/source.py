@@ -118,6 +118,16 @@ class PLEEmbeddingSource:
         self._dev_f32 = torch.empty(
             (self.max_tokens, self.embed_dim), dtype=torch.float32, device=device
         )
+        #: Raw (undecoded) landing buffer for the ASYNC gather. The pool writes into this while
+        #: the caller keeps preparing the batch; `finish_rows` decodes it into `_host_rows`. Sized
+        #: for the same worst case as `_host`, allocated once so an overlapped step allocates
+        #: nothing. ~5 MiB at max_tokens=2048.
+        self._raw = np.empty(
+            (self.max_tokens * heads.n_heads, table.row_bytes), dtype=np.uint8
+        )
+        #: Set by `begin_rows`, consumed by `finish_rows`. Not None == a gather is in flight.
+        self._pending = None
+        self._pending_tokens = 0
         #: The tensor the layer reads. Static address, cast target of `_dev_f32`.
         self.embeddings = torch.zeros(
             (self.max_tokens, self.embed_dim), dtype=dtype, device=device
@@ -172,8 +182,53 @@ class PLEEmbeddingSource:
             )
         if n_tokens == 0:
             return self.embeddings[:0]
+        self.begin_rows(ids)
+        return self.finish_rows()
+
+    # -- overlapped staging ------------------------------------------------
+    #
+    # WHY THE SPLIT EXISTS. `os.pread` releases the GIL for the syscall, so rows already in flight
+    # cost the calling thread nothing. Issuing the gather as soon as the row ids are known, and
+    # waiting only where the rows are actually needed, lets the scheduler's remaining batch
+    # preparation (CAM taps, sampler args, grammar bitmask, EOS gate) run WHILE the reads land
+    # instead of after them. `stage_rows` above is the two calls back to back, which is exactly the
+    # old behaviour, so a caller that does not care is unaffected.
+    #
+    # THE WINDOW BOUNDS THE WIN, and it is small: the gather is ~300 us against a ~50 ms decode
+    # forward. This cannot move TPOT on its own and is not claimed to -- it removes a serialisation,
+    # it does not remove work. Measure before believing otherwise.
+
+    def begin_rows(self, row_ids) -> None:
+        """Submit the gather for `row_ids` and return immediately. Pair with `finish_rows`."""
+        if self._pending is not None:
+            raise RuntimeError(
+                "begin_rows called with a gather already in flight — the raw landing buffer is "
+                "single-tenant, so a second begin would overwrite rows the first has not yet "
+                "returned. Call finish_rows() before starting another batch."
+            )
+        ids = np.asarray(row_ids, dtype=np.int64)
+        n_tokens = ids.shape[0]
+        if n_tokens > self.max_tokens:
+            raise ValueError(
+                f"PLE staging buffer holds {self.max_tokens} tokens, batch has {n_tokens}."
+            )
         flat = ids.reshape(-1)
-        self.table.gather_into(flat, self._host_rows[: flat.size])
+        self._pending_tokens = n_tokens
+        self._pending = self.table.gather_raw_into_async(flat, self._raw[: flat.size])
+
+    def finish_rows(self):
+        """Wait for the in-flight gather, decode it, and land it on the device.
+
+        Returns a VIEW of the static buffer, so the caller must not keep it across steps."""
+        if self._pending is None:
+            raise RuntimeError("finish_rows called with no gather in flight")
+        n_tokens, handle = self._pending_tokens, self._pending
+        self._pending, self._pending_tokens = None, 0
+        if n_tokens == 0:
+            return self.embeddings[:0]
+        raw = self.table.gather_wait(handle)
+        flat_n = n_tokens * self.heads.n_heads
+        self._host_rows[:flat_n] = self.table.decode_raw(raw)
         self._dev_f32[:n_tokens].copy_(self._host[:n_tokens], non_blocking=True)
         self.embeddings[:n_tokens].copy_(self._dev_f32[:n_tokens])
         return self.embeddings[:n_tokens]

@@ -2031,14 +2031,16 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # indexed by the same slot id) and before the forward, because none of it — mmap reads, a
         # numpy hash, an H2D — can happen inside the model, let alone inside a captured graph.
         # Inert (`_ple is None`) for every other model.
+        _ple_begin_s = 0.0
         if self._ple is not None:
             # Timed because it is REAL prefill cost that the forward's GPU-event pair cannot see —
             # NVMe row reads, a host hash and an H2D, all before the forward starts. See
-            # Engine.prefill_host_seconds_total.
+            # Engine.prefill_host_seconds_total. The reads are ISSUED here and waited for in
+            # `_finish_ple` below, so the charge is the two ends summed, not the wall clock between
+            # them — the span in the middle is other work, not PLE cost.
             _ple_t0 = time.perf_counter()
-            self._stage_ple(batch)
-            if batch.is_prefill:
-                self.engine.prefill_host_seconds_total += time.perf_counter() - _ple_t0
+            self._stage_ple(batch, defer_finish=True)
+            _ple_begin_s = time.perf_counter() - _ple_t0
         # CAM editable-memory (Option B): compute each memory request's tap bank ONCE, at its prefill
         # (mem_bank starts None; product-key read is variable-shape so it must NOT run per decode step or
         # inside a graph — read here, reuse across decode). Inert when CAM is not built.
@@ -2052,6 +2054,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # Reasoning gate: suppress EOS for rows still inside <think> so a thinking model can't stop
         # mid-reasoning and return a blank answer (bounded by the budget backstop, which forces </think>).
         sample_args.eos_suppress = self._build_eos_suppress(batch)
+        if self._ple is not None:
+            _ple_t1 = time.perf_counter()
+            self._finish_ple()
+            if batch.is_prefill:
+                self.engine.prefill_host_seconds_total += (
+                    _ple_begin_s + (time.perf_counter() - _ple_t1)
+                )
         return ForwardInput(
             batch=batch,
             sample_args=sample_args,
@@ -2848,7 +2857,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         inner.stage_cam_rows(cam, torch.cat(bank_chunks, 0), torch.cat(conf_chunks, 0))
 
     def _stage_ple(self, batch: Batch, extra_tokens: "dict[int, list[int]] | None" = None,
-                   *, defer_commit: bool = False) -> None:
+                   *, defer_commit: bool = False, defer_finish: bool = False) -> None:
         """Stage the Qwen4-Exp PLE n-gram embeddings for `batch` (host work, before the forward).
 
         `extra_tokens` maps uid -> the tokens of this pass that are NOT yet in the host buffer. It
@@ -2926,7 +2935,18 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 )
             slots.append(slot)
             tokens.append(ids.to(torch.int64).numpy())
-        self._ple.prepare(slots, tokens, defer_commit=defer_commit)
+        self._ple.prepare_begin(slots, tokens, defer_commit=defer_commit)
+        if not defer_finish:
+            self._ple.prepare_finish()
+
+    def _finish_ple(self) -> None:
+        """Wait for the n-gram rows `_stage_ple(defer_finish=True)` put in flight.
+
+        Called immediately before the ForwardInput is handed back, i.e. as late as the rows can
+        possibly be waited for: everything between the two calls (CAM taps, sampler args, grammar
+        bitmask, EOS gate) now runs while the reads are landing instead of after them.
+        """
+        self._ple.prepare_finish()
 
     def _step_boundary(self, batch, is_prefill: bool, *, trace: bool = True,
                        is_verify: bool = False) -> None:

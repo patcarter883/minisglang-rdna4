@@ -74,7 +74,12 @@ ARMS = [
     ("mmap",     dict(workers=0,  auto_prefetch=True,  small_gather="mmap"),  None),
     ("pread",    dict(workers=0,  auto_prefetch=False, small_gather="pread"), None),
     ("threaded", dict(workers=16, auto_prefetch=False, small_gather="mmap"),  1),
+    ("uring",    dict(workers=0,  auto_prefetch=False, small_gather="uring"), None),
 ]
+from minisgl.weights import uring as _uring
+if not _uring.available():
+    ARMS = [a for a in ARMS if a[0] != "uring"]
+    print("  (io_uring unavailable here — arm dropped; run with --security-opt seccomp=unconfined)")
 
 # ARMS ARE INTERLEAVED, NOT RUN BACK TO BACK. The first version of this probe ran each arm's whole
 # iteration block consecutively, so within every size the FIRST arm paid a cold ARC and the LAST ran

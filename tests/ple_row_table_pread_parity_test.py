@@ -93,6 +93,14 @@ with tempfile.TemporaryDirectory() as tmp:
 
     t_mmap = table(workers=0, small_gather="mmap")
     t_pread = table(workers=0, small_gather="pread")
+    # io_uring is optional: an old kernel, a foreign arch or a seccomp profile that blocks the
+    # setup syscall all make it genuinely unavailable, and this test must then skip that arm rather
+    # than fail. `available()` deliberately does NOT swallow programming errors, so a False here
+    # means unsupported, not broken.
+    from minisgl.weights import uring as _uring
+    HAVE_URING = _uring.available()
+    t_uring = table(workers=0, small_gather="uring") if HAVE_URING else None
+    print(f"  (io_uring available: {HAVE_URING})")
     t_thread = table(workers=4, small_gather="mmap")
     t_thread.threaded_min_rows = 1          # force the threaded arm even for tiny gathers
 
@@ -107,6 +115,42 @@ with tempfile.TemporaryDirectory() as tmp:
               np.array_equal(b, a), f"ids={ids}")
         check(f"{label}: threaded pread is byte-identical to mmap",
               np.array_equal(c, a), f"ids={ids}")
+        if HAVE_URING:
+            # THE ONE THAT MATTERS FOR io_uring: the ring's index arithmetic is hand-rolled, and a
+            # mistake there does not raise — it reads a different file offset into the right buffer
+            # slot. The first version of this backend collapsed every SQE in a batch onto ring
+            # index 0 (it used the mask's BYTE OFFSET as the mask) and returned the last row N
+            # times, with every completion reporting success. Only a byte comparison catches that.
+            check(f"{label}: io_uring is byte-identical to mmap",
+                  np.array_equal(t_uring.gather_raw(ids), a), f"ids={ids}")
+
+    # ASYNC path: the pool writes into a caller-owned buffer while the caller does other work, so
+    # a wrong fill is a partially-written buffer rather than an exception. Pin it against the
+    # synchronous result for the same ids, including the sub-threshold fallback (which fills
+    # synchronously) and the threaded path (which does not).
+    for label, tbl in (("below threshold", t_mmap), ("threaded", t_thread)):
+        for ids in ([0, 65, 700, 3], list(range(0, 127, 3)) + list(range(640, 700, 3)), [700]):
+            want = tbl.gather_raw(ids)
+            out = np.empty((len(ids), tbl.row_bytes), dtype=np.uint8)
+            h = tbl.gather_raw_into_async(ids, out)
+            got = tbl.gather_wait(h)
+            check(f"async gather ({label}, n={len(ids)}) matches the synchronous gather",
+                  np.array_equal(got, want) and np.array_equal(out, want))
+            check(f"async handle ({label}, n={len(ids)}) reports itself drained after the wait",
+                  not h.pending)
+
+    # A mis-sized landing buffer must be refused, not silently partially filled.
+    try:
+        t_thread.gather_raw_into_async([1, 2, 3], np.empty((2, t_thread.row_bytes), dtype=np.uint8))
+        check("a mis-sized async landing buffer is refused", False, "no ValueError")
+    except ValueError:
+        check("a mis-sized async landing buffer is refused", True)
+
+    # decode_raw is the SHARED decoder: gather() must be exactly decode_raw(gather_raw()).
+    ids = [0, 65, 700, 3]
+    check("gather() == decode_raw(gather_raw()) — one decoder, not two",
+          np.array_equal(t_mmap.gather(ids), t_mmap.decode_raw(t_mmap.gather_raw(ids)),
+                         equal_nan=True))
 
     # Dequantised output, not just raw bytes — the decoder runs on whatever the gather returned.
     ids = [0, 65, 700, 3]
@@ -125,8 +169,9 @@ with tempfile.TemporaryDirectory() as tmp:
     except ValueError:
         check("an unknown small_gather is refused", True)
 
-    for t in (t_mmap, t_pread, t_thread):
-        t.close()
+    for t in (t_mmap, t_pread, t_thread, t_uring):
+        if t is not None:
+            t.close()
 
 print()
 if FAILED:

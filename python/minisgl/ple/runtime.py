@@ -99,6 +99,8 @@ class PLERuntime:
         #: A non-zero `commit_noops` is a forward that ran with nothing staged (or a batch committed
         #: twice) — the failure that freezes the n-gram context with no error anywhere.
         self.prepares = 0
+        #: Set by `prepare_begin`, consumed by `prepare_finish`. Not None == reads in flight.
+        self._begun = None
         self.commits = 0
         self.discards = 0
         self.commit_noops = 0
@@ -120,12 +122,44 @@ class PLERuntime:
         history — call `commit` after the forward has actually run, so an aborted batch cannot
         leave a slot's n-gram history one chunk ahead of its conv state.
         """
+        self.prepare_begin(slots, token_lists, is_decode=is_decode, defer_commit=defer_commit)
+        return self.prepare_finish()
+
+    def prepare_begin(
+        self,
+        slots: Sequence[int],
+        token_lists: Sequence[np.ndarray],
+        *,
+        is_decode: bool | None = None,
+        defer_commit: bool = False,
+    ) -> None:
+        """Submit the n-gram row reads and return WITHOUT waiting for them.
+
+        Split out of `prepare` so the caller can issue the NVMe reads as soon as the slots exist and
+        then keep preparing the batch while they land -- `os.pread` releases the GIL, so rows in
+        flight cost the calling thread nothing. Pair with `prepare_finish`; `prepare` is the two
+        back to back and is what every caller that does not care about overlap should use.
+
+        Nothing here advances the token history, exactly as in `prepare`: an aborted batch between
+        begin and finish leaves no state behind except the in-flight gather, which `prepare_finish`
+        (or the next `prepare_begin`, which refuses) surfaces.
+        """
         if len(slots) > self.max_seqs:
             raise ValueError(f"{len(slots)} sequences > max_seqs {self.max_seqs}")
         seq_lens = [int(np.size(t)) for t in token_lists]
         if is_decode is None:
             is_decode = all(n == 1 for n in seq_lens)
-        embeddings = self.source.stage_batch(self.state, slots, token_lists)
+        self.source.begin_rows(self.source.batch_row_ids(self.state, slots, token_lists))
+        self._begun = (list(slots), list(token_lists), seq_lens, bool(is_decode),
+                       bool(defer_commit))
+
+    def prepare_finish(self) -> PLEBatch:
+        """Wait for the reads issued by `prepare_begin` and publish the batch."""
+        if self._begun is None:
+            raise RuntimeError("prepare_finish called without a preceding prepare_begin")
+        slots, token_lists, seq_lens, is_decode, defer_commit = self._begun
+        self._begun = None
+        embeddings = self.source.finish_rows()
         n = len(slots)
         self._slot_idx[:n].copy_(
             torch.as_tensor(np.asarray(slots, dtype=np.int64)), non_blocking=True

@@ -115,6 +115,24 @@ class TensorLoc:
         return n
 
 
+class _GatherHandle:
+    """In-flight gather: the buffer the pool is filling, plus the futures still to land.
+
+    Deliberately not a NamedTuple — `gather_wait` clears `futures` so a second wait is a cheap no-op
+    rather than a second `result()` on consumed futures.
+    """
+
+    __slots__ = ("out", "futures")
+
+    def __init__(self, out: np.ndarray, futures: list) -> None:
+        self.out = out
+        self.futures = futures
+
+    @property
+    def pending(self) -> bool:
+        return bool(self.futures)
+
+
 def read_safetensors_header(path: str) -> tuple[dict, int]:
     """Return (header dict, absolute offset of the data section)."""
     with open(path, "rb") as f:
@@ -239,8 +257,12 @@ class ShardedRowTable:
         #: -- see `_gather_raw_pread`). Both return identical bytes; they differ in latency and in
         #: how much of the box they leave buffered.
         self.small_gather = str(small_gather)
-        if self.small_gather not in ("mmap", "pread"):
-            raise ValueError(f"small_gather must be 'mmap' or 'pread', got {small_gather!r}")
+        if self.small_gather not in ("mmap", "pread", "uring"):
+            raise ValueError(
+                f"small_gather must be 'mmap', 'pread' or 'uring', got {small_gather!r}")
+        #: Lazily created io_uring (only when small_gather == "uring"), and its depth.
+        self._ring = None
+        self._ring_depth = 256
         #: Issue MADV_WILLNEED before a non-threaded gather. Advisory, so it can never return wrong
         #: data; on an already-resident range it is a cheap no-op syscall with no I/O.
         self.auto_prefetch = bool(auto_prefetch)
@@ -458,6 +480,9 @@ class ShardedRowTable:
             return self._gather_raw_threaded(ids)
         if self.small_gather == "pread":
             return self._gather_raw_pread(ids)
+        if self.small_gather == "uring":
+            return self._gather_raw_uring(
+                ids, np.empty((ids.size, self.row_bytes), dtype=np.uint8))
         if self.auto_prefetch:
             self.prefetch(ids)
         shard_of = ids // self.rows_per_shard
@@ -470,9 +495,102 @@ class ShardedRowTable:
             out[sel] = self._views[int(slot)][local[sel]]
         return out
 
+    def _gather_raw_uring(self, ids: np.ndarray, out: np.ndarray) -> np.ndarray:
+        """Fetch rows with ONE io_uring submission per batch instead of N pread syscalls.
+
+        No thread pool: the batch is submitted and reaped by the calling thread, so unlike the
+        threaded arm there is no cross-thread GIL traffic to store results. Reads land directly in
+        `out` by address, so nothing is copied twice either.
+
+        Batches larger than the ring depth are chunked; each chunk is fully reaped before the next
+        is submitted, which keeps at most `ring_depth` requests outstanding and means a short read
+        or an errno is attributed to a known row (see `Ring.reap`, which refuses both).
+        """
+        from . import uring
+
+        if self._ring is None:
+            self._ring = uring.Ring(self._ring_depth)
+        ring = self._ring
+        slots, offs = self._locate(ids)
+        fds = [self._fds[self.shards[int(s)].path] for s in slots]
+        rb = self.row_bytes
+        off_list = offs.tolist()
+        base_addr = out.ctypes.data
+        if not out.flags["C_CONTIGUOUS"]:
+            raise ValueError("uring gather needs a C-contiguous landing buffer")
+        depth = ring.entries
+        for lo in range(0, ids.size, depth):
+            hi = min(lo + depth, ids.size)
+            reqs = [(fds[i], rb, off_list[i], i) for i in range(lo, hi)]
+            ring.submit_reads(reqs, lambda s: base_addr + s * rb)
+            ring.reap(hi - lo, rb)
+        return out
+
+    def gather_raw_into_async(self, row_ids, out_raw: np.ndarray):
+        """Submit a gather and return a handle INSTEAD of the rows. Pair with `gather_wait`.
+
+        THE POINT IS THE GIL, NOT THE DRIVE. `os.pread` releases it for the duration of the syscall,
+        so once the reads are in flight on the pool the calling thread is free to run Python. The
+        caller can therefore issue this as soon as the row ids are known and do the rest of its batch
+        preparation while the rows land, instead of standing still for the whole gather.
+
+        `out_raw` is caller-owned and must stay alive and untouched until `gather_wait` returns —
+        the pool writes into it directly, so reading it early yields a partially filled buffer with
+        no error. It must be (n, row_bytes) uint8 and C-contiguous.
+
+        Falls back to a SYNCHRONOUS fill (returning an already-complete handle) whenever the threaded
+        path would not have been taken anyway — no pool, or a request below `threaded_min_rows`. That
+        keeps one code path for the caller rather than making overlap conditional at every call site.
+        """
+        ids = np.asarray(row_ids, dtype=np.int64)
+        if out_raw.shape != (ids.size, self.row_bytes) or out_raw.dtype != np.uint8:
+            raise ValueError(
+                f"out_raw must be ({ids.size}, {self.row_bytes}) uint8, got "
+                f"{out_raw.shape} {out_raw.dtype}"
+            )
+        if ids.size and (ids.min() < 0 or ids.max() >= self.n_rows):
+            raise IndexError(f"row id outside [0, {self.n_rows})")
+        if ids.size == 0:
+            return _GatherHandle(out_raw, [])
+        if not (self.workers > 1 and ids.size >= self.threaded_min_rows):
+            out_raw[...] = self.gather_raw(ids)
+            return _GatherHandle(out_raw, [])
+
+        slots, offs = self._locate(ids)
+        paths = [self.shards[int(s)].path for s in slots]
+        fds = [self._fds[pt] for pt in paths]          # hoisted: one dict lookup per ROW otherwise
+        rb = self.row_bytes
+        n_workers = min(self.workers, max(1, ids.size))
+        bounds = np.linspace(0, ids.size, n_workers + 1).astype(np.int64)
+        off_list = offs.tolist()                        # numpy scalar -> int per row, hoisted
+
+        def work(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                buf = os.pread(fds[i], rb, off_list[i])
+                if len(buf) != rb:
+                    raise OSError(f"short pread: {len(buf)} of {rb} at {off_list[i]}")
+                out_raw[i] = np.frombuffer(buf, dtype=np.uint8)
+
+        ex = self._pool(n_workers)
+        futs = [ex.submit(work, int(a), int(b)) for a, b in zip(bounds[:-1], bounds[1:])]
+        return _GatherHandle(out_raw, futs)
+
+    @staticmethod
+    def gather_wait(handle) -> np.ndarray:
+        """Block until every submitted read has landed, re-raising whatever a worker raised."""
+        for f in handle.futures:
+            f.result()
+        handle.futures = []
+        return handle.out
+
     def gather(self, row_ids) -> np.ndarray:
         """(n,) global row ids -> (n, row_elems) float32, dequantised and scaled."""
-        raw = self.gather_raw(row_ids)
+        return self.decode_raw(self.gather_raw(row_ids))
+
+    def decode_raw(self, raw: np.ndarray) -> np.ndarray:
+        """(n, row_bytes) uint8 -> (n, row_elems) float32. The dtype switch, shared by the
+        synchronous `gather` and by the async begin/finish split so the two can never drift into
+        decoding the same bytes differently."""
         if self.dtype == "F8_E4M3":
             return dequant_f8_e4m3(raw, self.scale)
         if self.dtype == "BF16":
@@ -496,6 +614,9 @@ class ShardedRowTable:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
+        if self._ring is not None:
+            self._ring.close()
+            self._ring = None
         if self._exec is not None:
             self._exec.shutdown(wait=True)
             self._exec, self._exec_workers = None, 0
