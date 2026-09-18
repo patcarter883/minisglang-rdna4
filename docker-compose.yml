@@ -441,6 +441,33 @@ x-lean-common: &lean-common
     # ROCm 7.2.1; they are kept ONLY so the next person finds this note instead of re-running the
     # experiment. DO NOT set either expecting the idle core back.
     HSA_ENABLE_MWAITX: "${HSA_ENABLE_MWAITX:-}"
+    #
+    # HSA_USERPTR_FOR_PAGED_MEM selects HOW ROCR obtains pinned host memory, and it is the one HSA
+    # knob in this block that is NOT known-inert. UNSET/1 (the ROCm default) takes the userptr path
+    # in libhsakmt `fmm.c`: an anonymous mmap, then an UNCONDITIONAL `madvise(MADV_HUGEPAGE)` for
+    # any allocation >= 2 MiB, registered with KFD_IOC_ALLOC_MEM_FLAGS_USERPTR. Setting it to 0
+    # takes the KFD_IOC_ALLOC_MEM_FLAGS_GTT path instead: driver/TTM-allocated GTT, with no
+    # anonymous mapping and no THP hint at all.
+    #
+    # WHY IT IS PLUMBED. The qwen4exp host arena is ~28 GiB/rank in 1372 MiB chunks, so EVERY chunk
+    # is madvised MADV_HUGEPAGE. This box runs `defrag=defer+madvise`, under which madvised regions
+    # enter DIRECT reclaim and compaction — so the arena is in the direct-reclaim class by
+    # construction. MEASURED 2026-09-18 on a live q4e serve: AnonHugePages 0.9 GiB against 48.6 GiB
+    # AnonPages, i.e. 1.9% of the arena actually got a huge page, with 131 free order-9 blocks
+    # against the ~28672 a 56 GiB arena wants and 54.7 GiB sitting in swap. Nearly every one of
+    # those ~28000 THP faults reclaims, fails, and falls back to 4K. The GTT path skips that
+    # machinery entirely.
+    #
+    # UNVALIDATED: the mechanism above is read from ROCR/KFD source plus this box's live state; the
+    # GTT path has NOT yet been booted here. Do not quote it as a fix until a boot says so.
+    #
+    # THE GATE IS GTT CAPACITY. `mem_info_gtt_total` is 45.92 GiB per discrete card here against
+    # ~28 GiB/rank, so it fits — but GTT is driver-pinned and UNSWAPPABLE, so a rank asking past the
+    # cap fails outright rather than degrading. Re-check gtt_total before raising the arena.
+    #
+    # Unlike the two knobs above, the symbol is present in torch's BUNDLED libhsa-runtime64.so —
+    # the build actually mapped by the rank, verified in /proc/<pid>/maps — not just the system one.
+    HSA_USERPTR_FOR_PAGED_MEM: "${HSA_USERPTR_FOR_PAGED_MEM:-}"
     # THE ACTUAL FIX for the idle spin, and it is not an HSA knob at all.
     #
     # torch ships its OWN `libhsa-runtime64.so` in `torch/lib/` (4,230,361 B) and loads it in
