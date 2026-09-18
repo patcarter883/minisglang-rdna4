@@ -36,6 +36,14 @@ def main() -> int:
     ap.add_argument("--chunk-mib", default="512,640,704,736,750,752,768,896,1024,1408,1504,1536,2048,3072")
     ap.add_argument("--device-gb", default="7.0,7.5,8.0,8.5,8.79,9.0,9.5,10.0")
     ap.add_argument("--json", default="")
+    # The MTP draft head is a 49th MoE layer in the plan (`plan.py` numbers it `num_layers + n`),
+    # and with `OFFLOAD_MTP_HEAD = True` it enters the arena. It matters here and not merely as one
+    # more layer: its `gate_up` region is 1.5625 GiB/rank at TP=2 -- BF16 where every backbone layer
+    # is NVFP4 -- which is larger than a whole chunk at the shipped 1372 MiB, so the arena's
+    # never-straddle rule GROWS the chunk to fit it and the backbone's 750 MiB/layer rows then pack
+    # badly into the wider chunk. A live boot measured 4.37 GiB (13.3%) abandoned that way, which is
+    # what pushed the reservation over its ceiling. Sweeping with spec="none" cannot see any of this.
+    ap.add_argument("--spec", default="none", help="spec algorithm; 'mtp' adds the draft head as layer num_layers")
     args = ap.parse_args()
 
     from minisgl.distributed import DistributedInfo, set_tp_info
@@ -55,7 +63,7 @@ def main() -> int:
     )
 
     hf = cached_load_hf_config(MODEL)
-    mc = ModelConfig.from_hf(hf, spec_algorithm="none")
+    mc = ModelConfig.from_hf(hf, spec_algorithm=args.spec)
     # A truncated depth is the only knob a subset needs; experts stay at the checkpoint's count so
     # the per-layer row bytes are the REAL ones.
     import dataclasses
