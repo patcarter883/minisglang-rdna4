@@ -69,6 +69,34 @@ def _norm_output_gate(value) -> str:
     )
 
 
+# Layer-type names denoting a FULL-CONTEXT attention layer: one that keeps a paged KV entry for
+# every token. A SET, not the bare string "full_attention", because the SAME checkpoint reports
+# DIFFERENT names depending on the installed transformers:
+#
+#   transformers 5.14.1  AutoConfig does not register `qwen4_exp_text` and RAISES, so
+#                        utils/hf.py:257 falls back to PretrainedConfig.from_dict(config.json),
+#                        which preserves the on-disk name -> "full_attention".
+#   transformers 5.17.0  AutoConfig DOES register it, and the registered class renames the layer
+#                        type -> "qwen_sparse_attention".
+#
+# So Qwen3.8-Flash-Next broke by being UNDERSTOOD: it booted for months only because transformers
+# could not parse its config, and the upgrade that taught transformers to read it is what broke the
+# engine. Worth stating because the instinct on seeing this is "the checkpoint changed" -- it did
+# not; `config.json` still says full_attention on disk.
+#
+# The failure was silent and total: `full_attn_layer_ids` returned [] while `gdn_layer_ids` claimed
+# 36 of 48 layers, leaving 12 in NEITHER partition, each reaching Qwen4ExpDecoderLayer with
+# attn_kv_id=None to die on a bare assert naming neither the layer type nor the version.
+#
+# "sparse" describes how the layer SELECTS keys (the QSA indexer picks a subset), not how much
+# context it RETAINS: the whole context stays resident, so it is full-context for every sizing and
+# indexing purpose here. Sliding-window layers are deliberately NOT in this set -- they keep a
+# window-bounded ring pool and are counted separately.
+_FULL_CONTEXT_ATTENTION = frozenset({"full_attention", "qwen_sparse_attention"})
+# Every layer-type name this file can partition. An unknown one must fail LOUDLY at config time.
+_KNOWN_LAYER_TYPES = _FULL_CONTEXT_ATTENTION | {"linear_attention", "sliding_attention"}
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
@@ -449,6 +477,22 @@ class ModelConfig:
         return len(self.gdn_layer_ids)
 
     @property
+    def unknown_layer_types(self) -> tuple[str, ...]:
+        """Layer-type names in `layer_types` this file cannot partition, in first-seen order.
+
+        Exists because the failure mode of not checking is terrible: an unrecognised name falls out
+        of BOTH `gdn_layer_ids` and `full_attn_layer_ids`, and the first symptom is a bare
+        `assert attn_kv_id is not None` in a decoder layer — which names neither the offending layer
+        type nor the transformers version that produced it. That cost a boot to diagnose once."""
+        if self.layer_types is None:
+            return ()
+        seen: list[str] = []
+        for t in self.layer_types:
+            if t not in _KNOWN_LAYER_TYPES and t not in seen:
+                seen.append(t)
+        return tuple(seen)
+
+    @property
     def full_attn_layer_ids(self) -> list[int]:
         """Global indices of the FULL-attention layers, in order. The paged KV pool is indexed by
         position in THIS list (a compact kv id) — the GDN/linear layers keep no paged KV, so
@@ -463,7 +507,7 @@ class ModelConfig:
             return [i for i, t in enumerate(self.block_types) if t == "attention"]
         if self.layer_types is None:
             return list(range(self.num_layers))
-        return [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
+        return [i for i, t in enumerate(self.layer_types) if t in _FULL_CONTEXT_ATTENTION]
 
     @property
     def num_kv_layers(self) -> int:
