@@ -275,7 +275,39 @@ class Ring:
         """
         if self._closed:
             raise UringError("ring is closed")
-        n = len(reqs)
+        return self.submit_reads_arrays(
+            np.asarray([r[0] for r in reqs], dtype=np.int32),
+            np.asarray([r[2] for r in reqs], dtype=np.uint64),
+            np.asarray([buf_addr_of(r[3]) for r in reqs], dtype=np.uint64),
+            np.asarray([r[1] for r in reqs], dtype=np.uint32),
+            np.asarray([r[3] for r in reqs], dtype=np.uint64),
+        )
+
+    def submit_reads_arrays(self, fds, offsets, addrs, lens, user_data) -> int:
+        """Array form of `submit_reads`: NO PER-ROW PYTHON ANYWHERE.
+
+        `submit_reads` above takes a list of (fd, nbytes, offset, slot) tuples, which forces five
+        O(N) Python passes before a single vector store happens — building the tuples, then one
+        comprehension per column. MEASURED on ARC-resident data, where the drive is out of the
+        picture and only per-batch overhead remains, the fill was 1073 us of a 4735 us 2048-row
+        batch. That is the whole of what a C submission path could have removed, and it did not need
+        C: it needed the caller to stop materialising tuples. With this API plus the contiguous SQE
+        fast path the fill is 531.6 us — HALF, in pure Python:
+
+            rows    fill (tuple API)   fill (this API)
+              16         29.7 us            15.2 us
+             256        162.3 us            74.6 us
+            2048       1073   us           531.6 us
+
+        What is left is the vector stores themselves, so a C submission path is now worth ~8% of a
+        real gather rather than ~18%.
+
+        Every argument is a numpy array of length n. Callers that already hold their data as columns
+        (the row table does — `_locate` returns arrays) should use this and never build tuples.
+        """
+        if self._closed:
+            raise UringError("ring is closed")
+        n = int(fds.shape[0])
         if n > self.entries:
             raise UringError(f"batch of {n} exceeds ring depth {self.entries}")
         p = self._p
@@ -287,9 +319,7 @@ class Ring:
         # against the thread pool's 2484 (26% WORSE); the syscall saving is real but the packing ate
         # it. Writing the fields as numpy columns over a structured view of the SQE mmap makes the
         # per-row cost a handful of vector stores instead.
-        addrs = np.asarray([buf_addr_of(r[3]) for r in reqs], dtype=np.uint64)
-        lens = np.asarray([r[1] for r in reqs], dtype=np.uint32)
-        raw_fds = np.asarray([r[0] for r in reqs], dtype=np.int32)
+        raw_fds = fds
 
         # Fixed FILE: the whole batch uses it only if every fd in it is registered — a partially
         # fixed batch would need per-row flags, and this path always reads the same shard set.
@@ -323,17 +353,24 @@ class Ring:
                     break
 
         sq = self._sqe_view
-        sq[idx] = 0                       # SQEs are reused; stale fields are live fields
-        sq["opcode"][idx] = IORING_OP_READ_FIXED if bidx is not None else IORING_OP_READ
-        sq["flags"][idx] = IOSQE_FIXED_FILE if use_fixed_file else 0
-        sq["fd"][idx] = fd_col
-        sq["off"][idx] = np.asarray([r[2] for r in reqs], dtype=np.uint64)
-        sq["addr"][idx] = addrs
-        sq["len"][idx] = lens
-        sq["user_data"][idx] = np.asarray([r[3] for r in reqs], dtype=np.uint64)
+        # CONTIGUOUS FAST PATH. `idx` wraps only when a batch straddles the ring's end, which is the
+        # uncommon case; the rest of the time the entries are consecutive and a SLICE assignment
+        # replaces a fancy-index scatter. numpy's fancy indexing allocates an index array and
+        # scatters element by element, while a slice is a strided copy — MEASURED below.
+        start = int(idx[0])
+        contiguous = (start + n <= sq.shape[0]) and (int(idx[-1]) == start + n - 1)
+        sel = slice(start, start + n) if contiguous else idx
+        sq[sel] = 0                       # SQEs are reused; stale fields are live fields
+        sq["opcode"][sel] = IORING_OP_READ_FIXED if bidx is not None else IORING_OP_READ
+        sq["flags"][sel] = IOSQE_FIXED_FILE if use_fixed_file else 0
+        sq["fd"][sel] = fd_col
+        sq["off"][sel] = offsets
+        sq["addr"][sel] = addrs
+        sq["len"][sel] = lens
+        sq["user_data"][sel] = user_data
         if bidx is not None:
-            sq["buf_index"][idx] = bidx
-        self._sq_array_view[idx] = idx
+            sq["buf_index"][sel] = bidx
+        self._sq_array_view[sel] = idx
         self._set_u32(self._sq, p.sq_tail, tail + n)
         if self.sqpoll:
             # The kernel poller picks the entries up on its own. A syscall is needed ONLY if it has

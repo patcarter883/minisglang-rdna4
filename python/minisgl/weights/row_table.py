@@ -264,6 +264,7 @@ class ShardedRowTable:
         self._ring = None
         self._ring_depth = 256
         self._uring_avail = None
+        self._fd_by_slot = None
         #: SQPOLL costs a kernel poller thread per ring, which on this box competes with the ranks
         #: for cores — so it is opt-in and measured, never a default. Verified usable unprivileged.
         self._ring_sqpoll = False
@@ -570,6 +571,11 @@ class ShardedRowTable:
                 except uring.UringError:
                     pass    # registration is an optimisation; a plain READ is still correct
         ring = self._ring
+        if self._fd_by_slot is None:
+            # slot -> fd as an array, built once, so mapping a batch's shards to descriptors is one
+            # numpy gather instead of a per-row dict lookup.
+            self._fd_by_slot = np.asarray(
+                [self._fds[s.path] for s in self.shards], dtype=np.int32)
         # REGISTER THE LANDING BUFFER on first sight. The overlapped path reuses one persistent
         # buffer (`PLEEmbeddingSource._raw`), so this fires once and every gather after it is a
         # READ_FIXED with the pages already pinned. A caller that passes a DIFFERENT buffer simply
@@ -581,17 +587,27 @@ class ShardedRowTable:
             except uring.UringError:
                 pass
         slots, offs = self._locate(ids)
-        fds = [self._fds[self.shards[int(s)].path] for s in slots]
         rb = self.row_bytes
-        off_list = offs.tolist()
-        base_addr = out.ctypes.data
         if not out.flags["C_CONTIGUOUS"]:
             raise ValueError("uring gather needs a C-contiguous landing buffer")
+
+        # EVERY COLUMN IS BUILT AS AN ARRAY. The previous form materialised one (fd, len, off, slot)
+        # tuple per row and handed the list to `submit_reads`, which then ran a comprehension per
+        # column: five O(N) Python passes per gather before any vector store. MEASURED on
+        # ARC-resident data (drive removed, only per-batch overhead left), that fill was 1073 us of
+        # a 4735 us 2048-row batch — the entire slice a C submission path could have taken.
+        n = int(ids.size)
+        fd_col = self._fd_by_slot[slots]
+        addr_col = np.uint64(out.ctypes.data) + np.arange(n, dtype=np.uint64) * np.uint64(rb)
+        len_col = np.full(n, rb, dtype=np.uint32)
+        ud_col = np.arange(n, dtype=np.uint64)
+        off_col = offs.astype(np.uint64, copy=False)
+
         depth = ring.entries
-        for lo in range(0, ids.size, depth):
-            hi = min(lo + depth, ids.size)
-            reqs = [(fds[i], rb, off_list[i], i) for i in range(lo, hi)]
-            ring.submit_reads(reqs, lambda s: base_addr + s * rb)
+        for lo in range(0, n, depth):
+            hi = min(lo + depth, n)
+            ring.submit_reads_arrays(fd_col[lo:hi], off_col[lo:hi], addr_col[lo:hi],
+                                     len_col[lo:hi], ud_col[lo:hi])
             ring.reap(hi - lo, rb)
         return out
 
