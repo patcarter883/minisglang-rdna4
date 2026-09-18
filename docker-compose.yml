@@ -52,6 +52,24 @@ x-lean-common: &lean-common
   group_add: [video]
   security_opt: [seccomp=unconfined, label=disable]
   cap_add: [SYS_PTRACE]
+  ulimits:
+    # memlock UNLIMITED, and this is load-bearing for the weight-offload arena, not hygiene.
+    #
+    # weights/hipmem.py mlocks every host-arena chunk at allocation, because the "pinned" arena is
+    # NOT driver-pinned: hipHostMalloc takes KFD's USERPTR path, which is HMM-managed (an MMU
+    # notifier and re-validation, no page pin), so the pages are ordinary swappable anon. Unlocked,
+    # a 2 x 27.94 GiB arena on this 91.8 GiB box thrashed 50-100 MB/s of swap in BOTH directions
+    # and prefill computed ZERO tokens for 12+ minutes (measured 2026-09-18).
+    #
+    # Docker's DEFAULT memlock is 8 MiB and the default capability set excludes CAP_IPC_LOCK, so
+    # without this every one of those mlocks returns ENOMEM. MEASURED in this image:
+    # `ulimit -l` = 8192, mlock(1 GiB) -> ENOMEM. The fix degrades LOUDLY (one warning, then the
+    # old behaviour) rather than refusing to boot, so the failure mode is a serve that is merely
+    # slow — exactly the thing the mlock exists to stop anyone inferring from a slow serve again.
+    #
+    # Inert on the GTT path (HSA_USERPTR_FOR_PAGED_MEM=0): that memory is driver/TTM-allocated and
+    # already unswappable, and hipmem skips the mlock entirely.
+    memlock: -1
   ipc: host
   shm_size: "16gb"
   volumes:
