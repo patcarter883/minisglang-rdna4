@@ -173,7 +173,8 @@ class ShardedRowTable:
 
     def __init__(self, shards: Sequence[TensorLoc], *, scale: float = 1.0,
                  advise_random: bool = True, shard_ids: Sequence[int] | None = None,
-                 workers: int = 0, auto_prefetch: bool = True) -> None:
+                 workers: int = 0, auto_prefetch: bool = True,
+                 small_gather: str = "mmap") -> None:
         if not shards:
             raise ValueError("no shards")
         row_elems = shards[0].shape[1]
@@ -197,9 +198,35 @@ class ShardedRowTable:
         self.row_bytes = self.row_elems * CODECS[self.dtype]
         self.scale = float(scale)
         self.workers = int(workers)
-        #: Below this many rows the thread pool costs more than the faults it overlaps — a decode
-        #: step asks for 16 rows and is better served by prefetch + mmap (609 us vs 802 us).
-        self.threaded_min_rows = 256
+        #: Threaded gathers from this many rows up. WAS 256, on the reading that "the thread pool
+        #: costs more than the faults it overlaps" for a 16-row decode step (609 us prefetch+mmap vs
+        #: 802 us threaded). That was true of the pool as it was THEN BUILT: `_gather_raw_threaded`
+        #: created and joined a fresh ThreadPoolExecutor on EVERY call, so the setup it was being
+        #: charged for was an artifact, not a property of the mechanism. `_pool` now keeps one.
+        #: RE-MEASURED 2026-09-18 on the real 51.2 GB table, arms INTERLEAVED with fresh random ids
+        #: per arm per iteration (running each arm's block back-to-back warms the ARC monotonically
+        #: and hands the win to whoever went last -- that error made one probe report serial pread
+        #: 8x faster than the same probe had minutes earlier). Medians, us:
+        #:
+        #:   rows   mmap+prefetch   serial pread   threaded      dCached over the block
+        #:     16       529             74            323        mmap accumulates, both preads ~0
+        #:     64      2305            245            648
+        #:    256      7136           5150           2029        mmap +55.6 MiB, pread +0.1 MiB
+        #:
+        #: and on a COLD table (first touch, nothing resident) the ordering differs: mmap 1135,
+        #: threaded 1115, serial pread 2231. Serial pread's median is the best of the three when the
+        #: rows are ARC-resident and the WORST when they are not -- its p90 reaches 23 ms at 256 rows
+        #: -- so it is not the default: with an 8 GiB ARC over a 49 GB table most n-gram rows miss.
+        #: Threaded is >= mmap in BOTH regimes and buffers nothing in the page cache, so the
+        #: threshold drops to the decode step's own width. Below 16 is unmeasured.
+        self.threaded_min_rows = 16
+        #: Mechanism for a SUB-THRESHOLD gather: "mmap" (fancy-index the mapped view, with
+        #: MADV_WILLNEED when auto_prefetch is on) or "pread" (serial os.pread, no page-cache copy
+        #: -- see `_gather_raw_pread`). Both return identical bytes; they differ in latency and in
+        #: how much of the box they leave buffered.
+        self.small_gather = str(small_gather)
+        if self.small_gather not in ("mmap", "pread"):
+            raise ValueError(f"small_gather must be 'mmap' or 'pread', got {small_gather!r}")
         #: Issue MADV_WILLNEED before a non-threaded gather. Advisory, so it can never return wrong
         #: data; on an already-resident range it is a cheap no-op syscall with no I/O.
         self.auto_prefetch = bool(auto_prefetch)
@@ -223,6 +250,9 @@ class ShardedRowTable:
         for slot, sid in enumerate(ids):
             self._slot_of_id[sid] = slot
 
+        #: Persistent gather pool (see `_pool`); created on first threaded gather.
+        self._exec = None
+        self._exec_workers = 0
         self._maps: Dict[str, mmap.mmap] = {}
         self._fds: Dict[str, int] = {}
         self._views: List[np.ndarray] = []
@@ -314,8 +344,6 @@ class ShardedRowTable:
         latency per row and reaches only ~10 MB/s regardless of what the drive can do. This is what
         the DGX recipe's `WORKERS=32` is buying.
         """
-        from concurrent.futures import ThreadPoolExecutor
-
         slots, offs = self._locate(ids)
         paths = [self.shards[int(s)].path for s in slots]
         out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
@@ -328,8 +356,68 @@ class ShardedRowTable:
                 fd = self._fds[paths[i]]
                 out[i] = np.frombuffer(os.pread(fd, rb, int(offs[i])), dtype=np.uint8)
 
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            list(ex.map(lambda b: work(*b), list(zip(bounds[:-1], bounds[1:]))))
+        ex = self._pool(n_workers)
+        list(ex.map(lambda b: work(*b), list(zip(bounds[:-1], bounds[1:]))))
+        return out
+
+    def _pool(self, n_workers: int):
+        """One PERSISTENT pool, not a fresh one per gather.
+
+        A `with ThreadPoolExecutor(...)` per call creates and joins `n_workers` OS threads on every
+        gather. At a 16-row decode step that setup is most of the call, which is what made the
+        threaded arm look like the wrong mechanism for small requests and pinned
+        `threaded_min_rows` at 256. Sized to the largest worker count asked for so far and reused;
+        `ex.map` over a fixed set of workers needs no per-call ownership.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._exec is None or self._exec_workers < n_workers:
+            if self._exec is not None:
+                self._exec.shutdown(wait=True)
+            self._exec = ThreadPoolExecutor(max_workers=n_workers,
+                                            thread_name_prefix="rowtable")
+            self._exec_workers = n_workers
+        return self._exec
+
+    def _gather_raw_pread(self, ids: np.ndarray) -> np.ndarray:
+        """Fetch rows with SERIAL `os.pread` — no thread pool, no mmap, no page-cache copy.
+
+        THE GAP THIS FILLS. The table below picked mmap+prefetch for a decode-sized gather because
+        the only pread arm measured was the THREADED one, where pool setup dominates at 16 rows
+        (802 us vs 609 us). Serial pread was never measured: it has neither the pool cost nor mmap's
+        page-cache copy.
+
+        WHY THE FOOTPRINT DIFFERS, measured for the checkpoint reader on this same ZFS pool
+        (`ckpt_read.py`, one cold 337.7 MiB shard):
+
+            mmap, 4 KiB walk           627 MiB/s   dCached +0.33 GiB   dARC +0.33 GiB
+            read() into reused buf    4948 MiB/s   dCached +0.00 GiB   dARC +0.31 GiB
+            O_DIRECT into reused buf  4967 MiB/s   dCached +0.00 GiB   dARC +0.00 GiB
+
+        OpenZFS intercepts read()/pread() at the VFS layer and serves from the ARC, so a pread costs
+        ONE cache copy; an mmap'd page costs a page-cache page AND its ARC buffer, i.e. the bytes are
+        buffered twice. mmap also pays roughly one ARC lookup per 4 KiB page (~91,855 lookups per
+        337.7 MiB, against 1,272 for read()), which is the tax that actually dominates a scattered
+        row gather. O_DIRECT would drop the ARC copy too, but its 4096-byte alignment requirement is
+        a poor fit for small scattered n-gram rows, and it buys only 19 MiB/s over read() here.
+
+        Offsets are NOT sorted: with one row per call there is nothing to merge, and sorting would
+        cost a permutation to undo afterwards.
+        """
+        slots, offs = self._locate(ids)
+        out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
+        rb = self.row_bytes
+        fds = [self._fds[self.shards[int(s)].path] for s in slots]
+        for i in range(ids.size):
+            buf = os.pread(fds[i], rb, int(offs[i]))
+            if len(buf) != rb:
+                # pread is permitted a short read; refuse rather than hand back a row that is part
+                # stale buffer. A truncated PLE row is silently wrong output, not a crash.
+                raise OSError(
+                    f"short pread on {os.path.basename(self.shards[int(slots[i])].path)}: got "
+                    f"{len(buf)} of {rb} bytes at offset {int(offs[i])}"
+                )
+            out[i] = np.frombuffer(buf, dtype=np.uint8)
         return out
 
     def gather_raw(self, row_ids) -> np.ndarray:
@@ -354,6 +442,8 @@ class ShardedRowTable:
         # is what a 16-row decode step actually wants.
         if self.workers > 1 and ids.size >= self.threaded_min_rows:
             return self._gather_raw_threaded(ids)
+        if self.small_gather == "pread":
+            return self._gather_raw_pread(ids)
         if self.auto_prefetch:
             self.prefetch(ids)
         shard_of = ids // self.rows_per_shard
@@ -392,6 +482,9 @@ class ShardedRowTable:
     # -- lifecycle ---------------------------------------------------------
 
     def close(self) -> None:
+        if self._exec is not None:
+            self._exec.shutdown(wait=True)
+            self._exec, self._exec_workers = None, 0
         self._views = []
         for mm in self._maps.values():
             mm.close()
@@ -474,6 +567,7 @@ def open_qwen4exp_ngram_table(
     scale_override: float | None = None,
     workers: int = 0,
     auto_prefetch: bool = True,
+    small_gather: str = "mmap",
 ):
     """Open the n-gram table from a Qwen4-Exp checkpoint's `model-plefp8-*.safetensors` set.
 
@@ -519,7 +613,7 @@ def open_qwen4exp_ngram_table(
 
     table = ShardedRowTable(
         [idx[n] for _, n in found], scale=scale, shard_ids=shard_ids, workers=workers,
-        auto_prefetch=auto_prefetch
+        auto_prefetch=auto_prefetch, small_gather=small_gather
     )
 
     heads = None
