@@ -120,3 +120,20 @@ _rocprof_*/
 .env
 .env.*
 !.env.example
+
+# Vendored kernel copies. The canonical HIP kernels live in the separate rdna4-hip-kernels repo and
+# are built into the image from there (Dockerfile COPY --from=kernels). Copies used to be tracked
+# here; they were never built, they lacked __init__.py so on PYTHONPATH they SHADOWED the real
+# /opt/kernels modules as empty namespace packages, and they went stale -- three of them still held
+# scaffolding that had already been rewritten upstream.
+/attn_decode/
+/attn_hip/
+/attn_prefill_paged/
+/cca_hip/
+/gdn_hip/
+/mla_hip/
+/moe_hip/
+/moe_splitk_hip/
+/swiglu_hip/
+/tail_hip/
+/w8a8_fp8_wmma/
