@@ -219,6 +219,20 @@ class ShardedRowTable:
         #: -- so it is not the default: with an 8 GiB ARC over a 49 GB table most n-gram rows miss.
         #: Threaded is >= mmap in BOTH regimes and buffers nothing in the page cache, so the
         #: threshold drops to the decode step's own width. Below 16 is unmeasured.
+        #:
+        #: END TO END THIS IS NEUTRAL, AND THE TABLE ABOVE IS NOT A THROUGHPUT CLAIM. Measured on a
+        #: live q4e serve (SPEC=none, CONC=2, TP=2, expert cache 2.5 GiB, 12 prompts): 17.57 tok/s
+        #: (17.1-18.7) against 17.76 (17.55-18.63) for the pre-change code at the same config. The
+        #: gather is ~300 us against a ~50 ms decode forward -- 0.6% -- so making it faster cannot
+        #: move TPOT. What it buys is the page cache it no longer fills. If the gather is ever worth
+        #: attacking for throughput, the lever is OVERLAP (fetch step t+1's rows during step t's
+        #: forward, when the Python thread is parked in a HIP sync and the GIL is free), not a
+        #: faster synchronous gather.
+        #:
+        #: MEASURE WARM-TO-WARM. The FIRST run after a boot reads 13.47 tok/s with a single prompt
+        #: stalling 476 s, purely because the table is cold in ARC; the second run on the SAME serve
+        #: reads 17.57. Comparing a cold first run against a warmed baseline reads as a 24%
+        #: regression that does not exist.
         self.threaded_min_rows = 16
         #: Mechanism for a SUB-THRESHOLD gather: "mmap" (fancy-index the mapped view, with
         #: MADV_WILLNEED when auto_prefetch is on) or "pread" (serial os.pread, no page-cache copy
