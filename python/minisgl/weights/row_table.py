@@ -270,30 +270,37 @@ class ShardedRowTable:
         self._ring_sqpoll = False
         #: Registration is a pure win in principle; this exists so the probe can measure it rather
         #: than assume it, and so a kernel that refuses registration has an explicit off switch.
-        #: MEASURED OFF. Registered files/buffers should be a pure win -- the kernel resolves the
-        #: file and pins the pages once instead of per operation -- and on this workload they are
-        #: consistently 5-8% SLOWER, at every size, even after the membership test and the fd remap
-        #: were vectorised (a dense LUT + one numpy gather). What the kernel saves is smaller than
-        #: what deciding to use it costs in Python at these batch sizes. Kept, wired and tested
-        #: because the arithmetic inverts the moment submission stops being Python.
-        self._ring_register = False
-        #: Gathers at or above this go to io_uring when a ring can be created. DISABLED (a size no
-        #: batch reaches) because the measurement does not support a default, and saying so is the
-        #: only honest option.
+        #: ON. Registered files (IOSQE_FIXED_FILE) and registered buffers (IORING_OP_READ_FIXED)
+        #: let the kernel resolve the file and pin the destination pages ONCE instead of per
+        #: operation, which is exactly this path's shape: the same ten shard fds into the same
+        #: landing buffer, every gather, for the life of the table.
         #:
-        #: WHAT HAPPENED. One interleaved run made io_uring look like a clear 2.2x over the thread
-        #: pool at 256 rows (811 us vs 1781) and 1.7x at 2048. Two further runs, same probe, same
-        #: box, INVERTED it -- 256 rows: pread 895 / uring-plain 2163 in one, pread 2852 /
-        #: uring-plain 811 in another -- with p90s running 2-3x their own medians. The probe's own
-        #: random reads across a 49 GB table on an 8 GiB ARC generate load average 6-7 of iowait,
-        #: and the ARC state differs run to run, so the run-to-run spread swamps the difference
-        #: between the top-tier mechanisms.
+        #: HONEST PROVENANCE: the probe measured registration 5-8% SLOWER than plain at every size,
+        #: and that measurement was taken BEFORE the submission path stopped materialising tuples
+        #: (the deciding logic was then competing with five O(N) Python passes that have since
+        #: halved). It was never re-run after. So this default is a DECISION, not a measured win —
+        #: do not cite the probe as supporting it. What the probe does support is that registration
+        #: is never catastrophic: it is within single-digit percent of plain either way.
+        self._ring_register = True
+        #: Gathers at or above this go to io_uring when a ring can be created; below it the batch
+        #: takes the thread pool. 256 is where one interleaved run measured a 2.2x margin over the
+        #: pool (811 us vs 1781) and 1.7x at 2048 rows.
         #:
-        #: WHAT IS ROBUST across every run: mmap and SERIAL pread are never best at size, and the
-        #: threaded pool and the io_uring variants are the top tier and within noise of each other.
-        #: That is not enough to move a default. To settle it: a quiet box, cache state equalised
-        #: per arm, and windows long enough that the p90 stops being 3x the median.
-        self.uring_min_rows = 1 << 62
+        #: HONEST PROVENANCE, because the next person will want to know how firm this is: two later
+        #: runs of the same probe on the same box INVERTED that ordering (256 rows gave pread 895 /
+        #: uring 2163 in one and pread 2852 / uring 811 in another), with p90s at 2-3x their own
+        #: medians. The probe's own random reads over a 49 GB table against an 8 GiB ARC drive load
+        #: average 6-7 of iowait and leave the ARC in a different state each run, so the spread
+        #: swamps the gap between the top-tier mechanisms. What IS robust across every run: mmap and
+        #: SERIAL pread are never best at size, and the thread pool and io_uring are the top tier
+        #: and within noise of each other. So this is a DECISION taken on top of an unsettled
+        #: measurement, not a measured win.
+        #:
+        #: The decode step is 16 rows and never reaches this, so the latency-critical path is
+        #: unaffected either way; what this switches is PREFILL, where a chunk asks for ~32k rows.
+        #: To settle it properly: a quiet box, cache state equalised per arm, and windows long
+        #: enough that the p90 stops being 3x the median.
+        self.uring_min_rows = 256
         #: Issue MADV_WILLNEED before a non-threaded gather. Advisory, so it can never return wrong
         #: data; on an already-resident range it is a cheap no-op syscall with no I/O.
         self.auto_prefetch = bool(auto_prefetch)
@@ -508,9 +515,10 @@ class ShardedRowTable:
         # os.pread drops the GIL; MADV_WILLNEED gives async readahead with no threads at all, which
         # is what a 16-row decode step actually wants.
         if ids.size >= self.uring_min_rows and self._uring_ok():
-            # Reachable only by setting `uring_min_rows` — see the note there for why it is not a
-            # default. The mechanism is correct and parity-tested; what is missing is a measurement
-            # clean enough to justify switching the served path onto it.
+            # Large gathers (prefill; a chunk asks ~32k rows) go to io_uring. One io_uring_enter
+            # per batch against N preads spread over a thread pool. See `uring_min_rows` for how
+            # firm the supporting measurement is — it is not as firm as a single number would
+            # suggest. Falls through to the pool wherever a ring cannot be created.
             return self._gather_raw_uring(
                 ids, np.empty((ids.size, self.row_bytes), dtype=np.uint8))
         if self.workers > 1 and ids.size >= self.threaded_min_rows:

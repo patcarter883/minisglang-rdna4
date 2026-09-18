@@ -139,6 +139,28 @@ with tempfile.TemporaryDirectory() as tmp:
             check(f"async handle ({label}, n={len(ids)}) reports itself drained after the wait",
                   not h.pending)
 
+    # THE DEFAULT PATH AT SCALE. `uring_min_rows` (256) routes large gathers to io_uring, and no
+    # case above is anywhere near that — so without this the shipped default would be untested by
+    # its own parity suite. Built from repeats of the loaded shards so it stays a valid id set.
+    big = (list(range(0, 128)) + list(range(640, 768))) * 2          # 512 ids, > uring_min_rows
+    t_default = table(workers=16)                                    # table defaults, nothing forced
+    check("the shipped default routes a large gather to io_uring",
+          t_default.uring_min_rows <= len(big) and (t_default._uring_ok() or not HAVE_URING),
+          f"uring_min_rows={t_default.uring_min_rows} n={len(big)} ok={t_default._uring_ok()}")
+    check("large gather via the DEFAULT path is byte-identical to mmap",
+          np.array_equal(t_default.gather_raw(big), t_mmap.gather_raw(big)),
+          f"n={len(big)}")
+    # And that it really took the ring rather than quietly falling back to the pool.
+    if HAVE_URING:
+        check("the default large gather actually created a ring",
+              t_default._ring is not None,
+              "" if t_default._ring is not None
+              else "ring is None — the gather fell through to the thread pool")
+        check("registration is on by default and took effect",
+              bool(t_default._ring._file_index) and bool(t_default._ring._buf_ranges),
+              f"files={len(t_default._ring._file_index)} bufs={len(t_default._ring._buf_ranges)}")
+    t_default.close()
+
     # A mis-sized landing buffer must be refused, not silently partially filled.
     try:
         t_thread.gather_raw_into_async([1, 2, 3], np.empty((2, t_thread.row_bytes), dtype=np.uint8))
