@@ -223,6 +223,30 @@ class ExpertResidencyCache:
         #: so the cache jams with `free=0` and a climbing `deferred`. A cache that starves the path
         #: it is accelerating is worse than no cache. 64 x 1.36 MiB = ~87 MiB of PCIe in flight.
         self._max_inflight = max(8, _env_int("MINISGL_EXPERT_CACHE_MAX_INFLIGHT", 64))
+        #: INFLIGHT IS BOUNDED BY THE POOL TOO, not only by PCIe bytes, and that second bound is
+        #: the one an operator trips by RESIZING the cache. An in-flight copy holds a SLOT until it
+        #: publishes, so a ceiling near the slot count leaves nothing to publish into: the manager
+        #: frees no slot, `promotions`/`evictions` stay at 0, `throttled` climbs, and the forward
+        #: keeps missing. It is the same jam the note above describes, reached by a different route
+        #: -- and unlike that one it does not announce itself, because the byte ceiling is still
+        #: being respected.
+        #: MEASURED 2026-09-18 on qwen4exp. The validated 2.5 GiB point gives 1923 slots, where 512
+        #: is 27% of the pool and healthy (fill 0.995, evictions 90+). The SAME 512 carried over to
+        #: a 1.0 GiB cache -- 769 slots, 67% -- froze replacement dead: inflight pinned at 512,
+        #: free=257, promotions=0, evictions=0, throttled climbing past 15k, and the serve emitted
+        #: 99 tokens and then none for 11 minutes while `running_requests` sat at 1.
+        #: CLAMP, do not raise: a cache the operator shrank should degrade, never wedge the serve.
+        _inflight_slot_cap = max(8, self.slots // 3)
+        if self._max_inflight > _inflight_slot_cap:
+            print(
+                f"[expert-cache] MAX_INFLIGHT={self._max_inflight} exceeds {_inflight_slot_cap} "
+                f"(slots//3 of {self.slots} slots); CLAMPING to {_inflight_slot_cap}. An in-flight "
+                f"copy holds a slot until it publishes, so a ceiling this close to the pool cannot "
+                f"drain and replacement freezes (promotions/evictions stick at 0). This ceiling was "
+                f"tuned at 1923 slots (--expert-cache-gb 2.5); raise the cache to use it.",
+                flush=True,
+            )
+            self._max_inflight = _inflight_slot_cap
         #: Ticks an in-flight copy may go unlanded before its slot is reclaimed unpublished.
         self._inflight_max_age = max(4, _env_int("MINISGL_EXPERT_CACHE_INFLIGHT_AGE", 64))
         #: Second-reference admission (see `_admit_ok`). ON: the sweep showed indiscriminate

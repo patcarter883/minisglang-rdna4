@@ -1464,6 +1464,41 @@ cmd=(python -m minisgl
 printf '[serve] model=%s served=%s spec=%s%s tp=%s dp=%s ep=%s ctx=%s conc=%s attn=%s mem=%s graph_bs=%s\n' \
   "$model_id" "$served_name" "$SPEC" "${SPEC_K:+ k=$SPEC_K}" "$TP" "$DP" "$EP" "${CTX:-checkpoint}" "$CONC" \
   "$ATTN" "$MEM_RATIO" "$GRAPH_BS" >&2
+
+# --- SAY WHEN A LAUNCH HAS LEFT THE VALIDATED OPERATING POINT -------------------------------------
+# WHY THIS EXISTS, 2026-09-18. A spec run needed VRAM, so EXPERT_CACHE_GB was moved 2.5 -> 1.0 on
+# the command line. The two knobs this file TUNES ALONGSIDE it -- MINISGL_EXPERT_CACHE_MAX_INFLIGHT
+# =512 and _LOW_WATER=25, both derived at 2.5 GiB / 1923 slots -- were exported unchanged. At the
+# 769 slots 1.0 GiB buys, 512 in flight is 67% of the pool, so replacement froze: promotions=0,
+# evictions=0, throttled climbing, and the serve emitted 99 tokens and then none for 11 minutes.
+# Nothing in the launch line said anything was unusual, and the wedge was only found by reading
+# Prometheus. expert_cache.py now CLAMPS that specific ratio, but the general hazard is not one
+# knob: a table value carries MEASUREMENTS that an override silently invalidates. So name every
+# deviation, next to the operating point, before the engine starts.
+_vop_dev=""
+_vop() {   # label, table value, launched value, what the table value is load-bearing for
+  [ -n "$2" ] || return 0
+  [ "$3" = "$2" ] && return 0
+  _vop_dev="${_vop_dev}[serve]   ${1}: table ${2} -> launched ${3}
+[serve]       ${4}
+"
+}
+_vop EXPERT_CACHE_GB "${expert_cache_gb:-}" "${EXPERT_CACHE_GB:-}" \
+  "MAX_INFLIGHT/LOW_WATER above were derived at the table size; re-derive them or expect a stall"
+_vop WOFF_DEVICE_GB "${woff_device_gb:-}" "${WOFF_DEVICE_GB:-}" \
+  "the pinned host arena is sized against this; shrinking it moves layers host-side and may not fit"
+_vop MEM_RATIO "${mem_default:-}" "${MEM_RATIO:-}" \
+  "the KV pool and any capture headroom are sized from this"
+_vop SPEC "${spec_default:-}" "${SPEC:-${spec_default:-}}" \
+  "throughput figures recorded for this model were taken at the table default"
+if [ -n "$_vop_dev" ]; then
+  printf '[serve] ===== OFF THE VALIDATED OPERATING POINT =====\n' >&2
+  printf '%s' "$_vop_dev" >&2
+  printf '[serve] Measurements recorded in this file for this model were taken at the TABLE\n' >&2
+  printf '[serve] values. Treat numbers from this boot as a NEW measurement, not a comparison\n' >&2
+  printf '[serve] against them, and re-derive whatever the table tunes alongside what you moved.\n' >&2
+  printf '[serve] ============================================\n' >&2
+fi
 [[ "$RSA_LADDER" = "1" ]] && printf '[serve] RSA effort ladder: ON (tau=%s beta=%s rollout_max=%s) — reasoning_effort low/medium/high/max -> (n,k,T)\n' \
   "${RSA_TAIL:-<default 4096>}" "${RSA_BETA:-<default: the request think budget>}" "${RSA_ROLLOUT_MAX:-<default 8192>}" >&2
 [[ -n "$swa_hybrid" ]] && printf '[serve] SWA-hybrid: MINISGL_SWA_RADIX=%s MINISGL_SPEC_MHA_PAGED=%s\n' \
