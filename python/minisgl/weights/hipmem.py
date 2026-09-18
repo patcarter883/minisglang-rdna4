@@ -34,8 +34,9 @@ correction and silently collapses the prefill budget, with the warning pointing 
 from __future__ import annotations
 
 import ctypes
-import errno
 import ctypes.util
+import errno
+import os
 import threading
 from contextlib import contextmanager
 from typing import Iterator, Tuple
@@ -86,6 +87,11 @@ def _mlock_region(addr: int, nbytes: int) -> None:
     failure this exists to prevent and it must never be inferred from a slow serve again.
     """
     global _MLOCK_WARNED
+    if os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0":
+        # GTT path: the allocation is driver/TTM memory (KFD_IOC_ALLOC_MEM_FLAGS_GTT), not an
+        # anonymous mapping of ours. It is already unswappable, and mlock on it is at best a no-op
+        # and at worst an errno that would print the warning below for a box that has no problem.
+        return
     if _LIBC.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
         return
     if not _MLOCK_WARNED:
