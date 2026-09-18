@@ -34,6 +34,7 @@ correction and silently collapses the prefill budget, with the warning pointing 
 from __future__ import annotations
 
 import ctypes
+import errno
 import ctypes.util
 import threading
 from contextlib import contextmanager
@@ -54,6 +55,50 @@ hipMemcpyDeviceToDevice = 3
 # unknown #6 was answered by measuring the COHERENT variant, on both cards, in both directions,
 # with no explicit flush; switching to NonCoherent would invalidate that result.
 HOST_ALLOC_FLAGS = hipHostMallocPortable | hipHostMallocMapped
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+#: Set once we have warned, so a box without the headroom logs the reason ONCE, not per chunk.
+_MLOCK_WARNED = False
+
+
+def _mlock_region(addr: int, nbytes: int) -> None:
+    """`mlock` a host allocation so the kernel cannot page it out.
+
+    THE ARENA IS NOT PINNED BY THE DRIVER, WHICH IS THE OPPOSITE OF WHAT ITS NAME SAYS. KFD's
+    userptr path (`KFD_IOC_ALLOC_MEM_FLAGS_USERPTR`, which is what `hipHostMalloc` takes here) is
+    HMM-managed: it registers an MMU notifier and re-validates on invalidation rather than taking a
+    page pin. `/proc/<pid>/status` confirms it — VmPin and VmLck are both 0 for a rank holding a
+    29.9 GiB resident arena. The pages are ordinary swappable anonymous memory.
+
+    MEASURED CONSEQUENCE, 2026-09-18, qwen4exp TP=2 (2 x 27.94 GiB arena on a 91.8 GiB box): a
+    request sat with `prefill_computed_tokens_total` at ZERO for 12+ minutes while the box moved
+    50-100 MB/s of swap in BOTH directions continuously. Swap occupancy sat frozen at 55.0 GiB
+    (37.0 GiB of it SwapCached — faulted back in but with the slot retained, so occupancy cannot
+    fall), and the ranks' resident anon oscillated 46.5 <-> 62.7 GiB: the arena being evicted and
+    dragged back, over and over, before prefill computed a single token.
+
+    The existing swap tripwire cannot catch this. It watches ALLOCATION; this happens long after,
+    on first use. So lock the pages at the point they are created.
+
+    NOT FATAL on failure. A box without the headroom should degrade to the old behaviour with a loud
+    line, not refuse to boot — but it warns once, because silently swapping a 56 GiB arena is the
+    failure this exists to prevent and it must never be inferred from a slow serve again.
+    """
+    global _MLOCK_WARNED
+    if _LIBC.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)) == 0:
+        return
+    if not _MLOCK_WARNED:
+        _MLOCK_WARNED = True
+        e = ctypes.get_errno()
+        print(
+            f"[hipmem] mlock({nbytes / (1 << 30):.2f} GiB) failed: {errno.errorcode.get(e, e)}. "
+            f"The host arena is HMM-managed userptr memory, NOT driver-pinned, so unlocked pages "
+            f"are swappable — on this box that showed up as 50-100 MB/s of bidirectional swap "
+            f"before prefill computed a single token. Raise RLIMIT_MEMLOCK (ulimit -l) or shrink "
+            f"the arena.",
+            flush=True,
+        )
 
 
 class HipError(RuntimeError):
@@ -259,6 +304,7 @@ class Hip:
                 "hipHostMalloc/hipHostGetDevicePointer returned hipSuccess with a NULL pointer — "
                 "this box has repeatedly returned success over wrong state; never trust the rc"
             )
+        _mlock_region(int(hp.value), int(nbytes))
         return int(hp.value), int(dp.value)
 
     def host_free(self, host_ptr: int) -> None:
