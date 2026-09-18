@@ -196,7 +196,19 @@ class PLEEmbeddingSource:
     #
     # THE WINDOW BOUNDS THE WIN, and it is small: the gather is ~300 us against a ~50 ms decode
     # forward. This cannot move TPOT on its own and is not claimed to -- it removes a serialisation,
-    # it does not remove work. Measure before believing otherwise.
+    # it does not remove work.
+    #
+    # MEASURED, so nobody has to wonder. Live q4e serve, SPEC=none CONC=2 TP=2, expert cache 2.5 GiB,
+    # 12 prompts, WARM run in every case (the first run after a boot reads ~13.8 with the table cold
+    # in ARC and is not comparable to anything):
+    #
+    #     pre-change                         17.76 tok/s  (17.55-18.63)
+    #     threaded decode gather             17.57        (17.1 -18.7 )
+    #     + this overlap                     17.74        (17.4 -19.0 )
+    #
+    # Indistinguishable, as predicted. The overlap is kept because it costs nothing and is the right
+    # shape if the gather ever grows (a prefill chunk asks for 32k rows, not 16), NOT because it made
+    # the serve faster. Do not cite it as a throughput change.
 
     def begin_rows(self, row_ids) -> None:
         """Submit the gather for `row_ids` and return immediately. Pair with `finish_rows`."""
