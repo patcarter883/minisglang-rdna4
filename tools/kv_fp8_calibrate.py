@@ -155,6 +155,9 @@ def _rank_main(rank: int, args, result_q) -> None:
             # out of the same budget as the bf16 KV pool this run needs to be twice normal size.
             # Turning it off changes nothing about the K/V values being measured.
             gdn_radix=args.gdn_radix,
+            # 0.0 is EngineConfig's own "no offload" default, so a model that fits is unaffected.
+            weight_offload_device_gb=args.weight_offload_device_gb,
+            weight_offload_gb=args.weight_offload_gb,
         )
         engine = llm.engine
         mc = ModelConfig.from_hf(cached_load_hf_config(args.model))
@@ -301,6 +304,18 @@ def main() -> int:
              "prefixes, so it only takes memory from the KV pool)",
     )
     ap.add_argument("--attn-backend", default="hip")
+    # WEIGHT OFFLOAD. Without these a checkpoint that does not fit the card is unreachable here:
+    # `bake.UnconfiguredDeviceTierError` refuses the boot from integers, because with no explicit
+    # tier the resolver DERIVES it as the whole KV budget and the pool would be left nothing. That
+    # is exactly the qwen4exp case, and it made the one model on this box that needs fp8-KV
+    # calibration the one model that could not be calibrated -- it served with every k_scale/v_scale
+    # at an implicit 1.0 instead. Mirror the SERVE's tier here: the quantity being measured is
+    # amax|K| / amax|V| of real activations, and those do not depend on where the expert weights
+    # live, but the boot does.
+    ap.add_argument("--weight-offload-device-gb", type=float, default=0.0,
+                    help="VRAM per rank for the MoE expert tier; required for an offloaded model")
+    ap.add_argument("--weight-offload-gb", type=float, default=0.0,
+                    help="clamp on the pinned host arena per rank (0 = no clamp)")
     args = ap.parse_args()
 
     if not os.path.isfile(args.text):
