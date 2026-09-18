@@ -263,6 +263,36 @@ class ShardedRowTable:
         #: Lazily created io_uring (only when small_gather == "uring"), and its depth.
         self._ring = None
         self._ring_depth = 256
+        self._uring_avail = None
+        #: SQPOLL costs a kernel poller thread per ring, which on this box competes with the ranks
+        #: for cores — so it is opt-in and measured, never a default. Verified usable unprivileged.
+        self._ring_sqpoll = False
+        #: Registration is a pure win in principle; this exists so the probe can measure it rather
+        #: than assume it, and so a kernel that refuses registration has an explicit off switch.
+        #: MEASURED OFF. Registered files/buffers should be a pure win -- the kernel resolves the
+        #: file and pins the pages once instead of per operation -- and on this workload they are
+        #: consistently 5-8% SLOWER, at every size, even after the membership test and the fd remap
+        #: were vectorised (a dense LUT + one numpy gather). What the kernel saves is smaller than
+        #: what deciding to use it costs in Python at these batch sizes. Kept, wired and tested
+        #: because the arithmetic inverts the moment submission stops being Python.
+        self._ring_register = False
+        #: Gathers at or above this go to io_uring when a ring can be created. DISABLED (a size no
+        #: batch reaches) because the measurement does not support a default, and saying so is the
+        #: only honest option.
+        #:
+        #: WHAT HAPPENED. One interleaved run made io_uring look like a clear 2.2x over the thread
+        #: pool at 256 rows (811 us vs 1781) and 1.7x at 2048. Two further runs, same probe, same
+        #: box, INVERTED it -- 256 rows: pread 895 / uring-plain 2163 in one, pread 2852 /
+        #: uring-plain 811 in another -- with p90s running 2-3x their own medians. The probe's own
+        #: random reads across a 49 GB table on an 8 GiB ARC generate load average 6-7 of iowait,
+        #: and the ARC state differs run to run, so the run-to-run spread swamps the difference
+        #: between the top-tier mechanisms.
+        #:
+        #: WHAT IS ROBUST across every run: mmap and SERIAL pread are never best at size, and the
+        #: threaded pool and the io_uring variants are the top tier and within noise of each other.
+        #: That is not enough to move a default. To settle it: a quiet box, cache state equalised
+        #: per arm, and windows long enough that the p90 stops being 3x the median.
+        self.uring_min_rows = 1 << 62
         #: Issue MADV_WILLNEED before a non-threaded gather. Advisory, so it can never return wrong
         #: data; on an already-resident range it is a cheap no-op syscall with no I/O.
         self.auto_prefetch = bool(auto_prefetch)
@@ -476,6 +506,12 @@ class ShardedRowTable:
         # So pick per call rather than committing to one. Threads give real I/O concurrency because
         # os.pread drops the GIL; MADV_WILLNEED gives async readahead with no threads at all, which
         # is what a 16-row decode step actually wants.
+        if ids.size >= self.uring_min_rows and self._uring_ok():
+            # Reachable only by setting `uring_min_rows` — see the note there for why it is not a
+            # default. The mechanism is correct and parity-tested; what is missing is a measurement
+            # clean enough to justify switching the served path onto it.
+            return self._gather_raw_uring(
+                ids, np.empty((ids.size, self.row_bytes), dtype=np.uint8))
         if self.workers > 1 and ids.size >= self.threaded_min_rows:
             return self._gather_raw_threaded(ids)
         if self.small_gather == "pread":
@@ -495,6 +531,22 @@ class ShardedRowTable:
             out[sel] = self._views[int(slot)][local[sel]]
         return out
 
+    def _uring_ok(self) -> bool:
+        """Whether io_uring can be used here — cached, because `available()` creates a real ring.
+
+        False on a non-x86_64 box, a kernel without io_uring, or under a seccomp profile that blocks
+        io_uring_setup (the default docker profile does; this repo's serve runs pass
+        `--security-opt seccomp=unconfined`). The gather then falls through to the thread pool,
+        which is correct and only moderately slower.
+        """
+        if self._uring_avail is None:
+            try:
+                from . import uring
+                self._uring_avail = uring.available()
+            except Exception:  # noqa: BLE001
+                self._uring_avail = False
+        return self._uring_avail
+
     def _gather_raw_uring(self, ids: np.ndarray, out: np.ndarray) -> np.ndarray:
         """Fetch rows with ONE io_uring submission per batch instead of N pread syscalls.
 
@@ -509,8 +561,25 @@ class ShardedRowTable:
         from . import uring
 
         if self._ring is None:
-            self._ring = uring.Ring(self._ring_depth)
+            self._ring = uring.Ring(self._ring_depth, sqpoll=self._ring_sqpoll)
+            # REGISTER THE FILES ONCE. The shard fds are fixed for the table's life, so every
+            # subsequent SQE carries an index instead of an fd and skips the per-op lookup/refcount.
+            if self._ring_register:
+                try:
+                    self._ring.register_files(sorted(self._fds.values()))
+                except uring.UringError:
+                    pass    # registration is an optimisation; a plain READ is still correct
         ring = self._ring
+        # REGISTER THE LANDING BUFFER on first sight. The overlapped path reuses one persistent
+        # buffer (`PLEEmbeddingSource._raw`), so this fires once and every gather after it is a
+        # READ_FIXED with the pages already pinned. A caller that passes a DIFFERENT buffer simply
+        # does not match a registered range and falls back to a plain READ — correct either way,
+        # which is why this needs no bookkeeping about who owns what.
+        if self._ring_register and not ring._buf_ranges:
+            try:
+                ring.register_buffers([(out.ctypes.data, out.nbytes)])
+            except uring.UringError:
+                pass
         slots, offs = self._locate(ids)
         fds = [self._fds[self.shards[int(s)].path] for s in slots]
         rb = self.row_bytes

@@ -74,7 +74,9 @@ ARMS = [
     ("mmap",     dict(workers=0,  auto_prefetch=True,  small_gather="mmap"),  None),
     ("pread",    dict(workers=0,  auto_prefetch=False, small_gather="pread"), None),
     ("threaded", dict(workers=16, auto_prefetch=False, small_gather="mmap"),  1),
-    ("uring",    dict(workers=0,  auto_prefetch=False, small_gather="uring"), None),
+    ("uring-reg", dict(workers=0, auto_prefetch=False, small_gather="uring"), None),
+    ("uring-plain", dict(workers=0, auto_prefetch=False, small_gather="uring"), None),
+    ("uring-sqpoll", dict(workers=0, auto_prefetch=False, small_gather="uring"), None),
 ]
 from minisgl.weights import uring as _uring
 if not _uring.available():
@@ -93,6 +95,10 @@ for n in SIZES:
         t, _ = open_qwen4exp_ngram_table(files, (), **kw)
         if force_thresh is not None:
             t.threaded_min_rows = force_thresh
+        if label == "uring-plain":
+            t._ring_register = False
+        if label == "uring-sqpoll":
+            t._ring_sqpoll = True
         t.gather_raw(rng.integers(0, t.n_rows, size=n))     # warm-up, not timed
         tables.append(t)
 

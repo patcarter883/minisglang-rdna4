@@ -47,14 +47,30 @@ from typing import List, Sequence
 # then report as "io_uring unsupported". ------------------------------------------------------------------
 _NR_IO_URING_SETUP = 425
 _NR_IO_URING_ENTER = 426
+_NR_IO_URING_REGISTER = 427
 
 # --- mmap offsets, from include/uapi/linux/io_uring.h ------------------------------------------
 IORING_OFF_SQ_RING = 0
 IORING_OFF_CQ_RING = 0x8000000
 IORING_OFF_SQES = 0x10000000
 
+IORING_OP_READ_FIXED = 4
 IORING_OP_READ = 22
+
 IORING_ENTER_GETEVENTS = 1
+IORING_ENTER_SQ_WAKEUP = 2
+
+IORING_SETUP_SQPOLL = 2
+
+IOSQE_FIXED_FILE = 1
+
+IORING_REGISTER_BUFFERS = 0
+IORING_UNREGISTER_BUFFERS = 1
+IORING_REGISTER_FILES = 2
+IORING_UNREGISTER_FILES = 3
+
+IORING_FEAT_SINGLE_MMAP = 1
+IORING_SQ_NEED_WAKEUP = 1
 
 _SQE_SIZE = 64
 _CQE_SIZE = 16
@@ -110,11 +126,20 @@ def available() -> bool:
 class Ring:
     """One io_uring, sized for `entries` in-flight reads. Not thread-safe: one owner, one batch."""
 
-    def __init__(self, entries: int = 256) -> None:
+    def __init__(self, entries: int = 256, *, sqpoll: bool = False,
+                 sq_thread_idle_ms: int = 1000) -> None:
         if entries & (entries - 1):
             entries = 1 << (entries - 1).bit_length()     # the kernel requires a power of two
         self.entries = int(entries)
         p = _Params()
+        if sqpoll:
+            # A kernel thread polls the submission queue, so `submit_reads` needs NO SYSCALL at all
+            # unless that thread has idled out (IORING_SQ_NEED_WAKEUP). Verified usable unprivileged
+            # on this kernel; older kernels required CAP_SYS_NICE, hence the caller-visible flag
+            # rather than an unconditional default.
+            p.flags = IORING_SETUP_SQPOLL
+            p.sq_thread_idle = int(sq_thread_idle_ms)
+        self.sqpoll = bool(sqpoll)
         fd = _syscall(_NR_IO_URING_SETUP, ctypes.c_int(self.entries), ctypes.byref(p))
         if fd < 0:
             e = ctypes.get_errno()
@@ -127,10 +152,22 @@ class Ring:
             # the mapping far too small (it only survived because mmap rounds up to a page).
             sq_len = p.sq_array + p.sq_entries * 4
             cq_len = p.cq_cqes + p.cq_entries * _CQE_SIZE
-            self._sq = mmap.mmap(self.fd, sq_len, flags=mmap.MAP_SHARED,
-                                 prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=IORING_OFF_SQ_RING)
-            self._cq = mmap.mmap(self.fd, cq_len, flags=mmap.MAP_SHARED,
-                                 prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=IORING_OFF_CQ_RING)
+            # IORING_FEAT_SINGLE_MMAP (5.4+): the CQ ring lives inside the SQ mapping, so ONE mmap
+            # covers both and every cq_* offset is relative to the same base. Two mappings still
+            # work on such a kernel, but they cost an extra VMA for nothing.
+            self.single_mmap = bool(p.features & IORING_FEAT_SINGLE_MMAP)
+            if self.single_mmap:
+                self._sq = mmap.mmap(self.fd, max(sq_len, cq_len), flags=mmap.MAP_SHARED,
+                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                                     offset=IORING_OFF_SQ_RING)
+                self._cq = self._sq
+            else:
+                self._sq = mmap.mmap(self.fd, sq_len, flags=mmap.MAP_SHARED,
+                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                                     offset=IORING_OFF_SQ_RING)
+                self._cq = mmap.mmap(self.fd, cq_len, flags=mmap.MAP_SHARED,
+                                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                                     offset=IORING_OFF_CQ_RING)
             self._sqes = mmap.mmap(self.fd, p.sq_entries * _SQE_SIZE, flags=mmap.MAP_SHARED,
                                    prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=IORING_OFF_SQES)
         except Exception:
@@ -146,18 +183,32 @@ class Ring:
         #: so untouched tail fields stay zeroed by the `sq[idx] = 0` above.
         self._sqe_dtype = np.dtype({
             "names": ["opcode", "flags", "ioprio", "fd", "off", "addr", "len", "rw_flags",
-                      "user_data"],
+                      "user_data", "buf_index"],
             "formats": [np.uint8, np.uint8, np.uint16, np.int32, np.uint64, np.uint64,
-                        np.uint32, np.uint32, np.uint64],
-            "offsets": [0, 1, 2, 4, 8, 16, 24, 28, 32],
+                        np.uint32, np.uint32, np.uint64, np.uint16],
+            "offsets": [0, 1, 2, 4, 8, 16, 24, 28, 32, 40],
             "itemsize": _SQE_SIZE,
         })
         self._sqe_view = np.frombuffer(self._sqes, dtype=self._sqe_dtype, count=p.sq_entries)
+        self._cqe_dtype = np.dtype({
+            "names": ["user_data", "res", "flags"],
+            "formats": [np.uint64, np.int32, np.uint32],
+            "offsets": [0, 8, 12],
+            "itemsize": _CQE_SIZE,
+        })
+        self._cqe_view = np.frombuffer(
+            self._cq, dtype=self._cqe_dtype, count=p.cq_entries, offset=p.cq_cqes)
         self._sq_array_view = np.frombuffer(
             self._sq, dtype=np.uint32, count=p.sq_entries, offset=p.sq_array)
         self._sq_mask = self._u32(self._sq, p.sq_ring_mask)
         self._cq_mask = self._u32(self._cq, p.cq_ring_mask)
         self._closed = False
+        #: Registered-file table: actual fd -> index, set by `register_files`. Empty == unused.
+        self._file_index = {}
+        self._fd_lut = None
+        #: Registered-buffer table: (addr, length) -> index, set by `register_buffers`.
+        self._buf_index = {}
+        self._buf_ranges = []
 
     # -- ring word access ---------------------------------------------------
     def _u32(self, buf, off: int) -> int:
@@ -165,6 +216,56 @@ class Ring:
 
     def _set_u32(self, buf, off: int, v: int) -> None:
         struct.pack_into("<I", buf, off, v & 0xFFFFFFFF)
+
+    # -- registration -------------------------------------------------------
+    #
+    # Both of these move per-operation work OUT of the submission path and do it ONCE:
+    #   * registered FILES  — the kernel resolves and refcounts the struct file at registration, so
+    #     an SQE carries an index instead of an fd and skips the per-op lookup/fget/fput.
+    #   * registered BUFFERS — the pages are pinned and the iovec mapped once, so a READ_FIXED skips
+    #     the per-op get_user_pages/unpin of the destination.
+    # This path reads the SAME ten shard fds into the SAME landing buffer on every gather, which is
+    # exactly the case they exist for.
+
+    def register_files(self, fds: Sequence[int]) -> None:
+        """Register `fds` once; later reads that name one of them use IOSQE_FIXED_FILE."""
+        arr = (ctypes.c_int * len(fds))(*[int(f) for f in fds])
+        r = _syscall(_NR_IO_URING_REGISTER, ctypes.c_int(self.fd),
+                     ctypes.c_uint(IORING_REGISTER_FILES), ctypes.byref(arr),
+                     ctypes.c_uint(len(fds)))
+        if r < 0:
+            e = ctypes.get_errno()
+            raise UringError(f"register_files({len(fds)}) failed: {errno.errorcode.get(e, e)}")
+        self._file_index = {int(f): i for i, f in enumerate(fds)}
+        # Dense fd -> registered-index table; -1 means "not registered". fds are small integers, so
+        # this is a few hundred bytes and turns the per-batch remap into one numpy gather.
+        self._fd_lut = np.full(max(int(f) for f in fds) + 1, -1, dtype=np.int32)
+        for i, f in enumerate(fds):
+            self._fd_lut[int(f)] = i
+
+    def register_buffers(self, bufs: Sequence[tuple]) -> None:
+        """Register `(addr, length)` landing buffers; reads into them become IORING_OP_READ_FIXED."""
+        class _IoVec(ctypes.Structure):
+            _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+        arr = (_IoVec * len(bufs))()
+        for i, (addr, ln) in enumerate(bufs):
+            arr[i].base, arr[i].len = int(addr), int(ln)
+        r = _syscall(_NR_IO_URING_REGISTER, ctypes.c_int(self.fd),
+                     ctypes.c_uint(IORING_REGISTER_BUFFERS), ctypes.byref(arr),
+                     ctypes.c_uint(len(bufs)))
+        if r < 0:
+            e = ctypes.get_errno()
+            raise UringError(f"register_buffers({len(bufs)}) failed: {errno.errorcode.get(e, e)}")
+        self._buf_index = {(int(a), int(ln)): i for i, (a, ln) in enumerate(bufs)}
+        self._buf_ranges = [(int(a), int(a) + int(ln), i) for i, (a, ln) in enumerate(bufs)]
+
+    def _fixed_buf_for(self, addr: int, nbytes: int):
+        """Index of the registered buffer wholly containing [addr, addr+nbytes), else None."""
+        for lo, hi, idx in self._buf_ranges:
+            if lo <= addr and addr + nbytes <= hi:
+                return idx
+        return None
 
     def submit_reads(self, reqs: Sequence[tuple], buf_addr_of) -> int:
         """Queue one IORING_OP_READ per `(fd, nbytes, offset, slot)` and submit them all.
@@ -186,16 +287,66 @@ class Ring:
         # against the thread pool's 2484 (26% WORSE); the syscall saving is real but the packing ate
         # it. Writing the fields as numpy columns over a structured view of the SQE mmap makes the
         # per-row cost a handful of vector stores instead.
+        addrs = np.asarray([buf_addr_of(r[3]) for r in reqs], dtype=np.uint64)
+        lens = np.asarray([r[1] for r in reqs], dtype=np.uint32)
+        raw_fds = np.asarray([r[0] for r in reqs], dtype=np.int32)
+
+        # Fixed FILE: the whole batch uses it only if every fd in it is registered — a partially
+        # fixed batch would need per-row flags, and this path always reads the same shard set.
+        # The membership test and the fd->index remap are BOTH vectorised: written as
+        # `all(f in self._file_index for f in raw_fds)` plus a list comprehension they are two more
+        # O(N) Python passes over the batch, and MEASURED 2026-09-18 that made the registered arm
+        # 8-10% SLOWER than the same backend with registration off at every size. `_fd_lut` is a
+        # dense lookup table built once at registration, so the remap is a single gather.
+        use_fixed_file = False
+        fd_col = raw_fds
+        if self._fd_lut is not None and raw_fds.size:
+            lo, hi = int(raw_fds.min()), int(raw_fds.max())
+            if lo >= 0 and hi < self._fd_lut.size:
+                mapped = self._fd_lut[raw_fds]
+                if mapped.min() >= 0:
+                    use_fixed_file, fd_col = True, mapped
+
+        # Fixed BUFFER: only when every destination falls inside one registered range.
+        bidx = None
+        if self._buf_ranges:
+            # VECTORISED containment test. The obvious form — a set comprehension calling
+            # `_fixed_buf_for` per request — is a Python loop over the whole batch, and it cost more
+            # than registration saved: MEASURED 2026-09-18, registered was 3018 us at 256 rows
+            # against 2947 for the same backend with registration OFF, i.e. the feature made it
+            # SLOWER. Same lesson as the SQE fill: at this batch size the kernel-side win is small
+            # and any per-row Python erases it.
+            ends = addrs + lens.astype(np.uint64)
+            for lo, hi, i in self._buf_ranges:
+                if addrs.min() >= lo and ends.max() <= hi:
+                    bidx = i
+                    break
+
         sq = self._sqe_view
         sq[idx] = 0                       # SQEs are reused; stale fields are live fields
-        sq["opcode"][idx] = IORING_OP_READ
-        sq["fd"][idx] = np.asarray([r[0] for r in reqs], dtype=np.int32)
+        sq["opcode"][idx] = IORING_OP_READ_FIXED if bidx is not None else IORING_OP_READ
+        sq["flags"][idx] = IOSQE_FIXED_FILE if use_fixed_file else 0
+        sq["fd"][idx] = fd_col
         sq["off"][idx] = np.asarray([r[2] for r in reqs], dtype=np.uint64)
-        sq["addr"][idx] = np.asarray([buf_addr_of(r[3]) for r in reqs], dtype=np.uint64)
-        sq["len"][idx] = np.asarray([r[1] for r in reqs], dtype=np.uint32)
+        sq["addr"][idx] = addrs
+        sq["len"][idx] = lens
         sq["user_data"][idx] = np.asarray([r[3] for r in reqs], dtype=np.uint64)
+        if bidx is not None:
+            sq["buf_index"][idx] = bidx
         self._sq_array_view[idx] = idx
         self._set_u32(self._sq, p.sq_tail, tail + n)
+        if self.sqpoll:
+            # The kernel poller picks the entries up on its own. A syscall is needed ONLY if it has
+            # idled out, which it advertises in sq_flags. This is the whole point of SQPOLL: in the
+            # steady state submission costs zero syscalls.
+            if self._u32(self._sq, p.sq_flags) & IORING_SQ_NEED_WAKEUP:
+                r = _syscall(_NR_IO_URING_ENTER, ctypes.c_int(self.fd), ctypes.c_uint(0),
+                             ctypes.c_uint(0), ctypes.c_uint(IORING_ENTER_SQ_WAKEUP),
+                             None, ctypes.c_size_t(0))
+                if r < 0:
+                    e = ctypes.get_errno()
+                    raise UringError(f"io_uring_enter(wakeup) failed: {errno.errorcode.get(e, e)}")
+            return n
         got = _syscall(_NR_IO_URING_ENTER, ctypes.c_int(self.fd), ctypes.c_uint(n),
                        ctypes.c_uint(0), ctypes.c_uint(0), None, ctypes.c_size_t(0))
         if got < 0:
@@ -227,19 +378,26 @@ class Ring:
                         continue
                     raise UringError(f"io_uring_enter(wait) failed: {errno.errorcode.get(e, e)}")
                 continue
-            while head != tail and len(done) < n:
-                off = p.cq_cqes + (head & self._cq_mask) * _CQE_SIZE
-                user_data, res, _flags = struct.unpack_from("<QiI", self._cq, off)
-                if res < 0:
-                    self._set_u32(self._cq, p.cq_head, head + 1)
+            # VECTORISED REAP. Unpacking one CQE per iteration is an O(N) Python pass over the
+            # batch — the same shape as the SQE fill, which cost 26% at 256 rows before it was
+            # turned into vector stores. The completions are read as numpy columns instead, and the
+            # validity checks are two whole-array comparisons.
+            avail = min(tail - head, n - len(done))
+            pos = (np.arange(avail, dtype=np.uint32) + head) & np.uint32(self._cq_mask)
+            cq = self._cqe_view
+            res = cq["res"][pos]
+            ud = cq["user_data"][pos]
+            bad = np.flatnonzero(res != expect_bytes)
+            if bad.size:
+                k = int(bad[0])
+                r0, u0 = int(res[k]), int(ud[k])
+                self._set_u32(self._cq, p.cq_head, head + k + 1)
+                if r0 < 0:
                     raise UringError(
-                        f"row {user_data}: read failed: {errno.errorcode.get(-res, -res)}")
-                if res != expect_bytes:
-                    self._set_u32(self._cq, p.cq_head, head + 1)
-                    raise UringError(
-                        f"row {user_data}: short read, {res} of {expect_bytes} bytes")
-                done.append(int(user_data))
-                head += 1
+                        f"row {u0}: read failed: {errno.errorcode.get(-r0, -r0)}")
+                raise UringError(f"row {u0}: short read, {r0} of {expect_bytes} bytes")
+            done.extend(ud.tolist())
+            head += avail
             self._set_u32(self._cq, p.cq_head, head)
         return done
 
@@ -247,9 +405,14 @@ class Ring:
         if self._closed:
             return
         self._closed = True
+        seen = set()
         for m in ("_sqes", "_cq", "_sq"):
+            mm = getattr(self, m, None)
+            if mm is None or id(mm) in seen:
+                continue          # under SINGLE_MMAP _cq IS _sq; closing it twice raises
+            seen.add(id(mm))
             try:
-                getattr(self, m).close()
+                mm.close()
             except Exception:  # noqa: BLE001
                 pass
         try:
