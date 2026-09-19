@@ -166,22 +166,6 @@ case "$MODEL" in
                   presence_default="1.5"
                   spec_default="mtp"; k_mtp=2
                   dflash_draft="z-lab/Qwen3.6-35B-A3B-DFlash"; k_dflash=15
-                  # 0.75 for PLAIN decode, below the global 0.80. MEASURED 2026-09-19: at 0.80 with
-                  # SPEC=none this arm boots (model 9.94 GiB, KV pool 2.53 GiB) and then dies MID-RUN
-                  # in prefill attention -- `_hip_prefill_paged_fp8_op` asks for 952 MiB with only
-                  # 646-716 MiB free. Not a boot-time refusal, so nothing warns.
-                  #
-                  # WHY SPEC=none IS THE FRAGILE CASE, which is counter-intuitive: with spec ON the
-                  # sizing line reserves `draft` and `graph`; with SPEC=none both are 0.00 and the KV
-                  # pool expands to swallow the whole budget instead. A larger pool admits more
-                  # concurrent context and the prefill transient is what gets squeezed out. The spec
-                  # reservations were acting as an accidental headroom guard.
-                  #
-                  # 0.80 -> 0.75 returns ~0.79 GiB against a measured ~300 MiB shortfall. A single
-                  # long prefill into an EMPTY pool survives at 0.80 (5,341 tokens, verified on BOTH
-                  # the 09-14 and 09-17 kernel images), so a clean-pool test does NOT reproduce it --
-                  # it needs a pool with live traffic already in it.
-                  mem_default="0.75"
                   # Same 737 MB bf16 drafter beside a same-size 4-bit 35B target as the AWQ twin
                   # above, so the same footprint arithmetic applies: at the global 0.80 default a
                   # bf16 drafter does not boot (see that arm's bracketing). Mirrors the AWQ twin's
@@ -192,11 +176,6 @@ case "$MODEL" in
                     # A CAP, not a default (CONC is already assigned above the case block): GRAPH_BS
                     # follows CONC, so capping admission keeps capture coverage equal to admission.
                     if [ "$CONC" -gt 4 ]; then CONC=4; fi
-                  elif [[ "${SPEC:-$spec_default}" == "mtp" ]]; then
-                    # PINNED at the old 0.80: the MTP arm is NOT the one that OOMs (its draft+graph
-                    # reservations shrink the pool) and it measured 104.67-109.23 tok/s median on
-                    # 2026-09-19. Explicit so lowering mem_default above cannot move it.
-                    mem_default_spec="0.80"
                   fi ;;
   # GLM's MTP head is a measured NET LOSS on this box, so its default is EAGLE3 (K=6 from the
   # spec-len sweep). MTP remains selectable — it is just not the default.
