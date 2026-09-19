@@ -222,7 +222,7 @@
       "id": 4,
       "type": "stat",
       "title": "Decode speed (tok/s)",
-      "description": "Per-stream decode rate = 1 / mean TPOT, measured prefill-excluded as (completion_time - first_token_time) / (tokens - 1).\n\nThis is the speed one request's tokens arrive at, not the server's aggregate \u2014 see \"Token throughput\" for that. It records on request COMPLETION, so it lags in-flight generation and stays flat during a long request; on a low request rate it can hold a stale value for minutes.\n\nUse it to answer \"how fast does a single user's stream feel?\" \u2014 it is unaffected by prefill time and by idle gaps between requests.",
+      "description": "Per-stream decode rate = 1 / mean TPOT, measured prefill-excluded as (completion_time - first_token_time) / (tokens - 1).\n\nThis is the speed one request's tokens arrive at, not the server's aggregate \u2014 see \"Token throughput\" for that. It records on request COMPLETION, so it lags in-flight generation and stays flat during a long request; on a low request rate it can hold a stale value for minutes.\n\nUse it to answer \"how fast does a single user's stream feel?\" \u2014 it is unaffected by prefill time and by idle gaps between requests.\n\nWINDOW PINNED TO [5m], deliberately NOT $__rate_interval: minisgl_tpot_seconds is written ONCE PER COMPLETED REQUEST, so the window has to be wide enough to hold several completions. At the old 1 s scrape $__rate_interval collapsed to ~4 s, which holds zero or one completion \u2014 the panel then plotted a single request's TPOT and swung between ~50 and ~120 tok/s on the same healthy serve.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -272,7 +272,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "1 / (sum(rate(minisgl_tpot_seconds_sum{model_name=~\"$model\"}[$__rate_interval])) / sum(rate(minisgl_tpot_seconds_count{model_name=~\"$model\"}[$__rate_interval])))"
+          "expr": "1 / (sum(rate(minisgl_tpot_seconds_sum{model_name=~\"$model\"}[5m])) / sum(rate(minisgl_tpot_seconds_count{model_name=~\"$model\"}[5m])))"
         }
       ]
     },
@@ -280,7 +280,7 @@
       "id": 5,
       "type": "stat",
       "title": "Prompt tok/s",
-      "description": "Prompt tokens/s actually run through prefill; tokens served from the prefix cache are excluded. Measured over a single 1 s scrape interval (irate) and reported as the peak within each display bucket, so it shows the real burst rate at any zoom level and reads 0 when nothing is prefilling. For the prefill kernel's own rate \u2014 computed tokens per GPU-second spent in prefill \u2014 see \"Prefill throughput (compute)\".",
+      "description": "Prompt tokens/s actually run through prefill; tokens served from the prefix cache are excluded. Measured over a a 30 s window at the 5 s scrape interval (irate) and reported as the peak within each display bucket, so it shows the real burst rate at any zoom level and reads 0 when nothing is prefilling. For the prefill kernel's own rate \u2014 computed tokens per GPU-second spent in prefill \u2014 see \"Prefill throughput (compute)\".",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -330,10 +330,10 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])"
         }
       ],
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 6,
@@ -616,7 +616,7 @@
       "id": 11,
       "type": "stat",
       "title": "Drafted tok/s",
-      "description": "Speculative draft tokens proposed per second. Measured over a single 1 s scrape interval (irate), reported as the peak within each display bucket: the rate while drafting is actually running, not an idle-inclusive average.",
+      "description": "Speculative draft tokens proposed per second. Measured over a a 30 s window at the 5 s scrape interval (irate), reported as the peak within each display bucket: the rate while drafting is actually running, not an idle-inclusive average.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -666,16 +666,16 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
+          "expr": "max_over_time(sum(irate(minisgl_spec_draft_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])"
         }
       ],
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 12,
       "type": "stat",
       "title": "Accepted tok/s",
-      "description": "Speculative draft tokens accepted by verify, per second. Measured over a single 1 s scrape interval (irate), reported as the peak within each display bucket. Compare against \"Drafted tok/s\" for the acceptance fraction.",
+      "description": "Speculative draft tokens accepted by verify, per second. Measured over a a 30 s window at the 5 s scrape interval (irate), reported as the peak within each display bucket. Compare against \"Drafted tok/s\" for the acceptance fraction.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -725,10 +725,10 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])"
+          "expr": "max_over_time(sum(irate(minisgl_spec_accepted_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])"
         }
       ],
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 13,
@@ -866,7 +866,7 @@
       "id": 16,
       "type": "timeseries",
       "title": "Token throughput (incl. prefix cache)",
-      "description": "Generation and prompt token rates. Each series is measured over a single 1 s scrape interval (irate) and plotted as the peak within each display bucket, so a burst keeps its true height however far you zoom out. \"prefill cached (saved)\" is prompt tokens served from the prefix cache \u2014 work skipped, not work done.",
+      "description": "Generation and prompt token rates. Each series is measured over a a 30 s window at the 5 s scrape interval (irate) and plotted as the peak within each display bucket, so a burst keeps its true height however far you zoom out. \"prefill cached (saved)\" is prompt tokens served from the prefix cache \u2014 work skipped, not work done.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -916,7 +916,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_generation_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_generation_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "generation"
         },
         {
@@ -925,7 +925,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "prompt"
         },
         {
@@ -933,12 +933,12 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "\u2514 prefill cached (saved)",
           "refId": "C"
         }
       ],
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 17,
@@ -1012,7 +1012,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Request rate",
-      "description": "Requests/s arrived, succeeded, and aborted. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
+      "description": "Requests/s arrived, succeeded, and aborted. Measured over a a 30 s window at the 5 s scrape interval (irate), peak within each display bucket.",
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
@@ -1062,7 +1062,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_requests_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_requests_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "arrived"
         },
         {
@@ -1071,7 +1071,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_requests_success_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_requests_success_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "success"
         },
         {
@@ -1080,11 +1080,11 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_requests_aborted_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_requests_aborted_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "aborted"
         }
       ],
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 19,
@@ -1212,7 +1212,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p50"
         },
         {
@@ -1221,7 +1221,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p95"
         },
         {
@@ -1230,7 +1230,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_ttft_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p99"
         }
       ]
@@ -1289,7 +1289,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p50"
         },
         {
@@ -1298,7 +1298,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p95"
         },
         {
@@ -1307,7 +1307,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_tpot_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p99"
         }
       ]
@@ -1366,7 +1366,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p50"
         },
         {
@@ -1375,7 +1375,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p95"
         },
         {
@@ -1384,7 +1384,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(minisgl_request_latency_seconds_bucket{model_name=~\"$model\"}[5m])))",
           "legendFormat": "p99"
         }
       ]
@@ -1606,7 +1606,7 @@
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Prompt tokens/s served from the prefix cache \u2014 prefill work skipped. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
+      "description": "Prompt tokens/s served from the prefix cache \u2014 prefill work skipped. Measured over a a 30 s window at the 5 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1643,20 +1643,20 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "refId": "A"
         }
       ],
       "title": "Cached tok/s (saved)",
       "type": "stat",
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Prompt tokens/s actually run through prefill (cache misses). Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
+      "description": "Prompt tokens/s actually run through prefill (cache misses). Measured over a a 30 s window at the 5 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1693,13 +1693,13 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "refId": "A"
         }
       ],
       "title": "Prefill computed tok/s",
       "type": "stat",
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "datasource": {
@@ -1881,7 +1881,7 @@
         "type": "prometheus",
         "uid": "vllm-prometheus"
       },
-      "description": "Stacked prompt-token rate: cache-saved vs actually computed; total height is prompt tok/s. Measured over a single 1 s scrape interval (irate), peak within each display bucket.",
+      "description": "Stacked prompt-token rate: cache-saved vs actually computed; total height is prompt tok/s. Measured over a a 30 s window at the 5 s scrape interval (irate), peak within each display bucket.",
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -1927,7 +1927,7 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefix_cache_hit_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "cached (saved)",
           "refId": "A"
         },
@@ -1936,14 +1936,14 @@
             "type": "prometheus",
             "uid": "vllm-prometheus"
           },
-          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[5s]))[$__interval:1s])",
+          "expr": "max_over_time(sum(irate(minisgl_prefill_computed_tokens_total{model_name=~\"$model\"}[30s]))[$__interval:1s])",
           "legendFormat": "computed",
           "refId": "B"
         }
       ],
       "title": "Prefill tokens: cached vs computed",
       "type": "timeseries",
-      "interval": "1s"
+      "interval": "5s"
     },
     {
       "id": 38,
