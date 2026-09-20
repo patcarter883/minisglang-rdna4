@@ -2823,7 +2823,22 @@ class FrontendManager:
             # Scheduler metrics snapshot (piggybacked on the detokenizer link) — feed /metrics, no uid.
             if isinstance(msg, StatsFrontendMsg):
                 if msg.max_seq_len:
+                    was = self.max_seq_len
                     self.max_seq_len = int(msg.max_seq_len)
+                    # The boot banner necessarily prints the FLOOR: `max_seq_len` only arrives here,
+                    # in this message, after the scheduler has sized the KV pool. Announce the real
+                    # per-request chat default once, the moment it becomes knowable — otherwise the
+                    # only number in the log is one the serve stops using a second later, which is
+                    # precisely the stale-operating-point report that costs an afternoon to unpick.
+                    if was is None:
+                        _d = _derived_chat_default()
+                        logger.info(
+                            "chat default max_tokens resolved to %d "
+                            "(KV pool %d tokens / max_running %d / %d, clamped to [%d, %d])%s",
+                            _d, self.max_seq_len, self.config.max_running_req,
+                            _OUTPUT_SLOT_DIVISOR, _CHAT_DEFAULT_MAX_TOKENS, _CHAT_MAX_DERIVED,
+                            " — OVERRIDDEN by MINISGL_DEFAULT_MAX_TOKENS"
+                            if os.environ.get("MINISGL_DEFAULT_MAX_TOKENS") else "")
                 self.metrics.update_backend(
                     BackendSnapshot(
                         dp_rank=msg.dp_rank,
@@ -4064,7 +4079,8 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     # finish_reason="length" — worth one line at boot rather than a per-request mystery.
     logger.info(
         "default max_tokens for a request that sets neither max_tokens nor max_completion_tokens: "
-        "%d (chat, MINISGL_DEFAULT_MAX_TOKENS), %d (/v1/completions, the OpenAI text-lane default); "
+        "%d (chat floor, pending the KV pool size — see the 'chat default max_tokens resolved' "
+        "line below), %d (/v1/completions, the OpenAI text-lane default); "
         "the scheduler clamps both to max_seq_len - prompt_len",
         default_max_tokens(is_text_completion=False),
         default_max_tokens(is_text_completion=True),
