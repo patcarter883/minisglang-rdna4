@@ -95,18 +95,29 @@ def test_other_families_and_the_json_default_are_untouched(monkeypatch):
     assert api._derive_tool_format() is None
 
 
-def test_auto_tag_does_not_force_json_into_the_qwen_wrapper(monkeypatch):
-    """THE BUG. Under `tool_choice` default the structural tag used to list `<tool_call>` and force
-    its body to a JSON schema, which xgrammar then enforced against a model emitting XML."""
-    _with_template(monkeypatch, QWEN_RENDERED)
-    assert api._structural_tag_from_tools(_Req(TOOLS)) is None
+def test_the_auto_path_carries_no_grammar_at_all(monkeypatch):
+    """THE DEFECT, and the scope of its fix.
+
+    `auto` used to get an xgrammar structural tag (b3456b04) triggering on `<tool_call>` and forcing
+    the wrapped body to a JSON schema. MEASURED on Qwen3.8-Flash-Next with the real Hermes
+    browser_exec definition, identical probe either side:
+
+        constrained    browser_exec  7/28 junk arguments (25.0%);  code bodies max 369 chars
+        unconstrained  browser_exec  0/25 junk arguments ( 0.0%);  code bodies max 5426 chars
+
+    The grammar layer is for STRUCTURED calls — `response_format` and a forced `tool_choice`. There
+    is no auto-path builder left to call, for ANY family: of the 24 checkpoints on this box, ZERO are
+    JSON-native inside `<tool_call>` (10 are Qwen XML, 3 are Laguna/GLM `<arg_key>/<arg_value>`), so
+    the tag corrupted 13 and helped none. The nine it spared were spared by wrapper SPELLING, not by
+    design, which is why this is removed rather than extended with another family arm."""
+    assert not hasattr(api, "_structural_tag_from_tools")
+    assert not hasattr(api, "_TOOL_STRUCT_WRAPPERS")
 
 
-def test_auto_tag_still_constrains_a_json_bodied_checkpoint(monkeypatch):
-    """The fix must not disarm `auto` for families that DO emit JSON inside `<tool_call>`."""
+def test_auto_stays_unconstrained_even_for_a_json_bodied_checkpoint(monkeypatch):
+    """No family enumeration survives: `auto` is unconstrained regardless of derived format."""
     _with_template(monkeypatch, '{"name": "f", "arguments": {}}')
-    tag = api._structural_tag_from_tools(_Req(TOOLS))
-    assert tag is not None and "<tool_call>" in tag
+    assert api._grammar_from_tools(_Req(TOOLS)) is None          # auto -> not forced -> no grammar
 
 
 def test_forced_call_uses_the_native_xml_grammar(monkeypatch):
