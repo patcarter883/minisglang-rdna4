@@ -2182,6 +2182,9 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
 
 
 _UNKNOWN_TOOL_WARNED: set = set()
+#: name -> how many times it was seen unoffered. A COUNT, not a one-shot warning flag:
+#: the warning fires once per name per process, so it cannot answer "did it recur?".
+_UNKNOWN_TOOL_SEEN: dict = {}
 
 
 def _known_tool_names(tools) -> "frozenset[str] | None":
@@ -2194,21 +2197,47 @@ def _known_tool_names(tools) -> "frozenset[str] | None":
 
 
 def _tool_name_allowed(name: str, allowed: "frozenset[str] | None") -> bool:
-    """Reject a call whose function name is NOT among the request's tools. A hallucinated name used
-    to stream to the client as a real call (the agent then errors or, worse, dispatches it); SGLang
-    skips undefined functions for the same reason. MINISGL_FORWARD_UNKNOWN_TOOLS=1 restores the old
-    forward-everything behaviour. One warning per name per process — degeneration can hallucinate
-    the same name thousands of times."""
+    """Whether to forward a tool call whose function name is not among the request's offered tools.
+
+    FORWARDS BY DEFAULT. Dropping was the default from b33756ec (2026-08-16) until 2026-09-21, and it
+    converts a recoverable turn into a silent dead end: the reply goes out 200 OK with `tool_calls:
+    []`, so an agent loop reads "the model chose not to act", ends the turn and parks the session.
+    Forwarding lets the client answer with a tool error, which the model reads on the next turn and
+    corrects — the ordinary contract an agent runtime is built around.
+
+    MEASURED (Hermes session db682d3cae84, 2026-09-20 21:13:24, Qwen3.8-Flash-Next): after 19,363
+    chars of reasoning the model wrote its preamble and called `web_fetch`, a plausible neighbour of
+    the `web_search`/`web_extract` it WAS offered. The call was dropped, the turn landed as
+    finish_reason=stop with no call, and the session sat idle until a human noticed. Nothing in the
+    transcript said why. Reproduced independently on a replay of that same prompt.
+
+    WHY THE ORIGINAL REASON NO LONGER HOLDS. b33756ec was written during a degeneration incident —
+    "a looping model can emit thousands of calls to invented names" — i.e. it defended against a
+    FLOOD, not a single hallucination. That flood now has its own defences, added the NEXT DAY
+    (2026-08-17, tests/toolcall_runaway_kill_test.py): `MINISGL_TOOLCALL_RUNAWAY_LIMIT` force-
+    finishes a runaway tool-call block, and the ack/stream cancellation paths stop decoding to a
+    disconnected client. Name validation is redundant for the case it was built for, and it is the
+    only one of the three that damages the single-call case.
+
+    MINISGL_DROP_UNKNOWN_TOOLS=1 restores the drop. It is deliberately NOT the inverse spelling of
+    the old knob: a serve that still sets MINISGL_FORWARD_UNKNOWN_TOOLS=1 keeps forwarding (that is
+    now the default), so no existing launch line changes meaning.
+
+    Counted either way (`_UNKNOWN_TOOL_SEEN`), because the old path logged one warning per name PER
+    PROCESS and exported no metric — so a second, third and thousandth drop were indistinguishable
+    from none, and "did this happen again?" was unanswerable after the fact."""
     if allowed is None or name in allowed:
         return True
-    if os.environ.get("MINISGL_FORWARD_UNKNOWN_TOOLS") == "1":
-        return True
+    _UNKNOWN_TOOL_SEEN[name] = _UNKNOWN_TOOL_SEEN.get(name, 0) + 1
+    drop = os.environ.get("MINISGL_DROP_UNKNOWN_TOOLS") == "1"
     if name not in _UNKNOWN_TOOL_WARNED:
         _UNKNOWN_TOOL_WARNED.add(name)
         logger.warning(
-            "dropped tool call to %r — not among the %d tool(s) offered in the request "
-            "(MINISGL_FORWARD_UNKNOWN_TOOLS=1 to forward unknown names)", name, len(allowed))
-    return False
+            "%s tool call to %r — not among the %d tool(s) offered in the request (%s)",
+            "dropped" if drop else "forwarding unknown", name, len(allowed),
+            "MINISGL_DROP_UNKNOWN_TOOLS=1 is set" if drop
+            else "set MINISGL_DROP_UNKNOWN_TOOLS=1 to drop instead")
+    return not drop
 
 
 def _parse_tool_calls(text: str, uid: int,
