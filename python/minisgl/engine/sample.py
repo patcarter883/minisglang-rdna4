@@ -67,6 +67,44 @@ def _apply_top_p(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
     return torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
 
 
+def _apply_top_k_top_p(probs: torch.Tensor, top_k: torch.Tensor,
+                       top_p: torch.Tensor | None) -> torch.Tensor:
+    """top-k (and the top-p that follows it) done in a [bs, kmax] slice instead of the full vocab.
+
+    WHY. `_apply_top_k` + `_apply_top_p` run `torch.sort` over the WHOLE vocab twice per decode
+    step — 248,320 elements per row on this family — to answer a question bounded by k, which the
+    checkpoints here set to 20. Two full sorts, two full `zeros_like` allocations and two full
+    scatters, to keep twenty values. `torch.topk(kmax)` answers exactly the same question over a
+    slice 4 orders of magnitude smaller.
+
+    WHY IT IS THE SAME ANSWER, not an approximation. top-k zeroes everything below rank k, so after
+    it the only survivors are inside the top kmax = max(top_k) of the row. A descending sort of that
+    masked row is the topk slice followed by zeros, and zeros add nothing to the top-p cumsum — so
+    the nucleus decision on every surviving element is bit-identical. (`torch.topk(sorted=True)`
+    returns descending order, matching `sort(descending=True)`.) Ties may be ORDERED differently
+    between topk and sort, exactly as they already may be between two sort implementations; which of
+    two equal-probability tokens survives is not defined by the reference either.
+
+    Falls back to the pair above when `kmax >= vocab` (top-k disabled for some row), where a topk is
+    a full sort anyway and the slice would buy nothing.
+
+    COSTS ONE SYNC. `kmax` is a device scalar, so `.item()` blocks. That is a fixed ~tens of µs per
+    step against two 248k-element sorts, and this is the reference path — the fused HIP kernel above
+    is what avoids the sync entirely."""
+    vocab = probs.shape[-1]
+    kmax = int(top_k.max().item())
+    if kmax >= vocab:
+        probs = _apply_top_k(probs, top_k)
+        return _apply_top_p(probs, top_p) if top_p is not None else probs
+    vals, idx = torch.topk(probs, kmax, dim=-1)
+    ranks = torch.arange(kmax, device=probs.device).unsqueeze(0)
+    vals = vals.masked_fill(ranks >= top_k.unsqueeze(-1), 0.0)
+    if top_p is not None:
+        cumsum = vals.cumsum(dim=-1)
+        vals = vals.masked_fill((cumsum - vals) > top_p.unsqueeze(-1), 0.0)
+    return torch.zeros_like(probs).scatter_(-1, idx, vals)
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -96,8 +134,9 @@ def sample_impl(
         floor = probs.max(dim=-1, keepdim=True).values * min_p.unsqueeze(-1)
         probs = probs.masked_fill(probs < floor, 0.0)
     if top_k is not None:
-        probs = _apply_top_k(probs, top_k)
-    if top_p is not None:
+        # Bounded by k -> one topk over a [bs, kmax] slice instead of two full-vocab sorts.
+        probs = _apply_top_k_top_p(probs, top_k, top_p)
+    elif top_p is not None:
         probs = _apply_top_p(probs, top_p)
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     return torch.multinomial(probs, num_samples=1).squeeze(-1).to(torch.int32)
