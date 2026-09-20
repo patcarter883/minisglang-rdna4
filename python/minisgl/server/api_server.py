@@ -2864,12 +2864,21 @@ class FrontendManager:
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
+        # Content actually delivered to the client, summed over every delta. The streaming lane has
+        # no assembled body to test at the end, so the empty-content guard on the terminal chunk
+        # (mirroring the non-stream one) needs this running total. Counts `content` only —
+        # `reasoning_content` is explicitly NOT an answer, which is the whole point of the check.
+        content_chars = 0
         # Wall-clock of the last byte written. While `tool_stream` is holding an unclosed block it
         # emits nothing, so without this the socket goes silent for as long as the model keeps
         # decoding into that block — indistinguishable, from the client, from a hung server.
         last_write = time.monotonic()
 
         def _chunk(delta: dict) -> bytes:
+            nonlocal content_chars
+            _c = delta.get("content")
+            if _c:
+                content_chars += len(_c)
             payload = {
                 "id": f"cmpl-{uid}",
                 "object": "chat.completion.chunk",
@@ -3006,6 +3015,23 @@ class FrontendManager:
                 final_delta["content"] = final_delta.get("content", "") + c_tail
         elif nontool_tail:
             final_delta["content"] = nontool_tail
+        # Streaming twin of the non-stream empty-content guard (see v1_chat_completions). The tail
+        # deltas assembled just above have not gone through `_chunk`, so add them before testing.
+        if final_delta.get("content"):
+            content_chars += len(final_delta["content"])
+        if finish_reason == "stop" and not content_chars:
+            logger.warning(
+                "uid=%s streamed NO content (finish_reason=stop, completion_tokens=%s) — the caller "
+                "sees an empty answer. %s",
+                uid, completion_tokens,
+                "Generation produced nothing at all." if not completion_tokens
+                else "Tokens were generated but none reached the client as content (check whether "
+                     "the whole completion went to reasoning_content).",
+            )
+            try:
+                self.metrics.on_empty_completion()
+            except Exception:  # noqa: BLE001 — never fail a stream over a counter
+                pass
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -3581,6 +3607,35 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     if tool_calls:
         message["tool_calls"] = tool_calls
         finish_reason = "tool_calls"
+
+    # EMPTY-CONTENT GUARD. A reply that ended normally and carries no answer is a 200 with a
+    # well-formed body that every OpenAI client reads as "". Nothing else in this lane notices: the
+    # request counts as a success, the tokens count as generated, and the only trace is whatever the
+    # caller does with an empty string. Two distinct causes reach here and BOTH are worth a line:
+    # the parser routing the whole completion into `reasoning_content` (the `_prompt_thinking_state`
+    # failure above), and the model genuinely emitting EOS at the end of its think span without
+    # answering. `completion_tokens` separates them at a glance — 0 means it never generated, >0
+    # means an answer was generated or thought and then lost.
+    #
+    # It also self-propagates on a thinking model: the client stores an empty assistant turn, and a
+    # chat template that wraps history unconditionally re-renders it as a blank `<think></think>`,
+    # which drifts the prompt and misses the prefix cache on every later turn.
+    if finish_reason == "stop" and not tool_calls and not (body or "").strip():
+        _rc_len = len(reasoning_content or "")
+        logger.warning(
+            "uid=%s returned NO content (finish_reason=stop, completion_tokens=%s, "
+            "reasoning_content=%s chars) — the caller sees an empty answer. %s",
+            uid, completion_tokens, _rc_len,
+            "Generation produced nothing at all."
+            if not completion_tokens
+            else ("The whole completion was routed to reasoning_content — suspect the think-span "
+                  "state for this request's prompt." if _rc_len else
+                  "Tokens were generated but the body is empty after the reasoning split."),
+        )
+        try:
+            state.metrics.on_empty_completion()
+        except Exception:  # noqa: BLE001 — never fail a reply over a counter
+            pass
 
     return {
         "id": f"chatcmpl-{uid}",

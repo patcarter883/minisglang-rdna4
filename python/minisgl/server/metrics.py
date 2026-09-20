@@ -133,6 +133,15 @@ class FrontendMetrics:
         self.requests_total = 0
         self.requests_success = 0
         self.requests_aborted = 0
+        # A completion that ended NORMALLY (finish_reason="stop", no tool call) but carried no
+        # answer: `content` empty after the reasoning split. Counted because it is otherwise SILENT —
+        # a 200 with a well-formed body that every OpenAI client reads as an empty string. It is also
+        # self-propagating on a thinking model: the client stores an empty assistant turn, and a chat
+        # template that wraps history unconditionally re-renders it as a blank `<think></think>`,
+        # drifting the prompt and missing the prefix cache on every later turn. Measured on
+        # Qwen3.8-Flash-Next 2026-09-20: a serve at 0/12 when fresh reached 12/12 after ~3 h of
+        # traffic with nothing in the log to say so.
+        self.empty_completions = 0
         # histograms
         self.ttft = _Histogram(_TTFT_BUCKETS)
         self.tpot = _Histogram(_TPOT_BUCKETS)
@@ -169,6 +178,10 @@ class FrontendMetrics:
                 self.tpot.observe((now - m.first_token) / (m.last_completion - 1))
             self.requests_success += 1
             self._req.pop(uid, None)
+
+    def on_empty_completion(self) -> None:
+        """A finished, non-tool-call reply whose `content` is empty. See `empty_completions`."""
+        self.empty_completions += 1
 
     def on_abort(self, uid: int) -> None:
         if self._req.pop(uid, None) is not None:
@@ -243,6 +256,10 @@ class FrontendMetrics:
                 "Requests that finished successfully.", self.requests_success)
         counter("minisgl_requests_aborted_total",
                 "Requests aborted (client disconnect / stop / abort).", self.requests_aborted)
+        counter("minisgl_empty_completions_total",
+                "Completions that finished normally (stop, no tool call) but returned no content. "
+                "A silent total output loss; see FrontendMetrics.empty_completions.",
+                self.empty_completions)
         gauge("minisgl_requests_inflight",
               "Requests currently in flight (frontend view).", len(self._req))
 
