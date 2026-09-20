@@ -63,8 +63,9 @@ def test_an_unrecognised_template_still_keeps_the_json_default(monkeypatch):
 def test_the_grammar_targets_the_same_wrapper_the_probe_looks_for():
     """Detection and constraint must agree — a probe that fires on a shape the grammar cannot
     produce would pin a format that then fails to constrain anything."""
-    ebnf = api._zaya_xml_grammar([
-        {"function": {"name": "get_weather", "parameters": {"properties": {"city": {}}}}}])
+    ebnf = api._wrapped_xml_grammar(
+        [{"function": {"name": "get_weather", "parameters": {"properties": {"city": {}}}}}],
+        None, "<zyphra_tool_call>", "</zyphra_tool_call>")
     assert ebnf is not None
     assert "<zyphra_tool_call>" in ebnf
 

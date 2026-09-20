@@ -387,10 +387,15 @@ def _grammar_from_tools(req: "OpenAICompletionRequest") -> str | None:
     if isinstance(choice, dict):
         forced_name = (choice.get("function") or {}).get("name")
     elif choice != "required":
-        return None  # "auto" / "none" / None -> not forced (see _structural_tag_from_tools)
+        return None  # "auto" / "none" / None -> not forced; auto is left UNCONSTRAINED
     fmt = _resolve_tool_format()
     if fmt == "zaya_xml":
-        ebnf = _zaya_xml_grammar(tools, forced_name)  # native <zyphra_tool_call> XML, not JSON
+        # native <zyphra_tool_call> XML, not JSON
+        ebnf = _wrapped_xml_grammar(tools, forced_name, "<zyphra_tool_call>", "</zyphra_tool_call>")
+        return json.dumps({"__ebnf__": ebnf}) if ebnf else None
+    if fmt == "qwen_xml":
+        # native <tool_call><function=…><parameter=…> XML, not JSON — see _derive_tool_format.
+        ebnf = _wrapped_xml_grammar(tools, forced_name, "<tool_call>", "</tool_call>")
         return json.dumps({"__ebnf__": ebnf}) if ebnf else None
     if fmt == "gemma_native":
         ebnf = _gemma_native_grammar(tools, forced_name)  # native <|tool_call>call:…, not JSON
@@ -412,13 +417,19 @@ def _ebnf_lit(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
 
-def _zaya_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str | None:
-    """EBNF constraining ZAYA's NATIVE tool call to its trained format:
-        <zyphra_tool_call>\\n<function=NAME>\\n(<parameter=P>\\nVALUE\\n</parameter>\\n)*</function>\\n</zyphra_tool_call>
+def _wrapped_xml_grammar(tools: List[dict], forced_name: str | None,
+                         open_tag: str, close_tag: str) -> str | None:
+    """EBNF constraining a `<WRAPPER><function=NAME><parameter=P>…` NATIVE tool call to its trained
+    format:
+        OPEN\\n<function=NAME>\\n(<parameter=P>\\nVALUE\\n</parameter>\\n)*</function>\\nCLOSE
     Function NAME is constrained to the allowed tools and parameter names to the known params (structure
     is guaranteed parseable by `_parse_tool_calls`); VALUES stay permissive ([^<]*) so the model isn't
     boxed on content. Any-order/any-subset params (a fixed order would reject valid calls). None if no
-    tool matches. Respects ZAYA's RL training instead of forcing an unfamiliar JSON shape."""
+    tool matches. Respects the checkpoint's training instead of forcing an unfamiliar JSON shape.
+
+    ONE BODY, parameterised by the wrapper, because ZAYA's `<zyphra_tool_call>` and Qwen3.6/3.8's
+    `<tool_call>` differ ONLY in that tag — the `<function=…>/<parameter=…>` interior is identical.
+    Copying it per family is what let Qwen go unrecognised while ZAYA was fixed."""
     fns: List[str] = []
     pnames: set[str] = set()
     for t in tools:
@@ -433,7 +444,8 @@ def _zaya_xml_grammar(tools: List[dict], forced_name: str | None = None) -> str 
     fname_alt = " | ".join(_ebnf_lit(n) for n in fns)
     pname_alt = " | ".join(_ebnf_lit(p) for p in sorted(pnames)) if pnames else _ebnf_lit("_")
     return "\n".join([
-        'root ::= "<zyphra_tool_call>\\n<function=" fname ">\\n" params "</function>\\n</zyphra_tool_call>"',
+        'root ::= ' + _ebnf_lit(open_tag + "\n<function=") + ' fname ' + _ebnf_lit(">\n")
+        + ' params ' + _ebnf_lit("</function>\n" + close_tag),
         f"fname ::= {fname_alt}",
         "params ::= param*",
         'param ::= "<parameter=" pname ">\\n" pval "\\n</parameter>\\n"',
@@ -500,8 +512,8 @@ def _gemma_native_grammar(tools: List[dict], forced_name: str | None = None) -> 
         mapping  -> `{k:v,…}`            sequence -> `[a,b]`        anything else -> raw
 
     The body is JSON-SHAPED but is NOT JSON — bare keys, and strings delimited by the `<|"|>` special
-    token rather than `"`. That is why this needs an EBNF and cannot ride the structural-tag path,
-    which is JSON-schema-only (see `_TOOL_STRUCT_WRAPPERS`). Forcing the JSON shape here would make a
+    token rather than `"`. That is why this needs an EBNF: an xgrammar structural tag is
+    JSON-schema-only, so it could never express this body. Forcing the JSON shape here would make a
     forced call come out in a format the checkpoint was never trained to emit AND that its own
     template cannot render back into a prompt.
 
@@ -597,6 +609,25 @@ def _derive_tool_format() -> str | None:
         return "atem"
     if "<zyphra_tool_call>" in rendered:
         return "zaya_xml"
+    # Qwen3.6 / Qwen3.8 (incl. Flash-Next): `<tool_call>\n<function=NAME>\n<parameter=P>\nV\n</parameter>`.
+    # Checked AFTER ZAYA on purpose — ZAYA's wrapper is `<zyphra_tool_call>`, which does not contain the
+    # literal `<tool_call>`, but ordering it this way keeps the more specific wrapper winning regardless.
+    #
+    # THIS ARM IS THE WHOLE POINT OF THE PROBE, AND IT WAS MISSING. Without it these checkpoints fell
+    # through to the "json" default, so BOTH constrained paths forced a JSON call on a model whose own
+    # template renders XML and whose system prompt (emitted by that same template) says:
+    #     "If you choose to call a function ONLY reply in the following format with NO suffix:
+    #      <tool_call>\n<function=example_function_name>\n<parameter=…>"
+    #     "Function calls MUST follow the specified format"
+    # MEASURED 2026-09-20 against xgrammar on the live Flash-Next tokenizer: the auto structural tag
+    # ACCEPTS `<tool_call>{"name":…,"arguments":{…}}` and REJECTS the model's own instructed form at the
+    # very FIRST token after the wrapper (the newline). The model, sampled unconstrained through
+    # /v1/completions, emits exactly that rejected form. So every tools request masked the model off its
+    # trained format mid-call — at the ARGUMENT region specifically, which is why the reasoning and the
+    # content of a failing turn stay perfectly coherent while only the arguments degenerate
+    # (`{"code": "# placeholder"}`, observed in Hermes sessions 30935df66949 / cdb27addb762).
+    if "<tool_call>" in rendered and "<function=" in rendered:
+        return "qwen_xml"
     return None
 
 
@@ -716,53 +747,37 @@ def _tool_call_variants(
     return variants, defs
 
 
-# Tool-call wrappers we constrain in `auto` mode: a trigger opener -> JSON call -> closer. The model
-# stays free to answer in prose (no trigger); if it opens one of these, xgrammar forces the wrapped
-# content to a schema-valid JSON call. MUST include ZAYA's native `<zyphra_tool_call>` — otherwise the
-# trigger never fires for ZAYA (`<tool_call>` is NOT a substring of `<zyphra_tool_call>`), the auto
-# grammar is effectively OFF, and the model free-forms into unparseable tool calls (the explore_do
-# format chaos). Structural tags are JSON-schema-only, so the wrapped content is forced to JSON (ZAYA
-# emits valid JSON when constrained — cf. the forced path); the XML `<function=…>` parser recovers any
-# native-XML that still slips through. For a GUARANTEED native-XML forced call see `_zaya_xml_grammar`
-# (MINISGL_TOOL_FORMAT=zaya_xml).
+# NO GRAMMAR ON THE `auto` PATH. The grammar layer exists for STRUCTURED calls — `response_format`
+# and a FORCED `tool_choice` (required / a specific function). `auto` means the model may answer in
+# prose or call a tool, in its own native format, and it is left UNCONSTRAINED.
 #
-# GEMMA-4 IS DELIBERATELY ABSENT, and it is the one family that cannot simply be added. Its wrapper
-# `<|tool_call>` … `<tool_call|>` would be a fine trigger, but a structural tag can only constrain its
-# body to a JSON SCHEMA (`grammar.py`: `xgr.StructuralTagItem(begin, schema, end)`), and Gemma's body
-# is not JSON — bare keys, and strings delimited by the `<|"|>` special token. Listing it here would
-# force the model to emit JSON inside its native wrapper: a shape it was never trained to produce and
-# that its own template cannot render back into a prompt on the next turn. So `auto` mode stays
-# UNCONSTRAINED for Gemma-4 (the model picks the format; `_parse_gemma_tool_call` reads it), and the
-# native format is guaranteed on the FORCED path instead, via `_gemma_native_grammar`. Closing this
-# properly needs per-tag EBNF support in xgrammar, which structural tags do not have today.
-# Muse-Glimmer's ATEM XML is omitted for the SAME reason: its body is `<atem:parameter name="k">v`
-# elements, not JSON. It likewise stays unconstrained under `auto` (parsed by the `_ATEM_INVOKE_RE`
-# scan) and is guaranteed on the forced path by `_atem_xml_grammar`.
-_TOOL_STRUCT_WRAPPERS = (
-    ("<zyphra_tool_call>", "</zyphra_tool_call>"),
-    ("<tool_call>", "</tool_call>"),
-    ("<tools>", "</tools>"),
-)
-
-
-def _structural_tag_from_tools(req: "OpenAICompletionRequest") -> str | None:
-    """`tool_choice: "auto"` (or default): build an xgrammar STRUCTURAL TAG so the model may answer in
-    prose OR call a tool, and when it opens a recognized tool-call wrapper the arguments are forced to
-    the tool's schema. Returns None for none/required/specific (handled by _grammar_from_tools) or no
-    tools. Strictly >= the un-constrained auto path (free text is unaffected)."""
-    tools = req.tools
-    if not tools or (req.tool_choice not in (None, "auto")):
-        return None
-    variants, defs = _tool_call_variants(tools)
-    if not variants:
-        return None
-    call_schema = variants[0] if len(variants) == 1 else {"anyOf": variants}
-    if defs:
-        call_schema = {**call_schema, "$defs": defs}
-    tags = [{"begin": b, "schema": call_schema, "end": e} for b, e in _TOOL_STRUCT_WRAPPERS]
-    triggers = [b for b, _ in _TOOL_STRUCT_WRAPPERS]
-    return json.dumps({"__structural_tag__": {"tags": tags, "triggers": triggers}})
-
+# There used to be an xgrammar structural tag here (b3456b04) that constrained `auto` by triggering on
+# `<tool_call>` / `<tools>` / `<zyphra_tool_call>` and forcing the wrapped body to the tool's JSON
+# schema. Its stated premise was "until the model opens a JSON tool-call wrapper" — but `<tool_call>`
+# is NOT a JSON wrapper for Qwen3.6/3.8, whose template renders (and whose system prompt mandates)
+# `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>`. Its claim of "strictly >= the
+# prior unconstrained auto path (free text is unaffected -> no regression)" held only for the prose;
+# the ARGUMENTS are not free text, and that is exactly what it forced.
+#
+# MEASURED, 2026-09-20, Qwen3.8-Flash-Next, identical probe either side:
+#     constrained auto   browser_exec  7/28 junk arguments  (25.0%)
+#     unconstrained auto browser_exec  see the A/B fixture
+# and the junk is always the same shape — the step-label comment the tool's own description mandates
+# ("Start `code` with a one-line comment ... e.g. `# Searching Amazon for paper towels`"), with the
+# string terminated immediately after it:
+#     {"code": "# Searching for X-NUCLEO-IHM16M1 shunt jumper map", "session": "eb-mig"}
+# Natively the model continues past that comment with a RAW NEWLINE inside <parameter=code>. A raw
+# newline cannot appear in a JSON string, so the tag masked it and the best legal token became `"` —
+# closing the argument and ending the call. Which is why only the multi-line `code` argument ever
+# degenerated, and single-line `query` / `command` never did (0/8 and 0/7 in the same run; zero across
+# ~2,700 production calls).
+#
+# The ZAYA caveat in b3456b04 saw half of this — it noted ZAYA's native format is not JSON — but
+# concluded ZAYA was safe BECAUSE the tag would not fire on `<zyphra_tool_call>`. The inverse case, a
+# family whose body is XML but whose wrapper IS `<tool_call>`, was never considered. Enumerating
+# families is what let that happen twice; not constraining `auto` at all is what stops it happening
+# again. A caller who wants a schema-valid call asks for one: tool_choice=required/specific still
+# gets a grammar, and for an XML-native family it is that family's OWN format (_wrapped_xml_grammar).
 
 def _parse_json_tool_call(body: str, uid: int) -> dict | None:
     """Parse a grammar-constrained tool call — a bare JSON object `{"name": …, "arguments": {…}}`
@@ -1992,8 +2007,9 @@ _ARG_KV_RE = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s
 # but no closer around an inline function) — strip them so `content` isn't polluted with dangling markup.
 _ORPHAN_WRAP_RE = re.compile(r"</?(?:" + "|".join(_TOOL_WRAPPERS) + r")>|<\|tool_call>|<tool_call\|>")
 # (E) GEMMA-4 native. The wrapper is PIPE-INSIDE and ASYMMETRIC — `<|tool_call>` … `<tool_call|>` —
-# so no `_TOOL_WRAPPERS` entry matches, and `<tool_call>` is NOT a substring of `<|tool_call>`:
-# exactly the trap the `_TOOL_STRUCT_WRAPPERS` comment already records for ZAYA. Both delimiters are
+# so no `_TOOL_WRAPPERS` entry matches, and `<tool_call>` is NOT a substring of `<|tool_call>`.
+# Wrapper-spelling luck like that is precisely what used to decide whether the deleted auto-path
+# structural tag corrupted a family or left it alone. Both delimiters are
 # real special tokens in the checkpoint tokenizer, as is `<|"|>`, which is how the template spells a
 # STRING DELIMITER. Per the checkpoint's chat_template.jinja:
 #     '<|tool_call>call:' + name + '{' + key ':' format_argument(value) … + '}<tool_call|>'
@@ -3303,14 +3319,10 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             # choice stays grammar-free and is parsed from the XML wrapper below).
             rf_grammar = _grammar_from_response_format(req.response_format)
             forced_tool_grammar = _grammar_from_tools(req) if rf_grammar is None else None
-            auto_tool_grammar = (
-                _structural_tag_from_tools(req)
-                if rf_grammar is None and forced_tool_grammar is None else None
-            )
             result = await run_markovian_rsa(
                 client, rsa_params, messages, req.model,
                 chat_template_kwargs=_resolve_chat_template_kwargs(req, state.config.model_path),
-                grammar=rf_grammar or forced_tool_grammar or auto_tool_grammar,
+                grammar=rf_grammar or forced_tool_grammar,
                 tools=_tools_for_template(req),
                 # UNCONDITIONAL close delim (not grammar-gated): RSA β-bounds reasoning on every
                 # grammar-free rollout, not just the structured final answer.
@@ -3438,10 +3450,6 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # specific) gets its own JSON-schema grammar so the arguments are schema-checked and terminate.
     _pl_rf_grammar = _grammar_from_response_format(req.response_format)
     _pl_forced_tool_grammar = _grammar_from_tools(req) if _pl_rf_grammar is None else None
-    _pl_auto_tool_grammar = (
-        _structural_tag_from_tools(req)
-        if _pl_rf_grammar is None and _pl_forced_tool_grammar is None else None
-    )
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -3456,7 +3464,7 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 **dict(zip(("temperature", "top_p", "top_k", "min_p"), _resolve_sampling(req, state.config.model_path))),
                 stop=_norm_stop(req.stop),
                 stop_keep=_tool_stop_keep(req),
-                grammar=_pl_rf_grammar or _pl_forced_tool_grammar or _pl_auto_tool_grammar,
+                grammar=_pl_rf_grammar or _pl_forced_tool_grammar,
                 # The auto structural tag is NOT a requirement — see SamplingParams.grammar_required.
                 grammar_required=bool(_pl_rf_grammar or _pl_forced_tool_grammar),
                 # UNCONDITIONAL close delim (was grammar-only): β-bounds reasoning on the PLAIN lane

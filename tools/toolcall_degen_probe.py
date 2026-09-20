@@ -131,6 +131,8 @@ TOOLS = [
 # Canned tool results. FIXED so every arm sees byte-identical tool output: a probe whose tool
 # results vary cannot attribute a rate difference to the engine.
 CANNED = {
+    "terminal": "stdout:\n/home/user/workspace\nagent_helpers.py\n(exit 0)",
+    "read_file": "# agent_helpers.py\ndef page_info():\n    ...\n",
     "browser_exec": "stdout:\nOK\n(exit 0)",
     "web_search": ("1. STM32G4 current sensing app note AN5397 — shunt amplifier configuration.\n"
                    "2. SimpleFOC docs: InlineCurrentSense with STM32 ADC injected conversions.\n"
@@ -160,11 +162,100 @@ TASKS = {
         "Use web_search to find the shunt-resistor jumper map for the X-NUCLEO-IHM16M1, then tell "
         "me in one sentence which jumper selects the low-side shunt."
     ),
+    "browser_task": (
+        "Find the shunt-resistor jumper map for the X-NUCLEO-IHM16M1 board on ST's website and tell "
+        "me which jumper selects the low-side shunt. Drive the browser yourself to get it — open the "
+        "page, wait for it to load, and pull the relevant section out of the DOM."
+    ),
     "long_prefix": (
         FILLER + "\n\nUse web_search to find the shunt-resistor jumper map for the "
         "X-NUCLEO-IHM16M1, then tell me in one sentence which jumper selects the low-side shunt."
     ),
 }
+
+
+# ---------------------------------------------------------------------------------------------
+# PRODUCTION-SHAPED TOOLSET. The simplified TOOLS above did NOT reproduce the failure: 60/60 calls
+# came back with substantive arguments (fixture 20260920-172021-q4edeg, 0/67 turns). Reading the
+# real definitions out of Hermes (tools/browser_use_cli.py: BROWSER_EXEC_SCHEMA, _HEADER_BASE,
+# _HELPERS_DIGEST) shows why that probe could not have reproduced it, and it is not subtle:
+#
+#   * EVERY junk turn ever observed, across EVERY model and 2,536 stored turns, is a `browser_exec`
+#     call. Zero on any other tool. Scored per browser_exec call rather than per turn, the real
+#     rates are Flash-Next 6/7, Qwen3.6-35B 1/4, Qwen3.8-27B 1/5, deepseek(cloud) 0/7 — so the
+#     published "7.9% vs <=0.8%" table was largely measuring HOW OFTEN each model happened to reach
+#     for this one tool, not how degenerate it is.
+#   * The real description MANDATES the shape the detector scores as junk: "Start `code` with a
+#     one-line comment describing the step for the user in plain language, max 60 chars
+#     (e.g. `# Searching Amazon for paper towels`)". The observed junk — "# placeholder",
+#     "# placeholder\nprint('ok')" — is that mandated comment with no body after it.
+#   * `code` is the only argument in the whole toolset that is inherently MULTI-LINE. Under the
+#     native XML form the model writes raw newlines inside <parameter=code>; under the JSON the
+#     structural tag forces, the same body has to be emitted as \n escapes inside a string.
+#
+# So the probe has to offer THIS tool, with THIS description, or it is not testing the thing that
+# fails. Descriptions are copied verbatim from Hermes rather than paraphrased — the mandated
+# leading comment is the whole point and a paraphrase would lose it.
+# ---------------------------------------------------------------------------------------------
+_BE_DESC = (
+    "Drive a real web browser via the Browser Use CLI: `code` runs as full Python (stdlib available) "
+    "with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line "
+    "comment describing the step for the user in plain language, max 60 chars "
+    "(e.g. `# Searching Amazon for paper towels`) \u2014 the UI shows it as the step label.\n\n"
+    "STATE: the browser session and workspace persist across calls; Python variables do NOT (fresh "
+    "interpreter each call). The workspace dir is $BH_AGENT_WORKSPACE (also `workspace` in every result); "
+    "functions defined in agent_helpers.py there are auto-imported into every call. For multi-item tasks "
+    "('all N products / every entry'), append each batch to a JSON/CSV file in the workspace, then read it "
+    "back and aggregate in code \u2014 dedupe/count/sort with Python, not in your head \u2014 and verify the "
+    "collected count against what was asked before answering.\n\n"
+    "Batch each sub-procedure (navigate, wait, extract, act) into one call \u2014 do not spend a call per "
+    "action \u2014 but for long extractions prefer several medium calls that append to workspace files over "
+    "one giant call, so progress survives timeouts."
+    "\n\nHELPERS (pre-imported): new_tab(url) opens/navigates (use for the FIRST navigation), goto_url(url) "
+    "navigates the current tab, wait_for_load() after navigation, page_info() summarizes the current page "
+    "state, js(expr) evaluates a JS expression and returns its value (js('document.title'); wrap function "
+    "bodies as js('(() => {...})()') \u2014 a bare '() => {...}' returns the function itself, uncalled), "
+    "fill_input(selector, text) types into inputs, click_at_xy(x, y) clicks viewport coordinates, "
+    "capture_screenshot() saves and prints a screenshot path, cdp('Domain.method', **kwargs) is raw CDP \u2014 "
+    "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
+    "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "
+    "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: never guess "
+    "credentials; see the vault note below if present, otherwise stop and ask the user."
+)
+
+HERMES_TOOLS = [
+    {"type": "function", "function": {
+        "name": "browser_exec",
+        "description": _BE_DESC,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."},
+                "session": {"type": "string", "description": "Named isolated browser session \u2014 its own daemon and (on cloud backends) own browser, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."},
+                "timeout_s": {"type": "integer", "default": 120, "description": "Max seconds to wait for the code to finish (default 120, max 600)."},
+            },
+            "required": ["code"],
+        }}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web and return result snippets.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string", "description": "The search query."},
+                                      "limit": {"type": "integer", "description": "Max results."}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "terminal",
+        "description": "Run a shell command on the host and return its stdout/stderr.",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string", "description": "The shell command."}},
+                       "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file from disk and return its contents.",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string", "description": "Absolute path."}},
+                       "required": ["path"]}}},
+]
 
 SYSTEM = ("You are a careful engineering assistant with tool access. Call a tool only when it "
           "advances the task, and always with real, complete arguments.")
@@ -329,7 +420,7 @@ def run_conversation(base: str, model: str, task: str, turns: int, args, rec: di
         payload = {
             "model": model,
             "messages": msgs,
-            "tools": TOOLS,
+            "tools": args.toolset_tools,
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -367,7 +458,12 @@ def run_conversation(base: str, model: str, task: str, turns: int, args, rec: di
 
         if not calls:
             break                                   # the model finished its answer
-        msgs.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
+        echo = {k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")}
+        if args.echo_reasoning:
+            rc = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            if rc:
+                echo["reasoning_content"] = rc
+        msgs.append(echo)
         for c in calls:
             name = (c.get("function") or {}).get("name")
             msgs.append({"role": "tool", "tool_call_id": c.get("id"),
@@ -382,6 +478,17 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1919)
     ap.add_argument("--tasks", default="long_spec,short_task,long_prefix")
+    ap.add_argument("--toolset", choices=("simple", "hermes"), default="hermes",
+                    help="hermes (default) offers the REAL browser_exec definition — the only tool "
+                         "that has ever produced a junk argument. `simple` is the original 2-tool "
+                         "set, kept only to reproduce the 0/67 null it produced.")
+    ap.add_argument("--echo-reasoning", dest="echo_reasoning",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="replay reasoning_content into the history, as Hermes does "
+                         "(hermes_state_messages.py:980-981). Default ON. --no-echo-reasoning is the "
+                         "old stripped regime, in which this checkpoint's unguarded template renders "
+                         "every prior assistant turn as the blank <think></think> NO-THINK marker — a "
+                         "prompt shape that was absent from 5 of the 6 real junk turns.")
     ap.add_argument("--reps", type=int, default=4, help="conversations per task")
     ap.add_argument("--turns", type=int, default=8, help="max assistant turns per conversation")
     ap.add_argument("--max-tokens", type=int, default=4096)
@@ -394,6 +501,7 @@ def main() -> int:
     ap.add_argument("--outdir", default=None)
     args = ap.parse_args()
 
+    args.toolset_tools = HERMES_TOOLS if args.toolset == "hermes" else TOOLS
     base = f"http://{args.host}:{args.port}"
     served = assert_provenance(base, args.expect_model)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -446,6 +554,23 @@ def main() -> int:
     n = max(total, 1)
     print(f"{'ALL':<14}{total:>6}" + "".join(f"{overall[k]:>12} {overall[k] / n * 100:>7.1f}%" for k in keys))
     rec["summary"] = {"total_turns": total, "counts": overall, "by_task": by_task}
+
+    # PER-TOOL, because every junk argument ever observed — in production and here — belongs to ONE
+    # tool. A per-turn rate divided by a tool mix is what made the original cross-model table read as
+    # a 10-40x model difference when the models had simply reached for browser_exec different numbers
+    # of times. Report the denominator that the defect actually lives in.
+    per_tool = {}
+    for conv in rec["conversations"]:
+        for t in conv["turns"]:
+            junk = bool(t.get("flags", {}).get("junk_args"))
+            for tc in t.get("tool_calls", []):
+                d = per_tool.setdefault(tc.get("name") or "?", {"calls": 0, "junk": 0})
+                d["calls"] += 1
+                d["junk"] += int(junk)
+    print(f"\n{'tool':<18}{'calls':>7}{'junk':>7}{'rate':>9}")
+    for name, d in sorted(per_tool.items(), key=lambda kv: -kv[1]["calls"]):
+        print(f"{name:<18}{d['calls']:>7}{d['junk']:>7}{d['junk'] / max(d['calls'], 1) * 100:>8.1f}%")
+    rec["summary"]["per_tool"] = per_tool
 
     path = os.path.join(outdir, "result.json")
     with open(path, "w") as fh:
