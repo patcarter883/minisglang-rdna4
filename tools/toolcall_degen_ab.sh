@@ -18,11 +18,17 @@ READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 LOGDIR="${LOGDIR:-/home/pat/fixtures/minisgl-toolcall-degen}"
 mkdir -p "$LOGDIR"
 
+# ARM_LABEL overrides the fixture label without changing the lease/container name, so two runs of
+# the SAME arm from DIFFERENT source trees (e.g. pre-fix vs fixed worktree) land in separate,
+# self-identifying fixtures instead of two directories that only a timestamp tells apart.
+# EXTRA_ARGS is forwarded to the serve verbatim (serve.sh appends it last and it wins).
 run_arm() {
-  local model="$1" expect="$2" name="$3"
-  local log="$LOGDIR/$(date +%Y%m%d-%H%M%S)-$name-serve.log"
-  echo "=== arm $name: booting MODEL=$model (log: $log)"
-  MODEL="$model" gpu-lease -n 2 --detach --name "$name" -- \
+  local model="$1" expect="$2" name="$3" extra="${4:-}"
+  local label="${ARM_LABEL:-$name}"
+  local log="$LOGDIR/$(date +%Y%m%d-%H%M%S)-${ARM_LABEL:-$name}-serve.log"
+  echo "=== arm $label: booting MODEL=$model EXTRA_ARGS='$extra' (log: $log)"
+  echo "=== source tree: $PWD  (commit $(git rev-parse --short HEAD 2>/dev/null || echo '?'))"
+  MODEL="$model" EXTRA_ARGS="$extra" gpu-lease -n 2 --detach --name "$name" -- \
       docker compose --profile serve up -d || { echo "boot failed"; return 1; }
 
   local container="lease-$name-serve"
@@ -49,10 +55,10 @@ run_arm() {
   grep -m1 "recurrent-radix" "$log" || echo "  (no recurrent-radix line in the boot log)"
 
   python3 tools/toolcall_degen_probe.py \
-      --arm "$name" --expect-model "$expect" --reps "$REPS" --serve-log "$log"
+      --arm "$label" --expect-model "$expect" --reps "$REPS" --serve-log "$log"
   local rc=$?
 
-  echo "=== arm $name: tearing down"
+  echo "=== arm $label: tearing down"
   docker compose -p "lease-$name" --profile serve down 2>/dev/null
   return $rc
 }
@@ -60,6 +66,10 @@ run_arm() {
 case "$ARM" in
   q4e)    run_arm q4e        "Qwen3.8-Flash-Next" q4edeg ;;
   qwen36) run_arm qwen35b-awq "Qwen3.6"           q36deg ;;
+  # SAME CHECKPOINT, suspect path OFF. The qwen36 arm changes the MODEL as well as the path, so a
+  # q4e-vs-qwen36 gap cannot separate "this NVFP4 checkpoint is worse at tool arguments" from "the
+  # q4e-only composite prefix-cache path corrupts state". This one moves only the path.
+  noradix) run_arm q4e "Qwen3.8-Flash-Next" q4edeg "--no-gdn-radix" ;;
   both)   run_arm q4e "Qwen3.8-Flash-Next" q4edeg; run_arm qwen35b-awq "Qwen3.6" q36deg ;;
-  *)      echo "usage: $0 {q4e|qwen36|both}"; exit 2 ;;
+  *)      echo "usage: $0 {q4e|qwen36|noradix|both}   (ARM_LABEL=<name> to label the fixture)"; exit 2 ;;
 esac
