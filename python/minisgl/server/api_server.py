@@ -158,28 +158,61 @@ class Message(BaseModel):
 # manager RESERVES `output_len` KV tokens at admission (`scheduler/prefill.py::_try_allocate_one`:
 # `estimated_len = extend_len + req.output_len`), so a request carrying the whole remaining context as
 # its cap reserves the whole remaining pool and nothing else can be admitted beside it — an uncapped
-# default would silently serialise the serve to one request at a time. A generous finite cap costs
-# nothing (8192 x max_running against a 225k-token pool here) and the scheduler still clamps it to
-# `max_seq_len - input_len` per request, so it is only ever an upper bound.
+# default would silently serialise the serve to one request at a time. So the cap stays FINITE, and
+# the scheduler still clamps it to `max_seq_len - input_len` per request, so it is only ever an
+# upper bound.
 #
-# 8192 has to cover the reasoning span AND the answer, since (per above) nothing else bounds the
-# span: it clears the ladder's `high` budget (4096) with as much again for the reply, and it is also
-# what stops a model that rambles and never closes `</think>` from decoding until the KV runs out —
-# under the old 16 that runaway was "capped" only by failing every request instead. A degenerate
-# input can still spend the whole 8192 inside the span and return an empty body; that is an honest
-# truncation a harness can retry, not a cap the server invented. Raise it with
-# MINISGL_DEFAULT_MAX_TOKENS when a lane genuinely needs longer uncapped replies.
-_CHAT_DEFAULT_MAX_TOKENS = 8192
+# IT IS DERIVED FROM THE POOL, not a constant. A flat 8192 had to be simultaneously large enough for
+# a reasoning model's whole span AND small enough that `max_running` of them fit a small serve's KV
+# pool — two requirements no single number satisfies across the arms this box runs. MEASURED on
+# Qwen3.8-Flash-Next 2026-09-21: reasoning spans of 3.8k / 6.4k / 6.5k / 9.2k tokens BEFORE the
+# answer, and 2 of 3 baseline A/B runs died at the 8192 cap with finish_reason=length and no tool
+# call — which ends an agent turn and parks the session. Meanwhile a 69k-token pool at max_running 6
+# is ALREADY over-subscribed by 8192 x 6 = 49k of reservation before a single prompt is counted.
+#
+#     per-slot share = max_seq_len // max_running       (the pool this request may fairly claim)
+#     output budget  = that // _OUTPUT_SLOT_DIVISOR     (the remainder is its prompt)
+#     clamped to     [_CHAT_DEFAULT_MAX_TOKENS, _CHAT_MAX_DERIVED]
+#
+# The FLOOR is the old constant, deliberately: no arm can come out of this with a SMALLER default
+# than it has today, so this cannot regress a serve nobody re-measured. The CEILING stops a huge
+# pool from handing one request a reservation that starves admission. q4e resolves to 24406
+# (195248 // 2 // 4), covering the measured spans with room while still leaving a 195k pool able to
+# admit both slots with their prompts.
+#
+# MINISGL_DEFAULT_MAX_TOKENS still wins outright when set — an operator pinning a number is never
+# second-guessed, and it is the escape hatch if a derived value is ever wrong for an arm.
+_CHAT_DEFAULT_MAX_TOKENS = 8192          # floor, and the fallback before the pool size is known
+_CHAT_MAX_DERIVED = 32768                # ceiling on the derived value
+_OUTPUT_SLOT_DIVISOR = 4                 # a quarter of a slot's share is output, the rest is prompt
 _TEXT_COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 
+def _derived_chat_default() -> int:
+    """Chat default from the live pool, or the floor when the pool size is not known yet.
+
+    `max_seq_len` reaches the frontend in a scheduler message AFTER boot, so an early request (or a
+    unit test with no global state) legitimately finds it unset. That is the fallback path, not an
+    error, and it yields exactly the old behaviour."""
+    try:
+        st = get_global_state()
+        seq = int(getattr(st, "max_seq_len", 0) or 0)
+        running = int(getattr(st.config, "max_running_req", 0) or 0)
+    except Exception:  # noqa: BLE001 — no global state (tests, early boot): take the floor
+        return _CHAT_DEFAULT_MAX_TOKENS
+    if seq <= 0 or running <= 0:
+        return _CHAT_DEFAULT_MAX_TOKENS
+    derived = seq // running // _OUTPUT_SLOT_DIVISOR
+    return max(_CHAT_DEFAULT_MAX_TOKENS, min(_CHAT_MAX_DERIVED, derived))
+
+
 def default_max_tokens(is_text_completion: bool) -> int:
-    """The output cap for a request that asked for none. See `_CHAT_DEFAULT_MAX_TOKENS`."""
+    """The output cap for a request that asked for none. See `_derived_chat_default` above."""
     if is_text_completion:
         return _TEXT_COMPLETION_DEFAULT_MAX_TOKENS
     # Floor at 1: `_reject_malformed` 400s on `max_tokens < 1`, so a junk knob must not turn every
-    # uncapped request into a client error.
-    return max(1, env_int("MINISGL_DEFAULT_MAX_TOKENS", _CHAT_DEFAULT_MAX_TOKENS))
+    # uncapped request into a client error. An EXPLICIT env value wins over the derived one.
+    return max(1, env_int("MINISGL_DEFAULT_MAX_TOKENS", _derived_chat_default()))
 
 
 class OpenAICompletionRequest(BaseModel):
