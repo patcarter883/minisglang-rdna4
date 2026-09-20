@@ -1,0 +1,136 @@
+"""Qwen3.6/3.8 native tool-call format must be DERIVED, and the auto tag must not force JSON into it.
+
+MEASURED DEFECT (2026-09-20). `_derive_tool_format` knew Gemma-4's, Muse-Glimmer's and ZAYA's
+wrappers but NOT Qwen's, so every Qwen3.6/3.8 checkpoint — including Qwen3.8-Flash-Next — fell
+through to the "json" default. Both constrained paths then forced a JSON call on a model whose own
+template renders XML and whose system prompt, emitted by that same template, says:
+
+    "If you choose to call a function ONLY reply in the following format with NO suffix:
+     <tool_call>\\n<function=example_function_name>\\n<parameter=…>"
+    "Function calls MUST follow the specified format"
+
+Measured against xgrammar on the live Flash-Next tokenizer: the auto structural tag ACCEPTED
+`<tool_call>{"name":…,"arguments":{…}}` and REJECTED the model's own instructed form at the FIRST
+token after the wrapper (the newline). Sampled unconstrained through /v1/completions, the model
+emits exactly that rejected form. So a tools request masked the model off its trained format mid
+call, at the ARGUMENT region — which is why a failing turn's reasoning and content stay coherent
+while only the arguments degenerate (`{"code": "# placeholder"}`, seen in Hermes sessions
+30935df66949 and cdb27addb762).
+
+    docker exec: python -m pytest tests/qwen_tool_format_test.py -q -o addopts=""
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import pytest  # noqa: E402
+
+import minisgl.server.api_server as api  # noqa: E402
+
+# What the shipped Qwen3.6 / Qwen3.8 templates render for an assistant tool call.
+QWEN_RENDERED = ("<|im_start|>assistant\n<tool_call>\n<function=f>\n"
+                 "<parameter=k>\nv\n</parameter>\n</function>\n</tool_call><|im_end|>\n")
+
+TOOLS = [
+    {"type": "function", "function": {"name": "browser_exec", "parameters": {
+        "type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}},
+    {"type": "function", "function": {"name": "web_search", "parameters": {
+        "type": "object", "properties": {"query": {"type": "string"}}}}},
+]
+
+
+class _StubTok:
+    def __init__(self, rendered: str):
+        self._rendered = rendered
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        return self._rendered
+
+
+class _Req:
+    def __init__(self, tools, tool_choice=None):
+        self.tools = tools
+        self.tool_choice = tool_choice
+
+
+@pytest.fixture(autouse=True)
+def _reset_derivation_cache():
+    """`_resolve_tool_format` memoises; each case must derive afresh."""
+    api._DERIVED_TOOL_FORMAT = None
+    api._DERIVED_TOOL_FORMAT_SET = False
+    yield
+    api._DERIVED_TOOL_FORMAT = None
+    api._DERIVED_TOOL_FORMAT_SET = False
+
+
+def _with_template(monkeypatch, rendered: str):
+    monkeypatch.setattr(api, "_frontend_tokenizer", lambda: _StubTok(rendered))
+
+
+def test_qwen_wrapper_derives_qwen_xml(monkeypatch):
+    _with_template(monkeypatch, QWEN_RENDERED)
+    assert api._derive_tool_format() == "qwen_xml"
+
+
+def test_zaya_still_wins_its_own_wrapper(monkeypatch):
+    """ZAYA's `<zyphra_tool_call>` also contains `<function=`. It must NOT be read as Qwen — that
+    would swap its forced grammar's wrapper and constrain it to a tag it never emits."""
+    _with_template(monkeypatch,
+                   "<zyphra_tool_call>\n<function=f>\n</function>\n</zyphra_tool_call>")
+    assert api._derive_tool_format() == "zaya_xml"
+
+
+def test_other_families_and_the_json_default_are_untouched(monkeypatch):
+    _with_template(monkeypatch, "<|tool_call>call:f{}")
+    assert api._derive_tool_format() == "gemma_native"
+    api._DERIVED_TOOL_FORMAT_SET = False
+    _with_template(monkeypatch, '<atem:invoke name="f">')
+    assert api._derive_tool_format() == "atem"
+    api._DERIVED_TOOL_FORMAT_SET = False
+    _with_template(monkeypatch, '{"name": "f", "arguments": {}}')
+    assert api._derive_tool_format() is None
+
+
+def test_auto_tag_does_not_force_json_into_the_qwen_wrapper(monkeypatch):
+    """THE BUG. Under `tool_choice` default the structural tag used to list `<tool_call>` and force
+    its body to a JSON schema, which xgrammar then enforced against a model emitting XML."""
+    _with_template(monkeypatch, QWEN_RENDERED)
+    assert api._structural_tag_from_tools(_Req(TOOLS)) is None
+
+
+def test_auto_tag_still_constrains_a_json_bodied_checkpoint(monkeypatch):
+    """The fix must not disarm `auto` for families that DO emit JSON inside `<tool_call>`."""
+    _with_template(monkeypatch, '{"name": "f", "arguments": {}}')
+    tag = api._structural_tag_from_tools(_Req(TOOLS))
+    assert tag is not None and "<tool_call>" in tag
+
+
+def test_forced_call_uses_the_native_xml_grammar(monkeypatch):
+    _with_template(monkeypatch, QWEN_RENDERED)
+    g = api._grammar_from_tools(_Req(TOOLS, tool_choice="required"))
+    assert g is not None
+    ebnf = json.loads(g)["__ebnf__"]
+    assert ebnf.startswith('root ::= "<tool_call>\\n<function=" fname ">\\n" params '
+                           '"</function>\\n</tool_call>"')
+    assert '"browser_exec" | "web_search"' in ebnf
+
+
+def test_generalised_grammar_reproduces_the_zaya_body_exactly():
+    """One body, parameterised by the wrapper — the ZAYA output must be byte-identical to the
+    dedicated function it replaced, or this refactor silently changed ZAYA's forced grammar."""
+    expected = "\n".join([
+        'root ::= "<zyphra_tool_call>\\n<function=" fname ">\\n" params '
+        '"</function>\\n</zyphra_tool_call>"',
+        'fname ::= "browser_exec" | "web_search"',
+        "params ::= param*",
+        'param ::= "<parameter=" pname ">\\n" pval "\\n</parameter>\\n"',
+        'pname ::= "code" | "query"',
+        "pval ::= [^<]*",
+    ])
+    got = api._wrapped_xml_grammar(
+        TOOLS, None, "<zyphra_tool_call>", "</zyphra_tool_call>")
+    assert got == expected
