@@ -104,6 +104,105 @@ def _pattern_tokens(p: Pattern) -> Set[int]:
 
 
 @dataclass
+class _ToolCallState:
+    openers: Tuple[Pattern, ...]   # any of these, once committed, means a call block is OPEN
+    closers: Tuple[Pattern, ...]   # any of these closes it again
+    width: int                     # committed tokens the matcher has to remember
+    budget: int                    # tokens to keep suppressing before giving up on this block
+    may_suppress_eos: bool         # False when an EOS id appears INSIDE a delimiter (see arm())
+    inside: bool = False
+    count: int = 0                 # tokens committed since the block opened
+    window: List[int] = field(default_factory=list)
+
+
+class ToolCallGate:
+    """Stop the model ENDING A TURN while a tool-call block it opened is still unclosed.
+
+    THE DEFECT THIS EXISTS FOR (2026-09-21). Until 3799717d an xgrammar structural tag constrained
+    the body of a `<tool_call>` wrapper, and a side effect of that constraint was that the turn-ending
+    token could not be sampled mid-structure: measured against the live tokenizer, `<|im_end|>` was
+    MASKED inside an open call. Removing the tag fixed a much worse problem (it forced a JSON body on
+    a checkpoint whose template mandates XML -- 25% junk arguments, code bodies capped at 369 chars)
+    but it also removed that side effect, and the model began ending turns halfway through a call it
+    had started. The frontend recovers the fragment rather than dropping it
+    (`ToolCallStreamState._parse_unclosed`) and reports finish_reason=length, so the visible symptom
+    is a truncated turn with the partial call surfaced as prose -- twice in eleven turns of Hermes
+    session e5b8b76e21e8.
+
+    This restores ONLY that property. It constrains no format and reads no schema: the body stays
+    whatever the checkpoint's template renders.
+
+    BOUNDED, because suppressing EOS is otherwise a way to hang a request. `budget` caps how long one
+    block may suppress; past it the model may end the turn and the frontend's existing runaway
+    handling (`MINISGL_TOOLCALL_RUNAWAY_LIMIT`) takes over. A gate that could refuse EOS forever would
+    trade a truncated turn for a wedged one.
+
+    Same purity contract as :class:`ThinkGate` -- ints and tuples only, `commit` the sole mutator, so
+    it is unit-testable with no GPU and safe to query per rank."""
+
+    def __init__(self, *, enabled: bool = True, budget: int = 8192) -> None:
+        self._enabled = bool(enabled)
+        self._budget = int(budget)
+        self._st: Dict[object, _ToolCallState] = {}
+
+    def arm(self, uid, *, openers: Iterable, closers: Iterable, eos_ids: Iterable[int] = ()) -> bool:
+        """Arm for one request. No-op (False) when disabled, already armed, or given no usable
+        opener/closer pair."""
+        if not self._enabled or uid in self._st:
+            return False
+        opats = tuple(q for q in (_as_pattern(o) for o in openers) if q is not None)
+        cpats = tuple(q for q in (_as_pattern(c) for c in closers) if q is not None)
+        if not opats or not cpats:
+            return False
+        # An EOS id that is itself PART of a delimiter cannot be suppressed: masking it would stop the
+        # model ever emitting the closer, turning the guard into the hang it is meant to avoid. Mirrors
+        # ThinkGate.may_suppress_eos.
+        delim_tokens: Set[int] = set()
+        for q in opats + cpats:
+            delim_tokens |= _pattern_tokens(q)
+        may = not (set(int(e) for e in eos_ids) & delim_tokens)
+        self._st[uid] = _ToolCallState(
+            openers=opats, closers=cpats,
+            width=max(_pattern_width(q) for q in opats + cpats),
+            budget=self._budget, may_suppress_eos=may,
+        )
+        return True
+
+    def commit(self, uid, token: int) -> None:
+        """Advance by one COMMITTED token. Drafted-then-rejected speculative tokens must not reach
+        here, or the window diverges from what the model conditioned on (and across TP ranks)."""
+        st = self._st.get(uid)
+        if st is None:
+            return
+        st.window.append(int(token))
+        del st.window[: max(0, len(st.window) - st.width)]
+        if st.inside:
+            st.count += 1
+            if any(ThinkGate._matches(st.window, q) for q in st.closers):
+                st.inside, st.count = False, 0
+        elif any(ThinkGate._matches(st.window, q) for q in st.openers):
+            st.inside, st.count = True, 0
+
+    def commit_many(self, uid, tokens: Sequence[int]) -> None:
+        for t in tokens:
+            self.commit(uid, t)
+
+    def suppress_eos(self, uid) -> bool:
+        st = self._st.get(uid)
+        return bool(st and st.inside and st.may_suppress_eos and st.count < st.budget)
+
+    def is_open(self, uid) -> bool:
+        st = self._st.get(uid)
+        return bool(st and st.inside)
+
+    def any_armed(self) -> bool:
+        return bool(self._st)
+
+    def free(self, uid) -> None:
+        self._st.pop(uid, None)
+
+
+@dataclass
 class _GateState:
     """Per-request gate state. All of it is derived from COMMITTED tokens, so every TP rank holds an
     identical copy."""

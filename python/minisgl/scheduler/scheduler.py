@@ -50,7 +50,7 @@ from .gdn_slots import GDNSlotManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
-from .think_gate import ThinkGate
+from .think_gate import ThinkGate, ToolCallGate
 
 # How many tokens the wildcard span inside a recipient-carrying reasoning closer may cover, i.e. the
 # longest tool name the gate will still recognise as "reasoning ended". Bounded so the pattern cannot
@@ -1033,6 +1033,14 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         #
         # MINISGL_GRAMMAR_THINK_GATE=0 is the escape hatch / A-B toggle: it reverts to applying the
         # schema from token 0 even with thinking on (the pre-gate behavior).
+        # Tool-call EOS guard: refuse the turn-ending token while a call the model OPENED is still
+        # unclosed. Restores the one property the auto-path structural tag used to provide as a side
+        # effect (measured: `<|im_end|>` was MASKED mid-call under it) without constraining the body.
+        # Budget-bounded so it can never hang a request; past it the frontend's runaway handling wins.
+        self._tool_gate = ToolCallGate(
+            enabled=os.environ.get("MINISGL_TOOLCALL_EOS_GUARD", "1") not in ("0", "false", "no"),
+            budget=int(os.environ.get("MINISGL_TOOLCALL_EOS_BUDGET", "8192") or 8192),
+        )
         self._think_gate = ThinkGate(
             enabled=os.environ.get("MINISGL_GRAMMAR_THINK_GATE", "1") not in ("0", "false", "no"),
             default_budget=int(os.environ.get("MINISGL_THINK_BUDGET", "1024") or 1024),
@@ -1489,6 +1497,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 # grammar-bitmask backstop (constrained-only) never reached — the paper's bounded
                 # workspace, and the fix for truncated-thinking-with-no-answer.
                 self._maybe_arm_think_gate(req)
+                self._maybe_arm_tool_gate(req)
                 _forced = self._think_gate.forced_next(req.uid)
                 if _forced is not None and int(next_token.item()) != _forced:
                     next_token = next_token.new_tensor(_forced)
@@ -1544,6 +1553,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                         # answer. Reasoning tokens are NOT fed to the matcher (the schema starts fresh
                         # on the answer).
                         self._think_gate.commit(req.uid, next_token)
+                        self._tool_gate.commit(req.uid, next_token)
                     elif m is not None and not m.is_terminated():
                         m.accept_token(next_token)
                 fr = ("stop" if eos_hit else "length") if finished else None
@@ -1692,6 +1702,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # (These used to be two calls with a load-bearing ordering between them — clear() ADDED the
         # uid to the done-set and a later line discarded it.)
         self._think_gate.free(req.uid)
+        self._tool_gate.free(req.uid)
         # Drop any un-attached recurrent-state checkpoint (idempotent; frees the cloned slot state).
         self._pending_rec_snap.pop(req.uid, None)
         self._rec_snap_ladder.pop(req.uid, None)  # frees any un-attached interior checkpoints
@@ -2073,9 +2084,13 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         yet over budget). Their EOS logits are masked to -inf so the model can't end the turn before it
         closes </think> — the budget backstop then force-emits </think> and clears the gate. None when no
         row is gated (the common case) so the sampler skips the mask entirely."""
-        if not self._think_gate.any_armed():
+        if not (self._think_gate.any_armed() or self._tool_gate.any_armed()):
             return None
-        flags = [self._think_gate.suppress_eos(getattr(r, "uid", None)) for r in batch.reqs]
+        # EITHER gate may hold a row: the reasoning span and an open tool-call block are independent
+        # structures and a turn must not end inside either.
+        flags = [bool(self._think_gate.suppress_eos(getattr(r, "uid", None))
+                      or self._tool_gate.suppress_eos(getattr(r, "uid", None)))
+                 for r in batch.reqs]
         if not any(flags):
             return None
         return torch.tensor(flags, dtype=torch.bool, device=self.device)
@@ -2089,7 +2104,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         emit EOS mid-reasoning (under budget) or is forced to </think> (over budget). The accept below then
         naturally avoids EOS; the gate is COUNTED/OPENED from the committed (rank0-authoritative) tokens in
         pass 2, so all TP ranks advance it identically. Returns True if any req was gated. No-op otherwise."""
-        if not self._think_gate.any_armed():
+        if not (self._think_gate.any_armed() or self._tool_gate.any_armed()):
             return False
         eos_ids = self.engine.sampler.eos_token_ids
         any_gated = False
@@ -2097,6 +2112,12 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         for req, sd in zip(reqs, staged_drafts):
             q_len = len(sd) + 1
             uid = getattr(req, "uid", None)
+            # The tool-call guard applies HERE TOO, or the guard would hold on the plain decode lane
+            # and quietly not on the spec one -- the "fix lands on one sibling" shape. No force arm:
+            # this gate only ever refuses EOS, it never emits a delimiter of its own.
+            if eos_ids is not None and self._tool_gate.suppress_eos(uid):
+                any_gated = True
+                logits[offset:offset + q_len][:, eos_ids] = float("-inf")
             if self._think_gate.is_armed(uid):
                 any_gated = True
                 block = logits[offset:offset + q_len]
@@ -2192,6 +2213,23 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                 ids = tuple(int(i) for i in enc)
         self._delim_ids[delim] = ids
         return ids
+
+    def _maybe_arm_tool_gate(self, req: Req) -> None:
+        """Arm the tool-call EOS guard for a request that was offered tools.
+
+        Delimiters come from the request (`api_server._tool_call_delims`), resolved to ids here — the
+        gate itself speaks only ints, same contract as ThinkGate. Idempotent; a request with no tools,
+        or whose delimiters do not resolve to token sequences, simply stays unarmed."""
+        sp = req.sampling_params
+        openers = getattr(sp, "tool_call_openers", None) or ()
+        closers = getattr(sp, "tool_call_closers", None) or ()
+        if not openers or not closers:
+            return
+        o_ids = [i for i in (self._resolve_delim_ids(o) for o in openers) if i]
+        c_ids = [i for i in (self._resolve_delim_ids(c) for c in closers) if i]
+        if not o_ids or not c_ids:
+            return
+        self._tool_gate.arm(req.uid, openers=o_ids, closers=c_ids, eos_ids=self.eos_token_ids)
 
     def _maybe_arm_think_gate(self, req: Req) -> None:
         """Arm the reasoning (β) gate for ANY thinking request that declared a think-close delimiter.
@@ -2330,6 +2368,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
                     )
                     continue
                 self._maybe_arm_think_gate(r)  # gate the schema until </think> if thinking is active
+                self._maybe_arm_tool_gate(r)
             # Reasoning gate: while still inside <think>…</think>, leave this row all-ones (free
             # reasoning) and do NOT advance the matcher — the schema starts fresh on the answer.
             # BACKSTOP: once the reasoning budget is spent, force the think-close token by masking this
@@ -5177,6 +5216,7 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
             gate_armed = self._think_gate.is_armed(req.uid)
             if gate_armed:
                 self._think_gate.commit_many(req.uid, keep)
+                self._tool_gate.commit_many(req.uid, keep)
             # DSpark confidence CALIBRATION (MINISGL_DSPARK_CONF_CAL=1). Position j is REACHED when
             # every position before it was accepted (j <= num_accepted) and ACCEPTED when
             # j < num_accepted. Comparing P(accept | reached) against the head's own prediction says
