@@ -166,6 +166,10 @@ x-lean-common: &lean-common
     # level-capable model (Qwen3.8, uncapped) is unfair unless this is raised. Third instance of
     # the five-hops trap: read by the engine, was never forwarded.
     MINISGL_THINK_BUDGET: "${MINISGL_THINK_BUDGET:-}"
+    # Tool-channel feed order (serve.sh sets the per-arm default; api_server._tool_match_gated).
+    # Forwarded so an A/B can override the arm's mode per launch (MINISGL_TOOL_MATCH=raw) the way
+    # every other knob is — serve.sh's ${VAR:-default} honours a value that reaches the container.
+    MINISGL_TOOL_MATCH: "${MINISGL_TOOL_MATCH:-}"
     # fp8-KV scale SIDECAR (tools/kv_fp8_calibrate.py output) — a path, not a feature gate. Unset =
     # resolve from the checkpoint's quantization_config.kv_cache_scheme, or warn + identity scale.
     MINISGL_KV_FP8_SCALES: "${MINISGL_KV_FP8_SCALES:-}"
