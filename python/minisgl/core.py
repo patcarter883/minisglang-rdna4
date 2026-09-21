@@ -92,6 +92,14 @@ class SamplingParams:
     # opens a tool call mid-think has finished thinking, so the budget stops counting and a held
     # grammar engages, exactly as if it had emitted the close delimiter.
     think_tool_release: List[str] = field(default_factory=list)
+    # TOOL-CALL EOS GUARD (`scheduler/think_gate.ToolCallGate`). Paired opener/closer delimiters for
+    # the tool-call wrapper this checkpoint emits, so the scheduler can refuse the turn-ending token
+    # while a call the model OPENED is still unclosed. Set whenever tools are offered, INDEPENDENT of
+    # whether thinking is on -- `think_tool_release` above carries the same openers but only when a
+    # reasoning delimiter was derived, and a non-reasoning model needs this guard just as much.
+    # Empty => no guard (no tools offered, or no closer known for the opener).
+    tool_call_openers: List[str] = field(default_factory=list)
+    tool_call_closers: List[str] = field(default_factory=list)
     think_close_suffix: str | None = None
     # Reasoning BUDGET (backstop for the gate above): a reasoning model often rambles in long/loose
     # prose and never emits a clean `</think>`, so the gate never opens and no JSON is produced. When

@@ -2475,6 +2475,16 @@ _TOOL_OPENERS = (
     "<tools>",
     "<function=",
 )
+def _tool_call_delims(req) -> tuple:
+    """(openers, closers) for the EOS guard — only pairs we know BOTH ends of, and only when tools
+    are actually offered (`tool_choice: "none"` withholds them, so the model should not be opening a
+    call at all). Returns ([], []) otherwise, which disarms the guard."""
+    if not getattr(req, "tools", None) or getattr(req, "tool_choice", None) == "none":
+        return [], []
+    pairs = [(o, _TOOL_CLOSERS[o]) for o in _TOOL_OPENERS if _TOOL_CLOSERS.get(o)]
+    return [o for o, _ in pairs], [c for _, c in pairs]
+
+
 _TOOL_CLOSERS = {
     "<|tool_call>": "<tool_call|>",  # Gemma-4: asymmetric, pipe-inside
     "<tool_call>": "</tool_call>",
@@ -3483,6 +3493,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # grammar-free rollout, not just the structured final answer.
                 think_close_delim=_reasoning_close_delim(req),
                 think_tool_release=list(_TOOL_OPENERS),
+                tool_call_openers=_tool_call_delims(req)[0],
+                tool_call_closers=_tool_call_delims(req)[1],
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
@@ -3630,6 +3642,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 # gates the schema until </think>); for plain thinking it's a pure backstop.
                 think_close_delim=_reasoning_close_delim(req),
                 think_tool_release=list(_TOOL_OPENERS),
+                tool_call_openers=_tool_call_delims(req)[0],
+                tool_call_closers=_tool_call_delims(req)[1],
                 think_answer_delim=_reasoning_answer_delim(req),
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
@@ -3915,6 +3929,8 @@ async def v1_text_completions(req: OpenAICompletionRequest, request: Request):
                 grammar_required=bool(_grammar_from_response_format(req.response_format)),
                 think_close_delim=_think_delim,
                 think_tool_release=list(_TOOL_OPENERS) if _think_delim else [],
+        tool_call_openers=_tool_call_delims(req)[0],
+        tool_call_closers=_tool_call_delims(req)[1],
                 think_answer_delim=_reasoning_answer_delim(req) if _think_delim else None,
                 think_close_prefix=(_reasoning_close_wildcard(req)[0] if _think_delim else None),
                 think_close_suffix=(_reasoning_close_wildcard(req)[1] if _think_delim else None),
