@@ -2093,18 +2093,86 @@ def _parse_pycall_args(argstr: str) -> dict:
         pass
     out = {}
     for m in _KV_FALLBACK_RE.finditer(argstr):
-        v = next((g for g in m.groups()[1:] if g is not None), "")
-        out[m.group(1)] = _coerce(v.strip())
+        # This format QUOTES its strings, so the source says the type and nothing has to be guessed:
+        # a quoted value is text and is kept verbatim (`a='true'` is the word, not a boolean), a bare
+        # one is a python/JSON literal. The previous `_coerce` over the merged groups could not tell
+        # them apart and re-typed quoted values by their content.
+        single, double, bare = m.group(2), m.group(3), m.group(4)
+        if single is not None or double is not None:
+            out[m.group(1)] = single if single is not None else double
+            continue
+        raw = (bare or "").strip()
+        try:
+            out[m.group(1)] = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            out[m.group(1)] = raw
     return out
 
 
-def _coerce(val: str):
-    """XML params arrive as strings; coerce JSON scalars/objects (numbers, bools, arrays), else keep
-    the raw string."""
-    try:
-        return json.loads(val)
-    except (json.JSONDecodeError, ValueError):
+def _pt(param_types, fname: str, pname: str) -> "str | None":
+    """Declared JSON type for one param, or None when the schema does not say."""
+    return ((param_types or {}).get(fname) or {}).get(pname)
+
+
+def _tool_param_types(tools) -> dict:
+    """{tool name: {param name: declared JSON type}} from the request's tool specs.
+
+    The XML/KV tool formats carry NO type information — a parameter's value is raw text between two
+    delimiters — so the only thing that can say whether `"true"` is a boolean or the four characters
+    a shell needs is the schema the caller already sent."""
+    out: dict = {}
+    for t in tools or ():
+        fn = (t or {}).get("function") or {}
+        name = fn.get("name")
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        if not name or not isinstance(props, dict):
+            continue
+        out[name] = {k: (v or {}).get("type") for k, v in props.items() if isinstance(v, dict)}
+    return out
+
+
+# Values a BAREWORD may safely become when the schema is silent. A quoted string and a bare number
+# are deliberately absent: see `_coerce`.
+_JSON_LITERALS = {"true": True, "false": False, "null": None}
+
+
+def _coerce(val: str, expected: "str | None" = None):
+    """Raw XML/KV parameter text -> the type the tool's schema declares.
+
+    WHY THIS TAKES A SCHEMA. These formats have no quoting convention: `<parameter=code>` contains
+    the code, verbatim, and `<arg_value>` contains the value. Running `json.loads` over that and
+    keeping whatever comes back guesses a type from the CONTENT, which silently rewrites any string
+    that happens to look like JSON:
+
+        {"command": "true"}   -> True      a shell command became a boolean
+        {"code": "123"}       -> 123       a one-line program became an int
+        {"query": "\"a b\""} -> 'a b'     the quotes the caller wanted were eaten
+        {"code": "[1, 2]"}    -> [1, 2]    a list literal became an actual list
+
+    Coercion is still REQUIRED for the non-string params these formats do carry (`limit: 6`,
+    `timeout_s: 120`, `local: false`), so the fix is to ask the schema rather than to stop coercing.
+
+    A declared `string` is returned verbatim, always. When the schema is silent — an unknown tool, an
+    undeclared param, or a caller that sent no `parameters` — fall back to a CONSERVATIVE guess:
+    objects, arrays and the three bare literals are unambiguous in a format whose strings are
+    unquoted, while a bare number or a quoted string is far likelier to be text the model meant
+    literally. That is a narrowing of the old behaviour and it only ever preserves a string."""
+    if expected == "string":
         return val
+    if expected in ("integer", "number", "boolean", "array", "object"):
+        try:
+            return json.loads(val)
+        except (json.JSONDecodeError, ValueError):
+            return val
+    stripped = val.strip()
+    if stripped in _JSON_LITERALS:
+        return _JSON_LITERALS[stripped]
+    if stripped[:1] in ("{", "["):
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return val
+    return val
 
 
 def _gemma_args_to_json(text: str) -> str:
@@ -2163,8 +2231,11 @@ def _parse_gemma_tool_call(inner: str) -> Tuple[str, dict] | None:
     return (head.group(1), args) if isinstance(args, dict) else None
 
 
-def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
-    """Parse one <tool_call> body (either format) -> (name, arguments_dict), or None."""
+def _parse_one_tool_call(inner: str, param_types: dict | None = None) -> Tuple[str, dict] | None:
+    """Parse one <tool_call> body (either format) -> (name, arguments_dict), or None.
+
+    `param_types` is {tool: {param: json type}} from the request; it is what lets a declared
+    string stay a string instead of being guessed at by `json.loads` (see `_coerce`)."""
     inner = inner.strip()
     # (E) Gemma-4 native `call:NAME{…}`. MUST be tried before (D): its body starts with neither `{`
     # nor `<`, so (D)'s bare-name branch would otherwise claim it and split on the first `<` — which
@@ -2188,12 +2259,15 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     if atem and atem.group(1).strip():
         return (
             atem.group(1).strip(),
-            {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(atem.group(2))},
+            {k.strip(): _coerce(v, _pt(param_types, atem.group(1).strip(), k.strip()))
+             for k, v in _ATEM_PARAM_RE.findall(atem.group(2))},
         )
     fn = _XML_FN_RE.search(inner)  # (B) Qwen3 XML: <function=NAME>…<parameter=…>…</function>
     if fn:
-        args = {k.strip(): _coerce(v.strip()) for k, v in _XML_PARAM_RE.findall(fn.group(2))}
-        return fn.group(1).strip(), args
+        _fname = fn.group(1).strip()
+        args = {k.strip(): _coerce(v.strip(), _pt(param_types, _fname, k.strip()))
+                for k, v in _XML_PARAM_RE.findall(fn.group(2))}
+        return _fname, args
     inl = _INLINE_FN_RE.search(inner)  # (C) ZAYA deviation: inline <function=NAME(a='x', b=1)>
     if inl:
         return inl.group(1).strip(), _parse_pycall_args(inl.group(2))
@@ -2209,7 +2283,8 @@ def _parse_one_tool_call(inner: str) -> Tuple[str, dict] | None:
     if inner and not inner.startswith(("{", "<")):
         name = inner.split("<", 1)[0].strip()
         if name and _TOOL_NAME_RE.fullmatch(name):
-            args = {k.strip(): _coerce(v.strip()) for k, v in _ARG_KV_RE.findall(inner)}
+            args = {k.strip(): _coerce(v.strip(), _pt(param_types, name, k.strip()))
+                    for k, v in _ARG_KV_RE.findall(inner)}
             return name, args
     return None
 
@@ -2274,14 +2349,15 @@ def _tool_name_allowed(name: str, allowed: "frozenset[str] | None") -> bool:
 
 
 def _parse_tool_calls(text: str, uid: int,
-                      allowed: "frozenset[str] | None" = None) -> Tuple[str | None, List[dict]]:
+                      allowed: "frozenset[str] | None" = None,
+                      param_types: dict | None = None) -> Tuple[str | None, List[dict]]:
     """Extract tool calls from a completion. Returns (content, tool_calls): `content` is the text with
     the <tool_call> blocks stripped (None if nothing but calls remain), `tool_calls` is the
     OpenAI-shaped list ([] when the model didn't call a tool)."""
     tool_calls: List[dict] = []
 
     def _add(inner: str) -> None:
-        parsed = _parse_one_tool_call(inner)
+        parsed = _parse_one_tool_call(inner, param_types)
         if parsed is None:
             return  # malformed block -> ignore, leave it in the text
         name, args = parsed
@@ -2310,7 +2386,8 @@ def _parse_tool_calls(text: str, uid: int,
         # Values are NOT stripped: the format's own instructions state that spaces in string values
         # are significant. `_coerce` still lifts JSON/number/bool forms, and it tolerates the
         # surrounding whitespace a multi-line value carries.
-        args = {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
+        args = {k.strip(): _coerce(v, _pt(param_types, m.group(1).strip(), k.strip()))
+                for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
         tool_calls.append(
             {
                 "id": f"call_{uid}_{len(tool_calls)}",
@@ -2347,7 +2424,8 @@ def _parse_tool_calls(text: str, uid: int,
                 name = m.group(1).strip()
                 if not name:
                     continue
-                args = {k.strip(): _coerce(v) for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
+                args = {k.strip(): _coerce(v, _pt(param_types, m.group(1).strip(), k.strip()))
+                for k, v in _ATEM_PARAM_RE.findall(m.group(2))}
                 tool_calls.append(
                     {
                         "id": f"call_{uid}_{len(tool_calls)}",
@@ -3435,7 +3513,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
             # Forced tool call: grammar constrained `body` to a complete call. zaya_xml -> native XML
             # (<function=…><parameter=…>), parsed by the wrapper parser; else JSON {"name","arguments"}.
             if '"__ebnf__"' in forced_tool_grammar:
-                _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools))
+                _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools),
+                                                   _tool_param_types(req.tools))
                 if tool_calls:
                     message["content"] = _tc_content
                     message["tool_calls"] = tool_calls
@@ -3448,7 +3527,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                     finish_reason = "tool_calls"
         elif req.tools and req.tool_choice != "none":
             # auto: the model chose; if it opened a wrapper its args were structural-tag-constrained.
-            _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools))
+            _tc_content, tool_calls = _parse_tool_calls(body, state.uid_counter, _known_tool_names(req.tools),
+                                                   _tool_param_types(req.tools))
             if tool_calls:
                 message["content"] = _tc_content
                 message["tool_calls"] = tool_calls
@@ -3644,7 +3724,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     if _pl_forced_tool_grammar is not None:
         # Forced tool call: zaya_xml -> native XML (wrapper parser); else JSON {"name","arguments"}.
         if '"__ebnf__"' in _pl_forced_tool_grammar:
-            _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools))
+            _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools),
+                                _tool_param_types(req.tools))
             if _tc:
                 tool_calls, remainder = _tc, (_c or "")
         else:
@@ -3668,7 +3749,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # Parsed even when finish_reason == "length": skipping truncated output guaranteed that any
         # markup already emitted leaked into `content` as prose. `_parse_tool_calls` recovers complete
         # blocks and logs the genuinely-truncated ones, so attempting it is strictly better than not.
-        _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools))
+        _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools),
+                                _tool_param_types(req.tools))
         if _tc:
             tool_calls, remainder = _tc, (_c or "")
 
