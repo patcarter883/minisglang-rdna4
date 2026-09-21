@@ -100,6 +100,21 @@ class SamplingParams:
     # Empty => no guard (no tools offered, or no closer known for the opener).
     tool_call_openers: List[str] = field(default_factory=list)
     tool_call_closers: List[str] = field(default_factory=list)
+    # THINK-GATED TOOL MATCHING (api_server `_tool_match_gated`, MINISGL_TOOL_MATCH=think-gated).
+    # True => the tool-call channel is parsed only from POST-REASONING-SPAN content: the frontend
+    # feeds the tool matcher from the reasoning split's content lane (never raw), the mid-flight
+    # runaway scan and the non-streaming final parse follow the same order, and the scheduler-side
+    # ToolCallGate is armed with the span's close patterns so openers committed INSIDE the span
+    # never latch or suppress EOS. For a template whose calls sit strictly after the span
+    # (Qwen3.8-Flash-Next: the generation prompt opens the span and the system prompt embeds the
+    # call-format example, so a degenerating model mimics it mid-think) this is the checkpoint's
+    # own contract. The raw default stays for Laguna-shaped models, whose template never closes
+    # the span before a call.
+    tool_match_gated: bool = False
+    # Whether the rendered generation prompt leaves the model INSIDE its reasoning span (the
+    # frontend's `_thinking_open`). The gated ToolCallGate arms its think-release tracking only
+    # for a request that STARTS in the span.
+    think_span_open: bool = False
     think_close_suffix: str | None = None
     # Reasoning BUDGET (backstop for the gate above): a reasoning model often rambles in long/loose
     # prose and never emits a clean `</think>`, so the gate never opens and no JSON is produced. When

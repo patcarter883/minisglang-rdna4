@@ -717,6 +717,15 @@ case "$MODEL" in
                   # running), inflight 9. That is the whole difference between the win above and no
                   # win at all. Exported here rather than left to the caller for that reason.
                   export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-512}"
+                  # THINK-GATED TOOL MATCHING for this arm: q4e's own chat template puts tool calls
+                  # strictly AFTER the reasoning span (its generation prompt opens the span and its
+                  # system prompt embeds the call-format example), so raw-first matching latching a
+                  # MID-SPAN opener is a defect, not a rescue — session ebbc1dd0903b degenerated
+                  # mid-think, the raw matcher latched the noise opener, and the client saw NOTHING
+                  # for 11 minutes while the EOS guard held the turn open (see api_server
+                  # _tool_match_gated). Laguna-shaped arms stay raw: their templates never close
+                  # the span before a call.
+                  export MINISGL_TOOL_MATCH="${MINISGL_TOOL_MATCH:-think-gated}"
                   # LOW_WATER=25 AND THE DEFAULT IS WRONG AT THIS CACHE SIZE. expert_cache.py:217
                   # computes `max(8, slots // 200)`, and 2.5 GiB gives 1923 slots -> 9. The sweep
                   # recorded in that file's own `_admit_ok` docstring measured 25 as the optimum

@@ -249,7 +249,9 @@ class ReasoningParser:
         so the failure would be a full chain-of-thought served as the answer."""
         return bool(self.start_token) and text.lstrip().startswith(self.start_token.lstrip())
 
-    def parse(self, text: str, thinking_open: bool = False) -> Tuple[Optional[str], str]:
+    def parse(
+        self, text: str, thinking_open: bool = False, tool_openers: tuple | None = None
+    ) -> Tuple[Optional[str], str]:
         """Split ``text`` into ``(reasoning_content, content)``.
 
         When the closing tag is present: reasoning is everything before it (a leading opening tag,
@@ -281,8 +283,15 @@ class ReasoningParser:
             pre = text
             if self.start_token and self.start_token in pre:
                 pre = pre.split(self.start_token, 1)[-1]
+            # `tool_openers` override (None => the parser's own): think-gated tool matching
+            # (MINISGL_TOOL_MATCH=think-gated) passes () so a mid-span opener stays inert — see
+            # stream_state() for the full rationale. Reference engines treat the opener as an
+            # implicit span end (vLLM/SGLang), but that rule serves templates that never close the
+            # span before a call; on one that does (q4e), a mid-span opener is register noise and
+            # releasing on it ends the span at a noise token.
+            t_openers = self.tool_openers if tool_openers is None else tuple(tool_openers)
             t_idx = -1
-            for tok in self.tool_openers:
+            for tok in t_openers:
                 j = pre.find(tok)
                 if j != -1 and (t_idx == -1 or j < t_idx):
                     t_idx = j
@@ -314,10 +323,21 @@ class ReasoningParser:
             content = content.rstrip()
         return (reasoning or None), content
 
-    def stream_state(self, active: bool) -> "ReasoningStreamState":
+    def stream_state(self, active: bool, tool_openers: tuple | None = None) -> "ReasoningStreamState":
+        # `tool_openers` override (None => the parser's own): think-gated tool matching
+        # (MINISGL_TOOL_MATCH=think-gated) passes () so a tool-call opener emitted INSIDE the
+        # reasoning span stays inert there instead of ending the span and routing the "call" into
+        # content. The default release rule exists for checkpoints that open a call WITHOUT
+        # closing the span (Laguna; both reference engines encode it for the Qwen3 family) — but on
+        # a template whose generation prompt opens the span and whose calls sit strictly after the
+        # closer (Qwen3.8-Flash-Next; the system prompt even embeds the call-format example, so a
+        # degenerating model mimics it mid-think), releasing on a mid-span opener ends the span at
+        # a noise token and feeds the tool matcher a call that does not exist — which then holds
+        # every later token from the client (session ebbc1dd0903b: 11 minutes, zero streamed).
         return ReasoningStreamState(
             self.start_token, self.end_token, active, self.turn_header,
-            self.end_prefix, self.end_suffix, tool_openers=self.tool_openers,
+            self.end_prefix, self.end_suffix,
+            tool_openers=self.tool_openers if tool_openers is None else tuple(tool_openers),
         )
 
 

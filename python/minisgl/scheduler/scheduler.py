@@ -2229,7 +2229,21 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         c_ids = [i for i in (self._resolve_delim_ids(c) for c in closers) if i]
         if not o_ids or not c_ids:
             return
-        self._tool_gate.arm(req.uid, openers=o_ids, closers=c_ids, eos_ids=self.eos_token_ids)
+        # THINK-GATED (SamplingParams.tool_match_gated): a request whose template starts it INSIDE
+        # the reasoning span suspends opener matching until the span closes — on a checkpoint whose
+        # calls sit strictly after the span (q4e), a mid-span opener is template-register noise,
+        # and arming the EOS guard on it is what let the ebbc1dd0903b think-loop hold EOS for 15
+        # minutes. The answer-turn header releases too (a model that answered directly has no
+        # span), mirroring ThinkGate's release set.
+        think_ids: list = []
+        if bool(getattr(sp, "tool_match_gated", False)) and getattr(sp, "think_span_open", False):
+            for d in (getattr(sp, "think_close_delim", None), getattr(sp, "think_answer_delim", None)):
+                if d:
+                    i = self._resolve_delim_ids(d)
+                    if i:
+                        think_ids.append(i)
+        self._tool_gate.arm(req.uid, openers=o_ids, closers=c_ids, eos_ids=self.eos_token_ids,
+                            think_closers=think_ids)
 
     def _maybe_arm_think_gate(self, req: Req) -> None:
         """Arm the reasoning (β) gate for ANY thinking request that declared a think-close delimiter.

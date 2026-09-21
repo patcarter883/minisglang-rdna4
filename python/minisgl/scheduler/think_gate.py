@@ -113,6 +113,11 @@ class _ToolCallState:
     inside: bool = False
     count: int = 0                 # tokens committed since the block opened
     window: List[int] = field(default_factory=list)
+    # THINK-GATED (arm(..., think_closers=...)): opener matching is SUSPENDED from arm until one
+    # of the think-close patterns commits. Set only for a request the template starts INSIDE its
+    # reasoning span; the patterns are the span's close (and answer-header) delimiters.
+    think_closers: Tuple[Pattern, ...] = ()
+    in_think: bool = False
 
 
 class ToolCallGate:
@@ -145,26 +150,39 @@ class ToolCallGate:
         self._budget = int(budget)
         self._st: Dict[object, _ToolCallState] = {}
 
-    def arm(self, uid, *, openers: Iterable, closers: Iterable, eos_ids: Iterable[int] = ()) -> bool:
+    def arm(self, uid, *, openers: Iterable, closers: Iterable, eos_ids: Iterable[int] = (),
+            think_closers: Iterable = ()) -> bool:
         """Arm for one request. No-op (False) when disabled, already armed, or given no usable
-        opener/closer pair."""
+        opener/closer pair.
+
+        ``think_closers`` (THINK-GATED mode, SamplingParams.tool_match_gated) suspends opener
+        matching until one of these patterns commits: the request's template starts the model
+        INSIDE its reasoning span, and on such a checkpoint a tool opener emitted before the
+        span's closer is template-register noise, not a call — the degenerating turn of session
+        ebbc1dd0903b emitted one mid-think, the gate armed on it, and EOS stayed suppressed
+        while the model looped for 15 minutes. Pass the span's close delimiter (and the
+        answer-turn header, which also ends the span) resolved to token sequences; an empty
+        iterable keeps the ungated behaviour.
+        """
         if not self._enabled or uid in self._st:
             return False
         opats = tuple(q for q in (_as_pattern(o) for o in openers) if q is not None)
         cpats = tuple(q for q in (_as_pattern(c) for c in closers) if q is not None)
         if not opats or not cpats:
             return False
+        tpats = tuple(q for q in (_as_pattern(t) for t in think_closers) if q is not None)
         # An EOS id that is itself PART of a delimiter cannot be suppressed: masking it would stop the
         # model ever emitting the closer, turning the guard into the hang it is meant to avoid. Mirrors
         # ThinkGate.may_suppress_eos.
         delim_tokens: Set[int] = set()
-        for q in opats + cpats:
+        for q in opats + cpats + tpats:
             delim_tokens |= _pattern_tokens(q)
         may = not (set(int(e) for e in eos_ids) & delim_tokens)
         self._st[uid] = _ToolCallState(
             openers=opats, closers=cpats,
-            width=max(_pattern_width(q) for q in opats + cpats),
+            width=max(_pattern_width(q) for q in opats + cpats + tpats),
             budget=self._budget, may_suppress_eos=may,
+            think_closers=tpats, in_think=bool(tpats),
         )
         return True
 
@@ -176,6 +194,14 @@ class ToolCallGate:
             return
         st.window.append(int(token))
         del st.window[: max(0, len(st.window) - st.width)]
+        if st.in_think:
+            # THINK-GATED: openers committed inside the reasoning span are inert. Only a
+            # think-close (or answer-header) pattern commits here ends the suspension — the
+            # caller armed with the span's own delimiters, so a genuine post-span opener still
+            # latches on the very next token.
+            if any(ThinkGate._matches(st.window, q) for q in st.think_closers):
+                st.in_think = False
+            return
         if st.inside:
             st.count += 1
             if any(ThinkGate._matches(st.window, q) for q in st.closers):

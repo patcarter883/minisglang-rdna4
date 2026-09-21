@@ -1328,6 +1328,28 @@ def _resolve_penalties(req: "OpenAICompletionRequest | GenerateRequest") -> tupl
     return presence, frequency
 
 
+def _tool_match_gated() -> bool:
+    """MINISGL_TOOL_MATCH=think-gated — the tool-call channel runs AFTER the reasoning split.
+
+    The default (`raw`) keeps the historical order: tool-call blocks are detected on the RAW
+    stream before any reasoning split, which exists for Laguna-shaped checkpoints that emit a
+    call WITHOUT ever closing their reasoning span — reasoning-first would trap the whole block
+    inside reasoning_content. But on a checkpoint whose template puts calls strictly AFTER the
+    span (Qwen3.8-Flash-Next: the generation prompt opens the span and the system prompt embeds
+    the call-format example, so a degenerating model mimics it mid-think), raw-first has a
+    measured failure: the model emitted an opener mid-think, the stream state latched it, and
+    (a) every token after it was held from the client — session ebbc1dd0903b streamed NOTHING
+    for 11 minutes while the engine warned "8,194 chars buffered inside an unclosed block" —
+    and (b) the EOS guard armed on a call that does not exist, holding the turn open while the
+    model looped. Gated mode parses the tool channel only from post-span content, keeps mid-span
+    openers inert in reasoning_content (the client keeps seeing the stream), and arms the
+    scheduler-side gate with the span's close patterns so in-span openers never suppress EOS.
+    The RSA lane is deliberately NOT gated: Markovian-RSA is ZAYA-only and ZAYA is
+    Laguna-shaped — raw is the correct mode there.
+    Per-arm in serve.sh; the default changes no arm's behaviour."""
+    return os.environ.get("MINISGL_TOOL_MATCH", "raw") == "think-gated"
+
+
 def _strip_replayed_think_spans(messages: List[dict]) -> None:
     """Remove BALANCED reasoning spans from HISTORICAL assistant `content`, in place.
 
@@ -3040,11 +3062,17 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_chat_completions(
-        self, uid: int, reasoning_stream=None, tool_stream=None, include_usage: bool = False
+        self, uid: int, reasoning_stream=None, tool_stream=None, include_usage: bool = False,
+        gated: bool = False
     ):
         first_chunk = True
         prompt_tokens = completion_tokens = 0
         finish_reason = "stop"
+        # THINK-GATED (MINISGL_TOOL_MATCH=think-gated): the caller computed the mode with the
+        # streams; here it just selects the feed order below (reasoning split first, tool matcher
+        # on its content lane) instead of the raw-first default.
+        _gated = bool(gated) and reasoning_stream is not None
+        _rs = reasoning_stream if _gated else None
         # Content actually delivered to the client, summed over every delta. The streaming lane has
         # no assembled body to test at the end, so the empty-content guard on the terminal chunk
         # (mirroring the non-stream one) needs this running total. Counts `content` only —
@@ -3087,25 +3115,41 @@ class FrontendManager:
                 first_chunk = False
             tool_deltas: List[dict] = []
             if ack.incremental_output:
-                # Tool calls are their OWN channel — detect them on the RAW stream FIRST (before the
-                # reasoning split), so a <tool_call> the model emits (Laguna emits them WITHOUT ever
-                # closing </think>, so the reasoning splitter would otherwise trap the whole block in
-                # reasoning_content) is pulled out as delta.tool_calls. The non-tool remainder then
-                # goes through the reasoning split (pre-</think> scratch -> reasoning_content, answer
-                # -> content). Buffers a partial opener across chunks.
-                if tool_stream is not None:
-                    nontool, tool_deltas = tool_stream.push(ack.incremental_output)
+                if _rs is not None:
+                    # THINK-GATED feed order: the reasoning split runs FIRST and the tool matcher
+                    # sees only its CONTENT lane, so an opener emitted INSIDE the span never
+                    # latches and nothing is ever held from the client while the span is open.
+                    # The raw-first order below exists for Laguna-shaped checkpoints that emit a
+                    # call WITHOUT closing the span; on a template whose calls sit strictly after
+                    # the span it armed on mid-span register noise — session ebbc1dd0903b then
+                    # streamed NOTHING for 11 minutes while the engine looped at 18 tok/s.
+                    r_delta, c_delta = _rs.push(ack.incremental_output)
+                    if c_delta and tool_stream is not None:
+                        c_delta, tool_deltas = tool_stream.push(c_delta)
+                    if r_delta:
+                        delta["reasoning_content"] = r_delta
+                    if c_delta:
+                        delta["content"] = c_delta
                 else:
-                    nontool = ack.incremental_output
-                if nontool:
-                    if reasoning_stream is not None:
-                        r_delta, c_delta = reasoning_stream.push(nontool)
-                        if r_delta:
-                            delta["reasoning_content"] = r_delta
-                        if c_delta:
-                            delta["content"] = c_delta
+                    # Tool calls are their OWN channel — detect them on the RAW stream FIRST (before the
+                    # reasoning split), so a <tool_call> the model emits (Laguna emits them WITHOUT ever
+                    # closing </think>, so the reasoning splitter would otherwise trap the whole block in
+                    # reasoning_content) is pulled out as delta.tool_calls. The non-tool remainder then
+                    # goes through the reasoning split (pre-</think> scratch -> reasoning_content, answer
+                    # -> content). Buffers a partial opener across chunks.
+                    if tool_stream is not None:
+                        nontool, tool_deltas = tool_stream.push(ack.incremental_output)
                     else:
-                        delta["content"] = nontool
+                        nontool = ack.incremental_output
+                    if nontool:
+                        if reasoning_stream is not None:
+                            r_delta, c_delta = reasoning_stream.push(nontool)
+                            if r_delta:
+                                delta["reasoning_content"] = r_delta
+                            if c_delta:
+                                delta["content"] = c_delta
+                        else:
+                            delta["content"] = nontool
             completion_tokens = max(completion_tokens, ack.completion_tokens)
             prompt_tokens = ack.prompt_tokens or prompt_tokens
             if ack.finish_reason:
@@ -3167,35 +3211,65 @@ class FrontendManager:
         # Tool tail FIRST (it fed off the RAW stream): emit any final tool fragment, then a buffered
         # partial-opener that turned out to be literal text still flows through the reasoning split.
         nontool_tail = None
-        if tool_stream is not None:
-            nontool_tail, t_tail = tool_stream.flush()
-            for td in t_tail:
-                yield _chunk({"tool_calls": [td]})
-            if tool_stream.emitted and finish_reason != "length":
-                finish_reason = "tool_calls"
-            elif tool_stream.unparsed_tail:
-                # A tool call was cut off mid-emission and its markup is going out as content. Saying
-                # "stop" would assert the model finished normally, so the client renders raw
-                # `<tool_call>{…` to the user and ends the turn. "length" is the truthful signal and
-                # is what makes an agent harness treat this as a partial turn to continue or retry.
-                finish_reason = "length"
-        if reasoning_stream is not None:
-            if nontool_tail:
-                r2, c2 = reasoning_stream.push(nontool_tail)
-                if r2:
-                    final_delta["reasoning_content"] = r2
-                if c2:
-                    final_delta["content"] = c2
-            # flush() returns BOTH tails: buffered reasoning (a partial close tag) and buffered
-            # content (a head held back while it might have been a model-side opener). Dropping the
-            # content one would silently truncate a reply shorter than the opening delimiter.
-            r_tail, c_tail = reasoning_stream.flush()
+        if _rs is not None:
+            # THINK-GATED tail: the reasoning split is UPSTREAM in this mode, so it flushes first;
+            # its content lane then feeds the tool matcher, and only then does the matcher flush
+            # what it still holds. A tail the matcher returns is POST-SPAN text by construction —
+            # it must not round-trip through the reasoning split.
+            r_tail, c_tail = _rs.flush()
             if r_tail:
-                final_delta["reasoning_content"] = final_delta.get("reasoning_content", "") + r_tail
-            if c_tail:
-                final_delta["content"] = final_delta.get("content", "") + c_tail
-        elif nontool_tail:
-            final_delta["content"] = nontool_tail
+                final_delta["reasoning_content"] = r_tail
+            if tool_stream is not None:
+                c_tool = c_tail
+                if c_tool:
+                    c_tool, t_mids = tool_stream.push(c_tool)
+                    for td in t_mids:
+                        yield _chunk({"tool_calls": [td]})
+                hold, t_tail = tool_stream.flush()
+                for td in t_tail:
+                    yield _chunk({"tool_calls": [td]})
+                if hold:
+                    c_tool = (c_tool or "") + hold
+                if c_tool:
+                    final_delta["content"] = c_tool
+                if tool_stream.emitted and finish_reason != "length":
+                    finish_reason = "tool_calls"
+                elif tool_stream.unparsed_tail:
+                    # Same contract as the raw branch below: markup surfacing as content means the
+                    # turn did not complete, and "length" is the truthful finish_reason.
+                    finish_reason = "length"
+            elif c_tail:
+                final_delta["content"] = c_tail
+        else:
+            if tool_stream is not None:
+                nontool_tail, t_tail = tool_stream.flush()
+                for td in t_tail:
+                    yield _chunk({"tool_calls": [td]})
+                if tool_stream.emitted and finish_reason != "length":
+                    finish_reason = "tool_calls"
+                elif tool_stream.unparsed_tail:
+                    # A tool call was cut off mid-emission and its markup is going out as content. Saying
+                    # "stop" would assert the model finished normally, so the client renders raw
+                    # wrapper markup to the user and ends the turn. "length" is the truthful signal and
+                    # is what makes an agent harness treat this as a partial turn to continue or retry.
+                    finish_reason = "length"
+            if reasoning_stream is not None:
+                if nontool_tail:
+                    r2, c2 = reasoning_stream.push(nontool_tail)
+                    if r2:
+                        final_delta["reasoning_content"] = r2
+                    if c2:
+                        final_delta["content"] = c2
+                # flush() returns BOTH tails: buffered reasoning (a partial close tag) and buffered
+                # content (a head held back while it might have been a model-side opener). Dropping the
+                # content one would silently truncate a reply shorter than the opening delimiter.
+                r_tail, c_tail = reasoning_stream.flush()
+                if r_tail:
+                    final_delta["reasoning_content"] = final_delta.get("reasoning_content", "") + r_tail
+                if c_tail:
+                    final_delta["content"] = final_delta.get("content", "") + c_tail
+            elif nontool_tail:
+                final_delta["content"] = nontool_tail
         # Streaming twin of the non-stream empty-content guard (see v1_chat_completions). The tail
         # deltas assembled just above have not gone through `_chunk`, so add them before testing.
         if final_delta.get("content"):
@@ -3648,17 +3722,24 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
                 think_close_prefix=_reasoning_close_wildcard(req)[0],
                 think_close_suffix=_reasoning_close_wildcard(req)[1],
                 think_budget=_resolve_think_budget(req, state.config.model_path),
+                tool_match_gated=_tool_match_gated(),
+                think_span_open=_thinking_open(req),
             ),
         )
     )
 
     if req.stream:
         parser = _reasoning_parser()
+        # THINK-GATED: the tool channel runs after the reasoning split, so the stream state must
+        # NOT release the span on a tool opener — a mid-span opener stays inert in reasoning.
+        _gated = _tool_match_gated()
         # `active` is the DERIVED span state, not a default: it says whether the model starts inside
         # a reasoning span. A closed start is not "no splitting" — the splitter still watches for the
         # model opening its own span and still splits on a close delimiter it meets mid-stream.
         reasoning_stream = (
-            parser.stream_state(active=_thinking_open(req)) if parser is not None else None
+            parser.stream_state(active=_thinking_open(req),
+                                tool_openers=() if _gated else None)
+            if parser is not None else None
         )
         # Stateful tool-call parser: only when tools are actually offered to the model (mirrors the
         # non-streaming path's `if req.tools`). `tool_choice:"none"` withholds the tools from the
@@ -3668,7 +3749,8 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         include_usage = bool((req.stream_options or {}).get("include_usage"))
         return StreamingResponse(
             state.stream_with_cancellation(
-                state.stream_chat_completions(uid, reasoning_stream, tool_stream, include_usage),
+                state.stream_chat_completions(uid, reasoning_stream, tool_stream, include_usage,
+                                               gated=_gated),
                 request, uid,
             ),
             media_type="text/event-stream",
@@ -3689,6 +3771,14 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     _rw_limit = env_int("MINISGL_TOOLCALL_RUNAWAY_LIMIT", 65536)
     _rw_scan = (ToolCallStreamState(uid) if _rw_limit > 0 and req.tools
                 and req.tool_choice != "none" else None)
+    # THINK-GATED runaway scan: mirror the streaming lane's feed order, so an opener emitted
+    # INSIDE the reasoning span cannot arm the mid-flight killer either — only post-span content
+    # reaches the scanner.
+    _rw_rs = None
+    if _rw_scan is not None and _tool_match_gated():
+        _rp = _reasoning_parser()
+        if _rp is not None:
+            _rw_rs = _rp.stream_state(active=_thinking_open(req), tool_openers=())
     _acks = state.acks_with_cancellation(uid, request)
     async for ack in _acks:
         if getattr(ack, "error", None):
@@ -3702,7 +3792,11 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         if ack.finished:
             break
         if _rw_scan is not None and ack.incremental_output:
-            _rw_scan.push(ack.incremental_output)
+            _rw_text = ack.incremental_output
+            if _rw_rs is not None:
+                _r, _rw_text = _rw_rs.push(_rw_text)
+            if _rw_text:
+                _rw_scan.push(_rw_text)
             if _rw_scan.held_chars > _rw_limit:
                 logger.warning(
                     "uid=%s force-finished: unclosed %s tool-call block reached %d chars "
@@ -3732,6 +3826,13 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # calls out of the raw text, THEN reasoning-split only the non-tool remainder.
     tool_calls: List[dict] | None = None
     remainder = full_content
+    # THINK-GATED (non-streaming): the tool channel is parsed from POST-SPAN content only, so the
+    # reasoning split must run FIRST here (the reverse of the raw order below). The parser is
+    # hoisted because the gated branch needs it before the raw comment's split site.
+    parser = _reasoning_parser()
+    _gated_ns = parser if (_tool_match_gated() and parser is not None and bool(req.tools)) else None
+    gated_reasoning: str | None = None
+    gated_split = False
     # Set only when a forced bare-JSON call was recovered from AFTER a think block: the reasoning was
     # split off here, so it has to be carried across or it would be dropped with the remainder.
     reasoning_prefix: str | None = None
@@ -3763,10 +3864,25 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
         # Parsed even when finish_reason == "length": skipping truncated output guaranteed that any
         # markup already emitted leaked into `content` as prose. `_parse_tool_calls` recovers complete
         # blocks and logs the genuinely-truncated ones, so attempting it is strictly better than not.
-        _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools),
-                                _tool_param_types(req.tools))
-        if _tc:
-            tool_calls, remainder = _tc, (_c or "")
+        if _gated_ns is not None:
+            # THINK-GATED: the reasoning split runs FIRST (tool_openers=(), so a mid-span opener
+            # stays inert), and calls are parsed from the POST-SPAN body only. A span that never
+            # closed has no body and hence no calls — the honest result for a template whose calls
+            # sit strictly after the span.
+            _rc, _body = _gated_ns.parse(full_content, thinking_open=_thinking_open(req),
+                                      tool_openers=())
+            _c, _tc = _parse_tool_calls(_body, uid, _known_tool_names(req.tools),
+                                        _tool_param_types(req.tools))
+            gated_reasoning, gated_split = _rc, True
+            if _tc:
+                tool_calls, remainder = _tc, (_c or "")
+            else:
+                remainder = _body
+        else:
+            _c, _tc = _parse_tool_calls(full_content, uid, _known_tool_names(req.tools),
+                                    _tool_param_types(req.tools))
+            if _tc:
+                tool_calls, remainder = _tc, (_c or "")
 
     # Reasoning: split the model's scratch reasoning out of the (tool-stripped) remainder into a
     # separate reasoning_content field, on THIS checkpoint's delimiters (derived from its chat
@@ -3776,8 +3892,13 @@ async def v1_chat_completions(req: OpenAICompletionRequest, request: Request):
     # contains the closing delimiter is split whatever the request asked for.
     reasoning_content: str | None = None
     body = remainder
-    parser = _reasoning_parser()
-    if parser is not None:
+    if gated_split:
+        # THINK-GATED: the split already ran above; re-splitting the post-span remainder with
+        # thinking_open=True would misclassify the whole answer as reasoning. `None` reasoning
+        # with a non-empty body is a legitimate gated outcome (span closed, no scratch text),
+        # which is why the flag — not the reasoning string — gates this branch.
+        reasoning_content, body = gated_reasoning, remainder
+    elif parser is not None:
         reasoning_content, body = parser.parse(remainder, thinking_open=_thinking_open(req))
     if reasoning_prefix is not None:
         reasoning_content = reasoning_prefix if not reasoning_content else reasoning_prefix + reasoning_content
