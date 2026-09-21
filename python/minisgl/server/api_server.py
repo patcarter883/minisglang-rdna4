@@ -1582,7 +1582,55 @@ def _resolve_chat_template_kwargs(req: "OpenAICompletionRequest",
                 level = _clamp_level(level, _template_level_values(model_path, level_key))
             if level:
                 kwargs[level_key] = level
+        # DEFAULT `preserve_thinking` OFF where the template reads it.
+        #
+        # The template's own default carries EVERY prior turn's raw reasoning trace forward. Qwen
+        # document that as preferable for agent work ("decision consistency"), and for a healthy
+        # conversation it may well be — but on this checkpoint a trace that has started to spiral is
+        # then re-read on every subsequent turn, and the spiral is what gets reinforced. MEASURED
+        # 2026-09-21, replaying a conversation that had already degenerated, 3 runs per arm:
+        #
+        #     baseline                  1/3 produced a tool call, 2/3 ran into the token cap
+        #     min_p=0.05 temperature .6 1/3                       1/3
+        #     preserve_thinking=False   3/3                       0/3
+        #
+        # It is not free: the ACTIVE tool loop keeps its reasoning either way (the template only
+        # strips turns before the last user message), but each NEW user turn rewrites the prefix —
+        # measured 34.6% reuse against 100% — so it costs one re-prefill per user turn, of a history
+        # roughly half the size.
+        #
+        # An explicit `chat_template_kwargs: {"preserve_thinking": …}` from the client still wins, and
+        # MINISGL_PRESERVE_THINKING=1 restores the template default serve-wide.
+        if (_template_reads_preserve_thinking(model_path)
+                and "preserve_thinking" not in kwargs
+                and os.environ.get("MINISGL_PRESERVE_THINKING") != "1"):
+            kwargs["preserve_thinking"] = False
     return kwargs or None
+
+
+@functools.cache
+def _template_reads_preserve_thinking(model_path: str) -> bool:
+    """Does this template's render CHANGE when `preserve_thinking=False` is passed?
+
+    Derived, never a model-name branch: the template is the fact. MEASURED across the checkpoints on
+    this box — Qwen3.8-Flash-Next and Qwen3.8-27B read it; Qwen3.6 (35B and 27B) and GLM-4.7-Flash
+    ignore the kwarg entirely and cannot be affected by the default below."""
+    probe = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a", "reasoning_content": "prior reasoning"},
+        {"role": "user", "content": "u2"},
+    ]
+    tok = _frontend_tokenizer()
+    if tok is None:
+        return False
+    try:
+        on = tok.apply_chat_template(probe, tokenize=False, add_generation_prompt=True)
+        off = tok.apply_chat_template(probe, tokenize=False, add_generation_prompt=True,
+                                      preserve_thinking=False)
+    except Exception as e:  # noqa: BLE001 — a template that rejects the probe simply does not read it
+        logger.debug("preserve_thinking probe failed: %s", e)
+        return False
+    return isinstance(on, str) and isinstance(off, str) and on != off
 
 
 @functools.cache
