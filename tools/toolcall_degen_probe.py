@@ -39,6 +39,14 @@ detector is only useful where the q4e column stands clear of the controls:
     30935df66949): 6/6 caught, ZERO other firings in 76 turns.
   * think_zero is secondary — elevated (9.2% vs 0.5-3.1%) but it co-occurs with junk_args rather
     than adding independent signal.
+  * id_noise (added 2026-09-21) — well-formed args carrying CONFABULATED identifier noise: invented
+    UUIDs, 40/64-hex strings, `shorthex::` prefixes, or shell syntax in a `path`/`pattern` value.
+    Observed once in production (session 268e9ff30b69, q4e NVFP4 at temp 0.8: ~2-3 of 19 calls; the
+    cloud full-precision model ran 250 calls with zero). junk_args is blind to it — these payloads
+    carry apparent work, not placeholders. At temp 0 the same decision point produced 0/10
+    (greedy never confabulates), so this signature tracks sampling-flipped arg assembly on
+    quantization-narrowed margins, not floor-level collapse. Calibration pending: replay it
+    through toolcall_degen_replay_validate before trusting its rates (see that script).
   * think_collapse is DIAGNOSTIC ONLY, NOT A DEFECT COUNT. It is HIGHER on the healthy controls
     (6.3% on cloud deepseek) than on q4e. It measures conversation style, not degeneration.
     Recorded so nobody re-derives it and mistakes it for a finding.
@@ -277,6 +285,56 @@ _SENTENCE_END = tuple('.!?:;"\')]}`' + '\u3002\uff01\uff1f\uff1b\uff1a\u300d\u30
 # ordinary traffic cannot measure a 6% effect.
 CONTENT_PARAMS = ("code", "query", "command", "content", "text", "input", "script", "body")
 
+# ID-NOISE DETECTOR (2026-09-21, session 268e9ff30b69): well-formed JSON whose CONTENT is
+# confabulated — a real filename decorated with invented identifier-shaped noise (`uuid::name`,
+# `_40hex_057`) that exists nowhere in the model's context, or a shell command stuffed into a
+# `path` param. Distinct from junk_args (empty payloads): these carry apparent work, so the
+# placeholder test is blind to them. Assembled from parts so the literal patterns cannot be
+# mangled by anything that processes this file's text (the same class of accident this detector
+# guards against upstream).
+_ID_UUID = re.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_ID_HEX = re.compile(r"\b[0-9a-f]{40}\b|\b[0-9a-f]{64}\b")
+# git-SHA-like 7-12 char hex with a `::` or `_` delimiter, as in the observed `c828746f::name`.
+_ID_SHORT = re.compile(r"\b[0-9a-f]{7,12}::")
+# URLs carry legitimate hex path segments (manuals.plus/m/e1fb4ee4…) — strip before matching.
+_URL = re.compile(r"https?://\S+")
+# THE DISCRIMINATING FORM (calibrated 2026-09-21): the incident noise is FUSED identifier
+# decoration — `uuid::name`, `hex::name`, `_hex_NNN` — which the model INVENTED. Bare hex/SHA in a
+# command is usually legitimate reuse of an id the model saw in a tool result (deepseek v4.1 runs
+# `SHA=a600…` copied verbatim from git output; 26 firings on that control were all this), so bare
+# ids without the fusion decoration are NOT id_noise.
+_ID_FUSED = re.compile(r"[0-9a-f-]{7,64}::")
+_ID_WRAPPED = re.compile(r"_[0-9a-f]{40}_")
+
+
+def call_has_id_noise(call: dict) -> bool:
+    """True when a tool call's ARGUMENTS contain identifier-shaped noise: invented UUIDs,
+    40/64-hex strings, or `shorthex::` prefixes — the fingerprint of the model assembling an
+    exact reference it cannot reproduce (2026-09-21, q4e NVFP4 at temp 0.8; greedy never
+    confabulates, so this signature tracks sampling-flipped arg assembly). Also fires on a
+    `path`/`pattern` value carrying shell syntax (` -`, `&&`), the `command`-stuffed-into-`path`
+    form of the same failure."""
+    fn = call.get("function") or {}
+    raw = fn.get("arguments")
+    if not isinstance(raw, str):
+        return False
+    # URLs out first: their hex segments are legitimate addresses, not confabulation.
+    body = _URL.sub(" ", raw)
+    if _ID_FUSED.search(body) or _ID_WRAPPED.search(body) or _ID_SHORT.search(body):
+        return True
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(d, dict):
+        return False
+    # Shell syntax in a `path` VALUE only — never `pattern`, whose pipes and dashes are legitimate
+    # regex/content syntax (calibrated 2026-09-21: pattern-shape over-fired 20 turns on the 27B-MTP
+    # control, all legitimate searches like "z_tilt|bed_screws|screws_tune" or "python -m minisgl";
+    # the q4e incident form is a COMMAND in the path slot: "./ui/tools/mock_bridge.mjs -u …").
+    p = d.get("path")
+    return isinstance(p, str) and (" -" in p or "&&" in p)
+
 
 def is_placeholder_value(val) -> bool:
     """True when a STRING argument carries no actual work.
@@ -323,7 +381,7 @@ def call_is_junk(call: dict, content_params=CONTENT_PARAMS) -> bool:
 # Scored as defects, in order of demonstrated discriminating power. Everything else in the
 # per-turn record is diagnostic: written down, never totalled into a verdict.
 PRIMARY = ("junk_args",)
-SECONDARY = ("think_zero",)
+SECONDARY = ("think_zero", "id_noise")
 DIAGNOSTIC = ("think_collapse", "content_unterminated", "empty_stop")
 SCORED = PRIMARY + SECONDARY + DIAGNOSTIC
 
@@ -335,6 +393,7 @@ def score_turn(msg: dict, prior_think: list, finish: str) -> dict:
     calls = msg.get("tool_calls") or []
 
     junk = any(call_is_junk(c) for c in calls)
+    id_noise = any(call_has_id_noise(c) for c in calls)
 
     # The collapse state seen at 37082/37085: a tool call with no deliberation and no prose.
     think_zero = bool(calls) and not think.strip() and not content.strip()
@@ -356,6 +415,7 @@ def score_turn(msg: dict, prior_think: list, finish: str) -> dict:
 
     return {
         "junk_args": junk,
+        "id_noise": id_noise,
         "think_zero": think_zero,
         "think_collapse": collapse,
         "content_unterminated": unterminated,
