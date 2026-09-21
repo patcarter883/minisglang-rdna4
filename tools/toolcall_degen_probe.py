@@ -385,11 +385,17 @@ def assert_provenance(base: str, expect: str) -> str:
         served = [m["id"] for m in get(f"{base}/v1/models").get("data", [])]
     except Exception as e:
         sys.exit(f"PROVENANCE: cannot reach {base}/v1/models ({e}). Is the serve up?")
-    if not any(expect.lower() in s.lower() for s in served):
+    matches = [s for s in served if expect.lower() in s.lower()]
+    if not matches:
         sys.exit(f"PROVENANCE FAIL: expected a model matching {expect!r}, endpoint serves {served}. "
                  f"Refusing to run — an arm that is not the arm you think it is produces a green "
                  f"result for the wrong build.")
-    return served[0]
+    # Return the MATCHING id, never served[0]: a multi-model endpoint (lemonade lists its whole
+    # downloaded registry, not just the loaded checkpoint) can name a different model first, and
+    # the probe would drive every request at a model that is not loaded — 6 conversations, 0
+    # turns, all request errors (observed 2026-09-21 vs lemonade 11.9.0, fixture
+    # 20260921-154617-lemonade-q4gguf).
+    return matches[0]
 
 
 def scan_serve_log(path: str) -> dict:
