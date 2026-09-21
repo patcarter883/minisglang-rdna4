@@ -27,8 +27,11 @@ Appends one row to `<out>/timeline.tsv` (header written once) and keeps every ti
 under `<out>/ticks/`. Prints an `ONSET` line the first time the rate crosses --onset-threshold, so a
 log watcher can catch the transition without parsing the TSV.
 
-    tools/answer_delivery_timeline.py --container lease-rebootab-serve \
-        --out /home/pat/fixtures/minisgl-answer-delivery-timeline
+    tools/answer_delivery_timeline.py --out /home/pat/fixtures/minisgl-answer-delivery-timeline
+
+`--container` defaults to `auto`: the container publishing the serve port is resolved PER TICK,
+because the name carries the lease label and changes on every relaunch. Nothing serving -> the tick
+exits non-zero and writes no row, rather than measuring a container that no longer exists.
 """
 from __future__ import annotations
 
@@ -98,6 +101,26 @@ def scrape_expert_cache(container: str) -> dict:
             for k in _EC_FIELDS}
 
 
+def resolve_container(name: str, base_url: str) -> str:
+    """`--container auto` -> whichever container publishes the serve's port right now.
+
+    The container name carries the lease label (`lease-<name>-serve`), so it CHANGES on every
+    relaunch. A scheduled tick with a hardcoded name would keep running against a container that no
+    longer exists and quietly stop measuring — the silent-stale failure this repo keeps paying for.
+    Resolve it per tick instead, and fail loudly when nothing is serving.
+    """
+    if name != "auto":
+        return name
+    port = re.search(r":(\d+)", base_url)
+    port = port.group(1) if port else "1919"
+    out = subprocess.run(["docker", "ps", "--filter", f"publish={port}",
+                          "--format", "{{.Names}}"], capture_output=True, text=True, timeout=30)
+    names = [n for n in out.stdout.split() if n]
+    if len(names) != 1:
+        sys.exit(f"--container auto: expected exactly one container publishing {port}, got {names}")
+    return names[0]
+
+
 def uptime_seconds(container: str) -> tuple[str, int | str]:
     try:
         started = subprocess.run(
@@ -114,7 +137,9 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://localhost:1919/v1")
     ap.add_argument("--expect-model", default="Qwen3.8-Flash-Next")
-    ap.add_argument("--container", required=True)
+    ap.add_argument("--container", default="auto",
+                    help="serve container name, or 'auto' to resolve whichever container publishes "
+                         "the serve port right now (the name changes on every relaunch)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=400)
@@ -123,6 +148,7 @@ def main() -> int:
     args = ap.parse_args()
 
     os.makedirs(os.path.join(args.out, "ticks"), exist_ok=True)
+    args.container = resolve_container(args.container, args.base_url)
     started, up_s = uptime_seconds(args.container)
 
     # The probe owns provenance assertion (--expect-model aborts on a mismatch) and fixture writing.
