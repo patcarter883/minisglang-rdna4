@@ -152,9 +152,25 @@ trustworthy control cells.
    boot: the 2.5 GiB / 1923-slot expert cache (`free=0`, ~48.7k promotions / 46.8k evictions at
    capture), the 27.94 GiB/rank pinned host weight arena, radix/KV fragmentation, the host-tier GDN
    snapshot store (`MINISGL_REC_SNAP_HOST=1`).
-2. **Cheap bisect, not yet run:** leave the fresh serve up and re-run `answer_delivery_probe` on a
-   schedule to find time-to-degradation, correlating with the `[expert-cache]` counter line. Cheap
-   because the probe is a CPU-only HTTP client and needs no lease.
+2. **Bisect INSTALLED and running** (`tools/answer_delivery_timeline.py`, `ccec304f`): systemd user
+   timer `q4e-delivery-timeline.timer` fires every 30 min — 10 chat requests per tick, CPU-only, no
+   lease — recording the failure rate beside serve uptime, request/token totals,
+   `empty_completions`, KV-pool use, prefix-hit ratio and the `[expert-cache]` counters.
+
+       column -t /home/pat/fixtures/minisgl-answer-delivery-timeline/timeline.tsv
+       journalctl --user -u q4e-delivery-timeline | grep ONSET
+       systemctl --user disable --now q4e-delivery-timeline.timer      # stop it
+
+   30 min brackets the transition to well under an hour (healthy 18:20, catastrophic 23:02 → a
+   ~4.7 h window) without the probe becoming a load on the serve it measures. The tick resolves its
+   container per run (`--container auto`), because the lease label changes on every relaunch and a
+   hardcoded name would quietly keep measuring a container that no longer exists. A tick against a
+   booting or absent serve exits non-zero and writes NO row, so a gap in the TSV means a failed tick,
+   never a stopped timer. Unit files: `~/.config/systemd/user/q4e-delivery-timeline.{service,timer}`.
+
+   **Already excluded as the signature:** `fill=0.987`, `inflight=25`, `free=0` read IDENTICALLY on
+   the fresh healthy serve and on the broken one. Look for what diverges, not for what looks
+   alarming. First three ticks (up 801/902/985 s): `no_answer` 0/10 throughout.
 3. **Fix the step-1 arming hole** regardless of the above: `_maybe_arm_think_gate` runs in the decode
    loop after the first token is sampled, so a bounded-budget request can still end with
    `completion_tokens=0`.
@@ -170,6 +186,7 @@ trustworthy control cells.
 |---|---|
 | `6494f18f` | `tools/answer_delivery_probe.py` — two-lane answer-delivery probe, `digit_noise` calibrated 10/10 |
 | `922dc870` | `tools/answer_delivery_compare.py` — arm comparison that REFUSES incomparable arms |
+| `2f689c44` + `ccec304f` | `tools/answer_delivery_timeline.py` — scheduled tick walking the uptime curve; container resolved per tick |
 
 Fixtures: `/home/pat/fixtures/minisgl-answer-delivery/` — `20260921-232215-before-reboot`,
 `20260921-233626-after-reboot`, plus `before-reboot-serve-state.txt` (the degraded serve's `/metrics`,
