@@ -176,6 +176,43 @@ class PLERuntime:
         self.prepares += 1
         return self.batch
 
+    def ledger_fault(self) -> str | None:
+        """The ONCE-PER-FORWARD invariant, evaluated. None when healthy, else why it is not.
+
+        The invariant is stated in the ledger's own comment above and was, until this method existed,
+        NEVER EVALUATED ANYWHERE: `prepares`, `commits`, `discards` and `commit_noops` were all
+        incremented and nothing in the engine read them. The module documents the exact arithmetic
+        for "the failure that freezes the n-gram context with no error anywhere" and then left the
+        arithmetic undone — the same shape as this repo's other silent instruments (a metric that
+        exports a flat zero because one plumbing hop is missing; a kernel gap closed with no caller).
+
+        Why it matters more here than a lost counter would: a frozen n-gram history does not crash
+        and does not corrupt the WEIGHTS. It corrupts the model's representation of ITS OWN CONTEXT,
+        so the reply stays fluent and confidently wrong — parametric knowledge intact, retrieval
+        broken. That is the exact signature under investigation (`@docs/ui-plan` ->
+        `docs/22909-74486-01`, Hermes session 5d26424a4be3).
+
+        Checked at a QUIESCENT point only (no batch staged, nothing in flight); mid-forward the two
+        halves are legitimately unequal.
+        """
+        if self.batch is not None or self._begun is not None:
+            return None  # mid-forward: the pairing is open by construction
+        if self.commit_noops:
+            return (f"commit_noops={self.commit_noops}: a forward ran with nothing staged (or a "
+                    f"batch was committed twice). Every slot in such a forward re-hashed a stale "
+                    f"token context, so its n-gram features are frozen")
+        if self.prepares != self.commits + self.discards:
+            return (f"prepares={self.prepares} != commits={self.commits} + "
+                    f"discards={self.discards}: a staged batch was neither committed nor discarded, "
+                    f"which leaves that slot's n-gram history behind its conv state")
+        return None
+
+    def ledger(self) -> dict:
+        """The raw counters, for logging and metric export."""
+        return {"prepares": self.prepares, "commits": self.commits,
+                "discards": self.discards, "commit_noops": self.commit_noops,
+                "pending": self._pending is not None}
+
     def commit(self, slots: Sequence[int], token_lists: Sequence[np.ndarray]) -> None:
         """Advance each slot's n-gram token history. Call AFTER a successful forward."""
         self.source.advance(self.state, slots, token_lists)

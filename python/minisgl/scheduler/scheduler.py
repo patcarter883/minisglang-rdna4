@@ -3116,6 +3116,28 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
         # `complete_one`). Inert for every non-PLE model. See PLERuntime.commit_staged.
         if self._ple is not None:
             self._ple.commit_staged()
+            # THE LEDGER, ACTUALLY EVALUATED. `PLERuntime` has always counted prepares/commits/
+            # discards/commit_noops and documented the invariant they satisfy — and nothing in the
+            # engine ever read them, so the one failure the counters exist to catch stayed silent.
+            # It is a bad failure to leave silent: a frozen n-gram history does not crash and does
+            # not touch the weights, it corrupts the model's representation of its OWN CONTEXT, so
+            # the reply comes back fluent, confident and wrong. Retrieval breaks while knowledge
+            # looks fine — the signature of Hermes session 5d26424a4be3 (`@docs/ui-plan` ->
+            # `docs/22909-74486-01`).
+            #
+            # Checked every step (it is four int compares on a quiescent runtime), reported ONCE at
+            # full volume and then at a decaying interval, because a fault here repeats every
+            # forward and a per-step log would bury the serve.
+            _fault = self._ple.ledger_fault()
+            if _fault is not None:
+                self._ple_faults = getattr(self, "_ple_faults", 0) + 1
+                if self._ple_faults == 1 or self._ple_faults % 1000 == 0:
+                    logger.warning_rank0(
+                        f"PLE LEDGER FAULT (#{self._ple_faults}): {_fault}. The n-gram context is "
+                        f"frozen for the affected slots: the model will keep answering fluently "
+                        f"from its parameters while misreading what it was GIVEN. ledger="
+                        f"{self._ple.ledger()}"
+                    )
         # Close the window on the DEVICE, not on the host queue — see STEP_LOG_SYNC. Without this
         # the captured leg's entry is a `hipGraphLaunch` return time.
         if STEP_LOG_SYNC:
