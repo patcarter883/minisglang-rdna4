@@ -875,7 +875,14 @@ class ExpertResidencyCache:
             if not self._queue_retract(victim):
                 continue
         for victim in held:
-            self._policy.admit(victim)
+            # The argument that this cannot evict is sound -- the loop above removed at least as
+            # many keys as `held` puts back -- but it is an ARGUMENT, and an eviction dropped on
+            # the floor here would strand a slot nothing can ever reclaim again: a silent leak,
+            # the exact failure class that cost this cache four diagnoses. Turning the argument
+            # into code costs one branch on a path that runs len(held) times.
+            displaced = self._policy.admit(victim)
+            if displaced is not None:
+                self._queue_retract(displaced)
 
     def summary(self) -> str:
         tot = self.stats["hits"] + self.stats["misses"]
