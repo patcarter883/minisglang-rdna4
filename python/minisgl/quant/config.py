@@ -162,12 +162,24 @@ def _modelopt_to_compressed_tensors(d: dict) -> "dict | None":
 #      has no reader for and must refuse, because a wrong nibble order does not fail -- it returns
 #      plausible, finite, wrong numbers.
 #
-# ACTIVATIONS ARE DELIBERATELY DROPPED. Quark checkpoints declare `input_tensors` (this one asks for
-# dynamic per-group fp4), but gfx1201 has no FP4 arithmetic and this engine never consumes a
-# checkpoint's activation scheme for the e2m1 formats -- it picks W4A8 (per-token fp8) or W4A16
-# (unquantized) at the METHOD, exactly as it does for a compressed-tensors MXFP4 file, which
-# declares `input_activations: null`. Emitting null here keeps those two identical rather than
-# inventing an activation scheme no kernel implements.
+# ACTIVATIONS ARE DELIBERATELY DROPPED. Quark/ModelOpt checkpoints declare `input_tensors`, but
+# gfx1201 has no FP4 arithmetic and this engine never consumes a checkpoint's activation scheme for
+# the e2m1 formats -- it picks W4A8 (per-token fp8) or W4A16 (unquantized) at the METHOD, exactly as
+# it does for a compressed-tensors MXFP4 file, which declares `input_activations: null`. Emitting
+# null here keeps those two identical rather than inventing an activation scheme no kernel
+# implements.
+#
+# CORRECTION 2026-09-22: this comment used to say the checkpoint "asks for dynamic per-group fp4".
+# It does not. Qwen3.8-Flash-Next's config declares
+#     input_activations: {dynamic: False, group_size: 16, num_bits: 4, type: float}
+# i.e. STATIC per-group fp4, and it ships the scales to match -- 1536 `*.input_scale` /
+# `*.input_global_scale` tensors that the loader counts in its ignore ledger. So what is dropped is
+# not an unusable runtime scheme, it is REAL CALIBRATION DATA, replaced by dynamic per-token fp8.
+# That substitution is still the only thing gfx1201 can execute (no fp4 math, and a per-group fp4
+# scale is neither the right format nor the right granularity for a per-token fp8 quantizer), and
+# per-token amax is arguably more adaptive than a static table. But it has never been MEASURED for
+# accuracy against the scheme the checkpoint was calibrated for, and it is worth being accurate about
+# which of those two things is true: the substitution is forced, not free.
 _QUARK_METHODS = ("quark",)
 
 # (weight dtype, scale_format) -> the compressed-tensors `format` naming the identical layout.
