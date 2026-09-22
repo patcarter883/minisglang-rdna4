@@ -1127,13 +1127,47 @@ case "$MODEL" in
                   if [[ -z "${MINISGL_PLE_FILES:-}" ]]; then
                     MINISGL_PLE_FILES="$(ls "$Q4E_PLE_DIR"/model-plefp8-*.safetensors 2>/dev/null | paste -sd:)"
                   fi
+                  # SECOND LAYOUT: the table INLINE in the ordinary model shards, which is what
+                  # `tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ` ships (int6 group-32 rows as
+                  # `shard_N.weight_packed` + `shard_N.weight_scale`, and the head metadata inline
+                  # too). There is no sidecar to mount and no `model-plefp8-*` to glob, so the
+                  # detection is by TENSOR HEADER, not by file name: the inline set is just
+                  # `model-*.safetensors` like every other weight shard, so a name-based rule would
+                  # either match every checkpoint or none.
+                  if [[ -z "$MINISGL_PLE_FILES" ]]; then
+                    inline_ple="$(python3 -c '
+import glob, json, struct, sys
+files = sorted(glob.glob(sys.argv[1] + "/model-*.safetensors"))
+for p in files:
+    try:
+        with open(p, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            h = json.loads(f.read(n))
+    except Exception:
+        continue
+    if any(".ngram_embedding.shard_" in k and k.endswith("weight_packed") for k in h):
+        print(":".join(files))
+        break
+' "$model_id" 2>/dev/null)"
+                    if [[ -n "$inline_ple" ]]; then
+                      MINISGL_PLE_FILES="$inline_ple"
+                      # The heads metadata is in the same set here, so META is the same list. Set
+                      # BEFORE the `:=` default below so that default never applies on this path.
+                      : "${MINISGL_PLE_META_FILES:=$inline_ple}"
+                      echo "[serve] PLE n-gram: INLINE layout in $model_id" \
+                           "($(awk -F: '{print NF}' <<< "$inline_ple") shards, packed+scale rows)." \
+                           "No plefp8 sidecar for this checkpoint; row_table decodes int6 group-32." >&2
+                    fi
+                  fi
                   : "${MINISGL_PLE_META_FILES:=$Q4E_PLE_DIR/model-bf16-00010.safetensors}"
                   # Refuse from integers rather than boot a model whose n-gram block cannot be fed.
                   if [[ -z "$MINISGL_PLE_FILES" ]]; then
-                    echo "[serve] ERROR: qwen4_exp needs the PLE n-gram shards, and none matched" \
-                         "$Q4E_PLE_DIR/model-plefp8-*.safetensors. Mount the sidecar (the measured" \
-                         "runs used -v /home/pat/.cache/hf-ple:/ple:ro) or set Q4E_PLE_DIR /" \
-                         "MINISGL_PLE_FILES explicitly." >&2
+                    echo "[serve] ERROR: qwen4_exp needs the PLE n-gram table and found NEITHER" \
+                         "layout: no $Q4E_PLE_DIR/model-plefp8-*.safetensors (the isolated fp8" \
+                         "sidecar), and no ngram_embedding.shard_*.weight_packed in" \
+                         "$model_id/model-*.safetensors (the inline int6 layout). Mount the sidecar" \
+                         "(the measured runs used -v /home/pat/.cache/hf-ple:/ple:ro) or set" \
+                         "Q4E_PLE_DIR / MINISGL_PLE_FILES explicitly." >&2
                     exit 2
                   fi
                   # `[SHIP-2026-09-05]` The META shard is checked TOO, and it was not before. The

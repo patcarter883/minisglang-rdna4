@@ -1061,6 +1061,13 @@ def open_qwen4exp_ngram_table(
         )
         pfound = sorted(((int(m.group(1)), name) for name in idx if (m := ppat.match(name))))
         if pfound:
+            if scale_override is not None:
+                raise ValueError(
+                    "scale_override is meaningless for a packed+scale n-gram table: the scales are "
+                    "PER ROW AND PER GROUP in the checkpoint's own weight_scale tensor, not one "
+                    "scalar. Silently ignoring it would let a caller believe it had overridden "
+                    "something."
+                )
             # Assigned, not returned: `heads` below is shared by both layouts and a second return
             # path would have silently handed back a bare table where every caller unpacks a pair.
             fused_table = _open_fused_ngram_table(
