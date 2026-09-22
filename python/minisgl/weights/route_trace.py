@@ -421,9 +421,10 @@ class RouteTracer:
             return
         self._harvested = True
         if self._cur_kind not in (KIND_DECODE, KIND_VERIFY):
-            # A PREFILL step never writes the stage (its records take the host path), so there is
-            # nothing to move and the stage is already all -1 by induction. Skipping keeps a
-            # 28-chunk prompt from paying 84 pointless device ops.
+            # A PREFILL step never writes the stage (every prefill record takes the host path), so
+            # there is nothing to move and nothing to reset -- the stage is all -1 by induction, since
+            # only a decode/verify step writes it and that step's own harvest reset it. Returning
+            # early keeps a 28-chunk prompt from issuing a pointless copy+fill per chunk.
             return
         # THE MASK, and the one invariant it rests on: REAL ROWS COME FIRST. `topk_ids.reshape(-1)`
         # is row-major, so rows 0..rows-1 are exactly the leading rows*top_k ids — and the padding is
@@ -491,7 +492,7 @@ class RouteTracer:
             # docstring.
             n = M * self.top_k
             self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
-            if M != self._cur_rows and self._cur_rows is not None:
+            if self._cur_rows is not None and M != self._cur_rows:
                 # The row count `harvest` will mask against disagrees with the one this MoE call
                 # actually carried. One int compare per layer per step, and it is worth it: a wrong
                 # mask either truncates a real row's union (the cache looks BETTER than it is) or
