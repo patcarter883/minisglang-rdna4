@@ -417,3 +417,45 @@ def test_t17_a_retracted_victim_is_unpublished_from_the_device_table():
         "apply_pending recycled the slot without un-publishing the victim: the table still sends "
         "the kernel to a slot the next promotion will overwrite")
     assert slot in cache._free, "the retracted slot never reached the free list"
+
+
+def test_t18_reclaim_never_retracts_a_copy_that_is_still_in_flight():
+    """THE FREEZE FIX'S OWN CLIFF: a cache that cancels the promotions it is paying for.
+
+    `_queue_retract` pops `_slot_of_key[victim]`, and that pop is exactly the test `apply_pending`
+    uses to decide a landed copy is stale. So retracting a key whose copy is still in flight
+    throws away a 1.36 MiB transfer AND the slot it was headed for. It is not a corner case: after
+    the 2026-09-22 freeze fix `_service` asks for up to `_max_inflight` slots per tick, while
+    `take_victim` drains PROBATION first — and probation is mostly the keys just promoted, because
+    a touched key leaves for protected. Once `want` reaches the probation segment's size the cache
+    eats its own fresh installs.
+
+    Measured on `tools/offload/expert_cache_freeze_repro.py --drain-every 180 --steps 24000`,
+    varying ONLY MINISGL_EXPERT_CACHE_MAX_INFLIGHT (the shipped default is 64; `tools/serve.sh`
+    exported 512 for five months and T1 of expert_cache_inflight_slot_cap_test.py still blesses it
+    at 1,923 slots):
+
+        64   h=0.5429  promotions +0.355/tick  stale_pub 0
+        512  h=0.1453  promotions +0.000/tick  stale_pub +2.844/tick   <- ZERO installs, ever
+
+    On the real-trace replay at 512 it discarded 1,115,132 landed copies — about 1.5 TB of H2D
+    traffic transferred and thrown away — while reporting a perfectly healthy-looking cache.
+    """
+    cache, _ = _build(slots=8)
+    for e in range(6):                          # fill the policy the unthreaded way
+        cache.observe(0, [e])
+        cache.observe(0, [e])
+    flying = 0 * E + 2
+    slot = cache._slot_of_key[flying]
+    cache._inflight.append((flying, slot, object(), 0))
+
+    cache._reclaim(len(cache._policy))          # ask for EVERYTHING the policy holds
+
+    assert flying in cache._policy, (
+        "_reclaim took an in-flight key out of the policy and never put it back: its slot is now "
+        "resident, published, and unevictable forever")
+    assert cache._slot_of_key.get(flying) == slot, (
+        "_reclaim retracted a copy that is still in flight — apply_pending will drop the landed "
+        "bytes as a stale publish, so the transfer and the slot are both wasted")
+    assert all(v != flying for v, _s in cache._to_retract), \
+        "the in-flight key was queued for retraction"
