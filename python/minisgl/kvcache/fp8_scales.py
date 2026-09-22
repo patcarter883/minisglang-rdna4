@@ -75,12 +75,64 @@ class KVScaleSet:
     per_head: bool
 
 
+def _shard_scale_keys(paths: list[str]) -> int:
+    """How many `*.{k,v}_scale` tensors the shards CONTAIN, from the HEADERS only.
+
+    Header-only because this is asked on the path where the scales are about to be SKIPPED, and
+    opening 21 shards to prove a negative is not worth it. `safe_open(...).keys()` reads the header
+    and no tensor data.
+    """
+    from safetensors import safe_open
+
+    n = 0
+    for path in paths:
+        try:
+            with safe_open(path, framework="pt", device="cpu") as f:
+                n += sum(1 for k in f.keys() if _SCALE_KEY.search(k))
+        except Exception:  # noqa: BLE001 -- an unreadable shard is the loader's problem, not ours
+            continue
+    return n
+
+
+def _check_sidecar_convention(path: str, f) -> None:
+    """Warn if a sidecar records a DIFFERENT scale convention from the one this cache assumes.
+
+    The write side has always recorded `convention` and `fp8_max` in `__metadata__`; the read side
+    never opened it, so a table calibrated against another engine's divisor loaded SILENTLY and every
+    stored value landed at the wrong fraction of range. Concretely, the divisor is not universal:
+    tcclaviger/vllm calibrates `(max * 1.10) / divisor` with Q/K=200 and V=100, so a V row from that
+    convention is ~4.15x off ours (`amax / 448`). Nothing here rescales a foreign table — inventing a
+    conversion is the failure mode this module exists to avoid — it only refuses to be silent.
+    """
+    try:
+        meta = f.metadata() or {}
+    except Exception:  # noqa: BLE001
+        return
+    if not meta:
+        logger.warning_rank0(
+            f"fp8-KV: sidecar {path} carries NO __metadata__, so its scale convention cannot be "
+            f"verified. This engine assumes the dequant convention `stored = k / k_scale` with "
+            f"k_scale = amax / {FP8_MAX:g}. If it was calibrated against another divisor the cache "
+            f"will store at the wrong fraction of range, silently."
+        )
+        return
+    recorded = meta.get("fp8_max")
+    if recorded is not None and abs(float(recorded) - FP8_MAX) > 1e-6:
+        logger.warning_rank0(
+            f"fp8-KV: sidecar {path} was calibrated against fp8_max={recorded}, but this cache "
+            f"stores e4m3 with max {FP8_MAX:g}. The scales are being used AS RECORDED and every "
+            f"stored value will be off by {float(recorded) / FP8_MAX:.3g}x. Recalibrate with "
+            f"tools/kv_fp8_calibrate.py."
+        )
+
+
 def _read_scale_file(path: str) -> Dict[int, Dict[str, torch.Tensor]]:
     """Pull every `*.{k,v}_scale` out of one safetensors file, keyed by layer index."""
     from safetensors import safe_open
 
     out: Dict[int, Dict[str, torch.Tensor]] = {}
     with safe_open(path, framework="pt", device="cpu") as f:
+        _check_sidecar_convention(path, f)
         for key in f.keys():
             m = _SCALE_KEY.search(key)
             if m is None:
@@ -153,6 +205,27 @@ def _from_checkpoint(model_path: str) -> KVScaleSet | None:
     folder = download_hf_weight(model_path)
     files = sorted(glob.glob(os.path.join(folder, "*.safetensors")))
     if not scheme:
+        # The tensors can be PRESENT while the scheme is absent, and then silence is the bug.
+        # `tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ` ships 12 QSA layers of
+        # `self_attn.{q,k,v}_scale` with `kv_cache_scheme: null`, so this returns None and the cache
+        # serves at the identity 1.0 with nothing said — which is exactly how this engine once
+        # served fp8-KV uncalibrated for weeks.
+        #
+        # Skipping is still CORRECT: an undeclared scheme means the divisor is unknown, and the
+        # divisor is not universal (that fork uses `(max * 1.10) / divisor`, Q/K=200, V=100 — a V row
+        # read as ours would be ~4.15x off). Widening the gate to trust undeclared tensors would
+        # misplace every stored value. So: say so, loudly, and name the fix.
+        n = _shard_scale_keys(files)
+        if n:
+            logger.warning_rank0(
+                f"fp8-KV: this checkpoint ships {n} `*.{{k,v}}_scale` tensor(s) but declares NO "
+                f"`quantization_config.kv_cache_scheme`, so the divisor they were calibrated against "
+                f"is unknown and they are SKIPPED — this cache will run at the identity scale 1.0. "
+                f"They are NOT assumed to be `amax / {FP8_MAX:g}`: at least one other engine "
+                f"calibrates `(max * 1.10) / divisor` with Q/K=200 and V=100, which read as ours "
+                f"would be ~4.15x off on V. To serve fp8-KV calibrated here, run "
+                f"tools/kv_fp8_calibrate.py and point MINISGL_KV_FP8_SCALES at the sidecar."
+            )
         return None
     bits, kind = scheme.get("num_bits"), (scheme.get("type") or "").lower()
     if bits != 8 or kind != "float":
