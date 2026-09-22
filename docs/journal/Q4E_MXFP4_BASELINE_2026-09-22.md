@@ -12,12 +12,16 @@ ROCm stack. This records what it took to boot on 16 GiB cards and what it measur
 
 ## 1. It serves, and it answers the failing cases correctly
 
-    K  arithmetic  2.2s   ->  43
-    R  verbatim    2.6s   ->  @docs/ui-plan @ui core/src/mc_velocity.c mc_velocity_update  (exact)
-    R  needle      2.8s   ->  2311-XON-8919                                               (exact)
+    K  arithmetic  2.4s   ->  43
+    R  verbatim    2.7s   ->  @docs/ui-plan @ui core/src/mc_velocity.c mc_velocity_update  (exact)
+    R  needle      3.0s   ->  2311-XON-8919                                               (exact)
 
-**~26 tok/s decode**, against our own engine's best measured arm on this model (20.31 tok/s, expert
-cache at low_water 25). That is with 19% of the routing mass held VRAM-resident.
+**~24-26 tok/s decode**, against our own engine's best measured arm on this model (20.31 tok/s, expert
+cache at low_water 25). That is with 19.9% of the routing mass held VRAM-resident.
+
+Shipped configuration: `max_model_len` **131,072**, KV pool **348,565 tokens** (2.66x concurrency at
+full length), expert cache 3.28 GiB / 2,698 slots, host 57.0 GiB mlocked, served as
+`Qwen3.8-Flash-Next` on port 1919.
 
 A clean pass on a fresh serve proves nothing about degeneration — §5 of the retrieval journal records
 four such passes on our own engine. Its value is as an instrument: it is registered under the SAME
@@ -87,19 +91,28 @@ expert cache to KV (the plan sizes its reserve from it and hands the remainder t
     max_model_len   expert slots   routing share VRAM-held   KV we can set   = tokens
         32,768         3,359              0.189                2.08 GiB       220,128
         65,536         3,117              0.176                2.37 GiB       251,333
-       131,072         2,633              0.149                2.50 GiB       262,000
+       131,072         2,698              0.199                2.50 GiB       348,565  <- SHIPPED
        262,144         1,664              0.094                4.14 GiB       438,692
 
 Set to 131,072 to match our own engine, which passes no context flag at all — it serves the model's
-native length and lets the KV pool be the limit, so an apples-to-apples baseline must too. The ~21%
-of resident expert share it costs is a real decode cost on a PCIe-bound arm, taken deliberately: a
-baseline that cannot hold a long agent session cannot be compared against the serve under debug.
+native length and lets the KV pool be the limit, so an apples-to-apples baseline must too.
+
+**The projected decode cost did not materialise, and the reason is worth keeping.** The table above
+predicted the resident routing share falling 0.189 -> 0.149. Measured, it went UP to **0.199**, and
+the KV pool came out at **348,565 tokens** rather than the projected 262,000. Capping
+`--expert-offload-mem` at 57 (§3b) does not merely limit host RAM — when the host set no longer fits,
+the plan pins the excess experts VRAM-only *hottest first*, which puts MORE of the routing mass in
+VRAM than the profile fraction alone would. The two knobs are coupled in a way that happens to favour
+us here: tightening host RAM bought back the coverage that shrinking the cache cost. Decode measured
+unchanged at ~24-26 tok/s. Do not assume the table's linear projection; the placement is not linear.
 
 ### 3b. Host RAM is the hard wall, and it moves the OPPOSITE way
 
-88 of 93 GiB used once up (57 GiB of mlocked expert rows plus two rank processes). Shrinking the VRAM
-cache to buy KV GROWS the host-backed set, so `--expert-offload-mem` has to come DOWN as
-`max-model-len` goes UP — 57, not 58, at 131,072. The two pressures are opposed.
+88 of 93 GiB used at `--expert-offload-mem 58` (57.2 GiB of mlocked expert rows plus two rank
+processes), leaving 4 GiB. Shrinking the VRAM cache to buy KV GROWS the host-backed set, so
+`--expert-offload-mem` has to come DOWN as `max-model-len` goes UP — 57, not 58, at 131,072.
+Measured after: **85 of 93 GiB, 7 GiB available**, and the plan reports `host: 57.0 GiB across 2 ranks
+of 57.0 GiB usable`, i.e. sitting exactly on the cap by design.
 
 ## 4. Pre-flight the plan in 15 seconds, not 5 minutes
 
