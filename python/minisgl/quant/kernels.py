@@ -985,6 +985,102 @@ def w4a16_moe(
     return output.to(x.dtype)
 
 
+def w4a16_moe_decode(
+    x: torch.Tensor,  # (M, K) activations — bf16/fp16 DIRECT, never quantized (the whole point)
+    w13_op: torch.Tensor,  # (E, 2*inter, K//8) int32 e2m1 codes — STANDARD layout, no w_rep
+    w13_scales: torch.Tensor,  # (E, K//g, 2*inter) e4m3 GROUP-MAJOR
+    w13_global: torch.Tensor,  # (E, 2*inter) f32-as-int32 — rides the w_zeros slot (NVFP4 global)
+    w2_op: torch.Tensor,  # (E, K, inter//8) int32
+    w2_scales: torch.Tensor,  # (E, inter//g, K) e4m3
+    w2_global: torch.Tensor,  # (E, K) f32-as-int32
+    hidden: int,
+    *,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    router_logits: torch.Tensor | None = None,
+    top_k: int = 0,
+    renormalize: bool = False,
+) -> torch.Tensor:
+    """Grouped W4A16 MoE on the STANDARD-LAYOUT decode GEMV pair — the NVFP4 (g=16) A16 arm.
+
+    THE GAP THIS CLOSES. `_NvFp4MoEMethod` had no A16 branch, so `MINISGL_MOE_W4A16=1` was a SILENT
+    NO-OP on it: env var set, serve clean, and the `[hip-engage]` ledger still showing
+    `mmq_fp8_moe_gemm1_silu(gemv+e2m1)` on every token. On Qwen3.8-Flash-Next that left NO activation
+    ablation at all, because its ignore list spares attention, GDN, the router, the shared expert,
+    hyper-connections and PLE — leaving 48x512x3 = 73,728 quantized modules that are ALL routed
+    experts, so b4cfe0f0's DENSE NVFP4 A16 path had nothing to act on.
+
+    IT IS A WIRING GAP, NOT A KERNEL GAP. The kernel side was already fixed:
+    `Int4A16GemvLoader::consume_chunk` "splits its 32-k chunk at the group boundary and folds a scale
+    per 16-K half", and its launcher checks `group_size % 16`, not % 32 — the comment there says in
+    so many words that the old % 32 "was what left NVFP4 -- whose native grouping IS 16 -- with no
+    unquantized decode arm while its W4A8 twin had one". All four `Int4A16GemvLoader` instantiations
+    were already GATHER=true, i.e. the grouped/MoE arm. Built, exported, and never called from here.
+
+    NOT A DENSE KERNEL IN A LOOP. Two grouped kernels per layer — the same shape as `w4a8_moe`'s
+    decode fast path — reading `_w_op` directly with no lane-order repack and no `wide`:
+        gemm1: mmq_regdirect_w4a16_moe_gemv_silu    -> post-activation (P, inter), no (P, 2*inter) trip
+        gemm2: mmq_regdirect_w4a16_moe_gemv_scatter -> fused topk-weight + atomic scatter, in place
+    A per-expert dense loop was the obvious shortcut and it is the wrong one: at M=1, top_k=10 it is
+    ~20 launches per layer, ~960 per decode step on a serve that is already launch-bound, which would
+    make the arm too slow to reach the failure it exists to study.
+
+    DECODE BAND ONLY, AND THAT IS A REAL LIMIT, NOT A PREFERENCE. The prefill/WMMA grouped A16 arm
+    (`mmq_regdirect_w4a16_moe`) needs `wide` in {2,4,8} with `k_sub % wide == 0` where
+    `k_sub = group_size / 16`; at g=16 that is 1 and no valid `wide` exists, so prefill has no A16
+    path without a new WIDE=1 (b32) weight load in the kernel. The caller must therefore keep W4A8
+    for M above the decode band, which SPLITS ACTIVATION PRECISION BY M — the exact thing 09f3dd71
+    reverted as a default. That is why this is opt-in behind MINISGL_MOE_W4A16 and why the caller
+    logs the split: as a named ablation it is sound, as a silent default it would not be.
+
+    Routing is the SHARED `_route_align`, deliberately: an A/B against W4A8 must differ in the
+    activation scheme and nothing else, and a private softmax+topk here would confound it.
+    """
+    import moe_hip
+    import fp8_wmma
+
+    M = x.shape[0]
+    E = w13_op.shape[0]
+    dev = x.device
+    block_m = 16
+    inter = w13_op.shape[1] // 2
+    sorted_ids = None
+    if topk_ids is None:
+        assert router_logits is not None and top_k > 0, (
+            "w4a16_moe_decode needs a precomputed route (topk_ids/topk_weights) or "
+            "router_logits + top_k"
+        )
+        topk_weights, topk_ids, sorted_ids, expert_ids, ntp = _moe_time(
+            "route_align", lambda: _route_align(router_logits, top_k, renormalize, E, block_m)
+        )
+    top_k = topk_ids.shape[1]
+    ti = topk_ids.to(torch.int32).contiguous()
+    if sorted_ids is None:
+        engaged("moe_hip.moe_align")
+        sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
+    tw_flat = topk_weights.to(torch.float32).reshape(-1).contiguous()
+
+    engaged("fp8_wmma.mmq_regdirect_w4a16_moe_gemv_silu+e2m1")
+    h = _moe_time(
+        "gemm1",
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe_gemv_silu(
+            x.contiguous(), w13_op, w13_scales, w13_global,
+            sorted_ids, expert_ids, ntp, top_k, block_m, True,
+        ),
+    )  # (P, inter), post-activation, in x's dtype
+
+    output = torch.zeros((M, hidden), dtype=torch.float32, device=dev)
+    engaged("fp8_wmma.mmq_regdirect_w4a16_moe_gemv_scatter+e2m1")
+    _moe_time(
+        "gemm2scat",
+        lambda: fp8_wmma.mmq_regdirect_w4a16_moe_gemv_scatter(
+            h.contiguous(), w2_op, w2_scales, w2_global,
+            sorted_ids, expert_ids, ntp, tw_flat, output, hidden, top_k, block_m, True,
+        ),
+    )
+    return output.to(x.dtype)
+
+
 def w4a16_linear(
     x: torch.Tensor,  # (M, K) activations — DIRECT, NOT quantized
     w_packed: torch.Tensor,  # (N, K//8) int32 — the SAME pack the W4A8 arms take, at every M
