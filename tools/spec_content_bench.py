@@ -124,7 +124,11 @@ def _stream_one(url, model, prompt, max_tokens, args, barrier, out, i):
                 usage_tok = d["usage"].get("completion_tokens")
             ch = (d.get("choices") or [{}])[0]
             delta = ch.get("delta") or {}
-            if delta.get("content") or delta.get("reasoning_content"):
+            # Any non-empty payload field counts as "first token out". Checking only `content`
+            # reports n/a for a reasoning model whose text arrives under reasoning_content, and
+            # checking only those two missed it again on one engine -- so take any string field.
+            payload = any(isinstance(v, str) and v for k, v in delta.items() if k != "role")
+            if payload:
                 if ttft is None:
                     ttft = time.perf_counter() - t0
                 ntok += 1
@@ -171,6 +175,21 @@ def _metrics(url):
     return out
 
 
+#: Spec counters, per engine. Both engines are benched by this harness and they name the same three
+#: quantities differently; reading only one family reports acceptance as ZERO on the other engine,
+#: which would look exactly like "spec did nothing" rather than "the harness did not look".
+_SPEC_NAMES = {
+    "accepted": ("vllm:spec_decode_num_accepted_tokens_total",
+                 "vllm:spec_decode_num_accepted_tokens_per_pos",
+                 "minisgl_spec_accepted_tokens_total"),
+    # DRAFTS OFFERED (verify rounds), not draft tokens. minisgl calls a round a "step".
+    "drafts":   ("vllm:spec_decode_num_drafts_total",
+                 "minisgl_spec_steps_total"),
+    "draft_tokens": ("vllm:spec_decode_num_draft_tokens_total",
+                     "minisgl_spec_draft_tokens_total"),
+}
+
+
 def _spec_delta(before, after):
     """Accepted tokens and drafts across a window, plus acceptance PER DRAFT OFFERED.
 
@@ -179,9 +198,17 @@ def _spec_delta(before, after):
     """
     def d(k):
         return after.get(k, 0.0) - before.get(k, 0.0)
-    acc = d("vllm:spec_decode_num_accepted_tokens_total") or d("vllm:spec_decode_num_accepted_tokens_per_pos")
-    drafts = d("vllm:spec_decode_num_drafts_total")
-    draft_tok = d("vllm:spec_decode_num_draft_tokens_total")
+
+    def first(kind):
+        for name in _SPEC_NAMES[kind]:
+            v = d(name)
+            if v:
+                return v
+        return 0.0
+
+    acc = first("accepted")
+    drafts = first("drafts")
+    draft_tok = first("draft_tokens")
     out = {"accepted_tokens": acc, "drafts": drafts, "draft_tokens": draft_tok}
     if drafts > 0:
         out["accepted_per_draft"] = acc / drafts
