@@ -7,6 +7,24 @@ over its own uptime.** A bounce restores it completely, with nothing else change
 
 Headline: **chat-lane `no_answer` 28/30 → 0/30 across a reboot on the same commit.**
 
+> **CORRECTION, same day — the title of this document overstates its own evidence.** "Uptime" was
+> never established. Across a reboot, uptime and cumulative work reset TOGETHER, so the A/B below
+> cannot separate them; it proves only that *a bounce restores it*. Pat pointed this out and the
+> Prometheus history settles it against uptime: all 3.26M submitted prompt tokens were processed
+> between 17:59 and 21:00, the serve then sat COMPLETELY IDLE until the 23:02 failure, and the first
+> empty completion appeared at 18:20 — 21 minutes in. Two idle hours immediately before the failure
+> contributed nothing. Whatever accumulates, it accumulates with WORK DONE.
+>
+> A second correction to the dose figure: `minisgl_prompt_tokens_total` read 3,263,790 while
+> `minisgl_prefill_computed_tokens_total` read only **731,822** — the prefix cache absorbed 4.5x of
+> it, doing no work. The reproduction target is ~730k COMPUTED prefill (~100k generated), not 3.3M,
+> and the first empty completion landed at just 189,627 computed.
+>
+> And the headline metric is the wrong one anyway. `no_answer` measures DELIVERY. The defect that
+> matters is wrong CONTENT — `@docs/ui-plan` -> `docs/22909-74486-01` — which this document's probe
+> set was structurally blind to, because none of its prompts contain an identifier to conflate. See
+> [`Q4E_RETRIEVAL_2026-09-22.md`](Q4E_RETRIEVAL_2026-09-22.md).
+
 ---
 
 ## 1. The incident: 25 minutes, zero delivered content
