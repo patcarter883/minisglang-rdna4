@@ -215,38 +215,34 @@ class ExpertResidencyCache:
         #: Free slots the manager tries to keep ready. ~0.5% of the pool: enough to absorb a
         #: scheduler round trip at decode rates, small enough that the residency given up is noise.
         self._low_water = max(8, _env_int("MINISGL_EXPERT_CACHE_LOW_WATER", self.slots // 200))
-        #: RECLAIM RATE, DECOUPLED FROM POOL DEPTH. These were one number, and that made the free
-        #: pool's DEPTH also the per-step promotion CEILING: the manager tops up to `_low_water`,
-        #: every freed slot is immediately consumed by a promotion that then holds it until the
-        #: scheduler publishes, so the steady state is `free=0, inflight=_low_water` and the cache
-        #: can install at most `_low_water` experts per publish cycle no matter how many it missed.
-        #: MEASURED 2026-09-22 (qwen4exp MXFP4, 2056 slots, LOW_WATER=25 from serve.sh): ~290
-        #: misses/step against 25 installs/step -- a 12x rate deficit -- giving h=0.3026 live where
-        #: this repo's own SLRU simulation gives 0.656 at the IDENTICAL slot count. Run-integrated:
-        #: 1.57M refs -> ~1,267 replacements (0.08% churn), `free=0` and `inflight=25` in every
-        #: summary line. That signature is this cap, not a stall: promotions/evictions DO advance.
-        #: This is the fourth recurrence of a replacement freeze on this cache, and the third
-        #: distinct mechanism (see the MAX_INFLIGHT notes below and the spec-path miss in
-        #: `Scheduler._step_boundary`), which is why the diagnostic counters are now in summary().
+        #: TWO THINGS THAT LOOK LIKE THE CAP AND MEASURABLY ARE NOT, so nobody spends another run
+        #: on them. Both were implemented and REVERTED 2026-09-22 (qwen4exp MXFP4, 2056 slots,
+        #: LOW_WATER=25):
         #:
-        #: WHY NOT JUST RAISE `_low_water`: it is the STEADY-STATE pool, and a reclaimed slot is a
-        #: resident expert given up. Measured sweep: low_water=25 -> h=0.6314, evictions=1,475,
-        #: TPOT 50.26 ms; low_water=1024 -> h=0.5961, evictions=61,404, TPOT 53.14 ms. Depth costs
-        #: hit rate. So keep the pool shallow and raise only the RATE at which it is refilled.
-        self._refill_batch = max(8, _env_int("MINISGL_EXPERT_CACHE_REFILL_BATCH", 0)
-                                 or max(self._low_water, self.slots // 16))
-        #: Target free-slot depth the manager aims for, ADAPTIVE to observed admission demand.
-        #: `_low_water` is the floor (the idle steady state, which the sweep above tuned); under
-        #: load it rises toward the recent per-tick admission rate so one step's admissions are not
-        #: rationed across a dozen publish cycles. Clamped to `slots // 8` so a pathological step
-        #: cannot reclaim the pool out from under the residency it exists to hold.
-        self._demand_ewma = 0.0
-        self._target_cap = max(self._low_water, self.slots // 8)
-        #: Slots wanted since the last `apply_pending`, i.e. one STEP's admission demand.
-        self._want_since_tick = 0
-        #: The depth `_reclaim` currently aims for. Starts at the floor and adapts; in summary()
-        #: because "the pool is shallow" and "the policy has no victims" both read as free=0.
-        self._free_target = self._low_water
+        #:  1. "Decouple `_refill_batch` from `_low_water` so MAX_INFLIGHT becomes reachable."
+        #:     A NO-OP BY INSPECTION: `_reclaim`'s argument is `min(short, _refill_batch)` and
+        #:     `short` is itself `_low_water - free - to_retract`, so it can never exceed
+        #:     `_low_water` however large `_refill_batch` is made.
+        #:  2. "Size the free pool to a STEP's admission demand." Built as an EWMA of per-tick
+        #:     `_promote` calls, and measured to change NOTHING: the arm reproduced the unchanged
+        #:     run TO THE DIGIT -- h=0.3275 vs 0.3256, refs 748000, promotions 2573, evictions
+        #:     567, ticks 3137 in both. Two independent reasons, either fatal: demand is BURSTY
+        #:     (prefill enqueues thousands of references across a few ticks, decode almost none),
+        #:     so any short-horizon average reads ~0 exactly when decode needs the depth; and
+        #:     steady-state demand measured only ~26/tick regardless, which `max(low_water, ...)`
+        #:     floors straight back to 25.
+        #:
+        #: WHAT IS ACTUALLY WRONG IS NOT YET LOCALISED. The cache installs 0.09 experts/tick while
+        #: 26/tick are deferred for want of a slot, with `free=0`, `to_retract=25` and `throttled`
+        #: FROZEN in every sample. `apply_pending` appends all 25 retracted slots to `_free` on
+        #: every tick, so promotes should be finding them and do not. Diagnose from `policy=` and
+        #: `to_retract=` in summary() before touching this: three of this cache's four freezes
+        #: were misdiagnosed from the other counters alone, this one included.
+        #:
+        #: AND NOT `_low_water` EITHER -- it is the steady-state pool, and a reclaimed slot is a
+        #: resident expert given up: low_water=25 -> h=0.6314, evictions 1,475, TPOT 50.26 ms
+        #: against low_water=1024 -> h=0.5961, evictions 61,404, TPOT 53.14 ms.
+        self._refill_batch = max(8, self._low_water)
         #: OUTSTANDING COPIES CEILING. Unbounded, the manager queues the whole cold fill onto the
         #: copy stream at once — measured 2026-09-08: 4,418 in-flight x 1.36 MiB = 6.2 GB, which
         #: saturates the same card-1-gated PCIe link the forward streams its OWN experts over. The
@@ -481,7 +477,7 @@ class ExpertResidencyCache:
                 # a reclaimed slot is a resident expert given up, so over-reclaiming lowers the hit
                 # rate for nothing.
                 with self._lock:
-                    short = self._free_target - len(self._free) - len(self._to_retract)
+                    short = self._low_water - len(self._free) - len(self._to_retract)
                 if short > 0:
                     self._reclaim(min(short, self._refill_batch))
                 # THE INSTRUMENT. Without a hit rate a flat A/B is uninterpretable: "the cache does
@@ -507,16 +503,6 @@ class ExpertResidencyCache:
             return
         self.stats["ticks"] += 1
         with self._lock:
-            # SIZE THE FREE POOL TO ONE STEP'S DEMAND. Here rather than in the manager loop because
-            # this is the only place that runs exactly once per step, and the pool is consumed
-            # per step: every admission holds its slot until the publish below returns it, so a
-            # pool shallower than the step's admissions caps installs at that depth however many
-            # times the manager loops. `_low_water` stays the floor (the idle steady state the
-            # sweep tuned) and `_target_cap` the ceiling, so this can only ever raise the pool
-            # under load and never below what was already validated.
-            want, self._want_since_tick = self._want_since_tick, 0
-            self._demand_ewma, self._free_target = self._next_free_target(
-                self._demand_ewma, want, self._low_water, self._target_cap)
             retract, self._to_retract = self._to_retract, []
             inflight, self._inflight = self._inflight, []
         for _victim, slot in retract:
@@ -594,11 +580,6 @@ class ExpertResidencyCache:
             return
 
         with self._lock:
-            # DEMAND SIGNAL. One call = one slot wanted, counted whether or not it gets one, and
-            # read per TICK rather than per manager batch: the pool is drained by a whole step's
-            # admissions (~290 here) but refilled against a per-batch view (~6), which is how a
-            # 25-deep pool came to ration a step's demand across a dozen publish cycles.
-            self._want_since_tick += 1
             # RATE LIMIT FIRST. Backpressure belongs before the slot is taken: taking one and then
             # refusing to copy would strand it out of the pool.
             if len(self._inflight) >= self._max_inflight:
@@ -686,26 +667,6 @@ class ExpertResidencyCache:
             self._to_retract.append((victim, slot))
         return True
 
-    @staticmethod
-    def _next_free_target(demand_ewma: float, want: int, low_water: int,
-                          cap: int) -> Tuple[float, int]:
-        """Next (demand EWMA, free-slot target) from one step's observed admission demand.
-
-        PURE, AND A STATICMETHOD, SO IT CAN BE TESTED WITHOUT A GPU. Its caller `apply_pending`
-        returns early on a non-CUDA device, so every line of this policy was unreachable from a
-        host test — and this cache's failures have all been quiet ones that a host test is exactly
-        the right shape to catch. Keeping the arithmetic separable is the difference between a
-        gate and a skip.
-
-        `low_water` floors it (the idle steady state the sweep tuned: 25 -> h=0.6314 against
-        1024 -> h=0.5961) and `cap` ceilings it, so under no input can this return a pool
-        shallower than the validated one, nor deep enough to reclaim the residency out from under
-        the cache. The 0.8 smoothing is deliberate: a single wide prefill step must not size the
-        decode pool, and a genuine load change is tracked within a handful of steps.
-        """
-        ewma = 0.8 * demand_ewma + 0.2 * float(want)
-        return ewma, int(min(cap, max(low_water, ewma)))
-
     def _reclaim(self, want: int) -> None:
         """Free capacity AHEAD of demand. MANAGER THREAD.
 
@@ -733,7 +694,6 @@ class ExpertResidencyCache:
                 # a policy with no evictable victim, and a retract queue the scheduler has not
                 # drained all present identically. Without these the last freeze could only be
                 # diagnosed by reading the source and doing arithmetic on the other counters.
-                f"target={self._free_target} demand={self._demand_ewma:.0f} "
                 f"policy={len(self._policy)} to_retract={len(self._to_retract)} "
                 f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
                 f"throttled={self.stats.get('throttled', 0)} "
