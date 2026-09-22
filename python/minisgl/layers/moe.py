@@ -719,6 +719,19 @@ class _MxFp4MoEMethod(MoEQuantMethod):
     supports_ep = True
     supports_producer_actquant = True
 
+    # (w, scales, zeros) in the kernel's pointer-slot order, matching what `apply()` below hands
+    # `kernels.w4a8_moe`: `w13._w_op, w13._scales_op, None`. Symmetric format, so the zeros slot is
+    # genuinely empty — unlike `_NvFp4MoEMethod`, which rides its per-channel global in that slot.
+    #
+    # WITHOUT THIS THE EXPERT RESIDENCY CACHE IS SILENTLY OFF for every MXFP4 MoE layer: the base
+    # declares `cache_plane_attrs = ()`, `moe_interpose` then refuses to register the layer ("method
+    # declares no slot triple — cache OFF for this layer") and every routed expert is read from the
+    # host base across PCIe on every step. That is fail-SAFE by design, and it cost the measured
+    # 1.264x the cache is worth on this model (68.76 -> 54.41 ms TPOT) on the
+    # Qwen3.8-Flash-Next-MXFP4 arm, where it read as "our engine is slow on this checkpoint".
+    # The NVFP4 sibling has declared its triple since the cache landed; this one never did.
+    cache_plane_attrs = ("_w_op", "_scales_op", None)
+
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
 
