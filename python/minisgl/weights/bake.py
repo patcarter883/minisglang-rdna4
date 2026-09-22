@@ -624,6 +624,13 @@ class StageASession:
             v = layout()
             what = getattr(v, "describe", None)
             self.log(f"weight offload: arena layout verified — {what() if callable(what) else v}")
+            # The CARVED total, which is what `originals_released` is denominated in: the arena
+            # hands out regions sized by `torch_charged_rows` (the segment torch opens), while
+            # `copied_bytes` is raw bytes written. Without this the ledger compares the two units
+            # and fails by the segment rounding alone — 105 MiB on the MXFP4 stacked-expert shapes.
+            carved = getattr(v, "carved_bytes", None)
+            if carved:
+                self.accounting.charged_bytes = int(carved)
         self._assert_device_accounting()
         self._require_complete_ledger()
         self.driver.freeze()  # arena.mark_populated() + arena.freeze() -> hipmem.freeze() (rule R1)

@@ -174,6 +174,14 @@ class WeightArenaAccounting:
     # separate "the originals were released" from "the arena rows were added" in a single
     # `memory_allocated()` delta, which otherwise nets to zero when the arena is pool-served.
     arena_torch_bytes: int = 0
+    #: Bytes the arena actually CARVED, i.e. the sum of region sizes. This is SEGMENT-granular:
+    #: regions are sized by `torch_charged_rows`, which models the segment torch opens for a row,
+    #: not the row itself. `copied_bytes` is raw bytes written. The two differ BY CONSTRUCTION and
+    #: the difference is a property of the checkpoint's shapes -- measured 105.0 MiB over the 168
+    #: regions of Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ's stacked experts (26.2500 charged vs 26.1475
+    #: raw), and small enough to hide under the tolerance on NVFP4's shapes. 0 when the arena did
+    #: not report, in which case the check below falls back to `copied_bytes` and behaves as before.
+    charged_bytes: int = 0
     # Device-tier bytes MEASURED off the live post-load containers (`moe_interpose.BindOutcome
     # .device_resident_bytes`), or None when no such measurement exists. See `device_tier_bytes`
     # for why the plan-derived fallback is not a measurement.
@@ -277,6 +285,17 @@ class WeightArenaAccounting:
         recoverable from a single delta. Without that term the two movements cancel exactly whenever
         the arena IS pool-served, and a completely un-dropped original would look perfect."""
         return self.arena_torch_bytes - self.alloc_delta_bake
+
+    @property
+    def released_expected(self) -> int:
+        """What `originals_released` should equal, IN THE SAME UNITS it is measured in.
+
+        `arena_torch_bytes` counts what torch asked the arena for, and the arena hands out regions
+        sized by `torch_charged_rows` -- the segment, not the row. So the expectation is the carved
+        total, not `copied_bytes`. Falls back to `copied_bytes` when the arena reported no carve, so
+        a driver that does not implement the layout verifier behaves exactly as before.
+        """
+        return self.charged_bytes or self.copied_bytes
 
     @property
     def alloc_correction(self) -> int:
@@ -402,13 +421,19 @@ class WeightArenaAccounting:
             ),
             AccountingCheck(
                 name="torch released the originals",
-                ok=abs(self.originals_released - self.copied_bytes) <= tol,
+                ok=abs(self.originals_released - self.released_expected) <= tol,
                 actual=self.originals_released,
-                expected=self.copied_bytes,
+                expected=self.released_expected,
                 tol=tol,
                 detail=(
                     "allocator delta across the bake, net of the arena rows it added. Short means a "
-                    "live reference to a pre-offload weight survived and peak VRAM never comes down"
+                    "live reference to a pre-offload weight survived and peak VRAM never comes down. "
+                    "Compared against the CARVED (segment-granular) total, not the raw copied bytes: "
+                    "`originals_released` is derived from `arena_torch_bytes`, which is what torch "
+                    "requested FROM the arena, and regions are sized by `torch_charged_rows`. "
+                    "Comparing it to raw bytes fails by the segment rounding alone -- 105 MiB on this "
+                    "checkpoint's 168 expert regions, which is shape-dependent and says nothing "
+                    "about whether an original survived"
                 ),
             ),
         ]
