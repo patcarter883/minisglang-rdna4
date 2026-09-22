@@ -84,6 +84,7 @@ import struct
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from minisgl.kvcache._envutil import env_int
@@ -424,6 +425,11 @@ class RouteTracer:
             # nothing to move and the stage is already all -1 by induction. Skipping keeps a
             # 28-chunk prompt from paying 84 pointless device ops.
             return
+        # THE MASK, and the one invariant it rests on: REAL ROWS COME FIRST. `topk_ids.reshape(-1)`
+        # is row-major, so rows 0..rows-1 are exactly the leading rows*top_k ids — and the padding is
+        # at the END because `GraphRunner.pad_batch` builds `padded_reqs = batch.reqs + [dummy_req]*k`.
+        # A future change that interleaved or prepended dummies would make this silently keep garbage
+        # and drop real routings, with nothing failing.
         rows = self._cur_rows
         if rows is None:
             self.rows_unknown += 1
@@ -486,10 +492,17 @@ class RouteTracer:
             n = M * self.top_k
             self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
             if M != self._cur_rows and self._cur_rows is not None:
-                # The row count `harvest` will mask against disagrees with the one this forward
+                # The row count `harvest` will mask against disagrees with the one this MoE call
                 # actually carried. One int compare per layer per step, and it is worth it: a wrong
                 # mask either truncates a real row's union (the cache looks BETTER than it is) or
-                # admits a padded row's experts, and both are invisible in a hit rate.
+                # admits a padded row's experts, and neither is visible in a hit rate.
+                # NONZERO IS NOT AUTOMATICALLY A PLUMBING BUG. Two legitimate causes, both of which
+                # genuinely DO give the policy a partial union and are worth surfacing:
+                #   * a tp_overlap ROW SPLIT (>= 256 rows): chunk 0 is the only one the ring takes,
+                #     so M is the chunk, not the forward;
+                #   * EP: `MoELayer` sees the EP group's gathered rows (dp_size*bs), not this
+                #     replica's. Before this change such a forward missed `ring_rows` entirely and
+                #     the policy saw NOTHING, so masking to the local rows is strictly more.
                 self.rows_mismatch += 1
             if self.blockmap_seen < self.blockmap_checks and ntp is not None and block_m:
                 self._blockmap_check(topk_ids, expert_ids, ntp, block_m)
@@ -618,9 +631,25 @@ class RouteTracer:
                     # loop to build a per-lid dict at all (the graph writes the stage with no Python
                     # running). An all -1 row means that layer never recorded; it is skipped, exactly
                     # as a missing dict key used to be, rather than emitting a zero-expert record.
+                    #
+                    # TWO COLUMN BOUNDS, both of which matter now that `ring_rows` is sized from
+                    # max_running_req/cuda_graph_max_bs instead of 1. The row is `top_k*ring_rows`
+                    # wide, but only the leading `ntok*top_k` ids can be real, and the dedupe used to
+                    # walk the FULL width in Python: at max_running_req 256 and top_k 10 that is
+                    # 64 steps x 48 layers x 2560 = 7.8M interpreter iterations PER DRAIN, on the
+                    # scheduler thread, to extract at most a few hundred ids. Slicing to the real
+                    # width and deduping in numpy (`np.unique` returns sorted-unique, so the result is
+                    # identical to the old `sorted({...})`) makes the drain proportional to the
+                    # routing it actually carries. MEASURED host-side, CPU only, 2026-09-23, 48
+                    # layers / top_k 10 / ring_rows 256 / 64 steps of 2 real rows: 50.1 ms for the
+                    # whole 64-step window with the bound, 97.3 ms without it -- i.e. the unbounded
+                    # scan is ~47 ms of scheduler-thread stall per drain, and that is WITH numpy
+                    # doing the dedupe.
+                    # (ntok == 0 -- an empty batch -- gives ncols 0, an empty slice, and no records.)
+                    ncols = min(max(int(ntok), 0) * self.top_k, self.ring_width)
                     for lid in range(self.num_layers):
-                        row = ids_np[slot, lid]
-                        ids = sorted({int(e) for e in row if 0 <= int(e) < self.num_experts})
+                        row = np.unique(ids_np[slot, lid, :ncols])
+                        ids = [int(e) for e in row if 0 <= e < self.num_experts]
                         if not ids:
                             continue
                         obs = getattr(self, "_observer", None)
