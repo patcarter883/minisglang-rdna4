@@ -29,15 +29,52 @@ of work and there are ~28 of them per 28k prompt; one sync there is noise. Prefi
 REQUIRED for the pollution analysis (a prefill touches most of the 512 experts and would flush a
 naive LRU), so they are not optional.
 
-NOT CAPTURE-SAFE, AND THAT IS NOT A CONSTRAINT ON THIS ARM. `tools/serve.sh:754` sets `GRAPH_BS=0`
-as the qwen4exp DEFAULT, with a measured rationale (capture buys 3.45-3.66 ms of a ~60 ms step and
-costs 78% of context reach at MEM_RATIO 0.90). Under bucketed capture the Python in
-`MoELayer.forward` runs once at capture and is dead at replay, and a bs=2 bucket's padded row 1
-carries garbage routing that would pollute the trace. Every write here is nevertheless guarded on
-`torch.cuda.is_current_stream_capturing()` so an accidental capture degrades to a gap in the trace,
-never to an illegal op or a poisoned record. `tools/moe_route_stats.sh:17-20` is the precedent that a
-routing statistic is legitimately taken eager: routing is a deterministic function of the hidden
-states, identical captured or not.
+CAPTURE-SAFE, VIA A STAGE BUFFER AND A HARVEST AT THE STEP BOUNDARY. This module used to be
+capture-UNSAFE by design, and said so: every write was guarded on
+`torch.cuda.is_current_stream_capturing()`, so an accidental capture degraded to a GAP in the trace
+rather than an illegal op. That gap stopped being acceptable the moment this ring became the expert
+cache's only input (`set_observer`) instead of just a measurement fixture. Under capture the ring
+recorded nothing, the cache observed nothing, and it went INERT while still holding its entire
+budget (2.5 GiB/rank on the shipped arm) — i.e. re-freezing exactly the stall that was just fixed at
+real cost (h 0.3256 -> 0.4067 measured, install rate 0.39 -> ~5/tick). Capture itself is worth a
+measured 3.45-3.66 ms of a ~60 ms decode step (`tools/serve.sh`, `[QSA-CAP-2026-09-06]`), so
+"capture or the cache, pick one" was not a trade worth keeping.
+
+Two things made the ring un-capturable. Both are fixed here:
+
+  1. THE RING INDEX WAS A HOST INT. `record` wrote `ids_ring[self.slot, lid, :n]` and `self.slot` is
+     host Python, computed in `begin_forward`. Under capture that Python runs ONCE, so the slot is
+     baked as a constant and every replay writes the SAME slot; `self.meta[slot]` (a host dict) is
+     never updated at replay either. FIX: `record` writes a per-step STAGE buffer at
+     `stage[lid, :n]` — constant indices, no slot, capture-safe — and `harvest()` copies stage into
+     `ids_ring[slot]` at the step boundary: in `begin_forward`, which is outside any capture region
+     and the one point every forward call site passes through. `lid` never needed fixing — each
+     layer's wrapper runs at capture with its own lid, so the graph holds one correctly-addressed
+     write per layer. The harvest is one [num_layers, ring_width] int32 D2D copy, ~4 KiB/step,
+     noise against a ~60 ms step. Device-side indexing of the ring (a `slot` tensor the scheduler
+     bumps) was deliberately NOT taken: it buys nothing here and the staging copy is far easier to
+     prove correct.
+  2. A CAPTURED BUCKET'S PADDED ROWS CARRY GARBAGE ROUTING. Capture is BUCKETED: a bs=2 graph
+     replayed for a 1-request step pushes a padded row through routing too, and whichever experts
+     that row lands on were referenced by NO request. Feeding them to the policy would admit slabs
+     nothing reads and evict ones something does. `record` cannot mask them — at capture time it
+     knows only the bucket width — so `harvest` does it on the host, where the step's REAL row count
+     is known (`begin_forward(num_rows=...)`, from `Scheduler._step_boundary`).
+     `topk_ids.reshape(-1)` is row-major, so rows 0..M-1 are exactly the first M*top_k entries.
+
+The HOST path (prefill, and any forward too wide for the ring) is still capture-guarded and must
+stay that way: it ends in a blocking `.tolist()`, which is illegal under capture. Nothing captured
+takes it — `engine/graph.py` captures decode and verify only, and `record` routes both to the ring.
+
+`tools/moe_route_stats.sh:17-20` remains the precedent that a routing statistic is legitimately
+taken from the forward at all: routing is a deterministic function of the hidden states, identical
+captured or not.
+
+TESTING THIS WITHOUT A GPU. Everything above is host logic over tensors; `device=torch.device("cpu")`
+constructs a working tracer (the pinned D2H staging buffer is only pinned on a cuda device, see
+__init__), and the capture branch is reachable two ways: call `_record_captured` directly, or
+monkeypatch `torch.cuda.is_current_stream_capturing`. `tests/route_trace_verify_test.py` is the
+existing shape of such a test.
 """
 
 from __future__ import annotations
@@ -96,14 +133,19 @@ def enabled() -> bool:
     return _TRACER is not None
 
 
-def begin_forward(is_prefill: bool, req_uid: int, *, is_verify: bool = False) -> None:
+def begin_forward(is_prefill: bool, req_uid: int, *, is_verify: bool = False,
+                  num_rows: "Optional[int]" = None) -> None:
     """Step boundary. Called from Scheduler._forward for EVERY loop (there are eight), and from the
     four speculative VERIFY sites. `is_verify` is not cosmetic: without it `_cur_kind` keeps the
     previous forward's value -- a PREFILL on a spec serve -- and every verify record early-returns
-    before reaching the ring, which is why the expert cache saw nothing under spec."""
+    before reaching the ring, which is why the expert cache saw nothing under spec.
+
+    `num_rows` is the REAL query-row count of the forward about to run (padding excluded). It is what
+    lets `harvest` mask a captured bucket's padded rows; None means "unknown", which is correct-but-
+    unmasked and is counted in `rows_unknown` rather than assumed harmless."""
     t = _TRACER
     if t is not None:
-        t.begin_forward(is_prefill, req_uid, is_verify=is_verify)
+        t.begin_forward(is_prefill, req_uid, is_verify=is_verify, num_rows=num_rows)
 
 
 def close() -> None:
@@ -134,9 +176,11 @@ class RouteTracer:
         dp_rank: int,
         expert_bytes: int,
         ring_steps: int,
-        # How many FORWARD ROWS one ring entry can hold. 1 is a plain decode; a speculative verify
-        # carries bs*(K+1). Sized by the caller from the engine's spec width, because a verify that
-        # does not fit falls to the host path and never reaches the observer.
+        # How many FORWARD ROWS one ring entry can hold: the WIDEST decode/verify the engine can
+        # produce. A plain decode carries one row per running request, a captured decode carries its
+        # BUCKET's padded rows, a speculative verify carries bs*(K+1) — `engine._route_trace_ring_rows`
+        # takes the max of the three. The default of 1 is for a direct caller/test only; it used to be
+        # the engine's non-spec value and that starved the observer on every concurrent decode step.
         ring_rows: int = 1,
         drain_every: int,
         max_steps: int,
@@ -183,6 +227,13 @@ class RouteTracer:
         self.blockmap_violations = 0
         self._thread = threading.get_ident()
         self._lock = threading.Lock()
+        # Per-step host state for the step CURRENTLY in flight. Initialised here rather than first
+        # assigned in `begin_forward` so `harvest` and a CPU test can read them before any step has
+        # run, and so `record` can never see a half-built object.
+        self._cur_uid = 0
+        self._cur_kind = KIND_OTHER
+        self._cur_rows: Optional[int] = None    # REAL rows of this forward; None = unknown
+        self._harvested = True                  # nothing staged yet -> nothing to harvest
 
         # RING WIDTH. One decode row needs top_k slots; a speculative VERIFY carries M = bs*(K+1)
         # rows and its union is what the cache must see, so the ring is widened to hold `ring_rows`
@@ -195,18 +246,46 @@ class RouteTracer:
         self.ids_ring = torch.full(
             (self.ring_steps, self.num_layers, self.ring_width), -1, dtype=torch.int32, device=device
         )
+        # PER-STEP STAGE. This, not the ring, is what `record` writes, and it is the whole reason a
+        # captured decode can be traced: the write is `stage[lid, :n]`, two CONSTANT indices, so the
+        # graph bakes a correct address. The ring's step index cannot appear inside a graph (it is
+        # host Python; a replay would rewrite one frozen slot forever) — `harvest` moves stage into
+        # `ids_ring[slot]` at the step boundary instead. Allocated ONCE, before any capture, so the
+        # address the graph bakes stays valid for the life of the serve (the same argument
+        # expert_cache.py's "GRAPH CAPTURE" note makes for `slot_of`).
+        self.stage = torch.full(
+            (self.num_layers, self.ring_width), -1, dtype=torch.int32, device=device
+        )
         # Pinned host staging for the ONE D2H per drain (the qsa runtime.py:331-333 pattern).
+        # pin_memory only on a cuda device: pinning is a hipHostMalloc and RAISES with no GPU, which
+        # would make this whole class unconstructable in a CPU test for no benefit (a cpu->cpu
+        # `copy_` neither needs nor uses the pinning).
         self.ids_host = torch.empty(
-            (self.ring_steps, self.num_layers, self.ring_width), dtype=torch.int32, pin_memory=True
+            (self.ring_steps, self.num_layers, self.ring_width), dtype=torch.int32,
+            pin_memory=(torch.device(device).type == "cuda"),
         )
         # Verify rows that did not fit `ring_rows`. Reported at close; a nonzero value means the
         # cache was fed a PARTIAL union and any hit rate measured against it is optimistic.
         self.rows_dropped = 0
-        # HOST meta (C8): every field is host-known at the call, so staging it on device would be a
-        # second dispatch per layer per step for nothing. slot -> lid -> (step, uid, kind, chunk, ntok)
-        self.meta: List[Dict[int, Tuple[int, int, int, int, int]]] = [
-            {} for _ in range(self.ring_steps)
-        ]
+        # Steps harvested with `num_rows=None`, i.e. with no real-row count to mask a captured
+        # bucket's padding against. Reported at close because it is the one way padded routing can
+        # still reach the policy: a caller that forgot to plumb the count.
+        self.rows_unknown = 0
+        # Steps where `record` saw a row count that disagreed with the one `begin_forward` was told.
+        # One int compare per layer per step buys the difference between "the mask is wrong" showing
+        # up as a counter and showing up as a quietly optimistic hit rate.
+        self.rows_mismatch = 0
+        # MoE calls that reached `record` under capture with no layer id in scope (an unwrapped MoE
+        # being captured — an MTP draft head is the plausible one). Not fatal: a missing record
+        # degrades the cache, it cannot corrupt it. Loud once, then counted.
+        self.capture_unwrapped = 0
+        # HOST meta, ONE TUPLE PER STEP: (step, uid, kind, rows). Every ring record of a given step
+        # shares all four — `record` used to store a per-lid dict entry, 48 dict setitems per step on
+        # the decode path, to hold 48 copies of the same tuple plus a lid-keyed "did this layer
+        # record" bit. `harvest` now owns it, one store per step, and `drain` recovers the per-layer
+        # bit from the ring row itself (all -1 => that layer never recorded). None = no ring record
+        # for this slot.
+        self.step_meta: List[Optional[Tuple[int, int, int, int]]] = [None] * self.ring_steps
         # Prefill/large-M records fall out of the ring entirely (variable num_ids).
         self.oversize: List[Tuple[int, int, int, int, int, int, List[int]]] = []
 
@@ -288,16 +367,20 @@ class RouteTracer:
             raise RouteTraceError(f"non-contiguous MoE layer ids: {sorted(self.ops)}")
 
     # -- step boundary ------------------------------------------------------------------------
-    def begin_forward(self, is_prefill: bool, req_uid: int, *, is_verify: bool = False) -> None:
+    def begin_forward(self, is_prefill: bool, req_uid: int, *, is_verify: bool = False,
+                      num_rows: "Optional[int]" = None) -> None:
         if self.disarmed:
             return
         assert threading.get_ident() == self._thread, (
             "route trace: a second thread drove a forward. The module globals that carry the layer "
             "id are only legal because the scheduler loop is single-threaded."
         )
-        # Drain FIRST, at the step boundary: outside the forward, outside any capture region, and
-        # the only point every one of the eight _forward call sites passes through. _hp_tick is NOT
-        # such a point (it runs only under MINISGL_HOSTPROF) — see C5.
+        # HARVEST FIRST, then drain. The step that just finished left its ids in `stage`; they have to
+        # reach `ids_ring[self.slot]` BEFORE the drain reads the ring and before this step's records
+        # overwrite the stage. Both run here for the same reason: `begin_forward` is outside the
+        # forward, outside any capture region, and the only point every forward call site passes
+        # through. _hp_tick is NOT such a point (it runs only under MINISGL_HOSTPROF) — see C5.
+        self.harvest()
         if self.n_since_drain >= self.drain_every:
             self.drain()
         self.step_id += 1
@@ -306,20 +389,75 @@ class RouteTracer:
             self.close()
             return
         self.slot = self.step_id % self.ring_steps
-        self.meta[self.slot] = {}
+        self.step_meta[self.slot] = None
         self._cur_uid = int(req_uid) & 0xFFFFFFFF
         self._cur_kind = (KIND_PREFILL if is_prefill
                           else KIND_VERIFY if is_verify else KIND_DECODE)
+        # The REAL row count of the forward about to run. `harvest` masks everything past it, which
+        # is how a captured bucket's padded rows are kept out of the policy — see (2) in the module
+        # docstring. None is "unknown": harvested unmasked and counted, never assumed to be 1.
+        self._cur_rows = None if num_rows is None else max(0, int(num_rows))
+        self._harvested = False
         self.n_since_drain += 1
         _CUR_CHUNK.clear()
+
+    def harvest(self) -> None:
+        """Move the finished step's staged ids into its ring slot, masking padded rows. IDEMPOTENT.
+
+        WHY THIS EXISTS: see (1) and (2) in the module docstring. `record` cannot address the ring
+        under capture (the slot is host Python) and cannot know the real row count (it sees the
+        bucket width), so both jobs land here — host side, at the step boundary, outside capture.
+
+        THREE DEVICE OPS PER STEP, and the eager path got CHEAPER in exchange: `record` no longer
+        clears the stale tail of its row (the stage is reset to -1 here, once, for all layers), so
+        the per-layer cost went from two device ops to one. Net on a 48-layer decode: 96 -> 51.
+
+        Idempotent via `_harvested` because `drain()` calls it too — a drain that ran without a
+        following `begin_forward` (every direct `drain()` in a test, and `close()`) must still see
+        the last step's ids, and a second harvest of the same step must not re-copy a stage that has
+        already been reset."""
+        if self.disarmed or self.slot < 0 or self._harvested:
+            return
+        self._harvested = True
+        if self._cur_kind not in (KIND_DECODE, KIND_VERIFY):
+            # A PREFILL step never writes the stage (its records take the host path), so there is
+            # nothing to move and the stage is already all -1 by induction. Skipping keeps a
+            # 28-chunk prompt from paying 84 pointless device ops.
+            return
+        rows = self._cur_rows
+        if rows is None:
+            self.rows_unknown += 1
+            n = self.ring_width
+        else:
+            n = min(rows * self.top_k, self.ring_width)
+        slot = self.slot
+        if n > 0:
+            self.ids_ring[slot, :, :n].copy_(self.stage[:, :n])
+        if n < self.ring_width:
+            # The tail is PADDING (a captured bucket wider than the live batch) or a narrower step's
+            # unused width. Either way it must not reach the policy, and it must not be left holding
+            # a wider previous step's ids in this reused slot.
+            self.ids_ring[slot, :, n:].fill_(-1)
+        self.stage.fill_(-1)
+        self.step_meta[slot] = (self.step_id, self._cur_uid, self._cur_kind,
+                                self.ring_rows if rows is None else rows)
 
     # -- the hot path -------------------------------------------------------------------------
     def record(self, topk_ids: torch.Tensor, num_tokens: int, expert_ids=None, ntp=None,
                block_m: int = 0) -> None:
         """One MoE call. DECODE: one device slice-assign, no sync, no .item(), no .tolist()."""
-        if self.disarmed or self.slot < 0:
+        if self.disarmed:
             return
         if torch.cuda.is_current_stream_capturing():
+            # UNDER CAPTURE this is the ONLY legal path, and it must not be skipped: whatever is
+            # recorded here is the whole of what every later replay will do. It cannot touch any
+            # per-step host state -- `self.slot` is -1 at capture time (capture runs at engine init,
+            # before the first `begin_forward`) and `_cur_kind` describes no real step -- so it is a
+            # separate method that touches only the stage. Costs the eager path nothing: this is the
+            # same single `is_current_stream_capturing()` call the old early-return made.
+            self._record_captured(topk_ids)
+            return
+        if self.slot < 0:
             return
         lid = _CUR_LID
         if lid is None:
@@ -339,12 +477,20 @@ class RouteTracer:
             # observer at all: under MTP every target forward is a verify with M = bs*(K+1), so an
             # M == 1 gate meant the ring never fired once and the expert cache sat inert, holding
             # its whole budget at fill=0.000 for zero hits.
+            #
+            # IT WRITES THE STAGE, NOT THE RING, and for the eager path that is not merely harmless
+            # but one device op cheaper: `harvest` resets the whole stage to -1 once per step, so the
+            # per-row tail clear this used to do (a second dispatch per layer per step, 48 of them)
+            # is gone. The ring's step index cannot appear here at all -- see (1) in the module
+            # docstring.
             n = M * self.top_k
-            flat = topk_ids.reshape(-1)[:n]
-            self.ids_ring[self.slot, lid, :n] = flat
-            if n < self.ring_width:
-                self.ids_ring[self.slot, lid, n:] = -1     # stale ids from a wider previous step
-            self.meta[self.slot][lid] = (self.step_id, self._cur_uid, self._cur_kind, 0, M)
+            self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
+            if M != self._cur_rows and self._cur_rows is not None:
+                # The row count `harvest` will mask against disagrees with the one this forward
+                # actually carried. One int compare per layer per step, and it is worth it: a wrong
+                # mask either truncates a real row's union (the cache looks BETTER than it is) or
+                # admits a padded row's experts, and both are invisible in a hit rate.
+                self.rows_mismatch += 1
             if self.blockmap_seen < self.blockmap_checks and ntp is not None and block_m:
                 self._blockmap_check(topk_ids, expert_ids, ntp, block_m)
             return
@@ -362,6 +508,53 @@ class RouteTracer:
         self.oversize.append(
             (self.step_id, self._cur_uid, lid, kind, chunk, min(M, 0xFFFF), ids)
         )
+
+    def _record_captured(self, topk_ids: torch.Tensor) -> None:
+        """The ring write as it is RECORDED INTO A GRAPH. Also the CPU test seam for capture.
+
+        Everything a graph bakes has to be a constant: the destination `stage[lid, :n]` is, because
+        `lid` comes from this layer's own wrapper (the wrapper runs at capture, once per layer, so
+        each layer's write is separately and correctly addressed) and `n` comes from the BUCKET width,
+        which is fixed for this graph. Nothing per-step is read or written -- no slot, no kind, no
+        meta, no `_CUR_CHUNK` -- because none of that host state exists at capture time and none of it
+        would be re-evaluated at replay if it did.
+
+        NO CHUNK BOOKKEEPING, and that is safe rather than sloppy: `rowchunked_ar_span` falls back to
+        an unsplit `produce(x)` under capture (`tp_overlap.py::_overlappable` excludes capturing
+        explicitly, since a side-stream collective cannot be recorded), so a captured forward calls
+        each MoE layer exactly once. Leaving `_CUR_CHUNK` untouched also keeps the capture-time
+        warmup from poisoning the first real step's chunk counters.
+
+        THE BUCKET MUST FIT. `n > ring_width` would bake a graph whose write is silently truncated --
+        every replay forever feeding the policy a partial union, which makes the cache look better
+        than it is. `engine._route_trace_ring_rows` sizes the ring from `cuda_graph_max_bs` precisely
+        so this cannot happen, so if it fires it is a sizing bug and must stop the boot, not the
+        serve.
+        """
+        lid = _CUR_LID
+        if lid is None:
+            # An unwrapped MoE is being captured -- an MTP draft head is the plausible one (they are
+            # filtered out of `self.ops` by design). Not fatal: a missing record starves the cache,
+            # it cannot corrupt it. Loud once, then counted, because the eager path RAISES on this
+            # and silently differing under capture is how a wrapper gap survives.
+            self.capture_unwrapped += 1
+            if self.capture_unwrapped == 1:
+                print(
+                    "[route-trace] a MoE call was CAPTURED with no layer id in scope: its routings "
+                    "will never reach the expert cache. Check that every MoE layer this graph runs "
+                    "is wrapped by install_hooks (MTP/draft heads are excluded on purpose).",
+                    flush=True,
+                )
+            return
+        n = int(topk_ids.shape[0]) * self.top_k
+        if n > self.ring_width:
+            raise RouteTraceError(
+                f"route trace: capturing a {int(topk_ids.shape[0])}-row forward but the ring holds "
+                f"{self.ring_rows} rows ({self.ring_width} ids). The graph would bake a truncated "
+                f"write and every replay would feed the expert cache a partial expert union. Size "
+                f"ring_rows from cuda_graph_max_bs (engine._route_trace_ring_rows)."
+            )
+        self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
 
     def _blockmap_check(self, topk_ids, expert_ids, ntp, block_m: int) -> None:
         """T1, bounded: does moe_align ever emit a block under an expert NOT in topk_ids?
@@ -397,10 +590,17 @@ class RouteTracer:
 
     def drain(self) -> None:
         """ONE D2H of the filled ring, then dedupe+sort per (step, layer) on host and append."""
+        if torch.cuda.is_current_stream_capturing():
+            # BEFORE the harvest, not after: harvesting under capture would record the staging copy
+            # into the graph, which is precisely the mistake this module is being fixed to avoid.
+            return
         if self.n_since_drain == 0 and not self.oversize:
             return
-        if torch.cuda.is_current_stream_capturing():
-            return
+        # The step in flight staged its ids and nothing has moved them into the ring yet. `drain`
+        # called from `begin_forward` has already harvested (and `harvest` is idempotent); `drain`
+        # called from `close()` or straight from a test has not, and without this the last step --
+        # the only one in a single-step test -- would be dropped.
+        self.harvest()
         with self._lock:
             n = min(self.n_since_drain, self.ring_steps)
             self.ids_host.copy_(self.ids_ring, non_blocking=False)
@@ -409,21 +609,32 @@ class RouteTracer:
             first = self.step_id - n + 1
             for s in range(first, self.step_id + 1):
                 slot = s % self.ring_steps
-                for lid, (step, uid, kind, chunk, ntok) in sorted(self.meta[slot].items()):
-                    row = ids_np[slot, lid]
-                    ids = sorted({int(e) for e in row if 0 <= int(e) < self.num_experts})
-                    obs = getattr(self, "_observer", None)
-                    if obs is not None and kind in (KIND_DECODE, KIND_VERIFY):
-                        # DECODE ONLY. A prefill chunk touches nearly every expert in the layer, so
-                        # feeding it to the policy would look like one enormous sweep; the oracle
-                        # measured that arm separately (prefill pollution, -0.0008 for SLRU) and the
-                        # manager is sized for the decode working set.
-                        obs(lid, ids)
-                    out += struct.pack(RECORD_FMT, step & 0xFFFFFFFF, uid, lid, kind, chunk,
-                                       ntok, len(ids))
-                    out += struct.pack(f"<{len(ids)}H", *ids)
-                    self.records_written += 1
-                self.meta[slot] = {}
+                sm = self.step_meta[slot]
+                if sm is not None:
+                    step, uid, kind, ntok = sm
+                    # ALL LAYERS, and the ring row decides which ones actually recorded. `harvest`
+                    # stores one tuple per STEP rather than the old per-lid dict entry, because every
+                    # ring record of a step shares it -- and because under capture there is no host
+                    # loop to build a per-lid dict at all (the graph writes the stage with no Python
+                    # running). An all -1 row means that layer never recorded; it is skipped, exactly
+                    # as a missing dict key used to be, rather than emitting a zero-expert record.
+                    for lid in range(self.num_layers):
+                        row = ids_np[slot, lid]
+                        ids = sorted({int(e) for e in row if 0 <= int(e) < self.num_experts})
+                        if not ids:
+                            continue
+                        obs = getattr(self, "_observer", None)
+                        if obs is not None and kind in (KIND_DECODE, KIND_VERIFY):
+                            # DECODE ONLY. A prefill chunk touches nearly every expert in the layer,
+                            # so feeding it to the policy would look like one enormous sweep; the
+                            # oracle measured that arm separately (prefill pollution, -0.0008 for
+                            # SLRU) and the manager is sized for the decode working set.
+                            obs(lid, ids)
+                        out += struct.pack(RECORD_FMT, step & 0xFFFFFFFF, uid, lid, kind, 0,
+                                           min(ntok, 0xFFFF), len(ids))
+                        out += struct.pack(f"<{len(ids)}H", *ids)
+                        self.records_written += 1
+                self.step_meta[slot] = None
             for (step, uid, lid, kind, chunk, ntok, ids) in self.oversize:
                 ids = ids[:0xFFFF]
                 out += struct.pack(RECORD_FMT, step & 0xFFFFFFFF, uid, lid, kind, chunk,
@@ -437,7 +648,7 @@ class RouteTracer:
                 # built unconditionally because the packing loop is also what computes `ids`, and
                 # splitting it would give the cache and the capture fixture two different notions of
                 # which experts a step touched.
-                self.meta = [{} for _ in range(self.ring_steps)]
+                self.step_meta = [None] * self.ring_steps
                 self.ids_ring.fill_(-1)
                 self.n_since_drain = 0
                 return
@@ -461,17 +672,25 @@ class RouteTracer:
         finally:
             if self._fh is not None and not self._fh.closed:
                 self._fh.close()
+        # EVERY WAY THE UNION CAN BE WRONG, in one line. Each of these makes the cache look BETTER
+        # than it is (a truncated or padding-polluted union), and none of them fails anything:
+        #   rows_dropped     a forward too wide for ring_rows fell to the host path -> not observed
+        #   rows_unknown     a step harvested with no real-row count -> padded rows NOT masked
+        #   rows_mismatch    the plumbed row count disagreed with the forward's own M
+        #   capture_unwrapped a captured MoE call had no layer id -> its layer is never observed
+        warn = (f" rows_dropped={self.rows_dropped} rows_unknown={self.rows_unknown} "
+                f"rows_mismatch={self.rows_mismatch} capture_unwrapped={self.capture_unwrapped}")
         if self._fh is None:
             print(
                 f"[route-trace] observe-only: {self.step_id + 1} steps fed to the observer, "
-                f"no fixture written",
+                f"no fixture written;{warn}",
                 flush=True,
             )
             return
         print(
             f"[route-trace] {self.records_written} records -> {self.path} "
             f"(steps={self.step_id + 1}, blockmap_checked={self.blockmap_seen}, "
-            f"violations={self.blockmap_violations})",
+            f"violations={self.blockmap_violations});{warn}",
             flush=True,
         )
 
@@ -482,6 +701,11 @@ class RouteTracer:
             "route_trace_steps": self.step_id + 1,
             "route_trace_blockmap_checked": self.blockmap_seen,
             "route_trace_blockmap_violations": self.blockmap_violations,
+            # See close(): the four ways a reported union can be narrower or dirtier than the truth.
+            "route_trace_rows_dropped": self.rows_dropped,
+            "route_trace_rows_unknown": self.rows_unknown,
+            "route_trace_rows_mismatch": self.rows_mismatch,
+            "route_trace_capture_unwrapped": self.capture_unwrapped,
         }
 
 
@@ -542,11 +766,14 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
         num_layers, num_experts, top_k = _derive_shape(model)
     ring = env_int("MINISGL_MOE_ROUTE_TRACE_RING", 1024)
     # RING ROWS and the byte budget. One entry is `top_k * ring_rows` int32 per (step, layer), so
-    # width scales with the spec width and the ring is steps x layers x width x 4 B. A wide spec
-    # config would otherwise allocate gigabytes silently -- e.g. max_running_req 64 at K=15 is 1024
-    # rows, 10240 wide, 2 GB. Rows come first (an under-wide ring drops verify records and feeds the
-    # cache a partial union, which is the failure this whole change exists to remove); `ring_steps`
-    # is what gives way, and loudly.
+    # width scales with the widest forward the engine can produce (`engine._route_trace_ring_rows`:
+    # max_running_req, cuda_graph_max_bs, and the spec K+1 factor) and the ring is
+    # steps x layers x width x 4 B. A wide config would otherwise allocate gigabytes silently -- e.g.
+    # max_running_req 64 at K=15 is 1024 rows, 10240 wide, 2 GB. Rows come first (an under-wide ring
+    # drops decode/verify records to the host path, where they never reach the observer, and under
+    # CAPTURE it is worse than that: `_record_captured` refuses to bake a truncated write and stops
+    # the boot); `ring_steps` is what gives way, and loudly. The device cost on top of the ring is one
+    # `stage` of layers x width x 4 B -- 1/ring_steps of it, i.e. unbudgeted on purpose.
     rows = max(1, int(ring_rows))
     width = max(1, int(top_k)) * rows
     budget = env_int("MINISGL_MOE_ROUTE_TRACE_MAX_MB", 64) * (1 << 20)

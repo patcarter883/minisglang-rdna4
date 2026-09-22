@@ -3034,10 +3034,37 @@ class Scheduler(SchedulerDiffusionMixin, SchedulerEPMixin, SchedulerIOMixin):
 
         A verify too wide for `ring_rows` still falls to the host path; `RouteTracer.rows_dropped`
         counts it, because a partial union makes the cache look BETTER than it is.
+
+        IT IS ALSO THE HARVEST POINT FOR A CAPTURED STEP, which is why "once per forward, on every
+        path" is now load-bearing twice over. `RouteTracer.record` writes a static STAGE buffer (the
+        only thing a graph can address correctly — the ring's step index is host Python and would be
+        baked as a constant), and `begin_forward` is what moves that stage into the ring slot. A
+        forward that skips this boundary does not merely go untraced: its routings sit in the stage
+        and are overwritten by the next one, so on a captured serve the cache would observe a
+        fraction of the steps and nothing would say so.
         """
-        if trace:
+        # `enabled()` up front so the row sum below is not paid on a serve with no tracer armed
+        # (the module-level begin_forward would have no-opped anyway, but the argument is evaluated
+        # first). With no tracer this is one call returning a global-is-None test, as before.
+        if trace and _route_trace.enabled():
+            # THE REAL QUERY-ROW COUNT, which only this side knows. A captured decode replays a
+            # BUCKET: a bs=2 graph serving one request pushes a padded row through routing, and those
+            # experts were referenced by nothing. `RouteTracer.record` cannot mask them (at capture
+            # time it sees only the bucket width), so it masks at the harvest against this number —
+            # see route_trace.py's module docstring, point (2).
+            #
+            # `extend_len` (device_len - cached_len) rather than `batch.size`, because it is the one
+            # expression that is right for all four shapes this method serves: 1/req on a plain
+            # decode, K+1 on a spec verify, the per-req tree width on a DDTree verify (they differ
+            # between reqs), and the chunk tokens on a prefill. `batch.size` would be right only for
+            # the first. It is read BEFORE the forward, where it is still valid: `forward_batch`
+            # calls `complete_one()`, which sets cached_len = device_len and collapses extend_len to
+            # zero (the same reason `_forward` reads `batch.is_prefill` up here).
+            # PADDING IS EXCLUDED BY CONSTRUCTION: `batch.reqs` is the real set, `batch.padded_reqs`
+            # is the one that carries the cudagraph dummies.
             _route_trace.begin_forward(bool(is_prefill), batch.reqs[0].uid if batch.reqs else 0,
-                                       is_verify=bool(is_verify))
+                                       is_verify=bool(is_verify),
+                                       num_rows=sum(r.extend_len for r in batch.reqs))
         # The expert cache's scheduler-side half: retract victims, publish landed copies. Here
         # because this is the step boundary AND this thread owns the compute stream the kernels
         # read `slot_of` from; the expensive copies run on the manager thread. Sub-microsecond
