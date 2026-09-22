@@ -879,10 +879,41 @@ class Fp8BlockDequantLinearMethod:
         # checkpoint ships (BF16 [N/128, K/128]).
         layer.weight_scale_inv = torch.empty((N // bn, K // bk), dtype=torch.bfloat16)
 
+    #: Cumulative bytes this method has ADDED to the weight budget on this rank by widening fp8 to
+    #: bf16, and the next 1 GiB boundary to report at. A module-level tally rather than a return value
+    #: because the cost is only meaningful summed over the whole model, and it must not be invisible:
+    #: on Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ it is ~1.25 GiB per card at TP=2, the single largest VRAM
+    #: item this method introduces, and a weight-format decision whose second site is the arena sizing.
+    _added_bytes: int = 0
+    _next_report: int = 1 << 30
+
     def process_weights_after_load(self, layer: "BaseOP") -> None:
         bn, bk = (int(self.quant.block_structure[0]), int(self.quant.block_structure[-1]))
         w = layer.weight
         N, K = w.shape
+        cls = Fp8BlockDequantLinearMethod
+        added = N * K  # fp8 (1 B) -> bf16 (2 B) on this module, minus the freed scale tile (~0)
+        first = cls._added_bytes == 0
+        cls._added_bytes += added
+        if first or cls._added_bytes >= cls._next_report:
+            if cls._added_bytes >= cls._next_report:
+                cls._next_report = ((cls._added_bytes >> 30) + 1) << 30
+            # A DIAGNOSTIC MUST NOT BE ABLE TO BREAK A LOAD. `info_rank0` resolves TP info, which a
+            # CPU-only unit test never sets (`tests/ct_block_fp8_test.py` called this and died on
+            # "TP info has not been set"), so the tally is reported on a best-effort basis and the
+            # dequantization proceeds either way.
+            try:
+                from minisgl.utils import init_logger
+
+                init_logger("quant").info_rank0(
+                    f"blockwise-fp8: dequantized to bf16 at load, "
+                    f"+{cls._added_bytes / (1 << 20):.0f} MiB on this rank so far "
+                    f"(latest module {N}x{K}, +{added / (1 << 20):.1f} MiB). This is EXACT and lands "
+                    f"on minv_linear, but it is a real VRAM cost a native blockwise-fp8 GEMM would "
+                    f"not pay — see docs/journal/ENGINE_COMPARISON_2026-09-22.md item 7."
+                )
+            except Exception:  # noqa: BLE001 -- no TP info (CPU test), or logging unavailable
+                pass
         # Expand the tile scale to full (N, K) by repeating each tile value over its block, then
         # multiply in f32 and narrow once. `repeat_interleave` on both axes rather than a broadcast
         # reshape: the reshape spelling only works when N/bn and K/bk tile exactly in that memory
