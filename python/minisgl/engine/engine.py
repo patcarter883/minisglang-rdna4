@@ -124,6 +124,44 @@ def _swa_ring_block(mc: ModelConfig, spec_config) -> int:
     return max(spec_block, canvas_block)
 
 
+def _route_trace_ring_rows(config: EngineConfig) -> int:
+    """How many FORWARD ROWS one route-ring entry must hold: the WIDEST decode/verify forward the
+    engine can produce, not the narrowest.
+
+    THIS WAS A LIVE BUG, not just a capture prerequisite. The value used to be
+    `max_running_req * (1 + spec_num_draft)` when spec was configured and **1 otherwise**.
+    `RouteTracer.record` takes its sync-free device-ring path only when `M <= ring_rows`, so with
+    ring_rows == 1 every decode step carrying two or more rows fell to the HOST path — and a
+    host-path record lands in `self.oversize`, which `drain()` packs into the trace FILE but never
+    forwards to the observer (see the loop there). On the shipped qwen4exp arm
+    (`--max-running-requests 2`, spec off) that means EVERY concurrent 2-request decode step was
+    invisible to the expert cache: the policy only ever saw the single-request steps. It is the
+    leading candidate for why the measured hit rate plateaued at h = 0.4067 against the 0.5425
+    offline ceiling on the same trace.
+
+    THREE TERMS, because three different things set the row count:
+      * `max_running_req` — a plain decode forward carries one row per running request. This is the
+        term that was missing, and it is the one that bit.
+      * `cuda_graph_max_bs` — a captured decode replays a BUCKET, so `record` sees the bucket's
+        padded row count at capture time, which can exceed the live request count. `None` means
+        "auto", which `engine/graph.py::get_cuda_graph_bs` resolves to max_running_req; 0 is capture
+        off. `_adjust_config` (called from `Engine.__init__` long before this) has already resolved
+        and capped the field, so reading it here is reading the final value.
+      * `1 + spec_num_draft` — a VERIFY forward carries (K+1) tokens per request.
+
+    THE COST OF BEING WRONG IS ASYMMETRIC, which is why this rounds UP. Too narrow silently starves
+    the observer (above). Too wide costs `top_k * ring_rows` int32 per layer per step: at top_k=10
+    and this arm's 2 rows that is 10 -> 20 int32 = 80 B per layer per step, and `maybe_install`
+    already trades `ring_steps` down against a byte budget if the product gets large."""
+    graph_bs = config.cuda_graph_max_bs
+    if graph_bs is None:                     # "auto" -> get_cuda_graph_bs covers max_running_req
+        graph_bs = config.max_running_req
+    rows = max(1, int(config.max_running_req), int(graph_bs))
+    if config.spec_config is not None:
+        rows *= 1 + config.spec_num_draft
+    return rows
+
+
 # --- env-gated decode-loop profiler (diagnostics only) -----------------------------------------
 # MINISGL_PROFILE=<trace.json> captures a window of forward steps on the primary rank into a Chrome
 # trace, then no-ops. Used to split per-step wall time into GPU-active vs launch-bubble overhead.
@@ -395,13 +433,7 @@ class Engine:
             dp_rank=self.dp_rank,
             device=self.device,
             observe_only=_cache is not None,
-            # A speculative VERIFY forward carries max_running_req * (num_draft + 1) rows, and the
-            # ring must hold them or the record falls to the host path and never reaches the expert
-            # cache's observer. Same row count engine.py already derives for the scored-row cap.
-            ring_rows=(
-                config.max_running_req * (1 + config.spec_num_draft)
-                if config.spec_config is not None else 1
-            ),
+            ring_rows=_route_trace_ring_rows(config),
         )
         if _cache is not None:
             if _tracer is None:
