@@ -37,6 +37,26 @@ one's answer is unambiguous evidence of state crossing between sequences — whi
 A KNOWLEDGE CONTROL runs alongside at every checkpoint. If knowledge degrades too, the defect is not
 retrieval-specific and this framing is wrong; say so rather than reporting only the retrieval number.
 
+THREE FALSE-POSITIVE MECHANISMS, all of which fired here before they were fixed. Every "retrieval
+failure" this probe produced on 2026-09-22 turned out to be one of them; none was the model.
+
+1. **max_tokens too small.** This is a THINKING model: it spends the budget reasoning and the answer
+   is cut MID-CODE. A run at `--max-tokens 120` scored 26/64 failures whose outputs were
+   `wants 1994-AUC-2417 got '1994-AUC-24'`, `wants 4863-XTE-6133 got '4863-XTE-'` — each one PROOF
+   that retrieval worked. `finish_reason == "length"` is now scored as `truncated` and excluded.
+2. **reasoning_max_tokens too small.** The fix for (1) introduced this. Capping the think span makes
+   the beta backstop force `</think>` mid-sentence, and the fragment the model had typed so far
+   becomes the answer — with `finish_reason == "stop"`, so the truncation check in (1) does NOT
+   catch it. Observed: reasoning containing `The code is "5632-FMT-8131".` twice, then
+   `So I will output: 5632` force-closed at 126 tokens, `content: '5632'`. Default is now 0.
+3. **Reading the wrong fixture directory.** `ls -dt | head -1` picked a KILLED run's directory and
+   reported "0 turns recorded" while the live run was writing rows normally, which looked like a
+   hung serve and prompted a wedge investigation. Check the path the run actually printed.
+
+A corollary worth keeping: the model's REASONING is the ground truth for whether retrieval happened.
+When content looks wrong, read `reasoning_content` before scoring a defect — in every case above the
+reasoning held the correct answer verbatim.
+
 CPU-only HTTP client. It holds no lease but it fully occupies the serve it measures.
 """
 from __future__ import annotations
@@ -67,9 +87,16 @@ def _post(url: str, body: dict, timeout: float) -> dict:
         return json.load(fh)
 
 
-def ask(base_url: str, model: str, messages: list, max_tokens: int, timeout: float) -> dict:
+def ask(base_url: str, model: str, messages: list, max_tokens: int, timeout: float,
+        reasoning_max_tokens: int | None = None) -> dict:
     body = {"model": model, "messages": messages, "max_tokens": max_tokens,
             "stream": False, "temperature": 0.0, "top_k": 1}
+    if reasoning_max_tokens:
+        # Cap the THINK span, not the reply. This is a thinking model: with a small `max_tokens` it
+        # spends the whole budget reasoning and the answer is truncated MID-CODE, which scores as a
+        # retrieval failure while actually proving retrieval WORKED (`wants 1994-AUC-2417 got
+        # 1994-AUC-24`). A run at max_tokens=120 produced 26/64 such artifacts before this existed.
+        body["reasoning_max_tokens"] = reasoning_max_tokens
     t0 = time.time()
     r = _post(base_url.rstrip("/") + "/chat/completions", body, timeout)
     ch = r["choices"][0]
@@ -159,7 +186,13 @@ def main() -> int:
                          "(the serve boots with frames=22) so frames churn and drops rise")
     ap.add_argument("--turns", type=int, default=6, help="turns per session after the first")
     ap.add_argument("--lines", type=int, default=400, help="prefix lines (~15 tokens each)")
-    ap.add_argument("--max-tokens", type=int, default=200)
+    # THE ONLY VALID CONFIGURATION, and both cheaper ones are BOOBY-TRAPPED (see the module
+    # docstring's THREE FALSE-POSITIVE MECHANISMS). Generous max_tokens, NO reasoning cap.
+    ap.add_argument("--max-tokens", type=int, default=800)
+    ap.add_argument("--reasoning-max-tokens", type=int, default=0,
+                    help="cap the THINK span. LEAVE AT 0: any cap guillotines the chain of thought "
+                         "mid-sentence and the fragment typed so far is served as the answer, which "
+                         "scores as a retrieval failure on a turn that retrieved correctly")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--seed", type=int, default=20260922)
     args = ap.parse_args()
@@ -197,10 +230,11 @@ def main() -> int:
     with open(tsv, "w") as fh:
         fh.write("\t".join(["turn_idx", "session", "turn", "computed", "hit_ratio", "radix_hits",
                             "frames", "in_use", "high_water", "drops",
-                            "retrieved", "wrong", "empty", "contaminated_by"]) + "\n")
+                            "retrieved", "wrong", "empty", "contaminated_by", "truncated"]) + "\n")
 
     n = 0
     fails = 0
+    truncs = 0
     for t in range(args.turns):
         for s in range(args.sessions):
             # Turn 1 of each session establishes the prefix; later turns RESUME it, which is what
@@ -217,20 +251,27 @@ def main() -> int:
                                       f"\n\nWhat is the vault authorisation code in dossier "
                                       f"{s:03d}? Reply with just the code, exactly as written.")
             try:
-                res = ask(args.base_url, args.expect_model, msgs, args.max_tokens, args.timeout)
+                res = ask(args.base_url, args.expect_model, msgs, args.max_tokens, args.timeout,
+                          args.reasoning_max_tokens)
             except Exception as exc:
                 sys.stderr.write(f"  turn failed s={s} t={t}: {repr(exc)[:140]}\n")
                 continue
             body = (res["content"] or "").strip()
             want = codes[s]
             got = want in body
+            # TRUNCATED != WRONG. A reply cut at max_tokens that carries a PREFIX of the right code
+            # retrieved correctly and merely ran out of room; counting it as a miss inverts the
+            # measurement. Scored separately and excluded from the failure count.
+            truncated = (res.get("finish_reason") == "length") and not got
             # CONTAMINATION: another session's code in this session's answer. Unambiguous.
             other = [c for c in code_set if c != want and c in body]
             c = counters(args.base_url)
             snap = snapshot_stats(container)
             n += 1
-            if not got:
+            if not got and not truncated:
                 fails += 1
+            if truncated:
+                truncs += 1
             with open(tsv, "a") as fh:
                 fh.write("\t".join(str(x) for x in [
                     n, s, t, int(c.get("computed", -1)), round(c.get("hit_ratio", -1), 4),
@@ -243,6 +284,9 @@ def main() -> int:
             if other:
                 print(f"  !! CONTAMINATION s={s} t={t}: answer carries {other} (wants {want})",
                       flush=True)
+            elif truncated:
+                print(f"  ~~ TRUNC s={s} t={t} wants {want} got {body[:40]!r} "
+                      f"(retrieval OK, ran out of tokens)", flush=True)
             elif not got:
                 print(f"  .. MISS s={s} t={t} wants {want} got {body[:60]!r}", flush=True)
         # Knowledge control once per sweep — if this degrades too, the retrieval framing is wrong.
@@ -256,7 +300,8 @@ def main() -> int:
             except Exception:
                 pass
         snap = snapshot_stats(container)
-        print(f"[sweep {t}] retrieval_fail={fails}/{n}  K_wrong={kbad}/{len(KNOWLEDGE)}  "
+        print(f"[sweep {t}] retrieval_fail={fails}/{n} truncated={truncs}  "
+              f"K_wrong={kbad}/{len(KNOWLEDGE)}  "
               f"snapshot={snap}  hit_ratio={counters(args.base_url).get('hit_ratio')}", flush=True)
         with open(os.path.join(outdir, "result.json"), "w") as fh:
             json.dump({"args": vars(args), "container": container, "turns": turns_log}, fh, indent=1)
@@ -265,7 +310,8 @@ def main() -> int:
         for t in turns_log:
             fh.write(f"===== s{t['session']} t{t['turn']} want={t['want']} got={t['got']} "
                      f"contaminated_by={t['contaminated_by']}\n--- content ---\n{t['content']}\n\n")
-    print(f"\nretrieval failures {fails}/{n}\nfixture: {outdir}")
+    print(f"\nretrieval failures {fails}/{n} (truncated, excluded: {truncs})\n"
+          f"fixture: {outdir}")
     return 0
 
 
