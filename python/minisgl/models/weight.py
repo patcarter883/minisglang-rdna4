@@ -1130,9 +1130,40 @@ _QWEN4EXP_RENAME = {
 }
 _Q4_QKVZ = (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_z.weight")
 _Q4_BA = (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight")
+#: The SAME concat, for the blockwise-fp8 scale leaf. `in_proj_qkv` and `in_proj_z` are merged into
+#: one `in_proj_qkvz` module, so a checkpoint that quantizes them blockwise ships one
+#: `weight_scale_inv` per member and the merged module needs both — concatenated on the SAME axis as
+#: the weight (dim 0), which stays exact because the 128-row block divides each member's N. Without
+#: this the merged module would receive only the first member's scale and silently mis-scale
+#: everything below row N_qkv.
+_Q4_QKVZ_SCALE = (".linear_attn.in_proj_qkv.weight_scale_inv",
+                  ".linear_attn.in_proj_z.weight_scale_inv")
+#: PRE-STACKED, GATE/UP-FUSED routed experts — the `tcclaviger/*-MXFP4-FP8-GPTQ` layout.
+#:
+#: The original Qwen3.8-Flash-Next checkpoint ships one module per expert
+#: (`...experts.<i>.gate_proj.weight_packed`, 48 x 512 x 3 = 73,728 of them) and this loader stacks
+#: them over E and merges gate|up itself. This repack ships the RESULT of both steps: four tensors
+#: per layer, already stacked over E and already fused on the N axis —
+#:
+#:     experts.gate_up_proj_packed  U8 (E, 2*inter, K//2)   experts.gate_up_proj_scale  U8 (E, 2*inter, K//32)
+#:     experts.down_proj_packed     U8 (E, hidden, inter//2) experts.down_proj_scale    U8 (E, hidden, inter//32)
+#:
+#: which is EXACTLY what `_GroupedMxFp4Experts` declares ("weight_packed (E, N, K//2) uint8 ...
+#: weight_scale (E, N, K//32) uint8"). So this is a pure RENAME: no reshape, no transpose, no repack,
+#: and deliberately no gate/up merge — the merge has already happened on disk, and doing it again
+#: would concatenate a fused tensor with itself.
+_QWEN4EXP_STACKED_EXPERTS = {
+    ".mlp.experts.gate_up_proj_packed": ".mlp.experts.gate_up_proj.weight_packed",
+    ".mlp.experts.gate_up_proj_scale": ".mlp.experts.gate_up_proj.weight_scale",
+    ".mlp.experts.down_proj_packed": ".mlp.experts.down_proj.weight_packed",
+    ".mlp.experts.down_proj_scale": ".mlp.experts.down_proj.weight_scale",
+}
+
 _QWEN4EXP_CONCAT = {
     _Q4_QKVZ[0]: (".linear_attn.in_proj_qkvz.weight", _Q4_QKVZ, 0),
     _Q4_QKVZ[1]: (".linear_attn.in_proj_qkvz.weight", _Q4_QKVZ, 0),
+    _Q4_QKVZ_SCALE[0]: (".linear_attn.in_proj_qkvz.weight_scale_inv", _Q4_QKVZ_SCALE, 0),
+    _Q4_QKVZ_SCALE[1]: (".linear_attn.in_proj_qkvz.weight_scale_inv", _Q4_QKVZ_SCALE, 0),
     _Q4_BA[0]: (".linear_attn.in_proj_ba.weight", _Q4_BA, 0),
     _Q4_BA[1]: (".linear_attn.in_proj_ba.weight", _Q4_BA, 0),
 }
@@ -1157,16 +1188,32 @@ _QWEN4EXP_NATIVE_OK = tuple(
         r"^model\.layers\.\d+\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj|norm)\.weight$",
         r"^model\.layers\.\d+\.linear_attn\.(conv1d_weight|A_log|dt_bias)$",
         r"^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj|q_norm|k_norm)\.weight$",
+        # Blockwise-fp8 scale leaf (`weight_scale_inv`), on the modules the MXFP4-FP8-GPTQ repack
+        # quantizes that way: the four attention projections and the GDN in/out projections. The GDN
+        # one is the MERGED `in_proj_qkvz` name, because `_QWEN4EXP_CONCAT` concatenates the two
+        # members' scales exactly as it concatenates their weights.
+        r"^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight_scale_inv$",
+        r"^model\.layers\.\d+\.linear_attn\.(in_proj_qkvz|out_proj)\.weight_scale_inv$",
         r"^model\.layers\.\d+\.self_attn\.indexer\."
         r"(index_qk_proj|q_layernorm|k_layernorm)\.weight$",
         r"^model\.layers\.\d+\.mlp\.(gate|shared_expert_gate)\.weight$",
-        r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\.weight$",
+        # `.weight` alone in the base checkpoint (which leaves the shared expert WIDE); the
+        # MXFP4-FP8-GPTQ repack quantizes it, so the packed leaves are allowed too. Following the
+        # checkpoint, not a preference: what the file ships decides.
+        r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\."
+        r"(weight|weight_packed|weight_scale)$",
         # `weight_global` is the NVFP4 split arm's second leaf: the per-output-channel f32 global
         # MULTIPLIER (see quant/nvfp4.py). `weight_global_scale` is the OLD repo-native spelling of
         # the raw per-TENSOR global, which the fold arm consumed and dropped; both are listed because
         # a mixed checkpoint can still hit the fold path on a non-expert module.
         r"^model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\."
         r"(weight|weight_packed|weight_scale|weight_global|weight_global_scale)$",
+        # PRE-STACKED, GATE/UP-FUSED experts (see _QWEN4EXP_STACKED_EXPERTS). These address the
+        # CONTAINER, not an expert index: the checkpoint already ships (E, N, K/2) codes and
+        # (E, N, K/32) scales, which is exactly what `_GroupedMxFp4Experts` declares, so there is
+        # nothing to stack and no expert axis to walk.
+        r"^model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)\."
+        r"(weight_packed|weight_scale)$",
         r"^model\.layers\.\d+\.ple\."
         r"(key_proj|value_proj|norm_key|norm_query|norm_conv)\.weight$",
         r"^model\.layers\.\d+\.ple\.conv1d_weight$",
@@ -1274,6 +1321,14 @@ def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = (),
         return ("skip", "quant-metadata")
     if ckpt_key.endswith((".k_scale", ".v_scale")):
         return ("skip", "fp8-kv-scale")
+    # `self_attn.q_scale`: a bare F32 SCALAR the MXFP4-FP8-GPTQ repack emits on each full-attention
+    # layer. It is NOT in the base checkpoint — that one carries only `k_scale`/`v_scale` (the fp8 KV
+    # cache scales this loader already skips) — so it is quantizer-emitted metadata, a static
+    # activation scale for Q, not a learned model scale whose loss would change numerics. This engine
+    # never quantizes Q, so nothing consumes it. Checked against the base checkpoint rather than
+    # assumed, because skipping a learned scalar would be silent and permanent.
+    if ckpt_key.endswith(".q_scale"):
+        return ("skip", "act-calibration")
     if ckpt_key.endswith(_MODELOPT_ACT_CALIB):
         return ("skip", "act-calibration")
     if ckpt_key == "lm_head.weight":
@@ -1290,6 +1345,11 @@ def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = (),
     if ".ple.ple_embedding." in native and not native.endswith(".layer_multipliers"):
         return ("skip", "ple-ngram-table")
 
+    # Pre-stacked experts first: these suffixes end in `_packed`/`_scale` and must not be offered to
+    # the generic rename table, whose entries match on trailing leaf names.
+    for suffix, renamed in _QWEN4EXP_STACKED_EXPERTS.items():
+        if native.endswith(suffix):
+            return ("direct", _q4_check_native(ckpt_key, native[: -len(suffix)] + renamed))
     for suffix, renamed in _QWEN4EXP_RENAME.items():
         if native.endswith(suffix):
             return ("direct", _q4_check_native(ckpt_key, native[: -len(suffix)] + renamed))
@@ -1394,12 +1454,48 @@ def qwen4_exp_chunk_files(model_folder: str, num_layers: int) -> "tuple[list[str
         files.sort()
     missing = [i for i in range(num_layers) if not per_layer.get(i)]
     if missing:
+        # PRE-STACKED layout: not a missing-shard error, a DIFFERENT layout. The
+        # `tcclaviger/*-MXFP4-FP8-GPTQ` repack ships four already-stacked, gate/up-fused expert
+        # tensors per layer inside ordinary `model-000NN.safetensors` shards, so there are no
+        # per-layer expert FILES to chunk on — and there is nothing to chunk FOR. Per-layer chunking
+        # exists to bound the peak while 512 per-expert tensors are accumulated into one stack; a
+        # pre-stacked tensor goes straight into its container, so the peak is one tensor (~0.78 GiB
+        # for gate_up at E=512) whether it is loaded in one chunk or forty-eight.
+        #
+        # Detected from the TENSOR NAMES, not the file names: a repack is free to name its shards
+        # anything, and `model-000NN` is just the HF default. An empty `per_layer` with no stacked
+        # tensors anywhere is still the original error, because then the experts really are absent.
+        if qwen4_exp_has_stacked_experts(body):
+            return body, {}
         raise FileNotFoundError(
             f"qwen4_exp chunked load: {model_folder} has no `layer-LLLLL-experts-*.safetensors` "
             f"shards for decoder layers {missing[:8]}{'...' if len(missing) > 8 else ''} "
-            f"(model declares {num_layers} layers)."
+            f"(model declares {num_layers} layers), and no pre-stacked "
+            f"`mlp.experts.gate_up_proj_packed` tensors either."
         )
     return body, per_layer
+
+
+def qwen4_exp_has_stacked_experts(files: "Sequence[str]") -> bool:
+    """Does this checkpoint ship PRE-STACKED, gate/up-fused routed experts?
+
+    Reads safetensors HEADERS only (the JSON prefix), never tensor bytes — this runs before the load
+    and must not pull 108 GiB to answer a yes/no question.
+    """
+    import json as _json
+    import struct as _struct
+
+    for path in files:
+        try:
+            with open(path, "rb") as fh:
+                n = _struct.unpack("<Q", fh.read(8))[0]
+                hdr = _json.loads(fh.read(n))
+        except Exception:
+            continue
+        for k in hdr:
+            if k != "__metadata__" and k.endswith(".mlp.experts.gate_up_proj_packed"):
+                return True
+    return False
 
 
 def qwen4_exp_nvfp4_prepass(files: "Sequence[str]") -> "tuple[set[str], FrozenSet[str]]":
@@ -1869,15 +1965,33 @@ def qwen4_exp_chunked_source(
     # `qwen4_exp_nvfp4_prepass` for why it may not be re-derived per chunk.
     nvfp4_sets = qwen4_exp_nvfp4_prepass(body_files + [f for fs in per_layer.values() for f in fs])
 
-    chunks = [LoadChunk(name="body", files=tuple(body_files))]
-    for lid in range(num_layers):
-        chunks.append(
-            LoadChunk(
-                name=f"layer-{lid:05d}-experts",
-                files=tuple(per_layer[lid]),
-                finalize_paths=(f"model.layers.{lid}.mlp.experts",),
+    if not per_layer:
+        # PRE-STACKED layout (see qwen4_exp_chunk_files): the experts are four already-stacked
+        # tensors per layer living in ordinary shards, so there is no per-layer FILE set to chunk on.
+        # ONE chunk over everything, finalizing every expert container at the end. The peak this
+        # gives up is small and bounded: nothing accumulates, so it is one tensor at a time (~0.78 GiB
+        # for a 512-expert gate_up) instead of a per-layer stack being built up.
+        #
+        # finalize_paths still lists every layer, so `post_load` runs per container exactly as it
+        # does on the chunked path — the difference is WHEN tensors are read, never how they are
+        # interpreted, which is the same contract the per-layer path states.
+        chunks = [LoadChunk(
+            name="body+stacked-experts",
+            files=tuple(body_files),
+            finalize_paths=tuple(
+                f"model.layers.{lid}.mlp.experts" for lid in range(num_layers)
+            ),
+        )]
+    else:
+        chunks = [LoadChunk(name="body", files=tuple(body_files))]
+        for lid in range(num_layers):
+            chunks.append(
+                LoadChunk(
+                    name=f"layer-{lid:05d}-experts",
+                    files=tuple(per_layer[lid]),
+                    finalize_paths=(f"model.layers.{lid}.mlp.experts",),
+                )
             )
-        )
 
     def stream(chunk) -> Iterator[Tuple[str, torch.Tensor]]:
         # No key filtering here. `_load_qwen4_exp_weight` drops `layers.<n>` with n >= num_layers
