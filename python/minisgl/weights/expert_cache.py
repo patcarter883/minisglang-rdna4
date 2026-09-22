@@ -198,6 +198,14 @@ class ExpertResidencyCache:
         # The slot is therefore never written while a launch that may still read it is in flight,
         # and a publish is never visible before its bytes land. Both directions of the one
         # invariant, preserved across two threads.
+        #
+        # THAT PIPELINE HAS A ONE-TICK LATENCY, SO THE MANAGER IS TICK-DRIVEN, NOT REFERENCE-DRIVEN.
+        # Capacity comes back a step AFTER it is asked for, while references arrive in one burst
+        # every `drain_every` steps — so a manager that only acted on arriving references slept
+        # through every moment its own slots landed, and the install rate collapsed to `_low_water`
+        # per burst. `apply_pending` therefore wakes the manager on every tick and `_service` (see
+        # there, it carries the measurement) does the placing. Demand that finds no slot is HELD,
+        # not dropped, because by the time the slot exists the reference that wanted it is gone.
         self._q: Deque = collections.deque(maxlen=max(64, _env_int("MINISGL_EXPERT_CACHE_QUEUE", 4096)))
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -232,16 +240,20 @@ class ExpertResidencyCache:
         #:     steady-state demand measured only ~26/tick regardless, which `max(low_water, ...)`
         #:     floors straight back to 25.
         #:
-        #: WHAT IS ACTUALLY WRONG IS NOT YET LOCALISED. The cache installs 0.09 experts/tick while
-        #: 26/tick are deferred for want of a slot, with `free=0`, `to_retract=25` and `throttled`
-        #: FROZEN in every sample. `apply_pending` appends all 25 retracted slots to `_free` on
-        #: every tick, so promotes should be finding them and do not. Diagnose from `policy=` and
-        #: `to_retract=` in summary() before touching this: three of this cache's four freezes
-        #: were misdiagnosed from the other counters alone, this one included.
+        #: LOCALISED AND FIXED 2026-09-22 -- see `_service`, which carries the whole argument.
+        #: Both notes above are right for the reason they now share: NEITHER the pool's SIZE nor
+        #: its target was ever the limiter. The limiter was that nothing ever ran to USE the pool
+        #: between drain bursts, so the install rate was pinned at `min(_low_water,
+        #: _max_inflight)` per burst no matter how the pool was sized. `apply_pending` did append
+        #: all 25 slots to `_free` every tick -- they then sat there unused for 63 ticks (measured
+        #: on 11,000 of 11,000 ticks, mean free 25.00) because every placement path lived inside
+        #: the manager's queue-drain loop and the queue was empty.
         #:
-        #: AND NOT `_low_water` EITHER -- it is the steady-state pool, and a reclaimed slot is a
-        #: resident expert given up: low_water=25 -> h=0.6314, evictions 1,475, TPOT 50.26 ms
-        #: against low_water=1024 -> h=0.5961, evictions 61,404, TPOT 53.14 ms.
+        #: THAT ALSO EXPLAINS `_low_water` MEASURING WORSE WHEN RAISED -- it bought installs and
+        #: eviction churn in one breath (low_water=25 -> h=0.6314, evictions 1,475, TPOT 50.26 ms
+        #: against low_water=1024 -> h=0.5961, evictions 61,404, TPOT 53.14 ms; note the eviction
+        #: ratio 41.6 ~ 1024/25, i.e. the same number of bursts in both arms). `_low_water` is
+        #: now only the IDLE floor; the backlog sizes the pool when there is one.
         self._refill_batch = max(8, self._low_water)
         #: OUTSTANDING COPIES CEILING. Unbounded, the manager queues the whole cold fill onto the
         #: copy stream at once — measured 2026-09-08: 4,418 in-flight x 1.36 MiB = 6.2 GB, which
@@ -283,9 +295,39 @@ class ExpertResidencyCache:
         #: is still remembered on its next route, small enough to forget a one-touch sweep.
         self._candidate_cap = max(256, _env_int("MINISGL_EXPERT_CACHE_CANDIDATES", self.slots * 2))
         self._candidates: Dict[int, None] = {}
+        #: ADMITTED REFERENCES THAT HAD NOWHERE TO GO YET — the backlog `_service` drains into
+        #: slots as they come back. Demand and capacity arrive at DIFFERENT TIMES in this design
+        #: (see `_service`), so discarding a reference the instant no slot is free throws demand
+        #: away microseconds before the capacity to serve it lands.
+        #:
+        #: BOUNDED, and LIFO on the way out: the freshest deferred reference is the best evidence
+        #: of what is hot right now, and one that has waited longer than the backlog is deep is
+        #: worth less than the resident expert it would displace. Overflow drops the OLDEST.
+        #:
+        #: THIS DEPTH IS THE STEADY-STATE INSTALL BUDGET, and that is the honest description of
+        #: it: references only arrive on a drain, so a drain can install at most what the backlog
+        #: retained (measured: `promotions` per drain == `_pending_cap` + `_low_water`, dead
+        #: constant). `_max_inflight` still caps the BYTES outstanding; this caps how much of one
+        #: burst's demand survives to be served. Measured on the CPU replay (22k steps, 2,056
+        #: slots, drain every 64): 512 -> served_h 0.5019, 2048 -> 0.4440. Deeper is WORSE, for
+        #: the same reason the low-water sweep found — indiscriminate promotion loses — so this
+        #: is a real optimum, not a memory bound. Re-derive it if `drain_every` ever changes: the
+        #: install RATE is this depth divided by the drain interval.
+        self._pending: Deque[int] = collections.deque()
+        self._pending_set: set = set()
+        self._pending_cap = max(64, _env_int("MINISGL_EXPERT_CACHE_PENDING",
+                                             8 * self._max_inflight))
         #: apply_pending() calls. In the summary because a stalled scheduler half and a stalled
         #: manager look identical from the outside, and this separates them.
         self.stats["ticks"] = 0
+        #: Ticks at the last summary line. The report USED to fire every N manager BATCHES, and a
+        #: batch only happens while the reference queue is draining — so every sample ever printed
+        #: was taken from inside a drain burst, in the one phase of the cycle where `free=0` and
+        #: `to_retract=_low_water`. The complementary phase (`free=_low_water`, `to_retract=0`)
+        #: held for 63 of every 64 ticks and NOTHING EVER SAMPLED IT. That is why three diagnoses
+        #: of this freeze fixed on the retract queue — the instrument was phase-locked to the
+        #: manager. A TICK cadence samples both phases.
+        self._report_tick = 0
 
     # -- setup -----------------------------------------------------------------------------------
     def register_layer(self, layer_id: int, gate_up: "tuple", down: "tuple") -> None:
@@ -471,22 +513,103 @@ class ExpertResidencyCache:
                           flush=True)
                     return
                 self.stats["manager_batches"] += 1
-                # TOP UP THE FREE POOL. A slot needs a scheduler round trip to come back, so
-                # reclaiming only when a miss needs one makes every miss pay that latency — which
-                # is exactly how replacement froze at 8 evictions in 240k references. Kept small:
-                # a reclaimed slot is a resident expert given up, so over-reclaiming lowers the hit
-                # rate for nothing.
-                with self._lock:
-                    short = self._low_water - len(self._free) - len(self._to_retract)
-                if short > 0:
-                    self._reclaim(min(short, self._refill_batch))
-                # THE INSTRUMENT. Without a hit rate a flat A/B is uninterpretable: "the cache does
-                # not help" and "the cache never warmed" produce the same TPOT, and this project has
-                # already spent three runs on the second one wearing the first one's face. Printed
-                # from the manager thread, so it also proves the thread is ALIVE — a dead manager
-                # degrades to host reads silently and the line simply stops.
-                if self._report_every and self.stats["manager_batches"] % self._report_every == 0:
-                    print(self.summary(), flush=True)
+                # PLACE WHAT IS WAITING AND TOP UP THE FREE POOL. A slot needs a scheduler
+                # round trip to come back, so reclaiming only when a miss needs one makes every
+                # miss pay that latency — which is exactly how replacement froze at 8 evictions in
+                # 240k references.
+                self._service()
+                self._report()
+            # AND ONCE MORE WITH AN EMPTY QUEUE. This line is the fix for the fourth freeze: see
+            # `_service`. Everything that places an expert used to live INSIDE the loop above, so
+            # the manager could only ever act while references were arriving — and references
+            # arrive in one burst per drain (64 steps), while the slots it asks for come back a
+            # tick LATER, by which time the loop has broken and the thread is asleep again.
+            self._service()
+            self._report()
+
+    def _report(self) -> None:
+        """THE INSTRUMENT. Without a hit rate a flat A/B is uninterpretable: "the cache does not
+        help" and "the cache never warmed" produce the same TPOT, and this project has already
+        spent three runs on the second one wearing the first one's face. Printed from the manager
+        thread, so it also proves the thread is ALIVE — a dead manager degrades to host reads
+        silently and the line simply stops.
+
+        ON A TICK CADENCE, not a batch cadence, and that is load-bearing: see `_report_tick`.
+        """
+        if not self._report_every:
+            return
+        t = self.stats["ticks"]
+        if t - self._report_tick >= self._report_every:
+            self._report_tick = t
+            print(self.summary(), flush=True)
+
+    def _service(self) -> None:
+        """MANAGER THREAD. Place what is waiting, then keep enough capacity ready for the rest.
+
+        WHY THIS EXISTS AT ALL, i.e. the fourth freeze, reproduced on CPU 2026-09-22 against the
+        real 22,001-step route trace (`tools/offload/route_traces/route._model.rank0.bin`) and
+        matching the live counters to the digit (resident=2031 fill=0.988 inflight=25 free=0
+        policy=2031 to_retract=25, `throttled` frozen):
+
+            DEMAND AND CAPACITY ARRIVE AT DIFFERENT TIMES, AND ONLY ONE OF THEM WOKE ANYTHING.
+
+        References arrive in one BURST per drain — `route_trace` drains every 64 steps, so ~3,000
+        records land at once and the manager chews through them in milliseconds. A slot, though,
+        takes a full scheduler TICK to come back (retract -> `apply_pending` -> `_free`). So the
+        manager could place only the slots that happened to be free at the instant the burst
+        landed — exactly `_low_water` of them, because `_reclaim` targets `free + to_retract ==
+        _low_water` — discarded the other ~4,000 admitted references as `deferred`, and went back
+        to sleep. The slots it had just asked for arrived one tick later and sat in `_free`,
+        UNUSED, for the remaining 63 ticks: measured on 11,000 of 11,000 second-half ticks, mean
+        free = 25.00. Nothing ran to use them, because every placement path lived inside the
+        queue-drain loop and that loop `break`s on an empty queue.
+
+        The install rate was therefore pinned at `min(_low_water, _max_inflight)` per DRAIN, with
+        no dependence on demand, hit rate, slot count or link speed. Its fingerprints:
+          * promotions and evictions advance in exact multiples of `_low_water` (live: +650 and
+            +650 over the sample window = 26 x 25);
+          * `throttled` frozen, because 25 in-flight copies never reach a 64 ceiling;
+          * the low-water sweep's eviction ratio 61,404 / 1,475 = 41.6 ~ 1024 / 25 = 41.0 — the
+            SAME number of drain episodes in both arms, each installing exactly `_low_water`.
+        Raising `_low_water` therefore cannot fix it: it buys installs and eviction churn in the
+        same breath (measured: h 0.6314 -> 0.5961), which is why that sweep read as "the pool is
+        not the problem" when the pool's LIFETIME was.
+
+        So: retain the demand (`_pending`), and run this on EVERY wake — including a wake with an
+        empty queue, which `apply_pending` now triggers the moment it returns slots to `_free`.
+        `_max_inflight` (the PCIe ceiling, ~87 MiB of copies outstanding) becomes the real
+        governor, which is what it was always documented to be.
+        """
+        while self._pending:
+            with self._lock:
+                if not self._free or len(self._inflight) >= self._max_inflight:
+                    break
+            key = self._pending.pop()               # LIFO: freshest evidence first
+            self._pending_set.discard(key)
+            if key in self._policy:
+                continue                            # a later reference already placed it
+            self._promote(key)
+        # KEEP CAPACITY READY FOR THE BACKLOG, not just for the idle floor. A reclaimed slot is a
+        # resident expert given up, so this asks for exactly as many as there is demand to fill,
+        # capped by the same PCIe ceiling the copies are: over-reclaiming is the low_water=1024
+        # arm, which evicted 41x harder for a WORSE hit rate.
+        want = self._low_water
+        if self._pending:
+            want = max(want, min(len(self._pending), self._max_inflight))
+        with self._lock:
+            short = want - len(self._free) - len(self._to_retract)
+        if short > 0:
+            self._reclaim(short)
+
+    def _defer(self, key: int) -> None:
+        """Remember an admitted reference we could not place yet. MANAGER THREAD (sole owner)."""
+        if key in self._pending_set or key in self._slot_of_key:
+            return
+        while len(self._pending) >= self._pending_cap:
+            self.stats["pending_dropped"] = self.stats.get("pending_dropped", 0) + 1
+            self._pending_set.discard(self._pending.popleft())
+        self._pending.append(key)
+        self._pending_set.add(key)
 
     # -- the scheduler-thread half of the handshake ----------------------------------------------
     def apply_pending(self) -> None:
@@ -505,12 +628,38 @@ class ExpertResidencyCache:
         with self._lock:
             retract, self._to_retract = self._to_retract, []
             inflight, self._inflight = self._inflight, []
-        for _victim, slot in retract:
+        if retract:
+            # (a) UN-PUBLISH THE VICTIM. THIS LINE IS THE CORRECTNESS INVARIANT, and it was MISSING
+            # until 2026-09-22: `apply_pending` recorded the fence and recycled the slot while
+            # leaving `slot_of[victim]` pointing at it, so the next expert to take that slot
+            # overwrote the bytes the table still sent the kernel to. That is the module
+            # docstring's one forbidden direction — a table that OVER-reports residency — and it
+            # is silent: plausible wrong numbers, no error anywhere. Measured on the CPU replay of
+            # the real route trace, 6,000 steps: `slot_of` published 3,376 experts over 2,056
+            # slots (1,320 double-claimed) while the cache believed 2,031 were resident, 1,345 of
+            # the table's entries dangling. The UNTHREADED path in `_promote` always did this
+            # write; only the threaded — i.e. every real serve — path skipped it.
+            for victim, _slot in retract:
+                vlayer, vexpert = divmod(victim, self.num_experts)
+                L = self._layers.get(vlayer)
+                if L is not None:
+                    L["slot_of"][vexpert] = -1      # compute stream: this thread owns it
+            # (b) FENCE, AFTER those writes and after every launch already queued. ONE EVENT FOR
+            # THE WHOLE TICK: every victim here is retracted at the SAME position on the compute
+            # stream, so one event describes all of them and the manager's per-slot `wait_event`
+            # is unchanged. Per-slot events cost an object and a record each, and this list is no
+            # longer `_low_water` long — it is as long as the install rate.
             ev = torch.cuda.Event()
-            ev.record(self._compute_stream)         # ordered after every launch already queued
-            self._retract_ev[slot] = ev
+            ev.record(self._compute_stream)
+            for _victim, slot in retract:
+                self._retract_ev[slot] = ev
             with self._lock:
-                self._free.append(slot)
+                self._free.extend(slot for _victim, slot in retract)
+        # WAKE THE MANAGER, EVERY TICK. Capacity lands here and the demand for it arrived up to a
+        # whole drain interval ago; a manager woken only by arriving REFERENCES sleeps through the
+        # moment its slots come back, which is precisely the freeze `_service` documents. The
+        # idle pass is two uncontended lock acquisitions at ~20 Hz.
+        self._wake.set()
         still = []
         for entry in inflight:
             key, slot, ev = entry[0], entry[1], entry[2]
@@ -584,7 +733,15 @@ class ExpertResidencyCache:
             # refusing to copy would strand it out of the pool.
             if len(self._inflight) >= self._max_inflight:
                 self.stats["throttled"] = self.stats.get("throttled", 0) + 1
-                return
+                throttled = True
+            else:
+                throttled = False
+        if throttled:
+            # BACKPRESSURE, NOT REFUSAL. The link is full this instant; it will not be next tick,
+            # and the reference is still the best evidence we have of what is hot.
+            self._defer(key)
+            return
+        with self._lock:
             slot = self._free.pop() if self._free else None
         if slot is None:
             if not threaded:
@@ -601,10 +758,12 @@ class ExpertResidencyCache:
                 self.stats["evictions"] += 1
                 slot = vslot
             else:
-                # No slot yet. Do NOT touch the policy: the reference is simply not placed this
-                # time, and `_reclaim` will have capacity ready shortly. Counting it keeps the
-                # stall visible instead of silent.
+                # No slot YET — and "yet" is the whole point. Do NOT touch the policy; hold the
+                # reference in `_pending` so the slot `_reclaim` is about to ask for has something
+                # to receive when it lands a tick from now. Dropping it here is what pinned the
+                # install rate to `_low_water` per drain burst for four investigations.
                 self.stats["deferred"] = self.stats.get("deferred", 0) + 1
+                self._defer(key)
                 return
 
         # We hold a slot, so this cannot evict — but handle it rather than assume it.
@@ -695,10 +854,12 @@ class ExpertResidencyCache:
                 # drained all present identically. Without these the last freeze could only be
                 # diagnosed by reading the source and doing arithmetic on the other counters.
                 f"policy={len(self._policy)} to_retract={len(self._to_retract)} "
+                f"pending={len(self._pending)} "
                 f"ticks={self.stats['ticks']} deferred={self.stats.get('deferred', 0)} "
                 f"throttled={self.stats.get('throttled', 0)} "
                 f"abandoned={self.stats.get('abandoned', 0)} "
                 f"admit_deferred={self.stats.get('admit_deferred', 0)} "
                 f"skipped_capture={self.stats.get('skipped_capture', 0)} "
                 f"dropped_refs={self.stats['dropped_refs']} "
+                f"pending_dropped={self.stats.get('pending_dropped', 0)} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")

@@ -708,15 +708,21 @@ case "$MODEL" in
                   # not fit (see the note below). So this budget comes from KV, and WOFF_DEVICE_GB
                   # stays at 4.
                   expert_cache_gb=2.5
-                  # MINISGL_EXPERT_CACHE_MAX_INFLIGHT=512 IS NOT OPTIONAL AND THE DEFAULT IS A TRAP.
-                  # expert_cache.py:225 defaults it to 64, and at 64 the cache SATURATES and never
-                  # fills: measured fill=0.399, observed_h=0.0841, evictions=0, inflight pinned at
-                  # 64 with 182,243 admissions deferred — i.e. a hit rate BELOW the static
-                  # f=0.125 it replaced, so enabling the cache at the default makes things WORSE.
-                  # At 512: fill=0.995, observed_h=0.28-0.35, evictions=90+ (replacement actually
-                  # running), inflight 9. That is the whole difference between the win above and no
-                  # win at all. Exported here rather than left to the caller for that reason.
-                  export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-512}"
+                  # MAX_INFLIGHT: 512 WAS A WORKAROUND FOR A BUG THAT IS NOW FIXED, AND AFTER
+                  # THE FIX IT MEANS SOMETHING ELSE. Until 2026-09-22 the manager only placed
+                  # experts while its reference queue was draining — once per route-trace drain,
+                  # i.e. once every 64 steps — so this ceiling acted as a PER-BURST install cap and
+                  # raising it to 512 was the only way to get the cache to fill at all (at 64:
+                  # fill=0.399, observed_h=0.0841, evictions=0, 182,243 admissions deferred, a hit
+                  # rate BELOW the static f=0.125 it replaced; at 512: fill=0.995, h=0.28-0.35).
+                  # `expert_cache._service` now runs the manager on every TICK, so this is a
+                  # PER-TICK rate: 512 x 1.36 MiB = 697 MiB of H2D per decode step on card 1's
+                  # permanently Gen4 x8 link (14.48 GB/s = ~725 MB per 50 ms step) — the cache
+                  # would take the whole link away from the forward it is accelerating. Back to
+                  # the documented default (64 = ~87 MiB/step, ~12% of the link).
+                  # RE-DERIVE THIS ON HARDWARE: the CPU replay that fixed the freeze measures hit
+                  # rate, not PCIe contention, so the right rate here is still an open A/B.
+                  export MINISGL_EXPERT_CACHE_MAX_INFLIGHT="${MINISGL_EXPERT_CACHE_MAX_INFLIGHT:-64}"
                   # THINK-GATED TOOL MATCHING for this arm: q4e's own chat template puts tool calls
                   # strictly AFTER the reasoning span (its generation prompt opens the span and its
                   # system prompt embeds the call-format example), so raw-first matching latching a
@@ -743,6 +749,16 @@ case "$MODEL" in
                   # `evictions` frozen at exactly low_water is the signature to look for; it is the
                   # same freeze expert_cache.py:424 describes ("froze at 8 evictions in 240k
                   # references"), recurring at a different cache size for the same reason.
+                  #
+                  # AND THAT SIGNATURE WAS THE BUG ITSELF, NOT A TUNING ERROR — root-caused and
+                  # fixed 2026-09-22 (`expert_cache._service`). Installs were pinned at exactly
+                  # `_low_water` per drain burst because the manager slept through every tick its
+                  # slots came back on, which is why raising low_water "worked" (more installs per
+                  # burst) while raising it further hurt (the same lever also buys eviction churn:
+                  # 25 -> h 0.6314, 1024 -> h 0.5961, evictions 1,475 -> 61,404 = 41x = 1024/25).
+                  # With the fix, low_water is only the IDLE floor and the backlog sizes the pool,
+                  # so 25 is no longer load-bearing — keep it, but a freeze here is now a bug
+                  # report, not a knob to turn.
                   export MINISGL_EXPERT_CACHE_LOW_WATER="${MINISGL_EXPERT_CACHE_LOW_WATER:-25}"
                   # SPEC IS OFF ON PURPOSE AND MUST STAY OFF UNTIL THE EXPERT CACHE IS ON.
                   # MEASURED 2026-09-11, same build, warm, single request:

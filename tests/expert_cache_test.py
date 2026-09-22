@@ -254,3 +254,166 @@ def test_t12_the_candidate_window_is_bounded():
     for k in range(500):
         cache.observe(k % LAYERS, [k % E])
     assert len(cache._candidates) <= cache._candidate_cap + 1
+
+
+# ---------------------------------------------------------------------------------------------
+# T13-T16: THE FOURTH REPLACEMENT FREEZE (2026-09-22), and the three properties that close it.
+#
+# The cache installed 0.4 experts/tick while ~180/tick were admitted, at a dead-steady
+# `free=0 to_retract=25 policy=2031` with `throttled` frozen. The mechanism, reproduced on CPU
+# against the real 22,001-step route trace: DEMAND AND CAPACITY ARRIVE AT DIFFERENT TIMES.
+# References land in one burst per route-trace drain (64 steps); a slot takes a scheduler TICK to
+# come back. The manager placed the slots that happened to be free when the burst landed —
+# exactly `_low_water` — DISCARDED the rest of the demand, and went to sleep. The slots it had
+# just asked for arrived one tick later and sat unused on 11,000 of 11,000 measured ticks,
+# because every placement path lived inside the manager's queue-drain loop and that loop breaks
+# on an empty queue. Install rate == `min(_low_water, _max_inflight)` per DRAIN, whatever the
+# demand, hit rate, slot count or link speed.
+#
+# Each of T13-T15 fails on the pre-fix code, and T16 is the reason it took four investigations.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_t13_a_reference_with_no_slot_is_remembered_not_discarded():
+    """Demand must OUTLIVE the instant it arrives, because capacity arrives later.
+
+    Freshest-first on the way out: the most recent deferred reference is the best evidence of what
+    is hot now, and the backlog is bounded so a stale one ages out rather than displacing a
+    resident expert on the strength of a reference from a minute ago.
+    """
+    cache, _ = _build(slots=16)
+    placed = []
+    cache._promote = lambda k: (placed.append(k), cache._free.pop())
+
+    cache._defer(1001)
+    cache._defer(1002)
+    assert len(cache._pending) == 2, "an admitted reference was thrown away for want of a slot"
+
+    cache._free = [7]                       # ONE slot comes back, a tick later
+    cache._service()
+    assert placed == [1002], f"expected the freshest deferred reference first, got {placed}"
+    assert 1001 in cache._pending_set, "the rest of the backlog must survive to the next slot"
+
+    cache._pending_cap = 2                  # and the backlog is BOUNDED, oldest dropped
+    cache._free = []
+    for k in (2001, 2002, 2003):
+        cache._defer(k)
+    assert len(cache._pending) == 2
+    assert 1001 not in cache._pending_set, "the cap must drop the OLDEST deferred reference"
+    assert cache.stats["pending_dropped"] >= 1
+
+
+def test_t14_the_free_pool_is_sized_to_the_backlog_not_to_the_idle_floor():
+    """`_low_water` is the IDLE floor. With demand waiting, the pool must follow the demand.
+
+    This is the one the low-water sweep could not see: raising `_low_water` bought installs and
+    eviction churn in the same breath (h 0.6314 -> 0.5961 at 25 -> 1024, evictions 1,475 ->
+    61,404 — a 41x ratio that is exactly 1024/25, i.e. the same number of drain bursts in both
+    arms, each installing precisely `_low_water`).
+    """
+    cache, _ = _build(slots=64)
+    rng = random.Random(7)
+    for _ in range(200):                    # fill the policy so there are victims to reclaim
+        cache.observe(rng.randrange(LAYERS), rng.sample(range(E), 8))
+    cache._promote = lambda k: None         # placement is not what this asserts
+    cache._low_water, cache._max_inflight = 4, 32
+    cache._free, cache._to_retract = [], []
+    for k in range(3000, 3020):             # 20 admitted references waiting on capacity
+        cache._defer(k)
+
+    cache._service()
+    assert len(cache._to_retract) == 20, (
+        f"reclaimed {len(cache._to_retract)} slots for a backlog of 20 — the free pool is still "
+        f"pinned to _low_water ({cache._low_water}), so the install rate is too")
+
+
+def test_t15_the_manager_services_the_cache_on_a_tick_with_no_new_references():
+    """THE FREEZE ITSELF. Slots come back on a TICK; references come in a BURST every 64 steps.
+
+    A manager that only acts while its reference queue is draining sleeps through every moment its
+    own slots land. Run one loop pass with an EMPTY queue and require that the cache was serviced.
+    """
+    import threading as _threading
+
+    cache, _ = _build(slots=8)
+    calls = []
+
+    def _fake_service():
+        calls.append(1)
+        cache._stopping = True              # one pass is all we need
+
+    cache._service = _fake_service
+    cache._stopping = False
+    cache._wake.set()
+    t = _threading.Thread(target=cache._run_loop, daemon=True)
+    t.start()
+    t.join(5.0)
+    cache._stopping = True
+    assert calls, ("the manager woke with an empty reference queue and placed nothing. Every slot "
+                   "returned by apply_pending on a tick without a drain is then parked until the "
+                   "next burst — the 2026-09-22 freeze.")
+
+
+def test_t16_a_summary_can_be_sampled_outside_a_drain_burst():
+    """WHY IT TOOK FOUR INVESTIGATIONS: the instrument was phase-locked to the manager.
+
+    The summary used to fire every N manager BATCHES, and a batch only happens while the reference
+    queue drains — so every sample ever printed came from inside a burst, where `free` has just
+    been drained to 0 and `to_retract` has just been refilled to `_low_water`. The complementary
+    phase (free=_low_water, to_retract=0) held for 63 of every 64 ticks and nothing sampled it,
+    which is why three diagnoses in a row blamed the retract queue.
+    """
+    import contextlib as _contextlib
+    import io as _io
+
+    cache, _ = _build(slots=8)
+    cache._report_every = 2
+    cache.stats["manager_batches"] = 0      # NO batches: the idle phase
+    cache.stats["ticks"] = 9
+    buf = _io.StringIO()
+    with _contextlib.redirect_stdout(buf):
+        cache._report()
+    assert "[expert-cache]" in buf.getvalue(), (
+        "no summary is emitted on a tick cadence, so the cache can only ever be observed in the "
+        "one phase of its cycle where the manager is running")
+
+
+def test_t17_a_retracted_victim_is_unpublished_from_the_device_table():
+    """THE WRONG-NUMBERS BUG, and the one direction the whole design forbids.
+
+    `slot_of[e] >= 0` is a PROMISE that slot holds expert e's bytes. Retraction must break that
+    promise BEFORE the slot is handed to anyone else, and on the threaded path — i.e. every real
+    serve — `apply_pending` never wrote it: it recorded the fence, pushed the slot back onto the
+    free list, and left `slot_of[victim]` pointing at a slot the next promotion overwrote. Only
+    the UNTHREADED path in `_promote` (selftests, including T2 above) did the write, which is
+    exactly why twelve green tests never saw it.
+
+    Measured on the CPU replay of the real 22,001-step route trace, 6,000 steps: `slot_of`
+    published 3,376 experts over 2,056 slots — 1,320 of them double-claimed — while the cache
+    believed 2,031 were resident and 1,345 table entries were dangling. Every one of those is a
+    grouped-GEMM read of another expert's weights, with no error anywhere.
+    """
+    cache, hosts = _build(slots=8)
+    cache.observe(0, [3])
+    cache.observe(0, [3])                       # second sighting -> resident (unthreaded path)
+    victim = 0 * E + 3
+    slot = cache._slot_of_key[victim]
+    assert int(cache._layers[0]["slot_of"][3]) == slot
+
+    class _FakeEvent:                           # the scheduler half without a GPU
+        def record(self, stream=None): pass
+        def query(self): return True
+
+    real_event, real_device = torch.cuda.Event, cache.device
+    torch.cuda.Event = _FakeEvent
+    try:
+        cache.device = torch.device("cuda")     # take the threaded scheduler-half path
+        assert cache._queue_retract(victim), "the victim held no slot"
+        cache.apply_pending()
+    finally:
+        torch.cuda.Event, cache.device = real_event, real_device
+
+    assert int(cache._layers[0]["slot_of"][3]) == -1, (
+        "apply_pending recycled the slot without un-publishing the victim: the table still sends "
+        "the kernel to a slot the next promotion will overwrite")
+    assert slot in cache._free, "the retracted slot never reached the free list"
