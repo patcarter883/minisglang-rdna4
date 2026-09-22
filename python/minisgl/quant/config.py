@@ -180,6 +180,51 @@ def _modelopt_to_compressed_tensors(d: dict) -> "dict | None":
 # per-token amax is arguably more adaptive than a static table. But it has never been MEASURED for
 # accuracy against the scheme the checkpoint was calibrated for, and it is worth being accurate about
 # which of those two things is true: the substitution is forced, not free.
+def _ct_targets_to_patterns(targets: tuple) -> tuple:
+    """compressed-tensors `targets` -> module-name patterns this engine can match.
+
+    A `targets` entry is EITHER a module selector (`re:.*\\.self_attn\\.q_proj$`, or a dotted path)
+    OR the NAME OF A TORCH MODULE CLASS — `["Linear"]` is the canonical spelling for "every
+    nn.Linear in the model", and it is what a single-group compressed-tensors checkpoint almost
+    always ships. Matched as a name pattern it selects NOTHING, because no module is called
+    "Linear": on Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ that made `for_module` return None for every
+    routed expert, i.e. served the MXFP4 bulk of the model as though it were unquantized while the
+    checkpoint ships `weight_packed`. So a class-name target becomes the catch-all `re:.*`, and the
+    `ignore` list plus `ckpt_quantized` do the narrowing they already do.
+
+    Detection is deliberately narrow — a bare identifier with no dot, no regex prefix and an
+    upper-case initial. Module paths in the wild are lower-case and dotted (`model.layers.0...`), and
+    a genuine regex carries the `re:` prefix, so neither is mistaken for a class.
+
+    Returns `(patterns, is_catchall)`. The flag matters for ORDERING: see the ct_groups construction.
+    """
+    out, catchall = [], False
+    for t in targets:
+        t = str(t)
+        if (not t.startswith("re:") and "." not in t and "/" not in t
+                and t[:1].isupper() and t.isidentifier()):
+            out.append("re:.*")
+            catchall = True
+        else:
+            out.append(t)
+    return tuple(out), catchall
+
+
+def _group_own_format(w: dict) -> "str | None":
+    """A compressed-tensors group's weight FORMAT from its own dtype, when it declares none.
+
+    Only decides the cases the headline format cannot be trusted for. 4-bit float is ambiguous on
+    (num_bits, type) alone — MXFP4 and NVFP4 differ by group size and scale structure — so it is left
+    to the declared/inherited format, exactly as before. 8-bit float is not ambiguous: it is
+    `float-quantized` (fp8 e4m3), whatever a multi-group checkpoint says at the top level.
+    """
+    if not w:
+        return None
+    if str(w.get("type", "")).lower() == "float" and int(w.get("num_bits") or 0) == 8:
+        return "float-quantized"
+    return None
+
+
 _QUARK_METHODS = ("quark",)
 
 # (weight dtype, scale_format) -> the compressed-tensors `format` naming the identical layout.
@@ -271,6 +316,18 @@ class QuantConfig:
     # are calibrated for it); None -> weight-only (activations stay in the compute dtype, W4A16/W8A16).
     # An env var must NEVER substitute a different activation scheme than the checkpoint declares.
     act_type: str | None = None
+    # WEIGHT quantization GRANULARITY (compressed-tensors `config_groups[*].weights.strategy`):
+    # "group" (a scale per `group_size` along K), "channel" (per output row), "tensor" (one scalar),
+    # or "block" (a scale per `block_structure` tile — 2-D, varying along BOTH N and K).
+    #
+    # Parsed because dropping it is not neutral. `strategy: "block"` with `group_size: null` used to
+    # fall through to the `else 32` default below and be described as group-32 — a scheme the
+    # checkpoint does not contain, silently. Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ ships exactly that for
+    # its attention and GDN projections (fp8, block [128,128]), so it would have been served as if
+    # its scale varied along K in 32-element groups when it actually tiles 128x128.
+    weight_strategy: str | None = None
+    # The `block_structure` tile, e.g. (128, 128). None for every non-block strategy.
+    block_structure: tuple[int, ...] | None = None
     # compressed-tensors `format` string (e.g. "mxfp4-pack-quantized", "nvfp4-pack-quantized",
     # "pack-quantized", "float-quantized"). It disambiguates the two float-4bit packings that
     # num_bits+type ALONE conflate: MXFP4 (group-32, E8M0 exponent scale, no global scale) vs NVFP4
@@ -295,6 +352,20 @@ class QuantConfig:
     # quantized. No string rule satisfies both; the checkpoint's own tensors do, unambiguously — so
     # the ignore list becomes advisory and the shipped tensors decide.
     ckpt_quantized: frozenset[str] | None = None
+
+    @property
+    def is_fp8_block(self) -> bool:
+        """DeepSeek-style BLOCKWISE fp8: e4m3 weights with a 2-D scale per `block_structure` tile.
+
+        Distinct from `is_fp8_w8a8`, which is per-OUTPUT-CHANNEL (one scale per row, `(N,1)`) and
+        folds into the GEMM epilogue. A block scale varies along K as well, so it cannot be an
+        epilogue factor and no kernel here consumes it — the method dequantizes to bf16 at load
+        instead (see Fp8BlockDequantLinearMethod). Checked BEFORE is_fp8_w8a8 at the dispatch,
+        because a block checkpoint satisfies both and the channel method would try to load a
+        `(N,1)` scale where the file has `(N/128, K/128)`.
+        """
+        return (self.is_compressed_tensors and self.weight_type == "float" and self.bits == 8
+                and self.weight_strategy == "block" and bool(self.block_structure))
 
     @property
     def is_awq(self) -> bool:
@@ -499,9 +570,22 @@ class QuantConfig:
                     ignore=norm_ignore,
                     weight_type=str(w["type"]).lower() if w.get("type") else "int",
                     act_type="fp8" if ia and str(ia.get("type", "")).lower() == "float" else None,
+                    weight_strategy=(str(w["strategy"]).lower() if w.get("strategy") else None),
+                    block_structure=(tuple(int(b) for b in w["block_structure"])
+                                     if w.get("block_structure") else None),
                     # A mixed-precision group carries its OWN format ("float-quantized" /
                     # "nvfp4-pack-quantized"); single-format checkpoints declare it top-level only.
-                    ct_format=(str((g or {}).get("format", "")).lower() or None) or group_fmt,
+                    #
+                    # A group must NOT inherit a format its own dtype contradicts. The top-level
+                    # format names a WEIGHT PACKING, and in a multi-group checkpoint the groups need
+                    # not share one: Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ declares
+                    # `format: mxfp4-pack-quantized` at the top while its group_1 is 8-bit float,
+                    # i.e. fp8. Inheriting there tagged an fp8 group as MXFP4, which routes it to the
+                    # e2m1 nibble decode — plausible, finite, wrong numbers. 8-bit float is
+                    # `float-quantized` no matter what the headline says.
+                    ct_format=(str((g or {}).get("format", "")).lower() or None)
+                    or _group_own_format(w)
+                    or group_fmt,
                 )
 
             # Groups in DECLARATION order (dict order == the JSON's, which these checkpoints author
@@ -512,9 +596,22 @@ class QuantConfig:
             # single-group checkpoint keeps ct_groups empty (the scalars below are the whole story).
             ct_groups: tuple[tuple[tuple[str, ...], "QuantConfig"], ...] = ()
             if len(ordered) > 1 or fmt == "mixed-precision":
-                ct_groups = tuple(
-                    (_norm_ignore(tuple(g.get("targets") or ())), _scheme(g, fmt))
-                    for _, g in ordered
+                # ORDER: explicit targets first, CLASS-LEVEL catch-alls last — regardless of
+                # declaration order. `for_module` is first-match-wins, and the two layouts in the
+                # wild disagree about what that should mean. Qwen3.8-27B-NVFP4 ships
+                # specific-before-general with both groups explicit, so declaration order is already
+                # right for it and partitioning leaves it untouched. Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ
+                # ships the opposite: group_0 is `["Linear"]` (every Linear) and the fp8 attention/GDN
+                # regexes come after — so honouring declaration order handed every attention and GDN
+                # projection to the MXFP4 e2m1 decode when the file ships them as blockwise fp8.
+                # A class-level target is compressed-tensors' FALLBACK ("any Linear not otherwise
+                # specified"), so it belongs last; that makes both layouts resolve correctly without
+                # either checkpoint having to declare an order it does not control.
+                _parsed = [(_norm_ignore(pats), _scheme(g, fmt), ca)
+                           for _, g in ordered
+                           for pats, ca in (_ct_targets_to_patterns(tuple(g.get("targets") or ())),)]
+                ct_groups = tuple((p, sc) for p, sc, ca in _parsed if not ca) + tuple(
+                    (p, sc) for p, sc, ca in _parsed if ca
                 )
             # Headline scalars stay the FIRST group's, so `quant.bits`/`group_size`/... keep meaning
             # for the single-format checkpoints (and for callers that only want a rough descriptor).

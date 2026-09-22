@@ -591,7 +591,13 @@ class ModelConfig:
             # native space (the `language_model.` infix stripped) so they match what the model asks
             # with. See QuantConfig.ckpt_quantized for why the ignore list alone cannot decide this.
             _QSUFFIX = (".weight_packed", ".qweight", ".weight_scale", ".scales",
-                        ".weight_global_scale", ".weight_scale_2", ".qzeros", ".weight_zero_point")
+                        ".weight_global_scale", ".weight_scale_2", ".qzeros", ".weight_zero_point",
+                        # DeepSeek-style BLOCKWISE fp8 names its scale `weight_scale_inv`, and
+                        # `.weight_scale` is not a suffix of it — so without this entry a blockwise
+                        # module ships fp8 bytes while being classified UNQUANTIZED, and the loader
+                        # asks for a bf16 `.weight` it will never get. Qwen3.8-Flash-Next-MXFP4-FP8
+                        # ships exactly this for its attention and GDN projections.
+                        ".weight_scale_inv")
 
             def _native(n: str) -> str:
                 # Mirror the loader's de-wrapping EXACTLY (same rewrites as quant _norm_ignore):

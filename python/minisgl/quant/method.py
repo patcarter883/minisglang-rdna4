@@ -696,6 +696,10 @@ def create_linear_method(
     # W8A8 WMMA core as the fp8 MoE experts (single-expert grouped GEMM). ZAYA's dense/attn linears
     # stay in the quant `ignore` list (-> unquantized), so this only fires for a checkpoint that
     # actually declares fp8-W8A8 dense linears (e.g. RedHatAI *-FP8-dynamic).
+    if quant.is_fp8_block:
+        # BEFORE is_fp8_w8a8: a blockwise checkpoint satisfies both, and the per-channel method would
+        # declare a (N,1) scale where the file ships (N/128, K/128).
+        return Fp8BlockDequantLinearMethod(quant)
     if quant.is_fp8_w8a8:
         return Fp8W8A8LinearMethod(quant)
     return W4A8LinearMethod(quant)
@@ -826,6 +830,74 @@ class NvFp4LinearMethod:
             x, w, layer._scales_op, layer._global_op,  # type: ignore[attr-defined]
             self.quant.group_size, weight_is_e2m1=True,
         ).to(x.dtype)
+
+
+class Fp8BlockDequantLinearMethod:
+    """DeepSeek-style BLOCKWISE fp8 (e4m3 weights + a 2-D scale per `block_structure` tile),
+    dequantized to bf16 ONCE at load and then served as an ordinary unquantized linear.
+
+    WHY DEQUANTIZE RATHER THAN SERVE IT QUANTIZED. A blockwise scale varies along K as well as N, so
+    unlike the per-output-channel `Fp8W8A8LinearMethod` it cannot fold into the GEMM epilogue, and no
+    kernel in this engine consumes a 2-D weight scale. The options were a new blockwise fp8 kernel or
+    an exact one-time dequantization; the second is chosen because it is EXACT (an fp8 value times its
+    block scale, widened — no second approximation), needs no kernel, and lands the module on
+    `minv_linear`, the same M-invariant chokepoint every other unquantized Linear uses, so a
+    chunked / prefix-cached / spec-verify forward still matches a fresh one bit-for-bit.
+
+    THE MEMORY IS AFFORDABLE HERE, which is the only reason this is a reasonable trade. It applies to
+    Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ's attention and GDN projections, and the NVFP4 sibling of that
+    same checkpoint SPARES those modules entirely — i.e. serves them bf16 already, at the same size
+    this produces. The bulk of the model (the routed experts) stays 4-bit either way. Do NOT reach for
+    this method on a checkpoint whose blockwise-fp8 modules are the bulk: there it would double the
+    weight budget and a real blockwise kernel is the answer.
+
+    The declared per-group-128 dynamic fp8 ACTIVATION scheme is deliberately dropped with the weight
+    quantization: once the weight is bf16 there is nothing to pair a quantized activation with, and
+    quantizing x for a bf16 GEMM would be a pure loss. Same reasoning the W4A16 arms use.
+    """
+
+    def __init__(self, quant: QuantConfig) -> None:
+        self.quant = quant
+
+    def create_weights(self, layer: "BaseOP", out_features: int, in_features: int) -> None:
+        # CHECKPOINT layout so the BaseOP loader lands tensors directly. N, K are the LOCAL (per-TP)
+        # sizes, and the scale is declared in the SAME sharded space so the generic sharder splits it
+        # with the weight: block 128 divides every shipped dimension of this checkpoint (2560/128=20,
+        # 10240/128=80, 12288/128=96, 6144/128=48) and it must keep dividing after the TP split, so
+        # that is asserted rather than assumed — a non-dividing shard would silently misalign every
+        # scale tile against the rows it scales.
+        bn, bk = (int(self.quant.block_structure[0]), int(self.quant.block_structure[-1]))
+        N, K = out_features, in_features
+        if N % bn or K % bk:
+            raise ValueError(
+                f"blockwise fp8: local shape ({N}, {K}) is not divisible by block {(bn, bk)}. The "
+                f"scale tiles would misalign against the rows they scale. This is usually a TP split "
+                f"that cut a block in half."
+            )
+        layer.weight = torch.empty((N, K), dtype=torch.float8_e4m3fn)
+        # `weight_scale_inv`, not `weight_scale`: the DeepSeek blockwise name, which is what the
+        # checkpoint ships (BF16 [N/128, K/128]).
+        layer.weight_scale_inv = torch.empty((N // bn, K // bk), dtype=torch.bfloat16)
+
+    def process_weights_after_load(self, layer: "BaseOP") -> None:
+        bn, bk = (int(self.quant.block_structure[0]), int(self.quant.block_structure[-1]))
+        w = layer.weight
+        N, K = w.shape
+        # Expand the tile scale to full (N, K) by repeating each tile value over its block, then
+        # multiply in f32 and narrow once. `repeat_interleave` on both axes rather than a broadcast
+        # reshape: the reshape spelling only works when N/bn and K/bk tile exactly in that memory
+        # order, and getting it wrong transposes the scale field silently.
+        sc = layer.weight_scale_inv.to(torch.float32)
+        sc = sc.repeat_interleave(bn, dim=0).repeat_interleave(bk, dim=1)[:N, :K]
+        layer.weight = (w.to(torch.float32) * sc).to(torch.bfloat16).contiguous()
+        del layer.weight_scale_inv
+
+    def apply(
+        self, layer: "BaseOP", x: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        from minisgl.layers.minv import minv_linear
+
+        return minv_linear(x, layer.weight, bias)
 
 
 class Fp8W8A8LinearMethod:
