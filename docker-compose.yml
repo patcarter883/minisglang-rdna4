@@ -833,6 +833,24 @@ services:
       # 2026-09-06, because the measured runs mounted them by hand in tools/qsa/run_qsa_longctx.sh
       # and that never made it into the compose service every other model serves from.
       # Read-only: a serve has no business writing to either.
+      #
+      # Q4E_PLE_DIR MUST POINT AT A recordsize=4K ZFS DATASET, AND IT IS NOT ENOUGH FOR THE FILES
+      # TO SIMPLY BE PLE FILES. A row is 120 B and decode reads 16 rows/token, so on a 1M-record
+      # dataset every row read pulls a whole record. MEASURED 2026-09-22: 418-444 KiB of device
+      # traffic per row on `zpcachyoshome/models/hf` (recordsize=1M) against 17-24 KiB on a 4K
+      # dataset -- 18-24x. At ~15 tok/s that is ~240 MiB/s of random reads on the SAME POOL that
+      # serves /home; it froze the desktop for seconds at a time (PSI io some=8.36) and the test
+      # had to be abandoned. A checkpoint that SHIPS ITS OWN PLE SHARDS (tcclaviger MXFP4-FP8)
+      # tempts you to point both Q4E_MODEL_DIR and Q4E_PLE_DIR at it -- that is the trap, because
+      # checkpoints live under models/hf at 1M. The NVFP4 arm never showed this only because
+      # /home/pat/ai/ple happens to be a dedicated 4K dataset.
+      #   NVFP4  : Q4E_PLE_DIR=/home/pat/ai/ple         (zpcachyoshome/models/ple,       4K)
+      #   MXFP4  : Q4E_PLE_DIR=/home/pat/ai/ple-mxfp4   (zpcachyoshome/models/ple-mxfp4, 4K)
+      # The two are NOT interchangeable: NVFP4 rows are fp8-LUT, MXFP4's are int6 g32.
+      # Building one: `zfs create -o recordsize=4K`, then `cp --reflink=never` -- a plain `cp`
+      # BLOCK-CLONES (zfs_bclone_enabled=1) and silently inherits the source's 1M geometry, so
+      # 47 GB "copies" in 30 s, pool avail never moves, and a probe shows no improvement at all.
+      # Verify with `zdb -ddddd <dataset> <inode>` and read dblk; never trust `zfs get recordsize`.
       - ${Q4E_MODEL_DIR:-./models/q4e}:/model:ro
       - ${Q4E_PLE_DIR:-./models/q4e-ple}:/ple:ro
     environment:
