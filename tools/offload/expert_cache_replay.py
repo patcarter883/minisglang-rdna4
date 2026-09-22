@@ -31,6 +31,10 @@ MEASURED WITH IT, 22,000 steps / 6,000 warm / 2,056 slots / LOW_WATER=25 / MAX_I
     offline SLRU ceiling          0.5425            --          --                         --
 
 RUN IT BEFORE AND AFTER ANY CHANGE TO THIS CACHE. It takes 20 seconds and needs no lease.
+
+SEE ALSO `expert_cache_freeze_repro.py`, the sibling harness that reached the same root cause from
+a GENERATED reference stream (it can sweep locality and drain interval; it needs real torch, so it
+runs in the image, and it scores the policy's `observed_h` rather than the device table).
 """
 
 import argparse

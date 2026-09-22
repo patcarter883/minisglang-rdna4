@@ -85,6 +85,17 @@ Usage:
     PYTHONPATH=<repo>/python python3 tools/offload/expert_cache_freeze_repro.py --drain-every 1
     PYTHONPATH=<repo>/python python3 tools/offload/expert_cache_freeze_repro.py \
         --drain-every 180 --steps 24000
+
+FIXED 2026-09-22 (d2c3ac43, `expert_cache._service`) — THIS FILE IS NOW A REGRESSION HARNESS, not
+an open diagnosis. Against the fixed cache its own verdict block reports the rate law broken:
+promotions 3.103/tick against the freeze's `_low_water/drain_every` = 0.391/tick.
+
+SEE ALSO `expert_cache_replay.py`, which answers the questions this one cannot and vice versa.
+That one replays the CAPTURED 22,001-step route fixture instead of a generated stream, scores the
+hit rate off the DEVICE-VISIBLE `slot_of` tables rather than the policy's `observed_h` (the gap
+between those two is where the silent wrong-bytes bug was found: 13.05% of expert reads), and
+needs no torch at all, so it runs on the bare host in 20 s. This one needs no fixture and can
+sweep the reference stream's own properties, which a replay of one capture cannot.
 """
 
 from __future__ import annotations
