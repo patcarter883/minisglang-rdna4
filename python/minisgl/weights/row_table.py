@@ -89,7 +89,60 @@ DTYPE_BYTES: Dict[str, int] = {
 
 #: The subset a row table may be built from — a dtype is only safe here if one value is one
 #: independently addressable unit, so a row can be sliced without decoding its neighbours.
-CODECS: Dict[str, int] = {"F8_E4M3": 1, "F8_E5M2": 1, "BF16": 2, "F16": 2, "F32": 4}
+CODECS: Dict[str, int] = {"F8_E4M3": 1, "F8_E5M2": 1, "BF16": 2, "F16": 2, "F32": 4,
+                          # U8/I8 carry PACKED sub-byte codes (int6, mxfp4). A row of them is
+                          # addressable and gatherable, but NOT decodable on its own — the group
+                          # scales live in a second tensor. `decode_raw` therefore refuses them, and
+                          # `FusedScaleRowTable` is the thing that pairs the two.
+                          "U8": 1, "I8": 1}
+
+
+# ---------------------------------------------------------------------------
+# int6 group-32 (the `*-MXFP4-FP8-GPTQ` n-gram table)
+# ---------------------------------------------------------------------------
+
+#: Codes are stored biased: the stored 6-bit value minus this is the signed code, range [-31, 31].
+INT6_CODE_OFFSET = 32
+INT6_GROUP = 32
+
+
+def dequant_int6_g32(packed: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """(n, head_dim*6//8) uint8 packed codes + (n, head_dim//32) fp16 scales -> (n, head_dim) f32.
+
+    THE CONVENTION IS READ, NOT INFERRED. Four 6-bit codes share a 24-bit LITTLE-ENDIAN word and are
+    extracted LSB-first; the stored code is biased by +32. Taken verbatim from the checkpoint
+    author's own reference (`vllm/models/qwen4_exp/common/ple.py::dequant_int6_fused_rows`, whose
+    docstring states it is bit-identical to libr4d's `ple_dequant_i6g32_f16`):
+
+        word  = b0 | b1 << 8 | b2 << 16
+        code_i = ((word >> 6*i) & 0x3F) - 32        for i in 0..3
+        value  = code_i * scale[group]              group = 32 values
+
+    Guessing any of those three (byte order, bit order, bias) produces a plausible tensor of the
+    right shape and silently wrong embeddings — the failure mode that cannot be caught downstream,
+    because an n-gram embedding has no self-evidently correct value.
+    """
+    n = packed.shape[0]
+    if packed.shape[1] % 3:
+        raise ValueError(
+            f"int6 packed row is {packed.shape[1]} bytes, not a multiple of 3. Four 6-bit codes "
+            f"share a 24-bit word, so the row must be whole words."
+        )
+    words = packed.reshape(n, -1, 3).astype(np.uint32)
+    w = words[:, :, 0] | (words[:, :, 1] << 8) | (words[:, :, 2] << 16)
+    # (n, nwords, 4) LSB-first, then flattened back to head_dim order.
+    codes = np.stack([(w >> (6 * i)) & 0x3F for i in range(4)], axis=-1)
+    codes = codes.reshape(n, -1).astype(np.int16) - np.int16(INT6_CODE_OFFSET)
+    head_dim = codes.shape[1]
+    ngroups = scale.shape[1]
+    if head_dim != ngroups * INT6_GROUP:
+        raise ValueError(
+            f"int6: {head_dim} codes against {ngroups} scales x {INT6_GROUP} = "
+            f"{ngroups * INT6_GROUP}. The packed and scale tensors describe different widths."
+        )
+    vals = codes.reshape(n, ngroups, INT6_GROUP).astype(np.float32)
+    vals *= scale.astype(np.float32).reshape(n, ngroups, 1)
+    return vals.reshape(n, head_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +789,127 @@ class ShardedRowTable:
 
 
 # ---------------------------------------------------------------------------
+# packed-codes + group-scales tables (int6 group-32 n-gram)
+# ---------------------------------------------------------------------------
+
+
+class FusedScaleRowTable:
+    """A row table whose rows are PACKED CODES in one tensor and GROUP SCALES in another.
+
+    `ShardedRowTable` assumes a row decodes from its own bytes and a single scalar scale. That holds
+    for the fp8 n-gram table (`RadixArk/...-NVFP4`) and not for the int6 one
+    (`tcclaviger/...-MXFP4-FP8-GPTQ`), where each row is 120 B of 6-bit codes in
+    `shard_N.weight_packed` plus five fp16 per-group scales in `shard_N.weight_scale`.
+
+    Rather than teach the gather machinery about two tensors, this COMPOSES two ShardedRowTables and
+    presents the checkpoint author's own "fused row" shape — `packed || scale` as one uint8 row — at
+    the staging boundary. That is deliberate: it is the representation `ple/source.py` already
+    allocates (one `(rows, row_bytes)` uint8 landing buffer) and decodes in one call, so the PLE
+    source needs NO change to serve a second format, and the measured gather path (threaded pread,
+    mmap thresholds, prefetch) is reused rather than forked.
+
+    Cost of the composition is one extra random read per row (10 B of scale beside 120 B of codes)
+    and a 2 KB assembly copy per token at 16 rows — against a gather budget the module's own header
+    prices at ~90 KB/s, i.e. nothing.
+    """
+
+    def __init__(self, packed: "ShardedRowTable", scale: "ShardedRowTable", *,
+                 codec: str = "INT6_G32") -> None:
+        if packed.n_rows != scale.n_rows:
+            raise ValueError(
+                f"packed table has {packed.n_rows} rows, scale table {scale.n_rows}. They index the "
+                f"same n-gram row space, so a mismatch means the two tensor sets disagree."
+            )
+        if packed.rows_per_shard != scale.rows_per_shard:
+            raise ValueError(
+                f"packed shards are {packed.rows_per_shard} rows high, scale shards "
+                f"{scale.rows_per_shard}. Row -> shard is a division in both, so they must match."
+            )
+        if codec != "INT6_G32":
+            raise ValueError(
+                f"unknown fused codec {codec!r}. The only one implemented is INT6_G32 "
+                f"(uint8 packed + fp16 group scales). The MXFP4 n-gram variant of this checkpoint "
+                f"family uses e2m1 codes with a uint8 E8M0 scale per 32 — add it here as a second "
+                f"codec, with its own fixture, rather than by loosening this check."
+            )
+        self.packed = packed
+        self.scale = scale
+        self.codec = codec
+        self.row_bytes = packed.row_bytes + scale.row_bytes
+        #: Decoded values per row: 6 bits each, so 8/6 of the packed byte count.
+        self.row_elems = packed.row_bytes * 8 // 6
+        self.n_rows = packed.n_rows
+        self.dtype = codec
+        self._split = packed.row_bytes
+        self._pbuf: np.ndarray | None = None
+        self._sbuf: np.ndarray | None = None
+        if self.row_elems != scale.row_elems * INT6_GROUP:
+            raise ValueError(
+                f"{self.row_elems} codes per row but {scale.row_elems} scales x {INT6_GROUP} = "
+                f"{scale.row_elems * INT6_GROUP}. Packed and scale tensors describe different widths."
+            )
+
+    def _scratch(self, n: int):
+        """Reused landing buffers. `gather_raw_into_async` demands C-contiguous WHOLE-ROW targets,
+        so the two gathers cannot write column slices of the caller's fused buffer directly."""
+        if self._pbuf is None or self._pbuf.shape[0] < n:
+            self._pbuf = np.empty((n, self.packed.row_bytes), dtype=np.uint8)
+            self._sbuf = np.empty((n, self.scale.row_bytes), dtype=np.uint8)
+        return self._pbuf[:n], self._sbuf[:n]
+
+    def gather_raw_into_async(self, row_ids, out_raw: np.ndarray):
+        ids = np.asarray(row_ids, dtype=np.int64)
+        if out_raw.shape != (ids.size, self.row_bytes) or out_raw.dtype != np.uint8:
+            raise ValueError(
+                f"out_raw must be ({ids.size}, {self.row_bytes}) uint8, got "
+                f"{out_raw.shape} {out_raw.dtype}"
+            )
+        pb, sb = self._scratch(int(ids.size))
+        hp = self.packed.gather_raw_into_async(ids, pb)
+        hs = self.scale.gather_raw_into_async(ids, sb)
+        return (out_raw, hp, hs, pb, sb)
+
+    def gather_wait(self, handle) -> np.ndarray:
+        out_raw, hp, hs, pb, sb = handle
+        ShardedRowTable.gather_wait(hp)
+        ShardedRowTable.gather_wait(hs)
+        out_raw[:, : self._split] = pb
+        out_raw[:, self._split :] = sb
+        return out_raw
+
+    def decode_raw(self, fused: np.ndarray) -> np.ndarray:
+        """(n, packed+scale) uint8 fused rows -> (n, row_elems) float32."""
+        packed = fused[:, : self._split]
+        scale = np.ascontiguousarray(fused[:, self._split :]).view("<f2")
+        return dequant_int6_g32(packed, scale)
+
+    def gather(self, row_ids) -> np.ndarray:
+        ids = np.asarray(row_ids, dtype=np.int64)
+        out = np.empty((ids.size, self.row_bytes), dtype=np.uint8)
+        return self.decode_raw(self.gather_wait(self.gather_raw_into_async(ids, out)))
+
+    def gather_into(self, row_ids, out: np.ndarray) -> np.ndarray:
+        out[...] = self.gather(row_ids)
+        return out
+
+    def prefetch(self, row_ids) -> None:
+        for t in (self.packed, self.scale):
+            if hasattr(t, "prefetch"):
+                t.prefetch(row_ids)
+
+    def close(self) -> None:
+        self.packed.close()
+        self.scale.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"FusedScaleRowTable({self.codec}, {self.n_rows:,} rows x {self.row_elems} "
+            f"({self.row_bytes} B packed+scale), "
+            f"{self.n_rows * self.row_bytes / 1e9:.2f} GB)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # n-gram head addressing
 # ---------------------------------------------------------------------------
 
@@ -787,6 +961,68 @@ class NgramHeads:
 PLE_PREFIX = "model.language_model.layers.1.ple.ple_embedding"
 
 
+def _read_ngram_heads(idx, layer_prefix: str, *, n_rows: int | None = None):
+    """`NgramHeads` from the two small metadata tensors, or None when they were not supplied.
+
+    Shared by both table layouts. It lives here rather than inline because the fp8 and packed paths
+    build different table types but identical heads, and a second copy is how the two drift.
+    """
+    ok = f"{layer_prefix}.ngram_heads_offsets"
+    vk = f"{layer_prefix}.ngram_heads_vocab_sizes"
+    if ok not in idx or vk not in idx:
+        return None
+    heads = NgramHeads(
+        offsets=read_tensor(idx[ok]).astype(np.int64),
+        vocab_sizes=read_tensor(idx[vk]).astype(np.int64),
+    )
+    if n_rows is not None:
+        heads.validate(n_rows)
+    return heads
+
+
+def _open_fused_ngram_table(idx, pfound, layer_prefix, *, workers, auto_prefetch, small_gather):
+    """Build a `FusedScaleRowTable` from `shard_N.weight_packed` + `shard_N.weight_scale`.
+
+    The format is decided by the SCALE DTYPE, which is how the author's own loader decides it
+    (`ple_shard_format`): fp16 scales -> int6 group-32, uint8 E8M0 scales -> MXFP4. Deciding on the
+    scale rather than on the packed width matters because both formats ship uint8 packed codes, so
+    the packed tensor alone cannot tell them apart without also knowing head_dim.
+    """
+    scale_names = []
+    for sid, pname in pfound:
+        sname = pname[: -len("weight_packed")] + "weight_scale"
+        if sname not in idx:
+            raise KeyError(
+                f"shard {sid} has '{pname}' but no '{sname}'. A packed n-gram row cannot be decoded "
+                f"without its group scales — this file set is incomplete."
+            )
+        scale_names.append(sname)
+    shard_ids = [i for i, _ in pfound]
+    sdtype = idx[scale_names[0]].dtype
+    if sdtype == "F16":
+        codec = "INT6_G32"
+    elif sdtype == "U8":
+        raise NotImplementedError(
+            f"this n-gram table ships uint8 (E8M0) group scales, i.e. the MXFP4 PLE variant, which "
+            f"is not decoded here yet. Add an MXFP4 codec beside dequant_int6_g32 (e2m1 codes two "
+            f"per byte, even element in the LOW nibble, one E8M0 exponent byte per group of 32) "
+            f"together with a fixture that pins the nibble order."
+        )
+    else:
+        raise ValueError(
+            f"n-gram scale dtype {sdtype} is neither F16 (int6 group-32) nor U8 (MXFP4 E8M0)."
+        )
+    packed = ShardedRowTable(
+        [idx[n] for _, n in pfound], shard_ids=shard_ids, workers=workers,
+        auto_prefetch=auto_prefetch, small_gather=small_gather,
+    )
+    scale = ShardedRowTable(
+        [idx[n] for n in scale_names], shard_ids=shard_ids, workers=workers,
+        auto_prefetch=auto_prefetch, small_gather=small_gather,
+    )
+    return FusedScaleRowTable(packed, scale, codec=codec)
+
+
 def open_qwen4exp_ngram_table(
     ple_files: Sequence[str],
     meta_files: Sequence[str] = (),
@@ -816,8 +1052,27 @@ def open_qwen4exp_ngram_table(
         ((int(m.group(1)), name) for name in idx if (m := pat.match(name))),
     )
     if not found:
+        # SECOND LAYOUT: packed codes + per-group scales in two tensors per shard, which is what
+        # `tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ` ships (and it ships them INLINE in the
+        # ordinary weight shards rather than an isolated plefp8 set, so `ple_files` there is just
+        # the model shards).
+        ppat = re.compile(
+            rf"^{re.escape(layer_prefix)}\.ngram_embedding\.shard_(\d+)\.weight_packed$"
+        )
+        pfound = sorted(((int(m.group(1)), name) for name in idx if (m := ppat.match(name))))
+        if pfound:
+            # Assigned, not returned: `heads` below is shared by both layouts and a second return
+            # path would have silently handed back a bare table where every caller unpacks a pair.
+            fused_table = _open_fused_ngram_table(
+                idx, pfound, layer_prefix, workers=workers, auto_prefetch=auto_prefetch,
+                small_gather=small_gather,
+            )
+            return fused_table, _read_ngram_heads(
+                idx, layer_prefix, n_rows=fused_table.n_rows
+            )
         raise KeyError(
-            f"no '{layer_prefix}.ngram_embedding.shard_*.weight' tensors in the given files. "
+            f"no '{layer_prefix}.ngram_embedding.shard_*.weight' (fp8) or '...weight_packed' "
+            f"(packed+scale) tensors in the given files. "
             f"Note only ONE layer carries the PLE block (ple_layer_ids is 1-BASED, so [2] means "
             f"tensors named layers.1.ple.*)."
         )
@@ -844,12 +1099,5 @@ def open_qwen4exp_ngram_table(
         auto_prefetch=auto_prefetch, small_gather=small_gather
     )
 
-    heads = None
-    ok, vk = f"{layer_prefix}.ngram_heads_offsets", f"{layer_prefix}.ngram_heads_vocab_sizes"
-    if ok in idx and vk in idx:
-        heads = NgramHeads(
-            offsets=read_tensor(idx[ok]).astype(np.int64),
-            vocab_sizes=read_tensor(idx[vk]).astype(np.int64),
-        )
-        heads.validate(table.n_rows)
+    heads = _read_ngram_heads(idx, layer_prefix, n_rows=table.n_rows)
     return table, heads
