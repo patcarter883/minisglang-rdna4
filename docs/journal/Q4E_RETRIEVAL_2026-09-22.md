@@ -126,7 +126,41 @@ it is not the bug under investigation. Recorded because it is real, because the 
 loud, and because the production decode path is separately guarded (PLE forces the SYNCHRONOUS loop
 precisely so the n-gram context cannot lag a token under overlap scheduling).
 
-## 5. Open, ranked
+## 5. NEGATIVE RESULT: raw prefill volume does not reproduce it
+
+`q4e_context_vs_knowledge.py` drove 265,172 computed prefill tokens into a fresh serve — well past
+the 189,627 at which the degraded boot produced its first empty completion — and the serve stayed
+clean at every check:
+
+    R-ident   -> @docs/ui-plan, core/src/mc_velocity.c, mc_velocity_update,
+                 tests/test_velocity.c, ui/panels/ConnectionPanel.tsx      verbatim, 0 altered
+    R-needle  -> 2311-XON-8919 retrieved exactly from depth 0.5 of a 900-line context
+    K control -> 43
+
+So the dose axis was still wrong, and the way it is wrong is the finding. The real traffic ran
+**3,263,790 submitted against 731,822 computed — 78% prefix-cache hits**: deep radix trees, pages
+shared and recurrent state RESTORED across turns. This load rotates corpus offsets specifically to
+avoid prefix reuse, so its requests never resume from cached state. The degraded serve's log, in the
+minute before the failing session:
+
+    recurrent-radix HIT: uid=94 restored recurrent state at cached_len=64
+
+That path restores GDN **and PLE** recurrent state at a cached prefix, and it is the one thing the
+synthetic load never exercised. Journal §3 tested HIT-vs-fresh and found them byte-identical — but on
+a FRESH serve with a shallow cache, which is exactly the condition this whole thread has learned not
+to generalise from.
+
+Two things checked and cleared while chasing it: the snapshot frame store (`host_arena.py`) is sound
+— `alloc` returning None is a DROP meaning "no snapshot stored", a safe re-prefill, not a wrong frame
+handed back; release is refcounted so a live node cannot have its frame recycled; and the
+cross-stream reuse hazard is handled by `lastuse` (a restore's H2D and a capture's D2H run on
+different streams, and the writer waits on the last access of either kind).
+
+**The load must be agent-shaped — multi-turn, prefix-reusing — not large independent prompts.** Which
+also means the best instrument available is the user's own traffic, since it reproduces the defect
+naturally and this harness does not.
+
+## 6. Open, ranked
 
 1. **Reproduce on demand.** `tools/q4e_context_vs_knowledge.py` dose ladder, x-axis COMPUTED prefill
    (target ~730k, first failure historically at 189,627). Baseline point 0 clean: K 0/10, R 0/12,
