@@ -125,6 +125,36 @@ before it ran. Scripts kept at `scratchpad/{argvprobe,planprobe}.py`.
 It does NOT catch worker-stage failures — the KV cap is applied after profiling, so the KV death was
 only visible in a real boot. Pre-flight bounds the plan, not the serve.
 
+## 4a. Tool calling and reasoning are OFF by default and must be named
+
+`tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set` — and since every
+Hermes turn carries tools, without these the arm is useless for the replay regardless of how well it
+serves.
+
+**`--tool-call-parser qwen3_xml`, NOT `hermes`.** Read off the checkpoint's OWN chat template rather
+than assumed from the model family. The template instructs the model to emit XML, not Hermes'
+JSON-in-`<tool_call>`:
+
+    <tool_call>\n<function=NAME>\n<parameter=KEY>\nvalue\n</parameter>\n</function>\n</tool_call>
+
+`hermes` would parse that as prose, so every tool call would arrive as CONTENT with no `tool_calls`
+field — silently, which is the same silent-tool-call-loss class we have chased on our own engine. In
+this image's registry `qwen3_xml` and `qwen3_coder` are two names for one `Qwen3EngineToolParser`.
+
+**`--reasoning-parser qwen3`** splits the think span into `reasoning_content` and leaves `content`
+holding the answer alone. Measured before and after on the same prompt:
+
+    without:  content = "We need answer user's simple arithmetic: 17 + 26 = 43. ...\n</think>\n\n43"
+    with:     content = "43"
+
+Verified end to end, not just parsed: a tools request returns `finish_reason=tool_calls` with
+`read_file({"path": "docs/ui-plan.md", "max_lines": 40})` — correct name, correct arguments, valid
+JSON.
+
+These cannot be pre-flighted CPU-only: building the frontend parser constructs a `VllmConfig`, which
+fails with `Failed to infer device type` without a GPU. A wrong parser NAME does fail at argparse in
+seconds, though, so the check is cheap in a real boot.
+
 ## 5. Two served names, on purpose
 
 `--served-model-name Qwen3.8-Flash-Next Qwen3.8-Flash-Next-MXFP4-tcvllm`. The first is the id Hermes
