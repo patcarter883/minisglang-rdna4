@@ -833,13 +833,56 @@ class ExpertResidencyCache:
         reclamation only starts when a miss needs a slot, every miss pays that latency and the
         cache stops adapting. Keeping a small pool of slots in flight makes replacement continuous
         — the policy decides WHO leaves, this decides WHEN, and they are different questions.
+
+        IT NEVER RETRACTS A KEY WHOSE COPY IS STILL IN FLIGHT, and that guard is load-bearing.
+        `_queue_retract` pops `_slot_of_key[victim]`, which is exactly the test `apply_pending`
+        uses to decide a landed copy is stale — so retracting an in-flight key CANCELS the
+        promotion that is paying for it, and the slot goes back to `_free` having transferred
+        1.36 MiB for nothing. `_service` asks for up to `_max_inflight` slots per tick while
+        `take_victim` drains PROBATION first, and probation is mostly the keys just promoted
+        (a touched key leaves for protected), so once `want` reaches the probation segment's
+        size this cache eats its own fresh installs. Measured on `expert_cache_freeze_repro.py`
+        (--drain-every 180 --steps 24000), varying ONLY MINISGL_EXPERT_CACHE_MAX_INFLIGHT:
+
+            64   h=0.5429  promotions +0.355/tick  stale_pub 0          <- shipped default
+            128  h=0.6500  promotions +0.711/tick  stale_pub 0
+            256  h=0.5907  promotions +1.105/tick  stale_pub +0.345/tick   <- cliff starts
+            512  h=0.1453  promotions +0.000/tick  stale_pub +2.844/tick   <- TOTAL: 0 installs
+
+        512 is not hypothetical: `tools/serve.sh` exported it for five months (and
+        `expert_cache_inflight_slot_cap_test.py` T1 still blesses it at 1,923 slots), so without
+        this guard the freeze fix turns a 0.378 hit rate into 0.145 for anyone still carrying
+        that env. With it, 512 measures h=0.5142 with 1.798 promotions/tick and stale_pub 0.
+
+        A skipped victim is re-admitted rather than dropped: `take_victim` has already removed it
+        from the policy, so leaving it out would strand a resident slot that nothing can ever
+        evict again. `admit` cannot itself evict here — this loop removed at least as many keys
+        as it puts back — and probation's newest end is the right place for a key whose copy
+        landed moments ago.
         """
+        with self._lock:
+            inflight = {entry[0] for entry in self._inflight}
+        held = []
         for _ in range(want):
             victim = self._policy.take_victim()
             if victim is None:
-                return
+                break
+            if victim in inflight:
+                held.append(victim)
+                self.stats["reclaim_skipped_inflight"] = \
+                    self.stats.get("reclaim_skipped_inflight", 0) + 1
+                continue
             if not self._queue_retract(victim):
                 continue
+        for victim in held:
+            # The argument that this cannot evict is sound -- the loop above removed at least as
+            # many keys as `held` puts back -- but it is an ARGUMENT, and an eviction dropped on
+            # the floor here would strand a slot nothing can ever reclaim again: a silent leak,
+            # the exact failure class that cost this cache four diagnoses. Turning the argument
+            # into code costs one branch on a path that runs len(held) times.
+            displaced = self._policy.admit(victim)
+            if displaced is not None:
+                self._queue_retract(displaced)
 
     def summary(self) -> str:
         tot = self.stats["hits"] + self.stats["misses"]
@@ -862,4 +905,5 @@ class ExpertResidencyCache:
                 f"skipped_capture={self.stats.get('skipped_capture', 0)} "
                 f"dropped_refs={self.stats['dropped_refs']} "
                 f"pending_dropped={self.stats.get('pending_dropped', 0)} "
+                f"skip_inflight={self.stats.get('reclaim_skipped_inflight', 0)} "
                 f"stale_pub={self.stats.get('stale_publishes_dropped', 0)}")
