@@ -769,6 +769,12 @@ class _MxFp4MoEMethod(MoEQuantMethod):
         )
 
 
+# Decode band for the NVFP4 A16 arm. 2, not 16: it is the serve's max_running_req, i.e. the widest
+# forward the standard-layout grouped GEMV is the right kernel for. Above it the GEMV reads each
+# weight once per token and loses to the WMMA tile, which has no A16 instantiation at g=16.
+_NVFP4_A16_DECODE_MAX = 2
+
+
 class _NvFp4MoEMethod(MoEQuantMethod):
     """NVFP4 (compressed-tensors 'nvfp4-pack-quantized') grouped experts through `kernels.w4a8_moe`
     with `weight_is_e2m1=True` at group_size 16 — the SAME e2m1 kernel MXFP4 uses (weights stay
@@ -779,6 +785,12 @@ class _NvFp4MoEMethod(MoEQuantMethod):
     hands raw router_logits, which w4a8_moe routes internally (topk_ids None). EP-capable like the
     other e2m1 experts (E on dim 0 of every buffer, including the global)."""
 
+    # STAYS True even under MINISGL_MOE_W4A16, unlike the dense sibling's property. The A16 arm here
+    # is DECODE-ONLY (see apply()), so prefill still runs W4A8 and still consumes the producer's
+    # (x_fp8, act_scales) pair — flipping this to False would strip that from the path that actually
+    # depends on it to save a per-token quant of at most `_NVFP4_A16_DECODE_MAX` tokens on the path
+    # that does not. If the prefill A16 arm ever lands (a WIDE=1 weight load at g=16), this must
+    # become the same `kernels.MOE_W4A16 == "0"` property the dense methods use.
     supports_producer_actquant = True
 
     supports_ep = True
@@ -788,35 +800,22 @@ class _NvFp4MoEMethod(MoEQuantMethod):
 
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
-        # REFUSE `MINISGL_MOE_W4A16=1` LOUDLY, because on this method it does NOTHING. There is no
-        # W4A16 branch here at all: the register-direct repack that the AWQ/MXFP4 grouped experts
-        # select under that knob needs group_size%32 and NVFP4's is 16, so `_w_rep` is never built
-        # and `apply()` falls through to `kernels.w4a8_moe`. Setting the knob therefore left the env
-        # var set, the serve booting clean, and every token still going through the fp8 activation
-        # path — verified 2026-09-22 on the live q4e serve, where the `[hip-engage]` ledger showed
-        # `mmq_fp8_moe_gemm1_silu(gemv+e2m1)` and no w4a16 arm whatsoever.
+        # W4A16 (unquantized-activation) arm, OPT-IN via MINISGL_MOE_W4A16. Until this existed the
+        # knob was a SILENT NO-OP here: env var set, serve clean, and the [hip-engage] ledger still
+        # showing `mmq_fp8_moe_gemm1_silu(gemv+e2m1)` on every token, because this method had no A16
+        # branch and b4cfe0f0's dense NVFP4 A16 path has nothing to act on — the checkpoint's ignore
+        # list spares attention, GDN, the router, the shared expert, hyper-connections and PLE, so
+        # every one of its 48x512x3 = 73,728 quantized modules is a routed expert.
         #
-        # A silent no-op is worse here than a refusal. The only reason to set this knob is to A/B the
-        # activation scheme, and a knob that quietly does nothing turns that A/B into the config
-        # measured against ITSELF — this repo's most expensive recurring mistake, and one an operator
-        # cannot detect from the boot log. Raising is also the house idiom
-        # (`_reject_w4a16_activation` already says "Unset MINISGL_MOE_W4A16 to serve this model
-        # through the W4A8 path").
-        #
-        # To make the ablation actually available, the MoE A16 core needs a RUNTIME group size, the
-        # way the dense tiled A16 core already got one (see NvFp4LinearMethod.post_load: "the tiled
-        # A16 core carries a RUNTIME group size, so g=16 is served like any other"). Until then the
-        # dense linears can run A16 and the experts cannot.
-        if kernels.MOE_W4A16 != "0":
-            raise RuntimeError(
-                "MINISGL_MOE_W4A16=1 has NO EFFECT on an NVFP4 MoE and is refused rather than "
-                "silently ignored: this method has no W4A16 path (the register-direct repack needs "
-                f"group_size%32 and NVFP4's is {self._quant.group_size}), so every expert GEMM "
-                "would still run the fp8-activation kernel while the knob suggested otherwise. "
-                "Unset MINISGL_MOE_W4A16 to serve this model through the W4A8 path. Giving the MoE "
-                "A16 core a runtime group size (as the DENSE tiled A16 core already has) is what "
-                "would make this ablation real."
-            )
+        # DECODE ONLY, and the split is NAMED rather than hidden. `kernels.w4a16_moe_decode` uses the
+        # standard-layout grouped GEMV pair, which supports NVFP4's g=16 (the kernel's
+        # `Int4A16GemvLoader` checks group_size%16). The prefill/WMMA grouped A16 arm needs `wide` in
+        # {2,4,8} with k_sub%wide==0 and k_sub = g/16 = 1, so there is no A16 prefill without a new
+        # WIDE=1 weight load. Prefill therefore stays W4A8 and activation precision SPLITS BY M —
+        # which 09f3dd71 rightly reverted as a DEFAULT. It is sound as an explicit ablation and the
+        # split is logged once so no measurement can mistake this for a uniform-A16 serve.
+        self._w4a16 = kernels.MOE_W4A16 != "0"
+        self._w4a16_split_logged = False
 
     def create_experts(self, num_experts, out_features, in_features):
         return _GroupedNvFp4Experts(num_experts, out_features, in_features, self._quant)
@@ -833,6 +832,27 @@ class _NvFp4MoEMethod(MoEQuantMethod):
         # Built from `cache_plane_attrs`, NOT spelled out again: the expert-residency cache copies
         # exactly these tensors and hands the kernel slab pointers in their place, so a second
         # spelling here is a chance for the two to disagree about which bytes an expert is.
+        if self._w4a16 and hidden_states.shape[0] <= _NVFP4_A16_DECODE_MAX:
+            # `plane()` is used here too, for the same reason: the residency cache may have swapped
+            # these pointers for slab views, and the A16 arm must read the same bytes the A8 arm
+            # would have.
+            w13p, w2p = self.plane(w13), self.plane(w2)
+            return kernels.w4a16_moe_decode(
+                hidden_states, *w13p, *w2p, hidden_states.shape[1],
+                topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits,
+                top_k=top_k, renormalize=renormalize,
+            )
+        if self._w4a16 and not self._w4a16_split_logged:
+            self._w4a16_split_logged = True
+            from minisgl.utils import init_logger
+
+            init_logger("nvfp4-moe").warning_rank0(
+                f"MoE W4A16 on NVFP4 is DECODE-ONLY: this forward carries M="
+                f"{hidden_states.shape[0]} > {_NVFP4_A16_DECODE_MAX} and falls back to W4A8, so "
+                f"activation precision SPLITS BY M on this serve. The prefill/WMMA grouped A16 arm "
+                f"needs a WIDE=1 (b32) weight load that does not exist at group_size 16. Treat any "
+                f"measurement from this arm as decode-A16 / prefill-A8, not uniform A16."
+            )
         return kernels.w4a8_moe(
             hidden_states, *self.plane(w13), *self.plane(w2),
             router_logits, top_k, renormalize, topk_weights=topk_weights, topk_ids=topk_ids,
