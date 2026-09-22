@@ -732,6 +732,11 @@ _Q4_EXPERT_ROW = (".down_proj.weight", ".down_proj.weight_scale")
 # it on dim 0 would hand each rank a quarter of the output channels it actually computes.
 _Q4_EXPERT_REPLICATED = (".down_proj.weight_global",)
 
+#: PRE-STACKED expert leaves (see _QWEN4EXP_STACKED_EXPERTS). CHECKPOINT spelling — `_shard_qwen4_exp`
+#: runs at READ time, before the remap renames them.
+_Q4_STACKED_COL = (".mlp.experts.gate_up_proj_packed", ".mlp.experts.gate_up_proj_scale")
+_Q4_STACKED_ROW = (".mlp.experts.down_proj_packed", ".mlp.experts.down_proj_scale")
+
 
 def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
     """Extract rank r's TP shard of a Qwen3.8-Flash-Next (`qwen4_exp`) CHECKPOINT tensor.
@@ -776,6 +781,77 @@ def _shard_qwen4_exp(name: str, t: torch.Tensor, r: int, n: int, config) -> torc
         return t
     if name.endswith(_QWEN4EXP_REPLICATED_SUFFIXES):
         return t
+
+    # ---- BLOCKWISE-fp8 scale leaf (`weight_scale_inv`) ----
+    # A (N/bn, K/bk) tile scale must shard on the SAME axis as its weight, in BLOCK units. Without
+    # these rules the leaf matches nothing and REPLICATES, which `load_state_dict` catches as a shape
+    # mismatch ([128,20] vs [64,20] on in_proj_qkvz) — loud, but only after a multi-minute load.
+    if name.endswith(".weight_scale_inv"):
+        base = name[: -len(".weight_scale_inv")]
+        bn = bk = 128
+        q = getattr(config, "quant", None)
+        if q is not None and getattr(q, "block_structure", None):
+            bn, bk = int(q.block_structure[0]), int(q.block_structure[-1])
+        if base.endswith(".linear_attn.in_proj_qkv"):
+            # Derived here, not inherited: `key_dim`/`value_dim` are locals of `_shard_qwen3_5` and
+            # this function runs before the fall-through to it.
+            key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            # [q|k|v] head blocks, in scale-ROW units. Each block must be a whole number of blocks
+            # AND divisible by n, or a rank's q rows would be scaled by another rank's k tiles.
+            blocks = [key_dim, key_dim, value_dim]
+            if any(b % bn or (b // bn) % n for b in blocks):
+                raise ValueError(
+                    f"{name}: qkv head blocks {blocks} must each be a multiple of the {bn}-row "
+                    f"scale block and divisible by tp={n}."
+                )
+            return _shard_blocks_dim0(t, [b // bn for b in blocks], r, n)
+        if base.endswith((".linear_attn.in_proj_z", ".self_attn.q_proj", ".self_attn.k_proj",
+                          ".self_attn.v_proj")):
+            # Column-parallel: split the OUTPUT (scale dim 0). Safe for the gated q_proj because q
+            # and its per-head gate are adjacent, so a chunk on a head boundary keeps them together —
+            # and bn divides that boundary, so the scale chunk lands where the weight chunk does.
+            if t.shape[0] % n:
+                raise ValueError(f"{name}: scale rows {t.shape[0]} not divisible by tp={n}")
+            return t.chunk(n, dim=0)[r].clone()
+        if base.endswith((".linear_attn.out_proj", ".self_attn.o_proj")):
+            # Row-parallel: the OUTPUT stays whole and the INPUT splits (scale dim 1).
+            if t.shape[1] % n:
+                raise ValueError(f"{name}: scale cols {t.shape[1]} not divisible by tp={n}")
+            return t.chunk(n, dim=1)[r].clone()
+        raise ValueError(
+            f"{name}: blockwise-fp8 scale on a module with no TP rule here. Add one mirroring that "
+            f"module's weight axis — replicating it would mis-scale every row outside rank 0's shard."
+        )
+
+    # ---- PRE-STACKED, gate/up-FUSED routed experts (MXFP4-FP8-GPTQ) ----
+    # These are [E, N, K'] with the EXPERT axis at dim 0, so the TP axis is one higher than the
+    # per-expert 2-D rules below: gate_up splits its OUTPUT (dim 1), down_proj its INPUT (dim 2).
+    # Named explicitly because falling through is silently wrong in two different ways:
+    # `gate_up_proj_packed` matches no `_SPLIT_DIM_*` substring and would REPLICATE, while
+    # `down_proj_packed` matches `.down_proj` and would split dim 1 — which for this layout is
+    # `hidden`, the one axis that must stay whole on a row-parallel projection.
+    if name.endswith(_Q4_STACKED_COL):
+        # N is [gate | up] CONCATENATED. A plain `chunk(n, dim=1)` would hand rank 0 all of gate and
+        # rank 1 all of up — same hazard `_shard_blocks_dim0` exists for, one axis over.
+        half = t.shape[1] // 2
+        if t.shape[1] % 2 or half % n:
+            raise ValueError(
+                f"{name}: gate_up output {t.shape[1]} must be even and its halves ({half}) "
+                f"divisible by tp={n}; otherwise gate and up shard differently and each rank "
+                f"computes a SiLU over mismatched halves."
+            )
+        return torch.cat(
+            [p.chunk(n, dim=1)[r] for p in torch.split(t, [half, half], dim=1)], dim=1
+        ).contiguous()
+    if name.endswith(_Q4_STACKED_ROW):
+        if t.shape[2] % n:
+            raise ValueError(
+                f"{name}: down_proj input axis {t.shape[2]} is not divisible by tp={n}. The packed "
+                f"byte axis and the group axis would round differently and each rank would "
+                f"dequantize its columns against another rank's group scales — silent, and fluent."
+            )
+        return t.chunk(n, dim=2)[r].clone()
 
     if name.startswith("mtp.") and ".mlp.experts." in name:
         # The head's experts ship STACKED [E, out, in] and BF16 — no packed/scale leaves — so the
@@ -1099,6 +1175,8 @@ _QWEN4EXP_SKIP_PREFIXES = ("model.visual.", "visual.")
 
 # skip reason -> what it means, for the loader's ignore ledger.
 QWEN4EXP_SKIP_REASONS: Dict[str, str] = {
+    "expert-routing-profile": "expert_routing_counts — a measured expert USAGE profile shipped "
+                              "alongside the weights (expert-routing-profile/1), not a parameter",
     "vision": "model.visual.* — vision tower; this engine serves the text decoder only",
     "mtp-head": "mtp.* — the MTP speculative head is not implemented (bring-up plan T8.1)",
     "ple-ngram-table": (
@@ -1197,11 +1275,16 @@ _QWEN4EXP_NATIVE_OK = tuple(
         r"^model\.layers\.\d+\.self_attn\.indexer\."
         r"(index_qk_proj|q_layernorm|k_layernorm)\.weight$",
         r"^model\.layers\.\d+\.mlp\.(gate|shared_expert_gate)\.weight$",
-        # `.weight` alone in the base checkpoint (which leaves the shared expert WIDE); the
-        # MXFP4-FP8-GPTQ repack quantizes it, so the packed leaves are allowed too. Following the
-        # checkpoint, not a preference: what the file ships decides.
-        r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\."
-        r"(weight|weight_packed|weight_scale)$",
+        # `.weight` ONLY, deliberately. The base checkpoint leaves the shared expert WIDE and this
+        # model builds it bf16 ("bf16 shared expert" — models/qwen4exp.py:12). The MXFP4-FP8-GPTQ
+        # repack quantizes it instead, and the author's own engine handles that by FUSING the shared
+        # expert into the routed stack as one more expert (`maybe_fuse_shared_experts`, gated on
+        # shared_expert_intermediate_size == moe_intermediate_size, which that file satisfies at 640).
+        # This engine keeps it separate, so its packed leaves are DEQUANTIZED to bf16 at load
+        # (see `_Q4_SHARED_DEQ`) and only `.weight` ever reaches the model. Allowing the packed leaves
+        # here instead just moved the failure later: the remap passed them and the model had no home
+        # for 192 of them.
+        r"^model\.layers\.\d+\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)\.weight$",
         # `weight_global` is the NVFP4 split arm's second leaf: the per-output-channel f32 global
         # MULTIPLIER (see quant/nvfp4.py). `weight_global_scale` is the OLD repo-native spelling of
         # the raw per-TENSOR global, which the fold arm consumed and dropped; both are listed because
@@ -1333,6 +1416,20 @@ def qwen4_exp_remap(ckpt_key: str, *, nvfp4_modules: "Collection[str]" = (),
         return ("skip", "act-calibration")
     if ckpt_key == "lm_head.weight":
         return ("direct", "lm_head.weight")  # untied; top-level, no LM prefix
+    # `expert_routing_counts`: an F32 (num_layers, num_experts) EXPERT USAGE PROFILE the
+    # MXFP4-FP8-GPTQ repack ships in its own `model-expertprofile.safetensors`, tagged
+    # `format: expert-routing-profile/1` with the token counts it was measured over. Not a parameter —
+    # no module has anywhere to put it — so it is skipped by name rather than left to raise.
+    #
+    # It is also the reason validating the remap against `model.safetensors.index.json` was NOT
+    # enough: that file is not IN the index, and the loader globs *.safetensors. A key set derived
+    # from the index passed clean while the real load raised on the first tensor of a file the index
+    # never mentions. Validate against the FILES.
+    #
+    # (Worth keeping in mind rather than only skipping: this is exactly the hot/cold expert ranking
+    # the residency cache currently has to learn at runtime.)
+    if ckpt_key == "expert_routing_counts":
+        return ("skip", "expert-routing-profile")
     if not ckpt_key.startswith(_QWEN4EXP_LM_PREFIX):
         raise ValueError(
             f"unexpected qwen4_exp checkpoint key (not under {_QWEN4EXP_LM_PREFIX!r}, "
@@ -1397,6 +1494,10 @@ def log_qwen4_exp_ignored(counts: "Dict[str, int]", log) -> None:
 #: model parameters (`weights/row_table.py` mmaps them directly), which is why they are normally kept
 #: in a separate directory. Skipped by FILE name as well as by key, so a deployment that does
 #: colocate them does not spend 51 GB of read bandwidth proving they are skipped.
+#: Checkpoint path segment of the SHARED expert, whose MXFP4 leaves are dequantized to bf16 at load
+#: (this engine keeps the shared expert separate and bf16; see the dequant site for why).
+_Q4_SHARED_DEQ = ".mlp.shared_expert."
+
 _QWEN4EXP_PLE_FILE_MARK = "model-plefp8-"
 
 #: `layer-<LLLLL>-experts-<lo>-<hi>.safetensors` — the per-layer, per-expert-range routed-expert
@@ -1474,6 +1575,60 @@ def qwen4_exp_chunk_files(model_folder: str, num_layers: int) -> "tuple[list[str
             f"`mlp.experts.gate_up_proj_packed` tensors either."
         )
     return body, per_layer
+
+
+#: Layers per chunk on the pre-stacked path. 4 keeps peak expert residency near 4.7 GiB (1.17 GiB a
+#: layer) on a 15.92 GiB card while holding the shard re-read to roughly one extra pass. Not 1: the
+#: key filter runs on tensors the loader has already read, so one chunk per layer would re-read every
+#: shard ~48 times.
+_Q4_STACKED_LAYERS_PER_CHUNK = 4
+
+#: The four NATIVE container leaves the pre-stacked layout produces (see _QWEN4EXP_STACKED_EXPERTS).
+_Q4_STACKED_NATIVE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(gate_up_proj|down_proj)\."
+    r"(weight_packed|weight_scale)$"
+)
+
+
+def _q4_stacked_expert_layer(native_key: str) -> "int | None":
+    """The decoder layer a pre-stacked expert CONTAINER key belongs to, or None if it is not one."""
+    m = _Q4_STACKED_NATIVE.match(native_key)
+    return None if m is None else int(m.group("layer"))
+
+
+def _q4_is_stacked_expert_key(native_key: str) -> bool:
+    return _Q4_STACKED_NATIVE.match(native_key) is not None
+
+
+def qwen4_exp_stacked_expert_files(files: "Sequence[str]") -> "dict[int, set[str]]":
+    """`{layer: shards holding that layer's pre-stacked expert tensors}`, from HEADERS only.
+
+    Needed because the pre-stacked layout puts several layers' experts in one ordinary shard, so the
+    chunk planner cannot derive the mapping from file names the way the per-layer-file layout does.
+    """
+    import json as _json
+    import struct as _struct
+
+    out: "dict[int, set[str]]" = {}
+    for path in files:
+        try:
+            with open(path, "rb") as fh:
+                n = _struct.unpack("<Q", fh.read(8))[0]
+                hdr = _json.loads(fh.read(n))
+        except Exception:
+            continue
+        for k in hdr:
+            if k == "__metadata__":
+                continue
+            # CHECKPOINT spelling here (the headers are the checkpoint's), not the native one.
+            if ".mlp.experts." in k and k.endswith(
+                ("gate_up_proj_packed", "gate_up_proj_scale",
+                 "down_proj_packed", "down_proj_scale")
+            ):
+                m = re.search(r"\.layers\.(\d+)\.mlp\.experts\.", k)
+                if m:
+                    out.setdefault(int(m.group(1)), set()).add(path)
+    return out
 
 
 def qwen4_exp_has_stacked_experts(files: "Sequence[str]") -> bool:
@@ -1583,6 +1738,9 @@ def _load_qwen4_exp_weight(
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # MoE gate/up -> gate_up
     expert_buf = _ExpertStacker()  # per-expert -> filled into a preallocated [E, ...]
     fold_buf: Dict[str, Dict[str, torch.Tensor]] = {}  # NVFP4 weight_scale + weight_scale_2
+    # MXFP4 shared expert -> bf16. Parks `weight_packed` until its `weight_scale` arrives (or the
+    # reverse) and emits ONE dequantized `.weight`. See _Q4_SHARED_DEQ.
+    shared_deq_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     skips: Dict[str, int] = {}
 
     def emit(native_key: str, tensor: torch.Tensor) -> Iterator[Tuple[str, torch.Tensor]]:
@@ -1719,6 +1877,40 @@ def _load_qwen4_exp_weight(
                         )
                     )
                     _bt_tick("ckpt.nvfp4_leaf_scales", time.perf_counter() - _t)
+                elif _Q4_SHARED_DEQ in ckpt_name and field in ("weight_packed", "weight_scale"):
+                    # MXFP4 SHARED EXPERT -> bf16, at the leaf.
+                    #
+                    # This model builds a bf16 shared expert on purpose (models/qwen4exp.py:12) and the
+                    # base checkpoint leaves it wide. The MXFP4-FP8-GPTQ repack quantizes it, because
+                    # the engine it was packed for FUSES the shared expert into the routed stack as one
+                    # more expert (`maybe_fuse_shared_experts`, gated on shared_expert_intermediate_size
+                    # == moe_intermediate_size, which that file satisfies at 640). This engine keeps it
+                    # separate, so the two leaves are folded back into one bf16 `.weight` here and the
+                    # model is unchanged. Emitting the packed leaves instead left 192 keys (48 layers x
+                    # 4) with no home in the model.
+                    #
+                    # Cheap and exact: the shared expert is ~3 MiB a matrix, and E2M1 x 2^(s-127) is
+                    # the same arithmetic the kernel would do, so nothing is approximated twice.
+                    buf = shared_deq_buf.setdefault(base, {})
+                    _t = time.perf_counter()
+                    _p = f.get_tensor(ckpt_name)
+                    _bt_tick("ckpt.get_tensor", time.perf_counter() - _t)
+                    _bt_count("ckpt.get_tensor_calls")
+                    _bt_count("ckpt.get_tensor_bytes", _p.numel() * _p.element_size())
+                    # CLONED for the same reason fold_buf clones: `get_tensor` hands out a view of a
+                    # REUSED read buffer, so a view retained past the next shard's read would be
+                    # silently overwritten.
+                    buf[field] = _p.clone()
+                    _p = None
+                    if len(buf) < 2:
+                        continue
+                    del shared_deq_buf[base]
+                    _t = time.perf_counter()
+                    from minisgl.quant import mxfp4 as _mxfp4
+
+                    _deq = _mxfp4.dequant_reference(buf["weight_packed"], buf["weight_scale"])
+                    _bt_tick("ckpt.shared_expert_dequant", time.perf_counter() - _t)
+                    leaves = [(base + ".weight", _deq.to(torch.bfloat16).contiguous())]
                 for name, override in leaves:
                     _t = time.perf_counter()
                     plan = qwen4_exp_remap(name, nvfp4_modules=nvfp4_modules,
@@ -1965,23 +2157,50 @@ def qwen4_exp_chunked_source(
     # `qwen4_exp_nvfp4_prepass` for why it may not be re-derived per chunk.
     nvfp4_sets = qwen4_exp_nvfp4_prepass(body_files + [f for fs in per_layer.values() for f in fs])
 
+    key_filters: "dict[str, Callable[[str], bool]]" = {}
     if not per_layer:
-        # PRE-STACKED layout (see qwen4_exp_chunk_files): the experts are four already-stacked
-        # tensors per layer living in ordinary shards, so there is no per-layer FILE set to chunk on.
-        # ONE chunk over everything, finalizing every expert container at the end. The peak this
-        # gives up is small and bounded: nothing accumulates, so it is one tensor at a time (~0.78 GiB
-        # for a 512-expert gate_up) instead of a per-layer stack being built up.
+        # PRE-STACKED layout (see qwen4_exp_chunk_files). There is no per-layer FILE set here — each
+        # shard mixes many layers — so chunks are keyed by LAYER and the stream filters.
         #
-        # finalize_paths still lists every layer, so `post_load` runs per container exactly as it
-        # does on the chunked path — the difference is WHEN tensors are read, never how they are
-        # interpreted, which is the same contract the per-layer path states.
+        # ONE CHUNK FOR EVERYTHING DOES NOT WORK, and the reason is worth stating because it is not
+        # the reason the per-layer path gives. `finalize_paths` is what runs a layer's `post_load` and
+        # hands its experts to the offload placement; until then they sit on the device. Collapsing to
+        # a single chunk therefore keeps all 48 layers of experts resident until the very end and OOMs
+        # at 15.43 GiB of 15.92 (measured). Chunking is not only about bounding an accumulation
+        # buffer, it is about FINALIZING each layer before the next is read — so the layers have to be
+        # split whatever the file layout is.
+        #
+        # Batched, not one chunk per layer: the filter is applied to keys the loader has already read,
+        # so a chunk pays for every tensor in its files. One chunk per layer would re-read each shard
+        # ~48 times. Batching `_Q4_STACKED_LAYERS_PER_CHUNK` layers and taking only the files that
+        # actually hold them keeps the re-read to roughly one extra pass while capping residency at a
+        # few layers' experts (~1.17 GiB per layer).
+        by_layer = qwen4_exp_stacked_expert_files(body_files)
+        step = _Q4_STACKED_LAYERS_PER_CHUNK
+        batches = [list(range(i, min(i + step, num_layers))) for i in range(0, num_layers, step)]
         chunks = [LoadChunk(
-            name="body+stacked-experts",
+            name="body",
             files=tuple(body_files),
-            finalize_paths=tuple(
-                f"model.layers.{lid}.mlp.experts" for lid in range(num_layers)
-            ),
+            finalize_paths=(),
         )]
+        key_filters["body"] = lambda k: not _q4_is_stacked_expert_key(k)
+        for lids in batches:
+            files = sorted({f for lid in lids for f in by_layer.get(lid, ())})
+            if not files:
+                raise FileNotFoundError(
+                    f"qwen4_exp pre-stacked load: no shard holds the expert tensors for layers "
+                    f"{lids}. The index named them but no file does."
+                )
+            name = f"stacked-experts-{lids[0]:05d}-{lids[-1]:05d}"
+            want = frozenset(lids)
+            chunks.append(LoadChunk(
+                name=name,
+                files=tuple(files),
+                finalize_paths=tuple(f"model.layers.{lid}.mlp.experts" for lid in lids),
+            ))
+            key_filters[name] = (
+                lambda k, _w=want: (lid := _q4_stacked_expert_layer(k)) is not None and lid in _w
+            )
     else:
         chunks = [LoadChunk(name="body", files=tuple(body_files))]
         for lid in range(num_layers):
@@ -1999,9 +2218,18 @@ def qwen4_exp_chunked_source(
         # CHUNKED path could load a layer-subset config and the ONE-SHOT path (the engine's) could
         # not. `ChunkedWeightLoader` stays strict: an unhomed key is still an error, because for a
         # key that is not beyond the decoder it means the remap dropped something real.
-        yield from _load_qwen4_exp_weight(
+        keep = key_filters.get(chunk.name)
+        it = _load_qwen4_exp_weight(
             model_folder, device, config, files=chunk.files, nvfp4_sets=nvfp4_sets
         )
+        if keep is None:
+            yield from it
+            return
+        # The filter is on the NATIVE key the remap produced, not the checkpoint key: that is what
+        # `ChunkedWeightLoader` homes, and it is what `finalize_paths` names.
+        for name, tensor in it:
+            if keep(name):
+                yield name, tensor
 
     return chunks, stream
 
