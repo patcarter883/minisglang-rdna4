@@ -788,6 +788,35 @@ class _NvFp4MoEMethod(MoEQuantMethod):
 
     def __init__(self, quant: "QuantConfig"):
         self._quant = quant
+        # REFUSE `MINISGL_MOE_W4A16=1` LOUDLY, because on this method it does NOTHING. There is no
+        # W4A16 branch here at all: the register-direct repack that the AWQ/MXFP4 grouped experts
+        # select under that knob needs group_size%32 and NVFP4's is 16, so `_w_rep` is never built
+        # and `apply()` falls through to `kernels.w4a8_moe`. Setting the knob therefore left the env
+        # var set, the serve booting clean, and every token still going through the fp8 activation
+        # path — verified 2026-09-22 on the live q4e serve, where the `[hip-engage]` ledger showed
+        # `mmq_fp8_moe_gemm1_silu(gemv+e2m1)` and no w4a16 arm whatsoever.
+        #
+        # A silent no-op is worse here than a refusal. The only reason to set this knob is to A/B the
+        # activation scheme, and a knob that quietly does nothing turns that A/B into the config
+        # measured against ITSELF — this repo's most expensive recurring mistake, and one an operator
+        # cannot detect from the boot log. Raising is also the house idiom
+        # (`_reject_w4a16_activation` already says "Unset MINISGL_MOE_W4A16 to serve this model
+        # through the W4A8 path").
+        #
+        # To make the ablation actually available, the MoE A16 core needs a RUNTIME group size, the
+        # way the dense tiled A16 core already got one (see NvFp4LinearMethod.post_load: "the tiled
+        # A16 core carries a RUNTIME group size, so g=16 is served like any other"). Until then the
+        # dense linears can run A16 and the experts cannot.
+        if kernels.MOE_W4A16 != "0":
+            raise RuntimeError(
+                "MINISGL_MOE_W4A16=1 has NO EFFECT on an NVFP4 MoE and is refused rather than "
+                "silently ignored: this method has no W4A16 path (the register-direct repack needs "
+                f"group_size%32 and NVFP4's is {self._quant.group_size}), so every expert GEMM "
+                "would still run the fp8-activation kernel while the knob suggested otherwise. "
+                "Unset MINISGL_MOE_W4A16 to serve this model through the W4A8 path. Giving the MoE "
+                "A16 core a runtime group size (as the DENSE tiled A16 core already has) is what "
+                "would make this ablation real."
+            )
 
     def create_experts(self, num_experts, out_features, in_features):
         return _GroupedNvFp4Experts(num_experts, out_features, in_features, self._quant)
