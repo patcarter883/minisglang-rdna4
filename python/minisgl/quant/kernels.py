@@ -1060,6 +1060,20 @@ def w4a16_moe_decode(
         sorted_ids, expert_ids, ntp = _moe_time("align", lambda: moe_hip.moe_align(ti, E, block_m))
     tw_flat = topk_weights.to(torch.float32).reshape(-1).contiguous()
 
+    # BOUNDARY ASSERTIONS. The torch dispatcher reports a positional type mismatch as
+    # "Expected a value of type 'Tensor' for argument 'w_zeros' but instead found type 'int'", which
+    # names the KERNEL's parameter, not the caller's — so it points at the wrong end of the call and
+    # cost a boot cycle to chase. These say which of OUR arguments is wrong, in our own vocabulary.
+    for _nm, _t in (("w13_op", w13_op), ("w13_scales", w13_scales), ("w13_global", w13_global),
+                    ("w2_op", w2_op), ("w2_scales", w2_scales), ("w2_global", w2_global),
+                    ("sorted_ids", sorted_ids), ("expert_ids", expert_ids), ("ntp", ntp)):
+        if not isinstance(_t, torch.Tensor):
+            raise TypeError(
+                f"w4a16_moe_decode: {_nm} must be a Tensor, got {type(_t).__name__} ({_t!r}). "
+                f"The grouped NVFP4 planes are (_w_op, _scales_op, _global_op) — check that "
+                f"cache_plane_attrs and this signature still agree on their ORDER and COUNT."
+            )
+    assert isinstance(hidden, int), f"hidden must be int, got {type(hidden).__name__} ({hidden!r})"
     engaged("fp8_wmma.mmq_regdirect_w4a16_moe_gemv_silu+e2m1")
     h = _moe_time(
         "gemm1",
