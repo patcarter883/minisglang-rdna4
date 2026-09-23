@@ -1046,6 +1046,25 @@ case "$MODEL" in
                   #    capture free. GRAPH_BS=2 is left as an OVERRIDE for a short-context serve
                   #    (measured good to ctx=4087 at 0.90, and to 16382 at MEM_RATIO=0.84), never a
                   #    default. It no longer requires MINISGL_QSA=0.
+                  #
+                  #    A SECOND BLOCKER EXISTED AND IS NOW GONE (2026-09-23) — written down because
+                  #    it was never in this table and it would have made a GRAPH_BS flip read as a
+                  #    pure speedup while costing more than it bought. `weights/route_trace.py` was
+                  #    capture-UNSAFE by construction (its own docstring said so), and that ring is
+                  #    the EXPERT CACHE's only input: under capture the ring recorded nothing, the
+                  #    cache observed nothing, `slot_of` froze, and 2.5 GiB/rank sat inert serving
+                  #    zero hits — re-freezing the stall just fixed at h 0.3256 -> 0.4067. Net of a
+                  #    naive flip: 3.45-3.66 ms/step of launch overhead removed, MINUS the entire
+                  #    expert-cache win. Fixed properly instead: `record` writes a static per-step
+                  #    STAGE buffer (no host slot index, so a graph bakes a correct address) and
+                  #    `Scheduler._step_boundary` harvests it into the ring, masking a captured
+                  #    bucket's PADDED rows against the step's real row count. `ring_rows` also
+                  #    stopped defaulting to 1, which was starving the cache on every 2-request
+                  #    decode step EAGER too (`engine._route_trace_ring_rows`).
+                  #    So the only remaining reason GRAPH_BS is 0 here is the REACH trade above, and
+                  #    the number to re-measure is the captured 16k run at MEM_RATIO 0.90 now that 4b
+                  #    is row-tiled (note 2). NOT re-measured — this is a pointer, not a result, and
+                  #    GRAPH_BS stays 0 until a measurement lands on this line.
                   # 2. MAX_PREFILL_LENGTH=2048. It was 1024 as a FEASIBILITY term while stage 4b
                   #    ran at full CHUNK width; 4b is now ROW-TILED at _ATTN_ROW_TILE
                   #    (QSA_INDEXER.md §8.1, the structural fix this comment used to point at), so
