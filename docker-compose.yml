@@ -1032,6 +1032,80 @@ services:
           --spec-algorithm "${MINISGL_CAM_SPEC:-mtp}" --spec-num-draft "${MINISGL_SPEC_K:-4}" \
           ${MINISGL_EXTRA_ARGS:-}
 
+  # ---------------------------------------------------------------------------------------------
+  # tcvllm-flashnext — Qwen3.8-Flash-Next (MXFP4) on the CHECKPOINT AUTHOR'S vLLM fork
+  # (tcclaviger/vllm:dev), not on minisgl. Launch from the GPU control panel under this profile.
+  #
+  # WHY IT IS HERE. On 2026-09-23 minisgl could not hold a long Hermes session on this checkpoint:
+  # a 120k prefill OOM'd on QSA-scoring-buffer fragmentation (qsa/runtime.py:555) and, 3 turns
+  # into a real session, both ranks hit "Memory access fault ... Page not present" under
+  # GRAPH_BS=2. The author's engine serves it end to end, so it is the serve for agent work until
+  # those are fixed. It was previously posted by hand through /api/custom; this makes it a
+  # first-class panel profile so nobody has to rebuild the YAML.
+  #
+  # SAME ENDPOINT AS THE MINISGL SERVE, deliberately: port 1919 and served name
+  # `Qwen3.8-Flash-Next`, so Hermes and every harness point at it unchanged. The two can never run
+  # together anyway -- both take both cards.
+  #
+  # THE FLAGS ARE NOT TASTE (measured 2026-09-22, recorded in memory `tcvllm-baseline-arm-constraints`):
+  #   * --kv-cache-memory-bytes is REQUIRED. With expert offload on, the fork hard-caps KV at the
+  #     plan's reserve, which is ~13% low; this flag returns before that cap, and it is the only
+  #     lever -- lowering --max-model-len or --enforce-eager does not move it.
+  #   * --expert-offload-mem 57 is host RAM, and host RAM is the wall on this 93 GiB box (~88 used
+  #     while serving). Close other large host consumers before launching.
+  #   * --expert-resident-layers= (empty) and --expert-direct-load/--expert-precise-memory: the
+  #     planner's defaults either fail the plan or stage experts through pageable RAM.
+  #   * PLE comes from /pleoffload through the fork's own bounded RAM clock-LRU arena
+  #     (--ple-cache-gb 2), which is why it is immune to the 1M-recordsize read amplification that
+  #     froze the desktop under minisgl -- do NOT point it at the checkpoint's inline shards.
+  tcvllm-flashnext:
+    profiles: ["tcvllm-flashnext"]
+    image: tcclaviger/vllm:dev
+    container_name: tcvllm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add: ["video"]
+    security_opt:
+      - seccomp=unconfined
+      - label=disable
+    cap_add: ["SYS_PTRACE"]
+    ipc: host
+    shm_size: 16gb
+    ports:
+      - "1919:8000"
+    volumes:
+      - /home/pat/ai/hf/q4e-mxfp4:/model:ro
+      - /home/pat/ai/triton-cache-tcclaviger:/root/.triton
+      - /home/pat/.cache/huggingface:/root/.cache/huggingface
+      - /home/pat/ai/pleoffload:/pleoffload
+    command: >
+      /model
+      --served-model-name Qwen3.8-Flash-Next Qwen3.8-Flash-Next-MXFP4-tcvllm
+      --tensor-parallel-size 2
+      --max-model-len 131072
+      --max-num-seqs 2
+      --max-num-batched-tokens 4096
+      --kv-cache-dtype fp8
+      --gpu-memory-utilization 0.95
+      --kv-cache-memory-bytes 2684354560
+      --enable-expert-offload
+      --expert-resident-layers=
+      --expert-offload-mem 57
+      --expert-precise-memory
+      --expert-direct-load
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_xml
+      --reasoning-parser qwen3
+      --ple-nvme-offload
+      --ple-nvme-dir /pleoffload
+      --ple-cache-gb 2
+      --ple-cache-reuse true
+      --host 0.0.0.0 --port 8000
+    ulimits:
+      memlock: -1
+    restart: "no"
+
 volumes:
   # Ghost-oracle state, declared because it is the DEFAULT source of the /ghost mount (see the
   # *lean-common anchor). A named volume outlives `down` and the worktree without needing a
