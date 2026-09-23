@@ -1091,6 +1091,14 @@ services:
     # torch profiler runs (5 active iterations by default), with stacks OFF to keep it cheap.
     #   curl -X POST localhost:1919/start_profile ; <traffic> ; curl -X POST localhost:1919/stop_profile
     environment:
+      # Carried over from the hand-posted arm, and NOT optional: the first cut of this profile
+      # dropped all four and failed at argument validation with "--ple-nvme-offload requires
+      # VLLM_PLE_CPU_OFFLOAD=1" -- the PLE offload process is what serves the table from NVMe.
+      # The two device vars default to both cards but let the lease's injected pair through.
+      HIP_VISIBLE_DEVICES: "${HIP_VISIBLE_DEVICES:-0,1}"
+      ROCR_VISIBLE_DEVICES: "${ROCR_VISIBLE_DEVICES:-0,1}"
+      HF_HUB_OFFLINE: "1"
+      VLLM_PLE_CPU_OFFLOAD: "1"
       R4D_LRU_TELEMETRY: "1"
     command: >
       /model
