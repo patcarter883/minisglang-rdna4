@@ -1079,8 +1079,24 @@ services:
       - /home/pat/ai/triton-cache-tcclaviger:/root/.triton
       - /home/pat/.cache/huggingface:/root/.cache/huggingface
       - /home/pat/ai/pleoffload:/pleoffload
+      # Profiler traces AND the expert-cache telemetry (expert_cache_rank{N}.json) land here.
+      - /home/pat/ai/tcvllm-traces:/traces
+    # EXPERT-CACHE HIT-RATE TELEMETRY. Their runtime LRU hit rate has never been measured, and it is
+    # the one input deciding whether the gap to minisgl is residency or compute (their planner's
+    # 0.149 is a static sizing floor, refuted as a runtime rate by the step arithmetic). The env var
+    # alone reads NOTHING out: expert_lru.py accumulates per-layer counters on the device
+    # (graph-safe, no host sync), and gpu_worker.profile() resets them at /start_profile and writes
+    # /traces/expert_cache_rank{N}.json at /stop_profile. Hence the --profiler-config flags below.
+    # Between windows the profiler is constructed but idle, so it costs nothing; inside a window the
+    # torch profiler runs (5 active iterations by default), with stacks OFF to keep it cheap.
+    #   curl -X POST localhost:1919/start_profile ; <traffic> ; curl -X POST localhost:1919/stop_profile
+    environment:
+      R4D_LRU_TELEMETRY: "1"
     command: >
       /model
+      --profiler-config.profiler torch
+      --profiler-config.torch_profiler_dir /traces
+      --profiler-config.torch_profiler_with_stack false
       --served-model-name Qwen3.8-Flash-Next Qwen3.8-Flash-Next-MXFP4-tcvllm
       --tensor-parallel-size 2
       --max-model-len 131072
