@@ -235,6 +235,9 @@ class RouteTracer:
         self._cur_kind = KIND_OTHER
         self._cur_rows: Optional[int] = None    # REAL rows of this forward; None = unknown
         self._harvested = True                  # nothing staged yet -> nothing to harvest
+        #: Something has written `stage` since the last reset. Guards the fill on the
+        #: early-return paths of `harvest` without issuing a device op per prefill chunk.
+        self._stage_dirty = False
 
         # RING WIDTH. One decode row needs top_k slots; a speculative VERIFY carries M = bs*(K+1)
         # rows and its union is what the cache must see, so the ring is widened to hold `ring_rows`
@@ -402,6 +405,13 @@ class RouteTracer:
         self.n_since_drain += 1
         _CUR_CHUNK.clear()
 
+    def _clear_stage_if_dirty(self) -> None:
+        """Reset the stage iff something wrote it since the last reset. Host bool, no device op
+        unless one is needed -- see the two call sites in `harvest`."""
+        if self._stage_dirty:
+            self.stage.fill_(-1)
+            self._stage_dirty = False
+
     def harvest(self) -> None:
         """Move the finished step's staged ids into its ring slot, masking padded rows. IDEMPOTENT.
 
@@ -418,13 +428,23 @@ class RouteTracer:
         the last step's ids, and a second harvest of the same step must not re-copy a stage that has
         already been reset."""
         if self.disarmed or self.slot < 0 or self._harvested:
+            # THE STAGE MAY BE DIRTY ON THIS PATH, and dropping it here leaks routings into the
+            # policy. `slot < 0` is exactly the capture warmup: graph capture runs inside
+            # `Engine.__init__`, BEFORE the first `begin_forward`, so `_record_captured` has already
+            # written the stage with warmup ids that belong to no request. Those survived into the
+            # first decode step whose plumbed row count exceeded the MoE call's own M (the
+            # tp_overlap row split, or a DP+EP gathered shape) -- measured as 4 leaked experts with
+            # rows_mismatch=1. Cheap because `_stage_dirty` is a host bool: no fill is issued unless
+            # something actually wrote the stage.
+            self._clear_stage_if_dirty()
             return
         self._harvested = True
         if self._cur_kind not in (KIND_DECODE, KIND_VERIFY):
-            # A PREFILL step never writes the stage (every prefill record takes the host path), so
-            # there is nothing to move and nothing to reset -- the stage is all -1 by induction, since
-            # only a decode/verify step writes it and that step's own harvest reset it. Returning
-            # early keeps a 28-chunk prompt from issuing a pointless copy+fill per chunk.
+            # A PREFILL step's own records all take the host path, so there is nothing to MOVE --
+            # but the stage is NOT -1 by induction the way this comment used to claim, because the
+            # capture warmup above can have written it before any step ran. Clear it if dirty and
+            # skip the copy: a 28-chunk prompt still issues no pointless work in the common case.
+            self._clear_stage_if_dirty()
             return
         # THE MASK, and the one invariant it rests on: REAL ROWS COME FIRST. `topk_ids.reshape(-1)`
         # is row-major, so rows 0..rows-1 are exactly the leading rows*top_k ids — and the padding is
@@ -446,6 +466,7 @@ class RouteTracer:
             # a wider previous step's ids in this reused slot.
             self.ids_ring[slot, :, n:].fill_(-1)
         self.stage.fill_(-1)
+        self._stage_dirty = False
         self.step_meta[slot] = (self.step_id, self._cur_uid, self._cur_kind,
                                 self.ring_rows if rows is None else rows)
 
@@ -492,6 +513,7 @@ class RouteTracer:
             # docstring.
             n = M * self.top_k
             self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
+            self._stage_dirty = True
             if self._cur_rows is not None and M != self._cur_rows:
                 # The row count `harvest` will mask against disagrees with the one this MoE call
                 # actually carried. One int compare per layer per step, and it is worth it: a wrong
@@ -513,7 +535,14 @@ class RouteTracer:
         # .tolist(); a prefill chunk is ~35 ms of work so this is noise, and there are only ~28 per
         # 28k prompt. A VERIFY landing here is a sizing miss, not a normal path -- count it, because
         # these records never reach the observer and the cache would be fed a partial union.
-        if self._cur_kind == KIND_VERIFY:
+        # COUNT A DROPPED DECODE TOO, not only a dropped VERIFY. A decode step too wide for the ring
+        # is silently invisible to the expert cache -- the host path's records go to `oversize`, which
+        # `drain()` never forwards to the observer -- and that silence is exactly the defect
+        # `_route_trace_ring_rows` was widened to fix. Left uncounted, the same starvation returns
+        # under any config whose row count outruns the derivation (EP/DP gathers a wider shape than
+        # `max_running_req`, and this file cannot see dp_size), and it returns looking like nothing
+        # more than a disappointing hit rate. It is a SIZING bug wherever it fires, so it is loud.
+        if self._cur_kind in (KIND_VERIFY, KIND_DECODE):
             self.rows_dropped += 1
         if self._cur_kind == KIND_PREFILL and not self.record_prefill:
             return
@@ -569,6 +598,9 @@ class RouteTracer:
                 f"ring_rows from cuda_graph_max_bs (engine._route_trace_ring_rows)."
             )
         self.stage[lid, :n] = topk_ids.reshape(-1)[:n]
+        # THE WRITE THAT LEAKS IF THIS FLAG IS MISSED. Capture runs inside `Engine.__init__`, so
+        # this executes while `slot == -1` and `harvest`'s first early-return owns the cleanup.
+        self._stage_dirty = True
 
     def _blockmap_check(self, topk_ids, expert_ids, ntp, block_m: int) -> None:
         """T1, bounded: does moe_align ever emit a block under an expert NOT in topk_ids?
@@ -810,11 +842,17 @@ def maybe_install(model: Any, *, model_slug: str, tp_rank: int, dp_rank: int,
     per_step = max(1, int(num_layers)) * width * 4
     if per_step * ring > budget:
         shrunk = max(8, budget // per_step)
-        _logger.info_rank0(
+        # `print`, NOT `logger.info_rank0`: this module has no logger (the NameError here killed
+        # the boot for every serve whose ring exceeded the budget, which `ring_rows = max_running_req`
+        # made reachable at the default mrr=256 -- 48 layers x top_k 10 crosses 64 MiB at rows>=35).
+        # And info_rank0 is not the fix: it raises `RuntimeError: TP info has not been set` this
+        # early in boot. Every other message in this module already prints.
+        print(
             f"[route-trace] ring {ring} -> {shrunk} steps to hold {rows} rows/entry "
             f"({width} ids x {num_layers} layers x 4 B = {per_step / 1024:.1f} KiB/step, "
             f"budget {budget >> 20} MiB). Rows are not negotiable: a verify that does not fit the "
-            f"ring falls to the host path and never reaches the expert cache."
+            f"ring falls to the host path and never reaches the expert cache.",
+            flush=True,
         )
         ring = shrunk
     t = RouteTracer(

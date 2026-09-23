@@ -477,7 +477,11 @@ def G16_widening_ring_rows_must_not_walk_into_an_undefined_logger():
 
     FIX: `from minisgl.utils import init_logger` + `_logger = init_logger(__name__)`, the same two
     lines weights/prefill_stage.py:50-54 already uses."""
-    check("route_trace defines the `_logger` its shrink branch calls", hasattr(RT, "_logger"),
+    # RELAXED from `hasattr(RT, "_logger")`: that pinned a mechanism and rejected the correct fix
+    # (info_rank0 raises "TP info has not been set" this early in boot, so the branch prints).
+    # The property is that the branch RUNS -- G16b below drives it at rows=256.
+    check("route_trace's shrink branch does not reference an undefined global",
+          "_logger." not in open(RT.__file__).read(),
           "route_trace.py:~813 calls _logger.info_rank0(...) and the module never defines it -> "
           "NameError at boot on any config whose ring exceeds the byte budget")
     n, _ = _ring_rows_for(max_running_req=256, cuda_graph_max_bs=None)
