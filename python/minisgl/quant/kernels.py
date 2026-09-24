@@ -352,7 +352,8 @@ _MOE_WMMA_DIM = 16
 _MOE_BLOCK_M_CHOICES = (16, 32, 64, 128)  # multiples of WMMA_DIM up to 8 warps
 
 
-def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
+def _moe_block_m(num_tokens: int, num_experts: int, top_k: int,
+                 flag_gemm1: bool | None = None) -> int:
     """Choose the grouped-MoE tile height from the WORKLOAD rather than a fixed constant.
 
     ``moe_align`` pads EACH expert's routed rows up to a multiple of ``block_m`` and the WMMA kernel
@@ -394,7 +395,29 @@ def _moe_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
     for choice in _MOE_BLOCK_M_CHOICES:
         if choice <= rows_per_expert:
             bm = choice
-    return bm
+    if flag_gemm1 is None or num_tokens <= _MOE_GEMM1_GEMV_MAX:
+        return bm
+    # THE W4A8 WMMA BAND (M > the gemm1 GEMV crossover), MEASURED, not argued — whole `w4a8_moe` op,
+    # graph replay, RX 9070 XT, outputs bit-identical across block_m at every cell
+    # (/home/pat/fixtures/minisgl-dgopt-20260925/moe_blockm.txt):
+    #   * flag-capable (silu, group 32/64/128, one-level scales): block_m=64 is what engages the
+    #     register-tiled gemm1_silu_flag, and it wins at EVERY M tried — Qwen3.6-35B tp2 M=64..512
+    #     2.20-2.99x over the rows rule's 16 (M=1024: 1.69x over its 32); GLM-4.7 tp2 M=64..512
+    #     1.70-2.68x.
+    #   * otherwise (the unfused tiled gemm1, e.g. gelu experts): the rows rule is one step short once
+    #     an expert holds ~16 rows. DiffusionGemma tp2 (g=32): M=256 32 beats 16 by 1.13x, M=512 64
+    #     beats 32 by 1.16x; at M=64..128 16 is still best (32 is 8-16% slower). Hence "largest tile
+    #     <= 2x rows-per-expert", capped at the largest measured (64).
+    # The shared analytic chooser (moe_tile_choose) was checked against the same 18 cells and picks
+    # the measured block_m in 3; it has no term for the flag arm, and none for the padding at ~1-8
+    # rows/expert (see the note above), so it is not what decides this.
+    if flag_gemm1:
+        return max(bm, 64)
+    wide = bm
+    for choice in _MOE_BLOCK_M_CHOICES:
+        if choice <= min(2 * rows_per_expert, 64):
+            wide = choice
+    return max(bm, wide)
 
 
 def _route_align(
@@ -587,8 +610,6 @@ def w4a8_moe(
     M, K = x.shape
     E = w13.shape[0]
     dev = x.device
-    if block_m is None:  # derive the grouped-GEMM tile from the workload (16 at decode, up to 128 at prefill)
-        block_m = _moe_block_m(M, E, top_k)
     # Decode fast path is PER-GEMM: the two grouped GEMMs want OPPOSITE kernels at M<=2 (measured on
     # gfx1201, Qwen3.6-35B). gemm1 (w13, wide 2*inter output, gather-by-sorted, top_k>1): the scalar
     # GEMV is ~8.7x faster than the prefill WMMA (35us vs 306us). gemm2 (w2, K output, identity
@@ -644,6 +665,12 @@ def w4a8_moe(
     # turn a fused/flag arm OFF, so a false positive costs a launch, never a wrong number.
     _E4M3_SCALE_DTYPES = (torch.float8_e4m3fn, torch.uint8)
     _two_level = (w13_scales.dtype in _E4M3_SCALE_DTYPES) or (w2_scales.dtype in _E4M3_SCALE_DTYPES)
+    if block_m is None:  # derive the grouped-GEMM tile from the workload (16 at decode, up to 128 at prefill)
+        # Whether gemm1 CAN take the register-tiled flag kernel — the same predicate as `_flag1`
+        # below, minus its block_m term, which is exactly what this decides.
+        _flag_capable = (activation == "silu" and _MOE_FUSED_SILU and x.dtype in _FUSED_SILU_DTYPES
+                         and _MOE_FLAG and not _two_level and _grp in (32, 64, 128))
+        block_m = _moe_block_m(M, E, top_k, flag_gemm1=_flag_capable)
 
     # Precomputed route (e.g. GLM/DeepSeek noaux_tc: sigmoid + correction bias + group top-k +
     # normalize + scale, done in the model). Otherwise route AND align in ONE op — see _route_align:
