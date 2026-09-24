@@ -9,6 +9,7 @@ import torch
 
 from minisgl.utils import init_logger
 
+from .draft_attn import DraftAttnBuilder
 from .base import ProposeContext
 from .capture import CapturableProposer, StagedPropose
 
@@ -40,8 +41,9 @@ class MTPProposer(CapturableProposer):
     ``[max_slots, ring, nkv, hd]`` keyed by ``req.table_idx`` — the same stable slot index the
     paged ``page_table`` and the GDN/CCA recurrent state use — plus a per-slot cursor. A growing
     per-uid Python list would be both a dynamic shape and a host-side mutation, i.e. uncapturable;
-    the fixed window + additive ``-inf`` mask beyond the cursor is byte-exact against it
-    (``softmax(-inf) == 0``; validated by ``tools/mtp_forward_draft_parity.py``).
+    each step's keep-mask becomes a per-row block table + visible length over the ring, and the draft
+    attention runs on the HIP decode kernel over the ring in place (spec/draft_attn.py; parity vs a
+    torch reference of the same masked attention in ``tools/mtp_forward_draft_parity.py``).
 
     Capture/replay itself is NOT here — it is the shared ``CapturableProposer`` machinery, which
     DFlash and EAGLE3 ride too. This class supplies only the four hooks.
@@ -104,8 +106,8 @@ class MTPProposer(CapturableProposer):
         # 15900, with nothing logged). A ring stores the most recent W positions at col = pos % W and
         # masks from ABSOLUTE POSITIONS, so context is unbounded at fixed VRAM. Same design DFlash's
         # prefix ring already uses here (spec/dflash.py: col = pos % C, keep = (pa <= qa) & (qa - pa
-        # < window)). The kernel needs no change: step_masked already takes an arbitrary write_col
-        # and an explicit mask_bias, and never assumes column == position.
+        # < window)). The drafter never assumes column == position: the keep-mask below is turned
+        # into a per-row block table in POSITION order (spec/draft_attn.py).
         #
         # W=512, MEASURED. The buffer is max_slots*W, so this is 3 MB where the old full-context
         # 8192 was 50 MB. A provenance-asserted sweep (35B-MXFP4 TP=2, MTP K=4) found NO detectable
@@ -144,7 +146,9 @@ class MTPProposer(CapturableProposer):
         # Absolute position held by each ring column; -1 = empty. This is what the mask is built from.
         self._pos_buf = torch.full((self._max_slots, self._ring), -1,
                                    dtype=torch.int64, device=dev)
-        self._col_idx = torch.arange(self._ring, device=dev)                     # [ring]
+        # The drafter's attention runs on the HIP decode kernel over the ring IN PLACE (spec/draft_attn.py):
+        # per step, the keep-mask below becomes a block table + visible length, not an additive mask.
+        self._draft_attn = DraftAttnBuilder(self._ring, dev)
         self._slot_uid: Dict[int, int] = {}   # which uid owns each slot (reset the cursor on reuse)
         self._drafted_slots: List[int] = []   # slots that drafted last step (for on_accept advance)
         # The width of the `last_hidden` the TARGET returns and this head consumes. NOT the
@@ -196,7 +200,7 @@ class MTPProposer(CapturableProposer):
             if self._slot_uid.get(s) != req.uid:   # fresh req on this slot -> cold cache
                 self._slot_uid[s] = req.uid
                 self._cur[s] = 0
-                # The ring mask keys off ABSOLUTE positions, so a cursor reset alone is not enough:
+                # The ring keep-mask keys off ABSOLUTE positions, so a cursor reset alone is not enough:
                 # the previous owner's positions would still satisfy `pa <= qa`. Invalidate the ring.
                 self._pos_buf[s].fill_(-1)
             j = len(rows)
@@ -234,7 +238,6 @@ class MTPProposer(CapturableProposer):
         cur = self._g_curb[:bs]
         cur_tok = self._g_tok[:bs]
         cur_hidden = self._g_seed[:bs]
-        col = self._col_idx.unsqueeze(0)
         # K+1 ITERATIONS, NOT K. Each step writes the K/V of the token it attends FROM, so a K-step
         # loop stores [confirmed, d_0 .. d_{K-2}] and the LAST draft d_{K-1} never gets a row. On a
         # full accept the target commits that token, so the drafter's ring was permanently one key
@@ -261,9 +264,9 @@ class MTPProposer(CapturableProposer):
             pa = self._pos_buf[slots]                          # [bs, ring] absolute pos per column
             qa = q_abs.unsqueeze(1)
             keep = (pa >= 0) & (pa <= qa) & ((qa - pa) < self._ring)
-            mask_bias = torch.where(keep, 0.0, float("-inf")).to(torch.float32)
+            meta = self._draft_attn.meta(slots, q_abs, keep)
             logits, cur_hidden = head.step_masked(
-                fused, positions, self._k_buf, self._v_buf, slots, write_col, mask_bias)
+                fused, positions, self._k_buf, self._v_buf, slots, write_col, meta)
             if j == self._num_draft:
                 break        # store-only pass: d_{K-1}'s K/V is now in the ring; logits unused
             nxt = logits.argmax(dim=-1)
