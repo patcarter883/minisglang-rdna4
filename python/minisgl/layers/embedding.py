@@ -46,9 +46,14 @@ def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
     TIES between unrelated tokens (measured on the served LM-head top-20; llama.cpp on the same
     weights is continuous). Ties collapse <0.125-nat distinctions at sampling time, so the store
     is now fp32 end-to-end: the M-invariant decode GEMV takes fp32_out (a store POLICY on the
-    shared core), and the rare rows > MMAX fall back to a chunked fp32 torch matmul (prefill
-    last-token batches; once per request, so the cast traffic is irrelevant there). minv stays
-    out of this path — its bf16 store is the exact grid this removes."""
+    shared core), and rows > MMAX take one half-precision GEMM that accumulates AND stores in fp32
+    (`out_dtype`). minv stays out of this path — its bf16 store is the exact grid this removes.
+
+    Rows > MMAX are NOT rare: every block-diffusion canvas step scores 256 rows, and every spec
+    verify with bs x qlen > 16 lands here too. They used to cast each 8192-row weight chunk to fp32
+    and run an fp32 GEMM — 53.5 ms per canvas step against 1.71 ms for this (RX 9070 XT, M=256,
+    K=2816, N=131072), which was a third of the whole DiffusionGemma step. Same products (a half x
+    half product is exact in fp32), same fp32 accumulation; only summation order differs."""
     gemv = _get_lmhead_gemv()
     if (gemv is not None
             and weight.dtype in (torch.bfloat16, torch.float16)
@@ -63,11 +68,13 @@ def _lm_head_linear(x: torch.Tensor, weight: torch.Tensor,
         if bias is not None:
             out = out + bias
         return out
-    xf = x.float()
-    out = torch.empty(x.shape[0], weight.shape[0], dtype=torch.float32, device=x.device)
-    CH = 8192
-    for i in range(0, weight.shape[0], CH):
-        out[:, i : i + CH] = xf @ weight[i : i + CH].float().t()
+    if weight.dtype in (torch.bfloat16, torch.float16) and x.dtype == weight.dtype:
+        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+    else:  # mixed/fp32 inputs: cast the weight a chunk at a time, never whole (1.5 GB at 262k vocab)
+        xf = x.float()
+        out = torch.empty(x.shape[0], weight.shape[0], dtype=torch.float32, device=x.device)
+        for i in range(0, weight.shape[0], 8192):
+            out[:, i : i + 8192] = xf @ weight[i : i + 8192].float().t()
     if bias is not None:
         out += bias
     return out
