@@ -509,35 +509,6 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         self._num_kv_heads = div_even(config.num_kv_heads, get_tp_info().size)
         self._scale = float(self._head_dim) ** -0.5
 
-    def forward_draft(
-        self, x: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
-    ) -> torch.Tensor:
-        T = x.shape[0]
-        hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
-        qg = self.q_proj.forward(x).view(T, nq, 2 * hd)
-        q = qg[..., :hd].reshape(T, nq * hd)
-        gate = qg[..., hd:].reshape(T, nq * hd)
-        k = self.k_proj.forward(x)
-        v = self.v_proj.forward(x).view(T, nkv, hd)
-        # q_norm/k_norm over head_dim, then partial rotary (same as AttentionLayer).
-        self.q_norm.forward_inplace(q.view(T, nq, hd))
-        self.k_norm.forward_inplace(k.view(T, nkv, hd))
-        q, k = self.attn.rotary.forward(positions, q, k)
-        q = q.view(T, nq, hd)
-        k = k.view(T, nkv, hd)
-        cache.append((k, v))
-        Ks = torch.stack([c[0] for c in cache], dim=0)  # [S,T,nkv,hd]
-        Vs = torch.stack([c[1] for c in cache], dim=0)  # [S,T,nkv,hd]
-        # GQA: each q-head maps to kv-head (h // (nq//nkv)). Expand kv heads to q heads.
-        rep = nq // nkv
-        Ks = Ks.repeat_interleave(rep, dim=2)  # [S,T,nq,hd]
-        Vs = Vs.repeat_interleave(rep, dim=2)
-        scores = torch.einsum("thd,sthd->ths", q, Ks) * self._scale  # [T,nq,S]
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        o = torch.einsum("ths,sthd->thd", probs, Vs).reshape(T, nq * hd)
-        o = o * torch.sigmoid(gate)
-        return self.o_proj.forward(o)
-
     def draft_buffer_dims(self) -> "tuple[int, int, int, int]":
         """(n_k_heads, k_dim, n_v_heads, v_dim) for the buffered MTP propose draft-KV buffer
         (spec/mtp.py). Qwen packs GQA with nkv heads and a symmetric head_dim for both K and V."""
@@ -547,23 +518,20 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         self,
         x: torch.Tensor,           # [B, hidden] — ONE draft token per batch row
         positions: torch.Tensor,   # [B] absolute RoPE position of this token per row
-        k_buf: torch.Tensor,       # [max_slots, max_ctx, nkv, hd] GLOBAL persistent draft K
-        v_buf: torch.Tensor,       # [max_slots, max_ctx, nkv, hd] GLOBAL persistent draft V
+        k_buf: torch.Tensor,       # [max_slots, R, nkv, hd] GLOBAL persistent draft-K ring
+        v_buf: torch.Tensor,       # [max_slots, R, nkv, hd] GLOBAL persistent draft-V ring
         slot_rows: torch.Tensor,   # [B] which global slot (= req.table_idx) each batch row uses
-        write_col: torch.Tensor,   # [B] column this token is written at, per row
-        mask_bias: torch.Tensor,   # [B, max_ctx] additive: 0 for cols <= write_col, -inf beyond
+        write_col: torch.Tensor,   # [B] ring column this token is written at, per row
+        meta: "DraftAttnMeta",     # per-row block table + visible length over the ring (spec/draft_attn.py)
     ) -> torch.Tensor:
-        """CUDA-graph-capturable equivalent of forward_draft: fixed-shape masked attention over a
-        GLOBAL persistent draft-KV buffer (keyed by req.table_idx, like the page_table / GDN-state
-        slots) instead of a torch.stack over a growing Python list. Each row writes its k/v into its own
-        slot at `write_col` (rows have DIFFERENT context lengths — why a single sliced tensor can't serve
-        the batch) and attends over the whole `max_ctx` window with an additive -inf mask beyond
-        `write_col`. softmax(-inf)=0, so this is byte-exact vs the sliced stack (validated by
-        tools/mtp_forward_draft_parity.py). No list mutation, no dynamic shapes → capturable. Writes go
-        to the GLOBAL buffer (persist across steps/decode-steps); the read gathers `k_buf[slot_rows]`.
-
-        Caller advances `write_col`/`mask_bias` per step; on_accept rewinds the slot cursor (rejected
-        drafts' columns are simply re-masked next step, no free)."""
+        """CUDA-graph-capturable draft attention over the GLOBAL persistent draft-KV ring, on the HIP
+        decode kernel (attn_decode.flash_decode_paged). Each row writes its k/v into its own slot at
+        `write_col`, then attends over exactly the keys the proposer's keep-mask admits — the ring is
+        read IN PLACE through a page_size-1 block table, so there is no gather of the slot and no
+        full-ring softmax. It used to gather `k_buf[slot_rows]` (a copy of the whole ring) and run torch
+        einsum/softmax over all R columns with an additive -inf mask, every draft step, every layer.
+        Not bit-identical to that torch form (different fp32 reduction order): a draft only affects
+        ACCEPTANCE, the target verifies every token."""
         B = x.shape[0]
         hd, nq, nkv = self._head_dim, self._num_qo_heads, self._num_kv_heads
         qg = self.q_proj.forward(x).view(B, nq, 2 * hd)
@@ -574,23 +542,12 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         self.q_norm.forward_inplace(q.view(B, nq, hd))
         self.k_norm.forward_inplace(k.view(B, nkv, hd))
         q, k = self.attn.rotary.forward(positions, q, k)
-        q = q.view(B, nq, hd)
-        k = k.view(B, nkv, hd)
         # Persist this token's k/v into its slot at write_col (dynamic tensor index — capturable).
-        k_buf[slot_rows, write_col] = k
+        k_buf[slot_rows, write_col] = k.view(B, nkv, hd)
         v_buf[slot_rows, write_col] = v
-        rep = nq // nkv
-        # GROUPED-QUERY attention WITHOUT expanding K/V to nq heads: expanding would materialize
-        # [B, max_ctx, nq, hd] (rep× larger, hundreds of MB over an 8k window — it OOM'd the graph pool).
-        # Instead group q as [B, nkv, rep, hd] and contract against the nkv-head K/V directly.
-        qg2 = q.view(B, nkv, rep, hd)                        # [B, nkv, rep, hd]
-        Ks = k_buf[slot_rows]                                # [B, max_ctx, nkv, hd] (gather, read-only)
-        Vs = v_buf[slot_rows]
-        scores = torch.einsum("bgrd,bsgd->bgrs", qg2, Ks) * self._scale       # [B, nkv, rep, max_ctx]
-        scores = scores + mask_bias.view(B, 1, 1, -1)                         # broadcast the -inf mask
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        o = torch.einsum("bgrs,bsgd->bgrd", probs, Vs).reshape(B, nq * hd)    # [B, nq*hd]
-        o = o * torch.sigmoid(gate)
+        from ..spec.draft_attn import paged_draft_attention   # lazy: models must not import spec/ at load
+        o = paged_draft_attention(q.view(B, nq, hd), k_buf, v_buf, meta, self._scale)
+        o = o.reshape(B, nq * hd) * torch.sigmoid(gate)
         return self.o_proj.forward(o)
 
     @torch.inference_mode()
@@ -668,32 +625,17 @@ class Qwen3_5MTPHead(BaseOP):
         h = self.pre_fc_norm_hidden.forward(last_hidden)
         return self.fc.forward(torch.cat([e, h], dim=-1))
 
-    def step(
-        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x, residual = self.input_layernorm.forward(fused, None)
-        x = self.self_attn.forward_draft(x, positions, cache, step)
-        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
-                                    fuse_actquant=self._fuse_actquant)
-        hidden = x + residual
-        normed = self.norm.forward(hidden, None)[0]
-        # Full-vocab logits via the (tied) lm_head's TP all_gather — identical on every rank.
-        logits = self._lm_head.logits_all_rows(normed)
-        return logits, hidden
-
     def step_masked(
         self, fused: torch.Tensor, positions: torch.Tensor,
         k_buf: torch.Tensor, v_buf: torch.Tensor, slot_rows: torch.Tensor,
-        write_col: torch.Tensor, mask_bias: torch.Tensor,
+        write_col: torch.Tensor, meta: "DraftAttnMeta",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Batched, CUDA-graph-capturable twin of step(): identical MLP/MoE/norm/lm-head, but the
-        self-attention uses forward_draft_masked (fixed-shape masked attention over a GLOBAL persistent
-        [max_slots,max_ctx,nkv,hd] draft-KV buffer keyed by slot_rows, at per-row write_col) instead of
-        the growing-list stack. Byte-exact vs step() (the divergence is only the attention core,
-        validated byte-exact by tools/mtp_forward_draft_parity.py). fused/positions batched over B rows."""
+        """One batched, CUDA-graph-capturable MTP draft step: fused input -> draft attention over the
+        persistent draft-KV ring (forward_draft_masked, on the HIP decode kernel) -> MLP/MoE -> norm ->
+        full-vocab logits. fused/positions batched over B rows."""
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft_masked(
-            x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias)
+            x, positions, k_buf, v_buf, slot_rows, write_col, meta)
         x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
                                     fuse_actquant=self._fuse_actquant)
         hidden = x + residual

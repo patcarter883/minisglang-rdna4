@@ -886,23 +886,15 @@ class Qwen4ExpMTPHead(BaseOP):
         mixed = self.hyper_connection_mixer.mix(wide)[0]
         return self._lm_head.logits_all_rows(mixed), wide
 
-    def step(
-        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._block(
-            fused,
-            lambda x: self.layers.op_list[0].self_attn.forward_draft(x, positions, cache, step),
-        )
-
     def step_masked(
         self, fused: torch.Tensor, positions: torch.Tensor,
         k_buf: torch.Tensor, v_buf: torch.Tensor, slot_rows: torch.Tensor,
-        write_col: torch.Tensor, mask_bias: torch.Tensor,
+        write_col: torch.Tensor, meta: "DraftAttnMeta",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._block(
             fused,
             lambda x: self.layers.op_list[0].self_attn.forward_draft_masked(
-                x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias),
+                x, positions, k_buf, v_buf, slot_rows, write_col, meta),
         )
 
     @torch.inference_mode()
