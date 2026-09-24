@@ -80,8 +80,9 @@ outstanding at once.
 
 THE CAPTURE PROBLEM, AND WHY THERE IS NO GATE IN THE MODELS
 -----------------------------------------------------------
-Side-stream collectives cannot be captured into a CUDA graph. The canvas step IS captured. Those two
-facts do not compose, and the honest resolution is not to make the models choose.
+Side-stream collectives DO capture into a CUDA graph (event fork/join), but on ROCm 7.2 the captured
+canvas step measured 13% SLOWER with them (see `_overlappable`). The canvas step IS captured, so the
+honest resolution is not to make the models choose.
 
 Instead the primitive is **capture-transparent**: when the current stream is capturing (or overlap is
 disabled, or the tensor is too small to be worth a side stream), `async_all_reduce` performs the
@@ -235,9 +236,12 @@ def overlap_active(x: torch.Tensor) -> bool:
 def _overlappable(x: torch.Tensor) -> bool:
     """Whether this collective should go to the side stream rather than the current one.
 
-    Capturing is the hard exclusion: a side-stream collective cannot be recorded into a CUDA graph, so
-    under capture we issue the ordinary in-place collective and the graph is exactly what it always
-    was."""
+    Capturing is the hard exclusion, and it is a MEASURED one, not a capability limit: the event
+    fork/join below does capture (2026-09-25, DiffusionGemma canvas, TP=2, the graph-vs-eager gate
+    stayed 0.000e+00), but the captured step got SLOWER, 87.8 -> 99.3 ms (branch overlap) / 99.9 ms
+    (row chunks) on ROCm 7.2 — the spinning one-shot collective competes with the grouped GEMM for
+    CUs, and the branched graph loses more than the hidden collective saves. So under capture we
+    issue the ordinary in-place collective and the graph is exactly what it always was."""
     return (
         _ENABLED
         and not _FORCE_INLINE

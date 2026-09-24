@@ -63,6 +63,9 @@ SHAPES = [
     ("glm.moe    tp2", 128, 8, 2048, 768, 128),
     # Gemma4 / a group-32 checkpoint, to keep the g axis in the surface
     ("g32.moe    tp2", 128, 4, 2048, 1024, 32),
+    # DiffusionGemma / Gemma-4 26B-A4B, TP=2: hidden 2816, moe_intermediate 704 -> 352 per rank, g=32.
+    # The block-diffusion canvas routes 256 rows x top-8 over 128 experts = 16 rows/expert EVERY step.
+    ("dg.moe     tp2", 128, 8, 2816, 352, 32),
     # A narrow-N grid point: this is where a constant BN is worst (few N-blocks -> ragged wave)
     ("narrowN    tp2", 64, 4, 1024, 512, 128),
 ]
@@ -80,7 +83,9 @@ def pack_uint4_3d(w: torch.Tensor) -> torch.Tensor:
 
 def expert_stack(E: int, N: int, K: int, g: int):
     wp = pack_uint4_3d(torch.randint(0, 16, (E, N, K), dtype=torch.int8, device=DEV))
-    sc = (torch.randn(E, N, K // g, device=DEV).abs() * 0.02 + 0.002).to(torch.float16)
+    # GROUP-major (E, K//g, N): the loader moved to this layout on 2026-08-07 and w4a8_moe refuses
+    # anything else, so an N-major fixture here is refused on every tile, not merely mis-timed.
+    sc = (torch.randn(E, K // g, N, device=DEV).abs() * 0.02 + 0.002).to(torch.float16)
     return wp, sc
 
 
