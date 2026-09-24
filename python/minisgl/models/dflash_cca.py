@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from minisgl.layers import RMSNorm
 from minisgl.layers.base import BaseOP
 
-from .dflash import _PlainLinear
+from .dflash import _PlainLinear, drafter_attend, drafter_attn_meta, drafter_attn_op
 
 
 def _rmsnorm_heads(x: torch.Tensor, num_heads: int, head_dim: int, sqrt_head_dim: float,
@@ -59,6 +59,10 @@ class _CCADrafterLayer(BaseOP):
         self.block_mixer = block_mixer
         self._conv_kernel = conv_kernel
         self._conv_pad = conv_kernel // 2
+        if block_mixer != "conv":
+            # Block attention runs on the HIP paged flash kernel; an uncovered head_dim is a LOAD
+            # error (no torch fallback).
+            drafter_attn_op(head_dim)
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -109,18 +113,23 @@ class _CCADrafterLayer(BaseOP):
         k = _rmsnorm_heads(k, self.num_k_heads, self.head_dim, self.sqrt_head_dim)
         temp = self._temp_eff().view(1, 1, self.num_k_heads, 1)
 
-        qh = q.view(S, L, self.num_q_heads, self.head_dim).float()
-        kh = k.view(S, L, self.num_k_heads, self.head_dim).float() * temp
-        vh = v.view(S, L, self.num_k_heads, self.head_dim).float()
-        kh = kh.repeat_interleave(self.gqa_groups, dim=2)  # GQA expand to q heads
-        vh = vh.repeat_interleave(self.gqa_groups, dim=2)
-
         if self.block_mixer == "conv":
-            out = vh.reshape(S, L, self.latent_q).to(x.dtype)
+            vh = v.view(S, L, self.num_k_heads, self.head_dim)
+            out = vh.repeat_interleave(self.gqa_groups, dim=2).reshape(S, L, self.latent_q)
         else:
-            attn = torch.einsum("slhd,smhd->shlm", qh, kh) / self.sqrt_head_dim
-            attn = torch.softmax(attn, dim=-1)
-            out = torch.einsum("shlm,smhd->slhd", attn, vh).reshape(S, L, self.latent_q).to(x.dtype)
+            # Bidirectional attention within each sequence's [seed | block], on the HIP paged flash
+            # kernel: sequence s is page s of a [S, L, Hk, hd] cache, GQA native. The per-k-head key
+            # temperature is folded into K (fp32 multiply, one rounding to the activation dtype);
+            # the kernel accumulates QK^T, softmax and PV in fp32.
+            qh = q.reshape(S * L, self.num_q_heads, self.head_dim)
+            kh = (k.view(S, L, self.num_k_heads, self.head_dim).float() * temp).to(x.dtype)
+            vh = v.view(S, L, self.num_k_heads, self.head_dim).contiguous()
+            meta = drafter_attn_meta(S, L, L, x.device, self.gqa_groups)
+            # split_ctx = L: the page is ONE key tile (L ~ 1 + num_spec), so there is no key axis to
+            # split — a forced split would only add empty slabs and a reduce.
+            out = drafter_attend(qh, kh.contiguous(), vh, meta, 1.0 / self.sqrt_head_dim, None,
+                                 split_ctx=L)
+            out = out.reshape(S, L, self.latent_q)
 
         out = self.o_proj.forward(out)[:, off:, :]  # drop seed column -> [S, T, H]
         h = residual + out

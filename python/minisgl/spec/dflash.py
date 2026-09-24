@@ -653,7 +653,11 @@ class DFlashProposer(CapturableProposer):
         # simply skips propose and decodes plain, which is lossless.
         from minisgl.engine.graph import get_free_memory
 
-        per_slot = sum(self._layer_cap) * Hkv * hd * dt.itemsize * 2
+        # + block_size SCRATCH columns per ring row: the block's own K/V are written there each
+        # propose so the attention kernel reads [prefix | block] in place (models/dflash.py
+        # attend_block_batched) instead of gathering + concatenating the whole ring row per layer.
+        Qs = self._block_size
+        per_slot = sum(c + Qs for c in self._layer_cap) * Hkv * hd * dt.itemsize * 2
         want = int(engine.page_table.shape[0])
         # `or "0.30"` not a dict default: docker-compose's `VAR: "${VAR:-}"` sets the variable to the
         # EMPTY STRING, so the key IS present and `os.environ.get(k, default)` returns "" — which
@@ -711,8 +715,10 @@ class DFlashProposer(CapturableProposer):
         self._pool_slots = max(1, min(want, fits, _cap or want))
         self._null_slot = self._pool_slots
         S = self._pool_slots + 1
-        self._pk = [torch.zeros(S, c, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
-        self._pv = [torch.zeros(S, c, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
+        # [slots+NULL, cap + Q, Hkv, hd]: columns [0, cap) are the modulo ring, [cap, cap+Q) the
+        # block scratch. Only the ring columns are ever addressed by position (`pos % cap`).
+        self._pk = [torch.zeros(S, c + Qs, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
+        self._pv = [torch.zeros(S, c + Qs, Hkv, hd, device=dev, dtype=dt) for c in self._layer_cap]
         # One position map PER DISTINCT CAPACITY (usually one; two for a mixed drafter). The ring is
         # modulo, so a column means nothing without the absolute position it currently holds, and
         # rings of different capacity map the same position to different columns.
@@ -761,7 +767,7 @@ class DFlashProposer(CapturableProposer):
         self.init_propose_capture_state(engine, tag="DFlash")
         # Report the per-layer geometry, not one number: on a mixed drafter the interesting fact is
         # that the windowed layers are small and only the full_attention one pays a max-context ring.
-        _bytes = 2 * S * sum(self._layer_cap) * Hkv * hd * dt.itemsize
+        _bytes = 2 * S * sum(c + Qs for c in self._layer_cap) * Hkv * hd * dt.itemsize
         _grp = sorted(set(zip(self._layer_cau, self._layer_win, self._layer_cap)))
         logger.info_rank0(
             f"spec-decode: DFlash propose ring (slots={self._pool_slots}+NULL of {want}, "

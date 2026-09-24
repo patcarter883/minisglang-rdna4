@@ -1,0 +1,77 @@
+# dflash drafter attention: torch vs attn_prefill_paged — AMD Radeon RX 9070 XT, ROCR_VISIBLE_DEVICES=0 (lease card 0)
+
+## qwen36-35b-dflash — PARITY (TP=1, real weights, block 16; vs fp32-attention reference)
+    path      P  N  attn|d| new  attn|d| old  logit|d| new  logit|d| old  agree new  agree old  new==old
+    ring    512  1    6.250e-02    1.250e-01     1.562e-01     2.188e-01    15/15      15/15     15/15
+    ring    512  4    6.250e-02    1.875e-01     1.250e-01     3.594e-01    59/60      58/60     59/60
+   eager    512  1                               1.562e-01     3.906e-01    59/60      59/60  
+    ring   2048  1    3.125e-02    1.250e-01     1.875e-01     5.938e-01    15/15      15/15     15/15
+    ring   2048  4    3.125e-02    1.250e-01     1.719e-01     4.377e-01    60/60      59/60     59/60
+   eager   2048  1                               1.562e-01     3.750e-01    60/60      56/60  
+    ring   8192  1    3.125e-02    6.250e-02     1.250e-01     3.906e-01    15/15      15/15     15/15
+    ring   8192  4    3.125e-02    1.250e-01     1.719e-01     6.250e-01    60/60      57/60     57/60
+   eager   8192  1                               1.875e-01     5.000e-01    59/60      55/60  
+    ring  32768  1    1.562e-02    4.688e-02     9.375e-02     2.266e-01    14/15      15/15     14/15
+    ring  32768  4    3.125e-02    9.375e-02     1.719e-01     4.385e-01    56/60      59/60     57/60
+   eager  32768  1                               1.328e-01     4.062e-01    59/60      55/60  
+drafted-token argmax agreement with the fp32-attention reference: NEW 531/540 (98.33%)  OLD torch bf16 518/540 (95.93%)
+DETERMINISM N=1: eager==replay True  replay==replay True
+DETERMINISM N=4: eager==replay True  replay==replay True
+
+## qwen36-35b-dflash — TIMING (TP=2 per rank: H=16 Hkv=4 hd=128, block 16, 6 layers, rings (causal,window,cap)=[(False, 0, 8208), (True, 4096, 4224)])
+graph replay, CUDA events, median of 15 interleaved reps x 40 replays; ms per step
+ N      P |  attn old  attn new  attn ctl  speedup |  prop old  prop new  prop ctl  speedup | ctl spread
+ 1    512 |    1.2492    0.7277    0.7279    1.72x |    4.6601    3.8995    3.8991    1.20x |      0.02%
+ 1   2048 |    1.2652    0.7559    0.7556    1.67x |    4.6464    3.8956    3.8957    1.19x |      0.04%
+ 1   8192 |    1.2772    0.7653    0.7678    1.67x |    4.8044    4.0561    4.0628    1.18x |      0.34%
+ 1  32768 |    1.2738    0.7615    0.7618    1.67x |    4.8033    4.0540    4.0508    1.18x |      0.08%
+ 4    512 |    5.6580    2.0892    2.0871    2.71x |    9.8607    5.9468    5.9481    1.66x |      0.10%
+ 4   2048 |    5.6678    2.1987    2.1984    2.58x |    9.8681    6.0898    6.0770    1.62x |      0.21%
+ 4   8192 |    5.7313    2.1897    2.1890    2.62x |    9.9488    6.0530    6.0597    1.64x |      0.11%
+ 4  32768 |    5.7293    2.1999    2.1988    2.60x |    9.9810    6.0773    6.0891    1.64x |      0.19%
+eager-fallback denoise_cached (N=1; S = window_prefix(P)+block keys per layer):
+     P |       old       new       ctl  speedup
+   512 |    2.2303    1.9123    1.9168    1.17x
+  2048 |    2.6181    2.0717    2.0753    1.26x
+  8192 |    5.0249    2.9355    2.9202    1.71x
+ 32768 |   16.0201    6.2783    6.2145    2.55x
+
+## qwen38-27b-dspark — PARITY (TP=1, real weights, block 7; vs fp32-attention reference)
+    path      P  N  attn|d| new  attn|d| old  logit|d| new  logit|d| old  agree new  agree old  new==old
+    ring    512  1    1.250e-01    6.250e-01     2.656e-01     5.625e-01     6/6        6/6       6/6
+    ring    512  4    1.250e-01    1.516e+00     2.188e-01     5.781e-01    22/24      19/24     17/24
+   eager    512  1                               2.188e-01     7.344e-01    23/24      23/24  
+    ring   2048  1    1.250e-01    7.500e-01     2.344e-01     6.875e-01     6/6        6/6       6/6
+    ring   2048  4    1.250e-01    1.125e+00     3.672e-01     9.531e-01    22/24      24/24     22/24
+   eager   2048  1                               1.875e-01     5.576e-01    23/24      23/24  
+    ring   8192  1    6.250e-02    6.875e-01     1.602e-01     4.688e-01     6/6        6/6       6/6
+    ring   8192  4    1.250e-01    8.984e-01     2.344e-01     9.180e-01    24/24      23/24     23/24
+   eager   8192  1                               1.875e-01     7.031e-01    21/24      21/24  
+    ring  32768  1    6.250e-02    6.250e-01     1.562e-01     3.281e-01     6/6        6/6       6/6
+    ring  32768  4    1.250e-01    1.156e+00     2.188e-01     5.625e-01    24/24      13/24     13/24
+   eager  32768  1                               1.875e-01     5.938e-01    24/24      17/24  
+drafted-token argmax agreement with the fp32-attention reference: NEW 207/216 (95.83%)  OLD torch bf16 187/216 (86.57%)
+DETERMINISM N=1: eager==replay True  replay==replay True
+DETERMINISM N=4: eager==replay True  replay==replay True
+
+## qwen38-27b-dspark — TIMING (TP=2 per rank: H=16 Hkv=4 hd=128, block 7, 5 layers, rings (causal,window,cap)=[(False, 0, 2055)])
+graph replay, CUDA events, median of 15 interleaved reps x 40 replays; ms per step
+ N      P |  attn old  attn new  attn ctl  speedup |  prop old  prop new  prop ctl  speedup | ctl spread
+ 1    512 |    0.5184    0.2966    0.2972    1.75x |    7.8193    7.1893    7.1861    1.09x |      0.23%
+ 1   2048 |    0.5186    0.3009    0.3010    1.72x |    7.8248    7.1960    7.1955    1.09x |      0.04%
+ 1   8192 |    0.5175    0.3012    0.3014    1.72x |    7.8126    7.1899    7.1925    1.09x |      0.07%
+ 1  32768 |    0.5169    0.3013    0.3015    1.72x |    7.8091    7.1855    7.1894    1.09x |      0.07%
+eager-fallback denoise_cached (N=1; S = window_prefix(P)+block keys per layer):
+     P |       old       new       ctl  speedup
+   512 |    4.2128    3.8566    3.8553    1.09x
+  2048 |    4.2567    3.9490    3.9510    1.08x
+  8192 |    5.9581    4.2719    4.2624    1.39x
+ 32768 |   14.1660    6.0446    6.0404    2.34x
+
+## ZAYA CCA drafter (random weights; hidden 2048, 8q/2k heads, hd 128, 2 layers) — attention fp32 torch (old) vs HIP (new)
+  S   L | hidden|d| new-vs-old     agree |   old ms   new ms   ctl ms  speedup
+  1  16 |            4.688e-02   15/15   |   0.8116   0.8074   0.8072    1.01x
+  4  16 |            6.250e-02   60/60   |   0.9275   0.9210   0.9217    1.01x
+  1   7 |            4.688e-02    6/6    |   0.7975   0.7811   0.7822    1.02x
+
+DETERMINISM GATE: PASS

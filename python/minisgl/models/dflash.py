@@ -36,7 +36,7 @@ linear verify_greedy (DFlash is a linear block, not a tree).
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +51,134 @@ from minisgl.layers.base import BaseOP
 # per KERNEL_CORE_POLICY.md. Aliased so the 12 call sites below are untouched.
 from .draft_linear import (  # noqa: E402
     SHARD_COL, SHARD_NONE, SHARD_ROW, DraftLinear as _PlainLinear)
+
+# ---- drafter attention: the native HIP paged flash-prefill kernel, never torch -----------------
+# Every DFlash/DSpark/CCA drafter attention call has the same shape: N short query blocks (Q rows
+# each), each attending over ITS OWN key sequence [prefix | block] with an optional additive mask.
+# That is exactly attn_prefill_paged.flash_prefill_paged's varlen contract with one PAGE PER
+# SEQUENCE: k/v_cache [pages, page_len, Hkv, hd], block_table [N, 1] naming each sequence's page,
+# cu_seqlens_q = arange(N+1)*Q, context_lens = page_len. It runs causal=0 and lets `mask_bias`
+# ([N*Q, page_len] fp32, 0 / -inf) carry all block structure (causal+SWA, liveness of ring columns),
+# so there is ONE code path whatever the layer's (causal, window) is. GQA is native (no
+# repeat_interleave), scores never materialise, and it is capture-safe: every argument is a device
+# tensor or a serve-lifetime constant, and `split_ctx` is the page length — the SAME number on the
+# eager and captured paths, which is what the op requires of it.
+#
+# The dense attn_hip.flash_prefill does NOT fit: it assumes q_len == k_len (one square [seq, seq]
+# bias), so a 16-row block over an 8k prefix would have to pad the query to 8k rows.
+_HIP_ATTN_HEAD_DIMS = (64, 128, 256, 512)   # the kernel's own TORCH_CHECK set (attention/rdna4.py)
+_PAGED_PREFILL = None
+# `split_ctx` floor for a drafter call. The op splits the key axis only when split_ctx exceeds its
+# MINISGL_ATTN_SPLIT_MIN_CTX gate (1024) — a gate tuned for ENGINE prefill, where a short context
+# usually arrives with a large query count that already fills the GPU. A drafter block never does:
+# it is <= block*group rows per KV head, a handful of CTAs. Measured on gfx1201 (RX 9070 XT, 16 q /
+# 4 kv heads, hd128): a 528-key page runs 132.5 us single-pass vs 35.0 us split; a 519-key block-7
+# page 131.3 vs 36.9 us. So the drafter always states a bound of at least this. It is a pure
+# function of the page length, so eager and captured calls still pass the same number, and every
+# ring page on the served pairs (2062 / 4240 / 8224 keys) is above it already — the captured path
+# is unaffected; this is the eager window/fallback path.
+_SPLIT_CTX_FLOOR = 2048
+
+
+def drafter_attn_op(head_dim: int):
+    """Resolve the HIP op AT LOAD, and refuse loudly if this geometry cannot run on it. There is no
+    torch fallback: a drafter the kernel cannot serve is a load error, not a silent slow path."""
+    global _PAGED_PREFILL
+    if head_dim not in _HIP_ATTN_HEAD_DIMS:
+        raise ValueError(
+            f"drafter head_dim={head_dim} is not covered by attn_prefill_paged "
+            f"(supports {_HIP_ATTN_HEAD_DIMS}); the drafter attention has no torch fallback")
+    if _PAGED_PREFILL is None:
+        try:
+            import attn_prefill_paged
+        except ImportError as e:  # pragma: no cover - image/PYTHONPATH defect
+            raise ImportError(
+                "the DFlash drafter attention runs on the attn_prefill_paged HIP kernel, which is "
+                "not importable — PYTHONPATH must include /opt/kernels (append it AFTER "
+                "/engine/python; see the tail_hip namespace-package note)") from e
+        _PAGED_PREFILL = attn_prefill_paged.flash_prefill_paged
+    return _PAGED_PREFILL
+
+
+class DrafterAttnMeta(NamedTuple):
+    """Page metadata for one drafter attention forward — shared by every layer that reads pages of
+    the same length. `group` is the GQA fan-out folded into the query axis (see `drafter_attend`)."""
+    block_table: torch.Tensor   # [n, 1] int32: sequence i reads page block_table[i]
+    cu_seqlens_q: torch.Tensor  # [n+1] int32: arange * (q * group)
+    context_lens: torch.Tensor  # [n] int32: page_len
+    q: int                      # query rows per sequence BEFORE the fold
+    group: int                  # num_heads // num_kv_heads
+
+
+def drafter_attn_meta(n: int, q: int, page_len: int, device, group: int,
+                      pages: Optional[torch.Tensor] = None) -> DrafterAttnMeta:
+    """Metadata for n sequences of q query rows, each over ONE page of `page_len` keys. `pages`
+    names each sequence's page in the cache (default: page i for sequence i). Device-side
+    construction only — no H2D, no host sync — so it is legal inside a captured body. Build it ONCE
+    per forward and share it across layers."""
+    i32 = torch.int32
+    rows = q * group
+    bt = (torch.arange(n, device=device, dtype=i32) if pages is None
+          else pages.to(i32)).view(n, 1)
+    cu = torch.arange(0, (n + 1) * rows, rows, device=device, dtype=i32)
+    cl = torch.full((n,), page_len, device=device, dtype=i32)
+    return DrafterAttnMeta(bt, cu, cl, q, group)
+
+
+def drafter_fold_mask(mask: Optional[torch.Tensor], group: int) -> Optional[torch.Tensor]:
+    """[n, q, page_len] (or [n*q, page_len]) additive mask -> the folded [n*q*group, page_len] fp32
+    rows the kernel indexes. Every head of a GQA group shares its query's mask row. Do this ONCE per
+    distinct mask per forward (layers share masks), not per layer."""
+    if mask is None:
+        return None
+    L = mask.shape[-1]
+    m = mask.reshape(-1, 1, L).to(torch.float32)
+    return m.expand(m.shape[0], group, L).reshape(-1, L).contiguous()
+
+
+def drafter_attend(q, k_cache, v_cache, meta: DrafterAttnMeta, scale: float,
+                   mask: Optional[torch.Tensor], split_ctx: Optional[int] = None) -> torch.Tensor:
+    """q [n*meta.q, H, hd] -> [n*meta.q, H, hd].
+
+    k/v_cache [pages, page_len, Hkv, hd] (may be a view whose PAGES stride, e.g. a ring pool's
+    [slots, cap+Q, Hkv, hd]; rows within a page must be packed). mask: None (bidirectional over the
+    whole page) or the FOLDED additive fp32 [n*meta.q*group, page_len] from `drafter_fold_mask`.
+    split_ctx: the op's split-K bound; default max(page_len, _SPLIT_CTX_FLOOR) (see there).
+
+    GQA IS FOLDED INTO THE QUERY AXIS. A drafter block is ~16 query rows against thousands of keys:
+    handed to the kernel as H heads x 16 rows, every CTA fills half of a 32-row tile and each KV head's
+    slab is re-streamed for every q-head pair. Handed over as Hkv heads x (16 * group) rows — the
+    `group` q-heads that share a KV head become extra query ROWS of that head — the tiles fill and K/V
+    is staged once per KV head. Same math (each row still sees exactly its own query vector, its own
+    mask row and its KV head's keys). Measured on gfx1201 (RX 9070, 16 q / 4 kv heads, hd128, block
+    16): 4240 keys 323.8 -> 176.0 us, 8224 keys 720.7 -> 315.4 us, and bit-identical to the unfolded
+    call (max|delta| 0.0) at block 16."""
+    from minisgl._hip_engage import engaged
+    engaged("attn_prefill_paged.flash_prefill_paged[drafter]")
+    page_len = k_cache.shape[1]
+    Hkv, hd = k_cache.shape[2], k_cache.shape[3]
+    for c in (k_cache, v_cache):   # rows inside a page must be packed; only the PAGE may stride
+        assert c.stride(3) == 1 and c.stride(2) == hd and c.stride(1) == Hkv * hd, (
+            f"drafter KV page must have packed rows, got strides {tuple(c.stride())}")
+    assert v_cache.stride(0) == k_cache.stride(0), "K and V pages must share one page stride"
+    T, H = q.shape[0], q.shape[1]
+    G = meta.group
+    assert H == Hkv * G, f"q heads {H} != kv heads {Hkv} x group {G}"
+    n = T // meta.q
+    rows = meta.q * G
+    if mask is not None:
+        assert mask.shape == (n * rows, page_len) and mask.dtype == torch.float32 \
+            and mask.is_contiguous(), (
+                f"mask must be drafter_fold_mask()'d: [{n * rows}, {page_len}] fp32, got "
+                f"{tuple(mask.shape)} {mask.dtype}")
+    qf = q.view(n, meta.q, Hkv, G, hd).transpose(2, 3).reshape(n * rows, Hkv, hd)
+    out = _PAGED_PREFILL(
+        qf, k_cache, v_cache, meta.block_table, meta.cu_seqlens_q, meta.context_lens, float(scale),
+        0, 0, int(rows),
+        int(split_ctx if split_ctx is not None else max(page_len, _SPLIT_CTX_FLOOR)),
+        int(k_cache.stride(0)), mask)
+    return out.view(n, meta.q, G, Hkv, hd).transpose(2, 3).reshape(T, H, hd)
+
 
 # DSpark Markov walk: how many unbiased top candidates each block position re-scores. The bias is a
 # low-rank ADDITIVE term, so the biased argmax can only move within tokens whose unbiased logit is
@@ -95,7 +223,7 @@ class _DFlashLayer(BaseOP):
         _asplit = tp.size if self._attn_sharded else 1
 
         self.hidden_size = hidden_size
-        # LOCAL head counts — every reshape/einsum below is expressed in these, so the attention math
+        # LOCAL head counts — every reshape and the attention call below are expressed in these, so the math
         # is per-rank by construction and needs no other edit.
         self.num_heads = num_heads // _asplit
         self.num_kv_heads = num_kv_heads // _asplit
@@ -114,6 +242,9 @@ class _DFlashLayer(BaseOP):
         # learned q_norm/k_norm at :235-236, and sglang/srt/models/dflash.py:158 identically — and
         # neither reads any family scale factor for a drafter. Do not "inherit" the target's scale.
         self.scale = head_dim ** -0.5
+        # The attention runs on the HIP paged flash kernel; resolve it (and refuse an uncovered
+        # head_dim) HERE, at load, rather than on the first propose.
+        drafter_attn_op(head_dim)
         self._rotary = rotary
         _acol = SHARD_COL if self._attn_sharded else SHARD_NONE
         _arow = SHARD_ROW if self._attn_sharded else SHARD_NONE
@@ -171,12 +302,20 @@ class _DFlashLayer(BaseOP):
         block_pos: torch.Tensor,  # [B]  RoPE positions for the noise block
         k_ctx: torch.Tensor,      # [P, Hkv, hd]  post-rotary prefix K (cached or freshly projected)
         v_ctx: torch.Tensor,      # [P, Hkv, hd]  prefix V
-        attn_mask: Optional[torch.Tensor] = None,  # [B, P+B] additive mask (0/-inf); None => bidirectional
+        attn_mask: Optional[torch.Tensor] = None,  # additive 0/-inf; None => bidirectional. [B, P+B]
+                                  # when meta is None, else already drafter_fold_mask()'d
+        meta=None,                # drafter_attn_meta(1, B, P+B, group) — shared across layers
     ) -> torch.Tensor:
         """The block half of the layer forward: project the noise queries/KV, then attend over
         [prefix K/V | noise K/V]. `attn_mask` None => bidirectional (z-lab Qwen); a [B, P+B] additive
         causal+sliding-window mask => Laguna (causal=true, window=512). `k_ctx`/`v_ctx` is the (possibly
-        persistent) target-context prefix from `project_ctx`."""
+        persistent) target-context prefix from `project_ctx`.
+
+        Attention is the HIP paged flash kernel over ONE page holding [prefix | block] (see
+        `drafter_attend`). It is not bit-identical to the torch einsum/softmax it replaced — a
+        different reduction order — and that is not a correctness property of a DRAFTER: a drafted
+        token only changes acceptance, and the target verifies every one. The contract is numerical
+        closeness to an fp32 reference (tools/dflash_window_parity.py)."""
         B = hidden.shape[0]
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
 
@@ -196,30 +335,13 @@ class _DFlashLayer(BaseOP):
         q = q_flat.view(B, H, hd)
         k_noise = kn_flat.view(B, Hkv, hd)
 
-        # K/V = [ctx prefix | noise]  along the key sequence.
-        K = torch.cat([k_ctx, k_noise], dim=0)  # [S, Hkv, hd], S = P + B
-        V = torch.cat([v_ctx, v_noise], dim=0)  # [S, Hkv, hd]
-        group = H // Hkv
-        # The group-expanded K/V stays. NOT an oversight — MEASURED, min-of-7, in
-        # tools/dflash_gqa_formulation_probe.py: the "carry a group axis in the einsum" rewrite (`bkgd,skd->bkgs` / `bkgs,skd->bkgd`)
-        # changes the underlying bmm from (batch=H, M=B, K=hd) to (batch=Hkv, M=B*group, K=hd) and the
-        # AV product from (batch=H, K=S) to (batch=Hkv, K=S). rocBLAS partitions those differently, so
-        # it is NOT bit-identical (dmax 2e-6..5e-4 on the attention output, ~1 bf16 ULP), and in
-        # tools/dflash_window_parity.py that was enough to FLIP a drafted token's argmax at P=512.
-        # A stride-0 broadcast `matmul` formulation IS bit-identical (dmax exactly 0 at every S) but
-        # torch materialises the broadcast anyway and it runs SLOWER than this (0.235 vs 0.160 ms at
-        # S=528). And the expansion is no longer the cost it was: once the window slice above caps
-        # S at sliding_window + block, these two copies are ~8.6 MB each per layer, not the ~492 MB
-        # they were at a 30k prefix — the grouped einsum's whole remaining edge at S=528 is 3.8% of
-        # the attention core (0.154 vs 0.160 ms), which does not buy a drafted-token flip.
-        K = K.repeat_interleave(group, dim=1)  # [S, H, hd]
-        V = V.repeat_interleave(group, dim=1)
-        # scores[b,h,s] = q[b,h] . K[s,h]; attention over the S keys (masked for Laguna causal+SWA).
-        scores = torch.einsum("bhd,shd->bhs", q, K) * self.scale  # [B, H, S]
-        if attn_mask is not None:
-            scores = scores + attn_mask.unsqueeze(1)  # [B, 1, S] broadcast over heads
-        probs = scores.softmax(dim=-1).to(V.dtype)
-        attn = torch.einsum("bhs,shd->bhd", probs, V)  # [B, H, hd]
+        # K/V = [ctx prefix | noise] along the key sequence, as ONE page of S = P + B rows.
+        K = torch.cat([k_ctx, k_noise], dim=0).unsqueeze(0)  # [1, S, Hkv, hd]
+        V = torch.cat([v_ctx, v_noise], dim=0).unsqueeze(0)
+        if meta is None:   # standalone call; the model forwards build these once for all layers
+            meta = drafter_attn_meta(1, B, K.shape[1], hidden.device, H // Hkv)
+            attn_mask = drafter_fold_mask(attn_mask, H // Hkv)
+        attn = drafter_attend(q, K, V, meta, self.scale, attn_mask)  # [B, H, hd]
         if self.gated:
             # Per-head softplus output gate (fp32, matches base LagunaAttention) before o_proj.
             gate = torch.nn.functional.softplus(self.g_proj.forward(x).float()).to(attn.dtype)  # [B,H]
@@ -235,31 +357,32 @@ class _DFlashLayer(BaseOP):
         self,
         hidden: torch.Tensor,     # [N, Q, hidden]  noise block hidden, N requests x Q block rows
         block_pos: torch.Tensor,  # [N, Q] int32 RoPE positions for the noise block
-        k_ctx: torch.Tensor,      # [N, C, Hkv, hd]  post-rotary prefix K (a ring slice of the pool)
-        v_ctx: torch.Tensor,      # [N, C, Hkv, hd]
-        attn_mask: torch.Tensor,  # [N, Q, C+Q] additive 0/-inf
+        k_pool: torch.Tensor,     # [slots, C+Q, Hkv, hd]  this layer's ring: C prefix cols + Q scratch
+        v_pool: torch.Tensor,
+        slots: torch.Tensor,      # [N] int64 ring slot each request reads (NULL slot for padding)
+        attn_mask: torch.Tensor,  # [N*Q*group, C+Q] additive 0/-inf, drafter_fold_mask()'d
+        meta,                     # drafter_attn_meta(N, Q, C+Q, group, pages=slots), shared
     ) -> torch.Tensor:
         """BATCHED, CUDA-graph-capturable twin of `attend_block`.
 
-        Three differences from the per-request form, each forced by capture (see spec/capture.py):
+        Differences from the per-request form, each forced by capture (see spec/capture.py):
           * N requests in ONE forward — the per-request Python loop is host control flow, which a
             graph cannot contain, and it was also serialising every request's ~150 launches.
-          * the prefix is a FIXED [N, C, ...] ring slice with an additive mask, not a variable [P,...]
-            slice: a data-dependent contraction dim cannot be captured.
-          * GROUPED-query contraction instead of `repeat_interleave(group)`. The expansion would
-            materialise [N, C+Q, H, hd] — 8x larger — INSIDE the graph, where every allocation is
-            charged to the graph's private pool permanently (this is the same allocation that OOM'd
-            the MTP propose pool before it was grouped). At the O(window) shape it is 8.6 MB/layer
-            expanded, so the trade that kept `repeat_interleave` in the eager path (bit-identity at
-            a 3.8% cost) does not survive multiplication by the batch and the pool.
+          * the prefix is a FIXED-capacity ring row with an additive mask, not a variable [P,...]
+            slice: a data-dependent key length cannot be captured.
+          * ZERO-COPY keys. Each ring row carries Q SCRATCH columns after its C prefix columns; the
+            block's own K/V are written there, and the kernel reads [prefix | block] straight out of
+            the pool with the request's slot as its page. The old path gathered `k_pool[slots]` and
+            `torch.cat`ed the block onto it — two full [N, C+Q, Hkv, hd] copies per tensor per layer,
+            all of it charged to the graph's private pool. Padding rows share the NULL slot and so
+            share its scratch; their outputs are discarded, and every value there is finite.
 
-        NOT bit-identical to `attend_block` — the reduction regroups (different bmm shapes, longer
-        masked-out key axis). It IS bit-identical to ITSELF eager vs replayed, which is the property
-        capture has to have; losslessness of the emitted tokens comes from verify, as always."""
+        Deterministic: eager == replayed bit for bit for the real rows (the kernel's split decision
+        keys on `split_ctx` = C+Q, a serve constant, never on anything that differs under capture)."""
         N, Q = hidden.shape[0], hidden.shape[1]
         H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
-        group = H // Hkv
         T = N * Q
+        C = k_pool.shape[1] - Q
 
         flat = hidden.reshape(T, -1)
         residual = flat
@@ -274,18 +397,11 @@ class _DFlashLayer(BaseOP):
             block_pos.reshape(T), q.reshape(T, H * hd).contiguous(),
             k_noise.reshape(T, Hkv * hd).contiguous()
         )
-        # [N, Q, Hkv, group, hd] — the regrouping that matches repeat_interleave's head mapping
-        # (expanded head h reads kv head h // group, so q head h = kv*group + r).
-        qg = q_flat.view(N, Q, Hkv, group, hd)
-        k_noise = kn_flat.view(N, Q, Hkv, hd)
-        v_noise = v_noise.view(N, Q, Hkv, hd)
-
-        K = torch.cat([k_ctx, k_noise], dim=1)   # [N, S, Hkv, hd], S = C + Q
-        V = torch.cat([v_ctx, v_noise], dim=1)
-        scores = torch.einsum("nqgrd,nsgd->nqgrs", qg, K) * self.scale       # [N,Q,Hkv,group,S]
-        scores = scores + attn_mask.view(N, Q, 1, 1, -1)
-        probs = scores.softmax(dim=-1).to(V.dtype)
-        attn = torch.einsum("nqgrs,nsgd->nqgrd", probs, V).reshape(T, H, hd)
+        # The block's K/V into each request's scratch columns [C, C+Q) of its own ring row.
+        k_pool[slots, C:] = kn_flat.view(N, Q, Hkv, hd)
+        v_pool[slots, C:] = v_noise.view(N, Q, Hkv, hd)
+        attn = drafter_attend(q_flat.view(T, H, hd), k_pool, v_pool, meta, self.scale,
+                              attn_mask)  # [T, H, hd]
         if self.gated:
             gate = torch.nn.functional.softplus(self.g_proj.forward(x).float()).to(attn.dtype)
             attn = attn * gate.unsqueeze(-1)
@@ -301,11 +417,12 @@ class _DFlashLayer(BaseOP):
         block_pos: torch.Tensor,      # [B]  RoPE positions for the noise block
         ctx_pos: torch.Tensor,        # [P]  RoPE positions for the target prefix
         attn_mask: Optional[torch.Tensor] = None,  # [B, P+B] additive mask (0/-inf); None => bidirectional
+        meta=None,                    # drafter_attn_meta(1, B, P+B), shared across layers
     ) -> torch.Tensor:
         # Recompute-every-step path (no persistent KV): project the whole prefix, then attend. Kept
         # byte-identical for the legacy/window fallback; the fast path caches project_ctx across steps.
         k_ctx, v_ctx = self.project_ctx(target_hidden, ctx_pos)
-        return self.attend_block(hidden, block_pos, k_ctx, v_ctx, attn_mask)
+        return self.attend_block(hidden, block_pos, k_ctx, v_ctx, attn_mask, meta)
 
 
 class DFlashDraftModel(BaseOP):
@@ -420,6 +537,8 @@ class DFlashDraftModel(BaseOP):
             for i in range(num_layers)
         ]
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # GQA fan-out the attention kernel folds into its query axis (per rank; identical per layer).
+        self._group = self.layers[0].num_heads // self.layers[0].num_kv_heads
 
         # Own embed/lm_head + d2t only for the pruned-vocab (Checkpoint B) variant.
         self.draft_vocab_size = draft_vocab_size
@@ -594,6 +713,18 @@ class DFlashDraftModel(BaseOP):
             keep, torch.zeros((), device=device), torch.full((), float("-inf"), device=device)
         ).float()
 
+    def _fold_masks(self, masks: List[Optional[torch.Tensor]]) -> List[Optional[torch.Tensor]]:
+        """drafter_fold_mask each DISTINCT mask once (layers share mask tensors), preserving the
+        per-layer sharing, so a uniform drafter pays one fold per forward, not one per layer."""
+        done: dict = {}
+        out = []
+        for m in masks:
+            k = id(m)
+            if k not in done:
+                done[k] = drafter_fold_mask(m, self._group)
+            out.append(done[k])
+        return out
+
     def layer_masks(self, P: int, B: int, device: torch.device) -> List[Optional[torch.Tensor]]:
         """One additive mask per layer, built once per distinct (causal, window) pair.
 
@@ -657,9 +788,11 @@ class DFlashDraftModel(BaseOP):
         if P < P_full:  # windowed: drop the prefix rows the mask discards BEFORE projecting them
             target_hidden = target_hidden[P_full - P :]
             ctx_pos = ctx_pos[P_full - P :]
-        masks = self.layer_masks(P, noise_embed.shape[0], noise_embed.device)
+        B = noise_embed.shape[0]
+        masks = self._fold_masks(self.layer_masks(P, B, noise_embed.device))
+        meta = drafter_attn_meta(1, B, P + B, noise_embed.device, self._group)  # [prefix | block]
         for layer, mask in zip(self.layers, masks):
-            hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos, mask)
+            hidden = layer.forward(hidden, target_hidden, block_pos, ctx_pos, mask, meta)
         return self.norm.forward(hidden)
 
     @torch.inference_mode()
@@ -690,12 +823,14 @@ class DFlashDraftModel(BaseOP):
         P = self.window_prefix(P_full)
         if P < P_full:
             # SLICE BEFORE THE CAT: a contiguous view of the newest W rows, so `attend_block`'s
-            # torch.cat + einsums see [W + B] keys instead of [P + B]. Constant-shaped once P >= W.
+            # torch.cat + attention see [W + B] keys instead of [P + B]. Constant-shaped once P >= W.
             d = P_full - P
             prefix_kv = [(k[d:], v[d:]) for (k, v) in prefix_kv]
-        masks = self.layer_masks(P, noise_embed.shape[0], noise_embed.device)
+        B = noise_embed.shape[0]
+        masks = self._fold_masks(self.layer_masks(P, B, noise_embed.device))
+        meta = drafter_attn_meta(1, B, P + B, noise_embed.device, self._group)
         for layer, (k_ctx, v_ctx), mask in zip(self.layers, prefix_kv, masks):
-            hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask)
+            hidden = layer.attend_block(hidden, block_pos, k_ctx, v_ctx, mask, meta)
         return self.norm.forward(hidden)
 
     # ---- CUDA-graph-capturable batched propose (see spec/capture.py, spec/dflash.py) -------------
@@ -703,7 +838,7 @@ class DFlashDraftModel(BaseOP):
         self,
         aux: torch.Tensor,          # [m, num_aux, hidden]  captured target aux, m rows
         rope_pos: torch.Tensor,     # [m] int32 absolute RoPE position of each row
-        k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd] persistent ring
+        k_pool: List[torch.Tensor],  # per-layer [slots, C+Q, Hkv, hd] ring (cols >= C are scratch)
         v_pool: List[torch.Tensor],
         wslot: torch.Tensor,        # [m] destination slot per row (NULL slot = discard)
         wcol,                       # [m] ring column per row, or a PER-LAYER list of them
@@ -743,22 +878,28 @@ class DFlashDraftModel(BaseOP):
         self,
         noise_embed: torch.Tensor,   # [N, Q, hidden]
         block_pos: torch.Tensor,     # [N, Q] int32
-        k_pool: List[torch.Tensor],  # per-layer [slots, C, Hkv, hd]
+        k_pool: List[torch.Tensor],  # per-layer [slots, C+Q, Hkv, hd]: C ring cols + Q block scratch
         v_pool: List[torch.Tensor],
         slots: torch.Tensor,         # [N] which ring slot each request reads
         mask,                        # [N, Q, C+Q] additive 0/-inf, or a PER-LAYER list of them
     ) -> torch.Tensor:
         """One BATCHED denoising forward over the persistent ring -> [N, Q, hidden].
 
-        The per-layer gather ``k_pool[l][slots]`` is issued INSIDE the layer loop, not hoisted: the
-        caching allocator then reuses one layer's [N, C, Hkv, hd] transient for the next, so the
-        graph's private pool holds one layer's worth rather than all of them."""
-        per_layer_mask = isinstance(mask, (list, tuple))
+        No per-layer gather: the attention kernel reads each request's ring row IN PLACE, the slot
+        being its page (see `attend_block_batched`). The page metadata depends only on (N, Q, page
+        length, slots), so it is built once per distinct ring capacity and shared by every layer."""
+        masks = self._fold_masks(
+            list(mask) if isinstance(mask, (list, tuple)) else [mask] * len(self.layers))
+        N, Q = noise_embed.shape[0], noise_embed.shape[1]
+        metas: dict = {}
         hidden = noise_embed
         for l, layer in enumerate(self.layers):
+            page_len = k_pool[l].shape[1]
+            if page_len not in metas:
+                metas[page_len] = drafter_attn_meta(
+                    N, Q, page_len, noise_embed.device, self._group, pages=slots)
             hidden = layer.attend_block_batched(
-                hidden, block_pos, k_pool[l][slots], v_pool[l][slots],
-                mask[l] if per_layer_mask else mask)
+                hidden, block_pos, k_pool[l], v_pool[l], slots, masks[l], metas[page_len])
         return self.norm.forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)
 
 
