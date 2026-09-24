@@ -560,8 +560,7 @@ class Qwen3_5MTPAttn(Qwen3_5Attn):
         slot: int,                # global slot (= req.table_idx) to seed
         start_col: int,           # first column to write (0 for a fresh prompt seed)
     ) -> None:
-        """Seed the GLOBAL draft-KV buffer from the prompt prefix, WITHOUT attention — the buffered
-        twin of GLMMTPAttention.seed_kv. Computes q/k/v + q_norm/k_norm + rotary EXACTLY as
+        """Seed the GLOBAL draft-KV buffer from the prompt prefix, WITHOUT attention. Computes q/k/v + q_norm/k_norm + rotary EXACTLY as
         forward_draft_masked does (keep in sync); only the attention read is dropped (we just persist
         k/v). Writes S rows into k_buf[slot, start_col:start_col+S] / v_buf[...], so the first decode
         propose (which appends the bonus token at column start_col+S and attends over the whole window)
@@ -651,8 +650,7 @@ class Qwen3_5MTPHead(BaseOP):
         """Seed the GLOBAL draft-KV buffer (the BUFFERED propose path) from the prompt prefill: for
         each prompt position build the same fused layer input ``step_masked`` would, then persist its
         k/v into k_buf/v_buf[slot] at columns start_col.. (no attention). Mirrors ``step_masked``'s
-        fuse + input_layernorm before the attention's seed_kv_masked — the buffered analogue of
-        GLMMTPHead.seed_kv (which returns a per-uid list; here we write the fixed-shape global buffer).
+        fuse + input_layernorm before the attention's seed_kv_masked, writing the fixed-shape global buffer.
 
         tokens: [S] (token_p at each seeded position p); prev_hidden: [S, hidden] (the target hidden
         h_{p-1} that produced it — the MTP ``previous_hidden_states``); positions: [S] RoPE positions."""
