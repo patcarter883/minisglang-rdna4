@@ -405,155 +405,97 @@ class GLMModel(BaseOP):
 
 
 class GLMMTPAttention(GLMMLAAttention):
-    """MLA attention for the self-contained MTP draft chain.
+    """MLA attention for the self-contained MTP draft chain, on the ``mla_hip.mla_decode`` kernel.
 
     Reuses the decoder MLA projections (q_a/q_b, kv_a/kv_b, o_proj, RoPE, W_UK/W_UV absorption via
-    post_load) but runs a MATERIALIZED causal attention over the SHORT per-request draft chain
-    (<= K tokens, freshly built each propose), never touching the engine's paged latent cache or the
-    attn backend. `forward_draft(x, positions)` processes one autoregressive step for all B requests
-    (x: [B, hidden]); it appends each step's per-head k/v latent to a running cache the caller owns."""
+    post_load) and runs the ABSORBED form — the same one the target's decode uses — over a persistent
+    per-slot LATENT draft ring owned by the proposer (spec/mtp.py). It never touches the engine's paged
+    latent cache or the attn backend.
 
-    def forward_draft(
-        self, x: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
-    ) -> torch.Tensor:
-        # x: [B, hidden] (one MTP token per request); positions: [B] absolute RoPE positions.
-        # cache: list growing per step, each entry (k_full [B,H,qk], v [B,H,vhd]); returns [B, hidden].
+    WHY LATENT, NOT MATERIALIZED. The draft ring used to hold per-head materialized K [H, qk] and V
+    [H, v] per token (TP=2 GLM-4.7-Flash: 10 x (256 + 256) = 5120 elements) and attended in PLAIN
+    TORCH: ``k_buf[slot_rows]`` gathered (copied) the slot's whole ring every draft step, then einsum +
+    softmax over all R columns with an additive -inf mask — work sized from the ring's CAPACITY, not the
+    live draft context. The latent row is [c_KV (kv_lora) | roped k_rope] = 576 elements shared by
+    every head (8.9x fewer bytes/key), the kv_b_proj up-projection of the new token disappears from
+    both the step and the prompt seed, and ``mla_decode`` reads the ring IN PLACE (page_size-1 pages,
+    block table from ``DraftAttnMeta``) over exactly the live keys. Absorbed == materialized
+    mathematically: q_nope·(W_UK c) = (q_nope W_UK)·c and Σp·(W_UV c) = W_UV·(Σp c)."""
+
+    def draft_buffer_dims(self) -> "tuple[int, int, int, int]":
+        """(n_k_heads, k_dim, n_v_heads, v_dim) for the GLOBAL persistent draft ring the proposer
+        allocates. The LATENT form stores ONE shared [c_KV | k_rope] row per token (1 "head", 576
+        wide) and NO separate V: mla_decode reads V as the latent's first kv_lora_rank dims. So the V
+        buffer is zero-sized and nothing indexes it."""
+        return 1, self.kv_lora_rank + self.qk_rope, 0, 0
+
+    def _latent(self, x: torch.Tensor, positions: torch.Tensor) -> "Tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """q_nope [T,H,nope], q_rope [T,H,rope] (roped) and latent [T, kv_lora+rope] (normed c_KV ‖
+        roped k_rope) — the exact rows GLMMLAAttention.forward stores in the target's latent cache."""
         T = x.shape[0]
-        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
+        H, nope, rope = self.num_heads, self.qk_nope, self.qk_rope
         q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
         q = q.view(T, H, self.qk_head_dim)
         q_nope, q_rope = q[..., :nope], q[..., nope:]
         kv = self.kv_a_proj_with_mqa.forward(x)
         c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
-        k_rope = kv[:, self.kv_lora_rank :]
         q_rope, k_rope = self.rotary.forward(
-            positions, q_rope.reshape(T, H * rope).contiguous(), k_rope.contiguous()
+            positions, q_rope.reshape(T, H * rope).contiguous(), kv[:, self.kv_lora_rank :].contiguous()
         )
-        q_rope = q_rope.view(T, H, rope)
-        # Materialize per-head k_nope / v from the latent (drop the absorption — chain is tiny).
-        kvb = self.kv_b_proj.forward(c_kv).view(T, H, nope + vhd)
-        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [T,H,nope], [T,H,vhd]
-        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(T, H, rope)], dim=-1)  # [T,H,qk]
-        q_full = torch.cat([q_nope, q_rope], dim=-1)  # [T,H,qk]
-        cache.append((k_full, v))
-        # Causal attention over the chain so far (steps 0..step). Stack -> [S,T,H,*].
-        Ks = torch.stack([c[0] for c in cache], dim=0)  # [S,T,H,qk]
-        Vs = torch.stack([c[1] for c in cache], dim=0)  # [S,T,H,vhd]
-        # scores[t,h,s] = q[t,h]·k[s,t,h]; per (t,h): attend keys 0..step (all causal, current incl.).
-        scores = torch.einsum("thd,sthd->ths", q_full, Ks) * self.scale_attn  # [T,H,S]
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        o = torch.einsum("ths,sthd->thd", probs, Vs)  # [T,H,vhd]
-        return self.o_proj.forward(o.reshape(T, H * vhd))
-
-    def seed_kv(
-        self, x: torch.Tensor, positions: torch.Tensor
-    ) -> "list[Tuple[torch.Tensor, torch.Tensor]]":
-        """Per-position (k_full, v) for a batch of prompt positions WITHOUT attention — used to SEED
-        the persistent MTP draft KV from the prompt prefill (MTPProposer.seed_prefill). The q/k/v +
-        RoPE math MUST mirror ``forward_draft`` exactly (keep in sync); only the attention is dropped
-        (the cache stores k/v; attention runs at propose time over the stacked cache).
-
-        x: [S, hidden] (already ``input_layernorm``'d, like forward_draft's input); positions: [S].
-        Returns a list of S ``(k_full [1,H,qk], v [1,H,vhd])`` entries — exactly what forward_draft
-        appends, so the proposer can stack them directly."""
-        S = x.shape[0]
-        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
-        q = q.view(S, H, self.qk_head_dim)
-        q_rope = q[..., nope:]
-        kv = self.kv_a_proj_with_mqa.forward(x)
-        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
-        k_rope = kv[:, self.kv_lora_rank :]
-        _, k_rope = self.rotary.forward(
-            positions, q_rope.reshape(S, H * rope).contiguous(), k_rope.contiguous()
-        )
-        kvb = self.kv_b_proj.forward(c_kv).view(S, H, nope + vhd)
-        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [S,H,nope], [S,H,vhd]
-        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(S, H, rope)], dim=-1)  # [S,H,qk]
-        return [(k_full[s : s + 1], v[s : s + 1]) for s in range(S)]
-
-    def draft_buffer_dims(self) -> "tuple[int, int, int, int]":
-        """(n_k_heads, k_dim, n_v_heads, v_dim) for the GLOBAL persistent draft-KV buffer the buffered
-        MTP propose allocates (spec/mtp.py). MLA materializes per-head K/V for the tiny draft chain, so
-        it is full multi-head (H q == H k, no GQA) with an ASYMMETRIC k-dim (qk = nope+rope) vs v-dim."""
-        return self.num_heads, self.qk_head_dim, self.num_heads, self.v_head_dim
+        return q_nope, q_rope.view(T, H, rope), torch.cat([c_kv, k_rope], dim=-1)
 
     def forward_draft_masked(
         self,
         x: torch.Tensor,           # [B, hidden] — ONE draft token per row (post input_layernorm)
         positions: torch.Tensor,   # [B] absolute RoPE position per row
-        k_buf: torch.Tensor,       # [max_slots, max_ctx, H, qk] GLOBAL persistent draft K (materialized)
-        v_buf: torch.Tensor,       # [max_slots, max_ctx, H, vhd] GLOBAL persistent draft V
+        k_buf: torch.Tensor,       # [max_slots, R, 1, kv_lora+rope] GLOBAL persistent LATENT draft ring
+        v_buf: torch.Tensor,       # zero-sized (see draft_buffer_dims) — unused
         slot_rows: torch.Tensor,   # [B] slot (= req.table_idx) per row
-        write_col: torch.Tensor,   # [B] column this token's K/V is written at, per row
-        mask_bias: torch.Tensor,   # [B, max_ctx] additive: 0 for cols <= write_col, -inf beyond
+        write_col: torch.Tensor,   # [B] ring column this token's latent is written at, per row
+        meta,                      # spec.draft_attn.DraftAttnMeta: block_table [B,R] i32, ctx_lens [B] i32
     ) -> torch.Tensor:
-        """CUDA-graph-capturable twin of forward_draft: fixed-shape masked attention over a GLOBAL
-        persistent draft-KV buffer (keyed by slot, like page_table / GDN-state) instead of a torch.stack
-        over a growing Python list. The q/k/v + RoPE + per-head materialization is IDENTICAL to
-        forward_draft (keep in sync); only the KV store + attention read change (write to k_buf/v_buf at
-        write_col, attend over the whole max_ctx with the additive -inf mask). softmax(-inf)=0, so this is
-        byte-exact vs the sliced stack. No list mutation, no dynamic shapes → capturable."""
+        """One capturable draft step: store this token's latent at (slot_rows, write_col), then absorbed
+        MLA decode over the row's visible keys (``meta``, built on device by the proposer from its keep
+        mask — exactly the keys the old -inf mask kept). Static shapes, no host reads."""
         B = x.shape[0]
-        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
-        q = q.view(B, H, self.qk_head_dim)
-        q_nope, q_rope = q[..., :nope], q[..., nope:]
-        kv = self.kv_a_proj_with_mqa.forward(x)
-        c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
-        k_rope = kv[:, self.kv_lora_rank :]
-        q_rope, k_rope = self.rotary.forward(
-            positions, q_rope.reshape(B, H * rope).contiguous(), k_rope.contiguous()
-        )
-        q_rope = q_rope.view(B, H, rope)
-        kvb = self.kv_b_proj.forward(c_kv).view(B, H, nope + vhd)
-        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [B,H,nope], [B,H,vhd]
-        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(B, H, rope)], dim=-1)  # [B,H,qk]
-        q_full = torch.cat([q_nope, q_rope], dim=-1)  # [B,H,qk]
-        # Persist this token's per-head K/V into its slot at write_col (dynamic index — capturable).
-        k_buf[slot_rows, write_col] = k_full
-        v_buf[slot_rows, write_col] = v
-        # Full multi-head (1:1 q<->k, no GQA) masked attention over the whole window.
-        Ks = k_buf[slot_rows]  # [B, max_ctx, H, qk] (gather, read-only)
-        Vs = v_buf[slot_rows]  # [B, max_ctx, H, vhd]
-        scores = torch.einsum("bhd,bshd->bhs", q_full, Ks) * self.scale_attn  # [B,H,max_ctx]
-        scores = scores + mask_bias.view(B, 1, -1)  # broadcast the -inf mask over heads
-        probs = scores.softmax(dim=-1).to(Vs.dtype)
-        o = torch.einsum("bhs,bshd->bhd", probs, Vs)  # [B,H,vhd]
+        H, vhd = self.num_heads, self.v_head_dim
+        q_nope, q_rope, latent = self._latent(x, positions)
+        k_buf[slot_rows, write_col, 0] = latent
+        engaged("torch.einsum(ROCBLAS_BMM:mla_absorb_uk)")
+        q_abs = torch.einsum("thn,hnl->thl", q_nope, self._w_uk)       # [B,H,kv_lora]
+        q_full = torch.cat([q_abs, q_rope], dim=-1).contiguous()       # [B,H,kv_lora+rope]
+        ms, R, _, D = k_buf.shape
+        engaged("mla_hip.mla_decode(draft)")
+        o_latent = self._mla_decode(q_full, k_buf.view(ms * R, 1, D), meta.block_table,
+                                    meta.ctx_lens, self.scale_attn, 0, 0, self.qk_rope)  # [B,H,kv_lora]
+        engaged("torch.einsum(ROCBLAS_BMM:mla_absorb_uv)")
+        o = torch.einsum("thl,hdl->thd", o_latent, self._w_uv)          # [B,H,v]
         return self.o_proj.forward(o.reshape(B, H * vhd))
 
     def seed_kv_masked(
         self,
         x: torch.Tensor,          # [S, hidden] — post input_layernorm prompt-prefix rows
         positions: torch.Tensor,  # [S] absolute RoPE position per row
-        k_buf: torch.Tensor,      # [max_slots, max_ctx, H, qk] GLOBAL persistent draft K
-        v_buf: torch.Tensor,      # [max_slots, max_ctx, H, vhd] GLOBAL persistent draft V
+        k_buf: torch.Tensor,      # [max_slots, R, 1, kv_lora+rope] GLOBAL persistent LATENT draft ring
+        v_buf: torch.Tensor,      # zero-sized — unused
         slot: int,                # slot (= req.table_idx) to seed
-        start_col: int,           # first column to write (0 for a fresh prompt seed)
+        start_col: int,           # first column to write
     ) -> None:
-        """Seed the GLOBAL draft-KV buffer from the prompt prefix WITHOUT attention — the buffered twin
-        of seed_kv. q/k/v + RoPE + materialization mirror forward_draft_masked EXACTLY (keep in sync);
-        only the attention read is dropped. Writes S rows into k_buf/v_buf[slot, start_col:start_col+S]."""
+        """Seed the latent ring from the prompt prefix WITHOUT attention. Only the latent is needed —
+        no q projection, no kv_b_proj — and k_rope is rotated alone (``forward_one`` is bit-identical
+        to the key half of ``forward``), so it matches what forward_draft_masked stores exactly."""
         S = x.shape[0]
-        H, nope, rope, vhd = self.num_heads, self.qk_nope, self.qk_rope, self.v_head_dim
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
-        q = q.view(S, H, self.qk_head_dim)
-        q_rope = q[..., nope:]
         kv = self.kv_a_proj_with_mqa.forward(x)
         c_kv = self.kv_a_layernorm.forward(kv[:, : self.kv_lora_rank].contiguous())
-        k_rope = kv[:, self.kv_lora_rank :]
-        _, k_rope = self.rotary.forward(
-            positions, q_rope.reshape(S, H * rope).contiguous(), k_rope.contiguous()
-        )
-        kvb = self.kv_b_proj.forward(c_kv).view(S, H, nope + vhd)
-        k_nope, v = kvb[..., :nope], kvb[..., nope:]  # [S,H,nope], [S,H,vhd]
-        k_full = torch.cat([k_nope, k_rope.unsqueeze(1).expand(S, H, rope)], dim=-1)  # [S,H,qk]
-        k_buf[slot, start_col : start_col + S] = k_full
-        v_buf[slot, start_col : start_col + S] = v
+        k_rope = self.rotary.forward_one(positions, kv[:, self.kv_lora_rank :].contiguous())
+        k_buf[slot, start_col : start_col + S, 0] = torch.cat([c_kv, k_rope], dim=-1)
 
     def post_load(self) -> None:
         super().post_load()
         self.scale_attn = float(self.qk_head_dim) ** -0.5
+        # Resolved at LOAD: a missing mla_hip build must fail the boot, never fall back to torch.
+        import mla_hip
+        self._mla_decode = mla_hip.mla_decode
 
 
 class GLMMTPHead(BaseOP):
@@ -563,7 +505,7 @@ class GLMMTPHead(BaseOP):
         h_mtp = layer( eh_proj( concat[ enorm(embed(tok)), hnorm(last_hidden) ] ) )
         logits = shared_head.head( shared_head.norm(h_mtp) )
 
-    Run K times autoregressively (own short draft chain, no paged KV); see MTPProposer."""
+    Run K+1 times per propose over a persistent LATENT draft ring (see MTPProposer)."""
 
     def __init__(self, config: "ModelConfig", layer_id: int, expert_quant):
         self.embed_tokens = VocabParallelEmbedding(
@@ -594,36 +536,6 @@ class GLMMTPHead(BaseOP):
         h = self.hnorm.forward(last_hidden)
         return self.eh_proj.forward(torch.cat([e, h], dim=-1))
 
-    def step(
-        self, fused: torch.Tensor, positions: torch.Tensor, cache: "list", step: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One MTP decoder-layer step over the fused [B, hidden] input. Returns (logits, hidden)
-        where hidden feeds the NEXT step's hnorm and logits gives the next draft token."""
-        # GLMDecoderLayer-shaped: input_layernorm(no residual on the fused input) -> attn ->
-        # post_attention_layernorm(residual) -> mlp(residual). The fused vector is the layer input.
-        x, residual = self.input_layernorm.forward(fused, None)
-        x = self.self_attn.forward_draft(x, positions, cache, step)
-        x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
-                                    fuse_actquant=self._fuse_actquant)
-        hidden = x + residual  # residual stream after the layer
-        logits = self.shared_head.forward(hidden)
-        return logits, hidden
-
-    @torch.inference_mode()
-    def seed_kv(
-        self, tokens: torch.Tensor, prev_hidden: torch.Tensor, positions: torch.Tensor
-    ) -> "list[Tuple[torch.Tensor, torch.Tensor]]":
-        """Seed the persistent MTP draft KV from the prompt: for each prompt position build the same
-        fused layer input ``step`` would, then compute its k/v (no attention). Returns the list of
-        (k_full, v) entries the proposer stacks into its per-uid cache.
-
-        tokens: [S] (the token at each seeded position p); prev_hidden: [S, hidden] (the target hidden
-        h_{p-1} that produced it — the standard MTP ``previous_hidden_states``); positions: [S] RoPE
-        positions (= p). Mirrors ``step``'s fuse + input_layernorm before the attention's seed_kv."""
-        fused = self.fuse(self.embed(tokens), prev_hidden)
-        x = self.input_layernorm.forward(fused, None)[0]
-        return self.self_attn.seed_kv(x, positions)
-
     def step_masked(
         self,
         fused: torch.Tensor,
@@ -632,15 +544,15 @@ class GLMMTPHead(BaseOP):
         v_buf: torch.Tensor,
         slot_rows: torch.Tensor,
         write_col: torch.Tensor,
-        mask_bias: torch.Tensor,
+        meta,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """CUDA-graph-capturable twin of step(): identical input_layernorm / MLP(MoE) / norm / lm-head,
-        but self-attention uses forward_draft_masked (fixed-shape masked attention over the GLOBAL
-        persistent draft-KV buffer) instead of the growing-list stack. Byte-exact vs step() — only the
-        attention core differs. Drives the batched K-step chain in MTPProposer._chain."""
+        """One capturable MTP decoder-layer step over the fused [B, hidden] input: input_layernorm ->
+        forward_draft_masked (mla_hip decode over the GLOBAL latent draft ring, visible keys given by
+        ``meta``) -> post_attention_layernorm + MoE -> own norm + lm-head. Returns (logits, hidden);
+        hidden feeds the NEXT step's hnorm. Drives the K-step chain in MTPProposer.propose_body."""
         x, residual = self.input_layernorm.forward(fused, None)
         x = self.self_attn.forward_draft_masked(
-            x, positions, k_buf, v_buf, slot_rows, write_col, mask_bias)
+            x, positions, k_buf, v_buf, slot_rows, write_col, meta)
         x, residual = norm_then_mlp(self.post_attention_layernorm, self.mlp, x, residual,
                                     fuse_actquant=self._fuse_actquant)
         hidden = x + residual
@@ -658,8 +570,10 @@ class GLMMTPHead(BaseOP):
         slot: int,
         start_col: int,
     ) -> None:
-        """Buffered twin of seed_kv: seed the GLOBAL draft-KV buffer from the prompt prefix (no attention).
-        Mirrors seed_kv's fuse + input_layernorm, then writes into k_buf/v_buf[slot, start_col:]."""
+        """Seed the GLOBAL latent draft ring from the prompt prefix (no attention): for each prompt
+        position build the same fused layer input step_masked would (fuse + input_layernorm), then
+        store its latent at k_buf[slot, start_col:]. tokens [S] = token at position p; prev_hidden
+        [S, hidden] = the target hidden h_{p-1} that produced it; positions [S] = p."""
         fused = self.fuse(self.embed(tokens), prev_hidden)
         x = self.input_layernorm.forward(fused, None)[0]
         self.self_attn.seed_kv_masked(x, positions, k_buf, v_buf, slot, start_col)

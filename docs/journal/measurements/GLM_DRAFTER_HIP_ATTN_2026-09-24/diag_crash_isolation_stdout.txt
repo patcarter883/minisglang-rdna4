@@ -1,0 +1,361 @@
+gpu-lease: waiting for 1 free GPU(s)…
+gpu-lease: leased card(s) [0] as 'gpu0'  (HIP=0, port=8000, project=lease-gpu0)
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      65.4 us
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     233.0 us
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   old    5276.5 us
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        new      41.1 us  new_ctl      41.0 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-module bs=1 R=512 live=64        new     204.3 us  new_ctl     203.2 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+free(): invalid pointer
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   new    5037.8 us  new_ctl    5038.5 us
+bash: line 1:     9 Aborted                 (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        new      41.2 us  new_ctl      41.1 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-module bs=1 R=512 live=64        new     203.9 us  new_ctl     203.2 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   new    5041.2 us  new_ctl    5041.5 us
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      65.6 us
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     233.1 us
+[phase] replay round 0 arm old
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/engine/tools/glm_drafter_attn_parity.py", line 848, in <module>
+[rank0]:     main()
+[rank0]:   File "/engine/tools/glm_drafter_attn_parity.py", line 841, in main
+[rank0]:     timing(E3Arms, d, K, "EAGLE3", log, d.hidden_size)
+[rank0]:   File "/engine/tools/glm_drafter_attn_parity.py", line 795, in timing
+[rank0]:     report_timing(f"{name} propose({n_iter} steps) bs={bs} R={R} live={live}", time_arms(gw), log)
+[rank0]:                                                                                ^^^^^^^^^^^^^
+[rank0]:   File "/engine/tools/glm_drafter_attn_parity.py", line 171, in time_arms
+[rank0]:     g.replay()
+[rank0]:   File "/opt/venv/lib/python3.12/site-packages/torch/cuda/graphs.py", line 708, in replay
+[rank0]:     super().replay()
+[rank0]: RuntimeError: std::get: wrong index for variant
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=old module
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        old      64.9 us
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-module bs=1 R=512 live=64        old     232.3 us
+[phase] replay round 0 arm old
+[phase] replay round 1 arm old
+[phase] replay round 2 arm old
+[phase] replay round 3 arm old
+[phase] replay round 4 arm old
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   old    5280.4 us
+bash: line 1:     9 Segmentation fault      (core dumped) python /engine/tools/glm_drafter_attn_parity.py
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=1 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 511] < 1024, ctx [64]
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new module
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl propose
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl core
+[phase] capture begin EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] capture done  EAGLE3 bs=1 R=512 live=64 arm=new_ctl module
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-core   bs=1 R=512 live=64        new      41.3 us  new_ctl      41.1 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 attn-module bs=1 R=512 live=64        new     204.2 us  new_ctl     203.4 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] EAGLE3 propose(6 steps) bs=1 R=512 live=64   new    5039.0 us  new_ctl    5039.8 us
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['mtp'] PARITY=False TIMING=True BS=4 CASES=2048/2048
+[load] GLM MTP head layer 47: 10/20 heads (rank-0 slice), expert quant=QuantConfig
+[phase] meta ok: bt in [0, 8191] < 10240, ctx [2047, 2047, 2047, 2047]
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new propose
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new propose
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new core
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new core
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new module
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new module
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new_ctl propose
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new_ctl propose
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new_ctl core
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new_ctl core
+[phase] capture begin MTP bs=4 R=2048 live=2048 arm=new_ctl module
+[phase] capture done  MTP bs=4 R=2048 live=2048 arm=new_ctl module
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] MTP attn-core   bs=4 R=2048 live=2048        new     113.5 us  new_ctl     113.4 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] MTP attn-module bs=4 R=2048 live=2048        new     277.9 us  new_ctl     277.6 us
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 2 arm new
+[phase] replay round 2 arm new_ctl
+[phase] replay round 3 arm new_ctl
+[phase] replay round 3 arm new
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[time] MTP propose(3 steps) bs=4 R=2048 live=2048   new    4693.3 us  new_ctl    4701.4 us
+[result] PASS
+[env] card ROCR_VISIBLE_DEVICES=0 torch=2.15.0.dev20260827+rocm7.2 device=AMD Radeon RX 9070 XT ITERS=300 ROUNDS=5 dtype=torch.float16 PARTS=['eagle3'] PARITY=False TIMING=True BS=4 CASES=512/64
+[load] EAGLE3 drafter 16q/4kv x 128
+[phase] meta ok: bt in [0, 2047] < 2560, ctx [64, 64, 64, 64]
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=old propose
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=old propose
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=old core
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=old core
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=old module
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=old module
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new propose
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new propose
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new core
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new core
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new module
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new module
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new_ctl propose
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new_ctl propose
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new_ctl core
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new_ctl core
+[phase] capture begin EAGLE3 bs=4 R=512 live=64 arm=new_ctl module
+[phase] capture done  EAGLE3 bs=4 R=512 live=64 arm=new_ctl module
+[phase] replay round 0 arm old
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm old
+[phase] replay round 2 arm new_ctl
+[phase] replay round 2 arm old
+[phase] replay round 2 arm new
+[phase] replay round 3 arm old
+[phase] replay round 3 arm new
+[phase] replay round 3 arm new_ctl
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-core   bs=4 R=512 live=64        old     104.3 us  new     42.4 us  ctl     42.4 us  speedup   2.46x  ctl-spread -0.04%  (old rounds 103.8-104.8, new 41.7-42.7)
+[phase] replay round 0 arm old
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm old
+[phase] replay round 2 arm new_ctl
+[phase] replay round 2 arm old
+[phase] replay round 2 arm new
+[phase] replay round 3 arm old
+[phase] replay round 3 arm new
+[phase] replay round 3 arm new_ctl
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[phase] replay round 4 arm old
+[time] EAGLE3 attn-module bs=4 R=512 live=64        old     285.5 us  new    204.7 us  ctl    205.4 us  speedup   1.39x  ctl-spread +0.31%  (old rounds 284.7-287.9, new 204.6-208.1)
+[phase] replay round 0 arm old
+[phase] replay round 0 arm new
+[phase] replay round 0 arm new_ctl
+[phase] replay round 1 arm new
+[phase] replay round 1 arm new_ctl
+[phase] replay round 1 arm old
+[phase] replay round 2 arm new_ctl
+[phase] replay round 2 arm old
+[phase] replay round 2 arm new
+[phase] replay round 3 arm old
+[phase] replay round 3 arm new
+[phase] replay round 3 arm new_ctl
+[phase] replay round 4 arm new
+[phase] replay round 4 arm new_ctl
+[phase] replay round 4 arm old
+[time] EAGLE3 propose(6 steps) bs=4 R=512 live=64   old    5586.5 us  new   5097.6 us  ctl   5099.6 us  speedup   1.10x  ctl-spread +0.04%  (old rounds 5582.9-5599.7, new 5096.8-5099.2)
+[result] PASS

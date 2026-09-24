@@ -1,8 +1,8 @@
 """Numerical parity for the prompt-prefill draft-KV seed (MINISGL_SPEC_PREFILL_SEED).
 
-Runs INSIDE vllm22-w4a8:combined (TP=1; the EAGLE3 draft is replicated, so a TP=1 forward is the
+Runs INSIDE the serve image via tools/run_seed_kv_parity.sh (TP=1; the EAGLE3 draft is replicated, so a TP=1 forward is the
 per-rank computation). Validates the ONE correctness risk of the seed: that the BATCHED, attention-free
-``GLMEagle3DraftModel.seed_kv`` produces BYTE-IDENTICAL (k, v) to the validated autoregressive ``step``
+``GLMEagle3DraftModel.seed_buffered`` produces BYTE-IDENTICAL (k, v) to the autoregressive ``step_masked``
 that the decode-time propose uses — i.e. seeding the cache from the prompt yields exactly the KV the
 draft layer would have produced had it processed those positions one-at-a-time during decode.
 
@@ -73,22 +73,24 @@ def main() -> None:
     hiddens = torch.randn(S, hidden, device="cuda", dtype=dtype) * 0.5
     positions = torch.arange(1, S + 1, device="cuda", dtype=torch.int32)
 
-    # Reference: autoregressive step over each position (the decode-time path). step appends one (k,v)
-    # per call; collect them. The attention output is discarded — only the appended KV matters here.
-    seq_cache: list = []
+    # Reference: the decode-time step_masked over each position, one at a time, writing its (k, v) into
+    # ring A at column s (the attention output is discarded — only the stored KV matters here).
+    # Batched: seed_buffered writes all S rows into ring B in one shot, attention-free.
+    from minisgl.spec.draft_attn import DraftAttnBuilder
+    R = 16
+    ring_a = [torch.zeros(1, R, Hkv, hd, device="cuda", dtype=dtype) for _ in range(2)]
+    ring_b = [torch.zeros(1, R, Hkv, hd, device="cuda", dtype=dtype) for _ in range(2)]
+    builder = DraftAttnBuilder(R, torch.device("cuda"))
+    slot = torch.zeros(1, dtype=torch.int64, device="cuda")
     for s in range(S):
-        m.step(embeds[s : s + 1], hiddens[s : s + 1], positions[s : s + 1], seq_cache)
-
-    # Batched: seed_kv computes all S (k,v) in one shot, attention-free.
-    seed_entries = m.seed_kv(embeds, hiddens, positions)
-
-    assert len(seed_entries) == len(seq_cache) == S, (len(seed_entries), len(seq_cache), S)
-    max_dk = max_dv = 0.0
-    for s in range(S):
-        kref, vref = seq_cache[s]
-        kseed, vseed = seed_entries[s]
-        max_dk = max(max_dk, (kref.float() - kseed.float()).abs().max().item())
-        max_dv = max(max_dv, (vref.float() - vseed.float()).abs().max().item())
+        col = torch.full((1,), s, dtype=torch.int64, device="cuda")
+        keep = torch.zeros(1, R, dtype=torch.bool, device="cuda")
+        keep[0, : s + 1] = True
+        m.step_masked(embeds[s : s + 1], hiddens[s : s + 1], positions[s : s + 1], ring_a[0], ring_a[1],
+                      slot, col, builder.meta(slot, col, keep))
+    m.seed_buffered(embeds, hiddens, positions, ring_b[0], ring_b[1], 0, 0)
+    max_dk = (ring_a[0][0, :S].float() - ring_b[0][0, :S].float()).abs().max().item()
+    max_dv = (ring_a[1][0, :S].float() - ring_b[1][0, :S].float()).abs().max().item()
     print(f"[seed-kv-parity] S={S} max|dk|={max_dk:.3e} max|dv|={max_dv:.3e}")
     ok = max_dk == 0.0 and max_dv == 0.0
     print("[seed-kv-parity] RESULT:", "PASS (byte-identical)" if ok else
