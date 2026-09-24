@@ -108,12 +108,6 @@ x-lean-common: &lean-common
     # (The LEASE_ prefix is historical: a card arbiter, where one is in use, exports these.)
     ROCR_VISIBLE_DEVICES: "${LEASE_ROCR_DEVICES:-0}"
     HIP_VISIBLE_DEVICES: "${LEASE_HIP_DEVICES:-0}"
-    # Fused MoE decode gemm2 top_k split (grid.z). The split itself is DERIVED from occupancy in
-    # the kernel launcher and is NOT gated — these two are sweep/A-B handles, exactly like
-    # VLLM_W4A8_MOE_BN: _K forces a slice count so a control leg can run the unsplit grid from the
-    # SAME binary, _DEBUG makes the launcher print the count it chose (the A/B's provenance).
-    MINISGL_MOE_G2_SPLIT_K: "${MINISGL_MOE_G2_SPLIT_K:-}"
-    MINISGL_MOE_G2_SPLIT_DEBUG: "${MINISGL_MOE_G2_SPLIT_DEBUG:-}"
     # Tool-call runaway defenses (api_server; empty-safe via env_int, defaults live in code):
     # _CONT_LIMIT rejects a continuation replaying an unclosed block past N chars (default 49152);
     # _RUNAWAY_LIMIT force-finishes an in-flight generation once a single unclosed block passes N
@@ -288,10 +282,6 @@ x-lean-common: &lean-common
     # the guard admits a chunk that cannot fit and the worker dies mid-forward. Set it per model.
     MINISGL_PREFILL_ACT_KIB_PER_TOKEN: "${MINISGL_PREFILL_ACT_KIB_PER_TOKEN:-}"
     MINISGL_PREFILL_ACT_SAFETY_MIB: "${MINISGL_PREFILL_ACT_SAFETY_MIB:-}"
-    # Decode-GEMV tiling override for the fused MoE gemm2 (gemv_decode.h select_gemv_tiling).
-    # 0 forces the K-on-lanes sweep, which is what every group-16 (NVFP4) shape got before
-    # Int4Fp8GemvLoader declared bylane_min_group_v=16 — i.e. the matched A/B baseline, same binary.
-    VLLM_W4A8_MOE_G2FUSE_BYLANE: "${VLLM_W4A8_MOE_G2FUSE_BYLANE:-}"
     # MoE quant mode: 0 = W4A8 (int4 wt + int8/fp8 act via FP8-WMMA); 1 = W4A16 (weight-only, fp16 act).
     MINISGL_MOE_W4A16: "${MINISGL_MOE_W4A16:-0}"
     # SSM recurrent-state STORAGE dtype: 1 (default) = bf16, 0 = fp32. Passed through for the

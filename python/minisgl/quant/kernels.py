@@ -92,7 +92,7 @@ MOE_MXFP4_REGDIRECT = _os.environ.get("MINISGL_MOE_MXFP4_REGDIRECT", "0") != "0"
 # where the grid is actually known -- the same rule, and the same function, that carves the fused
 # gather-reduce gemm2's top_k reduction.
 _MOE_SPLITK_AUTO = 0
-# A/B handle, not a feature gate — the twin of MINISGL_MOE_G2_SPLIT_K on the fused arm. `legacy`
+# A/B handle, not a feature gate (the kernels' own split-K overrides are retired). `legacy`
 # reproduces the retired `4 if M == 1 else 1` so a control leg can measure what the shipped constant
 # actually cost end-to-end; any integer forces that slice count. Unset = derive.
 _MOE_SPLITK_FORCE = _os.environ.get("MINISGL_MOE_SPLITK_SCATTER", "")
